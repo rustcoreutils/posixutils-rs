@@ -1,0 +1,13 @@
+[package]
+name = "truefalse"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "true"
+path = "src/true.rs"
+
+[[bin]]
+name = "false"
+path = "src/false.rs"
+

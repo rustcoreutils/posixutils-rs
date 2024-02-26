@@ -1,5 +1,5 @@
 [workspace]
 resolver = "2"
 
-members = [ "cat", "display", "link", "pathnames", "plib", "truefalse" , "xform"]
+members = [ "cat", "datetime", "display", "link", "pathnames", "plib", "truefalse" , "xform"]
 

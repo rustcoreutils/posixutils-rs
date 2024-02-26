@@ -12,5 +12,5 @@ gettext-rs = { version = "0.7", features = ["gettext-system"] }
 
 [[bin]]
 name = "cat"
-path = "src/main.rs"
+path = "src/cat.rs"
 

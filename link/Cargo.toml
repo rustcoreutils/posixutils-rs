@@ -1,5 +1,5 @@
 [package]
-name = "posixutils-cat"
+name = "posixutils-link"
 version = "0.1.0"
 edition = "2021"
 
@@ -9,6 +9,10 @@ clap = { version = "4", features = ["derive"] }
 gettext-rs = { version = "0.7", features = ["gettext-system"] }
 
 [[bin]]
-name = "cat"
-path = "src/cat.rs"
+name = "unlink"
+path = "src/unlink.rs"
+
+[[bin]]
+name = "link"
+path = "src/link.rs"
 

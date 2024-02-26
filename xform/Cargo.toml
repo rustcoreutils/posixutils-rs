@@ -1,5 +1,5 @@
 [package]
-name = "posixutils-cat"
+name = "posixutils-xform"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,8 +7,9 @@ edition = "2021"
 plib = { path = "../plib" }
 clap = { version = "4", features = ["derive"] }
 gettext-rs = { version = "0.7", features = ["gettext-system"] }
+crc32fast = "1.4"
 
 [[bin]]
-name = "cat"
-path = "src/cat.rs"
+name = "cksum"
+path = "src/cksum.rs"
 

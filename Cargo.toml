@@ -1,6 +1,5 @@
 [workspace]
 resolver = "2"
 
-members = ["plib"
-, "truefalse"]
+members = [ "cat", "plib", "truefalse" ]
 

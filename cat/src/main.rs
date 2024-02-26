@@ -8,8 +8,11 @@
 //
 
 extern crate clap;
+extern crate plib;
 
 use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, textdomain};
+use plib::PROJECT_NAME;
 use std::fs;
 use std::io::{self, Read, Write};
 
@@ -40,9 +43,12 @@ fn cat_file(filename: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // parse command line arguments
     let mut args = Args::parse();
+
+    textdomain(PROJECT_NAME)?;
+    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
     if args.files.is_empty() {
         args.files.push(String::from("-"));

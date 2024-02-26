@@ -12,3 +12,7 @@ gettext-rs = { version = "0.7", features = ["gettext-system"] }
 name = "basename"
 path = "src/basename.rs"
 
+[[bin]]
+name = "dirname"
+path = "src/dirname.rs"
+

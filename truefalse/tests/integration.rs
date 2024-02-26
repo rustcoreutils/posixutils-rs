@@ -15,7 +15,7 @@ fn test_false_exit_code() {
         .unwrap()
         .parent()
         .unwrap() // Move up to the workspace root from the current package directory
-        .join("target/debug/false"); // Adjust the path to the binary
+        .join("target/release/false"); // Adjust the path to the binary
 
     let output = Command::new(workspace_target)
         .output()
@@ -31,7 +31,7 @@ fn test_true_exit_code() {
         .unwrap()
         .parent()
         .unwrap() // Move up to the workspace root from the current package directory
-        .join("target/debug/true"); // Adjust the path to the binary
+        .join("target/release/true"); // Adjust the path to the binary
 
     let output = Command::new(workspace_target)
         .output()

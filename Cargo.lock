@@ -226,6 +226,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "posixutils-pathnames"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "gettext-rs",
+ "plib",
+]
+
+[[package]]
 name = "posixutils-truefalse"
 version = "0.1.0"
 

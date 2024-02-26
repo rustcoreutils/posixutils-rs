@@ -281,6 +281,16 @@ name = "posixutils-truefalse"
 version = "0.1.0"
 
 [[package]]
+name = "posixutils-users"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "gettext-rs",
+ "libc",
+ "plib",
+]
+
+[[package]]
 name = "posixutils-xform"
 version = "0.1.0"
 dependencies = [

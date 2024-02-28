@@ -143,7 +143,7 @@ A similar project from the author, written in C++, is https://github.com/jgarzik
  - [ ] tabs
  - [ ] tail
  - [ ] talk
- - [ ] tee
+ - [x] tee
  - [ ] test
  - [ ] time
  - [ ] touch

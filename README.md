@@ -160,7 +160,7 @@ A similar project from the author, written in C++, is https://github.com/jgarzik
  - [ ] uniq
  - [x] unlink
  - [ ] uucp (UUCP)
- - [ ] uudecode (uue)
+ - [x] uudecode (uue)
  - [x] uuencode (uue)
  - [ ] uustat (UUCP)
  - [ ] uux (UUCP)

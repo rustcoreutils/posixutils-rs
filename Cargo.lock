@@ -328,7 +328,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "posixutils-filetree"
+name = "posixutils-link"
 version = "0.1.0"
 dependencies = [
  "clap",
@@ -337,13 +337,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "posixutils-link"
+name = "posixutils-misc"
 version = "0.1.0"
-dependencies = [
- "clap",
- "gettext-rs",
- "plib",
-]
 
 [[package]]
 name = "posixutils-pathnames"
@@ -364,8 +359,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "posixutils-truefalse"
+name = "posixutils-tree"
 version = "0.1.0"
+dependencies = [
+ "clap",
+ "gettext-rs",
+ "plib",
+]
 
 [[package]]
 name = "posixutils-users"

@@ -5,12 +5,12 @@ members = [
 	"datetime",
 	"display",
 	"file",
-	"filetree",
 	"link",
+	"misc",
 	"pathnames",
 	"plib",
 	"text",
-	"truefalse",
+	"tree",
 	"users",
 	"xform"
 ]

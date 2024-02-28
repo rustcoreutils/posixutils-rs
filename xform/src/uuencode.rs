@@ -35,7 +35,6 @@ struct Args {
 
 fn encode_file(args: &Args) -> io::Result<()> {
     let mut file: Box<dyn Read>;
-
     if let Some(filename) = &args.file {
         file = Box::new(fs::File::open(filename)?);
     } else {

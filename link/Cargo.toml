@@ -16,3 +16,7 @@ path = "src/unlink.rs"
 name = "link"
 path = "src/link.rs"
 
+[[bin]]
+name = "ln"
+path = "src/ln.rs"
+

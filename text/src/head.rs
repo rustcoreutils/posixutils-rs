@@ -14,7 +14,7 @@ use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, textdomain};
 use plib::PROJECT_NAME;
 use std::fs;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, Read, Write};
 
 /// head - copy the first part of files
 #[derive(Parser, Debug)]
@@ -29,28 +29,49 @@ struct Args {
 }
 
 fn head_file(args: &Args, filename: &str) -> io::Result<()> {
-    let file: Box<dyn Read>;
+    // open file, or stdin
+    let mut file: Box<dyn Read>;
     if filename == "" {
         file = Box::new(io::stdin().lock());
     } else {
         file = Box::new(fs::File::open(filename)?);
     }
 
-    let mut reader = io::BufReader::new(file);
-    let mut line_no = 0;
+    let mut raw_buffer = [0; 4096];
+    let mut nl = 0;
 
     loop {
-        line_no = line_no + 1;
-
-        let mut raw_line = String::new();
-        let n_read = reader.read_line(&mut raw_line)?;
+        // read a chunk of file data
+        let n_read = file.read(&mut raw_buffer[..])?;
         if n_read == 0 {
             break;
         }
 
-        io::stdout().write_all(raw_line.as_bytes())?;
+        // slice of buffer containing file data
+        let buf = &raw_buffer[0..n_read];
+        let mut pos = 0;
 
-        if line_no == args.n {
+        // count newlines
+        for chv in buf {
+            // LF character encountered
+            if *chv == 10 {
+                nl = nl + 1;
+            }
+
+            pos = pos + 1;
+
+            // if user-specified limit reached, stop
+            if nl >= args.n {
+                break;
+            }
+        }
+
+        // output full or partial buffer
+        let final_buf = &raw_buffer[0..pos];
+        io::stdout().write_all(final_buf)?;
+
+        // if user-specified limit reached, stop
+        if nl >= args.n {
             break;
         }
     }

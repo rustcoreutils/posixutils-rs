@@ -5,6 +5,7 @@ members = [
 	"cat",
 	"datetime",
 	"display",
+	"filetree",
 	"link",
 	"pathnames",
 	"plib",

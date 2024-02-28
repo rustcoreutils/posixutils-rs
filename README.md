@@ -128,8 +128,8 @@ A similar project from the author, written in C++, is https://github.com/jgarzik
  - [ ] qsub (Batch cat.)
  - [ ] renice
  - [ ] rm
- - [ ] rmdel
- - [ ] rmdir
+ - [ ] rmdel (SCCS)
+ - [x] rmdir
  - [ ] sact
  - [ ] sccs (SCCS)
  - [ ] sed

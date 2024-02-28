@@ -14,7 +14,7 @@ use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, textdomain};
 use plib::PROJECT_NAME;
 use std::fs;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 
 /// asa - interpret carriage-control characters
 #[derive(Parser, Debug)]
@@ -25,7 +25,12 @@ struct Args {
 }
 
 fn asa_file(filename: &str) -> io::Result<()> {
-    let file = fs::File::open(filename)?;
+    let file: Box<dyn Read>;
+    if filename == "" {
+        file = Box::new(io::stdin().lock());
+    } else {
+        file = Box::new(fs::File::open(filename)?);
+    }
     let mut reader = io::BufReader::new(file);
     let mut line_no: usize = 0;
 
@@ -67,10 +72,15 @@ fn asa_file(filename: &str) -> io::Result<()> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // parse command line arguments
-    let args = Args::parse();
+    let mut args = Args::parse();
 
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+
+    // if no files, read from stdin
+    if args.files.is_empty() {
+        args.files.push(String::new());
+    }
 
     let mut exit_code = 0;
 

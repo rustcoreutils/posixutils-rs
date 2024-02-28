@@ -54,10 +54,56 @@ impl CountInfo {
             nl: 0,
         }
     }
+
+    fn accum(&mut self, count: &CountInfo) {
+        self.words = self.words + count.words;
+        self.chars = self.chars + count.chars;
+        self.nl = self.nl + count.nl;
+    }
+}
+
+fn build_display_str(args: &Args, count: &CountInfo, filename: &str) -> String {
+    let mut output = String::new();
+    output.reserve(filename.len() + (3 * 10));
+
+    if args.lines {
+        let numstr = format!("{:>8}", count.nl);
+        output.push_str(&numstr);
+    }
+    if args.words {
+        if output.len() > 0 {
+            output.push(' ');
+        }
+        let numstr = format!("{:>8}", count.words);
+        output.push_str(&numstr);
+    }
+    if args.bytes || args.chars {
+        if output.len() > 0 {
+            output.push(' ');
+        }
+        let numstr = format!("{:>8}", count.chars);
+        output.push_str(&numstr);
+    }
+
+    output.push(' ');
+
+    if filename == "" {
+        output.push_str("(stdin)");
+    } else {
+        output.push_str(filename);
+    }
+
+    output
 }
 
 fn wc_file_bytes(count: &mut CountInfo, filename: &str) -> io::Result<()> {
-    let mut file = fs::File::open(filename)?;
+    let mut file: Box<dyn Read>;
+    if filename == "" {
+        file = Box::new(io::stdin().lock());
+    } else {
+        file = Box::new(fs::File::open(filename)?);
+    }
+
     let mut buffer = [0; 4096];
     let mut in_word = false;
 
@@ -101,7 +147,13 @@ fn wc_file_bytes(count: &mut CountInfo, filename: &str) -> io::Result<()> {
 }
 
 fn wc_file_chars(args: &Args, count: &mut CountInfo, filename: &str) -> io::Result<()> {
-    let file = fs::File::open(filename)?;
+    let file: Box<dyn Read>;
+    if filename == "" {
+        file = Box::new(io::stdin().lock());
+    } else {
+        file = Box::new(fs::File::open(filename)?);
+    }
+
     let mut reader = io::BufReader::new(file);
 
     loop {
@@ -138,35 +190,16 @@ fn wc_file_chars(args: &Args, count: &mut CountInfo, filename: &str) -> io::Resu
     Ok(())
 }
 
-fn wc_file(args: &Args, chars_mode: bool, filename: &str) -> io::Result<()> {
-    let mut count = CountInfo::new();
-
+fn wc_file(args: &Args, chars_mode: bool, filename: &str, count: &mut CountInfo) -> io::Result<()> {
     if chars_mode {
-        wc_file_chars(args, &mut count, filename)?;
+        wc_file_chars(args, count, filename)?;
     } else {
-        wc_file_bytes(&mut count, filename)?;
+        wc_file_bytes(count, filename)?;
     }
 
-    let mut output = String::new();
-    output.reserve(filename.len() + (3 * 10));
+    let output = build_display_str(&args, count, filename);
 
-    if args.lines {
-        output.push_str(count.nl.to_string().as_str());
-    }
-    if args.bytes || args.chars {
-        if output.len() > 0 {
-            output.push(' ');
-        }
-        output.push_str(count.chars.to_string().as_str());
-    }
-    if args.words {
-        if output.len() > 0 {
-            output.push(' ');
-        }
-        output.push_str(count.words.to_string().as_str());
-    }
-
-    println!("{} {}", output, filename);
+    println!("{}", output);
 
     Ok(())
 }
@@ -191,15 +224,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
     let mut exit_code = 0;
+    let mut totals = CountInfo::new();
 
-    for filename in &args.files {
-        match wc_file(&args, chars_mode, filename) {
+    // input via stdin
+    if args.files.is_empty() {
+        let mut count = CountInfo::new();
+
+        match wc_file(&args, chars_mode, "", &mut count) {
             Ok(()) => {}
             Err(e) => {
                 exit_code = 1;
-                eprintln!("{}: {}", filename, e);
+                eprintln!("stdin: {}", e);
             }
         }
+
+    // input files
+    } else {
+        for filename in &args.files {
+            let mut count = CountInfo::new();
+
+            match wc_file(&args, chars_mode, filename, &mut count) {
+                Ok(()) => {}
+                Err(e) => {
+                    exit_code = 1;
+                    eprintln!("{}: {}", filename, e);
+                }
+            }
+
+            totals.accum(&count);
+        }
+    }
+
+    if args.files.len() > 1 {
+        let output = build_display_str(&args, &totals, "total");
+        println!("{}", output);
     }
 
     std::process::exit(exit_code)

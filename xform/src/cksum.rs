@@ -25,7 +25,13 @@ struct Args {
 }
 
 fn cksum_file(filename: &str) -> io::Result<()> {
-    let mut file = fs::File::open(filename)?;
+    let mut file: Box<dyn Read>;
+    if filename == "" {
+        file = Box::new(io::stdin().lock());
+    } else {
+        file = Box::new(fs::File::open(filename)?);
+    }
+
     let mut buffer = [0; 4096];
     let mut n_bytes: u64 = 0;
     let mut hash = Hasher::new();
@@ -54,8 +60,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
+    // if no file args, read from stdin
     if args.files.is_empty() {
-        args.files.push(String::from("-"));
+        args.files.push(String::new());
     }
 
     let mut exit_code = 0;

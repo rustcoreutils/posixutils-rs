@@ -28,27 +28,14 @@ struct Args {
     files: Vec<String>,
 }
 
-fn cat_stdin() -> io::Result<()> {
-    let mut buffer = [0; 4096];
-
-    loop {
-        let n_read = io::stdin().read(&mut buffer[..])?;
-        if n_read == 0 {
-            break;
-        }
-
-        io::stdout().write_all(&buffer[0..n_read])?;
-    }
-
-    Ok(())
-}
-
 fn cat_file(filename: &str) -> io::Result<()> {
+    let mut file: Box<dyn Read>;
     if filename == "-" {
-        return cat_stdin();
+        file = Box::new(io::stdin().lock());
+    } else {
+        file = Box::new(fs::File::open(filename)?);
     }
 
-    let mut file = fs::File::open(filename)?;
     let mut buffer = [0; 4096];
 
     loop {
@@ -70,6 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
+    // if no file args, read from stdin
     if args.files.is_empty() {
         args.files.push(String::from("-"));
     }

@@ -84,7 +84,7 @@ A similar project from the author, written in C++, is https://github.com/jgarzik
  - [ ] kill
  - [ ] lex (Development)
  - [x] link
- - [ ] ln
+ - [x] ln
  - [ ] locale
  - [ ] localedef
  - [x] logger

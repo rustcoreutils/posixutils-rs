@@ -8,6 +8,7 @@ members = [
 	"link",
 	"pathnames",
 	"plib",
+	"text",
 	"truefalse",
 	"users",
 	"xform"

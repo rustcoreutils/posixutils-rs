@@ -339,6 +339,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "posixutils-text"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "gettext-rs",
+ "plib",
+]
+
+[[package]]
 name = "posixutils-truefalse"
 version = "0.1.0"
 

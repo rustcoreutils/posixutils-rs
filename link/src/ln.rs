@@ -13,6 +13,7 @@ extern crate plib;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, textdomain};
 use plib::PROJECT_NAME;
+use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 #[derive(Parser, Debug)]
@@ -30,12 +31,22 @@ struct Args {
     files: Vec<String>,
 }
 
+#[allow(deprecated)] // for soft_link()
 fn do_link(args: &Args, file1: &str, file2: &str) -> io::Result<()> {
     if args.symlink {
         fs::soft_link(file1, file2)
     } else {
         fs::hard_link(file1, file2)
     }
+}
+
+fn do_link_into(args: &Args, src: &str, target_dir: &str) -> io::Result<()> {
+    let mut path = PathBuf::from(target_dir);
+    path.push(Path::new(src).file_name().expect("Invalid source name"));
+
+    let target_name = path.to_str().expect("Unicode filenames required");
+
+    do_link(args, src, target_name)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -62,6 +73,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => {
                 exit_code = 1;
                 eprintln!("{} -> {}: {}", src, target, e);
+            }
+        }
+    } else {
+        for src in sources {
+            match do_link_into(&args, src, target) {
+                Ok(()) => {}
+                Err(e) => {
+                    exit_code = 1;
+                    eprintln!("{} -> {}: {}", src, target, e);
+                }
             }
         }
     }

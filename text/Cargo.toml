@@ -9,6 +9,10 @@ clap = { version = "4", features = ["derive"] }
 gettext-rs = { version = "0.7", features = ["gettext-system"] }
 
 [[bin]]
+name = "asa"
+path = "src/asa.rs"
+
+[[bin]]
 name = "wc"
 path = "src/wc.rs"
 

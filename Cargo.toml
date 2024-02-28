@@ -2,9 +2,9 @@
 resolver = "2"
 
 members = [
-	"cat",
 	"datetime",
 	"display",
+	"file",
 	"filetree",
 	"link",
 	"pathnames",

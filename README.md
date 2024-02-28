@@ -24,3 +24,154 @@ A similar project with the aim of GNU compatibility is https://github.com/uutils
 
 A similar project from the author, written in C++, is https://github.com/jgarzik/posixutils
 
+## Checklist of utilities
+
+ - [ ] admin (SCCS)
+ - [ ] ar (Development)
+ - [x] asa
+ - [ ] at (cron cat.)
+ - [ ] awk
+ - [x] basename
+ - [ ] batch (cron cat.)
+ - [ ] bc
+ - [ ] c99 (Development)
+ - [ ] cal
+ - [x] cat
+ - [ ] cflow (Development)
+ - [ ] chgrp
+ - [ ] chmod
+ - [ ] chown
+ - [x] cksum
+ - [ ] cmp
+ - [ ] comm
+ - [ ] compress (compress cat.)
+ - [ ] cp
+ - [ ] crontab (cron cat.)
+ - [ ] csplit
+ - [ ] ctags (Development)
+ - [ ] cut
+ - [ ] cxref (Development)
+ - [ ] date
+ - [ ] dd
+ - [ ] delta (SCCS)
+ - [ ] df
+ - [ ] diff
+ - [x] dirname
+ - [ ] du
+ - [x] echo
+ - [ ] ed
+ - [ ] env
+ - [ ] ex
+ - [ ] expand
+ - [ ] expr
+ - [x] false
+ - [ ] file
+ - [ ] find
+ - [ ] fold
+ - [ ] fort77 (Development)
+ - [ ] fuser
+ - [ ] gencat (i18n)
+ - [ ] get (SCCS)
+ - [ ] getconf
+ - [ ] getopts
+ - [ ] grep
+ - [ ] head
+ - [ ] iconv (i18n)
+ - [ ] id
+ - [ ] ipcrm (IPC)
+ - [ ] ipcs (IPC)
+ - [ ] join
+ - [ ] kill
+ - [ ] lex (Development)
+ - [x] link
+ - [ ] ln
+ - [ ] locale
+ - [ ] localedef
+ - [x] logger
+ - [x] logname
+ - [ ] lp
+ - [ ] ls
+ - [ ] m4
+ - [ ] mailx
+ - [ ] make
+ - [ ] man
+ - [ ] mesg
+ - [ ] mkdir
+ - [ ] mkfifo
+ - [ ] more
+ - [ ] mv
+ - [ ] newgrp
+ - [ ] nice
+ - [ ] nl
+ - [ ] nm
+ - [ ] nohup
+ - [ ] od
+ - [ ] paste
+ - [ ] patch
+ - [ ] pathchk
+ - [ ] pax
+ - [ ] pr
+ - [ ] printf
+ - [ ] prs (SCCS)
+ - [ ] ps
+ - [ ] pwd
+ - [ ] qalter (Batch cat.)
+ - [ ] qdel (Batch cat.)
+ - [ ] qhold (Batch cat.)
+ - [ ] qmove (Batch cat.)
+ - [ ] qmsg (Batch cat.)
+ - [ ] qrerun (Batch cat.)
+ - [ ] qrls (Batch cat.)
+ - [ ] qselect (Batch cat.)
+ - [ ] qsig (Batch cat.)
+ - [ ] qstat (Batch cat.)
+ - [ ] qsub (Batch cat.)
+ - [ ] renice
+ - [ ] rm
+ - [ ] rmdel
+ - [ ] rmdir
+ - [ ] sact
+ - [ ] sccs (SCCS)
+ - [ ] sed
+ - [ ] sh
+ - [x] sleep
+ - [ ] sort
+ - [ ] split
+ - [ ] strings
+ - [ ] strip (Development)
+ - [ ] stty
+ - [ ] tabs
+ - [ ] tail
+ - [ ] talk
+ - [ ] tee
+ - [ ] test
+ - [ ] time
+ - [ ] touch
+ - [ ] tput
+ - [ ] tr
+ - [x] true
+ - [ ] tsort
+ - [ ] tty
+ - [ ] ulimit
+ - [ ] uname
+ - [ ] uncompress (compress cat.)
+ - [ ] unexpand
+ - [ ] unget
+ - [ ] uniq
+ - [x] unlink
+ - [ ] uucp (UUCP)
+ - [ ] uudecode (uue)
+ - [ ] uuencode (uue)
+ - [ ] uustat (UUCP)
+ - [ ] uux (UUCP)
+ - [ ] val
+ - [ ] vi
+ - [ ] wait
+ - [x] wc
+ - [ ] what (SCCS)
+ - [ ] who
+ - [ ] write
+ - [ ] xargs
+ - [ ] yacc (Development)
+ - [ ] zcat (compress cat.)
+

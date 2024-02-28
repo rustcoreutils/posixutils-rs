@@ -86,13 +86,24 @@ fn build_display_str(args: &Args, count: &CountInfo, filename: &str) -> String {
     }
 
     output.push(' ');
-    output.push_str(filename);
+
+    if filename == "" {
+        output.push_str("(stdin)");
+    } else {
+        output.push_str(filename);
+    }
 
     output
 }
 
 fn wc_file_bytes(count: &mut CountInfo, filename: &str) -> io::Result<()> {
-    let mut file = fs::File::open(filename)?;
+    let mut file: Box<dyn Read>;
+    if filename == "" {
+        file = Box::new(io::stdin().lock());
+    } else {
+        file = Box::new(fs::File::open(filename)?);
+    }
+
     let mut buffer = [0; 4096];
     let mut in_word = false;
 
@@ -136,7 +147,13 @@ fn wc_file_bytes(count: &mut CountInfo, filename: &str) -> io::Result<()> {
 }
 
 fn wc_file_chars(args: &Args, count: &mut CountInfo, filename: &str) -> io::Result<()> {
-    let file = fs::File::open(filename)?;
+    let file: Box<dyn Read>;
+    if filename == "" {
+        file = Box::new(io::stdin().lock());
+    } else {
+        file = Box::new(fs::File::open(filename)?);
+    }
+
     let mut reader = io::BufReader::new(file);
 
     loop {
@@ -209,18 +226,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut exit_code = 0;
     let mut totals = CountInfo::new();
 
-    for filename in &args.files {
+    // input via stdin
+    if args.files.is_empty() {
         let mut count = CountInfo::new();
 
-        match wc_file(&args, chars_mode, filename, &mut count) {
+        match wc_file(&args, chars_mode, "", &mut count) {
             Ok(()) => {}
             Err(e) => {
                 exit_code = 1;
-                eprintln!("{}: {}", filename, e);
+                eprintln!("stdin: {}", e);
             }
         }
 
-        totals.accum(&count);
+    // input files
+    } else {
+        for filename in &args.files {
+            let mut count = CountInfo::new();
+
+            match wc_file(&args, chars_mode, filename, &mut count) {
+                Ok(()) => {}
+                Err(e) => {
+                    exit_code = 1;
+                    eprintln!("{}: {}", filename, e);
+                }
+            }
+
+            totals.accum(&count);
+        }
     }
 
     if args.files.len() > 1 {

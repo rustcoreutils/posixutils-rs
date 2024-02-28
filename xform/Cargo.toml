@@ -16,6 +16,10 @@ name = "cksum"
 path = "src/cksum.rs"
 
 [[bin]]
+name = "uudecode"
+path = "src/uudecode.rs"
+
+[[bin]]
 name = "uuencode"
 path = "src/uuencode.rs"
 

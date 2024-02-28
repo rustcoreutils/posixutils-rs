@@ -39,7 +39,7 @@ fn remove_dir(dirname: &str, rm_parents: bool) -> io::Result<()> {
                 Some(parent_name) => return remove_dir(parent_name, rm_parents),
                 None => {
                     eprintln!("{}", gettext("Non-unicode directory name rejected"));
-                    return Err(Error::new(ErrorKind::Other, "Missing --dbid"));
+                    return Err(Error::new(ErrorKind::Other, "Non-unicode dir name"));
                 }
             }
         }

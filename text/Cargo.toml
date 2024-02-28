@@ -13,6 +13,10 @@ name = "asa"
 path = "src/asa.rs"
 
 [[bin]]
+name = "head"
+path = "src/head.rs"
+
+[[bin]]
 name = "wc"
 path = "src/wc.rs"
 

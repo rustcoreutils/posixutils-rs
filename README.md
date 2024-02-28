@@ -75,7 +75,7 @@ A similar project from the author, written in C++, is https://github.com/jgarzik
  - [ ] getconf
  - [ ] getopts
  - [ ] grep
- - [ ] head
+ - [x] head
  - [ ] iconv (i18n)
  - [ ] id
  - [ ] ipcrm (IPC)

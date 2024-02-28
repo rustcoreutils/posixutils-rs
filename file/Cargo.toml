@@ -7,8 +7,13 @@ edition = "2021"
 plib = { path = "../plib" }
 clap = { version = "4", features = ["derive"] }
 gettext-rs = { version = "0.7", features = ["gettext-system"] }
+libc = "0.2"
 
 [[bin]]
 name = "cat"
 path = "src/cat.rs"
+
+[[bin]]
+name = "tee"
+path = "src/tee.rs"
 

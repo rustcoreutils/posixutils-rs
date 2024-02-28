@@ -16,6 +16,7 @@ use plib::PROJECT_NAME;
 use std::fs;
 use std::io::{self, Read, Write};
 
+/// cat - concatenate and print files
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about)]
 struct Args {

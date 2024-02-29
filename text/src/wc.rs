@@ -63,8 +63,7 @@ impl CountInfo {
 }
 
 fn build_display_str(args: &Args, count: &CountInfo, filename: &str) -> String {
-    let mut output = String::new();
-    output.reserve(filename.len() + (3 * 10));
+    let mut output = String::with_capacity(filename.len() + (3 * 10));
 
     if args.lines {
         let numstr = format!("{:>8}", count.nl);

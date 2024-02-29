@@ -13,8 +13,7 @@ use gettextrs::{bind_textdomain_codeset, textdomain};
 use plib::PROJECT_NAME;
 
 fn translate_str(s: &str) -> String {
-    let mut output = String::new();
-    output.reserve(s.len());
+    let mut output = String::with_capacity(s.len());
 
     let mut in_bs = false;
     let mut nl = true;

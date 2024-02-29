@@ -106,7 +106,7 @@ A similar project from the author, written in C++, is https://github.com/jgarzik
  - [ ] nm
  - [ ] nohup
  - [ ] od
- - [ ] paste
+ - [x] paste
  - [ ] patch
  - [ ] pathchk
  - [ ] pax

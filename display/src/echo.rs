@@ -6,6 +6,12 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
+// TODO:
+// - echo needs to translate backslash-escaped octal numbers:
+// ```
+// \0num
+//	Write an 8-bit value that is the 0, 1, 2 or 3-digit octal number _num_.
+//
 
 extern crate plib;
 

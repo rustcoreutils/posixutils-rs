@@ -28,7 +28,16 @@ struct Args {
     files: Vec<String>,
 }
 
-fn head_file(args: &Args, filename: &str) -> io::Result<()> {
+fn head_file(args: &Args, filename: &str, first: bool, want_header: bool) -> io::Result<()> {
+    // print file header
+    if want_header {
+        if first {
+            println!("==> {} <==\n", filename);
+        } else {
+            println!("\n==> {} <==\n", filename);
+        }
+    }
+
     // open file, or stdin
     let mut file: Box<dyn Read>;
     if filename == "" {
@@ -92,15 +101,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut exit_code = 0;
+    let want_header = args.files.len() > 1;
+    let mut first = true;
 
     for filename in &args.files {
-        match head_file(&args, filename) {
+        match head_file(&args, filename, first, want_header) {
             Ok(()) => {}
             Err(e) => {
                 exit_code = 1;
                 eprintln!("{}: {}", filename, e);
             }
         }
+
+        first = false;
     }
 
     std::process::exit(exit_code)

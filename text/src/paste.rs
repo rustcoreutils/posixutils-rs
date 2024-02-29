@@ -6,7 +6,10 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// TODO: stdin ("-"), delimiter list
+// TODO:
+// - stdin ("-")
+// - fix:  empty-string delimiters \0
+// - improve:  don't open all files at once in --serial mode
 //
 
 extern crate clap;
@@ -26,6 +29,10 @@ struct Args {
     #[arg(short, long)]
     serial: bool,
 
+    /// Delimiter list
+    #[arg(short, long)]
+    delims: Option<String>,
+
     /// One or more input files.
     files: Vec<String>,
 }
@@ -38,17 +45,69 @@ struct PasteFile {
 }
 
 struct PasteInfo {
-    delim: char,
     inputs: Vec<PasteFile>,
 }
 
 impl PasteInfo {
     fn new() -> PasteInfo {
-        PasteInfo {
-            delim: '\t',
-            inputs: Vec::new(),
+        PasteInfo { inputs: Vec::new() }
+    }
+}
+
+struct DelimInfo {
+    cur_delim: usize,
+    delims: String,
+}
+
+impl DelimInfo {
+    fn new() -> DelimInfo {
+        DelimInfo {
+            cur_delim: 0,
+            delims: String::from("\t"),
         }
     }
+
+    fn delim(&mut self) -> char {
+        let ch = self.delims.chars().nth(self.cur_delim).unwrap();
+
+        self.advance();
+
+        ch
+    }
+
+    fn advance(&mut self) {
+        if self.delims.len() > 1 {
+            self.cur_delim = self.cur_delim + 1;
+            if self.cur_delim >= self.delims.len() {
+                self.cur_delim = 0;
+            }
+        }
+    }
+}
+
+fn xlat_delim_str(s: &str) -> String {
+    let mut output = String::with_capacity(s.len() + 10);
+
+    let mut in_escape = false;
+    for ch in s.chars() {
+        if in_escape {
+            let out_ch = match ch {
+                'n' => '\n',
+                't' => '\t',
+                '0' => '\0',
+                _ => ch,
+            };
+
+            output.push(out_ch);
+            in_escape = false;
+        } else if ch == '\\' {
+            in_escape = true;
+        } else {
+            output.push(ch);
+        }
+    }
+
+    output
 }
 
 fn open_inputs(args: &Args, info: &mut PasteInfo) -> io::Result<()> {
@@ -79,7 +138,7 @@ fn open_inputs(args: &Args, info: &mut PasteInfo) -> io::Result<()> {
     Ok(())
 }
 
-fn paste_files_serial(info: &mut PasteInfo) -> io::Result<()> {
+fn paste_files_serial(mut info: PasteInfo, mut dinfo: DelimInfo) -> io::Result<()> {
     // loop serially for each input file
     for input in &mut info.inputs {
         let mut first_line = true;
@@ -107,7 +166,7 @@ fn paste_files_serial(info: &mut PasteInfo) -> io::Result<()> {
                 if first_line {
                     print!("{}", slice);
                 } else {
-                    print!("{}{}", info.delim, slice);
+                    print!("{}{}", dinfo.delim(), slice);
                 }
             }
 
@@ -120,7 +179,7 @@ fn paste_files_serial(info: &mut PasteInfo) -> io::Result<()> {
     Ok(())
 }
 
-fn paste_files(info: &mut PasteInfo) -> io::Result<()> {
+fn paste_files(mut info: PasteInfo, mut dinfo: DelimInfo) -> io::Result<()> {
     // for each input line, across N files
     loop {
         let mut output = String::new();
@@ -156,7 +215,7 @@ fn paste_files(info: &mut PasteInfo) -> io::Result<()> {
 
             // next delimiter
             } else {
-                output.push(info.delim);
+                output.push(dinfo.delim());
             }
         }
 
@@ -185,13 +244,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
     let mut state = PasteInfo::new();
+    let mut delim_state = DelimInfo::new();
+    match &args.delims {
+        None => {}
+        Some(dlm) => {
+            delim_state.delims = xlat_delim_str(dlm);
+        }
+    }
 
     open_inputs(&args, &mut state)?;
 
     if args.serial {
-        paste_files_serial(&mut state)?;
+        paste_files_serial(state, delim_state)?;
     } else {
-        paste_files(&mut state)?;
+        paste_files(state, delim_state)?;
     }
 
     Ok(())

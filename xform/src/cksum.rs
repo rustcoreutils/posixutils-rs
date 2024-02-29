@@ -6,6 +6,8 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
+// FIXME !!! - checksum values do not match other cksum utils
+//
 
 extern crate clap;
 extern crate plib;
@@ -17,6 +19,7 @@ use plib::PROJECT_NAME;
 use std::fs;
 use std::io::{self, Read};
 
+/// cksum - write file checksums and sizes
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about)]
 struct Args {

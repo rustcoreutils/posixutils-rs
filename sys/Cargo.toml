@@ -1,5 +1,5 @@
 [package]
-name = "posixutils-users"
+name = "posixutils-sys"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,18 +7,9 @@ edition = "2021"
 plib = { path = "../plib" }
 clap = { version = "4", features = ["derive"] }
 gettext-rs = { version = "0.7", features = ["gettext-system"] }
-libc = "0.2"
-syslog = "6.1"
+uname = "0.1"
 
 [[bin]]
-name = "logname"
-path = "src/logname.rs"
-
-[[bin]]
-name = "logger"
-path = "src/logger.rs"
-
-[[bin]]
-name = "tty"
-path = "src/tty.rs"
+name = "uname"
+path = "src/uname.rs"
 

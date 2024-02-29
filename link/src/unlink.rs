@@ -15,9 +15,11 @@ use gettextrs::{bind_textdomain_codeset, textdomain};
 use plib::PROJECT_NAME;
 use std::{fs, io};
 
+/// unlink - call the unlink function
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about)]
 struct Args {
+    /// The pathname of an existing file.
     pathname: String,
 }
 

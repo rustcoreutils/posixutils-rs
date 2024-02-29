@@ -15,6 +15,7 @@ use gettextrs::{bind_textdomain_codeset, textdomain};
 use plib::PROJECT_NAME;
 use std::{fs, io};
 
+/// link - call link function
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about)]
 struct Args {

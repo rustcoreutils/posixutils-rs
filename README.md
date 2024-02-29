@@ -151,9 +151,9 @@ A similar project from the author, written in C++, is https://github.com/jgarzik
  - [ ] tr
  - [x] true
  - [ ] tsort
- - [ ] tty
+ - [x] tty
  - [ ] ulimit
- - [ ] uname
+ - [x] uname
  - [ ] uncompress (compress cat.)
  - [ ] unexpand
  - [ ] unget

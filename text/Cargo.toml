@@ -17,6 +17,10 @@ name = "head"
 path = "src/head.rs"
 
 [[bin]]
+name = "paste"
+path = "src/paste.rs"
+
+[[bin]]
 name = "wc"
 path = "src/wc.rs"
 

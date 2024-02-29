@@ -153,7 +153,7 @@ A similar project from the author, written in C++, is https://github.com/jgarzik
  - [ ] tsort
  - [x] tty
  - [ ] ulimit
- - [ ] uname
+ - [x] uname
  - [ ] uncompress (compress cat.)
  - [ ] unexpand
  - [ ] unget

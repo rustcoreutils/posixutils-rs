@@ -9,6 +9,7 @@ members = [
 	"misc",
 	"pathnames",
 	"plib",
+	"sys",
 	"text",
 	"tree",
 	"users",

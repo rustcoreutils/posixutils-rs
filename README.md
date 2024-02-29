@@ -6,8 +6,15 @@ ls, ...) using SuSv3 as the base POSIX specification.
 
 ## Goals
 
-The goal is to create clean, race-free userland utilities using safe
-Rust, while maximizing compatibility with existing shell scripts.
+The goal is to create clean, race-free userland utilities that are POSIX
+compliant, maximizing compatibility with existing shell scripts while
+minimizing bloat.
+
+Implementation goals include clean, safe Rust code and maximal use of
+Rust community crates.  This project's utilities should "look like
+normal Rust programs."
+
+Core specification: https://pubs.opengroup.org/onlinepubs/9699919799/
 
 ### Non-goals
 
@@ -20,9 +27,11 @@ bloat.
 
 ## Similar projects
 
-A similar project with the aim of GNU compatibility is https://github.com/uutils/coreutils
+A similar project with the aim of GNU compatibility is
+https://github.com/uutils/coreutils
 
-A similar project from the author, written in C++, is https://github.com/jgarzik/posixutils
+A similar project from the author, written in C++, is
+https://github.com/jgarzik/posixutils
 
 ## Checklist of utilities
 
@@ -60,7 +69,7 @@ A similar project from the author, written in C++, is https://github.com/jgarzik
  - [ ] du
  - [x] echo
  - [ ] ed
- - [ ] env
+ - [x] env
  - [ ] ex
  - [ ] expand
  - [ ] expr
@@ -103,7 +112,7 @@ A similar project from the author, written in C++, is https://github.com/jgarzik
  - [ ] newgrp
  - [ ] nice
  - [ ] nl
- - [ ] nm
+ - [ ] nm (Development)
  - [ ] nohup
  - [ ] od
  - [x] paste
@@ -164,7 +173,7 @@ A similar project from the author, written in C++, is https://github.com/jgarzik
  - [x] uuencode (uue)
  - [ ] uustat (UUCP)
  - [ ] uux (UUCP)
- - [ ] val
+ - [ ] val (SCCS)
  - [ ] vi
  - [ ] wait
  - [x] wc

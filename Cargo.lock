@@ -350,6 +350,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "posixutils-process"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "gettext-rs",
+ "plib",
+]
+
+[[package]]
 name = "posixutils-sys"
 version = "0.1.0"
 dependencies = [

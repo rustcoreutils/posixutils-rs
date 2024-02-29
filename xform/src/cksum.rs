@@ -35,7 +35,7 @@ fn cksum_file(filename: &str) -> io::Result<()> {
         file = Box::new(fs::File::open(filename)?);
     }
 
-    let mut buffer = [0; 4096];
+    let mut buffer = [0; plib::BUFSZ];
     let mut n_bytes: u64 = 0;
     let mut hash = Hasher::new();
 

@@ -41,7 +41,7 @@ fn cat_file(filename: &str) -> io::Result<()> {
         file = Box::new(fs::File::open(filename)?);
     }
 
-    let mut buffer = [0; 4096];
+    let mut buffer = [0; plib::BUFSZ];
 
     loop {
         let n_read = file.read(&mut buffer[..])?;

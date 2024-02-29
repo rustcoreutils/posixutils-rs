@@ -46,7 +46,7 @@ fn head_file(args: &Args, filename: &str, first: bool, want_header: bool) -> io:
         file = Box::new(fs::File::open(filename)?);
     }
 
-    let mut raw_buffer = [0; 4096];
+    let mut raw_buffer = [0; plib::BUFSZ];
     let mut nl = 0;
 
     loop {

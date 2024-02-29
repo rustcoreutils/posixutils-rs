@@ -60,7 +60,7 @@ A similar project from the author, written in C++, is https://github.com/jgarzik
  - [ ] du
  - [x] echo
  - [ ] ed
- - [ ] env
+ - [x] env
  - [ ] ex
  - [ ] expand
  - [ ] expr
@@ -103,7 +103,7 @@ A similar project from the author, written in C++, is https://github.com/jgarzik
  - [ ] newgrp
  - [ ] nice
  - [ ] nl
- - [ ] nm
+ - [ ] nm (Development)
  - [ ] nohup
  - [ ] od
  - [x] paste
@@ -164,7 +164,7 @@ A similar project from the author, written in C++, is https://github.com/jgarzik
  - [x] uuencode (uue)
  - [ ] uustat (UUCP)
  - [ ] uux (UUCP)
- - [ ] val
+ - [ ] val (SCCS)
  - [ ] vi
  - [ ] wait
  - [x] wc

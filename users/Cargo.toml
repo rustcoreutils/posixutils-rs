@@ -18,3 +18,7 @@ path = "src/logname.rs"
 name = "logger"
 path = "src/logger.rs"
 
+[[bin]]
+name = "tty"
+path = "src/tty.rs"
+

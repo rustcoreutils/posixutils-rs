@@ -103,7 +103,7 @@ fn wc_file_bytes(count: &mut CountInfo, filename: &str) -> io::Result<()> {
         file = Box::new(fs::File::open(filename)?);
     }
 
-    let mut buffer = [0; 4096];
+    let mut buffer = [0; plib::BUFSZ];
     let mut in_word = false;
 
     loop {

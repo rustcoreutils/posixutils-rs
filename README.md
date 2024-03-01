@@ -87,7 +87,7 @@ https://github.com/jgarzik/posixutils
  - [x] head
  - [ ] iconv (i18n)
  - [ ] id
- - [ ] ipcrm (IPC)
+ - [x] ipcrm (IPC)
  - [ ] ipcs (IPC)
  - [ ] join
  - [ ] kill

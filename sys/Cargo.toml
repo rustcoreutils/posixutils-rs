@@ -8,6 +8,11 @@ plib = { path = "../plib" }
 clap = { version = "4", features = ["derive"] }
 gettext-rs = { version = "0.7", features = ["gettext-system"] }
 uname = "0.1"
+libc = "0.2"
+
+[[bin]]
+name = "ipcrm"
+path = "src/ipcrm.rs"
 
 [[bin]]
 name = "uname"

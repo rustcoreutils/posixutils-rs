@@ -79,7 +79,7 @@ fn open_outputs(args: &Args, info: &mut TeeInfo) -> io::Result<()> {
 }
 
 fn tee_stdin(info: &mut TeeInfo) -> io::Result<()> {
-    let mut buffer = [0; 4096];
+    let mut buffer = [0; plib::BUFSZ];
 
     loop {
         let n_read_res = io::stdin().read(&mut buffer[..]);

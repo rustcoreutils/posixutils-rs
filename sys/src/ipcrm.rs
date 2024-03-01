@@ -14,7 +14,7 @@ extern crate plib;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, textdomain};
 #[cfg(not(target_os = "macos"))]
-use libc::{msgctl, msgget, msgid_ds};
+use libc::{msgctl, msgget, msqid_ds};
 use libc::{semctl, semget, shmctl, shmget, shmid_ds};
 use plib::PROJECT_NAME;
 use std::ffi::{c_int, c_ushort};
@@ -72,7 +72,7 @@ fn msg_rm(msgid: i32) -> io::Result<i32> {
         msgctl(
             msgid,
             libc::IPC_RMID,
-            ptr::null::<msgid_ds>() as *mut msgid_ds,
+            ptr::null::<msqid_ds>() as *mut msqid_ds,
         )
     };
 

@@ -135,7 +135,7 @@ https://github.com/jgarzik/posixutils
  - [ ] qsig (Batch cat.)
  - [ ] qstat (Batch cat.)
  - [ ] qsub (Batch cat.)
- - [ ] renice
+ - [x] renice
  - [ ] rm
  - [ ] rmdel (SCCS)
  - [x] rmdir

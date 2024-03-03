@@ -6,9 +6,6 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// TODO:
-// - BUG: split-by-byte does not work
-//
 
 extern crate clap;
 extern crate plib;
@@ -154,9 +151,10 @@ impl OutputState {
         while consumed < buf.len() {
             self.open_output()?;
 
-            let slice = &buf[consumed..];
+            let remainder = buf.len() - consumed;
             let dist = self.boundary - self.count;
-            let wlen = cmp::min(dist as usize, slice.len());
+            let wlen = cmp::min(dist as usize, remainder);
+            let slice = &buf[consumed..consumed + wlen];
             self.write(slice)?;
 
             consumed = consumed + wlen;

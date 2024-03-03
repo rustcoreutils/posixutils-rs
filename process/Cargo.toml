@@ -8,6 +8,7 @@ plib = { path = "../plib" }
 clap = { version = "4", features = ["derive"] }
 gettext-rs = { version = "0.7", features = ["gettext-system"] }
 libc = "0.2"
+errno = "0.3"
 
 [[bin]]
 name = "env"
@@ -16,4 +17,8 @@ path = "src/env.rs"
 [[bin]]
 name = "nice"
 path = "src/nice.rs"
+
+[[bin]]
+name = "renice"
+path = "src/renice.rs"
 

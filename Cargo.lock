@@ -148,6 +148,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "errno"
+version = "0.3.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a258e46cdc063eb8519c00b9fc845fc47bcfca4130e2f08e88665ceda8474245"
+dependencies = [
+ "libc",
+ "windows-sys",
+]
+
+[[package]]
 name = "error-chain"
 version = "0.12.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -354,6 +364,7 @@ name = "posixutils-process"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "errno",
  "gettext-rs",
  "libc",
  "plib",

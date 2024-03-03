@@ -139,7 +139,7 @@ https://github.com/jgarzik/posixutils
  - [ ] rm
  - [ ] rmdel (SCCS)
  - [x] rmdir
- - [ ] sact
+ - [ ] sact (SCCS)
  - [ ] sccs (SCCS)
  - [ ] sed
  - [ ] sh
@@ -165,7 +165,7 @@ https://github.com/jgarzik/posixutils
  - [x] uname
  - [ ] uncompress (compress cat.)
  - [ ] unexpand
- - [ ] unget
+ - [ ] unget (SCCS)
  - [ ] uniq
  - [x] unlink
  - [ ] uucp (UUCP)

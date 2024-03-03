@@ -110,7 +110,7 @@ https://github.com/jgarzik/posixutils
  - [ ] more
  - [ ] mv
  - [ ] newgrp
- - [ ] nice
+ - [x] nice
  - [ ] nl
  - [ ] nm (Development)
  - [ ] nohup

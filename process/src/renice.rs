@@ -58,12 +58,12 @@ fn lookup_uid(username: &str) -> Result<u32, &'static str> {
     Ok(passwd.pw_uid)
 }
 
-fn parse_id(which: i32, input: &str) -> Result<u32, &'static str> {
+fn parse_id(which: u32, input: &str) -> Result<u32, &'static str> {
     match input.parse::<u32>() {
         Ok(0) => Err("Invalid ID"),
         Ok(n) => Ok(n),
         Err(e) => {
-            if which != libc::PRIO_USER {
+            if which != libc::PRIO_USER as u32 {
                 eprintln!("{}", e);
                 Err("Invalid ID")
             } else {
@@ -79,10 +79,14 @@ fn parse_id(which: i32, input: &str) -> Result<u32, &'static str> {
     }
 }
 
-fn xgetpriority(which: i32, id: u32) -> io::Result<i32> {
+fn xgetpriority(which: u32, id: u32) -> io::Result<i32> {
     set_errno(errno::Errno(0));
 
+    #[cfg(not(target_os = "macos"))]
     let res = unsafe { libc::getpriority(which, id) };
+
+    #[cfg(target_os = "macos")]
+    let res = unsafe { libc::getpriority(which as i32, id) };
 
     let errno_res = errno().0;
     if errno_res == 0 {
@@ -94,8 +98,12 @@ fn xgetpriority(which: i32, id: u32) -> io::Result<i32> {
     }
 }
 
-fn xsetpriority(which: i32, id: u32, prio: i32) -> io::Result<()> {
+fn xsetpriority(which: u32, id: u32, prio: i32) -> io::Result<()> {
+    #[cfg(not(target_os = "macos"))]
     let res = unsafe { libc::setpriority(which, id, prio) };
+
+    #[cfg(target_os = "macos")]
+    let res = unsafe { libc::setpriority(which as i32, id, prio) };
 
     if res < 0 {
         let e = io::Error::from_raw_os_error(res);
@@ -114,13 +122,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
     // which class of priority to modify
-    let which = {
+    let which: u32 = {
         if args.pgrp {
-            libc::PRIO_PGRP
+            libc::PRIO_PGRP as u32
         } else if args.user {
-            libc::PRIO_USER
+            libc::PRIO_USER as u32
         } else {
-            libc::PRIO_PROCESS
+            libc::PRIO_PROCESS as u32
         }
     };
 

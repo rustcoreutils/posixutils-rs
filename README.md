@@ -145,7 +145,7 @@ https://github.com/jgarzik/posixutils
  - [ ] sh
  - [x] sleep
  - [ ] sort
- - [ ] split
+ - [x] split
  - [ ] strings
  - [ ] strip (Development)
  - [ ] stty

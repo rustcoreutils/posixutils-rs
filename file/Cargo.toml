@@ -14,6 +14,10 @@ name = "cat"
 path = "src/cat.rs"
 
 [[bin]]
+name = "split"
+path = "src/split.rs"
+
+[[bin]]
 name = "tee"
 path = "src/tee.rs"
 

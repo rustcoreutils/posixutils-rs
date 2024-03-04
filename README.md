@@ -104,7 +104,7 @@ https://github.com/jgarzik/posixutils
  - [ ] mailx
  - [ ] make
  - [ ] man
- - [ ] mesg
+ - [x] mesg
  - [ ] mkdir
  - [ ] mkfifo
  - [ ] more

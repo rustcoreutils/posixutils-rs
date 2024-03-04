@@ -19,6 +19,10 @@ name = "logger"
 path = "src/logger.rs"
 
 [[bin]]
+name = "mesg"
+path = "src/mesg.rs"
+
+[[bin]]
 name = "tty"
 path = "src/tty.rs"
 

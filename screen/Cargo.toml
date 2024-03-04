@@ -1,0 +1,15 @@
+[package]
+name = "posixutils-screen"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+plib = { path = "../plib" }
+clap = { version = "4", features = ["derive"] }
+gettext-rs = { version = "0.7", features = ["gettext-system"] }
+terminfo = "0.8"
+
+[[bin]]
+name = "tput"
+path = "src/tput.rs"
+

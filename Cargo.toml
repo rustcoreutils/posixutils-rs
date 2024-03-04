@@ -10,6 +10,7 @@ members = [
 	"pathnames",
 	"plib",
 	"process",
+	"screen",
 	"sys",
 	"text",
 	"tree",

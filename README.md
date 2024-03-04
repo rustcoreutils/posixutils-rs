@@ -156,10 +156,10 @@ https://github.com/jgarzik/posixutils
  - [ ] test
  - [ ] time
  - [ ] touch
- - [ ] tput
+ - [x] tput
  - [ ] tr
  - [x] true
- - [ ] tsort
+ - [x] tsort
  - [x] tty
  - [ ] ulimit
  - [x] uname

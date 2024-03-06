@@ -148,7 +148,7 @@ https://github.com/jgarzik/posixutils
  - [x] split
  - [ ] strings
  - [ ] strip (Development)
- - [ ] stty
+ - [x] stty
  - [ ] tabs
  - [ ] tail
  - [ ] talk

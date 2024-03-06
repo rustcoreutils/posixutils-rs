@@ -10,12 +10,22 @@
 extern crate libc;
 
 use std::collections::HashMap;
+
+#[cfg(target_os = "macos")]
 use termios::os::macos::{
     ALTWERASE, BS0, BS1, BSDLY, CCAR_OFLOW, CCTS_OFLOW, CDSR_OFLOW, CDTR_IFLOW, CR0, CR1, CR2, CR3,
     CRDLY, CRTS_IFLOW, ECHOCTL, ECHOKE, ECHOPRT, FF0, FF1, FFDLY, FLUSHO, IMAXBEL, IUTF8, NL0, NL1,
     NLDLY, NOKERNINFO, OFDEL, OFILL, ONOEOT, OXTABS, PENDIN, TAB0, TAB1, TAB2, TAB3, TABDLY, VT0,
     VT1, VTDLY,
 };
+
+#[cfg(target_os = "linux")]
+use termios::os::linux::{
+    BS0, BS1, BSDLY, CR0, CR1, CR2, CR3, CRDLY, ECHOCTL, ECHOKE, ECHOPRT, FF0, FF1, FFDLY, FLUSHO,
+    IMAXBEL, IUTF8, NL0, NL1, NLDLY, OFDEL, OFILL, PENDIN, TAB0, TAB1, TAB2, TAB3, TABDLY, VT0,
+    VT1, VTDLY,
+};
+
 use termios::*;
 
 pub fn load_speeds() -> HashMap<&'static str, speed_t> {
@@ -133,10 +143,15 @@ pub fn load_params() -> HashMap<&'static str, ParamType> {
         ("cstopb", ParamType::Cfl(PNEG, CSTOPB, CSTOPB)),
         ("cread", ParamType::Cfl(PNEG, CREAD, CREAD)),
         ("clocal", ParamType::Cfl(PNEG, CLOCAL, CLOCAL)),
+        #[cfg(target_os = "macos")]
         ("cctsoflow", ParamType::Cfl(PNEG, CCTS_OFLOW, CCTS_OFLOW)),
+        #[cfg(target_os = "macos")]
         ("crtsiflow", ParamType::Cfl(PNEG, CRTS_IFLOW, CRTS_IFLOW)),
+        #[cfg(target_os = "macos")]
         ("cdtriflow", ParamType::Cfl(PNEG, CDTR_IFLOW, CDTR_IFLOW)),
+        #[cfg(target_os = "macos")]
         ("cdsroflow", ParamType::Cfl(PNEG, CDSR_OFLOW, CDSR_OFLOW)),
+        #[cfg(target_os = "macos")]
         ("ccaroflow", ParamType::Cfl(PNEG, CCAR_OFLOW, CCAR_OFLOW)),
         /*
          * input flags
@@ -161,8 +176,6 @@ pub fn load_params() -> HashMap<&'static str, ParamType> {
          */
         ("opost", ParamType::Ofl(PNEG, OPOST, OPOST)),
         ("onlcr", ParamType::Ofl(PNEG, ONLCR, ONLCR)),
-        ("oxtabs", ParamType::Ofl(PNEG, OXTABS, OXTABS)),
-        ("onoeot", ParamType::Ofl(PNEG, ONOEOT, ONOEOT)),
         ("ocrnl", ParamType::Ofl(PNEG, OCRNL, OCRNL)),
         ("onocr", ParamType::Ofl(PNEG, ONOCR, ONOCR)),
         ("onlret", ParamType::Ofl(PNEG, ONLRET, ONLRET)),
@@ -185,6 +198,10 @@ pub fn load_params() -> HashMap<&'static str, ParamType> {
         ("ff1", ParamType::Ofl(0, FF1, FFDLY)),
         ("vt0", ParamType::Ofl(0, VT0, VTDLY)),
         ("vt1", ParamType::Ofl(0, VT1, VTDLY)),
+        #[cfg(target_os = "macos")]
+        ("oxtabs", ParamType::Ofl(PNEG, OXTABS, OXTABS)),
+        #[cfg(target_os = "macos")]
+        ("onoeot", ParamType::Ofl(PNEG, ONOEOT, ONOEOT)),
         /*
          * local modes
          */
@@ -200,10 +217,12 @@ pub fn load_params() -> HashMap<&'static str, ParamType> {
         ("echonl", ParamType::Lfl(PNEG, ECHONL, ECHONL)),
         ("noflsh", ParamType::Lfl(PNEG, NOFLSH, NOFLSH)),
         ("tostop", ParamType::Lfl(PNEG, TOSTOP, TOSTOP)),
+        #[cfg(target_os = "macos")]
         ("altwerase", ParamType::Lfl(PNEG, ALTWERASE, ALTWERASE)),
         ("flusho", ParamType::Lfl(PNEG, FLUSHO, FLUSHO)),
-        ("nokerninfo", ParamType::Lfl(PNEG, NOKERNINFO, NOKERNINFO)),
         ("pendin", ParamType::Lfl(PNEG, PENDIN, PENDIN)),
+        #[cfg(target_os = "macos")]
+        ("nokerninfo", ParamType::Lfl(PNEG, NOKERNINFO, NOKERNINFO)),
         /*
          * control characters
          */

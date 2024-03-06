@@ -8,8 +8,9 @@
 //
 // TODO:
 // - stty get-short display
+// - stty display: control chars
 // - stty operand: /number/ (baud rate)
-// - linux support
+// - BUG: linux baud display output incorrect
 //
 
 extern crate clap;

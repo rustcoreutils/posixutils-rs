@@ -8,6 +8,12 @@ plib = { path = "../plib" }
 clap = { version = "4", features = ["derive"] }
 gettext-rs = { version = "0.7", features = ["gettext-system"] }
 terminfo = "0.8"
+termios = "0.3"
+libc = "0.2"
+
+[[bin]]
+name = "stty"
+path = "src/stty.rs"
 
 [[bin]]
 name = "tput"

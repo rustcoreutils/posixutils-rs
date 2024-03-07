@@ -9,8 +9,6 @@
 // TODO:
 // - stty get-short display
 // - stty display: control chars
-// - stty operand: /number/ (baud rate)
-// - BUG: linux baud display output incorrect
 //
 
 extern crate clap;
@@ -48,14 +46,23 @@ struct Args {
     operands: Vec<String>,
 }
 
-fn ti_baud_str(ti: &Termios) -> String {
+fn speed_to_str(revspeed: &HashMap<speed_t, &'static str>, speed: speed_t) -> String {
+    match revspeed.get(&speed) {
+        None => format!("B{}?", speed),
+        Some(s) => String::from(*s),
+    }
+}
+
+fn ti_baud_str(revspeed: &HashMap<speed_t, &'static str>, ti: &Termios) -> String {
     let ispeed = cfgetispeed(&ti);
+    let ispeed_str = speed_to_str(revspeed, ispeed);
     let ospeed = cfgetospeed(&ti);
+    let ospeed_str = speed_to_str(revspeed, ospeed);
 
     if ispeed == ospeed {
-        format!("speed {} baud;", ispeed)
+        format!("speed {} baud;", ispeed_str)
     } else {
-        format!("ispeed {} baud; ospeed {} baud;", ispeed, ospeed)
+        format!("ispeed {} baud; ospeed {} baud;", ispeed_str, ospeed_str)
     }
 }
 
@@ -123,7 +130,9 @@ fn show_flags(name: &str, flags: &Vec<String>) {
 
 // display long-form stty values
 fn stty_show_long(ti: Termios) -> io::Result<()> {
-    println!("{}", ti_baud_str(&ti));
+    let speedmap = osdata::load_speeds();
+    let revspeed = osdata::load_speeds_rev(&speedmap);
+    println!("{}", ti_baud_str(&revspeed, &ti));
 
     let tty_params = osdata::load_params();
     let flagnames = vec!["lflags", "iflags", "oflags", "cflags"];
@@ -408,6 +417,14 @@ fn stty_set_long(mut ti: Termios, args: &Args) -> io::Result<()> {
                 &operand_raw[..]
             }
         };
+
+        // special case: set two speeds, if all-numeric operand
+        if operand.parse::<u64>().is_ok() {
+            set_ti_speed(&mut ti, &speedmap, true, operand)?;
+            set_ti_speed(&mut ti, &speedmap, false, operand)?;
+            idx = idx + 1;
+            continue;
+        }
 
         // lookup operand in param map
         let param_res = tty_params.get(operand);

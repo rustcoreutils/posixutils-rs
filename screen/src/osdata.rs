@@ -52,6 +52,16 @@ pub fn load_speeds() -> HashMap<&'static str, speed_t> {
     ])
 }
 
+pub fn load_speeds_rev(map: &HashMap<&'static str, speed_t>) -> HashMap<speed_t, &'static str> {
+    let mut retmap = HashMap::with_capacity(map.len());
+
+    for (k, v) in map {
+        retmap.insert(*v, *k);
+    }
+
+    retmap
+}
+
 pub fn load_cchar_xlat() -> HashMap<char, char> {
     HashMap::from([
         ('a', '\x01'),

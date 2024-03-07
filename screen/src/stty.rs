@@ -8,9 +8,6 @@
 //
 // TODO:
 // - stty get-short display
-// - stty display: control chars
-// - stty operand: /number/ (baud rate)
-// - BUG: linux baud display output incorrect
 //
 
 extern crate clap;
@@ -48,14 +45,23 @@ struct Args {
     operands: Vec<String>,
 }
 
-fn ti_baud_str(ti: &Termios) -> String {
+fn speed_to_str(revspeed: &HashMap<speed_t, &'static str>, speed: speed_t) -> String {
+    match revspeed.get(&speed) {
+        None => format!("B{}?", speed),
+        Some(s) => String::from(*s),
+    }
+}
+
+fn ti_baud_str(revspeed: &HashMap<speed_t, &'static str>, ti: &Termios) -> String {
     let ispeed = cfgetispeed(&ti);
+    let ispeed_str = speed_to_str(revspeed, ispeed);
     let ospeed = cfgetospeed(&ti);
+    let ospeed_str = speed_to_str(revspeed, ospeed);
 
     if ispeed == ospeed {
-        format!("speed {} baud;", ispeed)
+        format!("speed {} baud;", ispeed_str)
     } else {
-        format!("ispeed {} baud; ospeed {} baud;", ispeed, ospeed)
+        format!("ispeed {} baud; ospeed {} baud;", ispeed_str, ospeed_str)
     }
 }
 
@@ -121,9 +127,42 @@ fn show_flags(name: &str, flags: &Vec<String>) {
     println!("{}: {}", name, flags.join(" "));
 }
 
+fn show_cchars(tty_params: &HashMap<&'static str, ParamType>, ti: &Termios) {
+    let mut v = Vec::new();
+    let cchar_xlat = osdata::load_cchar_xlat();
+    let cchar_rev = osdata::reverse_charmap(&cchar_xlat);
+
+    // minor inefficiency: 2nd iteration through param list
+
+    for (name, param) in tty_params {
+        match param {
+            ParamType::Cchar(_pflg, chidx) => {
+                let ch = ti.c_cc[*chidx] as char;
+                let ch_rev = cchar_rev.get(&ch);
+                let ch_str = {
+                    if ch == '\0' {
+                        String::from("<undef>")
+                    } else if let Some(ch_xlat) = ch_rev {
+                        format!("^{}", ch_xlat)
+                    } else {
+                        format!("{}", ti.c_cc[*chidx] as u8)
+                    }
+                };
+
+                v.push(format!("{} = {}", name, ch_str));
+            }
+            _ => {}
+        }
+    }
+
+    println!("cchars: {}", v.join("; "));
+}
+
 // display long-form stty values
 fn stty_show_long(ti: Termios) -> io::Result<()> {
-    println!("{}", ti_baud_str(&ti));
+    let speedmap = osdata::load_speeds();
+    let revspeed = osdata::load_speeds_rev(&speedmap);
+    println!("{}", ti_baud_str(&revspeed, &ti));
 
     let tty_params = osdata::load_params();
     let flagnames = vec!["lflags", "iflags", "oflags", "cflags"];
@@ -133,13 +172,15 @@ fn stty_show_long(ti: Termios) -> io::Result<()> {
         flagmap.insert(name, Vec::new());
     }
 
-    for (name, param) in tty_params {
+    for (name, param) in &tty_params {
         flagmap_push(&ti, &mut flagmap, name, &param);
     }
 
     for flagname in &flagnames {
         show_flags(flagname, flagmap.get(flagname).unwrap());
     }
+
+    show_cchars(&tty_params, &ti);
 
     Ok(())
 }
@@ -408,6 +449,14 @@ fn stty_set_long(mut ti: Termios, args: &Args) -> io::Result<()> {
                 &operand_raw[..]
             }
         };
+
+        // special case: set two speeds, if all-numeric operand
+        if operand.parse::<u64>().is_ok() {
+            set_ti_speed(&mut ti, &speedmap, true, operand)?;
+            set_ti_speed(&mut ti, &speedmap, false, operand)?;
+            idx = idx + 1;
+            continue;
+        }
 
         // lookup operand in param map
         let param_res = tty_params.get(operand);

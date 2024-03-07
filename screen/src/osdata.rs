@@ -125,6 +125,16 @@ pub fn load_cchar_xlat() -> HashMap<char, char> {
     ])
 }
 
+pub fn reverse_charmap(map: &HashMap<char, char>) -> HashMap<char, char> {
+    let mut retmap = HashMap::with_capacity(map.len());
+
+    for (k, v) in map {
+        retmap.insert(*v, *k);
+    }
+
+    retmap
+}
+
 pub enum ParamType {
     Cfl(u32, tcflag_t, tcflag_t),
     Ispeed(u32),

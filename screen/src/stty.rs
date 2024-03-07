@@ -8,7 +8,6 @@
 //
 // TODO:
 // - stty get-short display
-// - stty display: control chars
 //
 
 extern crate clap;
@@ -128,6 +127,37 @@ fn show_flags(name: &str, flags: &Vec<String>) {
     println!("{}: {}", name, flags.join(" "));
 }
 
+fn show_cchars(tty_params: &HashMap<&'static str, ParamType>, ti: &Termios) {
+    let mut v = Vec::new();
+    let cchar_xlat = osdata::load_cchar_xlat();
+    let cchar_rev = osdata::reverse_charmap(&cchar_xlat);
+
+    // minor inefficiency: 2nd iteration through param list
+
+    for (name, param) in tty_params {
+        match param {
+            ParamType::Cchar(_pflg, chidx) => {
+                let ch = ti.c_cc[*chidx] as char;
+                let ch_rev = cchar_rev.get(&ch);
+                let ch_str = {
+                    if ch == '\0' {
+                        String::from("<undef>")
+                    } else if let Some(ch_xlat) = ch_rev {
+                        format!("^{}", ch_xlat)
+                    } else {
+                        format!("{}", ti.c_cc[*chidx] as u8)
+                    }
+                };
+
+                v.push(format!("{} = {}", name, ch_str));
+            }
+            _ => {}
+        }
+    }
+
+    println!("cchars: {}", v.join("; "));
+}
+
 // display long-form stty values
 fn stty_show_long(ti: Termios) -> io::Result<()> {
     let speedmap = osdata::load_speeds();
@@ -142,13 +172,15 @@ fn stty_show_long(ti: Termios) -> io::Result<()> {
         flagmap.insert(name, Vec::new());
     }
 
-    for (name, param) in tty_params {
+    for (name, param) in &tty_params {
         flagmap_push(&ti, &mut flagmap, name, &param);
     }
 
     for flagname in &flagnames {
         show_flags(flagname, flagmap.get(flagname).unwrap());
     }
+
+    show_cchars(&tty_params, &ti);
 
     Ok(())
 }

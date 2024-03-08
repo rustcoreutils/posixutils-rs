@@ -6,17 +6,21 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
+// TODO:
+// - FIXME: file tail truncated (data corruption)
+//
 
 extern crate clap;
 extern crate plib;
 
-mod crc32;
+mod lzw;
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, textdomain};
+use lzw::UnixLZWReader;
 use plib::PROJECT_NAME;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 
 /// cksum - write file checksums and sizes
 #[derive(Parser, Debug)]
@@ -26,34 +30,24 @@ struct Args {
     files: Vec<String>,
 }
 
-fn cksum_file(filename: &str) -> io::Result<()> {
-    let mut file: Box<dyn Read>;
+fn uncompress_file(filename: &str) -> io::Result<()> {
+    let file: Box<dyn Read>;
     if filename == "" {
         file = Box::new(io::stdin().lock());
     } else {
         file = Box::new(fs::File::open(filename)?);
     }
 
-    let mut buffer = [0; plib::BUFSZ];
-    let mut n_bytes: u64 = 0;
-    let mut crc: u32 = 0;
+    let mut decoder = UnixLZWReader::new(file);
 
     loop {
-        let n_read = file.read(&mut buffer[..])?;
-        if n_read == 0 {
+        let buf = decoder.read()?;
+        if buf.is_empty() {
             break;
         }
 
-        n_bytes = n_bytes + n_read as u64;
-        crc = crc32::update(crc, &buffer[0..n_read]);
+        io::stdout().write_all(&buf)?;
     }
-
-    println!(
-        "{} {} {}",
-        crc32::finalize(crc, n_bytes as usize),
-        n_bytes,
-        filename
-    );
 
     Ok(())
 }
@@ -73,7 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut exit_code = 0;
 
     for filename in &args.files {
-        match cksum_file(filename) {
+        match uncompress_file(filename) {
             Ok(()) => {}
             Err(e) => {
                 exit_code = 1;

@@ -7,13 +7,16 @@ edition = "2021"
 plib = { path = "../plib" }
 clap = { version = "4", features = ["derive"] }
 gettext-rs = { version = "0.7", features = ["gettext-system"] }
-crc32fast = "1.4"
 uuencode = "0.1"
 base64 = "0.21"
 
 [[bin]]
 name = "cksum"
 path = "src/cksum.rs"
+
+[[bin]]
+name = "uncompress"
+path = "src/uncompress.rs"
 
 [[bin]]
 name = "uudecode"

@@ -6,14 +6,13 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// FIXME !!! - checksum values do not match other cksum utils
-//
 
 extern crate clap;
 extern crate plib;
 
+mod crc32;
+
 use clap::Parser;
-use crc32fast::Hasher;
 use gettextrs::{bind_textdomain_codeset, textdomain};
 use plib::PROJECT_NAME;
 use std::fs;
@@ -37,7 +36,7 @@ fn cksum_file(filename: &str) -> io::Result<()> {
 
     let mut buffer = [0; plib::BUFSZ];
     let mut n_bytes: u64 = 0;
-    let mut hash = Hasher::new();
+    let mut crc: u32 = 0;
 
     loop {
         let n_read = file.read(&mut buffer[..])?;
@@ -46,12 +45,15 @@ fn cksum_file(filename: &str) -> io::Result<()> {
         }
 
         n_bytes = n_bytes + n_read as u64;
-        hash.update(&buffer[0..n_read]);
+        crc = crc32::update(crc, &buffer[0..n_read]);
     }
 
-    let checksum = hash.finalize();
-
-    println!("{} {} {}", checksum, n_bytes, filename);
+    println!(
+        "{} {} {}",
+        crc32::finalize(crc, n_bytes as usize),
+        n_bytes,
+        filename
+    );
 
     Ok(())
 }

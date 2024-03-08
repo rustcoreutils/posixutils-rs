@@ -10,10 +10,16 @@
 extern crate clap;
 extern crate plib;
 
+use object::{
+    Object, ObjectSection, ObjectSymbol, SectionIndex, SectionKind, Symbol, SymbolKind,
+    SymbolSection,
+};
+
 use clap::{Parser, ValueEnum};
 use gettextrs::{bind_textdomain_codeset, textdomain};
 use plib::PROJECT_NAME;
-use std::io::{self, Error, ErrorKind};
+use std::collections::HashMap;
+use std::fs;
 
 #[derive(Debug, ValueEnum, Clone)]
 enum OutputType {
@@ -55,7 +61,7 @@ struct Args {
     portable: bool,
 
     /// Write each numeric value in the specified format.
-    #[arg(short = 't', long = "format", value_enum)]
+    #[arg(short = 't', long = "format", value_enum, default_value = "d")]
     out_type: OutputType,
 
     /// Write only undefined symbols.
@@ -70,12 +76,88 @@ struct Args {
     file: String,
 }
 
+fn show_object_file(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let file_path = &args.file;
+    {
+        let filedata = match fs::read(file_path) {
+            Ok(file) => file,
+            Err(err) => {
+                println!("Failed to open file '{}': {}", file_path, err,);
+                return Err(Box::new(err));
+            }
+        };
+        let file = match object::File::parse(&*filedata) {
+            Ok(file) => file,
+            Err(err) => {
+                println!("Failed to parse file '{}': {}", file_path, err);
+                return Err(Box::new(err));
+            }
+        };
+
+        let section_kinds = file.sections().map(|s| (s.index(), s.kind())).collect();
+
+        println!("Debugging symbols:");
+        for symbol in file.symbols() {
+            print_symbol(&symbol, &section_kinds);
+        }
+        println!();
+
+        println!("Dynamic symbols:");
+        for symbol in file.dynamic_symbols() {
+            print_symbol(&symbol, &section_kinds);
+        }
+    }
+
+    Ok(())
+}
+
+fn print_symbol(symbol: &Symbol<'_, '_>, section_kinds: &HashMap<SectionIndex, SectionKind>) {
+    if let SymbolKind::Section | SymbolKind::File = symbol.kind() {
+        return;
+    }
+
+    let mut kind = match symbol.section() {
+        SymbolSection::Undefined => 'U',
+        SymbolSection::Absolute => 'A',
+        SymbolSection::Common => 'C',
+        SymbolSection::Section(index) => match section_kinds.get(&index) {
+            Some(SectionKind::Text) => 't',
+            Some(SectionKind::Data) | Some(SectionKind::Tls) | Some(SectionKind::TlsVariables) => {
+                'd'
+            }
+            Some(SectionKind::ReadOnlyData) | Some(SectionKind::ReadOnlyString) => 'r',
+            Some(SectionKind::UninitializedData) | Some(SectionKind::UninitializedTls) => 'b',
+            Some(SectionKind::Common) => 'C',
+            _ => '?',
+        },
+        _ => '?',
+    };
+
+    if symbol.is_global() {
+        kind = kind.to_ascii_uppercase();
+    }
+
+    if symbol.is_undefined() {
+        print!("{:16} ", "");
+    } else {
+        print!("{:016x} ", symbol.address());
+    }
+    println!(
+        "{:016x} {} {}",
+        symbol.size(),
+        kind,
+        symbol.name().unwrap_or("<unknown>"),
+    );
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // parse command line arguments
     let args = Args::parse();
 
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+
+    show_object_file(&args)?;
 
     Ok(())
 }

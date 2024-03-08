@@ -163,7 +163,7 @@ https://github.com/jgarzik/posixutils
  - [x] tty
  - [ ] ulimit
  - [x] uname
- - [ ] uncompress (compress cat.)
+ - [x] uncompress (compress cat.)
  - [ ] unexpand
  - [ ] unget (SCCS)
  - [ ] uniq

@@ -85,9 +85,9 @@ checksum = "0d8c1fef690941d3e7788d328517591fecc684c084084702d6ff1641e993699a"
 
 [[package]]
 name = "cc"
-version = "1.0.89"
+version = "1.0.90"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0ba8f7aaa012f30d5b2861462f6708eccd49c3c39863fe083a308035f63d723"
+checksum = "8cd6604a82acf3039f1144f54b8eb34e91ffba622051189e71b781822d5ee1f5"
 
 [[package]]
 name = "cfg-if"
@@ -97,9 +97,9 @@ checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 
 [[package]]
 name = "clap"
-version = "4.5.1"
+version = "4.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c918d541ef2913577a0f9566e9ce27cb35b6df072075769e0b26cb5a554520da"
+checksum = "b230ab84b0ffdf890d5a10abdbc8b83ae1c4918275daea1ab8801f71536b2651"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -107,9 +107,9 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.5.1"
+version = "4.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f3e7391dad68afb0c2ede1bf619f579a3dc9c2ec67f089baa397123a2f3d1eb"
+checksum = "ae129e2e766ae0ec03484e609954119f123cc1fe650337e155d03b022f24f7b4"
 dependencies = [
  "anstream",
  "anstyle",
@@ -412,11 +412,11 @@ dependencies = [
 
 [[package]]
 name = "plib"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "posixutils-datetime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -425,7 +425,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-display"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -434,7 +434,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-file"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -444,7 +444,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-link"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -453,11 +453,11 @@ dependencies = [
 
 [[package]]
 name = "posixutils-misc"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "posixutils-pathnames"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -466,7 +466,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-process"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "errno",
@@ -477,7 +477,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-screen"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -489,7 +489,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-sys"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -500,7 +500,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-text"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -510,7 +510,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-tree"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -519,7 +519,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-users"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -530,7 +530,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-xform"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "clap",

@@ -16,6 +16,10 @@ name = "cksum"
 path = "src/cksum.rs"
 
 [[bin]]
+name = "uncompress"
+path = "src/uncompress.rs"
+
+[[bin]]
 name = "uudecode"
 path = "src/uudecode.rs"
 

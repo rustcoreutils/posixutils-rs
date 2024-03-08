@@ -424,6 +424,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "posixutils-dev"
+version = "0.1.1"
+dependencies = [
+ "clap",
+ "gettext-rs",
+ "plib",
+]
+
+[[package]]
 name = "posixutils-display"
 version = "0.1.1"
 dependencies = [

@@ -51,7 +51,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let res = unsafe { libc::nice(args.niceval) };
     if res < 0 {
-        let e = io::Error::from_raw_os_error(res);
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
+        let e = io::Error::from_raw_os_error(errno);
         eprintln!("nice: {}", e);
         return Err(Box::new(e));
     }

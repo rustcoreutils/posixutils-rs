@@ -11,6 +11,3 @@
 	filename: OS error message
 ```
 
-* `from_raw_os_error()` is probably pulling the wrong value and should
-  query errno
-

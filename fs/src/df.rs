@@ -126,7 +126,8 @@ fn read_mount_info() -> io::Result<MountList> {
         let mut mounts: *mut libc::statfs = std::ptr::null_mut();
         let n_mnt = libc::getmntinfo(&mut mounts, libc::MNT_WAIT);
         if n_mnt < 0 {
-            return Err(io::Error::from_raw_os_error(n_mnt));
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
+            return Err(io::Error::from_raw_os_error(errno));
         }
 
         let mounts: &[libc::statfs] = std::slice::from_raw_parts(mounts as _, n_mnt as _);

@@ -55,7 +55,8 @@ fn stat_tty() -> io::Result<(i32, libc::stat)> {
         let ret = libc::fstat(fd, &mut st);
         if ret < 0 {
             eprintln!("{}", gettext("fstat failed"));
-            return Err(io::Error::from_raw_os_error(ret));
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
+            return Err(io::Error::from_raw_os_error(errno));
         }
 
         Ok((fd, st))
@@ -105,7 +106,8 @@ fn set_mesg(fd: i32, st: libc::stat, setting: &str) -> io::Result<()> {
     let chres = unsafe { libc::fchmod(fd, mode) };
     if chres < 0 {
         eprintln!("{}", gettext("failed to change terminal mode"));
-        return Err(io::Error::from_raw_os_error(chres));
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
+        return Err(io::Error::from_raw_os_error(errno));
     }
 
     Ok(())

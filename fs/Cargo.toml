@@ -1,0 +1,15 @@
+[package]
+name = "posixutils-fs"
+version = "0.1.1"
+edition = "2021"
+
+[dependencies]
+plib = { path = "../plib" }
+clap = { version = "4", features = ["derive"] }
+gettext-rs = { version = "0.7", features = ["gettext-system"] }
+libc = "0.2"
+
+[[bin]]
+name = "df"
+path = "src/df.rs"
+

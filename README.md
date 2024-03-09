@@ -63,7 +63,7 @@ https://github.com/jgarzik/posixutils
  - [ ] date
  - [ ] dd
  - [ ] delta (SCCS)
- - [ ] df
+ - [x] df
  - [ ] diff
  - [x] dirname
  - [ ] du

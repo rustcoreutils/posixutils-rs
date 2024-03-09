@@ -6,6 +6,10 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
+// TODO:
+// - vary output based on args
+// - sort output
+//
 
 extern crate clap;
 extern crate plib;
@@ -76,41 +80,6 @@ struct Args {
     file: String,
 }
 
-fn show_object_file(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    let file_path = &args.file;
-    {
-        let filedata = match fs::read(file_path) {
-            Ok(file) => file,
-            Err(err) => {
-                println!("Failed to open file '{}': {}", file_path, err,);
-                return Err(Box::new(err));
-            }
-        };
-        let file = match object::File::parse(&*filedata) {
-            Ok(file) => file,
-            Err(err) => {
-                println!("Failed to parse file '{}': {}", file_path, err);
-                return Err(Box::new(err));
-            }
-        };
-
-        let section_kinds = file.sections().map(|s| (s.index(), s.kind())).collect();
-
-        println!("Debugging symbols:");
-        for symbol in file.symbols() {
-            print_symbol(&symbol, &section_kinds);
-        }
-        println!();
-
-        println!("Dynamic symbols:");
-        for symbol in file.dynamic_symbols() {
-            print_symbol(&symbol, &section_kinds);
-        }
-    }
-
-    Ok(())
-}
-
 fn print_symbol(symbol: &Symbol<'_, '_>, section_kinds: &HashMap<SectionIndex, SectionKind>) {
     if let SymbolKind::Section | SymbolKind::File = symbol.kind() {
         return;
@@ -142,12 +111,38 @@ fn print_symbol(symbol: &Symbol<'_, '_>, section_kinds: &HashMap<SectionIndex, S
     } else {
         print!("{:016x} ", symbol.address());
     }
-    println!(
-        "{:016x} {} {}",
-        symbol.size(),
-        kind,
-        symbol.name().unwrap_or("<unknown>"),
-    );
+    println!("{} {}", kind, symbol.name().unwrap_or("<unknown>"),);
+}
+
+fn show_object_file(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let file_path = &args.file;
+    {
+        let filedata = match fs::read(file_path) {
+            Ok(file) => file,
+            Err(err) => {
+                println!("Failed to open file '{}': {}", file_path, err,);
+                return Err(Box::new(err));
+            }
+        };
+        let file = match object::File::parse(&*filedata) {
+            Ok(file) => file,
+            Err(err) => {
+                println!("Failed to parse file '{}': {}", file_path, err);
+                return Err(Box::new(err));
+            }
+        };
+
+        let section_kinds = file.sections().map(|s| (s.index(), s.kind())).collect();
+
+        for symbol in file.symbols() {
+            print_symbol(&symbol, &section_kinds);
+        }
+        for symbol in file.dynamic_symbols() {
+            print_symbol(&symbol, &section_kinds);
+        }
+    }
+
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

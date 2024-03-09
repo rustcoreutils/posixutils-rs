@@ -2,6 +2,9 @@
 name = "posixutils-misc"
 version = "0.1.1"
 edition = "2021"
+authors = ["Jeff Garzik"]
+license = "MIT"
+repository = "https://github.com/rustcoreutils/posixutils-rs.git"
 
 [[bin]]
 name = "true"

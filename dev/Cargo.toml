@@ -1,0 +1,15 @@
+[package]
+name = "posixutils-dev"
+version = "0.1.1"
+edition = "2021"
+
+[dependencies]
+plib = { path = "../plib" }
+clap = { version = "4", features = ["derive"] }
+gettext-rs = { version = "0.7", features = ["gettext-system"] }
+object = "0.33"
+
+[[bin]]
+name = "nm"
+path = "src/nm.rs"
+

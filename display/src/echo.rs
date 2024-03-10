@@ -17,6 +17,7 @@ extern crate plib;
 
 use gettextrs::{bind_textdomain_codeset, textdomain};
 use plib::PROJECT_NAME;
+use std::io::{self, Write};
 
 fn translate_str(s: &str) -> String {
     let mut output = String::with_capacity(s.len());
@@ -81,7 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let echo_str = translate_str(&args.join(" "));
 
-    println!("{}", echo_str);
+    io::stdout().write_all(echo_str.as_bytes())?;
 
     Ok(())
 }

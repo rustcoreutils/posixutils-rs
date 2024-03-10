@@ -65,31 +65,47 @@ impl CountInfo {
 fn build_display_str(args: &Args, count: &CountInfo, filename: &str) -> String {
     let mut output = String::with_capacity(filename.len() + (3 * 10));
 
+    let multi_file = args.files.len() > 1;
+    let only_lines = (args.words == false) && (args.bytes == false) && (args.chars == false);
+    let only_words = (args.lines == false) && (args.bytes == false) && (args.chars == false);
+    let only_bytechars = (args.lines == false) && (args.words == false);
+
     if args.lines {
-        let numstr = format!("{:>8}", count.nl);
+        let numstr = match only_lines {
+            true => format!("{}", count.nl),
+            false => format!("{:>8}", count.nl),
+        };
         output.push_str(&numstr);
     }
     if args.words {
         if output.len() > 0 {
             output.push(' ');
         }
-        let numstr = format!("{:>8}", count.words);
+        let numstr = match only_words {
+            true => format!("{}", count.words),
+            false => format!("{:>8}", count.words),
+        };
         output.push_str(&numstr);
     }
     if args.bytes || args.chars {
         if output.len() > 0 {
             output.push(' ');
         }
-        let numstr = format!("{:>8}", count.chars);
+        let numstr = match only_bytechars {
+            true => format!("{}", count.chars),
+            false => format!("{:>8}", count.chars),
+        };
         output.push_str(&numstr);
     }
 
-    output.push(' ');
+    if multi_file {
+        output.push(' ');
 
-    if filename == "" {
-        output.push_str("(stdin)");
-    } else {
-        output.push_str(filename);
+        if filename == "" {
+            output.push_str("(stdin)");
+        } else {
+            output.push_str(filename);
+        }
     }
 
     output

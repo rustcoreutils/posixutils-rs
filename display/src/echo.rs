@@ -19,7 +19,7 @@ use gettextrs::{bind_textdomain_codeset, textdomain};
 use plib::PROJECT_NAME;
 use std::io::{self, Write};
 
-fn translate_str(s: &str) -> String {
+fn translate_str(skip_nl: bool, s: &str) -> String {
     let mut output = String::with_capacity(s.len());
 
     let mut in_bs = false;
@@ -66,7 +66,7 @@ fn translate_str(s: &str) -> String {
         }
     }
 
-    if nl {
+    if nl && !skip_nl {
         output.push_str("\n");
     }
 
@@ -80,7 +80,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args: Vec<String> = std::env::args().collect();
     args.remove(0);
 
-    let echo_str = translate_str(&args.join(" "));
+    let skip_nl = {
+        if args.len() > 0 && (args[0] == "-n") {
+            args.remove(0);
+            true
+        } else {
+            false
+        }
+    };
+
+    let echo_str = translate_str(skip_nl, &args.join(" "));
 
     io::stdout().write_all(echo_str.as_bytes())?;
 

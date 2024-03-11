@@ -73,7 +73,7 @@ https://github.com/jgarzik/posixutils
  - [ ] ed
  - [x] env
  - [ ] ex
- - [ ] expand
+ - [x] expand
  - [ ] expr
  - [x] false
  - [ ] file

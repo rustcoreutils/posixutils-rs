@@ -23,4 +23,7 @@ fn echo_test(args: &[&str], expected_output: &str) {
 #[test]
 fn test_echo_basic() {
     echo_test(&["big", "brown", "bear"], "big brown bear\n");
+
+    echo_test(&["-n", "foo", "bar"], "foo bar");
+    echo_test(&["foo", "bar\\c"], "foo bar");
 }

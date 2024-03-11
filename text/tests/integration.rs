@@ -9,6 +9,15 @@
 
 use plib::{run_test, TestPlan};
 
+fn expand_test_noargs(test_data: &str, expected_output: &str) {
+    run_test(TestPlan {
+        cmd: String::from("expand"),
+        args: Vec::new(),
+        stdin_data: String::from(test_data),
+        expected_out: String::from(expected_output),
+    });
+}
+
 fn head_test(test_data: &str, expected_output: &str) {
     run_test(TestPlan {
         cmd: String::from("head"),
@@ -27,6 +36,12 @@ fn wc_test(args: &[&str], test_data: &str, expected_output: &str) {
         stdin_data: String::from(test_data),
         expected_out: String::from(expected_output),
     });
+}
+
+#[test]
+fn test_expand_basic() {
+    expand_test_noargs("", "");
+    expand_test_noargs("a\tb\tc\n", "a       b       c\n");
 }
 
 #[test]

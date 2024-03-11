@@ -17,6 +17,10 @@ name = "asa"
 path = "src/asa.rs"
 
 [[bin]]
+name = "expand"
+path = "src/expand.rs"
+
+[[bin]]
 name = "head"
 path = "src/head.rs"
 

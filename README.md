@@ -54,7 +54,7 @@ https://github.com/jgarzik/posixutils
  - [ ] chown
  - [x] cksum
  - [ ] cmp
- - [ ] comm
+ - [x] comm
  - [ ] compress (compress cat.)
  - [ ] cp
  - [ ] crontab (cron cat.)

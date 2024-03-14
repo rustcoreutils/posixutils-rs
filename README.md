@@ -138,7 +138,7 @@ https://github.com/jgarzik/posixutils
  - [ ] qstat (Batch cat.)
  - [ ] qsub (Batch cat.)
  - [x] renice
- - [ ] rm
+ - [x] rm
  - [ ] rmdel (SCCS)
  - [x] rmdir
  - [ ] sact (SCCS)

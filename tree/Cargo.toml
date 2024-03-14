@@ -10,6 +10,12 @@ repository = "https://github.com/rustcoreutils/posixutils-rs.git"
 plib = { path = "../plib" }
 clap = { version = "4", features = ["derive"] }
 gettext-rs = { version = "0.7", features = ["gettext-system"] }
+walkdir = "2.5"
+libc = "0.2"
+
+[[bin]]
+name = "rm"
+path = "src/rm.rs"
 
 [[bin]]
 name = "rmdir"

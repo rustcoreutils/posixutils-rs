@@ -525,15 +525,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "posixutils-link"
-version = "0.1.2"
-dependencies = [
- "clap",
- "gettext-rs",
- "plib",
-]
-
-[[package]]
 name = "posixutils-misc"
 version = "0.1.2"
 

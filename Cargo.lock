@@ -587,6 +587,7 @@ dependencies = [
  "clap",
  "gettext-rs",
  "plib",
+ "regex",
  "topological-sort",
 ]
 

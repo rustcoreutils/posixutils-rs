@@ -48,10 +48,18 @@ fn cksum_file(filename: &str) -> io::Result<()> {
         crc = crc32::update(crc, &buffer[0..n_read]);
     }
 
+    let filename_prefix = {
+        if filename == "" {
+            ""
+        } else {
+            " "
+        }
+    };
     println!(
-        "{} {} {}",
+        "{} {}{}{}",
         crc32::finalize(crc, n_bytes as usize),
         n_bytes,
+        filename_prefix,
         filename
     );
 

@@ -78,7 +78,7 @@ https://github.com/jgarzik/posixutils
  - [x] false
  - [ ] file
  - [ ] find
- - [ ] fold
+ - [x] fold
  - [ ] fort77 (Development)
  - [ ] fuser
  - [ ] gencat (i18n)

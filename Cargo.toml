@@ -7,7 +7,6 @@ members = [
 	"display",
 	"file",
 	"fs",
-	"link",
 	"misc",
 	"pathnames",
 	"plib",

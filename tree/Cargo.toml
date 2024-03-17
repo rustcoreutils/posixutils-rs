@@ -14,10 +14,22 @@ walkdir = "2.5"
 libc = "0.2"
 
 [[bin]]
+name = "link"
+path = "src/link.rs"
+
+[[bin]]
+name = "ln"
+path = "src/ln.rs"
+
+[[bin]]
 name = "rm"
 path = "src/rm.rs"
 
 [[bin]]
 name = "rmdir"
 path = "src/rmdir.rs"
+
+[[bin]]
+name = "unlink"
+path = "src/unlink.rs"
 

@@ -26,6 +26,10 @@ name = "mesg"
 path = "src/mesg.rs"
 
 [[bin]]
+name = "pwd"
+path = "src/pwd.rs"
+
+[[bin]]
 name = "tty"
 path = "src/tty.rs"
 

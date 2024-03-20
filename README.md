@@ -125,7 +125,7 @@ https://github.com/jgarzik/posixutils
  - [ ] printf
  - [ ] prs (SCCS)
  - [ ] ps
- - [ ] pwd
+ - [x] pwd
  - [ ] qalter (Batch cat.)
  - [ ] qdel (Batch cat.)
  - [ ] qhold (Batch cat.)

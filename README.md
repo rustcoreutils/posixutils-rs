@@ -122,7 +122,7 @@ https://github.com/jgarzik/posixutils
  - [ ] pathchk
  - [ ] pax
  - [ ] pr
- - [ ] printf
+ - [x] printf
  - [ ] prs (SCCS)
  - [ ] ps
  - [x] pwd

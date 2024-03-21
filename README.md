@@ -50,7 +50,7 @@ https://github.com/jgarzik/posixutils
  - [x] cat
  - [ ] cflow (Development)
  - [ ] chgrp
- - [ ] chmod
+ - [x] chmod
  - [ ] chown
  - [x] cksum
  - [ ] cmp

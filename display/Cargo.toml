@@ -15,3 +15,7 @@ gettext-rs = { version = "0.7", features = ["gettext-system"] }
 name = "echo"
 path = "src/echo.rs"
 
+[[bin]]
+name = "printf"
+path = "src/printf.rs"
+

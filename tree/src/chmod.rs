@@ -183,7 +183,6 @@ fn set_permissions_symbolic(path: &Path, symbolic: &ChmodSymbolic) -> Result<(),
         }
     }
 
-    eprintln!("SET_MODE: {:o}", new_mode);
     perms.set_mode(new_mode);
 
     fs::set_permissions(path, perms)?;
@@ -226,7 +225,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut exit_code = 0;
 
     let mode = modestr::parse(&args.mode)?;
-    eprintln!("mode: {:?}", mode);
 
     for filename in &args.files {
         if let Err(e) = chmod_file(filename, &mode, args.recurse) {

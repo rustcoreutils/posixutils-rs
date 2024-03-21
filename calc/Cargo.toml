@@ -1,0 +1,14 @@
+[package]
+name = "posixutils-calc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+plib = { path = "../plib" }
+gettext-rs = { version = "0.7", features = ["gettext-system"] }
+regex = "1.10"
+
+[[bin]]
+name = "expr"
+path = "src/expr.rs"
+

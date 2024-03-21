@@ -477,6 +477,15 @@ name = "plib"
 version = "0.1.2"
 
 [[package]]
+name = "posixutils-calc"
+version = "0.1.0"
+dependencies = [
+ "gettext-rs",
+ "plib",
+ "regex",
+]
+
+[[package]]
 name = "posixutils-datetime"
 version = "0.1.2"
 dependencies = [

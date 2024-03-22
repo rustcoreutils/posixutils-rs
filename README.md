@@ -157,7 +157,7 @@ https://github.com/jgarzik/posixutils
  - [x] tee
  - [ ] test
  - [ ] time
- - [ ] touch
+ - [x] touch
  - [x] tput
  - [ ] tr
  - [x] true

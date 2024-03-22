@@ -12,6 +12,7 @@ clap = { version = "4", features = ["derive"] }
 gettext-rs = { version = "0.7", features = ["gettext-system"] }
 walkdir = "2.5"
 libc = "0.2"
+chrono = "0.4"
 
 [[bin]]
 name = "chmod"
@@ -32,6 +33,10 @@ path = "src/rm.rs"
 [[bin]]
 name = "rmdir"
 path = "src/rmdir.rs"
+
+[[bin]]
+name = "touch"
+path = "src/touch.rs"
 
 [[bin]]
 name = "unlink"

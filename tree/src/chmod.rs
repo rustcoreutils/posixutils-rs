@@ -39,6 +39,7 @@ struct Args {
     files: Vec<String>,
 }
 
+// apply symbolic mutations to the given file at path
 fn set_permissions_symbolic(path: &Path, symbolic: &ChmodSymbolic) -> Result<(), io::Error> {
     let metadata = fs::metadata(path)?;
     let mut perms = metadata.permissions();
@@ -48,9 +49,12 @@ fn set_permissions_symbolic(path: &Path, symbolic: &ChmodSymbolic) -> Result<(),
     let mut group = perms.mode() & S_IRWXG as u32;
     let mut others = perms.mode() & S_IRWXO as u32;
 
+    // apply each clause
     for clause in &symbolic.clauses {
+        // apply each action
         for action in &clause.actions {
             match action.op {
+                // add bits to the mode
                 ChmodActionOp::Add => {
                     if action.copy_user {
                         user |= perms.mode() & S_IRWXU as u32;
@@ -88,6 +92,8 @@ fn set_permissions_symbolic(path: &Path, symbolic: &ChmodSymbolic) -> Result<(),
                         others |= S_ISVTX as u32;
                     }
                 }
+
+                // remove bits from the mode
                 ChmodActionOp::Remove => {
                     if action.copy_user {
                         user &= !(perms.mode() & S_IRWXU as u32);
@@ -126,6 +132,7 @@ fn set_permissions_symbolic(path: &Path, symbolic: &ChmodSymbolic) -> Result<(),
                     }
                 }
 
+                // set the mode bits
                 ChmodActionOp::Set => {
                     if action.copy_user {
                         user = perms.mode() & S_IRWXU as u32;
@@ -172,6 +179,7 @@ fn set_permissions_symbolic(path: &Path, symbolic: &ChmodSymbolic) -> Result<(),
             }
         }
 
+        // apply the clause
         if clause.user {
             new_mode = (new_mode & !S_IRWXU as u32) | user;
         }
@@ -183,8 +191,8 @@ fn set_permissions_symbolic(path: &Path, symbolic: &ChmodSymbolic) -> Result<(),
         }
     }
 
+    // update path in filesystem
     perms.set_mode(new_mode);
-
     fs::set_permissions(path, perms)?;
 
     Ok(())
@@ -204,9 +212,12 @@ fn chmod_file(filename: &str, mode: &ChmodMode, recurse: bool) -> Result<(), io:
     }
 
     match mode {
+        // set the mode bits to the given value
         ChmodMode::Absolute(m) => {
             fs::set_permissions(path, fs::Permissions::from_mode(*m))?;
         }
+
+        // apply symbolic mutations to the mode bits
         ChmodMode::Symbolic(s) => {
             set_permissions_symbolic(path, s)?;
         }
@@ -219,13 +230,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // parse command line arguments
     let args = Args::parse();
 
+    // initialize translations
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
     let mut exit_code = 0;
 
+    // parse the mode string
     let mode = modestr::parse(&args.mode)?;
 
+    // apply the mode to each file
     for filename in &args.files {
         if let Err(e) = chmod_file(filename, &mode, args.recurse) {
             exit_code = 1;

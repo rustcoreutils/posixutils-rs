@@ -35,6 +35,7 @@ enum Token {
     Str(String),
 }
 
+// comparison operators
 #[derive(Clone, Debug)]
 enum CmpOp {
     EQ,
@@ -45,6 +46,7 @@ enum CmpOp {
     LE,
 }
 
+// integer operations
 #[derive(Clone, Debug)]
 enum IntOp {
     Add,
@@ -54,6 +56,7 @@ enum IntOp {
     Rem,
 }
 
+// convert an lval to a string
 fn token_display(t: &Token) -> String {
     match t {
         Token::Integer(val) => val.to_string(),
@@ -64,6 +67,7 @@ fn token_display(t: &Token) -> String {
     }
 }
 
+// is token an lval?
 fn token_is_lval(t: &Token) -> bool {
     match t {
         Token::Integer(_) => true,
@@ -72,6 +76,7 @@ fn token_is_lval(t: &Token) -> bool {
     }
 }
 
+// is token zero?
 fn token_is_zero(t: &Token) -> bool {
     match t {
         Token::Integer(val) => *val == 0,
@@ -80,6 +85,7 @@ fn token_is_zero(t: &Token) -> bool {
     }
 }
 
+// convert token to string
 fn token_to_string(t: &Token) -> Result<String, &'static str> {
     match t {
         Token::Integer(val) => Ok(val.to_string()),
@@ -88,6 +94,7 @@ fn token_to_string(t: &Token) -> Result<String, &'static str> {
     }
 }
 
+// convert token to integer
 fn token_to_int(t: &Token) -> Option<i64> {
     match t {
         Token::Integer(val) => Some(*val),
@@ -95,6 +102,7 @@ fn token_to_int(t: &Token) -> Option<i64> {
     }
 }
 
+// convert token to integer, returning an error if not an integer
 fn token_to_int_req(t: &Token) -> Result<i64, &'static str> {
     match token_to_int(t) {
         Some(val) => Ok(val),
@@ -102,6 +110,7 @@ fn token_to_int_req(t: &Token) -> Result<i64, &'static str> {
     }
 }
 
+// parse a single token
 fn parse_token(s: &str) -> Token {
     match s {
         "(" => Token::LParen,
@@ -127,6 +136,7 @@ fn parse_token(s: &str) -> Token {
     }
 }
 
+// tokenize the command line arguments, all in a single pass
 fn tokenize() -> Vec<Token> {
     // collect program's command line args
     let mut args: Vec<String> = std::env::args().collect();
@@ -141,6 +151,7 @@ fn tokenize() -> Vec<Token> {
     tokens
 }
 
+// compare two integers
 fn cmpint(lhs: i64, rhs: i64, op: CmpOp) -> Result<Token, &'static str> {
     let result: bool = match op {
         CmpOp::EQ => lhs == rhs,
@@ -154,6 +165,7 @@ fn cmpint(lhs: i64, rhs: i64, op: CmpOp) -> Result<Token, &'static str> {
     Ok(Token::Integer(result as i64))
 }
 
+// compare two strings
 fn cmpstr(lhs: &Token, rhs: &Token, op: CmpOp) -> Result<Token, &'static str> {
     let lhs = token_to_string(lhs)?;
     let rhs = token_to_string(rhs)?;
@@ -170,6 +182,7 @@ fn cmpstr(lhs: &Token, rhs: &Token, op: CmpOp) -> Result<Token, &'static str> {
     Ok(Token::Integer(result as i64))
 }
 
+// perform a comparison operation
 fn cmpop(lhs: &Token, rhs: &Token, op: CmpOp) -> Result<Token, &'static str> {
     let lhs_int = token_to_int(lhs);
     let rhs_int = token_to_int(rhs);
@@ -190,6 +203,7 @@ fn cmpop(lhs: &Token, rhs: &Token, op: CmpOp) -> Result<Token, &'static str> {
     }
 }
 
+// perform an integer math operation
 fn intop(lhs: &Token, rhs: &Token, op: IntOp) -> Result<Token, &'static str> {
     let i1 = token_to_int_req(lhs)?;
     let i2 = token_to_int_req(rhs)?;
@@ -203,6 +217,7 @@ fn intop(lhs: &Token, rhs: &Token, op: IntOp) -> Result<Token, &'static str> {
     }
 }
 
+// logical and/or operation
 fn logop(lhs: &Token, rhs: &Token, is_and: bool) -> Token {
     let lhs_zero = token_is_zero(lhs);
     let rhs_zero = token_is_zero(rhs);
@@ -224,6 +239,7 @@ fn logop(lhs: &Token, rhs: &Token, is_and: bool) -> Token {
     }
 }
 
+// regex match operation
 fn matchop(lhs: &Token, rhs: &Token) -> Result<Token, &'static str> {
     let lhs = token_to_string(lhs)?;
     let rhs = token_to_string(rhs)?;
@@ -277,10 +293,13 @@ fn find_matching_paren(tokens: &[Token]) -> Option<usize> {
     None
 }
 
+// evaluate an expression
 fn eval_expression(tokens: &[Token]) -> Result<Token, &'static str> {
     let mut tokens = tokens.to_vec();
 
+    // continually consume tokens until only one remains
     while tokens.len() >= 3 {
+        // handle nested expressions: left hand side
         if tokens[0] == Token::LParen {
             if let Some(i) = find_matching_paren(&tokens) {
                 let subexpr = &tokens[1..i];
@@ -291,6 +310,7 @@ fn eval_expression(tokens: &[Token]) -> Result<Token, &'static str> {
                 return Err("syntax error EP0: unmatched left paren");
             }
         }
+        // handle nested expressions: right hand side
         if tokens[2] == Token::LParen {
             if let Some(i) = find_matching_paren(&tokens[2..]) {
                 let subexpr = &tokens[3..i + 2];
@@ -302,10 +322,12 @@ fn eval_expression(tokens: &[Token]) -> Result<Token, &'static str> {
             }
         }
 
+        // extract our left hand side, operator, and right hand side
         let lhs = &tokens[0];
         let operator = &tokens[1];
         let rhs = &tokens[2];
 
+        // dispatch to the appropriate operation
         let result = match operator {
             Token::OpAdd => intop(lhs, rhs, IntOp::Add)?,
             Token::OpSub => intop(lhs, rhs, IntOp::Sub)?,
@@ -330,9 +352,11 @@ fn eval_expression(tokens: &[Token]) -> Result<Token, &'static str> {
             }
         };
 
+        // replace the lhs, operator, and rhs with the result
         tokens.splice(0..=2, vec![result]);
     }
 
+    // final result should be a single token
     if tokens.len() == 1 {
         let lhs = &tokens[0];
         if token_is_lval(lhs) {
@@ -346,11 +370,15 @@ fn eval_expression(tokens: &[Token]) -> Result<Token, &'static str> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // initialize translations
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
+    // tokenize and evaluate the expression
     let arg_tokens = tokenize();
     let final_val = eval_expression(&arg_tokens)?;
+
+    // display the result
     println!("{}", token_display(&final_val));
 
     Ok(())

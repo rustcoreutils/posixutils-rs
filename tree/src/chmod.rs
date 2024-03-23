@@ -10,12 +10,10 @@
 extern crate clap;
 extern crate plib;
 
-mod modestr;
-
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, textdomain};
 use modestr::{ChmodMode, ChmodSymbolic};
-use plib::PROJECT_NAME;
+use plib::{modestr, PROJECT_NAME};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::{fs, io};

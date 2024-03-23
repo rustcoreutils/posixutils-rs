@@ -11,12 +11,10 @@ extern crate clap;
 extern crate libc;
 extern crate plib;
 
-mod modestr;
-
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, textdomain};
 use modestr::ChmodMode;
-use plib::PROJECT_NAME;
+use plib::{modestr, PROJECT_NAME};
 use std::io;
 
 /// mkfifo - make FIFO special files
@@ -34,7 +32,7 @@ struct Args {
 fn do_mkfifo(filename: &str, mode: &ChmodMode) -> io::Result<()> {
     let mode_val = match mode {
         ChmodMode::Absolute(mode) => *mode,
-        _ => 0o666,
+        ChmodMode::Symbolic(sym) => modestr::mutate(0o666, sym),
     };
 
     let res = unsafe { libc::mkfifo(filename.as_ptr() as *const i8, mode_val as u16) };

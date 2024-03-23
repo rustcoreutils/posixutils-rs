@@ -110,7 +110,7 @@ https://github.com/jgarzik/posixutils
  - [ ] mkdir
  - [ ] mkfifo
  - [ ] more
- - [ ] mv
+ - [x] mv
  - [ ] newgrp
  - [x] nice
  - [ ] nl

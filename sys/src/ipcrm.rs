@@ -60,8 +60,7 @@ fn msg_key_lookup(msgkey: i32) -> io::Result<i32> {
     let res: i32 = unsafe { msgget(msgkey, 0) };
 
     if res < 0 {
-        let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
-        Err(io::Error::from_raw_os_error(errno))
+        Err(io::Error::last_os_error())
     } else {
         Ok(res)
     }
@@ -78,8 +77,7 @@ fn msg_rm(msgid: i32) -> io::Result<i32> {
     };
 
     if res < 0 {
-        let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
-        Err(io::Error::from_raw_os_error(errno))
+        Err(io::Error::last_os_error())
     } else {
         Ok(res)
     }
@@ -92,8 +90,7 @@ fn shm_key_lookup(shmkey: i32) -> io::Result<i32> {
     let res: i32 = unsafe { shmget(shmkey, 0, 0) };
 
     if res < 0 {
-        let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
-        Err(io::Error::from_raw_os_error(errno))
+        Err(io::Error::last_os_error())
     } else {
         Ok(res)
     }
@@ -109,8 +106,7 @@ fn shm_rm(shmid: i32) -> io::Result<i32> {
     };
 
     if res < 0 {
-        let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
-        Err(io::Error::from_raw_os_error(errno))
+        Err(io::Error::last_os_error())
     } else {
         Ok(res)
     }
@@ -123,8 +119,7 @@ fn sem_key_lookup(semkey: i32) -> io::Result<i32> {
     let res: i32 = unsafe { semget(semkey, 0, 0) };
 
     if res < 0 {
-        let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
-        Err(io::Error::from_raw_os_error(errno))
+        Err(io::Error::last_os_error())
     } else {
         Ok(res)
     }
@@ -145,8 +140,7 @@ fn sem_rm(semid: i32) -> io::Result<i32> {
     let res: i32 = unsafe { semctl(semid, 0, libc::IPC_RMID, arg) };
 
     if res < 0 {
-        let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
-        Err(io::Error::from_raw_os_error(errno))
+        Err(io::Error::last_os_error())
     } else {
         Ok(res)
     }

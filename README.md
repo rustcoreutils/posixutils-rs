@@ -108,7 +108,7 @@ https://github.com/jgarzik/posixutils
  - [ ] man
  - [x] mesg
  - [ ] mkdir
- - [ ] mkfifo
+ - [x] mkfifo
  - [ ] more
  - [x] mv
  - [ ] newgrp

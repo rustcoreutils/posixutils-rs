@@ -10,6 +10,8 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+pub mod modestr;
+
 pub const PROJECT_NAME: &'static str = "posixutils-rs";
 
 pub const BUFSZ: usize = 8 * 1024;

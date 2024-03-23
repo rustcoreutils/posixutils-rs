@@ -10,16 +10,10 @@
 extern crate clap;
 extern crate plib;
 
-mod modestr;
-
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, textdomain};
-use libc::{
-    S_IRGRP, S_IROTH, S_IRUSR, S_IRWXG, S_IRWXO, S_IRWXU, S_ISUID, S_ISVTX, S_IWGRP, S_IWOTH,
-    S_IWUSR, S_IXGRP, S_IXOTH, S_IXUSR,
-};
-use modestr::{ChmodActionOp, ChmodMode, ChmodSymbolic};
-use plib::PROJECT_NAME;
+use modestr::{ChmodMode, ChmodSymbolic};
+use plib::{modestr, PROJECT_NAME};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::{fs, io};
@@ -41,155 +35,12 @@ struct Args {
 
 // apply symbolic mutations to the given file at path
 fn set_permissions_symbolic(path: &Path, symbolic: &ChmodSymbolic) -> Result<(), io::Error> {
+    // query the current mode bits
     let metadata = fs::metadata(path)?;
     let mut perms = metadata.permissions();
 
-    let mut new_mode = perms.mode();
-    let mut user = perms.mode() & S_IRWXU as u32;
-    let mut group = perms.mode() & S_IRWXG as u32;
-    let mut others = perms.mode() & S_IRWXO as u32;
-
-    // apply each clause
-    for clause in &symbolic.clauses {
-        // apply each action
-        for action in &clause.actions {
-            match action.op {
-                // add bits to the mode
-                ChmodActionOp::Add => {
-                    if action.copy_user {
-                        user |= perms.mode() & S_IRWXU as u32;
-                    }
-                    if action.copy_group {
-                        group |= perms.mode() & S_IRWXG as u32;
-                    }
-                    if action.copy_others {
-                        others |= perms.mode() & S_IRWXO as u32;
-                    }
-                    if action.read {
-                        user |= S_IRUSR as u32;
-                        group |= S_IRGRP as u32;
-                        others |= S_IROTH as u32;
-                    }
-                    if action.write {
-                        user |= S_IWUSR as u32;
-                        group |= S_IWGRP as u32;
-                        others |= S_IWOTH as u32;
-                    }
-                    if action.execute {
-                        user |= S_IXUSR as u32;
-                        group |= S_IXGRP as u32;
-                        others |= S_IXOTH as u32;
-                    }
-                    if action.execute_dir {
-                        user |= S_IXUSR as u32;
-                        group |= S_IXGRP as u32;
-                        others |= S_IXOTH as u32;
-                    }
-                    if action.setuid {
-                        user |= S_ISUID as u32;
-                    }
-                    if action.sticky {
-                        others |= S_ISVTX as u32;
-                    }
-                }
-
-                // remove bits from the mode
-                ChmodActionOp::Remove => {
-                    if action.copy_user {
-                        user &= !(perms.mode() & S_IRWXU as u32);
-                    }
-                    if action.copy_group {
-                        group &= !(perms.mode() & S_IRWXG as u32);
-                    }
-                    if action.copy_others {
-                        others &= !(perms.mode() & S_IRWXO as u32);
-                    }
-                    if action.read {
-                        user &= !S_IRUSR as u32;
-                        group &= !S_IRGRP as u32;
-                        others &= !S_IROTH as u32;
-                    }
-                    if action.write {
-                        user &= !S_IWUSR as u32;
-                        group &= !S_IWGRP as u32;
-                        others &= !S_IWOTH as u32;
-                    }
-                    if action.execute {
-                        user &= !S_IXUSR as u32;
-                        group &= !S_IXGRP as u32;
-                        others &= !S_IXOTH as u32;
-                    }
-                    if action.execute_dir {
-                        user &= !S_IXUSR as u32;
-                        group &= !S_IXGRP as u32;
-                        others &= !S_IXOTH as u32;
-                    }
-                    if action.setuid {
-                        user &= !S_ISUID as u32;
-                    }
-                    if action.sticky {
-                        others &= !S_ISVTX as u32;
-                    }
-                }
-
-                // set the mode bits
-                ChmodActionOp::Set => {
-                    if action.copy_user {
-                        user = perms.mode() & S_IRWXU as u32;
-                    } else {
-                        user = 0;
-                    }
-                    if action.copy_group {
-                        group = perms.mode() & S_IRWXG as u32;
-                    } else {
-                        group = 0;
-                    }
-                    if action.copy_others {
-                        others = perms.mode() & S_IRWXO as u32;
-                    } else {
-                        others = 0;
-                    }
-                    if action.read {
-                        user |= S_IRUSR as u32;
-                        group |= S_IRGRP as u32;
-                        others |= S_IROTH as u32;
-                    }
-                    if action.write {
-                        user |= S_IWUSR as u32;
-                        group |= S_IWGRP as u32;
-                        others |= S_IWOTH as u32;
-                    }
-                    if action.execute {
-                        user |= S_IXUSR as u32;
-                        group |= S_IXGRP as u32;
-                        others |= S_IXOTH as u32;
-                    }
-                    if action.execute_dir {
-                        user |= S_IXUSR as u32;
-                        group |= S_IXGRP as u32;
-                        others |= S_IXOTH as u32;
-                    }
-                    if action.setuid {
-                        user |= S_ISUID as u32;
-                    }
-                    if action.sticky {
-                        others |= S_ISVTX as u32;
-                    }
-                }
-            }
-        }
-
-        // apply the clause
-        if clause.user {
-            new_mode = (new_mode & !S_IRWXU as u32) | user;
-        }
-        if clause.group {
-            new_mode = (new_mode & !S_IRWXG as u32) | group;
-        }
-        if clause.others {
-            new_mode = (new_mode & !S_IRWXO as u32) | others;
-        }
-    }
+    // perform mutations on the mode bits
+    let new_mode = modestr::mutate(perms.mode(), symbolic);
 
     // update path in filesystem
     perms.set_mode(new_mode);

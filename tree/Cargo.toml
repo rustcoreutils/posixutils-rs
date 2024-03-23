@@ -27,6 +27,10 @@ name = "ln"
 path = "src/ln.rs"
 
 [[bin]]
+name = "mkfifo"
+path = "src/mkfifo.rs"
+
+[[bin]]
 name = "mv"
 path = "src/mv.rs"
 

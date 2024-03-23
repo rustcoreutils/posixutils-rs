@@ -106,8 +106,7 @@ fn xsetpriority(which: u32, id: u32, prio: i32) -> io::Result<()> {
     let res = unsafe { libc::setpriority(which as i32, id, prio) };
 
     if res < 0 {
-        let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
-        let e = io::Error::from_raw_os_error(errno);
+        let e = io::Error::last_os_error();
         eprintln!("setpriority: {}", e);
         Err(e)
     } else {

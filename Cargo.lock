@@ -568,11 +568,11 @@ dependencies = [
 
 [[package]]
 name = "plib"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "posixutils-calc"
-version = "0.1.0"
+version = "0.1.3"
 dependencies = [
  "gettext-rs",
  "plib",
@@ -581,7 +581,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-datetime"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -590,7 +590,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-dev"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -600,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-display"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -609,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-file"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -619,7 +619,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-fs"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -629,11 +629,11 @@ dependencies = [
 
 [[package]]
 name = "posixutils-misc"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "posixutils-pathnames"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -642,7 +642,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-process"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "clap",
  "errno",
@@ -653,7 +653,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-screen"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -665,7 +665,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-sys"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -676,7 +676,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-text"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -686,7 +686,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-tree"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "chrono",
  "clap",
@@ -698,7 +698,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-users"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -709,7 +709,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-xform"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "base64",
  "clap",
@@ -779,9 +779,9 @@ dependencies = [
 
 [[package]]
 name = "regex"
-version = "1.10.3"
+version = "1.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b62dbe01f0b06f9d8dc7d49e05a0785f153b00b2c227856282f671e0318c9b15"
+checksum = "c117dbdfde9c8308975b6a18d71f3f385c89461f7b3fb054288ecf2a2058ba4c"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -901,9 +901,9 @@ dependencies = [
 
 [[package]]
 name = "temp-dir"
-version = "0.1.12"
+version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd16aa9ffe15fe021c6ee3766772132c6e98dfa395a167e16864f61a9cfb71d6"
+checksum = "1f227968ec00f0e5322f9b8173c7a0cbcff6181a0a5b28e9892491c286277231"
 
 [[package]]
 name = "terminfo"

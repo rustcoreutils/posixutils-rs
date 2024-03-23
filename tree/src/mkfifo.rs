@@ -35,7 +35,7 @@ fn do_mkfifo(filename: &str, mode: &ChmodMode) -> io::Result<()> {
         ChmodMode::Symbolic(sym) => modestr::mutate(0o666, sym),
     };
 
-    let res = unsafe { libc::mkfifo(filename.as_ptr() as *const i8, mode_val as u16) };
+    let res = unsafe { libc::mkfifo(filename.as_ptr() as *const i8, mode_val as libc::mode_t) };
     if res < 0 {
         return Err(io::Error::last_os_error());
     }

@@ -19,6 +19,10 @@ name = "stty"
 path = "src/stty.rs"
 
 [[bin]]
+name = "tabs"
+path = "src/tabs.rs"
+
+[[bin]]
 name = "tput"
 path = "src/tput.rs"
 

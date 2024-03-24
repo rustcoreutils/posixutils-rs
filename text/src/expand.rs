@@ -166,12 +166,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut exit_code = 0;
 
     for filename in &args.files {
-        match expand_file(&tablist, filename) {
-            Ok(()) => {}
-            Err(e) => {
-                exit_code = 1;
-                eprintln!("{}: {}", filename, e);
-            }
+        if let Err(e) = expand_file(&tablist, filename) {
+            exit_code = 1;
+            eprintln!("{}: {}", filename, e);
         }
     }
 

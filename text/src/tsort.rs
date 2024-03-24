@@ -79,12 +79,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(name) => String::from(name),
     };
 
-    match tsort_file(&filename) {
-        Ok(()) => {}
-        Err(e) => {
-            exit_code = 1;
-            eprintln!("{}: {}", filename, e);
-        }
+    if let Err(e) = tsort_file(&filename) {
+        exit_code = 1;
+        eprintln!("{}: {}", filename, e);
     }
 
     std::process::exit(exit_code)

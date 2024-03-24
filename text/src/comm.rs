@@ -169,12 +169,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut exit_code = 0;
 
-    match comm_file(mask, lead_dup, &args.file1, &args.file2) {
-        Ok(()) => {}
-        Err(e) => {
-            exit_code = 1;
-            eprintln!("{}", e);
-        }
+    if let Err(e) = comm_file(mask, lead_dup, &args.file1, &args.file2) {
+        exit_code = 1;
+        eprintln!("{}", e);
     }
 
     std::process::exit(exit_code)

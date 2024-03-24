@@ -16,6 +16,9 @@ pub const PROJECT_NAME: &'static str = "posixutils-rs";
 
 pub const BUFSZ: usize = 8 * 1024;
 
+pub const TERM_VAR: &'static str = "TERM";
+pub const DEFAULT_TERM: &'static str = "vt100";
+
 pub struct TestPlan {
     pub cmd: String,
     pub args: Vec<String>,
@@ -49,4 +52,17 @@ pub fn run_test(plan: TestPlan) {
     assert_eq!(stdout, plan.expected_out);
     assert!(output.status.success());
     assert_eq!(output.status.code(), Some(0));
+}
+
+pub fn get_terminal() -> String {
+    let term: String = match std::env::var(TERM_VAR) {
+        Ok(val) => val,
+        Err(_) => String::new(),
+    };
+
+    if term.is_empty() {
+        String::from(DEFAULT_TERM)
+    } else {
+        term
+    }
 }

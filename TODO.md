@@ -3,6 +3,7 @@
 ## Translations
 
 * Standard OS error texts must be translated
+* Clap error messages must be translated
 
 ## OS errors
 

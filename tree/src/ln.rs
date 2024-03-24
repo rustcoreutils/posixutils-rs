@@ -69,21 +69,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if sources.len() == 1 {
         let src = &sources[0];
-        match do_link(&args, src, target) {
-            Ok(()) => {}
-            Err(e) => {
-                exit_code = 1;
-                eprintln!("{} -> {}: {}", src, target, e);
-            }
+        if let Err(e) = do_link(&args, src, target) {
+            exit_code = 1;
+            eprintln!("{} -> {}: {}", src, target, e);
         }
     } else {
         for src in sources {
-            match do_link_into(&args, src, target) {
-                Ok(()) => {}
-                Err(e) => {
-                    exit_code = 1;
-                    eprintln!("{} -> {}: {}", src, target, e);
-                }
+            if let Err(e) = do_link_into(&args, src, target) {
+                exit_code = 1;
+                eprintln!("{} -> {}: {}", src, target, e);
             }
         }
     }

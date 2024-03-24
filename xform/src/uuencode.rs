@@ -76,12 +76,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut exit_code = 0;
 
-    match encode_file(&args) {
-        Ok(()) => {}
-        Err(e) => {
-            exit_code = 1;
-            eprintln!("{:?}: {}", args.file, e);
-        }
+    if let Err(e) = encode_file(&args) {
+        exit_code = 1;
+        eprintln!("{:?}: {}", args.file, e);
     }
 
     std::process::exit(exit_code)

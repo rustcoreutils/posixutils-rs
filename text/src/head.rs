@@ -105,12 +105,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut first = true;
 
     for filename in &args.files {
-        match head_file(&args, filename, first, want_header) {
-            Ok(()) => {}
-            Err(e) => {
-                exit_code = 1;
-                eprintln!("{}: {}", filename, e);
-            }
+        if let Err(e) = head_file(&args, filename, first, want_header) {
+            exit_code = 1;
+            eprintln!("{}: {}", filename, e);
         }
 
         first = false;

@@ -92,12 +92,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut exit_code = 0;
 
-    match decode_file(&args) {
-        Ok(()) => {}
-        Err(e) => {
-            exit_code = 1;
-            eprintln!("{:?}: {}", args.file, e);
-        }
+    if let Err(e) = decode_file(&args) {
+        exit_code = 1;
+        eprintln!("{:?}: {}", args.file, e);
     }
 
     std::process::exit(exit_code)

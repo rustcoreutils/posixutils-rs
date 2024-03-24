@@ -151,7 +151,7 @@ https://github.com/jgarzik/posixutils
  - [ ] strings
  - [ ] strip (Development)
  - [x] stty
- - [ ] tabs
+ - [x] tabs
  - [ ] tail
  - [ ] talk
  - [x] tee

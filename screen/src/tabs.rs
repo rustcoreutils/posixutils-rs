@@ -7,8 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 // TODO:
-// - eliminate unwrap. more error checking.
-// - read init-file and reset-file data from filesystem
+// - (efficiency): collect all output in a buffer, then write to stdout
+// - Research if 100 is a POSIX-compliant limit for MAX_STOPS
 //
 
 extern crate clap;
@@ -17,9 +17,10 @@ extern crate plib;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, textdomain};
 use plib::PROJECT_NAME;
-use std::io::{self, Error, ErrorKind};
+use std::io::{self, Error, ErrorKind, Write};
 use terminfo::{capability as cap, Database};
 
+// arbitrarily chosen.  todo: search if POSIX-ly correct.
 const MAX_STOPS: usize = 100;
 
 /// tabs - set terminal tabs
@@ -30,39 +31,39 @@ struct Args {
     #[arg(short = 'T', long)]
     term: Option<String>,
 
-    /// Specify repetitive tab stops separated by number of column positions (1)
+    /// Specify repetitive tab stops separated by (1) columns
     #[arg(short = '1', long)]
     rep_1: bool,
 
-    /// Specify repetitive tab stops separated by number of column positions (2)
+    /// Specify repetitive tab stops separated by (2) columns
     #[arg(short = '2', long)]
     rep_2: bool,
 
-    /// Specify repetitive tab stops separated by number of column positions (3)
+    /// Specify repetitive tab stops separated by (3) columns
     #[arg(short = '3', long)]
     rep_3: bool,
 
-    /// Specify repetitive tab stops separated by number of column positions (4)
+    /// Specify repetitive tab stops separated by (4) columns
     #[arg(short = '4', long)]
     rep_4: bool,
 
-    /// Specify repetitive tab stops separated by number of column positions (5)
+    /// Specify repetitive tab stops separated by (5) columns
     #[arg(short = '5', long)]
     rep_5: bool,
 
-    /// Specify repetitive tab stops separated by number of column positions (6)
+    /// Specify repetitive tab stops separated by (6) columns
     #[arg(short = '6', long)]
     rep_6: bool,
 
-    /// Specify repetitive tab stops separated by number of column positions (7)
+    /// Specify repetitive tab stops separated by (7) columns
     #[arg(short = '7', long)]
     rep_7: bool,
 
-    /// Specify repetitive tab stops separated by number of column positions (8)
+    /// Specify repetitive tab stops separated by (8) columns
     #[arg(short = '8', long)]
     rep_8: bool,
 
-    /// Specify repetitive tab stops separated by number of column positions (9)
+    /// Specify repetitive tab stops separated by (9) columns
     #[arg(short = '9', long)]
     rep_9: bool,
 
@@ -99,7 +100,7 @@ struct Args {
     tabstops: Option<String>,
 }
 
-fn set_hw_tabs(info: &Database, args: &Args) -> io::Result<()> {
+fn parse_cmd_line(args: &Args) -> Result<Vec<u16>, &'static str> {
     let mut tabstops: Vec<u16> = Vec::new();
     let mut repeating_stop: Option<u16> = None;
 
@@ -162,18 +163,51 @@ fn set_hw_tabs(info: &Database, args: &Args) -> io::Result<()> {
         }
     }
 
-    // clear existing tabs
-    if let Some(cap) = info.get::<cap::ClearAllTabs>() {
-        match cap.expand().to(io::stdout()) {
-            Ok(_) => (),
-            Err(e) => {
-                let msg = format!("{}: {}", gettext("Failed to clear tabs"), e);
-                return Err(Error::new(ErrorKind::Other, msg));
-            }
+    // validate that stops are in strictly ascending order
+    for i in 1..tabstops.len() {
+        if tabstops[i] <= tabstops[i - 1] {
+            return Err("Tabstops must be in strictly ascending order.");
         }
     }
 
-    todo!()
+    Ok(tabstops)
+}
+
+// set hardware tabs.
+fn set_hw_tabs(info: &Database, tabstops: &Vec<u16>) -> io::Result<()> {
+    let clear_cap = info.get::<cap::ClearAllTabs>();
+    let set_cap = info.get::<cap::SetTab>();
+
+    if clear_cap.is_none() || set_cap.is_none() {
+        let msg = gettext("Terminal does not support hardware tabs.");
+        return Err(Error::new(ErrorKind::Other, msg));
+    }
+    let clear_cap = clear_cap.unwrap();
+    let set_cap = set_cap.unwrap();
+
+    // clear existing tabs
+    if let Err(e) = clear_cap.expand().to(io::stdout()) {
+        let msg = format!("{}: {}", gettext("Failed to clear tabs"), e);
+        return Err(Error::new(ErrorKind::Other, msg));
+    }
+
+    // set new tabs
+    let mut col = 0;
+    for stop in tabstops {
+        let stop = *stop as usize;
+
+        while col < stop {
+            io::stdout().write_all(b" ")?;
+            col += 1;
+        }
+
+        if let Err(e) = set_cap.expand().to(io::stdout()) {
+            let msg = format!("{}: {}", gettext("Failed to set tab"), e);
+            return Err(Error::new(ErrorKind::Other, msg));
+        }
+    }
+
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -188,7 +222,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(ref termtype) => Database::from_name(termtype).unwrap(),
     };
 
-    set_hw_tabs(&info, &args)?;
+    let tabstops = parse_cmd_line(&args)?;
+    set_hw_tabs(&info, &tabstops)?;
 
     Ok(())
 }

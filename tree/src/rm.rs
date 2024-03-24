@@ -138,13 +138,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for filepath_str in &cfg.args.files {
         let filepath = OsStr::new(filepath_str);
-        match rm_path(&cfg, &filepath) {
-            Ok(()) => {}
-            Err(e) => {
-                exit_code = 1;
-                if !cfg.args.force {
-                    eprintln!("{}: {}", filepath.to_string_lossy(), e);
-                }
+        if let Err(e) = rm_path(&cfg, &filepath) {
+            exit_code = 1;
+            if !cfg.args.force {
+                eprintln!("{}: {}", filepath.to_string_lossy(), e);
             }
         }
     }

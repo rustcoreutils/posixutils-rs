@@ -70,12 +70,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut exit_code = 0;
 
     for filename in &args.files {
-        match cat_file(filename) {
-            Ok(()) => {}
-            Err(e) => {
-                exit_code = 1;
-                eprintln!("{}: {}", filename, e);
-            }
+        if let Err(e) = cat_file(filename) {
+            exit_code = 1;
+            eprintln!("{}: {}", filename, e);
         }
     }
 

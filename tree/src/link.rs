@@ -39,12 +39,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut exit_code = 0;
 
-    match do_link(&args.file1, &args.file2) {
-        Ok(()) => {}
-        Err(e) => {
-            exit_code = 1;
-            eprintln!("{} -> {}: {}", args.file1, args.file2, e);
-        }
+    if let Err(e) = do_link(&args.file1, &args.file2) {
+        exit_code = 1;
+        eprintln!("{} -> {}: {}", args.file1, args.file2, e);
     }
 
     std::process::exit(exit_code)

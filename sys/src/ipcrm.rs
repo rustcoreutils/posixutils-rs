@@ -189,12 +189,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut exit_code = 0;
 
-    match remove_ipcs(&args) {
-        Ok(()) => {}
-        Err(e) => {
-            exit_code = 1;
-            eprintln!("{}", e);
-        }
+    if let Err(e) = remove_ipcs(&args) {
+        exit_code = 1;
+        eprintln!("{}", e);
     }
 
     std::process::exit(exit_code)

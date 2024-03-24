@@ -245,12 +245,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.files.is_empty() {
         let mut count = CountInfo::new();
 
-        match wc_file(&args, chars_mode, "", &mut count) {
-            Ok(()) => {}
-            Err(e) => {
-                exit_code = 1;
-                eprintln!("stdin: {}", e);
-            }
+        if let Err(e) = wc_file(&args, chars_mode, "", &mut count) {
+            exit_code = 1;
+            eprintln!("stdin: {}", e);
         }
 
     // input files
@@ -258,12 +255,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for filename in &args.files {
             let mut count = CountInfo::new();
 
-            match wc_file(&args, chars_mode, filename, &mut count) {
-                Ok(()) => {}
-                Err(e) => {
-                    exit_code = 1;
-                    eprintln!("{}: {}", filename, e);
-                }
+            if let Err(e) = wc_file(&args, chars_mode, filename, &mut count) {
+                exit_code = 1;
+                eprintln!("{}: {}", filename, e);
             }
 
             totals.accum(&count);

@@ -12,10 +12,15 @@ clap = { version = "4", features = ["derive"] }
 gettext-rs = { version = "0.7", features = ["gettext-system"] }
 libc = "0.2"
 errno = "0.3"
+regex = "1.10"
 
 [[bin]]
 name = "env"
 path = "src/env.rs"
+
+[[bin]]
+name = "kill"
+path = "src/kill.rs"
 
 [[bin]]
 name = "nice"

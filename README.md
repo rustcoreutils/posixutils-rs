@@ -92,7 +92,7 @@ https://github.com/jgarzik/posixutils
  - [x] ipcrm (IPC)
  - [ ] ipcs (IPC)
  - [ ] join
- - [ ] kill
+ - [x] kill
  - [ ] lex (Development)
  - [x] link
  - [x] ln

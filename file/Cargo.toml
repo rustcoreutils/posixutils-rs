@@ -21,6 +21,10 @@ name = "cp"
 path = "src/cp.rs"
 
 [[bin]]
+name = "dd"
+path = "src/dd.rs"
+
+[[bin]]
 name = "split"
 path = "src/split.rs"
 

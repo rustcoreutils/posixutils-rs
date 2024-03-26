@@ -56,7 +56,7 @@ https://github.com/jgarzik/posixutils
  - [ ] cmp
  - [x] comm
  - [ ] compress (compress cat.)
- - [ ] cp
+ - [x] cp
  - [ ] crontab (cron cat.)
  - [ ] csplit
  - [ ] ctags (Development)

@@ -30,3 +30,7 @@ path = "src/nice.rs"
 name = "renice"
 path = "src/renice.rs"
 
+[[bin]]
+name = "xargs"
+path = "src/xargs.rs"
+

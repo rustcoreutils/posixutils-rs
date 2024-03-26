@@ -182,7 +182,7 @@ https://github.com/jgarzik/posixutils
  - [ ] what (SCCS)
  - [ ] who
  - [ ] write
- - [ ] xargs
+ - [x] xargs
  - [ ] yacc (Development)
  - [ ] zcat (compress cat.)
 

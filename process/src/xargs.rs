@@ -23,7 +23,6 @@ use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, textdomain};
 use plib::PROJECT_NAME;
 use std::io::{self, Read};
-use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
 const ARG_MAX: i32 = 131072; // arbitrary.  todo: discover actual value
@@ -72,17 +71,21 @@ struct Args {
     util_args: Vec<String>,
 }
 
+// find a string in a vector of strings
 fn find_str(needle: &str, haystack: &[String]) -> Option<usize> {
     haystack.iter().position(|s| s == needle)
 }
 
+// execute the utility
 fn exec_util(util: &str, util_args: Vec<String>) -> io::Result<()> {
-    Err(Command::new(util)
+    let _output = Command::new(util)
         .args(util_args)
-        .stdin(Stdio::inherit())
+        .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .exec())
+        .output()?;
+
+    Ok(())
 }
 
 struct ParseState {

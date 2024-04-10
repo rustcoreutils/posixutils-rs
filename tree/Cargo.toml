@@ -23,6 +23,10 @@ name = "chmod"
 path = "src/chmod.rs"
 
 [[bin]]
+name = "chown"
+path = "src/chown.rs"
+
+[[bin]]
 name = "link"
 path = "src/link.rs"
 

@@ -8,11 +8,13 @@
 //
 
 extern crate clap;
+extern crate libc;
 extern crate plib;
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, textdomain};
 use plib::PROJECT_NAME;
+use std::ffi::CString;
 use std::path::{Component, Path};
 
 const _POSIX_PATH_MAX: usize = 255;
@@ -55,18 +57,23 @@ fn check_path_basic(pathname: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn check_path_posix(pathname: &str) -> Result<(), &'static str> {
-    if pathname.len() > _POSIX_PATH_MAX {
+fn check_path_limits(
+    pathname: &str,
+    max_path: usize,
+    max_name: usize,
+    check_ascii: bool,
+) -> Result<(), &'static str> {
+    if pathname.len() > max_path {
         return Err("pathname too long");
     }
 
     for component in Path::new(pathname).components() {
         match component {
             Component::Normal(filename) => {
-                if filename.len() > _POSIX_NAME_MAX {
+                if filename.len() > max_name {
                     return Err("filename too long");
                 }
-                if !filename.is_ascii() {
+                if check_ascii && !filename.is_ascii() {
                     return Err("filename contains non-portable characters");
                 }
             }
@@ -77,8 +84,45 @@ fn check_path_posix(pathname: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn check_path_fs(_pathname: &str) -> Result<(), &'static str> {
-    todo!()
+// find the first existing directory in the path
+fn find_fshandle(pathname: &str) -> Result<String, &'static str> {
+    let mut path = Path::new(pathname);
+    let mut fsh = String::new();
+
+    while !path.exists() {
+        match path.parent() {
+            Some(parent) => {
+                fsh = parent.to_string_lossy().to_string();
+                path = parent;
+            }
+            None => {
+                fsh = path.to_string_lossy().to_string();
+                break;
+            }
+        }
+    }
+
+    Ok(fsh)
+}
+
+fn check_path_posix(pathname: &str) -> Result<(), &'static str> {
+    check_path_limits(pathname, _POSIX_PATH_MAX, _POSIX_NAME_MAX, true)
+}
+
+fn check_path_fs(pathname: &str) -> Result<(), &'static str> {
+    let fsh = find_fshandle(pathname)?;
+    let fsh = CString::new(fsh).unwrap();
+
+    let path_max = unsafe { libc::pathconf(fsh.as_ptr(), libc::_PC_PATH_MAX) };
+    if path_max < 0 {
+        return Err("pathconf error(path length)");
+    }
+    let name_max = unsafe { libc::pathconf(fsh.as_ptr(), libc::_PC_NAME_MAX) };
+    if name_max < 0 {
+        return Err("pathconf error(name length)");
+    }
+
+    check_path_limits(pathname, path_max as usize, name_max as usize, false)
 }
 
 fn check_path(args: &Args, pathname: &str) -> Result<(), &'static str> {

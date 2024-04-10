@@ -32,7 +32,7 @@ struct Args {
     interactive: bool,
 
     /// Remove file hierarchies.
-    #[arg(short, short_alias = 'r', long)]
+    #[arg(short, short_alias = 'R', long)]
     recurse: bool,
 
     /// Filepaths to remove

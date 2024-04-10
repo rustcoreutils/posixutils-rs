@@ -68,7 +68,7 @@ https://github.com/jgarzik/posixutils
  - [x] df
  - [ ] diff
  - [x] dirname
- - [ ] du
+ - [x] du
  - [x] echo
  - [ ] ed
  - [x] env

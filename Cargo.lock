@@ -640,6 +640,7 @@ version = "0.1.3"
 dependencies = [
  "clap",
  "gettext-rs",
+ "libc",
  "plib",
 ]
 

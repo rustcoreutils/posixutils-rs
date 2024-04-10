@@ -19,3 +19,7 @@ path = "src/basename.rs"
 name = "dirname"
 path = "src/dirname.rs"
 
+[[bin]]
+name = "pathchk"
+path = "src/pathchk.rs"
+

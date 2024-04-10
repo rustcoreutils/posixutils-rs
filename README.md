@@ -119,7 +119,7 @@ https://github.com/jgarzik/posixutils
  - [ ] od
  - [x] paste
  - [ ] patch
- - [ ] pathchk
+ - [x] pathchk
  - [ ] pax
  - [ ] pr
  - [x] printf

@@ -49,7 +49,7 @@ https://github.com/jgarzik/posixutils
  - [ ] cal
  - [x] cat
  - [ ] cflow (Development)
- - [ ] chgrp
+ - [x] chgrp
  - [x] chmod
  - [ ] chown
  - [x] cksum

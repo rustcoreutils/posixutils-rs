@@ -15,6 +15,10 @@ libc = "0.2"
 chrono = "0.4"
 
 [[bin]]
+name = "chgrp"
+path = "src/chgrp.rs"
+
+[[bin]]
 name = "chmod"
 path = "src/chmod.rs"
 

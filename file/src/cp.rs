@@ -11,8 +11,8 @@
 // - do not repeatedly stat(2) the target, for each source
 //
 
+extern crate atty;
 extern crate clap;
-extern crate libc;
 extern crate plib;
 
 use clap::Parser;
@@ -68,7 +68,7 @@ impl Config {
         Config {
             force: args.force,
             interactive: args.interactive,
-            is_terminal: unsafe { libc::isatty(libc::STDIN_FILENO) != 0 },
+            is_terminal: atty::is(atty::Stream::Stdin),
         }
     }
 }

@@ -7,12 +7,13 @@
 // SPDX-License-Identifier: MIT
 //
 
+extern crate atty;
 extern crate libc;
 use std::ffi::CStr;
 
 fn main() {
-    let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) };
-    if is_tty == 0 {
+    let is_tty = atty::is(atty::Stream::Stdin);
+    if !is_tty {
         println!("not a tty");
         std::process::exit(1);
     }

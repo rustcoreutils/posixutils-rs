@@ -7,8 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
+extern crate atty;
 extern crate clap;
-extern crate libc;
 extern crate plib;
 
 use clap::Parser;
@@ -131,7 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
-    let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) != 0 };
+    let is_tty = atty::is(atty::Stream::Stdin);
     let cfg = RmConfig { args, is_tty };
 
     let mut exit_code = 0;

@@ -8,6 +8,8 @@
 //
 
 use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, textdomain};
+use plib::PROJECT_NAME;
 use std::fs;
 use std::io::{self, ErrorKind, Read};
 use std::path::PathBuf;
@@ -22,15 +24,13 @@ struct Args {
     verbose: bool,
 
     /// Write nothing for differing files; return exit status only.
-    #[arg(short = 's', long, group = "verbosity")]
+    #[arg(short, long, alias = "quiet", group = "verbosity")]
     silent: bool,
 
     /// A pathname of the first file to be compared. If file1 is '-', the standard input shall be used.
-    #[arg()]
     file1: PathBuf,
 
     /// A pathname of the second file to be compared. If file2 is '-', the standard input shall be used.
-    #[arg()]
     file2: PathBuf,
 }
 
@@ -129,6 +129,11 @@ fn cmp_main(args: &Args) -> io::Result<u8> {
 
 fn main() -> ExitCode {
     let args = Args::parse();
+
+    // Initialize translation system
+    textdomain(PROJECT_NAME).unwrap();
+    bind_textdomain_codeset(PROJECT_NAME, "UTF-8").unwrap();
+
     match cmp_main(&args) {
         Ok(x) => ExitCode::from(x),
         Err(_) => {

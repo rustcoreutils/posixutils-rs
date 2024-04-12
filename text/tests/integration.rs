@@ -15,6 +15,8 @@ fn expand_test_noargs(test_data: &str, expected_output: &str) {
         args: Vec::new(),
         stdin_data: String::from(test_data),
         expected_out: String::from(expected_output),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
     });
 }
 
@@ -24,6 +26,8 @@ fn head_test(test_data: &str, expected_output: &str) {
         args: Vec::new(),
         stdin_data: String::from(test_data),
         expected_out: String::from(expected_output),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
     });
 }
 
@@ -35,6 +39,8 @@ fn wc_test(args: &[&str], test_data: &str, expected_output: &str) {
         args: str_args,
         stdin_data: String::from(test_data),
         expected_out: String::from(expected_output),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
     });
 }
 

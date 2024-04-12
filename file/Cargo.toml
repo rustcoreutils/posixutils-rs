@@ -18,6 +18,10 @@ name = "cat"
 path = "src/cat.rs"
 
 [[bin]]
+name = "cmp"
+path = "src/cmp.rs"
+
+[[bin]]
 name = "cp"
 path = "src/cp.rs"
 

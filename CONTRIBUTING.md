@@ -7,6 +7,14 @@ There are several ways to contribute to posixutils-rs:
 * writing documentation
 * testing, especially POSIX compliance testing
 
+### Utility lifecycle:  Stages of Maturity
+
+1. Rough draft:  Core algorithm implemented.  Bugs may exist.  Many options not yet implemented.
+2. Feature complete:  Believed to be complete per POSIX specification.
+3. Test coverage:  Integration tests, positive and negative, are complete, pass 100%
+4. Code coverage:  Automated code coverage data indicates 100%
+5. Audited:  An external party has reviewed and tested for POSIX compliance.
+
 ### Coding considerations
 
 1. Separate logical changes into separate commits.  For example, bug fixes

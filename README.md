@@ -53,7 +53,7 @@ https://github.com/jgarzik/posixutils
  - [x] chmod
  - [x] chown
  - [x] cksum
- - [ ] cmp
+ - [x] cmp
  - [x] comm
  - [ ] compress (compress cat.)
  - [x] cp

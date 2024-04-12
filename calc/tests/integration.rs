@@ -17,6 +17,8 @@ fn expr_test(args: &[&str], expected_output: &str) {
         args: str_args,
         stdin_data: String::new(),
         expected_out: String::from(expected_output),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
     });
 }
 

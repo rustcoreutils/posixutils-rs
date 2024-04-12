@@ -24,6 +24,8 @@ pub struct TestPlan {
     pub args: Vec<String>,
     pub stdin_data: String,
     pub expected_out: String,
+    pub expected_err: String,
+    pub expected_exit_code: i32,
 }
 
 pub fn run_test(plan: TestPlan) {
@@ -39,6 +41,7 @@ pub fn run_test(plan: TestPlan) {
         .args(plan.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("failed to spawn head");
 
@@ -48,10 +51,17 @@ pub fn run_test(plan: TestPlan) {
         .expect("failed to write to stdin");
 
     let output = child.wait_with_output().expect("failed to wait for child");
+
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(stdout, plan.expected_out);
-    assert!(output.status.success());
-    assert_eq!(output.status.code(), Some(0));
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr, plan.expected_err);
+
+    assert_eq!(output.status.code(), Some(plan.expected_exit_code));
+    if plan.expected_exit_code == 0 {
+        assert!(output.status.success());
+    }
 }
 
 pub fn get_terminal() -> String {

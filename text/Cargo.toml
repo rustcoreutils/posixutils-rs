@@ -11,6 +11,7 @@ plib = { path = "../plib" }
 clap = { version = "4", features = ["derive"] }
 gettext-rs = { version = "0.7", features = ["gettext-system"] }
 topological-sort = "0.2"
+diff = "0.1"
 
 [[bin]]
 name = "asa"
@@ -19,6 +20,10 @@ path = "src/asa.rs"
 [[bin]]
 name = "comm"
 path = "src/comm.rs"
+
+[[bin]]
+name = "diff"
+path = "src/diff.rs"
 
 [[bin]]
 name = "expand"

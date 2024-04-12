@@ -66,7 +66,7 @@ https://github.com/jgarzik/posixutils
  - [x] dd
  - [ ] delta (SCCS)
  - [x] df
- - [ ] diff
+ - [x] diff
  - [x] dirname
  - [x] du
  - [x] echo

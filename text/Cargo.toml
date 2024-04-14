@@ -12,6 +12,7 @@ clap = { version = "4", features = ["derive"] }
 gettext-rs = { version = "0.7", features = ["gettext-system"] }
 topological-sort = "0.2"
 diff = "0.1"
+regex = "1.10"
 
 [[bin]]
 name = "asa"
@@ -36,6 +37,10 @@ path = "src/fold.rs"
 [[bin]]
 name = "head"
 path = "src/head.rs"
+
+[[bin]]
+name = "nl"
+path = "src/nl.rs"
 
 [[bin]]
 name = "paste"

@@ -10,6 +10,11 @@ repository = "https://github.com/rustcoreutils/posixutils-rs.git"
 plib = { path = "../plib" }
 clap = { version = "4", features = ["derive"] }
 gettext-rs = { version = "0.7", features = ["gettext-system"] }
+chrono = "0.4"
+
+[[bin]]
+name = "cal"
+path = "src/cal.rs"
 
 [[bin]]
 name = "sleep"

@@ -707,6 +707,7 @@ dependencies = [
  "diff",
  "gettext-rs",
  "plib",
+ "regex",
  "topological-sort",
 ]
 

@@ -50,7 +50,7 @@ fn print_month(month: u32, year: u32) {
     };
 
     println!("{} {}", month_name, year);
-    println!("Su Mo Tu We Th Fr Sa");
+    println!("{}", gettext("Su Mo Tu We Th Fr Sa"));
 
     let mut day = 1;
     let mut weekday = 1;

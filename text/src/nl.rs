@@ -10,8 +10,11 @@ use std::str::FromStr;
 
 /// nl - line numbering filter
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[command(author, version, about, long_about, disable_help_flag = true)]
 struct Args {
+    #[arg(long, action = clap::ArgAction::HelpLong)]
+    help: Option<bool>,
+
     /// Specify which logical page body lines shall be numbered.
     ///
     /// - a - Number all lines.
@@ -71,7 +74,7 @@ struct Args {
     starting_line_number: i64,
 
     /// Specify the number of characters to be used for the line number.
-    #[arg(short = 'v', long, default_value_t = 6, value_parser = clap::value_parser!(i64).range(1..))]
+    #[arg(short = 'w', long, default_value_t = 6, value_parser = clap::value_parser!(i64).range(1..))]
     number_width: i64,
 
     /// The standard input shall be used if no file operand is specified,

@@ -184,5 +184,5 @@ https://github.com/jgarzik/posixutils
  - [ ] write
  - [x] xargs
  - [ ] yacc (Development)
- - [ ] zcat (compress cat.)
+ - [x] zcat (compress cat.)
 

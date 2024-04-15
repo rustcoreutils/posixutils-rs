@@ -62,7 +62,7 @@ https://github.com/jgarzik/posixutils
  - [ ] ctags (Development)
  - [ ] cut
  - [ ] cxref (Development)
- - [ ] date
+ - [x] date
  - [x] dd
  - [ ] delta (SCCS)
  - [x] df

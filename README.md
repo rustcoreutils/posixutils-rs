@@ -107,7 +107,7 @@ https://github.com/jgarzik/posixutils
  - [ ] make
  - [ ] man
  - [x] mesg
- - [ ] mkdir
+ - [x] mkdir
  - [x] mkfifo
  - [ ] more
  - [x] mv

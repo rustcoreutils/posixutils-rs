@@ -11,10 +11,15 @@ plib = { path = "../plib" }
 clap = { version = "4", features = ["derive"] }
 gettext-rs = { version = "0.7", features = ["gettext-system"] }
 chrono = "0.4"
+libc = "0.2"
 
 [[bin]]
 name = "cal"
 path = "src/cal.rs"
+
+[[bin]]
+name = "date"
+path = "src/date.rs"
 
 [[bin]]
 name = "sleep"

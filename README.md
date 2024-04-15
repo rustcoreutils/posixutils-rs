@@ -46,7 +46,7 @@ https://github.com/jgarzik/posixutils
  - [ ] batch (cron cat.)
  - [ ] bc
  - [ ] c99 (Development)
- - [ ] cal
+ - [x] cal
  - [x] cat
  - [ ] cflow (Development)
  - [x] chgrp

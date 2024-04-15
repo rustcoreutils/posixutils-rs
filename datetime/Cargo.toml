@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-datetime"
-version = "0.1.3"
+version = "0.1.6"
 edition = "2021"
 authors = ["Jeff Garzik"]
 license = "MIT"

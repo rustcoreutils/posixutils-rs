@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-users"
-version = "0.1.4"
+version = "0.1.6"
 edition = "2021"
 authors = ["Jeff Garzik"]
 license = "MIT"

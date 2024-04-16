@@ -88,7 +88,7 @@ https://github.com/jgarzik/posixutils
  - [ ] grep
  - [x] head
  - [ ] iconv (i18n)
- - [ ] id
+ - [x] id
  - [x] ipcrm (IPC)
  - [ ] ipcs (IPC)
  - [ ] join

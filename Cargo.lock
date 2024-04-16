@@ -432,6 +432,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "90ed8c1e510134f979dbc4f070f87d4313098b704861a105fe34231c70a3901c"
 
 [[package]]
+name = "magic"
+version = "0.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a200ae03df8c3dce7a963f6eeaac8feb41bf9001cb7e5ab22e3205aec2f0373d"
+dependencies = [
+ "bitflags",
+ "libc",
+ "magic-sys",
+ "thiserror",
+]
+
+[[package]]
+name = "magic-sys"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eff86ae08895140d628119d407d568f3b657145ee8c265878064f717534bb3bc"
+dependencies = [
+ "libc",
+ "vcpkg",
+]
+
+[[package]]
 name = "malloc_buf"
 version = "0.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -639,6 +661,7 @@ dependencies = [
  "clap",
  "gettext-rs",
  "libc",
+ "magic",
  "plib",
 ]
 
@@ -1044,6 +1067,12 @@ name = "uuencode"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce87414615a82bde6978712c15b79bf056d16827930ff779f1e40ed74c692ac0"
+
+[[package]]
+name = "vcpkg"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "version_check"

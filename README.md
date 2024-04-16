@@ -76,7 +76,7 @@ https://github.com/jgarzik/posixutils
  - [x] expand
  - [x] expr
  - [x] false
- - [ ] file
+ - [x] file
  - [ ] find
  - [x] fold
  - [ ] fort77 (Development)
@@ -185,4 +185,3 @@ https://github.com/jgarzik/posixutils
  - [x] xargs
  - [ ] yacc (Development)
  - [ ] zcat (compress cat.)
-

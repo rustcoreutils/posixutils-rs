@@ -125,56 +125,36 @@ fn get_user_info(args: &Args) -> Result<UserInfo, Box<dyn std::error::Error>> {
     Ok(userinfo)
 }
 
-fn get_group_info(userinfo: &mut UserInfo) -> Result<(), Box<dyn std::error::Error>> {
-    let mut group_names: HashMap<libc::gid_t, String> = HashMap::new();
+fn load_group_db() -> Vec<libc::group> {
+    let mut groups = Vec::new();
 
-    let mut group = unsafe { libc::getgrgid(userinfo.gid) };
-    if group.is_null() {
-        let err = Error::last_os_error();
-        eprintln!("getgrgid({}): {}", userinfo.gid, err);
-        return Err(Box::new(err));
-    }
-    let group_name = unsafe {
-        std::ffi::CStr::from_ptr((*group).gr_name)
-            .to_string_lossy()
-            .to_string()
-    };
-    group_names.insert(userinfo.gid, group_name);
-    userinfo.groups.push(userinfo.gid);
+    unsafe { libc::setgrent() };
 
-    group = unsafe { libc::getgrgid(userinfo.egid) };
-    if group.is_null() {
-        let err = Error::last_os_error();
-        eprintln!("getgrgid: {}", err);
-        return Err(Box::new(err));
-    }
-    let group_name = unsafe {
-        std::ffi::CStr::from_ptr((*group).gr_name)
-            .to_string_lossy()
-            .to_string()
-    };
-    if userinfo.egid != userinfo.gid {
-        userinfo.groups.push(userinfo.egid);
-    }
-    group_names.insert(userinfo.egid, group_name);
-
-    for gid in &userinfo.groups {
-        group = unsafe { libc::getgrgid(*gid) };
+    loop {
+        let group = unsafe { libc::getgrent() };
         if group.is_null() {
-            let err = Error::last_os_error();
-            eprintln!("getgrgid: {}", err);
-            return Err(Box::new(err));
+            break;
         }
-        let group_name = unsafe {
-            std::ffi::CStr::from_ptr((*group).gr_name)
+
+        groups.push(unsafe { *group });
+    }
+
+    unsafe { libc::endgrent() };
+
+    groups
+}
+
+fn get_group_info(userinfo: &mut UserInfo) -> Result<(), Box<dyn std::error::Error>> {
+    let groups = load_group_db();
+
+    for group in &groups {
+        userinfo.groups.push(group.gr_gid);
+        userinfo.group_names.insert(group.gr_gid, unsafe {
+            std::ffi::CStr::from_ptr(group.gr_name)
                 .to_string_lossy()
                 .to_string()
-        };
-        group_names.insert(*gid, group_name);
+        });
     }
-
-    userinfo.groups.sort();
-    userinfo.group_names = group_names;
 
     Ok(())
 }

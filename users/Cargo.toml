@@ -15,6 +15,10 @@ syslog = "6.1"
 atty = "0.2"
 
 [[bin]]
+name = "id"
+path = "src/id.rs"
+
+[[bin]]
 name = "logname"
 path = "src/logname.rs"
 

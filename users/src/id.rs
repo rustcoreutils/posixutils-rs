@@ -125,35 +125,25 @@ fn get_user_info(args: &Args) -> Result<UserInfo, Box<dyn std::error::Error>> {
     Ok(userinfo)
 }
 
-fn load_group_db() -> Vec<libc::group> {
-    let mut groups = Vec::new();
-
-    unsafe { libc::setgrent() };
-
-    loop {
-        let group = unsafe { libc::getgrent() };
-        if group.is_null() {
-            break;
-        }
-
-        groups.push(unsafe { *group });
-    }
-
-    unsafe { libc::endgrent() };
-
-    groups
-}
-
 fn get_group_info(userinfo: &mut UserInfo) -> Result<(), Box<dyn std::error::Error>> {
-    let groups = load_group_db();
+    let groups = plib::group::load();
 
     for group in &groups {
-        userinfo.groups.push(group.gr_gid);
-        userinfo.group_names.insert(group.gr_gid, unsafe {
-            std::ffi::CStr::from_ptr(group.gr_name)
-                .to_string_lossy()
-                .to_string()
-        });
+        // skip groups that the user is not a member of
+        let mut found = false;
+        for member in &group.members {
+            if *member == userinfo.username {
+                found = true;
+                break;
+            }
+        }
+        if !found && group.gid != userinfo.gid {
+            continue;
+        }
+
+        // add group to user's group list
+        userinfo.groups.push(group.gid);
+        userinfo.group_names.insert(group.gid, group.name.clone());
     }
 
     Ok(())
@@ -190,7 +180,7 @@ fn display_user_info(args: &Args, userinfo: &UserInfo) {
             userinfo.uid, userinfo.username, userinfo.gid, group_name, userinfo.egid
         );
         for gid in &userinfo.groups {
-            print!("{},", userinfo.group_names[gid]);
+            print!("{}({}),", gid, userinfo.group_names[gid]);
         }
         println!();
         return;

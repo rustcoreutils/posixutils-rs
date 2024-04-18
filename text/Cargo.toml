@@ -13,6 +13,7 @@ gettext-rs.workspace = true
 topological-sort = "0.2"
 diff = "0.1"
 regex.workspace = true
+chrono = "0.4"
 
 [[bin]]
 name = "asa"
@@ -45,6 +46,10 @@ path = "src/nl.rs"
 [[bin]]
 name = "paste"
 path = "src/paste.rs"
+
+[[bin]]
+name = "pr"
+path = "src/pr.rs"
 
 [[bin]]
 name = "tsort"

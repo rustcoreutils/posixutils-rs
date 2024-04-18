@@ -8,9 +8,9 @@ repository = "https://github.com/rustcoreutils/posixutils-rs.git"
 
 [dependencies]
 plib = { path = "../plib" }
-clap = { version = "4", features = ["derive"] }
-gettext-rs = { version = "0.7", features = ["gettext-system"] }
-libc = "0.2"
+clap.workspace = true
+gettext-rs.workspace = true
+libc.workspace = true
 atty = "0.2"
 
 [[bin]]

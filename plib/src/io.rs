@@ -26,7 +26,7 @@ pub fn input_stream(pathname: &PathBuf, dashed_stdin: bool) -> io::Result<Box<dy
     Ok(file)
 }
 
-pub fn input_stream_opt(pathname: Option<PathBuf>) -> io::Result<Box<dyn Read>> {
+pub fn input_stream_opt(pathname: &Option<PathBuf>) -> io::Result<Box<dyn Read>> {
     match pathname {
         Some(path) => input_stream(&path, false),
         None => input_stream(&PathBuf::new(), false),

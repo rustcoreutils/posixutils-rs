@@ -15,7 +15,7 @@ use plib::PROJECT_NAME;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use self::pr_util::{line_transform, Args, PageIterator, Parameters};
@@ -211,14 +211,6 @@ fn column_width(num_columns: usize, page_width: usize) -> usize {
     (page_width - num_columns + 1) / num_columns
 }
 
-fn create_stream(path: &Path) -> io::Result<Box<dyn Read>> {
-    if path.as_os_str() == "-" {
-        Ok(Box::new(io::stdin().lock()))
-    } else {
-        Ok(Box::new(fs::File::open(path)?))
-    }
-}
-
 fn pr_serial(path: &PathBuf, params: &Parameters) -> io::Result<()> {
     let dt = if path.as_os_str() == "-" {
         datetime_now()
@@ -229,7 +221,7 @@ fn pr_serial(path: &PathBuf, params: &Parameters) -> io::Result<()> {
         dt.format(DATE_TIME_FORMAT).to_string()
     };
 
-    let stream = create_stream(path)?;
+    let stream = plib::io::input_stream(path, true)?;
 
     let column_width = column_width(params.num_columns, params.page_width);
 
@@ -424,7 +416,7 @@ fn pr_merged(paths: &[PathBuf], params: &Parameters) -> io::Result<()> {
 
     let mut page_iterators = Vec::with_capacity(paths.len());
     for p in paths {
-        let stream = create_stream(p)?;
+        let stream = plib::io::input_stream(p, true)?;
         let it = PageIterator::new(stream, params.body_lines_per_page);
         page_iterators.push(it);
     }

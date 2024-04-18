@@ -13,8 +13,8 @@ extern crate plib;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, textdomain};
 use plib::PROJECT_NAME;
-use std::fs;
 use std::io::{self, Read, Write};
+use std::path::PathBuf;
 
 /// head - copy the first part of files
 #[derive(Parser, Debug)]
@@ -25,26 +25,21 @@ struct Args {
     n: u64,
 
     /// Files to read as input.
-    files: Vec<String>,
+    files: Vec<PathBuf>,
 }
 
-fn head_file(args: &Args, filename: &str, first: bool, want_header: bool) -> io::Result<()> {
+fn head_file(args: &Args, pathname: &PathBuf, first: bool, want_header: bool) -> io::Result<()> {
     // print file header
     if want_header {
         if first {
-            println!("==> {} <==\n", filename);
+            println!("==> {} <==\n", pathname.display());
         } else {
-            println!("\n==> {} <==\n", filename);
+            println!("\n==> {} <==\n", pathname.display());
         }
     }
 
     // open file, or stdin
-    let mut file: Box<dyn Read>;
-    if filename == "" {
-        file = Box::new(io::stdin().lock());
-    } else {
-        file = Box::new(fs::File::open(filename)?);
-    }
+    let mut file = plib::io::input_stream(pathname, false)?;
 
     let mut raw_buffer = [0; plib::BUFSZ];
     let mut nl = 0;
@@ -97,7 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // if no files, read from stdin
     if args.files.is_empty() {
-        args.files.push(String::new());
+        args.files.push(PathBuf::new());
     }
 
     let mut exit_code = 0;
@@ -107,7 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for filename in &args.files {
         if let Err(e) = head_file(&args, filename, first, want_header) {
             exit_code = 1;
-            eprintln!("{}: {}", filename, e);
+            eprintln!("{}: {}", filename.display(), e);
         }
 
         first = false;

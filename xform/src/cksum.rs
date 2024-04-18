@@ -23,24 +23,19 @@ mod crc32;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, textdomain};
 use plib::PROJECT_NAME;
-use std::fs;
 use std::io::{self, Read};
+use std::path::PathBuf;
 
 /// cksum - write file checksums and sizes
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// Files to read as input.  Use "-" or no-args for stdin.
-    files: Vec<String>,
+    files: Vec<PathBuf>,
 }
 
-fn cksum_file(filename: &str) -> io::Result<()> {
-    let mut file: Box<dyn Read>;
-    if filename == "" {
-        file = Box::new(io::stdin().lock());
-    } else {
-        file = Box::new(fs::File::open(filename)?);
-    }
+fn cksum_file(filename: &PathBuf) -> io::Result<()> {
+    let mut file = plib::io::input_stream(filename, false)?;
 
     let mut buffer = [0; plib::BUFSZ];
     let mut n_bytes: u64 = 0;
@@ -57,7 +52,7 @@ fn cksum_file(filename: &str) -> io::Result<()> {
     }
 
     let filename_prefix = {
-        if filename == "" {
+        if filename.as_os_str() == "" {
             ""
         } else {
             " "
@@ -68,7 +63,7 @@ fn cksum_file(filename: &str) -> io::Result<()> {
         crc32::finalize(crc, n_bytes as usize),
         n_bytes,
         filename_prefix,
-        filename
+        filename.display()
     );
 
     Ok(())
@@ -83,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // if no file args, read from stdin
     if args.files.is_empty() {
-        args.files.push(String::new());
+        args.files.push(PathBuf::new());
     }
 
     let mut exit_code = 0;
@@ -91,7 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for filename in &args.files {
         if let Err(e) = cksum_file(filename) {
             exit_code = 1;
-            eprintln!("{}: {}", filename, e);
+            eprintln!("{}: {}", filename.display(), e);
         }
     }
 

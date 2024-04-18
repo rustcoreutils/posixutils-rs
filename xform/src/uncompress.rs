@@ -21,8 +21,8 @@ use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, textdomain};
 use lzw::UnixLZWReader;
 use plib::PROJECT_NAME;
-use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
+use std::path::PathBuf;
 
 /// uncompress - expand compressed data
 #[derive(Parser, Debug)]
@@ -41,17 +41,11 @@ struct Args {
     verbose: bool,
 
     /// Files to read as input.  Use "-" or no-args for stdin.
-    files: Vec<String>,
+    files: Vec<PathBuf>,
 }
 
-fn uncompress_file(filename: &str) -> io::Result<()> {
-    let file: Box<dyn Read>;
-    if filename == "" {
-        file = Box::new(io::stdin().lock());
-    } else {
-        file = Box::new(fs::File::open(filename)?);
-    }
-
+fn uncompress_file(pathname: &PathBuf) -> io::Result<()> {
+    let file = plib::io::input_stream(pathname, false)?;
     let mut decoder = UnixLZWReader::new(file);
 
     loop {
@@ -80,7 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // if no file args, read from stdin
     if args.files.is_empty() {
-        args.files.push(String::new());
+        args.files.push(PathBuf::new());
     }
 
     // zcat is a special case:  always write to stdout
@@ -93,7 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for filename in &args.files {
         if let Err(e) = uncompress_file(filename) {
             exit_code = 1;
-            eprintln!("{}: {}", filename, e);
+            eprintln!("{}: {}", filename.display(), e);
         }
     }
 

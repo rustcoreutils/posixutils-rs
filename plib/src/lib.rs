@@ -11,6 +11,7 @@ use std::io::Write;
 use std::process::{Command, Output, Stdio};
 
 pub mod group;
+pub mod io;
 pub mod modestr;
 
 pub const PROJECT_NAME: &'static str = "posixutils-rs";

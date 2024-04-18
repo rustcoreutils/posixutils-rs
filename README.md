@@ -84,7 +84,6 @@ https://github.com/jgarzik/posixutils
  - [ ] gencat (i18n)
  - [ ] get (SCCS)
  - [ ] getconf
- - [ ] getopts
  - [ ] grep
  - [x] head
  - [ ] iconv (i18n)
@@ -163,7 +162,6 @@ https://github.com/jgarzik/posixutils
  - [x] true
  - [x] tsort
  - [x] tty
- - [ ] ulimit
  - [x] uname
  - [x] uncompress (compress cat.)
  - [ ] unexpand
@@ -177,7 +175,6 @@ https://github.com/jgarzik/posixutils
  - [ ] uux (UUCP)
  - [ ] val (SCCS)
  - [ ] vi
- - [ ] wait
  - [x] wc
  - [ ] what (SCCS)
  - [ ] who

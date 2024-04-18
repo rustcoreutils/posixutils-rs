@@ -25,3 +25,11 @@ pub fn input_stream(pathname: &PathBuf, dashed_stdin: bool) -> io::Result<Box<dy
 
     Ok(file)
 }
+
+pub fn input_reader(
+    pathname: &PathBuf,
+    dashed_stdin: bool,
+) -> io::Result<io::BufReader<Box<dyn Read>>> {
+    let file = input_stream(pathname, dashed_stdin)?;
+    Ok(io::BufReader::new(file))
+}

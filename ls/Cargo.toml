@@ -1,0 +1,15 @@
+[package]
+name = "rust_ls"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+clap = "3.1.18"
+atty = "0.2.14"
+term_size = "0.3.2"
+chrono = "0.4.38"
+users = "0.11"
+xattr = "0.2.2"
+textwrap = "0.14.1"

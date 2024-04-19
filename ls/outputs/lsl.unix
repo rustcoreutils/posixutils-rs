@@ -1,0 +1,10 @@
+total 56
+-rw-r--r--   1 jd  staff  12968 Apr 19 16:13 Cargo.lock
+-rw-r--r--   1 jd  staff    296 Apr 19 16:13 Cargo.toml
+-rw-r--r--   1 jd  staff   1938 Apr 19 18:15 README.md
+-rw-r--r--   1 jd  staff    502 Apr 19 22:33 lsl.rust
+-rw-r--r--   1 jd  staff      0 Apr 19 22:33 lsl.unix
+drwxr-xr-x  14 jd  staff    448 Apr 19 22:00 src
+drwxr-xr-x@  6 jd  staff    192 Apr 19 16:47 target
+lrwxr-xr-x   1 jd  staff      8 Apr 19 10:12 test.symlink -> rust.out
+drwxr-xr-x   3 jd  staff     96 Apr 19 16:47 tests

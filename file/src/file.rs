@@ -24,25 +24,25 @@ use std::{
 /// file - determine file type
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about, disable_help_flag = true)]
-struct FileArgs {
+struct Args {
     /// Apply default position-sensitive system tests and context-sensitive system tests to the file.
-    #[clap(short = 'd', long)]
+    #[arg(short = 'd', long)]
     default_tests: bool,
 
     /// Identify symbolic link with non existent file as symbolic link
-    #[clap(short = 'h', long)]
+    #[arg(short = 'h', long)]
     identify_as_symbolic_link: bool,
 
     /// Don't perform further classification on regular file
-    #[clap(short = 'i', long)]
+    #[arg(short = 'i', long)]
     no_further_file_classification: bool,
 
     /// File containing position-sensitive tests
-    #[clap(short = 'm')]
+    #[arg(short = 'm')]
     test_file1: Option<PathBuf>,
 
     /// File containing additional position-sensitive tests
-    #[clap(short = 'M')]
+    #[arg(short = 'M')]
     test_file2: Option<PathBuf>,
 
     files: Vec<String>,
@@ -523,9 +523,19 @@ fn get_type_from_magic_file_dbs(test_file: &PathBuf, magic_file_dbs: &[PathBuf])
     })
 }
 
-fn analyze_file(mut path: String, args: &FileArgs) {
-    let default_magic_file: PathBuf = PathBuf::from("/etc/magic");
+/// Get the default raw(text based) magic file
+fn get_default_magic_file() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from("/usr/share/file/magic/magic")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        PathBuf::from("/etc/magic")
+    }
+}
 
+fn analyze_file(mut path: String, args: &Args) {
     // set priority according to the occurence of flags in the args lowest index will get highest priority
     let mut magic_files: Vec<PathBuf> = Vec::new();
 
@@ -545,24 +555,24 @@ fn analyze_file(mut path: String, args: &FileArgs) {
 
             if m_index > h_index {
                 magic_files.push(args.test_file1.as_ref().unwrap().clone());
-                magic_files.push(default_magic_file);
+                magic_files.push(get_default_magic_file());
             } else {
-                magic_files.push(default_magic_file);
+                magic_files.push(get_default_magic_file());
                 magic_files.push(args.test_file1.as_ref().unwrap().clone());
             }
         } else if args.test_file1.is_some() {
             magic_files.push(args.test_file1.as_ref().unwrap().clone());
         } else if args.default_tests {
-            magic_files.push(default_magic_file);
+            magic_files.push(get_default_magic_file());
         }
     } else if let Some(test_file1) = &args.test_file1 {
         magic_files.push(test_file1.clone());
 
         if args.test_file2.is_none() && !args.default_tests {
-            magic_files.push(default_magic_file);
+            magic_files.push(get_default_magic_file());
         }
     } else {
-        magic_files.push(default_magic_file);
+        magic_files.push(get_default_magic_file());
     }
 
     match fs::symlink_metadata(&path) {
@@ -627,7 +637,7 @@ fn analyze_file(mut path: String, args: &FileArgs) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = FileArgs::parse();
+    let args = Args::parse();
 
     // Initialize translation system
     textdomain(PROJECT_NAME).unwrap();

@@ -19,11 +19,11 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about)]
 struct Args {
-    pathname: String,
+    pathname: PathBuf,
 }
 
 fn show_dirname(args: &Args) {
-    let mut pb = PathBuf::from(&args.pathname);
+    let mut pb = args.pathname.clone();
     pb.pop();
 
     println!("{}", pb.to_string_lossy());

@@ -10,7 +10,6 @@
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, textdomain};
 use plib::PROJECT_NAME;
-use std::fs;
 use std::io::{self, ErrorKind, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -32,16 +31,6 @@ struct Args {
 
     /// A pathname of the second file to be compared. If file2 is '-', the standard input shall be used.
     file2: PathBuf,
-}
-
-/// Create a buffered reader for the input file.
-fn create_reader(path: &PathBuf) -> io::Result<io::BufReader<Box<dyn Read>>> {
-    let readable: Box<dyn Read> = if path.as_os_str() == "-" {
-        Box::new(io::stdin().lock())
-    } else {
-        Box::new(fs::File::open(path)?)
-    };
-    Ok(io::BufReader::new(readable))
 }
 
 /// Reads a single byte from a `BufReader`.
@@ -69,8 +58,8 @@ fn cmp_main(args: &Args) -> io::Result<u8> {
         return Ok(0);
     }
 
-    let mut reader1 = create_reader(&args.file1)?;
-    let mut reader2 = create_reader(&args.file2)?;
+    let mut reader1 = plib::io::input_reader(&args.file1, true)?;
+    let mut reader2 = plib::io::input_reader(&args.file2, true)?;
 
     let mut lines: u64 = 1;
     let mut bytes: u64 = 0;

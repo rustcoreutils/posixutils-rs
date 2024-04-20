@@ -17,15 +17,15 @@ extern crate plib;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, textdomain};
 use plib::PROJECT_NAME;
-use std::fs;
-use std::io::{self, BufRead, Read};
+use std::io::{self, BufRead};
+use std::path::PathBuf;
 
 /// asa - interpret carriage-control characters
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// Files to read as input.
-    files: Vec<String>,
+    files: Vec<PathBuf>,
 }
 
 struct AsaState {
@@ -69,14 +69,8 @@ impl AsaState {
     }
 }
 
-fn asa_file(filename: &str) -> io::Result<()> {
-    let file: Box<dyn Read>;
-    if filename == "" {
-        file = Box::new(io::stdin().lock());
-    } else {
-        file = Box::new(fs::File::open(filename)?);
-    }
-    let mut reader = io::BufReader::new(file);
+fn asa_file(pathname: &PathBuf) -> io::Result<()> {
+    let mut reader = plib::io::input_reader(pathname, false)?;
     let mut line_no: usize = 0;
     let mut state = AsaState::new();
 
@@ -142,7 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // if no files, read from stdin
     if args.files.is_empty() {
-        args.files.push(String::new());
+        args.files.push(PathBuf::new());
     }
 
     let mut exit_code = 0;
@@ -150,7 +144,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for filename in &args.files {
         if let Err(e) = asa_file(filename) {
             exit_code = 1;
-            eprintln!("{}: {}", filename, e);
+            eprintln!("{}: {}", filename.display(), e);
         }
     }
 

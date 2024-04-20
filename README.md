@@ -84,11 +84,10 @@ https://github.com/jgarzik/posixutils
  - [ ] gencat (i18n)
  - [ ] get (SCCS)
  - [ ] getconf
- - [ ] getopts
  - [ ] grep
  - [x] head
  - [ ] iconv (i18n)
- - [ ] id
+ - [x] id
  - [x] ipcrm (IPC)
  - [ ] ipcs (IPC)
  - [ ] join
@@ -121,7 +120,7 @@ https://github.com/jgarzik/posixutils
  - [ ] patch
  - [x] pathchk
  - [ ] pax
- - [ ] pr
+ - [x] pr
  - [x] printf
  - [ ] prs (SCCS)
  - [ ] ps
@@ -163,7 +162,6 @@ https://github.com/jgarzik/posixutils
  - [x] true
  - [x] tsort
  - [x] tty
- - [ ] ulimit
  - [x] uname
  - [x] uncompress (compress cat.)
  - [ ] unexpand
@@ -177,11 +175,10 @@ https://github.com/jgarzik/posixutils
  - [ ] uux (UUCP)
  - [ ] val (SCCS)
  - [ ] vi
- - [ ] wait
  - [x] wc
  - [ ] what (SCCS)
  - [ ] who
  - [ ] write
  - [x] xargs
  - [ ] yacc (Development)
- - [ ] zcat (compress cat.)
+ - [x] zcat (compress cat.)

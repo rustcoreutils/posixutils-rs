@@ -8,19 +8,17 @@
 //
 //
 
-use clap::{builder::Str, Parser};
+use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, textdomain};
 use plib::PROJECT_NAME;
 use regex::Regex;
 use std::{
     error::Error,
     fmt,
-    fs::{self, read_link, File, OpenOptions},
+    fs::{self, read_link, File},
     io::{self, BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom},
-    num::ParseIntError,
     os::unix::fs::FileTypeExt,
-    path::{Path, PathBuf},
-    str::Chars,
+    path::PathBuf,
 };
 
 /// file - determine file type
@@ -28,7 +26,7 @@ use std::{
 #[command(author, version, about, long_about, disable_help_flag = true)]
 struct FileArgs {
     /// Apply default position-sensitive system tests and context-sensitive system tests to the file.
-    #[clap(short = 'd', long, default_value_t)]
+    #[clap(short = 'd', long)]
     default_tests: bool,
 
     /// Identify symbolic link with non existent file as symbolic link
@@ -41,107 +39,13 @@ struct FileArgs {
 
     /// File containing position-sensitive tests
     #[clap(short = 'm')]
-    test_file1: Option<String>,
+    test_file1: Option<PathBuf>,
 
     /// File containing additional position-sensitive tests
     #[clap(short = 'M')]
-    test_file2: Option<String>,
+    test_file2: Option<PathBuf>,
 
     files: Vec<String>,
-}
-
-#[derive(Debug)]
-enum ComparisonOperator {
-    Equal,
-    LessThan,
-    GreaterThan,
-    AllSet,
-    AnyUnset,
-    FileLargeEnough,
-}
-
-#[derive(Debug)]
-pub enum Value {
-    String(String),
-    Number(ComparisonOperator, u64),
-}
-
-impl Value {
-    pub fn parse(mut input: String, _type: Type) -> Result<Value, RawMagicLineParseError> {
-        match _type {
-            Type::String => {
-                let mut result = String::new();
-                let mut chars = input.chars();
-
-                while let Some(c) = chars.next() {
-                    if c == '\\' {
-                        if let Some(escaped) = chars.next() {
-                            let replacement = match escaped {
-                                '\\' => '\\',
-                                'a' => '\x07', // Alert (bell)
-                                'b' => '\x08', // Backspace
-                                'f' => '\x0C', // Form feed
-                                'n' => '\n',   // Newline
-                                'r' => '\r',   // Carriage return
-                                't' => '\t',   // Horizontal tab
-                                'v' => '\x0B', // Vertical tab
-                                ' ' => ' ',    // Space
-                                _ => escaped,  // Treat any other character as itself
-                            };
-                            result.push(replacement);
-                        } else {
-                            result.push('\\');
-                        }
-                    } else {
-                        result.push(c);
-                    }
-                }
-                Ok(Value::String(result))
-            }
-            _ => {
-                let (comp, num) =
-                    Self::parse_number(&mut input).ok_or(RawMagicLineParseError::InvalidValue)?;
-                Ok(Value::Number(comp, num))
-            }
-        }
-    }
-
-    fn parse_number(input: &mut String) -> Option<(ComparisonOperator, u64)> {
-        let regex = Regex::new(r"^[=<>&^x]").unwrap();
-        let comparision_op = match regex.find(&input) {
-            Some(mat) => {
-                let comp = mat.as_str().chars().next().unwrap();
-                input.replace_range(..1, ""); // Remove the matched operator
-                match comp {
-                    '=' => ComparisonOperator::Equal,
-                    '<' => ComparisonOperator::LessThan,
-                    '>' => ComparisonOperator::GreaterThan,
-                    '&' => ComparisonOperator::AllSet,
-                    '^' => ComparisonOperator::AnyUnset,
-                    'x' => ComparisonOperator::FileLargeEnough,
-                    _ => return None,
-                }
-            }
-            None => ComparisonOperator::Equal,
-        };
-
-        let num = parse_number(input)?;
-        Some((comparision_op, num))
-    }
-}
-
-fn test_file_against_magic_db_file(
-    tf_reader: &mut BufReader<File>,
-    raw_magic_file_lines: &Vec<RawMagicFileLine>,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let mut value = String::new();
-
-    for raw_magic_file_line in raw_magic_file_lines {
-        raw_magic_file_line.test(tf_reader);
-        tf_reader.rewind();
-    }
-
-    Ok(value)
 }
 
 /// Errors that can occur during parsing of a raw magic line.
@@ -177,8 +81,114 @@ impl fmt::Display for RawMagicLineParseError {
     }
 }
 
-/// It removes parsed data from input string
-/// if the parsing was successful
+#[derive(Debug)]
+enum ComparisonOperator {
+    Equal,
+    LessThan,
+    GreaterThan,
+    AllSet,
+    AnyUnset,
+    FileLargeEnough,
+}
+
+#[derive(Debug)]
+enum Value {
+    String(String),
+    Number(ComparisonOperator, u64),
+}
+
+impl Value {
+    fn parse(mut input: String, _type: Type) -> Result<Value, RawMagicLineParseError> {
+        match _type {
+            Type::String => {
+                let mut result = String::new();
+                let mut chars = input.chars();
+
+                // replace character escape sequences with their characters
+                while let Some(c) = chars.next() {
+                    if c == '\\' {
+                        if let Some(escaped) = chars.next() {
+                            let replacement = match escaped {
+                                '\\' => '\\',
+                                'a' => '\x07', // alert
+                                'b' => '\x08', // backspace
+                                'f' => '\x0C', // form feed
+                                'n' => '\n',   // newline
+                                'r' => '\r',   // carriage return
+                                't' => '\t',   // horizontal tab
+                                'v' => '\x0B', // vertical tab
+                                ' ' => ' ',    // space
+                                _ => {
+                                    result.push('\\');
+                                    escaped
+                                } // Treat any other character as itself
+                            };
+                            result.push(replacement);
+                        } else {
+                            result.push('\\');
+                        }
+                    } else {
+                        result.push(c);
+                    }
+                }
+
+                result = Self::replace_all_octal_sequences_with_their_coded_values(&input)?;
+
+                Ok(Value::String(result))
+            }
+            _ => {
+                let (comp, num) =
+                    Self::parse_number(&mut input).ok_or(RawMagicLineParseError::InvalidValue)?;
+                Ok(Value::Number(comp, num))
+            }
+        }
+    }
+
+    /// Replace the octal sequences in the string with the value they represent
+    /// in utf8
+    fn replace_all_octal_sequences_with_their_coded_values(
+        input: &str,
+    ) -> Result<String, RawMagicLineParseError> {
+        // replace octal sequences with specific coded values
+        let re = Regex::new(r"\\([0-7]{1,3})").map_err(|_| RawMagicLineParseError::InvalidRegex)?;
+
+        let result = re
+            .replace_all(&input, |capture: &regex::Captures| {
+                let mat = capture.get(1).unwrap().as_str();
+
+                let v = u32::from_str_radix(mat, 8).unwrap();
+                let c = char::from_u32(v).unwrap();
+                c.to_string()
+            })
+            .to_string();
+        Ok(result)
+    }
+
+    fn parse_number(input: &mut String) -> Option<(ComparisonOperator, u64)> {
+        let regex = Regex::new(r"^[=<>&^x]").unwrap();
+        let comparision_op = match regex.find(&input) {
+            Some(mat) => {
+                let comp = mat.as_str().chars().next().unwrap();
+                input.replace_range(..1, ""); // Remove the matched operator
+                match comp {
+                    '=' => ComparisonOperator::Equal,
+                    '<' => ComparisonOperator::LessThan,
+                    '>' => ComparisonOperator::GreaterThan,
+                    '&' => ComparisonOperator::AllSet,
+                    '^' => ComparisonOperator::AnyUnset,
+                    'x' => ComparisonOperator::FileLargeEnough,
+                    _ => return None,
+                }
+            }
+            None => ComparisonOperator::Equal,
+        };
+
+        let num = parse_number(input)?;
+        Some((comparision_op, num))
+    }
+}
+
+/// Parses Hexadecimal, Octal and Unsigned Decimal
 fn parse_number(input: &mut String) -> Option<u64> {
     if let Some(hex_num) = parse_hexadecimal(input) {
         Some(hex_num)
@@ -231,7 +241,7 @@ enum Type {
 }
 
 impl Type {
-    pub fn parse(mut input: String) -> Result<Type, RawMagicLineParseError> {
+    fn parse(mut input: String) -> Result<Type, RawMagicLineParseError> {
         Self::replace_verbose_type_string_with_short_ones(&mut input);
 
         let tsc = Self::parse_type_specification_char(&mut input)
@@ -241,7 +251,6 @@ impl Type {
             'd' | 'u' => {
                 // parse decimal and unsigned type
                 let no_of_bytes = Self::parse_no_of_bytes_represented(&mut input)?;
-                println!("{input}");
                 let mask = Self::parse_mask(&mut input);
                 if tsc == 'u' {
                     Ok(Type::Decimal(no_of_bytes, mask))
@@ -339,7 +348,7 @@ struct Offset {
 }
 
 impl Offset {
-    pub fn parse(mut input: String) -> Result<Self, RawMagicLineParseError> {
+    fn parse(mut input: String) -> Result<Self, RawMagicLineParseError> {
         let is_continuation = match input.chars().next() {
             Some('>') => {
                 input.remove(0);
@@ -370,7 +379,7 @@ struct RawMagicFileLine {
 }
 
 impl RawMagicFileLine {
-    pub fn parse(input: String) -> Result<Self, RawMagicLineParseError> {
+    fn parse(input: String) -> Result<Self, RawMagicLineParseError> {
         let input = Self::normalize_whitespace(input)?;
         let fields: Vec<&str> = input.splitn(4, " ").collect();
 
@@ -394,16 +403,18 @@ impl RawMagicFileLine {
 
     fn test(&self, tf_reader: &mut BufReader<File>) -> Option<String> {
         let offset = self.offset.num;
-        tf_reader.seek(SeekFrom::Start(offset)).unwrap();
+
+        // put back the cursor position to beginning and start working
+        let _ = tf_reader.rewind();
+        let _ = tf_reader.seek(SeekFrom::Start(offset));
 
         match self._type {
             Type::Unsigned(size, mask) => {
-                let mut x = vec![0; size as usize];
-                tf_reader.read_exact(&mut x);
-                //let x = u64::from_be_bytes(x.try_into().unwrap());
-                //println!("{x}");
-                //println!("{:?}", self.value);
-                None
+                if self.number_test(size, mask, tf_reader) {
+                    Some(self.message.clone())
+                } else {
+                    None
+                }
             }
             Type::Decimal(size, mask) => {
                 if self.number_test(size, mask, tf_reader) {
@@ -412,11 +423,30 @@ impl RawMagicFileLine {
                     None
                 }
             }
-            Type::String => None,
+
+            Type::String => {
+                if self.string_test(tf_reader) {
+                    Some(self.message.clone())
+                } else {
+                    None
+                }
+            }
         }
     }
 
-    fn string_test() {}
+    fn string_test(&self, tf_reader: &mut BufReader<File>) -> bool {
+        if let Value::String(val) = &self.value {
+            let mut buf = vec![0u8; val.len()];
+            if let Err(_) = tf_reader.read_exact(&mut buf) {
+                return false;
+            }
+
+            if let Ok(tf_val) = String::from_utf8(buf.clone()) {
+                return tf_val.as_bytes() == val.as_bytes();
+            }
+        }
+        false
+    }
 
     fn number_test(&self, size: u64, mask: Option<u64>, tf_reader: &mut BufReader<File>) -> bool {
         let mut buf = vec![0; size as usize];
@@ -428,7 +458,11 @@ impl RawMagicFileLine {
 
         let mut array_buf = [0u8; 8];
         array_buf[(8 - buf.len())..8].copy_from_slice(&buf);
-        let tf_val = u64::from_be_bytes(array_buf);
+        let mut tf_val = u64::from_be_bytes(array_buf);
+
+        if let Some(mask) = mask {
+            tf_val = mask & tf_val;
+        }
 
         match &self.value {
             Value::Number(op, val) => match op {
@@ -472,32 +506,28 @@ fn parse_magic_file_and_test(
                     return Ok(result.unwrap());
                 }
             }
+        } else {
         }
     }
 
-    Err(Box::new(io::Error::new(
+    result.ok_or(Box::new(io::Error::new(
         ErrorKind::NotFound,
         "Couldn't match any magic number",
     )))
 }
 
 /// Get type for the file from the magic file databases(traversed in order of argument)
-fn get_type_from_magic_file_dbs(test_file: &str, magic_file_dbs: &[String]) -> Option<String> {
+fn get_type_from_magic_file_dbs(test_file: &PathBuf, magic_file_dbs: &[PathBuf]) -> Option<String> {
     magic_file_dbs.iter().find_map(|magic_file| {
         parse_magic_file_and_test(&PathBuf::from(magic_file), &PathBuf::from(test_file)).ok()
     })
 }
 
-/// The default magic file(text based)
-fn default_magic_file() -> String {
-    // Through different indirect resources, currently "/et/magic" is used as the default magic
-    // file database
-    return "/etc/magic".to_string();
-}
-
 fn analyze_file(mut path: String, args: &FileArgs) {
+    let default_magic_file: PathBuf = PathBuf::from("/etc/magic");
+
     // set priority according to the occurence of flags in the args lowest index will get highest priority
-    let mut magic_files = Vec::new();
+    let mut magic_files: Vec<PathBuf> = Vec::new();
 
     if path == "-" {
         path = String::new();
@@ -515,39 +545,45 @@ fn analyze_file(mut path: String, args: &FileArgs) {
 
             if m_index > h_index {
                 magic_files.push(args.test_file1.as_ref().unwrap().clone());
-                magic_files.push(default_magic_file());
+                magic_files.push(default_magic_file);
             } else {
-                magic_files.push(default_magic_file());
+                magic_files.push(default_magic_file);
                 magic_files.push(args.test_file1.as_ref().unwrap().clone());
             }
         } else if args.test_file1.is_some() {
             magic_files.push(args.test_file1.as_ref().unwrap().clone());
         } else if args.default_tests {
-            magic_files.push(default_magic_file());
+            magic_files.push(default_magic_file);
         }
     } else if let Some(test_file1) = &args.test_file1 {
         magic_files.push(test_file1.clone());
 
         if args.test_file2.is_none() && !args.default_tests {
-            magic_files.push(default_magic_file());
+            magic_files.push(default_magic_file);
         }
     } else {
-        magic_files.push(default_magic_file());
+        magic_files.push(default_magic_file);
     }
 
-    // perform file type test
-    match OpenOptions::new().read(true).open(&path) {
-        Ok(_) => {
-            let metadata = fs::symlink_metadata(&path).unwrap();
-            let file_type = metadata.file_type();
+    match fs::symlink_metadata(&path) {
+        Ok(met) => {
+            let file_type = met.file_type();
+
             if file_type.is_symlink() {
                 if args.identify_as_symbolic_link {
                     println!("{path}: symbolic link");
                 } else {
                     match read_link(&path) {
-                        Ok(file) => {
-                            let file_p = file.to_str().unwrap();
-                            println!("{path}: symbolic link to {file_p}");
+                        Ok(file_p) => {
+                            // trace the file pointed by symbolic link
+                            if file_p.exists() {
+                                println!("{path}: symbolic link to {}", file_p.to_str().unwrap());
+                            } else {
+                                println!(
+                                    "{path}: broken symbolic link to {}",
+                                    file_p.to_str().unwrap()
+                                );
+                            }
                         }
                         Err(_) => {
                             println!("{path}: symbolic link");
@@ -569,10 +605,10 @@ fn analyze_file(mut path: String, args: &FileArgs) {
                 if args.no_further_file_classification {
                     println!("{path}: regular file");
                 } else {
-                    if metadata.len() == 0 {
+                    if met.len() == 0 {
                         println!("{path}: empty");
                     } else {
-                        match get_type_from_magic_file_dbs(&path, &magic_files) {
+                        match get_type_from_magic_file_dbs(&PathBuf::from(&path), &magic_files) {
                             Some(f_type) => {
                                 println!("{path}: {f_type}");
                             }
@@ -584,9 +620,8 @@ fn analyze_file(mut path: String, args: &FileArgs) {
                 }
             }
         }
-
         Err(_) => {
-            println!("{path} : cannot open");
+            println!("{path}: cannot open");
         }
     }
 }

@@ -129,9 +129,9 @@ checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
 name = "cc"
-version = "1.0.94"
+version = "1.0.95"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17f6e324229dc011159fcc089755d1e2e216a90d43a7dea6853ca740b84f35e7"
+checksum = "d32a725bc159af97c3e629873bb9f88fb8cf8a4867175f76dc987815ea07c83b"
 
 [[package]]
 name = "cfg-if"
@@ -587,14 +587,14 @@ dependencies = [
 
 [[package]]
 name = "plib"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "posixutils-calc"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "gettext-rs",
  "plib",
@@ -603,7 +603,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-datetime"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "chrono",
  "clap",
@@ -614,7 +614,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-dev"
-version = "0.1.3"
+version = "0.1.7"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -624,7 +624,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-display"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -633,7 +633,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-file"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "atty",
  "clap",
@@ -644,7 +644,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-fs"
-version = "0.1.4"
+version = "0.1.7"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -654,11 +654,11 @@ dependencies = [
 
 [[package]]
 name = "posixutils-misc"
-version = "0.1.3"
+version = "0.1.7"
 
 [[package]]
 name = "posixutils-pathnames"
-version = "0.1.5"
+version = "0.1.7"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -668,7 +668,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-process"
-version = "0.1.4"
+version = "0.1.7"
 dependencies = [
  "clap",
  "errno",
@@ -680,7 +680,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-screen"
-version = "0.1.4"
+version = "0.1.7"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -692,7 +692,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-sys"
-version = "0.1.4"
+version = "0.1.7"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -703,7 +703,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-text"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "chrono",
  "clap",
@@ -716,7 +716,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-tree"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "atty",
  "chrono",
@@ -729,7 +729,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-users"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "atty",
  "clap",
@@ -741,7 +741,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-xform"
-version = "0.1.4"
+version = "0.1.7"
 dependencies = [
  "base64",
  "clap",
@@ -911,9 +911,9 @@ dependencies = [
 
 [[package]]
 name = "syslog"
-version = "6.1.0"
+version = "6.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7434e95bcccce1215d30f4bf84fe8c00e8de1b9be4fb736d747ca53d36e7f96f"
+checksum = "dfc7e95b5b795122fafe6519e27629b5ab4232c73ebb2428f568e82b1a457ad3"
 dependencies = [
  "error-chain",
  "hostname",
@@ -952,18 +952,18 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "1.0.58"
+version = "1.0.59"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03468839009160513471e86a034bb2c5c0e4baae3b43f79ffc55c4a5427b3297"
+checksum = "f0126ad08bff79f29fc3ae6a55cc72352056dfff61e3ff8bb7129476d44b23aa"
 dependencies = [
  "thiserror-impl",
 ]
 
 [[package]]
 name = "thiserror-impl"
-version = "1.0.58"
+version = "1.0.59"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c61f3ba182994efc43764a46c018c347bc492c79f024e705f46567b418f6d4f7"
+checksum = "d1cd413b5d558b4c5bf3680e324a6fa5014e7b7c067a51e69dbdf47eb7148b66"
 dependencies = [
  "proc-macro2",
  "quote",

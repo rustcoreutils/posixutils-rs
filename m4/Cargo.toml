@@ -7,3 +7,6 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "4", features = ["cargo"] }
+
+[dev-dependencies]
+insta = { version = "1.38.0", features = ["json"] }

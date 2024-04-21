@@ -1,9 +1,12 @@
 use std::{
     ffi::{OsStr, OsString},
     os::unix::ffi::OsStrExt,
+    path::PathBuf,
 };
 
 use clap::builder::{TypedValueParser, ValueParserFactory};
+
+mod lexer;
 
 // TODO: potentially we can use a reference here to avoid allocation
 #[derive(Debug, Clone)]
@@ -79,6 +82,7 @@ struct Args {
     defines: Vec<ArgumentDefine>,
     // Undefine `name`.
     undefines: Vec<ArgumentName>,
+    file: Option<PathBuf>,
 }
 
 impl Args {
@@ -97,6 +101,9 @@ impl Args {
                 .value_name("name")
                 .action(clap::ArgAction::Append)
                 .help("Undefine name"))
+        .arg(clap::Arg::new("file")
+                .required(false)
+                .help("A pathname of a text file to be processed. If no file is given, or if it is '-', the standard input shall be read."))
         .get_matches();
 
         Self {
@@ -111,6 +118,7 @@ impl Args {
                 .unwrap()
                 .cloned()
                 .collect(),
+            file: matches.get_one("file").cloned(),
         }
     }
 }

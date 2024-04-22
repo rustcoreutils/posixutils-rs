@@ -6,6 +6,30 @@
 //! definitions, otherwise potentially any input word not matching builtin macros could be a macro and we will need to re-analyze it in a second phase. Also I think there is the possibility to undefine builtin macros? in which case this is absolutely necessary. This seems relevant for nom https://github.com/rust-bakery/nom/issues/1419
 //! * Perhaps this might be useful https://github.com/fflorent/nom_locate/blob/master/README.md
 
+use nom::IResult;
+
+struct Macro<'a> {
+    name: &'a [u8],
+    args: Vec<Symbol<'a>>,
+}
+
+enum Symbol<'a> {
+    Text(&'a [u8]),
+    QuotedText(QuotedText<'a>),
+    Macro(Macro<'a>),
+}
+
+struct QuotedText<'a> {
+    quote_symbol: &'a [u8],
+    text: &'a [u8]
+}
+
+fn macro_name(input: &[u8]) -> no
+
+fn r#macro(input: &[u8]) -> IResult<&[u8], Option<Macro<'_>>> {
+    
+}
+
 // TODO: probably these tests will be deleted later in favour of integration test suite.
 #[cfg(test)]
 mod test {

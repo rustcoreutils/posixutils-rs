@@ -25,6 +25,9 @@ use std::{
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about, disable_help_flag = true)]
 struct Args {
+    #[clap(long, action = clap::ArgAction::HelpLong)]
+    help: Option<bool>,
+
     /// Apply default position-sensitive system tests and context-sensitive system tests to the file.
     #[arg(short = 'd', long)]
     default_tests: bool,

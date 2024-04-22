@@ -12,6 +12,7 @@ clap.workspace = true
 gettext-rs.workspace = true
 libc.workspace = true
 atty = "0.2"
+regex = "1.10"
 
 [[bin]]
 name = "cat"
@@ -37,3 +38,6 @@ path = "src/split.rs"
 name = "tee"
 path = "src/tee.rs"
 
+[[bin]]
+name = "file"
+path = "src/file.rs"

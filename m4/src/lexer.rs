@@ -6,7 +6,6 @@
 //! definitions, otherwise potentially any input word not matching builtin macros could be a macro and we will need to re-analyze it in a second phase. Also I think there is the possibility to undefine builtin macros? in which case this is absolutely necessary. This seems relevant for nom https://github.com/rust-bakery/nom/issues/1419
 //! * Perhaps this might be useful https://github.com/fflorent/nom_locate/blob/master/README.md
 
-use libc;
 use nom::IResult;
 
 #[derive(Debug, PartialEq)]
@@ -67,7 +66,9 @@ fn parse_macro(input: &[u8]) -> IResult<&[u8], Macro<'_>> {
                 nom::combinator::cut(parse_macro),
             ),
         ),
-        nom::bytes::complete::tag(")"),
+        // Make sure we fail for input that is missing the closing tag, this is what GNU m4 does
+        // anyway.
+        nom::combinator::cut(nom::bytes::complete::tag(")")),
     ))(remaining)?;
 
     Ok((
@@ -83,7 +84,7 @@ fn parse_macro(input: &[u8]) -> IResult<&[u8], Macro<'_>> {
 //
 // }
 
-// fn symbol(input: &[u8]) -> IResult<&[u8], Symbol<'_>> {
+// fn parse_symbol(input: &[u8]) -> IResult<&[u8], Symbol<'_>> {
 //
 // }
 
@@ -129,5 +130,17 @@ mod test {
         assert_eq!(m.name, MacroName(b"some_word_23"));
         assert_eq!(m.args.len(), 1);
         assert_eq!(m.args.get(0).unwrap().name, MacroName(b"hello"));
+    }
+
+    #[test]
+    fn test_parse_macro_args_fail_no_closing_bracket() {
+        // TODO: produce and check for a more specific error
+        parse_macro(b"some_word_23(hello").unwrap_err();
+    }
+
+    #[test]
+    fn test_parse_macro_args_fail_empty_no_closing_bracket() {
+        // TODO: produce and check for a more specific error
+        parse_macro(b"some_word_23(").unwrap_err();
     }
 }

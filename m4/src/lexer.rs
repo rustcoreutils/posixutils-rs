@@ -7,6 +7,19 @@
 //!  So it seems like a good optimization that once we know a word is not a current macro name, to
 //!  forget trying to parse the rest of it as a macro.
 //! * Perhaps this might be useful https://github.com/fflorent/nom_locate/blob/master/README.md
+//!
+//! Taking a look at this BSD licensed code
+//! https://github.com/chimera-linux/bsdm4/blob/master/main.c
+//!
+//! TODO: It's been decided that we want to support both single byte character encodings, and
+//! UTF-8. We will ignore other variable length encodings, and other wide character encodings.
+//! Will have to think how best to do this, perhaps we have two different parser implementations,
+//! one that uses nom::bytes and the libc functions, and another that uses UTF-8.
+//! We need to decide what to do in abscence of the LC_* telling us which encoding, do we just
+//! assume it's UTF-8?
+//! We'd like to try having UTF-8 support be the default and have a flag to disable it if extra
+//! compatibility with legacy utilities is required, as it's technically feasible that with some
+//! input it will result in different behaviour.
 
 use nom::IResult;
 
@@ -26,7 +39,7 @@ enum Symbol<'a> {
 #[cfg_attr(test, derive(Debug, PartialEq))]
 struct Quoted<'a> {
     pub open_quote_symbol: &'a [u8],
-    pub quoted: Box<Symbol<'a>>,
+    pub quoted: Vec<Symbol<'a>>,
     pub close_quote_symbol: &'a [u8],
 }
 
@@ -90,10 +103,7 @@ fn parse_quoted(input: &[u8]) -> IResult<&[u8], Quoted<'_>> {
         nom::bytes::complete::tag("`"),
         // TODO: replace with parse symbol and some combinator with take_until consuming the output
         // of that.
-        nom::branch::alt((
-            nom::combinator::map(parse_quoted, Symbol::Quoted),
-            nom::combinator::map(nom::bytes::complete::take_until("'"), Symbol::Text),
-        )),
+        nom::combinator::map_parser(nom::bytes::complete::take_until("'"), parse_symbols),
         nom::bytes::complete::tag("'"),
     )(input)?;
 
@@ -101,26 +111,70 @@ fn parse_quoted(input: &[u8]) -> IResult<&[u8], Quoted<'_>> {
         remaining,
         Quoted {
             open_quote_symbol: b"`",
-            quoted: Box::new(quoted),
+            quoted,
             close_quote_symbol: b"'",
         },
     ))
 }
 
-// fn r#macro(input: &[u8]) -> IResult<&[u8], Option<Macro<'_>>> {
-//
-// }
+extern "C" {
+    fn iswalnum(wc: i64) -> i64;
+}
 
-// fn parse_symbol(input: &[u8]) -> IResult<&[u8], Symbol<'_>> {
+//TODO: these don't handle multibyte characters!
 //
-// }
+//It seems like we might want to use https://linux.die.net/man/3/mbrtowc for UTF-8 and any other
+//multibyte encodings. Then https://linux.die.net/man/3/iswblank
+fn is_whitespace(c: u8) -> bool {
+    unsafe { libc::isblank(c.into()) != 0 }
+}
+
+fn is_alphnumeric(c: u8) -> bool {
+    unsafe { libc::isalnum(c.into()) != 0 }
+}
+
+// TODO: needs to change with changequote
+fn is_open_quote(c: u8) -> bool {
+    c == b'`'
+}
+
+// TODO: needs to change with changequote
+fn is_close_quote(c: u8) -> bool {
+    c == b'\''
+}
+
+/// Parse input that we already know is not quoted and not a macro, consume input until it could
+/// possibly be the beginning of either a quote or a macro, such as when an open quote is
+/// encountered, or when we encounter the first alpha character after a non-alphanumeric character.
+/// TODO: what happens if we encounter a close quote?
+fn parse_text(input: &[u8]) -> IResult<&[u8], &[u8]> {
+    let (remaining, text) =
+        nom::bytes::complete::take_till(|c| !is_alphnumeric(c) || is_open_quote(c))(input)?;
+    if remaining.is_empty() {
+        return Ok((remaining, text));
+    }
+
+    todo!()
+}
+
+fn parse_symbols(input: &[u8]) -> IResult<&[u8], Vec<Symbol<'_>>> {
+    nom::multi::many0(parse_symbol)(input)
+}
+
+fn parse_symbol(input: &[u8]) -> IResult<&[u8], Symbol<'_>> {
+    nom::branch::alt((
+        nom::combinator::map(parse_quoted, Symbol::Quoted),
+        nom::combinator::map(parse_macro, Symbol::Macro),
+        nom::combinator::map(parse_text, Symbol::Text),
+    ))(input)
+}
 
 // TODO: probably these tests will be deleted later in favour of integration test suite.
 #[cfg(test)]
 mod test {
     use crate::lexer::Symbol;
 
-    use super::{parse_macro, parse_macro_name, parse_quoted, MacroName};
+    use super::{parse_macro, parse_macro_name, parse_quoted, Macro, MacroName};
     // TODO: add tests based on input in
     // https://pubs.opengroup.org/onlinepubs/9699919799/utilities/m4.html#tag_20_74_17
     const M4SRC: &str = r#"The value of `VER' is "VER".
@@ -178,6 +232,12 @@ mod test {
         let quote = parse_quoted(b"`hello'").unwrap().1;
         assert_eq!(b"`", quote.open_quote_symbol);
         assert_eq!(b"'", quote.close_quote_symbol);
-        assert_eq!(Symbol::Text(b"hello"), *quote.quoted);
+        assert_eq!(
+            vec![Symbol::Macro(Macro {
+                name: MacroName(b"hello"),
+                args: Vec::new(),
+            })],
+            quote.quoted
+        );
     }
 }

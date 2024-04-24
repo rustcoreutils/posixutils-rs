@@ -20,6 +20,8 @@
 //! We'd like to try having UTF-8 support be the default and have a flag to disable it if extra
 //! compatibility with legacy utilities is required, as it's technically feasible that with some
 //! input it will result in different behaviour.
+//!
+//! TODO: Recoverable parsing warnings should be emitted to stderr
 
 use nom::IResult;
 
@@ -78,6 +80,7 @@ fn parse_macro(input: &[u8]) -> IResult<&[u8], Macro<'_>> {
         nom::bytes::complete::tag("("),
         nom::multi::separated_list0(
             nom::bytes::complete::tag(","),
+            // TODO: check, we should be allowed to have empty arguments?
             // TODO: replace with parse_symbol
             nom::combinator::map_parser(
                 nom::bytes::complete::is_not(")"),
@@ -115,10 +118,6 @@ fn parse_quoted(input: &[u8]) -> IResult<&[u8], Quoted<'_>> {
             close_quote_symbol: b"'",
         },
     ))
-}
-
-extern "C" {
-    fn iswalnum(wc: i64) -> i64;
 }
 
 //TODO: these don't handle multibyte characters!

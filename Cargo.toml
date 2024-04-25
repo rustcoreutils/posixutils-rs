@@ -2,12 +2,12 @@
 resolver = "2"
 
 members = [
+	"calc",
 	"datetime",
 	"dev",
 	"display",
 	"file",
 	"fs",
-	"link",
 	"misc",
 	"pathnames",
 	"plib",
@@ -20,3 +20,8 @@ members = [
 	"xform"
 ]
 
+[workspace.dependencies]
+clap = { version = "4", features = ["derive"] }
+gettext-rs = { version = "0.7", features = ["gettext-system"] }
+libc = "0.2"
+regex = "1.10"

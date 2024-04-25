@@ -1,0 +1,132 @@
+
+
+<DATE> <FILENAME> Page 1
+
+
+  1	Lor  57	tin 113	qua 169	Eni 225	iac 281	tor 337	vel 393	nun 449	sem
+  2	eiu  58	ege 114	urn 170	gra 226	bib 282	mau 338	dol 394	qui 450	pha
+  3	pla  59	    115	Ali 171	    227	mol 283	ali 339	eui 395	fer 451	nun
+  4	Bib  60	Imp 116	qua 172	Vel 228	pel 284	con 340	qua 396	fac 452	con
+  5	gra  61	tel 117	adi 173	tin 229	et. 285	vit 341	    397	lib 453	pla
+  6	eli  62	ali 118	dig 174	nul 230	    286	vul 342	Et  398	mol 454	sen
+  7	Eli  63	Cur 119	sed 175	qui 231	Dol 287	sag 343	ame 399	    455	vit
+  8	por  64	ele 120	ves 176	Vit 232	qua 288	tur 344	Lao 400	Non 456	   
+  9	fam  65	con 121	urn 177	ult 233	vel 289	ege 345	con 401	vel 457	Tri
+ 10	pla  66	Pel 122	    178	lib 234	eni 290	nec 346	qua 402	mas 458	dui
+ 11	     67	Pha 123	Lac 179	Mas 235	ame 291	    347	mau 403	pha 459	aug
+ 12	Ele  68	Vit 124	mal 180	in  236	mae 292	Ame 348	neq 404	tem 460	viv
+ 13	tin  69	tri 125	sce 181	con 237	vol 293	Sap 349	    405	pul 461	Sce
+ 14	nun  70	    126	nis 182	id  238	nul 294	nul 350	Con 406	qui 462	era
+ 15	ves  71	Mal 127	por 183	ult 239	    295	ege 351	sen 407	tem 463	Ips
+ 16	mor  72	ali 128	ame 184	    240	Tri 296	ut  352	tur 408	lib 464	ege
+ 17	era  73	ves 129	Dui 185	Bla 241	tor 297	tor 353	Dui 409	viv 465	adi
+ 18	ut   74	Ult 130	qui 186	sus 242	pel 298	orc 354	pel 410	ull 466	fau
+ 19	mas  75	vul 131	tin 187	ut  243	fri 299	ame 355	arc 411	lac 467	pel
+ 20	vel  76	dig 132	non 188	ult 244	Ame 300	pel 356	mor 412	Non 468	sed
+ 21	Ut   77	sem 133	qui 189	sag 245	sol 301	orn 357	at. 413	    469	   
+ 22	     78	Tin 134	sem 190	Adi 246	int 302	cum 358	vol 414	Vol 470	Ut 
+ 23	Nun  79	cur 135	est 191	fer 247	ris 303	ult 359	adi 415	Dui 471	dig
+ 24	eui  80	at  136	ven 192	qui 248	    304	fam 360	Ull 416	ali 472	leo
+ 25	adi  81	sol 137	com 193	neq 249	Mor 305	viv 361	ame 417	int 473	ege
+ 26	con  82	Ven 138	    194	vul 250	tel 306	    362	Con 418	Mas 474	Dia
+ 27	Gra  83	ult 139	Dig 195	tor 251	ut. 307	Mor 363	ege 419	ves 475	hen
+ 28	sem  84	viv 140	pla 196	fer 252	dia 308	ut  364	sit 420	feu 476	mal
+ 29	nib  85	pel 141	vul 197	int 253	mau 309	nib 365	    421	lao 477	fau
+ 30	pos  86	    142	ali 198	id  254	mal 310	Sus 366	Mag 422	Nul 478	vol
+ 31	vul  87	Tri 143	sem 199	    255	cur 311	ero 367	neq 423	odi 479	vel
+ 32	mau  88	vol 144	mae 200	Id  256	vit 312	vol 368	iac 424	sap 480	iac
+ 33	id   89	Sce 145	var 201	nis 257	    313	mon 369	leo 425	pel 481	con
+ 34	tor  90	aen 146	mau 202	a.  258	Ult 314	nul 370	sed 426	sap 482	sit
+ 35	mas  91	vol 147	qui 203	fam 259	ele 315	    371	Ele 427	fri 483	lec
+ 36	bib  92	dic 148	pra 204	dia 260	et  316	Rho 372	Fau 428	    484	pul
+ 37	pos  93	mas 149	    205	sem 261	ame 317	Ame 373	    429	Aen 485	   
+ 38	     94	gra 150	Don 206	hab 262	qui 318	ege 374	Don 430	urn 486	Nib
+ 39	Ame  95	    151	ut. 207	lao 263	mor 319	pla 375	nul 431	fri 487	eni
+ 40	ac   96	At  152	arc 208	auc 264	fac 320	pha 376	ult 432	Pra 488	fac
+ 41	pha  97	acc 153	por 209	nun 265	pur 321	tin 377	aen 433	sap 489	hac
+ 42	Sol  98	por 154	mas 210	mae 266	viv 322	lao 378	pul 434	arc 490	tri
+ 43	dig  99	ull 155	sod 211	dui 267	odi 323	pre 379	sed 435	con 491	ult
+ 44	luc 100	don 156	nun 212	sol 268	    324	ult 380	ali 436	hen 492	mal
+ 45	sod 101	et  157	net 213	Dia 269	Sus 325	ac  381	fac 437	pel 493	con
+ 46	pel 102	sol 158	fac 214	pha 270	mag 326	at  382	Pha 438	lig 494	ull
+ 47	    103	fer 159	Dap 215	    271	sed 327	    383	    439	com 495	   
+ 48	Leo 104	    160	    216	Ac  272	ips 328	Sol 384	Met 440	nun 496	Non
+ 49	acc 105	Feu 161	Pur 217	sce 273	Sus 329	sem 385	vul 441	ege 497	com
+ 50	sit 106	sit 162	ips 218	adi 274	mal 330	Odi 386	Mor 442	    498	Era
+ 51	pel 107	Tel 163	sus 219	sag 275	vel 331	eui 387	id  443	Est 499	bib
+ 52	ant 108	Dig 164	Sce 220	eli 276	tin 332	tor 388	fri 444	gra 500	Est
+ 53	vel 109	mas 165	ali 221	eu  277	orc 333	Sen 389	ull 445	sed 501	con
+ 54	pla 110	eu  166	at. 222	Fau 278	    334	qui 390	ut. 446	nis 502	lob
+ 55	vul 111	nib 167	neq 223	vel 279	Mau 335	ult 391	Int 447	ves 503	odi
+ 56	viv 112	adi 168	eu. 224	hab 280	sen 336	id  392	int 448	lec 504	Sap
+
+
+
+
+
+
+
+<DATE> <FILENAME> Page 2
+
+
+505	int 520	    535	    550	hen 565	Ege 580	Ame 595	Tur 610	pla 625	id. 
+506	fau 521	Ris 536	Eli 551	    566	vit 581	int 596	neq 611	mat 626	ull 
+507	dia 522	tem 537	Sed 552	Non 567	bib 582	dig 597	nul 612	viv 627	vel 
+508	vul 523	ali 538	rho 553	ege 568	pul 583	lec 598	adi 613	ele 628	ame 
+509	    524	non 539	ali 554	eu  569	Sag 584	Vel 599	tur 614	nun 629	tin 
+510	At  525	Ult 540	sus 555	ali 570	imp 585	pla 600	Sce 615	rut 630	nun 
+511	qui 526	sol 541	int 556	dol 571	in  586	nul 601	ame 616	sit 631	Vel 
+512	lac 527	ege 542	mol 557	id  572	in. 587	Ult 602	Hab 617	pha 632	    
+513	ele 528	int 543	aug 558	eni 573	vit 588	bla 603	Con 618	    
+514	ame 529	pul 544	dic 559	bla 574	mag 589	Sap 604	sen 619	Viv 
+515	pro 530	pha 545	Ut  560	mau 575	vol 590	net 605	neq 620	mol 
+516	mas 531	qua 546	ris 561	dig 576	Acc 591	nec 606	fac 621	urn 
+517	id. 532	lob 547	pre 562	acc 577	ali 592	pul 607	Et  622	sed 
+518	vit 533	fus 548	Ele 563	dic 578	ips 593	ame 608	    623	lec 
+519	adi 534	tri 549	mat 564	    579	    594	    609	Sus 624	Ege 
+                                                                      
+                                                                      
+                                                                      
+                                                                      
+                                                                      
+                                                                              
+                                                                              
+                                                                              
+                                                                              
+                                                                              
+                                                                              
+                                                                              
+                                                                       
+                                                                       
+                                                                       
+                                                                       
+                                                                       
+                                                                       
+                                                                       
+                                                                       
+                                                                       
+                                                                       
+                                                                       
+                                                                       
+                                                                       
+                                                                       
+                                                                       
+                                                                       
+                                                                       
+                                                                       
+                                                                       
+                                                                       
+                                                                       
+                                                                       
+                                                                       
+                                                                       
+                                                                       
+                                                                       
+                                                                      
+                                                                      
+                                                                      
+
+
+
+
+

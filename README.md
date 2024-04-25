@@ -46,53 +46,52 @@ https://github.com/jgarzik/posixutils
  - [ ] batch (cron cat.)
  - [ ] bc
  - [ ] c99 (Development)
- - [ ] cal
+ - [x] cal
  - [x] cat
  - [ ] cflow (Development)
- - [ ] chgrp
- - [ ] chmod
- - [ ] chown
+ - [x] chgrp
+ - [x] chmod
+ - [x] chown
  - [x] cksum
- - [ ] cmp
+ - [x] cmp
  - [x] comm
  - [ ] compress (compress cat.)
- - [ ] cp
+ - [x] cp
  - [ ] crontab (cron cat.)
  - [ ] csplit
  - [ ] ctags (Development)
  - [ ] cut
  - [ ] cxref (Development)
- - [ ] date
- - [ ] dd
+ - [x] date
+ - [x] dd
  - [ ] delta (SCCS)
  - [x] df
- - [ ] diff
+ - [x] diff
  - [x] dirname
- - [ ] du
+ - [x] du
  - [x] echo
  - [ ] ed
  - [x] env
  - [ ] ex
  - [x] expand
- - [ ] expr
+ - [x] expr
  - [x] false
- - [ ] file
+ - [x] file
  - [ ] find
- - [ ] fold
+ - [x] fold
  - [ ] fort77 (Development)
  - [ ] fuser
  - [ ] gencat (i18n)
  - [ ] get (SCCS)
  - [ ] getconf
- - [ ] getopts
  - [ ] grep
  - [x] head
  - [ ] iconv (i18n)
- - [ ] id
+ - [x] id
  - [x] ipcrm (IPC)
  - [ ] ipcs (IPC)
  - [ ] join
- - [ ] kill
+ - [x] kill
  - [ ] lex (Development)
  - [x] link
  - [x] ln
@@ -107,25 +106,25 @@ https://github.com/jgarzik/posixutils
  - [ ] make
  - [ ] man
  - [x] mesg
- - [ ] mkdir
- - [ ] mkfifo
+ - [x] mkdir
+ - [x] mkfifo
  - [ ] more
- - [ ] mv
+ - [x] mv
  - [ ] newgrp
  - [x] nice
- - [ ] nl
+ - [x] nl
  - [x] nm (Development)
  - [ ] nohup
  - [ ] od
  - [x] paste
  - [ ] patch
- - [ ] pathchk
+ - [x] pathchk
  - [ ] pax
- - [ ] pr
- - [ ] printf
+ - [x] pr
+ - [x] printf
  - [ ] prs (SCCS)
  - [ ] ps
- - [ ] pwd
+ - [x] pwd
  - [ ] qalter (Batch cat.)
  - [ ] qdel (Batch cat.)
  - [ ] qhold (Batch cat.)
@@ -151,19 +150,18 @@ https://github.com/jgarzik/posixutils
  - [ ] strings
  - [ ] strip (Development)
  - [x] stty
- - [ ] tabs
+ - [x] tabs
  - [ ] tail
  - [ ] talk
  - [x] tee
  - [ ] test
  - [ ] time
- - [ ] touch
+ - [x] touch
  - [x] tput
  - [ ] tr
  - [x] true
  - [x] tsort
  - [x] tty
- - [ ] ulimit
  - [x] uname
  - [x] uncompress (compress cat.)
  - [ ] unexpand
@@ -177,12 +175,10 @@ https://github.com/jgarzik/posixutils
  - [ ] uux (UUCP)
  - [ ] val (SCCS)
  - [ ] vi
- - [ ] wait
  - [x] wc
  - [ ] what (SCCS)
  - [ ] who
  - [ ] write
- - [ ] xargs
+ - [x] xargs
  - [ ] yacc (Development)
- - [ ] zcat (compress cat.)
-
+ - [x] zcat (compress cat.)

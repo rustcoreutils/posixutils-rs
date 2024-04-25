@@ -15,8 +15,8 @@ use base64::prelude::*;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, textdomain};
 use plib::PROJECT_NAME;
-use std::fs;
 use std::io::{self, Read, Write};
+use std::path::PathBuf;
 
 /// uuencode - encode a binary file
 #[derive(Parser, Debug)]
@@ -27,44 +27,42 @@ struct Args {
     base64: bool,
 
     /// File to read as input.
-    file: Option<String>,
+    file: Option<PathBuf>,
 
     /// Decode pathname
     decode_path: Option<String>,
 }
 
 fn encode_file(args: &Args) -> io::Result<()> {
-    let mut file: Box<dyn Read>;
-    if let Some(filename) = &args.file {
-        file = Box::new(fs::File::open(filename)?);
-    } else {
-        file = Box::new(io::stdin().lock());
-    }
+    let mut file = plib::io::input_stream_opt(&args.file)?;
 
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer)?;
 
-    let decode_path;
-    match &args.decode_path {
-        None => {
-            decode_path = String::from("/dev/stdout");
-        }
-        Some(path) => {
-            decode_path = String::from(path);
-        }
-    }
+    let decode_path = match &args.decode_path {
+        None => String::from("/dev/stdout"),
+        Some(path) => String::from(path),
+    };
 
-    let output;
-    if args.base64 {
-        output = BASE64_STANDARD.encode(&buffer[..]);
-    } else {
-        output = uuencode::uuencode(&decode_path, &buffer[..]);
-    }
+    let output = {
+        if args.base64 {
+            BASE64_STANDARD.encode(&buffer[..])
+        } else {
+            uuencode::uuencode(&decode_path, &buffer[..])
+        }
+    };
 
     io::stdout().write_all(output.as_bytes())?;
     io::stdout().write_all(b"\n")?;
 
     Ok(())
+}
+
+fn pathname_display(path: &Option<PathBuf>) -> String {
+    match path {
+        None => String::from("stdin"),
+        Some(p) => p.display().to_string(),
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -76,12 +74,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut exit_code = 0;
 
-    match encode_file(&args) {
-        Ok(()) => {}
-        Err(e) => {
-            exit_code = 1;
-            eprintln!("{:?}: {}", args.file, e);
-        }
+    if let Err(e) = encode_file(&args) {
+        exit_code = 1;
+        eprintln!("{:?}: {}", pathname_display(&args.file), e);
     }
 
     std::process::exit(exit_code)

@@ -38,12 +38,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut exit_code = 0;
 
-    match do_unlink(&args.pathname) {
-        Ok(()) => {}
-        Err(e) => {
-            exit_code = 1;
-            eprintln!("{}: {}", args.pathname, e);
-        }
+    if let Err(e) = do_unlink(&args.pathname) {
+        exit_code = 1;
+        eprintln!("{}: {}", args.pathname, e);
     }
 
     std::process::exit(exit_code)

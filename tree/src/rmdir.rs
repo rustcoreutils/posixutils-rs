@@ -58,12 +58,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut exit_code = 0;
 
     for dirname in &args.dirs {
-        match remove_dir(dirname, args.parents) {
-            Ok(()) => {}
-            Err(e) => {
-                exit_code = 1;
-                eprintln!("{}: {}", dirname, e);
-            }
+        if let Err(e) = remove_dir(dirname, args.parents) {
+            exit_code = 1;
+            eprintln!("{}: {}", dirname, e);
         }
     }
 

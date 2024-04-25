@@ -13,8 +13,9 @@ extern crate plib;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, textdomain};
 use plib::PROJECT_NAME;
-use std::fs;
+use std::ffi::OsStr;
 use std::io::{self, BufRead, Read};
+use std::path::PathBuf;
 
 /// wc - word, line, and byte or character count
 #[derive(Parser, Debug)]
@@ -37,7 +38,7 @@ struct Args {
     words: bool,
 
     /// Files to read as input.
-    files: Vec<String>,
+    files: Vec<PathBuf>,
 }
 
 struct CountInfo {
@@ -62,7 +63,7 @@ impl CountInfo {
     }
 }
 
-fn build_display_str(args: &Args, count: &CountInfo, filename: &str) -> String {
+fn build_display_str(args: &Args, count: &CountInfo, filename: &OsStr) -> String {
     let mut output = String::with_capacity(filename.len() + (3 * 10));
 
     let multi_file = args.files.len() > 1;
@@ -104,20 +105,15 @@ fn build_display_str(args: &Args, count: &CountInfo, filename: &str) -> String {
         if filename == "" {
             output.push_str("(stdin)");
         } else {
-            output.push_str(filename);
+            output.push_str(filename.to_string_lossy().as_ref());
         }
     }
 
     output
 }
 
-fn wc_file_bytes(count: &mut CountInfo, filename: &str) -> io::Result<()> {
-    let mut file: Box<dyn Read>;
-    if filename == "" {
-        file = Box::new(io::stdin().lock());
-    } else {
-        file = Box::new(fs::File::open(filename)?);
-    }
+fn wc_file_bytes(count: &mut CountInfo, pathname: &PathBuf) -> io::Result<()> {
+    let mut file = plib::io::input_stream(pathname, false)?;
 
     let mut buffer = [0; plib::BUFSZ];
     let mut in_word = false;
@@ -161,15 +157,8 @@ fn wc_file_bytes(count: &mut CountInfo, filename: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn wc_file_chars(args: &Args, count: &mut CountInfo, filename: &str) -> io::Result<()> {
-    let file: Box<dyn Read>;
-    if filename == "" {
-        file = Box::new(io::stdin().lock());
-    } else {
-        file = Box::new(fs::File::open(filename)?);
-    }
-
-    let mut reader = io::BufReader::new(file);
+fn wc_file_chars(args: &Args, count: &mut CountInfo, pathname: &PathBuf) -> io::Result<()> {
+    let mut reader = plib::io::input_reader(pathname, false)?;
 
     loop {
         let mut buffer = String::new();
@@ -205,14 +194,19 @@ fn wc_file_chars(args: &Args, count: &mut CountInfo, filename: &str) -> io::Resu
     Ok(())
 }
 
-fn wc_file(args: &Args, chars_mode: bool, filename: &str, count: &mut CountInfo) -> io::Result<()> {
+fn wc_file(
+    args: &Args,
+    chars_mode: bool,
+    pathname: &PathBuf,
+    count: &mut CountInfo,
+) -> io::Result<()> {
     if chars_mode {
-        wc_file_chars(args, count, filename)?;
+        wc_file_chars(args, count, pathname)?;
     } else {
-        wc_file_bytes(count, filename)?;
+        wc_file_bytes(count, pathname)?;
     }
 
-    let output = build_display_str(&args, count, filename);
+    let output = build_display_str(&args, count, pathname.as_os_str());
 
     println!("{}", output);
 
@@ -245,12 +239,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.files.is_empty() {
         let mut count = CountInfo::new();
 
-        match wc_file(&args, chars_mode, "", &mut count) {
-            Ok(()) => {}
-            Err(e) => {
-                exit_code = 1;
-                eprintln!("stdin: {}", e);
-            }
+        if let Err(e) = wc_file(&args, chars_mode, &PathBuf::new(), &mut count) {
+            exit_code = 1;
+            eprintln!("stdin: {}", e);
         }
 
     // input files
@@ -258,12 +249,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for filename in &args.files {
             let mut count = CountInfo::new();
 
-            match wc_file(&args, chars_mode, filename, &mut count) {
-                Ok(()) => {}
-                Err(e) => {
-                    exit_code = 1;
-                    eprintln!("{}: {}", filename, e);
-                }
+            if let Err(e) = wc_file(&args, chars_mode, filename, &mut count) {
+                exit_code = 1;
+                eprintln!("{}: {}", filename.display(), e);
             }
 
             totals.accum(&count);
@@ -271,7 +259,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if args.files.len() > 1 {
-        let output = build_display_str(&args, &totals, "total");
+        let output = build_display_str(&args, &totals, &OsStr::new("total"));
         println!("{}", output);
     }
 

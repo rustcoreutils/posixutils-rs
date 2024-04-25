@@ -8,20 +8,29 @@
 //
 
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+
+pub mod group;
+pub mod io;
+pub mod modestr;
 
 pub const PROJECT_NAME: &'static str = "posixutils-rs";
 
 pub const BUFSZ: usize = 8 * 1024;
+
+pub const TERM_VAR: &'static str = "TERM";
+pub const DEFAULT_TERM: &'static str = "vt100";
 
 pub struct TestPlan {
     pub cmd: String,
     pub args: Vec<String>,
     pub stdin_data: String,
     pub expected_out: String,
+    pub expected_err: String,
+    pub expected_exit_code: i32,
 }
 
-pub fn run_test(plan: TestPlan) {
+fn run_test_base(plan: TestPlan) -> (TestPlan, Output) {
     let relpath = format!("target/release/{}", plan.cmd);
     let test_bin_path = std::env::current_dir()
         .unwrap()
@@ -31,9 +40,10 @@ pub fn run_test(plan: TestPlan) {
 
     let mut command = Command::new(test_bin_path);
     let mut child = command
-        .args(plan.args)
+        .args(&plan.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("failed to spawn head");
 
@@ -43,8 +53,38 @@ pub fn run_test(plan: TestPlan) {
         .expect("failed to write to stdin");
 
     let output = child.wait_with_output().expect("failed to wait for child");
+    (plan, output)
+}
+
+pub fn run_test(plan: TestPlan) {
+    let (plan, output) = run_test_base(plan);
+
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(stdout, plan.expected_out);
-    assert!(output.status.success());
-    assert_eq!(output.status.code(), Some(0));
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr, plan.expected_err);
+
+    assert_eq!(output.status.code(), Some(plan.expected_exit_code));
+    if plan.expected_exit_code == 0 {
+        assert!(output.status.success());
+    }
+}
+
+pub fn run_test_with_checker<F: FnMut(&TestPlan, &Output)>(plan: TestPlan, mut checker: F) {
+    let (plan, output) = run_test_base(plan);
+    checker(&plan, &output);
+}
+
+pub fn get_terminal() -> String {
+    let term: String = match std::env::var(TERM_VAR) {
+        Ok(val) => val,
+        Err(_) => String::new(),
+    };
+
+    if term.is_empty() {
+        String::from(DEFAULT_TERM)
+    } else {
+        term
+    }
 }

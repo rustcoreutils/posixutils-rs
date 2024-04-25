@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-text"
-version = "0.1.1"
+version = "0.1.7"
 edition = "2021"
 authors = ["Jeff Garzik"]
 license = "MIT"
@@ -8,10 +8,12 @@ repository = "https://github.com/rustcoreutils/posixutils-rs.git"
 
 [dependencies]
 plib = { path = "../plib" }
-clap = { version = "4", features = ["derive"] }
-gettext-rs = { version = "0.7", features = ["gettext-system"] }
+clap.workspace = true
+gettext-rs.workspace = true
 topological-sort = "0.2"
-regex = "1"
+diff = "0.1"
+regex.workspace = true
+chrono = "0.4"
 
 [[bin]]
 name = "asa"
@@ -26,16 +28,32 @@ name = "csplit"
 path = "src/csplit.rs"
 
 [[bin]]
+name = "diff"
+path = "src/diff.rs"
+
+[[bin]]
 name = "expand"
 path = "src/expand.rs"
+
+[[bin]]
+name = "fold"
+path = "src/fold.rs"
 
 [[bin]]
 name = "head"
 path = "src/head.rs"
 
 [[bin]]
+name = "nl"
+path = "src/nl.rs"
+
+[[bin]]
 name = "paste"
 path = "src/paste.rs"
+
+[[bin]]
+name = "pr"
+path = "src/pr.rs"
 
 [[bin]]
 name = "tsort"

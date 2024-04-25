@@ -6,6 +6,14 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
+// TODO:
+// - investigate whether Rust crates such as crc32fast provide this
+//   functionality more efficiently.  It was tested, and did not work;
+//   However, it is theorized that the polynomial was correct,
+//   and the source of the error was that the final input data size
+//   was not appended to the CRC calculation.  The likely solution is
+//   a Rust crate + our finalize() function.
+//
 
 extern crate clap;
 extern crate plib;
@@ -15,24 +23,19 @@ mod crc32;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, textdomain};
 use plib::PROJECT_NAME;
-use std::fs;
 use std::io::{self, Read};
+use std::path::PathBuf;
 
 /// cksum - write file checksums and sizes
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// Files to read as input.  Use "-" or no-args for stdin.
-    files: Vec<String>,
+    files: Vec<PathBuf>,
 }
 
-fn cksum_file(filename: &str) -> io::Result<()> {
-    let mut file: Box<dyn Read>;
-    if filename == "" {
-        file = Box::new(io::stdin().lock());
-    } else {
-        file = Box::new(fs::File::open(filename)?);
-    }
+fn cksum_file(filename: &PathBuf) -> io::Result<()> {
+    let mut file = plib::io::input_stream(filename, false)?;
 
     let mut buffer = [0; plib::BUFSZ];
     let mut n_bytes: u64 = 0;
@@ -48,11 +51,19 @@ fn cksum_file(filename: &str) -> io::Result<()> {
         crc = crc32::update(crc, &buffer[0..n_read]);
     }
 
+    let filename_prefix = {
+        if filename.as_os_str() == "" {
+            ""
+        } else {
+            " "
+        }
+    };
     println!(
-        "{} {} {}",
+        "{} {}{}{}",
         crc32::finalize(crc, n_bytes as usize),
         n_bytes,
-        filename
+        filename_prefix,
+        filename.display()
     );
 
     Ok(())
@@ -67,18 +78,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // if no file args, read from stdin
     if args.files.is_empty() {
-        args.files.push(String::new());
+        args.files.push(PathBuf::new());
     }
 
     let mut exit_code = 0;
 
     for filename in &args.files {
-        match cksum_file(filename) {
-            Ok(()) => {}
-            Err(e) => {
-                exit_code = 1;
-                eprintln!("{}: {}", filename, e);
-            }
+        if let Err(e) = cksum_file(filename) {
+            exit_code = 1;
+            eprintln!("{}: {}", filename.display(), e);
         }
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-tree"
-version = "0.1.1"
+version = "0.1.7"
 edition = "2021"
 authors = ["Jeff Garzik"]
 license = "MIT"
@@ -8,10 +8,55 @@ repository = "https://github.com/rustcoreutils/posixutils-rs.git"
 
 [dependencies]
 plib = { path = "../plib" }
-clap = { version = "4", features = ["derive"] }
-gettext-rs = { version = "0.7", features = ["gettext-system"] }
+clap.workspace = true
+gettext-rs.workspace = true
 walkdir = "2.5"
-libc = "0.2"
+libc.workspace = true
+chrono = "0.4"
+atty = "0.2"
+
+[dev-dependencies]
+regex.workspace = true
+
+[[bin]]
+name = "chgrp"
+path = "src/chgrp.rs"
+
+[[bin]]
+name = "chmod"
+path = "src/chmod.rs"
+
+[[bin]]
+name = "chown"
+path = "src/chown.rs"
+
+[[bin]]
+name = "du"
+path = "src/du.rs"
+
+[[bin]]
+name = "link"
+path = "src/link.rs"
+
+[[bin]]
+name = "ln"
+path = "src/ln.rs"
+
+[[bin]]
+name = "ls"
+path = "src/ls.rs"
+
+[[bin]]
+name = "mkdir"
+path = "src/mkdir.rs"
+
+[[bin]]
+name = "mkfifo"
+path = "src/mkfifo.rs"
+
+[[bin]]
+name = "mv"
+path = "src/mv.rs"
 
 [[bin]]
 name = "rm"
@@ -20,4 +65,12 @@ path = "src/rm.rs"
 [[bin]]
 name = "rmdir"
 path = "src/rmdir.rs"
+
+[[bin]]
+name = "touch"
+path = "src/touch.rs"
+
+[[bin]]
+name = "unlink"
+path = "src/unlink.rs"
 

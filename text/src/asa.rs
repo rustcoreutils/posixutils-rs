@@ -6,6 +6,10 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
+// TODO:
+// - fix correctness
+// - add tests
+//
 
 extern crate clap;
 extern crate plib;
@@ -13,26 +17,62 @@ extern crate plib;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, textdomain};
 use plib::PROJECT_NAME;
-use std::fs;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead};
+use std::path::PathBuf;
 
 /// asa - interpret carriage-control characters
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// Files to read as input.
-    files: Vec<String>,
+    files: Vec<PathBuf>,
 }
 
-fn asa_file(filename: &str) -> io::Result<()> {
-    let file: Box<dyn Read>;
-    if filename == "" {
-        file = Box::new(io::stdin().lock());
-    } else {
-        file = Box::new(fs::File::open(filename)?);
+struct AsaState {
+    first_line: bool,
+    lines: Vec<String>,
+}
+
+impl AsaState {
+    fn new() -> AsaState {
+        AsaState {
+            first_line: true,
+            lines: Vec::new(),
+        }
     }
-    let mut reader = io::BufReader::new(file);
+
+    fn push(&mut self, line: &str) {
+        self.lines.push(line.to_string());
+        if self.first_line {
+            self.first_line = false;
+        }
+    }
+
+    fn formfeed(&mut self) {
+        if !self.first_line {
+            print!("\x0c"); // formfeed
+        }
+    }
+
+    fn flush(&mut self) {
+        let mut nl = String::new();
+        for line in &self.lines {
+            print!("{}{}", nl, line);
+
+            // do not prefix with newline on first line
+            if nl.is_empty() {
+                nl = "\n".to_string();
+            }
+        }
+
+        self.lines.clear();
+    }
+}
+
+fn asa_file(pathname: &PathBuf) -> io::Result<()> {
+    let mut reader = plib::io::input_reader(pathname, false)?;
     let mut line_no: usize = 0;
+    let mut state = AsaState::new();
 
     loop {
         line_no = line_no + 1;
@@ -51,20 +91,37 @@ fn asa_file(filename: &str) -> io::Result<()> {
         let ch = raw_line.chars().next().unwrap();
 
         // exclude first char, and trailing newline
-        let line = &raw_line[1..(raw_line.len() - 1)];
+        let mut line_len = raw_line.len() - 1;
+        if raw_line.ends_with('\n') {
+            line_len = line_len - 1;
+        }
+        let line = &raw_line[1..line_len];
 
-        let output = match ch {
-            ' ' => format!("{}", line),
-            '0' => format!("\n{}", line),
-            '1' => format!("\x12{}", line),
-            '+' => format!("\r{}", line),
+        match ch {
+            '+' => {
+                state.push(line);
+            }
+            '0' => {
+                state.flush();
+                println!();
+                state.push(line);
+            }
+            '-' => {
+                state.flush();
+                println!();
+                println!();
+                state.push(line);
+            }
+            '1' => {
+                state.flush();
+                state.formfeed();
+                state.push(line);
+            }
             _ => {
-                eprintln!("{} {}", gettext("malformed line"), line_no);
-                continue;
+                state.flush();
+                state.push(line);
             }
         };
-
-        io::stdout().write_all(output.as_bytes())?;
     }
 
     Ok(())
@@ -79,18 +136,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // if no files, read from stdin
     if args.files.is_empty() {
-        args.files.push(String::new());
+        args.files.push(PathBuf::new());
     }
 
     let mut exit_code = 0;
 
     for filename in &args.files {
-        match asa_file(filename) {
-            Ok(()) => {}
-            Err(e) => {
-                exit_code = 1;
-                eprintln!("{}: {}", filename, e);
-            }
+        if let Err(e) = asa_file(filename) {
+            exit_code = 1;
+            eprintln!("{}: {}", filename.display(), e);
         }
     }
 

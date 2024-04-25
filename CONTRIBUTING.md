@@ -7,6 +7,16 @@ There are several ways to contribute to posixutils-rs:
 * writing documentation
 * testing, especially POSIX compliance testing
 
+### Utility lifecycle:  Stages of Maturity
+
+1. Rough draft:  Core algorithm implemented.  Bugs may exist.  Many options not yet implemented.
+2. Feature complete:  Believed to be complete per POSIX specification.
+3. Test coverage:  Integration tests, positive and negative, are complete, pass 100%
+4. Code coverage:  Automated code coverage data indicates 100%
+5. Translated:  All strings are internationalized, including common OS errors for common error cases.
+6. Audited:  An external party has reviewed and tested for correctness, 
+   POSIX compliance, security, races and similar issues.
+
 ### Coding considerations
 
 1. Separate logical changes into separate commits.  For example, bug fixes
@@ -22,18 +32,24 @@ There are several ways to contribute to posixutils-rs:
 2. Ideal goal:  **Each utility should look like a standard Rust CLI program.** 
    Small, lightweight utility with command line processing,
    core algorithm, and zero external crate dependencies.
-3. When an external crate is required, avoid mega-crates.  Prefer tiny
-   crates that perform a single, lightweight function.
+3. "only std"  When an external crate is required, avoid mega-crates.  Prefer
+   std-only, or, tiny crates such as `atty` that perform a single,
+   lightweight function.
 4. Correctness, readability, performance, in that order.
-   Code should be readable by unfamiliar developers.
-   Avoid dense, uncommented code.
+   Code should be readable by unfamiliar developers.  Avoid dense,
+   uncommented code.
 
-### Testing and POSIX compliance goals
+### Testing, POSIX compliance and programmaticgoals
 
 * All utilities should have tests.
 * Only "quick" tests should be run automatically in `cargo test`
-* Goal #1: POSIX compliance
-* Goal #2: Support the most popular Linux/BSD extesnsions
+* Longer tests, or tests requiring root access, should be triggered
+  via special environment variables.
+* POSIX compliance
+* Support the most widely used GNU/BSD extensions
+* If a system has an OS-specific feature that _must_ be
+  exposed through a given utility, do so.
+* Race-free userland.  `walker` crate should be able to help.
 
 ### Testing and Bug Reporting
 

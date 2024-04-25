@@ -1,12 +1,13 @@
 [package]
 name = "plib"
-version = "0.1.1"
+version = "0.1.7"
 edition = "2021"
 authors = ["Jeff Garzik"]
 license = "MIT"
 repository = "https://github.com/rustcoreutils/posixutils-rs.git"
 
 [dependencies]
+libc.workspace = true
 
 [lib]
 doctest = false

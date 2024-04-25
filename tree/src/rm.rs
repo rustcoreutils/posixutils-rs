@@ -7,8 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
+extern crate atty;
 extern crate clap;
-extern crate libc;
 extern crate plib;
 
 use clap::Parser;
@@ -32,7 +32,7 @@ struct Args {
     interactive: bool,
 
     /// Remove file hierarchies.
-    #[arg(short, short_alias = 'r', long)]
+    #[arg(short, short_alias = 'R', long)]
     recurse: bool,
 
     /// Filepaths to remove
@@ -131,20 +131,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
-    let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) != 0 };
+    let is_tty = atty::is(atty::Stream::Stdin);
     let cfg = RmConfig { args, is_tty };
 
     let mut exit_code = 0;
 
     for filepath_str in &cfg.args.files {
         let filepath = OsStr::new(filepath_str);
-        match rm_path(&cfg, &filepath) {
-            Ok(()) => {}
-            Err(e) => {
-                exit_code = 1;
-                if !cfg.args.force {
-                    eprintln!("{}: {}", filepath.to_string_lossy(), e);
-                }
+        if let Err(e) = rm_path(&cfg, &filepath) {
+            exit_code = 1;
+            if !cfg.args.force {
+                eprintln!("{}: {}", filepath.to_string_lossy(), e);
             }
         }
     }

@@ -15,6 +15,9 @@ libc.workspace = true
 chrono = "0.4"
 atty = "0.2"
 
+[dev-dependencies]
+regex.workspace = true
+
 [[bin]]
 name = "chgrp"
 path = "src/chgrp.rs"
@@ -38,6 +41,10 @@ path = "src/link.rs"
 [[bin]]
 name = "ln"
 path = "src/ln.rs"
+
+[[bin]]
+name = "ls"
+path = "src/ls.rs"
 
 [[bin]]
 name = "mkdir"

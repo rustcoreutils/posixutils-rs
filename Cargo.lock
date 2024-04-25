@@ -616,6 +616,7 @@ dependencies = [
 name = "posixutils-dev"
 version = "0.1.7"
 dependencies = [
+ "chrono",
  "clap",
  "gettext-rs",
  "object",

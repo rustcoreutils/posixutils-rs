@@ -76,8 +76,8 @@ fn change_file_time(path: &str, time: TimeToChange) {
     };
     let dt =
         chrono::DateTime::parse_from_str(&format!("{s} +0000"), "%Y-%m-%d %H:%M:%S %z").unwrap();
-    let tv_sec = dt.timestamp();
-    let tv_usec = dt.timestamp_subsec_micros() as i64;
+    let tv_sec = dt.timestamp() as libc::time_t;
+    let tv_usec = dt.timestamp_subsec_micros() as libc::suseconds_t;
 
     unsafe {
         let filename = CString::new(path).unwrap();
@@ -91,15 +91,15 @@ fn change_file_time(path: &str, time: TimeToChange) {
                     TimeToChange::Accessed(_) => {
                         let modified_dt: chrono::DateTime<chrono::Utc> =
                             metadata.modified().unwrap().into();
-                        let tv_sec = modified_dt.timestamp();
-                        let tv_usec = modified_dt.timestamp_subsec_micros() as i64;
+                        let tv_sec = modified_dt.timestamp() as libc::time_t;
+                        let tv_usec = modified_dt.timestamp_subsec_micros() as libc::suseconds_t;
                         times[1] = libc::timeval { tv_sec, tv_usec }
                     }
                     TimeToChange::Modified(_) => {
                         let accessed_dt: chrono::DateTime<chrono::Utc> =
                             metadata.accessed().unwrap().into();
-                        let tv_sec = accessed_dt.timestamp();
-                        let tv_usec = accessed_dt.timestamp_subsec_micros() as i64;
+                        let tv_sec = accessed_dt.timestamp() as libc::time_t;
+                        let tv_usec = accessed_dt.timestamp_subsec_micros() as libc::suseconds_t;
                         times[0] = libc::timeval { tv_sec, tv_usec }
                     }
                     _ => unreachable!(),

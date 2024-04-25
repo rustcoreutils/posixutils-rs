@@ -38,7 +38,7 @@ https://github.com/jgarzik/posixutils
 ## Checklist of utilities
 
  - [ ] admin (SCCS)
- - [ ] ar (Development)
+ - [x] ar (Development)
  - [x] asa
  - [ ] at (cron cat.)
  - [ ] awk
@@ -100,7 +100,7 @@ https://github.com/jgarzik/posixutils
  - [x] logger
  - [x] logname
  - [ ] lp
- - [ ] ls
+ - [x] ls
  - [ ] m4
  - [ ] mailx
  - [ ] make

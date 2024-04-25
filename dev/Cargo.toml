@@ -11,8 +11,13 @@ plib = { path = "../plib" }
 clap.workspace = true
 gettext-rs.workspace = true
 object = "0.33"
+chrono = "0.4.38"
 
 [[bin]]
 name = "nm"
 path = "src/nm.rs"
 
+[[bin]]
+name = "ar"
+path = "src/ar.rs"
+required-features = ["object/read_core", "object/archive"]

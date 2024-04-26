@@ -221,6 +221,26 @@ fn test_csplit_c_code_by_regex() {
 }
 
 #[test]
+fn test_csplit_c_code_by_regex_negative_offset() {
+    csplit_test(
+        &[
+            "-f",
+            "code_c_neg",
+            "tests/assets/test_file_c",
+            r"%main\(%",
+            "/^}/-2",
+            "{3}",
+        ],
+        "",
+        "43\n\n30\n\n52\n\n91\n\n",
+    );
+    std::fs::remove_file("code_c_neg00").unwrap();
+    std::fs::remove_file("code_c_neg01").unwrap();
+    std::fs::remove_file("code_c_neg02").unwrap();
+    std::fs::remove_file("code_c_neg03").unwrap();
+}
+
+#[test]
 fn test_csplit_c_code_by_regex_suppress() {
     csplit_test(
         &[

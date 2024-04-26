@@ -281,9 +281,9 @@ dependencies = [
 
 [[package]]
 name = "flate2"
-version = "1.0.28"
+version = "1.0.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46303f565772937ffe1d394a4fac6f411c6013172fadde9dcdb1e147a086940e"
+checksum = "4556222738635b7a3417ae6130d8f52201e45a0c4d1a907f0826383adb5f85e7"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
@@ -614,7 +614,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-dev"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "chrono",
  "clap",
@@ -634,7 +634,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-file"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "atty",
  "clap",
@@ -718,7 +718,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-tree"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "atty",
  "chrono",
@@ -1143,11 +1143,11 @@ checksum = "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6"
 
 [[package]]
 name = "winapi-util"
-version = "0.1.6"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f29e6f9198ba0d26b4c9f07dbe6f9ed633e1f3d5b8b414090084349e46a52596"
+checksum = "4d4cc384e1e73b93bafa6fb4f1df8c41695c8a91cf9c4c64358067d15a7b6c6b"
 dependencies = [
- "winapi",
+ "windows-sys",
 ]
 
 [[package]]

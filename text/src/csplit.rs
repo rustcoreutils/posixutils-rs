@@ -215,6 +215,9 @@ fn csplit_file(args: &Args, ctx: SplitOps, new_files: &mut Vec<String>) -> io::R
         match split_options.first().unwrap() {
             Operand::LineNum(num) => {
                 if *num == state.in_line_no {
+                    if lines.ends_with('\n') {
+                        lines.pop();
+                    }
                     process_lines(&mut lines, &mut state, new_files, args.suppress)?;
                     state.in_line_no = 0;
                     lines = String::new();
@@ -231,6 +234,9 @@ fn csplit_file(args: &Args, ctx: SplitOps, new_files: &mut Vec<String>) -> io::R
                 }
             }
             Operand::Rx(regex, offset, skip) => {
+                if line == "\n" {
+                    line = String::new();
+                }
                 if regex.is_match(&line) {
                     match offset.cmp(&0) {
                         std::cmp::Ordering::Less => {
@@ -240,24 +246,40 @@ fn csplit_file(args: &Args, ctx: SplitOps, new_files: &mut Vec<String>) -> io::R
                             let length = lines_vec.len();
                             if length >= offset.unsigned_abs() {
                                 let removed_lines =
-                                    lines_vec.split_off(length - offset.unsigned_abs());
+                                    lines_vec.split_off(length - offset.unsigned_abs() - 1);
                                 removed_lines_string = removed_lines.join("\n");
                             }
 
                             lines = lines_vec.join("\n");
-
-                            if *skip {
-                                lines.clear();
-                            } else {
-                                process_lines(&mut lines, &mut state, new_files, args.suppress)?;
+                            if !lines.is_empty() {
+                                if *skip {
+                                    lines.clear();
+                                } else {
+                                    if lines.ends_with('\n') {
+                                        lines.pop();
+                                    }
+                                    process_lines(
+                                        &mut lines,
+                                        &mut state,
+                                        new_files,
+                                        args.suppress,
+                                    )?;
+                                }
                             }
+
                             lines = removed_lines_string;
                         }
                         std::cmp::Ordering::Equal => {
                             if *skip {
                                 lines.clear();
+                                if line.is_empty() {
+                                    line = "\n".to_string();
+                                }
                                 lines.push_str(&line);
                             } else {
+                                if lines.ends_with('\n') {
+                                    lines.pop();
+                                }
                                 process_lines(&mut lines, &mut state, new_files, args.suppress)?;
                                 lines = String::new();
                             }
@@ -275,6 +297,9 @@ fn csplit_file(args: &Args, ctx: SplitOps, new_files: &mut Vec<String>) -> io::R
                             if *skip {
                                 lines.clear();
                             } else {
+                                if lines.ends_with('\n') {
+                                    lines.pop();
+                                }
                                 process_lines(&mut lines, &mut state, new_files, args.suppress)?;
                                 lines = String::new();
                             }
@@ -442,13 +467,16 @@ fn parse_op_rx(opstr: &str, delim: char) -> io::Result<Operand> {
 ///
 fn parse_op_repeat(opstr: &str) -> io::Result<Operand> {
     // a regex fully describes what must be parsed
-    let re = Regex::new(r"^\{(\d+)}$").unwrap();
+    let re = Regex::new(r"^\{(\d*|[*])}$").unwrap();
 
     // grab and parse capture #1, if matched
     match re.captures(opstr) {
         None => {}
         Some(caps) => {
             let numstr = caps.get(1).unwrap().as_str();
+            if numstr == "*" {
+                return Ok(Operand::Repeat(usize::MAX));
+            }
             match numstr.parse::<usize>() {
                 Ok(n) => return Ok(Operand::Repeat(n)),
                 Err(_e) => {}

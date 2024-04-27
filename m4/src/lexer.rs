@@ -28,11 +28,14 @@ use nom::IResult;
 #[cfg_attr(test, derive(Debug, PartialEq))]
 struct Macro<'a> {
     name: MacroName<'a>,
-    args: Vec<Macro<'a>>,
+    args: Vec<Vec<Symbol<'a>>>,
 }
 
 #[cfg_attr(test, derive(Debug, PartialEq))]
 enum Symbol<'a> {
+    // Comments in m4 are not discarded, their contents (including delimeters) are copied verbatim to output without
+    // further processing.
+    Comment(&'a [u8]),
     Text(&'a [u8]),
     Quoted(Quoted<'a>),
     Macro(Macro<'a>),
@@ -40,9 +43,7 @@ enum Symbol<'a> {
 
 #[cfg_attr(test, derive(Debug, PartialEq))]
 struct Quoted<'a> {
-    pub open_quote_symbol: &'a [u8],
-    pub quoted: Vec<Symbol<'a>>,
-    pub close_quote_symbol: &'a [u8],
+    pub quoted: &'a [u8],
 }
 
 #[cfg_attr(test, derive(Debug, PartialEq))]
@@ -62,6 +63,13 @@ fn is_word_char_start(c: u8) -> bool {
 /// `[_a-zA-Z][_a-zA-Z0-9]*`
 fn parse_macro_name(input: &[u8]) -> IResult<&[u8], MacroName<'_>> {
     println!("parsing macro name {:?}", String::from_utf8_lossy(input));
+    if input.is_empty() {
+        println!("empty macro name");
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::NonEmpty,
+        )));
+    }
     let (remaining, start) = nom::bytes::complete::take_while1(is_word_char_start)(input)?;
     let (remaining, rest) =
         nom::bytes::complete::take_while_m_n(0, remaining.len(), is_word_char_end)(remaining)?;
@@ -69,28 +77,28 @@ fn parse_macro_name(input: &[u8]) -> IResult<&[u8], MacroName<'_>> {
     Ok((remaining, MacroName(&input[..(start.len() + rest.len())])))
 }
 
+//TODO: should not parse multiline arguments?
 fn parse_macro(input: &[u8]) -> IResult<&[u8], Macro<'_>> {
-    println!("parsing macro {:?}", String::from_utf8_lossy(input));
+    println!("parse_macro {:?}", String::from_utf8_lossy(input));
     let (remaining, name) = parse_macro_name(input)?;
-    println!(
-        "parsing macro args {:?}",
-        String::from_utf8_lossy(remaining)
-    );
+    println!("macro_args {:?}", String::from_utf8_lossy(remaining));
     let (remaining, args) = nom::combinator::opt(nom::sequence::delimited(
         nom::bytes::complete::tag("("),
         nom::multi::separated_list0(
             nom::bytes::complete::tag(","),
             // TODO: check, we should be allowed to have empty arguments?
-            // TODO: replace with parse_symbol
             nom::combinator::map_parser(
                 nom::bytes::complete::is_not(")"),
-                nom::combinator::cut(parse_macro),
+                nom::combinator::cut(parse_symbols),
             ),
         ),
         // Make sure we fail for input that is missing the closing tag, this is what GNU m4 does
         // anyway.
         nom::combinator::cut(nom::bytes::complete::tag(")")),
     ))(remaining)?;
+
+    #[cfg(test)]
+    dbg!(&args);
 
     Ok((
         remaining,
@@ -101,23 +109,45 @@ fn parse_macro(input: &[u8]) -> IResult<&[u8], Macro<'_>> {
     ))
 }
 
-fn parse_quoted(input: &[u8]) -> IResult<&[u8], Quoted<'_>> {
-    let (remaining, quoted) = nom::sequence::delimited(
-        nom::bytes::complete::tag("`"),
-        // TODO: replace with parse symbol and some combinator with take_until consuming the output
-        // of that.
-        nom::combinator::map_parser(nom::bytes::complete::take_until("'"), parse_symbols),
-        nom::bytes::complete::tag("'"),
-    )(input)?;
+const OPEN_TAG: &[u8] = b"`";
+const CLOSE_TAG: &[u8] = b"'";
 
-    Ok((
-        remaining,
-        Quoted {
-            open_quote_symbol: b"`",
-            quoted,
-            close_quote_symbol: b"'",
-        },
-    ))
+fn parse_quoted(input: &[u8]) -> IResult<&[u8], Quoted<'_>> {
+    let mut nest_level = 0;
+
+    let (mut remaining, _) = nom::bytes::complete::tag(OPEN_TAG)(input)?;
+    nest_level += 1;
+
+    let quote_start_index = input.len() - remaining.len();
+
+    let quote_end_index = loop {
+        if remaining.is_empty() {
+            return Err(nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::TagClosure,
+            )));
+        }
+
+        if remaining.starts_with(CLOSE_TAG) {
+            if nest_level == 1 {
+                break input.len() - remaining.len();
+            }
+            remaining = &remaining[CLOSE_TAG.len()..];
+            nest_level -= 1;
+            continue;
+        }
+        if remaining.starts_with(OPEN_TAG) {
+            remaining = &remaining[OPEN_TAG.len()..];
+            nest_level += 1;
+            continue;
+        }
+
+        remaining = &remaining[1..];
+    };
+
+    let quoted = &input[quote_start_index..quote_end_index];
+
+    Ok((remaining, Quoted { quoted }))
 }
 
 //TODO: these don't handle multibyte characters!
@@ -147,20 +177,53 @@ fn is_close_quote(c: u8) -> bool {
 /// encountered, or when we encounter the first alpha character after a non-alphanumeric character.
 /// TODO: what happens if we encounter a close quote?
 fn parse_text(input: &[u8]) -> IResult<&[u8], &[u8]> {
-    let (remaining, text) =
-        nom::bytes::complete::take_till(|c| !is_alphnumeric(c) || is_open_quote(c))(input)?;
-    if remaining.is_empty() {
-        return Ok((remaining, text));
+    if input.is_empty() {
+        return Ok((input, input));
     }
 
-    todo!()
+    let (remaining, text) = if is_whitespace(*input.first().unwrap()) {
+        nom::bytes::complete::take_till(|c| is_alphnumeric(c) || is_open_quote(c))(input)?
+    } else {
+        nom::bytes::complete::take_till(|c| !is_alphnumeric(c) || is_open_quote(c))(input)?
+    };
+    Ok((remaining, text))
 }
 
 fn parse_symbols(input: &[u8]) -> IResult<&[u8], Vec<Symbol<'_>>> {
-    nom::multi::many0(parse_symbol)(input)
+    println!("parse_symbols: {:?}", String::from_utf8_lossy(input));
+    if input.is_empty() {
+        return Ok((input, Vec::new()));
+    }
+    let result = nom::multi::many0(parse_symbol)(input);
+    #[cfg(test)]
+    dbg!(&result);
+    result
+}
+
+fn parse_comment(input: &[u8]) -> IResult<&[u8], &[u8]> {
+    let mut total_len = 0;
+    let (remaining, open_tag) = nom::bytes::complete::tag("#")(input)?;
+    total_len += open_tag.len();
+    let (remaining, contents) = nom::bytes::complete::take_till(|c| c == b'\n')(remaining)?;
+    total_len += contents.len();
+    let remaining = if !remaining.is_empty() {
+        let (remaining, close_tag) = nom::bytes::complete::tag("\n")(remaining)?;
+        total_len += close_tag.len();
+        remaining
+    } else {
+        remaining
+    };
+    Ok((remaining, &input[..total_len]))
 }
 
 fn parse_symbol(input: &[u8]) -> IResult<&[u8], Symbol<'_>> {
+    println!("parse_symbol: {:?}", String::from_utf8_lossy(input));
+    if input.is_empty() {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::NonEmpty,
+        )));
+    }
     nom::branch::alt((
         nom::combinator::map(parse_quoted, Symbol::Quoted),
         nom::combinator::map(parse_macro, Symbol::Macro),
@@ -173,7 +236,7 @@ fn parse_symbol(input: &[u8]) -> IResult<&[u8], Symbol<'_>> {
 mod test {
     use crate::lexer::Symbol;
 
-    use super::{parse_macro, parse_macro_name, parse_quoted, Macro, MacroName};
+    use super::{parse_comment, parse_macro, parse_macro_name, parse_quoted, MacroName};
     // TODO: add tests based on input in
     // https://pubs.opengroup.org/onlinepubs/9699919799/utilities/m4.html#tag_20_74_17
     const M4SRC: &str = r#"The value of `VER' is "VER".
@@ -207,11 +270,37 @@ mod test {
     }
 
     #[test]
-    fn test_parse_macro_args() {
+    fn test_parse_macro_args_1() {
         let m = parse_macro(b"some_word_23(hello)").unwrap().1;
         assert_eq!(m.name, MacroName(b"some_word_23"));
         assert_eq!(m.args.len(), 1);
-        assert_eq!(m.args.get(0).unwrap().name, MacroName(b"hello"));
+        let m1 = match m.args.get(0).unwrap().get(0).unwrap() {
+            Symbol::Macro(m1) => m1,
+            _ => panic!(),
+        };
+        assert_eq!(m1.name, MacroName(b"hello"));
+    }
+
+    #[test]
+    fn test_parse_macro_args_2() {
+        let m = parse_macro(b"some_word_23(hello world)").unwrap().1;
+        assert_eq!(m.name, MacroName(b"some_word_23"));
+        assert_eq!(m.args.len(), 1);
+        let m1 = match m.args.get(0).unwrap().get(0).unwrap() {
+            Symbol::Macro(m) => m,
+            _ => panic!(),
+        };
+        assert_eq!(m1.name, MacroName(b"hello"));
+        let t = match m.args.get(0).unwrap().get(1).unwrap() {
+            Symbol::Text(t) => t,
+            _ => panic!(),
+        };
+        assert_eq!(t, b" ");
+        let m3 = match m.args.get(0).unwrap().get(2).unwrap() {
+            Symbol::Macro(m) => m,
+            _ => panic!(),
+        };
+        assert_eq!(m3.name, MacroName(b"world"));
     }
 
     #[test]
@@ -229,14 +318,24 @@ mod test {
     #[test]
     fn test_parse_quoted() {
         let quote = parse_quoted(b"`hello'").unwrap().1;
-        assert_eq!(b"`", quote.open_quote_symbol);
-        assert_eq!(b"'", quote.close_quote_symbol);
-        assert_eq!(
-            vec![Symbol::Macro(Macro {
-                name: MacroName(b"hello"),
-                args: Vec::new(),
-            })],
-            quote.quoted
-        );
+        assert_eq!("hello".as_bytes(), quote.quoted);
+    }
+
+    #[test]
+    fn test_parse_quoted_nested() {
+        let quote = parse_quoted(b"`a `quote' is good!'").unwrap().1;
+        assert_eq!("a `quote' is good!".as_bytes(), quote.quoted);
+    }
+
+    #[test]
+    fn test_parse_comment_standard() {
+        let comment = parse_comment(b"# hello world\ngoodbye").unwrap().1;
+        assert_eq!(b"# hello world\n", comment);
+    }
+
+    #[test]
+    fn test_parse_comment_standard_no_newline() {
+        let comment = parse_comment(b"# hello world").unwrap().1;
+        assert_eq!(b"# hello world", comment);
     }
 }

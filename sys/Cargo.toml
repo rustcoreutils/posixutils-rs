@@ -12,6 +12,7 @@ clap.workspace = true
 gettext-rs.workspace = true
 uname = "0.1"
 libc.workspace = true
+chrono = "0.4"
 
 [[bin]]
 name = "ipcrm"
@@ -20,4 +21,8 @@ path = "src/ipcrm.rs"
 [[bin]]
 name = "uname"
 path = "src/uname.rs"
+
+[[bin]]
+name = "who"
+path = "src/who.rs"
 

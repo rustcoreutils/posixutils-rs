@@ -177,7 +177,7 @@ https://github.com/jgarzik/posixutils
  - [ ] vi
  - [x] wc
  - [ ] what (SCCS)
- - [ ] who
+ - [x] who
  - [ ] write
  - [x] xargs
  - [ ] yacc (Development)

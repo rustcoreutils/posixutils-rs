@@ -117,20 +117,19 @@ fn print_entry(args: &Args, entry: &plib::utmpx::Utmpx) {
         selected = true;
     }
 
-    let line = {
-        if entry.typ == libc::BOOT_TIME {
-            "system boot"
-        } else {
-            entry.line.as_str()
-        }
+    if !selected {
+        return;
+    }
+
+    let line = match entry.typ {
+        libc::BOOT_TIME => "system boot",
+        _ => entry.line.as_str(),
     };
 
-    if selected {
-        if args.short_format {
-            print_fmt_short(entry, line);
-        } else {
-            print_fmt_term(entry, line);
-        }
+    if args.short_format {
+        print_fmt_short(entry, line);
+    } else {
+        print_fmt_term(entry, line);
     }
 }
 

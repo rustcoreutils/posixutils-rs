@@ -207,20 +207,21 @@ fn csplit_file(args: &Args, ctx: SplitOps, new_files: &mut Vec<String>) -> io::R
             process_lines(&mut lines, &mut state, new_files, args.suppress)?;
             break;
         }
-        lines.push_str(&line);
 
         if split_options.is_empty() {
+            lines.push_str(&line);
             continue;
         }
         match split_options.first().unwrap() {
             Operand::LineNum(num) => {
                 if *num == state.in_line_no {
-                    if lines.ends_with('\n') {
+                    if lines.ends_with('\n') && lines != "\n" {
                         lines.pop();
                     }
                     process_lines(&mut lines, &mut state, new_files, args.suppress)?;
-                    state.in_line_no = 0;
+                    state.in_line_no = 1;
                     lines = String::new();
+                    lines.push_str(&line);
 
                     if split_options.len() > 1 {
                         if let Operand::Repeat(repeat) = &mut split_options[1] {
@@ -231,6 +232,8 @@ fn csplit_file(args: &Args, ctx: SplitOps, new_files: &mut Vec<String>) -> io::R
                             }
                         }
                     }
+                } else {
+                    lines.push_str(&line);
                 }
             }
             Operand::Rx(regex, offset, skip) => {
@@ -246,8 +249,10 @@ fn csplit_file(args: &Args, ctx: SplitOps, new_files: &mut Vec<String>) -> io::R
                             let length = lines_vec.len();
                             if length >= offset.unsigned_abs() {
                                 let removed_lines =
-                                    lines_vec.split_off(length - offset.unsigned_abs() - 1);
+                                    lines_vec.split_off(length - offset.unsigned_abs());
                                 removed_lines_string = removed_lines.join("\n");
+
+                                removed_lines_string.push('\n');
                             }
 
                             lines = lines_vec.join("\n");
@@ -268,6 +273,12 @@ fn csplit_file(args: &Args, ctx: SplitOps, new_files: &mut Vec<String>) -> io::R
                             }
 
                             lines = removed_lines_string;
+
+                            if line.is_empty() {
+                                lines.push('\n');
+                            } else {
+                                lines.push_str(&line);
+                            }
                         }
                         std::cmp::Ordering::Equal => {
                             if *skip {
@@ -281,14 +292,30 @@ fn csplit_file(args: &Args, ctx: SplitOps, new_files: &mut Vec<String>) -> io::R
                                     lines.pop();
                                 }
                                 process_lines(&mut lines, &mut state, new_files, args.suppress)?;
-                                lines = String::new();
+
+                                if line.is_empty() {
+                                    lines = "\n".to_string();
+                                } else {
+                                    lines = line;
+                                }
                             }
                         }
                         std::cmp::Ordering::Greater => {
-                            for _ in 0..*offset {
+                            if line.is_empty() {
+                                lines.push('\n');
+                            } else {
+                                lines.push_str(&line);
+                            }
+                            for _ in 0..*offset - 1 {
                                 let mut new_line = String::new();
                                 let n_read = reader.read_line(&mut new_line)?;
                                 if n_read == 0 {
+                                    process_lines(
+                                        &mut lines,
+                                        &mut state,
+                                        new_files,
+                                        args.suppress,
+                                    )?;
                                     break;
                                 }
                                 lines.push_str(&new_line);
@@ -319,6 +346,11 @@ fn csplit_file(args: &Args, ctx: SplitOps, new_files: &mut Vec<String>) -> io::R
                             split_options.remove(0);
                         }
                     }
+                } else {
+                    if line.is_empty() {
+                        line = "\n".to_string();
+                    }
+                    lines.push_str(&line);
                 }
             }
             _ => {}
@@ -814,7 +846,7 @@ mod tests {
     fn test_split_text_file() {
         // Test valid operands
         let args = Args {
-            prefix: String::from("xx"),
+            prefix: String::from("txt"),
             keep: false,
             num: 2,
             suppress: false,
@@ -836,36 +868,35 @@ mod tests {
             }
         }
 
-        let mut file = File::open("xx00").unwrap();
+        let mut file = File::open("txt00").unwrap();
 
         let mut contents = String::new();
         file.read_to_string(&mut contents).unwrap();
 
-        let expected =
-            String::from("1sdfghnm\n2sadsgdhjmf\n3zcxbncvm vbm\n4asdbncv\n5adsbfdgfnfm\n");
+        let expected = String::from("1sdfghnm\n2sadsgdhjmf\n3zcxbncvm vbm\n4asdbncv");
 
         assert_eq!(contents, expected);
 
-        let mut file = File::open("xx03").unwrap();
+        let mut file = File::open("txt03").unwrap();
 
         let mut contents = String::new();
         file.read_to_string(&mut contents).unwrap();
 
-        let expected = String::from("16\n17");
+        let expected = String::from("13\n14\n15\n16\n17");
 
         assert_eq!(contents, expected);
 
-        fs::remove_file("xx00").unwrap();
-        fs::remove_file("xx01").unwrap();
-        fs::remove_file("xx02").unwrap();
-        fs::remove_file("xx03").unwrap();
+        fs::remove_file("txt00").unwrap();
+        fs::remove_file("txt01").unwrap();
+        fs::remove_file("txt02").unwrap();
+        fs::remove_file("txt03").unwrap();
     }
 
     #[test]
-    fn test_split_c_file_2() {
+    fn test_split_c_file_1() {
         // Test valid operands
         let args = Args {
-            prefix: String::from("xx"),
+            prefix: String::from("c_file"),
             keep: false,
             num: 2,
             suppress: false,
@@ -892,28 +923,255 @@ mod tests {
             }
         }
 
-        let mut file = File::open("xx00").unwrap();
+        let mut file = File::open("c_file00").unwrap();
 
         let mut contents = String::new();
         file.read_to_string(&mut contents).unwrap();
 
         let expected =
-            String::from("int main() {\n    printf(\"Hello, world!\\n\");\n    return 0;\n}\n\n");
+            String::from("int main() {\n    printf(\"Hello, world!\\n\");\n    return 0;\n}");
 
         assert_eq!(contents, expected);
 
-        let mut file = File::open("xx03").unwrap();
+        let mut file = File::open("c_file03").unwrap();
 
         let mut contents = String::new();
         file.read_to_string(&mut contents).unwrap();
 
-        let expected = String::from("void func3() {\n    printf(\"This is function 3\\n\");\n}\n");
+        let expected =
+            String::from("\nvoid func3() {\n    printf(\"This is function 3\\n\");\n}\n");
 
         assert_eq!(contents, expected);
 
-        fs::remove_file("xx00").unwrap();
-        fs::remove_file("xx01").unwrap();
-        fs::remove_file("xx02").unwrap();
-        fs::remove_file("xx03").unwrap();
+        fs::remove_file("c_file00").unwrap();
+        fs::remove_file("c_file01").unwrap();
+        fs::remove_file("c_file02").unwrap();
+        fs::remove_file("c_file03").unwrap();
+    }
+
+    #[test]
+    fn test_split_c_file_2() {
+        // Test valid operands
+        let args = Args {
+            prefix: String::from("c_file_2_"),
+            keep: false,
+            num: 2,
+            suppress: false,
+            filename: String::from("tests/assets/test_file_c"),
+            operands: vec![
+                String::from(r"%main\(%+1"),
+                String::from("/^}/+1"),
+                String::from("{3}"),
+            ],
+        };
+
+        let ctx = parse_operands(&args).unwrap();
+
+        let mut new_files = vec![];
+        match csplit_file(&args, ctx, &mut new_files) {
+            Ok(_) => {}
+            Err(e) => {
+                if !args.keep {
+                    for file_name in new_files.iter() {
+                        fs::remove_file(file_name).unwrap();
+                    }
+                }
+                panic!("{e}");
+            }
+        }
+
+        let mut file = File::open("c_file_2_00").unwrap();
+
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).unwrap();
+
+        let expected = String::from("    printf(\"Hello, world!\\n\");\n    return 0;\n}");
+
+        assert_eq!(contents, expected);
+
+        let mut file = File::open("c_file_2_03").unwrap();
+
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).unwrap();
+
+        let expected =
+            String::from("\nvoid func3() {\n    printf(\"This is function 3\\n\");\n}\n");
+
+        assert_eq!(contents, expected);
+
+        fs::remove_file("c_file_2_00").unwrap();
+        fs::remove_file("c_file_2_01").unwrap();
+        fs::remove_file("c_file_2_02").unwrap();
+        fs::remove_file("c_file_2_03").unwrap();
+    }
+
+    #[test]
+    fn test_split_c_file_3() {
+        // Test valid operands
+        let args = Args {
+            prefix: String::from("c_file_3_"),
+            keep: false,
+            num: 2,
+            suppress: false,
+            filename: String::from("tests/assets/test_file_c"),
+            operands: vec![
+                String::from(r"%main\(%-1"),
+                String::from("/^}/+1"),
+                String::from("{3}"),
+            ],
+        };
+
+        let ctx = parse_operands(&args).unwrap();
+
+        let mut new_files = vec![];
+        match csplit_file(&args, ctx, &mut new_files) {
+            Ok(_) => {}
+            Err(e) => {
+                if !args.keep {
+                    for file_name in new_files.iter() {
+                        fs::remove_file(file_name).unwrap();
+                    }
+                }
+                panic!("{e}");
+            }
+        }
+
+        let mut file = File::open("c_file_3_00").unwrap();
+
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).unwrap();
+
+        let expected =
+            String::from("\nint main() {\n    printf(\"Hello, world!\\n\");\n    return 0;\n}");
+
+        assert_eq!(contents, expected);
+
+        let mut file = File::open("c_file_3_03").unwrap();
+
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).unwrap();
+
+        let expected =
+            String::from("\nvoid func3() {\n    printf(\"This is function 3\\n\");\n}\n");
+
+        assert_eq!(contents, expected);
+
+        fs::remove_file("c_file_3_00").unwrap();
+        fs::remove_file("c_file_3_01").unwrap();
+        fs::remove_file("c_file_3_02").unwrap();
+        fs::remove_file("c_file_3_03").unwrap();
+    }
+
+    #[test]
+    fn test_split_c_file_4() {
+        // Test valid operands
+        let args = Args {
+            prefix: String::from("c_file_4_"),
+            keep: false,
+            num: 2,
+            suppress: false,
+            filename: String::from("tests/assets/test_file_c"),
+            operands: vec![
+                String::from(r"%main\(%"),
+                String::from("/^}/"),
+                String::from("{3}"),
+            ],
+        };
+
+        let ctx = parse_operands(&args).unwrap();
+
+        let mut new_files = vec![];
+        match csplit_file(&args, ctx, &mut new_files) {
+            Ok(_) => {}
+            Err(e) => {
+                if !args.keep {
+                    for file_name in new_files.iter() {
+                        fs::remove_file(file_name).unwrap();
+                    }
+                }
+                panic!("{e}");
+            }
+        }
+
+        let mut file = File::open("c_file_4_00").unwrap();
+
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).unwrap();
+
+        let expected =
+            String::from("int main() {\n    printf(\"Hello, world!\\n\");\n    return 0;");
+
+        assert_eq!(contents, expected);
+
+        let mut file = File::open("c_file_4_03").unwrap();
+
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).unwrap();
+
+        let expected =
+            String::from("}\n\nvoid func3() {\n    printf(\"This is function 3\\n\");\n}\n");
+
+        assert_eq!(contents, expected);
+
+        fs::remove_file("c_file_4_00").unwrap();
+        fs::remove_file("c_file_4_01").unwrap();
+        fs::remove_file("c_file_4_02").unwrap();
+        fs::remove_file("c_file_4_03").unwrap();
+    }
+
+    #[test]
+    fn test_split_c_file_5() {
+        // Test valid operands
+        let args = Args {
+            prefix: String::from("c_file_5_"),
+            keep: false,
+            num: 2,
+            suppress: false,
+            filename: String::from("tests/assets/test_file_c"),
+            operands: vec![
+                String::from(r"%main\(%"),
+                String::from("/^}/-1"),
+                String::from("{3}"),
+            ],
+        };
+
+        let ctx = parse_operands(&args).unwrap();
+
+        let mut new_files = vec![];
+        match csplit_file(&args, ctx, &mut new_files) {
+            Ok(_) => {}
+            Err(e) => {
+                if !args.keep {
+                    for file_name in new_files.iter() {
+                        fs::remove_file(file_name).unwrap();
+                    }
+                }
+                panic!("{e}");
+            }
+        }
+
+        let mut file = File::open("c_file_5_00").unwrap();
+
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).unwrap();
+
+        let expected = String::from("int main() {\n    printf(\"Hello, world!\\n\");");
+
+        assert_eq!(contents, expected);
+
+        let mut file = File::open("c_file_5_03").unwrap();
+
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).unwrap();
+
+        let expected =
+            String::from("    printf(\"This is function 2\\n\");\n}\n\nvoid func3() {\n    printf(\"This is function 3\\n\");\n}\n");
+
+        assert_eq!(contents, expected);
+
+        fs::remove_file("c_file_5_00").unwrap();
+        fs::remove_file("c_file_5_01").unwrap();
+        fs::remove_file("c_file_5_02").unwrap();
+        fs::remove_file("c_file_5_03").unwrap();
     }
 }

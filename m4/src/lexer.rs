@@ -48,7 +48,8 @@ struct Quoted<'a> {
 
 /// Macro names shall consist of letters, digits, and underscores, where the first character is not a digit. Tokens not of this form shall not be treated as macros.
 /// `[_a-zA-Z][_a-zA-Z0-9]*`
-#[cfg_attr(test, derive(Debug, PartialEq))]
+#[cfg_attr(test, derive(Debug))]
+#[derive(PartialEq)]
 struct MacroName<'a>(&'a [u8]);
 
 impl<'a> MacroName<'a> {
@@ -84,6 +85,7 @@ fn is_word_char_start(c: u8) -> bool {
 }
 
 fn parse_macro<'a, 'b: 'a>(
+    // TODO: perhaps faster with a hashset?
     current_macro_names: &'b [MacroName<'a>],
 ) -> impl Fn(&'a [u8]) -> IResult<&'a [u8], Macro<'a>> {
     move |input: &'a [u8]| {
@@ -91,6 +93,7 @@ fn parse_macro<'a, 'b: 'a>(
         dbg!(current_macro_names);
         println!("parse_macro {:?}", String::from_utf8_lossy(input));
         let (remaining, name) = MacroName::parse(input)?;
+        if current_macro_names.contains(&name) {}
         println!("macro_args {:?}", String::from_utf8_lossy(remaining));
         let (remaining, args) = nom::combinator::opt(nom::sequence::delimited(
             nom::bytes::complete::tag("("),
@@ -117,45 +120,47 @@ fn parse_macro<'a, 'b: 'a>(
     }
 }
 
-const OPEN_TAG: &[u8] = b"`";
-const CLOSE_TAG: &[u8] = b"'";
+const DEFAULT_QUOTE_OPEN_TAG: &[u8] = b"`";
+const DEFAULT_QUOTE_CLOSE_TAG: &[u8] = b"'";
 
-fn parse_quoted(input: &[u8]) -> IResult<&[u8], Quoted<'_>> {
-    let mut nest_level = 0;
+fn parse_quoted(open_tag: &[u8], close_tag: &[u8]) -> impl Fn(&[u8]) -> IResult<&[u8], Quoted<'_>> {
+    |input: &[u8]| {
+        let mut nest_level = 0;
 
-    let (mut remaining, _) = nom::bytes::complete::tag(OPEN_TAG)(input)?;
-    nest_level += 1;
+        let (mut remaining, _) = nom::bytes::complete::tag(DEFAULT_QUOTE_OPEN_TAG)(input)?;
+        nest_level += 1;
 
-    let quote_start_index = input.len() - remaining.len();
+        let quote_start_index = input.len() - remaining.len();
 
-    let quote_end_index = loop {
-        if remaining.is_empty() {
-            return Err(nom::Err::Error(nom::error::Error::new(
-                input,
-                nom::error::ErrorKind::TagClosure,
-            )));
-        }
-
-        if remaining.starts_with(CLOSE_TAG) {
-            if nest_level == 1 {
-                break input.len() - remaining.len();
+        let quote_end_index = loop {
+            if remaining.is_empty() {
+                return Err(nom::Err::Error(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::TagClosure,
+                )));
             }
-            remaining = &remaining[CLOSE_TAG.len()..];
-            nest_level -= 1;
-            continue;
-        }
-        if remaining.starts_with(OPEN_TAG) {
-            remaining = &remaining[OPEN_TAG.len()..];
-            nest_level += 1;
-            continue;
-        }
 
-        remaining = &remaining[1..];
-    };
+            if remaining.starts_with(DEFAULT_QUOTE_CLOSE_TAG) {
+                if nest_level == 1 {
+                    break input.len() - remaining.len();
+                }
+                remaining = &remaining[DEFAULT_QUOTE_CLOSE_TAG.len()..];
+                nest_level -= 1;
+                continue;
+            }
+            if remaining.starts_with(DEFAULT_QUOTE_OPEN_TAG) {
+                remaining = &remaining[DEFAULT_QUOTE_OPEN_TAG.len()..];
+                nest_level += 1;
+                continue;
+            }
 
-    let quoted = &input[quote_start_index..quote_end_index];
+            remaining = &remaining[1..];
+        };
 
-    Ok((remaining, Quoted { quoted }))
+        let quoted = &input[quote_start_index..quote_end_index];
+
+        Ok((remaining, Quoted { quoted }))
+    }
 }
 
 //TODO: these don't handle multibyte characters!
@@ -197,17 +202,6 @@ fn parse_text(input: &[u8]) -> IResult<&[u8], &[u8]> {
     Ok((remaining, text))
 }
 
-fn parse_symbols(input: &[u8]) -> IResult<&[u8], Vec<Symbol<'_>>> {
-    println!("parse_symbols: {:?}", String::from_utf8_lossy(input));
-    if input.is_empty() {
-        return Ok((input, Vec::new()));
-    }
-    let result = nom::multi::many0(parse_symbol(&[]))(input);
-    #[cfg(test)]
-    dbg!(&result);
-    result
-}
-
 fn parse_comment(input: &[u8]) -> IResult<&[u8], &[u8]> {
     let mut total_len = 0;
     let (remaining, open_tag) = nom::bytes::complete::tag("#")(input)?;
@@ -226,6 +220,8 @@ fn parse_comment(input: &[u8]) -> IResult<&[u8], &[u8]> {
 
 fn parse_symbol<'a, 'b: 'a>(
     current_macro_names: &'b [MacroName<'a>],
+    quote_open_tag: &'b [u8],
+    quote_close_tag: &'b [u8],
 ) -> impl Fn(&'a [u8]) -> IResult<&'a [u8], Symbol<'a>> + 'a {
     |input: &'a [u8]| {
         println!("parse_symbol: {:?}", String::from_utf8_lossy(input));
@@ -236,11 +232,29 @@ fn parse_symbol<'a, 'b: 'a>(
             )));
         }
         nom::branch::alt((
-            nom::combinator::map(parse_quoted, Symbol::Quoted),
+            nom::combinator::map(
+                parse_quoted(quote_open_tag, quote_close_tag),
+                Symbol::Quoted,
+            ),
             nom::combinator::map(parse_macro(current_macro_names), Symbol::Macro),
             nom::combinator::map(parse_text, Symbol::Text),
         ))(input)
     }
+}
+
+fn parse_symbols(input: &[u8]) -> IResult<&[u8], Vec<Symbol<'_>>> {
+    println!("parse_symbols: {:?}", String::from_utf8_lossy(input));
+    if input.is_empty() {
+        return Ok((input, Vec::new()));
+    }
+    let result = nom::multi::many0(parse_symbol(
+        &[],
+        DEFAULT_QUOTE_OPEN_TAG,
+        DEFAULT_QUOTE_CLOSE_TAG,
+    ))(input);
+    #[cfg(test)]
+    dbg!(&result);
+    result
 }
 
 // TODO: probably these tests will be deleted later in favour of integration test suite.
@@ -248,7 +262,10 @@ fn parse_symbol<'a, 'b: 'a>(
 mod test {
     use crate::lexer::Symbol;
 
-    use super::{parse_comment, parse_macro, parse_quoted, MacroName};
+    use super::{
+        parse_comment, parse_macro, parse_quoted, MacroName, DEFAULT_QUOTE_CLOSE_TAG,
+        DEFAULT_QUOTE_OPEN_TAG,
+    };
     // TODO: add tests based on input in
     // https://pubs.opengroup.org/onlinepubs/9699919799/utilities/m4.html#tag_20_74_17
     const M4SRC: &str = r#"The value of `VER' is "VER".
@@ -339,13 +356,18 @@ mod test {
 
     #[test]
     fn test_parse_quoted() {
-        let quote = parse_quoted(b"`hello'").unwrap().1;
+        let quote = parse_quoted(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_QUOTE_CLOSE_TAG)(b"`hello'")
+            .unwrap()
+            .1;
         assert_eq!("hello".as_bytes(), quote.quoted);
     }
 
     #[test]
     fn test_parse_quoted_nested() {
-        let quote = parse_quoted(b"`a `quote' is good!'").unwrap().1;
+        let quote =
+            parse_quoted(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_QUOTE_CLOSE_TAG)(b"`a `quote' is good!'")
+                .unwrap()
+                .1;
         assert_eq!("a `quote' is good!".as_bytes(), quote.quoted);
     }
 

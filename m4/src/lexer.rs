@@ -23,7 +23,7 @@
 //!
 //! TODO: Recoverable parsing warnings should be emitted to stderr
 
-use nom::IResult;
+use nom::{error::ContextError, IResult};
 
 #[cfg_attr(test, derive(Debug, PartialEq))]
 struct Macro<'a> {
@@ -46,8 +46,32 @@ struct Quoted<'a> {
     pub quoted: &'a [u8],
 }
 
+/// Macro names shall consist of letters, digits, and underscores, where the first character is not a digit. Tokens not of this form shall not be treated as macros.
+/// `[_a-zA-Z][_a-zA-Z0-9]*`
 #[cfg_attr(test, derive(Debug, PartialEq))]
 struct MacroName<'a>(&'a [u8]);
+
+impl<'a> MacroName<'a> {
+    pub fn parse(input: &'a [u8]) -> IResult<&'a [u8], Self> {
+        println!("parsing macro name {:?}", String::from_utf8_lossy(input));
+        if input.is_empty() {
+            println!("empty macro name");
+            return Err(nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::NonEmpty,
+            )));
+        }
+        let (remaining, start) = nom::bytes::complete::take_while1(is_word_char_start)(input)?;
+        let (remaining, rest) =
+            nom::bytes::complete::take_while_m_n(0, remaining.len(), is_word_char_end)(remaining)?;
+        // TODO: check whether the name matches any names in the current state.
+        Ok((remaining, Self(&input[..(start.len() + rest.len())])))
+    }
+
+    fn try_from_slice(input: &'a [u8]) -> Result<Self, nom::Err<nom::error::Error<&'a [u8]>>> {
+        Self::parse(input.into()).map(|ok| ok.1)
+    }
+}
 
 fn is_word_char_end(c: u8) -> bool {
     // TODO: check safety!
@@ -59,54 +83,38 @@ fn is_word_char_start(c: u8) -> bool {
     (unsafe { libc::isalpha(c.into()) } != 0) || c == b'_'
 }
 
-/// Macro names shall consist of letters, digits, and underscores, where the first character is not a digit. Tokens not of this form shall not be treated as macros.
-/// `[_a-zA-Z][_a-zA-Z0-9]*`
-fn parse_macro_name(input: &[u8]) -> IResult<&[u8], MacroName<'_>> {
-    println!("parsing macro name {:?}", String::from_utf8_lossy(input));
-    if input.is_empty() {
-        println!("empty macro name");
-        return Err(nom::Err::Error(nom::error::Error::new(
-            input,
-            nom::error::ErrorKind::NonEmpty,
-        )));
-    }
-    let (remaining, start) = nom::bytes::complete::take_while1(is_word_char_start)(input)?;
-    let (remaining, rest) =
-        nom::bytes::complete::take_while_m_n(0, remaining.len(), is_word_char_end)(remaining)?;
-    // TODO: check whether the name matches any names in the current state.
-    Ok((remaining, MacroName(&input[..(start.len() + rest.len())])))
-}
-
-//TODO: should not parse multiline arguments?
-fn parse_macro(input: &[u8]) -> IResult<&[u8], Macro<'_>> {
-    println!("parse_macro {:?}", String::from_utf8_lossy(input));
-    let (remaining, name) = parse_macro_name(input)?;
-    println!("macro_args {:?}", String::from_utf8_lossy(remaining));
-    let (remaining, args) = nom::combinator::opt(nom::sequence::delimited(
-        nom::bytes::complete::tag("("),
-        nom::multi::separated_list0(
-            nom::bytes::complete::tag(","),
-            // TODO: check, we should be allowed to have empty arguments?
-            nom::combinator::map_parser(
-                nom::bytes::complete::is_not(")"),
-                nom::combinator::cut(parse_symbols),
+fn parse_macro<'a, 'b: 'a>(
+    current_macro_names: &'b [MacroName<'a>],
+) -> impl Fn(&'a [u8]) -> IResult<&'a [u8], Macro<'a>> {
+    move |input: &'a [u8]| {
+        #[cfg(test)]
+        dbg!(current_macro_names);
+        println!("parse_macro {:?}", String::from_utf8_lossy(input));
+        let (remaining, name) = MacroName::parse(input)?;
+        println!("macro_args {:?}", String::from_utf8_lossy(remaining));
+        let (remaining, args) = nom::combinator::opt(nom::sequence::delimited(
+            nom::bytes::complete::tag("("),
+            nom::multi::separated_list0(
+                nom::bytes::complete::tag(","),
+                // TODO: check, we should be allowed to have empty arguments?
+                nom::combinator::map_parser(
+                    nom::bytes::complete::is_not(")"),
+                    nom::combinator::cut(parse_symbols),
+                ),
             ),
-        ),
-        // Make sure we fail for input that is missing the closing tag, this is what GNU m4 does
-        // anyway.
-        nom::combinator::cut(nom::bytes::complete::tag(")")),
-    ))(remaining)?;
+            // Make sure we fail for input that is missing the closing tag, this is what GNU m4 does
+            // anyway.
+            nom::combinator::cut(nom::bytes::complete::tag(")")),
+        ))(remaining)?;
 
-    #[cfg(test)]
-    dbg!(&args);
-
-    Ok((
-        remaining,
-        Macro {
-            name,
-            args: args.unwrap_or_default(),
-        },
-    ))
+        Ok((
+            remaining,
+            Macro {
+                name,
+                args: args.unwrap_or_default(),
+            },
+        ))
+    }
 }
 
 const OPEN_TAG: &[u8] = b"`";
@@ -194,7 +202,7 @@ fn parse_symbols(input: &[u8]) -> IResult<&[u8], Vec<Symbol<'_>>> {
     if input.is_empty() {
         return Ok((input, Vec::new()));
     }
-    let result = nom::multi::many0(parse_symbol)(input);
+    let result = nom::multi::many0(parse_symbol(&[]))(input);
     #[cfg(test)]
     dbg!(&result);
     result
@@ -216,19 +224,23 @@ fn parse_comment(input: &[u8]) -> IResult<&[u8], &[u8]> {
     Ok((remaining, &input[..total_len]))
 }
 
-fn parse_symbol(input: &[u8]) -> IResult<&[u8], Symbol<'_>> {
-    println!("parse_symbol: {:?}", String::from_utf8_lossy(input));
-    if input.is_empty() {
-        return Err(nom::Err::Error(nom::error::Error::new(
-            input,
-            nom::error::ErrorKind::NonEmpty,
-        )));
+fn parse_symbol<'a, 'b: 'a>(
+    current_macro_names: &'b [MacroName<'a>],
+) -> impl Fn(&'a [u8]) -> IResult<&'a [u8], Symbol<'a>> + 'a {
+    |input: &'a [u8]| {
+        println!("parse_symbol: {:?}", String::from_utf8_lossy(input));
+        if input.is_empty() {
+            return Err(nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::NonEmpty,
+            )));
+        }
+        nom::branch::alt((
+            nom::combinator::map(parse_quoted, Symbol::Quoted),
+            nom::combinator::map(parse_macro(current_macro_names), Symbol::Macro),
+            nom::combinator::map(parse_text, Symbol::Text),
+        ))(input)
     }
-    nom::branch::alt((
-        nom::combinator::map(parse_quoted, Symbol::Quoted),
-        nom::combinator::map(parse_macro, Symbol::Macro),
-        nom::combinator::map(parse_text, Symbol::Text),
-    ))(input)
 }
 
 // TODO: probably these tests will be deleted later in favour of integration test suite.
@@ -236,7 +248,7 @@ fn parse_symbol(input: &[u8]) -> IResult<&[u8], Symbol<'_>> {
 mod test {
     use crate::lexer::Symbol;
 
-    use super::{parse_comment, parse_macro, parse_macro_name, parse_quoted, MacroName};
+    use super::{parse_comment, parse_macro, parse_quoted, MacroName};
     // TODO: add tests based on input in
     // https://pubs.opengroup.org/onlinepubs/9699919799/utilities/m4.html#tag_20_74_17
     const M4SRC: &str = r#"The value of `VER' is "VER".
@@ -247,31 +259,38 @@ mod test {
 
     #[test]
     fn test_parse_macro_name_underscore_number() {
-        let name = parse_macro_name(b"some_word_23").unwrap().1;
+        let name = MacroName::parse(b"some_word_23").unwrap().1;
         assert_eq!(name, MacroName(b"some_word_23"));
     }
 
     #[test]
     fn test_parse_macro_name_fail_number_start() {
-        parse_macro_name(b"22word").unwrap_err();
+        MacroName::parse(b"22word").unwrap_err();
+    }
+
+    fn macro_name(input: &[u8]) -> MacroName<'_> {
+        MacroName::try_from_slice(input).unwrap()
     }
 
     #[test]
     fn test_parse_macro_name_only() {
-        let m = parse_macro(b"some_word_23").unwrap().1;
+        let macro_names = &[macro_name(b"some_word_23")];
+        let m = parse_macro(macro_names)(b"some_word_23").unwrap().1;
         assert_eq!(m.name, MacroName(b"some_word_23"));
     }
 
     #[test]
     fn test_parse_macro_args_empty() {
-        let m = parse_macro(b"some_word_23()").unwrap().1;
+        let macro_names = &[macro_name(b"some_word_23")];
+        let m = parse_macro(macro_names)(b"some_word_23()").unwrap().1;
         assert_eq!(m.name, MacroName(b"some_word_23"));
         assert_eq!(m.args.len(), 0);
     }
 
     #[test]
     fn test_parse_macro_args_1() {
-        let m = parse_macro(b"some_word_23(hello)").unwrap().1;
+        let macro_names = &[macro_name(b"some_word_23")];
+        let m = parse_macro(macro_names)(b"some_word_23(hello)").unwrap().1;
         assert_eq!(m.name, MacroName(b"some_word_23"));
         assert_eq!(m.args.len(), 1);
         let m1 = match m.args.get(0).unwrap().get(0).unwrap() {
@@ -283,7 +302,10 @@ mod test {
 
     #[test]
     fn test_parse_macro_args_2() {
-        let m = parse_macro(b"some_word_23(hello world)").unwrap().1;
+        let macro_names = &[macro_name(b"some_word_23")];
+        let m = parse_macro(macro_names)(b"some_word_23(hello world)")
+            .unwrap()
+            .1;
         assert_eq!(m.name, MacroName(b"some_word_23"));
         assert_eq!(m.args.len(), 1);
         let m1 = match m.args.get(0).unwrap().get(0).unwrap() {
@@ -306,13 +328,13 @@ mod test {
     #[test]
     fn test_parse_macro_args_fail_no_closing_bracket() {
         // TODO: produce and check for a more specific error
-        parse_macro(b"some_word_23(hello").unwrap_err();
+        parse_macro(&[macro_name(b"some_word_23")])(b"some_word_23(hello").unwrap_err();
     }
 
     #[test]
     fn test_parse_macro_args_fail_empty_no_closing_bracket() {
         // TODO: produce and check for a more specific error
-        parse_macro(b"some_word_23(").unwrap_err();
+        parse_macro(&[macro_name(b"some_word_23")])(b"some_word_23(").unwrap_err();
     }
 
     #[test]

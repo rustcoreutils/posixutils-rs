@@ -87,13 +87,19 @@ fn is_word_char_start(c: u8) -> bool {
 fn parse_macro<'a, 'b: 'a>(
     // TODO: perhaps faster with a hashset?
     current_macro_names: &'b [MacroName<'a>],
+    recursion_limit: usize,
 ) -> impl Fn(&'a [u8]) -> IResult<&'a [u8], Macro<'a>> {
     move |input: &'a [u8]| {
         #[cfg(test)]
         dbg!(current_macro_names);
         println!("parse_macro {:?}", String::from_utf8_lossy(input));
         let (remaining, name) = MacroName::parse(input)?;
-        if current_macro_names.contains(&name) {}
+        if !current_macro_names.contains(&name) {
+            return Err(nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Fail,
+            )));
+        }
         println!("macro_args {:?}", String::from_utf8_lossy(remaining));
         let (remaining, args) = nom::combinator::opt(nom::sequence::delimited(
             nom::bytes::complete::tag("("),
@@ -102,7 +108,7 @@ fn parse_macro<'a, 'b: 'a>(
                 // TODO: check, we should be allowed to have empty arguments?
                 nom::combinator::map_parser(
                     nom::bytes::complete::is_not(")"),
-                    nom::combinator::cut(parse_symbols),
+                    nom::combinator::cut(parse_symbols(recursion_limit)),
                 ),
             ),
             // Make sure we fail for input that is missing the closing tag, this is what GNU m4 does
@@ -122,6 +128,7 @@ fn parse_macro<'a, 'b: 'a>(
 
 const DEFAULT_QUOTE_OPEN_TAG: &[u8] = b"`";
 const DEFAULT_QUOTE_CLOSE_TAG: &[u8] = b"'";
+const DEFAULT_RECURSION_LIMIT: usize = 100;
 
 fn parse_quoted(open_tag: &[u8], close_tag: &[u8]) -> impl Fn(&[u8]) -> IResult<&[u8], Quoted<'_>> {
     |input: &[u8]| {
@@ -222,9 +229,18 @@ fn parse_symbol<'a, 'b: 'a>(
     current_macro_names: &'b [MacroName<'a>],
     quote_open_tag: &'b [u8],
     quote_close_tag: &'b [u8],
+    recursion_limit: usize,
 ) -> impl Fn(&'a [u8]) -> IResult<&'a [u8], Symbol<'a>> + 'a {
-    |input: &'a [u8]| {
-        println!("parse_symbol: {:?}", String::from_utf8_lossy(input));
+    move |input: &'a [u8]| {
+        println!(
+            "parse_symbol: {:?}, current_macro_names: {:?}",
+            String::from_utf8_lossy(input),
+            current_macro_names
+                .iter()
+                .map(|n| n.0)
+                .map(String::from_utf8_lossy)
+                .collect::<Vec<_>>()
+        );
         if input.is_empty() {
             return Err(nom::Err::Error(nom::error::Error::new(
                 input,
@@ -236,31 +252,43 @@ fn parse_symbol<'a, 'b: 'a>(
                 parse_quoted(quote_open_tag, quote_close_tag),
                 Symbol::Quoted,
             ),
-            nom::combinator::map(parse_macro(current_macro_names), Symbol::Macro),
+            nom::combinator::map(
+                parse_macro(current_macro_names, recursion_limit),
+                Symbol::Macro,
+            ),
             nom::combinator::map(parse_text, Symbol::Text),
         ))(input)
     }
 }
 
-fn parse_symbols(input: &[u8]) -> IResult<&[u8], Vec<Symbol<'_>>> {
-    println!("parse_symbols: {:?}", String::from_utf8_lossy(input));
-    if input.is_empty() {
-        return Ok((input, Vec::new()));
+fn parse_symbols(recursion_limit: usize) -> impl Fn(&[u8]) -> IResult<&[u8], Vec<Symbol<'_>>> {
+    move |input: &[u8]| {
+        if recursion_limit == 0 {
+            return Err(nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Fail,
+            )));
+        }
+        println!("parse_symbols: {:?}", String::from_utf8_lossy(input));
+        if input.is_empty() {
+            return Ok((input, Vec::new()));
+        }
+        let result = nom::multi::many0(parse_symbol(
+            &[],
+            DEFAULT_QUOTE_OPEN_TAG,
+            DEFAULT_QUOTE_CLOSE_TAG,
+            recursion_limit - 1,
+        ))(input);
+        #[cfg(test)]
+        dbg!(&result);
+        result
     }
-    let result = nom::multi::many0(parse_symbol(
-        &[],
-        DEFAULT_QUOTE_OPEN_TAG,
-        DEFAULT_QUOTE_CLOSE_TAG,
-    ))(input);
-    #[cfg(test)]
-    dbg!(&result);
-    result
 }
 
 // TODO: probably these tests will be deleted later in favour of integration test suite.
 #[cfg(test)]
 mod test {
-    use crate::lexer::Symbol;
+    use crate::lexer::{Symbol, DEFAULT_RECURSION_LIMIT};
 
     use super::{
         parse_comment, parse_macro, parse_quoted, MacroName, DEFAULT_QUOTE_CLOSE_TAG,
@@ -290,24 +318,36 @@ mod test {
     }
 
     #[test]
+    fn test_parse_macro_name_fail_not_in_list() {
+        let macro_names = &[];
+        parse_macro(macro_names, DEFAULT_RECURSION_LIMIT)(b"some_word_23").unwrap_err();
+    }
+
+    #[test]
     fn test_parse_macro_name_only() {
         let macro_names = &[macro_name(b"some_word_23")];
-        let m = parse_macro(macro_names)(b"some_word_23").unwrap().1;
+        let m = parse_macro(macro_names, DEFAULT_RECURSION_LIMIT)(b"some_word_23")
+            .unwrap()
+            .1;
         assert_eq!(m.name, MacroName(b"some_word_23"));
     }
 
     #[test]
     fn test_parse_macro_args_empty() {
         let macro_names = &[macro_name(b"some_word_23")];
-        let m = parse_macro(macro_names)(b"some_word_23()").unwrap().1;
+        let m = parse_macro(macro_names, DEFAULT_RECURSION_LIMIT)(b"some_word_23()")
+            .unwrap()
+            .1;
         assert_eq!(m.name, MacroName(b"some_word_23"));
         assert_eq!(m.args.len(), 0);
     }
 
     #[test]
     fn test_parse_macro_args_1() {
-        let macro_names = &[macro_name(b"some_word_23")];
-        let m = parse_macro(macro_names)(b"some_word_23(hello)").unwrap().1;
+        let macro_names = &[macro_name(b"some_word_23"), macro_name(b"hello")];
+        let m = parse_macro(macro_names, DEFAULT_RECURSION_LIMIT)(b"some_word_23(hello)")
+            .unwrap()
+            .1;
         assert_eq!(m.name, MacroName(b"some_word_23"));
         assert_eq!(m.args.len(), 1);
         let m1 = match m.args.get(0).unwrap().get(0).unwrap() {
@@ -319,8 +359,12 @@ mod test {
 
     #[test]
     fn test_parse_macro_args_2() {
-        let macro_names = &[macro_name(b"some_word_23")];
-        let m = parse_macro(macro_names)(b"some_word_23(hello world)")
+        let macro_names = &[
+            macro_name(b"some_word_23"),
+            macro_name(b"hello"),
+            macro_name(b"world"),
+        ];
+        let m = parse_macro(macro_names, DEFAULT_RECURSION_LIMIT)(b"some_word_23(hello world)")
             .unwrap()
             .1;
         assert_eq!(m.name, MacroName(b"some_word_23"));
@@ -345,13 +389,15 @@ mod test {
     #[test]
     fn test_parse_macro_args_fail_no_closing_bracket() {
         // TODO: produce and check for a more specific error
-        parse_macro(&[macro_name(b"some_word_23")])(b"some_word_23(hello").unwrap_err();
+        parse_macro(&[macro_name(b"some_word_23")], DEFAULT_RECURSION_LIMIT)(b"some_word_23(hello")
+            .unwrap_err();
     }
 
     #[test]
     fn test_parse_macro_args_fail_empty_no_closing_bracket() {
         // TODO: produce and check for a more specific error
-        parse_macro(&[macro_name(b"some_word_23")])(b"some_word_23(").unwrap_err();
+        parse_macro(&[macro_name(b"some_word_23")], DEFAULT_RECURSION_LIMIT)(b"some_word_23(")
+            .unwrap_err();
     }
 
     #[test]

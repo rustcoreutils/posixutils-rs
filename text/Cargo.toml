@@ -24,6 +24,10 @@ name = "comm"
 path = "src/comm.rs"
 
 [[bin]]
+name = "csplit"
+path = "src/csplit.rs"
+
+[[bin]]
 name = "diff"
 path = "src/diff.rs"
 

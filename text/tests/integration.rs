@@ -364,6 +364,7 @@ fn test_csplit_regex_in_seq() {
     std::fs::remove_file("in_seq03").unwrap();
 }
 
+#[test]
 fn test_nl_justification() {
     nl_test(&["-n", "ln"], "a", "1     \ta\n");
     nl_test(&["-n", "rn"], "b", "     1\tb\n");

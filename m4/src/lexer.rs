@@ -22,6 +22,8 @@
 //! input it will result in different behaviour.
 //!
 //! TODO: Recoverable parsing warnings should be emitted to stderr
+//!
+//! TODO: should quotes support alphanumeric characters? Seems like GNU m4 at least doesn't.
 
 use nom::{error::ContextError, IResult};
 
@@ -111,7 +113,7 @@ impl<'a> Symbol<'a> {
                     Symbol::Quoted,
                 ),
                 nom::combinator::map(Macro::parse(config), Symbol::Macro),
-                nom::combinator::map(parse_text, Symbol::Text),
+                nom::combinator::map(parse_text(&config.quote_open_tag), Symbol::Text),
             ))(input)
         }
     }
@@ -239,33 +241,48 @@ fn is_alphnumeric(c: u8) -> bool {
     unsafe { libc::isalnum(c.into()) != 0 }
 }
 
-// TODO: needs to change with changequote
-fn is_open_quote(c: u8) -> bool {
-    c == b'`'
-}
-
-// TODO: needs to change with changequote
-fn is_close_quote(c: u8) -> bool {
-    c == b'\''
-}
-
 /// Parse input that we already know is not quoted and not a macro, consume input until it could
 /// possibly be the beginning of either a quote or a macro, such as when an open quote is
 /// encountered, or when we encounter the first alpha character after a non-alphanumeric character.
 /// TODO: what happens if we encounter a close quote?
-fn parse_text(input: &[u8]) -> IResult<&[u8], &[u8]> {
-    if input.is_empty() {
-        return Ok((input, input));
-    }
+/// TODO: comment tag
+fn parse_text(quote_open_tag: &[u8]) -> impl Fn(&[u8]) -> IResult<&[u8], &[u8]> + '_ {
+    move |input: &[u8]| {
+        if input.is_empty() {
+            return Ok((input, input));
+        }
 
-    let (remaining, text) = if is_whitespace(*input.first().unwrap()) {
-        nom::bytes::complete::take_till(|c| is_alphnumeric(c) || is_open_quote(c))(input)?
-    } else {
-        nom::bytes::complete::take_till(|c| !is_alphnumeric(c) || is_open_quote(c))(input)?
-    };
-    Ok((remaining, text))
+        let stop_tags = &[quote_open_tag];
+        let mut previous_was_alphanumeric = true;
+        let mut stop_index = 0;
+        'forloop: for i in 0..input.len() {
+            let current_is_alphanumeric = is_alphnumeric(input[i]);
+            if current_is_alphanumeric && !previous_was_alphanumeric {
+                println!("found possible start of macro");
+                break 'forloop;
+            }
+            for tag in stop_tags {
+                if input[i..].starts_with(tag) {
+                    println!("found start of tag {tag:?}");
+                    break 'forloop;
+                }
+            }
+            stop_index = i;
+            previous_was_alphanumeric = current_is_alphanumeric;
+        }
+
+        let (matched, remaining) = input.split_at(stop_index + 1);
+        println!(
+            "input: {}, matched: {}, remaining: {}, stop_index: {stop_index}",
+            String::from_utf8_lossy(input),
+            String::from_utf8_lossy(matched),
+            String::from_utf8_lossy(remaining),
+        );
+        Ok((remaining, matched))
+    }
 }
 
+// TODO: changequote support
 fn parse_comment(input: &[u8]) -> IResult<&[u8], &[u8]> {
     let mut total_len = 0;
     let (remaining, open_tag) = nom::bytes::complete::tag("#")(input)?;
@@ -310,7 +327,7 @@ mod test {
     use crate::lexer::Symbol;
 
     use super::{
-        parse_comment, Macro, MacroName, ParseConfig, Quoted, DEFAULT_QUOTE_CLOSE_TAG,
+        parse_comment, parse_text, Macro, MacroName, ParseConfig, Quoted, DEFAULT_QUOTE_CLOSE_TAG,
         DEFAULT_QUOTE_OPEN_TAG,
     };
     // TODO: add tests based on input in
@@ -320,6 +337,10 @@ mod test {
         ifelse(VER, 1, ``VER'' is `VER'.)
         ifelse(VER, 2, ``VER'' is `VER'., ``VER'' is not 2.)
         end"#;
+
+    fn utf8(input: &[u8]) -> String {
+        String::from_utf8(input.to_vec()).unwrap()
+    }
 
     #[test]
     fn test_parse_macro_name_underscore_number() {
@@ -468,5 +489,29 @@ mod test {
     fn test_parse_comment_standard_no_newline() {
         let comment = parse_comment(b"# hello world").unwrap().1;
         assert_eq!(b"# hello world", comment);
+    }
+
+    #[test]
+    fn test_parse_text_before_quote_space() {
+        let (remaining, text) = parse_text(b"`")(b"hello `world'").unwrap();
+        assert_eq!("hello ", utf8(text));
+        assert_eq!("`world'", utf8(remaining));
+    }
+
+    #[test]
+    fn test_parse_text_before_quote_no_space() {
+        let (remaining, text) = parse_text(b"`")(b"hello`world'").unwrap();
+        assert_eq!("hello", utf8(text));
+        assert_eq!("`world'", utf8(remaining));
+    }
+
+    #[test]
+    fn test_parse_text_before_non_alphanum() {
+        let (remaining, text) = parse_text(b"`")(b"hello|world").unwrap();
+        assert_eq!("hello|", utf8(text));
+        assert_eq!("world", utf8(remaining));
+        let (remaining, text) = parse_text(b"`")(remaining).unwrap();
+        assert_eq!("world", utf8(text));
+        assert_eq!("", utf8(remaining));
     }
 }

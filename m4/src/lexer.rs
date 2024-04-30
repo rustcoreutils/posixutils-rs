@@ -24,6 +24,8 @@
 //! TODO: Recoverable parsing warnings should be emitted to stderr
 //!
 //! TODO: should quotes support alphanumeric characters? Seems like GNU m4 at least doesn't.
+//!
+//! If the
 
 use nom::{error::ContextError, IResult};
 
@@ -34,6 +36,11 @@ struct Macro<'a> {
 }
 
 impl<'a> Macro<'a> {
+    /// ## Notes
+    ///
+    /// * The parsing of macro arguments happens at the time of definition.
+    /// * The unwrapping and parsing of quoted arguments happens at the time of calling.
+    /// * The evaluation of expressions defined in macros happens at the time of calling.
     pub fn parse<'b, 'c: 'a>(
         // TODO: perhaps faster with a hashset?
         config: &'c ParseConfig<'a, 'b>,
@@ -112,8 +119,12 @@ impl<'a> Symbol<'a> {
                     Quoted::parse(config.quote_open_tag, config.quote_close_tag),
                     Symbol::Quoted,
                 ),
+                nom::combinator::map(parse_comment, Symbol::Comment),
                 nom::combinator::map(Macro::parse(config), Symbol::Macro),
-                nom::combinator::map(parse_text(&config.quote_open_tag), Symbol::Text),
+                nom::combinator::map(
+                    parse_text(&config.quote_open_tag, &config.comment_open_tag),
+                    Symbol::Text,
+                ),
             ))(input)
         }
     }
@@ -121,7 +132,7 @@ impl<'a> Symbol<'a> {
 
 #[cfg_attr(test, derive(Debug, PartialEq))]
 struct Quoted<'a> {
-    pub quoted: &'a [u8],
+    pub contents: &'a [u8],
 }
 
 impl<'a> Quoted<'a> {
@@ -164,7 +175,7 @@ impl<'a> Quoted<'a> {
 
             let quoted = &input[quote_start_index..quote_end_index];
 
-            Ok((remaining, Quoted { quoted }))
+            Ok((remaining, Quoted { contents: quoted }))
         }
     }
 }
@@ -211,11 +222,15 @@ struct ParseConfig<'a, 'b: 'a> {
     current_macro_names: &'b [MacroName<'a>],
     quote_open_tag: &'b [u8],
     quote_close_tag: &'b [u8],
+    comment_open_tag: &'b [u8],
+    comment_close_tag: &'b [u8],
     symbol_recursion_limit: usize,
 }
 
 const DEFAULT_QUOTE_OPEN_TAG: &[u8] = b"`";
 const DEFAULT_QUOTE_CLOSE_TAG: &[u8] = b"'";
+const DEFAULT_COMMENT_OPEN_TAG: &[u8] = b"#";
+const DEFAULT_COMMENT_CLOSE_TAG: &[u8] = b"\n";
 const DEFAULT_SYMBOL_RECURSION_LIMIT: usize = 100;
 
 impl<'a, 'b> Default for ParseConfig<'a, 'b> {
@@ -224,6 +239,8 @@ impl<'a, 'b> Default for ParseConfig<'a, 'b> {
             current_macro_names: &[],
             quote_open_tag: &DEFAULT_QUOTE_OPEN_TAG,
             quote_close_tag: &DEFAULT_QUOTE_CLOSE_TAG,
+            comment_open_tag: &DEFAULT_COMMENT_OPEN_TAG,
+            comment_close_tag: &DEFAULT_COMMENT_CLOSE_TAG,
             symbol_recursion_limit: DEFAULT_SYMBOL_RECURSION_LIMIT,
         }
     }
@@ -246,13 +263,16 @@ fn is_alphnumeric(c: u8) -> bool {
 /// encountered, or when we encounter the first alpha character after a non-alphanumeric character.
 /// TODO: what happens if we encounter a close quote?
 /// TODO: comment tag
-fn parse_text(quote_open_tag: &[u8]) -> impl Fn(&[u8]) -> IResult<&[u8], &[u8]> + '_ {
+fn parse_text<'a>(
+    quote_open_tag: &'a [u8],
+    comment_open_tag: &'a [u8],
+) -> impl for<'b> Fn(&'b [u8]) -> IResult<&'b [u8], &'b [u8]> + 'a {
     move |input: &[u8]| {
         if input.is_empty() {
             return Ok((input, input));
         }
 
-        let stop_tags = &[quote_open_tag];
+        let stop_tags = &[quote_open_tag, comment_open_tag];
         let mut previous_was_alphanumeric = true;
         let mut stop_index = 0;
         'forloop: for i in 0..input.len() {
@@ -324,7 +344,7 @@ fn parse_symbols<'a, 'b, 'c: 'a>(
 // TODO: probably these tests will be deleted later in favour of integration test suite.
 #[cfg(test)]
 mod test {
-    use crate::lexer::Symbol;
+    use crate::lexer::{Symbol, DEFAULT_COMMENT_OPEN_TAG};
 
     use super::{
         parse_comment, parse_text, Macro, MacroName, ParseConfig, Quoted, DEFAULT_QUOTE_CLOSE_TAG,
@@ -408,6 +428,23 @@ mod test {
     }
 
     #[test]
+    fn test_parse_macro_args_1_quoted() {
+        let current_macro_names = &[macro_name(b"some_word_23"), macro_name(b"hello")];
+        let config = &ParseConfig {
+            current_macro_names,
+            ..ParseConfig::default()
+        };
+        let m = Macro::parse(config)(b"some_word_23(`hello')").unwrap().1;
+        assert_eq!(m.name, MacroName(b"some_word_23"));
+        assert_eq!(m.args.len(), 1);
+        let q = match m.args.get(0).unwrap().get(0).unwrap() {
+            Symbol::Quoted(q) => q,
+            _ => panic!(),
+        };
+        assert_eq!(q.contents, b"hello");
+    }
+
+    #[test]
     fn test_parse_macro_args_2() {
         let current_macro_names = &[
             macro_name(b"some_word_23"),
@@ -467,7 +504,7 @@ mod test {
         let quote = Quoted::parse(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_QUOTE_CLOSE_TAG)(b"`hello'")
             .unwrap()
             .1;
-        assert_eq!("hello".as_bytes(), quote.quoted);
+        assert_eq!("hello".as_bytes(), quote.contents);
     }
 
     #[test]
@@ -476,7 +513,7 @@ mod test {
             Quoted::parse(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_QUOTE_CLOSE_TAG)(b"`a `quote' is good!'")
                 .unwrap()
                 .1;
-        assert_eq!("a `quote' is good!".as_bytes(), quote.quoted);
+        assert_eq!("a `quote' is good!".as_bytes(), quote.contents);
     }
 
     #[test]
@@ -493,25 +530,39 @@ mod test {
 
     #[test]
     fn test_parse_text_before_quote_space() {
-        let (remaining, text) = parse_text(b"`")(b"hello `world'").unwrap();
+        let (remaining, text) =
+            parse_text(b"`", DEFAULT_COMMENT_OPEN_TAG)(b"hello `world'").unwrap();
         assert_eq!("hello ", utf8(text));
         assert_eq!("`world'", utf8(remaining));
     }
 
     #[test]
     fn test_parse_text_before_quote_no_space() {
-        let (remaining, text) = parse_text(b"`")(b"hello`world'").unwrap();
+        let (remaining, text) =
+            parse_text(b"`", DEFAULT_COMMENT_OPEN_TAG)(b"hello`world'").unwrap();
         assert_eq!("hello", utf8(text));
         assert_eq!("`world'", utf8(remaining));
     }
 
     #[test]
     fn test_parse_text_before_non_alphanum() {
-        let (remaining, text) = parse_text(b"`")(b"hello|world").unwrap();
+        let (remaining, text) =
+            parse_text(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_COMMENT_OPEN_TAG)(b"hello|world").unwrap();
         assert_eq!("hello|", utf8(text));
         assert_eq!("world", utf8(remaining));
-        let (remaining, text) = parse_text(b"`")(remaining).unwrap();
+        let (remaining, text) =
+            parse_text(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_COMMENT_OPEN_TAG)(remaining).unwrap();
         assert_eq!("world", utf8(text));
         assert_eq!("", utf8(remaining));
+    }
+
+    #[test]
+    fn test_parse_text_before_comment() {
+        todo!()
+    }
+
+    #[test]
+    fn test_parse_comment() {
+        todo!()
     }
 }

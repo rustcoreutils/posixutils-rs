@@ -21,45 +21,10 @@ fn get_errno() -> i32 {
     io::Error::last_os_error().raw_os_error().unwrap()
 }
 
-fn create_dir_if_not_exists(path: &str) -> io::Result<()> {
-    match fs::create_dir(path) {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            if e.kind() == io::ErrorKind::AlreadyExists {
-                Ok(())
-            } else {
-                Err(e)
-            }
-        }
-    }
-}
-
-fn create_file_if_not_exists(path: &str) -> io::Result<()> {
-    match fs::File::create(path) {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            if e.kind() == io::ErrorKind::AlreadyExists {
-                Ok(())
-            } else {
-                Err(e)
-            }
-        }
-    }
-}
-
-fn create_symlink_if_not_exists(original: &str, link: &str) -> io::Result<()> {
+fn canonical_symlink(original: &str, link: &str) -> io::Result<()> {
     // `fs::canonicalize` is important here. If it's left out then the
     // symbolic link cannot be followed with -L.
-    match std::os::unix::fs::symlink(fs::canonicalize(original).unwrap(), link) {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            if e.kind() == io::ErrorKind::AlreadyExists {
-                Ok(())
-            } else {
-                Err(e)
-            }
-        }
-    }
+    std::os::unix::fs::symlink(fs::canonicalize(original).unwrap(), link)
 }
 
 enum TimeToChange<'a> {
@@ -145,8 +110,9 @@ fn ls_test_with_checker<F: FnMut(&TestPlan, &std::process::Output)>(args: &[&str
 #[test]
 fn test_ls_empty_directory() {
     let test_dir = "tests/ls/tmp/empty_directory";
-    create_dir_if_not_exists(test_dir).unwrap();
+    fs::create_dir(test_dir).unwrap();
     ls_test(&["-aA", test_dir], "", "", 0);
+    fs::remove_dir_all(test_dir).unwrap();
 }
 
 // Partial port of coreutils/tests/ls/dangle.sh
@@ -159,9 +125,9 @@ fn test_ls_dangle() {
     let dir_sub = "tests/ls/tmp/dangle/dir/sub";
     let slink_to_dir = "tests/ls/tmp/dangle/slink-to-dir";
 
-    create_dir_if_not_exists(test_dir).unwrap();
-    create_dir_if_not_exists(dir).unwrap();
-    create_dir_if_not_exists(dir_sub).unwrap();
+    fs::create_dir(test_dir).unwrap();
+    fs::create_dir(dir).unwrap();
+    fs::create_dir(dir_sub).unwrap();
 
     if let Err(e) = std::os::unix::fs::symlink("no-such-file", dangle) {
         if e.kind() != io::ErrorKind::AlreadyExists {
@@ -169,7 +135,7 @@ fn test_ls_dangle() {
         }
     }
 
-    create_symlink_if_not_exists(dir, slink_to_dir).unwrap();
+    canonical_symlink(dir, slink_to_dir).unwrap();
 
     // Must fail to dereference the symlink
     ls_test(
@@ -192,6 +158,8 @@ fn test_ls_dangle() {
     ls_test(&[slink_to_dir], "sub\n", "", 0);
     ls_test(&["-H", slink_to_dir], "sub\n", "", 0);
     ls_test(&["-L", slink_to_dir], "sub\n", "", 0);
+
+    fs::remove_dir_all(test_dir).unwrap();
 }
 
 // Partial port of coreutils/tests/ls/file-type.sh
@@ -216,18 +184,14 @@ fn test_ls_file_type() {
     let char_cstr = CString::new(char).unwrap();
     let fifo_cstr = CString::new(fifo).unwrap();
 
-    create_dir_if_not_exists(test_dir).unwrap();
-    create_dir_if_not_exists(sub).unwrap();
-    create_dir_if_not_exists(dir).unwrap();
+    fs::create_dir(test_dir).unwrap();
+    fs::create_dir(sub).unwrap();
+    fs::create_dir(dir).unwrap();
 
-    create_file_if_not_exists(regular).unwrap();
+    fs::File::create(regular).unwrap();
+    fs::File::create(executable).unwrap();
 
     unsafe {
-        // `create_file_if_not_exists` would get permission denied if used here
-        if !Path::new(executable).exists() {
-            fs::File::create(executable).unwrap();
-        }
-
         let executable_cstr = CString::new(executable).unwrap();
 
         // Executable for all
@@ -239,8 +203,8 @@ fn test_ls_file_type() {
         }
     }
 
-    create_symlink_if_not_exists(regular, slink_reg).unwrap();
-    create_symlink_if_not_exists(dir, slink_dir).unwrap();
+    canonical_symlink(regular, slink_reg).unwrap();
+    canonical_symlink(dir, slink_dir).unwrap();
 
     if let Err(e) = std::os::unix::fs::symlink("nowhere", slink_dangle) {
         if e.kind() != io::ErrorKind::AlreadyExists {
@@ -292,6 +256,8 @@ fn test_ls_file_type() {
     } else {
         ls_test(&["-p", sub], ls_p_result, "", 0);
     }
+
+    fs::remove_dir_all(test_dir).unwrap();
 }
 
 // Port of coreutils/tests/ls/infloop.sh
@@ -301,9 +267,9 @@ fn test_ls_infloop() {
     let loop_dir = "tests/ls/tmp/infloop/loop";
     let loop_sub = "tests/ls/tmp/infloop/loop/sub";
 
-    create_dir_if_not_exists(test_dir).unwrap();
-    create_dir_if_not_exists(loop_dir).unwrap();
-    create_symlink_if_not_exists(loop_dir, loop_sub).unwrap();
+    fs::create_dir(test_dir).unwrap();
+    fs::create_dir(loop_dir).unwrap();
+    canonical_symlink(loop_dir, loop_sub).unwrap();
 
     ls_test(
         &["-RL", loop_sub],
@@ -311,6 +277,8 @@ fn test_ls_infloop() {
         &format!("ls: {loop_sub}: not listing already-listed directory\n"),
         2,
     );
+
+    fs::remove_dir_all(test_dir).unwrap();
 }
 
 // Port of coreutils/tests/ls/inode.sh
@@ -322,9 +290,9 @@ fn test_ls_inode() {
 
     let re = Regex::new(r"(\d+) .*f\s+(\d+) .*slink").unwrap();
 
-    create_dir_if_not_exists(test_dir).unwrap();
-    create_file_if_not_exists(original).unwrap();
-    create_symlink_if_not_exists(original, link).unwrap();
+    fs::create_dir(test_dir).unwrap();
+    fs::File::create(original).unwrap();
+    canonical_symlink(original, link).unwrap();
 
     // Args passed in command line
     // Different inode numbers without -H or -L
@@ -391,6 +359,8 @@ fn test_ls_inode() {
         assert_ne!(inode_f, inode_slink);
         assert_eq!(output.status.code(), Some(0));
     });
+
+    fs::remove_dir_all(test_dir).unwrap();
 }
 
 // Partial port of coreutils/tests/ls/m-option.sh
@@ -401,9 +371,9 @@ fn test_ls_m_option() {
     let a = "tests/ls/tmp/m_option/a";
     let b = "tests/ls/tmp/m_option/b";
 
-    create_dir_if_not_exists(test_dir).unwrap();
-    create_file_if_not_exists(a).unwrap();
-    if !Path::new(b).exists() {
+    fs::create_dir(test_dir).unwrap();
+    fs::File::create(a).unwrap();
+    {
         let mut file = fs::File::create(b).unwrap();
 
         for i in 1..=2000 {
@@ -420,6 +390,8 @@ fn test_ls_m_option() {
     // section of:
     // https://pubs.opengroup.org/onlinepubs/9699919799/utilities/ls.html
     ls_test(&["-smk", a, b], &format!("0 {a}, 12 {b}\n"), "", 0);
+
+    fs::remove_dir_all(test_dir).unwrap();
 }
 
 // Port of coreutils/tests/ls/no-arg.sh
@@ -457,10 +429,10 @@ fn test_ls_no_arg() {
     let out = "tests/ls/tmp/no_arg/out";
     let exp = "tests/ls/tmp/no_arg/exp";
 
-    create_dir_if_not_exists(test_dir).unwrap();
-    create_dir_if_not_exists(dir).unwrap();
-    create_dir_if_not_exists(subdir).unwrap();
-    create_file_if_not_exists(file2).unwrap();
+    fs::create_dir(test_dir).unwrap();
+    fs::create_dir(dir).unwrap();
+    fs::create_dir(subdir).unwrap();
+    fs::File::create(file2).unwrap();
 
     if let Err(e) = std::os::unix::fs::symlink("f", symlink) {
         if e.kind() != io::ErrorKind::AlreadyExists {
@@ -469,16 +441,15 @@ fn test_ls_no_arg() {
     }
 
     // Not really using this to write the output unlike in the original test
-    create_file_if_not_exists(out).unwrap();
+    fs::File::create(out).unwrap();
 
     let exp_str = "dir\n\
                    exp\n\
                    out\n\
                    symlink\n";
 
-    if !Path::new(exp).exists() {
+    {
         let mut file = fs::File::create(exp).unwrap();
-
         file.write_all(exp_str.as_bytes()).unwrap();
     }
 
@@ -496,6 +467,8 @@ fn test_ls_no_arg() {
                    ./dir/subdir:\n\
                    file2\n";
     ls_run_test(test_dir, &["-R1"], exp_str);
+
+    fs::remove_dir_all(test_dir).unwrap();
 }
 
 // Port of coreutils/tests/ls/recursive.sh
@@ -515,15 +488,15 @@ fn test_ls_recursive() {
     let a1i = "tests/ls/tmp/recursive/a/1/I";
     let a1ii = "tests/ls/tmp/recursive/a/1/II";
 
-    create_dir_if_not_exists(test_dir).unwrap();
+    fs::create_dir(test_dir).unwrap();
     for dir in [x, y, a, b, c] {
-        create_dir_if_not_exists(dir).unwrap();
+        fs::create_dir(dir).unwrap();
     }
     for dir in [a1, a2, a3] {
-        create_dir_if_not_exists(dir).unwrap();
+        fs::create_dir(dir).unwrap();
     }
     for file in [f, a1i, a1ii] {
-        create_file_if_not_exists(file).unwrap();
+        fs::File::create(file).unwrap();
     }
 
     let result = format!(
@@ -554,6 +527,8 @@ fn test_ls_recursive() {
         {y}:\n"
     );
     ls_test(&["-R1", x, y, f], &result, "", 0);
+
+    fs::remove_dir_all(test_dir).unwrap();
 }
 
 // Port of coreutils/tests/ls/rt-1.sh
@@ -565,16 +540,18 @@ fn test_ls_rt_1() {
     let c = "tests/ls/tmp/rt_1/c";
     let date = "1998-01-15 00:00:00";
 
-    create_dir_if_not_exists(test_dir).unwrap();
-    create_file_if_not_exists(a).unwrap();
-    create_file_if_not_exists(b).unwrap();
-    create_file_if_not_exists(c).unwrap();
+    fs::create_dir(test_dir).unwrap();
+    fs::File::create(a).unwrap();
+    fs::File::create(b).unwrap();
+    fs::File::create(c).unwrap();
     change_file_time(a, TimeToChange::Both(date));
     change_file_time(b, TimeToChange::Both(date));
     change_file_time(c, TimeToChange::Both(date));
 
     ls_test(&["-1t", a, b, c], &format!("{a}\n{b}\n{c}\n"), "", 0);
     ls_test(&["-1rt", a, b, c], &format!("{c}\n{b}\n{a}\n"), "", 0);
+
+    fs::remove_dir_all(test_dir).unwrap();
 }
 
 // Port of coreutils/tests/ls/size-align.sh
@@ -585,13 +562,13 @@ fn test_ls_size_align() {
     let alloc = "tests/ls/tmp/size_align/alloc";
     let large = "tests/ls/tmp/size_align/large";
 
-    create_dir_if_not_exists(test_dir).unwrap();
-    create_file_if_not_exists(small).unwrap();
-    if !Path::new(alloc).exists() {
+    fs::create_dir(test_dir).unwrap();
+    fs::File::create(small).unwrap();
+    {
         let mut file = fs::File::create(alloc).unwrap();
         file.write_all(b"\n").unwrap();
     }
-    if !Path::new(large).exists() {
+    {
         let mut file = fs::File::create(large).unwrap();
         let data = vec![b'\n'; 123456];
         file.write_all(&data).unwrap();
@@ -605,6 +582,8 @@ fn test_ls_size_align() {
         assert!(lengths.iter().all(|l| *l == length));
         assert_eq!(output.status.code(), Some(0));
     });
+
+    fs::remove_dir_all(test_dir).unwrap();
 }
 
 // Partial port of coreutils/tests/ls/ls-time.sh
@@ -627,10 +606,10 @@ fn test_ls_time() {
     let u2 = "1998-01-14 12:00:00";
     let u3 = "1998-01-14 13:00:00";
 
-    create_dir_if_not_exists(test_dir).unwrap();
-    create_file_if_not_exists(a).unwrap();
-    create_file_if_not_exists(b).unwrap();
-    create_file_if_not_exists(c).unwrap();
+    fs::create_dir(test_dir).unwrap();
+    fs::File::create(a).unwrap();
+    fs::File::create(b).unwrap();
+    fs::File::create(c).unwrap();
 
     change_file_time(a, TimeToChange::Modified(t3));
     change_file_time(b, TimeToChange::Modified(t2));
@@ -683,4 +662,6 @@ fn test_ls_time() {
 
     // c's ctime is newer than a's
     ls_test(&["-ct", a, c], &format!("{c}\n{a}\n"), "", 0);
+
+    fs::remove_dir_all(test_dir).unwrap();
 }

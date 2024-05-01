@@ -106,10 +106,28 @@ fn ls_test_with_checker<F: FnMut(&TestPlan, &std::process::Output)>(args: &[&str
     run_test_with_checker(test_plan, checker);
 }
 
+// `ls_test` but sets the working directory for the child process
+fn cd_and_ls_test(test_dir: &str, args: &[&str], expected_out: &str) {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_ls"));
+    let child = command
+        .current_dir(test_dir)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let output = child.wait_with_output().unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout, expected_out);
+
+    assert_eq!(output.status.code(), Some(0));
+}
+
 // Port of coreutils/tests/ls/a-option.sh
 #[test]
 fn test_ls_empty_directory() {
-    let test_dir = "tests/ls/tmp/empty_directory";
+    let test_dir = &format!("{}/test_ls_empty_directory", env!("CARGO_TARGET_TMPDIR"));
     fs::create_dir(test_dir).unwrap();
     ls_test(&["-aA", test_dir], "", "", 0);
     fs::remove_dir_all(test_dir).unwrap();
@@ -119,11 +137,11 @@ fn test_ls_empty_directory() {
 // Not including substituting missing metadata with "?" which is non-standard
 #[test]
 fn test_ls_dangle() {
-    let test_dir = "tests/ls/tmp/dangle";
-    let dangle = "tests/ls/tmp/dangle/dangle";
-    let dir = "tests/ls/tmp/dangle/dir";
-    let dir_sub = "tests/ls/tmp/dangle/dir/sub";
-    let slink_to_dir = "tests/ls/tmp/dangle/slink-to-dir";
+    let test_dir = &format!("{}/test_ls_dangle", env!("CARGO_TARGET_TMPDIR"));
+    let dangle = &format!("{test_dir}/dangle");
+    let dir = &format!("{test_dir}/dir");
+    let dir_sub = &format!("{test_dir}/dir/sub");
+    let slink_to_dir = &format!("{test_dir}/slink-to-dir");
 
     fs::create_dir(test_dir).unwrap();
     fs::create_dir(dir).unwrap();
@@ -169,20 +187,20 @@ fn test_ls_dangle() {
 // `sudo -E cargo test`
 #[test]
 fn test_ls_file_type() {
-    let test_dir = "tests/ls/tmp/file_type";
-    let sub = "tests/ls/tmp/file_type/sub";
-    let dir = "tests/ls/tmp/file_type/sub/dir";
-    let regular = "tests/ls/tmp/file_type/sub/regular";
-    let executable = "tests/ls/tmp/file_type/sub/executable";
-    let slink_reg = "tests/ls/tmp/file_type/sub/slink-reg";
-    let slink_dir = "tests/ls/tmp/file_type/sub/slink-dir";
-    let slink_dangle = "tests/ls/tmp/file_type/sub/slink-dangle";
-    let block = "tests/ls/tmp/file_type/sub/block";
-    let char = "tests/ls/tmp/file_type/sub/char";
-    let fifo = "tests/ls/tmp/file_type/sub/fifo";
-    let block_cstr = CString::new(block).unwrap();
-    let char_cstr = CString::new(char).unwrap();
-    let fifo_cstr = CString::new(fifo).unwrap();
+    let test_dir = &format!("{}/test_ls_file_type", env!("CARGO_TARGET_TMPDIR"));
+    let sub = &format!("{test_dir}/sub");
+    let dir = &format!("{test_dir}/sub/dir");
+    let regular = &format!("{test_dir}/sub/regular");
+    let executable = &format!("{test_dir}/sub/executable");
+    let slink_reg = &format!("{test_dir}/sub/slink-reg");
+    let slink_dir = &format!("{test_dir}/sub/slink-dir");
+    let slink_dangle = &format!("{test_dir}/sub/slink-dangle");
+    let block = &format!("{test_dir}/sub/block");
+    let char = &format!("{test_dir}/sub/char");
+    let fifo = &format!("{test_dir}/sub/fifo");
+    let block_cstr = CString::new(block.as_bytes()).unwrap();
+    let char_cstr = CString::new(char.as_bytes()).unwrap();
+    let fifo_cstr = CString::new(fifo.as_bytes()).unwrap();
 
     fs::create_dir(test_dir).unwrap();
     fs::create_dir(sub).unwrap();
@@ -192,7 +210,7 @@ fn test_ls_file_type() {
     fs::File::create(executable).unwrap();
 
     unsafe {
-        let executable_cstr = CString::new(executable).unwrap();
+        let executable_cstr = CString::new(executable.as_bytes()).unwrap();
 
         // Executable for all
         let mode = libc::S_IXUSR | libc::S_IXGRP | libc::S_IXOTH;
@@ -263,9 +281,9 @@ fn test_ls_file_type() {
 // Port of coreutils/tests/ls/infloop.sh
 #[test]
 fn test_ls_infloop() {
-    let test_dir = "tests/ls/tmp/infloop";
-    let loop_dir = "tests/ls/tmp/infloop/loop";
-    let loop_sub = "tests/ls/tmp/infloop/loop/sub";
+    let test_dir = &format!("{}/test_ls_infloop", env!("CARGO_TARGET_TMPDIR"));
+    let loop_dir = &format!("{test_dir}/loop");
+    let loop_sub = &format!("{test_dir}/loop/sub");
 
     fs::create_dir(test_dir).unwrap();
     fs::create_dir(loop_dir).unwrap();
@@ -284,9 +302,9 @@ fn test_ls_infloop() {
 // Port of coreutils/tests/ls/inode.sh
 #[test]
 fn test_ls_inode() {
-    let test_dir = "tests/ls/tmp/inode";
-    let original = "tests/ls/tmp/inode/f";
-    let link = "tests/ls/tmp/inode/slink";
+    let test_dir = &format!("{}/test_ls_inode", env!("CARGO_TARGET_TMPDIR"));
+    let original = &format!("{test_dir}/f");
+    let link = &format!("{test_dir}/slink");
 
     let re = Regex::new(r"(\d+) .*f\s+(\d+) .*slink").unwrap();
 
@@ -367,9 +385,9 @@ fn test_ls_inode() {
 // The -w argument is non-POSIX.
 #[test]
 fn test_ls_m_option() {
-    let test_dir = "tests/ls/tmp/m_option";
-    let a = "tests/ls/tmp/m_option/a";
-    let b = "tests/ls/tmp/m_option/b";
+    let test_dir = &format!("{}/test_ls_m_option", env!("CARGO_TARGET_TMPDIR"));
+    let a = &format!("{test_dir}/a");
+    let b = &format!("{test_dir}/b");
 
     fs::create_dir(test_dir).unwrap();
     fs::File::create(a).unwrap();
@@ -382,14 +400,18 @@ fn test_ls_m_option() {
         }
     }
 
+    // Use `cd_and_ls_test` to avoid forcing the output into a single column
+    // because of the operands `a` and `b` being too long if passed as absolute
+    // paths.
+
     // Original test is using -w2 here
-    ls_test(&["-m", a, b], &format!("{a}, {b}\n"), "", 0);
+    cd_and_ls_test(test_dir, &["-m", "a", "b"], &format!("a, b\n"));
 
     // -k for 1024-byte block sizes which is the default for coreutils. Default
     // for this implementation is 512-byte blocks as mentioned in the STDOUT
     // section of:
     // https://pubs.opengroup.org/onlinepubs/9699919799/utilities/ls.html
-    ls_test(&["-smk", a, b], &format!("0 {a}, 12 {b}\n"), "", 0);
+    cd_and_ls_test(test_dir, &["-smk", "a", "b"], &format!("0 a, 12 b\n"));
 
     fs::remove_dir_all(test_dir).unwrap();
 }
@@ -397,37 +419,13 @@ fn test_ls_m_option() {
 // Port of coreutils/tests/ls/no-arg.sh
 #[test]
 fn test_ls_no_arg() {
-    // `ps::run_test` but sets the working directory for the child process
-    fn ls_run_test(test_dir: &str, args: &[&str], expected_out: &str) {
-        let ls_path = std::env::current_dir()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("target/release/ls");
-
-        let mut command = std::process::Command::new(ls_path);
-        let child = command
-            .current_dir(test_dir)
-            .args(args)
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-
-        let output = child.wait_with_output().unwrap();
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert_eq!(stdout, expected_out);
-
-        assert_eq!(output.status.code(), Some(0));
-    }
-
-    let test_dir = "tests/ls/tmp/no_arg";
-    let dir = "tests/ls/tmp/no_arg/dir";
-    let subdir = "tests/ls/tmp/no_arg/dir/subdir";
-    let file2 = "tests/ls/tmp/no_arg/dir/subdir/file2";
-    let symlink = "tests/ls/tmp/no_arg/symlink";
-    let out = "tests/ls/tmp/no_arg/out";
-    let exp = "tests/ls/tmp/no_arg/exp";
+    let test_dir = &format!("{}/test_ls_no_arg", env!("CARGO_TARGET_TMPDIR"));
+    let dir = &format!("{test_dir}/dir");
+    let subdir = &format!("{test_dir}/dir/subdir");
+    let file2 = &format!("{test_dir}/dir/subdir/file2");
+    let symlink = &format!("{test_dir}/symlink");
+    let out = &format!("{test_dir}/out");
+    let exp = &format!("{test_dir}/exp");
 
     fs::create_dir(test_dir).unwrap();
     fs::create_dir(dir).unwrap();
@@ -453,7 +451,7 @@ fn test_ls_no_arg() {
         file.write_all(exp_str.as_bytes()).unwrap();
     }
 
-    ls_run_test(test_dir, &["-1"], exp_str);
+    cd_and_ls_test(test_dir, &["-1"], exp_str);
 
     let exp_str = ".:\n\
                    dir\n\
@@ -466,7 +464,7 @@ fn test_ls_no_arg() {
                    \n\
                    ./dir/subdir:\n\
                    file2\n";
-    ls_run_test(test_dir, &["-R1"], exp_str);
+    cd_and_ls_test(test_dir, &["-R1"], exp_str);
 
     fs::remove_dir_all(test_dir).unwrap();
 }
@@ -474,19 +472,19 @@ fn test_ls_no_arg() {
 // Port of coreutils/tests/ls/recursive.sh
 #[test]
 fn test_ls_recursive() {
-    let test_dir = "tests/ls/tmp/recursive";
-    let x = "tests/ls/tmp/recursive/x";
-    let y = "tests/ls/tmp/recursive/y";
-    let a = "tests/ls/tmp/recursive/a";
-    let b = "tests/ls/tmp/recursive/b";
-    let c = "tests/ls/tmp/recursive/c";
-    let a1 = "tests/ls/tmp/recursive/a/1";
-    let a2 = "tests/ls/tmp/recursive/a/2";
-    let a3 = "tests/ls/tmp/recursive/a/3";
+    let test_dir = &format!("{}/test_ls_recursive", env!("CARGO_TARGET_TMPDIR"));
+    let x = &format!("{test_dir}/x");
+    let y = &format!("{test_dir}/y");
+    let a = &format!("{test_dir}/a");
+    let b = &format!("{test_dir}/b");
+    let c = &format!("{test_dir}/c");
+    let a1 = &format!("{test_dir}/a/1");
+    let a2 = &format!("{test_dir}/a/2");
+    let a3 = &format!("{test_dir}/a/3");
 
-    let f = "tests/ls/tmp/recursive/f";
-    let a1i = "tests/ls/tmp/recursive/a/1/I";
-    let a1ii = "tests/ls/tmp/recursive/a/1/II";
+    let f = &format!("{test_dir}/f");
+    let a1i = &format!("{test_dir}/a/1/I");
+    let a1ii = &format!("{test_dir}/a/1/II");
 
     fs::create_dir(test_dir).unwrap();
     for dir in [x, y, a, b, c] {
@@ -534,10 +532,10 @@ fn test_ls_recursive() {
 // Port of coreutils/tests/ls/rt-1.sh
 #[test]
 fn test_ls_rt_1() {
-    let test_dir = "tests/ls/tmp/rt_1";
-    let a = "tests/ls/tmp/rt_1/a";
-    let b = "tests/ls/tmp/rt_1/b";
-    let c = "tests/ls/tmp/rt_1/c";
+    let test_dir = &format!("{}/test_ls_rt_1", env!("CARGO_TARGET_TMPDIR"));
+    let a = &format!("{test_dir}/a");
+    let b = &format!("{test_dir}/b");
+    let c = &format!("{test_dir}/c");
     let date = "1998-01-15 00:00:00";
 
     fs::create_dir(test_dir).unwrap();
@@ -557,10 +555,10 @@ fn test_ls_rt_1() {
 // Port of coreutils/tests/ls/size-align.sh
 #[test]
 fn test_ls_size_align() {
-    let test_dir = "tests/ls/tmp/size_align";
-    let small = "tests/ls/tmp/size_align/small";
-    let alloc = "tests/ls/tmp/size_align/alloc";
-    let large = "tests/ls/tmp/size_align/large";
+    let test_dir = &format!("{}/test_ls_size_align", env!("CARGO_TARGET_TMPDIR"));
+    let small = &format!("{test_dir}/small");
+    let alloc = &format!("{test_dir}/alloc");
+    let large = &format!("{test_dir}/large");
 
     fs::create_dir(test_dir).unwrap();
     fs::File::create(small).unwrap();
@@ -593,10 +591,10 @@ fn test_ls_time() {
     // This gets inherited by child processes
     std::env::set_var("TZ", "UTC0");
 
-    let test_dir = "tests/ls/tmp/time";
-    let a = "tests/ls/tmp/time/a";
-    let b = "tests/ls/tmp/time/b";
-    let c = "tests/ls/tmp/time/c";
+    let test_dir = &format!("{}/test_ls_time", env!("CARGO_TARGET_TMPDIR"));
+    let a = &format!("{test_dir}/a");
+    let b = &format!("{test_dir}/b");
+    let c = &format!("{test_dir}/c");
 
     let t1 = "1998-01-15 21:00:00";
     let t2 = "1998-01-15 22:00:00";

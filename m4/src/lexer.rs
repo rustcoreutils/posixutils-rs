@@ -119,7 +119,10 @@ impl<'a> Symbol<'a> {
                     Quoted::parse(config.quote_open_tag, config.quote_close_tag),
                     Symbol::Quoted,
                 ),
-                nom::combinator::map(parse_comment, Symbol::Comment),
+                nom::combinator::map(
+                    parse_comment(&config.comment_open_tag, &config.comment_close_tag),
+                    Symbol::Comment,
+                ),
                 nom::combinator::map(Macro::parse(config), Symbol::Macro),
                 nom::combinator::map(
                     parse_text(&config.quote_open_tag, &config.comment_open_tag),
@@ -303,20 +306,37 @@ fn parse_text<'a>(
 }
 
 // TODO: changequote support
-fn parse_comment(input: &[u8]) -> IResult<&[u8], &[u8]> {
-    let mut total_len = 0;
-    let (remaining, open_tag) = nom::bytes::complete::tag("#")(input)?;
-    total_len += open_tag.len();
-    let (remaining, contents) = nom::bytes::complete::take_till(|c| c == b'\n')(remaining)?;
-    total_len += contents.len();
-    let remaining = if !remaining.is_empty() {
-        let (remaining, close_tag) = nom::bytes::complete::tag("\n")(remaining)?;
-        total_len += close_tag.len();
-        remaining
-    } else {
-        remaining
-    };
-    Ok((remaining, &input[..total_len]))
+fn parse_comment<'a, 'b>(
+    open_comment_tag: &'b [u8],
+    close_comment_tag: &'b [u8],
+) -> impl Fn(&'a [u8]) -> IResult<&'a [u8], &'a [u8]> + 'b {
+    move |input: &[u8]| {
+        let mut total_len = 0;
+        println!(
+            "parsing open tag {:?}",
+            String::from_utf8_lossy(open_comment_tag)
+        );
+        let (remaining, open_tag) = nom::bytes::complete::tag(open_comment_tag)(input)?;
+        total_len += open_tag.len();
+        println!(
+            "finding close tag {:?}",
+            String::from_utf8_lossy(close_comment_tag)
+        );
+        // TODO this could probably be optimized
+        let (remaining, contents) = nom::branch::alt((
+            nom::bytes::complete::take_until(close_comment_tag),
+            nom::combinator::rest,
+        ))(remaining)?;
+        total_len += contents.len();
+        let remaining = if !remaining.is_empty() {
+            let (remaining, close_tag) = nom::bytes::complete::tag(close_comment_tag)(remaining)?;
+            total_len += close_tag.len();
+            remaining
+        } else {
+            remaining
+        };
+        Ok((remaining, &input[..total_len]))
+    }
 }
 
 fn parse_symbols<'a, 'b, 'c: 'a>(
@@ -340,11 +360,11 @@ fn parse_symbols<'a, 'b, 'c: 'a>(
         result
     }
 }
-
 // TODO: probably these tests will be deleted later in favour of integration test suite.
+
 #[cfg(test)]
 mod test {
-    use crate::lexer::{Symbol, DEFAULT_COMMENT_OPEN_TAG};
+    use crate::lexer::{Symbol, DEFAULT_COMMENT_CLOSE_TAG, DEFAULT_COMMENT_OPEN_TAG};
 
     use super::{
         parse_comment, parse_text, Macro, MacroName, ParseConfig, Quoted, DEFAULT_QUOTE_CLOSE_TAG,
@@ -518,14 +538,21 @@ mod test {
 
     #[test]
     fn test_parse_comment_standard() {
-        let comment = parse_comment(b"# hello world\ngoodbye").unwrap().1;
-        assert_eq!(b"# hello world\n", comment);
+        let comment = parse_comment(DEFAULT_COMMENT_OPEN_TAG, DEFAULT_COMMENT_CLOSE_TAG)(
+            b"# hello world\ngoodbye",
+        )
+        .unwrap()
+        .1;
+        assert_eq!("# hello world\n", utf8(comment));
     }
 
     #[test]
     fn test_parse_comment_standard_no_newline() {
-        let comment = parse_comment(b"# hello world").unwrap().1;
-        assert_eq!(b"# hello world", comment);
+        let comment =
+            parse_comment(DEFAULT_COMMENT_OPEN_TAG, DEFAULT_COMMENT_CLOSE_TAG)(b"# hello world")
+                .unwrap()
+                .1;
+        assert_eq!("# hello world", utf8(comment));
     }
 
     #[test]
@@ -554,15 +581,5 @@ mod test {
             parse_text(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_COMMENT_OPEN_TAG)(remaining).unwrap();
         assert_eq!("world", utf8(text));
         assert_eq!("", utf8(remaining));
-    }
-
-    #[test]
-    fn test_parse_text_before_comment() {
-        todo!()
-    }
-
-    #[test]
-    fn test_parse_comment() {
-        todo!()
     }
 }

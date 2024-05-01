@@ -83,7 +83,7 @@ impl<'a> Macro<'a> {
     }
 }
 
-#[cfg_attr(test, derive(Debug, PartialEq))]
+#[cfg_attr(test, derive(PartialEq))]
 enum Symbol<'a> {
     // Comments in m4 are not discarded, their contents (including delimeters) are copied verbatim to output without
     // further processing.
@@ -91,6 +91,24 @@ enum Symbol<'a> {
     Text(&'a [u8]),
     Quoted(Quoted<'a>),
     Macro(Macro<'a>),
+}
+
+#[cfg(test)]
+impl<'a> std::fmt::Debug for Symbol<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Comment(arg0) => f
+                .debug_tuple("Comment")
+                .field(&String::from_utf8_lossy(arg0))
+                .finish(),
+            Self::Text(arg0) => f
+                .debug_tuple("Text")
+                .field(&String::from_utf8_lossy(arg0))
+                .finish(),
+            Self::Quoted(arg0) => f.debug_tuple("Quoted").field(arg0).finish(),
+            Self::Macro(arg0) => f.debug_tuple("Macro").field(arg0).finish(),
+        }
+    }
 }
 
 impl<'a> Symbol<'a> {
@@ -133,9 +151,18 @@ impl<'a> Symbol<'a> {
     }
 }
 
-#[cfg_attr(test, derive(Debug, PartialEq))]
+#[cfg_attr(test, derive(PartialEq))]
 struct Quoted<'a> {
     pub contents: &'a [u8],
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for Quoted<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Quoted")
+            .field("contents", &String::from_utf8_lossy(self.contents))
+            .finish()
+    }
 }
 
 impl<'a> Quoted<'a> {
@@ -185,9 +212,17 @@ impl<'a> Quoted<'a> {
 
 /// Macro names shall consist of letters, digits, and underscores, where the first character is not a digit. Tokens not of this form shall not be treated as macros.
 /// `[_a-zA-Z][_a-zA-Z0-9]*`
-#[cfg_attr(test, derive(Debug))]
 #[derive(PartialEq)]
 struct MacroName<'a>(&'a [u8]);
+
+#[cfg(test)]
+impl std::fmt::Debug for MacroName<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("MacroName")
+            .field(&String::from_utf8_lossy(self.0))
+            .finish()
+    }
+}
 
 impl<'a> MacroName<'a> {
     pub fn parse(input: &'a [u8]) -> IResult<&'a [u8], Self> {
@@ -235,6 +270,13 @@ const DEFAULT_QUOTE_CLOSE_TAG: &[u8] = b"'";
 const DEFAULT_COMMENT_OPEN_TAG: &[u8] = b"#";
 const DEFAULT_COMMENT_CLOSE_TAG: &[u8] = b"\n";
 const DEFAULT_SYMBOL_RECURSION_LIMIT: usize = 100;
+static INBUILT_MACRO_NAMES: once_cell::sync::Lazy<Vec<MacroName<'static>>> =
+    once_cell::sync::Lazy::new(|| {
+        ["define", "dnf"]
+            .iter()
+            .map(|n| MacroName::parse(n.as_bytes()).unwrap().1)
+            .collect()
+    });
 
 impl<'a, 'b> Default for ParseConfig<'a, 'b> {
     fn default() -> Self {
@@ -339,6 +381,7 @@ fn parse_comment<'a, 'b>(
     }
 }
 
+// TODO: config should be a function itself, or its fields should be functions.
 fn parse_symbols<'a, 'b, 'c: 'a>(
     config: &'c ParseConfig<'a, 'b>,
 ) -> impl Fn(&'a [u8]) -> IResult<&'a [u8], Vec<Symbol<'a>>> {
@@ -354,6 +397,8 @@ fn parse_symbols<'a, 'b, 'c: 'a>(
         if input.is_empty() {
             return Ok((input, Vec::new()));
         }
+        // TODO: when changing to streaming would change this into a loop which consumes input as a
+        // Read in chunks and grabs more input if the parse is incomplete.
         let result = nom::multi::many0(Symbol::parse(config))(input);
         #[cfg(test)]
         dbg!(&result);
@@ -367,8 +412,8 @@ mod test {
     use crate::lexer::{Symbol, DEFAULT_COMMENT_CLOSE_TAG, DEFAULT_COMMENT_OPEN_TAG};
 
     use super::{
-        parse_comment, parse_text, Macro, MacroName, ParseConfig, Quoted, DEFAULT_QUOTE_CLOSE_TAG,
-        DEFAULT_QUOTE_OPEN_TAG,
+        parse_comment, parse_symbols, parse_text, Macro, MacroName, ParseConfig, Quoted,
+        DEFAULT_QUOTE_CLOSE_TAG, DEFAULT_QUOTE_OPEN_TAG, INBUILT_MACRO_NAMES,
     };
     // TODO: add tests based on input in
     // https://pubs.opengroup.org/onlinepubs/9699919799/utilities/m4.html#tag_20_74_17
@@ -581,5 +626,17 @@ mod test {
             parse_text(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_COMMENT_OPEN_TAG)(remaining).unwrap();
         assert_eq!("world", utf8(text));
         assert_eq!("", utf8(remaining));
+    }
+
+    #[test]
+    fn test_parse_symbols_evaluation_order() {
+        let f = std::fs::read("fixtures/integration_tests/evaluation_order.m4").unwrap();
+        let config = ParseConfig {
+            current_macro_names: &*INBUILT_MACRO_NAMES,
+            ..ParseConfig::default()
+        };
+        let (remaining, symbols) = parse_symbols(&config)(&f).unwrap();
+
+        insta::assert_debug_snapshot!(symbols);
     }
 }

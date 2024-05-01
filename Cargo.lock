@@ -476,6 +476,7 @@ dependencies = [
  "insta",
  "libc",
  "nom",
+ "once_cell",
 ]
 
 [[package]]

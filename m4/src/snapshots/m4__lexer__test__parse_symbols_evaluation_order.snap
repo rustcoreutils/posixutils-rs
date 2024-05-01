@@ -1,0 +1,151 @@
+---
+source: m4/src/lexer.rs
+expression: symbols
+---
+[
+    Text(
+        "dnl ",
+    ),
+    Text(
+        "demonstrates ",
+    ),
+    Text(
+        "that ",
+    ),
+    Text(
+        "evaluation ",
+    ),
+    Text(
+        "of ",
+    ),
+    Text(
+        "macro ",
+    ),
+    Text(
+        "arguments ",
+    ),
+    Text(
+        "is ",
+    ),
+    Text(
+        "deferred ",
+    ),
+    Text(
+        "until ",
+    ),
+    Text(
+        "it ",
+    ),
+    Text(
+        "is ",
+    ),
+    Text(
+        "called.\n",
+    ),
+    Macro(
+        Macro {
+            name: MacroName(
+                "define",
+            ),
+            args: [
+                [
+                    Text(
+                        "hello, ",
+                    ),
+                    Text(
+                        "error",
+                    ),
+                ],
+            ],
+        },
+    ),
+    Text(
+        "dnl\n",
+    ),
+    Macro(
+        Macro {
+            name: MacroName(
+                "define",
+            ),
+            args: [
+                [
+                    Text(
+                        "m2, ",
+                    ),
+                    Text(
+                        "m1(",
+                    ),
+                    Text(
+                        "hello",
+                    ),
+                ],
+            ],
+        },
+    ),
+    Text(
+        " ",
+    ),
+    Text(
+        "m1(\\$",
+    ),
+    Text(
+        "1))",
+    ),
+    Text(
+        "dnl \n",
+    ),
+    Macro(
+        Macro {
+            name: MacroName(
+                "define",
+            ),
+            args: [
+                [
+                    Text(
+                        "hello, ",
+                    ),
+                    Text(
+                        "goodbye",
+                    ),
+                ],
+            ],
+        },
+    ),
+    Text(
+        "dnl\n",
+    ),
+    Macro(
+        Macro {
+            name: MacroName(
+                "define",
+            ),
+            args: [
+                [
+                    Text(
+                        "m1, ",
+                    ),
+                    Quoted(
+                        Quoted {
+                            contents: "`m1'",
+                        },
+                    ),
+                    Text(
+                        "' \\$",
+                    ),
+                    Text(
+                        "1",
+                    ),
+                ],
+            ],
+        },
+    ),
+    Text(
+        "dnl\n",
+    ),
+    Text(
+        "m2(",
+    ),
+    Text(
+        "hi)\n",
+    ),
+]

@@ -148,7 +148,7 @@ https://github.com/jgarzik/posixutils
  - [ ] sort
  - [x] split
  - [ ] strings
- - [ ] strip (Development)
+ - [x] strip (Development)
  - [x] stty
  - [x] tabs
  - [ ] tail

@@ -1,3 +1,4 @@
+use object::{Object, ObjectSection, ObjectSymbol};
 use plib::{run_test, run_test_with_checker, TestPlan};
 use std::fs;
 
@@ -78,6 +79,20 @@ fn ar_print_test(args: &[&str], stdout_bytes: &[u8]) {
             assert_eq!(output.stdout, stdout_bytes);
         },
     );
+}
+
+fn strip_file(path: &str, previous_contents: &[u8]) -> Vec<u8> {
+    run_test(TestPlan {
+        cmd: "strip".to_string(),
+        args: vec![path.to_string()],
+        stdin_data: "".to_string(),
+        expected_out: "".to_string(),
+        expected_err: "".to_string(),
+        expected_exit_code: 0,
+    });
+    let result = fs::read(path).expect("could not open result file");
+    fs::write(path, previous_contents).expect("could not reset result file");
+    result
 }
 
 #[test]
@@ -419,4 +434,76 @@ fn test_ar_list_some() {
         expected_err: "".to_string(),
         expected_exit_code: 0,
     });
+}
+
+#[test]
+fn test_strip_stripped_elf_is_valid_elf() {
+    let stripped = strip_file(
+        "tests/strip/stripped_elf_is_valid_elf.o",
+        include_bytes!("strip/stripped_elf_is_valid_elf.o"),
+    );
+    object::read::elf::ElfFile64::<object::Endianness>::parse(&*stripped).expect("invalid ELF");
+}
+
+#[test]
+fn test_strip_stripped_archive_contains_valid_elf_members() {
+    let stripped = strip_file(
+        "tests/strip/stripped_archive_contains_valid_elf_members.a",
+        include_bytes!("strip/stripped_archive_contains_valid_elf_members.a"),
+    );
+    let archive = object::read::archive::ArchiveFile::parse(&*stripped).unwrap();
+    for member in archive.members() {
+        let member = member.unwrap();
+        object::read::elf::ElfFile64::<object::Endianness>::parse(
+            member.data(&*stripped).expect("could not read member data"),
+        )
+        .expect("invalid ELF");
+    }
+}
+
+#[test]
+fn test_strip_remove_all_non_section_symbols() {
+    let stripped = strip_file(
+        "tests/strip/remove_all_non_section_symbols.o",
+        include_bytes!("strip/remove_all_non_section_symbols.o"),
+    );
+    let elf = object::read::elf::ElfFile64::<object::Endianness>::parse(&*stripped).unwrap();
+    for symbol in elf.symbols() {
+        assert_eq!(symbol.kind(), object::SymbolKind::Section);
+    }
+}
+
+#[test]
+fn test_strip_remove_all_relocations() {
+    let stripped = strip_file(
+        "tests/strip/remove_all_relocations.o",
+        include_bytes!("strip/remove_all_relocations.o"),
+    );
+    let elf = object::read::elf::ElfFile64::<object::Endianness>::parse(&*stripped).unwrap();
+    for section in elf.sections() {
+        assert_eq!(section.relocations().count(), 0);
+    }
+}
+
+#[test]
+fn test_strip_removes_all_debug_sections() {
+    const DEBUG_SECTIONS: [&[u8]; 7] = [
+        b".debug",
+        b".gnu.debuglto_.debug_",
+        b".gnu.linkonce.wi.",
+        b".zdebug",
+        b".line",
+        b".stab",
+        b".gdb_index",
+    ];
+    let stripped = strip_file(
+        "tests/strip/remove_all_debug_sections.o",
+        include_bytes!("strip/remove_all_debug_sections.o"),
+    );
+    let elf = object::read::elf::ElfFile64::<object::Endianness>::parse(&*stripped).unwrap();
+    for section in elf.sections() {
+        for debug_section in &DEBUG_SECTIONS {
+            assert!(!section.name_bytes().unwrap().starts_with(debug_section));
+        }
+    }
 }

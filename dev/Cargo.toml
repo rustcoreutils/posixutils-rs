@@ -10,8 +10,9 @@ repository = "https://github.com/rustcoreutils/posixutils-rs.git"
 plib = { path = "../plib" }
 clap.workspace = true
 gettext-rs.workspace = true
-object = "0.33"
+object =  { version = "0.35", features = ["read", "build", "elf"]}
 chrono = "0.4"
+ar = "0.9"
 
 [[bin]]
 name = "nm"
@@ -21,3 +22,7 @@ path = "src/nm.rs"
 name = "ar"
 path = "src/ar.rs"
 required-features = ["object/read_core", "object/archive"]
+
+[[bin]]
+name = "strip"
+path = "src/strip.rs"

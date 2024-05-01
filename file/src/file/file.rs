@@ -652,3 +652,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+//fn main() -> Result<(), Box<dyn std::error::Error>> {
+//    let args = Args::parse();
+//
+//    // Initialize translation system
+//    textdomain(PROJECT_NAME).unwrap();
+//    bind_textdomain_codeset(PROJECT_NAME, "UTF-8").unwrap();
+//
+//    let rm_file = File::open("./file/magic/acorn").unwrap();
+//    let mut rm_rdr = BufReader::new(rm_file);
+//
+//    //let lines: Vec<String> = vec![];
+//
+//    let mut magic: Option<Magic> = None;
+//    for line in rm_rdr.lines() {
+//        let mut l = line.unwrap();
+//        if (l.trim_start().is_empty() || l.starts_with('#')) {
+//            // donot parse
+//        } else if (l.starts_with("!:")) {
+//            //parse_extras(l);
+//            //l.replace_range(0..=1, "");
+//            //l.spli
+//            //let v = l.split_whitespace()
+//            //println!("{l}");
+//        } else {
+//            let z = magic::Magic::from_line(l);
+//        }
+//
+//        //let m = Magic::f
+//    }
+//
+//    //for line in x.li
+//
+//    //let x = magic::CompiledMagicFile::parse_and_test("./acorn.mgc", "./acorn.mgc").unwrap();
+//
+//    //let x =
+//    //for file in &args.files {
+//    //analyze_file(file.clone(), &args);
+//    //}
+//
+//    Ok(())
+//}
+//
+// Parse the extras
+//fn parse_extras(mut line: String, magic: &mut Magic) {
+//    // remove the first two characters i.e "!:"
+//    line.replace_range(0..=1, "");
+//
+//    let re = Regex::new(r"[ \t]+").unwrap();
+//    line = re.replacen(&line, 1, " ").to_string();
+//
+//    let split: Vec<&str> = line.splitn(2, " ").collect();
+//
+//    let _type = split[0];
+//    let value = split[1];
+//
+//    match _type {
+//        "apple" => magic.set_mime(value),
+//        "mime" => magic.set_apple(value),
+//        "strength" => {}
+//        "ext" => magic.set_ext(value),
+//        _ => {}
+//    }
+//}

@@ -640,6 +640,7 @@ dependencies = [
  "clap",
  "gettext-rs",
  "libc",
+ "num-traits",
  "plib",
  "regex",
 ]

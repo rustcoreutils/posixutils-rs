@@ -30,22 +30,22 @@
 use nom::{error::ContextError, IResult};
 
 #[cfg_attr(test, derive(Debug, PartialEq))]
-struct Macro<'a> {
-    name: MacroName<'a>,
-    args: Vec<Vec<Symbol<'a>>>,
+struct Macro<'i> {
+    name: MacroName<'i>,
+    args: Vec<Vec<Symbol<'i>>>,
 }
 
-impl<'a> Macro<'a> {
+impl<'c, 'i: 'c> Macro<'i> {
     /// ## Notes
     ///
     /// * The parsing of macro arguments happens at the time of definition.
     /// * The unwrapping and parsing of quoted arguments happens at the time of calling.
     /// * The evaluation of expressions defined in macros happens at the time of calling.
-    pub fn parse<'b: 'a>(
+    pub fn parse(
         // TODO: perhaps faster with a hashset?
-        config: &'b ParseConfig<'a>,
-    ) -> impl Fn(&'a [u8]) -> IResult<&'a [u8], Self> {
-        move |input: &'a [u8]| {
+        config: &'c ParseConfig<'c>,
+    ) -> impl Fn(&'i [u8]) -> IResult<&'i [u8], Self> + 'c {
+        move |input: &'i [u8]| {
             #[cfg(test)]
             dbg!(&config.current_macro_names);
             println!("parse_macro {:?}", String::from_utf8_lossy(input));
@@ -84,17 +84,17 @@ impl<'a> Macro<'a> {
 }
 
 #[cfg_attr(test, derive(PartialEq))]
-enum Symbol<'a> {
+enum Symbol<'i> {
     // Comments in m4 are not discarded, their contents (including delimeters) are copied verbatim to output without
     // further processing.
-    Comment(&'a [u8]),
-    Text(&'a [u8]),
-    Quoted(Quoted<'a>),
-    Macro(Macro<'a>),
+    Comment(&'i [u8]),
+    Text(&'i [u8]),
+    Quoted(Quoted<'i>),
+    Macro(Macro<'i>),
 }
 
 #[cfg(test)]
-impl<'a> std::fmt::Debug for Symbol<'a> {
+impl<'i> std::fmt::Debug for Symbol<'i> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Comment(arg0) => f
@@ -111,11 +111,11 @@ impl<'a> std::fmt::Debug for Symbol<'a> {
     }
 }
 
-impl<'a> Symbol<'a> {
-    fn parse<'b: 'a>(
-        config: &'b ParseConfig<'a>,
-    ) -> impl Fn(&'a [u8]) -> IResult<&'a [u8], Symbol<'a>> + 'a {
-        move |input: &'a [u8]| {
+impl<'c, 'i: 'c> Symbol<'i> {
+    fn parse(
+        config: &'c ParseConfig<'c>,
+    ) -> impl Fn(&'i [u8]) -> IResult<&'i [u8], Symbol<'i>> + 'c {
+        move |input: &'i [u8]| {
             println!(
                 "parse_symbol: {:?}, current_macro_names: {:?}",
                 String::from_utf8_lossy(input),
@@ -152,8 +152,8 @@ impl<'a> Symbol<'a> {
 }
 
 #[cfg_attr(test, derive(PartialEq))]
-struct Quoted<'a> {
-    pub contents: &'a [u8],
+struct Quoted<'i> {
+    pub contents: &'i [u8],
 }
 
 #[cfg(test)]
@@ -165,11 +165,11 @@ impl std::fmt::Debug for Quoted<'_> {
     }
 }
 
-impl<'a> Quoted<'a> {
+impl<'i> Quoted<'i> {
     fn parse(
-        open_tag: &'a [u8],
-        close_tag: &'a [u8],
-    ) -> impl Fn(&[u8]) -> IResult<&[u8], Quoted<'_>> + 'a {
+        open_tag: &'i [u8],
+        close_tag: &'i [u8],
+    ) -> impl for<'c> Fn(&'c [u8]) -> IResult<&'c [u8], Quoted<'c>> + 'i {
         |input: &[u8]| {
             let mut nest_level = 0;
 
@@ -213,7 +213,7 @@ impl<'a> Quoted<'a> {
 /// Macro names shall consist of letters, digits, and underscores, where the first character is not a digit. Tokens not of this form shall not be treated as macros.
 /// `[_a-zA-Z][_a-zA-Z0-9]*`
 #[derive(PartialEq, Clone)]
-struct MacroName<'a>(&'a [u8]);
+struct MacroName<'i>(&'i [u8]);
 
 #[cfg(test)]
 impl std::fmt::Debug for MacroName<'_> {
@@ -224,8 +224,8 @@ impl std::fmt::Debug for MacroName<'_> {
     }
 }
 
-impl<'a> MacroName<'a> {
-    pub fn parse(input: &'a [u8]) -> IResult<&'a [u8], Self> {
+impl<'i> MacroName<'i> {
+    pub fn parse(input: &'i [u8]) -> IResult<&'i [u8], Self> {
         println!("parsing macro name {:?}", String::from_utf8_lossy(input));
         if input.is_empty() {
             println!("empty macro name");
@@ -241,7 +241,7 @@ impl<'a> MacroName<'a> {
         Ok((remaining, Self(&input[..(start.len() + rest.len())])))
     }
 
-    fn try_from_slice(input: &'a [u8]) -> Result<Self, nom::Err<nom::error::Error<&'a [u8]>>> {
+    fn try_from_slice(input: &'i [u8]) -> Result<Self, nom::Err<nom::error::Error<&'i [u8]>>> {
         Self::parse(input.into()).map(|ok| ok.1)
     }
 }
@@ -256,12 +256,12 @@ fn is_word_char_start(c: u8) -> bool {
     (unsafe { libc::isalpha(c.into()) } != 0) || c == b'_'
 }
 
-struct ParseConfig<'a> {
-    current_macro_names: Vec<MacroName<'a>>,
-    quote_open_tag: &'a [u8],
-    quote_close_tag: &'a [u8],
-    comment_open_tag: &'a [u8],
-    comment_close_tag: &'a [u8],
+struct ParseConfig<'i> {
+    current_macro_names: Vec<MacroName<'i>>,
+    quote_open_tag: &'i [u8],
+    quote_close_tag: &'i [u8],
+    comment_open_tag: &'i [u8],
+    comment_close_tag: &'i [u8],
     symbol_recursion_limit: usize,
 }
 
@@ -308,10 +308,10 @@ fn is_alphnumeric(c: u8) -> bool {
 /// encountered, or when we encounter the first alpha character after a non-alphanumeric character.
 /// TODO: what happens if we encounter a close quote?
 /// TODO: comment tag
-fn parse_text<'a>(
-    quote_open_tag: &'a [u8],
-    comment_open_tag: &'a [u8],
-) -> impl for<'b> Fn(&'b [u8]) -> IResult<&'b [u8], &'b [u8]> + 'a {
+fn parse_text<'c>(
+    quote_open_tag: &'c [u8],
+    comment_open_tag: &'c [u8],
+) -> impl for<'i> Fn(&'i [u8]) -> IResult<&'i [u8], &'i [u8]> + 'c {
     move |input: &[u8]| {
         if input.is_empty() {
             return Ok((input, input));
@@ -381,49 +381,51 @@ fn parse_comment<'a, 'b>(
     }
 }
 
-fn process_streaming<'a, R: std::io::Read>(
-    config: ParseConfig<'a>,
-    execute: impl for<'b, 'c> Fn(ParseConfig<'b>, &'c [Symbol<'c>]) -> ParseConfig<'b>,
-) -> impl Fn(R) + 'a {
-    move |mut reader: R| {
-        let buffer_size = 10;
-        let buffer_growth_factor = 2;
-        let mut previous_buffer = circular::Buffer::with_capacity(buffer_size);
-        let mut current_buffer = circular::Buffer::with_capacity(buffer_size);
+fn process_streaming<'d, R: std::io::Read, W: std::io::Write>(
+    config: ParseConfig<'d>,
+    execute: impl for<'b, 'i> Fn(ParseConfig<'b>, Symbol<'i>) -> ParseConfig<'b> + 'd,
+    mut reader: R,
+    mut writer: W,
+) {
+    let buffer_size = 10;
+    let buffer_growth_factor = 2;
+    let mut previous_buffer = circular::Buffer::with_capacity(buffer_size);
+    let mut current_buffer = circular::Buffer::with_capacity(buffer_size);
+    let mut config = config;
+
+    loop {
+        let read = reader.read(current_buffer.space()).unwrap();
+        if read == 0 {
+            break;
+        }
+        current_buffer.fill(read);
 
         loop {
-            let read = reader.read(current_buffer.space()).unwrap();
-            if read == 0 {
-                break;
-            }
-            current_buffer.fill(read);
+            let input = current_buffer.data();
 
-            loop {
-                let input = current_buffer.data();
+            let result = Symbol::parse(&config)(input);
+            let (remaining, symbol) = match result {
+                Ok(ok) => ok,
+                Err(nom::Err::Incomplete(_)) => {
+                    let new_capacity = buffer_growth_factor * current_buffer.capacity();
+                    current_buffer.grow(new_capacity);
+                    previous_buffer.grow(new_capacity);
+                    break;
+                }
+                Err(error) => panic!("{}", error),
+            };
+            let remaining_len = remaining.len();
+            config = execute(config, symbol);
 
-                let result = Symbol::parse(&config)(input);
-                let (remaining, _symbols) = match result {
-                    Ok(ok) => ok,
-                    Err(nom::Err::Incomplete(_)) => {
-                        let new_capacity = buffer_growth_factor * current_buffer.capacity();
-                        current_buffer.grow(new_capacity);
-                        previous_buffer.grow(new_capacity);
-                        break;
-                    }
-                    Err(error) => panic!("{}", error),
-                };
-
-                // TODO: process symbols and mutate the config
-                current_buffer.consume(input.len() - remaining.len());
-                std::mem::swap(&mut previous_buffer, &mut current_buffer);
-            }
+            current_buffer.consume(input.len() - remaining_len);
+            std::mem::swap(&mut previous_buffer, &mut current_buffer);
         }
     }
 }
 
-fn parse_symbols<'a, 'b: 'a>(
-    config: &'b ParseConfig<'a>,
-) -> impl Fn(&'a [u8]) -> IResult<&'a [u8], Vec<Symbol<'a>>> {
+fn parse_symbols<'b, 'a: 'b>(
+    config: &'b ParseConfig<'b>,
+) -> impl Fn(&'a [u8]) -> IResult<&'a [u8], Vec<Symbol<'a>>> + 'b {
     move |input: &[u8]| {
         if config.symbol_recursion_limit == 0 {
             // TODO: Add a better error

@@ -29,6 +29,8 @@
 
 use nom::IResult;
 
+use std::io::{Read, Write};
+
 #[cfg_attr(test, derive(Debug, PartialEq))]
 struct Macro<'i> {
     name: MacroName,
@@ -286,7 +288,7 @@ static INBUILT_MACRO_NAMES: once_cell::sync::Lazy<Vec<MacroName>> =
 impl Default for ParseConfig {
     fn default() -> Self {
         Self {
-            current_macro_names: vec![],
+            current_macro_names: INBUILT_MACRO_NAMES.clone(),
             quote_open_tag: DEFAULT_QUOTE_OPEN_TAG.to_vec(),
             quote_close_tag: DEFAULT_QUOTE_CLOSE_TAG.to_vec(),
             comment_open_tag: DEFAULT_COMMENT_OPEN_TAG.to_vec(),
@@ -386,7 +388,11 @@ fn parse_comment<'a, 'b>(
     }
 }
 
-fn process_streaming<'c, R: std::io::Read, W: std::io::Write>(
+/// `evaluate` is a function which takes the current [`ParseConfig`], and evaluates the provided
+/// [`Symbol`] writing output to `writer`, and returns a [`ParseConfig`] which has been
+/// modified during the process of evaluation (for example a new macro was defined, or
+/// changequote).
+fn process_streaming<'c, R: Read, W: Write>(
     initial_config: ParseConfig,
     mut evaluate: impl for<'i, 'w> FnMut(ParseConfig, Symbol<'i>, &'w mut W) -> ParseConfig,
     mut reader: R,
@@ -452,10 +458,10 @@ fn parse_symbols<'b, 'a: 'b>(
 #[cfg(test)]
 mod test {
     use crate::lexer::{Symbol, DEFAULT_COMMENT_CLOSE_TAG, DEFAULT_COMMENT_OPEN_TAG};
+    use std::io::Write;
 
     use super::{
-        parse_comment, parse_symbols, parse_text, Macro, MacroName, ParseConfig, Quoted,
-        DEFAULT_QUOTE_CLOSE_TAG, DEFAULT_QUOTE_OPEN_TAG, INBUILT_MACRO_NAMES,
+        parse_comment, parse_symbols, parse_text, process_streaming, Macro, MacroName, ParseConfig, Quoted, DEFAULT_QUOTE_CLOSE_TAG, DEFAULT_QUOTE_OPEN_TAG, INBUILT_MACRO_NAMES
     };
     // TODO: add tests based on input in
     // https://pubs.opengroup.org/onlinepubs/9699919799/utilities/m4.html#tag_20_74_17
@@ -464,6 +470,16 @@ mod test {
         ifelse(VER, 1, ``VER'' is `VER'.)
         ifelse(VER, 2, ``VER'' is `VER'., ``VER'' is not 2.)
         end"#;
+
+    fn snapshot_symbols_as_stream(initial_config: ParseConfig, input: &[u8]) -> String {
+        let mut writer = Vec::new();
+        process_streaming(initial_config, |config, symbol, writer| {
+            writer.write_all(format!("{symbol:?}").as_bytes()).unwrap();
+            config
+        }, input, &mut writer);
+
+        String::from_utf8(writer).unwrap()
+    }
 
     fn utf8(input: &[u8]) -> String {
         String::from_utf8(input.to_vec()).unwrap()
@@ -672,13 +688,16 @@ mod test {
     #[test]
     fn test_parse_symbols_evaluation_order() {
         let f = std::fs::read("fixtures/integration_tests/evaluation_order.m4").unwrap();
-        let config = ParseConfig {
-            current_macro_names: (*INBUILT_MACRO_NAMES).clone(),
-            ..ParseConfig::default()
-        };
+        let config = ParseConfig::default();
         let (remaining, symbols) = parse_symbols(&config)(&f).unwrap();
 
         insta::assert_debug_snapshot!(symbols);
         assert!(remaining.is_empty())
+    }
+
+    #[test]
+    fn test_parse_stream_symbols_evaluation_order() {
+        let f = std::fs::read("fixtures/integration_tests/evaluation_order.m4").unwrap();
+        insta::assert_snapshot!(snapshot_symbols_as_stream(ParseConfig::default(), &f));
     }
 }

@@ -41,4 +41,4 @@ path = "src/tee.rs"
 
 [[bin]]
 name = "file"
-path = "src/file/file.rs"
+path = "src/file.rs"

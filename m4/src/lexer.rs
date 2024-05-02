@@ -223,10 +223,7 @@ impl<'i> Quoted<'i> {
 
             let quote_end_index = loop {
                 if remaining.is_empty() {
-                    return Err(nom::Err::Error(nom::error::Error::new(
-                        input,
-                        nom::error::ErrorKind::TagClosure,
-                    )));
+                    return Err(nom::Err::Incomplete(nom::Needed::Unknown));
                 }
 
                 if remaining.starts_with(&*close_tag) {
@@ -375,7 +372,7 @@ fn parse_comment<'a, 'b>(
         );
         // TODO this could probably be optimized
         let (remaining, contents) = nom::branch::alt((
-            nom::combinator::complete(nom::bytes::streaming::take_until(close_comment_tag)),
+            nom::bytes::complete::take_until(close_comment_tag),
             nom::bytes::streaming::take_until("\0"),
         ))(remaining)?;
 
@@ -383,7 +380,7 @@ fn parse_comment<'a, 'b>(
         total_len += contents.len();
         let remaining = if !remaining.is_empty() {
             let (remaining, final_tag) = nom::branch::alt((
-                nom::combinator::complete(nom::bytes::streaming::tag(close_comment_tag)),
+                nom::bytes::complete::tag(close_comment_tag),
                 nom::bytes::streaming::tag(b"\0"),
             ))(remaining)?;
             total_len += final_tag.len();
@@ -648,6 +645,13 @@ mod test {
     }
 
     #[test]
+    fn test_parse_quoted_incomplete() {
+        let error =
+            Quoted::parse(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_QUOTE_CLOSE_TAG)(b"`hello").unwrap_err();
+        assert!(matches!(error, nom::Err::Incomplete(_)));
+    }
+
+    #[test]
     fn test_parse_quoted_nested() {
         let quote =
             Quoted::parse(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_QUOTE_CLOSE_TAG)(b"`a `quote' is good!'")
@@ -657,9 +661,17 @@ mod test {
     }
 
     #[test]
+    fn test_parse_quoted_nested_incomplete() {
+        let error =
+            Quoted::parse(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_QUOTE_CLOSE_TAG)(b"`a `quote is good!'")
+                .unwrap_err();
+        assert!(matches!(error, nom::Err::Incomplete(_)));
+    }
+
+    #[test]
     fn test_parse_comment_standard() {
         let comment = parse_comment(DEFAULT_COMMENT_OPEN_TAG, DEFAULT_COMMENT_CLOSE_TAG)(
-            b"# hello world\ngoodbye",
+            b"# hello world\ngoodbye\0",
         )
         .unwrap()
         .1;
@@ -673,6 +685,14 @@ mod test {
                 .unwrap()
                 .1;
         assert_eq!("# hello world\0", utf8(comment));
+    }
+
+    #[test]
+    fn test_parse_comment_standard_incomplete() {
+        let error =
+            parse_comment(DEFAULT_COMMENT_OPEN_TAG, DEFAULT_COMMENT_CLOSE_TAG)(b"# hello world")
+                .unwrap_err();
+        assert!(matches!(error, nom::Err::Incomplete(_)));
     }
 
     #[test]

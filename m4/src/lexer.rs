@@ -41,13 +41,13 @@ impl<'a> Macro<'a> {
     /// * The parsing of macro arguments happens at the time of definition.
     /// * The unwrapping and parsing of quoted arguments happens at the time of calling.
     /// * The evaluation of expressions defined in macros happens at the time of calling.
-    pub fn parse<'b, 'c: 'a>(
+    pub fn parse<'b: 'a>(
         // TODO: perhaps faster with a hashset?
-        config: &'c ParseConfig<'a, 'b>,
+        config: &'b ParseConfig<'a>,
     ) -> impl Fn(&'a [u8]) -> IResult<&'a [u8], Self> {
         move |input: &'a [u8]| {
             #[cfg(test)]
-            dbg!(config.current_macro_names);
+            dbg!(&config.current_macro_names);
             println!("parse_macro {:?}", String::from_utf8_lossy(input));
             let (remaining, name) = MacroName::parse(input)?;
             if !config.current_macro_names.contains(&name) {
@@ -112,8 +112,8 @@ impl<'a> std::fmt::Debug for Symbol<'a> {
 }
 
 impl<'a> Symbol<'a> {
-    fn parse<'b: 'a, 'c: 'a>(
-        config: &'c ParseConfig<'a, 'b>,
+    fn parse<'b: 'a>(
+        config: &'b ParseConfig<'a>,
     ) -> impl Fn(&'a [u8]) -> IResult<&'a [u8], Symbol<'a>> + 'a {
         move |input: &'a [u8]| {
             println!(
@@ -212,7 +212,7 @@ impl<'a> Quoted<'a> {
 
 /// Macro names shall consist of letters, digits, and underscores, where the first character is not a digit. Tokens not of this form shall not be treated as macros.
 /// `[_a-zA-Z][_a-zA-Z0-9]*`
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone)]
 struct MacroName<'a>(&'a [u8]);
 
 #[cfg(test)]
@@ -256,12 +256,12 @@ fn is_word_char_start(c: u8) -> bool {
     (unsafe { libc::isalpha(c.into()) } != 0) || c == b'_'
 }
 
-struct ParseConfig<'a, 'b: 'a> {
-    current_macro_names: &'b [MacroName<'a>],
-    quote_open_tag: &'b [u8],
-    quote_close_tag: &'b [u8],
-    comment_open_tag: &'b [u8],
-    comment_close_tag: &'b [u8],
+struct ParseConfig<'a> {
+    current_macro_names: Vec<MacroName<'a>>,
+    quote_open_tag: &'a [u8],
+    quote_close_tag: &'a [u8],
+    comment_open_tag: &'a [u8],
+    comment_close_tag: &'a [u8],
     symbol_recursion_limit: usize,
 }
 
@@ -278,10 +278,10 @@ static INBUILT_MACRO_NAMES: once_cell::sync::Lazy<Vec<MacroName<'static>>> =
             .collect()
     });
 
-impl<'a, 'b> Default for ParseConfig<'a, 'b> {
+impl<'a> Default for ParseConfig<'a> {
     fn default() -> Self {
         Self {
-            current_macro_names: &[],
+            current_macro_names: vec![],
             quote_open_tag: &DEFAULT_QUOTE_OPEN_TAG,
             quote_close_tag: &DEFAULT_QUOTE_CLOSE_TAG,
             comment_open_tag: &DEFAULT_COMMENT_OPEN_TAG,
@@ -381,9 +381,48 @@ fn parse_comment<'a, 'b>(
     }
 }
 
-// TODO: config should be a function itself, or its fields should be functions.
-fn parse_symbols<'a, 'b, 'c: 'a>(
-    config: &'c ParseConfig<'a, 'b>,
+fn process_streaming<'a, R: std::io::Read>(
+    config: ParseConfig<'a>,
+    execute: impl for<'b, 'c> Fn(ParseConfig<'b>, &'c [Symbol<'c>]) -> ParseConfig<'b>,
+) -> impl Fn(R) + 'a {
+    move |mut reader: R| {
+        let buffer_size = 10;
+        let buffer_growth_factor = 2;
+        let mut previous_buffer = circular::Buffer::with_capacity(buffer_size);
+        let mut current_buffer = circular::Buffer::with_capacity(buffer_size);
+
+        loop {
+            let read = reader.read(current_buffer.space()).unwrap();
+            if read == 0 {
+                break;
+            }
+            current_buffer.fill(read);
+
+            loop {
+                let input = current_buffer.data();
+
+                let result = Symbol::parse(&config)(input);
+                let (remaining, _symbols) = match result {
+                    Ok(ok) => ok,
+                    Err(nom::Err::Incomplete(_)) => {
+                        let new_capacity = buffer_growth_factor * current_buffer.capacity();
+                        current_buffer.grow(new_capacity);
+                        previous_buffer.grow(new_capacity);
+                        break;
+                    }
+                    Err(error) => panic!("{}", error),
+                };
+
+                // TODO: process symbols and mutate the config
+                current_buffer.consume(input.len() - remaining.len());
+                std::mem::swap(&mut previous_buffer, &mut current_buffer);
+            }
+        }
+    }
+}
+
+fn parse_symbols<'a, 'b: 'a>(
+    config: &'b ParseConfig<'a>,
 ) -> impl Fn(&'a [u8]) -> IResult<&'a [u8], Vec<Symbol<'a>>> {
     move |input: &[u8]| {
         if config.symbol_recursion_limit == 0 {
@@ -397,8 +436,6 @@ fn parse_symbols<'a, 'b, 'c: 'a>(
         if input.is_empty() {
             return Ok((input, Vec::new()));
         }
-        // TODO: when changing to streaming would change this into a loop which consumes input as a
-        // Read in chunks and grabs more input if the parse is incomplete.
         let result = nom::multi::many0(Symbol::parse(config))(input);
         #[cfg(test)]
         dbg!(&result);
@@ -444,9 +481,8 @@ mod test {
 
     #[test]
     fn test_parse_macro_name_fail_not_in_list() {
-        let current_macro_names = &[];
         Macro::parse(&ParseConfig {
-            current_macro_names,
+            current_macro_names: vec![],
             ..ParseConfig::default()
         })(b"some_word_23")
         .unwrap_err();
@@ -454,7 +490,7 @@ mod test {
 
     #[test]
     fn test_parse_macro_name_only() {
-        let current_macro_names = &[macro_name(b"some_word_23")];
+        let current_macro_names = vec![macro_name(b"some_word_23")];
         let config = ParseConfig {
             current_macro_names,
             ..ParseConfig::default()
@@ -465,7 +501,7 @@ mod test {
 
     #[test]
     fn test_parse_macro_args_empty() {
-        let current_macro_names = &[macro_name(b"some_word_23")];
+        let current_macro_names = vec![macro_name(b"some_word_23")];
         let config = ParseConfig {
             current_macro_names,
             ..ParseConfig::default()
@@ -477,7 +513,7 @@ mod test {
 
     #[test]
     fn test_parse_macro_args_1() {
-        let current_macro_names = &[macro_name(b"some_word_23"), macro_name(b"hello")];
+        let current_macro_names = vec![macro_name(b"some_word_23"), macro_name(b"hello")];
         let config = &ParseConfig {
             current_macro_names,
             ..ParseConfig::default()
@@ -494,7 +530,7 @@ mod test {
 
     #[test]
     fn test_parse_macro_args_1_quoted() {
-        let current_macro_names = &[macro_name(b"some_word_23"), macro_name(b"hello")];
+        let current_macro_names = vec![macro_name(b"some_word_23"), macro_name(b"hello")];
         let config = &ParseConfig {
             current_macro_names,
             ..ParseConfig::default()
@@ -511,7 +547,7 @@ mod test {
 
     #[test]
     fn test_parse_macro_args_2() {
-        let current_macro_names = &[
+        let current_macro_names = vec![
             macro_name(b"some_word_23"),
             macro_name(b"hello"),
             macro_name(b"world"),
@@ -545,7 +581,7 @@ mod test {
     #[test]
     fn test_parse_macro_args_fail_no_closing_bracket() {
         // TODO: produce and check for a more specific error
-        let current_macro_names = &[macro_name(b"some_word_23")];
+        let current_macro_names = vec![macro_name(b"some_word_23")];
         Macro::parse(&ParseConfig {
             current_macro_names,
             ..ParseConfig::default()
@@ -556,7 +592,7 @@ mod test {
     #[test]
     fn test_parse_macro_args_fail_empty_no_closing_bracket() {
         // TODO: produce and check for a more specific error
-        let current_macro_names = &[macro_name(b"some_word_23")];
+        let current_macro_names = vec![macro_name(b"some_word_23")];
         Macro::parse(&ParseConfig {
             current_macro_names,
             ..ParseConfig::default()
@@ -632,7 +668,7 @@ mod test {
     fn test_parse_symbols_evaluation_order() {
         let f = std::fs::read("fixtures/integration_tests/evaluation_order.m4").unwrap();
         let config = ParseConfig {
-            current_macro_names: &*INBUILT_MACRO_NAMES,
+            current_macro_names: (*INBUILT_MACRO_NAMES).clone(),
             ..ParseConfig::default()
         };
         let (remaining, symbols) = parse_symbols(&config)(&f).unwrap();

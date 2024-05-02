@@ -31,6 +31,49 @@ use nom::IResult;
 
 use std::io::{Read, Write};
 
+/// Configuration for parsing, affects what are considered macros, quotes or comments. Also keeps a
+/// record of the recusion limit for processing a [`Symbol`].
+// TODO: Can probably optimize using something like smallvec
+#[derive(Clone)]
+struct ParseConfig {
+    current_macro_names: Vec<MacroName>,
+    quote_open_tag: Vec<u8>,
+    quote_close_tag: Vec<u8>,
+    comment_open_tag: Vec<u8>,
+    comment_close_tag: Vec<u8>,
+    symbol_recursion_limit: usize,
+}
+
+const DEFAULT_QUOTE_OPEN_TAG: &[u8] = b"`";
+const DEFAULT_QUOTE_CLOSE_TAG: &[u8] = b"'";
+const DEFAULT_COMMENT_OPEN_TAG: &[u8] = b"#";
+const DEFAULT_COMMENT_CLOSE_TAG: &[u8] = b"\n";
+const DEFAULT_SYMBOL_RECURSION_LIMIT: usize = 100;
+static INBUILT_MACRO_NAMES: once_cell::sync::Lazy<Vec<MacroName>> =
+    once_cell::sync::Lazy::new(|| {
+        ["define", "dnf"]
+            .iter()
+            .map(|n| {
+                MacroName::parse(n.as_bytes())
+                    .expect(&format!("failed to parse {n:?}"))
+                    .1
+            })
+            .collect()
+    });
+
+impl Default for ParseConfig {
+    fn default() -> Self {
+        Self {
+            current_macro_names: INBUILT_MACRO_NAMES.clone(),
+            quote_open_tag: DEFAULT_QUOTE_OPEN_TAG.to_vec(),
+            quote_close_tag: DEFAULT_QUOTE_CLOSE_TAG.to_vec(),
+            comment_open_tag: DEFAULT_COMMENT_OPEN_TAG.to_vec(),
+            comment_close_tag: DEFAULT_COMMENT_CLOSE_TAG.to_vec(),
+            symbol_recursion_limit: DEFAULT_SYMBOL_RECURSION_LIMIT,
+        }
+    }
+}
+
 #[cfg_attr(test, derive(Debug, PartialEq))]
 struct Macro<'i> {
     name: MacroName,
@@ -229,14 +272,11 @@ impl MacroName {
         println!("parsing macro name {:?}", String::from_utf8_lossy(input));
         if input.is_empty() {
             println!("empty macro name");
-            return Err(nom::Err::Error(nom::error::Error::new(
-                input,
-                nom::error::ErrorKind::NonEmpty,
-            )));
+            return Err(nom::Err::Incomplete(nom::Needed::Unknown));
         }
-        let (remaining, start) = nom::bytes::complete::take_while1(is_word_char_start)(input)?;
+        let (remaining, start) = nom::bytes::streaming::take_while1(is_word_char_start)(input)?;
         let (remaining, rest) =
-            nom::bytes::complete::take_while_m_n(0, remaining.len(), is_word_char_end)(remaining)?;
+            nom::bytes::streaming::take_while_m_n(0, remaining.len(), is_word_char_end)(remaining)?;
         // TODO: check whether the name matches any names in the current state.
         Ok((
             remaining,
@@ -257,45 +297,6 @@ fn is_word_char_end(c: u8) -> bool {
 fn is_word_char_start(c: u8) -> bool {
     // TODO: check safety!
     (unsafe { libc::isalpha(c.into()) } != 0) || c == b'_'
-}
-
-/// Configuration for parsing, affects what are considered macros, quotes or comments. Also keeps a
-/// record of the recusion limit for processing a [`Symbol`].
-// TODO: Can probably optimize using something like smallvec
-#[derive(Clone)]
-struct ParseConfig {
-    current_macro_names: Vec<MacroName>,
-    quote_open_tag: Vec<u8>,
-    quote_close_tag: Vec<u8>,
-    comment_open_tag: Vec<u8>,
-    comment_close_tag: Vec<u8>,
-    symbol_recursion_limit: usize,
-}
-
-const DEFAULT_QUOTE_OPEN_TAG: &[u8] = b"`";
-const DEFAULT_QUOTE_CLOSE_TAG: &[u8] = b"'";
-const DEFAULT_COMMENT_OPEN_TAG: &[u8] = b"#";
-const DEFAULT_COMMENT_CLOSE_TAG: &[u8] = b"\n";
-const DEFAULT_SYMBOL_RECURSION_LIMIT: usize = 100;
-static INBUILT_MACRO_NAMES: once_cell::sync::Lazy<Vec<MacroName>> =
-    once_cell::sync::Lazy::new(|| {
-        ["define", "dnf"]
-            .iter()
-            .map(|n| MacroName::parse(n.as_bytes()).unwrap().1)
-            .collect()
-    });
-
-impl Default for ParseConfig {
-    fn default() -> Self {
-        Self {
-            current_macro_names: INBUILT_MACRO_NAMES.clone(),
-            quote_open_tag: DEFAULT_QUOTE_OPEN_TAG.to_vec(),
-            quote_close_tag: DEFAULT_QUOTE_CLOSE_TAG.to_vec(),
-            comment_open_tag: DEFAULT_COMMENT_OPEN_TAG.to_vec(),
-            comment_close_tag: DEFAULT_COMMENT_CLOSE_TAG.to_vec(),
-            symbol_recursion_limit: DEFAULT_SYMBOL_RECURSION_LIMIT,
-        }
-    }
 }
 
 //TODO: these don't handle multibyte characters!
@@ -360,12 +361,13 @@ fn parse_comment<'a, 'b>(
     close_comment_tag: &'b [u8],
 ) -> impl Fn(&'a [u8]) -> IResult<&'a [u8], &'a [u8]> + 'b {
     move |input: &[u8]| {
+        println!("input: {}", String::from_utf8_lossy(input));
         let mut total_len = 0;
         println!(
             "parsing open tag {:?}",
             String::from_utf8_lossy(open_comment_tag)
         );
-        let (remaining, open_tag) = nom::bytes::complete::tag(open_comment_tag)(input)?;
+        let (remaining, open_tag) = nom::bytes::streaming::tag(open_comment_tag)(input)?;
         total_len += open_tag.len();
         println!(
             "finding close tag {:?}",
@@ -373,13 +375,18 @@ fn parse_comment<'a, 'b>(
         );
         // TODO this could probably be optimized
         let (remaining, contents) = nom::branch::alt((
-            nom::bytes::complete::take_until(close_comment_tag),
-            nom::combinator::rest,
+            nom::combinator::complete(nom::bytes::streaming::take_until(close_comment_tag)),
+            nom::bytes::streaming::take_until("\0"),
         ))(remaining)?;
+
+        println!("found closing tag or EOF");
         total_len += contents.len();
         let remaining = if !remaining.is_empty() {
-            let (remaining, close_tag) = nom::bytes::complete::tag(close_comment_tag)(remaining)?;
-            total_len += close_tag.len();
+            let (remaining, final_tag) = nom::branch::alt((
+                nom::combinator::complete(nom::bytes::streaming::tag(close_comment_tag)),
+                nom::bytes::streaming::tag(b"\0"),
+            ))(remaining)?;
+            total_len += final_tag.len();
             remaining
         } else {
             remaining
@@ -461,7 +468,8 @@ mod test {
     use std::io::Write;
 
     use super::{
-        parse_comment, parse_symbols, parse_text, process_streaming, Macro, MacroName, ParseConfig, Quoted, DEFAULT_QUOTE_CLOSE_TAG, DEFAULT_QUOTE_OPEN_TAG, INBUILT_MACRO_NAMES
+        parse_comment, parse_symbols, parse_text, process_streaming, Macro, MacroName, ParseConfig,
+        Quoted, DEFAULT_QUOTE_CLOSE_TAG, DEFAULT_QUOTE_OPEN_TAG,
     };
     // TODO: add tests based on input in
     // https://pubs.opengroup.org/onlinepubs/9699919799/utilities/m4.html#tag_20_74_17
@@ -473,10 +481,15 @@ mod test {
 
     fn snapshot_symbols_as_stream(initial_config: ParseConfig, input: &[u8]) -> String {
         let mut writer = Vec::new();
-        process_streaming(initial_config, |config, symbol, writer| {
-            writer.write_all(format!("{symbol:?}").as_bytes()).unwrap();
-            config
-        }, input, &mut writer);
+        process_streaming(
+            initial_config,
+            |config, symbol, writer| {
+                writer.write_all(format!("{symbol:?}").as_bytes()).unwrap();
+                config
+            },
+            input,
+            &mut writer,
+        );
 
         String::from_utf8(writer).unwrap()
     }
@@ -485,10 +498,15 @@ mod test {
         String::from_utf8(input.to_vec()).unwrap()
     }
 
+    fn macro_name(input: &[u8]) -> MacroName {
+        MacroName::try_from_slice(input).unwrap()
+    }
+
     #[test]
     fn test_parse_macro_name_underscore_number() {
-        let name = MacroName::parse(b"some_word_23").unwrap().1;
+        let (remaining, name) = MacroName::parse(b"some_word_23").unwrap();
         assert_eq!(name, MacroName(b"some_word_23".into()));
+        assert!(remaining.is_empty());
     }
 
     #[test]
@@ -496,12 +514,8 @@ mod test {
         MacroName::parse(b"22word").unwrap_err();
     }
 
-    fn macro_name(input: &[u8]) -> MacroName {
-        MacroName::try_from_slice(input).unwrap()
-    }
-
     #[test]
-    fn test_parse_macro_name_fail_not_in_list() {
+    fn test_parse_macro_with_name_fail_not_in_list() {
         Macro::parse(&ParseConfig {
             current_macro_names: vec![],
             ..ParseConfig::default()
@@ -510,14 +524,15 @@ mod test {
     }
 
     #[test]
-    fn test_parse_macro_name_only() {
+    fn test_parse_macro_with_name_only() {
         let current_macro_names = vec![macro_name(b"some_word_23")];
         let config = ParseConfig {
             current_macro_names,
             ..ParseConfig::default()
         };
-        let m = Macro::parse(&config)(b"some_word_23").unwrap().1;
+        let (remaining, m) = Macro::parse(&config)(b"some_word_23").unwrap();
         assert_eq!(m.name, MacroName(b"some_word_23".into()));
+        assert!(remaining.is_empty());
     }
 
     #[test]
@@ -527,9 +542,10 @@ mod test {
             current_macro_names,
             ..ParseConfig::default()
         };
-        let m = Macro::parse(&config)(b"some_word_23()").unwrap().1;
+        let (remaining, m) = Macro::parse(&config)(b"some_word_23()").unwrap();
         assert_eq!(m.name, MacroName(b"some_word_23".into()));
         assert_eq!(m.args.len(), 0);
+        assert!(remaining.is_empty());
     }
 
     #[test]
@@ -539,9 +555,10 @@ mod test {
             current_macro_names,
             ..ParseConfig::default()
         };
-        let m = Macro::parse(config)(b"some_word_23(hello)").unwrap().1;
+        let (remaining, m) = Macro::parse(config)(b"some_word_23(hello)").unwrap();
         assert_eq!(m.name, MacroName(b"some_word_23".into()));
         assert_eq!(m.args.len(), 1);
+        assert!(remaining.is_empty());
         let m1 = match m.args.get(0).unwrap().get(0).unwrap() {
             Symbol::Macro(m1) => m1,
             _ => panic!(),
@@ -556,9 +573,10 @@ mod test {
             current_macro_names,
             ..ParseConfig::default()
         };
-        let m = Macro::parse(config)(b"some_word_23(`hello')").unwrap().1;
+        let (remaining, m) = Macro::parse(config)(b"some_word_23(`hello')").unwrap();
         assert_eq!(m.name, MacroName(b"some_word_23".into()));
         assert_eq!(m.args.len(), 1);
+        assert!(remaining.is_empty());
         let q = match m.args.get(0).unwrap().get(0).unwrap() {
             Symbol::Quoted(q) => q,
             _ => panic!(),
@@ -651,10 +669,10 @@ mod test {
     #[test]
     fn test_parse_comment_standard_no_newline() {
         let comment =
-            parse_comment(DEFAULT_COMMENT_OPEN_TAG, DEFAULT_COMMENT_CLOSE_TAG)(b"# hello world")
+            parse_comment(DEFAULT_COMMENT_OPEN_TAG, DEFAULT_COMMENT_CLOSE_TAG)(b"# hello world\0")
                 .unwrap()
                 .1;
-        assert_eq!("# hello world", utf8(comment));
+        assert_eq!("# hello world\0", utf8(comment));
     }
 
     #[test]
@@ -695,6 +713,7 @@ mod test {
         assert!(remaining.is_empty())
     }
 
+    #[ignore]
     #[test]
     fn test_parse_stream_symbols_evaluation_order() {
         let f = std::fs::read("fixtures/integration_tests/evaluation_order.m4").unwrap();

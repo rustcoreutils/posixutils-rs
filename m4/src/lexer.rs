@@ -27,11 +27,11 @@
 //!
 //! If the
 
-use nom::{error::ContextError, IResult};
+use nom::IResult;
 
 #[cfg_attr(test, derive(Debug, PartialEq))]
 struct Macro<'i> {
-    name: MacroName<'i>,
+    name: MacroName,
     args: Vec<Vec<Symbol<'i>>>,
 }
 
@@ -43,7 +43,7 @@ impl<'c, 'i: 'c> Macro<'i> {
     /// * The evaluation of expressions defined in macros happens at the time of calling.
     pub fn parse(
         // TODO: perhaps faster with a hashset?
-        config: &'c ParseConfig<'c>,
+        config: &'c ParseConfig,
     ) -> impl Fn(&'i [u8]) -> IResult<&'i [u8], Self> + 'c {
         move |input: &'i [u8]| {
             #[cfg(test)]
@@ -112,9 +112,7 @@ impl<'i> std::fmt::Debug for Symbol<'i> {
 }
 
 impl<'c, 'i: 'c> Symbol<'i> {
-    fn parse(
-        config: &'c ParseConfig<'c>,
-    ) -> impl Fn(&'i [u8]) -> IResult<&'i [u8], Symbol<'i>> + 'c {
+    fn parse(config: &'c ParseConfig) -> impl Fn(&'i [u8]) -> IResult<&'i [u8], Symbol<'i>> + 'c {
         move |input: &'i [u8]| {
             println!(
                 "parse_symbol: {:?}, current_macro_names: {:?}",
@@ -122,8 +120,7 @@ impl<'c, 'i: 'c> Symbol<'i> {
                 config
                     .current_macro_names
                     .iter()
-                    .map(|n| n.0)
-                    .map(String::from_utf8_lossy)
+                    .map(|n| String::from_utf8_lossy(&n.0))
                     .collect::<Vec<_>>()
             );
             if input.is_empty() {
@@ -134,7 +131,7 @@ impl<'c, 'i: 'c> Symbol<'i> {
             }
             nom::branch::alt((
                 nom::combinator::map(
-                    Quoted::parse(config.quote_open_tag, config.quote_close_tag),
+                    Quoted::parse(&config.quote_open_tag, &config.quote_close_tag),
                     Symbol::Quoted,
                 ),
                 nom::combinator::map(
@@ -213,19 +210,19 @@ impl<'i> Quoted<'i> {
 /// Macro names shall consist of letters, digits, and underscores, where the first character is not a digit. Tokens not of this form shall not be treated as macros.
 /// `[_a-zA-Z][_a-zA-Z0-9]*`
 #[derive(PartialEq, Clone)]
-struct MacroName<'i>(&'i [u8]);
+struct MacroName(Vec<u8>);
 
 #[cfg(test)]
-impl std::fmt::Debug for MacroName<'_> {
+impl std::fmt::Debug for MacroName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("MacroName")
-            .field(&String::from_utf8_lossy(self.0))
+            .field(&String::from_utf8_lossy(&self.0))
             .finish()
     }
 }
 
-impl<'i> MacroName<'i> {
-    pub fn parse(input: &'i [u8]) -> IResult<&'i [u8], Self> {
+impl MacroName {
+    pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
         println!("parsing macro name {:?}", String::from_utf8_lossy(input));
         if input.is_empty() {
             println!("empty macro name");
@@ -238,10 +235,13 @@ impl<'i> MacroName<'i> {
         let (remaining, rest) =
             nom::bytes::complete::take_while_m_n(0, remaining.len(), is_word_char_end)(remaining)?;
         // TODO: check whether the name matches any names in the current state.
-        Ok((remaining, Self(&input[..(start.len() + rest.len())])))
+        Ok((
+            remaining,
+            Self(input[..(start.len() + rest.len())].to_vec()),
+        ))
     }
 
-    fn try_from_slice(input: &'i [u8]) -> Result<Self, nom::Err<nom::error::Error<&'i [u8]>>> {
+    fn try_from_slice(input: &[u8]) -> Result<Self, nom::Err<nom::error::Error<&[u8]>>> {
         Self::parse(input.into()).map(|ok| ok.1)
     }
 }
@@ -256,12 +256,14 @@ fn is_word_char_start(c: u8) -> bool {
     (unsafe { libc::isalpha(c.into()) } != 0) || c == b'_'
 }
 
-struct ParseConfig<'i> {
-    current_macro_names: Vec<MacroName<'i>>,
-    quote_open_tag: &'i [u8],
-    quote_close_tag: &'i [u8],
-    comment_open_tag: &'i [u8],
-    comment_close_tag: &'i [u8],
+// Can probably optimize using something like smallvec
+#[derive(Clone)]
+struct ParseConfig {
+    current_macro_names: Vec<MacroName>,
+    quote_open_tag: Vec<u8>,
+    quote_close_tag: Vec<u8>,
+    comment_open_tag: Vec<u8>,
+    comment_close_tag: Vec<u8>,
     symbol_recursion_limit: usize,
 }
 
@@ -270,7 +272,7 @@ const DEFAULT_QUOTE_CLOSE_TAG: &[u8] = b"'";
 const DEFAULT_COMMENT_OPEN_TAG: &[u8] = b"#";
 const DEFAULT_COMMENT_CLOSE_TAG: &[u8] = b"\n";
 const DEFAULT_SYMBOL_RECURSION_LIMIT: usize = 100;
-static INBUILT_MACRO_NAMES: once_cell::sync::Lazy<Vec<MacroName<'static>>> =
+static INBUILT_MACRO_NAMES: once_cell::sync::Lazy<Vec<MacroName>> =
     once_cell::sync::Lazy::new(|| {
         ["define", "dnf"]
             .iter()
@@ -278,14 +280,14 @@ static INBUILT_MACRO_NAMES: once_cell::sync::Lazy<Vec<MacroName<'static>>> =
             .collect()
     });
 
-impl<'a> Default for ParseConfig<'a> {
+impl Default for ParseConfig {
     fn default() -> Self {
         Self {
             current_macro_names: vec![],
-            quote_open_tag: &DEFAULT_QUOTE_OPEN_TAG,
-            quote_close_tag: &DEFAULT_QUOTE_CLOSE_TAG,
-            comment_open_tag: &DEFAULT_COMMENT_OPEN_TAG,
-            comment_close_tag: &DEFAULT_COMMENT_CLOSE_TAG,
+            quote_open_tag: DEFAULT_QUOTE_OPEN_TAG.to_vec(),
+            quote_close_tag: DEFAULT_QUOTE_CLOSE_TAG.to_vec(),
+            comment_open_tag: DEFAULT_COMMENT_OPEN_TAG.to_vec(),
+            comment_close_tag: DEFAULT_COMMENT_CLOSE_TAG.to_vec(),
             symbol_recursion_limit: DEFAULT_SYMBOL_RECURSION_LIMIT,
         }
     }
@@ -381,9 +383,9 @@ fn parse_comment<'a, 'b>(
     }
 }
 
-fn process_streaming<'d, R: std::io::Read, W: std::io::Write>(
-    config: ParseConfig<'d>,
-    execute: impl for<'b, 'i> Fn(ParseConfig<'b>, Symbol<'i>) -> ParseConfig<'b> + 'd,
+fn process_streaming<'c, R: std::io::Read, W: std::io::Write>(
+    config: ParseConfig,
+    execute: impl for<'cc, 'i> Fn(ParseConfig, Symbol<'i>) -> ParseConfig,
     mut reader: R,
     mut writer: W,
 ) {
@@ -417,14 +419,14 @@ fn process_streaming<'d, R: std::io::Read, W: std::io::Write>(
             let remaining_len = remaining.len();
             config = execute(config, symbol);
 
-            current_buffer.consume(input.len() - remaining_len);
-            std::mem::swap(&mut previous_buffer, &mut current_buffer);
+            // current_buffer.consume(input.len() - remaining_len);
+            // std::mem::swap(&mut previous_buffer, &mut current_buffer);
         }
     }
 }
 
 fn parse_symbols<'b, 'a: 'b>(
-    config: &'b ParseConfig<'b>,
+    config: &'b ParseConfig,
 ) -> impl Fn(&'a [u8]) -> IResult<&'a [u8], Vec<Symbol<'a>>> + 'b {
     move |input: &[u8]| {
         if config.symbol_recursion_limit == 0 {
@@ -469,7 +471,7 @@ mod test {
     #[test]
     fn test_parse_macro_name_underscore_number() {
         let name = MacroName::parse(b"some_word_23").unwrap().1;
-        assert_eq!(name, MacroName(b"some_word_23"));
+        assert_eq!(name, MacroName(b"some_word_23".into()));
     }
 
     #[test]
@@ -477,7 +479,7 @@ mod test {
         MacroName::parse(b"22word").unwrap_err();
     }
 
-    fn macro_name(input: &[u8]) -> MacroName<'_> {
+    fn macro_name(input: &[u8]) -> MacroName {
         MacroName::try_from_slice(input).unwrap()
     }
 
@@ -498,7 +500,7 @@ mod test {
             ..ParseConfig::default()
         };
         let m = Macro::parse(&config)(b"some_word_23").unwrap().1;
-        assert_eq!(m.name, MacroName(b"some_word_23"));
+        assert_eq!(m.name, MacroName(b"some_word_23".into()));
     }
 
     #[test]
@@ -509,7 +511,7 @@ mod test {
             ..ParseConfig::default()
         };
         let m = Macro::parse(&config)(b"some_word_23()").unwrap().1;
-        assert_eq!(m.name, MacroName(b"some_word_23"));
+        assert_eq!(m.name, MacroName(b"some_word_23".into()));
         assert_eq!(m.args.len(), 0);
     }
 
@@ -521,13 +523,13 @@ mod test {
             ..ParseConfig::default()
         };
         let m = Macro::parse(config)(b"some_word_23(hello)").unwrap().1;
-        assert_eq!(m.name, MacroName(b"some_word_23"));
+        assert_eq!(m.name, MacroName(b"some_word_23".into()));
         assert_eq!(m.args.len(), 1);
         let m1 = match m.args.get(0).unwrap().get(0).unwrap() {
             Symbol::Macro(m1) => m1,
             _ => panic!(),
         };
-        assert_eq!(m1.name, MacroName(b"hello"));
+        assert_eq!(m1.name, MacroName(b"hello".into()));
     }
 
     #[test]
@@ -538,7 +540,7 @@ mod test {
             ..ParseConfig::default()
         };
         let m = Macro::parse(config)(b"some_word_23(`hello')").unwrap().1;
-        assert_eq!(m.name, MacroName(b"some_word_23"));
+        assert_eq!(m.name, MacroName(b"some_word_23".into()));
         assert_eq!(m.args.len(), 1);
         let q = match m.args.get(0).unwrap().get(0).unwrap() {
             Symbol::Quoted(q) => q,
@@ -561,13 +563,13 @@ mod test {
         let m = Macro::parse(&config)(b"some_word_23(hello world)")
             .unwrap()
             .1;
-        assert_eq!(m.name, MacroName(b"some_word_23"));
+        assert_eq!(m.name, MacroName(b"some_word_23".into()));
         assert_eq!(m.args.len(), 1);
         let m1 = match m.args.get(0).unwrap().get(0).unwrap() {
             Symbol::Macro(m) => m,
             _ => panic!(),
         };
-        assert_eq!(m1.name, MacroName(b"hello"));
+        assert_eq!(m1.name, MacroName(b"hello".into()));
         let t = match m.args.get(0).unwrap().get(1).unwrap() {
             Symbol::Text(t) => t,
             _ => panic!(),
@@ -577,7 +579,7 @@ mod test {
             Symbol::Macro(m) => m,
             _ => panic!(),
         };
-        assert_eq!(m3.name, MacroName(b"world"));
+        assert_eq!(m3.name, MacroName(b"world".into()));
     }
 
     #[test]

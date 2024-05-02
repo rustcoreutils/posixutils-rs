@@ -32,6 +32,7 @@ use nom::IResult;
 #[cfg_attr(test, derive(Debug, PartialEq))]
 struct Macro<'i> {
     name: MacroName,
+    // TODO: can also be an expression in the case of the eval macro
     args: Vec<Vec<Symbol<'i>>>,
 }
 
@@ -256,7 +257,9 @@ fn is_word_char_start(c: u8) -> bool {
     (unsafe { libc::isalpha(c.into()) } != 0) || c == b'_'
 }
 
-// Can probably optimize using something like smallvec
+/// Configuration for parsing, affects what are considered macros, quotes or comments. Also keeps a
+/// record of the recusion limit for processing a [`Symbol`].
+// TODO: Can probably optimize using something like smallvec
 #[derive(Clone)]
 struct ParseConfig {
     current_macro_names: Vec<MacroName>,
@@ -384,15 +387,15 @@ fn parse_comment<'a, 'b>(
 }
 
 fn process_streaming<'c, R: std::io::Read, W: std::io::Write>(
-    config: ParseConfig,
-    mut execute: impl for<'cc, 'i> FnMut(ParseConfig, Symbol<'i>) -> ParseConfig,
+    initial_config: ParseConfig,
+    mut evaluate: impl for<'i, 'w> FnMut(ParseConfig, Symbol<'i>, &'w mut W) -> ParseConfig,
     mut reader: R,
     mut writer: W,
 ) {
     let buffer_size = 10;
     let buffer_growth_factor = 2;
     let mut buffer = circular::Buffer::with_capacity(buffer_size);
-    let mut config = config;
+    let mut config = initial_config;
 
     loop {
         let read = reader.read(buffer.space()).unwrap();
@@ -416,7 +419,7 @@ fn process_streaming<'c, R: std::io::Read, W: std::io::Write>(
                 Err(error) => panic!("{}", error),
             };
             let remaining_len = remaining.len();
-            config = execute(config, symbol);
+            config = evaluate(config, symbol, &mut writer);
 
             buffer.consume(input.len() - remaining_len);
         }

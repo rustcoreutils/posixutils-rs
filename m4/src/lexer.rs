@@ -678,5 +678,6 @@ mod test {
         let (remaining, symbols) = parse_symbols(&config)(&f).unwrap();
 
         insta::assert_debug_snapshot!(symbols);
+        assert!(remaining.is_empty())
     }
 }

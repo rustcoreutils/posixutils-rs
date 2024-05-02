@@ -385,33 +385,32 @@ fn parse_comment<'a, 'b>(
 
 fn process_streaming<'c, R: std::io::Read, W: std::io::Write>(
     config: ParseConfig,
-    execute: impl for<'cc, 'i> Fn(ParseConfig, Symbol<'i>) -> ParseConfig,
+    mut execute: impl for<'cc, 'i> FnMut(ParseConfig, Symbol<'i>) -> ParseConfig,
     mut reader: R,
     mut writer: W,
 ) {
     let buffer_size = 10;
     let buffer_growth_factor = 2;
-    let mut previous_buffer = circular::Buffer::with_capacity(buffer_size);
-    let mut current_buffer = circular::Buffer::with_capacity(buffer_size);
+    let mut buffer = circular::Buffer::with_capacity(buffer_size);
     let mut config = config;
 
     loop {
-        let read = reader.read(current_buffer.space()).unwrap();
+        let read = reader.read(buffer.space()).unwrap();
         if read == 0 {
             break;
         }
-        current_buffer.fill(read);
+        buffer.fill(read);
 
         loop {
-            let input = current_buffer.data();
+            // TODO: what to do if the buffer is empty after previous iteration?
+            let input = buffer.data();
 
             let result = Symbol::parse(&config)(input);
             let (remaining, symbol) = match result {
                 Ok(ok) => ok,
                 Err(nom::Err::Incomplete(_)) => {
-                    let new_capacity = buffer_growth_factor * current_buffer.capacity();
-                    current_buffer.grow(new_capacity);
-                    previous_buffer.grow(new_capacity);
+                    let new_capacity = buffer_growth_factor * buffer.capacity();
+                    buffer.grow(new_capacity);
                     break;
                 }
                 Err(error) => panic!("{}", error),
@@ -419,8 +418,7 @@ fn process_streaming<'c, R: std::io::Read, W: std::io::Write>(
             let remaining_len = remaining.len();
             config = execute(config, symbol);
 
-            // current_buffer.consume(input.len() - remaining_len);
-            // std::mem::swap(&mut previous_buffer, &mut current_buffer);
+            buffer.consume(input.len() - remaining_len);
         }
     }
 }

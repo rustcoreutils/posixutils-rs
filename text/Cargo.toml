@@ -32,6 +32,10 @@ name = "diff"
 path = "src/diff.rs"
 
 [[bin]]
+name = "cut"
+path = "src/cut.rs"
+
+[[bin]]
 name = "expand"
 path = "src/expand.rs"
 

@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-text"
-version = "0.1.7"
+version = "0.1.9"
 edition = "2021"
 authors = ["Jeff Garzik"]
 license = "MIT"

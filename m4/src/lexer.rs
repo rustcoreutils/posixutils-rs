@@ -54,9 +54,7 @@ static INBUILT_MACRO_NAMES: once_cell::sync::Lazy<Vec<MacroName>> =
         ["define", "dnf"]
             .iter()
             .map(|n| {
-                MacroName::parse(n.as_bytes())
-                    .expect(&format!("failed to parse {n:?}"))
-                    .1
+                MacroName::try_from_slice(n.as_bytes()).expect(&format!("failed to parse {n:?}"))
             })
             .collect()
     });
@@ -81,13 +79,13 @@ struct Macro<'i> {
     args: Vec<Vec<Symbol<'i>>>,
 }
 
-impl<'c, 'i: 'c> Macro<'i> {
+impl<'i> Macro<'i> {
     /// ## Notes
     ///
     /// * The parsing of macro arguments happens at the time of definition.
     /// * The unwrapping and parsing of quoted arguments happens at the time of calling.
     /// * The evaluation of expressions defined in macros happens at the time of calling.
-    pub fn parse(
+    pub fn parse<'c>(
         // TODO: perhaps faster with a hashset?
         config: &'c ParseConfig,
     ) -> impl Fn(&'i [u8]) -> IResult<&'i [u8], Self> + 'c {
@@ -96,6 +94,7 @@ impl<'c, 'i: 'c> Macro<'i> {
             dbg!(&config.current_macro_names);
             println!("parse_macro {:?}", String::from_utf8_lossy(input));
             let (remaining, name) = MacroName::parse(input)?;
+            println!("successfully parsed macro name!");
             if !config.current_macro_names.contains(&name) {
                 return Err(nom::Err::Error(nom::error::Error::new(
                     input,
@@ -104,18 +103,18 @@ impl<'c, 'i: 'c> Macro<'i> {
             }
             println!("macro_args {:?}", String::from_utf8_lossy(remaining));
             let (remaining, args) = nom::combinator::opt(nom::sequence::delimited(
-                nom::bytes::complete::tag("("),
+                nom::bytes::streaming::tag("("),
                 nom::multi::separated_list0(
-                    nom::bytes::complete::tag(","),
+                    nom::bytes::streaming::tag(","),
                     // TODO: check, we should be allowed to have empty arguments?
                     nom::combinator::map_parser(
-                        nom::bytes::complete::is_not(")"),
+                        nom::bytes::streaming::is_not(")"),
                         nom::combinator::cut(parse_symbols(config)),
                     ),
                 ),
                 // Make sure we fail for input that is missing the closing tag, this is what GNU m4 does
                 // anyway.
-                nom::combinator::cut(nom::bytes::complete::tag(")")),
+                nom::combinator::cut(nom::bytes::streaming::tag(")")),
             ))(remaining)?;
 
             Ok((
@@ -137,6 +136,7 @@ enum Symbol<'i> {
     Text(&'i [u8]),
     Quoted(Quoted<'i>),
     Macro(Macro<'i>),
+    Eof,
 }
 
 #[cfg(test)]
@@ -153,6 +153,7 @@ impl<'i> std::fmt::Debug for Symbol<'i> {
                 .finish(),
             Self::Quoted(arg0) => f.debug_tuple("Quoted").field(arg0).finish(),
             Self::Macro(arg0) => f.debug_tuple("Macro").field(arg0).finish(),
+            Self::Eof => f.debug_tuple("Eof").finish(),
         }
     }
 }
@@ -176,6 +177,7 @@ impl<'c, 'i: 'c> Symbol<'i> {
                 )));
             }
             nom::branch::alt((
+                nom::combinator::map(nom::bytes::streaming::tag(b"\0"), |_| Symbol::Eof),
                 nom::combinator::map(
                     Quoted::parse(&config.quote_open_tag, &config.quote_close_tag),
                     Symbol::Quoted,
@@ -250,8 +252,6 @@ impl<'i> Quoted<'i> {
     }
 }
 
-/// Macro names shall consist of letters, digits, and underscores, where the first character is not a digit. Tokens not of this form shall not be treated as macros.
-/// `[_a-zA-Z][_a-zA-Z0-9]*`
 #[derive(PartialEq, Clone)]
 struct MacroName(Vec<u8>);
 
@@ -265,24 +265,34 @@ impl std::fmt::Debug for MacroName {
 }
 
 impl MacroName {
+    /// Macro names shall consist of letters, digits, and underscores, where the first character is not a digit. Tokens not of this form shall not be treated as macros.
+    /// `[_a-zA-Z][_a-zA-Z0-9]*`
     pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
         println!("parsing macro name {:?}", String::from_utf8_lossy(input));
         if input.is_empty() {
             println!("empty macro name");
             return Err(nom::Err::Incomplete(nom::Needed::Unknown));
         }
+        println!("parsing the start of the macro name");
         let (remaining, start) = nom::bytes::streaming::take_while1(is_word_char_start)(input)?;
-        let (remaining, rest) =
-            nom::bytes::streaming::take_while_m_n(0, remaining.len(), is_word_char_end)(remaining)?;
-        // TODO: check whether the name matches any names in the current state.
+        println!(
+            "found macro name start: {:?}",
+            String::from_utf8_lossy(input)
+        );
+        let (remaining, rest) = nom::bytes::streaming::take_while(is_word_char_end)(remaining)?;
         Ok((
             remaining,
             Self(input[..(start.len() + rest.len())].to_vec()),
         ))
     }
 
-    fn try_from_slice(input: &[u8]) -> Result<Self, nom::Err<nom::error::Error<&[u8]>>> {
-        Self::parse(input.into()).map(|ok| ok.1)
+    /// Parse macro name from a complete slice, not including the EOF byte.
+    fn try_from_slice(input: &[u8]) -> Result<Self, String> {
+        let mut input = input.to_vec();
+        input.push(b'\0');
+        Self::parse(input.as_slice())
+            .map(|ok| ok.1)
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -358,31 +368,20 @@ fn parse_comment<'a, 'b>(
     close_comment_tag: &'b [u8],
 ) -> impl Fn(&'a [u8]) -> IResult<&'a [u8], &'a [u8]> + 'b {
     move |input: &[u8]| {
-        println!("input: {}", String::from_utf8_lossy(input));
         let mut total_len = 0;
-        println!(
-            "parsing open tag {:?}",
-            String::from_utf8_lossy(open_comment_tag)
-        );
         let (remaining, open_tag) = nom::bytes::streaming::tag(open_comment_tag)(input)?;
         total_len += open_tag.len();
-        println!(
-            "finding close tag {:?}",
-            String::from_utf8_lossy(close_comment_tag)
-        );
         // TODO this could probably be optimized
         let (remaining, contents) = nom::branch::alt((
+            // This can be complete because the other branch is streaming and won't stop until the
+            // end of the file.
             nom::bytes::complete::take_until(close_comment_tag),
             nom::bytes::streaming::take_until("\0"),
         ))(remaining)?;
 
-        println!("found closing tag or EOF");
         total_len += contents.len();
-        let remaining = if !remaining.is_empty() {
-            let (remaining, final_tag) = nom::branch::alt((
-                nom::bytes::complete::tag(close_comment_tag),
-                nom::bytes::streaming::tag(b"\0"),
-            ))(remaining)?;
+        let remaining = if !remaining.is_empty() && remaining[0] != b'\0' {
+            let (remaining, final_tag) = nom::bytes::complete::tag(close_comment_tag)(remaining)?;
             total_len += final_tag.len();
             remaining
         } else {
@@ -406,13 +405,26 @@ fn process_streaming<'c, R: Read, W: Write>(
     let buffer_growth_factor = 2;
     let mut buffer = circular::Buffer::with_capacity(buffer_size);
     let mut config = initial_config;
+    let mut eof = false;
 
     loop {
-        let read = reader.read(buffer.space()).unwrap();
-        if read == 0 {
+        if eof {
             break;
         }
-        buffer.fill(read);
+        let read = reader.read(buffer.space()).unwrap();
+
+        // Insert an EOF null byte, this should not be used in any string encoding so it should be
+        // fine, the streaming parsers rely on this to know whether they have reached the end of
+        // the input.
+        let fill_amount = if read == 0 {
+            let eof_bytes = &[b'\0'];
+            buffer.space().copy_from_slice(eof_bytes);
+            eof = true;
+            eof_bytes.len()
+        } else {
+            read
+        };
+        buffer.fill(fill_amount);
 
         loop {
             // TODO: what to do if the buffer is empty after previous iteration?
@@ -496,19 +508,33 @@ mod test {
     }
 
     fn macro_name(input: &[u8]) -> MacroName {
-        MacroName::try_from_slice(input).unwrap()
+        MacroName::try_from_slice(input).expect("Error parsing macro name")
+    }
+
+    #[test]
+    fn test_parse_macro_name_simple() {
+        let (remaining, name) = MacroName::parse(b"hello\0").unwrap();
+        assert_eq!(name, MacroName(b"hello".into()));
+        assert_eq!("\0", utf8(remaining));
+    }
+
+    #[test]
+    fn test_parse_macro_name_end_bracket() {
+        let (remaining, name) = MacroName::parse(b"hello)").unwrap();
+        assert_eq!(name, MacroName(b"hello".into()));
+        assert_eq!(")", utf8(remaining));
     }
 
     #[test]
     fn test_parse_macro_name_underscore_number() {
-        let (remaining, name) = MacroName::parse(b"some_word_23").unwrap();
+        let (remaining, name) = MacroName::parse(b"some_word_23\0").unwrap();
         assert_eq!(name, MacroName(b"some_word_23".into()));
-        assert!(remaining.is_empty());
+        assert_eq!("\0", utf8(remaining));
     }
 
     #[test]
     fn test_parse_macro_name_fail_number_start() {
-        MacroName::parse(b"22word").unwrap_err();
+        MacroName::parse(b"22word\0").unwrap_err();
     }
 
     #[test]
@@ -670,21 +696,22 @@ mod test {
 
     #[test]
     fn test_parse_comment_standard() {
-        let comment = parse_comment(DEFAULT_COMMENT_OPEN_TAG, DEFAULT_COMMENT_CLOSE_TAG)(
-            b"# hello world\ngoodbye\0",
-        )
-        .unwrap()
-        .1;
+        let (remaining, comment) = parse_comment(
+            DEFAULT_COMMENT_OPEN_TAG,
+            DEFAULT_COMMENT_CLOSE_TAG,
+        )(b"# hello world\ngoodbye\0")
+        .unwrap();
         assert_eq!("# hello world\n", utf8(comment));
+        assert_eq!("goodbye\0", utf8(remaining));
     }
 
     #[test]
     fn test_parse_comment_standard_no_newline() {
-        let comment =
+        let (remaining, comment) =
             parse_comment(DEFAULT_COMMENT_OPEN_TAG, DEFAULT_COMMENT_CLOSE_TAG)(b"# hello world\0")
-                .unwrap()
-                .1;
-        assert_eq!("# hello world\0", utf8(comment));
+                .unwrap();
+        assert_eq!("# hello world", utf8(comment));
+        assert_eq!("\0", utf8(remaining));
     }
 
     #[test]
@@ -693,6 +720,20 @@ mod test {
             parse_comment(DEFAULT_COMMENT_OPEN_TAG, DEFAULT_COMMENT_CLOSE_TAG)(b"# hello world")
                 .unwrap_err();
         assert!(matches!(error, nom::Err::Incomplete(_)));
+    }
+
+    #[test]
+    fn test_parse_text() {
+        let (remaining, text) = parse_text(b"`", DEFAULT_COMMENT_OPEN_TAG)(b"hello\0").unwrap();
+        assert_eq!("hello", utf8(text));
+        assert_eq!("\0", utf8(remaining));
+    }
+
+    #[test]
+    fn test_parse_text_incomplete() {
+        let (remaining, text) = parse_text(b"`", DEFAULT_COMMENT_OPEN_TAG)(b"hello").unwrap();
+        assert_eq!("hello", utf8(text));
+        assert_eq!("", utf8(remaining));
     }
 
     #[test]

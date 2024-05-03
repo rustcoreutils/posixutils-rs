@@ -107,6 +107,18 @@ impl<'i> Macro<'i> {
                 nom::multi::separated_list0(
                     nom::bytes::streaming::tag(","),
                     // TODO: check, we should be allowed to have empty arguments?
+                    //
+                    // ERROR: this is broken! By excluding ), parsing macro name has no way to know
+                    // if it's the end of input or not. If we do include it, text will just attempt
+                    // to continually parse it.
+                    //
+                    // Perhaps we need an EOF input for config?
+                    //
+                    // Okay I need to do something different here, we need to parse to the closing
+                    // tag, but we can't do that because we could encounter other closing tags,
+                    // that could be contained within a comment.
+                    //
+                    // We need a way to tell the parsers that they are inside complete input here
                     nom::combinator::map_parser(
                         nom::bytes::streaming::is_not(")"),
                         nom::combinator::cut(parse_symbols(config)),
@@ -742,6 +754,16 @@ mod test {
             parse_text(b"`", DEFAULT_COMMENT_OPEN_TAG)(b"hello `world'").unwrap();
         assert_eq!("hello ", utf8(text));
         assert_eq!("`world'", utf8(remaining));
+    }
+  
+    // TODO: what should this do?
+    #[ignore]
+    #[test]
+    fn test_parse_text_before_close_bracket() {
+        let (remaining, text) =
+            parse_text(b"`", DEFAULT_COMMENT_OPEN_TAG)(b"hello)").unwrap();
+        assert_eq!("hello", utf8(text));
+        assert_eq!(")", utf8(remaining));
     }
 
     #[test]

@@ -60,7 +60,7 @@ https://github.com/jgarzik/posixutils
  - [ ] crontab (cron cat.)
  - [x] csplit
  - [ ] ctags (Development)
- - [ ] cut
+ - [x] cut
  - [ ] cxref (Development)
  - [x] date
  - [x] dd

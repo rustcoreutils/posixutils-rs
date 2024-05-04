@@ -19,6 +19,7 @@ use plib::PROJECT_NAME;
 use regex::Regex;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Error, ErrorKind, Read, Write};
+use std::path::PathBuf;
 
 /// csplit - split files based on context
 #[derive(Parser, Debug)]
@@ -41,7 +42,7 @@ struct Args {
     suppress: bool,
 
     /// File to read as input.
-    filename: String,
+    filename: PathBuf,
 
     /// Operands defining context on which to split.
     operands: Vec<String>,
@@ -189,7 +190,7 @@ fn csplit_file(args: &Args, ctx: SplitOps, new_files: &mut Vec<String>) -> io::R
     let mut split_options = ctx.ops;
     // open file, or stdin
     let file: Box<dyn Read> = {
-        if args.filename == "-" {
+        if args.filename == PathBuf::from("-") {
             Box::new(io::stdin().lock())
         } else {
             Box::new(fs::File::open(&args.filename)?)
@@ -605,7 +606,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut new_files = vec![];
     if let Err(err) = csplit_file(&args, ctx, &mut new_files) {
         exit_code = 1;
-        eprintln!("{}: {}", args.filename, err);
+        eprintln!("{}: {}", args.filename.display(), err);
         if !args.keep {
             for file_name in new_files.iter() {
                 fs::remove_file(file_name).unwrap();
@@ -803,7 +804,7 @@ mod tests {
             keep: false,
             num: 2,
             suppress: false,
-            filename: String::from("test.txt"),
+            filename: PathBuf::from("test.txt"),
             operands: vec![
                 String::from("/pattern/+1"),
                 String::from("%skip%10"),
@@ -850,7 +851,7 @@ mod tests {
             keep: false,
             num: 2,
             suppress: false,
-            filename: String::from("tests/assets/test_file.txt"),
+            filename: PathBuf::from("tests/assets/test_file.txt"),
             operands: vec![String::from("5"), String::from("{3}")],
         };
 
@@ -900,7 +901,7 @@ mod tests {
             keep: false,
             num: 2,
             suppress: false,
-            filename: String::from("tests/assets/test_file_c"),
+            filename: PathBuf::from("tests/assets/test_file_c"),
             operands: vec![
                 String::from(r"%main\(%"),
                 String::from("/^}/+1"),
@@ -957,7 +958,7 @@ mod tests {
             keep: false,
             num: 2,
             suppress: false,
-            filename: String::from("tests/assets/test_file_c"),
+            filename: PathBuf::from("tests/assets/test_file_c"),
             operands: vec![
                 String::from(r"%main\(%+1"),
                 String::from("/^}/+1"),
@@ -1013,7 +1014,7 @@ mod tests {
             keep: false,
             num: 2,
             suppress: false,
-            filename: String::from("tests/assets/test_file_c"),
+            filename: PathBuf::from("tests/assets/test_file_c"),
             operands: vec![
                 String::from(r"%main\(%-1"),
                 String::from("/^}/+1"),
@@ -1070,7 +1071,7 @@ mod tests {
             keep: false,
             num: 2,
             suppress: false,
-            filename: String::from("tests/assets/test_file_c"),
+            filename: PathBuf::from("tests/assets/test_file_c"),
             operands: vec![
                 String::from(r"%main\(%"),
                 String::from("/^}/"),
@@ -1127,7 +1128,7 @@ mod tests {
             keep: false,
             num: 2,
             suppress: false,
-            filename: String::from("tests/assets/test_file_c"),
+            filename: PathBuf::from("tests/assets/test_file_c"),
             operands: vec![
                 String::from(r"%main\(%"),
                 String::from("/^}/-1"),

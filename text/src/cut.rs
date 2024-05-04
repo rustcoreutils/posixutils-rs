@@ -11,10 +11,10 @@ extern crate clap;
 extern crate plib;
 use std::io::{self, BufRead, Error, ErrorKind, Read};
 
+use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, textdomain};
 use plib::PROJECT_NAME;
-
-use clap::Parser;
+use std::path::PathBuf;
 
 /// Cut - cut out selected fields of each line of a file
 #[derive(Parser, Debug, Clone)]
@@ -45,7 +45,7 @@ struct Args {
     no_split: bool,
 
     /// Input files
-    filenames: Vec<String>,
+    filenames: Vec<PathBuf>,
 }
 
 fn validate_args(args: &Args) -> Result<(), String> {
@@ -292,15 +292,16 @@ fn cut_files(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // open files, or stdin
 
-    let readers: Vec<Box<dyn Read>> = if args.filenames.len() == 1 && args.filenames[0] == "-" {
-        vec![Box::new(io::stdin().lock())]
-    } else {
-        let mut bufs: Vec<Box<dyn Read>> = vec![];
-        for file in &args.filenames {
-            bufs.push(Box::new(std::fs::File::open(file)?))
-        }
-        bufs
-    };
+    let readers: Vec<Box<dyn Read>> =
+        if args.filenames.len() == 1 && args.filenames[0] == PathBuf::from("-") {
+            vec![Box::new(io::stdin().lock())]
+        } else {
+            let mut bufs: Vec<Box<dyn Read>> = vec![];
+            for file in &args.filenames {
+                bufs.push(Box::new(std::fs::File::open(file)?))
+            }
+            bufs
+        };
 
     // Process each file
     for file in readers {

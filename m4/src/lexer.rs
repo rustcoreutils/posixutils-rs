@@ -79,19 +79,44 @@ struct Macro<'i> {
     args: Vec<Vec<Symbol<'i>>>,
 }
 
+fn parse_macro_arg<'c>(
+    config: &'c ParseConfig,
+) -> impl for<'i> Fn(&'i [u8]) -> IResult<&'i [u8], Vec<Symbol<'i>>> + 'c {
+    move |input: &[u8]| {
+        let mut symbols = Vec::new();
+
+        if let Some(b')') = input.get(0) {
+            return Err(nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Tag,
+            )));
+        }
+
+        let mut remaining = input;
+
+        loop {
+            let (r, symbol) = nom::combinator::cut(Symbol::parse(config))(remaining)?;
+            symbols.push(symbol);
+
+            if r.is_empty() || r == b"\0" {
+                break;
+            }
+            remaining = r;
+        }
+
+        Ok((remaining, symbols))
+    }
+}
+
 impl<'i> Macro<'i> {
     /// ## Notes
     ///
     /// * The parsing of macro arguments happens at the time of definition.
     /// * The unwrapping and parsing of quoted arguments happens at the time of calling.
     /// * The evaluation of expressions defined in macros happens at the time of calling.
-    pub fn parse<'c>(
-        // TODO: perhaps faster with a hashset?
-        config: &'c ParseConfig,
-    ) -> impl Fn(&'i [u8]) -> IResult<&'i [u8], Self> + 'c {
-        move |input: &'i [u8]| {
+    pub fn parse<'c>(config: &'c ParseConfig) -> impl Fn(&'i [u8]) -> IResult<&'i [u8], Self> + 'c {
+        move |input: &[u8]| {
             #[cfg(test)]
-            dbg!(&config.current_macro_names);
             println!("parse_macro {:?}", String::from_utf8_lossy(input));
             let (remaining, name) = MacroName::parse(input)?;
             println!("successfully parsed macro name!");
@@ -119,10 +144,10 @@ impl<'i> Macro<'i> {
                     // that could be contained within a comment.
                     //
                     // We need a way to tell the parsers that they are inside complete input here
-                    nom::combinator::map_parser(
-                        nom::bytes::streaming::is_not(")"),
-                        nom::combinator::cut(parse_symbols(config)),
-                    ),
+                    parse_macro_arg(config)
+                    // nom::combinator::map_parser(
+                    //     nom::combinator::peek(nom::bytes::streaming::is_not(")")),
+                    // )
                 ),
                 // Make sure we fail for input that is missing the closing tag, this is what GNU m4 does
                 // anyway.
@@ -334,7 +359,6 @@ fn is_alphnumeric(c: u8) -> bool {
 /// possibly be the beginning of either a quote or a macro, such as when an open quote is
 /// encountered, or when we encounter the first alpha character after a non-alphanumeric character.
 /// TODO: what happens if we encounter a close quote?
-/// TODO: comment tag
 fn parse_text<'c>(
     quote_open_tag: &'c [u8],
     comment_open_tag: &'c [u8],
@@ -344,7 +368,7 @@ fn parse_text<'c>(
             return Ok((input, input));
         }
 
-        let stop_tags = &[quote_open_tag, comment_open_tag];
+        let stop_tags = &[quote_open_tag, comment_open_tag, b")", b"\0"];
         let mut previous_was_alphanumeric = true;
         let mut stop_index = 0;
         'forloop: for i in 0..input.len() {
@@ -565,9 +589,9 @@ mod test {
             current_macro_names,
             ..ParseConfig::default()
         };
-        let (remaining, m) = Macro::parse(&config)(b"some_word_23").unwrap();
+        let (remaining, m) = Macro::parse(&config)(b"some_word_23\0").unwrap();
         assert_eq!(m.name, MacroName(b"some_word_23".into()));
-        assert!(remaining.is_empty());
+        assert_eq!("\0", utf8(remaining));
     }
 
     #[test]
@@ -755,13 +779,12 @@ mod test {
         assert_eq!("hello ", utf8(text));
         assert_eq!("`world'", utf8(remaining));
     }
-  
+
     // TODO: what should this do?
     #[ignore]
     #[test]
     fn test_parse_text_before_close_bracket() {
-        let (remaining, text) =
-            parse_text(b"`", DEFAULT_COMMENT_OPEN_TAG)(b"hello)").unwrap();
+        let (remaining, text) = parse_text(b"`", DEFAULT_COMMENT_OPEN_TAG)(b"hello)").unwrap();
         assert_eq!("hello", utf8(text));
         assert_eq!(")", utf8(remaining));
     }

@@ -561,13 +561,6 @@ mod test {
         parse_comment, parse_dnl, parse_text, process_streaming, Macro, MacroName, ParseConfig,
         Quoted, DEFAULT_QUOTE_CLOSE_TAG, DEFAULT_QUOTE_OPEN_TAG,
     };
-    // TODO: add tests based on input in
-    // https://pubs.opengroup.org/onlinepubs/9699919799/utilities/m4.html#tag_20_74_17
-    const M4SRC: &str = r#"The value of `VER' is "VER".
-        ifdef(`VER', ``VER'' is defined to be VER., VER is not defined.)
-        ifelse(VER, 1, ``VER'' is `VER'.)
-        ifelse(VER, 2, ``VER'' is `VER'., ``VER'' is not 2.)
-        end"#;
 
     fn snapshot_symbols_as_stream(initial_config: ParseConfig, input: &[u8]) -> String {
         let mut writer = Vec::new();

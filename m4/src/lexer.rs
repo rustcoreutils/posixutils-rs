@@ -499,7 +499,6 @@ fn process_streaming<'c, R: Read, W: Write>(
             #[cfg(test)]
             dbg!(String::from_utf8_lossy(input), &symbol, remaining);
 
-
             if matches!(symbol, Symbol::Eof) {
                 return;
             }
@@ -875,14 +874,16 @@ mod test {
 
     #[test]
     fn test_parse_text() {
-        let (remaining, text) = parse_text(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_COMMENT_OPEN_TAG)(b"hello\0").unwrap();
+        let (remaining, text) =
+            parse_text(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_COMMENT_OPEN_TAG)(b"hello\0").unwrap();
         assert_eq!("hello", utf8(text));
         assert_eq!("\0", utf8(remaining));
     }
 
     #[test]
     fn test_parse_text_incomplete() {
-        let (remaining, text) = parse_text(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_COMMENT_OPEN_TAG)(b"hello").unwrap();
+        let (remaining, text) =
+            parse_text(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_COMMENT_OPEN_TAG)(b"hello").unwrap();
         assert_eq!("hello", utf8(text));
         assert_eq!("", utf8(remaining));
     }
@@ -1017,7 +1018,7 @@ mod test {
         insta::assert_debug_snapshot!(symbols);
         assert!(remaining.is_empty())
     }
-    
+
     // TODO remove
     #[test]
     fn test_parse_stream_symbols_text_1() {
@@ -1065,7 +1066,7 @@ mod test {
         "###
         );
     }
-    
+
     // TODO remove
     #[test]
     fn test_parse_stream_symbols_text_not_macro() {

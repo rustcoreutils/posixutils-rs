@@ -74,6 +74,9 @@ pub struct Macro<'i> {
     pub args: Vec<Vec<Symbol<'i>>>,
 }
 
+// TODO: not sure whether leading whitespace can be significant for macros, it doesn't appear to be
+// significant for define (and the macros that it in turn defines) and it gets stripped from the
+// output, so if that's always the case then we can strip it at this stage.
 fn parse_macro_arg<'c>(
     config: &'c ParseConfig,
 ) -> impl for<'i> Fn(&'i [u8]) -> IResult<&'i [u8], Vec<Symbol<'i>>> + 'c {
@@ -692,6 +695,46 @@ mod test {
             _ => panic!(),
         };
         assert_eq!(m1.name, MacroName(b"hello".into()));
+    }
+
+    #[test]
+    fn test_parse_macro_args_2_nested() {
+        let current_macro_names = vec![macro_name(b"m1"), macro_name(b"m2"), macro_name(b"m3")];
+        let config = &ParseConfig {
+            current_macro_names,
+            ..ParseConfig::default()
+        };
+        let (remaining, m1) = Macro::parse(config)(b"m1(hello,m2($1) m3($1))dnl").unwrap();
+        assert_eq!("dnl", utf8(remaining));
+        assert_eq!(m1.name, MacroName(b"m1".into()));
+        assert_eq!(m1.args.len(), 2);
+        assert_eq!(m1.args.get(1).unwrap().len(), 3);
+        match m1.args.get(1).unwrap().get(0).unwrap() {
+            Symbol::Macro(m) => assert_eq!(m.name, MacroName(b"m2".into())),
+            s => panic!("unexpected symbol {s:?}"),
+        }
+        match m1.args.get(1).unwrap().get(2).unwrap() {
+            Symbol::Macro(m) => assert_eq!(m.name, MacroName(b"m3".into())),
+            s => panic!("unexpected symbol {s:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_macro_args_2_nested_missing_close_incomplete() {
+        let error = Macro::parse(&ParseConfig::default())(b"define(m, m2(hello)").unwrap_err();
+        match error {
+            nom::Err::Incomplete(_) => {},
+            _ => panic!(),
+        }
+    }
+    
+    #[test]
+    fn test_parse_macro_args_2_nested_missing_close_complete() {
+        let error = Macro::parse(&ParseConfig::default())(b"define(m, m2(hello)\0").unwrap_err();
+        match error {
+            nom::Err::Error(_) => {},
+            _ => panic!(),
+        }
     }
 
     #[test]

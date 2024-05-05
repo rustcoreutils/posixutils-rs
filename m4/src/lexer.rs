@@ -11,22 +11,10 @@
 //! Taking a look at this BSD licensed code
 //! https://github.com/chimera-linux/bsdm4/blob/master/main.c
 //!
-//! TODO: It's been decided that we want to support both single byte character encodings, and
-//! UTF-8. We will ignore other variable length encodings, and other wide character encodings.
-//! Will have to think how best to do this, perhaps we have two different parser implementations,
-//! one that uses nom::bytes and the libc functions, and another that uses UTF-8.
-//! We need to decide what to do in abscence of the LC_* telling us which encoding, do we just
-//! assume it's UTF-8?
-//! We'd like to try having UTF-8 support be the default and have a flag to disable it if extra
-//! compatibility with legacy utilities is required, as it's technically feasible that with some
-//! input it will result in different behaviour.
-//!
 //! TODO: Recoverable parsing warnings should be emitted to stderr
 //!
 //! TODO: should quotes support alphanumeric characters? Seems like GNU m4 at least doesn't.
 //!
-//! If the
-
 use nom::IResult;
 
 use std::io::{Read, Write};

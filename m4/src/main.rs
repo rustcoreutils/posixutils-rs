@@ -4,8 +4,15 @@ use std::{
     path::PathBuf,
 };
 
-use clap::builder::{TypedValueParser, ValueParserFactory};
+use clap::{
+    builder::{TypedValueParser, ValueParserFactory},
+    Parser,
+};
 
+use crate::{evaluate::State, lexer::ParseConfig};
+
+mod error;
+mod evaluate;
 mod lexer;
 
 // TODO: potentially we can use a reference here to avoid allocation
@@ -45,7 +52,7 @@ impl TypedValueParser for ArgumentDefineParser {
         _cmd: &clap::Command,
         _arg: Option<&clap::Arg>,
         value: &std::ffi::OsStr,
-    ) -> Result<Self::Value, clap::Error> {
+    ) -> std::result::Result<Self::Value, clap::Error> {
         let value_bytes = value.as_encoded_bytes();
         // TODO: do we need to support stripping whitespace after or before the `=`
         let mut split = value_bytes.splitn(2, |b| *b == b'=');
@@ -71,59 +78,47 @@ impl ValueParserFactory for ArgumentDefine {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, clap::Parser, Clone)]
+#[command(version, about)]
 struct Args {
     /// Enable line synchronization output for the c99 preprocessor phase (that is, #line
     /// directives).
+    #[arg(short = 's', long)]
     line_synchronization: bool,
     /// `name[=val]`
     ///
     /// Define `name` to `val` or to `null` if `=val` is omitted.
+    #[arg(short = 'D', long)]
     defines: Vec<ArgumentDefine>,
     // Undefine `name`.
+    #[arg(short = 'U', long)]
     undefines: Vec<ArgumentName>,
+    /// Whether to read input from a file.
     file: Option<PathBuf>,
 }
 
-impl Args {
-    pub fn parse() -> Self {
-        let matches = clap::command!()
-        .arg(clap::Arg::new("line_synchronization")
-            .short('s')
-            .help("Enable line synchronization output for the c99 preprocessor phase (that is, #line directives)."))
-        .arg(clap::Arg::new("defines")
-                .short('D')
-                .value_name("name=[value]")
-                .action(clap::ArgAction::Append)
-                .help("Define name to val or to null if = val is omitted"))
-        .arg(clap::Arg::new("undefines")
-                .short('U')
-                .value_name("name")
-                .action(clap::ArgAction::Append)
-                .help("Undefine name"))
-        .arg(clap::Arg::new("file")
-                .required(false)
-                .help("A pathname of a text file to be processed. If no file is given, or if it is '-', the standard input shall be read."))
-        .get_matches();
-
-        Self {
-            line_synchronization: matches.get_flag("line_synchronization"),
-            defines: matches
-                .get_many::<ArgumentDefine>("defines")
-                .unwrap()
-                .cloned()
-                .collect(),
-            undefines: matches
-                .get_many::<ArgumentName>("undefines")
-                .unwrap()
-                .cloned()
-                .collect(),
-            file: matches.get_one("file").cloned(),
-        }
-    }
-}
-
 fn main() {
+    env_logger::init();
     let args = Args::parse();
-    dbg!(args);
+
+    let stdout = std::io::stdout();
+    if let Some(file_path) = args.file {
+        lexer::process_streaming(
+            State::default(),
+            ParseConfig::default(),
+            evaluate::evaluate,
+            std::fs::File::open(file_path).unwrap(),
+            stdout,
+        )
+        .unwrap();
+    } else {
+        lexer::process_streaming(
+            State::default(),
+            ParseConfig::default(),
+            evaluate::evaluate,
+            std::io::stdin(),
+            stdout,
+        )
+        .unwrap();
+    }
 }

@@ -24,14 +24,14 @@ use std::io::{Read, Write};
 // TODO: Can probably optimize using something like smallvec
 #[derive(Clone)]
 pub(crate) struct ParseConfig {
-    current_macro_names: Vec<MacroName>,
-    quote_open_tag: Vec<u8>,
-    quote_close_tag: Vec<u8>,
-    comment_open_tag: Vec<u8>,
-    comment_close_tag: Vec<u8>,
-    symbol_recursion_limit: usize,
+    pub current_macro_names: Vec<MacroName>,
+    pub quote_open_tag: Vec<u8>,
+    pub quote_close_tag: Vec<u8>,
+    pub comment_open_tag: Vec<u8>,
+    pub comment_close_tag: Vec<u8>,
+    pub symbol_recursion_limit: usize,
     // While this is true, we skip all following input until the end of the line.
-    dnl: bool,
+    pub dnl: bool,
 }
 
 const DEFAULT_QUOTE_OPEN_TAG: &[u8] = b"`";
@@ -39,9 +39,13 @@ const DEFAULT_QUOTE_CLOSE_TAG: &[u8] = b"'";
 const DEFAULT_COMMENT_OPEN_TAG: &[u8] = b"#";
 const DEFAULT_COMMENT_CLOSE_TAG: &[u8] = b"\n";
 const DEFAULT_SYMBOL_RECURSION_LIMIT: usize = 100;
+
+// TODO: get this from default macro registry
+pub const DNL_MACRO_NAME: &str = "dnl";
+pub const DEFINE_MACRO_NAME: &str = "define";
 static INBUILT_MACRO_NAMES: once_cell::sync::Lazy<Vec<MacroName>> =
     once_cell::sync::Lazy::new(|| {
-        ["define", "dnl"]
+        [DEFINE_MACRO_NAME, DNL_MACRO_NAME]
             .iter()
             .map(|n| {
                 MacroName::try_from_slice(n.as_bytes()).expect(&format!("failed to parse {n:?}"))
@@ -64,17 +68,17 @@ impl Default for ParseConfig {
 }
 
 #[cfg_attr(test, derive(Debug, PartialEq))]
-struct Macro<'i> {
-    name: MacroName,
+pub struct Macro<'i> {
+    pub name: MacroName,
     // TODO: can also be an expression in the case of the eval macro
-    args: Vec<Vec<Symbol<'i>>>,
+    pub args: Vec<Vec<Symbol<'i>>>,
 }
 
 fn parse_macro_arg<'c>(
     config: &'c ParseConfig,
 ) -> impl for<'i> Fn(&'i [u8]) -> IResult<&'i [u8], Vec<Symbol<'i>>> + 'c {
     move |input: &[u8]| {
-        println!(
+        log::trace!(
             "parse_macro_arg() input: {:?}",
             String::from_utf8_lossy(input)
         );
@@ -83,7 +87,7 @@ fn parse_macro_arg<'c>(
         let mut remaining = input;
 
         loop {
-            println!(
+            log::trace!(
                 "parse_macro_arg() remaining: {:?}",
                 String::from_utf8_lossy(remaining)
             );
@@ -113,18 +117,18 @@ impl<'i> Macro<'i> {
     pub fn parse<'c>(config: &'c ParseConfig) -> impl Fn(&'i [u8]) -> IResult<&'i [u8], Self> + 'c {
         move |input: &[u8]| {
             #[cfg(test)]
-            println!("Macro::parse() input: {:?}", String::from_utf8_lossy(input));
+            log::trace!("Macro::parse() input: {:?}", String::from_utf8_lossy(input));
             let (remaining, name) = MacroName::parse(input)?;
             #[cfg(test)]
-            println!("Macro::parse() successfully parsed macro name {name:?}");
+            log::trace!("Macro::parse() successfully parsed macro name {name:?}");
             if !config.current_macro_names.contains(&name) {
-                println!("Macro::parse() not a current macro name");
+                log::trace!("Macro::parse() not a current macro name");
                 return Err(nom::Err::Error(nom::error::Error::new(
                     input,
                     nom::error::ErrorKind::Fail,
                 )));
             }
-            println!(
+            log::trace!(
                 "Macro::parse() macro_args: {:?}",
                 String::from_utf8_lossy(remaining)
             );
@@ -198,7 +202,7 @@ impl<'i> std::fmt::Debug for Symbol<'i> {
 impl<'c, 'i: 'c> Symbol<'i> {
     fn parse(config: &'c ParseConfig) -> impl Fn(&'i [u8]) -> IResult<&'i [u8], Symbol<'i>> + 'c {
         move |input: &'i [u8]| {
-            println!(
+            log::trace!(
                 "Symbol::parse() {:?}, current_macro_names: {:?}",
                 String::from_utf8_lossy(input),
                 config
@@ -235,7 +239,7 @@ impl<'c, 'i: 'c> Symbol<'i> {
 }
 
 #[cfg_attr(test, derive(PartialEq))]
-struct Quoted<'i> {
+pub struct Quoted<'i> {
     pub contents: &'i [u8],
 }
 
@@ -291,7 +295,7 @@ impl<'i> Quoted<'i> {
 }
 
 #[derive(PartialEq, Clone)]
-struct MacroName(Vec<u8>);
+pub struct MacroName(Vec<u8>);
 
 #[cfg(test)]
 impl std::fmt::Debug for MacroName {
@@ -306,17 +310,17 @@ impl MacroName {
     /// Macro names shall consist of letters, digits, and underscores, where the first character is not a digit. Tokens not of this form shall not be treated as macros.
     /// `[_a-zA-Z][_a-zA-Z0-9]*`
     pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
-        println!(
+        log::trace!(
             "MacroName::parse() input {:?}",
             String::from_utf8_lossy(input)
         );
         if input.is_empty() {
-            println!("MacroName::parse() empty macro name");
+            log::trace!("MacroName::parse() empty macro name");
             return Err(nom::Err::Incomplete(nom::Needed::Unknown));
         }
-        println!("MacroName::parse() parsing the start of the macro name");
+        log::trace!("MacroName::parse() parsing the start of the macro name");
         let (remaining, start) = nom::bytes::streaming::take_while1(is_word_char_start)(input)?;
-        println!(
+        log::trace!(
             "MacroName::parse() found macro name start: {:?}",
             String::from_utf8_lossy(input)
         );
@@ -328,12 +332,17 @@ impl MacroName {
     }
 
     /// Parse macro name from a complete slice, not including the EOF byte.
-    fn try_from_slice(input: &[u8]) -> Result<Self, String> {
+    /// Mostly used for testing, use [`MacroName::parse`] instead for parsing.
+    pub fn try_from_slice(input: &[u8]) -> Result<Self, String> {
         let mut input = input.to_vec();
         input.push(b'\0');
         Self::parse(input.as_slice())
             .map(|ok| ok.1)
             .map_err(|e| e.to_string())
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
     }
 }
 
@@ -368,7 +377,7 @@ fn parse_text<'c>(
     comment_open_tag: &'c [u8],
 ) -> impl for<'i> Fn(&'i [u8]) -> IResult<&'i [u8], &'i [u8]> + 'c {
     move |input: &[u8]| {
-        println!("parse_text() input: {:?}", String::from_utf8_lossy(input));
+        log::trace!("parse_text() input: {:?}", String::from_utf8_lossy(input));
         if input.is_empty() {
             return Err(nom::Err::Incomplete(nom::Needed::Unknown));
         }
@@ -380,9 +389,9 @@ fn parse_text<'c>(
         for i in 0..input.len() {
             let current_is_alphanumeric = is_alphnumeric(input[i]);
             if current_is_alphanumeric && !previous_was_alphanumeric {
-                println!("parse_text() found possible start of macro");
+                log::trace!("parse_text() found possible start of macro");
                 let (matched, remaining) = input.split_at(stop_index + 1);
-                println!(
+                log::trace!(
                     "parse_text() successfully parsed text. matched: {:?}, remaining: {:?}, stop_index: {stop_index}",
                     String::from_utf8_lossy(matched),
                     String::from_utf8_lossy(remaining),
@@ -391,12 +400,12 @@ fn parse_text<'c>(
             }
             for tag in stop_tags {
                 if input[i..].starts_with(tag) {
-                    println!(
+                    log::trace!(
                         "parse_text() found start of tag {:?}",
                         String::from_utf8_lossy(tag)
                     );
                     if i == 0 && !allowed_to_include_tags.contains(tag) {
-                        println!("parse_text() Error found tag at start of input");
+                        log::trace!("parse_text() Error found tag at start of input");
                         return Err(nom::Err::Error(nom::error::Error::new(
                             input,
                             nom::error::ErrorKind::Fail,
@@ -404,7 +413,7 @@ fn parse_text<'c>(
                     }
 
                     let (matched, remaining) = input.split_at(stop_index + 1);
-                    println!(
+                    log::trace!(
                         "parse_text() successfully parsed text. matched: {:?}, remaining: {:?}, stop_index: {stop_index}",
                         String::from_utf8_lossy(matched),
                         String::from_utf8_lossy(remaining),
@@ -467,10 +476,15 @@ pub fn parse_dnl(input: &[u8]) -> IResult<&[u8], &[u8]> {
 pub(crate) fn process_streaming<'c, R: Read, W: Write, STATE>(
     mut evaluation_state: STATE,
     initial_config: ParseConfig,
-    evaluate: impl for<'i, 'w> Fn(STATE, ParseConfig, Symbol<'i>, &'w mut W) -> (STATE, ParseConfig),
+    evaluate: impl for<'i, 'w> Fn(
+        STATE,
+        ParseConfig,
+        Symbol<'i>,
+        &'w mut W,
+    ) -> crate::error::Result<(STATE, ParseConfig)>,
     mut reader: R,
     mut writer: W,
-) {
+) -> crate::error::Result<()> {
     let buffer_size = 10;
     let buffer_growth_factor = 2;
     let mut buffer = circular::Buffer::with_capacity(buffer_size);
@@ -487,7 +501,7 @@ pub(crate) fn process_streaming<'c, R: Read, W: Write, STATE>(
         // fine, the streaming parsers rely on this to know whether they have reached the end of
         // the input.
         let fill_amount = if read == 0 {
-            println!("process_streaming() inserting EOF");
+            log::trace!("process_streaming() inserting EOF");
             let eof_bytes = &[b'\0'];
             let space = buffer.space();
             assert!(space.len() > eof_bytes.len());
@@ -502,7 +516,6 @@ pub(crate) fn process_streaming<'c, R: Read, W: Write, STATE>(
         loop {
             // TODO: what to do if the buffer is empty after previous iteration?
             let input = buffer.data();
-            dbg!(String::from_utf8_lossy(input));
 
             if input.is_empty() {
                 break;
@@ -540,16 +553,18 @@ pub(crate) fn process_streaming<'c, R: Read, W: Write, STATE>(
                 dbg!(String::from_utf8_lossy(input), &symbol, remaining);
 
                 if matches!(symbol, Symbol::Eof) {
-                    return;
+                    return Ok(());
                 }
                 (evaluation_state, config) =
-                    evaluate(evaluation_state, config, symbol, &mut writer);
+                    evaluate(evaluation_state, config, symbol, &mut writer)?;
                 remaining
             };
 
             buffer.consume(input.len() - remaining.len());
         }
     }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -570,11 +585,12 @@ mod test {
             |state, config, symbol, writer| {
                 writer.write_all(format!("{symbol:#?}").as_bytes()).unwrap();
                 writer.write(b"\n").unwrap();
-                (state, config)
+                Ok((state, config))
             },
             input,
             &mut writer,
-        );
+        )
+        .unwrap();
 
         String::from_utf8(writer).unwrap()
     }

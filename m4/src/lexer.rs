@@ -464,8 +464,11 @@ fn process_streaming<'c, R: Read, W: Write>(
         // fine, the streaming parsers rely on this to know whether they have reached the end of
         // the input.
         let fill_amount = if read == 0 {
+            println!("process_streaming() inserting EOF");
             let eof_bytes = &[b'\0'];
-            buffer.space().copy_from_slice(eof_bytes);
+            let space = buffer.space();
+            assert!(space.len() > eof_bytes.len());
+            space[0..eof_bytes.len()].copy_from_slice(eof_bytes);
             eof = true;
             eof_bytes.len()
         } else {
@@ -476,6 +479,11 @@ fn process_streaming<'c, R: Read, W: Write>(
         loop {
             // TODO: what to do if the buffer is empty after previous iteration?
             let input = buffer.data();
+            dbg!(String::from_utf8_lossy(input));
+
+            if input.is_empty() {
+                break;
+            }
 
             let result = Symbol::parse(&config)(input);
             let (remaining, symbol) = match result {
@@ -487,6 +495,15 @@ fn process_streaming<'c, R: Read, W: Write>(
                 }
                 Err(error) => panic!("{}", error),
             };
+
+            #[cfg(test)]
+            dbg!(String::from_utf8_lossy(input), &symbol, remaining);
+
+
+            if matches!(symbol, Symbol::Eof) {
+                return;
+            }
+
             let remaining_len = remaining.len();
             config = evaluate(config, symbol, &mut writer);
 
@@ -556,7 +573,8 @@ mod test {
         process_streaming(
             initial_config,
             |config, symbol, writer| {
-                writer.write_all(format!("{symbol:?}").as_bytes()).unwrap();
+                writer.write_all(format!("{symbol:#?}").as_bytes()).unwrap();
+                writer.write(b"\n").unwrap();
                 config
             },
             input,
@@ -857,14 +875,14 @@ mod test {
 
     #[test]
     fn test_parse_text() {
-        let (remaining, text) = parse_text(b"`", DEFAULT_COMMENT_OPEN_TAG)(b"hello\0").unwrap();
+        let (remaining, text) = parse_text(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_COMMENT_OPEN_TAG)(b"hello\0").unwrap();
         assert_eq!("hello", utf8(text));
         assert_eq!("\0", utf8(remaining));
     }
 
     #[test]
     fn test_parse_text_incomplete() {
-        let (remaining, text) = parse_text(b"`", DEFAULT_COMMENT_OPEN_TAG)(b"hello").unwrap();
+        let (remaining, text) = parse_text(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_COMMENT_OPEN_TAG)(b"hello").unwrap();
         assert_eq!("hello", utf8(text));
         assert_eq!("", utf8(remaining));
     }
@@ -998,6 +1016,82 @@ mod test {
 
         insta::assert_debug_snapshot!(symbols);
         assert!(remaining.is_empty())
+    }
+    
+    // TODO remove
+    #[test]
+    fn test_parse_stream_symbols_text_1() {
+        insta::assert_snapshot!(
+            snapshot_symbols_as_stream(
+                ParseConfig::default(),
+                b"hello"
+            ),
+            @r###"
+        Text(
+            "hello",
+        )
+        "###
+        );
+    }
+
+    // TODO remove
+    #[test]
+    fn test_parse_stream_symbols_macro_1() {
+        insta::assert_snapshot!(
+            snapshot_symbols_as_stream(
+                ParseConfig::default(),
+                b"define(hello,world)"
+            ),
+            @r###"
+        Macro(
+            Macro {
+                name: MacroName(
+                    "define",
+                ),
+                args: [
+                    [
+                        Text(
+                            "hello",
+                        ),
+                    ],
+                    [
+                        Text(
+                            "world",
+                        ),
+                    ],
+                ],
+            },
+        )
+        "###
+        );
+    }
+    
+    // TODO remove
+    #[test]
+    fn test_parse_stream_symbols_text_not_macro() {
+        insta::assert_snapshot!(
+            snapshot_symbols_as_stream(
+                ParseConfig::default(),
+                b"m1(hello,world)"
+            ),
+            @r###"
+        Text(
+            "m1(",
+        )
+        Text(
+            "hello",
+        )
+        Text(
+            ",",
+        )
+        Text(
+            "world",
+        )
+        Text(
+            ")",
+        )
+        "###
+        );
     }
 
     #[ignore]

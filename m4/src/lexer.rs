@@ -522,51 +522,14 @@ pub(crate) fn process_streaming<'c, R: Read, W: Write>(
     }
 }
 
-fn parse_symbols<'b, 'a: 'b>(
-    config: &'b ParseConfig,
-) -> impl Fn(&'a [u8]) -> IResult<&'a [u8], Vec<Symbol<'a>>> + 'b {
-    move |input: &[u8]| {
-        if config.symbol_recursion_limit == 0 {
-            // TODO: Add a better error
-            return Err(nom::Err::Error(nom::error::Error::new(
-                input,
-                nom::error::ErrorKind::Fail,
-            )));
-        }
-        println!(
-            "parse_symbols() input: {:?}",
-            String::from_utf8_lossy(input)
-        );
-        if input.is_empty() {
-            return Ok((input, Vec::new()));
-        }
-        let result = nom::multi::many0(|input| {
-            println!(
-                "parse_symbols() matching symbol on input: {:?}",
-                String::from_utf8_lossy(input)
-            );
-            let (remaining, symbol) = Symbol::parse(config)(input)?;
-            #[cfg(test)]
-            println!(
-                "parse_symbols() symbol: {:?} remaining: {:?}",
-                symbol,
-                String::from_utf8_lossy(remaining)
-            );
-            Ok((remaining, symbol))
-        })(input);
-        result
-    }
-}
-// TODO: probably these tests will be deleted later in favour of integration test suite.
-
 #[cfg(test)]
 mod test {
     use crate::lexer::{Symbol, DEFAULT_COMMENT_CLOSE_TAG, DEFAULT_COMMENT_OPEN_TAG};
     use std::io::Write;
 
     use super::{
-        parse_comment, parse_symbols, parse_text, process_streaming, Macro, MacroName, ParseConfig,
-        Quoted, DEFAULT_QUOTE_CLOSE_TAG, DEFAULT_QUOTE_OPEN_TAG,
+        parse_comment, parse_text, process_streaming, Macro, MacroName, ParseConfig, Quoted,
+        DEFAULT_QUOTE_CLOSE_TAG, DEFAULT_QUOTE_OPEN_TAG,
     };
     // TODO: add tests based on input in
     // https://pubs.opengroup.org/onlinepubs/9699919799/utilities/m4.html#tag_20_74_17
@@ -1020,17 +983,6 @@ mod test {
             _ => panic!(),
         }
         assert_eq!("\0", utf8(remaining));
-    }
-
-    #[test]
-    fn test_parse_symbols_evaluation_order() {
-        let mut f = std::fs::read("fixtures/integration_tests/evaluation_order.m4").unwrap();
-        f.push(b'\0');
-        let config = ParseConfig::default();
-        let (remaining, symbols) = parse_symbols(&config)(&f).unwrap();
-
-        insta::assert_debug_snapshot!(symbols);
-        assert!(remaining.is_empty())
     }
 
     #[test]

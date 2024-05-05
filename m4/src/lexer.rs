@@ -30,6 +30,8 @@ pub(crate) struct ParseConfig {
     comment_open_tag: Vec<u8>,
     comment_close_tag: Vec<u8>,
     symbol_recursion_limit: usize,
+    // While this is true, we skip all following input until the end of the line.
+    dnl: bool,
 }
 
 const DEFAULT_QUOTE_OPEN_TAG: &[u8] = b"`";
@@ -56,6 +58,7 @@ impl Default for ParseConfig {
             comment_open_tag: DEFAULT_COMMENT_OPEN_TAG.to_vec(),
             comment_close_tag: DEFAULT_COMMENT_CLOSE_TAG.to_vec(),
             symbol_recursion_limit: DEFAULT_SYMBOL_RECURSION_LIMIT,
+            dnl: false,
         }
     }
 }
@@ -142,9 +145,7 @@ impl<'i> Macro<'i> {
                     // that could be contained within a comment.
                     //
                     // We need a way to tell the parsers that they are inside complete input here
-                    parse_macro_arg(config), // nom::combinator::map_parser(
-                                             //     nom::combinator::peek(nom::bytes::streaming::is_not(")")),
-                                             // )
+                    parse_macro_arg(config),
                 ),
                 // Make sure we fail for input that is missing the closing tag, this is what GNU m4 does
                 // anyway.
@@ -449,13 +450,24 @@ fn parse_comment<'a, 'b>(
     }
 }
 
+/// Parse all input until either a newline or an EOF.
+pub fn parse_dnl(input: &[u8]) -> IResult<&[u8], &[u8]> {
+    let (remaining, _) = nom::bytes::streaming::take_till(|c| c == b'\0' || c == b'\n')(input)?;
+    let (remaining, _) = nom::branch::alt((
+        nom::bytes::streaming::tag("\n"),
+        nom::combinator::peek(nom::bytes::streaming::tag("\0")),
+    ))(remaining)?;
+    Ok((remaining, &input[0..(input.len() - remaining.len())]))
+}
+
 /// `evaluate` is a function which takes the current [`ParseConfig`], and evaluates the provided
 /// [`Symbol`] writing output to `writer`, and returns a [`ParseConfig`] which has been
 /// modified during the process of evaluation (for example a new macro was defined, or
 /// changequote).
-pub(crate) fn process_streaming<'c, R: Read, W: Write>(
+pub(crate) fn process_streaming<'c, R: Read, W: Write, STATE>(
+    mut evaluation_state: STATE,
     initial_config: ParseConfig,
-    mut evaluate: impl for<'i, 'w> FnMut(ParseConfig, Symbol<'i>, &'w mut W) -> ParseConfig,
+    evaluate: impl for<'i, 'w> Fn(STATE, ParseConfig, Symbol<'i>, &'w mut W) -> (STATE, ParseConfig),
     mut reader: R,
     mut writer: W,
 ) {
@@ -496,28 +508,46 @@ pub(crate) fn process_streaming<'c, R: Read, W: Write>(
                 break;
             }
 
-            let result = Symbol::parse(&config)(input);
-            let (remaining, symbol) = match result {
-                Ok(ok) => ok,
-                Err(nom::Err::Incomplete(_)) => {
-                    let new_capacity = buffer_growth_factor * buffer.capacity();
-                    buffer.grow(new_capacity);
-                    break;
+            let remaining = if config.dnl {
+                let result = parse_dnl(input);
+                let remaining = match result {
+                    Ok((remaining, _)) => remaining,
+                    Err(nom::Err::Incomplete(_)) => {
+                        let new_capacity = buffer_growth_factor * buffer.capacity();
+                        buffer.grow(new_capacity);
+                        break;
+                    }
+                    // TODO: handle unwrap
+                    Err(error) => panic!("{}", error),
+                };
+                config.dnl = false;
+
+                remaining
+            } else {
+                let result = Symbol::parse(&config)(input);
+                let (remaining, symbol) = match result {
+                    Ok(ok) => ok,
+                    Err(nom::Err::Incomplete(_)) => {
+                        let new_capacity = buffer_growth_factor * buffer.capacity();
+                        buffer.grow(new_capacity);
+                        break;
+                    }
+                    // TODO: handle unwrap
+                    Err(error) => panic!("{}", error),
+                };
+
+                #[cfg(test)]
+                dbg!(String::from_utf8_lossy(input), &symbol, remaining);
+
+                if matches!(symbol, Symbol::Eof) {
+                    return;
                 }
-                Err(error) => panic!("{}", error),
+                (evaluation_state, config) =
+                    evaluate(evaluation_state, config, symbol, &mut writer);
+                remaining
             };
 
-            #[cfg(test)]
-            dbg!(String::from_utf8_lossy(input), &symbol, remaining);
-
-            if matches!(symbol, Symbol::Eof) {
-                return;
-            }
-
-            let remaining_len = remaining.len();
-            config = evaluate(config, symbol, &mut writer);
-
-            buffer.consume(input.len() - remaining_len);
+            buffer.consume(input.len() - remaining.len());
         }
     }
 }
@@ -528,8 +558,8 @@ mod test {
     use std::io::Write;
 
     use super::{
-        parse_comment, parse_text, process_streaming, Macro, MacroName, ParseConfig, Quoted,
-        DEFAULT_QUOTE_CLOSE_TAG, DEFAULT_QUOTE_OPEN_TAG,
+        parse_comment, parse_dnl, parse_text, process_streaming, Macro, MacroName, ParseConfig,
+        Quoted, DEFAULT_QUOTE_CLOSE_TAG, DEFAULT_QUOTE_OPEN_TAG,
     };
     // TODO: add tests based on input in
     // https://pubs.opengroup.org/onlinepubs/9699919799/utilities/m4.html#tag_20_74_17
@@ -542,11 +572,12 @@ mod test {
     fn snapshot_symbols_as_stream(initial_config: ParseConfig, input: &[u8]) -> String {
         let mut writer = Vec::new();
         process_streaming(
+            (),
             initial_config,
-            |config, symbol, writer| {
+            |state, config, symbol, writer| {
                 writer.write_all(format!("{symbol:#?}").as_bytes()).unwrap();
                 writer.write(b"\n").unwrap();
-                config
+                (state, config)
             },
             input,
             &mut writer,
@@ -983,6 +1014,39 @@ mod test {
             _ => panic!(),
         }
         assert_eq!("\0", utf8(remaining));
+    }
+
+    #[test]
+    fn test_parse_dnl() {
+        let (remaining, matched) = parse_dnl(b" hello world\n\0").unwrap();
+        assert_eq!(" hello world\n", utf8(matched));
+        assert_eq!("\0", utf8(remaining));
+    }
+
+    #[test]
+    fn test_parse_dnl_only_newline() {
+        let (remaining, matched) = parse_dnl(b"\n\0").unwrap();
+        assert_eq!("\n", utf8(matched));
+        assert_eq!("\0", utf8(remaining));
+    }
+
+    #[test]
+    fn test_parse_dnl_only_eof() {
+        let (remaining, matched) = parse_dnl(b"\0").unwrap();
+        assert_eq!("", utf8(matched));
+        assert_eq!("\0", utf8(remaining));
+    }
+
+    #[test]
+    fn test_parse_stream_symbols_dnl() {
+        insta::assert_snapshot!(snapshot_symbols_as_stream(
+            ParseConfig {
+                dnl: true,
+                ..ParseConfig::default()
+            },
+            b" this is some text\n"),
+            @""
+        );
     }
 
     #[test]

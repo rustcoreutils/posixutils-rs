@@ -50,9 +50,7 @@ expression: symbols
     Text(
         "called.",
     ),
-    Text(
-        "\n",
-    ),
+    Newline,
     Macro(
         Macro {
             name: MacroName(
@@ -83,9 +81,7 @@ expression: symbols
             args: [],
         },
     ),
-    Text(
-        "\n",
-    ),
+    Newline,
     Macro(
         Macro {
             name: MacroName(
@@ -137,9 +133,7 @@ expression: symbols
     Text(
         " ",
     ),
-    Text(
-        "\n",
-    ),
+    Newline,
     Macro(
         Macro {
             name: MacroName(
@@ -170,9 +164,7 @@ expression: symbols
             args: [],
         },
     ),
-    Text(
-        "\n",
-    ),
+    Newline,
     Macro(
         Macro {
             name: MacroName(
@@ -211,9 +203,7 @@ expression: symbols
             args: [],
         },
     ),
-    Text(
-        "\n",
-    ),
+    Newline,
     Text(
         "m2(",
     ),
@@ -223,8 +213,6 @@ expression: symbols
     Text(
         ")",
     ),
-    Text(
-        "\n",
-    ),
+    Newline,
     Eof,
 ]

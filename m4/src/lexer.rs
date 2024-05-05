@@ -182,6 +182,7 @@ pub(crate) enum Symbol<'i> {
     Text(&'i [u8]),
     Quoted(Quoted<'i>),
     Macro(Macro<'i>),
+    Newline,
     Eof,
 }
 
@@ -199,6 +200,7 @@ impl<'i> std::fmt::Debug for Symbol<'i> {
                 .finish(),
             Self::Quoted(arg0) => f.debug_tuple("Quoted").field(arg0).finish(),
             Self::Macro(arg0) => f.debug_tuple("Macro").field(arg0).finish(),
+            Self::Newline => f.debug_tuple("Newline").finish(),
             Self::Eof => f.debug_tuple("Eof").finish(),
         }
     }
@@ -223,6 +225,7 @@ impl<'c, 'i: 'c> Symbol<'i> {
                 )));
             }
             nom::branch::alt((
+                nom::combinator::map(nom::bytes::streaming::tag(b"\n"), |_| Symbol::Newline),
                 nom::combinator::map(nom::bytes::streaming::tag(b"\0"), |_| Symbol::Eof),
                 nom::combinator::map(
                     Quoted::parse(&config.quote_open_tag, &config.quote_close_tag),
@@ -376,11 +379,13 @@ fn parse_text<'c>(
     comment_open_tag: &'c [u8],
 ) -> impl for<'i> Fn(&'i [u8]) -> IResult<&'i [u8], &'i [u8]> + 'c {
     move |input: &[u8]| {
+        println!("parse_text() input: {:?}", String::from_utf8_lossy(input));
         if input.is_empty() {
-            return Ok((input, input));
+            return Err(nom::Err::Incomplete(nom::Needed::Unknown));
         }
 
         let stop_tags = &[quote_open_tag, comment_open_tag, b"\n", b",", b")", b"\0"];
+        let allowed_to_include_tags: &[&[u8]] = &[b",", b")"];
         let mut previous_was_alphanumeric = true;
         let mut stop_index = 0;
         for i in 0..input.len() {
@@ -397,13 +402,25 @@ fn parse_text<'c>(
             }
             for tag in stop_tags {
                 if input[i..].starts_with(tag) {
-                    println!("parse_text() found start of tag {tag:?}");
+                    println!(
+                        "parse_text() found start of tag {:?}",
+                        String::from_utf8_lossy(tag)
+                    );
+                    if i == 0 && !allowed_to_include_tags.contains(tag) {
+                        println!("parse_text() Error found tag at start of input");
+                        return Err(nom::Err::Error(nom::error::Error::new(
+                            input,
+                            nom::error::ErrorKind::Fail,
+                        )));
+                    }
+
                     let (matched, remaining) = input.split_at(stop_index + 1);
                     println!(
                         "parse_text() successfully parsed text. matched: {:?}, remaining: {:?}, stop_index: {stop_index}",
                         String::from_utf8_lossy(matched),
                         String::from_utf8_lossy(remaining),
                     );
+                    assert!(!matched.is_empty());
                     return Ok((remaining, matched));
                 }
             }
@@ -549,8 +566,6 @@ fn parse_symbols<'b, 'a: 'b>(
             );
             Ok((remaining, symbol))
         })(input);
-        #[cfg(test)]
-        dbg!(&result);
         result
     }
 }
@@ -946,17 +961,23 @@ mod test {
 
     #[test]
     fn test_parse_text_newline_only() {
-        let (remaining, text) =
-            parse_text(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_COMMENT_OPEN_TAG)(b"\n\0").unwrap();
-        assert_eq!("\n", utf8(text));
-        assert_eq!("\0", utf8(remaining));
+        let error =
+            parse_text(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_COMMENT_OPEN_TAG)(b"\n").unwrap_err();
+        assert!(matches!(error, nom::Err::Error(_)));
+    }
+
+    #[test]
+    fn test_parse_text_eof_only() {
+        let error =
+            parse_text(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_COMMENT_OPEN_TAG)(b"\0").unwrap_err();
+        assert!(matches!(error, nom::Err::Error(_)));
     }
 
     #[test]
     fn test_parse_symbol_newline() {
         let (remaining, symbol) = Symbol::parse(&ParseConfig::default())(b"\n\0").unwrap();
         match symbol {
-            Symbol::Text(text) => assert_eq!("\n", utf8(text)),
+            Symbol::Newline => {}
             _ => panic!(),
         }
         assert_eq!("\0", utf8(remaining));
@@ -1007,7 +1028,7 @@ mod test {
     fn test_parse_symbol_newline_eof() {
         let (remaining, symbol) = Symbol::parse(&ParseConfig::default())(b"\n\0").unwrap();
         match symbol {
-            Symbol::Text(text) => assert_eq!("\n", utf8(text)),
+            Symbol::Newline => {}
             _ => panic!(),
         }
         assert_eq!("\0", utf8(remaining));
@@ -1022,82 +1043,6 @@ mod test {
 
         insta::assert_debug_snapshot!(symbols);
         assert!(remaining.is_empty())
-    }
-
-    // TODO remove
-    #[test]
-    fn test_parse_stream_symbols_text_1() {
-        insta::assert_snapshot!(
-            snapshot_symbols_as_stream(
-                ParseConfig::default(),
-                b"hello"
-            ),
-            @r###"
-        Text(
-            "hello",
-        )
-        "###
-        );
-    }
-
-    // TODO remove
-    #[test]
-    fn test_parse_stream_symbols_macro_1() {
-        insta::assert_snapshot!(
-            snapshot_symbols_as_stream(
-                ParseConfig::default(),
-                b"define(hello,world)"
-            ),
-            @r###"
-        Macro(
-            Macro {
-                name: MacroName(
-                    "define",
-                ),
-                args: [
-                    [
-                        Text(
-                            "hello",
-                        ),
-                    ],
-                    [
-                        Text(
-                            "world",
-                        ),
-                    ],
-                ],
-            },
-        )
-        "###
-        );
-    }
-
-    // TODO remove
-    #[test]
-    fn test_parse_stream_symbols_text_not_macro() {
-        insta::assert_snapshot!(
-            snapshot_symbols_as_stream(
-                ParseConfig::default(),
-                b"m1(hello,world)"
-            ),
-            @r###"
-        Text(
-            "m1(",
-        )
-        Text(
-            "hello",
-        )
-        Text(
-            ",",
-        )
-        Text(
-            "world",
-        )
-        Text(
-            ")",
-        )
-        "###
-        );
     }
 
     #[test]

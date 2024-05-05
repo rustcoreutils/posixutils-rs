@@ -49,9 +49,7 @@ Text(
 Text(
     "called.",
 )
-Text(
-    "\n",
-)
+Newline
 Macro(
     Macro {
         name: MacroName(
@@ -82,9 +80,7 @@ Macro(
         args: [],
     },
 )
-Text(
-    "\n",
-)
+Newline
 Macro(
     Macro {
         name: MacroName(
@@ -136,9 +132,7 @@ Macro(
 Text(
     " ",
 )
-Text(
-    "\n",
-)
+Newline
 Macro(
     Macro {
         name: MacroName(
@@ -169,9 +163,7 @@ Macro(
         args: [],
     },
 )
-Text(
-    "\n",
-)
+Newline
 Macro(
     Macro {
         name: MacroName(
@@ -210,9 +202,7 @@ Macro(
         args: [],
     },
 )
-Text(
-    "\n",
-)
+Newline
 Text(
     "m2(",
 )
@@ -222,6 +212,4 @@ Text(
 Text(
     ")",
 )
-Text(
-    "\n",
-)
+Newline

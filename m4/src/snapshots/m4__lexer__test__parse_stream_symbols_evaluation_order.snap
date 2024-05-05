@@ -1,0 +1,227 @@
+---
+source: m4/src/lexer.rs
+expression: "snapshot_symbols_as_stream(ParseConfig::default(), &f)"
+---
+Macro(
+    Macro {
+        name: MacroName(
+            "dnl",
+        ),
+        args: [],
+    },
+)
+Text(
+    " ",
+)
+Text(
+    "demonstrates ",
+)
+Text(
+    "that ",
+)
+Text(
+    "evaluation ",
+)
+Text(
+    "of ",
+)
+Text(
+    "macro ",
+)
+Text(
+    "arguments ",
+)
+Text(
+    "is ",
+)
+Text(
+    "deferred ",
+)
+Text(
+    "until ",
+)
+Text(
+    "it ",
+)
+Text(
+    "is ",
+)
+Text(
+    "called.",
+)
+Text(
+    "\n",
+)
+Macro(
+    Macro {
+        name: MacroName(
+            "define",
+        ),
+        args: [
+            [
+                Text(
+                    "hello",
+                ),
+            ],
+            [
+                Text(
+                    " ",
+                ),
+                Text(
+                    "error",
+                ),
+            ],
+        ],
+    },
+)
+Macro(
+    Macro {
+        name: MacroName(
+            "dnl",
+        ),
+        args: [],
+    },
+)
+Text(
+    "\n",
+)
+Macro(
+    Macro {
+        name: MacroName(
+            "define",
+        ),
+        args: [
+            [
+                Text(
+                    "m2",
+                ),
+            ],
+            [
+                Text(
+                    " ",
+                ),
+                Text(
+                    "m1(",
+                ),
+                Text(
+                    "hello",
+                ),
+            ],
+        ],
+    },
+)
+Text(
+    " ",
+)
+Text(
+    "m1($",
+)
+Text(
+    "1",
+)
+Text(
+    ")",
+)
+Text(
+    ")",
+)
+Macro(
+    Macro {
+        name: MacroName(
+            "dnl",
+        ),
+        args: [],
+    },
+)
+Text(
+    " ",
+)
+Text(
+    "\n",
+)
+Macro(
+    Macro {
+        name: MacroName(
+            "define",
+        ),
+        args: [
+            [
+                Text(
+                    "hello",
+                ),
+            ],
+            [
+                Text(
+                    " ",
+                ),
+                Text(
+                    "goodbye",
+                ),
+            ],
+        ],
+    },
+)
+Macro(
+    Macro {
+        name: MacroName(
+            "dnl",
+        ),
+        args: [],
+    },
+)
+Text(
+    "\n",
+)
+Macro(
+    Macro {
+        name: MacroName(
+            "define",
+        ),
+        args: [
+            [
+                Text(
+                    "m1",
+                ),
+            ],
+            [
+                Text(
+                    " ",
+                ),
+                Quoted(
+                    Quoted {
+                        contents: "`m1'",
+                    },
+                ),
+                Text(
+                    "' $",
+                ),
+                Text(
+                    "1",
+                ),
+            ],
+        ],
+    },
+)
+Macro(
+    Macro {
+        name: MacroName(
+            "dnl",
+        ),
+        args: [],
+    },
+)
+Text(
+    "\n",
+)
+Text(
+    "m2(",
+)
+Text(
+    "hi",
+)
+Text(
+    ")",
+)
+Text(
+    "\n",
+)

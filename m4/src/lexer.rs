@@ -35,7 +35,7 @@ use std::io::{Read, Write};
 /// record of the recusion limit for processing a [`Symbol`].
 // TODO: Can probably optimize using something like smallvec
 #[derive(Clone)]
-struct ParseConfig {
+pub(crate) struct ParseConfig {
     current_macro_names: Vec<MacroName>,
     quote_open_tag: Vec<u8>,
     quote_close_tag: Vec<u8>,
@@ -175,7 +175,7 @@ impl<'i> Macro<'i> {
 }
 
 #[cfg_attr(test, derive(PartialEq))]
-enum Symbol<'i> {
+pub(crate) enum Symbol<'i> {
     // Comments in m4 are not discarded, their contents (including delimeters) are copied verbatim to output without
     // further processing.
     Comment(&'i [u8]),
@@ -380,32 +380,38 @@ fn parse_text<'c>(
             return Ok((input, input));
         }
 
-        let stop_tags = &[quote_open_tag, comment_open_tag, b",", b")", b"\0"];
+        let stop_tags = &[quote_open_tag, comment_open_tag, b"\n", b",", b")", b"\0"];
         let mut previous_was_alphanumeric = true;
         let mut stop_index = 0;
-        'forloop: for i in 0..input.len() {
+        for i in 0..input.len() {
             let current_is_alphanumeric = is_alphnumeric(input[i]);
             if current_is_alphanumeric && !previous_was_alphanumeric {
                 println!("parse_text() found possible start of macro");
-                break 'forloop;
+                let (matched, remaining) = input.split_at(stop_index + 1);
+                println!(
+                    "parse_text() successfully parsed text. matched: {:?}, remaining: {:?}, stop_index: {stop_index}",
+                    String::from_utf8_lossy(matched),
+                    String::from_utf8_lossy(remaining),
+                );
+                return Ok((remaining, matched));
             }
             for tag in stop_tags {
                 if input[i..].starts_with(tag) {
                     println!("parse_text() found start of tag {tag:?}");
-                    break 'forloop;
+                    let (matched, remaining) = input.split_at(stop_index + 1);
+                    println!(
+                        "parse_text() successfully parsed text. matched: {:?}, remaining: {:?}, stop_index: {stop_index}",
+                        String::from_utf8_lossy(matched),
+                        String::from_utf8_lossy(remaining),
+                    );
+                    return Ok((remaining, matched));
                 }
             }
             stop_index = i;
             previous_was_alphanumeric = current_is_alphanumeric;
         }
 
-        let (matched, remaining) = input.split_at(stop_index + 1);
-        println!(
-            "parse_text() successfully parsed text. matched: {:?}, remaining: {:?}, stop_index: {stop_index}",
-            String::from_utf8_lossy(matched),
-            String::from_utf8_lossy(remaining),
-        );
-        Ok((remaining, matched))
+        return Err(nom::Err::Incomplete(nom::Needed::Unknown));
     }
 }
 
@@ -442,7 +448,7 @@ fn parse_comment<'a, 'b>(
 /// [`Symbol`] writing output to `writer`, and returns a [`ParseConfig`] which has been
 /// modified during the process of evaluation (for example a new macro was defined, or
 /// changequote).
-fn process_streaming<'c, R: Read, W: Write>(
+pub(crate) fn process_streaming<'c, R: Read, W: Write>(
     initial_config: ParseConfig,
     mut evaluate: impl for<'i, 'w> FnMut(ParseConfig, Symbol<'i>, &'w mut W) -> ParseConfig,
     mut reader: R,
@@ -882,10 +888,9 @@ mod test {
 
     #[test]
     fn test_parse_text_incomplete() {
-        let (remaining, text) =
-            parse_text(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_COMMENT_OPEN_TAG)(b"hello").unwrap();
-        assert_eq!("hello", utf8(text));
-        assert_eq!("", utf8(remaining));
+        let error =
+            parse_text(DEFAULT_COMMENT_OPEN_TAG, DEFAULT_COMMENT_CLOSE_TAG)(b"hello").unwrap_err();
+        assert!(matches!(error, nom::Err::Incomplete(_)));
     }
 
     #[test]
@@ -921,13 +926,13 @@ mod test {
     #[test]
     fn test_parse_text_before_non_alphanum() {
         let (remaining, text) =
-            parse_text(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_COMMENT_OPEN_TAG)(b"hello|world").unwrap();
+            parse_text(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_COMMENT_OPEN_TAG)(b"hello|world\0").unwrap();
         assert_eq!("hello|", utf8(text));
-        assert_eq!("world", utf8(remaining));
+        assert_eq!("world\0", utf8(remaining));
         let (remaining, text) =
             parse_text(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_COMMENT_OPEN_TAG)(remaining).unwrap();
         assert_eq!("world", utf8(text));
-        assert_eq!("", utf8(remaining));
+        assert_eq!("\0", utf8(remaining));
     }
 
     #[test]
@@ -935,8 +940,8 @@ mod test {
         let (remaining, text) =
             parse_text(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_COMMENT_OPEN_TAG)(b"hello\nworld\0")
                 .unwrap();
-        assert_eq!("hello\n", utf8(text));
-        assert_eq!("world\0", utf8(remaining));
+        assert_eq!("hello", utf8(text));
+        assert_eq!("\nworld\0", utf8(remaining));
     }
 
     #[test]
@@ -1095,7 +1100,6 @@ mod test {
         );
     }
 
-    #[ignore]
     #[test]
     fn test_parse_stream_symbols_evaluation_order() {
         let f = std::fs::read("fixtures/integration_tests/evaluation_order.m4").unwrap();

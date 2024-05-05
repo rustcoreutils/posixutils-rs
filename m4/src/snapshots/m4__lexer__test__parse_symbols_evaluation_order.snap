@@ -48,7 +48,10 @@ expression: symbols
         "is ",
     ),
     Text(
-        "called.\n",
+        "called.",
+    ),
+    Text(
+        "\n",
     ),
     Macro(
         Macro {
@@ -112,7 +115,7 @@ expression: symbols
         " ",
     ),
     Text(
-        "m1(\\$",
+        "m1($",
     ),
     Text(
         "1",
@@ -132,7 +135,10 @@ expression: symbols
         },
     ),
     Text(
-        " \n",
+        " ",
+    ),
+    Text(
+        "\n",
     ),
     Macro(
         Macro {
@@ -188,7 +194,7 @@ expression: symbols
                         },
                     ),
                     Text(
-                        "' \\$",
+                        "' $",
                     ),
                     Text(
                         "1",

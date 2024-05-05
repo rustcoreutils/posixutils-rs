@@ -7,7 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 // TODO:
-// - FIXME: file tail truncated (data corruption)
 // - support NOT writing to stdout (but to file.Z, with .Z suffix removed)
 // - support options -f, -v
 //

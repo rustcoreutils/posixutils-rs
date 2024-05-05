@@ -723,16 +723,16 @@ mod test {
     fn test_parse_macro_args_2_nested_missing_close_incomplete() {
         let error = Macro::parse(&ParseConfig::default())(b"define(m, m2(hello)").unwrap_err();
         match error {
-            nom::Err::Incomplete(_) => {},
+            nom::Err::Incomplete(_) => {}
             _ => panic!(),
         }
     }
-    
+
     #[test]
     fn test_parse_macro_args_2_nested_missing_close_complete() {
         let error = Macro::parse(&ParseConfig::default())(b"define(m, m2(hello)\0").unwrap_err();
         match error {
-            nom::Err::Error(_) => {},
+            nom::Err::Error(_) => {}
             _ => panic!(),
         }
     }

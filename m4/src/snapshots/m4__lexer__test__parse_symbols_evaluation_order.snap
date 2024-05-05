@@ -3,8 +3,16 @@ source: m4/src/lexer.rs
 expression: symbols
 ---
 [
+    Macro(
+        Macro {
+            name: MacroName(
+                "dnl",
+            ),
+            args: [],
+        },
+    ),
     Text(
-        "dnl ",
+        " ",
     ),
     Text(
         "demonstrates ",
@@ -50,7 +58,12 @@ expression: symbols
             args: [
                 [
                     Text(
-                        "hello, ",
+                        "hello",
+                    ),
+                ],
+                [
+                    Text(
+                        " ",
                     ),
                     Text(
                         "error",
@@ -59,8 +72,16 @@ expression: symbols
             ],
         },
     ),
+    Macro(
+        Macro {
+            name: MacroName(
+                "dnl",
+            ),
+            args: [],
+        },
+    ),
     Text(
-        "dnl\n",
+        "\n",
     ),
     Macro(
         Macro {
@@ -70,7 +91,12 @@ expression: symbols
             args: [
                 [
                     Text(
-                        "m2, ",
+                        "m2",
+                    ),
+                ],
+                [
+                    Text(
+                        " ",
                     ),
                     Text(
                         "m1(",
@@ -89,10 +115,24 @@ expression: symbols
         "m1(\\$",
     ),
     Text(
-        "1))",
+        "1",
     ),
     Text(
-        "dnl \n",
+        ")",
+    ),
+    Text(
+        ")",
+    ),
+    Macro(
+        Macro {
+            name: MacroName(
+                "dnl",
+            ),
+            args: [],
+        },
+    ),
+    Text(
+        " \n",
     ),
     Macro(
         Macro {
@@ -102,7 +142,12 @@ expression: symbols
             args: [
                 [
                     Text(
-                        "hello, ",
+                        "hello",
+                    ),
+                ],
+                [
+                    Text(
+                        " ",
                     ),
                     Text(
                         "goodbye",
@@ -111,8 +156,16 @@ expression: symbols
             ],
         },
     ),
+    Macro(
+        Macro {
+            name: MacroName(
+                "dnl",
+            ),
+            args: [],
+        },
+    ),
     Text(
-        "dnl\n",
+        "\n",
     ),
     Macro(
         Macro {
@@ -122,7 +175,12 @@ expression: symbols
             args: [
                 [
                     Text(
-                        "m1, ",
+                        "m1",
+                    ),
+                ],
+                [
+                    Text(
+                        " ",
                     ),
                     Quoted(
                         Quoted {
@@ -139,13 +197,28 @@ expression: symbols
             ],
         },
     ),
+    Macro(
+        Macro {
+            name: MacroName(
+                "dnl",
+            ),
+            args: [],
+        },
+    ),
     Text(
-        "dnl\n",
+        "\n",
     ),
     Text(
         "m2(",
     ),
     Text(
-        "hi)\n",
+        "hi",
     ),
+    Text(
+        ")",
+    ),
+    Text(
+        "\n",
+    ),
+    Eof,
 ]

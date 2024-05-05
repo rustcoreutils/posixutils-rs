@@ -51,7 +51,7 @@ const DEFAULT_COMMENT_CLOSE_TAG: &[u8] = b"\n";
 const DEFAULT_SYMBOL_RECURSION_LIMIT: usize = 100;
 static INBUILT_MACRO_NAMES: once_cell::sync::Lazy<Vec<MacroName>> =
     once_cell::sync::Lazy::new(|| {
-        ["define", "dnf"]
+        ["define", "dnl"]
             .iter()
             .map(|n| {
                 MacroName::try_from_slice(n.as_bytes()).expect(&format!("failed to parse {n:?}"))
@@ -83,28 +83,33 @@ fn parse_macro_arg<'c>(
     config: &'c ParseConfig,
 ) -> impl for<'i> Fn(&'i [u8]) -> IResult<&'i [u8], Vec<Symbol<'i>>> + 'c {
     move |input: &[u8]| {
+        println!(
+            "parse_macro_arg() input: {:?}",
+            String::from_utf8_lossy(input)
+        );
         let mut symbols = Vec::new();
-
-        if let Some(b')') = input.get(0) {
-            return Err(nom::Err::Error(nom::error::Error::new(
-                input,
-                nom::error::ErrorKind::Tag,
-            )));
-        }
 
         let mut remaining = input;
 
         loop {
+            println!(
+                "parse_macro_arg() remaining: {:?}",
+                String::from_utf8_lossy(remaining)
+            );
+            if let Some(b',' | b')') = remaining.get(0) {
+                return Ok((remaining, symbols));
+            }
             let (r, symbol) = nom::combinator::cut(Symbol::parse(config))(remaining)?;
             symbols.push(symbol);
 
             if r.is_empty() || r == b"\0" {
-                break;
+                return Err(nom::Err::Error(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::Fail,
+                )));
             }
             remaining = r;
         }
-
-        Ok((remaining, symbols))
     }
 }
 
@@ -117,16 +122,21 @@ impl<'i> Macro<'i> {
     pub fn parse<'c>(config: &'c ParseConfig) -> impl Fn(&'i [u8]) -> IResult<&'i [u8], Self> + 'c {
         move |input: &[u8]| {
             #[cfg(test)]
-            println!("parse_macro {:?}", String::from_utf8_lossy(input));
+            println!("Macro::parse() input: {:?}", String::from_utf8_lossy(input));
             let (remaining, name) = MacroName::parse(input)?;
-            println!("successfully parsed macro name!");
+            #[cfg(test)]
+            println!("Macro::parse() successfully parsed macro name {name:?}");
             if !config.current_macro_names.contains(&name) {
+                println!("Macro::parse() not a current macro name");
                 return Err(nom::Err::Error(nom::error::Error::new(
                     input,
                     nom::error::ErrorKind::Fail,
                 )));
             }
-            println!("macro_args {:?}", String::from_utf8_lossy(remaining));
+            println!(
+                "Macro::parse() macro_args: {:?}",
+                String::from_utf8_lossy(remaining)
+            );
             let (remaining, args) = nom::combinator::opt(nom::sequence::delimited(
                 nom::bytes::streaming::tag("("),
                 nom::multi::separated_list0(
@@ -144,10 +154,9 @@ impl<'i> Macro<'i> {
                     // that could be contained within a comment.
                     //
                     // We need a way to tell the parsers that they are inside complete input here
-                    parse_macro_arg(config)
-                    // nom::combinator::map_parser(
-                    //     nom::combinator::peek(nom::bytes::streaming::is_not(")")),
-                    // )
+                    parse_macro_arg(config), // nom::combinator::map_parser(
+                                             //     nom::combinator::peek(nom::bytes::streaming::is_not(")")),
+                                             // )
                 ),
                 // Make sure we fail for input that is missing the closing tag, this is what GNU m4 does
                 // anyway.
@@ -199,7 +208,7 @@ impl<'c, 'i: 'c> Symbol<'i> {
     fn parse(config: &'c ParseConfig) -> impl Fn(&'i [u8]) -> IResult<&'i [u8], Symbol<'i>> + 'c {
         move |input: &'i [u8]| {
             println!(
-                "parse_symbol: {:?}, current_macro_names: {:?}",
+                "Symbol::parse() {:?}, current_macro_names: {:?}",
                 String::from_utf8_lossy(input),
                 config
                     .current_macro_names
@@ -305,15 +314,18 @@ impl MacroName {
     /// Macro names shall consist of letters, digits, and underscores, where the first character is not a digit. Tokens not of this form shall not be treated as macros.
     /// `[_a-zA-Z][_a-zA-Z0-9]*`
     pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
-        println!("parsing macro name {:?}", String::from_utf8_lossy(input));
+        println!(
+            "MacroName::parse() input {:?}",
+            String::from_utf8_lossy(input)
+        );
         if input.is_empty() {
-            println!("empty macro name");
+            println!("MacroName::parse() empty macro name");
             return Err(nom::Err::Incomplete(nom::Needed::Unknown));
         }
-        println!("parsing the start of the macro name");
+        println!("MacroName::parse() parsing the start of the macro name");
         let (remaining, start) = nom::bytes::streaming::take_while1(is_word_char_start)(input)?;
         println!(
-            "found macro name start: {:?}",
+            "MacroName::parse() found macro name start: {:?}",
             String::from_utf8_lossy(input)
         );
         let (remaining, rest) = nom::bytes::streaming::take_while(is_word_char_end)(remaining)?;
@@ -368,18 +380,18 @@ fn parse_text<'c>(
             return Ok((input, input));
         }
 
-        let stop_tags = &[quote_open_tag, comment_open_tag, b")", b"\0"];
+        let stop_tags = &[quote_open_tag, comment_open_tag, b",", b")", b"\0"];
         let mut previous_was_alphanumeric = true;
         let mut stop_index = 0;
         'forloop: for i in 0..input.len() {
             let current_is_alphanumeric = is_alphnumeric(input[i]);
             if current_is_alphanumeric && !previous_was_alphanumeric {
-                println!("found possible start of macro");
+                println!("parse_text() found possible start of macro");
                 break 'forloop;
             }
             for tag in stop_tags {
                 if input[i..].starts_with(tag) {
-                    println!("found start of tag {tag:?}");
+                    println!("parse_text() found start of tag {tag:?}");
                     break 'forloop;
                 }
             }
@@ -389,8 +401,7 @@ fn parse_text<'c>(
 
         let (matched, remaining) = input.split_at(stop_index + 1);
         println!(
-            "input: {}, matched: {}, remaining: {}, stop_index: {stop_index}",
-            String::from_utf8_lossy(input),
+            "parse_text() successfully parsed text. matched: {:?}, remaining: {:?}, stop_index: {stop_index}",
             String::from_utf8_lossy(matched),
             String::from_utf8_lossy(remaining),
         );
@@ -495,11 +506,27 @@ fn parse_symbols<'b, 'a: 'b>(
                 nom::error::ErrorKind::Fail,
             )));
         }
-        println!("parse_symbols: {:?}", String::from_utf8_lossy(input));
+        println!(
+            "parse_symbols() input: {:?}",
+            String::from_utf8_lossy(input)
+        );
         if input.is_empty() {
             return Ok((input, Vec::new()));
         }
-        let result = nom::multi::many0(Symbol::parse(config))(input);
+        let result = nom::multi::many0(|input| {
+            println!(
+                "parse_symbols() matching symbol on input: {:?}",
+                String::from_utf8_lossy(input)
+            );
+            let (remaining, symbol) = Symbol::parse(config)(input)?;
+            #[cfg(test)]
+            println!(
+                "parse_symbols() symbol: {:?} remaining: {:?}",
+                symbol,
+                String::from_utf8_lossy(remaining)
+            );
+            Ok((remaining, symbol))
+        })(input);
         #[cfg(test)]
         dbg!(&result);
         result
@@ -548,7 +575,7 @@ mod test {
     }
 
     #[test]
-    fn test_parse_macro_name_simple() {
+    fn test_parse_macro_name_end_eof() {
         let (remaining, name) = MacroName::parse(b"hello\0").unwrap();
         assert_eq!(name, MacroName(b"hello".into()));
         assert_eq!("\0", utf8(remaining));
@@ -559,6 +586,18 @@ mod test {
         let (remaining, name) = MacroName::parse(b"hello)").unwrap();
         assert_eq!(name, MacroName(b"hello".into()));
         assert_eq!(")", utf8(remaining));
+    }
+
+    #[test]
+    fn test_parse_macro_name_end_newline() {
+        let (remaining, name) = MacroName::parse(b"hello\n").unwrap();
+        assert_eq!(name, MacroName(b"hello".into()));
+        assert_eq!("\n", utf8(remaining));
+    }
+
+    #[test]
+    fn test_parse_macro_name_start_newline() {
+        let _error = MacroName::parse(b"\nhello").unwrap_err();
     }
 
     #[test]
@@ -603,12 +642,13 @@ mod test {
         };
         let (remaining, m) = Macro::parse(&config)(b"some_word_23()").unwrap();
         assert_eq!(m.name, MacroName(b"some_word_23".into()));
-        assert_eq!(m.args.len(), 0);
+        assert_eq!(m.args.len(), 1);
+        assert_eq!(m.args.get(0).unwrap().len(), 0);
         assert!(remaining.is_empty());
     }
 
     #[test]
-    fn test_parse_macro_args_1() {
+    fn test_parse_macro_args_1_symbol() {
         let current_macro_names = vec![macro_name(b"some_word_23"), macro_name(b"hello")];
         let config = &ParseConfig {
             current_macro_names,
@@ -626,7 +666,21 @@ mod test {
     }
 
     #[test]
-    fn test_parse_macro_args_1_quoted() {
+    fn test_parse_macro_args_1_text_after() {
+        let (remaining, m) = Macro::parse(&ParseConfig::default())(b"define(hello)m1").unwrap();
+        assert_eq!(m.name, MacroName(b"define".into()));
+        assert_eq!(m.args.len(), 1);
+        assert_eq!("m1", utf8(remaining));
+        match m.args.get(0).unwrap().get(0).unwrap() {
+            Symbol::Text(text) => {
+                assert_eq!("hello", utf8(text));
+            }
+            _ => panic!(),
+        };
+    }
+
+    #[test]
+    fn test_parse_macro_args_1_symbol_quoted() {
         let current_macro_names = vec![macro_name(b"some_word_23"), macro_name(b"hello")];
         let config = &ParseConfig {
             current_macro_names,
@@ -644,7 +698,7 @@ mod test {
     }
 
     #[test]
-    fn test_parse_macro_args_2() {
+    fn test_parse_macro_args_1_2_symbols() {
         let current_macro_names = vec![
             macro_name(b"some_word_23"),
             macro_name(b"hello"),
@@ -674,6 +728,49 @@ mod test {
             _ => panic!(),
         };
         assert_eq!(m3.name, MacroName(b"world".into()));
+    }
+
+    #[test]
+    fn test_parse_macro_args_2() {
+        let current_macro_names = vec![macro_name(b"some_word_23")];
+        let config = ParseConfig {
+            current_macro_names,
+            ..ParseConfig::default()
+        };
+        let (remaining, m) = Macro::parse(&config)(b"some_word_23(hello,world)").unwrap();
+        assert_eq!(m.name, MacroName(b"some_word_23".into()));
+        dbg!(&m.args);
+        assert_eq!(m.args.len(), 2);
+        assert_eq!(m.args.get(0).unwrap().len(), 1);
+        assert_eq!(m.args.get(1).unwrap().len(), 1);
+        let arg0 = m.args.get(0).unwrap().get(0).unwrap();
+        match arg0 {
+            Symbol::Text(text) => assert_eq!("hello", utf8(text)),
+            _ => panic!(),
+        }
+        let arg1 = m.args.get(1).unwrap().get(0).unwrap();
+        match arg1 {
+            Symbol::Text(text) => assert_eq!("world", utf8(text)),
+            _ => panic!(),
+        }
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn test_parse_macro_args_3_middle_empty() {
+        let current_macro_names = vec![macro_name(b"some_word_23")];
+        let config = ParseConfig {
+            current_macro_names,
+            ..ParseConfig::default()
+        };
+        let (remaining, m) = Macro::parse(&config)(b"some_word_23(hello,,world)").unwrap();
+        assert_eq!(m.name, MacroName(b"some_word_23".into()));
+        dbg!(&m.args);
+        assert_eq!(m.args.len(), 3);
+        assert_eq!(m.args.get(0).unwrap().len(), 1);
+        assert_eq!(m.args.get(1).unwrap().len(), 0);
+        assert_eq!(m.args.get(2).unwrap().len(), 1);
+        assert!(remaining.is_empty());
     }
 
     #[test]
@@ -780,13 +877,18 @@ mod test {
         assert_eq!("`world'", utf8(remaining));
     }
 
-    // TODO: what should this do?
-    #[ignore]
     #[test]
     fn test_parse_text_before_close_bracket() {
         let (remaining, text) = parse_text(b"`", DEFAULT_COMMENT_OPEN_TAG)(b"hello)").unwrap();
         assert_eq!("hello", utf8(text));
         assert_eq!(")", utf8(remaining));
+    }
+
+    #[test]
+    fn test_parse_text_before_comma() {
+        let (remaining, text) = parse_text(b"`", DEFAULT_COMMENT_OPEN_TAG)(b"hello,").unwrap();
+        assert_eq!("hello", utf8(text));
+        assert_eq!(",", utf8(remaining));
     }
 
     #[test]
@@ -810,8 +912,87 @@ mod test {
     }
 
     #[test]
+    fn test_parse_text_before_newline() {
+        let (remaining, text) =
+            parse_text(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_COMMENT_OPEN_TAG)(b"hello\nworld\0")
+                .unwrap();
+        assert_eq!("hello\n", utf8(text));
+        assert_eq!("world\0", utf8(remaining));
+    }
+
+    #[test]
+    fn test_parse_text_newline_only() {
+        let (remaining, text) =
+            parse_text(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_COMMENT_OPEN_TAG)(b"\n\0").unwrap();
+        assert_eq!("\n", utf8(text));
+        assert_eq!("\0", utf8(remaining));
+    }
+
+    #[test]
+    fn test_parse_symbol_newline() {
+        let (remaining, symbol) = Symbol::parse(&ParseConfig::default())(b"\n\0").unwrap();
+        match symbol {
+            Symbol::Text(text) => assert_eq!("\n", utf8(text)),
+            _ => panic!(),
+        }
+        assert_eq!("\0", utf8(remaining));
+    }
+
+    #[test]
+    fn test_parse_symbol_macro_not_current() {
+        let (remaining, symbol) = Symbol::parse(&ParseConfig::default())(b"m2(hello)\0").unwrap();
+        match symbol {
+            Symbol::Text(text) => assert_eq!("m2(", utf8(text)),
+            _ => panic!(),
+        }
+        assert_eq!("hello)\0", utf8(remaining));
+    }
+
+    #[test]
+    fn test_parse_symbol_text_then_close_bracket() {
+        let (remaining, symbol) = Symbol::parse(&ParseConfig::default())(b"hello)\0").unwrap();
+        match symbol {
+            Symbol::Text(text) => assert_eq!("hello", utf8(text)),
+            _ => panic!(),
+        }
+        assert_eq!(")\0", utf8(remaining));
+    }
+
+    #[test]
+    fn test_parse_symbol_close_bracket() {
+        let (remaining, symbol) = Symbol::parse(&ParseConfig::default())(b")\0").unwrap();
+        match symbol {
+            Symbol::Text(text) => assert_eq!(")", utf8(text)),
+            _ => panic!(),
+        }
+        assert_eq!("\0", utf8(remaining));
+    }
+
+    #[test]
+    fn test_parse_symbol_macro_arg_1() {
+        let (remaining, symbol) =
+            Symbol::parse(&ParseConfig::default())(b"define(hello, error)dnl\0").unwrap();
+        match symbol {
+            Symbol::Macro(_) => {}
+            _ => panic!(),
+        }
+        assert_eq!("dnl\0", utf8(remaining));
+    }
+
+    #[test]
+    fn test_parse_symbol_newline_eof() {
+        let (remaining, symbol) = Symbol::parse(&ParseConfig::default())(b"\n\0").unwrap();
+        match symbol {
+            Symbol::Text(text) => assert_eq!("\n", utf8(text)),
+            _ => panic!(),
+        }
+        assert_eq!("\0", utf8(remaining));
+    }
+
+    #[test]
     fn test_parse_symbols_evaluation_order() {
-        let f = std::fs::read("fixtures/integration_tests/evaluation_order.m4").unwrap();
+        let mut f = std::fs::read("fixtures/integration_tests/evaluation_order.m4").unwrap();
+        f.push(b'\0');
         let config = ParseConfig::default();
         let (remaining, symbols) = parse_symbols(&config)(&f).unwrap();
 

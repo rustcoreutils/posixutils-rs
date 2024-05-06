@@ -30,6 +30,7 @@ pub(crate) struct ParseConfig {
     pub comment_open_tag: Vec<u8>,
     pub comment_close_tag: Vec<u8>,
     pub symbol_recursion_limit: usize,
+    pub inside_macro: bool,
     // While this is true, we skip all following input until the end of the line.
     pub dnl: bool,
 }
@@ -62,6 +63,7 @@ impl Default for ParseConfig {
             comment_open_tag: DEFAULT_COMMENT_OPEN_TAG.to_vec(),
             comment_close_tag: DEFAULT_COMMENT_CLOSE_TAG.to_vec(),
             symbol_recursion_limit: DEFAULT_SYMBOL_RECURSION_LIMIT,
+            inside_macro: false,
             dnl: false,
         }
     }
@@ -74,9 +76,13 @@ pub struct Macro<'i> {
     pub args: Vec<Vec<Symbol<'i>>>,
 }
 
-// TODO: not sure whether leading whitespace can be significant for macros, it doesn't appear to be
-// significant for define (and the macros that it in turn defines) and it gets stripped from the
-// output, so if that's always the case then we can strip it at this stage.
+// TODO: Unquoted white-space characters preceding each argument shall be ignored
+// TODO: <comma> characters enclosed between <left-parenthesis> and <right-parenthesis> characters
+// do not delimit arguments.
+//
+/// TODO: we still need to handle the case where a close bracket is used inside a macro
+/// argument eg. define(m1, x(hello)) where `hello)` is the offending close bracket, which causes
+/// this parser to terminate early because it doesn't parse x as a macro.
 fn parse_macro_arg<'c>(
     config: &'c ParseConfig,
 ) -> impl for<'i> Fn(&'i [u8]) -> IResult<&'i [u8], Vec<Symbol<'i>>> + 'c {
@@ -117,8 +123,13 @@ impl<'i> Macro<'i> {
     /// * The parsing of macro arguments happens at the time of definition.
     /// * The unwrapping and parsing of quoted arguments happens at the time of calling.
     /// * The evaluation of expressions defined in macros happens at the time of calling.
+    ///
     pub fn parse<'c>(config: &'c ParseConfig) -> impl Fn(&'i [u8]) -> IResult<&'i [u8], Self> + 'c {
         move |input: &[u8]| {
+            let config = ParseConfig {
+                inside_macro: true,
+                ..config.clone()
+            };
             #[cfg(test)]
             log::trace!("Macro::parse() input: {:?}", String::from_utf8_lossy(input));
             let (remaining, name) = MacroName::parse(input)?;
@@ -152,7 +163,7 @@ impl<'i> Macro<'i> {
                     // that could be contained within a comment.
                     //
                     // We need a way to tell the parsers that they are inside complete input here
-                    parse_macro_arg(config),
+                    parse_macro_arg(&config),
                 ),
                 // Make sure we fail for input that is missing the closing tag, this is what GNU m4 does
                 // anyway.
@@ -232,10 +243,7 @@ impl<'c, 'i: 'c> Symbol<'i> {
                     Symbol::Comment,
                 ),
                 nom::combinator::map(Macro::parse(config), Symbol::Macro),
-                nom::combinator::map(
-                    parse_text(&config.quote_open_tag, &config.comment_open_tag),
-                    Symbol::Text,
-                ),
+                nom::combinator::map(parse_text(&config), Symbol::Text),
             ))(input)
         }
     }
@@ -374,10 +382,13 @@ fn is_alphnumeric(c: u8) -> bool {
 /// Parse input that we already know is not quoted and not a macro, consume input until it could
 /// possibly be the beginning of either a quote or a macro, such as when an open quote is
 /// encountered, or when we encounter the first alpha character after a non-alphanumeric character.
+///
+/// If the text is being parsed inside the macro `inside_macro`, it requires that all open brackets
+/// `(` encountered have an equal number of close brackets `)`
+///
 /// TODO: what happens if we encounter a close quote?
 fn parse_text<'c>(
-    quote_open_tag: &'c [u8],
-    comment_open_tag: &'c [u8],
+    config: &'c ParseConfig,
 ) -> impl for<'i> Fn(&'i [u8]) -> IResult<&'i [u8], &'i [u8]> + 'c {
     move |input: &[u8]| {
         log::trace!("parse_text() input: {:?}", String::from_utf8_lossy(input));
@@ -385,12 +396,28 @@ fn parse_text<'c>(
             return Err(nom::Err::Incomplete(nom::Needed::Unknown));
         }
 
-        let stop_tags = &[quote_open_tag, comment_open_tag, b"\n", b",", b")", b"\0"];
+        let stop_tags = &[
+            config.quote_open_tag.as_slice(),
+            config.comment_open_tag.as_slice(),
+            b"\n",
+            b",",
+            b")",
+            b"\0",
+        ];
         let allowed_to_include_tags: &[&[u8]] = &[b",", b")"];
         let mut previous_was_alphanumeric = true;
         let mut stop_index = 0;
+        let mut bracket_count = 0;
+
         for i in 0..input.len() {
-            let current_is_alphanumeric = is_alphnumeric(input[i]);
+            let c = input[i];
+            if c == b'(' {
+                bracket_count += 1
+            }
+            if c == b')' {
+                bracket_count += 1
+            }
+            let current_is_alphanumeric = is_alphnumeric(c);
             if current_is_alphanumeric && !previous_was_alphanumeric {
                 log::trace!("parse_text() found possible start of macro");
                 let (matched, remaining) = input.split_at(stop_index + 1);
@@ -399,6 +426,9 @@ fn parse_text<'c>(
                     String::from_utf8_lossy(matched),
                     String::from_utf8_lossy(remaining),
                 );
+                if config.inside_macro && bracket_count > 0 {
+                    return Err(nom::Err::Incomplete(nom::Needed::Unknown));
+                }
                 return Ok((remaining, matched));
             }
             for tag in stop_tags {
@@ -422,6 +452,9 @@ fn parse_text<'c>(
                         String::from_utf8_lossy(remaining),
                     );
                     assert!(!matched.is_empty());
+                    if config.inside_macro && bracket_count > 0 {
+                        return Err(nom::Err::Incomplete(nom::Needed::Unknown));
+                    }
                     return Ok((remaining, matched));
                 }
             }
@@ -552,9 +585,6 @@ pub(crate) fn process_streaming<'c, R: Read, W: Write, STATE>(
                     Err(error) => panic!("{}", error),
                 };
 
-                #[cfg(test)]
-                dbg!(String::from_utf8_lossy(input), &symbol, remaining);
-
                 if matches!(symbol, Symbol::Eof) {
                     return Ok(());
                 }
@@ -574,6 +604,7 @@ pub(crate) fn process_streaming<'c, R: Read, W: Write, STATE>(
 mod test {
     use crate::lexer::{Symbol, DEFAULT_COMMENT_CLOSE_TAG, DEFAULT_COMMENT_OPEN_TAG};
     use std::io::Write;
+    use test_env_log::test;
 
     use super::{
         parse_comment, parse_dnl, parse_text, process_streaming, Macro, MacroName, ParseConfig,
@@ -929,81 +960,71 @@ mod test {
 
     #[test]
     fn test_parse_text() {
-        let (remaining, text) =
-            parse_text(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_COMMENT_OPEN_TAG)(b"hello\0").unwrap();
+        let (remaining, text) = parse_text(&ParseConfig::default())(b"hello\0").unwrap();
         assert_eq!("hello", utf8(text));
         assert_eq!("\0", utf8(remaining));
     }
 
     #[test]
     fn test_parse_text_incomplete() {
-        let error =
-            parse_text(DEFAULT_COMMENT_OPEN_TAG, DEFAULT_COMMENT_CLOSE_TAG)(b"hello").unwrap_err();
+        let error = parse_text(&ParseConfig::default())(b"hello").unwrap_err();
         assert!(matches!(error, nom::Err::Incomplete(_)));
     }
 
     #[test]
     fn test_parse_text_before_quote_space() {
-        let (remaining, text) =
-            parse_text(b"`", DEFAULT_COMMENT_OPEN_TAG)(b"hello `world'").unwrap();
+        let (remaining, text) = parse_text(&ParseConfig::default())(b"hello `world'").unwrap();
         assert_eq!("hello ", utf8(text));
         assert_eq!("`world'", utf8(remaining));
     }
 
     #[test]
     fn test_parse_text_before_close_bracket() {
-        let (remaining, text) = parse_text(b"`", DEFAULT_COMMENT_OPEN_TAG)(b"hello)").unwrap();
+        let (remaining, text) = parse_text(&ParseConfig::default())(b"hello)").unwrap();
         assert_eq!("hello", utf8(text));
         assert_eq!(")", utf8(remaining));
     }
 
     #[test]
     fn test_parse_text_before_comma() {
-        let (remaining, text) = parse_text(b"`", DEFAULT_COMMENT_OPEN_TAG)(b"hello,").unwrap();
+        let (remaining, text) = parse_text(&ParseConfig::default())(b"hello,").unwrap();
         assert_eq!("hello", utf8(text));
         assert_eq!(",", utf8(remaining));
     }
 
     #[test]
     fn test_parse_text_before_quote_no_space() {
-        let (remaining, text) =
-            parse_text(b"`", DEFAULT_COMMENT_OPEN_TAG)(b"hello`world'").unwrap();
+        let (remaining, text) = parse_text(&ParseConfig::default())(b"hello`world'").unwrap();
         assert_eq!("hello", utf8(text));
         assert_eq!("`world'", utf8(remaining));
     }
 
     #[test]
     fn test_parse_text_before_non_alphanum() {
-        let (remaining, text) =
-            parse_text(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_COMMENT_OPEN_TAG)(b"hello|world\0").unwrap();
+        let (remaining, text) = parse_text(&ParseConfig::default())(b"hello|world\0").unwrap();
         assert_eq!("hello|", utf8(text));
         assert_eq!("world\0", utf8(remaining));
-        let (remaining, text) =
-            parse_text(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_COMMENT_OPEN_TAG)(remaining).unwrap();
+        let (remaining, text) = parse_text(&ParseConfig::default())(remaining).unwrap();
         assert_eq!("world", utf8(text));
         assert_eq!("\0", utf8(remaining));
     }
 
     #[test]
     fn test_parse_text_before_newline() {
-        let (remaining, text) =
-            parse_text(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_COMMENT_OPEN_TAG)(b"hello\nworld\0")
-                .unwrap();
+        let (remaining, text) = parse_text(&ParseConfig::default())(b"hello\nworld\0").unwrap();
         assert_eq!("hello", utf8(text));
         assert_eq!("\nworld\0", utf8(remaining));
     }
 
     #[test]
     fn test_parse_text_newline_only() {
-        let error =
-            parse_text(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_COMMENT_OPEN_TAG)(b"\n").unwrap_err();
+        let error = parse_text(&ParseConfig::default())(b"\n").unwrap_err();
         assert!(matches!(error, nom::Err::Error(_)));
     }
 
     #[test]
     fn test_parse_text_eof_only() {
-        let error =
-            parse_text(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_COMMENT_OPEN_TAG)(b"\0").unwrap_err();
+        let error = parse_text(&ParseConfig::default())(b"\0").unwrap_err();
         assert!(matches!(error, nom::Err::Error(_)));
     }
 

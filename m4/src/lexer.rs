@@ -30,7 +30,6 @@ pub(crate) struct ParseConfig {
     pub comment_open_tag: Vec<u8>,
     pub comment_close_tag: Vec<u8>,
     pub symbol_recursion_limit: usize,
-    pub inside_macro: bool,
     // While this is true, we skip all following input until the end of the line.
     pub dnl: bool,
 }
@@ -63,7 +62,6 @@ impl Default for ParseConfig {
             comment_open_tag: DEFAULT_COMMENT_OPEN_TAG.to_vec(),
             comment_close_tag: DEFAULT_COMMENT_CLOSE_TAG.to_vec(),
             symbol_recursion_limit: DEFAULT_SYMBOL_RECURSION_LIMIT,
-            inside_macro: false,
             dnl: false,
         }
     }
@@ -71,9 +69,57 @@ impl Default for ParseConfig {
 
 #[cfg_attr(test, derive(Debug, PartialEq))]
 pub struct Macro<'i> {
+    pub input: &'i [u8],
     pub name: MacroName,
     // TODO: can also be an expression in the case of the eval macro
     pub args: Vec<Vec<Symbol<'i>>>,
+}
+
+/// When inside a macro we need to parse content within matching pairs of brackets. If we don't
+/// find the matching closing tag, then the parsing should fail entirely.
+fn parse_inside_brackets<'c>(
+    config: &'c ParseConfig,
+) -> impl for<'i> Fn(&'i [u8]) -> IResult<&'i [u8], Vec<Symbol<'i>>> + 'c {
+    move |input: &[u8]| {
+        log::trace!(
+            "parse_inside_brackets() input: {:?}",
+            String::from_utf8_lossy(input)
+        );
+
+        let mut symbols = Vec::new();
+        let (mut remaining, open_bracket) = nom::bytes::streaming::tag(b"(")(input)?;
+
+        log::trace!(
+            "parse_inside_brackets() should be inside brackets. remaining: {:?}",
+            String::from_utf8_lossy(remaining)
+        );
+
+        symbols.push(Symbol::Text(open_bracket));
+        loop {
+            log::trace!(
+                "parse_inside_brackets() remaining: {:?}",
+                String::from_utf8_lossy(remaining)
+            );
+            if let Some(b')') = remaining.get(0) {
+                log::trace!("parse_inside_brackets() reached closing bracket, successful parse!",);
+                return Ok((&remaining[1..], symbols));
+            }
+            let (r, symbol) = nom::combinator::cut(Symbol::parse(config))(remaining)?;
+            remaining = r;
+            symbols.push(symbol);
+
+            if remaining.is_empty() {
+                return Err(nom::Err::Incomplete(nom::Needed::Unknown));
+            }
+
+            if remaining == b"\0" {
+                return Err(nom::Err::Failure(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::Fail,
+                )));
+            }
+        }
+    }
 }
 
 // TODO: Unquoted white-space characters preceding each argument shall be ignored
@@ -92,7 +138,6 @@ fn parse_macro_arg<'c>(
             String::from_utf8_lossy(input)
         );
         let mut symbols = Vec::new();
-
         let mut remaining = input;
 
         loop {
@@ -100,13 +145,23 @@ fn parse_macro_arg<'c>(
                 "parse_macro_arg() remaining: {:?}",
                 String::from_utf8_lossy(remaining)
             );
-            if let Some(b',' | b')') = remaining.get(0) {
+            if let Some(b')' | b',') = remaining.get(0) {
                 return Ok((remaining, symbols));
             }
-            let (r, symbol) = nom::combinator::cut(Symbol::parse(config))(remaining)?;
-            symbols.push(symbol);
 
-            if r.is_empty() || r == b"\0" {
+            let (r, new_symbols) = nom::branch::alt((
+                parse_inside_brackets(config),
+                nom::combinator::cut(nom::combinator::map(Symbol::parse(config), |symbol| {
+                    vec![symbol]
+                })),
+            ))(remaining)?;
+            symbols.extend(new_symbols);
+
+            // TODO: is empty should be incomplete
+            if r.is_empty() {
+                return Err(nom::Err::Incomplete(nom::Needed::Unknown));
+            }
+            if r == b"\0" {
                 return Err(nom::Err::Error(nom::error::Error::new(
                     input,
                     nom::error::ErrorKind::Fail,
@@ -126,15 +181,13 @@ impl<'i> Macro<'i> {
     ///
     pub fn parse<'c>(config: &'c ParseConfig) -> impl Fn(&'i [u8]) -> IResult<&'i [u8], Self> + 'c {
         move |input: &[u8]| {
-            let config = ParseConfig {
-                inside_macro: true,
-                ..config.clone()
-            };
             #[cfg(test)]
             log::trace!("Macro::parse() input: {:?}", String::from_utf8_lossy(input));
             let (remaining, name) = MacroName::parse(input)?;
             #[cfg(test)]
             log::trace!("Macro::parse() successfully parsed macro name {name:?}");
+            // TODO: this should be ignored inside the define macro's second argument, or perhaps
+            // just in general.
             if !config.current_macro_names.contains(&name) {
                 log::trace!("Macro::parse() not a current macro name");
                 return Err(nom::Err::Error(nom::error::Error::new(
@@ -173,6 +226,7 @@ impl<'i> Macro<'i> {
             Ok((
                 remaining,
                 Macro {
+                    input: &input[..(input.len() - remaining.len())],
                     name,
                     args: args.unwrap_or_default(),
                 },
@@ -231,6 +285,7 @@ impl<'c, 'i: 'c> Symbol<'i> {
                     nom::error::ErrorKind::NonEmpty,
                 )));
             }
+
             nom::branch::alt((
                 nom::combinator::map(nom::bytes::streaming::tag(b"\n"), |_| Symbol::Newline),
                 nom::combinator::map(nom::bytes::streaming::tag(b"\0"), |_| Symbol::Eof),
@@ -401,22 +456,23 @@ fn parse_text<'c>(
             config.comment_open_tag.as_slice(),
             b"\n",
             b",",
+            b"(",
             b")",
             b"\0",
         ];
         let allowed_to_include_tags: &[&[u8]] = &[b",", b")"];
         let mut previous_was_alphanumeric = true;
         let mut stop_index = 0;
-        let mut bracket_count = 0;
+        // let mut bracket_count = 0;
 
         for i in 0..input.len() {
             let c = input[i];
-            if c == b'(' {
-                bracket_count += 1
-            }
-            if c == b')' {
-                bracket_count += 1
-            }
+            // if c == b'(' {
+            //     bracket_count += 1
+            // }
+            // if c == b')' {
+            //     bracket_count += 1
+            // }
             let current_is_alphanumeric = is_alphnumeric(c);
             if current_is_alphanumeric && !previous_was_alphanumeric {
                 log::trace!("parse_text() found possible start of macro");
@@ -426,9 +482,9 @@ fn parse_text<'c>(
                     String::from_utf8_lossy(matched),
                     String::from_utf8_lossy(remaining),
                 );
-                if config.inside_macro && bracket_count > 0 {
-                    return Err(nom::Err::Incomplete(nom::Needed::Unknown));
-                }
+                // if config.inside_macro && bracket_count > 0 {
+                //     return Err(nom::Err::Incomplete(nom::Needed::Unknown));
+                // }
                 return Ok((remaining, matched));
             }
             for tag in stop_tags {
@@ -452,9 +508,9 @@ fn parse_text<'c>(
                         String::from_utf8_lossy(remaining),
                     );
                     assert!(!matched.is_empty());
-                    if config.inside_macro && bracket_count > 0 {
-                        return Err(nom::Err::Incomplete(nom::Needed::Unknown));
-                    }
+                    // if config.inside_macro && bracket_count > 0 {
+                    //     return Err(nom::Err::Incomplete(nom::Needed::Unknown));
+                    // }
                     return Ok((remaining, matched));
                 }
             }
@@ -582,7 +638,7 @@ pub(crate) fn process_streaming<'c, R: Read, W: Write, STATE>(
                         break;
                     }
                     // TODO: handle unwrap
-                    Err(error) => panic!("{}", error),
+                    Err(error) => return Err(crate::Error::Parsing(error.to_string())),
                 };
 
                 if matches!(symbol, Symbol::Eof) {
@@ -602,9 +658,11 @@ pub(crate) fn process_streaming<'c, R: Read, W: Write, STATE>(
 
 #[cfg(test)]
 mod test {
-    use crate::lexer::{Symbol, DEFAULT_COMMENT_CLOSE_TAG, DEFAULT_COMMENT_OPEN_TAG};
+    use crate::lexer::{
+        parse_inside_brackets, Symbol, DEFAULT_COMMENT_CLOSE_TAG, DEFAULT_COMMENT_OPEN_TAG,
+    };
     use std::io::Write;
-    use test_env_log::test;
+    use test_log::test;
 
     use super::{
         parse_comment, parse_dnl, parse_text, process_streaming, Macro, MacroName, ParseConfig,
@@ -729,6 +787,32 @@ mod test {
     }
 
     #[test]
+    fn test_parse_macro_args_2() {
+        let current_macro_names = vec![macro_name(b"some_word_23")];
+        let config = ParseConfig {
+            current_macro_names,
+            ..ParseConfig::default()
+        };
+        let (remaining, m) = Macro::parse(&config)(b"some_word_23(hello,world)").unwrap();
+        assert_eq!(m.name, MacroName(b"some_word_23".into()));
+        dbg!(&m.args);
+        assert_eq!(m.args.len(), 2);
+        assert_eq!(m.args.get(0).unwrap().len(), 1);
+        assert_eq!(m.args.get(1).unwrap().len(), 1);
+        let arg0 = m.args.get(0).unwrap().get(0).unwrap();
+        match arg0 {
+            Symbol::Text(text) => assert_eq!("hello", utf8(text)),
+            _ => panic!(),
+        }
+        let arg1 = m.args.get(1).unwrap().get(0).unwrap();
+        match arg1 {
+            Symbol::Text(text) => assert_eq!("world", utf8(text)),
+            _ => panic!(),
+        }
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
     fn test_parse_macro_args_2_nested() {
         let current_macro_names = vec![macro_name(b"m1"), macro_name(b"m2"), macro_name(b"m3")];
         let config = &ParseConfig {
@@ -755,7 +839,7 @@ mod test {
         let error = Macro::parse(&ParseConfig::default())(b"define(m, m2(hello)").unwrap_err();
         match error {
             nom::Err::Incomplete(_) => {}
-            _ => panic!(),
+            _ => panic!("Unexpected error: {error:?}"),
         }
     }
 
@@ -763,8 +847,8 @@ mod test {
     fn test_parse_macro_args_2_nested_missing_close_complete() {
         let error = Macro::parse(&ParseConfig::default())(b"define(m, m2(hello)\0").unwrap_err();
         match error {
-            nom::Err::Error(_) => {}
-            _ => panic!(),
+            nom::Err::Failure(_) => {}
+            _ => panic!("Unexpected error: {error:?}"),
         }
     }
 
@@ -831,32 +915,6 @@ mod test {
             _ => panic!(),
         };
         assert_eq!(m3.name, MacroName(b"world".into()));
-    }
-
-    #[test]
-    fn test_parse_macro_args_2() {
-        let current_macro_names = vec![macro_name(b"some_word_23")];
-        let config = ParseConfig {
-            current_macro_names,
-            ..ParseConfig::default()
-        };
-        let (remaining, m) = Macro::parse(&config)(b"some_word_23(hello,world)").unwrap();
-        assert_eq!(m.name, MacroName(b"some_word_23".into()));
-        dbg!(&m.args);
-        assert_eq!(m.args.len(), 2);
-        assert_eq!(m.args.get(0).unwrap().len(), 1);
-        assert_eq!(m.args.get(1).unwrap().len(), 1);
-        let arg0 = m.args.get(0).unwrap().get(0).unwrap();
-        match arg0 {
-            Symbol::Text(text) => assert_eq!("hello", utf8(text)),
-            _ => panic!(),
-        }
-        let arg1 = m.args.get(1).unwrap().get(0).unwrap();
-        match arg1 {
-            Symbol::Text(text) => assert_eq!("world", utf8(text)),
-            _ => panic!(),
-        }
-        assert!(remaining.is_empty());
     }
 
     #[test]
@@ -1042,10 +1100,10 @@ mod test {
     fn test_parse_symbol_macro_not_current() {
         let (remaining, symbol) = Symbol::parse(&ParseConfig::default())(b"m2(hello)\0").unwrap();
         match symbol {
-            Symbol::Text(text) => assert_eq!("m2(", utf8(text)),
+            Symbol::Text(text) => assert_eq!("m2", utf8(text)),
             _ => panic!(),
         }
-        assert_eq!("hello)\0", utf8(remaining));
+        assert_eq!("(hello)\0", utf8(remaining));
     }
 
     #[test]
@@ -1108,6 +1166,33 @@ mod test {
         let (remaining, matched) = parse_dnl(b"\0").unwrap();
         assert_eq!("", utf8(matched));
         assert_eq!("\0", utf8(remaining));
+    }
+
+    #[test]
+    fn test_parse_inside_brackets_fail_no_bracket() {
+        let error = parse_inside_brackets(&ParseConfig::default())(b"hello").unwrap_err();
+        match error {
+            nom::Err::Error(_) => {}
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_parse_inside_brackets_incomplete() {
+        let error = parse_inside_brackets(&ParseConfig::default())(b"(hello").unwrap_err();
+        match error {
+            nom::Err::Incomplete(_) => {}
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn test_parse_inside_brackets_fail_no_closing_bracket_eof() {
+        let error = parse_inside_brackets(&ParseConfig::default())(b"(hello\0").unwrap_err();
+        match error {
+            nom::Err::Failure(_) => {}
+            _ => panic!(),
+        }
     }
 
     #[test]

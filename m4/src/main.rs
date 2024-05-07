@@ -15,6 +15,8 @@ mod error;
 mod evaluate;
 mod lexer;
 
+use error::Error;
+
 // TODO: potentially we can use a reference here to avoid allocation
 #[derive(Debug, Clone)]
 struct ArgumentName(OsString);

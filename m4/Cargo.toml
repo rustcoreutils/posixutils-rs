@@ -17,4 +17,4 @@ env_logger = "0.11.3"
 
 [dev-dependencies]
 insta = { version = "1.38.0", features = ["json"] }
-test-env-log = { version = "0.2.8", default-features=false, features=["log"]}
+test-log = { version = "0.2.16", default-features=false, features=["log"]}

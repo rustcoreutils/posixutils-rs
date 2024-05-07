@@ -463,16 +463,9 @@ fn parse_text<'c>(
         let allowed_to_include_tags: &[&[u8]] = &[b",", b")"];
         let mut previous_was_alphanumeric = true;
         let mut stop_index = 0;
-        // let mut bracket_count = 0;
 
         for i in 0..input.len() {
             let c = input[i];
-            // if c == b'(' {
-            //     bracket_count += 1
-            // }
-            // if c == b')' {
-            //     bracket_count += 1
-            // }
             let current_is_alphanumeric = is_alphnumeric(c);
             if current_is_alphanumeric && !previous_was_alphanumeric {
                 log::trace!("parse_text() found possible start of macro");
@@ -482,9 +475,6 @@ fn parse_text<'c>(
                     String::from_utf8_lossy(matched),
                     String::from_utf8_lossy(remaining),
                 );
-                // if config.inside_macro && bracket_count > 0 {
-                //     return Err(nom::Err::Incomplete(nom::Needed::Unknown));
-                // }
                 return Ok((remaining, matched));
             }
             for tag in stop_tags {
@@ -508,9 +498,6 @@ fn parse_text<'c>(
                         String::from_utf8_lossy(remaining),
                     );
                     assert!(!matched.is_empty());
-                    // if config.inside_macro && bracket_count > 0 {
-                    //     return Err(nom::Err::Incomplete(nom::Needed::Unknown));
-                    // }
                     return Ok((remaining, matched));
                 }
             }

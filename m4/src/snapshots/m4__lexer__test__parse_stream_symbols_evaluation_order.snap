@@ -4,6 +4,7 @@ expression: "snapshot_symbols_as_stream(ParseConfig::default(), &f)"
 ---
 Macro(
     Macro {
+        input: "dnl",
         name: MacroName(
             "dnl",
         ),
@@ -52,6 +53,7 @@ Text(
 Newline
 Macro(
     Macro {
+        input: "define(hello, error)",
         name: MacroName(
             "define",
         ),
@@ -74,6 +76,7 @@ Macro(
 )
 Macro(
     Macro {
+        input: "dnl",
         name: MacroName(
             "dnl",
         ),
@@ -83,6 +86,7 @@ Macro(
 Newline
 Macro(
     Macro {
+        input: "define(m2, m1(hello) m1($1))",
         name: MacroName(
             "define",
         ),
@@ -97,32 +101,36 @@ Macro(
                     " ",
                 ),
                 Text(
-                    "m1(",
+                    "m1",
+                ),
+                Text(
+                    "(",
                 ),
                 Text(
                     "hello",
+                ),
+                Text(
+                    " ",
+                ),
+                Text(
+                    "m1",
+                ),
+                Text(
+                    "(",
+                ),
+                Text(
+                    "$",
+                ),
+                Text(
+                    "1",
                 ),
             ],
         ],
     },
 )
-Text(
-    " ",
-)
-Text(
-    "m1($",
-)
-Text(
-    "1",
-)
-Text(
-    ")",
-)
-Text(
-    ")",
-)
 Macro(
     Macro {
+        input: "dnl",
         name: MacroName(
             "dnl",
         ),
@@ -135,6 +143,7 @@ Text(
 Newline
 Macro(
     Macro {
+        input: "define(hello, goodbye)",
         name: MacroName(
             "define",
         ),
@@ -157,6 +166,7 @@ Macro(
 )
 Macro(
     Macro {
+        input: "dnl",
         name: MacroName(
             "dnl",
         ),
@@ -166,6 +176,7 @@ Macro(
 Newline
 Macro(
     Macro {
+        input: "define(m1, ``m1'' $1)",
         name: MacroName(
             "define",
         ),
@@ -196,6 +207,7 @@ Macro(
 )
 Macro(
     Macro {
+        input: "dnl",
         name: MacroName(
             "dnl",
         ),
@@ -204,7 +216,10 @@ Macro(
 )
 Newline
 Text(
-    "m2(",
+    "m2",
+)
+Text(
+    "(",
 )
 Text(
     "hi",

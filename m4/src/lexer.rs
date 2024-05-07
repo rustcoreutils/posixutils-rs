@@ -67,12 +67,23 @@ impl Default for ParseConfig {
     }
 }
 
-#[cfg_attr(test, derive(Debug, PartialEq))]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct Macro<'i> {
     pub input: &'i [u8],
     pub name: MacroName,
     // TODO: can also be an expression in the case of the eval macro
     pub args: Vec<Vec<Symbol<'i>>>,
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for Macro<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Macro")
+            .field("input", &String::from_utf8_lossy(&self.input))
+            .field("name", &self.name)
+            .field("args", &self.args)
+            .finish()
+    }
 }
 
 /// When inside a macro we need to parse content within matching pairs of brackets. If we don't
@@ -457,7 +468,7 @@ fn parse_text<'c>(
             b")",
             b"\0",
         ];
-        let allowed_to_include_tags: &[&[u8]] = &[b",", b")"];
+        let allowed_to_include_tags: &[&[u8]] = &[b",", b"(", b")"];
         let mut previous_was_alphanumeric = true;
         let mut stop_index = 0;
 
@@ -734,6 +745,7 @@ mod test {
             ..ParseConfig::default()
         };
         let (remaining, m) = Macro::parse(&config)(b"some_word_23\0").unwrap();
+        assert_eq!("some_word_23", utf8(m.input));
         assert_eq!(m.name, MacroName(b"some_word_23".into()));
         assert_eq!("\0", utf8(remaining));
     }
@@ -746,6 +758,7 @@ mod test {
             ..ParseConfig::default()
         };
         let (remaining, m) = Macro::parse(&config)(b"some_word_23()").unwrap();
+        assert_eq!("some_word_23()", utf8(m.input));
         assert_eq!(m.name, MacroName(b"some_word_23".into()));
         assert_eq!(m.args.len(), 1);
         assert_eq!(m.args.get(0).unwrap().len(), 0);
@@ -778,6 +791,7 @@ mod test {
             ..ParseConfig::default()
         };
         let (remaining, m) = Macro::parse(&config)(b"some_word_23(hello,world)").unwrap();
+        assert_eq!("some_word_23(hello,world)", utf8(m.input));
         assert_eq!(m.name, MacroName(b"some_word_23".into()));
         dbg!(&m.args);
         assert_eq!(m.args.len(), 2);
@@ -804,6 +818,7 @@ mod test {
             ..ParseConfig::default()
         };
         let (remaining, m1) = Macro::parse(config)(b"m1(hello,m2($1) m3($1))dnl").unwrap();
+        assert_eq!("m1(hello,m2($1) m3($1))", utf8(m1.input));
         assert_eq!("dnl", utf8(remaining));
         assert_eq!(m1.name, MacroName(b"m1".into()));
         assert_eq!(m1.args.len(), 2);

@@ -26,3 +26,7 @@ required-features = ["object/read_core", "object/archive"]
 [[bin]]
 name = "strip"
 path = "src/strip.rs"
+
+[[bin]]
+name = "strings"
+path = "src/strings.rs"

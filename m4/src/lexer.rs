@@ -280,10 +280,7 @@ impl<'c, 'i: 'c> Symbol<'i> {
                     .collect::<Vec<_>>()
             );
             if input.is_empty() {
-                return Err(nom::Err::Error(nom::error::Error::new(
-                    input,
-                    nom::error::ErrorKind::NonEmpty,
-                )));
+                return Err(nom::Err::Incomplete(nom::Needed::Unknown));
             }
 
             nom::branch::alt((
@@ -1078,7 +1075,7 @@ mod test {
         let (remaining, symbol) = Symbol::parse(&ParseConfig::default())(b"\n\0").unwrap();
         match symbol {
             Symbol::Newline => {}
-            _ => panic!(),
+            _ => panic!("Unexpected symbol: {symbol:?}"),
         }
         assert_eq!("\0", utf8(remaining));
     }
@@ -1098,7 +1095,7 @@ mod test {
         let (remaining, symbol) = Symbol::parse(&ParseConfig::default())(b"hello)\0").unwrap();
         match symbol {
             Symbol::Text(text) => assert_eq!("hello", utf8(text)),
-            _ => panic!(),
+            _ => panic!("Unexpected symbol: {symbol:?}"),
         }
         assert_eq!(")\0", utf8(remaining));
     }
@@ -1119,7 +1116,7 @@ mod test {
             Symbol::parse(&ParseConfig::default())(b"define(hello, error)dnl\0").unwrap();
         match symbol {
             Symbol::Macro(_) => {}
-            _ => panic!(),
+            _ => panic!("Unexpected symbol: {symbol:?}"),
         }
         assert_eq!("dnl\0", utf8(remaining));
     }
@@ -1129,9 +1126,18 @@ mod test {
         let (remaining, symbol) = Symbol::parse(&ParseConfig::default())(b"\n\0").unwrap();
         match symbol {
             Symbol::Newline => {}
-            _ => panic!(),
+            _ => panic!("Unexpected symbol: {symbol:?}"),
         }
         assert_eq!("\0", utf8(remaining));
+    }
+
+    #[test]
+    fn test_parse_symbol_incomplete_nested_macro_missing_close() {
+        let error = Symbol::parse(&ParseConfig::default())(b"define(m2, m1(").unwrap_err();
+        match error {
+            nom::Err::Incomplete(_) => {}
+            _ => panic!("Unexpected error: {error:?}"),
+        }
     }
 
     #[test]
@@ -1160,16 +1166,25 @@ mod test {
         let error = parse_inside_brackets(&ParseConfig::default())(b"hello").unwrap_err();
         match error {
             nom::Err::Error(_) => {}
-            _ => panic!(),
+            _ => panic!("Unexpected error: {error:?}"),
         }
     }
 
     #[test]
-    fn test_parse_inside_brackets_incomplete() {
+    fn test_parse_inside_brackets_incomplete_text() {
         let error = parse_inside_brackets(&ParseConfig::default())(b"(hello").unwrap_err();
         match error {
             nom::Err::Incomplete(_) => {}
-            _ => panic!(),
+            _ => panic!("Unexpected error: {error:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_inside_brackets_incomplete_empty() {
+        let error = parse_inside_brackets(&ParseConfig::default())(b"(").unwrap_err();
+        match error {
+            nom::Err::Incomplete(_) => {}
+            _ => panic!("Unexpected error: {error:?}"),
         }
     }
 
@@ -1178,7 +1193,7 @@ mod test {
         let error = parse_inside_brackets(&ParseConfig::default())(b"(hello\0").unwrap_err();
         match error {
             nom::Err::Failure(_) => {}
-            _ => panic!(),
+            _ => panic!("Unexpected error: {error:?}"),
         }
     }
 

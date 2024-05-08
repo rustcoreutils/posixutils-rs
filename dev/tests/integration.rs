@@ -95,6 +95,17 @@ fn strip_file(path: &str, previous_contents: &[u8]) -> Vec<u8> {
     result
 }
 
+fn strings_test(args: &[&str], stdout: &str) {
+    run_test(TestPlan {
+        cmd: "strings".to_string(),
+        args: args.iter().map(|s| s.to_string()).collect(),
+        stdin_data: "".to_string(),
+        expected_out: stdout.to_string(),
+        expected_err: "".to_string(),
+        expected_exit_code: 0,
+    });
+}
+
 #[test]
 fn test_ar_delete_one() {
     ar_compare_test(
@@ -506,4 +517,82 @@ fn test_strip_removes_all_debug_sections() {
             assert!(!section.name_bytes().unwrap().starts_with(debug_section));
         }
     }
+}
+
+#[test]
+fn test_strings_empty_file() {
+    strings_test(&["tests/strings/empty.txt"], "");
+}
+
+#[test]
+fn test_strings_print_one() {
+    strings_test(
+        &["tests/strings/one.txt"],
+        include_str!("strings/one.correct.txt"),
+    );
+}
+
+#[test]
+fn test_strings_print_multiple() {
+    strings_test(
+        &["tests/strings/multiple.bin"],
+        include_str!("strings/multiple.correct.txt"),
+    );
+}
+
+#[test]
+fn test_strings_utf8_file() {
+    std::env::set_var("LC_CTYPE", "UTF-8");
+    strings_test(
+        &["tests/strings/utf8.bin"],
+        include_str!("strings/utf8.correct.txt"),
+    );
+}
+
+#[test]
+fn test_strings_object_file() {
+    strings_test(
+        &["tests/strings/object.o"],
+        include_str!("strings/object.correct.txt"),
+    );
+}
+
+#[test]
+fn test_strings_print_shorter_than_default_length() {
+    strings_test(
+        &["tests/strings/short.bin", "-n", "2"],
+        include_str!("strings/short.correct.txt"),
+    );
+}
+
+#[test]
+fn test_strings_print_longer_than_default_length() {
+    strings_test(
+        &["tests/strings/long.bin", "-n", "7"],
+        include_str!("strings/long.correct.txt"),
+    );
+}
+
+#[test]
+fn test_strings_print_with_decimal_offset() {
+    strings_test(
+        &["-t", "d", "tests/strings/with_offset.bin"],
+        include_str!("strings/with_decimal_offset.correct.txt"),
+    );
+}
+
+#[test]
+fn test_strings_print_with_hex_offset() {
+    strings_test(
+        &["-t", "x", "tests/strings/with_offset.bin"],
+        include_str!("strings/with_hex_offset.correct.txt"),
+    );
+}
+
+#[test]
+fn test_strings_print_with_octal_offset() {
+    strings_test(
+        &["-t", "o", "tests/strings/with_offset.bin"],
+        include_str!("strings/with_octal_offset.correct.txt"),
+    );
 }

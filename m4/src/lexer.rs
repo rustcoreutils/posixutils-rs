@@ -21,10 +21,10 @@ use std::io::{Read, Write};
 
 /// Configuration for parsing, affects what are considered macros, quotes or comments. Also keeps a
 /// record of the recusion limit for processing a [`Symbol`].
-// TODO: Can probably optimize using something like smallvec
 #[derive(Clone)]
 pub(crate) struct ParseConfig {
     pub current_macro_names: Vec<MacroName>,
+    // TODO: Can probably optimize using something like smallvec
     pub quote_open_tag: Vec<u8>,
     pub quote_close_tag: Vec<u8>,
     pub comment_open_tag: Vec<u8>,
@@ -75,7 +75,6 @@ pub struct Macro<'i> {
     pub args: Vec<Vec<Symbol<'i>>>,
 }
 
-#[cfg(test)]
 impl std::fmt::Debug for Macro<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Macro")
@@ -258,7 +257,6 @@ pub(crate) enum Symbol<'i> {
     Eof,
 }
 
-#[cfg(test)]
 impl<'i> std::fmt::Debug for Symbol<'i> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -281,6 +279,16 @@ impl<'i> std::fmt::Debug for Symbol<'i> {
 impl<'c, 'i: 'c> Symbol<'i> {
     fn parse(config: &'c ParseConfig) -> impl Fn(&'i [u8]) -> IResult<&'i [u8], Symbol<'i>> + 'c {
         move |input: &'i [u8]| {
+            if config.symbol_recursion_limit == 0 {
+                log::error!("Symbol recursion limit reached");
+                return Err(nom::Err::Failure(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::Fail,
+                )));
+            }
+            let mut config = config.clone();
+            config.symbol_recursion_limit -= 1;
+
             log::trace!(
                 "Symbol::parse() {:?}, current_macro_names: {:?}",
                 String::from_utf8_lossy(input),
@@ -294,7 +302,7 @@ impl<'c, 'i: 'c> Symbol<'i> {
                 return Err(nom::Err::Incomplete(nom::Needed::Unknown));
             }
 
-            nom::branch::alt((
+            let result = nom::branch::alt((
                 nom::combinator::map(nom::bytes::streaming::tag(b"\n"), |_| Symbol::Newline),
                 nom::combinator::map(nom::bytes::streaming::tag(b"\0"), |_| Symbol::Eof),
                 nom::combinator::map(
@@ -305,9 +313,10 @@ impl<'c, 'i: 'c> Symbol<'i> {
                     parse_comment(&config.comment_open_tag, &config.comment_close_tag),
                     Symbol::Comment,
                 ),
-                nom::combinator::map(Macro::parse(config), Symbol::Macro),
+                nom::combinator::map(Macro::parse(&config), Symbol::Macro),
                 nom::combinator::map(parse_text(&config), Symbol::Text),
-            ))(input)
+            ))(input);
+            result
         }
     }
 }
@@ -317,7 +326,6 @@ pub struct Quoted<'i> {
     pub contents: &'i [u8],
 }
 
-#[cfg(test)]
 impl std::fmt::Debug for Quoted<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Quoted")
@@ -327,10 +335,10 @@ impl std::fmt::Debug for Quoted<'_> {
 }
 
 impl<'i> Quoted<'i> {
-    fn parse(
-        open_tag: &'i [u8],
-        close_tag: &'i [u8],
-    ) -> impl for<'c> Fn(&'c [u8]) -> IResult<&'c [u8], Quoted<'c>> + 'i {
+    fn parse<'c>(
+        open_tag: &'c [u8],
+        close_tag: &'c [u8],
+    ) -> impl Fn(&'i [u8]) -> IResult<&'i [u8], Quoted<'i>> + 'c {
         |input: &[u8]| {
             let mut nest_level = 0;
 
@@ -371,7 +379,6 @@ impl<'i> Quoted<'i> {
 #[derive(PartialEq, Clone)]
 pub struct MacroName(Vec<u8>);
 
-#[cfg(test)]
 impl std::fmt::Debug for MacroName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("MacroName")
@@ -763,6 +770,22 @@ mod test {
         assert_eq!(m.args.len(), 1);
         assert_eq!(m.args.get(0).unwrap().len(), 0);
         assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn test_macro_symbol_recursion_limit() {
+        let current_macro_names = vec![macro_name(b"hello")];
+        let config = ParseConfig {
+            current_macro_names,
+            symbol_recursion_limit: 1,
+            ..ParseConfig::default()
+        };
+        Macro::parse(&config)(b"hello(hello())").unwrap();
+        let error = Macro::parse(&config)(b"hello(hello(hello()))").unwrap_err();
+        match error {
+            nom::Err::Failure(_) => {}
+            _ => panic!("Unexpected error {error:?}"),
+        }
     }
 
     #[test]

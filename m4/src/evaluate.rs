@@ -11,6 +11,7 @@ pub(crate) fn evaluate<W: Write>(
     symbol: Symbol,
     writer: &mut W,
 ) -> crate::error::Result<(State, ParseConfig)> {
+    log::debug!("{symbol:?}");
     match symbol {
         Symbol::Comment(comment) => writer.write_all(comment)?,
         Symbol::Text(text) => writer.write_all(text)?,

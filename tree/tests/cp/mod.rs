@@ -955,7 +955,7 @@ fn test_cp_proc_short_read() {
     not(all(
         target_os = "linux",
         feature = "posixutils_test_all",
-        feature = "test_mv_sticky_to_xpart"
+        feature = "requires_root"
     )),
     ignore
 )]

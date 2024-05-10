@@ -13,13 +13,16 @@ extern crate clap;
 extern crate libc;
 extern crate plib;
 
+mod common;
+
+use self::common::{copy_characteristics, error_string, is_file_writable};
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, textdomain};
 use plib::PROJECT_NAME;
 use std::collections::{HashMap, HashSet};
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::os::unix::fs::FileTypeExt;
-use std::os::{fd::AsRawFd, unix::ffi::OsStrExt, unix::fs::MetadataExt};
+use std::os::{unix::ffi::OsStrExt, unix::fs::MetadataExt};
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
@@ -59,76 +62,6 @@ impl Config {
     }
 }
 
-/// Return the error message.
-///
-/// This is for compatibility with coreutils mv. `format!("{e}")` will append
-/// the error code after the error message which we do not want.
-fn error_string(e: io::Error) -> String {
-    let s = match e.raw_os_error() {
-        // Like `format!("{e}")` except without the error code.
-        //
-        // `std` doesn't expose `sys::os::error_string` so this was copied from:
-        // https://github.com/rust-lang/rust/blob/72f616273cbbacc06918ef50470d052d39d9b514/library/std/src/sys/pal/unix/os.rs#L124-L149
-        Some(errno) => {
-            let mut buf = [0; 128];
-
-            unsafe {
-                if libc::strerror_r(errno as _, buf.as_mut_ptr(), buf.len()) == 0 {
-                    String::from_utf8_lossy(CStr::from_ptr(buf.as_ptr()).to_bytes()).to_string()
-                } else {
-                    // `std` just panics here
-                    String::from("Unknown error")
-                }
-            }
-        }
-        None => format!("{e}"),
-    };
-
-    // Translate the error string
-    gettext(s)
-}
-
-fn copy_characteristics(source: &Path, target: &Path, target_file: &fs::File) -> io::Result<()> {
-    let source_md = source.metadata()?;
-
-    // [last_access_time, last_modified_time]
-    let times = [
-        libc::timespec {
-            tv_sec: source_md.atime(),
-            tv_nsec: source_md.atime_nsec(),
-        },
-        libc::timespec {
-            tv_sec: source_md.mtime(),
-            tv_nsec: source_md.mtime_nsec(),
-        },
-    ];
-
-    unsafe {
-        // Copy last access and last modified times
-        let ret = libc::futimens(target_file.as_raw_fd(), times.as_ptr());
-        if ret != 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-
-    let target_cstr = CString::new(target.as_os_str().as_bytes())?;
-
-    unsafe {
-        // Copy user and group
-        let ret = libc::chown(target_cstr.as_ptr(), source_md.uid(), source_md.gid());
-        if ret != 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        // Copy permissions
-        let ret = libc::chmod(target_cstr.as_ptr(), source_md.mode() as libc::mode_t);
-        if ret != 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(())
-}
-
 fn copy_file_and_attributes(
     source: &Path,
     target: &Path,
@@ -162,26 +95,8 @@ fn copy_file_and_attributes(
 
     fs::copy(&source, &target)?;
 
-    const MAX_TRIES: i32 = 5;
-    let mut tries = 0;
-
-    // Loop until `fs::copy` creates the file
-    let target_file = loop {
-        match fs::File::open(&target) {
-            Ok(f) => break f,
-            Err(e) => {
-                if e.kind() == io::ErrorKind::NotFound && tries < MAX_TRIES {
-                    tries += 1;
-                    continue;
-                } else {
-                    return Err(e);
-                }
-            }
-        }
-    };
-
     // Error while copying file characteristics does not change the exit status
-    let _ = copy_characteristics(source, target, &target_file);
+    let _ = copy_characteristics(source_md, target);
     Ok(())
 }
 
@@ -234,7 +149,7 @@ fn copy_dir_all(
             copy_or_hard_link(&source, &target, &source_md, inode_map).map_err(
                 |e: io::Error| -> io::Error {
                     let from_to = gettext!("'{}' to '{}'", source.display(), target.display());
-                    let err_str = format!("{}: {}", from_to, error_string(e));
+                    let err_str = format!("{}: {}", from_to, error_string(&e));
                     io::Error::other(err_str)
                 },
             )?;
@@ -249,33 +164,6 @@ fn prompt_user(prompt: &str) -> bool {
     let mut response = String::new();
     io::stdin().read_line(&mut response).unwrap();
     response.to_lowercase().starts_with('y')
-}
-
-fn is_file_writable(md: &Option<fs::Metadata>) -> bool {
-    match md {
-        Some(md) => {
-            // These are "effective" IDs and not "real" to allow for things like
-            // sudo
-            let uid = unsafe { libc::geteuid() };
-            let gid = unsafe { libc::getegid() };
-
-            let same_user = md.uid() == uid;
-            let same_group = md.gid() == gid;
-
-            // `libc::mode_t` is not the same for all platforms while
-            // `unix::fs::MetadataExt::mode` is always a `u32`.
-            let mode = md.mode() as libc::mode_t;
-
-            if same_user && (mode & libc::S_IWUSR != 0) {
-                true
-            } else if same_group && (mode & libc::S_IWGRP != 0) {
-                true
-            } else {
-                mode & libc::S_IWOTH != 0
-            }
-        }
-        None => false,
-    }
 }
 
 /// Handles moving the file.
@@ -294,7 +182,7 @@ fn move_file(
             if e.kind() == io::ErrorKind::NotFound {
                 None
             } else {
-                let err_str = format!("{}: {}", target.display(), error_string(e));
+                let err_str = format!("{}: {}", target.display(), error_string(&e));
                 return Err(io::Error::other(err_str));
             }
         }
@@ -312,7 +200,7 @@ fn move_file(
             if e.kind() == io::ErrorKind::NotFound {
                 None
             } else {
-                let err_str = format!("{}: {}", source.display(), error_string(e));
+                let err_str = format!("{}: {}", source.display(), error_string(&e));
                 return Err(io::Error::other(err_str));
             }
         }
@@ -431,7 +319,7 @@ fn move_file(
                             "cannot move '{}' to '{}': {}",
                             source.display(),
                             target.display(),
-                            error_string(e)
+                            error_string(&e)
                         )
                     }
                 };
@@ -444,7 +332,7 @@ fn move_file(
 
     let err_reason = |e: io::Error| -> io::Error {
         let from_to = gettext!("'{}' to '{}'", source.display(), target.display(),);
-        let err_str = format!("{}: {}", from_to, error_string(e));
+        let err_str = format!("{}: {}", from_to, error_string(&e));
         io::Error::other(err_str)
     };
 
@@ -462,7 +350,7 @@ fn move_file(
         };
         remove_result
             .map_err(|e| {
-                let err_str = gettext!("unable to remove target: {}", error_string(e));
+                let err_str = gettext!("unable to remove target: {}", error_string(&e));
                 io::Error::other(err_str)
             })
             .map_err(err_reason)
@@ -521,7 +409,7 @@ fn move_files(cfg: &Config, sources: &[PathBuf], target: &Path) -> Option<()> {
                         }
                     }
                     Err(e) => {
-                        eprintln!("mv: {}", error_string(e));
+                        eprintln!("mv: {}", error_string(&e));
                         result = None;
                     }
                 }
@@ -547,7 +435,7 @@ fn move_files(cfg: &Config, sources: &[PathBuf], target: &Path) -> Option<()> {
             eprintln!(
                 "mv: {}: {}",
                 gettext!("cannot remove '{}'", source.display()),
-                error_string(e)
+                error_string(&e)
             );
             result = None;
         }
@@ -584,7 +472,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if e.kind() == io::ErrorKind::NotFound {
                     false
                 } else {
-                    eprintln!("mv: {}: {}", target.display(), error_string(e));
+                    eprintln!("mv: {}: {}", target.display(), error_string(&e));
                     std::process::exit(1);
                 }
             }

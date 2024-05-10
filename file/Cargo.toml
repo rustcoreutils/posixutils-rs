@@ -23,10 +23,6 @@ name = "cmp"
 path = "src/cmp.rs"
 
 [[bin]]
-name = "cp"
-path = "src/cp.rs"
-
-[[bin]]
 name = "dd"
 path = "src/dd.rs"
 

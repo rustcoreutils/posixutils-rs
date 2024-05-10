@@ -37,6 +37,10 @@ name = "chown"
 path = "src/chown.rs"
 
 [[bin]]
+name = "cp"
+path = "src/cp.rs"
+
+[[bin]]
 name = "du"
 path = "src/du.rs"
 

@@ -20,9 +20,7 @@ regex.workspace = true
 
 [features]
 posixutils_test_all = []
-
-# This test must be run alone
-test_mv_sticky_to_xpart = []
+requires_root = []
 
 [[bin]]
 name = "chgrp"
@@ -35,6 +33,10 @@ path = "src/chmod.rs"
 [[bin]]
 name = "chown"
 path = "src/chown.rs"
+
+[[bin]]
+name = "cp"
+path = "src/cp.rs"
 
 [[bin]]
 name = "du"

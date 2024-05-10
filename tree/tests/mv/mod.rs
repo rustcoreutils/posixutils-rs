@@ -1362,7 +1362,7 @@ fn test_mv_i_link_no() {
     not(all(
         target_os = "linux",
         feature = "posixutils_test_all",
-        feature = "test_mv_sticky_to_xpart"
+        feature = "requires_root"
     )),
     ignore
 )]
@@ -1396,7 +1396,7 @@ fn test_mv_sticky_to_xpart() {
     fs::create_dir(other_dir).unwrap();
 
     let non_root = option_env!("NON_ROOT_USERNAME").expect(
-        "`test_mv_sticky_to_xpart` requires the \
+        "`requires_root` requires the \
         `NON_ROOT_USERNAME` environment variable",
     );
 

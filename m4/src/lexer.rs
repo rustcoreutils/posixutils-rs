@@ -22,6 +22,7 @@ use std::io::{Read, Write};
 /// Configuration for parsing, affects what are considered macros, quotes or comments. Also keeps a
 /// record of the recusion limit for processing a [`Symbol`].
 #[derive(Clone)]
+#[cfg_attr(test, derive(PartialEq, Debug))]
 pub(crate) struct ParseConfig {
     pub current_macro_names: Vec<MacroName>,
     // TODO: Can probably optimize using something like smallvec
@@ -663,6 +664,7 @@ mod test {
     use crate::lexer::{
         parse_inside_brackets, Symbol, DEFAULT_COMMENT_CLOSE_TAG, DEFAULT_COMMENT_OPEN_TAG,
     };
+    use crate::test_utils::{utf8, macro_name};
     use std::io::Write;
     use test_log::test;
 
@@ -687,14 +689,6 @@ mod test {
         .unwrap();
 
         String::from_utf8(writer).unwrap()
-    }
-
-    fn utf8(input: &[u8]) -> String {
-        String::from_utf8(input.to_vec()).unwrap()
-    }
-
-    fn macro_name(input: &[u8]) -> MacroName {
-        MacroName::try_from_slice(input).expect("Error parsing macro name")
     }
 
     #[test]

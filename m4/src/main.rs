@@ -14,6 +14,8 @@ use crate::{evaluate::State, lexer::ParseConfig};
 mod error;
 mod evaluate;
 mod lexer;
+#[cfg(test)]
+mod test_utils;
 
 use error::Error;
 

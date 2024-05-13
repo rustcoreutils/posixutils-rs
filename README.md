@@ -182,3 +182,22 @@ https://github.com/jgarzik/posixutils
  - [x] xargs
  - [ ] yacc (Development)
  - [x] zcat (compress cat.)
+
+## Testing
+
+A few tests require additional setup such as a case-insensitive filesystem or the use of another command like [script](https://www.man7.org/linux/man-pages/man1/script.1.html). They are locked under the `posixutils_test_all` feature flag to exclude them from GitHub CI. These tests can be run by passing the feature flag to `cargo`:
+
+```sh
+cargo test --release --features posixutils_test_all
+```
+
+A further subset of `posixutils_test_all` tests are marked as `requires_root`. Running as root would override Unix permissions and thus give false failures on tests where such permissions are expected to be upheld so it is recommended to run these tests individually. There are currently two such tests:
+
+- test_cp_special_bits
+- test_mv_sticky_to_xpart
+
+```sh
+sudo -E cargo test --release --features posixutils_test_all,requires_root <test_name>
+```
+
+Integration tests may generate test data under `CARGO_TARGET_TMPDIR` (usually resolves to `target/tmp`) and `/dev/shm` (Linux only).

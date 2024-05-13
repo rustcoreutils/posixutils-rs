@@ -17,14 +17,27 @@
 //!
 use nom::IResult;
 
-use std::io::{Read, Write};
+use std::{
+    collections::HashMap,
+    io::{Read, Write},
+};
+
+#[derive(Clone, Hash)]
+#[cfg_attr(test, derive(PartialEq, Debug))]
+pub struct MacroParseConfig {
+    pub name: MacroName,
+    /// Some builtin macros (like `define`) require args (in brackets, even if the brackets are
+    /// empty, this counts as a single empty argument). At least this many args are required in
+    /// order to parse a macro using this macro name.
+    pub min_args: usize,
+}
 
 /// Configuration for parsing, affects what are considered macros, quotes or comments. Also keeps a
 /// record of the recusion limit for processing a [`Symbol`].
 #[derive(Clone)]
 #[cfg_attr(test, derive(PartialEq, Debug))]
 pub(crate) struct ParseConfig {
-    pub current_macro_names: Vec<MacroName>,
+    pub current_macro_parse_configs: HashMap<MacroName, MacroParseConfig>,
     // TODO: Can probably optimize using something like smallvec
     pub quote_open_tag: Vec<u8>,
     pub quote_close_tag: Vec<u8>,
@@ -41,23 +54,59 @@ const DEFAULT_COMMENT_OPEN_TAG: &[u8] = b"#";
 const DEFAULT_COMMENT_CLOSE_TAG: &[u8] = b"\n";
 const DEFAULT_SYMBOL_RECURSION_LIMIT: usize = 100;
 
-// TODO: get this from default macro registry
-pub const DNL_MACRO_NAME: &str = "dnl";
-pub const DEFINE_MACRO_NAME: &str = "define";
-static INBUILT_MACRO_NAMES: once_cell::sync::Lazy<Vec<MacroName>> =
-    once_cell::sync::Lazy::new(|| {
-        [DEFINE_MACRO_NAME, DNL_MACRO_NAME]
-            .iter()
-            .map(|n| {
-                MacroName::try_from_slice(n.as_bytes()).expect(&format!("failed to parse {n:?}"))
-            })
-            .collect()
-    });
+#[derive(Clone, Copy)]
+pub enum BuiltinMacro {
+    Dnl,
+    Define,
+    Undefine,
+    Errprint,
+}
+
+impl AsRef<[u8]> for BuiltinMacro {
+    fn as_ref(&self) -> &'static [u8] {
+        match self {
+            BuiltinMacro::Dnl => b"dnl",
+            BuiltinMacro::Define => b"define",
+            BuiltinMacro::Undefine => b"undefine",
+            BuiltinMacro::Errprint => b"errprint",
+        }
+    }
+}
+
+impl BuiltinMacro {
+    pub fn enumerate() -> &'static [Self] {
+        &[Self::Dnl, Self::Define, Self::Undefine, Self::Errprint]
+    }
+    pub fn name(&self) -> MacroName {
+        MacroName::try_from_slice(self.as_ref()).expect("Expected valid builtin macro name")
+    }
+
+    pub fn min_args(&self) -> usize {
+        match self {
+            BuiltinMacro::Dnl => 0,
+            BuiltinMacro::Define => 1,
+            BuiltinMacro::Undefine => 1,
+            BuiltinMacro::Errprint => 1,
+        }
+    }
+    pub fn parse_config(&self) -> MacroParseConfig {
+        MacroParseConfig {
+            name: self.name(),
+            min_args: self.min_args(),
+        }
+    }
+}
 
 impl Default for ParseConfig {
     fn default() -> Self {
         Self {
-            current_macro_names: INBUILT_MACRO_NAMES.clone(),
+            current_macro_parse_configs: BuiltinMacro::enumerate()
+                .into_iter()
+                .map(|m| {
+                    let c = m.parse_config();
+                    (c.name.clone(), c)
+                })
+                .collect(),
             quote_open_tag: DEFAULT_QUOTE_OPEN_TAG.to_vec(),
             quote_close_tag: DEFAULT_QUOTE_CLOSE_TAG.to_vec(),
             comment_open_tag: DEFAULT_COMMENT_OPEN_TAG.to_vec(),
@@ -199,7 +248,7 @@ impl<'i> Macro<'i> {
             log::trace!("Macro::parse() successfully parsed macro name {name:?}");
             // TODO: this should be ignored inside the define macro's second argument, or perhaps
             // just in general.
-            if !config.current_macro_names.contains(&name) {
+            if !config.current_macro_parse_configs.contains(&name) {
                 log::trace!("Macro::parse() not a current macro name");
                 return Err(nom::Err::Error(nom::error::Error::new(
                     input,
@@ -294,9 +343,9 @@ impl<'c, 'i: 'c> Symbol<'i> {
                 "Symbol::parse() {:?}, current_macro_names: {:?}",
                 String::from_utf8_lossy(input),
                 config
-                    .current_macro_names
+                    .current_macro_parse_configs
                     .iter()
-                    .map(|n| String::from_utf8_lossy(&n.0))
+                    .map(|n| String::from_utf8_lossy(&n.name.0))
                     .collect::<Vec<_>>()
             );
             if input.is_empty() {
@@ -378,7 +427,7 @@ impl<'i> Quoted<'i> {
 }
 
 // TODO: small vec optimization could be possible
-#[derive(PartialEq, Clone, Hash)]
+#[derive(PartialEq, Clone, Hash, Eq)]
 pub struct MacroName(Vec<u8>);
 
 impl std::fmt::Debug for MacroName {
@@ -667,7 +716,7 @@ mod test {
     use crate::lexer::{
         parse_inside_brackets, Symbol, DEFAULT_COMMENT_CLOSE_TAG, DEFAULT_COMMENT_OPEN_TAG,
     };
-    use crate::test_utils::{macro_name, utf8};
+    use crate::test_utils::{macro_name_config, utf8};
     use std::io::Write;
     use test_log::test;
 
@@ -759,7 +808,7 @@ mod test {
     #[test]
     fn test_parse_macro_with_name_fail_not_in_list() {
         Macro::parse(&ParseConfig {
-            current_macro_names: vec![],
+            current_macro_parse_configs: vec![],
             ..ParseConfig::default()
         })(b"some_word_23")
         .unwrap_err();
@@ -767,9 +816,9 @@ mod test {
 
     #[test]
     fn test_parse_macro_with_name_only() {
-        let current_macro_names = vec![macro_name(b"some_word_23")];
+        let current_macro_names = vec![macro_name_config(b"some_word_23", 0)];
         let config = ParseConfig {
-            current_macro_names,
+            current_macro_parse_configs,
             ..ParseConfig::default()
         };
         let (remaining, m) = Macro::parse(&config)(b"some_word_23\0").unwrap();
@@ -780,9 +829,9 @@ mod test {
 
     #[test]
     fn test_parse_macro_args_empty() {
-        let current_macro_names = vec![macro_name(b"some_word_23")];
+        let current_macro_names = vec![macro_name_config(b"some_word_23", 0)];
         let config = ParseConfig {
-            current_macro_names,
+            current_macro_parse_configs,
             ..ParseConfig::default()
         };
         let (remaining, m) = Macro::parse(&config)(b"some_word_23()").unwrap();
@@ -795,9 +844,9 @@ mod test {
 
     #[test]
     fn test_macro_symbol_recursion_limit() {
-        let current_macro_names = vec![macro_name(b"hello")];
+        let current_macro_names = vec![macro_name_config(b"hello", 0)];
         let config = ParseConfig {
-            current_macro_names,
+            current_macro_parse_configs,
             symbol_recursion_limit: 1,
             ..ParseConfig::default()
         };
@@ -809,11 +858,18 @@ mod test {
         }
     }
 
+    // TODO
+    #[test]
+    fn test_parse_macro_builtin_requires_args() {}
+
     #[test]
     fn test_parse_macro_args_1_symbol() {
-        let current_macro_names = vec![macro_name(b"some_word_23"), macro_name(b"hello")];
+        let current_macro_names = vec![
+            macro_name_config(b"some_word_23", 0),
+            macro_name_config(b"hello", 0),
+        ];
         let config = &ParseConfig {
-            current_macro_names,
+            current_macro_parse_configs,
             ..ParseConfig::default()
         };
         let (remaining, m) = Macro::parse(config)(b"some_word_23(hello)").unwrap();
@@ -829,9 +885,9 @@ mod test {
 
     #[test]
     fn test_parse_macro_args_2() {
-        let current_macro_names = vec![macro_name(b"some_word_23")];
+        let current_macro_names = vec![macro_name_config(b"some_word_23", 0)];
         let config = ParseConfig {
-            current_macro_names,
+            current_macro_parse_configs,
             ..ParseConfig::default()
         };
         let (remaining, m) = Macro::parse(&config)(b"some_word_23(hello,world)").unwrap();
@@ -856,9 +912,13 @@ mod test {
 
     #[test]
     fn test_parse_macro_args_2_nested() {
-        let current_macro_names = vec![macro_name(b"m1"), macro_name(b"m2"), macro_name(b"m3")];
+        let current_macro_names = vec![
+            macro_name_config(b"m1", 0),
+            macro_name_config(b"m2", 0),
+            macro_name_config(b"m3", 0),
+        ];
         let config = &ParseConfig {
-            current_macro_names,
+            current_macro_parse_configs,
             ..ParseConfig::default()
         };
         let (remaining, m1) = Macro::parse(config)(b"m1(hello,m2($1) m3($1))dnl").unwrap();
@@ -911,9 +971,12 @@ mod test {
 
     #[test]
     fn test_parse_macro_args_1_symbol_quoted() {
-        let current_macro_names = vec![macro_name(b"some_word_23"), macro_name(b"hello")];
+        let current_macro_names = vec![
+            macro_name_config(b"some_word_23", 0),
+            macro_name_config(b"hello", 0),
+        ];
         let config = &ParseConfig {
-            current_macro_names,
+            current_macro_parse_configs,
             ..ParseConfig::default()
         };
         let (remaining, m) = Macro::parse(config)(b"some_word_23(`hello')").unwrap();
@@ -930,12 +993,12 @@ mod test {
     #[test]
     fn test_parse_macro_args_1_2_symbols() {
         let current_macro_names = vec![
-            macro_name(b"some_word_23"),
-            macro_name(b"hello"),
-            macro_name(b"world"),
+            macro_name_config(b"some_word_23", 0),
+            macro_name_config(b"hello", 0),
+            macro_name_config(b"world", 0),
         ];
         let config = &ParseConfig {
-            current_macro_names,
+            current_macro_parse_configs,
             ..ParseConfig::default()
         };
         let m = Macro::parse(&config)(b"some_word_23(hello world)")
@@ -962,9 +1025,9 @@ mod test {
 
     #[test]
     fn test_parse_macro_args_3_middle_empty() {
-        let current_macro_names = vec![macro_name(b"some_word_23")];
+        let current_macro_names = vec![macro_name_config(b"some_word_23", 0)];
         let config = ParseConfig {
-            current_macro_names,
+            current_macro_parse_configs,
             ..ParseConfig::default()
         };
         let (remaining, m) = Macro::parse(&config)(b"some_word_23(hello,,world)").unwrap();
@@ -980,9 +1043,9 @@ mod test {
     #[test]
     fn test_parse_macro_args_fail_no_closing_bracket() {
         // TODO: produce and check for a more specific error
-        let current_macro_names = vec![macro_name(b"some_word_23")];
+        let current_macro_names = vec![macro_name_config(b"some_word_23", 0)];
         Macro::parse(&ParseConfig {
-            current_macro_names,
+            current_macro_parse_configs,
             ..ParseConfig::default()
         })(b"some_word_23(hello")
         .unwrap_err();
@@ -991,9 +1054,9 @@ mod test {
     #[test]
     fn test_parse_macro_args_fail_empty_no_closing_bracket() {
         // TODO: produce and check for a more specific error
-        let current_macro_names = vec![macro_name(b"some_word_23")];
+        let current_macro_names = vec![macro_name_config(b"some_word_23", 0)];
         Macro::parse(&ParseConfig {
-            current_macro_names,
+            current_macro_parse_configs,
             ..ParseConfig::default()
         })(b"some_word_23(")
         .unwrap_err();

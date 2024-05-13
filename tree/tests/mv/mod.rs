@@ -1396,7 +1396,7 @@ fn test_mv_sticky_to_xpart() {
     fs::create_dir(other_dir).unwrap();
 
     let non_root = option_env!("NON_ROOT_USERNAME").expect(
-        "`requires_root` requires the \
+        "`test_mv_sticky_to_xpart` requires the \
         `NON_ROOT_USERNAME` environment variable",
     );
 

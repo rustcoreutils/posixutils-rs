@@ -106,6 +106,7 @@ fn main() {
     let args = Args::parse();
 
     let stdout = std::io::stdout();
+    let stderr = std::io::stderr();
     if let Some(file_path) = args.file {
         lexer::process_streaming(
             State::default(),
@@ -113,6 +114,7 @@ fn main() {
             evaluate::evaluate,
             std::fs::File::open(file_path).unwrap(),
             stdout,
+            stderr,
         )
         .unwrap();
     } else {
@@ -122,6 +124,7 @@ fn main() {
             evaluate::evaluate,
             std::io::stdin(),
             stdout,
+            stderr,
         )
         .unwrap();
     }

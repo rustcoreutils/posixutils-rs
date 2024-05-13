@@ -377,7 +377,8 @@ impl<'i> Quoted<'i> {
     }
 }
 
-#[derive(PartialEq, Clone)]
+// TODO: small vec optimization could be possible
+#[derive(PartialEq, Clone, Hash)]
 pub struct MacroName(Vec<u8>);
 
 impl std::fmt::Debug for MacroName {
@@ -568,17 +569,19 @@ pub fn parse_dnl(input: &[u8]) -> IResult<&[u8], &[u8]> {
 /// [`Symbol`] writing output to `writer`, and returns a [`ParseConfig`] which has been
 /// modified during the process of evaluation (for example a new macro was defined, or
 /// changequote).
-pub(crate) fn process_streaming<'c, R: Read, W: Write, STATE>(
+pub(crate) fn process_streaming<'c, R: Read, STDOUT: Write, STDERR: Write, STATE>(
     mut evaluation_state: STATE,
     initial_config: ParseConfig,
     evaluate: impl for<'i, 'w> Fn(
         STATE,
         ParseConfig,
         Symbol<'i>,
-        &'w mut W,
+        &'w mut STDOUT,
+        &'w mut STDERR,
     ) -> crate::error::Result<(STATE, ParseConfig)>,
     mut reader: R,
-    mut writer: W,
+    mut stdout: STDOUT,
+    mut stderr: STDERR,
 ) -> crate::error::Result<()> {
     let buffer_size = 10;
     let buffer_growth_factor = 2;
@@ -648,7 +651,7 @@ pub(crate) fn process_streaming<'c, R: Read, W: Write, STATE>(
                     return Ok(());
                 }
                 (evaluation_state, config) =
-                    evaluate(evaluation_state, config, symbol, &mut writer)?;
+                    evaluate(evaluation_state, config, symbol, &mut stdout, &mut stderr)?;
                 remaining
             };
 
@@ -664,7 +667,7 @@ mod test {
     use crate::lexer::{
         parse_inside_brackets, Symbol, DEFAULT_COMMENT_CLOSE_TAG, DEFAULT_COMMENT_OPEN_TAG,
     };
-    use crate::test_utils::{utf8, macro_name};
+    use crate::test_utils::{macro_name, utf8};
     use std::io::Write;
     use test_log::test;
 
@@ -673,22 +676,46 @@ mod test {
         Quoted, DEFAULT_QUOTE_CLOSE_TAG, DEFAULT_QUOTE_OPEN_TAG,
     };
 
-    fn snapshot_symbols_as_stream(initial_config: ParseConfig, input: &[u8]) -> String {
-        let mut writer = Vec::new();
+    struct SymbolsAsStreamSnapshot {
+        stdout: String,
+        stderr: String,
+    }
+
+    impl std::fmt::Display for SymbolsAsStreamSnapshot {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "STDOUT:\n")?;
+            self.stdout.fmt(f)?;
+            write!(f, "\n")?;
+            write!(f, "STDERR:\n")?;
+            self.stderr.fmt(f)?;
+            Ok(())
+        }
+    }
+
+    fn snapshot_symbols_as_stream(
+        initial_config: ParseConfig,
+        input: &[u8],
+    ) -> SymbolsAsStreamSnapshot {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
         process_streaming(
             (),
             initial_config,
-            |state, config, symbol, writer| {
-                writer.write_all(format!("{symbol:#?}").as_bytes()).unwrap();
-                writer.write(b"\n").unwrap();
+            |state, config, symbol, stdout, _stderr| {
+                stdout.write_all(format!("{symbol:#?}").as_bytes()).unwrap();
+                stdout.write(b"\n").unwrap();
                 Ok((state, config))
             },
             input,
-            &mut writer,
+            &mut stdout,
+            &mut stderr,
         )
         .unwrap();
 
-        String::from_utf8(writer).unwrap()
+        SymbolsAsStreamSnapshot {
+            stdout: String::from_utf8(stdout).unwrap(),
+            stderr: String::from_utf8(stderr).unwrap(),
+        }
     }
 
     #[test]
@@ -1237,7 +1264,11 @@ mod test {
                 ..ParseConfig::default()
             },
             b" this is some text\n"),
-            @""
+            @r###"
+        STDOUT:
+
+        STDERR:
+        "###
         );
     }
 

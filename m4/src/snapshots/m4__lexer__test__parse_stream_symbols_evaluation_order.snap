@@ -2,6 +2,7 @@
 source: m4/src/lexer.rs
 expression: "snapshot_symbols_as_stream(ParseConfig::default(), &f)"
 ---
+STDOUT:
 Macro(
     Macro {
         input: "dnl",
@@ -228,3 +229,5 @@ Text(
     ")",
 )
 Newline
+
+STDERR:

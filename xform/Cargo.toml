@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-xform"
-version = "0.1.7"
+version = "0.1.10"
 edition = "2021"
 authors = ["Jeff Garzik"]
 license = "MIT"

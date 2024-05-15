@@ -209,6 +209,12 @@ mod test {
         // Output: ERROR
     }
 
+    #[test]
+    fn test_changequote_in_quotes_excess_arguments() {
+        let input = br#"define(x, \`changequote(,,,x,,,,)')x"#;
+        // This leads to an m4 stack overflow in GNU m4.
+    }
+
     /// The first definition of y is used in x
     #[test]
     fn test_macro_define_eval_order_unquoted() {

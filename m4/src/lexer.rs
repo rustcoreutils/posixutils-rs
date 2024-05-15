@@ -37,7 +37,7 @@ pub struct MacroParseConfig {
 #[derive(Clone)]
 #[cfg_attr(test, derive(PartialEq, Debug))]
 pub(crate) struct ParseConfig {
-    pub current_macro_parse_configs: HashMap<MacroName, MacroParseConfig>,
+    pub macro_parse_configs: HashMap<MacroName, MacroParseConfig>,
     // TODO: Can probably optimize using something like smallvec
     pub quote_open_tag: Vec<u8>,
     pub quote_close_tag: Vec<u8>,
@@ -100,7 +100,7 @@ impl BuiltinMacro {
 impl Default for ParseConfig {
     fn default() -> Self {
         Self {
-            current_macro_parse_configs: BuiltinMacro::enumerate()
+            macro_parse_configs: BuiltinMacro::enumerate()
                 .into_iter()
                 .map(|m| {
                     let c = m.parse_config();
@@ -248,7 +248,7 @@ impl<'i> Macro<'i> {
             log::trace!("Macro::parse() successfully parsed macro name {name:?}");
             // TODO: this should be ignored inside the define macro's second argument, or perhaps
             // just in general.
-            if !config.current_macro_parse_configs.contains(&name) {
+            if !config.macro_parse_configs.contains_key(&name) {
                 log::trace!("Macro::parse() not a current macro name");
                 return Err(nom::Err::Error(nom::error::Error::new(
                     input,
@@ -343,9 +343,9 @@ impl<'c, 'i: 'c> Symbol<'i> {
                 "Symbol::parse() {:?}, current_macro_names: {:?}",
                 String::from_utf8_lossy(input),
                 config
-                    .current_macro_parse_configs
+                    .macro_parse_configs
                     .iter()
-                    .map(|n| String::from_utf8_lossy(&n.name.0))
+                    .map(|n| String::from_utf8_lossy(&n.0 .0))
                     .collect::<Vec<_>>()
             );
             if input.is_empty() {
@@ -716,7 +716,8 @@ mod test {
     use crate::lexer::{
         parse_inside_brackets, Symbol, DEFAULT_COMMENT_CLOSE_TAG, DEFAULT_COMMENT_OPEN_TAG,
     };
-    use crate::test_utils::{macro_name_config, utf8};
+    use crate::test_utils::{macro_parse_config, macro_parse_configs, utf8};
+    use std::collections::HashMap;
     use std::io::Write;
     use test_log::test;
 
@@ -808,7 +809,7 @@ mod test {
     #[test]
     fn test_parse_macro_with_name_fail_not_in_list() {
         Macro::parse(&ParseConfig {
-            current_macro_parse_configs: vec![],
+            macro_parse_configs: HashMap::default(),
             ..ParseConfig::default()
         })(b"some_word_23")
         .unwrap_err();
@@ -816,9 +817,8 @@ mod test {
 
     #[test]
     fn test_parse_macro_with_name_only() {
-        let current_macro_names = vec![macro_name_config(b"some_word_23", 0)];
         let config = ParseConfig {
-            current_macro_parse_configs,
+            macro_parse_configs: macro_parse_configs([macro_parse_config(b"some_word_23", 0)]),
             ..ParseConfig::default()
         };
         let (remaining, m) = Macro::parse(&config)(b"some_word_23\0").unwrap();
@@ -829,9 +829,8 @@ mod test {
 
     #[test]
     fn test_parse_macro_args_empty() {
-        let current_macro_names = vec![macro_name_config(b"some_word_23", 0)];
         let config = ParseConfig {
-            current_macro_parse_configs,
+            macro_parse_configs: macro_parse_configs([macro_parse_config(b"some_word_23", 0)]),
             ..ParseConfig::default()
         };
         let (remaining, m) = Macro::parse(&config)(b"some_word_23()").unwrap();
@@ -844,9 +843,8 @@ mod test {
 
     #[test]
     fn test_macro_symbol_recursion_limit() {
-        let current_macro_names = vec![macro_name_config(b"hello", 0)];
         let config = ParseConfig {
-            current_macro_parse_configs,
+            macro_parse_configs: macro_parse_configs([macro_parse_config(b"hello", 0)]),
             symbol_recursion_limit: 1,
             ..ParseConfig::default()
         };
@@ -864,12 +862,11 @@ mod test {
 
     #[test]
     fn test_parse_macro_args_1_symbol() {
-        let current_macro_names = vec![
-            macro_name_config(b"some_word_23", 0),
-            macro_name_config(b"hello", 0),
-        ];
         let config = &ParseConfig {
-            current_macro_parse_configs,
+            macro_parse_configs: macro_parse_configs([
+                macro_parse_config(b"some_word_23", 0),
+                macro_parse_config(b"hello", 0),
+            ]),
             ..ParseConfig::default()
         };
         let (remaining, m) = Macro::parse(config)(b"some_word_23(hello)").unwrap();
@@ -885,9 +882,8 @@ mod test {
 
     #[test]
     fn test_parse_macro_args_2() {
-        let current_macro_names = vec![macro_name_config(b"some_word_23", 0)];
         let config = ParseConfig {
-            current_macro_parse_configs,
+            macro_parse_configs: macro_parse_configs([macro_parse_config(b"some_word_23", 0)]),
             ..ParseConfig::default()
         };
         let (remaining, m) = Macro::parse(&config)(b"some_word_23(hello,world)").unwrap();
@@ -912,13 +908,12 @@ mod test {
 
     #[test]
     fn test_parse_macro_args_2_nested() {
-        let current_macro_names = vec![
-            macro_name_config(b"m1", 0),
-            macro_name_config(b"m2", 0),
-            macro_name_config(b"m3", 0),
-        ];
         let config = &ParseConfig {
-            current_macro_parse_configs,
+            macro_parse_configs: macro_parse_configs([
+                macro_parse_config(b"m1", 0),
+                macro_parse_config(b"m2", 0),
+                macro_parse_config(b"m3", 0),
+            ]),
             ..ParseConfig::default()
         };
         let (remaining, m1) = Macro::parse(config)(b"m1(hello,m2($1) m3($1))dnl").unwrap();
@@ -971,12 +966,11 @@ mod test {
 
     #[test]
     fn test_parse_macro_args_1_symbol_quoted() {
-        let current_macro_names = vec![
-            macro_name_config(b"some_word_23", 0),
-            macro_name_config(b"hello", 0),
-        ];
         let config = &ParseConfig {
-            current_macro_parse_configs,
+            macro_parse_configs: macro_parse_configs([
+                macro_parse_config(b"some_word_23", 0),
+                macro_parse_config(b"hello", 0),
+            ]),
             ..ParseConfig::default()
         };
         let (remaining, m) = Macro::parse(config)(b"some_word_23(`hello')").unwrap();
@@ -992,13 +986,12 @@ mod test {
 
     #[test]
     fn test_parse_macro_args_1_2_symbols() {
-        let current_macro_names = vec![
-            macro_name_config(b"some_word_23", 0),
-            macro_name_config(b"hello", 0),
-            macro_name_config(b"world", 0),
-        ];
         let config = &ParseConfig {
-            current_macro_parse_configs,
+            macro_parse_configs: macro_parse_configs([
+                macro_parse_config(b"some_word_23", 0),
+                macro_parse_config(b"hello", 0),
+                macro_parse_config(b"world", 0),
+            ]),
             ..ParseConfig::default()
         };
         let m = Macro::parse(&config)(b"some_word_23(hello world)")
@@ -1025,9 +1018,8 @@ mod test {
 
     #[test]
     fn test_parse_macro_args_3_middle_empty() {
-        let current_macro_names = vec![macro_name_config(b"some_word_23", 0)];
         let config = ParseConfig {
-            current_macro_parse_configs,
+            macro_parse_configs: macro_parse_configs([macro_parse_config(b"some_word_23", 0)]),
             ..ParseConfig::default()
         };
         let (remaining, m) = Macro::parse(&config)(b"some_word_23(hello,,world)").unwrap();
@@ -1043,9 +1035,8 @@ mod test {
     #[test]
     fn test_parse_macro_args_fail_no_closing_bracket() {
         // TODO: produce and check for a more specific error
-        let current_macro_names = vec![macro_name_config(b"some_word_23", 0)];
         Macro::parse(&ParseConfig {
-            current_macro_parse_configs,
+            macro_parse_configs: macro_parse_configs([macro_parse_config(b"some_word_23", 0)]),
             ..ParseConfig::default()
         })(b"some_word_23(hello")
         .unwrap_err();
@@ -1054,9 +1045,8 @@ mod test {
     #[test]
     fn test_parse_macro_args_fail_empty_no_closing_bracket() {
         // TODO: produce and check for a more specific error
-        let current_macro_names = vec![macro_name_config(b"some_word_23", 0)];
         Macro::parse(&ParseConfig {
-            current_macro_parse_configs,
+            macro_parse_configs: macro_parse_configs([macro_parse_config(b"some_word_23", 0)]),
             ..ParseConfig::default()
         })(b"some_word_23(")
         .unwrap_err();

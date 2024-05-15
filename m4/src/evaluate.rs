@@ -1,10 +1,7 @@
 use std::{collections::HashMap, io::Write};
 
 use crate::error::Result;
-use crate::lexer::{
-    BuiltinMacro, Macro, MacroName, MacroParseConfig, ParseConfig, Symbol,
-    BUILTIN_MACRO_NAME_CONFIGS,
-};
+use crate::lexer::{BuiltinMacro, Macro, MacroName, MacroParseConfig, ParseConfig, Symbol};
 
 pub(crate) struct State {
     macro_definitions: HashMap<MacroName, MacroDefinition>,
@@ -71,7 +68,7 @@ fn define(
     mut config: ParseConfig,
     m: Macro,
 ) -> crate::error::Result<(State, ParseConfig)> {
-    config.current_macro_parse_configs = state.current_macro_parse_configs();
+    config.macro_parse_configs = state.current_macro_parse_configs();
     todo!();
     Ok((state, config))
 }
@@ -84,7 +81,7 @@ fn undefine(
     if let Some(input) = args.first() {
         if let Ok(name) = MacroName::try_from_slice(input) {
             state.macro_definitions.remove(&name);
-            config.current_macro_parse_configs = state.current_macro_parse_configs()
+            config.macro_parse_configs = state.current_macro_parse_configs()
         }
     }
     Ok((state, config))
@@ -149,7 +146,7 @@ pub(crate) fn evaluate(
 mod test {
     use super::{evaluate, ParseConfig, State, Symbol};
     use crate::lexer::Macro;
-    use crate::test_utils::{macro_name_config, utf8};
+    use crate::test_utils::{macro_name, macro_parse_config, utf8};
     use test_log::test;
 
     #[test]
@@ -179,7 +176,7 @@ mod test {
             ParseConfig::default(),
             Symbol::Macro(Macro {
                 input: b"dnl",
-                name: macro_name_config(b"dnl"),
+                name: macro_name(b"dnl"),
                 args: vec![],
             }),
             &mut stdout,

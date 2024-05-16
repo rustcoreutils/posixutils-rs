@@ -1,6 +1,5 @@
 {
-  "stdout": "m1 goodbye m1 hi
-# This \"is\" a test \\ hi",
+  "stdout": "m1 goodbye m1 hi",
   "stderr": "",
   "status": 0
 }

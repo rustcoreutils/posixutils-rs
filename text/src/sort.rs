@@ -990,16 +990,18 @@ fn merge_empty_lines(vec: Vec<&str>) -> Vec<String> {
 /// * `Err(Box<dyn Error>)` if an error occurs during sorting or merging.
 ///
 fn sort(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    let mut readers: Vec<Box<dyn Read>> =
-        if args.filenames.len() == 1 && args.filenames[0] == PathBuf::from("-") {
-            vec![Box::new(io::stdin().lock())]
-        } else {
-            let mut bufs: Vec<Box<dyn Read>> = vec![];
-            for file in &args.filenames {
-                bufs.push(Box::new(std::fs::File::open(file)?))
-            }
-            bufs
-        };
+    let mut readers: Vec<Box<dyn Read>> = if (args.filenames.len() == 1
+        && args.filenames[0] == PathBuf::from("-"))
+        || args.filenames.is_empty()
+    {
+        vec![Box::new(io::stdin().lock())]
+    } else {
+        let mut bufs: Vec<Box<dyn Read>> = vec![];
+        for file in &args.filenames {
+            bufs.push(Box::new(std::fs::File::open(file)?))
+        }
+        bufs
+    };
 
     if args.merge_only {
         merge_files(&mut readers, &args.output_file)?;

@@ -968,112 +968,88 @@ mod sort_tests {
 
     #[test]
     fn test_n1() {
-        sort_test(&["-n", "-"], ".01\n0\n", "0\n.01\n", 0, "");
+        sort_test(&["-n"], ".01\n0\n", "0\n.01\n", 0, "");
     }
 
     #[test]
     fn test_n2() {
-        sort_test(&["-n", "-"], ".02\n.01\n", ".01\n.02\n", 0, "");
+        sort_test(&["-n"], ".02\n.01\n", ".01\n.02\n", 0, "");
     }
 
     #[test]
     fn test_n3() {
-        sort_test(&["-n", "-"], ".02\n.00\n", ".00\n.02\n", 0, "");
+        sort_test(&["-n"], ".02\n.00\n", ".00\n.02\n", 0, "");
     }
 
     #[test]
     fn test_n4() {
-        sort_test(&["-n", "-"], ".02\n.000\n", ".000\n.02\n", 0, "");
+        sort_test(&["-n"], ".02\n.000\n", ".000\n.02\n", 0, "");
     }
 
     #[test]
     fn test_n5() {
-        sort_test(&["-n", "-"], ".021\n.029\n", ".021\n.029\n", 0, "");
+        sort_test(&["-n"], ".021\n.029\n", ".021\n.029\n", 0, "");
     }
 
     #[test]
     fn test_n6() {
-        sort_test(&["-n", "-"], ".02\n.0*\n", ".0*\n.02\n", 0, "");
+        sort_test(&["-n"], ".02\n.0*\n", ".0*\n.02\n", 0, "");
     }
 
     #[test]
     fn test_n7() {
-        sort_test(&["-n", "-"], ".02\n.*\n", ".*\n.02\n", 0, "");
+        sort_test(&["-n"], ".02\n.*\n", ".*\n.02\n", 0, "");
     }
 
     #[test]
     fn test_n8a() {
-        sort_test(&["-n", "-k1,1", "-"], ".0a\n.0b\n", ".0a\n.0b\n", 0, "");
+        sort_test(&["-n", "-k1,1"], ".0a\n.0b\n", ".0a\n.0b\n", 0, "");
     }
 
     #[test]
     fn test_n8b() {
-        sort_test(&["-n", "-k1,1", "-"], ".0b\n.0a\n", ".0b\n.0a\n", 0, "");
+        sort_test(&["-n", "-k1,1"], ".0b\n.0a\n", ".0b\n.0a\n", 0, "");
     }
 
     #[test]
     fn test_n9a() {
-        sort_test(
-            &["-n", "-k1,1", "-"],
-            ".000a\n.000b\n",
-            ".000a\n.000b\n",
-            0,
-            "",
-        );
+        sort_test(&["-n", "-k1,1"], ".000a\n.000b\n", ".000a\n.000b\n", 0, "");
     }
 
     #[test]
     fn test_n9b() {
-        sort_test(
-            &["-n", "-k1,1", "-"],
-            ".000b\n.000a\n",
-            ".000b\n.000a\n",
-            0,
-            "",
-        );
+        sort_test(&["-n", "-k1,1"], ".000b\n.000a\n", ".000b\n.000a\n", 0, "");
     }
 
     #[test]
     fn test_n10a() {
-        sort_test(
-            &["-n", "-k1,1", "-"],
-            ".00a\n.000b\n",
-            ".00a\n.000b\n",
-            0,
-            "",
-        );
+        sort_test(&["-n", "-k1,1"], ".00a\n.000b\n", ".00a\n.000b\n", 0, "");
     }
 
     #[test]
     fn test_n10b() {
-        sort_test(
-            &["-n", "-k1,1", "-"],
-            ".00b\n.000a\n",
-            ".00b\n.000a\n",
-            0,
-            "",
-        );
+        sort_test(&["-n", "-k1,1"], ".00b\n.000a\n", ".00b\n.000a\n", 0, "");
     }
 
     #[test]
     fn test_n11a() {
-        sort_test(&["-n", "-k1,1", "-"], ".01a\n.010\n", ".01a\n.010\n", 0, "");
+        sort_test(&["-n", "-k1,1"], ".01a\n.010\n", ".01a\n.010\n", 0, "");
     }
 
     #[test]
     fn test_n11b() {
-        sort_test(&["-n", "-k1,1", "-"], ".010\n.01a\n", ".010\n.01a\n", 0, "");
+        sort_test(&["-n", "-k1,1"], ".010\n.01a\n", ".010\n.01a\n", 0, "");
     }
 
     #[test]
     fn test_02a() {
-        sort_test(&["-c", "-"], "A\nB\nC\n", "", 0, "");
+        sort_test(&["-c"], "A\nB\nC\n", "", 0, "");
     }
 
     #[test]
     fn test_02b() {
         sort_test(
-            &["-c", "-"],
+            &["-c"],
             "A\nC\nB\n",
             "",
             1,
@@ -1083,18 +1059,18 @@ mod sort_tests {
 
     #[test]
     fn test_02c() {
-        sort_test(&["-c", "-k1,1", "-"], "a\na b\n", "", 0, "");
+        sort_test(&["-c", "-k1,1"], "a\na b\n", "", 0, "");
     }
 
     #[test]
     fn test_02d() {
-        sort_test(&["-C", "-"], "A\nB\nC\n", "", 0, "");
+        sort_test(&["-C"], "A\nB\nC\n", "", 0, "");
     }
 
     #[test]
     fn test_02e() {
         sort_test(
-            &["-C", "-"],
+            &["-C"],
             "A\nC\nB\n",
             "",
             1,
@@ -1104,24 +1080,18 @@ mod sort_tests {
 
     #[test]
     fn test_02m() {
-        sort_test(
-            &["-cu", "-"],
-            "A\nA\n",
-            "",
-            1,
-            "Duplicate key was found! `A`\n",
-        );
+        sort_test(&["-cu"], "A\nA\n", "", 1, "Duplicate key was found! `A`\n");
     }
 
     #[test]
     fn test_02n() {
-        sort_test(&["-cu", "-"], "A\nB\n", "", 0, "");
+        sort_test(&["-cu"], "A\nB\n", "", 0, "");
     }
 
     #[test]
     fn test_02o() {
         sort_test(
-            &["-cu", "-"],
+            &["-cu"],
             "A\nB\nB\n",
             "",
             1,
@@ -1132,7 +1102,7 @@ mod sort_tests {
     #[test]
     fn test_02p() {
         sort_test(
-            &["-cu", "-"],
+            &["-cu"],
             "B\nA\nB\n",
             "",
             1,
@@ -1235,7 +1205,7 @@ mod sort_tests {
 
     #[test]
     fn test_07b() {
-        sort_test(&["-k2,3", "-"], "a a b\nz a a\n", "z a a\na a b\n", 0, "");
+        sort_test(&["-k2,3"], "a a b\nz a a\n", "z a a\na a b\n", 0, "");
     }
 
     #[test]

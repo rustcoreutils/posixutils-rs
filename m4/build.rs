@@ -9,7 +9,7 @@ use std::{
 struct TestCandidate {
     name: String,
     input: Option<PathBuf>,
-    expected_output: Option<PathBuf>,
+    output_json: Option<PathBuf>,
 }
 
 impl TryFrom<TestCandidate> for Test {
@@ -24,11 +24,11 @@ impl TryFrom<TestCandidate> for Test {
                 .to_str()
                 .ok_or("Error converting input path to string")?
                 .to_owned(),
-            expected_output: value
-                .expected_output
-                .ok_or("No expected_output provided")?
+            output_json: value
+                .output_json
+                .ok_or("No output json file provided")?
                 .to_str()
-                .ok_or("Error converting expected_output path to string")?
+                .ok_or("Error converting output json path to string")?
                 .to_owned(),
         })
     }
@@ -37,7 +37,7 @@ impl TryFrom<TestCandidate> for Test {
 struct Test {
     name: String,
     input: String,
-    expected_output: String,
+    output_json: String,
 }
 
 impl Test {
@@ -45,23 +45,28 @@ impl Test {
         let Self {
             name,
             input,
-            expected_output,
+            output_json,
         } = self;
-        format!(
+        let mut s = format!(
             r##"#[test]
 fn test_{name}() {{
-    let output = String::from_utf8(std::process::Command::new("cargo")
+    let output = std::process::Command::new("cargo")
         .arg("run")
         .arg("--")
         .arg("{input}")
         .output()
-        .unwrap()
-        .stdout).unwrap();
-    
-    let expected_output = std::fs::read_to_string("{expected_output}").unwrap();
-    assert_eq!(output, expected_output);
-}}"##
-        )
+        .unwrap();
+
+        let expected_output: ExpectedOutput = serde_json::from_str(&std::fs::read_to_string("{output_json}").unwrap()).unwrap();
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected_output.stdout);
+        assert_eq!(String::from_utf8(output.stderr).unwrap(), expected_output.stderr);
+        assert_eq!(output.status, std::process::ExitStatus::from_raw(expected_output.status));
+"##
+        );
+
+        s.push_str("}");
+
+        s
     }
 }
 
@@ -87,7 +92,7 @@ fn main() {
                     });
                 candidate.input = Some(path);
             }
-            Some(b"stdout") => {
+            Some(b"json") => {
                 let name = name_from_path(&path).unwrap();
                 let candidate = test_candidates
                     .entry(name.clone())
@@ -95,7 +100,7 @@ fn main() {
                         name,
                         ..TestCandidate::default()
                     });
-                candidate.expected_output = Some(path);
+                candidate.output_json = Some(path);
             }
             _ => eprintln!("Ignoring file {path:?}"),
         }
@@ -103,6 +108,14 @@ fn main() {
     let mut integration_test: String =
         r#"//! NOTE: This file has been auto generated using build.rs, don't edit by hand!
 use similar_asserts::assert_eq;
+use std::os::unix::process::ExitStatusExt;
+
+#[derive(serde::Deserialize)]
+struct ExpectedOutput {
+    stdout: String,
+    stderr: String,
+    status: i32,
+}
 "#
         .to_owned();
     for (name, candidate) in test_candidates {

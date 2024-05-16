@@ -19,3 +19,5 @@ env_logger = "0.11.3"
 insta = { version = "1.38.0", features = ["json"] }
 test-log = { version = "0.2.16", default-features=false, features=["log"]}
 similar-asserts = "1.5.0"
+serde_json = "1.0.117"
+serde = { version = "1.0.202", features = ["derive"]}

@@ -39,7 +39,6 @@ struct Test {
     input: String,
     output_json: String,
 }
-
 impl Test {
     fn as_code(&self) -> String {
         let Self {
@@ -57,10 +56,10 @@ fn test_{name}() {{
         .output()
         .unwrap();
 
-        let expected_output: ExpectedOutput = serde_json::from_str(&std::fs::read_to_string("{output_json}").unwrap()).unwrap();
-        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected_output.stdout);
-        assert_eq!(String::from_utf8(output.stderr).unwrap(), expected_output.stderr);
-        assert_eq!(output.status, std::process::ExitStatus::from_raw(expected_output.status));
+        let test: Test = read_test_json("{output_json}");
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), test.stdout);
+        assert_eq!(String::from_utf8(output.stderr).unwrap(), test.stderr);
+        assert_eq!(output.status, std::process::ExitStatus::from_raw(test.status));
 "##
         );
 
@@ -109,12 +108,28 @@ fn main() {
         r#"//! NOTE: This file has been auto generated using build.rs, don't edit by hand!
 use similar_asserts::assert_eq;
 use std::os::unix::process::ExitStatusExt;
+use tinyjson::JsonValue;
+use std::fs::read_to_string;
+use std::collections::HashMap;
 
-#[derive(serde::Deserialize)]
-struct ExpectedOutput {
+struct Test {
     stdout: String,
     stderr: String,
     status: i32,
+}
+
+fn read_test_json(path: impl AsRef<std::path::Path>) -> Test {
+    let value: JsonValue = read_to_string(path).unwrap().parse().unwrap();
+    let map: &HashMap<_, _> = value.get().unwrap();
+    let stdout: &String = map.get("stdout").unwrap().get().unwrap();
+    let stderr: &String = map.get("stderr").unwrap().get().unwrap();
+    let status: &f64= map.get("status").unwrap().get().unwrap();
+    let status = status.round() as i32;
+    Test {
+        stdout: stdout.clone(),
+        stderr: stderr.clone(),
+        status,
+    }
 }
 "#
         .to_owned();

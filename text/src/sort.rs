@@ -800,11 +800,7 @@ fn create_ranges(
 /// * `Ok(())` if the sorting and writing process completes successfully.
 /// * `Err(Box<dyn Error>)` if an error occurs during sorting, reading, or writing.
 ///
-fn sort_lines(args: &Args, reader: Box<dyn Read>) -> Result<(), Box<dyn std::error::Error>> {
-    let reader = io::BufReader::new(reader);
-
-    // Read lines from a file
-    let lines: Vec<String> = reader.lines().map(|l| l.unwrap()).collect();
+fn sort_lines(args: &Args, lines: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let mut result_lines = lines.clone();
     let mut duplicates = vec![];
 
@@ -1007,10 +1003,13 @@ fn sort(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         merge_files(&mut readers, &args.output_file)?;
         return Ok(());
     }
-    let mut result = Vec::new();
+    let mut all_lines: Vec<String> = Vec::new();
     for reader in readers {
-        result.push(sort_lines(args, reader)?);
+        let reader = io::BufReader::new(reader);
+        let lines: Vec<String> = reader.lines().map(|l| l.unwrap()).collect();
+        all_lines.extend(lines);
     }
+    sort_lines(args, all_lines)?;
 
     Ok(())
 }

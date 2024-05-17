@@ -22,7 +22,7 @@ use std::{
     io::{Read, Write},
 };
 
-use crate::evaluate::State;
+use crate::evaluate::{BuiltinMacro, State};
 
 #[derive(Clone, Hash)]
 #[cfg_attr(test, derive(PartialEq, Debug))]
@@ -56,57 +56,14 @@ const DEFAULT_COMMENT_OPEN_TAG: &[u8] = b"#";
 const DEFAULT_COMMENT_CLOSE_TAG: &[u8] = b"\n";
 const DEFAULT_SYMBOL_RECURSION_LIMIT: usize = 100;
 
-#[derive(Clone, Copy)]
-pub enum BuiltinMacro {
-    Dnl,
-    Define,
-    Undefine,
-    Errprint,
-}
-
-impl AsRef<[u8]> for BuiltinMacro {
-    fn as_ref(&self) -> &'static [u8] {
-        match self {
-            BuiltinMacro::Dnl => b"dnl",
-            BuiltinMacro::Define => b"define",
-            BuiltinMacro::Undefine => b"undefine",
-            BuiltinMacro::Errprint => b"errprint",
-        }
-    }
-}
-
-impl BuiltinMacro {
-    pub fn enumerate() -> &'static [Self] {
-        &[Self::Dnl, Self::Define, Self::Undefine, Self::Errprint]
-    }
-    pub fn name(&self) -> MacroName {
-        MacroName::try_from_slice(self.as_ref()).expect("Expected valid builtin macro name")
-    }
-
-    pub fn min_args(&self) -> usize {
-        match self {
-            BuiltinMacro::Dnl => 0,
-            BuiltinMacro::Define => 1,
-            BuiltinMacro::Undefine => 1,
-            BuiltinMacro::Errprint => 1,
-        }
-    }
-    pub fn parse_config(&self) -> MacroParseConfig {
-        MacroParseConfig {
-            name: self.name(),
-            min_args: self.min_args(),
-        }
-    }
-}
-
 impl Default for ParseConfig {
     fn default() -> Self {
         Self {
             macro_parse_configs: BuiltinMacro::enumerate()
                 .into_iter()
-                .map(|m| {
-                    let c = m.parse_config();
-                    (c.name.clone(), c)
+                .map(|builtin| {
+                    let parse_config = builtin.parse_config();
+                    (parse_config.name.clone(), parse_config)
                 })
                 .collect(),
             quote_open_tag: DEFAULT_QUOTE_OPEN_TAG.to_vec(),
@@ -127,6 +84,7 @@ pub struct Macro<'i> {
     pub args: Vec<Vec<Symbol<'i>>>,
 }
 
+#[cfg(test)]
 impl std::fmt::Debug for Macro<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Macro")
@@ -309,6 +267,7 @@ pub(crate) enum Symbol<'i> {
     Eof,
 }
 
+#[cfg(test)]
 impl<'i> std::fmt::Debug for Symbol<'i> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

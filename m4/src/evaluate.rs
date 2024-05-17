@@ -1,11 +1,21 @@
-use std::{collections::HashMap, io::Write};
+use std::{collections::HashMap, io::Write, rc::Rc};
 
 use crate::error::Result;
-use crate::lexer::{BuiltinMacro, Macro, MacroName, MacroParseConfig, ParseConfig, Symbol};
+use crate::lexer::{Macro, MacroName, MacroParseConfig, ParseConfig, Symbol};
 
-pub(crate) struct State<STDERR> {
-    macro_definitions: HashMap<MacroName, MacroDefinition<STDERR>>,
+pub struct State<STDERR> {
+    macro_definitions: HashMap<MacroName, Rc<MacroDefinition<STDERR>>>,
     pub parse_config: ParseConfig,
+}
+
+#[cfg(test)]
+impl<STDERR> std::fmt::Debug for State<STDERR> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("State")
+            .field("macro_definitions", &self.macro_definitions)
+            .field("parse_config", &self.parse_config)
+            .finish()
+    }
 }
 
 impl<STDERR: Write> Default for State<STDERR> {
@@ -15,11 +25,73 @@ impl<STDERR: Write> Default for State<STDERR> {
                 .into_iter()
                 .map(|builtin| {
                     let parse_config = builtin.parse_config();
-                    (parse_config.name.clone(), MacroDefinition { parse_config })
+                    (
+                        parse_config.name.clone(),
+                        Rc::new(MacroDefinition {
+                            parse_config,
+                            implementation: inbuilt_macro_implementation(builtin),
+                        }),
+                    )
                 })
                 .collect(),
             parse_config: ParseConfig::default(),
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum BuiltinMacro {
+    Dnl,
+    Define,
+    Undefine,
+    Errprint,
+}
+
+impl AsRef<[u8]> for BuiltinMacro {
+    fn as_ref(&self) -> &'static [u8] {
+        match self {
+            BuiltinMacro::Dnl => b"dnl",
+            BuiltinMacro::Define => b"define",
+            BuiltinMacro::Undefine => b"undefine",
+            BuiltinMacro::Errprint => b"errprint",
+        }
+    }
+}
+
+impl BuiltinMacro {
+    pub fn enumerate() -> &'static [Self] {
+        &[Self::Dnl, Self::Define, Self::Undefine, Self::Errprint]
+    }
+    pub fn name(&self) -> MacroName {
+        MacroName::try_from_slice(self.as_ref()).expect("Expected valid builtin macro name")
+    }
+
+    pub fn min_args(&self) -> usize {
+        match self {
+            BuiltinMacro::Dnl => 0,
+            BuiltinMacro::Define => 1,
+            BuiltinMacro::Undefine => 1,
+            BuiltinMacro::Errprint => 1,
+        }
+    }
+
+    pub fn parse_config(&self) -> MacroParseConfig {
+        MacroParseConfig {
+            name: self.name(),
+            min_args: self.min_args(),
+        }
+    }
+}
+
+// TODO: refactor this is not great
+fn inbuilt_macro_implementation<STDERR: Write>(
+    builtin: &BuiltinMacro,
+) -> Box<dyn MacroImplementation<STDERR>> {
+    match builtin {
+        BuiltinMacro::Dnl => Box::new(DnlMacro),
+        BuiltinMacro::Define => Box::new(DefineMacro),
+        BuiltinMacro::Undefine => Box::new(UndefineMacro),
+        BuiltinMacro::Errprint => Box::new(ErrprintMacro),
     }
 }
 
@@ -28,17 +100,26 @@ impl<STDERR> State<STDERR> {
         self.macro_definitions
             .iter()
             .map(|(name, definition)| {
-                let config = definition.parse_config;
-                (config.name.clone(), config)
+                let config = definition.parse_config.clone();
+                (name.clone(), config)
             })
             .collect()
     }
 }
 
-struct MacroDefinition<STDERR> {
-    parse_config: MacroParseConfig,
+pub(crate) struct MacroDefinition<STDERR> {
+    pub parse_config: MacroParseConfig,
     // TODO: improve performance with enum dispatch
     implementation: Box<dyn MacroImplementation<STDERR>>,
+}
+
+#[cfg(test)]
+impl<STDERR> std::fmt::Debug for MacroDefinition<STDERR> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MacroDefinition")
+            .field("parse_config", &self.parse_config)
+            .finish()
+    }
 }
 
 trait MacroImplementation<STDERR: Write> {
@@ -47,7 +128,7 @@ trait MacroImplementation<STDERR: Write> {
         state: State<STDERR>,
         stderror: &mut STDERR,
         m: Macro,
-    ) -> Result<State<STDERR>>;
+    ) -> Result<(Vec<u8>, State<STDERR>)>;
 }
 
 struct DnlMacro;
@@ -56,11 +137,11 @@ impl<STDERR: Write> MacroImplementation<STDERR> for DnlMacro {
     fn evaluate(
         &self,
         mut state: State<STDERR>,
-        stderror: &mut STDERR,
+        _stderror: &mut STDERR,
         _m: Macro,
-    ) -> Result<State<STDERR>> {
+    ) -> Result<(Vec<u8>, State<STDERR>)> {
         state.parse_config.dnl = true;
-        Ok(state)
+        Ok((Vec::new(), state))
     }
 }
 
@@ -72,34 +153,34 @@ impl<STDERR: Write> MacroImplementation<STDERR> for DefineMacro {
         mut state: State<STDERR>,
         stderror: &mut STDERR,
         m: Macro,
-    ) -> Result<State<STDERR>> {
+    ) -> Result<(Vec<u8>, State<STDERR>)> {
         let mut args = m.args.into_iter();
         let name = if let Some(i) = args.next() {
-            let mut name_bytes = Vec::new();
+            let name_bytes: Vec<u8>;
             (name_bytes, state) = evaluate_to_text(state, i, stderror)?;
 
             if let Ok(name) = MacroName::try_from_slice(&name_bytes) {
                 name
             } else {
-                return Ok(state);
+                return Ok((Vec::new(), state));
             }
         } else {
-            return Ok(state);
+            return Ok((Vec::new(), state));
         };
         let definition = if let Some(i) = args.next() {
-            let mut definition = Vec::new();
+            let definition: Vec<u8>;
             (definition, state) = evaluate_to_text(state, i, stderror)?;
             definition
         } else {
-            return Ok(state);
+            return Ok((Vec::new(), state));
         };
         let definition = MacroDefinition {
             parse_config: MacroParseConfig { name, min_args: 0 },
             implementation: Box::new(UserDefinedMacro { definition }),
         };
-        state.macro_definitions.insert(m.name, definition);
+        state.macro_definitions.insert(m.name, Rc::new(definition));
         state.parse_config.macro_parse_configs = state.current_macro_parse_configs();
-        Ok(state)
+        return Ok((Vec::new(), state));
     }
 }
 
@@ -110,11 +191,11 @@ struct UserDefinedMacro {
 impl<STDERR: Write> MacroImplementation<STDERR> for UserDefinedMacro {
     fn evaluate(
         &self,
-        mut state: State<STDERR>,
-        stderror: &mut STDERR,
+        _state: State<STDERR>,
+        _stderror: &mut STDERR,
         m: Macro,
-    ) -> Result<State<STDERR>> {
-        todo!()
+    ) -> Result<(Vec<u8>, State<STDERR>)> {
+        todo!("User defined macro not yet implemented")
     }
 }
 
@@ -126,16 +207,16 @@ impl<STDERR: Write> MacroImplementation<STDERR> for UndefineMacro {
         mut state: State<STDERR>,
         stderror: &mut STDERR,
         m: Macro,
-    ) -> Result<State<STDERR>> {
+    ) -> Result<(Vec<u8>, State<STDERR>)> {
         if let Some(first_arg_symbols) = m.args.into_iter().next() {
-            let mut text = Vec::new();
+            let text: Vec<u8>;
             (text, state) = evaluate_to_text(state, first_arg_symbols, stderror)?;
             if let Ok(name) = MacroName::try_from_slice(&text) {
                 state.macro_definitions.remove(&name);
                 state.parse_config.macro_parse_configs = state.current_macro_parse_configs();
             }
         }
-        Ok(state)
+        return Ok((Vec::new(), state));
     }
 }
 
@@ -147,18 +228,14 @@ impl<STDERR: Write> MacroImplementation<STDERR> for ErrprintMacro {
         mut state: State<STDERR>,
         stderror: &mut STDERR,
         m: Macro,
-    ) -> Result<State<STDERR>> {
+    ) -> Result<(Vec<u8>, State<STDERR>)> {
         for input in m.args {
-            let mut text = Vec::new();
+            let text: Vec<u8>;
             (text, state) = evaluate_to_text(state, input, stderror)?;
             stderror.write_all(&text)?
         }
-        Ok(state)
+        return Ok((Vec::new(), state));
     }
-}
-
-fn errprint(stderror: &mut impl Write, args: &[&[u8]]) -> Result<()> {
-    Ok(())
 }
 
 fn evaluate_to_text<STDERR: Write>(
@@ -189,7 +266,11 @@ pub(crate) fn evaluate<STDOUT: Write, STDERR: Write>(
     stdout: &mut STDOUT,
     stderror: &mut STDERR,
 ) -> Result<State<STDERR>> {
-    log::debug!("{symbol:?}");
+    #[cfg(test)]
+    {
+        log::debug!("symbol: {symbol:?}");
+        log::debug!("state: {state:?}");
+    }
     // We should never be evaluating symbols when dnl is enabled
     debug_assert!(!state.parse_config.dnl);
     match symbol {
@@ -199,10 +280,12 @@ pub(crate) fn evaluate<STDOUT: Write, STDERR: Write>(
             stdout.write_all(quoted.contents)?;
         }
         Symbol::Macro(m) => {
-            state = if let Some(definition) = state.macro_definitions.get(&m.name) {
-                todo!()
-                // Some(MacroDefinition::Builtin(BuiltinMacro::Define)) => define(state, config, m)?,
+            state = if let Some(definition) = state.macro_definitions.get(&m.name).cloned() {
+                let (output, state) = definition.implementation.evaluate(state, stderror, m)?;
+                stdout.write_all(&output)?;
+                state
             } else {
+                // TODO: remove this branch it should probably panic
                 write!(
                     stdout,
                     "TODO({})",

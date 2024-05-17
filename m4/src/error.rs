@@ -9,3 +9,16 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+pub trait GetExitCode {
+    fn get_exit_code(&self) -> u8;
+}
+
+impl<T> GetExitCode for Result<T> {
+    fn get_exit_code(&self) -> u8 {
+        match self {
+            Ok(_) => 0,
+            Err(_) => 1,
+        }
+    }
+}

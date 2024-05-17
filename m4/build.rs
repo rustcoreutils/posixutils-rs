@@ -49,17 +49,12 @@ impl Test {
         let mut s = format!(
             r##"#[test]
 fn test_{name}() {{
-    let output = std::process::Command::new("cargo")
-        .arg("run")
-        .arg("--")
-        .arg("{input}")
-        .output()
-        .unwrap();
+    let output = run_command("{input}");
 
-        let test: Test = read_test_json("{output_json}");
-        assert_eq!(String::from_utf8(output.stdout).unwrap(), test.stdout);
-        assert_eq!(String::from_utf8(output.stderr).unwrap(), test.stderr);
-        assert_eq!(output.status, std::process::ExitStatus::from_raw(test.status));
+    let test: Test = read_test_json("{output_json}");
+    assert_eq!(output.status, std::process::ExitStatus::from_raw(test.status), "status");
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), test.stdout, "stdout");
+    assert_eq!(String::from_utf8(output.stderr).unwrap(), test.stderr, "stderr");
 "##
         );
 
@@ -107,10 +102,13 @@ fn main() {
     let mut integration_test: String =
         r#"//! NOTE: This file has been auto generated using build.rs, don't edit by hand!
 use similar_asserts::assert_eq;
+use std::process::ExitStatus;
 use std::os::unix::process::ExitStatusExt;
 use tinyjson::JsonValue;
 use std::fs::read_to_string;
 use std::collections::HashMap;
+use test_log::test;
+use m4::error::GetExitCode;
 
 struct Test {
     stdout: String,
@@ -129,6 +127,24 @@ fn read_test_json(path: impl AsRef<std::path::Path>) -> Test {
         stdout: stdout.clone(),
         stderr: stderr.clone(),
         status,
+    }
+}
+
+fn run_command(input: &str) -> std::process::Output {
+    // std::process::Command::new("cargo")
+    //     .arg("run")
+    //     .arg("--")
+    //     .arg(input)
+    //     .output()
+    //     .unwrap()
+    log::debug!("Running command with input {input:?}:\n\x1b[34m{}\x1b[0m", read_to_string(input).unwrap());
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    let args = m4::Args { file: Some(input.into()), ..m4::Args::default()};
+    let result = m4::run(&mut stdout, &mut stderr, args);
+    let status = ExitStatus::from_raw(result.get_exit_code() as i32);
+    std::process::Output {
+        stdout, stderr, status
     }
 }
 "#

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs::read_dir,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
@@ -75,7 +75,7 @@ fn name_from_path(path: &Path) -> Option<String> {
 
 fn main() {
     println!("cargo::rerun-if-changed=fixtures/");
-    let mut test_candidates: HashMap<String, TestCandidate> = HashMap::new();
+    let mut test_candidates: BTreeMap<String, TestCandidate> = BTreeMap::new();
     for entry in read_dir("fixtures/integration_tests").unwrap() {
         let entry = entry.unwrap();
         let path = entry.path();

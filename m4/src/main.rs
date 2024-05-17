@@ -1,5 +1,6 @@
 use std::{
     ffi::{OsStr, OsString},
+    io::{Stderr, Stdout},
     os::unix::ffi::OsStrExt,
     path::PathBuf,
 };
@@ -109,8 +110,7 @@ fn main() {
     let stderr = std::io::stderr();
     if let Some(file_path) = args.file {
         lexer::process_streaming(
-            State::default(),
-            ParseConfig::default(),
+            State::<Stderr>::default(),
             evaluate::evaluate,
             std::fs::File::open(file_path).unwrap(),
             stdout,
@@ -119,8 +119,7 @@ fn main() {
         .unwrap();
     } else {
         lexer::process_streaming(
-            State::default(),
-            ParseConfig::default(),
+            State::<Stderr>::default(),
             evaluate::evaluate,
             std::io::stdin(),
             stdout,

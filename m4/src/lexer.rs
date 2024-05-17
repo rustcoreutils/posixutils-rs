@@ -22,6 +22,8 @@ use std::{
     io::{Read, Write},
 };
 
+use crate::evaluate::State;
+
 #[derive(Clone, Hash)]
 #[cfg_attr(test, derive(PartialEq, Debug))]
 pub struct MacroParseConfig {
@@ -618,16 +620,14 @@ pub fn parse_dnl(input: &[u8]) -> IResult<&[u8], &[u8]> {
 /// [`Symbol`] writing output to `writer`, and returns a [`ParseConfig`] which has been
 /// modified during the process of evaluation (for example a new macro was defined, or
 /// changequote).
-pub(crate) fn process_streaming<'c, R: Read, STDOUT: Write, STDERR: Write, STATE>(
-    mut evaluation_state: STATE,
-    initial_config: ParseConfig,
+pub(crate) fn process_streaming<'c, R: Read, STDOUT: Write, STDERR: Write>(
+    mut evaluation_state: State<STDERR>,
     evaluate: impl for<'i, 'w> Fn(
-        STATE,
-        ParseConfig,
+        State<STDERR>,
         Symbol<'i>,
         &'w mut STDOUT,
         &'w mut STDERR,
-    ) -> crate::error::Result<(STATE, ParseConfig)>,
+    ) -> crate::error::Result<State<STDERR>>,
     mut reader: R,
     mut stdout: STDOUT,
     mut stderr: STDERR,
@@ -635,7 +635,6 @@ pub(crate) fn process_streaming<'c, R: Read, STDOUT: Write, STDERR: Write, STATE
     let buffer_size = 10;
     let buffer_growth_factor = 2;
     let mut buffer = circular::Buffer::with_capacity(buffer_size);
-    let mut config = initial_config;
     let mut eof = false;
 
     loop {
@@ -668,7 +667,7 @@ pub(crate) fn process_streaming<'c, R: Read, STDOUT: Write, STDERR: Write, STATE
                 break;
             }
 
-            let remaining = if config.dnl {
+            let remaining = if evaluation_state.parse_config.dnl {
                 let result = parse_dnl(input);
                 let remaining = match result {
                     Ok((remaining, _)) => remaining,
@@ -680,11 +679,11 @@ pub(crate) fn process_streaming<'c, R: Read, STDOUT: Write, STDERR: Write, STATE
                     // TODO: handle unwrap
                     Err(error) => panic!("{}", error),
                 };
-                config.dnl = false;
+                evaluation_state.parse_config.dnl = false;
 
                 remaining
             } else {
-                let result = Symbol::parse(&config)(input);
+                let result = Symbol::parse(&evaluation_state.parse_config)(input);
                 let (remaining, symbol) = match result {
                     Ok(ok) => ok,
                     Err(nom::Err::Incomplete(_)) => {
@@ -699,8 +698,7 @@ pub(crate) fn process_streaming<'c, R: Read, STDOUT: Write, STDERR: Write, STATE
                 if matches!(symbol, Symbol::Eof) {
                     return Ok(());
                 }
-                (evaluation_state, config) =
-                    evaluate(evaluation_state, config, symbol, &mut stdout, &mut stderr)?;
+                evaluation_state = evaluate(evaluation_state, symbol, &mut stdout, &mut stderr)?;
                 remaining
             };
 
@@ -713,6 +711,7 @@ pub(crate) fn process_streaming<'c, R: Read, STDOUT: Write, STDERR: Write, STATE
 
 #[cfg(test)]
 mod test {
+    use crate::evaluate::State;
     use crate::lexer::{
         parse_inside_brackets, Symbol, DEFAULT_COMMENT_CLOSE_TAG, DEFAULT_COMMENT_OPEN_TAG,
     };
@@ -748,13 +747,14 @@ mod test {
     ) -> SymbolsAsStreamSnapshot {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
+        let mut state = State::default();
+        state.parse_config = initial_config;
         process_streaming(
-            (),
-            initial_config,
-            |state, config, symbol, stdout, _stderr| {
+            state,
+            |state, symbol, stdout, _stderr| {
                 stdout.write_all(format!("{symbol:#?}").as_bytes()).unwrap();
                 stdout.write(b"\n").unwrap();
-                Ok((state, config))
+                Ok(state)
             },
             input,
             &mut stdout,

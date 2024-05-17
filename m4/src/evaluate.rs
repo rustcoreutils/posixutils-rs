@@ -3,95 +3,174 @@ use std::{collections::HashMap, io::Write};
 use crate::error::Result;
 use crate::lexer::{BuiltinMacro, Macro, MacroName, MacroParseConfig, ParseConfig, Symbol};
 
-pub(crate) struct State {
-    macro_definitions: HashMap<MacroName, MacroDefinition>,
+pub(crate) struct State<STDERR> {
+    macro_definitions: HashMap<MacroName, MacroDefinition<STDERR>>,
+    pub parse_config: ParseConfig,
 }
 
-impl Default for State {
+impl<STDERR: Write> Default for State<STDERR> {
     fn default() -> Self {
         Self {
             macro_definitions: BuiltinMacro::enumerate()
                 .into_iter()
                 .map(|builtin| {
-                    (
-                        builtin.parse_config().name,
-                        MacroDefinition::Builtin(*builtin),
-                    )
+                    let parse_config = builtin.parse_config();
+                    (parse_config.name.clone(), MacroDefinition { parse_config })
                 })
                 .collect(),
+            parse_config: ParseConfig::default(),
         }
     }
 }
 
-impl State {
+impl<STDERR> State<STDERR> {
     fn current_macro_parse_configs(&self) -> HashMap<MacroName, MacroParseConfig> {
         self.macro_definitions
             .iter()
             .map(|(name, definition)| {
-                let config = match definition {
-                    MacroDefinition::Builtin(builtin) => builtin.parse_config(),
-                    MacroDefinition::UserDefined(_) => MacroParseConfig {
-                        name: name.clone(),
-                        min_args: 0,
-                    },
-                };
+                let config = definition.parse_config;
                 (config.name.clone(), config)
             })
             .collect()
     }
 }
 
-enum MacroDefinition {
-    Builtin(BuiltinMacro),
-    UserDefined(UserDefinedMacro),
+struct MacroDefinition<STDERR> {
+    parse_config: MacroParseConfig,
+    // TODO: improve performance with enum dispatch
+    implementation: Box<dyn MacroImplementation<STDERR>>,
 }
 
-struct UserDefinedMacro {}
-
-fn evaluate_macro_args(
-    m: Macro,
-    mut state: State,
-    mut config: ParseConfig,
-    stdout: &mut impl Write,
-    stderror: &mut impl Write,
-) {
-    todo!()
+trait MacroImplementation<STDERR: Write> {
+    fn evaluate(
+        &self,
+        state: State<STDERR>,
+        stderror: &mut STDERR,
+        m: Macro,
+    ) -> Result<State<STDERR>>;
 }
 
-fn dnl(mut config: ParseConfig) -> ParseConfig {
-    config.dnl = true;
-    config
-}
+struct DnlMacro;
 
-fn define(
-    mut state: State,
-    mut config: ParseConfig,
-    m: Macro,
-) -> crate::error::Result<(State, ParseConfig)> {
-    config.macro_parse_configs = state.current_macro_parse_configs();
-    todo!();
-    Ok((state, config))
-}
-
-fn undefine(
-    mut state: State,
-    mut config: ParseConfig,
-    args: &[&[u8]],
-) -> crate::error::Result<(State, ParseConfig)> {
-    if let Some(input) = args.first() {
-        if let Ok(name) = MacroName::try_from_slice(input) {
-            state.macro_definitions.remove(&name);
-            config.macro_parse_configs = state.current_macro_parse_configs()
-        }
+impl<STDERR: Write> MacroImplementation<STDERR> for DnlMacro {
+    fn evaluate(
+        &self,
+        mut state: State<STDERR>,
+        stderror: &mut STDERR,
+        _m: Macro,
+    ) -> Result<State<STDERR>> {
+        state.parse_config.dnl = true;
+        Ok(state)
     }
-    Ok((state, config))
+}
+
+struct DefineMacro;
+
+impl<STDERR: Write> MacroImplementation<STDERR> for DefineMacro {
+    fn evaluate(
+        &self,
+        mut state: State<STDERR>,
+        stderror: &mut STDERR,
+        m: Macro,
+    ) -> Result<State<STDERR>> {
+        let mut args = m.args.into_iter();
+        let name = if let Some(i) = args.next() {
+            let mut name_bytes = Vec::new();
+            (name_bytes, state) = evaluate_to_text(state, i, stderror)?;
+
+            if let Ok(name) = MacroName::try_from_slice(&name_bytes) {
+                name
+            } else {
+                return Ok(state);
+            }
+        } else {
+            return Ok(state);
+        };
+        let definition = if let Some(i) = args.next() {
+            let mut definition = Vec::new();
+            (definition, state) = evaluate_to_text(state, i, stderror)?;
+            definition
+        } else {
+            return Ok(state);
+        };
+        let definition = MacroDefinition {
+            parse_config: MacroParseConfig { name, min_args: 0 },
+            implementation: Box::new(UserDefinedMacro { definition }),
+        };
+        state.macro_definitions.insert(m.name, definition);
+        state.parse_config.macro_parse_configs = state.current_macro_parse_configs();
+        Ok(state)
+    }
+}
+
+struct UserDefinedMacro {
+    definition: Vec<u8>,
+}
+
+impl<STDERR: Write> MacroImplementation<STDERR> for UserDefinedMacro {
+    fn evaluate(
+        &self,
+        mut state: State<STDERR>,
+        stderror: &mut STDERR,
+        m: Macro,
+    ) -> Result<State<STDERR>> {
+        todo!()
+    }
+}
+
+struct UndefineMacro;
+
+impl<STDERR: Write> MacroImplementation<STDERR> for UndefineMacro {
+    fn evaluate(
+        &self,
+        mut state: State<STDERR>,
+        stderror: &mut STDERR,
+        m: Macro,
+    ) -> Result<State<STDERR>> {
+        if let Some(first_arg_symbols) = m.args.into_iter().next() {
+            let mut text = Vec::new();
+            (text, state) = evaluate_to_text(state, first_arg_symbols, stderror)?;
+            if let Ok(name) = MacroName::try_from_slice(&text) {
+                state.macro_definitions.remove(&name);
+                state.parse_config.macro_parse_configs = state.current_macro_parse_configs();
+            }
+        }
+        Ok(state)
+    }
+}
+
+struct ErrprintMacro;
+
+impl<STDERR: Write> MacroImplementation<STDERR> for ErrprintMacro {
+    fn evaluate(
+        &self,
+        mut state: State<STDERR>,
+        stderror: &mut STDERR,
+        m: Macro,
+    ) -> Result<State<STDERR>> {
+        for input in m.args {
+            let mut text = Vec::new();
+            (text, state) = evaluate_to_text(state, input, stderror)?;
+            stderror.write_all(&text)?
+        }
+        Ok(state)
+    }
 }
 
 fn errprint(stderror: &mut impl Write, args: &[&[u8]]) -> Result<()> {
-    for input in args {
-        stderror.write_all(input)?
-    }
     Ok(())
+}
+
+fn evaluate_to_text<STDERR: Write>(
+    mut state: State<STDERR>,
+    symbols: Vec<Symbol>,
+    stderror: &mut STDERR,
+) -> Result<(Vec<u8>, State<STDERR>)> {
+    let mut buffer = Vec::new();
+    for symbol in symbols {
+        state = evaluate(state, symbol, &mut buffer, stderror)?;
+    }
+    Ok((buffer, state))
 }
 
 /// It seems like macro arguments are parsed in their entirety including unwrapping quotes inside a
@@ -104,16 +183,15 @@ fn errprint(stderror: &mut impl Write, args: &[&[u8]]) -> Result<()> {
 /// defining text, if any, and rescanned for matching macro names. Once no portion of the token
 /// matches the name of a macro, it shall be written to standard output. Macros may have arguments,
 /// in which case the arguments shall be substituted into the defining text before it is rescanned.
-pub(crate) fn evaluate(
-    mut state: State,
-    mut config: ParseConfig,
+pub(crate) fn evaluate<STDOUT: Write, STDERR: Write>(
+    mut state: State<STDERR>,
     symbol: Symbol,
-    stdout: &mut impl Write,
-    stderror: &mut impl Write,
-) -> Result<(State, ParseConfig)> {
+    stdout: &mut STDOUT,
+    stderror: &mut STDERR,
+) -> Result<State<STDERR>> {
     log::debug!("{symbol:?}");
     // We should never be evaluating symbols when dnl is enabled
-    debug_assert!(!config.dnl);
+    debug_assert!(!state.parse_config.dnl);
     match symbol {
         Symbol::Comment(comment) => stdout.write_all(comment)?,
         Symbol::Text(text) => stdout.write_all(text)?,
@@ -121,48 +199,45 @@ pub(crate) fn evaluate(
             stdout.write_all(quoted.contents)?;
         }
         Symbol::Macro(m) => {
-            (state, config) = match state.macro_definitions.get(&m.name) {
-                Some(MacroDefinition::Builtin(BuiltinMacro::Dnl)) => (state, dnl(config)),
-                Some(MacroDefinition::Builtin(BuiltinMacro::Undefine)) => (state, dnl(config)),
+            state = if let Some(definition) = state.macro_definitions.get(&m.name) {
+                todo!()
                 // Some(MacroDefinition::Builtin(BuiltinMacro::Define)) => define(state, config, m)?,
-                _ => {
-                    write!(
-                        stdout,
-                        "TODO({})",
-                        String::from_utf8_lossy(m.name.as_bytes())
-                    )?;
-                    (state, config)
-                }
+            } else {
+                write!(
+                    stdout,
+                    "TODO({})",
+                    String::from_utf8_lossy(m.name.as_bytes())
+                )?;
+                state
             }
         }
         Symbol::Newline => write!(stdout, "\n")?,
         Symbol::Eof => {}
     }
 
-    Ok((state, config))
+    Ok(state)
 }
 
 #[cfg(test)]
 mod test {
     use super::{evaluate, ParseConfig, State, Symbol};
     use crate::lexer::Macro;
-    use crate::test_utils::{macro_name, macro_parse_config, utf8};
+    use crate::test_utils::{macro_name, utf8};
     use test_log::test;
 
     #[test]
     fn test_text() {
         let mut stdout: Vec<u8> = Vec::new();
         let mut stderr: Vec<u8> = Vec::new();
-        let (_state, config) = evaluate(
+        let state = evaluate(
             State::default(),
-            ParseConfig::default(),
             Symbol::Text(b"Some text to evaluate"),
             &mut stdout,
             &mut stderr,
         )
         .unwrap();
 
-        assert_eq!(config, ParseConfig::default());
+        assert_eq!(state.parse_config, ParseConfig::default());
         assert_eq!("Some text to evaluate", utf8(&stdout));
         assert!(stderr.is_empty());
     }
@@ -171,9 +246,8 @@ mod test {
     fn test_macro_dnl() {
         let mut stdout: Vec<u8> = Vec::new();
         let mut stderr: Vec<u8> = Vec::new();
-        let (_state, config) = evaluate(
+        let state = evaluate(
             State::default(),
-            ParseConfig::default(),
             Symbol::Macro(Macro {
                 input: b"dnl",
                 name: macro_name(b"dnl"),
@@ -184,80 +258,8 @@ mod test {
         )
         .unwrap();
 
-        assert_eq!(true, config.dnl);
+        assert_eq!(true, state.parse_config.dnl);
         assert!(stdout.is_empty());
         assert!(stderr.is_empty());
-    }
-
-    /// This results in no syntax error because the macro is not evaluated.
-    #[test]
-    fn test_macro_define_eval_syntax_order_quoted_unevaluated() {
-        let input = br#"define(x, `eval(1+)')"#;
-        // Output: NOTHING
-    }
-
-    #[test]
-    fn test_macro_define_eval_syntax_order_quoted_evaluated() {
-        let input = br#"define(x, `eval(1+)')x"#;
-        // Output: ERROR
-    }
-
-    /// This results in syntax error because argument is unquoted.
-    #[test]
-    fn test_macro_define_eval_syntax_order_unquoted() {
-        let input = br#"define(x, eval(1+))"#;
-        // Output: ERROR
-    }
-
-    #[test]
-    fn test_changequote_in_quotes_excess_arguments() {
-        let input = br#"define(x, \`changequote(,,,x,,,,)')x"#;
-        // This leads to an m4 stack overflow in GNU m4.
-    }
-
-    /// The first definition of y is used in x
-    #[test]
-    fn test_macro_define_eval_order_unquoted() {
-        let input = br#"define(y, 5)define(x, eval(1+y))define(y, 1)x"#;
-        // Output: 6
-    }
-
-    /// The first definition of y is used in x (even when quoted!)
-    #[test]
-    fn test_macro_define_eval_order_quoted() {
-        let input = br#"define(y, 5)define(x, `eval(1+y)')define(y, 100)x"#;
-        // Output: 6
-    }
-
-    /// The first definition of y is used during the expansion of y in the definition of x.
-    #[test]
-    fn test_macro_define_order_defined() {
-        let input = br#"define(y, 1)define(x, y)define(y, 5)x"#;
-        // Output: 1
-    }
-
-    /// The definition of y from after the x definition is used in the evaluation of x macro.
-    #[test]
-    fn test_macro_define_order_undefined() {
-        let input = br#"define(x, y)define(y, 5)x"#;
-        // Output: 5
-    }
-
-    #[test]
-    fn test_macro_errprint_no_evaluation_quoted() {
-        let input = br#"define(x, \`errprint(2)')"#;
-        // Output(stderr): NOTHING
-    }
-
-    #[test]
-    fn test_macro_errprint_no_evaluation() {
-        let input = br#"define(x, errprint(2))"#;
-        // Output(stderr): 2
-    }
-
-    #[test]
-    fn test_macro_errprint_evaluation() {
-        let input = br#"define(x, errprint(2))x"#;
-        // Output(stderr): 2
     }
 }

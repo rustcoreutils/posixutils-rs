@@ -45,16 +45,15 @@ fn test_changequote_in_quotes_excess_arguments() {
 }
 
 #[test]
-fn test_define_eval_syntax_order_quoted_evaluated() {
+fn test_define_eval_order_quoted() {
     let output = std::process::Command::new("cargo")
         .arg("run")
         .arg("--")
-        .arg("fixtures/integration_tests/define_eval_syntax_order_quoted_evaluated.m4")
+        .arg("fixtures/integration_tests/define_eval_order_quoted.m4")
         .output()
         .unwrap();
 
-    let test: Test =
-        read_test_json("fixtures/integration_tests/define_eval_syntax_order_quoted_evaluated.json");
+    let test: Test = read_test_json("fixtures/integration_tests/define_eval_order_quoted.json");
     assert_eq!(String::from_utf8(output.stdout).unwrap(), test.stdout);
     assert_eq!(String::from_utf8(output.stderr).unwrap(), test.stderr);
     assert_eq!(
@@ -82,15 +81,73 @@ fn test_define_eval_order_unquoted() {
 }
 
 #[test]
-fn test_evaluation_order() {
+fn test_define_eval_syntax_order_quoted_evaluated() {
     let output = std::process::Command::new("cargo")
         .arg("run")
         .arg("--")
-        .arg("fixtures/integration_tests/evaluation_order.m4")
+        .arg("fixtures/integration_tests/define_eval_syntax_order_quoted_evaluated.m4")
         .output()
         .unwrap();
 
-    let test: Test = read_test_json("fixtures/integration_tests/evaluation_order.json");
+    let test: Test =
+        read_test_json("fixtures/integration_tests/define_eval_syntax_order_quoted_evaluated.json");
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), test.stdout);
+    assert_eq!(String::from_utf8(output.stderr).unwrap(), test.stderr);
+    assert_eq!(
+        output.status,
+        std::process::ExitStatus::from_raw(test.status)
+    );
+}
+
+#[test]
+fn test_define_eval_syntax_order_quoted_unevaluated() {
+    let output = std::process::Command::new("cargo")
+        .arg("run")
+        .arg("--")
+        .arg("fixtures/integration_tests/define_eval_syntax_order_quoted_unevaluated.m4")
+        .output()
+        .unwrap();
+
+    let test: Test = read_test_json(
+        "fixtures/integration_tests/define_eval_syntax_order_quoted_unevaluated.json",
+    );
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), test.stdout);
+    assert_eq!(String::from_utf8(output.stderr).unwrap(), test.stderr);
+    assert_eq!(
+        output.status,
+        std::process::ExitStatus::from_raw(test.status)
+    );
+}
+
+#[test]
+fn test_define_eval_syntax_order_unquoted() {
+    let output = std::process::Command::new("cargo")
+        .arg("run")
+        .arg("--")
+        .arg("fixtures/integration_tests/define_eval_syntax_order_unquoted.m4")
+        .output()
+        .unwrap();
+
+    let test: Test =
+        read_test_json("fixtures/integration_tests/define_eval_syntax_order_unquoted.json");
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), test.stdout);
+    assert_eq!(String::from_utf8(output.stderr).unwrap(), test.stderr);
+    assert_eq!(
+        output.status,
+        std::process::ExitStatus::from_raw(test.status)
+    );
+}
+
+#[test]
+fn test_define_order_defined() {
+    let output = std::process::Command::new("cargo")
+        .arg("run")
+        .arg("--")
+        .arg("fixtures/integration_tests/define_order_defined.m4")
+        .output()
+        .unwrap();
+
+    let test: Test = read_test_json("fixtures/integration_tests/define_order_defined.json");
     assert_eq!(String::from_utf8(output.stdout).unwrap(), test.stdout);
     assert_eq!(String::from_utf8(output.stderr).unwrap(), test.stderr);
     assert_eq!(
@@ -118,34 +175,15 @@ fn test_define_order_undefined() {
 }
 
 #[test]
-fn test_define_eval_order_quoted() {
+fn test_evaluation_order() {
     let output = std::process::Command::new("cargo")
         .arg("run")
         .arg("--")
-        .arg("fixtures/integration_tests/define_eval_order_quoted.m4")
+        .arg("fixtures/integration_tests/evaluation_order.m4")
         .output()
         .unwrap();
 
-    let test: Test = read_test_json("fixtures/integration_tests/define_eval_order_quoted.json");
-    assert_eq!(String::from_utf8(output.stdout).unwrap(), test.stdout);
-    assert_eq!(String::from_utf8(output.stderr).unwrap(), test.stderr);
-    assert_eq!(
-        output.status,
-        std::process::ExitStatus::from_raw(test.status)
-    );
-}
-
-#[test]
-fn test_define_eval_syntax_order_unquoted() {
-    let output = std::process::Command::new("cargo")
-        .arg("run")
-        .arg("--")
-        .arg("fixtures/integration_tests/define_eval_syntax_order_unquoted.m4")
-        .output()
-        .unwrap();
-
-    let test: Test =
-        read_test_json("fixtures/integration_tests/define_eval_syntax_order_unquoted.json");
+    let test: Test = read_test_json("fixtures/integration_tests/evaluation_order.json");
     assert_eq!(String::from_utf8(output.stdout).unwrap(), test.stdout);
     assert_eq!(String::from_utf8(output.stderr).unwrap(), test.stderr);
     assert_eq!(
@@ -191,24 +229,6 @@ fn test_macro_errprint_no_evaluation() {
 }
 
 #[test]
-fn test_define_order_defined() {
-    let output = std::process::Command::new("cargo")
-        .arg("run")
-        .arg("--")
-        .arg("fixtures/integration_tests/define_order_defined.m4")
-        .output()
-        .unwrap();
-
-    let test: Test = read_test_json("fixtures/integration_tests/define_order_defined.json");
-    assert_eq!(String::from_utf8(output.stdout).unwrap(), test.stdout);
-    assert_eq!(String::from_utf8(output.stderr).unwrap(), test.stderr);
-    assert_eq!(
-        output.status,
-        std::process::ExitStatus::from_raw(test.status)
-    );
-}
-
-#[test]
 fn test_macro_errprint_no_evaluation_quoted() {
     let output = std::process::Command::new("cargo")
         .arg("run")
@@ -219,26 +239,6 @@ fn test_macro_errprint_no_evaluation_quoted() {
 
     let test: Test =
         read_test_json("fixtures/integration_tests/macro_errprint_no_evaluation_quoted.json");
-    assert_eq!(String::from_utf8(output.stdout).unwrap(), test.stdout);
-    assert_eq!(String::from_utf8(output.stderr).unwrap(), test.stderr);
-    assert_eq!(
-        output.status,
-        std::process::ExitStatus::from_raw(test.status)
-    );
-}
-
-#[test]
-fn test_define_eval_syntax_order_quoted_unevaluated() {
-    let output = std::process::Command::new("cargo")
-        .arg("run")
-        .arg("--")
-        .arg("fixtures/integration_tests/define_eval_syntax_order_quoted_unevaluated.m4")
-        .output()
-        .unwrap();
-
-    let test: Test = read_test_json(
-        "fixtures/integration_tests/define_eval_syntax_order_quoted_unevaluated.json",
-    );
     assert_eq!(String::from_utf8(output.stdout).unwrap(), test.stdout);
     assert_eq!(String::from_utf8(output.stderr).unwrap(), test.stderr);
     assert_eq!(

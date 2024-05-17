@@ -1,14 +1,13 @@
 use std::{collections::HashMap, io::Write, rc::Rc};
 
 use crate::error::Result;
-use crate::lexer::{Macro, MacroName, MacroParseConfig, ParseConfig, Symbol};
+use crate::lexer::{self, Macro, MacroName, MacroParseConfig, ParseConfig, Symbol};
 
 pub struct State<STDERR> {
     macro_definitions: HashMap<MacroName, Rc<MacroDefinition<STDERR>>>,
     pub parse_config: ParseConfig,
 }
 
-#[cfg(test)]
 impl<STDERR> std::fmt::Debug for State<STDERR> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("State")
@@ -113,7 +112,6 @@ pub(crate) struct MacroDefinition<STDERR> {
     implementation: Box<dyn MacroImplementation<STDERR>>,
 }
 
-#[cfg(test)]
 impl<STDERR> std::fmt::Debug for MacroDefinition<STDERR> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MacroDefinition")
@@ -175,10 +173,13 @@ impl<STDERR: Write> MacroImplementation<STDERR> for DefineMacro {
             return Ok((Vec::new(), state));
         };
         let definition = MacroDefinition {
-            parse_config: MacroParseConfig { name, min_args: 0 },
+            parse_config: MacroParseConfig {
+                name: name.clone(),
+                min_args: 0,
+            },
             implementation: Box::new(UserDefinedMacro { definition }),
         };
-        state.macro_definitions.insert(m.name, Rc::new(definition));
+        state.macro_definitions.insert(name, Rc::new(definition));
         state.parse_config.macro_parse_configs = state.current_macro_parse_configs();
         return Ok((Vec::new(), state));
     }
@@ -191,11 +192,12 @@ struct UserDefinedMacro {
 impl<STDERR: Write> MacroImplementation<STDERR> for UserDefinedMacro {
     fn evaluate(
         &self,
-        _state: State<STDERR>,
-        _stderror: &mut STDERR,
-        m: Macro,
+        state: State<STDERR>,
+        stderror: &mut STDERR,
+        _m: Macro,
     ) -> Result<(Vec<u8>, State<STDERR>)> {
-        todo!("User defined macro not yet implemented")
+        // TODO: handle arguments
+        parse_and_evaluate_to_text(state, &self.definition, stderror)
     }
 }
 
@@ -238,6 +240,17 @@ impl<STDERR: Write> MacroImplementation<STDERR> for ErrprintMacro {
     }
 }
 
+fn parse_and_evaluate_to_text<STDERR: Write>(
+    mut state: State<STDERR>,
+    text: &[u8],
+    stderror: &mut STDERR,
+) -> Result<(Vec<u8>, State<STDERR>)> {
+    // TODO: hint size so it deosn't need to re-allocate
+    let mut stdout: Vec<u8> = Vec::new();
+    state = lexer::process_streaming(state, evaluate, text, &mut stdout, stderror)?;
+    Ok((stdout, state))
+}
+
 fn evaluate_to_text<STDERR: Write>(
     mut state: State<STDERR>,
     symbols: Vec<Symbol>,
@@ -266,11 +279,8 @@ pub(crate) fn evaluate<STDOUT: Write, STDERR: Write>(
     stdout: &mut STDOUT,
     stderror: &mut STDERR,
 ) -> Result<State<STDERR>> {
-    #[cfg(test)]
-    {
-        log::debug!("symbol: {symbol:?}");
-        log::debug!("state: {state:?}");
-    }
+    log::debug!("symbol: {symbol:?}");
+    log::debug!("macro_definitions: {:?}", state.macro_definitions.keys());
     // We should never be evaluating symbols when dnl is enabled
     debug_assert!(!state.parse_config.dnl);
     match symbol {

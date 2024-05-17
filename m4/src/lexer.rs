@@ -24,8 +24,8 @@ use std::{
 
 use crate::evaluate::{BuiltinMacro, State};
 
-#[derive(Clone, Hash)]
-#[cfg_attr(test, derive(PartialEq, Debug))]
+#[derive(Clone, Hash, Debug)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct MacroParseConfig {
     pub name: MacroName,
     /// Some builtin macros (like `define`) require args (in brackets, even if the brackets are
@@ -36,8 +36,8 @@ pub struct MacroParseConfig {
 
 /// Configuration for parsing, affects what are considered macros, quotes or comments. Also keeps a
 /// record of the recusion limit for processing a [`Symbol`].
-#[derive(Clone)]
-#[cfg_attr(test, derive(PartialEq, Debug))]
+#[derive(Clone, Debug)]
+#[cfg_attr(test, derive(PartialEq))]
 pub(crate) struct ParseConfig {
     pub macro_parse_configs: HashMap<MacroName, MacroParseConfig>,
     // TODO: Can probably optimize using something like smallvec
@@ -84,7 +84,6 @@ pub struct Macro<'i> {
     pub args: Vec<Vec<Symbol<'i>>>,
 }
 
-#[cfg(test)]
 impl std::fmt::Debug for Macro<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Macro")
@@ -267,7 +266,6 @@ pub(crate) enum Symbol<'i> {
     Eof,
 }
 
-#[cfg(test)]
 impl<'i> std::fmt::Debug for Symbol<'i> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -580,7 +578,7 @@ pub fn parse_dnl(input: &[u8]) -> IResult<&[u8], &[u8]> {
 /// modified during the process of evaluation (for example a new macro was defined, or
 /// changequote).
 pub(crate) fn process_streaming<'c, R: Read, STDOUT: Write, STDERR: Write>(
-    mut evaluation_state: State<STDERR>,
+    mut state: State<STDERR>,
     evaluate: impl for<'i, 'w> Fn(
         State<STDERR>,
         Symbol<'i>,
@@ -588,9 +586,9 @@ pub(crate) fn process_streaming<'c, R: Read, STDOUT: Write, STDERR: Write>(
         &'w mut STDERR,
     ) -> crate::error::Result<State<STDERR>>,
     mut reader: R,
-    mut stdout: STDOUT,
-    mut stderr: STDERR,
-) -> crate::error::Result<()> {
+    stdout: &mut STDOUT,
+    stderr: &mut STDERR,
+) -> crate::error::Result<State<STDERR>> {
     let buffer_size = 10;
     let buffer_growth_factor = 2;
     let mut buffer = circular::Buffer::with_capacity(buffer_size);
@@ -626,7 +624,7 @@ pub(crate) fn process_streaming<'c, R: Read, STDOUT: Write, STDERR: Write>(
                 break;
             }
 
-            let remaining = if evaluation_state.parse_config.dnl {
+            let remaining = if state.parse_config.dnl {
                 let result = parse_dnl(input);
                 let remaining = match result {
                     Ok((remaining, _)) => remaining,
@@ -638,11 +636,11 @@ pub(crate) fn process_streaming<'c, R: Read, STDOUT: Write, STDERR: Write>(
                     // TODO: handle unwrap
                     Err(error) => panic!("{}", error),
                 };
-                evaluation_state.parse_config.dnl = false;
+                state.parse_config.dnl = false;
 
                 remaining
             } else {
-                let result = Symbol::parse(&evaluation_state.parse_config)(input);
+                let result = Symbol::parse(&state.parse_config)(input);
                 let (remaining, symbol) = match result {
                     Ok(ok) => ok,
                     Err(nom::Err::Incomplete(_)) => {
@@ -655,9 +653,9 @@ pub(crate) fn process_streaming<'c, R: Read, STDOUT: Write, STDERR: Write>(
                 };
 
                 if matches!(symbol, Symbol::Eof) {
-                    return Ok(());
+                    return Ok(state);
                 }
-                evaluation_state = evaluate(evaluation_state, symbol, &mut stdout, &mut stderr)?;
+                state = evaluate(state, symbol, stdout, stderr)?;
                 remaining
             };
 
@@ -665,7 +663,7 @@ pub(crate) fn process_streaming<'c, R: Read, STDOUT: Write, STDERR: Write>(
         }
     }
 
-    Ok(())
+    Ok(state)
 }
 
 #[cfg(test)]

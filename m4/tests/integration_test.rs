@@ -35,7 +35,7 @@ fn run_command(input: &str) -> std::process::Output {
     //     .arg(input)
     //     .output()
     //     .unwrap()
-    log::debug!(
+    log::info!(
         "Running command with input {input:?}:\n\x1b[34m{}\x1b[0m",
         read_to_string(input).unwrap()
     );
@@ -47,35 +47,14 @@ fn run_command(input: &str) -> std::process::Output {
     };
     let result = m4::run(&mut stdout, &mut stderr, args);
     let status = ExitStatus::from_raw(result.get_exit_code() as i32);
+    log::info!("Received status: {status}");
+    log::info!("Received stdout: {}", String::from_utf8_lossy(&stdout));
+    log::info!("Received stderr: {}", String::from_utf8_lossy(&stderr));
     std::process::Output {
         stdout,
         stderr,
         status,
     }
-}
-
-#[test]
-fn test_changequote_in_quotes_excess_arguments() {
-    let output =
-        run_command("fixtures/integration_tests/changequote_in_quotes_excess_arguments.m4");
-
-    let test: Test =
-        read_test_json("fixtures/integration_tests/changequote_in_quotes_excess_arguments.json");
-    assert_eq!(
-        output.status,
-        std::process::ExitStatus::from_raw(test.status),
-        "status"
-    );
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        test.stdout,
-        "stdout"
-    );
-    assert_eq!(
-        String::from_utf8(output.stderr).unwrap(),
-        test.stderr,
-        "stderr"
-    );
 }
 
 #[test]

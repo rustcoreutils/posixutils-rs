@@ -112,11 +112,11 @@ impl Default for Args {
 }
 
 pub fn run<STDOUT: Write, STDERR: Write>(
-    stdout: STDOUT,
-    stderr: STDERR,
+    stdout: &mut STDOUT,
+    stderr: &mut STDERR,
     args: Args,
 ) -> crate::error::Result<()> {
-    if let Some(file_path) = args.file {
+    let result = if let Some(file_path) = args.file {
         lexer::process_streaming(
             State::default(),
             evaluate::evaluate,
@@ -132,5 +132,11 @@ pub fn run<STDOUT: Write, STDERR: Write>(
             stdout,
             stderr,
         )
+    };
+
+    if let Err(error) = &result {
+        stderr.write_all(error.to_string().as_bytes())?;
     }
+
+    result.map(|_| ())
 }

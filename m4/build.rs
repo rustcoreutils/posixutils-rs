@@ -137,12 +137,15 @@ fn run_command(input: &str) -> std::process::Output {
     //     .arg(input)
     //     .output()
     //     .unwrap()
-    log::debug!("Running command with input {input:?}:\n\x1b[34m{}\x1b[0m", read_to_string(input).unwrap());
+    log::info!("Running command with input {input:?}:\n\x1b[34m{}\x1b[0m", read_to_string(input).unwrap());
     let mut stdout: Vec<u8> = Vec::new();
     let mut stderr: Vec<u8> = Vec::new();
     let args = m4::Args { file: Some(input.into()), ..m4::Args::default()};
     let result = m4::run(&mut stdout, &mut stderr, args);
     let status = ExitStatus::from_raw(result.get_exit_code() as i32);
+    log::info!("Received status: {status}");
+    log::info!("Received stdout: {}", String::from_utf8_lossy(&stdout));
+    log::info!("Received stderr: {}", String::from_utf8_lossy(&stderr));
     std::process::Output {
         stdout, stderr, status
     }

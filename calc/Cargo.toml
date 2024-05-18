@@ -7,8 +7,15 @@ edition = "2021"
 plib = { path = "../plib" }
 gettext-rs.workspace = true
 regex.workspace = true
+clap.workspace = true
+pest = "2.7.10"
+pest_derive = "2.7.10"
+lazy_static = "1.4.0"
 
 [[bin]]
 name = "expr"
 path = "src/expr.rs"
 
+[[bin]]
+name = "bc"
+path = "src/bc.rs"

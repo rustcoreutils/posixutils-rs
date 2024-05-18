@@ -10,8 +10,7 @@
 // adapted from FreeBSD's zopen.c.
 //
 
-use std::fs::File;
-use std::io::{self, Error, ErrorKind, Read, Write};
+use std::io::{self, Error, ErrorKind, Read};
 
 const INIT_BITS: u32 = 9;
 const HSIZE: usize = 69_001;
@@ -428,7 +427,11 @@ enum WriterState {
 
 impl UnixLZWWriter {
     pub fn new(mbits: Option<u32>) -> UnixLZWWriter {
-        let maxbits = mbits.unwrap_or(BITS);
+        let maxbits = match mbits {
+            Some(m) => m.clamp(9, 16),
+            None => BITS,
+        };
+
         let maxmaxcode = (1 << maxbits) as i32;
 
         UnixLZWWriter {
@@ -643,7 +646,7 @@ impl UnixLZWWriter {
         Ok(outbytes)
     }
 
-    // Return the remaining bytes which could not be written from close()
+    /// Return the remaining bytes which could not be written from close()
     pub fn close(&mut self) -> io::Result<Vec<u8>> {
         let mut outbytes: Vec<u8> = Vec::new();
         outbytes.extend(self.output(self.write_params.ent)?);

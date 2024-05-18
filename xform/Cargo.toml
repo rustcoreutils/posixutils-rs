@@ -22,10 +22,13 @@ name = "uncompress"
 path = "src/uncompress.rs"
 
 [[bin]]
+name = "compress"
+path = "src/compress.rs"
+
+[[bin]]
 name = "uudecode"
 path = "src/uudecode.rs"
 
 [[bin]]
 name = "uuencode"
 path = "src/uuencode.rs"
-

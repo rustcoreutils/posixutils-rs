@@ -11,17 +11,22 @@ extern crate plib;
 
 use gettextrs::{bind_textdomain_codeset, textdomain};
 use plib::PROJECT_NAME;
+use std::fs::File;
 use std::io::{self, Write};
 use std::process::{self, Child};
 
 enum Input {
     ChangeDir(String),
-    Exec(Vec<Vec<String>>), // List of commands for piping
+    Exec(Vec<Vec<String>>, Option<String>, Option<(String, bool)>), // Commands, stdin file, stdout file (and append flag)
     Exit,
     NoOp,
 }
 
-fn exec_piped_commands(commands: Vec<Vec<String>>) -> io::Result<()> {
+fn exec_piped_commands(
+    commands: Vec<Vec<String>>,
+    stdin: Option<String>,
+    stdout: Option<(String, bool)>,
+) -> io::Result<()> {
     let mut previous_command: Option<Child> = None;
 
     for (i, command) in commands.iter().enumerate() {
@@ -29,7 +34,11 @@ fn exec_piped_commands(commands: Vec<Vec<String>>) -> io::Result<()> {
         let mut cmd = process::Command::new(input);
         cmd.args(args);
 
-        if let Some(previous) = previous_command {
+        if let Some(ref input_file) = stdin {
+            if i == 0 {
+                cmd.stdin(process::Stdio::from(File::open(input_file)?));
+            }
+        } else if let Some(previous) = previous_command {
             cmd.stdin(process::Stdio::from(previous.stdout.unwrap()));
         } else {
             cmd.stdin(process::Stdio::inherit());
@@ -38,7 +47,17 @@ fn exec_piped_commands(commands: Vec<Vec<String>>) -> io::Result<()> {
         if i < commands.len() - 1 {
             cmd.stdout(process::Stdio::piped());
         } else {
-            cmd.stdout(process::Stdio::inherit());
+            if let Some((ref output_file, append)) = stdout {
+                if append {
+                    cmd.stdout(process::Stdio::from(
+                        File::options().append(true).open(output_file)?,
+                    ));
+                } else {
+                    cmd.stdout(process::Stdio::from(File::create(output_file)?));
+                }
+            } else {
+                cmd.stdout(process::Stdio::inherit());
+            }
         }
 
         previous_command = Some(cmd.spawn()?);
@@ -52,16 +71,40 @@ fn exec_piped_commands(commands: Vec<Vec<String>>) -> io::Result<()> {
 }
 
 fn parse_input(rawline: &str) -> Input {
-    let commands: Vec<Vec<String>> = rawline
-        .split('|')
-        .map(|cmd| cmd.split_whitespace().map(|s| s.to_string()).collect())
-        .collect();
+    let mut commands = Vec::new();
+    let mut stdin = None;
+    let mut stdout = None;
+    let mut current_command = Vec::new();
 
-    if commands.is_empty() {
-        return Input::NoOp;
+    let parts: Vec<&str> = rawline.split_whitespace().collect();
+    let mut iter = parts.into_iter().peekable();
+
+    while let Some(part) = iter.next() {
+        match part {
+            "|" => {
+                commands.push(current_command);
+                current_command = Vec::new();
+            }
+            "<" => {
+                stdin = iter.next().map(String::from);
+            }
+            ">" => {
+                stdout = iter.next().map(|s| (s.to_string(), false));
+            }
+            ">>" => {
+                stdout = iter.next().map(|s| (s.to_string(), true));
+            }
+            _ => {
+                current_command.push(part.to_string());
+            }
+        }
     }
 
-    if commands[0].is_empty() {
+    if !current_command.is_empty() {
+        commands.push(current_command);
+    }
+
+    if commands.is_empty() {
         return Input::NoOp;
     }
 
@@ -74,7 +117,7 @@ fn parse_input(rawline: &str) -> Input {
             }
         }
         "exit" => Input::Exit,
-        _ => Input::Exec(commands),
+        _ => Input::Exec(commands, stdin, stdout),
     }
 }
 
@@ -104,8 +147,8 @@ fn read_eval_print() -> io::Result<bool> {
             }
         }
         Input::Exit => return Ok(false),
-        Input::Exec(commands) => {
-            exec_piped_commands(commands)?;
+        Input::Exec(commands, stdin, stdout) => {
+            exec_piped_commands(commands, stdin, stdout)?;
         }
         Input::NoOp => {}
     }

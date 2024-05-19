@@ -1,0 +1,14 @@
+GCC: (Ubuntu 12.3.0-1ubuntu1~22.04) 12.3.0
+object.c
+object_function
+.symtab
+.strtab
+.shstrtab
+.rela.text
+.data
+.bss
+.rodata
+.comment
+.note.GNU-stack
+.note.gnu.property
+.rela.eh_frame

@@ -38,7 +38,7 @@ https://github.com/jgarzik/posixutils
 ## Checklist of utilities
 
  - [ ] admin (SCCS)
- - [ ] ar (Development)
+ - [x] ar (Development)
  - [x] asa
  - [ ] at (cron cat.)
  - [ ] awk
@@ -46,27 +46,27 @@ https://github.com/jgarzik/posixutils
  - [ ] batch (cron cat.)
  - [ ] bc
  - [ ] c99 (Development)
- - [ ] cal
+ - [x] cal
  - [x] cat
  - [ ] cflow (Development)
  - [x] chgrp
  - [x] chmod
  - [x] chown
  - [x] cksum
- - [ ] cmp
+ - [x] cmp
  - [x] comm
  - [ ] compress (compress cat.)
  - [x] cp
  - [ ] crontab (cron cat.)
- - [ ] csplit
+ - [x] csplit
  - [ ] ctags (Development)
- - [ ] cut
+ - [x] cut
  - [ ] cxref (Development)
- - [ ] date
+ - [x] date
  - [x] dd
  - [ ] delta (SCCS)
  - [x] df
- - [ ] diff
+ - [x] diff
  - [x] dirname
  - [x] du
  - [x] echo
@@ -76,7 +76,7 @@ https://github.com/jgarzik/posixutils
  - [x] expand
  - [x] expr
  - [x] false
- - [ ] file
+ - [x] file
  - [ ] find
  - [x] fold
  - [ ] fort77 (Development)
@@ -84,11 +84,10 @@ https://github.com/jgarzik/posixutils
  - [ ] gencat (i18n)
  - [ ] get (SCCS)
  - [ ] getconf
- - [ ] getopts
  - [ ] grep
  - [x] head
  - [ ] iconv (i18n)
- - [ ] id
+ - [x] id
  - [x] ipcrm (IPC)
  - [ ] ipcs (IPC)
  - [ ] join
@@ -101,19 +100,19 @@ https://github.com/jgarzik/posixutils
  - [x] logger
  - [x] logname
  - [ ] lp
- - [ ] ls
+ - [x] ls
  - [ ] m4
  - [ ] mailx
  - [ ] make
  - [ ] man
  - [x] mesg
- - [ ] mkdir
+ - [x] mkdir
  - [x] mkfifo
  - [ ] more
  - [x] mv
  - [ ] newgrp
  - [x] nice
- - [ ] nl
+ - [x] nl
  - [x] nm (Development)
  - [ ] nohup
  - [ ] od
@@ -121,7 +120,7 @@ https://github.com/jgarzik/posixutils
  - [ ] patch
  - [x] pathchk
  - [ ] pax
- - [ ] pr
+ - [x] pr
  - [x] printf
  - [ ] prs (SCCS)
  - [ ] ps
@@ -148,8 +147,8 @@ https://github.com/jgarzik/posixutils
  - [x] sleep
  - [ ] sort
  - [x] split
- - [ ] strings
- - [ ] strip (Development)
+ - [x] strings
+ - [x] strip (Development)
  - [x] stty
  - [x] tabs
  - [ ] tail
@@ -163,7 +162,6 @@ https://github.com/jgarzik/posixutils
  - [x] true
  - [x] tsort
  - [x] tty
- - [ ] ulimit
  - [x] uname
  - [x] uncompress (compress cat.)
  - [ ] unexpand
@@ -177,12 +175,29 @@ https://github.com/jgarzik/posixutils
  - [ ] uux (UUCP)
  - [ ] val (SCCS)
  - [ ] vi
- - [ ] wait
  - [x] wc
  - [ ] what (SCCS)
- - [ ] who
+ - [x] who
  - [ ] write
  - [x] xargs
  - [ ] yacc (Development)
- - [ ] zcat (compress cat.)
+ - [x] zcat (compress cat.)
 
+## Testing
+
+A few tests require additional setup such as a case-insensitive filesystem or the use of another command like [script](https://www.man7.org/linux/man-pages/man1/script.1.html). They are locked under the `posixutils_test_all` feature flag to exclude them from GitHub CI. These tests can be run by passing the feature flag to `cargo`:
+
+```sh
+cargo test --release --features posixutils_test_all
+```
+
+A further subset of `posixutils_test_all` tests are marked as `requires_root`. Running as root would override Unix permissions and thus give false failures on tests where such permissions are expected to be upheld so it is recommended to run these tests individually. There are currently two such tests:
+
+- test_cp_special_bits
+- test_mv_sticky_to_xpart
+
+```sh
+sudo -E cargo test --release --features posixutils_test_all,requires_root <test_name>
+```
+
+Integration tests may generate test data under `CARGO_TARGET_TMPDIR` (usually resolves to `target/tmp`) and `/dev/shm` (Linux only).

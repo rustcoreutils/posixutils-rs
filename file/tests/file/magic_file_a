@@ -1,0 +1,4 @@
+0  short     070707              cpio archive from magic_file_a
+0  string    \037\036            Packed data
+0  string    \377\037            Compacted data
+0  string    \037\235            Compressed data

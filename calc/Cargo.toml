@@ -1,12 +1,12 @@
 [package]
 name = "posixutils-calc"
-version = "0.1.3"
+version = "0.1.7"
 edition = "2021"
 
 [dependencies]
 plib = { path = "../plib" }
-gettext-rs = { version = "0.7", features = ["gettext-system"] }
-regex = "1.10"
+gettext-rs.workspace = true
+regex.workspace = true
 
 [[bin]]
 name = "expr"

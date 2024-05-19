@@ -15,8 +15,9 @@ use base64::prelude::*;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, textdomain};
 use plib::PROJECT_NAME;
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{self, Error, ErrorKind, Read, Write};
+use std::path::PathBuf;
 
 /// uudecode - decode a binary file
 #[derive(Parser, Debug)]
@@ -24,23 +25,23 @@ use std::io::{self, Error, ErrorKind, Read, Write};
 struct Args {
     /// A pathname of a file that shall be used instead of any pathname contained in the input data.
     #[arg(short, long)]
-    outfile: Option<String>,
+    outfile: Option<PathBuf>,
 
-    /// The pathname of a file containing the output of uuencode.
-    file: Option<String>,
+    /// The pathname of a file containing uuencoded data.
+    file: Option<PathBuf>,
 }
 
-fn write_file(filename: &str, bindata: &[u8]) -> io::Result<()> {
+fn write_file(pathname: &PathBuf, bindata: &[u8]) -> io::Result<()> {
     let f_res = OpenOptions::new()
         .read(false)
         .write(true)
         .create(true)
         .truncate(true)
-        .open(filename);
+        .open(pathname);
 
     match f_res {
         Err(e) => {
-            eprintln!("{}: {}", filename, e);
+            eprintln!("{}: {}", pathname.display(), e);
             return Err(e);
         }
         Ok(mut file) => file.write_all(bindata),
@@ -48,12 +49,7 @@ fn write_file(filename: &str, bindata: &[u8]) -> io::Result<()> {
 }
 
 fn decode_file(args: &Args) -> io::Result<()> {
-    let mut file: Box<dyn Read>;
-    if let Some(filename) = &args.file {
-        file = Box::new(fs::File::open(filename)?);
-    } else {
-        file = Box::new(io::stdin().lock());
-    }
+    let mut file = plib::io::input_stream_opt(&args.file)?;
 
     // read entire file into memory.
     // ugly but necessary due to uudecode crate implementation.
@@ -68,7 +64,7 @@ fn decode_file(args: &Args) -> io::Result<()> {
 
         // decode succeeded. exit here.
         Ok(bindata) => match &args.outfile {
-            None => return write_file("bindata.out", &bindata[..]),
+            None => return write_file(&PathBuf::from("bindata.out"), &bindata[..]),
             Some(outfn) => return write_file(outfn, &bindata[..]),
         },
     }
@@ -77,9 +73,16 @@ fn decode_file(args: &Args) -> io::Result<()> {
     match uuencode::uudecode(&buffer) {
         None => return Err(Error::new(ErrorKind::Other, "invalid input data")),
         Some((bindata, filename)) => match &args.outfile {
-            None => write_file(&filename, &bindata[..]),
+            None => write_file(&PathBuf::from(filename), &bindata[..]),
             Some(outfn) => write_file(outfn, &bindata[..]),
         },
+    }
+}
+
+fn pathname_display(path: &Option<PathBuf>) -> String {
+    match path {
+        None => "stdin".to_string(),
+        Some(p) => p.display().to_string(),
     }
 }
 
@@ -94,7 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Err(e) = decode_file(&args) {
         exit_code = 1;
-        eprintln!("{:?}: {}", args.file, e);
+        eprintln!("{:?}: {}", pathname_display(&args.file), e);
     }
 
     std::process::exit(exit_code)

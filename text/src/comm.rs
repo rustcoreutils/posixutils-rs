@@ -15,6 +15,7 @@ use gettextrs::{bind_textdomain_codeset, textdomain};
 use plib::PROJECT_NAME;
 use std::fs;
 use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
 
 const NO1: u32 = 1 << 0;
 const NO2: u32 = 1 << 1;
@@ -37,10 +38,10 @@ struct Args {
     no_dup: bool,
 
     /// Comparison file1
-    file1: String,
+    file1: PathBuf,
 
     /// Comparison file2
-    file2: String,
+    file2: PathBuf,
 }
 
 fn line_out(lead_dup: &'static str, outmask: u32, curtype: u32, s: &str) -> io::Result<()> {
@@ -75,15 +76,15 @@ fn line_out(lead_dup: &'static str, outmask: u32, curtype: u32, s: &str) -> io::
     Ok(())
 }
 
-fn open_file(filename: &str) -> io::Result<io::BufReader<fs::File>> {
-    Ok(io::BufReader::new(fs::File::open(filename)?))
+fn open_file(pathname: &PathBuf) -> io::Result<io::BufReader<fs::File>> {
+    Ok(io::BufReader::new(fs::File::open(pathname)?))
 }
 
 fn comm_file(
     mask: u32,
     lead_dup: &'static str,
-    file1name: &str,
-    file2name: &str,
+    file1name: &PathBuf,
+    file2name: &PathBuf,
 ) -> io::Result<()> {
     // open files, or stdin
     let mut rdr1 = open_file(file1name)?;

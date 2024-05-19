@@ -15,6 +15,8 @@ fn cksum_test(test_data: &str, expected_output: &str) {
         args: Vec::new(),
         stdin_data: String::from(test_data),
         expected_out: String::from(expected_output),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
     });
 }
 

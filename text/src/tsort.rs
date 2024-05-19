@@ -13,8 +13,8 @@ extern crate plib;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, textdomain};
 use plib::PROJECT_NAME;
-use std::fs;
-use std::io::{self, BufRead, Read};
+use std::io::{self, BufRead};
+use std::path::PathBuf;
 use topological_sort::TopologicalSort;
 
 /// tsort - topological sort
@@ -22,18 +22,13 @@ use topological_sort::TopologicalSort;
 #[command(author, version, about, long_about)]
 struct Args {
     /// File to read as input.
-    file: Option<String>,
+    file: Option<PathBuf>,
 }
 
-fn tsort_file(filename: &str) -> io::Result<()> {
-    let file: Box<dyn Read>;
-    if filename == "" {
-        file = Box::new(io::stdin().lock());
-    } else {
-        file = Box::new(fs::File::open(filename)?);
-    }
-
+fn tsort_file(pathname: &Option<PathBuf>) -> io::Result<()> {
+    let file = plib::io::input_stream_opt(pathname)?;
     let mut reader = io::BufReader::new(file);
+
     let mut ts = TopologicalSort::<String>::new();
     let mut sv: Vec<String> = Vec::new();
 
@@ -65,6 +60,13 @@ fn tsort_file(filename: &str) -> io::Result<()> {
     Ok(())
 }
 
+fn pathname_display(path: &Option<PathBuf>) -> String {
+    match path {
+        None => String::from("stdin"),
+        Some(p) => p.display().to_string(),
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // parse command line arguments
     let args = Args::parse();
@@ -74,14 +76,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut exit_code = 0;
 
-    let filename = match &args.file {
-        None => String::new(),
-        Some(name) => String::from(name),
-    };
-
-    if let Err(e) = tsort_file(&filename) {
+    if let Err(e) = tsort_file(&args.file) {
         exit_code = 1;
-        eprintln!("{}: {}", filename, e);
+        eprintln!("{}: {}", pathname_display(&args.file), e);
     }
 
     std::process::exit(exit_code)

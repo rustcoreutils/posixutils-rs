@@ -37,7 +37,7 @@ enum OutputType {
 #[command(author, version, about, long_about)]
 struct Args {
     /// Write the full pathname or library name of an object on each line.
-    #[arg(short = 'A', long)]
+    #[arg(short = 'A', long = "print-file-name")]
     print_name: bool,
 
     /// Write only external (global) and static symbol information.
@@ -49,7 +49,7 @@ struct Args {
     full: bool,
 
     /// Write only external (global) symbol information.
-    #[arg(short, long)]
+    #[arg(short, long = "extern-only")]
     global: bool,
 
     /// Write numeric values in octal (equivalent to -t o).
@@ -61,7 +61,7 @@ struct Args {
     hex: bool,
 
     /// Write information in a portable output format
-    #[arg(short = 'P', long)]
+    #[arg(short = 'P', long = "portability")]
     portable: bool,
 
     /// Write each numeric value in the specified format.
@@ -69,7 +69,7 @@ struct Args {
     out_type: OutputType,
 
     /// Write only undefined symbols.
-    #[arg(short, long)]
+    #[arg(short, long = "undefined-only")]
     undef: bool,
 
     /// Sort output by value instead of by symbol name.

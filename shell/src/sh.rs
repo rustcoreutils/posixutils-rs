@@ -12,46 +12,70 @@ extern crate plib;
 use gettextrs::{bind_textdomain_codeset, textdomain};
 use plib::PROJECT_NAME;
 use std::io::{self, Write};
-use std::process;
+use std::process::{self, Child};
 
 enum Input {
     ChangeDir(String),
-    Exec(String, Vec<String>),
+    Exec(Vec<Vec<String>>), // List of commands for piping
     Exit,
     NoOp,
 }
 
+fn exec_piped_commands(commands: Vec<Vec<String>>) -> io::Result<()> {
+    let mut previous_command: Option<Child> = None;
+
+    for (i, command) in commands.iter().enumerate() {
+        let (input, args) = command.split_first().expect("command is empty");
+        let mut cmd = process::Command::new(input);
+        cmd.args(args);
+
+        if let Some(previous) = previous_command {
+            cmd.stdin(process::Stdio::from(previous.stdout.unwrap()));
+        } else {
+            cmd.stdin(process::Stdio::inherit());
+        }
+
+        if i < commands.len() - 1 {
+            cmd.stdout(process::Stdio::piped());
+        } else {
+            cmd.stdout(process::Stdio::inherit());
+        }
+
+        previous_command = Some(cmd.spawn()?);
+    }
+
+    if let Some(mut final_command) = previous_command {
+        final_command.wait()?;
+    }
+
+    Ok(())
+}
+
 fn parse_input(rawline: &str) -> Input {
-    let mut args: Vec<String> = rawline.split_whitespace().map(|s| s.to_string()).collect();
-    if args.len() == 0 {
+    let commands: Vec<Vec<String>> = rawline
+        .split('|')
+        .map(|cmd| cmd.split_whitespace().map(|s| s.to_string()).collect())
+        .collect();
+
+    if commands.is_empty() {
         return Input::NoOp;
     }
-    let command = args.remove(0);
 
-    match command.as_str() {
+    if commands[0].is_empty() {
+        return Input::NoOp;
+    }
+
+    match commands[0][0].as_str() {
         "cd" => {
-            if args.len() == 0 {
+            if commands[0].len() == 1 {
                 Input::ChangeDir("".to_string())
             } else {
-                Input::ChangeDir(args[0].clone())
+                Input::ChangeDir(commands[0][1].clone())
             }
         }
         "exit" => Input::Exit,
-        _ => {
-            if args.len() == 0 {
-                Input::Exec(command, Vec::new())
-            } else {
-                Input::Exec(command, args)
-            }
-        }
+        _ => Input::Exec(commands),
     }
-}
-
-fn exec_command(input: String, args: Vec<String>) -> io::Result<()> {
-    let mut child = process::Command::new(input).args(args).spawn()?;
-
-    child.wait()?;
-    Ok(())
 }
 
 fn read_eval_print() -> io::Result<bool> {
@@ -72,7 +96,7 @@ fn read_eval_print() -> io::Result<bool> {
     // execute based on input
     match input {
         Input::ChangeDir(dir) => {
-            if dir == "" {
+            if dir.is_empty() {
                 let home = std::env::var("HOME").unwrap();
                 std::env::set_current_dir(home)?;
             } else {
@@ -80,8 +104,8 @@ fn read_eval_print() -> io::Result<bool> {
             }
         }
         Input::Exit => return Ok(false),
-        Input::Exec(input, args) => {
-            exec_command(input, args)?;
+        Input::Exec(commands) => {
+            exec_piped_commands(commands)?;
         }
         Input::NoOp => {}
     }

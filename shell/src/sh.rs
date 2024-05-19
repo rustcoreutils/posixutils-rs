@@ -13,112 +13,304 @@ use gettextrs::{bind_textdomain_codeset, textdomain};
 use plib::PROJECT_NAME;
 use std::fs::File;
 use std::io::{self, Write};
-use std::process::{self, Child};
+use std::process;
 
-enum Input {
-    ChangeDir(String),
-    Exec(Vec<Vec<String>>, Option<String>, Option<(String, bool)>), // Commands, stdin file, stdout file (and append flag)
-    Exit,
-    NoOp,
+#[derive(Debug, PartialEq)]
+enum Token {
+    Word(String),
+    Pipe,
+    RedirectIn,
+    RedirectOut,
+    RedirectAppend,
+    And,
+    Or,
+    EndOfLine,
 }
 
-fn exec_piped_commands(
-    commands: Vec<Vec<String>>,
-    stdin: Option<String>,
-    stdout: Option<(String, bool)>,
-) -> io::Result<()> {
-    let mut previous_command: Option<Child> = None;
+fn tokenize(input: &str) -> Vec<Token> {
+    let mut tokens = Vec::new();
+    let mut chars = input.chars().peekable();
 
-    for (i, command) in commands.iter().enumerate() {
-        let (input, args) = command.split_first().expect("command is empty");
-        let mut cmd = process::Command::new(input);
-        cmd.args(args);
-
-        if let Some(ref input_file) = stdin {
-            if i == 0 {
-                cmd.stdin(process::Stdio::from(File::open(input_file)?));
+    while let Some(&ch) = chars.peek() {
+        match ch {
+            ' ' => {
+                chars.next();
             }
-        } else if let Some(previous) = previous_command {
-            cmd.stdin(process::Stdio::from(previous.stdout.unwrap()));
-        } else {
-            cmd.stdin(process::Stdio::inherit());
-        }
-
-        if i < commands.len() - 1 {
-            cmd.stdout(process::Stdio::piped());
-        } else {
-            if let Some((ref output_file, append)) = stdout {
-                if append {
-                    cmd.stdout(process::Stdio::from(
-                        File::options().append(true).open(output_file)?,
-                    ));
+            '<' => {
+                chars.next();
+                tokens.push(Token::RedirectIn);
+            }
+            '>' => {
+                chars.next();
+                if chars.peek() == Some(&'>') {
+                    chars.next();
+                    tokens.push(Token::RedirectAppend);
                 } else {
-                    cmd.stdout(process::Stdio::from(File::create(output_file)?));
+                    tokens.push(Token::RedirectOut);
                 }
-            } else {
-                cmd.stdout(process::Stdio::inherit());
             }
-        }
-
-        previous_command = Some(cmd.spawn()?);
-    }
-
-    if let Some(mut final_command) = previous_command {
-        final_command.wait()?;
-    }
-
-    Ok(())
-}
-
-fn parse_input(rawline: &str) -> Input {
-    let mut commands = Vec::new();
-    let mut stdin = None;
-    let mut stdout = None;
-    let mut current_command = Vec::new();
-
-    let parts: Vec<&str> = rawline.split_whitespace().collect();
-    let mut iter = parts.into_iter().peekable();
-
-    while let Some(part) = iter.next() {
-        match part {
-            "|" => {
-                commands.push(current_command);
-                current_command = Vec::new();
+            '&' => {
+                chars.next();
+                if chars.peek() == Some(&'&') {
+                    chars.next();
+                    tokens.push(Token::And);
+                }
             }
-            "<" => {
-                stdin = iter.next().map(String::from);
-            }
-            ">" => {
-                stdout = iter.next().map(|s| (s.to_string(), false));
-            }
-            ">>" => {
-                stdout = iter.next().map(|s| (s.to_string(), true));
+            '|' => {
+                chars.next();
+                if chars.peek() == Some(&'|') {
+                    chars.next();
+                    tokens.push(Token::Or);
+                } else {
+                    tokens.push(Token::Pipe);
+                }
             }
             _ => {
-                current_command.push(part.to_string());
+                let mut word = String::new();
+                while let Some(&ch) = chars.peek() {
+                    if ch == ' ' || ch == '|' || ch == '&' || ch == '<' || ch == '>' {
+                        break;
+                    }
+                    word.push(ch);
+                    chars.next();
+                }
+                tokens.push(Token::Word(word));
             }
         }
     }
 
-    if !current_command.is_empty() {
-        commands.push(current_command);
+    tokens.push(Token::EndOfLine);
+    tokens
+}
+
+#[derive(Debug)]
+enum Command {
+    Simple(Vec<String>),
+    Piped(Vec<Command>),
+    And(Box<Command>, Box<Command>),
+    Or(Box<Command>, Box<Command>),
+    RedirectIn(Box<Command>, String),
+    RedirectOut(Box<Command>, String, bool), // bool for append
+}
+
+fn parse(tokens: &[Token]) -> (Command, &[Token]) {
+    parse_and(tokens)
+}
+
+fn parse_and(tokens: &[Token]) -> (Command, &[Token]) {
+    let (left, tokens) = parse_pipe(tokens);
+    if tokens.is_empty() {
+        return (left, tokens);
     }
 
-    if commands.is_empty() {
-        return Input::NoOp;
+    match tokens[0] {
+        Token::And => {
+            let (right, tokens) = parse_and(&tokens[1..]);
+            (Command::And(Box::new(left), Box::new(right)), tokens)
+        }
+        _ => (left, tokens),
+    }
+}
+
+fn parse_pipe(tokens: &[Token]) -> (Command, &[Token]) {
+    let (left, tokens) = parse_simple(tokens);
+    let mut commands = vec![left];
+    let mut remaining_tokens = tokens;
+
+    while !remaining_tokens.is_empty() && remaining_tokens[0] == Token::Pipe {
+        let (right, tokens) = parse_simple(&remaining_tokens[1..]);
+        commands.push(right);
+        remaining_tokens = tokens;
     }
 
-    match commands[0][0].as_str() {
-        "cd" => {
-            if commands[0].len() == 1 {
-                Input::ChangeDir("".to_string())
+    if commands.len() == 1 {
+        (commands.pop().unwrap(), remaining_tokens)
+    } else {
+        (Command::Piped(commands), remaining_tokens)
+    }
+}
+
+fn parse_simple(tokens: &[Token]) -> (Command, &[Token]) {
+    let mut commands = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        match &tokens[i] {
+            Token::Word(word) => {
+                commands.push(word.clone());
+                i += 1;
+            }
+            Token::RedirectIn => {
+                if let Token::Word(file) = &tokens[i + 1] {
+                    return (
+                        Command::RedirectIn(Box::new(Command::Simple(commands)), file.clone()),
+                        &tokens[i + 2..],
+                    );
+                }
+            }
+            Token::RedirectOut => {
+                if let Token::Word(file) = &tokens[i + 1] {
+                    return (
+                        Command::RedirectOut(
+                            Box::new(Command::Simple(commands)),
+                            file.clone(),
+                            false,
+                        ),
+                        &tokens[i + 2..],
+                    );
+                }
+            }
+            Token::RedirectAppend => {
+                if let Token::Word(file) = &tokens[i + 1] {
+                    return (
+                        Command::RedirectOut(
+                            Box::new(Command::Simple(commands)),
+                            file.clone(),
+                            true,
+                        ),
+                        &tokens[i + 2..],
+                    );
+                }
+            }
+            _ => break,
+        }
+    }
+
+    (Command::Simple(commands), &tokens[i..])
+}
+
+fn execute(command: Command) -> io::Result<()> {
+    match command {
+        Command::Simple(args) => {
+            let mut cmd = process::Command::new(&args[0]);
+            if args.len() > 1 {
+                cmd.args(&args[1..]);
+            }
+            let status = cmd.status()?;
+            if !status.success() {
+                return Err(io::Error::new(io::ErrorKind::Other, "command failed"));
+            }
+        }
+        Command::Piped(commands) => {
+            let mut previous_command: Option<process::Child> = None;
+            let mut iter = commands.iter().peekable();
+
+            while let Some(command) = iter.next() {
+                let mut cmd = match command {
+                    Command::Simple(args) => {
+                        let mut cmd = process::Command::new(&args[0]);
+                        if args.len() > 1 {
+                            cmd.args(&args[1..]);
+                        }
+                        cmd
+                    }
+                    Command::RedirectIn(sub_command, file) => {
+                        let mut cmd = match **sub_command {
+                            Command::Simple(ref args) => {
+                                let mut cmd = process::Command::new(&args[0]);
+                                if args.len() > 1 {
+                                    cmd.args(&args[1..]);
+                                }
+                                cmd
+                            }
+                            _ => unimplemented!(),
+                        };
+                        cmd.stdin(process::Stdio::from(File::open(file)?));
+                        cmd
+                    }
+                    Command::RedirectOut(sub_command, file, append) => {
+                        let mut cmd = match **sub_command {
+                            Command::Simple(ref args) => {
+                                let mut cmd = process::Command::new(&args[0]);
+                                if args.len() > 1 {
+                                    cmd.args(&args[1..]);
+                                }
+                                cmd
+                            }
+                            _ => unimplemented!(),
+                        };
+                        let file = if *append {
+                            File::options().create(true).append(true).open(file)?
+                        } else {
+                            File::create(file)?
+                        };
+                        cmd.stdout(process::Stdio::from(file));
+                        cmd
+                    }
+                    _ => unimplemented!(),
+                };
+
+                if let Some(previous) = previous_command {
+                    cmd.stdin(previous.stdout.unwrap());
+                } else {
+                    cmd.stdin(process::Stdio::inherit());
+                }
+
+                if iter.peek().is_some() {
+                    cmd.stdout(process::Stdio::piped());
+                } else {
+                    cmd.stdout(process::Stdio::inherit());
+                }
+
+                previous_command = Some(cmd.spawn()?);
+            }
+
+            if let Some(mut final_command) = previous_command {
+                final_command.wait()?;
+            }
+        }
+        Command::And(left, right) => {
+            if execute(*left).is_ok() {
+                execute(*right)?;
+            }
+        }
+        Command::Or(left, right) => {
+            if execute(*left).is_err() {
+                execute(*right)?;
+            }
+        }
+        Command::RedirectIn(command, file) => {
+            let mut cmd = match *command {
+                Command::Simple(ref args) => {
+                    let mut cmd = process::Command::new(&args[0]);
+                    if args.len() > 1 {
+                        cmd.args(&args[1..]);
+                    }
+                    cmd
+                }
+                _ => unimplemented!(),
+            };
+
+            cmd.stdin(process::Stdio::from(File::open(file)?));
+            let status = cmd.status()?;
+            if !status.success() {
+                return Err(io::Error::new(io::ErrorKind::Other, "command failed"));
+            }
+        }
+        Command::RedirectOut(command, file, append) => {
+            let mut cmd = match *command {
+                Command::Simple(ref args) => {
+                    let mut cmd = process::Command::new(&args[0]);
+                    if args.len() > 1 {
+                        cmd.args(&args[1..]);
+                    }
+                    cmd
+                }
+                _ => unimplemented!(),
+            };
+
+            let file = if append {
+                File::options().create(true).append(true).open(file)?
             } else {
-                Input::ChangeDir(commands[0][1].clone())
+                File::create(file)?
+            };
+            cmd.stdout(process::Stdio::from(file));
+            let status = cmd.status()?;
+            if !status.success() {
+                return Err(io::Error::new(io::ErrorKind::Other, "command failed"));
             }
         }
-        "exit" => Input::Exit,
-        _ => Input::Exec(commands, stdin, stdout),
     }
+    Ok(())
 }
 
 fn read_eval_print() -> io::Result<bool> {
@@ -133,25 +325,19 @@ fn read_eval_print() -> io::Result<bool> {
         return Ok(false);
     }
 
-    // parse the input
-    let input = parse_input(&rawline);
+    // tokenize the input
+    let tokens = tokenize(&rawline.trim());
 
-    // execute based on input
-    match input {
-        Input::ChangeDir(dir) => {
-            if dir.is_empty() {
-                let home = std::env::var("HOME").unwrap();
-                std::env::set_current_dir(home)?;
-            } else {
-                std::env::set_current_dir(dir)?;
-            }
-        }
-        Input::Exit => return Ok(false),
-        Input::Exec(commands, stdin, stdout) => {
-            exec_piped_commands(commands, stdin, stdout)?;
-        }
-        Input::NoOp => {}
+    // println!("Tokens: {:?}", tokens);
+
+    // parse the tokens into a command
+    let (command, _) = parse(&tokens);
+
+    // execute the command
+    if let Err(e) = execute(command) {
+        eprintln!("Error: {}", e);
     }
+
     Ok(true)
 }
 

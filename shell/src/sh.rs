@@ -94,45 +94,56 @@ enum Command {
 }
 
 fn parse(tokens: &[Token]) -> (Command, &[Token]) {
-    parse_and(tokens)
+    parse_expr(tokens)
 }
 
-fn parse_and(tokens: &[Token]) -> (Command, &[Token]) {
-    let (left, tokens) = parse_pipe(tokens);
-    if tokens.is_empty() {
-        return (left, tokens);
+fn parse_expr(tokens: &[Token]) -> (Command, &[Token]) {
+    let (mut left, mut tokens) = parse_pipe(tokens);
+
+    while !tokens.is_empty() {
+        match tokens[0] {
+            Token::And => {
+                let (right, new_tokens) = parse_pipe(&tokens[1..]);
+                left = Command::And(Box::new(left), Box::new(right));
+                tokens = new_tokens;
+            }
+            Token::Or => {
+                let (right, new_tokens) = parse_pipe(&tokens[1..]);
+                left = Command::Or(Box::new(left), Box::new(right));
+                tokens = new_tokens;
+            }
+            _ => break,
+        }
     }
 
-    match tokens[0] {
-        Token::And => {
-            let (right, tokens) = parse_and(&tokens[1..]);
-            (Command::And(Box::new(left), Box::new(right)), tokens)
-        }
-        _ => (left, tokens),
-    }
+    (left, tokens)
 }
 
 fn parse_pipe(tokens: &[Token]) -> (Command, &[Token]) {
-    let (left, tokens) = parse_simple(tokens);
+    let (left, mut tokens) = parse_simple(tokens);
     let mut commands = vec![left];
-    let mut remaining_tokens = tokens;
 
-    while !remaining_tokens.is_empty() && remaining_tokens[0] == Token::Pipe {
-        let (right, tokens) = parse_simple(&remaining_tokens[1..]);
-        commands.push(right);
-        remaining_tokens = tokens;
+    while !tokens.is_empty() {
+        if tokens[0] == Token::Pipe {
+            let (right, new_tokens) = parse_simple(&tokens[1..]);
+            commands.push(right);
+            tokens = new_tokens;
+        } else {
+            break;
+        }
     }
 
     if commands.len() == 1 {
-        (commands.pop().unwrap(), remaining_tokens)
+        (commands.pop().unwrap(), tokens)
     } else {
-        (Command::Piped(commands), remaining_tokens)
+        (Command::Piped(commands), tokens)
     }
 }
 
 fn parse_simple(tokens: &[Token]) -> (Command, &[Token]) {
     let mut commands = Vec::new();
     let mut i = 0;
+
     while i < tokens.len() {
         match &tokens[i] {
             Token::Word(word) => {
@@ -141,33 +152,36 @@ fn parse_simple(tokens: &[Token]) -> (Command, &[Token]) {
             }
             Token::RedirectIn => {
                 if let Token::Word(file) = &tokens[i + 1] {
+                    let (_, remaining_tokens) = parse_simple(&tokens[i + 2..]);
                     return (
                         Command::RedirectIn(Box::new(Command::Simple(commands)), file.clone()),
-                        &tokens[i + 2..],
+                        remaining_tokens,
                     );
                 }
             }
             Token::RedirectOut => {
                 if let Token::Word(file) = &tokens[i + 1] {
+                    let (_, remaining_tokens) = parse_simple(&tokens[i + 2..]);
                     return (
                         Command::RedirectOut(
                             Box::new(Command::Simple(commands)),
                             file.clone(),
                             false,
                         ),
-                        &tokens[i + 2..],
+                        remaining_tokens,
                     );
                 }
             }
             Token::RedirectAppend => {
                 if let Token::Word(file) = &tokens[i + 1] {
+                    let (_, remaining_tokens) = parse_simple(&tokens[i + 2..]);
                     return (
                         Command::RedirectOut(
                             Box::new(Command::Simple(commands)),
                             file.clone(),
                             true,
                         ),
-                        &tokens[i + 2..],
+                        remaining_tokens,
                     );
                 }
             }

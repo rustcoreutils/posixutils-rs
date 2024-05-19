@@ -10,15 +10,13 @@
 mod lzw;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, textdomain};
+use gettextrs::{bind_textdomain_codeset, gettext, textdomain};
 use lzw::UnixLZWWriter;
 use plib::PROJECT_NAME;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-
 const NAME_MAX: usize = 255;
-
 /// compress - compress data
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about)]
@@ -41,6 +39,13 @@ struct Args {
 
     /// Files to read as input.  Use "-" or no-args for stdin.
     files: Vec<PathBuf>,
+}
+
+fn prompt_user(prompt: &str) -> bool {
+    eprint!("compress: {} ", prompt);
+    let mut response = String::new();
+    io::stdin().read_line(&mut response).unwrap();
+    response.to_lowercase().starts_with('y')
 }
 
 fn compress_file(args: &Args, pathname: &PathBuf) -> io::Result<i32> {
@@ -72,13 +77,12 @@ fn compress_file(args: &Args, pathname: &PathBuf) -> io::Result<i32> {
             } else {
                 let path = Path::new(&fname);
                 if path.exists() && !args.force {
-                    print!("Do you want to overwrite {fname} (y)es or (n)o ?");
-                    io::stdout().flush().unwrap();
+                    let is_affirm = prompt_user(&gettext!(
+                        "Do you want to overwrite {} (y)es or (n)o?",
+                        fname
+                    ));
 
-                    let mut inp = String::new();
-                    io::stdin().read_line(&mut inp).unwrap();
-
-                    if !inp.starts_with('y') {
+                    if !is_affirm {
                         println!("{fname} not overwritten");
                         return Ok(1);
                     }

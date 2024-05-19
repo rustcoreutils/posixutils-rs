@@ -362,7 +362,15 @@ impl UnixLZWReader {
     }
 }
 
+/// Enum to store the current state of the writer
+#[derive(PartialEq)]
+enum WriterState {
+    Start,
+    Middle,
+}
+
 pub struct UnixLZWWriter {
+    /// The current state of the writer
     state: WriterState,
 
     /// Current number of bits per code
@@ -390,6 +398,7 @@ pub struct UnixLZWWriter {
 
     /// Flag for block compression
     block_compress: bool,
+
     /// Flag to clear the dictionary
     clear_flg: bool,
 
@@ -402,7 +411,9 @@ pub struct UnixLZWWriter {
     offset: u32,
 
     in_count: i32,
+
     bytes_out: i32,
+
     out_count: i32,
 
     /// Buffer for output bytes
@@ -413,20 +424,16 @@ pub struct UnixLZWWriter {
 
 struct WriteParams {
     fcode: i32,
+
     ent: i32,
+
     hsize_reg: i32,
+
     hshift: i32,
 }
 
-/// Enum to store the current state of the writer
-#[derive(PartialEq)]
-enum WriterState {
-    Start,
-    Middle,
-}
-
 impl UnixLZWWriter {
-    pub fn new(mbits: Option<u32>) -> UnixLZWWriter {
+    pub fn new(mbits: Option<u32>) -> Self {
         let maxbits = match mbits {
             Some(m) => m.clamp(9, 16),
             None => BITS,
@@ -434,7 +441,7 @@ impl UnixLZWWriter {
 
         let maxmaxcode = (1 << maxbits) as i32;
 
-        UnixLZWWriter {
+        Self {
             state: WriterState::Start,
             n_bits: INIT_BITS,
             maxbits,

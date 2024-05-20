@@ -1,7 +1,6 @@
 use gettextrs::{bind_textdomain_codeset, textdomain};
-use nix::libc;
-use nix::sys::signal::{self, SigHandler, Signal};
-use nix::unistd::isatty;
+use libc::signal;
+use libc::{dup, dup2, SIGHUP, SIG_IGN};
 use plib::PROJECT_NAME;
 use std::env;
 use std::fs::{File, OpenOptions};
@@ -12,13 +11,18 @@ use std::process::{self, Command};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
-    // Ignoring the SIGHUP signal
+
     unsafe {
-        signal::signal(Signal::SIGHUP, SigHandler::SigIgn).expect("Failed to ignore SIGHUP");
+        // Ignore the SIGHUP signal
+        signal(SIGHUP, SIG_IGN);
     }
 
     // Save the original stderr
-    let original_stderr = nix::unistd::dup(libc::STDERR_FILENO)?;
+    let original_stderr = unsafe { dup(libc::STDERR_FILENO) };
+    if original_stderr == -1 {
+        eprintln!("Failed to duplicate stderr");
+        process::exit(127);
+    }
 
     // Getting the command and arguments
     let mut args = env::args().skip(1);
@@ -31,13 +35,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Redirecting stdout and stderr to the nohup.out file if they are connected to a terminal
-    if isatty(libc::STDOUT_FILENO)? || isatty(libc::STDERR_FILENO)? {
+    if atty::is(atty::Stream::Stdout) || atty::is(atty::Stream::Stderr) {
         let nohup_out_file =
             get_nohup_out_file().expect("Failed to open nohup.out in current or home directory");
 
-        if isatty(libc::STDOUT_FILENO)? {
+        if atty::is(atty::Stream::Stdout) {
             let fd = nohup_out_file.0.as_raw_fd();
-            dup2(fd, libc::STDOUT_FILENO).expect("Failed to redirect stdout");
+
+            if unsafe { dup2(fd, libc::STDOUT_FILENO) } == -1 {
+                eprintln!("Failed to redirect stdout");
+                process::exit(127);
+            }
+
             match nohup_out_file.1 {
                 NohupDir::Current => {
                     eprintln!(
@@ -52,9 +61,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        if isatty(libc::STDERR_FILENO)? {
+        if atty::is(atty::Stream::Stderr) {
             let fd = nohup_out_file.0.as_raw_fd();
-            dup2(fd, libc::STDERR_FILENO).expect("Failed to redirect stderr");
+
+            if unsafe { dup2(fd, libc::STDERR_FILENO) } == -1 {
+                eprintln!("Failed to redirect stderr");
+                process::exit(127);
+            }
         }
     }
 
@@ -64,10 +77,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(error) => {
             use std::io::ErrorKind;
+
             // Restore the original stderr
-            dup2(original_stderr, libc::STDERR_FILENO).expect("Failed to restore stderr");
+
+            if unsafe { dup2(original_stderr, libc::STDERR_FILENO) } == -1 {
+                eprintln!("Failed to restore stderr");
+                process::exit(127);
+            }
+
             // Close the duplicated descriptor as it's no longer needed
-            nix::unistd::close(original_stderr)?;
+            unsafe { libc::close(original_stderr) };
+
             match error.kind() {
                 ErrorKind::NotFound => {
                     eprintln!("Error: command not found");
@@ -113,11 +133,4 @@ fn get_nohup_out_file() -> Result<(File, NohupDir), io::Error> {
             }
         }
     }
-}
-
-fn dup2(old_fd: i32, new_fd: i32) -> Result<(), nix::Error> {
-    if old_fd != new_fd {
-        nix::unistd::dup2(old_fd, new_fd)?;
-    }
-    Ok(())
 }

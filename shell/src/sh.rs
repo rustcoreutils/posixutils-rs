@@ -36,9 +36,9 @@ struct Args {
 #[derive(Debug, PartialEq)]
 enum Token {
     Word(String),
-    Pipe,
+    Operator(String),
     RedirectIn,
-    RedirectOut,
+    // RedirectOut,
     RedirectAppend,
     And,
     Or,
@@ -48,53 +48,84 @@ enum Token {
 fn tokenize(input: &str) -> Vec<Token> {
     let mut tokens = Vec::new();
     let mut chars = input.chars().peekable();
+    let mut current_token = String::new();
 
     while let Some(&ch) = chars.peek() {
         match ch {
             ' ' => {
                 chars.next();
-            }
-            '<' => {
-                chars.next();
-                tokens.push(Token::RedirectIn);
-            }
-            '>' => {
-                chars.next();
-                if chars.peek() == Some(&'>') {
-                    chars.next();
-                    tokens.push(Token::RedirectAppend);
-                } else {
-                    tokens.push(Token::RedirectOut);
+                if !current_token.is_empty() {
+                    tokens.push(Token::Word(current_token.clone()));
+                    current_token.clear();
                 }
             }
-            '&' => {
-                chars.next();
-                if chars.peek() == Some(&'&') {
-                    chars.next();
-                    tokens.push(Token::And);
+            '<' | '>' | '|' | '&' => {
+                if !current_token.is_empty() {
+                    tokens.push(Token::Word(current_token.clone()));
+                    current_token.clear();
+                }
+                let mut operator = String::new();
+                operator.push(chars.next().unwrap());
+                if let Some(&next_ch) = chars.peek() {
+                    if operator == "<" && next_ch == '<' {
+                        operator.push(chars.next().unwrap());
+                        tokens.push(Token::RedirectIn);
+                    } else if operator == ">" && next_ch == '>' {
+                        operator.push(chars.next().unwrap());
+                        tokens.push(Token::RedirectAppend);
+                    } else if operator == "|" && next_ch == '|' {
+                        operator.push(chars.next().unwrap());
+                        tokens.push(Token::Or);
+                    } else if operator == "&" && next_ch == '&' {
+                        operator.push(chars.next().unwrap());
+                        tokens.push(Token::And);
+                    } else {
+                        tokens.push(Token::Operator(operator.clone()));
+                    }
+                } else {
+                    tokens.push(Token::Operator(operator.clone()));
                 }
             }
-            '|' => {
-                chars.next();
-                if chars.peek() == Some(&'|') {
+            '#' => {
+                if !current_token.is_empty() {
+                    tokens.push(Token::Word(current_token.clone()));
+                    current_token.clear();
+                }
+                chars.next(); // Skip the '#'
+                while let Some(&next_ch) = chars.peek() {
+                    if next_ch == '\n' {
+                        break;
+                    }
                     chars.next();
-                    tokens.push(Token::Or);
-                } else {
-                    tokens.push(Token::Pipe);
+                }
+            }
+            '\'' | '"' => {
+                let quote = chars.next().unwrap();
+                current_token.push(quote);
+                while let Some(&next_ch) = chars.peek() {
+                    current_token.push(chars.next().unwrap());
+                    if next_ch == quote {
+                        break;
+                    }
+                }
+            }
+            '$' | '`' => {
+                current_token.push(chars.next().unwrap());
+                while let Some(&next_ch) = chars.peek() {
+                    current_token.push(chars.next().unwrap());
+                    if next_ch == '`' || next_ch == ')' {
+                        break;
+                    }
                 }
             }
             _ => {
-                let mut word = String::new();
-                while let Some(&ch) = chars.peek() {
-                    if ch == ' ' || ch == '|' || ch == '&' || ch == '<' || ch == '>' {
-                        break;
-                    }
-                    word.push(ch);
-                    chars.next();
-                }
-                tokens.push(Token::Word(word));
+                current_token.push(chars.next().unwrap());
             }
         }
+    }
+
+    if !current_token.is_empty() {
+        tokens.push(Token::Word(current_token));
     }
 
     tokens.push(Token::EndOfLine);
@@ -149,10 +180,14 @@ fn parse_pipe(tokens: &[Token]) -> (Command, &[Token]) {
     let mut commands = vec![left];
 
     while !tokens.is_empty() {
-        if tokens[0] == Token::Pipe {
-            let (right, new_tokens) = parse_simple(&tokens[1..]);
-            commands.push(right);
-            tokens = new_tokens;
+        if let Token::Operator(ref op) = tokens[0] {
+            if op == "|" {
+                let (right, new_tokens) = parse_simple(&tokens[1..]);
+                commands.push(right);
+                tokens = new_tokens;
+            } else {
+                break;
+            }
         } else {
             break;
         }
@@ -192,30 +227,8 @@ fn parse_simple(tokens: &[Token]) -> (Command, &[Token]) {
                     i += 1;
                 }
             }
-            Token::RedirectIn => {
-                if let Token::Word(file) = &tokens[i + 1] {
-                    let (_, remaining_tokens) = parse_simple(&tokens[i + 2..]);
-                    return (
-                        Command::RedirectIn(Box::new(Command::Simple(commands)), file.clone()),
-                        remaining_tokens,
-                    );
-                }
-            }
-            Token::RedirectOut => {
-                if let Token::Word(file) = &tokens[i + 1] {
-                    let (_, remaining_tokens) = parse_simple(&tokens[i + 2..]);
-                    return (
-                        Command::RedirectOut(
-                            Box::new(Command::Simple(commands)),
-                            file.clone(),
-                            false,
-                        ),
-                        remaining_tokens,
-                    );
-                }
-            }
             Token::RedirectAppend => {
-                if let Token::Word(file) = &tokens[i + 1] {
+                if let Some(Token::Word(file)) = tokens.get(i + 1) {
                     let (_, remaining_tokens) = parse_simple(&tokens[i + 2..]);
                     return (
                         Command::RedirectOut(
@@ -225,6 +238,55 @@ fn parse_simple(tokens: &[Token]) -> (Command, &[Token]) {
                         ),
                         remaining_tokens,
                     );
+                }
+            }
+            Token::Operator(op) => {
+                match op.as_str() {
+                    "<" => {
+                        if let Some(Token::Word(file)) = tokens.get(i + 1) {
+                            let (_, remaining_tokens) = parse_simple(&tokens[i + 2..]);
+                            return (
+                                Command::RedirectIn(
+                                    Box::new(Command::Simple(commands)),
+                                    file.clone(),
+                                ),
+                                remaining_tokens,
+                            );
+                        }
+                    }
+                    ">" => {
+                        if let Some(Token::Word(file)) = tokens.get(i + 1) {
+                            let (_, remaining_tokens) = parse_simple(&tokens[i + 2..]);
+                            return (
+                                Command::RedirectOut(
+                                    Box::new(Command::Simple(commands)),
+                                    file.clone(),
+                                    false,
+                                ),
+                                remaining_tokens,
+                            );
+                        }
+                    }
+                    ">>" => {
+                        if let Some(Token::Word(file)) = tokens.get(i + 1) {
+                            let (_, remaining_tokens) = parse_simple(&tokens[i + 2..]);
+                            return (
+                                Command::RedirectOut(
+                                    Box::new(Command::Simple(commands)),
+                                    file.clone(),
+                                    true,
+                                ),
+                                remaining_tokens,
+                            );
+                        }
+                    }
+                    "|" => {
+                        return (Command::Simple(commands), &tokens[i..]);
+                    }
+                    _ => {
+                        // Unsupported operator, handle appropriately
+                        i += 1;
+                    }
                 }
             }
             _ => break,

@@ -55,7 +55,7 @@ https://github.com/jgarzik/posixutils
  - [x] cksum
  - [x] cmp
  - [x] comm
- - [ ] compress (compress cat.)
+ - [x] compress (compress cat.)
  - [x] cp
  - [ ] crontab (cron cat.)
  - [x] csplit
@@ -114,7 +114,7 @@ https://github.com/jgarzik/posixutils
  - [x] nice
  - [x] nl
  - [x] nm (Development)
- - [ ] nohup
+ - [x] nohup
  - [ ] od
  - [x] paste
  - [ ] patch
@@ -145,7 +145,7 @@ https://github.com/jgarzik/posixutils
  - [ ] sed
  - [ ] sh
  - [x] sleep
- - [ ] sort
+ - [x] sort
  - [x] split
  - [x] strings
  - [x] strip (Development)

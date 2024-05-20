@@ -14,6 +14,9 @@ topological-sort = "0.2"
 diff = "0.1"
 regex.workspace = true
 chrono = "0.4"
+dirs = "5.0.1"
+atty = "0.2.14"
+libc = "0.2.155"
 
 [[bin]]
 name = "asa"
@@ -34,6 +37,10 @@ path = "src/diff.rs"
 [[bin]]
 name = "cut"
 path = "src/cut.rs"
+
+[[bin]]
+name = "nohup"
+path = "src/nohup.rs"
 
 [[bin]]
 name = "sort"

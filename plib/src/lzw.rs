@@ -13,7 +13,8 @@
 use std::io::{self, Error, ErrorKind, Read};
 
 const INIT_BITS: u32 = 9;
-const HSIZE: usize = 69001;
+const HSIZE: usize = 69_001;
+const CHECK_GAP: usize = 10_000;
 const BITS: u32 = 16;
 const MAGIC_HEADER: [u8; 2] = [0x1F, 0x9D];
 const HDR_BIT_MASK: u8 = 0x1f;
@@ -21,6 +22,7 @@ const HDR_BLOCK_MASK: u8 = 0x80;
 const FIRST: i32 = 257;
 const CLEAR: i32 = 256;
 
+const LMASK: [i32; 9] = [0xff, 0xfe, 0xfc, 0xf8, 0xf0, 0xe0, 0xc0, 0x80, 0x00];
 const RMASK: [i32; 9] = [0x00, 0x01, 0x03, 0x07, 0x0f, 0x1f, 0x3f, 0x7f, 0xff];
 
 /// A wrapper around the Read trait object used
@@ -122,23 +124,41 @@ impl UnixLZWReader {
     pub fn new(rdr: Box<dyn Read>) -> UnixLZWReader {
         UnixLZWReader {
             rdr: CompReader::new(rdr),
+
             have_hdr: false,
+
             eof: false,
+
             maxbits: 0,
+
             n_bits: 0,
+
             block_compress: false,
+
             clear: false,
+
             code: 0,
+
             oldcode: 0,
+
             incode: 0,
+
             maxcode: 0,
+
             maxmaxcode: 0,
+
             free_ent: 0,
+
             finchar: 0,
+
             roffset: 0,
+
             size: 0,
+
             gbuf: [0; BITS as usize],
+
             tab_suffix: [0; HSIZE],
+
             tab_prefix: [0; HSIZE],
         }
     }
@@ -334,6 +354,307 @@ impl UnixLZWReader {
             self.oldcode = self.incode;
         }
 
+        Ok(outbytes)
+    }
+}
+
+/// Enum to store the current state of the writer
+#[derive(PartialEq)]
+enum WriterState {
+    Start,
+    Middle,
+}
+
+pub struct UnixLZWWriter {
+    /// The current state of the writer
+    state: WriterState,
+
+    /// Current number of bits per code
+    n_bits: u32,
+
+    /// Maximum bits allowed for codes
+    maxbits: u32,
+
+    /// Maximum code for current number of bits
+    maxcode: i32,
+
+    // Maximum code for maximum bits
+    maxmaxcode: i32,
+
+    /// Hash table for codes
+    htab: Vec<i32>,
+
+    /// Size of the hash table
+    hsize: i32,
+    /// Code table
+    codetab: Vec<u16>,
+
+    /// Next free entry in the table
+    free_ent: i32,
+
+    /// Flag for block compression
+    block_compress: bool,
+
+    /// Flag to clear the dictionary
+    clear_flg: bool,
+
+    ratio: i32,
+
+    /// Next checkpoint for compression ratio
+    checkpoint: i32,
+
+    /// Offset for current byte
+    offset: u32,
+
+    in_count: i32,
+
+    bytes_out: i32,
+
+    out_count: i32,
+
+    /// Buffer for output bytes
+    buf: [u8; BITS as usize],
+
+    write_params: WriteParams,
+}
+
+struct WriteParams {
+    fcode: i32,
+
+    ent: i32,
+
+    hsize_reg: i32,
+
+    hshift: i32,
+}
+
+impl UnixLZWWriter {
+    pub fn new(mbits: Option<u32>) -> Self {
+        let maxbits = match mbits {
+            Some(m) => m.clamp(9, 16),
+            None => BITS,
+        };
+
+        let maxmaxcode = (1 << maxbits) as i32;
+
+        Self {
+            state: WriterState::Start,
+            n_bits: INIT_BITS,
+            maxbits,
+            maxcode: max_code(INIT_BITS) as i32,
+            maxmaxcode,
+            htab: vec![-1; HSIZE],
+            codetab: vec![0; HSIZE],
+            hsize: HSIZE as i32,
+            free_ent: 0,
+            block_compress: true,
+            clear_flg: false,
+            ratio: 0,
+            checkpoint: CHECK_GAP as i32,
+            offset: 0,
+            in_count: 0,
+            bytes_out: 0,
+            out_count: 0,
+            buf: [0; BITS as usize],
+            write_params: WriteParams {
+                fcode: 0,
+                ent: 0,
+                hsize_reg: 0,
+                hshift: 0,
+            },
+        }
+    }
+
+    fn clear_block(&mut self) -> io::Result<()> {
+        self.checkpoint = self.in_count + CHECK_GAP as i32;
+
+        let rat = if self.in_count > 0x007fffff {
+            match self.bytes_out >> 8 {
+                0 => 0x7fffffff,
+                _ => self.in_count / (self.bytes_out >> 8),
+            }
+        } else {
+            (self.in_count << 8) / self.bytes_out
+        };
+
+        if rat > self.ratio {
+            self.ratio = rat;
+        } else {
+            self.ratio = 0;
+            self.clear_hash();
+            self.free_ent = FIRST;
+            self.clear_flg = true;
+            self.output(CLEAR)?;
+        }
+        Ok(())
+    }
+
+    fn clear_hash(&mut self) {
+        self.htab.fill(-1)
+    }
+
+    fn output(&mut self, mut ocode: i32) -> io::Result<Vec<u8>> {
+        let mut r_off = self.offset;
+        let mut bits = self.n_bits;
+        let mut bp: usize = 0;
+        let mut outbytes: Vec<u8> = Vec::new();
+
+        if ocode >= 0 {
+            bp += (r_off >> 3) as usize;
+            r_off &= 7;
+
+            self.buf[bp] = ((self.buf[bp] as i32 & RMASK[r_off as usize] as i32) as u8)
+                | ((ocode << r_off) & LMASK[r_off as usize] as i32) as u8;
+            bp += 1;
+            bits -= 8 - r_off;
+            ocode >>= 8 - r_off;
+
+            if bits >= 8 {
+                self.buf[bp] = ocode as u8;
+                bp += 1;
+                ocode >>= 8;
+                bits -= 8;
+            }
+
+            if bits > 0 {
+                self.buf[bp] = ocode as u8;
+            }
+
+            self.offset += self.n_bits;
+
+            if self.offset == (self.n_bits << 3) {
+                bits = self.n_bits;
+                self.bytes_out += bits as i32;
+                let temp_buf = &self.buf[..bits as usize];
+                outbytes.extend(temp_buf);
+                self.offset = 0;
+            }
+
+            if self.free_ent > self.maxcode || self.clear_flg {
+                if self.offset > 0 {
+                    let temp_buf = &self.buf[..self.n_bits as usize];
+                    outbytes.extend(temp_buf);
+                    self.bytes_out += self.n_bits as i32;
+                }
+                self.offset = 0;
+
+                if self.clear_flg {
+                    self.maxcode = max_code(INIT_BITS) as i32;
+                    self.clear_flg = false;
+                } else {
+                    self.n_bits += 1;
+                    self.maxcode = if self.n_bits == self.maxbits {
+                        self.maxmaxcode
+                    } else {
+                        max_code(self.n_bits) as i32
+                    };
+                }
+            }
+        } else {
+            if self.offset > 0 {
+                self.offset = (self.offset + 7) / 8;
+                let temp_buf = &self.buf[..self.offset as usize];
+                outbytes.extend(temp_buf);
+                self.bytes_out += self.offset as i32;
+            }
+            self.offset = 0;
+        }
+
+        Ok(outbytes)
+    }
+
+    pub fn write(&mut self, buffer: &[u8]) -> io::Result<Vec<u8>> {
+        let mut outbytes: Vec<u8> = Vec::new();
+
+        if self.state == WriterState::Start {
+            self.state = WriterState::Middle;
+            self.maxmaxcode = 1 << self.maxbits;
+            outbytes.extend(&[0x1F, 0x9D]);
+            let tmp = (self.maxbits as u8)
+                | if self.block_compress {
+                    HDR_BLOCK_MASK
+                } else {
+                    0
+                };
+            outbytes.push(tmp);
+
+            self.bytes_out = 3;
+            self.clear_flg = false;
+            self.in_count = 1;
+            self.free_ent = if self.block_compress { FIRST } else { 256 };
+
+            let mut fcode = self.hsize;
+            let mut hshift = 0;
+            while fcode < 65536 {
+                hshift += 1;
+                fcode *= 2;
+            }
+            self.write_params = WriteParams {
+                fcode,
+                ent: buffer[0] as i32,
+                hsize_reg: self.hsize,
+                hshift: 8 - hshift,
+            };
+
+            self.clear_hash();
+        }
+
+        for &item in &buffer[1..] {
+            let c = item as i32;
+            self.in_count += 1;
+
+            self.write_params.fcode = ((c) << self.maxbits) + (self.write_params.ent);
+            let mut i = (c << self.write_params.hshift) ^ self.write_params.ent;
+
+            let mut skip_flag = false;
+            if self.htab[i as usize] as i32 == self.write_params.fcode {
+                self.write_params.ent = self.codetab[i as usize] as i32;
+                continue;
+            } else if self.htab[i as usize] as i32 >= 0 {
+                let mut disp = self.write_params.hsize_reg - i;
+                if i == 0 {
+                    disp = 1;
+                }
+                loop {
+                    i -= disp;
+                    if i < 0 {
+                        i += self.write_params.hsize_reg;
+                    }
+                    if self.htab[i as usize] as i32 == self.write_params.fcode {
+                        self.write_params.ent = self.codetab[i as usize] as i32;
+                        skip_flag = true;
+                        break;
+                    }
+                    if self.htab[i as usize] < 0 {
+                        break;
+                    }
+                }
+            }
+            if skip_flag {
+                continue;
+            }
+
+            outbytes.extend(self.output(self.write_params.ent)?);
+            self.out_count += 1;
+            self.write_params.ent = c;
+
+            if self.free_ent < self.maxmaxcode {
+                self.codetab[i as usize] = self.free_ent as u16;
+                self.free_ent += 1;
+                self.htab[i as usize] = self.write_params.fcode as i32;
+            } else if self.in_count >= self.checkpoint && self.block_compress {
+                self.clear_block()?;
+            }
+        }
+        Ok(outbytes)
+    }
+
+    /// Return the remaining bytes which could not be written from close()
+    pub fn close(&mut self) -> io::Result<Vec<u8>> {
+        let mut outbytes: Vec<u8> = Vec::new();
+        outbytes.extend(self.output(self.write_params.ent)?);
+        self.out_count += 1;
+        outbytes.extend(self.output(-1)?);
         Ok(outbytes)
     }
 }

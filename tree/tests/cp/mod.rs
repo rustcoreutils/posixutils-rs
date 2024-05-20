@@ -302,10 +302,8 @@ fn test_cp_existing_perm_dir() {
 
     fs::create_dir(test_dir).unwrap();
 
-    unsafe {
-        // Always succeeds
-        libc::umask(0o002);
-    }
+    let umask_setter = super::UMASK_SETTER.lock().unwrap();
+    let original_umask = umask_setter.umask(0o002);
 
     fs::DirBuilder::new()
         .mode(0o775)
@@ -323,6 +321,7 @@ fn test_cp_existing_perm_dir() {
     let mode = fs::metadata(dst_dir).unwrap().mode();
     assert_eq!(mode & 0o777, 0o700); // Should be drwx-----
 
+    umask_setter.umask(original_umask);
     fs::remove_dir_all(test_dir).unwrap();
 }
 
@@ -481,10 +480,11 @@ fn test_cp_perm() {
         vec!["-p", "-f", src, dest],
     ];
 
+    let umask_setter = super::UMASK_SETTER.lock().unwrap();
+    let original_umask = umask_setter.umask(0o31);
+
     for mask in [0o31, 0o37, 0o2] {
-        unsafe {
-            libc::umask(mask);
-        }
+        umask_setter.umask(mask);
         for args in &args_combination {
             for existing_dest in [true, false] {
                 for g_perm in 1..=7 {
@@ -537,6 +537,7 @@ fn test_cp_perm() {
         }
     }
 
+    umask_setter.umask(original_umask);
     fs::remove_dir_all(test_dir).unwrap();
 }
 

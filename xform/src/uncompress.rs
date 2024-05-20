@@ -14,11 +14,9 @@
 extern crate clap;
 extern crate plib;
 
-mod lzw;
-
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, textdomain};
-use lzw::UnixLZWReader;
+use plib::lzw::UnixLZWReader;
 use plib::PROJECT_NAME;
 use std::io::{self, Write};
 use std::path::PathBuf;

@@ -67,10 +67,6 @@ fn max_code(n_bits: u32) -> u32 {
     (1 << (n_bits)) - 1
 }
 
-fn maxmax_code(max_bits: u32) -> i32 {
-    (1 << max_bits) as i32
-}
-
 pub struct UnixLZWReader {
     /// the reader of the compressed file or the file to be compressed
     rdr: CompReader,

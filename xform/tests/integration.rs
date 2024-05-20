@@ -118,7 +118,7 @@ fn test_compression_compress_file() {
     fs::copy(&source_file, &file).unwrap();
 
     let mut buf = String::new();
-    let file_contents = File::open(&file).unwrap().read_to_string(&mut buf);
+    let _file_contents = File::open(&file).unwrap().read_to_string(&mut buf);
 
     let compressed_file_path = cargo_manifest_dir.join("tests/compress/compression.txt.Z");
 

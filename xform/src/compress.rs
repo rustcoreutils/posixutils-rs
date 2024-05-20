@@ -7,16 +7,16 @@
 // SPDX-License-Identifier: MIT
 //
 
-mod lzw;
-
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, textdomain};
-use lzw::UnixLZWWriter;
+use plib::lzw::UnixLZWWriter;
 use plib::PROJECT_NAME;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+
 const NAME_MAX: usize = 255;
+
 /// compress - compress data
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about)]

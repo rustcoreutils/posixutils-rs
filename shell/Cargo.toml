@@ -15,6 +15,7 @@ libc = "0.2"
 [dev-dependencies]
 assert_cmd = "2.0"
 predicates = "2.0"
+tempfile = "3.3"
 
 [[bin]]
 name = "sh"

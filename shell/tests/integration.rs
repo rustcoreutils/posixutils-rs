@@ -69,3 +69,23 @@ fn sh_combined_operators() {
         .success()
         .stdout(predicates::str::contains("Hello").and(predicates::str::contains("world")));
 }
+
+#[test]
+fn sh_cd_command() {
+    // Create a temporary directory
+    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let temp_path = temp_dir.path().to_str().expect("Failed to get temp path");
+
+    // Change directory to the temporary directory and check the current directory
+    run_sh(&format!("cd {} && pwd", temp_path))
+        .success()
+        .stdout(predicates::str::contains(temp_path));
+
+    // Cleanup is automatic when temp_dir goes out of scope
+}
+
+#[test]
+fn sh_exit_command() {
+    // The `exit` command should terminate the shell without an error
+    run_sh("exit").success();
+}

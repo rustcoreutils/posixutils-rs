@@ -1528,4 +1528,26 @@ mod sort_tests {
     fn test_use_nl() {
         sort_test(&["-"], "\n\t\n", "\n\t\n", 0, "");
     }
+
+    #[test]
+    fn test_files_sort_1() {
+        sort_test(
+            &["tests/assets/empty_line.txt", "tests/assets/in_uniq"],
+            "",
+            "\n\n\n\nXX\nXX\nXX\nYY\nYY\nYY\na\na\nb\nb\nc\nd\nd\nd\nline 1\nline 3\n",
+            0,
+            "",
+        );
+    }
+
+    #[test]
+    fn test_files_sort_2() {
+        sort_test(
+            &["-n", "tests/assets/in_seq", "tests/assets/test_file.txt"],
+            "",
+            "1\n1sdfghnm\n2\n2sadsgdhjmf\n3\n3zcxbncvm vbm\n4\n4asdbncv\n5\n5adsbfdgfnfm\n6\n6sdfcvncbmcg\n7zsdgdgfndcgmncg\n8asdbsfdndcgmn\n9sfbdxgfndcgmncgmn\n10dvsd\n11\n12\n13\n14\n15\n16\n17\n",
+            0,
+            "",
+        );
+    }
 }

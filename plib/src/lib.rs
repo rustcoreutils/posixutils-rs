@@ -12,6 +12,7 @@ pub mod io;
 pub mod modestr;
 pub mod testing;
 pub mod utmpx;
+pub mod lzw;
 
 pub const PROJECT_NAME: &'static str = "posixutils-rs";
 

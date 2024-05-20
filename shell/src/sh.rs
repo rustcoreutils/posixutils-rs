@@ -413,7 +413,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.stdin = true;
     }
 
-    read_eval_print_loop()?;
+    if args.cmd {
+        let command = args.command_and_args.join(" ");
+        let tokens = tokenize(&command);
+        let (command, _) = parse(&tokens);
+        execute(command)?;
+        Ok(())
+    } else {
+        read_eval_print_loop()?;
 
-    Ok(())
+        Ok(())
+    }
 }

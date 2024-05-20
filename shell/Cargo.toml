@@ -12,6 +12,10 @@ clap = { version = "4", features = ["derive"] }
 gettext-rs = { version = "0.7", features = ["gettext-system"] }
 libc = "0.2"
 
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "2.0"
+
 [[bin]]
 name = "sh"
 path = "src/sh.rs"

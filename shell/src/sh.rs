@@ -192,139 +192,156 @@ fn parse_simple(tokens: &[Token]) -> (Command, &[Token]) {
     (Command::Simple(commands), &tokens[i..])
 }
 
-fn execute(command: Command) -> io::Result<()> {
-    match command {
-        Command::Simple(args) => {
-            let mut cmd = process::Command::new(&args[0]);
-            if args.len() > 1 {
-                cmd.args(&args[1..]);
-            }
-            let status = cmd.status()?;
-            if !status.success() {
-                return Err(io::Error::new(io::ErrorKind::Other, "command failed"));
-            }
-        }
-        Command::Piped(commands) => {
-            let mut previous_command: Option<process::Child> = None;
-            let mut iter = commands.iter().peekable();
+fn execute_simple(args: Vec<String>) -> io::Result<()> {
+    let mut cmd = process::Command::new(&args[0]);
+    if args.len() > 1 {
+        cmd.args(&args[1..]);
+    }
+    let status = cmd.status()?;
+    if !status.success() {
+        return Err(io::Error::new(io::ErrorKind::Other, "command failed"));
+    }
+    Ok(())
+}
 
-            while let Some(command) = iter.next() {
-                let mut cmd = match command {
-                    Command::Simple(args) => {
+fn execute_piped(commands: Vec<Command>) -> io::Result<()> {
+    let mut previous_command: Option<process::Child> = None;
+    let mut iter = commands.iter().peekable();
+
+    while let Some(command) = iter.next() {
+        let mut cmd = match command {
+            Command::Simple(args) => {
+                let mut cmd = process::Command::new(&args[0]);
+                if args.len() > 1 {
+                    cmd.args(&args[1..]);
+                }
+                cmd
+            }
+            Command::RedirectIn(sub_command, file) => {
+                let mut cmd = match **sub_command {
+                    Command::Simple(ref args) => {
                         let mut cmd = process::Command::new(&args[0]);
                         if args.len() > 1 {
                             cmd.args(&args[1..]);
                         }
                         cmd
                     }
-                    Command::RedirectIn(sub_command, file) => {
-                        let mut cmd = match **sub_command {
-                            Command::Simple(ref args) => {
-                                let mut cmd = process::Command::new(&args[0]);
-                                if args.len() > 1 {
-                                    cmd.args(&args[1..]);
-                                }
-                                cmd
-                            }
-                            _ => unimplemented!(),
-                        };
-                        cmd.stdin(process::Stdio::from(File::open(file)?));
-                        cmd
-                    }
-                    Command::RedirectOut(sub_command, file, append) => {
-                        let mut cmd = match **sub_command {
-                            Command::Simple(ref args) => {
-                                let mut cmd = process::Command::new(&args[0]);
-                                if args.len() > 1 {
-                                    cmd.args(&args[1..]);
-                                }
-                                cmd
-                            }
-                            _ => unimplemented!(),
-                        };
-                        let file = if *append {
-                            File::options().create(true).append(true).open(file)?
-                        } else {
-                            File::create(file)?
-                        };
-                        cmd.stdout(process::Stdio::from(file));
+                    _ => unimplemented!(),
+                };
+                cmd.stdin(process::Stdio::from(File::open(file)?));
+                cmd
+            }
+            Command::RedirectOut(sub_command, file, append) => {
+                let mut cmd = match **sub_command {
+                    Command::Simple(ref args) => {
+                        let mut cmd = process::Command::new(&args[0]);
+                        if args.len() > 1 {
+                            cmd.args(&args[1..]);
+                        }
                         cmd
                     }
                     _ => unimplemented!(),
                 };
-
-                if let Some(previous) = previous_command {
-                    cmd.stdin(previous.stdout.unwrap());
+                let file = if *append {
+                    File::options().create(true).append(true).open(file)?
                 } else {
-                    cmd.stdin(process::Stdio::inherit());
-                }
+                    File::create(file)?
+                };
+                cmd.stdout(process::Stdio::from(file));
+                cmd
+            }
+            _ => unimplemented!(),
+        };
 
-                if iter.peek().is_some() {
-                    cmd.stdout(process::Stdio::piped());
-                } else {
-                    cmd.stdout(process::Stdio::inherit());
-                }
+        if let Some(previous) = previous_command {
+            cmd.stdin(previous.stdout.unwrap());
+        } else {
+            cmd.stdin(process::Stdio::inherit());
+        }
 
-                previous_command = Some(cmd.spawn()?);
-            }
+        if iter.peek().is_some() {
+            cmd.stdout(process::Stdio::piped());
+        } else {
+            cmd.stdout(process::Stdio::inherit());
+        }
 
-            if let Some(mut final_command) = previous_command {
-                final_command.wait()?;
-            }
-        }
-        Command::And(left, right) => {
-            if execute(*left).is_ok() {
-                execute(*right)?;
-            }
-        }
-        Command::Or(left, right) => {
-            if execute(*left).is_err() {
-                execute(*right)?;
-            }
-        }
-        Command::RedirectIn(command, file) => {
-            let mut cmd = match *command {
-                Command::Simple(ref args) => {
-                    let mut cmd = process::Command::new(&args[0]);
-                    if args.len() > 1 {
-                        cmd.args(&args[1..]);
-                    }
-                    cmd
-                }
-                _ => unimplemented!(),
-            };
+        previous_command = Some(cmd.spawn()?);
+    }
 
-            cmd.stdin(process::Stdio::from(File::open(file)?));
-            let status = cmd.status()?;
-            if !status.success() {
-                return Err(io::Error::new(io::ErrorKind::Other, "command failed"));
-            }
-        }
-        Command::RedirectOut(command, file, append) => {
-            let mut cmd = match *command {
-                Command::Simple(ref args) => {
-                    let mut cmd = process::Command::new(&args[0]);
-                    if args.len() > 1 {
-                        cmd.args(&args[1..]);
-                    }
-                    cmd
-                }
-                _ => unimplemented!(),
-            };
-
-            let file = if append {
-                File::options().create(true).append(true).open(file)?
-            } else {
-                File::create(file)?
-            };
-            cmd.stdout(process::Stdio::from(file));
-            let status = cmd.status()?;
-            if !status.success() {
-                return Err(io::Error::new(io::ErrorKind::Other, "command failed"));
-            }
-        }
+    if let Some(mut final_command) = previous_command {
+        final_command.wait()?;
     }
     Ok(())
+}
+
+fn execute_and(left: Box<Command>, right: Box<Command>) -> io::Result<()> {
+    if execute(*left).is_ok() {
+        execute(*right)?;
+    }
+    Ok(())
+}
+
+fn execute_or(left: Box<Command>, right: Box<Command>) -> io::Result<()> {
+    if execute(*left).is_err() {
+        execute(*right)?;
+    }
+    Ok(())
+}
+
+fn execute_redirect_in(command: Box<Command>, file: String) -> io::Result<()> {
+    let mut cmd = match *command {
+        Command::Simple(ref args) => {
+            let mut cmd = process::Command::new(&args[0]);
+            if args.len() > 1 {
+                cmd.args(&args[1..]);
+            }
+            cmd
+        }
+        _ => unimplemented!(),
+    };
+
+    cmd.stdin(process::Stdio::from(File::open(file)?));
+    let status = cmd.status()?;
+    if !status.success() {
+        return Err(io::Error::new(io::ErrorKind::Other, "command failed"));
+    }
+    Ok(())
+}
+
+fn execute_redirect_out(command: Box<Command>, file: String, append: bool) -> io::Result<()> {
+    let mut cmd = match *command {
+        Command::Simple(ref args) => {
+            let mut cmd = process::Command::new(&args[0]);
+            if args.len() > 1 {
+                cmd.args(&args[1..]);
+            }
+            cmd
+        }
+        _ => unimplemented!(),
+    };
+
+    let file = if append {
+        File::options().create(true).append(true).open(file)?
+    } else {
+        File::create(file)?
+    };
+    cmd.stdout(process::Stdio::from(file));
+    let status = cmd.status()?;
+    if !status.success() {
+        return Err(io::Error::new(io::ErrorKind::Other, "command failed"));
+    }
+    Ok(())
+}
+
+fn execute(command: Command) -> io::Result<()> {
+    match command {
+        Command::Simple(args) => execute_simple(args),
+        Command::Piped(commands) => execute_piped(commands),
+        Command::And(left, right) => execute_and(left, right),
+        Command::Or(left, right) => execute_or(left, right),
+        Command::RedirectIn(command, file) => execute_redirect_in(command, file),
+        Command::RedirectOut(command, file, append) => execute_redirect_out(command, file, append),
+    }
 }
 
 fn read_eval_print() -> io::Result<bool> {

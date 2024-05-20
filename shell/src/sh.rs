@@ -7,13 +7,31 @@
 // SPDX-License-Identifier: MIT
 //
 
+extern crate clap;
 extern crate plib;
 
+use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, textdomain};
 use plib::PROJECT_NAME;
 use std::fs::File;
 use std::io::{self, Write};
 use std::process;
+
+/// sh - shell, the standard command language interpreter
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about)]
+struct Args {
+    /// Read commands from the standard input.
+    #[arg(short, long)]
+    stdin: bool,
+
+    /// Read commands from the command_string operand.
+    #[arg(short, long)]
+    cmd: bool,
+
+    /// Command files/arguments
+    command_and_args: Vec<String>,
+}
 
 #[derive(Debug, PartialEq)]
 enum Token {
@@ -384,8 +402,16 @@ fn read_eval_print_loop() -> io::Result<()> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // parse command line arguments
+    let mut args = Args::parse();
+
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+
+    // if no operands, and no -c, assume -s
+    if !args.stdin && !args.cmd && args.command_and_args.is_empty() {
+        args.stdin = true;
+    }
 
     read_eval_print_loop()?;
 

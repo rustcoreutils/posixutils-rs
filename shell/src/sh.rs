@@ -42,6 +42,7 @@ enum Token {
     RedirectAppend,
     And,
     Or,
+    Semicolon,
     EndOfLine,
 }
 
@@ -59,14 +60,16 @@ fn tokenize(input: &str) -> Vec<Token> {
                     current_token.clear();
                 }
             }
-            '<' | '>' | '|' | '&' => {
+            '<' | '>' | '|' | '&' | ';' => {
                 if !current_token.is_empty() {
                     tokens.push(Token::Word(current_token.clone()));
                     current_token.clear();
                 }
                 let mut operator = String::new();
                 operator.push(chars.next().unwrap());
-                if let Some(&next_ch) = chars.peek() {
+                if operator == ";" {
+                    tokens.push(Token::Semicolon);
+                } else if let Some(&next_ch) = chars.peek() {
                     if operator == "<" && next_ch == '<' {
                         operator.push(chars.next().unwrap());
                         tokens.push(Token::RedirectIn);
@@ -141,6 +144,7 @@ enum Command {
     RedirectIn(Box<Command>, String),
     RedirectOut(Box<Command>, String, bool), // bool for append
     BuiltIn(BuiltInCommand),
+    Sequential(Vec<Command>),
 }
 
 #[derive(Debug)]
@@ -155,9 +159,16 @@ fn parse(tokens: &[Token]) -> (Command, &[Token]) {
 
 fn parse_expr(tokens: &[Token]) -> (Command, &[Token]) {
     let (mut left, mut tokens) = parse_pipe(tokens);
+    let mut commands = vec![];
 
     while !tokens.is_empty() {
         match tokens[0] {
+            Token::Semicolon => {
+                commands.push(left); // Push the current command to the sequence
+                let (right, new_tokens) = parse_pipe(&tokens[1..]);
+                left = right;
+                tokens = new_tokens;
+            }
             Token::And => {
                 let (right, new_tokens) = parse_pipe(&tokens[1..]);
                 left = Command::And(Box::new(left), Box::new(right));
@@ -172,7 +183,13 @@ fn parse_expr(tokens: &[Token]) -> (Command, &[Token]) {
         }
     }
 
-    (left, tokens)
+    commands.push(left); // Push the final command to the sequence
+
+    if commands.len() > 1 {
+        (Command::Sequential(commands), tokens)
+    } else {
+        (commands.pop().unwrap(), tokens)
+    }
 }
 
 fn parse_pipe(tokens: &[Token]) -> (Command, &[Token]) {
@@ -463,6 +480,12 @@ fn execute(command: Command) -> io::Result<()> {
         Command::RedirectIn(command, file) => execute_redirect_in(command, file),
         Command::RedirectOut(command, file, append) => execute_redirect_out(command, file, append),
         Command::BuiltIn(builtin) => execute_builtin(builtin),
+        Command::Sequential(commands) => {
+            for cmd in commands {
+                execute(cmd)?;
+            }
+            Ok(())
+        }
     }
 }
 

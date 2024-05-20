@@ -89,3 +89,19 @@ fn sh_exit_command() {
     // The `exit` command should terminate the shell without an error
     run_sh("exit").success();
 }
+
+#[test]
+fn sh_sequential_commands() {
+    // Test sequential execution of two simple commands
+    run_sh("echo First; echo Second")
+        .success()
+        .stdout(predicates::str::contains("First\nSecond"));
+}
+
+#[test]
+fn sh_sequential_mixed_operators() {
+    // Test sequential execution with mixed operators
+    run_sh("echo First && echo Second; echo Third || echo Fourth")
+        .success()
+        .stdout(predicates::str::contains("First\nSecond\nThird"));
+}

@@ -109,6 +109,13 @@ enum Command {
     Or(Box<Command>, Box<Command>),
     RedirectIn(Box<Command>, String),
     RedirectOut(Box<Command>, String, bool), // bool for append
+    BuiltIn(BuiltInCommand),
+}
+
+#[derive(Debug)]
+enum BuiltInCommand {
+    Cd(String),
+    Exit,
 }
 
 fn parse(tokens: &[Token]) -> (Command, &[Token]) {
@@ -165,8 +172,25 @@ fn parse_simple(tokens: &[Token]) -> (Command, &[Token]) {
     while i < tokens.len() {
         match &tokens[i] {
             Token::Word(word) => {
-                commands.push(word.clone());
-                i += 1;
+                if word == "cd" {
+                    if i + 1 < tokens.len() {
+                        if let Token::Word(dir) = &tokens[i + 1] {
+                            return (
+                                Command::BuiltIn(BuiltInCommand::Cd(dir.clone())),
+                                &tokens[i + 2..],
+                            );
+                        }
+                    }
+                    return (
+                        Command::BuiltIn(BuiltInCommand::Cd(String::new())),
+                        &tokens[i + 1..],
+                    );
+                } else if word == "exit" {
+                    return (Command::BuiltIn(BuiltInCommand::Exit), &tokens[i + 1..]);
+                } else {
+                    commands.push(word.clone());
+                    i += 1;
+                }
             }
             Token::RedirectIn => {
                 if let Token::Word(file) = &tokens[i + 1] {
@@ -208,6 +232,23 @@ fn parse_simple(tokens: &[Token]) -> (Command, &[Token]) {
     }
 
     (Command::Simple(commands), &tokens[i..])
+}
+
+fn execute_builtin(builtin: BuiltInCommand) -> io::Result<()> {
+    match builtin {
+        BuiltInCommand::Cd(dir) => {
+            let target_dir = if dir.is_empty() {
+                std::env::var("HOME").unwrap()
+            } else {
+                dir
+            };
+            std::env::set_current_dir(target_dir)?;
+            Ok(())
+        }
+        BuiltInCommand::Exit => {
+            std::process::exit(0);
+        }
+    }
 }
 
 fn execute_simple(args: Vec<String>) -> io::Result<()> {
@@ -359,6 +400,7 @@ fn execute(command: Command) -> io::Result<()> {
         Command::Or(left, right) => execute_or(left, right),
         Command::RedirectIn(command, file) => execute_redirect_in(command, file),
         Command::RedirectOut(command, file, append) => execute_redirect_out(command, file, append),
+        Command::BuiltIn(builtin) => execute_builtin(builtin),
     }
 }
 

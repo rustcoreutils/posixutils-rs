@@ -66,9 +66,6 @@ Macro(
             ],
             [
                 Text(
-                    " ",
-                ),
-                Text(
                     "error",
                 ),
             ],
@@ -98,9 +95,6 @@ Macro(
                 ),
             ],
             [
-                Text(
-                    " ",
-                ),
                 Text(
                     "m1",
                 ),
@@ -156,9 +150,6 @@ Macro(
             ],
             [
                 Text(
-                    " ",
-                ),
-                Text(
                     "goodbye",
                 ),
             ],
@@ -188,9 +179,6 @@ Macro(
                 ),
             ],
             [
-                Text(
-                    " ",
-                ),
                 Quoted(
                     Quoted {
                         contents: "`m1'",

@@ -9,6 +9,7 @@ members = [
 	"file",
 	"fs",
     "m4",
+    "m4/test-manager",
 	"misc",
 	"pathnames",
 	"plib",

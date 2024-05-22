@@ -1,0 +1,3 @@
+stdout=\n
+stderr=m4:fixtures/integration_tests/define_eval_syntax_order_unquoted.m4:2: bad expression in eval: 1+\n
+status=0

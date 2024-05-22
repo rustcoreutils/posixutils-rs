@@ -1,5 +1,0 @@
-{
-  "stdout": "",
-  "stderr": "m4:fixtures/integration_tests/define_eval_syntax_order_quoted_evaluated.m4:1: bad expression in eval: 1+",
-  "status": 0
-}

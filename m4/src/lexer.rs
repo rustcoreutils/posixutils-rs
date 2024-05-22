@@ -696,6 +696,10 @@ mod test {
         initial_config: ParseConfig,
         input: &[u8],
     ) -> SymbolsAsStreamSnapshot {
+        // TODO: looks as though GNU m4 might drop the newline? Or is it due to the different way
+        // that we call it in the integration tests, it gets lost through piping? Will it show if
+        // we run with pipe with cargo run?
+        log::debug!("snapshot_symbols_as_stream() input: {:?}", utf8(input));
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut state = State::default();

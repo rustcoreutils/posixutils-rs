@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     fs::read_dir,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
@@ -9,7 +9,7 @@ use std::{
 struct TestCandidate {
     name: String,
     input: Option<PathBuf>,
-    output_json: Option<PathBuf>,
+    output: Option<PathBuf>,
 }
 
 impl TryFrom<TestCandidate> for Test {
@@ -24,11 +24,11 @@ impl TryFrom<TestCandidate> for Test {
                 .to_str()
                 .ok_or("Error converting input path to string")?
                 .to_owned(),
-            output_json: value
-                .output_json
-                .ok_or("No output json file provided")?
+            output: value
+                .output
+                .ok_or("No output file provided")?
                 .to_str()
-                .ok_or("Error converting output json path to string")?
+                .ok_or("Error converting output path to string")?
                 .to_owned(),
         })
     }
@@ -37,21 +37,21 @@ impl TryFrom<TestCandidate> for Test {
 struct Test {
     name: String,
     input: String,
-    output_json: String,
+    output: String,
 }
 impl Test {
     fn as_code(&self) -> String {
         let Self {
             name,
             input,
-            output_json,
+            output,
         } = self;
         let mut s = format!(
             r##"#[test]
 fn test_{name}() {{
     let output = run_command("{input}");
 
-    let test: Test = read_test_json("{output_json}");
+    let test: TestSnapshot = read_test("{output}");
     assert_eq!(output.status, std::process::ExitStatus::from_raw(test.status), "status");
     assert_eq!(String::from_utf8(output.stdout).unwrap(), test.stdout, "stdout");
     assert_eq!(String::from_utf8(output.stderr).unwrap(), test.stderr, "stderr");
@@ -86,7 +86,7 @@ fn main() {
                     });
                 candidate.input = Some(path);
             }
-            Some(b"json") => {
+            Some(b"out") => {
                 let name = name_from_path(&path).unwrap();
                 let candidate = test_candidates
                     .entry(name.clone())
@@ -94,7 +94,7 @@ fn main() {
                         name,
                         ..TestCandidate::default()
                     });
-                candidate.output_json = Some(path);
+                candidate.output = Some(path);
             }
             _ => eprintln!("Ignoring file {path:?}"),
         }
@@ -104,30 +104,14 @@ fn main() {
 use similar_asserts::assert_eq;
 use std::process::ExitStatus;
 use std::os::unix::process::ExitStatusExt;
-use tinyjson::JsonValue;
 use std::fs::read_to_string;
-use std::collections::HashMap;
 use test_log::test;
 use m4::error::GetExitCode;
+use m4_test_manager::TestSnapshot;
 
-struct Test {
-    stdout: String,
-    stderr: String,
-    status: i32,
-}
-
-fn read_test_json(path: impl AsRef<std::path::Path>) -> Test {
-    let value: JsonValue = read_to_string(path).unwrap().parse().unwrap();
-    let map: &HashMap<_, _> = value.get().unwrap();
-    let stdout: &String = map.get("stdout").unwrap().get().unwrap();
-    let stderr: &String = map.get("stderr").unwrap().get().unwrap();
-    let status: &f64= map.get("status").unwrap().get().unwrap();
-    let status = status.round() as i32;
-    Test {
-        stdout: stdout.clone(),
-        stderr: stderr.clone(),
-        status,
-    }
+fn read_test(path: impl AsRef<std::path::Path>) -> TestSnapshot {
+    let mut f = std::fs::File::open(path).unwrap();
+    TestSnapshot::deserialize(&mut f)
 }
 
 fn run_command(input: &str) -> std::process::Output {

@@ -121,6 +121,7 @@ fn parse_inside_brackets<'c>(
             );
             if let Some(b')') = remaining.get(0) {
                 log::trace!("parse_inside_brackets() reached closing bracket, successful parse!",);
+                symbols.push(Symbol::Text(b")"));
                 return Ok((&remaining[1..], symbols));
             }
             let (r, symbol) = nom::combinator::cut(Symbol::parse(config))(remaining)?;
@@ -177,6 +178,7 @@ fn parse_macro_arg<'c>(
                     vec![symbol]
                 })),
             ))(remaining)?;
+            log::trace!("parse_macro_arg() new_symbols: {new_symbols:?}");
             symbols.extend(new_symbols);
 
             // TODO: is empty should be incomplete
@@ -221,10 +223,12 @@ impl<'i> Macro<'i> {
                 "Macro::parse() macro_args: {:?}",
                 String::from_utf8_lossy(remaining)
             );
+
             let (remaining, args) = nom::combinator::opt(nom::sequence::delimited(
                 nom::bytes::streaming::tag("("),
                 nom::multi::separated_list0(
                     nom::bytes::streaming::tag(","),
+                    // TODO: check, we should be allowed to have empty arguments?
                     parse_macro_arg(&config),
                 ),
                 // Make sure we fail for input that is missing the closing tag, this is what GNU m4 does
@@ -886,6 +890,41 @@ mod test {
             nom::Err::Incomplete(_) => {}
             _ => panic!("Unexpected error: {error:?}"),
         }
+    }
+
+    #[test]
+    fn test_parse_macro_args_2_nested_undefined_macro() {
+        let (remaining, m) =
+            Macro::parse(&ParseConfig::default())(b"define(m, m2(hello))").unwrap();
+        assert_eq!(m.name, MacroName(b"define".into()));
+        assert_eq!(m.args.len(), 2);
+        assert_eq!("", utf8(remaining));
+        let second_arg = m.args.get(1).unwrap();
+        match second_arg.get(0).unwrap() {
+            Symbol::Text(text) => {
+                assert_eq!("m2", utf8(text));
+            }
+            _ => panic!(),
+        };
+        match second_arg.get(1).unwrap() {
+            Symbol::Text(text) => {
+                assert_eq!("(", utf8(text));
+            }
+            _ => panic!(),
+        };
+        match second_arg.get(2).unwrap() {
+            Symbol::Text(text) => {
+                assert_eq!("hello", utf8(text));
+            }
+            _ => panic!(),
+        };
+        match second_arg.get(3).unwrap() {
+            Symbol::Text(text) => {
+                assert_eq!(")", utf8(text));
+            }
+            _ => panic!(),
+        };
+        assert_eq!(second_arg.len(), 4);
     }
 
     #[test]

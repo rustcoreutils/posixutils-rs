@@ -105,6 +105,9 @@ Macro(
                     "hello",
                 ),
                 Text(
+                    ")",
+                ),
+                Text(
                     " ",
                 ),
                 Text(
@@ -118,6 +121,9 @@ Macro(
                 ),
                 Text(
                     "1",
+                ),
+                Text(
+                    ")",
                 ),
             ],
         ],

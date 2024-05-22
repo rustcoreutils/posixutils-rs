@@ -159,6 +159,9 @@ fn parse_macro_arg<'c>(
         let mut symbols = Vec::new();
         let mut remaining = input;
 
+        // Unquoted white-space characters preceding each argument shall be ignored.
+        (remaining, _) = nom::bytes::streaming::take_while(is_whitespace)(remaining)?;
+
         loop {
             log::trace!(
                 "parse_macro_arg() remaining: {:?}",
@@ -222,19 +225,6 @@ impl<'i> Macro<'i> {
                 nom::bytes::streaming::tag("("),
                 nom::multi::separated_list0(
                     nom::bytes::streaming::tag(","),
-                    // TODO: check, we should be allowed to have empty arguments?
-                    //
-                    // ERROR: this is broken! By excluding ), parsing macro name has no way to know
-                    // if it's the end of input or not. If we do include it, text will just attempt
-                    // to continually parse it.
-                    //
-                    // Perhaps we need an EOF input for config?
-                    //
-                    // Okay I need to do something different here, we need to parse to the closing
-                    // tag, but we can't do that because we could encounter other closing tags,
-                    // that could be contained within a comment.
-                    //
-                    // We need a way to tell the parsers that they are inside complete input here
                     parse_macro_arg(&config),
                 ),
                 // Make sure we fail for input that is missing the closing tag, this is what GNU m4 does
@@ -916,6 +906,25 @@ mod test {
         match m.args.get(0).unwrap().get(0).unwrap() {
             Symbol::Text(text) => {
                 assert_eq!("hello", utf8(text));
+            }
+            _ => panic!(),
+        };
+    }
+
+    /// Unquoted white-space characters preceding each argument shall be ignored. All other
+    /// characters, including trailing white-space characters, are retained.
+    #[test]
+    fn test_parse_macro_args_2_whitespace() {
+        let (remaining, m) =
+            Macro::parse(&ParseConfig::default())(b"define(hello,   goodbye   )").unwrap();
+        assert_eq!(m.name, MacroName(b"define".into()));
+        assert_eq!(m.args.len(), 2);
+        assert!(remaining.is_empty());
+        let second_arg = m.args.get(1).unwrap();
+        assert_eq!(second_arg.len(), 1);
+        match second_arg.get(0).unwrap() {
+            Symbol::Text(text) => {
+                assert_eq!("goodbye   ", utf8(text));
             }
             _ => panic!(),
         };

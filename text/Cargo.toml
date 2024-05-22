@@ -43,6 +43,10 @@ name = "nohup"
 path = "src/nohup.rs"
 
 [[bin]]
+name = "uniq"
+path = "src/uniq.rs"
+
+[[bin]]
 name = "sort"
 path = "src/sort.rs"
 

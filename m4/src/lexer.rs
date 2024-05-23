@@ -352,7 +352,7 @@ impl<'i> Quoted<'i> {
             );
             let mut nest_level = 0;
 
-            let (mut remaining, _) = nom::bytes::complete::tag(&*open_tag)(input)?;
+            let (mut remaining, _) = nom::bytes::streaming::tag(&*open_tag)(input)?;
             nest_level += 1;
 
             let quote_start_index = input.len() - remaining.len();
@@ -1090,6 +1090,14 @@ mod test {
     fn test_parse_quoted_incomplete() {
         let error =
             Quoted::parse(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_QUOTE_CLOSE_TAG)(b"`hello").unwrap_err();
+        assert!(matches!(error, nom::Err::Incomplete(_)));
+    }
+
+    #[test]
+    fn test_parse_quoted_incomplete_empty() {
+        let error =
+            Quoted::parse(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_QUOTE_CLOSE_TAG)(b"").unwrap_err();
+        dbg!(&error);
         assert!(matches!(error, nom::Err::Incomplete(_)));
     }
 

@@ -587,18 +587,18 @@ pub fn parse_dnl(input: &[u8]) -> IResult<&[u8], &[u8]> {
 /// [`Symbol`] writing output to `writer`, and returns a [`ParseConfig`] which has been
 /// modified during the process of evaluation (for example a new macro was defined, or
 /// changequote).
-pub(crate) fn process_streaming<'c, R: Read, STDOUT: Write, STDERR: Write>(
-    mut state: State<STDERR>,
+pub(crate) fn process_streaming<'c, R: Read>(
+    mut state: State,
     evaluate: impl for<'i, 'w> Fn(
-        State<STDERR>,
+        State,
         Symbol<'i>,
-        &'w mut STDOUT,
-        &'w mut STDERR,
-    ) -> crate::error::Result<State<STDERR>>,
+        &'w mut dyn Write,
+        &'w mut dyn Write,
+    ) -> crate::error::Result<State>,
     mut reader: R,
-    stdout: &mut STDOUT,
-    stderr: &mut STDERR,
-) -> crate::error::Result<State<STDERR>> {
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> crate::error::Result<State> {
     let buffer_size = 10;
     let buffer_growth_factor = 2;
     let mut buffer = circular::Buffer::with_capacity(buffer_size);

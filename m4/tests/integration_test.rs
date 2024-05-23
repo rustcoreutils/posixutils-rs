@@ -226,6 +226,28 @@ fn test_evaluation_order() {
 }
 
 #[test]
+fn test_include() {
+    let output = run_command("fixtures/integration_tests/include.m4");
+
+    let test: TestSnapshot = read_test("fixtures/integration_tests/include.out");
+    assert_eq!(
+        output.status,
+        std::process::ExitStatus::from_raw(test.status),
+        "status"
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        test.stdout,
+        "stdout"
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        test.stderr,
+        "stderr"
+    );
+}
+
+#[test]
 fn test_macro_errprint_evaluation() {
     let output = run_command("fixtures/integration_tests/macro_errprint_evaluation.m4");
 

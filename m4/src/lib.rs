@@ -120,7 +120,7 @@ pub fn run<STDOUT: Write, STDERR: Write>(
         lexer::process_streaming(
             State::default(),
             evaluate::evaluate,
-            std::fs::File::open(file_path).unwrap(),
+            std::fs::File::open(file_path)?,
             stdout,
             stderr,
         )

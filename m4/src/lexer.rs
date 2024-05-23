@@ -346,6 +346,10 @@ impl<'i> Quoted<'i> {
         close_tag: &'c [u8],
     ) -> impl Fn(&'i [u8]) -> IResult<&'i [u8], Quoted<'i>> + 'c {
         |input: &[u8]| {
+            log::trace!(
+                "Quoted::parse() input: {:?}",
+                String::from_utf8_lossy(input)
+            );
             let mut nest_level = 0;
 
             let (mut remaining, _) = nom::bytes::complete::tag(&*open_tag)(input)?;
@@ -373,11 +377,20 @@ impl<'i> Quoted<'i> {
                 }
 
                 remaining = &remaining[1..];
+                log::trace!(
+                    "Quoted::parse() remaining: {:?}",
+                    String::from_utf8_lossy(remaining)
+                );
             };
 
-            let quoted = &input[quote_start_index..quote_end_index];
+            let contents = &input[quote_start_index..quote_end_index];
+            remaining = &input[quote_end_index + 1..];
+            log::trace!(
+                "Quoted::parse() contents: {:?}",
+                String::from_utf8_lossy(contents)
+            );
 
-            Ok((remaining, Quoted { contents: quoted }))
+            Ok((remaining, Quoted { contents }))
         }
     }
 }

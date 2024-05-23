@@ -1,5 +1,5 @@
 ---
-source: m4/src/lexer.rs
+source: src/lexer.rs
 expression: "snapshot_symbols_as_stream(ParseConfig::default(), &f)"
 ---
 STDOUT:
@@ -191,7 +191,7 @@ Macro(
                     },
                 ),
                 Text(
-                    "' $",
+                    " $",
                 ),
                 Text(
                     "1",

@@ -81,12 +81,9 @@ fn encode_historical_line(line: &[u8]) -> Vec<u8> {
 
         // https://pubs.opengroup.org/onlinepubs/9699919799/utilities/uuencode.html directly mentions
         // the algorithm below(to convert 3 byte to 4 bytes of historical encoding)
-        //
-        // btw "uuencode" specification mentions ANDING with 0x3F i.e six 1's
-        // but we already have shifted 8 bit by 1, so that's not necessary
         let out_chunk = [
-            0x20 + (a >> 2),
-            0x20 + ((a & 0x03) << 4) | (b >> 4) & 0x0F,
+            0x20 + (a >> 2) & 0x3F,
+            0x20 + ((a & 0x03) << 4) | ((b >> 4) & 0x0F),
             0x20 + ((b & 0x0F) << 2) | ((c >> 6) & 0x03),
             0x20 + (c & 0x3F),
         ];
@@ -114,7 +111,6 @@ fn encode(args: &Args) -> io::Result<()> {
     let mut out: Vec<u8> = Vec::new();
 
     let header_init = encoding_type.get_header();
-
     let file_p = args
         .file
         .as_ref()
@@ -140,8 +136,7 @@ fn encode(args: &Args) -> io::Result<()> {
                 out.extend(encode_historical_line(line));
             }
 
-            out.push(b'\n');
-            out.extend(b"end");
+            out.extend(b"`\nend");
         }
         EncodingType::Base64 => {
             for line in buf.chunks(45) {

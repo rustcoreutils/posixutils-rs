@@ -1066,9 +1066,10 @@ mod test {
 
     #[test]
     fn test_parse_quoted() {
-        let quote = Quoted::parse(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_QUOTE_CLOSE_TAG)(b"`hello'")
-            .unwrap()
-            .1;
+        let (remaining, quote) =
+            Quoted::parse(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_QUOTE_CLOSE_TAG)(b"`hello'").unwrap();
+
+        assert_eq!("", utf8(remaining));
         assert_eq!("hello".as_bytes(), quote.contents);
     }
 
@@ -1081,10 +1082,10 @@ mod test {
 
     #[test]
     fn test_parse_quoted_nested() {
-        let quote =
+        let (remaining, quote) =
             Quoted::parse(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_QUOTE_CLOSE_TAG)(b"`a `quote' is good!'")
-                .unwrap()
-                .1;
+                .unwrap();
+        assert_eq!("", utf8(remaining));
         assert_eq!("a `quote' is good!".as_bytes(), quote.contents);
     }
 

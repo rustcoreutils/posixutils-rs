@@ -19,6 +19,9 @@ fn run_command(input: &str) -> std::process::Output {
     //     .arg(input)
     //     .output()
     //     .unwrap()
+
+    // The reason why we run the command using this as a library is so we can run with it built in
+    // test configuration, with all the associated conditionally compiled test log instrumentation.
     log::info!(
         "Running command with input {input:?}:\n\x1b[34m{}\x1b[0m",
         read_to_string(input).unwrap()

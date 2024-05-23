@@ -7,7 +7,10 @@ use nom::error::{ContextError, FromExternalError};
 use nom::IResult;
 
 use crate::error::Result;
-use crate::lexer::{self, Macro, MacroName, MacroParseConfig, ParseConfig, Symbol};
+use crate::lexer::{
+    self, Macro, MacroName, MacroParseConfig, ParseConfig, Symbol, DEFAULT_QUOTE_CLOSE_TAG,
+    DEFAULT_QUOTE_OPEN_TAG,
+};
 
 pub struct State {
     macro_definitions: HashMap<MacroName, Rc<MacroDefinition>>,
@@ -376,6 +379,51 @@ impl MacroImplementation for IncludeMacro {
                 stdout,
                 stderror,
             );
+        }
+
+        Ok(state)
+    }
+}
+
+struct ChangecomMacro;
+
+impl MacroImplementation for ChangecomMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        _stdout: &mut dyn Write,
+        _stderror: &mut dyn Write,
+        m: Macro,
+    ) -> Result<State> {
+        todo!();
+    }
+}
+
+struct ChangequoteMacro;
+
+impl MacroImplementation for ChangequoteMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        _stdout: &mut dyn Write,
+        _stderror: &mut dyn Write,
+        m: Macro,
+    ) -> Result<State> {
+        match m.args.len() {
+            0 => {
+                state.parse_config.quote_open_tag = DEFAULT_QUOTE_OPEN_TAG.to_owned();
+                state.parse_config.quote_close_tag = DEFAULT_QUOTE_CLOSE_TAG.to_owned();
+            }
+            1 => {}
+            2.. => {
+                let mut args = m.args.into_iter();
+                let open = args.next().expect("2 arguments should be present");
+                let close = args.next().expect("2 arguments should be present");
+                // The behavior is unspecified if there is a single argument or either argument is null.
+                if !open.is_empty() && !close.is_empty() {
+                    todo!()
+                }
+            } //TODO what about when there are more arguments? Add integration test for this.
         }
 
         Ok(state)

@@ -50,10 +50,10 @@ pub(crate) struct ParseConfig {
     pub dnl: bool,
 }
 
-const DEFAULT_QUOTE_OPEN_TAG: &[u8] = b"`";
-const DEFAULT_QUOTE_CLOSE_TAG: &[u8] = b"'";
-const DEFAULT_COMMENT_OPEN_TAG: &[u8] = b"#";
-const DEFAULT_COMMENT_CLOSE_TAG: &[u8] = b"\n";
+pub const DEFAULT_QUOTE_OPEN_TAG: &[u8] = b"`";
+pub const DEFAULT_QUOTE_CLOSE_TAG: &[u8] = b"'";
+pub const DEFAULT_COMMENT_OPEN_TAG: &[u8] = b"#";
+pub const DEFAULT_COMMENT_CLOSE_TAG: &[u8] = b"\n";
 const DEFAULT_SYMBOL_RECURSION_LIMIT: usize = 100;
 
 impl Default for ParseConfig {

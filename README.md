@@ -166,7 +166,7 @@ https://github.com/jgarzik/posixutils
  - [x] uncompress (compress cat.)
  - [ ] unexpand
  - [ ] unget (SCCS)
- - [ ] uniq
+ - [x] uniq
  - [x] unlink
  - [ ] uucp (UUCP)
  - [x] uudecode (uue)

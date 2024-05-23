@@ -1,5 +1,8 @@
 use std::{collections::HashMap, io::Write, rc::Rc};
 
+use nom::error::{ContextError, FromExternalError};
+use nom::IResult;
+
 use crate::error::Result;
 use crate::lexer::{self, Macro, MacroName, MacroParseConfig, ParseConfig, Symbol};
 
@@ -185,19 +188,112 @@ impl<STDERR: Write> MacroImplementation<STDERR> for DefineMacro {
     }
 }
 
+enum UserDefinedMacroArg {
+    Index(usize),
+    List,
+    NumberOfArgs,
+}
+
 struct UserDefinedMacro {
     definition: Vec<u8>,
+}
+
+fn parse_index(input: &[u8]) -> IResult<&[u8], usize> {
+    log::trace!("parse_index() {}", String::from_utf8_lossy(input));
+    let (remaining, found) = nom::bytes::complete::take_while(|c| c >= b'1' && c <= b'9')(input)?;
+    let s = std::str::from_utf8(found).expect("Should be valid utf8 betweeen b'1' and b'9'");
+    let i: usize = s.parse().map_err(|e| {
+        let e = nom::error::Error::from_external_error(found, nom::error::ErrorKind::Digit, e);
+        nom::Err::Error(nom::error::Error::add_context(
+            found,
+            "Error parsing user defined macro argument as an index",
+            e,
+        ))
+    })?;
+    log::trace!("parse_index() successfully parsed: {i}");
+
+    Ok((remaining, i))
+}
+
+fn parse_user_defined_macro_arg(input: &[u8]) -> IResult<&[u8], UserDefinedMacroArg> {
+    log::trace!(
+        "parse_user_defined_macro_arg() {}",
+        String::from_utf8_lossy(input)
+    );
+    let (remaining, _) = nom::bytes::complete::tag(b"$")(input)?;
+    if remaining.is_empty() {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::NonEmpty,
+        )));
+    }
+
+    nom::branch::alt((
+        nom::combinator::map(nom::bytes::complete::tag(b"*"), |_| {
+            UserDefinedMacroArg::List
+        }),
+        nom::combinator::map(nom::bytes::complete::tag(b"#"), |_| {
+            UserDefinedMacroArg::NumberOfArgs
+        }),
+        nom::combinator::map(parse_index, UserDefinedMacroArg::Index),
+    ))(remaining)
 }
 
 impl<STDERR: Write> MacroImplementation<STDERR> for UserDefinedMacro {
     fn evaluate(
         &self,
-        state: State<STDERR>,
+        mut state: State<STDERR>,
         stderror: &mut STDERR,
-        _m: Macro,
+        m: Macro,
     ) -> Result<(Vec<u8>, State<STDERR>)> {
-        // TODO: handle arguments
-        parse_and_evaluate_to_text(state, &self.definition, stderror)
+        let mut buffer: Vec<u8> = Vec::with_capacity(self.definition.len());
+        let mut remaining = self.definition.as_slice();
+        let mut found: &[u8];
+
+        loop {
+            if remaining.is_empty() {
+                break;
+            }
+            (remaining, found) =
+                nom::bytes::complete::take_till::<_, _, ()>(|c| c == b'$')(remaining)
+                    .expect("Expect this to always succeed");
+            buffer.extend_from_slice(found);
+            if remaining.is_empty() {
+                break;
+            }
+            let arg;
+            (remaining, arg) = match parse_user_defined_macro_arg(remaining) {
+                Ok((remaining, arg)) => (remaining, arg),
+                Err(_) => {
+                    buffer.push(b'$');
+                    if remaining.len() > 1 {
+                        remaining = &remaining[1..];
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+            };
+
+            match arg {
+                UserDefinedMacroArg::Index(i) => {
+                    if let Some(arg) = m.args.get(i - 1) {
+                        log::trace!("UserDefinedMacro::evaluate() Replacing arg {i} with {arg:?}");
+                        for symbol in arg {
+                            state = evaluate(state, symbol.clone(), &mut buffer, stderror)?;
+                        }
+                    } else {
+                        log::trace!("UserDefinedMacro::evaluate() Cannot find arg with index {i}");
+                    }
+                }
+                UserDefinedMacroArg::List => todo!(),
+                UserDefinedMacroArg::NumberOfArgs => {
+                    buffer.extend_from_slice(m.args.len().to_string().as_bytes());
+                }
+            }
+        }
+
+        parse_and_evaluate_to_text(state, &buffer, stderror)
     }
 }
 
@@ -357,7 +453,7 @@ mod test {
     }
 
     #[test]
-    fn test_macro_define() {
+    fn test_macro_define_replace_1() {
         let mut stdout: Vec<u8> = Vec::new();
         let mut stderr: Vec<u8> = Vec::new();
         let mut state = State::default();

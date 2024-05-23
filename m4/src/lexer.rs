@@ -77,6 +77,7 @@ impl Default for ParseConfig {
 }
 
 #[cfg_attr(test, derive(PartialEq))]
+#[derive(Clone)]
 pub struct Macro<'i> {
     pub input: &'i [u8],
     pub name: MacroName,
@@ -249,6 +250,7 @@ impl<'i> Macro<'i> {
 }
 
 #[cfg_attr(test, derive(PartialEq))]
+#[derive(Clone)]
 pub(crate) enum Symbol<'i> {
     // Comments in m4 are not discarded, their contents (including delimeters) are copied verbatim to output without
     // further processing.
@@ -325,6 +327,7 @@ impl<'c, 'i: 'c> Symbol<'i> {
 }
 
 #[cfg_attr(test, derive(PartialEq))]
+#[derive(Clone)]
 pub struct Quoted<'i> {
     pub contents: &'i [u8],
 }

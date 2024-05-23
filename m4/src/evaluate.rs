@@ -355,4 +355,45 @@ mod test {
         assert!(stdout.is_empty());
         assert!(stderr.is_empty());
     }
+
+    #[test]
+    fn test_macro_define() {
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut state = State::default();
+        assert!(matches!(
+            state.macro_definitions.get(&macro_name(b"hello")),
+            None
+        ));
+        state = evaluate(
+            state,
+            Symbol::Macro(Macro {
+                input: b"define(hello,hi $1)",
+                name: macro_name(b"define"),
+                args: vec![vec![Symbol::Text(b"hello")], vec![Symbol::Text(b"hi $1")]],
+            }),
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap();
+
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+
+        state.macro_definitions.get(&macro_name(b"hello")).unwrap();
+        evaluate(
+            state,
+            Symbol::Macro(Macro {
+                input: b"hello(friend)",
+                name: macro_name(b"hello"),
+                args: vec![vec![Symbol::Text(b"friend")]],
+            }),
+            &mut stdout,
+            &mut stderr,
+        )
+        .unwrap();
+
+        assert_eq!("hi friend", utf8(&stdout));
+        assert!(stderr.is_empty());
+    }
 }

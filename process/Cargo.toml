@@ -13,6 +13,8 @@ gettext-rs.workspace = true
 libc.workspace = true
 errno = "0.3"
 regex.workspace = true
+atty = "0.2"
+dirs = "5.0"
 
 [[bin]]
 name = "env"
@@ -25,6 +27,10 @@ path = "src/kill.rs"
 [[bin]]
 name = "nice"
 path = "src/nice.rs"
+
+[[bin]]
+name = "nohup"
+path = "src/nohup.rs"
 
 [[bin]]
 name = "renice"

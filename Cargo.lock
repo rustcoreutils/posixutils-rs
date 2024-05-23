@@ -753,7 +753,9 @@ dependencies = [
 name = "posixutils-process"
 version = "0.1.7"
 dependencies = [
+ "atty",
  "clap",
+ "dirs 5.0.1",
  "errno",
  "gettext-rs",
  "libc",
@@ -789,11 +791,9 @@ dependencies = [
 name = "posixutils-text"
 version = "0.1.10"
 dependencies = [
- "atty",
  "chrono",
  "clap",
  "diff",
- "dirs 5.0.1",
  "gettext-rs",
  "libc",
  "plib",

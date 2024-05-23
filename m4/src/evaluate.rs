@@ -54,6 +54,8 @@ pub enum BuiltinMacro {
     Undefine,
     Errprint,
     Include,
+    Changecom,
+    Changequote,
 }
 
 impl AsRef<[u8]> for BuiltinMacro {
@@ -64,6 +66,8 @@ impl AsRef<[u8]> for BuiltinMacro {
             BuiltinMacro::Undefine => b"undefine",
             BuiltinMacro::Errprint => b"errprint",
             BuiltinMacro::Include => b"include",
+            BuiltinMacro::Changecom => b"changecom",
+            BuiltinMacro::Changequote => b"changequote",
         }
     }
 }
@@ -76,12 +80,16 @@ impl BuiltinMacro {
             Self::Undefine,
             Self::Errprint,
             Self::Include,
+            Self::Changecom,
+            Self::Changequote,
         ]
     }
     pub fn name(&self) -> MacroName {
         MacroName::try_from_slice(self.as_ref()).expect("Expected valid builtin macro name")
     }
 
+    /// The minimum number of args that this macro requires in order for it to be parsed as a
+    /// macro.
     pub fn min_args(&self) -> usize {
         match self {
             BuiltinMacro::Dnl => 0,
@@ -89,6 +97,8 @@ impl BuiltinMacro {
             BuiltinMacro::Undefine => 1,
             BuiltinMacro::Errprint => 1,
             BuiltinMacro::Include => 1,
+            BuiltinMacro::Changecom => 1,
+            BuiltinMacro::Changequote => 1,
         }
     }
 
@@ -108,6 +118,8 @@ fn inbuilt_macro_implementation(builtin: &BuiltinMacro) -> Box<dyn MacroImplemen
         BuiltinMacro::Undefine => Box::new(UndefineMacro),
         BuiltinMacro::Errprint => Box::new(ErrprintMacro),
         BuiltinMacro::Include => Box::new(IncludeMacro),
+        BuiltinMacro::Changecom => Box::new(ChangecomMacro),
+        BuiltinMacro::Changequote => Box::new(ChangequoteMacro),
     }
 }
 
@@ -367,10 +379,8 @@ impl MacroImplementation for IncludeMacro {
         m: Macro,
     ) -> Result<State> {
         if let Some(path_symbols) = m.args.into_iter().next() {
-            let mut buffer: Vec<u8> = Vec::new();
-            for symbol in path_symbols {
-                state = evaluate(state, symbol, &mut buffer, stderror)?;
-            }
+            let buffer;
+            (buffer, state) = evaluate_to_text(state, path_symbols, stderror)?;
             let file_path = PathBuf::from(OsString::from_vec(buffer));
             return lexer::process_streaming(
                 state,
@@ -406,7 +416,7 @@ impl MacroImplementation for ChangequoteMacro {
         &self,
         mut state: State,
         _stdout: &mut dyn Write,
-        _stderror: &mut dyn Write,
+        stderror: &mut dyn Write,
         m: Macro,
     ) -> Result<State> {
         match m.args.len() {
@@ -415,13 +425,24 @@ impl MacroImplementation for ChangequoteMacro {
                 state.parse_config.quote_close_tag = DEFAULT_QUOTE_CLOSE_TAG.to_owned();
             }
             1 => {}
-            2.. => {
+            args_len @ 2.. => {
+                if args_len > 2 {
+                    stderror
+                        .write_all(b"Warning: excess arguments to builtin `changequote' ignored")?;
+                }
                 let mut args = m.args.into_iter();
                 let open = args.next().expect("2 arguments should be present");
                 let close = args.next().expect("2 arguments should be present");
                 // The behavior is unspecified if there is a single argument or either argument is null.
                 if !open.is_empty() && !close.is_empty() {
-                    todo!()
+                    // TODO: it looks like GNU m4 only allows quote strings using non-alphanumeric
+                    // characters. The spec I'm following doesn't mention anything about that.
+                    let open_tag;
+                    (open_tag, state) = evaluate_to_text(state, open, stderror)?;
+                    state.parse_config.quote_open_tag = open_tag;
+                    let close_tag;
+                    (close_tag, state) = evaluate_to_text(state, close, stderror)?;
+                    state.parse_config.quote_close_tag = close_tag;
                 }
             } //TODO what about when there are more arguments? Add integration test for this.
         }

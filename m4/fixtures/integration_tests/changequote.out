@@ -1,0 +1,3 @@
+stdout=`hi'\n<<`hi'>>\n`hi'\n <<hi>>\nxx`hi'yy\n
+stderr=
+status=0

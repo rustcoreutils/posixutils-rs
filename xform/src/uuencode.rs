@@ -81,21 +81,26 @@ fn encode_historical_line(line: &[u8]) -> Vec<u8> {
 
         // https://pubs.opengroup.org/onlinepubs/9699919799/utilities/uuencode.html directly mentions
         // the algorithm below(to convert 3 byte to 4 bytes of historical encoding)
-        let out_chunk = [
+        let mut out_chunk = [
             0x20 + (a >> 2) & 0x3F,
             0x20 + ((a & 0x03) << 4) | ((b >> 4) & 0x0F),
             0x20 + ((b & 0x0F) << 2) | ((c >> 6) & 0x03),
             0x20 + (c & 0x3F),
         ];
 
+        for i in out_chunk.iter_mut() {
+            if *i == 32 {
+                *i = 96
+            }
+        }
         out.extend_from_slice(&out_chunk);
     }
     out.push(b'\n');
     out
 }
 
-/// encodes and puts out on stdout
-fn encode(args: &Args) -> io::Result<()> {
+/// encodes the file(it can be standard input too) and outputs on standard output
+fn encode_file(args: &Args) -> io::Result<()> {
     let decode_path = match &args.decode_path {
         None => String::from("/dev/stdout"),
         Some(path) => String::from(path),
@@ -160,7 +165,6 @@ fn pathname_display(path: &Option<PathBuf>) -> String {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
     let args = Args::parse();
 
     textdomain(PROJECT_NAME)?;
@@ -168,7 +172,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut exit_code = 0;
 
-    if let Err(e) = encode(&args) {
+    if let Err(e) = encode_file(&args) {
         exit_code = 1;
         eprintln!("{:?}: {}", pathname_display(&args.file), e);
     }

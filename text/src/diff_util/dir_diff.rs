@@ -1,6 +1,8 @@
 use std::{collections::HashSet, ffi::OsString, io, path::PathBuf};
 
-use crate::diff_util::{constants::COULD_NOT_UNWRAP_FILENAME, file_diff::FileDiff};
+use crate::diff_util::{
+    constants::COULD_NOT_UNWRAP_FILENAME, diff_exit_status::DiffExitStatus, file_diff::FileDiff,
+};
 
 use super::{common::FormatOptions, dir_data::DirData};
 
@@ -31,17 +33,17 @@ impl<'a> DirDiff<'a> {
         path2: PathBuf,
         format_options: &FormatOptions,
         recursive: bool,
-    ) -> io::Result<()> {
+    ) -> io::Result<DiffExitStatus> {
         let mut dir1: DirData = DirData::load(PathBuf::from(path1))?;
         let mut dir2: DirData = DirData::load(PathBuf::from(path2))?;
 
         let mut dir_diff = DirDiff::new(&mut dir1, &mut dir2, &format_options, recursive);
-        dir_diff.analyze()?;
-
-        Ok(())
+        return dir_diff.analyze();
     }
 
-    fn analyze(&mut self) -> io::Result<()> {
+    fn analyze(&mut self) -> io::Result<DiffExitStatus> {
+        let mut exit_status = DiffExitStatus::NotDifferent;
+
         fn is_file(file_name: &OsString, dir_data: &DirData) -> io::Result<bool> {
             let is_file = dir_data
                 .files()
@@ -86,15 +88,69 @@ impl<'a> DirDiff<'a> {
                     let path2 = self.dir2.path().join(file_name);
 
                     if in_dir1_is_file && in_dir2_is_file {
-                        // TODO: output format should be included
+                        let mut show_if_different = String::from("diff ");
 
-                        println!(
-                            "diff \"{}\" \"{}\"",
-                            path1.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME),
-                            path2.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME)
-                        );
+                        match self.format_options.output_format {
+                            crate::diff_util::common::OutputFormat::Debug => {
+                                show_if_different.push_str("--debug ")
+                            }
+                            crate::diff_util::common::OutputFormat::Default => {}
+                            crate::diff_util::common::OutputFormat::Context(ctx) => {
+                                show_if_different.push_str(format!("-C {} ", ctx).as_str())
+                            }
+                            crate::diff_util::common::OutputFormat::EditScript => {
+                                show_if_different.push_str("-e ")
+                            }
+                            crate::diff_util::common::OutputFormat::ForwardEditScript => {
+                                show_if_different.push_str("-f ")
+                            }
+                            crate::diff_util::common::OutputFormat::Unified(ufd) => {
+                                show_if_different.push_str(format!("-U {} ", ufd).as_str())
+                            }
+                        }
 
-                        FileDiff::file_diff(path1, path2, self.format_options)?;
+                        if self.recursive {
+                            show_if_different.push_str("-r ");
+                        }
+
+                        if self.format_options.ignore_trailing_white_spaces {
+                            show_if_different.push_str("-b ");
+                        }
+
+                        if let Some(label1) = &self.format_options.label1 {
+                            show_if_different.push_str(format!("--label {} ", label1).as_str())
+                        }
+
+                        if let Some(label2) = &self.format_options.label2 {
+                            show_if_different.push_str(format!("{} ", label2).as_str())
+                        }
+
+                        if let Some(label1) = &self.format_options.label1 {
+                            show_if_different.push_str(format!("{} ", label1).as_str())
+                        } else {
+                            show_if_different
+                                .push_str(path1.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME));
+                            show_if_different.push(' ');
+                        }
+
+                        if let Some(label2) = &self.format_options.label2 {
+                            show_if_different.push_str(format!("{} ", label2).as_str())
+                        } else {
+                            show_if_different
+                                .push_str(path2.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME));
+                            show_if_different.push(' ');
+                        }
+
+                        let inner_exit_status = FileDiff::file_diff(
+                            path1,
+                            path2,
+                            self.format_options,
+                            Some(show_if_different),
+                        )?;
+
+                        if exit_status.status_code() < inner_exit_status.status_code() {
+                            exit_status = inner_exit_status;
+                        }
                     } else if !in_dir1_is_file && !in_dir2_is_file {
                         if self.recursive {
                             Self::dir_diff(
@@ -151,13 +207,16 @@ impl<'a> DirDiff<'a> {
                         file_name.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME)
                     )
                 }
-                (false, false) => panic!(
-                    "At least one of directories should contain file \"{}\"",
-                    file_name.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME)
-                ),
+                (false, false) => {
+                    println!(
+                        "At least one of directories should contain file \"{}\"",
+                        file_name.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME)
+                    );
+                    return Ok(DiffExitStatus::Trouble);
+                }
             }
         }
 
-        Ok(())
+        return Ok(exit_status);
     }
 }

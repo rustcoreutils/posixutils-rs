@@ -2,6 +2,7 @@ use super::{
     change::ChangeData,
     common::{FormatOptions, OutputFormat},
     constants::COULD_NOT_UNWRAP_FILENAME,
+    diff_exit_status::DiffExitStatus,
     file_data::FileData,
     functions::{check_existance, is_binary, system_time_to_rfc2822, vec_min},
     hunks::Hunks,
@@ -27,9 +28,14 @@ pub struct FileDiff<'a> {
     file2: &'a mut FileData,
     hunks: Hunks,
     format_options: &'a FormatOptions,
+    are_different: bool,
 }
 
 impl<'a> FileDiff<'a> {
+    pub fn are_different(&self) -> bool {
+        self.are_different
+    }
+
     fn new(
         file1: &'a mut FileData,
         file2: &'a mut FileData,
@@ -44,6 +50,7 @@ impl<'a> FileDiff<'a> {
             file2,
             hunks: Hunks::new(),
             format_options: format_options,
+            are_different: false,
         }
     }
 
@@ -51,9 +58,10 @@ impl<'a> FileDiff<'a> {
         path1: PathBuf,
         path2: PathBuf,
         format_options: &FormatOptions,
-    ) -> io::Result<()> {
+        show_if_different: Option<String>,
+    ) -> io::Result<DiffExitStatus> {
         if is_binary(&path1)? || is_binary(&path2)? {
-            Self::binary_file_diff(&path1, &path2)?;
+            return Self::binary_file_diff(&path1, &path2);
         } else {
             let mut file1 = FileData::get_file(path1)?;
             let mut file2 = FileData::get_file(path2)?;
@@ -61,17 +69,22 @@ impl<'a> FileDiff<'a> {
             let mut diff = FileDiff::new(&mut file1, &mut file2, format_options);
 
             diff.needleman_wunsch_diff_lines();
-            diff.print();
-        }
 
-        Ok(())
+            if diff.are_different() {
+                if let Some(show_if_different) = show_if_different {
+                    println!("{}", show_if_different);
+                }
+            }
+
+            return diff.print();
+        }
     }
 
     pub fn file_dir_diff(
         path1: PathBuf,
         path2: PathBuf,
         format_options: &FormatOptions,
-    ) -> io::Result<()> {
+    ) -> io::Result<DiffExitStatus> {
         let path1_file_type = path1.metadata()?.file_type();
 
         if path1_file_type.is_file() {
@@ -80,26 +93,24 @@ impl<'a> FileDiff<'a> {
             let path2 = path2.join(path1_file);
 
             if !check_existance(&path2)? {
-                return Ok(());
+                return Ok(DiffExitStatus::Trouble);
             }
 
-            FileDiff::file_diff(path1, path2, format_options)?;
+            return FileDiff::file_diff(path1, path2, format_options, None);
         } else {
             let path2_file = path2.clone();
             let path2_file = path2_file.file_name().expect(&COULD_NOT_UNWRAP_FILENAME);
             let path1 = path1.join(path2_file);
 
             if !check_existance(&path1)? {
-                return Ok(());
+                return Ok(DiffExitStatus::Trouble);
             }
 
-            FileDiff::file_diff(path1, path2, format_options)?;
+            return FileDiff::file_diff(path1, path2, format_options, None);
         }
-
-        Ok(())
     }
 
-    fn binary_file_diff(file1_path: &PathBuf, file2_path: &PathBuf) -> io::Result<()> {
+    fn binary_file_diff(file1_path: &PathBuf, file2_path: &PathBuf) -> io::Result<DiffExitStatus> {
         let differ_report = format!(
             "Binary files {} and {} differ",
             file1_path.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME),
@@ -111,7 +122,7 @@ impl<'a> FileDiff<'a> {
 
         if file1.metadata()?.size() != file2.metadata()?.size() {
             println!("{}", differ_report);
-            return Ok(());
+            return Ok(DiffExitStatus::Different);
         }
 
         let file1 = BufReader::new(file1);
@@ -121,13 +132,14 @@ impl<'a> FileDiff<'a> {
             let (b1, b2) = (bytes_pair.0?, bytes_pair.1?);
             if b1 != b2 {
                 println!("{}", differ_report);
+                return Ok(DiffExitStatus::Different);
             }
         }
 
-        Ok(())
+        Ok(DiffExitStatus::NotDifferent)
     }
 
-    fn print(&mut self) {
+    fn print(&mut self) -> io::Result<DiffExitStatus> {
         self.order_hunks_by_output_format();
 
         if let OutputFormat::Context(context) = self.format_options.output_format {
@@ -150,16 +162,26 @@ impl<'a> FileDiff<'a> {
                         hunk_index == hunks_count - 1,
                     ),
                     OutputFormat::Context(_) => {
-                        panic!("OutputFormat::Context should be handled in other place")
+                        println!("OutputFormat::Context should be handled in other place");
+                        return Ok(DiffExitStatus::Trouble);
                     }
                     OutputFormat::ForwardEditScript => hunk.print_forward_edit_script(
                         &self.file1,
                         &self.file2,
                         hunk_index == hunks_count - 1,
                     ),
-                    OutputFormat::Unified(_) => todo!(),
+                    OutputFormat::Unified(_) => {
+                        println!("OutputFormat::Unified should be handled in other place");
+                        return Ok(DiffExitStatus::Trouble);
+                    }
                 }
             }
+        }
+
+        if self.are_different() {
+            return Ok(DiffExitStatus::Different);
+        } else {
+            return Ok(DiffExitStatus::NotDifferent);
         }
     }
 
@@ -234,6 +256,16 @@ impl<'a> FileDiff<'a> {
     fn add_change(&mut self, change: Change) {
         if let Change::None = change {
         } else {
+            if !self.are_different {
+                self.are_different = match &change {
+                    Change::None => false,
+                    Change::Unchanged(_) => false,
+                    Change::Insert(_) => true,
+                    Change::Delete(_) => true,
+                    Change::Substitute(_) => true,
+                }
+            }
+
             let (l1, l2) = change.get_lns();
 
             if l1 != 0 {

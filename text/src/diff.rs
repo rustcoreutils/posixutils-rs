@@ -18,12 +18,12 @@ extern crate clap;
 extern crate diff;
 extern crate plib;
 
-use std::{fs, path::PathBuf};
+use std::{fs, io, path::PathBuf};
 
 use clap::Parser;
 use diff_util::{
     common::{FormatOptions, OutputFormat},
-    constants::EXIT_STATUS_TROUBLE,
+    diff_exit_status::DiffExitStatus,
     dir_diff::DirDiff,
     file_diff::FileDiff,
     functions::check_existance,
@@ -107,7 +107,7 @@ impl From<&Args> for OutputFormat {
     }
 }
 
-fn check_difference(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
@@ -120,11 +120,11 @@ fn check_difference(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let path2_exists = check_existance(&path2)?;
 
     if !path1_exists || !path2_exists {
-        return Ok(());
+        return Ok(DiffExitStatus::Trouble);
     }
 
     if path1 == path2 {
-        return Ok(());
+        return Ok(DiffExitStatus::Trouble);
     }
 
     let path1_is_file = fs::metadata(&path1)?.is_file();
@@ -138,35 +138,30 @@ fn check_difference(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if path1_is_file && path2_is_file {
-        FileDiff::file_diff(path1, path2, &format_options)?;
+        return FileDiff::file_diff(path1, path2, &format_options, None);
     } else if !path1_is_file && !path2_is_file {
-        DirDiff::dir_diff(
+        return DirDiff::dir_diff(
             PathBuf::from(path1),
             PathBuf::from(path2),
             &format_options,
             args.recurse,
-        )?;
+        );
     } else {
-        FileDiff::file_dir_diff(path1, path2, &format_options)?;
+        return FileDiff::file_dir_diff(path1, path2, &format_options);
     }
-
-    Ok(())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<DiffExitStatus, Box<dyn std::error::Error>> {
     // parse command line arguments
     let args = Args::parse();
 
     let result = check_difference(args);
 
-    if let Ok(_) = &result {
-        // 0 -> no difference
-        // 1 -> different
-        std::process::exit(0)
+    if let Ok(diff_exit_status) = &result {
+        return Ok(*diff_exit_status);
     } else if let Err(error) = &result {
         println!("diff: {}", error);
-        std::process::exit(EXIT_STATUS_TROUBLE)
     }
 
-    Ok(())
+    return Ok(DiffExitStatus::NotDifferent);
 }

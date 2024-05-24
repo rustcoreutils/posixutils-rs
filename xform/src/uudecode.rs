@@ -147,14 +147,16 @@ fn decode_file(args: &Args) -> io::Result<()> {
         }
     }
 
-    if header.out == PathBuf::from("/dev/stdout") {
+    let out_path = args.outfile.as_ref().unwrap_or(&header.out);
+
+    if out_path == &PathBuf::from("/dev/stdout") {
         io::stdout().write_all(&out)?;
     } else {
-        if header.out.exists() {
-            remove_file(&header.out)?;
+        if out_path.exists() {
+            remove_file(&out_path)?;
         }
 
-        let mut o_file = File::create(&header.out)?;
+        let mut o_file = File::create(&out_path)?;
         let mut o_file_perm = o_file.metadata()?.permissions();
         let o_file_perm_mode = o_file_perm.mode();
         let new_o_file_perm_mode = ((o_file_perm_mode >> 9) << 9) | header.lower_perm_bits;

@@ -9,14 +9,13 @@
 
 extern crate clap;
 extern crate plib;
-extern crate uuencode;
 
 use base64::prelude::*;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, textdomain};
 use plib::PROJECT_NAME;
-use std::fs::{remove_file, File, OpenOptions, Permissions};
-use std::io::{self, Error, ErrorKind, Read, Write};
+use std::fs::{remove_file, File};
+use std::io::{self, Error, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
@@ -36,23 +35,6 @@ struct Args {
 
     /// The pathname of a file containing uuencoded data.
     file: Option<PathBuf>,
-}
-
-fn write_file(pathname: &PathBuf, bindata: &[u8]) -> io::Result<()> {
-    let f_res = OpenOptions::new()
-        .read(false)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(pathname);
-
-    match f_res {
-        Err(e) => {
-            eprintln!("{}: {}", pathname.display(), e);
-            return Err(e);
-        }
-        Ok(mut file) => file.write_all(bindata),
-    }
 }
 
 #[derive(Debug)]

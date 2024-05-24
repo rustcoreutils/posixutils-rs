@@ -59,7 +59,7 @@ impl Header {
         let split: Vec<&str> = line.split(' ').collect();
         let dec_type = if split[0] == "begin" {
             DecodingType::Historical
-        } else if split[0] == "base64-begin" {
+        } else if split[0] == "begin-base64" {
             DecodingType::Base64
         } else {
             panic!("Invalid encoding type");
@@ -147,20 +147,21 @@ fn decode_file(args: &Args) -> io::Result<()> {
         }
     }
 
-    let out_file = args.file.as_ref().unwrap_or(&header.out);
-
-    if out_file == &PathBuf::from("/dev/stdout") {
+    if header.out == PathBuf::from("/dev/stdout") {
         io::stdout().write_all(&out)?;
     } else {
-        if out_file.exists() {
-            remove_file(&out_file)?;
+        if header.out.exists() {
+            remove_file(&header.out)?;
         }
 
-        let out_file = File::create(&out_file)?;
-        let mut out_file_perm = out_file.metadata()?.permissions();
-        let out_file_raw_perm = out_file_perm.mode();
-        let new_out_file_raw_perm = ((out_file_raw_perm >> 9) << 9) | header.lower_perm_bits;
-        out_file_perm.set_mode(new_out_file_raw_perm);
+        let mut o_file = File::create(&header.out)?;
+        let mut o_file_perm = o_file.metadata()?.permissions();
+        let o_file_perm_mode = o_file_perm.mode();
+        let new_o_file_perm_mode = ((o_file_perm_mode >> 9) << 9) | header.lower_perm_bits;
+        o_file_perm.set_mode(new_o_file_perm_mode);
+
+        o_file.write_all(&out)?;
+        o_file.set_permissions(o_file_perm)?;
     }
 
     Ok(())

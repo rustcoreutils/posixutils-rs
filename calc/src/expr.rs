@@ -152,7 +152,7 @@ fn tokenize() -> Vec<Token> {
 }
 
 // compare two integers
-fn cmpint(lhs: i64, rhs: i64, op: CmpOp) -> Result<Token, &'static str> {
+fn cmpint(lhs: i64, rhs: i64, op: CmpOp) -> Token {
     let result: bool = match op {
         CmpOp::EQ => lhs == rhs,
         CmpOp::NE => lhs != rhs,
@@ -162,7 +162,7 @@ fn cmpint(lhs: i64, rhs: i64, op: CmpOp) -> Result<Token, &'static str> {
         CmpOp::LE => lhs <= rhs,
     };
 
-    Ok(Token::Integer(result as i64))
+    Token::Integer(result as i64)
 }
 
 // compare two strings
@@ -189,7 +189,7 @@ fn cmpop(lhs: &Token, rhs: &Token, op: CmpOp) -> Result<Token, &'static str> {
 
     // if both are integers, perform int comparison
     if lhs_int.is_some() && rhs_int.is_some() {
-        cmpint(lhs_int.unwrap(), rhs_int.unwrap(), op)
+        Ok(cmpint(lhs_int.unwrap(), rhs_int.unwrap(), op))
 
     // otherwise, convert int to string, and perform string compare
     } else if let Some(val) = lhs_int {

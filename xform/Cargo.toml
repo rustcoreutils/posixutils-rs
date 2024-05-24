@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-xform"
-version = "0.1.7"
+version = "0.1.10"
 edition = "2021"
 authors = ["Jeff Garzik"]
 license = "MIT"
@@ -22,10 +22,13 @@ name = "uncompress"
 path = "src/uncompress.rs"
 
 [[bin]]
+name = "compress"
+path = "src/compress.rs"
+
+[[bin]]
 name = "uudecode"
 path = "src/uudecode.rs"
 
 [[bin]]
 name = "uuencode"
 path = "src/uuencode.rs"
-

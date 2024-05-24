@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-text"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 authors = ["Jeff Garzik"]
 license = "MIT"
@@ -14,6 +14,7 @@ topological-sort = "0.2"
 diff = "0.1"
 regex.workspace = true
 chrono = "0.4"
+libc.workspace = true
 
 [[bin]]
 name = "asa"
@@ -34,6 +35,14 @@ path = "src/diff.rs"
 [[bin]]
 name = "cut"
 path = "src/cut.rs"
+
+[[bin]]
+name = "uniq"
+path = "src/uniq.rs"
+
+[[bin]]
+name = "sort"
+path = "src/sort.rs"
 
 [[bin]]
 name = "expand"

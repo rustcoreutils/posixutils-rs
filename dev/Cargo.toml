@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-dev"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 authors = ["Jeff Garzik"]
 license = "MIT"
@@ -26,3 +26,7 @@ required-features = ["object/read_core", "object/archive"]
 [[bin]]
 name = "strip"
 path = "src/strip.rs"
+
+[[bin]]
+name = "strings"
+path = "src/strings.rs"

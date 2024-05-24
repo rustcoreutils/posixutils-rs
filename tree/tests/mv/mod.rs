@@ -1362,7 +1362,7 @@ fn test_mv_i_link_no() {
     not(all(
         target_os = "linux",
         feature = "posixutils_test_all",
-        feature = "test_mv_sticky_to_xpart"
+        feature = "requires_root"
     )),
     ignore
 )]

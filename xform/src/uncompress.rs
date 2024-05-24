@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2024 Jeff Garzik
+// Copyright (c) 2024 Hemi Labs, Inc.
 //
 // This file is part of the posixutils-rs project covered under
 // the MIT License.  For the full license text, please see the LICENSE
@@ -14,11 +14,9 @@
 extern crate clap;
 extern crate plib;
 
-mod lzw;
-
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, textdomain};
-use lzw::UnixLZWReader;
+use plib::lzw::UnixLZWReader;
 use plib::PROJECT_NAME;
 use std::io::{self, Write};
 use std::path::PathBuf;

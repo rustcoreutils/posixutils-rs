@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-file"
-version = "0.1.8"
+version = "0.1.10"
 edition = "2021"
 authors = ["Jeff Garzik"]
 license = "MIT"
@@ -21,10 +21,6 @@ path = "src/cat.rs"
 [[bin]]
 name = "cmp"
 path = "src/cmp.rs"
-
-[[bin]]
-name = "cp"
-path = "src/cp.rs"
 
 [[bin]]
 name = "dd"

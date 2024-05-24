@@ -97,8 +97,8 @@ impl BuiltinMacro {
             BuiltinMacro::Undefine => 1,
             BuiltinMacro::Errprint => 1,
             BuiltinMacro::Include => 1,
-            BuiltinMacro::Changecom => 1,
-            BuiltinMacro::Changequote => 1,
+            BuiltinMacro::Changecom => 0,
+            BuiltinMacro::Changequote => 0,
         }
     }
 
@@ -408,24 +408,22 @@ impl MacroImplementation for ChangecomMacro {
         let args_len = m.args.len();
 
         if args_len == 0 {
-            state.parse_config.comment_open_tag = DEFAULT_COMMENT_OPEN_TAG.to_owned();
-            state.parse_config.comment_close_tag = DEFAULT_COMMENT_CLOSE_TAG.to_owned();
+            state.parse_config.comment_enabled = false;
             log::trace!("ChangecomMacro::evaluate() reset to default");
             return Ok(state);
         }
 
         let mut args = m.args.into_iter();
-        if args_len >= 1 {
-            let open = args.next().expect("1 argument should be present");
-            let open_tag;
-            (open_tag, state) = evaluate_to_text(state, open, stderror)?;
-            if !open_tag.is_empty() {
-                log::trace!(
-                    "ChangecomMacro::evaluate() comment_open_tag set to {:?}",
-                    String::from_utf8_lossy(&open_tag)
-                );
-                state.parse_config.comment_open_tag = open_tag;
-            }
+        let open = args.next().expect("1 argument should be present");
+        let open_tag;
+        (open_tag, state) = evaluate_to_text(state, open, stderror)?;
+        if !open_tag.is_empty() {
+            log::trace!(
+                "ChangecomMacro::evaluate() comment_open_tag set to {:?}",
+                String::from_utf8_lossy(&open_tag)
+            );
+            state.parse_config.comment_enabled = true;
+            state.parse_config.comment_open_tag = open_tag;
         }
 
         if args_len >= 2 {
@@ -437,7 +435,7 @@ impl MacroImplementation for ChangecomMacro {
                     "ChangecomMacro::evaluate() comment_close_tag set to {:?}",
                     String::from_utf8_lossy(&close_tag)
                 );
-                state.parse_config.comment_open_tag = close_tag;
+                state.parse_config.comment_close_tag = close_tag;
             }
         }
 

@@ -297,6 +297,7 @@ where
         if condition {
             f.parse(input)
         } else {
+            log::trace!("cond_error() skipping parser, it's disabled");
             Err(nom::Err::Error(E::from_error_kind(
                 input,
                 nom::error::ErrorKind::Alt,

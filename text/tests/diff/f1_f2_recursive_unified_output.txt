@@ -1,8 +1,8 @@
---- f1.txt Fri, 24 May 2024 08:03:24 -0400
-+++ f1.txt Fri, 24 May 2024 08:03:26 -0400
+--- f1.txt Fri, 24 May 2024 13:38:46 +0000
++++ f1.txt Fri, 24 May 2024 13:38:46 +0000
 diff -U 3 -r tests/diff/f1/f1.txt tests/diff/f2/f1.txt 
---- f1.txt Fri, 24 May 2024 08:00:25 -0400
-+++ f1.txt Fri, 24 May 2024 08:00:49 -0400
+--- f1.txt Fri, 24 May 2024 13:38:46 +0000
++++ f1.txt Fri, 24 May 2024 13:38:46 +0000
 @@ -3,15 +3,11 @@
  
  line 4

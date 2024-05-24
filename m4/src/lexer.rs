@@ -513,15 +513,17 @@ fn parse_text<'c>(
             return Err(nom::Err::Incomplete(nom::Needed::Unknown));
         }
 
-        let stop_tags = &[
-            config.quote_open_tag.as_slice(),
-            config.comment_open_tag.as_slice(),
-            b"\n",
-            b",",
-            b"(",
-            b")",
-            b"\0",
-        ];
+        let default_stop_tags: &[&[u8]] = &[b"\n", b",", b"(", b")", b"\0"];
+        let stop_tags = if config.comment_enabled {
+            let mut stop_tags = vec![
+                config.quote_open_tag.as_slice(),
+                config.comment_open_tag.as_slice(),
+            ];
+            stop_tags.extend_from_slice(default_stop_tags);
+            stop_tags
+        } else {
+            default_stop_tags.to_vec()
+        };
         let allowed_to_include_tags: &[&[u8]] = &[b",", b"(", b")"];
         let mut previous_was_alphanumeric = true;
         let mut stop_index = 0;
@@ -539,14 +541,14 @@ fn parse_text<'c>(
                 );
                 return Ok((remaining, matched));
             }
-            for tag in stop_tags {
+            for tag in &stop_tags {
                 if input[i..].starts_with(tag) {
                     log::trace!(
                         "parse_text() found start of tag {:?}",
                         String::from_utf8_lossy(tag)
                     );
                     if i == 0 && !allowed_to_include_tags.contains(tag) {
-                        log::trace!("parse_text() Error found tag at start of input");
+                        log::error!("parse_text() Error found an unexpected tag at start of input");
                         return Err(nom::Err::Error(nom::error::Error::new(
                             input,
                             nom::error::ErrorKind::Fail,
@@ -688,7 +690,17 @@ pub(crate) fn process_streaming<'c, R: Read>(
                         buffer.grow(new_capacity);
                         break;
                     }
-                    Err(error) => return Err(crate::Error::Parsing(error.to_string())),
+                    Err(error) => {
+                        return Err(crate::error::Error::Parsing(match error {
+                            nom::Err::Error(error) | nom::Err::Failure(error) => {
+                                let input = std::str::from_utf8(error.input)
+                                    .map(|s| format!("{s:?}"))
+                                    .unwrap_or_else(|_| format!("{:?}", error.input));
+                                format!("Parsing Error for input {}, code: {:?}", input, error.code)
+                            }
+                            nom::Err::Incomplete(_) => error.to_string(),
+                        }));
+                    }
                 };
 
                 if matches!(symbol, Symbol::Eof) {

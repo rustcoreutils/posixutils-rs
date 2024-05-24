@@ -1,3 +1,3 @@
-stdout=\n| world ^ # hello\n| hello ^ # world\n
+stdout=\n| world ^ # hello\n| hello ^ # world\n | world ^ # world\n
 stderr=
 status=0

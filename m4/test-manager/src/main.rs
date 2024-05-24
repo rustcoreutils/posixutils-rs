@@ -102,6 +102,9 @@ fn update_snapshots(args: &Args, update: &UpdateSnapshots) {
 
             let snapshot_file_name = format!("{test_name}.out");
             let snapshot_file = args.fixtures_directory.join(snapshot_file_name);
+            if snapshot_file.exists() {
+                std::fs::remove_file(&snapshot_file).unwrap();
+            }
             let mut f = std::fs::OpenOptions::new()
                 .write(true)
                 .create(true)

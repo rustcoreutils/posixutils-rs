@@ -1,4 +1,7 @@
 //! NOTE: This file has been auto generated using build.rs, don't edit by hand!
+//! You can regenerate the tests (which are based on the fixtures in `fixtures/integration_tests/`)
+//! using the following command:
+//! `cargo run -p m4-test-manager update-snapshots`
 use m4::error::GetExitCode;
 use m4_test_manager::TestSnapshot;
 use similar_asserts::assert_eq;
@@ -52,17 +55,17 @@ fn test_changequote() {
     assert_eq!(
         output.status,
         std::process::ExitStatus::from_raw(test.status),
-        "status"
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
-        "stdout"
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
         test.stderr,
-        "stderr"
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
 }
 
@@ -74,17 +77,17 @@ fn test_define_eval_order_quoted() {
     assert_eq!(
         output.status,
         std::process::ExitStatus::from_raw(test.status),
-        "status"
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
-        "stdout"
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
         test.stderr,
-        "stderr"
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
 }
 
@@ -96,17 +99,17 @@ fn test_define_eval_order_unquoted() {
     assert_eq!(
         output.status,
         std::process::ExitStatus::from_raw(test.status),
-        "status"
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
-        "stdout"
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
         test.stderr,
-        "stderr"
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
 }
 
@@ -120,17 +123,17 @@ fn test_define_eval_syntax_order_quoted_evaluated() {
     assert_eq!(
         output.status,
         std::process::ExitStatus::from_raw(test.status),
-        "status"
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
-        "stdout"
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
         test.stderr,
-        "stderr"
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
 }
 
@@ -144,17 +147,17 @@ fn test_define_eval_syntax_order_quoted_unevaluated() {
     assert_eq!(
         output.status,
         std::process::ExitStatus::from_raw(test.status),
-        "status"
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
-        "stdout"
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
         test.stderr,
-        "stderr"
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
 }
 
@@ -167,17 +170,17 @@ fn test_define_eval_syntax_order_unquoted() {
     assert_eq!(
         output.status,
         std::process::ExitStatus::from_raw(test.status),
-        "status"
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
-        "stdout"
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
         test.stderr,
-        "stderr"
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
 }
 
@@ -189,17 +192,17 @@ fn test_define_order_defined() {
     assert_eq!(
         output.status,
         std::process::ExitStatus::from_raw(test.status),
-        "status"
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
-        "stdout"
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
         test.stderr,
-        "stderr"
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
 }
 
@@ -211,17 +214,39 @@ fn test_define_order_undefined() {
     assert_eq!(
         output.status,
         std::process::ExitStatus::from_raw(test.status),
-        "status"
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
-        "stdout"
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
         test.stderr,
-        "stderr"
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+}
+
+#[test]
+fn test_dnl() {
+    let output = run_command("fixtures/integration_tests/dnl.m4");
+
+    let test: TestSnapshot = read_test("fixtures/integration_tests/dnl.out");
+    assert_eq!(
+        output.status,
+        std::process::ExitStatus::from_raw(test.status),
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        test.stdout,
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        test.stderr,
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
 }
 
@@ -233,17 +258,17 @@ fn test_evaluation_order() {
     assert_eq!(
         output.status,
         std::process::ExitStatus::from_raw(test.status),
-        "status"
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
-        "stdout"
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
         test.stderr,
-        "stderr"
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
 }
 
@@ -255,17 +280,17 @@ fn test_include() {
     assert_eq!(
         output.status,
         std::process::ExitStatus::from_raw(test.status),
-        "status"
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
-        "stdout"
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
         test.stderr,
-        "stderr"
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
 }
 
@@ -277,17 +302,17 @@ fn test_macro_errprint_evaluation() {
     assert_eq!(
         output.status,
         std::process::ExitStatus::from_raw(test.status),
-        "status"
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
-        "stdout"
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
         test.stderr,
-        "stderr"
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
 }
 
@@ -300,17 +325,17 @@ fn test_macro_errprint_no_evaluation() {
     assert_eq!(
         output.status,
         std::process::ExitStatus::from_raw(test.status),
-        "status"
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
-        "stdout"
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
         test.stderr,
-        "stderr"
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
 }
 
@@ -323,16 +348,16 @@ fn test_macro_errprint_no_evaluation_quoted() {
     assert_eq!(
         output.status,
         std::process::ExitStatus::from_raw(test.status),
-        "status"
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
-        "stdout"
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
     assert_eq!(
         String::from_utf8(output.stderr).unwrap(),
         test.stderr,
-        "stderr"
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
 }

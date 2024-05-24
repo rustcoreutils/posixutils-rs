@@ -384,12 +384,15 @@ impl<'i> Quoted<'i> {
             };
 
             let contents = &input[quote_start_index..quote_end_index];
-            remaining = &input[quote_end_index + 1..];
+            remaining = &input[quote_end_index + close_tag.len()..];
             log::trace!(
                 "Quoted::parse() contents: {:?}",
                 String::from_utf8_lossy(contents)
             );
-
+            log::trace!(
+                "Quoted::parse() remaining: {:?}",
+                String::from_utf8_lossy(remaining)
+            );
             Ok((remaining, Quoted { contents }))
         }
     }
@@ -1081,6 +1084,22 @@ mod test {
     fn test_parse_quoted() {
         let (remaining, quote) =
             Quoted::parse(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_QUOTE_CLOSE_TAG)(b"`hello'").unwrap();
+
+        assert_eq!("", utf8(remaining));
+        assert_eq!("hello".as_bytes(), quote.contents);
+    }
+
+    #[test]
+    fn test_parse_quoted_alpha() {
+        let (remaining, quote) = Quoted::parse(b"x", b"z")(b"xhelloz").unwrap();
+
+        assert_eq!("", utf8(remaining));
+        assert_eq!("hello".as_bytes(), quote.contents);
+    }
+
+    #[test]
+    fn test_parse_quoted_multi_nonalphanumeric() {
+        let (remaining, quote) = Quoted::parse(b"<<", b">>")(b"<<hello>>").unwrap();
 
         assert_eq!("", utf8(remaining));
         assert_eq!("hello".as_bytes(), quote.contents);

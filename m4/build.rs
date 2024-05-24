@@ -52,9 +52,9 @@ fn test_{name}() {{
     let output = run_command("{input}");
 
     let test: TestSnapshot = read_test("{output}");
-    assert_eq!(output.status, std::process::ExitStatus::from_raw(test.status), "status");
-    assert_eq!(String::from_utf8(output.stdout).unwrap(), test.stdout, "stdout");
-    assert_eq!(String::from_utf8(output.stderr).unwrap(), test.stderr, "stderr");
+    assert_eq!(output.status, std::process::ExitStatus::from_raw(test.status), "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)");
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), test.stdout, "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)");
+    assert_eq!(String::from_utf8(output.stderr).unwrap(), test.stderr, "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)");
 "##
         );
 
@@ -101,6 +101,9 @@ fn main() {
     }
     let mut integration_test: String =
         r#"//! NOTE: This file has been auto generated using build.rs, don't edit by hand!
+//! You can regenerate the tests (which are based on the fixtures in `fixtures/integration_tests/`)
+//! using the following command:
+//! `cargo run -p m4-test-manager update-snapshots`
 use similar_asserts::assert_eq;
 use std::process::ExitStatus;
 use std::os::unix::process::ExitStatusExt;

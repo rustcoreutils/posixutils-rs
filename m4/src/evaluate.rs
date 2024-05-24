@@ -8,8 +8,8 @@ use nom::IResult;
 
 use crate::error::Result;
 use crate::lexer::{
-    self, Macro, MacroName, MacroParseConfig, ParseConfig, Symbol, DEFAULT_COMMENT_CLOSE_TAG,
-    DEFAULT_COMMENT_OPEN_TAG, DEFAULT_QUOTE_CLOSE_TAG, DEFAULT_QUOTE_OPEN_TAG,
+    self, Macro, MacroName, MacroParseConfig, ParseConfig, Symbol, DEFAULT_QUOTE_CLOSE_TAG,
+    DEFAULT_QUOTE_OPEN_TAG,
 };
 
 pub struct State {
@@ -56,6 +56,8 @@ pub enum BuiltinMacro {
     Include,
     Changecom,
     Changequote,
+    Pushdef,
+    Popdef,
 }
 
 impl AsRef<[u8]> for BuiltinMacro {
@@ -68,6 +70,8 @@ impl AsRef<[u8]> for BuiltinMacro {
             BuiltinMacro::Include => b"include",
             BuiltinMacro::Changecom => b"changecom",
             BuiltinMacro::Changequote => b"changequote",
+            BuiltinMacro::Pushdef => b"pushdef",
+            BuiltinMacro::Popdef => b"pushdef",
         }
     }
 }
@@ -82,6 +86,8 @@ impl BuiltinMacro {
             Self::Include,
             Self::Changecom,
             Self::Changequote,
+            Self::Pushdef,
+            Self::Popdef,
         ]
     }
     pub fn name(&self) -> MacroName {
@@ -99,6 +105,8 @@ impl BuiltinMacro {
             BuiltinMacro::Include => 1,
             BuiltinMacro::Changecom => 0,
             BuiltinMacro::Changequote => 0,
+            BuiltinMacro::Pushdef => 1,
+            BuiltinMacro::Popdef => 1,
         }
     }
 
@@ -120,6 +128,8 @@ fn inbuilt_macro_implementation(builtin: &BuiltinMacro) -> Box<dyn MacroImplemen
         BuiltinMacro::Include => Box::new(IncludeMacro),
         BuiltinMacro::Changecom => Box::new(ChangecomMacro),
         BuiltinMacro::Changequote => Box::new(ChangequoteMacro),
+        BuiltinMacro::Pushdef => Box::new(PushdefMacro),
+        BuiltinMacro::Popdef => Box::new(PopdefMacro),
     }
 }
 
@@ -214,6 +224,34 @@ impl MacroImplementation for DefineMacro {
         state.macro_definitions.insert(name, Rc::new(definition));
         state.parse_config.macro_parse_configs = state.current_macro_parse_configs();
         return Ok(state);
+    }
+}
+
+struct PushdefMacro;
+
+impl MacroImplementation for PushdefMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        _stdout: &mut dyn Write,
+        stderror: &mut dyn Write,
+        m: Macro,
+    ) -> Result<State> {
+        todo!()
+    }
+}
+
+struct PopdefMacro;
+
+impl MacroImplementation for PopdefMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        _stdout: &mut dyn Write,
+        stderror: &mut dyn Write,
+        m: Macro,
+    ) -> Result<State> {
+        todo!()
     }
 }
 

@@ -43,6 +43,7 @@ pub(crate) struct ParseConfig {
     // TODO: Can probably optimize using something like smallvec
     pub quote_open_tag: Vec<u8>,
     pub quote_close_tag: Vec<u8>,
+    pub comment_enabled: bool,
     pub comment_open_tag: Vec<u8>,
     pub comment_close_tag: Vec<u8>,
     pub symbol_recursion_limit: usize,
@@ -68,6 +69,7 @@ impl Default for ParseConfig {
                 .collect(),
             quote_open_tag: DEFAULT_QUOTE_OPEN_TAG.to_vec(),
             quote_close_tag: DEFAULT_QUOTE_CLOSE_TAG.to_vec(),
+            comment_enabled: true,
             comment_open_tag: DEFAULT_COMMENT_OPEN_TAG.to_vec(),
             comment_close_tag: DEFAULT_COMMENT_CLOSE_TAG.to_vec(),
             symbol_recursion_limit: DEFAULT_SYMBOL_RECURSION_LIMIT,
@@ -281,6 +283,28 @@ impl<'i> std::fmt::Debug for Symbol<'i> {
     }
 }
 
+/// Very similar to [`nom::combinator::cond`], however instead of returning `None` when `condition`
+/// is `false`, it returns an error with kind [`nom::error::ErrorKind::Alt`], designed to be used
+/// in [`nom::branch::alt`] to disable branches.
+fn cond_error<I, O, E: nom::error::ParseError<I>, F>(
+    condition: bool,
+    mut f: F,
+) -> impl FnMut(I) -> IResult<I, O, E>
+where
+    F: nom::Parser<I, O, E>,
+{
+    move |input: I| {
+        if condition {
+            f.parse(input)
+        } else {
+            Err(nom::Err::Error(E::from_error_kind(
+                input,
+                nom::error::ErrorKind::Alt,
+            )))
+        }
+    }
+}
+
 impl<'c, 'i: 'c> Symbol<'i> {
     fn parse(config: &'c ParseConfig) -> impl Fn(&'i [u8]) -> IResult<&'i [u8], Symbol<'i>> + 'c {
         move |input: &'i [u8]| {
@@ -314,9 +338,12 @@ impl<'c, 'i: 'c> Symbol<'i> {
                     Quoted::parse(&config.quote_open_tag, &config.quote_close_tag),
                     Symbol::Quoted,
                 ),
-                nom::combinator::map(
-                    parse_comment(&config.comment_open_tag, &config.comment_close_tag),
-                    Symbol::Comment,
+                cond_error(
+                    config.comment_enabled,
+                    nom::combinator::map(
+                        parse_comment(&config.comment_open_tag, &config.comment_close_tag),
+                        Symbol::Comment,
+                    ),
                 ),
                 nom::combinator::map(Macro::parse(&config), Symbol::Macro),
                 nom::combinator::map(parse_text(&config), Symbol::Text),
@@ -443,10 +470,6 @@ impl MacroName {
         Self::parse(input.as_slice())
             .map(|ok| ok.1)
             .map_err(|e| e.to_string())
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
     }
 }
 
@@ -646,8 +669,11 @@ pub(crate) fn process_streaming<'c, R: Read>(
                         buffer.grow(new_capacity);
                         break;
                     }
-                    // TODO: handle unwrap
-                    Err(error) => panic!("{}", error),
+                    Err(error) => {
+                        return Err(crate::error::Error::Parsing(format!(
+                            "Error parsing dnl {error}"
+                        )))
+                    }
                 };
                 state.parse_config.dnl = false;
 
@@ -661,7 +687,6 @@ pub(crate) fn process_streaming<'c, R: Read>(
                         buffer.grow(new_capacity);
                         break;
                     }
-                    // TODO: handle unwrap
                     Err(error) => return Err(crate::Error::Parsing(error.to_string())),
                 };
 
@@ -687,7 +712,6 @@ mod test {
     };
     use crate::test_utils::{macro_parse_config, macro_parse_configs, utf8};
     use std::collections::HashMap;
-    use std::io::Write;
     use test_log::test;
 
     use super::{
@@ -1155,6 +1179,12 @@ mod test {
                 .unwrap();
         assert_eq!("# hello world", utf8(comment));
         assert_eq!("\0", utf8(remaining));
+    }
+    #[test]
+    fn test_parse_comment_custom() {
+        let (remaining, comment) = parse_comment(b"|", b"^")(b"| hello ^ goodbye").unwrap();
+        assert_eq!("| hello ^", utf8(comment));
+        assert_eq!(" goodbye", utf8(remaining));
     }
 
     #[test]

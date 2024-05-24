@@ -38,13 +38,41 @@ fn run_command(input: &str) -> std::process::Output {
     let result = m4::run(&mut stdout, &mut stderr, args);
     let status = ExitStatus::from_raw(result.get_exit_code() as i32);
     log::info!("Received status: {status}");
-    log::info!("Received stdout: {}", String::from_utf8_lossy(&stdout));
-    log::info!("Received stderr: {}", String::from_utf8_lossy(&stderr));
+    log::info!(
+        "Received stdout: \x1b[34m{}\x1b[0m",
+        String::from_utf8_lossy(&stdout)
+    );
+    log::info!(
+        "Received stderr: \x1b[34m{}\x1b[0m",
+        String::from_utf8_lossy(&stderr)
+    );
     std::process::Output {
         stdout,
         stderr,
         status,
     }
+}
+
+#[test]
+fn test_changecom() {
+    let output = run_command("fixtures/integration_tests/changecom.m4");
+
+    let test: TestSnapshot = read_test("fixtures/integration_tests/changecom.out");
+    assert_eq!(
+        output.status,
+        std::process::ExitStatus::from_raw(test.status),
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        test.stdout,
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        test.stderr,
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
 }
 
 #[test]

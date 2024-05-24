@@ -8,8 +8,8 @@ use nom::IResult;
 
 use crate::error::Result;
 use crate::lexer::{
-    self, Macro, MacroName, MacroParseConfig, ParseConfig, Symbol, DEFAULT_QUOTE_CLOSE_TAG,
-    DEFAULT_QUOTE_OPEN_TAG,
+    self, Macro, MacroName, MacroParseConfig, ParseConfig, Symbol, DEFAULT_COMMENT_CLOSE_TAG,
+    DEFAULT_COMMENT_OPEN_TAG, DEFAULT_QUOTE_CLOSE_TAG, DEFAULT_QUOTE_OPEN_TAG,
 };
 
 pub struct State {
@@ -402,10 +402,50 @@ impl MacroImplementation for ChangecomMacro {
         &self,
         mut state: State,
         _stdout: &mut dyn Write,
-        _stderror: &mut dyn Write,
+        stderror: &mut dyn Write,
         m: Macro,
     ) -> Result<State> {
-        todo!();
+        let args_len = m.args.len();
+
+        if args_len == 0 {
+            state.parse_config.comment_open_tag = DEFAULT_COMMENT_OPEN_TAG.to_owned();
+            state.parse_config.comment_close_tag = DEFAULT_COMMENT_CLOSE_TAG.to_owned();
+            log::trace!("ChangecomMacro::evaluate() reset to default");
+            return Ok(state);
+        }
+
+        let mut args = m.args.into_iter();
+        if args_len >= 1 {
+            let open = args.next().expect("1 argument should be present");
+            let open_tag;
+            (open_tag, state) = evaluate_to_text(state, open, stderror)?;
+            if !open_tag.is_empty() {
+                log::trace!(
+                    "ChangecomMacro::evaluate() comment_open_tag set to {:?}",
+                    String::from_utf8_lossy(&open_tag)
+                );
+                state.parse_config.comment_open_tag = open_tag;
+            }
+        }
+
+        if args_len >= 2 {
+            let close = args.next().expect("2 arguments should be present");
+            let close_tag;
+            (close_tag, state) = evaluate_to_text(state, close, stderror)?;
+            if !close_tag.is_empty() {
+                log::trace!(
+                    "ChangecomMacro::evaluate() comment_close_tag set to {:?}",
+                    String::from_utf8_lossy(&close_tag)
+                );
+                state.parse_config.comment_open_tag = close_tag;
+            }
+        }
+
+        if args_len > 2 {
+            stderror.write_all(b"Warning: excess arguments to builtin `changecom' ignored")?;
+        }
+
+        Ok(state)
     }
 }
 
@@ -433,15 +473,15 @@ impl MacroImplementation for ChangequoteMacro {
                 let mut args = m.args.into_iter();
                 let open = args.next().expect("2 arguments should be present");
                 let close = args.next().expect("2 arguments should be present");
+                let open_tag;
+                (open_tag, state) = evaluate_to_text(state, open, stderror)?;
+                let close_tag;
+                (close_tag, state) = evaluate_to_text(state, close, stderror)?;
                 // The behavior is unspecified if there is a single argument or either argument is null.
-                if !open.is_empty() && !close.is_empty() {
+                if !open_tag.is_empty() && !close_tag.is_empty() {
                     // TODO: it looks like GNU m4 only allows quote strings using non-alphanumeric
                     // characters. The spec I'm following doesn't mention anything about that.
-                    let open_tag;
-                    (open_tag, state) = evaluate_to_text(state, open, stderror)?;
                     state.parse_config.quote_open_tag = open_tag;
-                    let close_tag;
-                    (close_tag, state) = evaluate_to_text(state, close, stderror)?;
                     state.parse_config.quote_close_tag = close_tag;
                 }
             } //TODO what about when there are more arguments? Add integration test for this.
@@ -479,8 +519,6 @@ pub(crate) fn evaluate(
     stdout: &mut dyn Write,
     stderror: &mut dyn Write,
 ) -> Result<State> {
-    log::debug!("symbol: {symbol:?}");
-    log::debug!("macro_definitions: {:?}", state.macro_definitions.keys());
     // We should never be evaluating symbols when dnl is enabled
     debug_assert!(!state.parse_config.dnl);
     match symbol {

@@ -54,6 +54,7 @@ pub enum BuiltinMacro {
     Undefine,
     Errprint,
     Include,
+    Sinclude,
     Changecom,
     Changequote,
     Pushdef,
@@ -68,6 +69,7 @@ impl AsRef<[u8]> for BuiltinMacro {
             BuiltinMacro::Undefine => b"undefine",
             BuiltinMacro::Errprint => b"errprint",
             BuiltinMacro::Include => b"include",
+            BuiltinMacro::Sinclude => b"sinclude",
             BuiltinMacro::Changecom => b"changecom",
             BuiltinMacro::Changequote => b"changequote",
             BuiltinMacro::Pushdef => b"pushdef",
@@ -84,6 +86,7 @@ impl BuiltinMacro {
             Self::Undefine,
             Self::Errprint,
             Self::Include,
+            Self::Sinclude,
             Self::Changecom,
             Self::Changequote,
             Self::Pushdef,
@@ -103,6 +106,7 @@ impl BuiltinMacro {
             BuiltinMacro::Undefine => 1,
             BuiltinMacro::Errprint => 1,
             BuiltinMacro::Include => 1,
+            BuiltinMacro::Sinclude => 1,
             BuiltinMacro::Changecom => 0,
             BuiltinMacro::Changequote => 0,
             BuiltinMacro::Pushdef => 1,
@@ -126,6 +130,7 @@ fn inbuilt_macro_implementation(builtin: &BuiltinMacro) -> Box<dyn MacroImplemen
         BuiltinMacro::Undefine => Box::new(UndefineMacro),
         BuiltinMacro::Errprint => Box::new(ErrprintMacro),
         BuiltinMacro::Include => Box::new(IncludeMacro),
+        BuiltinMacro::Sinclude => Box::new(SincludeMacro),
         BuiltinMacro::Changecom => Box::new(ChangecomMacro),
         BuiltinMacro::Changequote => Box::new(ChangequoteMacro),
         BuiltinMacro::Pushdef => Box::new(PushdefMacro),
@@ -406,27 +411,74 @@ impl MacroImplementation for ErrprintMacro {
     }
 }
 
+/// The defining text for the include macro shall be the contents of the file named by the first
+/// argument. It shall be an error if the file cannot be read. The behavior is unspecified if
+/// include is not immediately followed by a `<left-parenthesis>`.
 struct IncludeMacro;
+
+impl IncludeMacro {
+    fn get_file_path(
+        m: Macro,
+        state: State,
+        stderror: &mut dyn Write,
+    ) -> Result<(Option<PathBuf>, State)> {
+        if let Some(path_symbols) = m.args.into_iter().next() {
+            let (buffer, state) = evaluate_to_text(state, path_symbols, stderror)?;
+            let path = PathBuf::from(OsString::from_vec(buffer));
+            Ok((Some(path), state))
+        } else {
+            Ok((None, state))
+        }
+    }
+}
 
 impl MacroImplementation for IncludeMacro {
     fn evaluate(
         &self,
-        mut state: State,
+        state: State,
         stdout: &mut dyn Write,
         stderror: &mut dyn Write,
         m: Macro,
     ) -> Result<State> {
-        if let Some(path_symbols) = m.args.into_iter().next() {
-            let buffer;
-            (buffer, state) = evaluate_to_text(state, path_symbols, stderror)?;
-            let file_path = PathBuf::from(OsString::from_vec(buffer));
-            return lexer::process_streaming(
+        let (path, state) = Self::get_file_path(m, state, stderror)?;
+        if let Some(path) = path {
+            lexer::process_streaming(
                 state,
                 evaluate,
-                std::fs::File::open(file_path)?,
+                std::fs::File::open(path)?,
                 stdout,
                 stderror,
-            );
+            )
+        } else {
+            Ok(state)
+        }
+    }
+}
+
+/// The sinclude macro shall be equivalent to the [`IncludeMacro`], except that it shall not be an
+/// error if the file is inaccessible. The behavior is unspecified if sinclude is not immediately
+/// followed by a `<left-parenthesis>`.
+struct SincludeMacro;
+
+impl MacroImplementation for SincludeMacro {
+    fn evaluate(
+        &self,
+        state: State,
+        stdout: &mut dyn Write,
+        stderror: &mut dyn Write,
+        m: Macro,
+    ) -> Result<State> {
+        let (path, state) = IncludeMacro::get_file_path(m, state, stderror)?;
+        if let Some(path) = path {
+            if path.is_file() {
+                return lexer::process_streaming(
+                    state,
+                    evaluate,
+                    std::fs::File::open(path)?,
+                    stdout,
+                    stderror,
+                );
+            }
         }
 
         Ok(state)

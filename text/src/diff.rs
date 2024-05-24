@@ -64,7 +64,7 @@ struct Args {
     unified3: bool,
 
     /// Output <N> lines of unified context
-    #[arg(short='U', value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(short='U', value_parser = clap::value_parser!(u32).range(0..))]
     unified: Option<u32>,
 
     /// First comparison file (or directory, if -r is specified)

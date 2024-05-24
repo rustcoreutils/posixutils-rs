@@ -53,7 +53,7 @@ impl Change {
     /// panics if self is None
     pub fn get_lns(&self) -> (usize, usize) {
         match self {
-            Change::None => panic!("Change::None is not allowed in hunk."),
+            Change::None => Default::default(),
             Change::Unchanged(data) => (data.ln1, data.ln2),
             Change::Insert(data) => (data.ln1, data.ln2),
             Change::Delete(data) => (data.ln1, data.ln2),

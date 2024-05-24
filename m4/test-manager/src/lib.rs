@@ -4,6 +4,7 @@ pub struct TestSnapshot {
     pub stdout: String,
     pub stderr: String,
     pub status: i32,
+    pub ignore: bool,
 }
 
 fn escape_newlines(input: &str) -> String {
@@ -25,12 +26,17 @@ impl TestSnapshot {
             .unwrap();
         write!(out, "\n").unwrap();
         write!(out, "status={}", self.status).unwrap();
+        if self.ignore {
+            write!(out, "\n").unwrap();
+            write!(out, "ignore={}", self.ignore).unwrap();
+        }
     }
 
     pub fn deserialize(input: &mut impl Read) -> Self {
         let mut stdout: Option<String> = None;
         let mut stderr: Option<String> = None;
         let mut status: Option<i32> = None;
+        let mut ignore = false;
 
         let mut buffer: String = String::new();
         input.read_to_string(&mut buffer).unwrap();
@@ -44,6 +50,7 @@ impl TestSnapshot {
                 "stdout" => stdout = Some(unescape_newlines(value)),
                 "stderr" => stderr = Some(unescape_newlines(value)),
                 "status" => status = Some(value.parse().unwrap()),
+                "ignore" => ignore = value.parse().unwrap(),
                 _ => panic!("Unsupported key {name:?}"),
             }
         }
@@ -52,6 +59,7 @@ impl TestSnapshot {
             stdout: stdout.unwrap(),
             stderr: stderr.unwrap(),
             status: status.unwrap(),
+            ignore,
         }
     }
 }

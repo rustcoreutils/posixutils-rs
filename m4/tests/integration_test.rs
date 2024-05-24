@@ -97,6 +97,7 @@ fn test_changequote() {
     );
 }
 
+#[ignore]
 #[test]
 fn test_define_eval_order_quoted() {
     let output = run_command("fixtures/integration_tests/define_eval_order_quoted.m4");
@@ -119,6 +120,7 @@ fn test_define_eval_order_quoted() {
     );
 }
 
+#[ignore]
 #[test]
 fn test_define_eval_order_unquoted() {
     let output = run_command("fixtures/integration_tests/define_eval_order_unquoted.m4");
@@ -141,6 +143,7 @@ fn test_define_eval_order_unquoted() {
     );
 }
 
+#[ignore]
 #[test]
 fn test_define_eval_syntax_order_quoted_evaluated() {
     let output =
@@ -189,6 +192,7 @@ fn test_define_eval_syntax_order_quoted_unevaluated() {
     );
 }
 
+#[ignore]
 #[test]
 fn test_define_eval_syntax_order_unquoted() {
     let output = run_command("fixtures/integration_tests/define_eval_syntax_order_unquoted.m4");

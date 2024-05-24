@@ -5,11 +5,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use m4_test_manager::TestSnapshot;
+
 #[derive(Default)]
 struct TestCandidate {
     name: String,
     input: Option<PathBuf>,
     output: Option<PathBuf>,
+    ignore: bool,
 }
 
 impl TryFrom<TestCandidate> for Test {
@@ -30,6 +33,7 @@ impl TryFrom<TestCandidate> for Test {
                 .to_str()
                 .ok_or("Error converting output path to string")?
                 .to_owned(),
+            ignore: value.ignore,
         })
     }
 }
@@ -38,6 +42,7 @@ struct Test {
     name: String,
     input: String,
     output: String,
+    ignore: bool,
 }
 impl Test {
     fn as_code(&self) -> String {
@@ -45,8 +50,15 @@ impl Test {
             name,
             input,
             output,
+            ignore,
         } = self;
-        let mut s = format!(
+        let mut s = String::new();
+
+        if *ignore {
+            s.push_str("#[ignore]");
+        }
+
+        s.push_str(&format!(
             r##"#[test]
 fn test_{name}() {{
     let output = run_command("{input}");
@@ -55,10 +67,8 @@ fn test_{name}() {{
     assert_eq!(output.status, std::process::ExitStatus::from_raw(test.status), "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)");
     assert_eq!(String::from_utf8(output.stdout).unwrap(), test.stdout, "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)");
     assert_eq!(String::from_utf8(output.stderr).unwrap(), test.stderr, "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)");
-"##
-        );
-
-        s.push_str("}");
+}}"##
+        ));
 
         s
     }
@@ -71,17 +81,31 @@ fn name_from_path(path: &Path) -> Option<String> {
 fn main() {
     println!("cargo::rerun-if-changed=fixtures/");
     let mut test_candidates: BTreeMap<String, TestCandidate> = BTreeMap::new();
-    for entry in read_dir("fixtures/integration_tests").unwrap() {
+    let fixtures_directory = Path::new("fixtures/integration_tests");
+    for entry in read_dir(fixtures_directory).unwrap() {
         let entry = entry.unwrap();
         let path = entry.path();
 
         match path.extension().map(|e| e.as_bytes()) {
             Some(b"m4") => {
                 let name = name_from_path(&path).unwrap();
+                let snapshot_file_name = format!("{name}.out");
+                let snapshot_file = fixtures_directory.join(snapshot_file_name);
+                let ignore = if snapshot_file.exists() {
+                    let mut f = std::fs::OpenOptions::new()
+                        .read(true)
+                        .open(&snapshot_file)
+                        .unwrap();
+                    let snapshot = TestSnapshot::deserialize(&mut f);
+                    snapshot.ignore
+                } else {
+                    false
+                };
                 let candidate = test_candidates
                     .entry(name.clone())
                     .or_insert(TestCandidate {
                         name,
+                        ignore,
                         ..TestCandidate::default()
                     });
                 candidate.input = Some(path);

@@ -80,7 +80,22 @@ fn update_snapshots(args: &Args, update: &UpdateSnapshots) {
                 .to_str()
                 .unwrap()
                 .to_owned();
-            println!("Updating snapshot for {test_name}");
+
+            let snapshot_file_name = format!("{test_name}.out");
+            let snapshot_file = args.fixtures_directory.join(snapshot_file_name);
+            if snapshot_file.exists() {
+                let mut f = std::fs::OpenOptions::new()
+                    .read(true)
+                    .open(&snapshot_file)
+                    .unwrap();
+                let snapshot = TestSnapshot::deserialize(&mut f);
+                if snapshot.ignore {
+                    println!("SKIPPING ignored snapshot for {test_name}");
+                    return;
+                }
+            }
+
+            println!("UPDATING snapshot for {test_name}");
             let output = std::process::Command::new(&update.reference_command)
                 .arg(m4_file.path())
                 .output()
@@ -98,10 +113,9 @@ fn update_snapshots(args: &Args, update: &UpdateSnapshots) {
                 stdout: String::from_utf8(output.stdout).unwrap(),
                 stderr: String::from_utf8(output.stderr).unwrap(),
                 status: output.status.code().unwrap(),
+                ignore: false,
             };
 
-            let snapshot_file_name = format!("{test_name}.out");
-            let snapshot_file = args.fixtures_directory.join(snapshot_file_name);
             if snapshot_file.exists() {
                 std::fs::remove_file(&snapshot_file).unwrap();
             }

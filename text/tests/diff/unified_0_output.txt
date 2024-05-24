@@ -1,0 +1,16 @@
+--- f1.txt Fri, 24 May 2024 06:42:36 -0400
++++ f2.txt Fri, 24 May 2024 06:43:29 -0400
+@@ -6 +6 @@
+-line 6 will change
++line 6 is updated
+@@ -9,2 +8,0 @@
+-This line will be removed
+-
+@@ -12,2 +10,2 @@
+-line 9 will change
++line 9 is updated
+-line 10 will change
++line 10 is updated
+@@ -17 +13 @@
+ line 11
+-This will be removed, too

@@ -1,0 +1,9 @@
+17,18d
+12,13c
+line 9 is updated
+line 10 is updated
+.
+9,10d
+6c
+line 6 is updated
+.

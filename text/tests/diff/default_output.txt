@@ -1,0 +1,16 @@
+6c6
+< line 6 will change
+---
+> line 6 is updated
+9,10d8
+< This line will be removed
+< 
+12,13c10,11
+< line 9 will change
+< line 10 will change
+---
+> line 9 is updated
+> line 10 is updated
+17,18d14
+< This will be removed, too
+< 

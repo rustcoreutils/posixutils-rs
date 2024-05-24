@@ -71,7 +71,7 @@ struct Args {
     file1: String,
 
     #[arg(long, value_parser= clap::value_parser!(String))]
-    label1: Option<String>,
+    label: Option<String>,
 
     #[arg(long, value_parser= clap::value_parser!(String))]
     label2: Option<String>,
@@ -132,7 +132,7 @@ fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
 
     let format_options = FormatOptions {
         ignore_trailing_white_spaces: args.ignore_eol_space,
-        label1: args.label1,
+        label1: args.label,
         label2: args.label2,
         output_format: output_format,
     };

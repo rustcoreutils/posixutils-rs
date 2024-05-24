@@ -1,0 +1,35 @@
+*** f1.txt Fri, 24 May 2024 08:03:24 -0400
+--- f1.txt Fri, 24 May 2024 08:03:26 -0400
+diff -C 3 -r tests/diff/f1/f1.txt tests/diff/f2/f1.txt 
+*** f1.txt Fri, 24 May 2024 08:00:25 -0400
+--- f1.txt Fri, 24 May 2024 08:00:49 -0400
+***************
+*** 3,17 ***
+  
+  line 4
+  line 5
+! line 6 will change
+  line 7
+  
+- This line will be removed
+- 
+  line 8
+! line 9 will change
+! line 10 will change
+  
+  line 11
+  
+- This will be removed, too
+--- 3,13 ---
+  
+  line 4
+  line 5
+! line 6 is updated
+  line 7
+- 
+  line 8
+! line 9 is updated
+! line 10 is updated
+  
+  line 11
+File "tests/diff/f1/f3.txt" is a directory while file "tests/diff/f2/f3.txt" is a regular file

@@ -1,0 +1,11 @@
+diff -f -r tests/diff/f1/f1.txt tests/diff/f2/f1.txt 
+c6
+line 6 is updated
+.
+d9 10
+c12 13
+line 9 is updated
+line 10 is updated
+.
+d17 18
+File "tests/diff/f1/f3.txt" is a directory while file "tests/diff/f2/f3.txt" is a regular file

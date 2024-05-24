@@ -429,11 +429,11 @@ impl<'a> FileDiff<'a> {
 
     fn print_unified(&mut self, unified: usize) {
         println!(
-            "*** {}",
+            "--- {}",
             Self::get_header(self.file1, &self.format_options.label1)
         );
         println!(
-            "--- {}",
+            "+++ {}",
             Self::get_header(self.file2, &self.format_options.label2)
         );
 

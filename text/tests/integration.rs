@@ -89,6 +89,19 @@ fn pr_test(args: &[&str], test_data: &str, expected_output: &str) {
     });
 }
 
+fn diff_test(args: &[&str], expected_output: &str) {
+    let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
+
+    run_test(TestPlan {
+        cmd: String::from("diff"),
+        args: str_args,
+        stdin_data: String::from(""),
+        expected_out: String::from(expected_output),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
 fn cut_test(args: &[&str], test_data: &str, expected_output: &str) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
 
@@ -617,7 +630,9 @@ fn test_pr_expand_and_replace() {
 
 #[cfg(test)]
 mod tests {
-    use crate::cut_test;
+    use std::fs;
+
+    use crate::{cut_test, diff_test};
 
     #[test]
     fn test_cut_0() {
@@ -940,5 +955,195 @@ mod tests {
     #[test]
     fn test_od_overlap5() {
         cut_test(&["-d", ":", "-b", "1-3,1-4", "-"], "abcde\n", "abcd\n");
+    }
+
+    #[test]
+    fn test_diff_default() {
+        diff_test(
+            &["tests/diff/f1.txt", "tests/diff/f2.txt"],
+            fs::read_to_string("tests/diff/default_output.txt")
+                .unwrap()
+                .as_str(),
+        );
+    }
+
+    #[test]
+    fn test_diff_context3() {
+        diff_test(
+            &["-c", "tests/diff/f1.txt", "tests/diff/f2.txt"],
+            fs::read_to_string("tests/diff/context_output.txt")
+                .unwrap()
+                .as_str(),
+        );
+    }
+
+    #[test]
+    fn test_diff_context1() {
+        diff_test(
+            &["-C", "1", "tests/diff/f1.txt", "tests/diff/f2.txt"],
+            fs::read_to_string("tests/diff/context_1_output.txt")
+                .unwrap()
+                .as_str(),
+        );
+    }
+
+    #[test]
+    fn test_diff_context10() {
+        diff_test(
+            &["-C", "10", "tests/diff/f1.txt", "tests/diff/f2.txt"],
+            fs::read_to_string("tests/diff/context_10_output.txt")
+                .unwrap()
+                .as_str(),
+        );
+    }
+
+    #[test]
+    fn test_diff_edit_script() {
+        diff_test(
+            &["-e", "tests/diff/f1.txt", "tests/diff/f2.txt"],
+            fs::read_to_string("tests/diff/edit_script_output.txt")
+                .unwrap()
+                .as_str(),
+        );
+    }
+
+    #[test]
+    fn test_diff_forward_edit_script() {
+        diff_test(
+            &["-f", "tests/diff/f1.txt", "tests/diff/f2.txt"],
+            fs::read_to_string("tests/diff/forward_edit_script_output.txt")
+                .unwrap()
+                .as_str(),
+        );
+    }
+
+    #[test]
+    fn test_diff_unified3() {
+        diff_test(
+            &["-u", "tests/diff/f1.txt", "tests/diff/f2.txt"],
+            fs::read_to_string("tests/diff/unified_output.txt")
+                .unwrap()
+                .as_str(),
+        );
+    }
+
+    #[test]
+    fn test_diff_unified0() {
+        diff_test(
+            &["-U", "0", "tests/diff/f1.txt", "tests/diff/f2.txt"],
+            fs::read_to_string("tests/diff/unified_0_output.txt")
+                .unwrap()
+                .as_str(),
+        );
+    }
+
+    #[test]
+    fn test_diff_unified10() {
+        diff_test(
+            &["-U", "10", "tests/diff/f1.txt", "tests/diff/f2.txt"],
+            fs::read_to_string("tests/diff/unified_10_output.txt")
+                .unwrap()
+                .as_str(),
+        );
+    }
+
+    #[test]
+    fn test_diff_file_directory() {
+        diff_test(
+            &["tests/diff/f1.txt", "tests/diff/f2"],
+            fs::read_to_string("tests/diff/file_dir_output.txt")
+                .unwrap()
+                .as_str(),
+        );
+    }
+
+    #[test]
+    fn test_diff_directories() {
+        diff_test(
+            &["tests/diff/f1", "tests/diff/f2"],
+            fs::read_to_string("tests/diff/f1_f2_default_output.txt")
+                .unwrap()
+                .as_str(),
+        );
+    }
+
+    #[test]
+    fn test_diff_directories_recursive() {
+        diff_test(
+            &["-r", "tests/diff/f1", "tests/diff/f2"],
+            fs::read_to_string("tests/diff/f1_f2_recursive_output.txt")
+                .unwrap()
+                .as_str(),
+        );
+    }
+
+    #[test]
+    fn test_diff_directories_recursive_context() {
+        diff_test(
+            &["-r", "-c", "tests/diff/f1", "tests/diff/f2"],
+            fs::read_to_string("tests/diff/f1_f2_recursive_context_output.txt")
+                .unwrap()
+                .as_str(),
+        );
+    }
+
+    #[test]
+    fn test_diff_directories_recursive_edit_script() {
+        diff_test(
+            &["-r", "-e", "tests/diff/f1", "tests/diff/f2"],
+            fs::read_to_string("tests/diff/f1_f2_recursive_ed_output.txt")
+                .unwrap()
+                .as_str(),
+        );
+    }
+
+    #[test]
+    fn test_diff_directories_recursive_forward_edit_script() {
+        diff_test(
+            &["-r", "-f", "tests/diff/f1", "tests/diff/f2"],
+            fs::read_to_string("tests/diff/f1_f2_recursive_f_output.txt")
+                .unwrap()
+                .as_str(),
+        );
+    }
+
+    #[test]
+    fn test_diff_directories_recursive_unified() {
+        diff_test(
+            &["-r", "-u", "tests/diff/f1", "tests/diff/f2"],
+            fs::read_to_string("tests/diff/f1_f2_recursive_unified_output.txt")
+                .unwrap()
+                .as_str(),
+        );
+    }
+
+    #[test]
+    fn test_diff_counting_eol_spaces() {
+        diff_test(
+            &["tests/diff/f1.txt", "tests/diff/f1_with_eol_spaces.txt"],
+            fs::read_to_string("tests/diff/f1_counting_eol_spacesd_output.txt")
+                .unwrap()
+                .as_str(),
+        );
+    }
+
+    #[test]
+    fn test_diff_ignoring_eol_spaces() {
+        diff_test(
+            &["-b" , "tests/diff/f1.txt", "tests/diff/f1_with_eol_spaces.txt"],
+            fs::read_to_string("tests/diff/f1_ignoring_eol_spacesd_output.txt")
+                .unwrap()
+                .as_str(),
+        );
+    }
+
+    #[test]
+    fn test_diff_unified_two_labels() {
+        diff_test(
+            &["--label" , "F1" , "--label2" , "F2" , "-u" , "tests/diff/f1.txt", "tests/diff/f2.txt"],
+            fs::read_to_string("tests/diff/label_output.txt")
+                .unwrap()
+                .as_str(),
+        );
     }
 }

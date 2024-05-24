@@ -1222,6 +1222,27 @@ mod test {
     }
 
     #[test]
+    fn test_parse_text_first_comment_disabled() {
+        let (remaining, text) = parse_text(&ParseConfig {
+            comment_enabled: false,
+            ..ParseConfig::default()
+        })(b"#hello\0")
+        .unwrap();
+        assert_eq!("#", utf8(text));
+        assert_eq!("hello\0", utf8(remaining));
+    }
+
+    #[test]
+    fn test_parse_text_first_comment_enabled() {
+        let error = parse_text(&ParseConfig {
+            comment_enabled: true,
+            ..ParseConfig::default()
+        })(b"#hello\0")
+        .unwrap_err();
+        assert!(matches!(error, nom::Err::Error(_)));
+    }
+
+    #[test]
     fn test_parse_text_before_quote_space() {
         let (remaining, text) = parse_text(&ParseConfig::default())(b"hello `world'").unwrap();
         assert_eq!("hello ", utf8(text));

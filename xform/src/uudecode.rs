@@ -15,9 +15,16 @@ use base64::prelude::*;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, textdomain};
 use plib::PROJECT_NAME;
-use std::fs::OpenOptions;
+use std::fs::{remove_file, File, OpenOptions, Permissions};
 use std::io::{self, Error, ErrorKind, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+
+macro_rules! reduce {
+    ($e : expr) => {
+        $e - 0x20
+    };
+}
 
 /// uudecode - decode a binary file
 #[derive(Parser, Debug)]
@@ -48,35 +55,133 @@ fn write_file(pathname: &PathBuf, bindata: &[u8]) -> io::Result<()> {
     }
 }
 
+#[derive(Debug)]
+enum DecodingType {
+    Historical,
+
+    Base64,
+}
+
+#[derive(Debug)]
+struct Header {
+    dec_type: DecodingType,
+
+    lower_perm_bits: u32,
+
+    out: PathBuf,
+}
+
+impl Header {
+    fn parse(line: &str) -> Self {
+        // split with spaces
+        let split: Vec<&str> = line.split(' ').collect();
+        let dec_type = if split[0] == "begin" {
+            DecodingType::Historical
+        } else if split[0] == "base64-begin" {
+            DecodingType::Base64
+        } else {
+            panic!("Invalid encoding type");
+        };
+
+        let lower_perm_bits = u32::from_str_radix(split[1], 8).expect("Invalid permission value");
+        let out = PathBuf::from(split[2]);
+
+        Self {
+            dec_type,
+            lower_perm_bits,
+            out,
+        }
+    }
+}
+
+fn decode_historical_line(line: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+
+    for chunk in line.as_bytes().chunks(4) {
+        let chunk = chunk.to_vec();
+
+        let out_chunk = [
+            reduce!(chunk[0]) << 2 | (reduce!(chunk[1])) >> 4,
+            reduce!(chunk[1]) << 4 | reduce!(chunk[2]) >> 2,
+            reduce!(chunk[2]) << 6 | reduce!(chunk[3]),
+        ];
+
+        out.extend_from_slice(&out_chunk);
+    }
+
+    out
+}
+
+fn decode_base64_line(line: &str) -> io::Result<Vec<u8>> {
+    BASE64_STANDARD
+        .decode(&line)
+        .map_err(|_| Error::from(io::ErrorKind::InvalidInput))
+}
+
 fn decode_file(args: &Args) -> io::Result<()> {
-    let mut file = plib::io::input_stream_opt(&args.file)?;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut out: Vec<u8> = Vec::new();
 
-    // read entire file into memory.
-    // ugly but necessary due to uudecode crate implementation.
-    let mut buffer = String::new();
-    file.read_to_string(&mut buffer)?;
+    let file_p = args
+        .file
+        .as_ref()
+        .unwrap_or(&PathBuf::from("/dev/stdin"))
+        .clone();
 
-    // attempt base64 decode
-    let b64_res = BASE64_STANDARD.decode(buffer.as_bytes());
-    match b64_res {
-        // fall through to uudecode format
-        Err(_e) => {}
-
-        // decode succeeded. exit here.
-        Ok(bindata) => match &args.outfile {
-            None => return write_file(&PathBuf::from("bindata.out"), &bindata[..]),
-            Some(outfn) => return write_file(outfn, &bindata[..]),
-        },
+    if file_p == PathBuf::from("/dev/stdin") {
+        io::stdin().lock().read_to_end(&mut buf)?;
+    } else {
+        let mut file = File::open(&file_p)?;
+        file.read_to_end(&mut buf)?;
     }
 
-    // attempt to decode using uudecode format
-    match uuencode::uudecode(&buffer) {
-        None => return Err(Error::new(ErrorKind::Other, "invalid input data")),
-        Some((bindata, filename)) => match &args.outfile {
-            None => write_file(&PathBuf::from(filename), &bindata[..]),
-            Some(outfn) => write_file(outfn, &bindata[..]),
-        },
+    let buf = String::from_utf8(buf).unwrap();
+    let mut lines = buf.lines();
+    let header = Header::parse(lines.next().expect("No header line"));
+
+    match header.dec_type {
+        DecodingType::Historical => {
+            while let Some(line) = lines.next() {
+                let line = line.replace("`", " ");
+                if line.len() == 1 && line == " " {
+                    let end_line = lines.next().expect("No end line");
+                    if end_line == "end" || end_line == "end\r" {
+                        break;
+                    } else {
+                        panic!("Invalid ending")
+                    }
+                }
+
+                out.extend_from_slice(&decode_historical_line(&line[1..]));
+            }
+        }
+        DecodingType::Base64 => {
+            while let Some(line) = lines.next() {
+                if line == "====" || line == "====\n" {
+                    break;
+                }
+                out.extend_from_slice(&decode_base64_line(line)?);
+            }
+        }
     }
+
+    let out_file = args.file.as_ref().unwrap_or(&header.out);
+
+    if out_file == &PathBuf::from("/dev/stdout") {
+        io::stdout().write_all(&out)?;
+    } else {
+        if out_file.exists() {
+            remove_file(&out_file)?;
+        }
+
+        let out_file = File::create(&out_file)?;
+        let mut out_file_perm = out_file.metadata()?.permissions();
+        let out_file_raw_perm = out_file_perm.mode();
+        let new_out_file_raw_perm = ((out_file_raw_perm >> 9) << 9) | header.lower_perm_bits;
+        out_file_perm.set_mode(new_out_file_raw_perm);
+    }
+
+    Ok(())
 }
 
 fn pathname_display(path: &Option<PathBuf>) -> String {

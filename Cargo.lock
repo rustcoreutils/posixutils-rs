@@ -835,7 +835,6 @@ dependencies = [
  "clap",
  "gettext-rs",
  "plib",
- "uuencode",
 ]
 
 [[package]]
@@ -1127,12 +1126,6 @@ name = "utf8parse"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "711b9620af191e0cdc7468a8d14e709c3dcdb115b36f838e601583af800a370a"
-
-[[package]]
-name = "uuencode"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce87414615a82bde6978712c15b79bf056d16827930ff779f1e40ed74c692ac0"
 
 [[package]]
 name = "version_check"

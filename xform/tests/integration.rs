@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::{run_binary_test, run_test, BinaryTestPlan, TestPlan};
+use plib::{run_test, TestPlan};
 use std::{
     fs::{remove_file, File},
     io::Read,

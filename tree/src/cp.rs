@@ -358,7 +358,7 @@ fn copy_file(
             }
 
             // 3.a.i
-            let target_is_writable = is_file_writable(&target_symlink_md);
+            let target_is_writable = is_file_writable(target_symlink_md.as_ref());
             // Different prompt if the target is not writable
             if !target_is_writable && (cfg.interactive || cfg.force) {
                 let mode = target_symlink_md.as_ref().unwrap().mode();

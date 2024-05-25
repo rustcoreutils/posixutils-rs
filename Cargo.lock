@@ -234,6 +234,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctor"
+version = "0.2.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edb49164822f3ee45b17acd4a208cfc1251410cf0cad9a833234c9890774dd9f"
+dependencies = [
+ "quote",
+ "syn 2.0.65",
+]
+
+[[package]]
 name = "deranged"
 version = "0.3.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -793,6 +803,7 @@ version = "0.1.10"
 dependencies = [
  "chrono",
  "clap",
+ "ctor",
  "diff",
  "gettext-rs",
  "libc",

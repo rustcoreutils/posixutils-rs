@@ -75,19 +75,19 @@ fn encode_historical_line(line: &[u8]) -> Vec<u8> {
     // in every line we'll take a chunk of 3 bytes and encode it
     for in_chunk in line.chunks(3) {
         // there could be less than 3 bytes, we need to fill it up with the padding byte
+        // those are simply the null ASCII character i.e 0
         let a = in_chunk[0];
         let b = *in_chunk.get(1).unwrap_or(&0);
         let c = *in_chunk.get(2).unwrap_or(&0);
-
-        // https://pubs.opengroup.org/onlinepubs/9699919799/utilities/uuencode.html directly mentions
-        // the algorithm below(to convert 3 byte to 4 bytes of historical encoding)
         let mut out_chunk = [
-            0x20 + (a >> 2) & 0x3F,
-            0x20 + ((a & 0x03) << 4) | ((b >> 4) & 0x0F),
-            0x20 + ((b & 0x0F) << 2) | ((c >> 6) & 0x03),
+            0x20 + ((a >> 2) & 0x3F),
+            0x20 + (((a & 0x03) << 4) | ((b >> 4) & 0x0F)),
+            0x20 + (((b & 0x0F) << 2) | ((c >> 6) & 0x03)),
             0x20 + (c & 0x3F),
         ];
 
+        // https://pubs.opengroup.org/onlinepubs/9699919799/utilities/uuencode.html directly mentions
+        // the algorithm below(to convert 3 byte to 4 bytes of historical encoding)
         for i in out_chunk.iter_mut() {
             if *i == 32 {
                 *i = 96

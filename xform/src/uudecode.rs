@@ -134,9 +134,13 @@ fn decode_file(args: &Args) -> io::Result<()> {
                     }
                 }
 
-                out.extend_from_slice(&decode_historical_line(&line[1..]));
+                let len = (line[..1].as_bytes()[0] - 32) as usize;
+                let mut dec_out = decode_historical_line(&line[1..]);
+                dec_out.truncate(len);
+                out.extend_from_slice(&dec_out);
             }
         }
+
         DecodingType::Base64 => {
             while let Some(line) = lines.next() {
                 if line == "====" || line == "====\n" {

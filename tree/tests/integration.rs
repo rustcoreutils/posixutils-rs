@@ -10,6 +10,7 @@
 mod cp;
 mod ls;
 mod mv;
+mod rm;
 
 use std::sync::Mutex;
 

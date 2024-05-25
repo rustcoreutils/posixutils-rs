@@ -10,13 +10,10 @@ repository = "https://github.com/rustcoreutils/posixutils-rs.git"
 plib = { path = "../plib" }
 clap.workspace = true
 gettext-rs.workspace = true
-walkdir = "2.5"
 libc.workspace = true
+regex.workspace = true
 chrono = "0.4"
 atty = "0.2"
-
-[dev-dependencies]
-regex.workspace = true
 
 [features]
 posixutils_test_all = []

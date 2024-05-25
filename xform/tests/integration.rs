@@ -63,14 +63,14 @@ fn uuencode_test(args: &[&str], expected_output: &str, expected_error: &str) {
     })
 }
 
-fn uudecode_test(args: &[&str], expected_output: &Vec<u8>, expected_error: &str) {
+fn uudecode_test(args: &[&str], expected_output: &str, expected_error: &str) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
 
-    run_binary_test(BinaryTestPlan {
+    run_test(TestPlan {
         cmd: String::from("uudecode"),
         args: str_args,
         stdin_data: String::new(),
-        expected_out: expected_output.clone(),
+        expected_out: String::from(expected_output),
         expected_err: String::from(expected_error),
         expected_exit_code: 0,
     });
@@ -190,6 +190,7 @@ fn test_uuencode_uudecode_with_historical_encoding_text_file() {
         .unwrap()
         .read_to_end(&mut source_file_content)
         .unwrap();
+    let source_file_content = String::from_utf8_lossy(&source_file_content);
 
     // Decode the encoded file using uudecode
     uudecode_test(&[encoded_file.to_str().unwrap()], &source_file_content, "");
@@ -221,6 +222,7 @@ fn test_uuencode_uudecode_with_base64_encoding_text_file() {
         .unwrap()
         .read_to_end(&mut source_file_content)
         .unwrap();
+    let source_file_content = String::from_utf8_lossy(&source_file_content);
 
     // Decode the encoded file using uudecode
     uudecode_test(&[encoded_file.to_str().unwrap()], &source_file_content, "");
@@ -252,6 +254,7 @@ fn test_uuencode_uudecode_with_historical_encoding_jpg_file() {
         .unwrap()
         .read_to_end(&mut source_file_content)
         .unwrap();
+    let source_file_content = String::from_utf8_lossy(&source_file_content);
 
     // Decode the encoded file using uudecode
     uudecode_test(&[encoded_file.to_str().unwrap()], &source_file_content, "");
@@ -283,6 +286,7 @@ fn test_uuencode_uudecode_with_base64_encoding_jpg_file() {
         .unwrap()
         .read_to_end(&mut source_file_content)
         .unwrap();
+    let source_file_content = String::from_utf8_lossy(&source_file_content);
 
     // Decode the encoded file using uudecode
     uudecode_test(&[encoded_file.to_str().unwrap()], &source_file_content, "");

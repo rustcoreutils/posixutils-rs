@@ -7,12 +7,11 @@
 // SPDX-License-Identifier: MIT
 //
 
+use plib::{run_test, TestPlan};
 use std::{
     fs::{remove_file, File},
     io::Read,
 };
-
-use plib::{run_test, TestPlan};
 
 fn cksum_test(test_data: &str, expected_output: &str) {
     run_test(TestPlan {
@@ -43,6 +42,32 @@ fn uncompress_test(args: &[&str], expected_output: &str, expected_error: &str) {
 
     run_test(TestPlan {
         cmd: String::from("uncompress"),
+        args: str_args,
+        stdin_data: String::new(),
+        expected_out: String::from(expected_output),
+        expected_err: String::from(expected_error),
+        expected_exit_code: 0,
+    });
+}
+
+fn uuencode_test(args: &[&str], expected_output: &str, expected_error: &str) {
+    let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
+
+    run_test(TestPlan {
+        cmd: String::from("uuencode"),
+        args: str_args,
+        stdin_data: String::new(),
+        expected_out: String::from(expected_output),
+        expected_err: String::from(expected_error),
+        expected_exit_code: 0,
+    })
+}
+
+fn uudecode_test(args: &[&str], expected_output: &str, expected_error: &str) {
+    let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
+
+    run_test(TestPlan {
+        cmd: String::from("uudecode"),
         args: str_args,
         stdin_data: String::new(),
         expected_out: String::from(expected_output),
@@ -135,4 +160,134 @@ fn test_compression_compress_file() {
     if compressed_file_path.exists() {
         remove_file(&compressed_file_path).unwrap();
     }
+}
+
+#[test]
+fn test_uuencode_uudecode_with_historical_encoding_text_file() {
+    use std::env;
+    use std::path::PathBuf;
+
+    let cargo_manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let source_file = cargo_manifest_dir.join("tests/uucode/sample.txt");
+
+    // the "sample_historical_encoded.txt" is generated from the GNU uuencode sharutils
+    let encoded_file = cargo_manifest_dir.join("tests/uucode/sample_historical_encoded.txt");
+
+    let mut encoded_file_content = String::new();
+    File::open(&encoded_file)
+        .unwrap()
+        .read_to_string(&mut encoded_file_content)
+        .unwrap();
+
+    uuencode_test(
+        &[source_file.to_str().unwrap(), "/dev/stdout"],
+        &encoded_file_content,
+        "",
+    );
+
+    let mut source_file_content = Vec::new();
+    File::open(&source_file)
+        .unwrap()
+        .read_to_end(&mut source_file_content)
+        .unwrap();
+    let source_file_content = String::from_utf8_lossy(&source_file_content);
+
+    // Decode the encoded file using uudecode
+    uudecode_test(&[encoded_file.to_str().unwrap()], &source_file_content, "");
+}
+
+#[test]
+fn test_uuencode_uudecode_with_base64_encoding_text_file() {
+    use std::env;
+    use std::path::PathBuf;
+
+    let cargo_manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let source_file = cargo_manifest_dir.join("tests/uucode/sample.txt");
+    let encoded_file = cargo_manifest_dir.join("tests/uucode/sample_base64_encoded.txt");
+
+    let mut encoded_file_content = String::new();
+    File::open(&encoded_file)
+        .unwrap()
+        .read_to_string(&mut encoded_file_content)
+        .unwrap();
+
+    uuencode_test(
+        &["-m", source_file.to_str().unwrap(), "/dev/stdout"],
+        &encoded_file_content,
+        "",
+    );
+
+    let mut source_file_content = Vec::new();
+    File::open(&source_file)
+        .unwrap()
+        .read_to_end(&mut source_file_content)
+        .unwrap();
+    let source_file_content = String::from_utf8_lossy(&source_file_content);
+
+    // Decode the encoded file using uudecode
+    uudecode_test(&[encoded_file.to_str().unwrap()], &source_file_content, "");
+}
+
+#[test]
+fn test_uuencode_uudecode_with_historical_encoding_jpg_file() {
+    use std::env;
+    use std::path::PathBuf;
+
+    let cargo_manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let source_file = cargo_manifest_dir.join("tests/uucode/image.jpg");
+    let encoded_file = cargo_manifest_dir.join("tests/uucode/image_historical_encoded.txt");
+
+    let mut encoded_file_content = String::new();
+    File::open(&encoded_file)
+        .unwrap()
+        .read_to_string(&mut encoded_file_content)
+        .unwrap();
+
+    uuencode_test(
+        &[source_file.to_str().unwrap(), "/dev/stdout"],
+        &encoded_file_content,
+        "",
+    );
+
+    let mut source_file_content = Vec::new();
+    File::open(&source_file)
+        .unwrap()
+        .read_to_end(&mut source_file_content)
+        .unwrap();
+    let source_file_content = String::from_utf8_lossy(&source_file_content);
+
+    // Decode the encoded file using uudecode
+    uudecode_test(&[encoded_file.to_str().unwrap()], &source_file_content, "");
+}
+
+#[test]
+fn test_uuencode_uudecode_with_base64_encoding_jpg_file() {
+    use std::env;
+    use std::path::PathBuf;
+
+    let cargo_manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let source_file = cargo_manifest_dir.join("tests/uucode/image.jpg");
+    let encoded_file = cargo_manifest_dir.join("tests/uucode/image_base64_encoded.txt");
+
+    let mut encoded_file_content = String::new();
+    File::open(&encoded_file)
+        .unwrap()
+        .read_to_string(&mut encoded_file_content)
+        .unwrap();
+
+    uuencode_test(
+        &["-m", source_file.to_str().unwrap(), "/dev/stdout"],
+        &encoded_file_content,
+        "",
+    );
+
+    let mut source_file_content = Vec::new();
+    File::open(&source_file)
+        .unwrap()
+        .read_to_end(&mut source_file_content)
+        .unwrap();
+    let source_file_content = String::from_utf8_lossy(&source_file_content);
+
+    // Decode the encoded file using uudecode
+    uudecode_test(&[encoded_file.to_str().unwrap()], &source_file_content, "");
 }

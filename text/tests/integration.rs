@@ -1785,10 +1785,10 @@ mod diff_tests {
     const F2_DIR_F1_TXT_PATH: &'static str = "tests/diff/f2/f1.txt";
     const F2_DIR_F1_TXT_RFC2822_MODIFICATION_DATA: &'static str = "Fri, 24 May 2024 13:38:46 +0000";
 
-    const F1_DIR_EMPTY_DIR_F1_TXT_PATH: &'static str = "tests/diff/f1/f1.txt";
+    const F1_DIR_EMPTY_DIR_F1_TXT_PATH: &'static str = "tests/diff/f1/empty/f1.txt";
     const F1_DIR_EMPTY_DIR_F1_TXT_RFC2822_MODIFICATION_DATA: &'static str = "Sat, 25 May 2024 07:04:10 +0000";
 
-    const F2_DIR_EMPTY_DIR_F1_TXT_PATH: &'static str = "tests/diff/f2/f1.txt";
+    const F2_DIR_EMPTY_DIR_F1_TXT_PATH: &'static str = "tests/diff/f2/empty/f1.txt";
     const F2_DIR_EMPTY_DIR_F1_TXT_RFC2822_MODIFICATION_DATA: &'static str = "Sat, 25 May 2024 07:04:10 +0000";
 
     fn update_file_modification_data(path: &str , rfc2822_date: &str) {

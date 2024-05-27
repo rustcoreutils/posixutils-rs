@@ -15,6 +15,8 @@ use bc_util::{
 };
 use clap::Parser;
 
+use rustyline::{error::ReadlineError, DefaultEditor, Result};
+
 mod bc_util;
 
 /// bc - arbitrary-precision arithmetic language
@@ -47,33 +49,56 @@ fn exec_str(s: &str, interpreter: &mut Interpreter) -> bool {
     false
 }
 
-fn main() {
+fn main() -> Result<()> {
     let args = Args::parse();
     let mut interpreter = Interpreter::default();
     for file in args.files {
         match std::fs::read_to_string(&file) {
             Ok(s) => {
                 if exec_str(&s, &mut interpreter) {
-                    return;
+                    return Ok(());
                 }
             }
             Err(_) => {
                 eprintln!("Could not read file: {}", file.to_string_lossy());
-                return;
+                return Ok(());
             }
         };
     }
 
-    let mut buf = String::new();
+    let mut repl = DefaultEditor::new()?;
+    let mut line_buffer = String::new();
     loop {
-        std::io::stdin().read_line(&mut buf).unwrap();
-        if is_incomplete(&buf) {
-            continue;
+        let line = if line_buffer.is_empty() {
+            repl.readline(">> ")
         } else {
-            if exec_str(&buf, &mut interpreter) {
-                return;
+            repl.readline(".. ")
+        };
+        match line {
+            Ok(line) => {
+                line_buffer.push_str(&line);
+                line_buffer.push('\n');
+                if !is_incomplete(&line_buffer) {
+                    if exec_str(&line_buffer, &mut interpreter) {
+                        return Ok(());
+                    }
+                    line_buffer.clear();
+                }
+                repl.add_history_entry(line)?;
             }
-            buf.clear()
+            Err(ReadlineError::Eof) => {
+                println!("CTRL-D");
+                break;
+            }
+            Err(ReadlineError::Interrupted) => {
+                println!("CTRL-C");
+                break;
+            }
+            Err(e) => {
+                eprintln!("Error: {:?}", e);
+                break;
+            }
         }
     }
+    Ok(())
 }

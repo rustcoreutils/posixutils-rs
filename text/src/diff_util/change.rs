@@ -30,23 +30,23 @@ pub enum Change {
 
 impl Change {
     pub fn is_none(&self) -> bool {
-        self == Change::None
+        *self == Change::None
     }
 
     pub fn is_unchanged(&self) -> bool {
-        self == Change::Unchanged(Default::default())
+        *self == Change::Unchanged(Default::default())
     }
 
     pub fn is_insert(&self) -> bool {
-        self == Change::Insert(Default::default())
+        *self == Change::Insert(Default::default())
     }
 
     pub fn is_delete(&self) -> bool {
-        self == Change::Delete(Default::default())
+        *self == Change::Delete(Default::default())
     }
 
     pub fn is_substitute(&self) -> bool {
-        self == Change::Substitute(Default::default())
+        *self == Change::Substitute(Default::default())
     }
 
     /// returns (ln1,ln2)
@@ -90,19 +90,6 @@ impl PartialEq for Change {
             (Self::Insert(_), Self::Insert(_)) => true,
             (Self::Delete(_), Self::Delete(_)) => true,
             (Self::Substitute(_), Self::Substitute(_)) => true,
-            _ => false,
-        }
-    }
-}
-
-impl PartialEq<Change> for &Change {
-    fn eq(&self, other: &Change) -> bool {
-        match (self, other) {
-            (Change::None, Change::None) => true,
-            (Change::Unchanged(_), Change::Unchanged(_)) => true,
-            (Change::Insert(_), Change::Insert(_)) => true,
-            (Change::Delete(_), Change::Delete(_)) => true,
-            (Change::Substitute(_), Change::Substitute(_)) => true,
             _ => false,
         }
     }

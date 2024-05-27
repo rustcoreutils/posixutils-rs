@@ -332,7 +332,7 @@ impl Hunks {
         if let Some(last_hunk) = self.hunks.last_mut() {
             let last_change_kind = last_hunk.kind();
 
-            if last_change_kind == change {
+            if *last_change_kind == change {
                 if last_hunk.change_sequence_acceptable(&change) {
                     last_hunk.add(change);
                 } else {

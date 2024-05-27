@@ -108,4 +108,8 @@ impl FileData {
     pub fn change(&self, index: usize) -> &Change {
         &self.changes[index]
     }
+
+    pub fn path(&self) -> &str {
+        self.path.to_str().unwrap_or(&COULD_NOT_UNWRAP_FILENAME)
+    }
 }

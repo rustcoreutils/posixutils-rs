@@ -573,7 +573,7 @@ impl<'a> FileDiff<'a> {
         } else {
             return format!(
                 "{} {}",
-                file.name(),
+                file.path(),
                 system_time_to_rfc2822(file.modified())
             );
         }

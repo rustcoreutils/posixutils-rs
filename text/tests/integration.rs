@@ -1765,55 +1765,68 @@ mod uniq_tests {
 #[cfg(test)]
 mod diff_tests {
     use std::{
-        fs::{self, File},
-        time::SystemTime,
+        fs::{self, File}, time::SystemTime
     };
 
     use chrono::DateTime;
 
     use crate::diff_test;
 
-    // update this, according to output of diff-unified and diff-context header
-    const F1_RFC2822_MODIFICATION_DATA: &'static str = "Fri, 24 May 2024 13:38:46 +0000";
-    const F2_RFC2822_MODIFICATION_DATA: &'static str = "Fri, 24 May 2024 13:38:46 +0000";
-    const F1_PATH: &'static str = "tests/diff/f1.txt";
-    const F2_PATH: &'static str = "tests/diff/f2.txt";
+    // update these, according to output of diff-unified and diff-context header
+    const F1_TXT_PATH: &'static str = "tests/diff/f1.txt";
+    const F1_TXT_RFC2822_MODIFICATION_DATA: &'static str = "Fri, 24 May 2024 13:38:46 +0000";
+    
+    const F2_TXT_PATH: &'static str = "tests/diff/f2.txt";
+    const F2_TXT_RFC2822_MODIFICATION_DATA: &'static str = "Fri, 24 May 2024 13:38:46 +0000";
+    
+    const F1_DIR_F1_TXT_PATH: &'static str = "tests/diff/f1/f1.txt";
+    const F1_DIR_F1_TXT_RFC2822_MODIFICATION_DATA: &'static str = "Fri, 24 May 2024 13:38:46 +0000";
+
+    const F2_DIR_F1_TXT_PATH: &'static str = "tests/diff/f2/f1.txt";
+    const F2_DIR_F1_TXT_RFC2822_MODIFICATION_DATA: &'static str = "Fri, 24 May 2024 13:38:46 +0000";
+
+    const F1_DIR_EMPTY_DIR_F1_TXT_PATH: &'static str = "tests/diff/f1/f1.txt";
+    const F1_DIR_EMPTY_DIR_F1_TXT_RFC2822_MODIFICATION_DATA: &'static str = "Sat, 25 May 2024 07:04:10 +0000";
+
+    const F2_DIR_EMPTY_DIR_F1_TXT_PATH: &'static str = "tests/diff/f2/f1.txt";
+    const F2_DIR_EMPTY_DIR_F1_TXT_RFC2822_MODIFICATION_DATA: &'static str = "Sat, 25 May 2024 07:04:10 +0000";
+
+    fn update_file_modification_data(path: &str , rfc2822_date: &str) {
+        let file_modification_data = SystemTime::from(
+            DateTime::parse_from_rfc2822(rfc2822_date)
+                .expect( format!("Could not parse RFC2822 string<{}> into DataTime" , rfc2822_date).as_str()),
+        );
+
+        let file =
+            File::open(path).expect(format!("Could not open file: {}", path).as_str());
+
+            file
+            .set_modified(file_modification_data)
+            .expect(format!("Could set modified of file: {}", F1_TXT_PATH).as_str());
+
+        drop(file);
+    }
 
     #[ctor::ctor]
     fn test_setup() {
-        let f1_modification_data = SystemTime::from(
-            DateTime::parse_from_rfc2822(F1_RFC2822_MODIFICATION_DATA)
-                .expect("Could not parse RFC2822 string into DataTime"),
-        );
+        let path_date_collection = vec![
+            (F1_TXT_PATH , F1_TXT_RFC2822_MODIFICATION_DATA),
+            (F2_TXT_PATH , F2_TXT_RFC2822_MODIFICATION_DATA),
+            (F1_DIR_F1_TXT_PATH , F1_DIR_F1_TXT_RFC2822_MODIFICATION_DATA),
+            (F2_DIR_F1_TXT_PATH , F2_DIR_F1_TXT_RFC2822_MODIFICATION_DATA),
+            (F1_DIR_EMPTY_DIR_F1_TXT_PATH , F1_DIR_EMPTY_DIR_F1_TXT_RFC2822_MODIFICATION_DATA),
+            (F2_DIR_EMPTY_DIR_F1_TXT_PATH , F2_DIR_EMPTY_DIR_F1_TXT_RFC2822_MODIFICATION_DATA),
+        ];
 
-        let file1 =
-            File::open(F1_PATH).expect(format!("Could not open file: {}", F1_PATH).as_str());
-
-        file1
-            .set_modified(f1_modification_data)
-            .expect(format!("Could set modified of file: {}", F1_PATH).as_str());
-
-        drop(file1);
-
-        let f2_modification_data = SystemTime::from(
-            DateTime::parse_from_rfc2822(F2_RFC2822_MODIFICATION_DATA)
-                .expect("Could not parse RFC2822 string into DataTime"),
-        );
-
-        let file2 =
-            File::open(F2_PATH).expect(format!("Could not open file: {}", F2_PATH).as_str());
-
-        file2
-            .set_modified(f2_modification_data)
-            .expect(format!("Could set modified of file: {}", F2_PATH).as_str());
-
-        drop(file2);
+        for (path, date) in path_date_collection {
+            update_file_modification_data(path, date);
+        }
     }
 
     #[test]
     fn test_diff_default() {
         diff_test(
-            &[F1_PATH, F2_PATH],
+            &[F1_TXT_PATH, F2_TXT_PATH],
             fs::read_to_string("tests/diff/default_output.txt")
                 .unwrap()
                 .as_str(),
@@ -1823,7 +1836,7 @@ mod diff_tests {
     #[test]
     fn test_diff_context3() {
         diff_test(
-            &["-c", F1_PATH, F2_PATH],
+            &["-c", F1_TXT_PATH, F2_TXT_PATH],
             fs::read_to_string("tests/diff/context_output.txt")
                 .unwrap()
                 .as_str(),
@@ -1833,7 +1846,7 @@ mod diff_tests {
     #[test]
     fn test_diff_context1() {
         diff_test(
-            &["-C", "1", F1_PATH, F2_PATH],
+            &["-C", "1", F1_TXT_PATH, F2_TXT_PATH],
             fs::read_to_string("tests/diff/context_1_output.txt")
                 .unwrap()
                 .as_str(),
@@ -1843,7 +1856,7 @@ mod diff_tests {
     #[test]
     fn test_diff_context10() {
         diff_test(
-            &["-C", "10", F1_PATH, F2_PATH],
+            &["-C", "10", F1_TXT_PATH, F2_TXT_PATH],
             fs::read_to_string("tests/diff/context_10_output.txt")
                 .unwrap()
                 .as_str(),
@@ -1853,7 +1866,7 @@ mod diff_tests {
     #[test]
     fn test_diff_edit_script() {
         diff_test(
-            &["-e", F1_PATH, F2_PATH],
+            &["-e", F1_TXT_PATH, F2_TXT_PATH],
             fs::read_to_string("tests/diff/edit_script_output.txt")
                 .unwrap()
                 .as_str(),
@@ -1863,7 +1876,7 @@ mod diff_tests {
     #[test]
     fn test_diff_forward_edit_script() {
         diff_test(
-            &["-f", F1_PATH, F2_PATH],
+            &["-f", F1_TXT_PATH, F2_TXT_PATH],
             fs::read_to_string("tests/diff/forward_edit_script_output.txt")
                 .unwrap()
                 .as_str(),
@@ -1873,7 +1886,7 @@ mod diff_tests {
     #[test]
     fn test_diff_unified3() {
         diff_test(
-            &["-u", F1_PATH, F2_PATH],
+            &["-u", F1_TXT_PATH, F2_TXT_PATH],
             fs::read_to_string("tests/diff/unified_output.txt")
                 .unwrap()
                 .as_str(),
@@ -1883,7 +1896,7 @@ mod diff_tests {
     #[test]
     fn test_diff_unified0() {
         diff_test(
-            &["-U", "0", F1_PATH, F2_PATH],
+            &["-U", "0", F1_TXT_PATH, F2_TXT_PATH],
             fs::read_to_string("tests/diff/unified_0_output.txt")
                 .unwrap()
                 .as_str(),
@@ -1893,7 +1906,7 @@ mod diff_tests {
     #[test]
     fn test_diff_unified10() {
         diff_test(
-            &["-U", "10", F1_PATH, F2_PATH],
+            &["-U", "10", F1_TXT_PATH, F2_TXT_PATH],
             fs::read_to_string("tests/diff/unified_10_output.txt")
                 .unwrap()
                 .as_str(),
@@ -1903,7 +1916,7 @@ mod diff_tests {
     #[test]
     fn test_diff_file_directory() {
         diff_test(
-            &[F1_PATH,  "tests/diff/f2"],
+            &[F1_TXT_PATH,  "tests/diff/f2"],
             fs::read_to_string("tests/diff/file_dir_output.txt")
                 .unwrap()
                 .as_str(),
@@ -1973,7 +1986,7 @@ mod diff_tests {
     #[test]
     fn test_diff_counting_eol_spaces() {
         diff_test(
-            &[F1_PATH, "tests/diff/f1_with_eol_spaces.txt"],
+            &[F1_TXT_PATH, "tests/diff/f1_with_eol_spaces.txt"],
             fs::read_to_string("tests/diff/f1_counting_eol_spacesd_output.txt")
                 .unwrap()
                 .as_str(),
@@ -1983,7 +1996,7 @@ mod diff_tests {
     #[test]
     fn test_diff_ignoring_eol_spaces() {
         diff_test(
-            &["-b", F1_PATH, "tests/diff/f1_with_eol_spaces.txt"],
+            &["-b", F1_TXT_PATH, "tests/diff/f1_with_eol_spaces.txt"],
             fs::read_to_string("tests/diff/f1_ignoring_eol_spacesd_output.txt")
                 .unwrap()
                 .as_str(),
@@ -1993,7 +2006,7 @@ mod diff_tests {
     #[test]
     fn test_diff_unified_two_labels() {
         diff_test(
-            &["--label", "F1", "--label2", "F2", "-u", F1_PATH, F2_PATH],
+            &["--label", "F1", "--label2", "F2", "-u", F1_TXT_PATH, F2_TXT_PATH],
             fs::read_to_string("tests/diff/label_output.txt")
                 .unwrap()
                 .as_str(),

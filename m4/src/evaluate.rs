@@ -73,7 +73,7 @@ impl AsRef<[u8]> for BuiltinMacro {
             BuiltinMacro::Changecom => b"changecom",
             BuiltinMacro::Changequote => b"changequote",
             BuiltinMacro::Pushdef => b"pushdef",
-            BuiltinMacro::Popdef => b"pushdef",
+            BuiltinMacro::Popdef => b"popdef",
         }
     }
 }
@@ -174,6 +174,8 @@ trait MacroImplementation {
     ) -> Result<State>;
 }
 
+/// The dnl macro shall cause m4 to discard all input characters up to and including the next
+/// `<newline>`.
 struct DnlMacro;
 
 impl MacroImplementation for DnlMacro {
@@ -189,6 +191,10 @@ impl MacroImplementation for DnlMacro {
     }
 }
 
+/// The second argument shall become the defining text of the macro whose name is the first
+/// argument. It is unspecified whether the define macro deletes all prior definitions of the macro
+/// named by its first argument or preserves all but the current definition of the macro. The
+/// behavior is unspecified if define is not immediately followed by a `<left-parenthesis>`.
 struct DefineMacro;
 
 impl MacroImplementation for DefineMacro {
@@ -203,6 +209,7 @@ impl MacroImplementation for DefineMacro {
         let name = if let Some(i) = args.next() {
             let name_bytes: Vec<u8>;
             (name_bytes, state) = evaluate_to_text(state, i, stderror)?;
+            log::debug!("name_bytes {:?}", String::from_utf8_lossy(&name_bytes));
 
             if let Ok(name) = MacroName::try_from_slice(&name_bytes) {
                 name
@@ -226,12 +233,16 @@ impl MacroImplementation for DefineMacro {
             },
             implementation: Box::new(UserDefinedMacro { definition }),
         };
+        log::trace!("DefineMacro::evaluate() inserting new macro definition for {name}");
         state.macro_definitions.insert(name, Rc::new(definition));
         state.parse_config.macro_parse_configs = state.current_macro_parse_configs();
         return Ok(state);
     }
 }
 
+/// The pushdef macro shall be equivalent to the define macro with the exception that it shall
+/// preserve any current definition for future retrieval using the popdef macro. The behavior is
+/// unspecified if pushdef is not immediately followed by a `<left-parenthesis>`.
 struct PushdefMacro;
 
 impl MacroImplementation for PushdefMacro {
@@ -239,13 +250,17 @@ impl MacroImplementation for PushdefMacro {
         &self,
         mut state: State,
         _stdout: &mut dyn Write,
-        stderror: &mut dyn Write,
+        _stderror: &mut dyn Write,
         m: Macro,
     ) -> Result<State> {
-        todo!()
+        //TODO
+        Ok(state)
     }
 }
 
+/// The popdef macro shall delete the current definition of its arguments, replacing that
+/// definition with the previous one. If there is no previous definition, the macro is undefined.
+/// The behavior is unspecified if popdef is not immediately followed by a `<left-parenthesis>`.
 struct PopdefMacro;
 
 impl MacroImplementation for PopdefMacro {
@@ -253,10 +268,11 @@ impl MacroImplementation for PopdefMacro {
         &self,
         mut state: State,
         _stdout: &mut dyn Write,
-        stderror: &mut dyn Write,
+        _stderror: &mut dyn Write,
         m: Macro,
     ) -> Result<State> {
-        todo!()
+        //TODO
+        Ok(state)
     }
 }
 
@@ -370,6 +386,9 @@ impl MacroImplementation for UserDefinedMacro {
     }
 }
 
+/// The undefine macro shall delete all definitions (including those preserved using the pushdef
+/// macro) of the macros named by its arguments. The behavior is unspecified if undefine is not
+/// immediately followed by a ``left-parenthesis>`.
 struct UndefineMacro;
 
 impl MacroImplementation for UndefineMacro {
@@ -616,6 +635,7 @@ pub(crate) fn evaluate(
             stdout.write_all(quoted.contents)?;
         }
         Symbol::Macro(m) => {
+            log::trace!("evaluate() evaluating macro {m:?}");
             let definition = state
                 .macro_definitions
                 .get(&m.name)
@@ -686,6 +706,7 @@ mod test {
             state.macro_definitions.get(&macro_name(b"hello")),
             None
         ));
+        let n_macro_definitions_before_define = state.macro_definitions.len();
         state = evaluate(
             state,
             Symbol::Macro(Macro {
@@ -700,6 +721,11 @@ mod test {
 
         assert!(stdout.is_empty());
         assert!(stderr.is_empty());
+
+        assert_eq!(
+            state.macro_definitions.len(),
+            n_macro_definitions_before_define + 1
+        );
 
         state.macro_definitions.get(&macro_name(b"hello")).unwrap();
         evaluate(

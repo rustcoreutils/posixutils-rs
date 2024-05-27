@@ -1,0 +1,3 @@
+stdout=hello(friend)\nhi friend\ngoodbye friend\nhi friend\nhello(friend)\nwow friend\nhi friend\nhello(friend)\n
+stderr=
+status=0

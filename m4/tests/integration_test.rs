@@ -8,11 +8,22 @@ use similar_asserts::assert_eq;
 use std::fs::read_to_string;
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
-use test_log::test;
+
+fn init() {
+    let _ = env_logger::builder()
+        .is_test(true)
+        // No timestamp to make it easier to diff output
+        .format_timestamp(None)
+        .try_init();
+}
 
 fn read_test(path: impl AsRef<std::path::Path>) -> TestSnapshot {
     let mut f = std::fs::File::open(path).unwrap();
-    TestSnapshot::deserialize(&mut f)
+    let snapshot = TestSnapshot::deserialize(&mut f);
+    log::info!("Expecting stdout:\n\x1b[34m{}\x1b[0m", snapshot.stdout,);
+    log::info!("Expecting stderr:\n\x1b[34m{}\x1b[0m", snapshot.stderr,);
+    log::info!("Expecting status:\n\x1b[34m{}\x1b[0m", snapshot.status,);
+    snapshot
 }
 
 fn run_command(input: &str) -> std::process::Output {
@@ -55,6 +66,7 @@ fn run_command(input: &str) -> std::process::Output {
 
 #[test]
 fn test_changecom() {
+    init();
     let output = run_command("fixtures/integration_tests/changecom.m4");
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/changecom.out");
@@ -77,6 +89,7 @@ fn test_changecom() {
 
 #[test]
 fn test_changequote() {
+    init();
     let output = run_command("fixtures/integration_tests/changequote.m4");
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/changequote.out");
@@ -100,6 +113,7 @@ fn test_changequote() {
 #[ignore]
 #[test]
 fn test_define_eval_order_quoted() {
+    init();
     let output = run_command("fixtures/integration_tests/define_eval_order_quoted.m4");
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/define_eval_order_quoted.out");
@@ -123,6 +137,7 @@ fn test_define_eval_order_quoted() {
 #[ignore]
 #[test]
 fn test_define_eval_order_unquoted() {
+    init();
     let output = run_command("fixtures/integration_tests/define_eval_order_unquoted.m4");
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/define_eval_order_unquoted.out");
@@ -146,6 +161,7 @@ fn test_define_eval_order_unquoted() {
 #[ignore]
 #[test]
 fn test_define_eval_syntax_order_quoted_evaluated() {
+    init();
     let output =
         run_command("fixtures/integration_tests/define_eval_syntax_order_quoted_evaluated.m4");
 
@@ -170,6 +186,7 @@ fn test_define_eval_syntax_order_quoted_evaluated() {
 
 #[test]
 fn test_define_eval_syntax_order_quoted_unevaluated() {
+    init();
     let output =
         run_command("fixtures/integration_tests/define_eval_syntax_order_quoted_unevaluated.m4");
 
@@ -195,6 +212,7 @@ fn test_define_eval_syntax_order_quoted_unevaluated() {
 #[ignore]
 #[test]
 fn test_define_eval_syntax_order_unquoted() {
+    init();
     let output = run_command("fixtures/integration_tests/define_eval_syntax_order_unquoted.m4");
 
     let test: TestSnapshot =
@@ -217,7 +235,31 @@ fn test_define_eval_syntax_order_unquoted() {
 }
 
 #[test]
+fn test_define_invalid_macro_name() {
+    init();
+    let output = run_command("fixtures/integration_tests/define_invalid_macro_name.m4");
+
+    let test: TestSnapshot = read_test("fixtures/integration_tests/define_invalid_macro_name.out");
+    assert_eq!(
+        output.status,
+        std::process::ExitStatus::from_raw(test.status),
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        test.stdout,
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        test.stderr,
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+}
+
+#[test]
 fn test_define_order_defined() {
+    init();
     let output = run_command("fixtures/integration_tests/define_order_defined.m4");
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/define_order_defined.out");
@@ -240,6 +282,7 @@ fn test_define_order_defined() {
 
 #[test]
 fn test_define_order_undefined() {
+    init();
     let output = run_command("fixtures/integration_tests/define_order_undefined.m4");
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/define_order_undefined.out");
@@ -261,7 +304,31 @@ fn test_define_order_undefined() {
 }
 
 #[test]
+fn test_define_pushpopdef_undefine() {
+    init();
+    let output = run_command("fixtures/integration_tests/define_pushpopdef_undefine.m4");
+
+    let test: TestSnapshot = read_test("fixtures/integration_tests/define_pushpopdef_undefine.out");
+    assert_eq!(
+        output.status,
+        std::process::ExitStatus::from_raw(test.status),
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        test.stdout,
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        test.stderr,
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+}
+
+#[test]
 fn test_dnl() {
+    init();
     let output = run_command("fixtures/integration_tests/dnl.m4");
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/dnl.out");
@@ -284,6 +351,7 @@ fn test_dnl() {
 
 #[test]
 fn test_evaluation_order() {
+    init();
     let output = run_command("fixtures/integration_tests/evaluation_order.m4");
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/evaluation_order.out");
@@ -306,6 +374,7 @@ fn test_evaluation_order() {
 
 #[test]
 fn test_include() {
+    init();
     let output = run_command("fixtures/integration_tests/include.m4");
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/include.out");
@@ -328,6 +397,7 @@ fn test_include() {
 
 #[test]
 fn test_macro_errprint_evaluation() {
+    init();
     let output = run_command("fixtures/integration_tests/macro_errprint_evaluation.m4");
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/macro_errprint_evaluation.out");
@@ -350,6 +420,7 @@ fn test_macro_errprint_evaluation() {
 
 #[test]
 fn test_macro_errprint_no_evaluation() {
+    init();
     let output = run_command("fixtures/integration_tests/macro_errprint_no_evaluation.m4");
 
     let test: TestSnapshot =
@@ -373,6 +444,7 @@ fn test_macro_errprint_no_evaluation() {
 
 #[test]
 fn test_macro_errprint_no_evaluation_quoted() {
+    init();
     let output = run_command("fixtures/integration_tests/macro_errprint_no_evaluation_quoted.m4");
 
     let test: TestSnapshot =
@@ -395,7 +467,31 @@ fn test_macro_errprint_no_evaluation_quoted() {
 }
 
 #[test]
+fn test_recursive_defines() {
+    init();
+    let output = run_command("fixtures/integration_tests/recursive_defines.m4");
+
+    let test: TestSnapshot = read_test("fixtures/integration_tests/recursive_defines.out");
+    assert_eq!(
+        output.status,
+        std::process::ExitStatus::from_raw(test.status),
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        test.stdout,
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        test.stderr,
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+}
+
+#[test]
 fn test_sinclude() {
+    init();
     let output = run_command("fixtures/integration_tests/sinclude.m4");
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/sinclude.out");

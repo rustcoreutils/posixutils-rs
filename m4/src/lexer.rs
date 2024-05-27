@@ -322,11 +322,15 @@ impl<'c, 'i: 'c> Symbol<'i> {
             log::trace!(
                 "Symbol::parse() {:?}, current_macro_names: {:?}",
                 String::from_utf8_lossy(input),
-                config
-                    .macro_parse_configs
-                    .iter()
-                    .map(|n| String::from_utf8_lossy(&n.0 .0))
-                    .collect::<Vec<_>>()
+                {
+                    let mut names = config
+                        .macro_parse_configs
+                        .iter()
+                        .map(|n| String::from_utf8_lossy(&n.0 .0))
+                        .collect::<Vec<_>>();
+                    names.sort();
+                    names
+                }
             );
             if input.is_empty() {
                 return Err(nom::Err::Incomplete(nom::Needed::Unknown));
@@ -438,6 +442,12 @@ impl std::fmt::Debug for MacroName {
     }
 }
 
+impl std::fmt::Display for MacroName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&String::from_utf8_lossy(&self.0))
+    }
+}
+
 impl MacroName {
     /// Macro names shall consist of letters, digits, and underscores, where the first character is not a digit. Tokens not of this form shall not be treated as macros.
     /// `[_a-zA-Z][_a-zA-Z0-9]*`
@@ -465,12 +475,18 @@ impl MacroName {
 
     /// Parse macro name from a complete slice, not including the EOF byte.
     /// Mostly used for testing, use [`MacroName::parse`] instead for parsing.
-    pub fn try_from_slice(input: &[u8]) -> Result<Self, String> {
+    pub fn try_from_slice(input: &[u8]) -> crate::error::Result<Self> {
         let mut input = input.to_vec();
         input.push(b'\0');
-        Self::parse(input.as_slice())
-            .map(|ok| ok.1)
-            .map_err(|e| e.to_string())
+        let (remaining, name) =
+            Self::parse(input.as_slice()).map_err(|e| crate::Error::Parsing(e.to_string()))?;
+        if remaining != &[b'\0'] {
+            return Err(crate::Error::Parsing(format!(
+                "Could not completely parse input as macro name. Remaining: {:?}",
+                String::from_utf8_lossy(&input)
+            )));
+        }
+        Ok(name)
     }
 }
 

@@ -61,6 +61,7 @@ impl Test {
         s.push_str(&format!(
             r##"#[test]
 fn test_{name}() {{
+    init();
     let output = run_command("{input}");
 
     let test: TestSnapshot = read_test("{output}");
@@ -132,13 +133,33 @@ use similar_asserts::assert_eq;
 use std::process::ExitStatus;
 use std::os::unix::process::ExitStatusExt;
 use std::fs::read_to_string;
-use test_log::test;
 use m4::error::GetExitCode;
 use m4_test_manager::TestSnapshot;
 
+fn init() {
+    let _ = env_logger::builder()
+        .is_test(true)
+        // No timestamp to make it easier to diff output
+        .format_timestamp(None)
+        .try_init();
+}
+
 fn read_test(path: impl AsRef<std::path::Path>) -> TestSnapshot {
     let mut f = std::fs::File::open(path).unwrap();
-    TestSnapshot::deserialize(&mut f)
+    let snapshot = TestSnapshot::deserialize(&mut f);
+    log::info!(
+        "Expecting stdout:\n\x1b[34m{}\x1b[0m",
+        snapshot.stdout,
+    );
+    log::info!(
+        "Expecting stderr:\n\x1b[34m{}\x1b[0m",
+        snapshot.stderr,
+    );
+    log::info!(
+        "Expecting status:\n\x1b[34m{}\x1b[0m",
+        snapshot.status,
+    );
+    snapshot
 }
 
 fn run_command(input: &str) -> std::process::Output {

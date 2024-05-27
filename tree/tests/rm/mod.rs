@@ -158,14 +158,15 @@ fn test_rm_deep_1() {
     let test_dir = &format!("{}/test_rm_deep_1", env!("CARGO_TARGET_TMPDIR"));
     let k20 = ["/k"; 20].join("");
     let k200 = [k20.as_str(); 10].join("");
-    let t = &format!("{test_dir}/t{k200}{k200}");
+    let t = &format!("{test_dir}/t");
+    let k_deep = &format!("{t}{k200}{k200}");
 
     fs::create_dir(test_dir).unwrap();
 
     let umask_setter = super::UMASK_SETTER.lock().unwrap();
     let original_umask = umask_setter.umask(0o002);
 
-    fs::create_dir_all(t).unwrap();
+    fs::create_dir_all(k_deep).unwrap();
 
     rm_test(&["-r", t], "", "", 0);
 

@@ -13,7 +13,7 @@ use crate::lexer::{
 };
 
 pub struct State {
-    macro_definitions: HashMap<MacroName, Rc<MacroDefinition>>,
+    macro_definitions: HashMap<MacroName, Vec<Rc<MacroDefinition>>>,
     pub parse_config: ParseConfig,
 }
 
@@ -35,10 +35,10 @@ impl Default for State {
                     let parse_config = builtin.parse_config();
                     (
                         parse_config.name.clone(),
-                        Rc::new(MacroDefinition {
+                        vec![Rc::new(MacroDefinition {
                             parse_config,
                             implementation: inbuilt_macro_implementation(builtin),
-                        }),
+                        })],
                     )
                 })
                 .collect(),
@@ -140,10 +140,20 @@ fn inbuilt_macro_implementation(builtin: &BuiltinMacro) -> Box<dyn MacroImplemen
 
 impl State {
     fn current_macro_parse_configs(&self) -> HashMap<MacroName, MacroParseConfig> {
+        log::debug!(
+            "definitions: {:?}",
+            self.macro_definitions
+                .iter()
+                .map(|(name, e)| (name, e.len()))
+                .collect::<Vec<_>>()
+        );
         self.macro_definitions
             .iter()
-            .map(|(name, definition)| {
-                let config = definition.parse_config.clone();
+            .map(|(name, definitions)| {
+                let current_definition = definitions
+                    .last()
+                    .expect("There should always be at least one definition");
+                let config = current_definition.parse_config.clone();
                 (name.clone(), config)
             })
             .collect()
@@ -197,6 +207,40 @@ impl MacroImplementation for DnlMacro {
 /// behavior is unspecified if define is not immediately followed by a `<left-parenthesis>`.
 struct DefineMacro;
 
+impl DefineMacro {
+    fn define(
+        mut state: State,
+        stderror: &mut dyn Write,
+        m: Macro,
+    ) -> Result<(State, Option<MacroDefinition>)> {
+        let mut args = m.args.into_iter();
+        let name = if let Some(i) = args.next() {
+            let name_bytes: Vec<u8>;
+            (name_bytes, state) = evaluate_to_text(state, i, stderror)?;
+
+            if let Ok(name) = MacroName::try_from_slice(&name_bytes) {
+                name
+            } else {
+                return Ok((state, None));
+            }
+        } else {
+            return Ok((state, None));
+        };
+        let definition = if let Some(i) = args.next() {
+            let definition: Vec<u8>;
+            (definition, state) = evaluate_to_text(state, i, stderror)?;
+            definition
+        } else {
+            return Ok((state, None));
+        };
+        let definition = MacroDefinition {
+            parse_config: MacroParseConfig { name, min_args: 0 },
+            implementation: Box::new(UserDefinedMacro { definition }),
+        };
+        Ok((state, Some(definition)))
+    }
+}
+
 impl MacroImplementation for DefineMacro {
     fn evaluate(
         &self,
@@ -205,38 +249,18 @@ impl MacroImplementation for DefineMacro {
         stderror: &mut dyn Write,
         m: Macro,
     ) -> Result<State> {
-        let mut args = m.args.into_iter();
-        let name = if let Some(i) = args.next() {
-            let name_bytes: Vec<u8>;
-            (name_bytes, state) = evaluate_to_text(state, i, stderror)?;
-            log::debug!("name_bytes {:?}", String::from_utf8_lossy(&name_bytes));
-
-            if let Ok(name) = MacroName::try_from_slice(&name_bytes) {
-                name
-            } else {
-                return Ok(state);
-            }
-        } else {
-            return Ok(state);
+        let (mut state, definition) = DefineMacro::define(state, stderror, m)?;
+        let definition = match definition {
+            Some(definition) => definition,
+            None => return Ok(state),
         };
-        let definition = if let Some(i) = args.next() {
-            let definition: Vec<u8>;
-            (definition, state) = evaluate_to_text(state, i, stderror)?;
-            definition
-        } else {
-            return Ok(state);
-        };
-        let definition = MacroDefinition {
-            parse_config: MacroParseConfig {
-                name: name.clone(),
-                min_args: 0,
-            },
-            implementation: Box::new(UserDefinedMacro { definition }),
-        };
+        let name = definition.parse_config.name.clone();
         log::trace!("DefineMacro::evaluate() inserting new macro definition for {name}");
-        state.macro_definitions.insert(name, Rc::new(definition));
+        state
+            .macro_definitions
+            .insert(name, vec![Rc::new(definition)]);
         state.parse_config.macro_parse_configs = state.current_macro_parse_configs();
-        return Ok(state);
+        Ok(state)
     }
 }
 
@@ -250,10 +274,26 @@ impl MacroImplementation for PushdefMacro {
         &self,
         mut state: State,
         _stdout: &mut dyn Write,
-        _stderror: &mut dyn Write,
+        stderror: &mut dyn Write,
         m: Macro,
     ) -> Result<State> {
-        //TODO
+        let (mut state, definition) = DefineMacro::define(state, stderror, m)?;
+        let definition = match definition {
+            Some(definition) => definition,
+            None => return Ok(state),
+        };
+        let name = definition.parse_config.name.clone();
+        log::trace!("PushdefMacro::evaluate() pushing new macro definition for {name}");
+        let definition_modify = Rc::new(definition);
+        let definition_insert = definition_modify.clone();
+        state
+            .macro_definitions
+            .entry(name)
+            .and_modify(|e| {
+                e.push(definition_modify);
+            })
+            .or_insert_with(|| vec![definition_insert]);
+        state.parse_config.macro_parse_configs = state.current_macro_parse_configs();
         Ok(state)
     }
 }
@@ -268,11 +308,28 @@ impl MacroImplementation for PopdefMacro {
         &self,
         mut state: State,
         _stdout: &mut dyn Write,
-        _stderror: &mut dyn Write,
+        stderror: &mut dyn Write,
         m: Macro,
     ) -> Result<State> {
-        //TODO
-        Ok(state)
+        if let Some(first_arg_symbols) = m.args.into_iter().next() {
+            let text: Vec<u8>;
+            (text, state) = evaluate_to_text(state, first_arg_symbols, stderror)?;
+            if let Ok(name) = MacroName::try_from_slice(&text) {
+                if let Some(n_remaining_definitions) =
+                    state.macro_definitions.get_mut(&name).map(|e| {
+                        e.pop();
+                        e.len()
+                    })
+                {
+                    // This was the last definition, so the entry should be removed entirely.
+                    if n_remaining_definitions == 0 {
+                        state.macro_definitions.remove(&name);
+                    }
+                    state.parse_config.macro_parse_configs = state.current_macro_parse_configs();
+                }
+            }
+        }
+        return Ok(state);
     }
 }
 
@@ -635,11 +692,19 @@ pub(crate) fn evaluate(
             stdout.write_all(quoted.contents)?;
         }
         Symbol::Macro(m) => {
-            log::trace!("evaluate() evaluating macro {m:?}");
+            log::debug!(
+                "definitions: {:?}",
+                state
+                    .macro_definitions
+                    .iter()
+                    .map(|(name, e)| (name, e.len()))
+                    .collect::<Vec<_>>()
+            );
+            log::debug!("evaluate() evaluating macro {m:?}");
             let definition = state
                 .macro_definitions
                 .get(&m.name)
-                .cloned()
+                .and_then(|e| e.last().cloned())
                 .expect("There should always be a definition for a parsed macro");
             state = definition
                 .implementation

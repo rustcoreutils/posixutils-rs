@@ -135,6 +135,9 @@ impl Interpreter {
 
     fn call_function(&mut self, name: char, args: &[FunctionArgument]) -> ExecutionResult<Number> {
         let function = &self.functions[name_index(name)].clone();
+        if function.name == '\0' {
+            return Err("undefined function");
+        }
         let mut call_frame = CallFrame::default();
 
         for (arg, param) in args.iter().zip(function.parameters.iter()) {
@@ -1050,5 +1053,18 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(output.string, "10\n");
+    }
+
+    #[test]
+    fn test_call_undefined_function_is_error() {
+        let mut interpreter = Interpreter::default();
+        // ```
+        // f()
+        // ```
+        let output = interpreter.exec(vec![StmtInstruction::Expr(ExprInstruction::Call {
+            name: 'f',
+            args: vec![],
+        })]);
+        assert!(output.is_err());
     }
 }

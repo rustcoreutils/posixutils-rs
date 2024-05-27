@@ -7,6 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::rc::Rc;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BuiltinFunction {
     Length,
@@ -115,10 +117,21 @@ pub enum Variable {
     Array(char),
 }
 
-#[derive(Clone, Default, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Function {
     pub name: char,
-    pub parameters: Vec<Variable>,
-    pub locals: Vec<Variable>,
-    pub body: Vec<StmtInstruction>,
+    pub parameters: Rc<[Variable]>,
+    pub locals: Rc<[Variable]>,
+    pub body: Rc<[StmtInstruction]>,
+}
+
+impl Default for Function {
+    fn default() -> Self {
+        Function {
+            name: '\0',
+            parameters: Rc::new([]),
+            locals: Rc::new([]),
+            body: Rc::new([]),
+        }
+    }
 }

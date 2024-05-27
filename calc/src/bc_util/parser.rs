@@ -367,9 +367,9 @@ fn parse_function(func: Pair<Rule>) -> Result<Function, pest::error::Error<Rule>
     }
     Ok(Function {
         name,
-        parameters,
-        locals,
-        body,
+        parameters: parameters.into(),
+        locals: locals.into(),
+        body: body.into(),
     })
 }
 
@@ -898,7 +898,7 @@ mod test {
                 name: 'f',
                 function: Function {
                     name: 'f',
-                    body: vec![StmtInstruction::Return],
+                    body: [StmtInstruction::Return].into(),
                     ..Default::default()
                 }
             }
@@ -914,9 +914,10 @@ mod test {
                 name: 'f',
                 function: Function {
                     name: 'f',
-                    body: vec![StmtInstruction::ReturnExpr(ExprInstruction::Number(
+                    body: [StmtInstruction::ReturnExpr(ExprInstruction::Number(
                         "1".to_string()
-                    ))],
+                    ))]
+                    .into(),
                     ..Default::default()
                 }
             }
@@ -1091,12 +1092,13 @@ mod test {
             func,
             Function {
                 name: 'f',
-                parameters: vec![
+                parameters: [
                     Variable::Array('a'),
                     Variable::Number('b'),
                     Variable::Number('c'),
                     Variable::Array('d')
-                ],
+                ]
+                .into(),
                 ..Default::default()
             }
         );
@@ -1109,12 +1111,13 @@ mod test {
             func,
             Function {
                 name: 'f',
-                locals: vec![
+                locals: [
                     Variable::Array('a'),
                     Variable::Number('b'),
                     Variable::Number('c'),
                     Variable::Array('d')
-                ],
+                ]
+                .into(),
                 ..Default::default()
             }
         );
@@ -1127,10 +1130,11 @@ mod test {
             func,
             Function {
                 name: 'f',
-                body: vec![StmtInstruction::Expr(ExprInstruction::Add(
+                body: [StmtInstruction::Expr(ExprInstruction::Add(
                     Box::new(ExprInstruction::Number("1".to_string())),
                     Box::new(ExprInstruction::Number("2".to_string()))
-                ))],
+                ))]
+                .into(),
                 ..Default::default()
             }
         );

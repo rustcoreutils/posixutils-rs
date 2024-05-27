@@ -134,12 +134,10 @@ impl Interpreter {
     }
 
     fn call_function(&mut self, name: char, args: &[FunctionArgument]) -> ExecutionResult<Number> {
-        // FIXME: remove copies
-        //let function = &self.functions[name_index(name)];
+        let function = &self.functions[name_index(name)].clone();
         let mut call_frame = CallFrame::default();
-        let parameters = self.functions[name_index(name)].parameters.clone();
 
-        for (arg, param) in args.iter().zip(parameters.iter()) {
+        for (arg, param) in args.iter().zip(function.parameters.iter()) {
             // check if argument and parameter match
             match (arg, param) {
                 (FunctionArgument::Expr(expr), Variable::Number(name)) => {
@@ -155,8 +153,6 @@ impl Interpreter {
             }
         }
 
-        let function = &self.functions[name_index(name)];
-
         for local in function.locals.iter() {
             match local {
                 Variable::Number(name) => {
@@ -170,7 +166,7 @@ impl Interpreter {
         let body = function.body.clone();
 
         self.call_frames.push(call_frame);
-        for stmt in &body {
+        for stmt in body.iter() {
             match self.eval_stmt(stmt)? {
                 ControlFlow::Return(value) => {
                     self.call_frames.pop();
@@ -589,11 +585,12 @@ mod tests {
                     name: 'f',
                     function: Function {
                         name: 'f',
-                        parameters: vec![],
-                        locals: vec![],
-                        body: vec![StmtInstruction::Expr(ExprInstruction::Number(
+                        parameters: [].into(),
+                        locals: [].into(),
+                        body: [StmtInstruction::Expr(ExprInstruction::Number(
                             "5".to_string(),
-                        ))],
+                        ))]
+                        .into(),
                     },
                 },
                 StmtInstruction::Expr(ExprInstruction::Call {
@@ -667,9 +664,7 @@ mod tests {
                     name: 'f',
                     function: Function {
                         name: 'f',
-                        parameters: vec![],
-                        locals: vec![],
-                        body: vec![],
+                        ..Default::default()
                     },
                 },
                 StmtInstruction::Expr(ExprInstruction::Call {
@@ -696,11 +691,12 @@ mod tests {
                     name: 'f',
                     function: Function {
                         name: 'f',
-                        parameters: vec![],
-                        locals: vec![],
-                        body: vec![StmtInstruction::ReturnExpr(ExprInstruction::Number(
+                        parameters: [].into(),
+                        locals: [].into(),
+                        body: [StmtInstruction::ReturnExpr(ExprInstruction::Number(
                             "5".to_string(),
-                        ))],
+                        ))]
+                        .into(),
                     },
                 },
                 StmtInstruction::Expr(ExprInstruction::Call {
@@ -805,9 +801,9 @@ mod tests {
                     name: 'f',
                     function: Function {
                         name: 'f',
-                        parameters: vec![],
-                        locals: vec![],
-                        body: vec![StmtInstruction::Quit],
+                        parameters: [].into(),
+                        locals: [].into(),
+                        body: [StmtInstruction::Quit].into(),
                     },
                 },
                 StmtInstruction::Expr(ExprInstruction::Number("1".to_string())),
@@ -886,12 +882,13 @@ mod tests {
                     name: 'f',
                     function: Function {
                         name: 'f',
-                        parameters: vec![],
-                        locals: vec![Variable::Number('a')],
-                        body: vec![StmtInstruction::Expr(ExprInstruction::Assignment {
+                        parameters: [].into(),
+                        locals: [Variable::Number('a')].into(),
+                        body: [StmtInstruction::Expr(ExprInstruction::Assignment {
                             named: NamedExpr::VariableNumber('a'),
                             value: Box::new(ExprInstruction::Number("5".to_string())),
-                        })],
+                        })]
+                        .into(),
                     },
                 },
                 StmtInstruction::Expr(ExprInstruction::Call {
@@ -921,12 +918,13 @@ mod tests {
                     name: 'f',
                     function: Function {
                         name: 'f',
-                        parameters: vec![Variable::Number('a')],
-                        locals: vec![],
-                        body: vec![StmtInstruction::Expr(ExprInstruction::Assignment {
+                        parameters: [Variable::Number('a')].into(),
+                        locals: [].into(),
+                        body: [StmtInstruction::Expr(ExprInstruction::Assignment {
                             named: NamedExpr::VariableNumber('a'),
                             value: Box::new(ExprInstruction::Number("5".to_string())),
-                        })],
+                        })]
+                        .into(),
                     },
                 },
                 StmtInstruction::Expr(ExprInstruction::Assignment {
@@ -960,11 +958,12 @@ mod tests {
                     name: 'f',
                     function: Function {
                         name: 'f',
-                        parameters: vec![Variable::Number('a')],
-                        locals: vec![],
-                        body: vec![StmtInstruction::ReturnExpr(ExprInstruction::Named(
+                        parameters: [Variable::Number('a')].into(),
+                        locals: [].into(),
+                        body: [StmtInstruction::ReturnExpr(ExprInstruction::Named(
                             NamedExpr::VariableNumber('a'),
-                        ))],
+                        ))]
+                        .into(),
                     },
                 },
                 StmtInstruction::Expr(ExprInstruction::Call {
@@ -996,9 +995,9 @@ mod tests {
                     name: 'f',
                     function: Function {
                         name: 'f',
-                        parameters: vec![Variable::Array('a')],
-                        locals: vec![],
-                        body: vec![
+                        parameters: [Variable::Array('a')].into(),
+                        locals: [].into(),
+                        body: [
                             StmtInstruction::Expr(ExprInstruction::Named(NamedExpr::ArrayItem {
                                 name: 'a',
                                 index: Box::new(ExprInstruction::Number("0".to_string())),
@@ -1010,7 +1009,8 @@ mod tests {
                                 },
                                 value: Box::new(ExprInstruction::Number("5".to_string())),
                             }),
-                        ],
+                        ]
+                        .into(),
                     },
                 },
                 StmtInstruction::Expr(ExprInstruction::Assignment {

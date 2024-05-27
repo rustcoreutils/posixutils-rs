@@ -15,6 +15,8 @@ use bc_util::{
 };
 use clap::Parser;
 
+use gettextrs::{bind_textdomain_codeset, textdomain};
+use plib::PROJECT_NAME;
 use rustyline::{error::ReadlineError, DefaultEditor, Result};
 
 mod bc_util;
@@ -50,6 +52,9 @@ fn exec_str(s: &str, interpreter: &mut Interpreter) -> bool {
 }
 
 fn main() -> Result<()> {
+    textdomain(PROJECT_NAME)?;
+    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+
     let args = Args::parse();
     let mut interpreter = Interpreter::default();
     for file in args.files {

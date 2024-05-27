@@ -347,9 +347,18 @@ impl MacroImplementation for PopdefMacro {
     }
 }
 
+/// Arguments are positionally defined and referenced. The string "$1" in the defining text shall
+/// be replaced by the first argument. Systems shall support at least nine arguments; only the
+/// first nine can be referenced, using the strings "$1" to "$9", inclusive. The string "$0" is
+/// replaced with the name of the macro. The string "$#" is replaced by the number of arguments as
+/// a string. The string "$*" is replaced by a list of all of the arguments, separated by <comma>
+/// characters. The string "$@" is replaced by a list of all of the arguments separated by <comma>
+/// characters, and each argument is quoted using the current left and right quoting strings. The
+/// string "${" produces unspecified behavior.
 enum UserDefinedMacroArg {
     Index(usize),
     List,
+    QuotedList,
     NumberOfArgs,
 }
 
@@ -359,8 +368,8 @@ struct UserDefinedMacro {
 
 fn parse_index(input: &[u8]) -> IResult<&[u8], usize> {
     log::trace!("parse_index() {}", String::from_utf8_lossy(input));
-    let (remaining, found) = nom::bytes::complete::take_while(|c| c >= b'1' && c <= b'9')(input)?;
-    let s = std::str::from_utf8(found).expect("Should be valid utf8 betweeen b'1' and b'9'");
+    let (remaining, found) = nom::bytes::complete::take_while(|c| c >= b'0' && c <= b'9')(input)?;
+    let s = std::str::from_utf8(found).expect("Should be valid utf8 betweeen b'0' and b'9'");
     let i: usize = s.parse().map_err(|e| {
         let e = nom::error::Error::from_external_error(found, nom::error::ErrorKind::Digit, e);
         nom::Err::Error(nom::error::Error::add_context(
@@ -390,6 +399,9 @@ fn parse_user_defined_macro_arg(input: &[u8]) -> IResult<&[u8], UserDefinedMacro
     nom::branch::alt((
         nom::combinator::map(nom::bytes::complete::tag(b"*"), |_| {
             UserDefinedMacroArg::List
+        }),
+        nom::combinator::map(nom::bytes::complete::tag(b"@"), |_| {
+            UserDefinedMacroArg::QuotedList
         }),
         nom::combinator::map(nom::bytes::complete::tag(b"#"), |_| {
             UserDefinedMacroArg::NumberOfArgs
@@ -437,16 +449,45 @@ impl MacroImplementation for UserDefinedMacro {
 
             match arg {
                 UserDefinedMacroArg::Index(i) => {
-                    if let Some(arg) = m.args.get(i - 1) {
-                        log::trace!("UserDefinedMacro::evaluate() Replacing arg {i} with {arg:?}");
+                    if i == 0 {
+                        buffer.write_all(&m.name.0)?;
+                    } else {
+                        if let Some(arg) = m.args.get(i - 1) {
+                            log::trace!(
+                                "UserDefinedMacro::evaluate() Replacing arg {i} with {arg:?}"
+                            );
+                            for symbol in arg {
+                                state = evaluate(state, symbol.clone(), &mut buffer, stderror)?;
+                            }
+                        } else {
+                            log::trace!(
+                                "UserDefinedMacro::evaluate() Cannot find arg with index {i}"
+                            );
+                        }
+                    }
+                }
+                UserDefinedMacroArg::List => {
+                    for (i, arg) in m.args.iter().enumerate() {
                         for symbol in arg {
                             state = evaluate(state, symbol.clone(), &mut buffer, stderror)?;
                         }
-                    } else {
-                        log::trace!("UserDefinedMacro::evaluate() Cannot find arg with index {i}");
+                        if i < m.args.len() - 1 {
+                            buffer.write_all(b",")?;
+                        }
                     }
                 }
-                UserDefinedMacroArg::List => todo!(),
+                UserDefinedMacroArg::QuotedList => {
+                    for (i, arg) in m.args.iter().enumerate() {
+                        buffer.write_all(&state.parse_config.quote_open_tag)?;
+                        for symbol in arg {
+                            state = evaluate(state, symbol.clone(), &mut buffer, stderror)?;
+                        }
+                        buffer.write_all(&state.parse_config.quote_close_tag)?;
+                        if i < m.args.len() - 1 {
+                            buffer.write_all(b",")?;
+                        }
+                    }
+                }
                 UserDefinedMacroArg::NumberOfArgs => {
                     buffer.extend_from_slice(m.args.len().to_string().as_bytes());
                 }

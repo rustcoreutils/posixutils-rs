@@ -432,7 +432,7 @@ impl<'i> Quoted<'i> {
 
 // TODO: small vec optimization could be possible
 #[derive(PartialEq, Clone, Hash, Eq)]
-pub struct MacroName(Vec<u8>);
+pub struct MacroName(pub Vec<u8>);
 
 impl std::fmt::Debug for MacroName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

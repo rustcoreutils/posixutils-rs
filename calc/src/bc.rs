@@ -39,7 +39,7 @@ fn exec_str(s: &str, interpreter: &mut Interpreter) -> bool {
                 }
             }
             Err(e) => {
-                println!("{}", e);
+                println!("runtime error: {}", e);
             }
         },
         Err(e) => {

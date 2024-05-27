@@ -1,0 +1,19 @@
+a = 3.5
+b = 9.78
+c = 4
+
+++c * d
+-a ^ 2
+a * b + c
+b - a / c
+a * b / c + a
+c ^ 2 * a
+(a + b) * c
+((a + b) * c - a) / b
+2 + a += b
+
+if (a + b == b + a) {
+	"if works"
+}
+
+quit

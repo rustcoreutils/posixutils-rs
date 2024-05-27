@@ -8,20 +8,28 @@
 //
 
 WHITESPACE = _{ " " | "\t" | "\\\n" }
-COMMENT = _{ "/*" ~ (!"*/" ~ ANY)* ~ "*/" }
+COMMENT = _{ ("/*" ~ (!"*/" ~ ANY)* ~ "*/") }
 
 letter = { 'a'..'z' }
 digit = _{ '0'..'9' | 'A' .. 'F' }
 string = { "\"" ~ (!("\"") ~ ANY)* ~  "\"" }
-integer = { (digit)+ }
-number = {
+integer = { ( digit | "\\\n" )+ }
+number = @{
     | (integer ~ "." ~ integer)
     | ("." ~ integer)
     | (integer ~ ".")
 	| integer
 }
 rel_op = { "==" | "<=" | ">=" | "!=" | "<" | ">" }
-assign_op = { "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "^=" }
+assign_op = _{ assign | add_assign | sub_assign | mul_assign | div_assign | mod_assign | pow_assign }
+assign = { "=" }
+add_assign = { "+=" }
+sub_assign = { "-=" }
+mul_assign = { "*=" }
+div_assign = { "/=" }
+mod_assign = { "%=" }
+pow_assign = { "^=" }
+
 
 neg = { "-" }
 
@@ -42,11 +50,10 @@ pow = { "^" }
 
 builtin_fn = { "length" | "sqrt" | "scale" }
 
-
 program = { SOI ~ input_item* ~ EOI }
-input_item = { (semicolon_list ~ "\n") | function }
+input_item = _{ (semicolon_list ~ "\n") | function }
 semicolon_list = { (statement ~ (";" ~ statement)*)? ~ ";"? }
-statement_list = { (statement ~ ((";" | "\n") ~ statement)*)? ~ (";" | "\n")? }
+statement_list = { (";" | "\n")* ~ (statement ~ (";" | "\n")*)* }
 
 statement = {
     | break_stmt
@@ -55,7 +62,7 @@ statement = {
     | if_stmt
     | while_stmt
    	| for_stmt
-    | scoped_statement_list
+    | braced_statement_list
     | string
 	| expression
 }
@@ -65,7 +72,7 @@ return_stmt = { "return" ~ ( "(" ~ expression? ~ ")" )? }
 for_stmt = { "for" ~ "(" ~ expression ~ ";" ~ condition ~ ";" ~ expression ~ ")" ~ statement }
 if_stmt = { "if" ~ "(" ~ condition ~ ")" ~ statement }
 while_stmt = { "while" ~ "(" ~ condition ~ ")" ~ statement }
-scoped_statement_list = { "{" ~ statement_list ~ "}" }
+braced_statement_list = { "{" ~ statement_list ~ "}" }
 condition = { relational_expression | expression }
 relational_expression = { expression ~ rel_op ~ expression }
 
@@ -77,8 +84,8 @@ array = { letter ~ "[" ~ "]" }
 
 auto_define_list = { "auto" ~ define_list ~ ("\n" | ";") }
 define_list = { variable ~ ("," ~ variable)* }
-argument_list = { expression | (letter ~ "[" ~ "]" ~ "," ~ argument_list) }
-
+argument_list = { argument ~ ("," ~ argument)* }
+argument = _{ array | expression }
 
 expression = { primary ~ (binary_op ~ primary)* }
 primary = {
@@ -91,6 +98,8 @@ primary = {
     | postfix_increment
     | postfix_decrement
     | negation
+    | register_assignment
+    | register
     | assignment
 	| named_expression
 }
@@ -101,16 +110,19 @@ prefix_increment = { "++" ~ named_expression }
 prefix_decrement = { "--" ~ named_expression }
 postfix_increment = { named_expression ~ "++" }
 postfix_decrement = { named_expression ~ "--" }
-negation = { "-" ~ expression }
+negation = { "-" ~ primary }
 assignment = { named_expression ~ assign_op ~ expression }
+register_assignment = { register ~ assign_op ~ expression }
 named_expression = {
-    | scale
-    | ibase
-    | obase
     | array_item
 	| variable_number
 }
 array_item = { letter ~ "[" ~ expression ~ "]" }
+register = {
+    | scale
+    | ibase
+    | obase
+}
 scale = { "scale" }
 ibase = { "ibase" }
 obase = { "obase" }

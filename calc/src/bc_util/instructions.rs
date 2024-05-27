@@ -7,14 +7,21 @@
 // SPDX-License-Identifier: MIT
 //
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BuiltinFunction {
     Length,
     Sqrt,
     Scale,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Register {
+    IBase,
+    OBase,
+    Scale,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum StmtInstruction {
     Break,
     Quit,
@@ -28,6 +35,12 @@ pub enum StmtInstruction {
         condition: ConditionInstruction,
         body: Vec<StmtInstruction>,
     },
+    For {
+        init: ExprInstruction,
+        condition: ConditionInstruction,
+        update: ExprInstruction,
+        body: Vec<StmtInstruction>,
+    },
     String(String),
     Expr(ExprInstruction),
     DefineFunction {
@@ -36,11 +49,8 @@ pub enum StmtInstruction {
     },
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum NamedExpr {
-    Scale,
-    IBase,
-    OBase,
     VariableNumber(char),
     ArrayItem {
         name: char,
@@ -48,10 +58,17 @@ pub enum NamedExpr {
     },
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
+pub enum FunctionArgument {
+    Expr(ExprInstruction),
+    ArrayVariable(char),
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum ExprInstruction {
-    Number(f64),
+    Number(String),
     Named(NamedExpr),
+    GetRegister(Register),
     Builtin {
         function: BuiltinFunction,
         arg: Box<ExprInstruction>,
@@ -62,10 +79,14 @@ pub enum ExprInstruction {
     PostDecrement(NamedExpr),
     Call {
         name: char,
-        args: Vec<ExprInstruction>,
+        args: Vec<FunctionArgument>,
     },
     Assignment {
-        name: char,
+        named: NamedExpr,
+        value: Box<ExprInstruction>,
+    },
+    SetRegister {
+        register: Register,
         value: Box<ExprInstruction>,
     },
     UnaryMinus(Box<ExprInstruction>),
@@ -77,7 +98,7 @@ pub enum ExprInstruction {
     Pow(Box<ExprInstruction>, Box<ExprInstruction>),
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ConditionInstruction {
     Expr(ExprInstruction),
     Eq(ExprInstruction, ExprInstruction),
@@ -88,13 +109,13 @@ pub enum ConditionInstruction {
     Geq(ExprInstruction, ExprInstruction),
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Variable {
     Number(char),
     Array(char),
 }
 
-#[derive(Default, Debug, PartialEq)]
+#[derive(Clone, Default, Debug, PartialEq)]
 pub struct Function {
     pub name: char,
     pub parameters: Vec<Variable>,

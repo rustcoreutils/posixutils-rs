@@ -12,6 +12,9 @@ use crate::lexer::{
     DEFAULT_QUOTE_OPEN_TAG,
 };
 
+const AT_LEAST_ONE_MACRO_DEFINITION_EXPECT: &str =
+    "There should always be at least one macro definition";
+
 pub struct State {
     macro_definitions: HashMap<MacroName, Vec<Rc<MacroDefinition>>>,
     pub parse_config: ParseConfig,
@@ -141,10 +144,10 @@ fn inbuilt_macro_implementation(builtin: &BuiltinMacro) -> Box<dyn MacroImplemen
 impl State {
     fn current_macro_parse_configs(&self) -> HashMap<MacroName, MacroParseConfig> {
         log::debug!(
-            "definitions: {:?}",
+            "State::current_macro_parse_configs() definitions: {:?}",
             self.macro_definitions
                 .iter()
-                .map(|(name, e)| (name, e.len()))
+                .map(|(name, e)| (name.to_string(), e.len()))
                 .collect::<Vec<_>>()
         );
         self.macro_definitions
@@ -152,7 +155,7 @@ impl State {
             .map(|(name, definitions)| {
                 let current_definition = definitions
                     .last()
-                    .expect("There should always be at least one definition");
+                    .expect(AT_LEAST_ONE_MACRO_DEFINITION_EXPECT);
                 let config = current_definition.parse_config.clone();
                 (name.clone(), config)
             })
@@ -205,6 +208,9 @@ impl MacroImplementation for DnlMacro {
 /// argument. It is unspecified whether the define macro deletes all prior definitions of the macro
 /// named by its first argument or preserves all but the current definition of the macro. The
 /// behavior is unspecified if define is not immediately followed by a `<left-parenthesis>`.
+///
+/// This particular implementation matches GNU m4 behaviour, and perserves all but the current
+/// definition of the macro.
 struct DefineMacro;
 
 impl DefineMacro {
@@ -221,9 +227,14 @@ impl DefineMacro {
             if let Ok(name) = MacroName::try_from_slice(&name_bytes) {
                 name
             } else {
+                log::warn!(
+                    "Invalid macro name {}, skipping defintion",
+                    String::from_utf8_lossy(&name_bytes)
+                );
                 return Ok((state, None));
             }
         } else {
+            log::warn!("No macro name specified, skipping definition");
             return Ok((state, None));
         };
         let definition = if let Some(i) = args.next() {
@@ -231,6 +242,7 @@ impl DefineMacro {
             (definition, state) = evaluate_to_text(state, i, stderror)?;
             definition
         } else {
+            log::warn!("No macro definition provided, skipping definition");
             return Ok((state, None));
         };
         let definition = MacroDefinition {
@@ -244,7 +256,7 @@ impl DefineMacro {
 impl MacroImplementation for DefineMacro {
     fn evaluate(
         &self,
-        mut state: State,
+        state: State,
         _stdout: &mut dyn Write,
         stderror: &mut dyn Write,
         m: Macro,
@@ -256,9 +268,14 @@ impl MacroImplementation for DefineMacro {
         };
         let name = definition.parse_config.name.clone();
         log::trace!("DefineMacro::evaluate() inserting new macro definition for {name}");
-        state
-            .macro_definitions
-            .insert(name, vec![Rc::new(definition)]);
+
+        let definition = Rc::new(definition);
+        if let Some(e) = state.macro_definitions.get_mut(&name) {
+            let last = e.last_mut().expect(AT_LEAST_ONE_MACRO_DEFINITION_EXPECT);
+            *last = definition;
+        } else {
+            state.macro_definitions.insert(name, vec![definition]);
+        }
         state.parse_config.macro_parse_configs = state.current_macro_parse_configs();
         Ok(state)
     }
@@ -272,7 +289,7 @@ struct PushdefMacro;
 impl MacroImplementation for PushdefMacro {
     fn evaluate(
         &self,
-        mut state: State,
+        state: State,
         _stdout: &mut dyn Write,
         stderror: &mut dyn Write,
         m: Macro,
@@ -283,16 +300,13 @@ impl MacroImplementation for PushdefMacro {
             None => return Ok(state),
         };
         let name = definition.parse_config.name.clone();
-        log::trace!("PushdefMacro::evaluate() pushing new macro definition for {name}");
-        let definition_modify = Rc::new(definition);
-        let definition_insert = definition_modify.clone();
-        state
-            .macro_definitions
-            .entry(name)
-            .and_modify(|e| {
-                e.push(definition_modify);
-            })
-            .or_insert_with(|| vec![definition_insert]);
+        log::debug!("PushdefMacro::evaluate() pushing new macro definition for {name}");
+        let definition = Rc::new(definition);
+        if let Some(e) = state.macro_definitions.get_mut(&name) {
+            e.push(definition);
+        } else {
+            state.macro_definitions.insert(name, vec![definition]);
+        }
         state.parse_config.macro_parse_configs = state.current_macro_parse_configs();
         Ok(state)
     }
@@ -697,7 +711,7 @@ pub(crate) fn evaluate(
                 state
                     .macro_definitions
                     .iter()
-                    .map(|(name, e)| (name, e.len()))
+                    .map(|(name, e)| (name.to_string(), e.len()))
                     .collect::<Vec<_>>()
             );
             log::debug!("evaluate() evaluating macro {m:?}");

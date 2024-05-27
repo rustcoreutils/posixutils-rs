@@ -50,11 +50,11 @@ fn run_command(input: &str) -> std::process::Output {
     let status = ExitStatus::from_raw(result.get_exit_code() as i32);
     log::info!("Received status: {status}");
     log::info!(
-        "Received stdout: \x1b[34m{}\x1b[0m",
+        "Received stdout:\n\x1b[34m{}\x1b[0m",
         String::from_utf8_lossy(&stdout)
     );
     log::info!(
-        "Received stderr: \x1b[34m{}\x1b[0m",
+        "Received stderr:\n\x1b[34m{}\x1b[0m",
         String::from_utf8_lossy(&stderr)
     );
     std::process::Output {

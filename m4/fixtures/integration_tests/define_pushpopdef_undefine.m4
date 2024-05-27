@@ -1,20 +1,19 @@
-hello(friend)
+1 hello(friend)
 define(`hello',hi $1)dnl
-hello(friend)
+2 hello(friend)
 pushdef(`hello',goodbye $1)dnl
-hello(friend)
+3 hello(friend)
 popdef(`hello')dnl
-hello(friend)
+4 hello(friend)
 popdef(`hello')dnl
-hello(friend)
+5 hello(friend)
 pushdef(`hello',hi $1)dnl
 pushdef(`hello',hello $1)dnl
 define(`hello',wow $1)dnl
-define(`hello',wow $1)dnl
-hello(friend)
+6 hello(friend)
 popdef(`hello')dnl
-hello(friend)
+7 hello(friend)
 pushdef(`hello',hi $1)dnl
 pushdef(`hello',hello $1)dnl
 undefine(`hello')dnl
-hello(friend)
+8 hello(friend)

@@ -396,11 +396,80 @@ fn test_evaluation_order() {
 }
 
 #[test]
+fn test_forloop() {
+    init();
+    let output = run_command("fixtures/integration_tests/forloop.m4");
+
+    let test: TestSnapshot = read_test("fixtures/integration_tests/forloop.out");
+    assert_eq!(
+        output.status,
+        std::process::ExitStatus::from_raw(test.status),
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        test.stdout,
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        test.stderr,
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+}
+
+#[test]
+fn test_ifelse() {
+    init();
+    let output = run_command("fixtures/integration_tests/ifelse.m4");
+
+    let test: TestSnapshot = read_test("fixtures/integration_tests/ifelse.out");
+    assert_eq!(
+        output.status,
+        std::process::ExitStatus::from_raw(test.status),
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        test.stdout,
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        test.stderr,
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+}
+
+#[test]
 fn test_include() {
     init();
     let output = run_command("fixtures/integration_tests/include.m4");
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/include.out");
+    assert_eq!(
+        output.status,
+        std::process::ExitStatus::from_raw(test.status),
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        test.stdout,
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        test.stderr,
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+}
+
+#[test]
+fn test_incr() {
+    init();
+    let output = run_command("fixtures/integration_tests/incr.m4");
+
+    let test: TestSnapshot = read_test("fixtures/integration_tests/incr.out");
     assert_eq!(
         output.status,
         std::process::ExitStatus::from_raw(test.status),

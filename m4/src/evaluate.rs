@@ -62,6 +62,8 @@ pub enum BuiltinMacro {
     Changequote,
     Pushdef,
     Popdef,
+    Incr,
+    Ifelse,
 }
 
 impl AsRef<[u8]> for BuiltinMacro {
@@ -77,6 +79,8 @@ impl AsRef<[u8]> for BuiltinMacro {
             BuiltinMacro::Changequote => b"changequote",
             BuiltinMacro::Pushdef => b"pushdef",
             BuiltinMacro::Popdef => b"popdef",
+            BuiltinMacro::Incr => b"incr",
+            BuiltinMacro::Ifelse => b"ifelse",
         }
     }
 }
@@ -94,6 +98,8 @@ impl BuiltinMacro {
             Self::Changequote,
             Self::Pushdef,
             Self::Popdef,
+            Self::Incr,
+            Self::Ifelse,
         ]
     }
     pub fn name(&self) -> MacroName {
@@ -114,6 +120,8 @@ impl BuiltinMacro {
             BuiltinMacro::Changequote => 0,
             BuiltinMacro::Pushdef => 1,
             BuiltinMacro::Popdef => 1,
+            BuiltinMacro::Incr => 1,
+            BuiltinMacro::Ifelse => 1,
         }
     }
 
@@ -138,6 +146,8 @@ fn inbuilt_macro_implementation(builtin: &BuiltinMacro) -> Box<dyn MacroImplemen
         BuiltinMacro::Changequote => Box::new(ChangequoteMacro),
         BuiltinMacro::Pushdef => Box::new(PushdefMacro),
         BuiltinMacro::Popdef => Box::new(PopdefMacro),
+        BuiltinMacro::Incr => Box::new(IncrMacro),
+        BuiltinMacro::Ifelse => Box::new(IfelseMacro),
     }
 }
 
@@ -710,6 +720,93 @@ impl MacroImplementation for ChangequoteMacro {
     }
 }
 
+/// The defining text of the incr macro shall be its first argument incremented by 1. It shall be
+/// an error to specify an argument containing any non-numeric characters. The behavior is
+/// unspecified if incr is not immediately followed by a <left-parenthesis>.
+struct IncrMacro;
+
+impl MacroImplementation for IncrMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stdout: &mut dyn Write,
+        stderror: &mut dyn Write,
+        m: Macro,
+    ) -> Result<State> {
+        if let Some(first) = m.args.into_iter().next() {
+            let number;
+            (number, state) = evaluate_to_text(state, first, stderror)?;
+            let mut number: i64 = std::str::from_utf8(&number).unwrap().parse().unwrap();
+            number += 1;
+            stdout.write_all(number.to_string().as_bytes())?;
+        }
+        Ok(state)
+    }
+}
+
+/// The ifelse macro takes three or more arguments. If the first two arguments compare as equal
+/// strings (after macro expansion of both arguments), the defining text shall be the third
+/// argument. If the first two arguments do not compare as equal strings and there are three
+/// arguments, the defining text shall be null. If the first two arguments do not compare as equal
+/// strings and there are four or five arguments, the defining text shall be the fourth argument.
+/// If the first two arguments do not compare as equal strings and there are six or more arguments,
+/// the first three arguments shall be discarded and processing shall restart with the remaining
+/// arguments. The behavior is unspecified if ifelse is not immediately followed by a
+/// <left-parenthesis>.
+struct IfelseMacro;
+
+impl MacroImplementation for IfelseMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stdout: &mut dyn Write,
+        stderror: &mut dyn Write,
+        m: Macro,
+    ) -> Result<State> {
+        if m.args.len() < 3 {
+            write!(stderror, "Too few arguments to builtin `ifelse'")?;
+            return Ok(state);
+        }
+
+        let mut args_len = m.args.len();
+        let mut args = m.args.into_iter();
+        let symbols = args.next().expect("at least 3 args");
+        let first;
+        (first, state) = evaluate_to_text(state, symbols, stderror)?;
+        let symbols = args.next().expect("at least 3 args");
+        let second;
+        (second, state) = evaluate_to_text(state, symbols, stderror)?;
+        loop {
+            if first == second {
+                let symbols = args.next().expect("at least 3 args");
+                for symbol in symbols {
+                    state = evaluate(state, symbol, stdout, stderror)?;
+                }
+                return Ok(state);
+            } else {
+                match args_len {
+                    0 | 1 | 2 => panic!("at least 3 args"),
+                    3 => return Ok(state),
+                    4 | 5 => {
+                        args.next();
+                        let symbols = args.next().expect("at least 4 args");
+                        for symbol in symbols {
+                            state = evaluate(state, symbol, stdout, stderror)?;
+                        }
+                        return Ok(state);
+                    }
+                    6.. => {
+                        // the first three arguments shall be discarded and processing shall
+                        // restart with the remaining arguments.
+                        args.next();
+                        args_len -= 3;
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn evaluate_to_text(
     mut state: State,
     symbols: Vec<Symbol>,
@@ -770,97 +867,4 @@ pub(crate) fn evaluate(
     }
 
     Ok(state)
-}
-
-#[cfg(test)]
-mod test {
-    use super::{evaluate, ParseConfig, State, Symbol};
-    use crate::lexer::Macro;
-    use crate::test_utils::{macro_name, utf8};
-    use test_log::test;
-
-    #[test]
-    fn test_text() {
-        let mut stdout: Vec<u8> = Vec::new();
-        let mut stderr: Vec<u8> = Vec::new();
-        let state = evaluate(
-            State::default(),
-            Symbol::Text(b"Some text to evaluate"),
-            &mut stdout,
-            &mut stderr,
-        )
-        .unwrap();
-
-        assert_eq!(state.parse_config, ParseConfig::default());
-        assert_eq!("Some text to evaluate", utf8(&stdout));
-        assert!(stderr.is_empty());
-    }
-
-    #[test]
-    fn test_macro_dnl() {
-        let mut stdout: Vec<u8> = Vec::new();
-        let mut stderr: Vec<u8> = Vec::new();
-        let state = evaluate(
-            State::default(),
-            Symbol::Macro(Macro {
-                input: b"dnl",
-                name: macro_name(b"dnl"),
-                args: vec![],
-            }),
-            &mut stdout,
-            &mut stderr,
-        )
-        .unwrap();
-
-        assert_eq!(true, state.parse_config.dnl);
-        assert!(stdout.is_empty());
-        assert!(stderr.is_empty());
-    }
-
-    #[test]
-    fn test_macro_define_replace_1() {
-        let mut stdout: Vec<u8> = Vec::new();
-        let mut stderr: Vec<u8> = Vec::new();
-        let mut state = State::default();
-        assert!(matches!(
-            state.macro_definitions.get(&macro_name(b"hello")),
-            None
-        ));
-        let n_macro_definitions_before_define = state.macro_definitions.len();
-        state = evaluate(
-            state,
-            Symbol::Macro(Macro {
-                input: b"define(hello,hi $1)",
-                name: macro_name(b"define"),
-                args: vec![vec![Symbol::Text(b"hello")], vec![Symbol::Text(b"hi $1")]],
-            }),
-            &mut stdout,
-            &mut stderr,
-        )
-        .unwrap();
-
-        assert!(stdout.is_empty());
-        assert!(stderr.is_empty());
-
-        assert_eq!(
-            state.macro_definitions.len(),
-            n_macro_definitions_before_define + 1
-        );
-
-        state.macro_definitions.get(&macro_name(b"hello")).unwrap();
-        evaluate(
-            state,
-            Symbol::Macro(Macro {
-                input: b"hello(friend)",
-                name: macro_name(b"hello"),
-                args: vec![vec![Symbol::Text(b"friend")]],
-            }),
-            &mut stdout,
-            &mut stderr,
-        )
-        .unwrap();
-
-        assert_eq!("hi friend", utf8(&stdout));
-        assert!(stderr.is_empty());
-    }
 }

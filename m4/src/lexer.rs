@@ -546,13 +546,13 @@ fn parse_text<'c>(
             default_stop_tags.to_vec()
         };
         let allowed_to_include_tags: &[&[u8]] = &[b",", b"(", b")"];
-        let mut previous_was_alphanumeric = true;
+        let mut previous_was_alphanumeric_or_underscore = true;
         let mut stop_index = 0;
 
         for i in 0..input.len() {
             let c = input[i];
-            let current_is_alphanumeric = is_alphnumeric(c);
-            if current_is_alphanumeric && !previous_was_alphanumeric {
+            let current_is_alphanumeric_or_underscore = is_alphnumeric(c) || c == b'_';
+            if current_is_alphanumeric_or_underscore && !previous_was_alphanumeric_or_underscore {
                 log::trace!("parse_text() found possible start of macro");
                 let (matched, remaining) = input.split_at(stop_index + 1);
                 log::trace!(
@@ -587,7 +587,7 @@ fn parse_text<'c>(
                 }
             }
             stop_index = i;
-            previous_was_alphanumeric = current_is_alphanumeric;
+            previous_was_alphanumeric_or_underscore = current_is_alphanumeric_or_underscore;
         }
 
         return Err(nom::Err::Incomplete(nom::Needed::Unknown));
@@ -1351,6 +1351,27 @@ mod test {
     fn test_parse_text_eof_only() {
         let error = parse_text(&ParseConfig::default())(b"\0").unwrap_err();
         assert!(matches!(error, nom::Err::Error(_)));
+    }
+
+    #[test]
+    fn test_parse_text_start_underscore() {
+        let (remaining, text) = parse_text(&ParseConfig::default())(b"_define\0").unwrap();
+        assert_eq!("_define", utf8(text));
+        assert_eq!("\0", utf8(remaining));
+    }
+
+    #[test]
+    fn test_parse_text_end_underscore() {
+        let (remaining, text) = parse_text(&ParseConfig::default())(b"define_\0").unwrap();
+        assert_eq!("define_", utf8(text));
+        assert_eq!("\0", utf8(remaining));
+    }
+
+    #[test]
+    fn test_parse_text_middle_underscore() {
+        let (remaining, text) = parse_text(&ParseConfig::default())(b"define_define\0").unwrap();
+        assert_eq!("define_define", utf8(text));
+        assert_eq!("\0", utf8(remaining));
     }
 
     #[test]

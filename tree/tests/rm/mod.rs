@@ -459,9 +459,11 @@ fn test_rm_isatty() {
 
     // Pretend to be a terminal using `script`
     let mut command = Command::new("script");
-    let mut child = command
+    let child = command
         .args(&script_args)
+        .stdin(Stdio::piped()) // Prevents mangling of terminal output
         .stdout(Stdio::piped()) // script writes the prompt to stdout
+        .stderr(Stdio::piped()) // Hides SIGTERM message
         .spawn()
         .unwrap();
 
@@ -471,7 +473,16 @@ fn test_rm_isatty() {
 
     // Terminate without giving an answer to the prompt and then inspect the
     // prompt
-    child.kill().unwrap();
+    unsafe {
+        // SIGTERM should allow `script` to properly shutdown. The SIGKILL in
+        // `Child::kill` occasionally causes a "broken pipe" error on other
+        // tests.
+        let ret = libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+        if ret != 0 {
+            panic!("{}", io::Error::last_os_error());
+        }
+    }
+
     let output = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 

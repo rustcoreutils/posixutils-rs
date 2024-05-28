@@ -142,7 +142,10 @@ impl Number {
 
         result.push('.');
         let mut temp = BigDecimal::one();
-        // TODO: what does this do?
+        // The standard doesn't specify how many fractional digits to print.
+        // Here, we set the scale of the number to the value smallest value of
+        // i such that: (base ^ i).digits() > scale.
+        // This method is also used in other implementations, including GNU bc.
         while temp.digits() <= scale {
             fractional_part *= base;
             let integer_part = fractional_part.with_scale(0);

@@ -65,7 +65,7 @@ impl Hunk {
 
     pub fn add(&mut self, change: Change) {
         assert!(
-            self.change_sequence_acceptable(&change) && self.kind == change,
+            self.change_sequence_acceptable(&change),
             "Only change of following lines in one file and of the same kind accepted."
         );
 
@@ -107,14 +107,16 @@ impl Hunk {
     }
 
     pub fn change_sequence_acceptable(&self, change: &Change) -> bool {
-        if let Some(_) = self.changes.last() {
+        let sequence_is_allowed = if let Some(_) = self.changes.last() {
             change.get_ln1().abs_diff(self.ln1_start) == 1
                 || change.get_ln1().abs_diff(self.ln1_end) == 1
                 || change.get_ln2().abs_diff(self.ln2_start) == 1
                 || change.get_ln2().abs_diff(self.ln2_end) == 1
         } else {
             true
-        }
+        };
+
+        sequence_is_allowed && self.kind == *change
     }
 
     pub fn print_default(&mut self, file1: &FileData, file2: &FileData, is_last: bool) {

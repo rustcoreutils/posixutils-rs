@@ -42,7 +42,7 @@ impl<'a> FileDiff<'a> {
         format_options: &'a FormatOptions,
     ) -> Self {
         if format_options.label1.is_none() && format_options.label2.is_some() {
-            panic!("label1 can not be NONE when label2 is SOME");
+            panic!("label1 can not be NONE when label2 is available");
         }
 
         Self {
@@ -162,7 +162,7 @@ impl<'a> FileDiff<'a> {
                         hunk_index == hunks_count - 1,
                     ),
                     OutputFormat::Context(_) => {
-                        println!("OutputFormat::Context should be handled in other place");
+                        eprintln!("OutputFormat::Context should be handled in other place");
                         return Ok(DiffExitStatus::Trouble);
                     }
                     OutputFormat::ForwardEditScript => hunk.print_forward_edit_script(
@@ -171,7 +171,7 @@ impl<'a> FileDiff<'a> {
                         hunk_index == hunks_count - 1,
                     ),
                     OutputFormat::Unified(_) => {
-                        println!("OutputFormat::Unified should be handled in other place");
+                        eprintln!("OutputFormat::Unified should be handled in other place");
                         return Ok(DiffExitStatus::Trouble);
                     }
                 }

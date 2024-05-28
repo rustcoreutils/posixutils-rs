@@ -122,7 +122,7 @@ impl<'a> DirDiff<'a> {
                         }
 
                         if let Some(label2) = &self.format_options.label2 {
-                            show_if_different.push_str(format!("{} ", label2).as_str())
+                            show_if_different.push_str(format!("--label2 {} ", label2).as_str())
                         }
 
                         if let Some(label1) = &self.format_options.label1 {
@@ -208,7 +208,7 @@ impl<'a> DirDiff<'a> {
                     )
                 }
                 (false, false) => {
-                    println!(
+                    eprintln!(
                         "At least one of directories should contain file \"{}\"",
                         file_name.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME)
                     );

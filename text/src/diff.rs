@@ -160,7 +160,7 @@ fn main() -> Result<DiffExitStatus, Box<dyn std::error::Error>> {
     if let Ok(diff_exit_status) = &result {
         return Ok(*diff_exit_status);
     } else if let Err(error) = &result {
-        println!("diff: {}", error);
+        eprintln!("diff: {}", error);
     }
 
     return Ok(DiffExitStatus::NotDifferent);

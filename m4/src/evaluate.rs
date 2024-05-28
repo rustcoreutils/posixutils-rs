@@ -64,6 +64,7 @@ pub enum BuiltinMacro {
     Popdef,
     Incr,
     Ifelse,
+    Shift,
 }
 
 impl AsRef<[u8]> for BuiltinMacro {
@@ -81,6 +82,7 @@ impl AsRef<[u8]> for BuiltinMacro {
             BuiltinMacro::Popdef => b"popdef",
             BuiltinMacro::Incr => b"incr",
             BuiltinMacro::Ifelse => b"ifelse",
+            BuiltinMacro::Shift => b"shift",
         }
     }
 }
@@ -100,6 +102,7 @@ impl BuiltinMacro {
             Self::Popdef,
             Self::Incr,
             Self::Ifelse,
+            Self::Shift,
         ]
     }
     pub fn name(&self) -> MacroName {
@@ -122,6 +125,7 @@ impl BuiltinMacro {
             BuiltinMacro::Popdef => 1,
             BuiltinMacro::Incr => 1,
             BuiltinMacro::Ifelse => 1,
+            BuiltinMacro::Shift => 1,
         }
     }
 
@@ -148,6 +152,7 @@ fn inbuilt_macro_implementation(builtin: &BuiltinMacro) -> Box<dyn MacroImplemen
         BuiltinMacro::Popdef => Box::new(PopdefMacro),
         BuiltinMacro::Incr => Box::new(IncrMacro),
         BuiltinMacro::Ifelse => Box::new(IfelseMacro),
+        BuiltinMacro::Shift => Box::new(ShiftMacro),
     }
 }
 
@@ -819,6 +824,36 @@ impl MacroImplementation for IfelseMacro {
                 }
             }
         }
+    }
+}
+
+/// The defining text for the shift macro shall be a comma-separated list of its arguments except
+/// the first one. Each argument shall be quoted using the current quoting strings. The behavior is
+/// unspecified if shift is not immediately followed by a <left-parenthesis>.
+struct ShiftMacro;
+
+impl MacroImplementation for ShiftMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stdout: &mut dyn Write,
+        stderror: &mut dyn Write,
+        m: Macro,
+    ) -> Result<State> {
+        let args_len = m.args.len();
+        for (i, symbols) in m.args.into_iter().enumerate() {
+            if i == 0 {
+                continue;
+            }
+            let buffer;
+            (buffer, state) = evaluate_to_text(state, symbols, stderror)?;
+            stdout.write_all(&buffer)?;
+            if i < (args_len - 1) {
+                stdout.write_all(b",")?;
+            }
+        }
+
+        Ok(state)
     }
 }
 

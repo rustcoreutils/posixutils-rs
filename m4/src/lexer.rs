@@ -215,13 +215,17 @@ impl<'i> Macro<'i> {
             log::trace!("Macro::parse() successfully parsed macro name {name:?}");
             // TODO: this should be ignored inside the define macro's second argument, or perhaps
             // just in general.
-            if !config.macro_parse_configs.contains_key(&name) {
-                log::trace!("Macro::parse() not a current macro name");
-                return Err(nom::Err::Error(nom::error::Error::new(
-                    input,
-                    nom::error::ErrorKind::Fail,
-                )));
-            }
+            let macro_parse_config = match config.macro_parse_configs.get(&name) {
+                None => {
+                    log::trace!("Macro::parse() {name} not a current macro name");
+                    return Err(nom::Err::Error(nom::error::Error::new(
+                        input,
+                        nom::error::ErrorKind::Fail,
+                    )));
+                }
+                Some(c) => c,
+            };
+
             log::trace!(
                 "Macro::parse() macro_args: {:?}",
                 String::from_utf8_lossy(remaining)
@@ -239,12 +243,24 @@ impl<'i> Macro<'i> {
                 nom::combinator::cut(nom::bytes::streaming::tag(")")),
             ))(remaining)?;
 
+            let args = args.unwrap_or_default();
+            if args.len() < macro_parse_config.min_args {
+                log::trace!(
+                    "Macro::parse() {name} does not have enough arguments ({})",
+                    args.len()
+                );
+                return Err(nom::Err::Error(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::Fail,
+                )));
+            }
+
             Ok((
                 remaining,
                 Macro {
                     input: &input[..(input.len() - remaining.len())],
                     name,
-                    args: args.unwrap_or_default(),
+                    args,
                 },
             ))
         }

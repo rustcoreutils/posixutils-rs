@@ -742,9 +742,16 @@ impl MacroImplementation for IncrMacro {
         m: Macro,
     ) -> Result<State> {
         if let Some(first) = m.args.into_iter().next() {
-            let number;
-            (number, state) = evaluate_to_text(state, first, stderror)?;
-            let mut number: i64 = std::str::from_utf8(&number).unwrap().parse().unwrap();
+            let number_bytes;
+            (number_bytes, state) = evaluate_to_text(state, first, stderror)?;
+            let number_string = std::str::from_utf8(&number_bytes).map_err(|e| {
+                crate::Error::Parsing(format!(
+                    "Error parsing number as valid utf8 from {number_bytes:?}: {e}"
+                ))
+            })?;
+            let mut number: i64 = number_string.parse().map_err(|e| {
+                crate::Error::Parsing(format!("Error parsing number from {number_string:?}: {e}"))
+            })?;
             number += 1;
             stdout.write_all(number.to_string().as_bytes())?;
         }

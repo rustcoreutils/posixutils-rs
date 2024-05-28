@@ -849,6 +849,13 @@ mod test {
     }
 
     #[test]
+    fn test_parse_macro_name_start_underscore() {
+        let (remaining, name) = MacroName::parse(b"_hello\0").unwrap();
+        assert_eq!(name, MacroName(b"_hello".into()));
+        assert_eq!("\0", utf8(remaining));
+    }
+
+    #[test]
     fn test_parse_macro_name_underscore_number() {
         let (remaining, name) = MacroName::parse(b"some_word_23\0").unwrap();
         assert_eq!(name, MacroName(b"some_word_23".into()));
@@ -1403,6 +1410,16 @@ mod test {
         match symbol {
             Symbol::Newline => {}
             _ => panic!("Unexpected symbol: {symbol:?}"),
+        }
+        assert_eq!("\0", utf8(remaining));
+    }
+
+    #[test]
+    fn test_parse_symbol_underscore_macro_name() {
+        let (remaining, symbol) = Symbol::parse(&ParseConfig::default())(b"_define\0").unwrap();
+        match symbol {
+            Symbol::Text(text) => assert_eq!("_define", utf8(text)),
+            _ => panic!(),
         }
         assert_eq!("\0", utf8(remaining));
     }

@@ -257,6 +257,29 @@ fn test_define_invalid_macro_name() {
 }
 
 #[test]
+fn test_define_nested() {
+    init();
+    let output = run_command("fixtures/integration_tests/define_nested.m4");
+
+    let test: TestSnapshot = read_test("fixtures/integration_tests/define_nested.out");
+    assert_eq!(
+        output.status,
+        std::process::ExitStatus::from_raw(test.status),
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        test.stdout,
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        test.stderr,
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+}
+
+#[test]
 fn test_define_order_defined() {
     init();
     let output = run_command("fixtures/integration_tests/define_order_defined.m4");

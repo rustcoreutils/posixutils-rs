@@ -572,7 +572,7 @@ impl<'a> FileDiff<'a> {
             return format!("{}", label);
         } else {
             return format!(
-                "{} {}",
+                "{}\t{}",
                 file.path(),
                 system_time_to_rfc2822(file.modified())
             );

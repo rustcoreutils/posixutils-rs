@@ -361,6 +361,9 @@ impl<'c, 'i: 'c> Symbol<'i> {
 #[cfg_attr(test, derive(PartialEq))]
 #[derive(Clone)]
 pub struct Quoted<'i> {
+    /// The input that is a quote including the open and close tags.
+    pub all: &'i [u8],
+    /// The input that is between the open and close tags (not including the open and close tags).
     pub contents: &'i [u8],
 }
 
@@ -416,6 +419,8 @@ impl<'i> Quoted<'i> {
             };
 
             let contents = &input[quote_start_index..quote_end_index];
+            let all =
+                &input[quote_start_index - close_tag.len()..quote_end_index + close_tag.len()];
             remaining = &input[quote_end_index + close_tag.len()..];
             log::trace!(
                 "Quoted::parse() contents: {:?}",
@@ -425,7 +430,7 @@ impl<'i> Quoted<'i> {
                 "Quoted::parse() remaining: {:?}",
                 String::from_utf8_lossy(remaining)
             );
-            Ok((remaining, Quoted { contents }))
+            Ok((remaining, Quoted { all, contents }))
         }
     }
 }
@@ -1162,6 +1167,7 @@ mod test {
 
         assert_eq!("", utf8(remaining));
         assert_eq!("hello".as_bytes(), quote.contents);
+        assert_eq!("`hello'".as_bytes(), quote.all);
     }
 
     #[test]
@@ -1170,6 +1176,7 @@ mod test {
 
         assert_eq!("", utf8(remaining));
         assert_eq!("hello".as_bytes(), quote.contents);
+        assert_eq!("xhelloz".as_bytes(), quote.all);
     }
 
     #[test]
@@ -1178,6 +1185,7 @@ mod test {
 
         assert_eq!("", utf8(remaining));
         assert_eq!("hello".as_bytes(), quote.contents);
+        assert_eq!("<<hello>>".as_bytes(), quote.all);
     }
 
     #[test]
@@ -1202,6 +1210,7 @@ mod test {
                 .unwrap();
         assert_eq!("", utf8(remaining));
         assert_eq!("a `quote' is good!".as_bytes(), quote.contents);
+        assert_eq!("`a `quote' is good!'".as_bytes(), quote.all);
     }
 
     #[test]

@@ -238,7 +238,7 @@ impl DefineMacro {
                 name
             } else {
                 log::warn!(
-                    "Invalid macro name {:?}, skipping defintion",
+                    "Invalid macro name {:?}, skipping definition",
                     String::from_utf8_lossy(&name_bytes)
                 );
                 return Ok((state, None));
@@ -850,6 +850,13 @@ fn evaluate_to_text(
 /// "world" it's a macro so evaluate it
 /// "amazing amazing fantastic"
 /// contains no macros so break and output to stdout
+///
+///
+/// The input to the define macro should only have its quotes unwrapped, not subsequently
+/// evaluated. Perhaps input from unwrapping quotes should never be evaluated?
+/// Ahh perhaps unwrapping quotes should be a separate step after there are no macros remaining.
+///
+/// First question, why are the quotes evaluated after being unwrapped for macro arguments?
 pub(crate) fn evaluate(
     mut state: State,
     symbol: Symbol,
@@ -871,6 +878,7 @@ pub(crate) fn evaluate(
 
     let mut first = true;
     let mut buffer = Vec::new();
+    let mut last = false;
     loop {
         log::debug!("evaluate() buffer: {:?}", String::from_utf8_lossy(&buffer));
         let symbols = if first {
@@ -880,29 +888,35 @@ pub(crate) fn evaluate(
             // Symbol so it can be used in this loop. Or put some kind of self rererential
             // struct in the stack containing the symbol and the buffer it came from.
             let symbols = lexer::parse_symbols_complete(&state.parse_config, &mut buffer)?;
-            // No symbols which require evaluation are remaining.
-            if !symbols
-                .iter()
-                .find(|s| matches!(s, Symbol::Macro(_)))
-                .is_some()
-            {
-                // Remove b'\0' from lexer::parse_symbols_complete()
-                buffer.pop();
-                stdout.write_all(&mut buffer)?;
-                break;
-            }
             symbols
         };
+        // No symbols which require evaluation are remaining.
+        if !symbols
+            .iter()
+            .find(|s| matches!(s, Symbol::Macro(_)))
+            .is_some()
+        {
+            last = true;
+        }
         let mut new_buffer: Vec<u8> = Vec::new();
 
+        if last {
+            log::debug!("evaluate() last");
+        }
         log::debug!("evaluate() {symbols:?}");
 
+        // TODO(performance): if this is the last we could write directly to stdout
         for symbol in symbols {
             match symbol {
                 Symbol::Comment(comment) => new_buffer.write_all(comment)?,
                 Symbol::Text(text) => new_buffer.write_all(text)?,
                 Symbol::Quoted(quoted) => {
-                    new_buffer.write_all(quoted.contents)?;
+                    log::debug!("evaluate() writing quoted {quoted:?}");
+                    if last {
+                        new_buffer.write_all(quoted.contents)?;
+                    } else {
+                        new_buffer.write_all(quoted.all)?;
+                    }
                 }
                 Symbol::Macro(m) => {
                     log::debug!("evaluate() evaluating macro {:?}", m.name.to_string());
@@ -923,6 +937,15 @@ pub(crate) fn evaluate(
 
         first = false;
         buffer = new_buffer;
+
+        if last {
+            log::debug!(
+                "evaluate() finished: {:?}",
+                String::from_utf8_lossy(&buffer)
+            );
+            stdout.write_all(&mut buffer)?;
+            break;
+        }
     }
 
     Ok(state)

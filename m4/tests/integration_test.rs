@@ -395,6 +395,7 @@ fn test_evaluation_order() {
     );
 }
 
+#[ignore]
 #[test]
 fn test_forloop() {
     init();

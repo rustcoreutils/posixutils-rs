@@ -63,3 +63,22 @@ impl TestSnapshot {
         }
     }
 }
+
+#[cfg(test)]
+mod test {
+    use crate::TestSnapshot;
+
+    #[test]
+    fn test_deserialize() {
+        let input = r#"stdout=1 2 \n
+stderr=i 1 2 i  |i 1 2 i  |
+status=0
+ignore=true
+"#;
+        let snapshot = TestSnapshot::deserialize(&mut input.as_bytes());
+        assert_eq!(snapshot.stdout, "1 2 \n");
+        assert_eq!(snapshot.stderr, "i 1 2 i  |i 1 2 i  |");
+        assert_eq!(snapshot.status, 0);
+        assert_eq!(snapshot.ignore, true);
+    }
+}

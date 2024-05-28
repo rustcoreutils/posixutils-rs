@@ -1,15 +1,12 @@
 use error::Error;
 use std::{
     ffi::{OsStr, OsString},
-    io::{Stderr, Stdout, Write},
+    io::Write,
     os::unix::ffi::OsStrExt,
     path::PathBuf,
 };
 
-use clap::{
-    builder::{TypedValueParser, ValueParserFactory},
-    Parser,
-};
+use clap::builder::{TypedValueParser, ValueParserFactory};
 use evaluate::State;
 
 pub mod error;

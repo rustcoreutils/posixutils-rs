@@ -543,10 +543,14 @@ impl MacroImplementation for ErrprintMacro {
         stderror: &mut dyn Write,
         m: Macro,
     ) -> Result<State> {
-        for input in m.args {
+        let args_len = m.args.len();
+        for (i, input) in m.args.into_iter().enumerate() {
             let text: Vec<u8>;
             (text, state) = evaluate_to_text(state, input, stderror)?;
-            stderror.write_all(&text)?
+            stderror.write_all(&text)?;
+            if i < (args_len - 1) {
+                stderror.write_all(b" ")?;
+            }
         }
         return Ok(state);
     }

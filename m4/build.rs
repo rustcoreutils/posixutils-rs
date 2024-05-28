@@ -110,6 +110,7 @@ fn main() {
                         ..TestCandidate::default()
                     });
                 candidate.input = Some(path);
+                candidate.ignore = ignore;
             }
             Some(b"out") => {
                 let name = name_from_path(&path).unwrap();

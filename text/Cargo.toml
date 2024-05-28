@@ -13,7 +13,7 @@ gettext-rs.workspace = true
 topological-sort = "0.2"
 diff = "0.1"
 regex.workspace = true
-chrono = "0.4"
+chrono.workspace = true
 libc.workspace = true
 
 [[bin]]

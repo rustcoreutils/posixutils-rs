@@ -153,13 +153,13 @@ fn inbuilt_macro_implementation(builtin: &BuiltinMacro) -> Box<dyn MacroImplemen
 
 impl State {
     fn current_macro_parse_configs(&self) -> HashMap<MacroName, MacroParseConfig> {
-        log::debug!(
-            "State::current_macro_parse_configs() definitions: {:?}",
-            self.macro_definitions
-                .iter()
-                .map(|(name, e)| (name.to_string(), e.len()))
-                .collect::<Vec<_>>()
-        );
+        // log::debug!(
+        //     "State::current_macro_parse_configs() definitions: {:?}",
+        //     self.macro_definitions
+        //         .iter()
+        //         .map(|(name, e)| (name.to_string(), e.len()))
+        //         .collect::<Vec<_>>()
+        // );
         self.macro_definitions
             .iter()
             .map(|(name, definitions)| {
@@ -238,7 +238,7 @@ impl DefineMacro {
                 name
             } else {
                 log::warn!(
-                    "Invalid macro name {}, skipping defintion",
+                    "Invalid macro name {:?}, skipping defintion",
                     String::from_utf8_lossy(&name_bytes)
                 );
                 return Ok((state, None));
@@ -255,6 +255,10 @@ impl DefineMacro {
             log::warn!("No macro definition provided, skipping definition");
             return Ok((state, None));
         };
+        log::debug!(
+            "DefineMacro::define() defined macro {name}: {:?}",
+            String::from_utf8_lossy(&definition)
+        );
         let definition = MacroDefinition {
             parse_config: MacroParseConfig { name, min_args: 0 },
             implementation: Box::new(UserDefinedMacro { definition }),
@@ -833,92 +837,92 @@ fn evaluate_to_text(
 /// defining text, if any, and rescanned for matching macro names. Once no portion of the token
 /// matches the name of a macro, it shall be written to standard output. Macros may have arguments,
 /// in which case the arguments shall be substituted into the defining text before it is rescanned.
+///
+/// great(fantastic)
+///
+/// It's a macro so evaluate it.
+///
+/// "hello fantastic"
+/// contains a macro so don't output, and evaluate the symbols
+///
+/// "hello" it's a macro so evaluate it
+/// "world world fantastic"
+/// "world" it's a macro so evaluate it
+/// "amazing amazing fantastic"
+/// contains no macros so break and output to stdout
 pub(crate) fn evaluate(
     mut state: State,
     symbol: Symbol,
     stdout: &mut dyn Write,
     stderror: &mut dyn Write,
 ) -> Result<State> {
+    log::debug!("evaluate() EVALUATING {symbol:?}");
+    // log::debug!(
+    //     "evaluate() macro_definitions: {:?}",
+    //     state
+    //         .macro_definitions
+    //         .iter()
+    //         .map(|(name, e)| (name.to_string(), e.len()))
+    //         .collect::<Vec<_>>()
+    // );
     let mut root_symbol = Some(symbol);
     // We should never be evaluating symbols when dnl is enabled
     debug_assert!(!state.parse_config.dnl);
 
-    let mut macro_stack: Vec<Vec<u8>> = Vec::new();
-
     let mut first = true;
-    let mut macro_buffer;
+    let mut buffer = Vec::new();
     loop {
+        log::debug!("evaluate() buffer: {:?}", String::from_utf8_lossy(&buffer));
         let symbols = if first {
             vec![root_symbol.take().expect("First iteration")]
         } else {
-            if let Some(b) = macro_stack.pop() {
-                macro_buffer = b;
-                lexer::parse_symbols_complete(&state.parse_config, &mut macro_buffer)?
-            } else {
+            // TODO: parses symbols twice, not ideal! Need to find a way to make an owned
+            // Symbol so it can be used in this loop. Or put some kind of self rererential
+            // struct in the stack containing the symbol and the buffer it came from.
+            let symbols = lexer::parse_symbols_complete(&state.parse_config, &mut buffer)?;
+            // No symbols which require evaluation are remaining.
+            if !symbols
+                .iter()
+                .find(|s| matches!(s, Symbol::Macro(_)))
+                .is_some()
+            {
+                // Remove b'\0' from lexer::parse_symbols_complete()
+                buffer.pop();
+                stdout.write_all(&mut buffer)?;
                 break;
             }
+            symbols
         };
+        let mut new_buffer: Vec<u8> = Vec::new();
 
         log::debug!("evaluate() {symbols:?}");
 
         for symbol in symbols {
             match symbol {
-                Symbol::Comment(comment) => stdout.write_all(comment)?,
-                Symbol::Text(text) => stdout.write_all(text)?,
+                Symbol::Comment(comment) => new_buffer.write_all(comment)?,
+                Symbol::Text(text) => new_buffer.write_all(text)?,
                 Symbol::Quoted(quoted) => {
-                    stdout.write_all(quoted.contents)?;
+                    new_buffer.write_all(quoted.contents)?;
                 }
                 Symbol::Macro(m) => {
-                    log::debug!(
-                        "definitions: {:?}",
-                        state
-                            .macro_definitions
-                            .iter()
-                            .map(|(name, e)| (name.to_string(), e.len()))
-                            .collect::<Vec<_>>()
-                    );
-                    log::debug!("evaluate() evaluating macro {m:?}");
+                    log::debug!("evaluate() evaluating macro {:?}", m.name.to_string());
                     let definition = state
                         .macro_definitions
                         .get(&m.name)
                         .and_then(|e| e.last().cloned())
                         .expect("There should always be a definition for a parsed macro");
-                    let mut macro_buffer: Vec<u8> = Vec::new();
-                    state = definition.implementation.evaluate(
-                        state,
-                        &mut macro_buffer,
-                        stderror,
-                        m,
-                    )?;
-                    log::debug!(
-                        "evaluate() parsing symbols from {:?}",
-                        String::from_utf8_lossy(&macro_buffer)
-                    );
-                    let symbols =
-                        lexer::parse_symbols_complete(&state.parse_config, &mut macro_buffer)?;
-                    log::debug!("evaluate() parsed symbols {symbols:?}");
-
-                    // TODO: parses symbols twice, not ideal! Need to find a way to make an owned
-                    // Symbol so it can be used in this loop. Or put some kind of self rererential
-                    // struct in the stack containing the symbol and the buffer it came from.
-                    if symbols
-                        .iter()
-                        .find(|s| matches!(s, Symbol::Macro(_)))
-                        .is_some()
-                    {
-                        macro_stack.push(macro_buffer);
-                    } else {
-                        // Remove trailing b'\0' after parse_symbols_complete
-                        macro_buffer.pop();
-                        stdout.write_all(&macro_buffer)?;
-                    }
+                    state =
+                        definition
+                            .implementation
+                            .evaluate(state, &mut new_buffer, stderror, m)?;
                 }
-                Symbol::Newline => write!(stdout, "\n")?,
+                Symbol::Newline => new_buffer.write_all(b"\n")?,
                 Symbol::Eof => {}
             }
         }
 
         first = false;
+        buffer = new_buffer;
     }
 
     Ok(state)

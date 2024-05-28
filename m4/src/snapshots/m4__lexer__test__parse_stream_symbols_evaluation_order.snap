@@ -1,57 +1,8 @@
 ---
-source: src/lexer.rs
+source: m4/src/lexer.rs
 expression: "snapshot_symbols_as_stream(ParseConfig::default(), &f)"
 ---
 STDOUT:
-Macro(
-    Macro {
-        input: "dnl",
-        name: MacroName(
-            "dnl",
-        ),
-        args: [],
-    },
-)
-Text(
-    " ",
-)
-Text(
-    "demonstrates ",
-)
-Text(
-    "that ",
-)
-Text(
-    "evaluation ",
-)
-Text(
-    "of ",
-)
-Text(
-    "macro ",
-)
-Text(
-    "arguments ",
-)
-Text(
-    "is ",
-)
-Text(
-    "deferred ",
-)
-Text(
-    "until ",
-)
-Text(
-    "it ",
-)
-Text(
-    "is ",
-)
-Text(
-    "called.",
-)
-Newline
 Macro(
     Macro {
         input: "define(hello, error)",
@@ -140,6 +91,75 @@ Macro(
 )
 Text(
     " ",
+)
+Newline
+Macro(
+    Macro {
+        input: "dnl",
+        name: MacroName(
+            "dnl",
+        ),
+        args: [],
+    },
+)
+Text(
+    " ",
+)
+Text(
+    "this ",
+)
+Text(
+    "actually ",
+)
+Text(
+    "defines ",
+)
+Text(
+    "a ",
+)
+Text(
+    "macro ",
+)
+Text(
+    "called ",
+)
+Quoted(
+    Quoted {
+        contents: "error",
+    },
+)
+Text(
+    " ",
+)
+Text(
+    "and ",
+)
+Text(
+    "so ",
+)
+Text(
+    "the ",
+)
+Text(
+    "original ",
+)
+Text(
+    "definition ",
+)
+Text(
+    "for ",
+)
+Text(
+    "hello ",
+)
+Text(
+    "remains ",
+)
+Text(
+    "the ",
+)
+Text(
+    "same.",
 )
 Newline
 Macro(

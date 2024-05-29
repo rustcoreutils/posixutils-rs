@@ -106,7 +106,7 @@ pub struct MacroArg<'i> {
 
 impl std::fmt::Debug for MacroArg<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Macro")
+        f.debug_struct("MacroArg")
             .field("input", &String::from_utf8_lossy(&self.input))
             .field("symbols", &self.symbols)
             .finish()
@@ -791,11 +791,37 @@ pub fn parse_symbols_complete<'i>(
     Ok(symbols)
 }
 
+pub fn unquote<'c, 'i>(config: &'c ParseConfig, input: &'i [u8]) -> Vec<u8> {
+    let mut input = input.to_vec();
+    let mut output = Vec::new();
+    if input.last() != Some(&b'\0') {
+        input.push(b'\0');
+    }
+    let mut remaining: &[u8] = &input;
+    let mut previous_index = 0;
+    while !remaining.is_empty() {
+        let symbol;
+        (remaining, symbol) = Symbol::parse(&config)(remaining)
+            .map_err(|e| crate::Error::Parsing(e.to_string()))
+            .unwrap();
+        let current_index = input.len() - remaining.len();
+        match symbol {
+            Symbol::Quoted(quoted) => output.write_all(quoted.contents).unwrap(),
+            Symbol::Eof => {}
+            _ => output
+                .write_all(&input[previous_index..current_index])
+                .unwrap(),
+        }
+        previous_index = current_index;
+    }
+    output
+}
+
 #[cfg(test)]
 mod test {
     use crate::evaluate::State;
     use crate::lexer::{
-        parse_inside_brackets, Symbol, DEFAULT_COMMENT_CLOSE_TAG, DEFAULT_COMMENT_OPEN_TAG,
+        parse_inside_brackets, unquote, Symbol, DEFAULT_COMMENT_CLOSE_TAG, DEFAULT_COMMENT_OPEN_TAG,
     };
     use crate::test_utils::{macro_parse_config, macro_parse_configs, utf8};
     use std::collections::HashMap;
@@ -1576,5 +1602,15 @@ mod test {
     fn test_parse_stream_symbols_evaluation_order() {
         let f = std::fs::read("fixtures/integration_tests/evaluation_order.m4").unwrap();
         insta::assert_snapshot!(snapshot_symbols_as_stream(ParseConfig::default(), &f));
+    }
+
+    #[test]
+    fn test_unquote() {
+        let unquoted = unquote(&ParseConfig::default(), b"test");
+        assert_eq!("test", utf8(&unquoted));
+        let unquoted = unquote(&ParseConfig::default(), b"`test'");
+        assert_eq!("test", utf8(&unquoted));
+        let unquoted = unquote(&ParseConfig::default(), b"`test' `test'");
+        assert_eq!("test test", utf8(&unquoted));
     }
 }

@@ -25,3 +25,5 @@ end
 16 define(`hi', `$@')hi(a,b)
 17 define(`hi', ``$@'')hi(a,b)
 18 define(`hi', ```$@''')hi(a,b)
+19 define(`hi', `$@')hi(`a,b')
+20 define(`hello',`a,b')define(`hi', `$# $@')hi(hello)

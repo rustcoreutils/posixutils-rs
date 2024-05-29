@@ -437,6 +437,11 @@ impl MacroImplementation for UserDefinedMacro {
         stderror: &mut dyn Write,
         m: Macro,
     ) -> Result<State> {
+        log::debug!(
+            "UserDefinedMacro::evaluate() evaluating {:?}: {:?}",
+            m.name.to_string(),
+            String::from_utf8_lossy(&self.definition)
+        );
         let mut buffer: Vec<u8> = Vec::with_capacity(self.definition.len());
         let mut remaining = self.definition.as_slice();
         let mut found: &[u8];
@@ -468,24 +473,31 @@ impl MacroImplementation for UserDefinedMacro {
 
             match arg {
                 UserDefinedMacroArg::Index(i) => {
-                    if i == 0 {
-                        buffer.write_all(&m.name.0)?;
+                    if m.args.len() < i {
+                        log::warn!("UserDefinedMacro::evaluate() Cannot find arg with index {i}");
                     } else {
-                        if let Some(arg) = m.args.get(i - 1) {
-                            log::trace!(
-                                "UserDefinedMacro::evaluate() Replacing arg {i} with {arg:?}"
-                            );
-                            for symbol in &arg.symbols {
-                                state = evaluate(state, symbol.clone(), &mut buffer, stderror)?;
-                            }
+                        // TODO: remove new_buffer
+                        let mut new_buffer: Vec<u8> = Vec::new();
+                        if i == 0 {
+                            new_buffer.write_all(&m.name.0)?;
                         } else {
-                            log::trace!(
-                                "UserDefinedMacro::evaluate() Cannot find arg with index {i}"
-                            );
+                            let arg = m.args.get(i - 1).expect("Checked args length");
+                            for symbol in &arg.symbols {
+                                state = evaluate(state, symbol.clone(), &mut new_buffer, stderror)?;
+                            }
                         }
+                        log::debug!(
+                            "UserDefinedMacro::evaluate() Replacing ${i} with {:?}",
+                            String::from_utf8_lossy(&new_buffer)
+                        );
+                        buffer.append(&mut new_buffer);
                     }
                 }
                 UserDefinedMacroArg::List => {
+                    log::debug!(
+                        "UserDefinedMacro::evaluate() Replacing $* with {:?}",
+                        m.args
+                    );
                     for (i, arg) in m.args.iter().enumerate() {
                         for symbol in &arg.symbols {
                             state = evaluate(state, symbol.clone(), &mut buffer, stderror)?;
@@ -496,22 +508,36 @@ impl MacroImplementation for UserDefinedMacro {
                     }
                 }
                 UserDefinedMacroArg::QuotedList => {
+                    // TODO: remove new_buffer
+                    let mut new_buffer: Vec<u8> = Vec::new();
                     for (i, arg) in m.args.iter().enumerate() {
-                        buffer.write_all(&state.parse_config.quote_open_tag)?;
+                        new_buffer.write_all(&state.parse_config.quote_open_tag)?;
                         for symbol in &arg.symbols {
-                            state = evaluate(state, symbol.clone(), &mut buffer, stderror)?;
+                            state = evaluate(state, symbol.clone(), &mut new_buffer, stderror)?;
                         }
-                        buffer.write_all(&state.parse_config.quote_close_tag)?;
+                        new_buffer.write_all(&state.parse_config.quote_close_tag)?;
                         if i < m.args.len() - 1 {
-                            buffer.write_all(b",")?;
+                            new_buffer.write_all(b",")?;
                         }
                     }
+                    log::debug!(
+                        "UserDefinedMacro::evaluate() Replacing $@ with {:?}",
+                        String::from_utf8_lossy(&new_buffer)
+                    );
+                    buffer.append(&mut new_buffer);
                 }
                 UserDefinedMacroArg::NumberOfArgs => {
                     buffer.extend_from_slice(m.args.len().to_string().as_bytes());
                 }
             }
         }
+        log::debug!(
+            "UserDefinedMacro::evaluate() substituted {:?}\nargs: {:?}\nold: {:?}\nnew: {:?}",
+            m.name.to_string(),
+            &m.args,
+            String::from_utf8_lossy(&self.definition),
+            String::from_utf8_lossy(&buffer)
+        );
         stdout.write_all(&buffer)?;
         Ok(state)
     }
@@ -796,13 +822,13 @@ impl MacroImplementation for IfelseMacro {
         let mut i = 0;
         loop {
             let symbols = args.next().expect("at least 3 args").symbols;
-            let first;
-            (first, state) = evaluate_to_text(state, symbols, stderror)?;
+            let arg_0;
+            (arg_0, state) = evaluate_to_text(state, symbols, stderror)?;
             let symbols = args.next().expect("at least 3 args").symbols;
-            let second;
-            (second, state) = evaluate_to_text(state, symbols, stderror)?;
-            if first == second {
-                log::debug!("IfelseMacro::evaluate() evaluating argument {}", i * 3 + 3);
+            let arg_1;
+            (arg_1, state) = evaluate_to_text(state, symbols, stderror)?;
+            if arg_0 == arg_1 {
+                log::debug!("IfelseMacro::evaluate() evaluating argument {}", i * 3 + 2);
                 let symbols = args.next().expect("at least 3 args").symbols;
                 for symbol in symbols {
                     state = evaluate(state, symbol, stdout, stderror)?;
@@ -814,7 +840,7 @@ impl MacroImplementation for IfelseMacro {
                     3 => return Ok(state),
                     4 | 5 => {
                         args.next();
-                        log::debug!("IfelseMacro::evaluate() evaluating argument {}", i * 3 + 4);
+                        log::debug!("IfelseMacro::evaluate() evaluating argument {}", i * 3 + 3);
                         let symbols = args.next().expect("at least 4 args").symbols;
                         for symbol in symbols {
                             state = evaluate(state, symbol, stdout, stderror)?;
@@ -919,7 +945,8 @@ pub(crate) fn evaluate(
     stdout: &mut dyn Write,
     stderror: &mut dyn Write,
 ) -> Result<State> {
-    log::debug!("evaluate() EVALUATING {symbol:?}");
+    let symbol_debug = format!("{symbol:?}");
+    log::debug!("evaluate() EVALUATING {symbol_debug}");
     // log::debug!(
     //     "evaluate() macro_definitions: {:?}",
     //     state
@@ -998,18 +1025,16 @@ pub(crate) fn evaluate(
                 Symbol::Eof => {}
             }
         }
-
-        first = false;
-        buffer = new_buffer;
-
         if last {
             log::debug!(
-                "evaluate() finished: {:?}",
-                String::from_utf8_lossy(&buffer)
+                "evaluate() FINISHED {symbol_debug}: new_buffer: {:?}",
+                String::from_utf8_lossy(&new_buffer)
             );
-            stdout.write_all(&mut buffer)?;
+            stdout.write_all(&mut new_buffer)?;
             break;
         }
+        first = false;
+        buffer = new_buffer;
     }
 
     Ok(state)

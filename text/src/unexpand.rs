@@ -1,7 +1,7 @@
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, textdomain};
 use plib::PROJECT_NAME;
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -43,24 +43,12 @@ fn unexpand(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         Some(s) => parse_tablist(s)?,
         None => vec![8],
     };
-    let readers: Vec<Box<dyn Read>> = if (args.files.len() == 1
-        && args.files[0] == PathBuf::from("-"))
-        || args.files.is_empty()
-    {
-        vec![Box::new(io::stdin().lock())]
-    } else {
-        let mut bufs: Vec<Box<dyn Read>> = vec![];
-        for file in &args.files {
-            bufs.push(Box::new(std::fs::File::open(file)?))
-        }
-        bufs
-    };
-
     let mut stdout = io::stdout();
 
-    for reader in readers {
-        let reader = io::BufReader::new(reader);
-        for line in reader.lines() {
+    if (args.files.len() == 1 && args.files[0] == PathBuf::from("-")) || args.files.is_empty() {
+        let reader = io::stdin();
+        let lines = io::BufReader::new(reader).lines();
+        for line in lines {
             let line = line?;
             let converted_line = if args.all_spaces && args.tablist.is_none() {
                 convert_all_blanks(&line, &tablist)
@@ -69,7 +57,20 @@ fn unexpand(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             };
             writeln!(stdout, "{}", converted_line)?;
         }
-    }
+    } else {
+        for file in &args.files {
+            let reader = io::BufReader::new(std::fs::File::open(file)?);
+            for line in reader.lines() {
+                let line = line?;
+                let converted_line = if args.all_spaces && args.tablist.is_none() {
+                    convert_all_blanks(&line, &tablist)
+                } else {
+                    convert_leading_blanks(&line, &tablist)
+                };
+                writeln!(stdout, "{}", converted_line)?;
+            }
+        }
+    };
 
     Ok(())
 }

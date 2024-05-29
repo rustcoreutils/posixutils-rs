@@ -793,6 +793,7 @@ impl MacroImplementation for IfelseMacro {
 
         let mut args_len = m.args.len();
         let mut args = m.args.into_iter();
+        let mut i = 0;
         loop {
             let symbols = args.next().expect("at least 3 args").symbols;
             let first;
@@ -801,6 +802,7 @@ impl MacroImplementation for IfelseMacro {
             let second;
             (second, state) = evaluate_to_text(state, symbols, stderror)?;
             if first == second {
+                log::debug!("IfelseMacro::evaluate() evaluating argument {}", i * 3 + 3);
                 let symbols = args.next().expect("at least 3 args").symbols;
                 for symbol in symbols {
                     state = evaluate(state, symbol, stdout, stderror)?;
@@ -812,6 +814,7 @@ impl MacroImplementation for IfelseMacro {
                     3 => return Ok(state),
                     4 | 5 => {
                         args.next();
+                        log::debug!("IfelseMacro::evaluate() evaluating argument {}", i * 3 + 4);
                         let symbols = args.next().expect("at least 4 args").symbols;
                         for symbol in symbols {
                             state = evaluate(state, symbol, stdout, stderror)?;
@@ -833,6 +836,7 @@ impl MacroImplementation for IfelseMacro {
                     }
                 }
             }
+            i += 1;
         }
     }
 }
@@ -932,7 +936,10 @@ pub(crate) fn evaluate(
     let mut buffer = Vec::new();
     let mut last = false;
     loop {
-        log::debug!("evaluate() buffer: {:?}", String::from_utf8_lossy(&buffer));
+        log::debug!(
+            "evaluate() begin loop buffer: {:?}",
+            String::from_utf8_lossy(&buffer)
+        );
         let symbols = if first {
             vec![root_symbol.take().expect("First iteration")]
         } else {
@@ -971,7 +978,8 @@ pub(crate) fn evaluate(
                     }
                 }
                 Symbol::Macro(m) => {
-                    log::debug!("evaluate() evaluating macro {:?}", m.name.to_string());
+                    let name = m.name.to_string();
+                    log::debug!("evaluate() evaluating macro {name:?}");
                     let definition = state
                         .macro_definitions
                         .get(&m.name)
@@ -981,6 +989,10 @@ pub(crate) fn evaluate(
                         definition
                             .implementation
                             .evaluate(state, &mut new_buffer, stderror, m)?;
+                    log::debug!(
+                        "evaluate() finished evaluating macro {name:?}, new_buffer: {:?}",
+                        String::from_utf8_lossy(&new_buffer)
+                    );
                 }
                 Symbol::Newline => new_buffer.write_all(b"\n")?,
                 Symbol::Eof => {}

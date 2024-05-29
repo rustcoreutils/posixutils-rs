@@ -21,5 +21,7 @@ end
 11 define
 12 define(`hi', `$1')hi(hello)
 13 define(`hi', ``$1'')hi(hello)
-15 define(`hi2', $1 friend)dnl
-define(`hi', `hi2(`$1')')hi(hello)
+15 define(`hi2', $1 friend)define(`hi', `hi2(`$1')')hi(hello)
+16 define(`hi', `$@')hi(a,b)
+17 define(`hi', ``$@'')hi(a,b)
+18 define(`hi', ```$@''')hi(a,b)

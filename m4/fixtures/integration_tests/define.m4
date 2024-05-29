@@ -31,4 +31,4 @@ end
 22 define(`hi', ``hello'')$# hi
 23 define(`hi2', ``hello'')define(`hi', `$# hi2')hi
 24 define(`hello',`a,b')define(`hi', `$# 1:$1 2:$2 $@')hi(hello)
-24 define(`hello',`a,b,`c,d'')define(`hi', `$# 1:$1 2:$2 3:$3 $@')hi(hello)
+25 define(`hello',`a,b,`c,d'')define(`hi', `$# 1:$1 2:$2 3:$3 $@')hi(hello)

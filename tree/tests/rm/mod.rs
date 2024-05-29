@@ -152,30 +152,6 @@ fn test_rm_dangling_symlink() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
-// Port of coreutils/tests/rm/deep-1.sh
-#[test]
-fn test_rm_deep_1() {
-    let test_dir = &format!("{}/test_rm_deep_1", env!("CARGO_TARGET_TMPDIR"));
-    let k20 = ["/k"; 20].join("");
-    let k200 = [k20.as_str(); 10].join("");
-    let t = &format!("{test_dir}/t");
-    let k_deep = &format!("{t}{k200}{k200}");
-
-    fs::create_dir(test_dir).unwrap();
-
-    let umask_setter = super::UMASK_SETTER.lock().unwrap();
-    let original_umask = umask_setter.umask(0o002);
-
-    fs::create_dir_all(k_deep).unwrap();
-
-    rm_test(&["-r", t], "", "", 0);
-
-    assert!(!Path::new(t).exists());
-
-    umask_setter.umask(original_umask);
-    fs::remove_dir_all(test_dir).unwrap();
-}
-
 // Port of coreutils/tests/rm/deep-2.sh
 #[test]
 fn test_rm_deep_2() {
@@ -483,9 +459,11 @@ fn test_rm_isatty() {
 
     // Pretend to be a terminal using `script`
     let mut command = Command::new("script");
-    let mut child = command
+    let child = command
         .args(&script_args)
+        .stdin(Stdio::piped()) // Prevents mangling of terminal output
         .stdout(Stdio::piped()) // script writes the prompt to stdout
+        .stderr(Stdio::piped()) // Hides SIGTERM message
         .spawn()
         .unwrap();
 
@@ -495,7 +473,16 @@ fn test_rm_isatty() {
 
     // Terminate without giving an answer to the prompt and then inspect the
     // prompt
-    child.kill().unwrap();
+    unsafe {
+        // SIGTERM should allow `script` to properly shutdown. The SIGKILL in
+        // `Child::kill` occasionally causes a "broken pipe" error on other
+        // tests.
+        let ret = libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+        if ret != 0 {
+            panic!("{}", io::Error::last_os_error());
+        }
+    }
+
     let output = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 

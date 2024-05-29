@@ -166,7 +166,7 @@ https://github.com/jgarzik/posixutils
  - [x] uncompress (compress cat.)
  - [ ] unexpand
  - [ ] unget (SCCS)
- - [ ] uniq
+ - [x] uniq
  - [x] unlink
  - [ ] uucp (UUCP)
  - [x] uudecode (uue)
@@ -191,10 +191,12 @@ A few tests require additional setup such as a case-insensitive filesystem or th
 cargo test --release --features posixutils_test_all
 ```
 
-A further subset of `posixutils_test_all` tests are marked as `requires_root`. Running as root would override Unix permissions and thus give false failures on tests where such permissions are expected to be upheld so it is recommended to run these tests individually. There are currently two such tests:
+A further subset of `posixutils_test_all` tests are marked as `requires_root`. Running as root would override Unix permissions and thus give false failures on tests where such permissions are expected to be upheld so it is recommended to run these tests individually. There are currently 4 such tests:
 
 - test_cp_special_bits
 - test_mv_sticky_to_xpart
+- test_rm_fail_2eperm
+- test_rm_no_give_up
 
 ```sh
 sudo -E cargo test --release --features posixutils_test_all,requires_root <test_name>

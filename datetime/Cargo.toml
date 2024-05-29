@@ -10,7 +10,7 @@ repository = "https://github.com/rustcoreutils/posixutils-rs.git"
 plib = { path = "../plib" }
 clap.workspace = true
 gettext-rs.workspace = true
-chrono = "0.4"
+chrono.workspace = true
 libc.workspace = true
 
 [[bin]]

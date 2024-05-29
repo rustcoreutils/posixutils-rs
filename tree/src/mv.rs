@@ -192,7 +192,7 @@ fn move_file(
         Some(md) => md.is_dir(),
         None => false,
     };
-    let target_is_writable = is_file_writable(&target_md);
+    let target_is_writable = is_file_writable(target_md.as_ref());
 
     let source_md = match fs::metadata(source) {
         Ok(md) => Some(md),

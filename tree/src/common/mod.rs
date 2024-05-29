@@ -1,3 +1,9 @@
+// This module is shared between `cp`, `mv` and `rm` but is considered as three
+// separated modules due to the project structure. The `#![allow(unused)]` is
+// to remove warnings when, say, `rm` doesn't use all the the functions in this
+// module (but is used in `cp` or `mv`).
+#![allow(unused)]
+
 use gettextrs::gettext;
 use std::ffi::{CStr, CString};
 use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
@@ -80,7 +86,7 @@ pub fn copy_characteristics(source_md: &fs::Metadata, target: &Path) -> io::Resu
 }
 
 /// Check if the file is writable for the current process.
-pub fn is_file_writable(md: &Option<fs::Metadata>) -> bool {
+pub fn is_file_writable(md: Option<&fs::Metadata>) -> bool {
     match md {
         Some(md) => {
             // These are "effective" IDs and not "real" to allow for things like

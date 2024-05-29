@@ -235,9 +235,9 @@ impl DefineMacro {
         m: Macro,
     ) -> Result<(State, Option<MacroDefinition>)> {
         let mut args = m.args.into_iter();
-        let name = if let Some(i) = args.next() {
+        let name = if let Some(arg) = args.next() {
             let name_bytes: Vec<u8>;
-            (name_bytes, state) = evaluate_to_text(state, i, stderror)?;
+            (name_bytes, state) = evaluate_to_text(state, arg.symbols, stderror)?;
 
             if let Ok(name) = MacroName::try_from_slice(&name_bytes) {
                 name
@@ -252,9 +252,9 @@ impl DefineMacro {
             log::warn!("No macro name specified, skipping definition");
             return Ok((state, None));
         };
-        let definition = if let Some(i) = args.next() {
+        let definition = if let Some(arg) = args.next() {
             let definition: Vec<u8>;
-            (definition, state) = evaluate_to_text(state, i, stderror)?;
+            (definition, state) = evaluate_to_text(state, arg.symbols, stderror)?;
             definition
         } else {
             log::warn!("No macro definition provided, skipping definition");
@@ -344,9 +344,9 @@ impl MacroImplementation for PopdefMacro {
         stderror: &mut dyn Write,
         m: Macro,
     ) -> Result<State> {
-        if let Some(first_arg_symbols) = m.args.into_iter().next() {
+        if let Some(first) = m.args.into_iter().next() {
             let text: Vec<u8>;
-            (text, state) = evaluate_to_text(state, first_arg_symbols, stderror)?;
+            (text, state) = evaluate_to_text(state, first.symbols, stderror)?;
             if let Ok(name) = MacroName::try_from_slice(&text) {
                 if let Some(n_remaining_definitions) =
                     state.macro_definitions.get_mut(&name).map(|e| {
@@ -475,7 +475,7 @@ impl MacroImplementation for UserDefinedMacro {
                             log::trace!(
                                 "UserDefinedMacro::evaluate() Replacing arg {i} with {arg:?}"
                             );
-                            for symbol in arg {
+                            for symbol in &arg.symbols {
                                 state = evaluate(state, symbol.clone(), &mut buffer, stderror)?;
                             }
                         } else {
@@ -487,7 +487,7 @@ impl MacroImplementation for UserDefinedMacro {
                 }
                 UserDefinedMacroArg::List => {
                     for (i, arg) in m.args.iter().enumerate() {
-                        for symbol in arg {
+                        for symbol in &arg.symbols {
                             state = evaluate(state, symbol.clone(), &mut buffer, stderror)?;
                         }
                         if i < m.args.len() - 1 {
@@ -498,7 +498,7 @@ impl MacroImplementation for UserDefinedMacro {
                 UserDefinedMacroArg::QuotedList => {
                     for (i, arg) in m.args.iter().enumerate() {
                         buffer.write_all(&state.parse_config.quote_open_tag)?;
-                        for symbol in arg {
+                        for symbol in &arg.symbols {
                             state = evaluate(state, symbol.clone(), &mut buffer, stderror)?;
                         }
                         buffer.write_all(&state.parse_config.quote_close_tag)?;
@@ -530,9 +530,9 @@ impl MacroImplementation for UndefineMacro {
         stderror: &mut dyn Write,
         m: Macro,
     ) -> Result<State> {
-        if let Some(first_arg_symbols) = m.args.into_iter().next() {
+        if let Some(arg) = m.args.into_iter().next() {
             let text: Vec<u8>;
-            (text, state) = evaluate_to_text(state, first_arg_symbols, stderror)?;
+            (text, state) = evaluate_to_text(state, arg.symbols, stderror)?;
             if let Ok(name) = MacroName::try_from_slice(&text) {
                 state.macro_definitions.remove(&name);
                 state.parse_config.macro_parse_configs = state.current_macro_parse_configs();
@@ -553,9 +553,9 @@ impl MacroImplementation for ErrprintMacro {
         m: Macro,
     ) -> Result<State> {
         let args_len = m.args.len();
-        for (i, input) in m.args.into_iter().enumerate() {
+        for (i, arg) in m.args.into_iter().enumerate() {
             let text: Vec<u8>;
-            (text, state) = evaluate_to_text(state, input, stderror)?;
+            (text, state) = evaluate_to_text(state, arg.symbols, stderror)?;
             stderror.write_all(&text)?;
             if i < (args_len - 1) {
                 stderror.write_all(b" ")?;
@@ -576,8 +576,8 @@ impl IncludeMacro {
         state: State,
         stderror: &mut dyn Write,
     ) -> Result<(Option<PathBuf>, State)> {
-        if let Some(path_symbols) = m.args.into_iter().next() {
-            let (buffer, state) = evaluate_to_text(state, path_symbols, stderror)?;
+        if let Some(arg) = m.args.into_iter().next() {
+            let (buffer, state) = evaluate_to_text(state, arg.symbols, stderror)?;
             let path = PathBuf::from(OsString::from_vec(buffer));
             Ok((Some(path), state))
         } else {
@@ -660,7 +660,7 @@ impl MacroImplementation for ChangecomMacro {
         let mut args = m.args.into_iter();
         let open = args.next().expect("1 argument should be present");
         let open_tag;
-        (open_tag, state) = evaluate_to_text(state, open, stderror)?;
+        (open_tag, state) = evaluate_to_text(state, open.symbols, stderror)?;
         if !open_tag.is_empty() {
             log::trace!(
                 "ChangecomMacro::evaluate() comment_open_tag set to {:?}",
@@ -673,7 +673,7 @@ impl MacroImplementation for ChangecomMacro {
         if args_len >= 2 {
             let close = args.next().expect("2 arguments should be present");
             let close_tag;
-            (close_tag, state) = evaluate_to_text(state, close, stderror)?;
+            (close_tag, state) = evaluate_to_text(state, close.symbols, stderror)?;
             if !close_tag.is_empty() {
                 log::trace!(
                     "ChangecomMacro::evaluate() comment_close_tag set to {:?}",
@@ -716,9 +716,9 @@ impl MacroImplementation for ChangequoteMacro {
                 let open = args.next().expect("2 arguments should be present");
                 let close = args.next().expect("2 arguments should be present");
                 let open_tag;
-                (open_tag, state) = evaluate_to_text(state, open, stderror)?;
+                (open_tag, state) = evaluate_to_text(state, open.symbols, stderror)?;
                 let close_tag;
-                (close_tag, state) = evaluate_to_text(state, close, stderror)?;
+                (close_tag, state) = evaluate_to_text(state, close.symbols, stderror)?;
                 // The behavior is unspecified if there is a single argument or either argument is null.
                 if !open_tag.is_empty() && !close_tag.is_empty() {
                     // TODO: it looks like GNU m4 only allows quote strings using non-alphanumeric
@@ -748,7 +748,7 @@ impl MacroImplementation for IncrMacro {
     ) -> Result<State> {
         if let Some(first) = m.args.into_iter().next() {
             let number_bytes;
-            (number_bytes, state) = evaluate_to_text(state, first, stderror)?;
+            (number_bytes, state) = evaluate_to_text(state, first.symbols, stderror)?;
             let number_string = std::str::from_utf8(&number_bytes).map_err(|e| {
                 crate::Error::Parsing(format!(
                     "Error parsing number as valid utf8 from {number_bytes:?}: {e}"
@@ -773,6 +773,9 @@ impl MacroImplementation for IncrMacro {
 /// the first three arguments shall be discarded and processing shall restart with the remaining
 /// arguments. The behavior is unspecified if ifelse is not immediately followed by a
 /// <left-parenthesis>.
+///
+/// ifelse (string-1, string-2, equal, [not-equal])
+/// ifelse (string-1, string-2, equal-1, string-3, string-4, equal-2, …, [not-equal])
 struct IfelseMacro;
 
 impl MacroImplementation for IfelseMacro {
@@ -790,15 +793,15 @@ impl MacroImplementation for IfelseMacro {
 
         let mut args_len = m.args.len();
         let mut args = m.args.into_iter();
-        let symbols = args.next().expect("at least 3 args");
-        let first;
-        (first, state) = evaluate_to_text(state, symbols, stderror)?;
-        let symbols = args.next().expect("at least 3 args");
-        let second;
-        (second, state) = evaluate_to_text(state, symbols, stderror)?;
         loop {
+            let symbols = args.next().expect("at least 3 args").symbols;
+            let first;
+            (first, state) = evaluate_to_text(state, symbols, stderror)?;
+            let symbols = args.next().expect("at least 3 args").symbols;
+            let second;
+            (second, state) = evaluate_to_text(state, symbols, stderror)?;
             if first == second {
-                let symbols = args.next().expect("at least 3 args");
+                let symbols = args.next().expect("at least 3 args").symbols;
                 for symbol in symbols {
                     state = evaluate(state, symbol, stdout, stderror)?;
                 }
@@ -809,9 +812,16 @@ impl MacroImplementation for IfelseMacro {
                     3 => return Ok(state),
                     4 | 5 => {
                         args.next();
-                        let symbols = args.next().expect("at least 4 args");
+                        let symbols = args.next().expect("at least 4 args").symbols;
                         for symbol in symbols {
                             state = evaluate(state, symbol, stdout, stderror)?;
+                        }
+                        if args_len == 5 {
+                            write!(
+                                stderror,
+                                "Excess argument {:?} to builtin `ifelse' will be ignored",
+                                args.next().expect("5 arguments")
+                            )?;
                         }
                         return Ok(state);
                     }
@@ -841,12 +851,12 @@ impl MacroImplementation for ShiftMacro {
         m: Macro,
     ) -> Result<State> {
         let args_len = m.args.len();
-        for (i, symbols) in m.args.into_iter().enumerate() {
+        for (i, arg) in m.args.into_iter().enumerate() {
             if i == 0 {
                 continue;
             }
             let buffer;
-            (buffer, state) = evaluate_to_text(state, symbols, stderror)?;
+            (buffer, state) = evaluate_to_text(state, arg.symbols, stderror)?;
             stdout.write_all(&buffer)?;
             if i < (args_len - 1) {
                 stdout.write_all(b",")?;

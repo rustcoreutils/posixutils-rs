@@ -10,16 +10,22 @@ Macro(
             "define",
         ),
         args: [
-            [
-                Text(
-                    "hello",
-                ),
-            ],
-            [
-                Text(
-                    "error",
-                ),
-            ],
+            Macro {
+                input: "hello",
+                symbols: [
+                    Text(
+                        "hello",
+                    ),
+                ],
+            },
+            Macro {
+                input: "error",
+                symbols: [
+                    Text(
+                        "error",
+                    ),
+                ],
+            },
         ],
     },
 )
@@ -40,43 +46,49 @@ Macro(
             "define",
         ),
         args: [
-            [
-                Text(
-                    "m2",
-                ),
-            ],
-            [
-                Text(
-                    "m1",
-                ),
-                Text(
-                    "(",
-                ),
-                Text(
-                    "hello",
-                ),
-                Text(
-                    ")",
-                ),
-                Text(
-                    " ",
-                ),
-                Text(
-                    "m1",
-                ),
-                Text(
-                    "(",
-                ),
-                Text(
-                    "$",
-                ),
-                Text(
-                    "1",
-                ),
-                Text(
-                    ")",
-                ),
-            ],
+            Macro {
+                input: "m2",
+                symbols: [
+                    Text(
+                        "m2",
+                    ),
+                ],
+            },
+            Macro {
+                input: "m1(hello) m1($1)",
+                symbols: [
+                    Text(
+                        "m1",
+                    ),
+                    Text(
+                        "(",
+                    ),
+                    Text(
+                        "hello",
+                    ),
+                    Text(
+                        ")",
+                    ),
+                    Text(
+                        " ",
+                    ),
+                    Text(
+                        "m1",
+                    ),
+                    Text(
+                        "(",
+                    ),
+                    Text(
+                        "$",
+                    ),
+                    Text(
+                        "1",
+                    ),
+                    Text(
+                        ")",
+                    ),
+                ],
+            },
         ],
     },
 )
@@ -169,16 +181,22 @@ Macro(
             "define",
         ),
         args: [
-            [
-                Text(
-                    "hello",
-                ),
-            ],
-            [
-                Text(
-                    "goodbye",
-                ),
-            ],
+            Macro {
+                input: "hello",
+                symbols: [
+                    Text(
+                        "hello",
+                    ),
+                ],
+            },
+            Macro {
+                input: "goodbye",
+                symbols: [
+                    Text(
+                        "goodbye",
+                    ),
+                ],
+            },
         ],
     },
 )
@@ -199,24 +217,30 @@ Macro(
             "define",
         ),
         args: [
-            [
-                Text(
-                    "m1",
-                ),
-            ],
-            [
-                Quoted(
-                    Quoted {
-                        contents: "`m1'",
-                    },
-                ),
-                Text(
-                    " $",
-                ),
-                Text(
-                    "1",
-                ),
-            ],
+            Macro {
+                input: "m1",
+                symbols: [
+                    Text(
+                        "m1",
+                    ),
+                ],
+            },
+            Macro {
+                input: "``m1'' $1",
+                symbols: [
+                    Quoted(
+                        Quoted {
+                            contents: "`m1'",
+                        },
+                    ),
+                    Text(
+                        " $",
+                    ),
+                    Text(
+                        "1",
+                    ),
+                ],
+            },
         ],
     },
 )

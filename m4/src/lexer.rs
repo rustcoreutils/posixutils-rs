@@ -84,7 +84,7 @@ pub struct Macro<'i> {
     pub input: &'i [u8],
     pub name: MacroName,
     // TODO: can also be an expression in the case of the eval macro
-    pub args: Vec<Vec<Symbol<'i>>>,
+    pub args: Vec<MacroArg<'i>>,
 }
 
 impl std::fmt::Debug for Macro<'_> {
@@ -93,6 +93,22 @@ impl std::fmt::Debug for Macro<'_> {
             .field("input", &String::from_utf8_lossy(&self.input))
             .field("name", &self.name)
             .field("args", &self.args)
+            .finish()
+    }
+}
+
+#[cfg_attr(test, derive(PartialEq))]
+#[derive(Clone)]
+pub struct MacroArg<'i> {
+    pub input: &'i [u8],
+    pub symbols: Vec<Symbol<'i>>,
+}
+
+impl std::fmt::Debug for MacroArg<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Macro")
+            .field("input", &String::from_utf8_lossy(&self.input))
+            .field("symbols", &self.symbols)
             .finish()
     }
 }
@@ -145,16 +161,9 @@ fn parse_inside_brackets<'c>(
     }
 }
 
-// TODO: Unquoted white-space characters preceding each argument shall be ignored
-// TODO: <comma> characters enclosed between <left-parenthesis> and <right-parenthesis> characters
-// do not delimit arguments.
-//
-/// TODO: we still need to handle the case where a close bracket is used inside a macro
-/// argument eg. define(m1, x(hello)) where `hello)` is the offending close bracket, which causes
-/// this parser to terminate early because it doesn't parse x as a macro.
 fn parse_macro_arg<'c>(
     config: &'c ParseConfig,
-) -> impl for<'i> Fn(&'i [u8]) -> IResult<&'i [u8], Vec<Symbol<'i>>> + 'c {
+) -> impl for<'i> Fn(&'i [u8]) -> IResult<&'i [u8], MacroArg<'i>> + 'c {
     move |input: &[u8]| {
         log::trace!(
             "parse_macro_arg() input: {:?}",
@@ -166,13 +175,19 @@ fn parse_macro_arg<'c>(
         // Unquoted white-space characters preceding each argument shall be ignored.
         (remaining, _) = nom::bytes::streaming::take_while(is_whitespace)(remaining)?;
 
+        let start_arg_index = input.len() - remaining.len();
         loop {
             log::trace!(
                 "parse_macro_arg() remaining: {:?}",
                 String::from_utf8_lossy(remaining)
             );
             if let Some(b')' | b',') = remaining.get(0) {
-                return Ok((remaining, symbols));
+                let end_arg_index = input.len() - remaining.len();
+                let arg = MacroArg {
+                    input: &input[start_arg_index..end_arg_index],
+                    symbols,
+                };
+                return Ok((remaining, arg));
             }
 
             let (r, new_symbols) = nom::branch::alt((
@@ -526,7 +541,7 @@ fn is_word_char_start(c: u8) -> bool {
 //It seems like we might want to use https://linux.die.net/man/3/mbrtowc for UTF-8 and any other
 //multibyte encodings. Then https://linux.die.net/man/3/iswblank
 fn is_whitespace(c: u8) -> bool {
-    unsafe { libc::isblank(c.into()) != 0 }
+    (unsafe { libc::isblank(c.into()) != 0 }) || c == b'\n'
 }
 
 fn is_alphnumeric(c: u8) -> bool {
@@ -914,7 +929,7 @@ mod test {
         assert_eq!("some_word_23()", utf8(m.input));
         assert_eq!(m.name, MacroName(b"some_word_23".into()));
         assert_eq!(m.args.len(), 1);
-        assert_eq!(m.args.get(0).unwrap().len(), 0);
+        assert_eq!(m.args.get(0).unwrap().symbols.len(), 0);
         assert!(remaining.is_empty());
     }
 
@@ -950,11 +965,25 @@ mod test {
         assert_eq!(m.name, MacroName(b"some_word_23".into()));
         assert_eq!(m.args.len(), 1);
         assert!(remaining.is_empty());
-        let m1 = match m.args.get(0).unwrap().get(0).unwrap() {
+        let m1 = match m.args.get(0).unwrap().symbols.get(0).unwrap() {
             Symbol::Macro(m1) => m1,
             _ => panic!(),
         };
         assert_eq!(m1.name, MacroName(b"hello".into()));
+    }
+
+    #[test]
+    fn test_parse_macro_args_1_newline() {
+        let config = &ParseConfig {
+            macro_parse_configs: macro_parse_configs([macro_parse_config(b"hello", 0)]),
+            ..ParseConfig::default()
+        };
+        let (remaining, m) = Macro::parse(config)(b"hello(\n)").unwrap();
+        assert_eq!(m.name, MacroName(b"hello".into()));
+        assert_eq!(m.args.len(), 1);
+        assert_eq!(remaining, &[]);
+        dbg!(&m.args);
+        assert_eq!(m.args.get(0).unwrap().symbols.len(), 0);
     }
 
     #[test]
@@ -968,14 +997,14 @@ mod test {
         assert_eq!(m.name, MacroName(b"some_word_23".into()));
         dbg!(&m.args);
         assert_eq!(m.args.len(), 2);
-        assert_eq!(m.args.get(0).unwrap().len(), 1);
-        assert_eq!(m.args.get(1).unwrap().len(), 1);
-        let arg0 = m.args.get(0).unwrap().get(0).unwrap();
+        assert_eq!(m.args.get(0).unwrap().symbols.len(), 1);
+        assert_eq!(m.args.get(1).unwrap().symbols.len(), 1);
+        let arg0 = m.args.get(0).unwrap().symbols.get(0).unwrap();
         match arg0 {
             Symbol::Text(text) => assert_eq!("hello", utf8(text)),
             _ => panic!(),
         }
-        let arg1 = m.args.get(1).unwrap().get(0).unwrap();
+        let arg1 = m.args.get(1).unwrap().symbols.get(0).unwrap();
         match arg1 {
             Symbol::Text(text) => assert_eq!("world", utf8(text)),
             _ => panic!(),
@@ -998,12 +1027,12 @@ mod test {
         assert_eq!("dnl", utf8(remaining));
         assert_eq!(m1.name, MacroName(b"m1".into()));
         assert_eq!(m1.args.len(), 2);
-        assert_eq!(m1.args.get(1).unwrap().len(), 3);
-        match m1.args.get(1).unwrap().get(0).unwrap() {
+        assert_eq!(m1.args.get(1).unwrap().symbols.len(), 3);
+        match m1.args.get(1).unwrap().symbols.get(0).unwrap() {
             Symbol::Macro(m) => assert_eq!(m.name, MacroName(b"m2".into())),
             s => panic!("unexpected symbol {s:?}"),
         }
-        match m1.args.get(1).unwrap().get(2).unwrap() {
+        match m1.args.get(1).unwrap().symbols.get(2).unwrap() {
             Symbol::Macro(m) => assert_eq!(m.name, MacroName(b"m3".into())),
             s => panic!("unexpected symbol {s:?}"),
         }
@@ -1026,31 +1055,31 @@ mod test {
         assert_eq!(m.args.len(), 2);
         assert_eq!("", utf8(remaining));
         let second_arg = m.args.get(1).unwrap();
-        match second_arg.get(0).unwrap() {
+        match second_arg.symbols.get(0).unwrap() {
             Symbol::Text(text) => {
                 assert_eq!("m2", utf8(text));
             }
             _ => panic!(),
         };
-        match second_arg.get(1).unwrap() {
+        match second_arg.symbols.get(1).unwrap() {
             Symbol::Text(text) => {
                 assert_eq!("(", utf8(text));
             }
             _ => panic!(),
         };
-        match second_arg.get(2).unwrap() {
+        match second_arg.symbols.get(2).unwrap() {
             Symbol::Text(text) => {
                 assert_eq!("hello", utf8(text));
             }
             _ => panic!(),
         };
-        match second_arg.get(3).unwrap() {
+        match second_arg.symbols.get(3).unwrap() {
             Symbol::Text(text) => {
                 assert_eq!(")", utf8(text));
             }
             _ => panic!(),
         };
-        assert_eq!(second_arg.len(), 4);
+        assert_eq!(second_arg.symbols.len(), 4);
     }
 
     #[test]
@@ -1068,7 +1097,7 @@ mod test {
         assert_eq!(m.name, MacroName(b"define".into()));
         assert_eq!(m.args.len(), 1);
         assert_eq!("m1", utf8(remaining));
-        match m.args.get(0).unwrap().get(0).unwrap() {
+        match m.args.get(0).unwrap().symbols.get(0).unwrap() {
             Symbol::Text(text) => {
                 assert_eq!("hello", utf8(text));
             }
@@ -1086,8 +1115,8 @@ mod test {
         assert_eq!(m.args.len(), 2);
         assert!(remaining.is_empty());
         let second_arg = m.args.get(1).unwrap();
-        assert_eq!(second_arg.len(), 1);
-        match second_arg.get(0).unwrap() {
+        assert_eq!(second_arg.symbols.len(), 1);
+        match second_arg.symbols.get(0).unwrap() {
             Symbol::Text(text) => {
                 assert_eq!("goodbye   ", utf8(text));
             }
@@ -1108,7 +1137,7 @@ mod test {
         assert_eq!(m.name, MacroName(b"some_word_23".into()));
         assert_eq!(m.args.len(), 1);
         assert!(remaining.is_empty());
-        let q = match m.args.get(0).unwrap().get(0).unwrap() {
+        let q = match m.args.get(0).unwrap().symbols.get(0).unwrap() {
             Symbol::Quoted(q) => q,
             _ => panic!(),
         };
@@ -1130,17 +1159,17 @@ mod test {
             .1;
         assert_eq!(m.name, MacroName(b"some_word_23".into()));
         assert_eq!(m.args.len(), 1);
-        let m1 = match m.args.get(0).unwrap().get(0).unwrap() {
+        let m1 = match m.args.get(0).unwrap().symbols.get(0).unwrap() {
             Symbol::Macro(m) => m,
             _ => panic!(),
         };
         assert_eq!(m1.name, MacroName(b"hello".into()));
-        let t = match m.args.get(0).unwrap().get(1).unwrap() {
+        let t = match m.args.get(0).unwrap().symbols.get(1).unwrap() {
             Symbol::Text(t) => t,
             _ => panic!(),
         };
         assert_eq!(t, b" ");
-        let m3 = match m.args.get(0).unwrap().get(2).unwrap() {
+        let m3 = match m.args.get(0).unwrap().symbols.get(2).unwrap() {
             Symbol::Macro(m) => m,
             _ => panic!(),
         };
@@ -1157,9 +1186,9 @@ mod test {
         assert_eq!(m.name, MacroName(b"some_word_23".into()));
         dbg!(&m.args);
         assert_eq!(m.args.len(), 3);
-        assert_eq!(m.args.get(0).unwrap().len(), 1);
-        assert_eq!(m.args.get(1).unwrap().len(), 0);
-        assert_eq!(m.args.get(2).unwrap().len(), 1);
+        assert_eq!(m.args.get(0).unwrap().symbols.len(), 1);
+        assert_eq!(m.args.get(1).unwrap().symbols.len(), 0);
+        assert_eq!(m.args.get(2).unwrap().symbols.len(), 1);
         assert!(remaining.is_empty());
     }
 

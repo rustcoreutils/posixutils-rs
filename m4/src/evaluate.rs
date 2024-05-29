@@ -1027,6 +1027,8 @@ pub(crate) fn evaluate(
                     //   ^^^^^ should not be evaluated
                     //
                     // It's seeming like this just needs to be a special evaluation case.
+                    //
+                    // Or perhaps we need a completely different model for evaluation.
                     let name = m.name.to_string();
                     log::debug!("evaluate() evaluating macro {name:?}");
                     let definition = state

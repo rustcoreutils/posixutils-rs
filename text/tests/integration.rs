@@ -1765,20 +1765,61 @@ mod uniq_tests {
 #[cfg(test)]
 mod diff_tests {
     use std::{
-        fs::{self, File}, time::SystemTime
+        fs::{self, File},
+        path::PathBuf,
+        time::SystemTime,
     };
 
     use chrono::DateTime;
 
     use crate::diff_test;
 
+    fn generate_diff_test_artifacts(
+        options: &str,
+        file1_path: &PathBuf,
+        file2_path: &PathBuf,
+        output_file_path: &PathBuf,
+    ) {
+        let base_path = PathBuf::from("tests").join("diff");
+        let binding = base_path.join(output_file_path);
+        let output_file_path = binding.to_str().unwrap();
+
+        let binding = base_path.join(file1_path);
+        let file1_path = binding.to_str().unwrap();
+
+        let from = base_path.join(&file2_path);
+        let file2_path = from.to_str().unwrap();
+
+        let output_file = File::create(&output_file_path)
+            .expect(format!("Failed to create output file: {}", output_file_path).as_str());
+
+        let args = format!(
+            "run --release --bin diff --{} {} {}",
+            options, file1_path, file2_path
+        );
+
+        let args_list = args.split(' ').collect::<Vec<&str>>();
+
+        std::process::Command::new("cargo")
+            .args(args_list)
+            .stdout(output_file)
+            .output()
+            .expect(
+                format!(
+                    "Failed to run command: cargo {} > {}",
+                    args, output_file_path
+                )
+                .as_str(),
+            );
+    }
+
     // update these, according to output of diff-unified and diff-context header
     const F1_TXT_PATH: &'static str = "tests/diff/f1.txt";
     const F1_TXT_RFC2822_MODIFICATION_DATA: &'static str = "Fri, 24 May 2024 13:38:46 +0000";
-    
+
     const F2_TXT_PATH: &'static str = "tests/diff/f2.txt";
     const F2_TXT_RFC2822_MODIFICATION_DATA: &'static str = "Fri, 24 May 2024 13:38:46 +0000";
-    
+
     const F1_DIR_F1_TXT_PATH: &'static str = "tests/diff/f1/f1.txt";
     const F1_DIR_F1_TXT_RFC2822_MODIFICATION_DATA: &'static str = "Fri, 24 May 2024 13:38:46 +0000";
 
@@ -1786,22 +1827,27 @@ mod diff_tests {
     const F2_DIR_F1_TXT_RFC2822_MODIFICATION_DATA: &'static str = "Fri, 24 May 2024 13:38:46 +0000";
 
     const F1_DIR_EMPTY_DIR_F1_TXT_PATH: &'static str = "tests/diff/f1/empty/f1.txt";
-    const F1_DIR_EMPTY_DIR_F1_TXT_RFC2822_MODIFICATION_DATA: &'static str = "Sat, 25 May 2024 07:04:10 +0000";
+    const F1_DIR_EMPTY_DIR_F1_TXT_RFC2822_MODIFICATION_DATA: &'static str =
+        "Sat, 25 May 2024 07:04:10 +0000";
 
     const F2_DIR_EMPTY_DIR_F1_TXT_PATH: &'static str = "tests/diff/f2/empty/f1.txt";
-    const F2_DIR_EMPTY_DIR_F1_TXT_RFC2822_MODIFICATION_DATA: &'static str = "Sat, 25 May 2024 07:04:10 +0000";
+    const F2_DIR_EMPTY_DIR_F1_TXT_RFC2822_MODIFICATION_DATA: &'static str =
+        "Sat, 25 May 2024 07:04:10 +0000";
 
-    fn update_file_modification_data(path: &str , rfc2822_date: &str) {
+    fn update_file_modification_data(path: &str, rfc2822_date: &str) {
         let file_modification_data = SystemTime::from(
-            DateTime::parse_from_rfc2822(rfc2822_date)
-                .expect( format!("Could not parse RFC2822 string<{}> into DataTime" , rfc2822_date).as_str()),
+            DateTime::parse_from_rfc2822(rfc2822_date).expect(
+                format!(
+                    "Could not parse RFC2822 string<{}> into DataTime",
+                    rfc2822_date
+                )
+                .as_str(),
+            ),
         );
 
-        let file =
-            File::open(path).expect(format!("Could not open file: {}", path).as_str());
+        let file = File::open(path).expect(format!("Could not open file: {}", path).as_str());
 
-            file
-            .set_modified(file_modification_data)
+        file.set_modified(file_modification_data)
             .expect(format!("Could set modified of file: {}", F1_TXT_PATH).as_str());
 
         drop(file);
@@ -1809,17 +1855,93 @@ mod diff_tests {
 
     #[ctor::ctor]
     fn test_setup() {
-        let path_date_collection = vec![
-            (F1_TXT_PATH , F1_TXT_RFC2822_MODIFICATION_DATA),
-            (F2_TXT_PATH , F2_TXT_RFC2822_MODIFICATION_DATA),
-            (F1_DIR_F1_TXT_PATH , F1_DIR_F1_TXT_RFC2822_MODIFICATION_DATA),
-            (F2_DIR_F1_TXT_PATH , F2_DIR_F1_TXT_RFC2822_MODIFICATION_DATA),
-            (F1_DIR_EMPTY_DIR_F1_TXT_PATH , F1_DIR_EMPTY_DIR_F1_TXT_RFC2822_MODIFICATION_DATA),
-            (F2_DIR_EMPTY_DIR_F1_TXT_PATH , F2_DIR_EMPTY_DIR_F1_TXT_RFC2822_MODIFICATION_DATA),
+        let f1_txt_path = PathBuf::from("f1.txt");
+        let f2_txt_path = PathBuf::from("f2.txt");
+
+        let f1_dir_path = PathBuf::from("f1");
+        let f2_dir_path = PathBuf::from("f2");
+
+        let f1_txt_eols_path = PathBuf::from("f1_with_eol_spaces.txt");
+
+        let artifact_generation_args = vec![
+            (" -C 1", &f1_txt_path, &f2_txt_path, "context_1_output.txt"),
+            (
+                " -C 10",
+                &f1_txt_path,
+                &f2_txt_path,
+                "context_10_output.txt",
+            ),
+            (" -c", &f1_txt_path, &f2_txt_path, "context_output.txt"),
+            ("", &f1_txt_path, &f2_txt_path, "default_output.txt"),
+            (" -e", &f1_txt_path, &f2_txt_path, "edit_script_output.txt"),
+            (
+                "",
+                &f1_txt_path,
+                &f1_txt_eols_path,
+                "f1_counting_eol_spacesd_output.txt",
+            ),
+            ("", &f1_dir_path, &f2_dir_path, "f1_f2_default_output.txt"),
+            (
+                " -r -c",
+                &f1_dir_path,
+                &f2_dir_path,
+                "f1_f2_recursive_context_output.txt",
+            ),
+            (
+                " -r -e",
+                &f1_dir_path,
+                &f2_dir_path,
+                "f1_f2_recursive_ed_output.txt",
+            ),
+            (
+                " -r -f",
+                &f1_dir_path,
+                &f2_dir_path,
+                "f1_f2_recursive_f_output.txt",
+            ),
+            (
+                " -r",
+                &f1_dir_path,
+                &f2_dir_path,
+                "f1_f2_recursive_output.txt",
+            ),
+            (
+                " -r -u",
+                &f1_dir_path,
+                &f2_dir_path,
+                "f1_f2_recursive_unified_output.txt",
+            ),
+            (
+                " -b",
+                &f1_txt_path,
+                &f1_txt_eols_path,
+                "f1_ignoring_eol_spacesd_output.txt",
+            ),
+            ("", &f1_txt_path, &f2_dir_path, "file_dir_output.txt"),
+            (
+                " -f",
+                &f1_txt_path,
+                &f2_txt_path,
+                "forward_edit_script_output.txt",
+            ),
+            (
+                " -u --label F1 --label2 F2",
+                &f1_txt_path,
+                &f2_txt_path,
+                "label_output.txt",
+            ),
+            (" -U 0", &f1_txt_path, &f2_txt_path, "unified_0_output.txt"),
+            (
+                " -U 10",
+                &f1_txt_path,
+                &f2_txt_path,
+                "unified_10_output.txt",
+            ),
+            (" -u", &f1_txt_path, &f2_txt_path, "unified_output.txt"),
         ];
 
-        for (path, date) in path_date_collection {
-            update_file_modification_data(path, date);
+        for (option, f1_path, f2_path, output_path) in artifact_generation_args {
+            generate_diff_test_artifacts(option, f1_path, f2_path, &PathBuf::from(output_path));
         }
     }
 
@@ -1916,7 +2038,7 @@ mod diff_tests {
     #[test]
     fn test_diff_file_directory() {
         diff_test(
-            &[F1_TXT_PATH,  "tests/diff/f2"],
+            &[F1_TXT_PATH, "tests/diff/f2"],
             fs::read_to_string("tests/diff/file_dir_output.txt")
                 .unwrap()
                 .as_str(),
@@ -2006,7 +2128,15 @@ mod diff_tests {
     #[test]
     fn test_diff_unified_two_labels() {
         diff_test(
-            &["--label", "F1", "--label2", "F2", "-u", F1_TXT_PATH, F2_TXT_PATH],
+            &[
+                "--label",
+                "F1",
+                "--label2",
+                "F2",
+                "-u",
+                F1_TXT_PATH,
+                F2_TXT_PATH,
+            ],
             fs::read_to_string("tests/diff/label_output.txt")
                 .unwrap()
                 .as_str(),

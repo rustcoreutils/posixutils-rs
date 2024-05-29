@@ -155,7 +155,7 @@ impl Hunk {
                         file2.line(change.get_ln2() - 1),
                         file1.line(change.get_ln1() - 1),
                     );
-                    replaced_lines.push(&new);
+                    replaced_lines.push(new);
                     println!("< {}", old);
                 }
 

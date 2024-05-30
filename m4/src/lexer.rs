@@ -22,7 +22,7 @@ use std::{
     io::{Read, Write},
 };
 
-use crate::evaluate::{BuiltinMacro, State};
+use crate::evaluate::{BuiltinMacro, Evaluator, State};
 
 #[derive(Clone, Hash, Debug)]
 #[cfg_attr(test, derive(PartialEq))]
@@ -670,12 +670,7 @@ pub fn parse_dnl(input: &[u8]) -> IResult<&[u8], &[u8]> {
 /// changequote).
 pub(crate) fn process_streaming<'c, R: Read>(
     mut state: State,
-    evaluate: impl for<'i, 'w> Fn(
-        State,
-        Symbol<'i>,
-        &'w mut dyn Write,
-        &'w mut dyn Write,
-    ) -> crate::error::Result<State>,
+    evaluator: impl Evaluator,
     mut reader: R,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
@@ -758,7 +753,7 @@ pub(crate) fn process_streaming<'c, R: Read>(
                 if matches!(symbol, Symbol::Eof) {
                     return Ok(state);
                 }
-                state = evaluate(state, symbol, stdout, stderr)?;
+                state = evaluator.evaluate(state, symbol, stdout, stderr, true)?;
                 remaining
             };
 
@@ -825,6 +820,7 @@ mod test {
     };
     use crate::test_utils::{macro_parse_config, macro_parse_configs, utf8};
     use std::collections::HashMap;
+    use std::io::Write;
     use test_log::test;
 
     use super::{
@@ -859,19 +855,20 @@ mod test {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut state = State::default();
+
+        fn evaluate(
+            state: State,
+            symbol: Symbol,
+            stdout: &mut dyn Write,
+            _stderror: &mut dyn Write,
+            _unwrap_quotes: bool,
+        ) -> crate::error::Result<State> {
+            stdout.write_all(format!("{symbol:#?}").as_bytes()).unwrap();
+            stdout.write(b"\n").unwrap();
+            Ok(state)
+        }
         state.parse_config = initial_config;
-        process_streaming(
-            state,
-            |state, symbol, stdout, _stderr| {
-                stdout.write_all(format!("{symbol:#?}").as_bytes()).unwrap();
-                stdout.write(b"\n").unwrap();
-                Ok(state)
-            },
-            input,
-            &mut stdout,
-            &mut stderr,
-        )
-        .unwrap();
+        process_streaming(state, evaluate, input, &mut stdout, &mut stderr).unwrap();
 
         SymbolsAsStreamSnapshot {
             stdout: String::from_utf8(stdout).unwrap(),

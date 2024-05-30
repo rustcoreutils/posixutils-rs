@@ -132,6 +132,7 @@ fn parse_primary(expr: Pair<Rule>) -> ExprInstruction {
         Rule::number => ExprInstruction::Number(to_bc_number(expr.as_str())),
         Rule::paren => parse_expr(first_child(expr)),
         Rule::builtin_call => {
+            // name ( expr )
             let mut inner = expr.into_inner();
             let func = match inner.next().unwrap().as_str() {
                 "length" => BuiltinFunction::Length,
@@ -275,6 +276,7 @@ fn parse_stmt(
             statements.push(StmtInstruction::Quit);
         }
         Rule::return_stmt => {
+            // return ( "(" expr? ")" )?
             if !in_function {
                 return Err(pest::error::Error::new_from_span(
                     pest::error::ErrorVariant::CustomError {
@@ -291,6 +293,7 @@ fn parse_stmt(
             }
         }
         Rule::if_stmt => {
+            // if (condition) stmt
             let mut inner = stmt.into_inner();
             let condition = parse_condition(inner.next().unwrap());
             let mut body = Vec::new();
@@ -339,6 +342,9 @@ fn parse_stmt(
 
 fn parse_function(func: Pair<Rule>) -> Result<Function, pest::error::Error<Rule>> {
     let mut function = func.into_inner();
+
+    // define letter ( parameter_list ) auto_define_list statement_list end
+
     let name = as_letter(function.next().unwrap());
 
     let mut parameters = Vec::new();
@@ -385,6 +391,7 @@ pub fn parse_program(text: &str) -> Result<Program, pest::error::Error<Rule>> {
     for item in program.into_inner() {
         match item.as_rule() {
             Rule::semicolon_list => {
+                // stmt*
                 for stmt in item.into_inner() {
                     parse_stmt(stmt, false, false, &mut result)?;
                 }
@@ -410,11 +417,23 @@ fn location_end(loc: InputLocation) -> usize {
     }
 }
 
+/// Returns `true` if `text` contains an incomplete expression or statement.
+/// # Examples
+/// ```
+/// assert!(is_incomplete("1 + 2 *\\\n"))
+/// assert!(is_incomplete("define f() {\n"))
+/// assert!(is_incomplete("if (c) {\n"))
+/// assert!(is_incomplete("while (c) {\n"))
+/// ```
 pub fn is_incomplete(text: &str) -> bool {
     match parse_program(text) {
         Ok(_) => false,
         Err(e) => {
             let pos = location_end(e.location);
+            // The program is incomplete if either:
+            // - we expect something after the end of the input
+            // - the error occurs at the start of and incomplete comment
+            // - the error occurs at the start of an incomplete string
             pos == text.len()
                 || text.as_bytes()[pos..text.len().min(pos + 2)] == [b'/', b'*']
                 || text.as_bytes()[pos] == b'"'

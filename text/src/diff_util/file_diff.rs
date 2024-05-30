@@ -375,13 +375,7 @@ impl<'a> FileDiff<'a> {
         for cr_index in 0..change_ranges.len() {
             let cr = change_ranges[cr_index];
 
-            let stars = if cr_index == 0 {
-                "***************"
-            } else {
-                "**************"
-            };
-
-            println!("{}", stars);
+            println!("***************");
             println!("*** {} ***", format!("{},{}", cr.0, cr.1));
             if self.file1.expected_changed_in_range(
                 cr.0 - 1,

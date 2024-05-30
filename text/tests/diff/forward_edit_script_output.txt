@@ -1,9 +1,0 @@
-c6
-line 6 is updated
-.
-d9 10
-c12 13
-line 9 is updated
-line 10 is updated
-.
-d17 18

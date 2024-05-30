@@ -379,16 +379,6 @@ pub struct BcParser;
 
 pub type Program = Vec<StmtInstruction>;
 
-pub struct ParseError {
-    err: pest::error::Error<Rule>,
-}
-
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}", self.err)
-    }
-}
-
 pub fn parse_program(text: &str) -> Result<Program, pest::error::Error<Rule>> {
     let program = BcParser::parse(Rule::program, text)?.next().unwrap();
     let mut result = Vec::new();

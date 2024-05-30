@@ -33,9 +33,29 @@ fn test_bc(program: &str, expected_output: &str) {
     });
 }
 
+fn test_bc_with_math_library(program: &str, expected_output: &str) {
+    run_test(TestPlan {
+        cmd: String::from("bc"),
+        args: vec!["-l".to_string()],
+        stdin_data: program.to_string(),
+        expected_out: String::from(expected_output),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
 macro_rules! test_bc {
     ($test_name:ident) => {
         test_bc(
+            include_str!(concat!("bc/", stringify!($test_name), ".bc")),
+            include_str!(concat!("bc/", stringify!($test_name), ".out")),
+        )
+    };
+}
+
+macro_rules! test_bc_l {
+    ($test_name:ident) => {
+        test_bc_with_math_library(
             include_str!(concat!("bc/", stringify!($test_name), ".bc")),
             include_str!(concat!("bc/", stringify!($test_name), ".out")),
         )
@@ -298,4 +318,29 @@ fn test_bc_uninitialized_variables_are_zero() {
 #[test]
 fn test_bc_while_loop() {
     test_bc!(while_loop)
+}
+
+#[test]
+fn test_bc_compile_math_library() {
+    test_bc_with_math_library("quit\n", "");
+}
+
+#[test]
+fn test_bc_ln_to_scale_17() {
+    test_bc_l!(ln_to_scale_17)
+}
+
+#[test]
+fn test_bc_atan_to_scale_17() {
+    test_bc_l!(atan_to_scale_17)
+}
+
+#[test]
+fn test_bc_sin_to_scale_18() {
+    test_bc_l!(sin_to_scale_18)
+}
+
+#[test]
+fn test_bc_cos_to_scale_18() {
+    test_bc_l!(cos_to_scale_18)
 }

@@ -57,6 +57,15 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
     let mut interpreter = Interpreter::default();
+
+    if args.define_math_functions {
+        let lib = parse_program(include_str!("bc_util/math_functions.bc"))
+            .expect("error parsing standard math functions");
+        interpreter
+            .exec(lib)
+            .expect("error loading standard math functions");
+    }
+
     for file in args.files {
         match std::fs::read_to_string(&file) {
             Ok(s) => {

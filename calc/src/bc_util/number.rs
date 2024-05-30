@@ -35,10 +35,6 @@ impl Number {
         Self(BigDecimal::zero())
     }
 
-    pub fn one() -> Self {
-        Self(BigDecimal::one())
-    }
-
     pub fn as_u64(&self) -> Option<u64> {
         self.0.to_u64()
     }

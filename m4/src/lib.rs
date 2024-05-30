@@ -120,6 +120,7 @@ pub fn run<STDOUT: Write, STDERR: Write>(
             std::fs::File::open(file_path)?,
             stdout,
             stderr,
+            true,
         )
     } else {
         lexer::process_streaming(
@@ -128,6 +129,7 @@ pub fn run<STDOUT: Write, STDERR: Write>(
             std::io::stdin(),
             stdout,
             stderr,
+            true,
         )
     };
 

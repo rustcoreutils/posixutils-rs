@@ -688,6 +688,7 @@ pub(crate) fn process_streaming<'c, R: Read>(
     mut reader: R,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
+    unwrap_quotes: bool,
 ) -> crate::error::Result<State> {
     let buffer_size = 10;
     let buffer_growth_factor = 2;
@@ -767,7 +768,7 @@ pub(crate) fn process_streaming<'c, R: Read>(
                 if matches!(symbol, Symbol::Eof) {
                     return Ok(state);
                 }
-                state = evaluator.evaluate(state, symbol, stdout, stderr, true)?;
+                state = evaluator.evaluate(state, symbol, stdout, stderr, unwrap_quotes)?;
                 remaining
             };
 
@@ -883,7 +884,7 @@ mod test {
             Ok(state)
         }
         state.parse_config = initial_config;
-        process_streaming(state, evaluate, input, &mut stdout, &mut stderr).unwrap();
+        process_streaming(state, evaluate, input, &mut stdout, &mut stderr, true).unwrap();
 
         SymbolsAsStreamSnapshot {
             stdout: String::from_utf8(stdout).unwrap(),

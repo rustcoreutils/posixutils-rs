@@ -557,7 +557,7 @@ impl MacroImplementation for UserDefinedMacro {
             String::from_utf8_lossy(&self.definition),
             String::from_utf8_lossy(&buffer)
         );
-        stdout.write_all(&buffer)?;
+        state = lexer::process_streaming(state, evaluate, &*buffer, stdout, stderror, false)?;
         Ok(state)
     }
 }
@@ -647,6 +647,7 @@ impl MacroImplementation for IncludeMacro {
                 std::fs::File::open(path)?,
                 stdout,
                 stderror,
+                false,
             )
         } else {
             Ok(state)
@@ -676,6 +677,7 @@ impl MacroImplementation for SincludeMacro {
                     std::fs::File::open(path)?,
                     stdout,
                     stderror,
+                    false,
                 );
             }
         }

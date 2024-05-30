@@ -1,5 +1,8 @@
 use bigdecimal::{num_bigint::BigInt, BigDecimal, Num, One, Signed, ToPrimitive, Zero};
 
+/// Converts a character to a number
+/// # Panics
+/// panics if the character is not a valid hexadecimal digit
 fn to_digit(c: u8) -> u8 {
     match c {
         b'0'..=b'9' => c - b'0',
@@ -8,6 +11,9 @@ fn to_digit(c: u8) -> u8 {
     }
 }
 
+/// Convert a number to a character
+/// # Panics
+/// panics if the number is bigger than 15
 fn to_char(val: u8) -> char {
     match val {
         0..=9 => (val + b'0') as char,
@@ -16,6 +22,7 @@ fn to_char(val: u8) -> char {
     }
 }
 
+/// converts a number to a string of len `base_ilog10`, padding with zeros
 fn pad_digit(d: u64, base_ilog10: u32) -> String {
     let width = base_ilog10 + 1;
     format!("{:0width$}", d, width = width as usize)
@@ -43,7 +50,12 @@ impl Number {
     /// # Returns
     /// `None` if the string contains invalid characters for the given base.
     /// # Panics
-    /// panics if the string is empty or if base is not in the range 2..=16.
+    /// panics if:
+    /// - the string is empty
+    /// - `base` is not in the range 2..=16.
+    /// - `s` does not contain a valid number
+    ///
+    /// all the above should have been already checked by the parser
     pub fn parse(s: &str, base: u64) -> Option<Number> {
         assert!(!s.is_empty(), "parsed number has no digits");
         assert!((2..=16).contains(&base), "base must be in the range 2..=16");

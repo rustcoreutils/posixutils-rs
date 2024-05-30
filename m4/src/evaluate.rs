@@ -1040,31 +1040,38 @@ pub(crate) fn evaluate(
                         new_buffer.write_all(quoted.all)?;
                     }
                 }
-                Symbol::Macro(m) => {
-                    // TODO: We need to somehow expand the arguments for the macro and re-parse it
-                    // as arguments.
-                    //
-                    // Perhaps the define macro is special
-                    //
-                    // The problem with this is when the macro argument is a quote, we don't want
-                    // to re-parse what was inside the evaluated quotes because it might contain a
-                    // # or a quote or something similar which should not and can not be parsed.
-                    // Perhaps Macro arguments should consist only of input, but then we still need
-                    // a way to divide up the arguments after expansion, that respects quotes.
-                    // Perhaps we have a special parser for expanded arguments which only respects
-                    // quotes?
-                    //
-                    // NOOOO: okay now I understand what's going on. Macros should be expanded
-                    // here, but quotes should not!
-                    //
-                    // x(y)
-                    //   ^ should be evaluated
-                    // x(`a,b`)
-                    //   ^^^^^ should not be evaluated
-                    //
-                    // It's seeming like this just needs to be a special evaluation case.
-                    //
-                    // Or perhaps we need a completely different model for evaluation.
+                Symbol::Macro(mut m) => {
+                    let mut arg_buffer: Vec<u8> = Vec::new();
+                    if !m.args.is_empty() {
+                        // Here we need to expand the macros which may form additional arguments which
+                        // were not picked up in the initial round of parsing.
+                        let args_length = m.args.len();
+                        for (i, arg) in m.args.into_iter().enumerate() {
+                            for symbol in arg.symbols {
+                                // Important that we don't evaluate quotes.
+                                // x(y)
+                                //   ^ should be evaluated
+                                // x(`a,b`)
+                                //   ^^^^^ should not be evaluated
+                                state = evaluate(state, symbol, &mut arg_buffer, stderror, false)?;
+                            }
+                            if i < args_length - 1 {
+                                arg_buffer.push(b',');
+                            }
+                        }
+                        log::debug!(
+                            "evaluate() arg_buffer {:?}",
+                            String::from_utf8_lossy(&arg_buffer)
+                        );
+                        // Necessary for the streaming args parser to terminate.
+                        arg_buffer.push(b')');
+                        let (remaining, args) =
+                            lexer::parse_macro_args(&state.parse_config)(&arg_buffer)?;
+                        debug_assert_eq!(remaining, b")");
+                        log::debug!("evaluate() updated args {args:?}");
+                        m.args = args;
+                    }
+
                     let name = m.name.to_string();
                     log::debug!("evaluate() evaluating macro {name:?}");
                     let definition = state

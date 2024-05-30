@@ -181,6 +181,7 @@ fn parse_macro_arg<'c>(
                 "parse_macro_arg() remaining: {:?}",
                 String::from_utf8_lossy(remaining)
             );
+            // Check if we've reached the end of the current macro argument.
             if let Some(b')' | b',') = remaining.get(0) {
                 let end_arg_index = input.len() - remaining.len();
                 let arg = MacroArg {
@@ -211,6 +212,18 @@ fn parse_macro_arg<'c>(
             }
             remaining = r;
         }
+    }
+}
+
+pub fn parse_macro_args<'c>(
+    config: &'c ParseConfig,
+) -> impl for<'i> Fn(&'i [u8]) -> IResult<&'i [u8], Vec<MacroArg<'i>>> + 'c {
+    move |input: &[u8]| {
+        nom::multi::separated_list0(
+            nom::bytes::streaming::tag(","),
+            // TODO: check, we should be allowed to have empty arguments?
+            parse_macro_arg(&config),
+        )(input)
     }
 }
 
@@ -485,7 +498,8 @@ impl std::fmt::Display for MacroName {
 }
 
 impl MacroName {
-    /// Macro names shall consist of letters, digits, and underscores, where the first character is not a digit. Tokens not of this form shall not be treated as macros.
+    /// Macro names shall consist of letters, digits, and underscores, where the first character is
+    /// not a digit. Tokens not of this form shall not be treated as macros.
     /// `[_a-zA-Z][_a-zA-Z0-9]*`
     pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
         log::trace!(
@@ -816,7 +830,8 @@ pub fn unquote<'c, 'i>(config: &'c ParseConfig, input: &'i [u8]) -> Vec<u8> {
 mod test {
     use crate::evaluate::State;
     use crate::lexer::{
-        parse_inside_brackets, unquote, Symbol, DEFAULT_COMMENT_CLOSE_TAG, DEFAULT_COMMENT_OPEN_TAG,
+        parse_inside_brackets, parse_macro_args, unquote, Symbol, DEFAULT_COMMENT_CLOSE_TAG,
+        DEFAULT_COMMENT_OPEN_TAG,
     };
     use crate::test_utils::{macro_parse_config, macro_parse_configs, utf8};
     use std::collections::HashMap;
@@ -1593,6 +1608,22 @@ mod test {
         STDERR:
         "###
         );
+    }
+
+    #[test]
+    fn test_parse_macro_args() {
+        let (remaining, args) = parse_macro_args(&ParseConfig::default())(b"a,b,c)").unwrap();
+        assert_eq!(")", utf8(remaining));
+        assert_eq!(3, args.len());
+        let args: Vec<String> = args
+            .into_iter()
+            .map(|arg| match arg.symbols.first().unwrap() {
+                Symbol::Text(text) => String::from_utf8_lossy(text).to_string(),
+                _ => panic!(),
+            })
+            .collect();
+        let args_refs = args.iter().map(|arg| arg.as_str()).collect::<Vec<_>>();
+        assert_eq!(vec!["a", "b", "c"], args_refs);
     }
 
     #[test]

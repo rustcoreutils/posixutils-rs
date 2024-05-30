@@ -8,6 +8,12 @@ pub enum Error {
     Io(#[from] std::io::Error),
 }
 
+impl<E: std::fmt::Debug> From<nom::Err<E>> for Error {
+    fn from(value: nom::Err<E>) -> Self {
+        Self::Parsing(format!("{value}"))
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 pub trait GetExitCode {

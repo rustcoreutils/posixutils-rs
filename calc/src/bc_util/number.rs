@@ -99,9 +99,6 @@ impl Number {
         if self.is_zero() {
             return "0".to_string();
         }
-        if base == 10 {
-            return self.0.to_string();
-        }
         let scale = self.scale();
         let base_ilog10 = base.ilog10();
         let mut integer_part = self.0.with_scale(0);
@@ -136,7 +133,7 @@ impl Number {
             }
         }
 
-        if fractional_part.is_zero() {
+        if fractional_part.fractional_digit_count() == 0 {
             return result;
         }
 
@@ -309,6 +306,18 @@ mod tests {
             "123.456"
         );
         assert_eq!(Number::parse(".1234", 10).unwrap().to_string(10), "0.1234");
+        assert_eq!(
+            Number::parse("0.000000000000000000000000001", 10)
+                .unwrap()
+                .to_string(10),
+            "0.000000000000000000000000001"
+        );
+        assert_eq!(
+            Number::parse("100000000000000000000000000000000000000000000000", 10)
+                .unwrap()
+                .to_string(10),
+            "100000000000000000000000000000000000000000000000",
+        );
     }
 
     #[test]

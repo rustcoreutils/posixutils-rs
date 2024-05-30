@@ -1,7 +1,4 @@
-use bigdecimal::{
-    num_bigint::{BigInt, Sign},
-    BigDecimal, Num, One, Signed, ToPrimitive, Zero,
-};
+use bigdecimal::{num_bigint::BigInt, BigDecimal, Num, One, Signed, ToPrimitive, Zero};
 
 fn to_digit(c: u8) -> u8 {
     match c {
@@ -95,21 +92,22 @@ impl Number {
     }
 
     /// Convert the number to a string in the given base.
-    pub fn to_string(self, base: u64) -> String {
+    pub fn to_string(mut self, base: u64) -> String {
         if self.is_zero() {
             return "0".to_string();
         }
+
         let scale = self.scale();
-        let base_ilog10 = base.ilog10();
-        let mut integer_part = self.0.with_scale(0);
-        let mut fractional_part = self.0 - &integer_part;
 
         let mut result = String::new();
-        if integer_part.sign() == Sign::Minus {
-            integer_part = -integer_part;
-            fractional_part = -fractional_part;
+        if self.0.is_negative() {
             result.push('-');
+            self.0 = -self.0;
         }
+
+        let base_ilog10 = base.ilog10();
+        let integer_part = self.0.with_scale(0);
+        let mut fractional_part = self.0 - &integer_part;
 
         if integer_part.is_zero() {
             result.push('0');
@@ -300,12 +298,25 @@ mod tests {
     #[test]
     fn test_output_base_10() {
         assert_eq!(Number::from(1).to_string(10), "1");
-        assert_eq!(Number::parse("123", 10).unwrap().to_string(10), "123");
+        assert_eq!(Number::from(123).to_string(10), "123");
+        assert_eq!(Number::from(123).negate().to_string(10), "-123");
         assert_eq!(
             Number::parse("123.456", 10).unwrap().to_string(10),
             "123.456"
         );
+        assert_eq!(
+            Number::parse("123.456", 10).unwrap().negate().to_string(10),
+            "-123.456"
+        );
         assert_eq!(Number::parse(".1234", 10).unwrap().to_string(10), "0.1234");
+        assert_eq!(
+            Number::parse(".1234", 10).unwrap().negate().to_string(10),
+            "-0.1234"
+        );
+        assert_eq!(
+            Number::parse("2.000000", 10).unwrap().to_string(10),
+            "2.000000"
+        );
         assert_eq!(
             Number::parse("0.000000000000000000000000001", 10)
                 .unwrap()
@@ -324,9 +335,14 @@ mod tests {
     fn test_output_base_2() {
         assert_eq!(Number::from(1).to_string(2), "1");
         assert_eq!(Number::from(13).to_string(2), "1101");
+        assert_eq!(Number::from(13).negate().to_string(2), "-1101");
         assert_eq!(
             Number::parse("13.625", 10).unwrap().to_string(2),
             "1101.1010000000"
+        );
+        assert_eq!(
+            Number::parse("13.625", 10).unwrap().negate().to_string(2),
+            "-1101.1010000000"
         );
         assert_eq!(
             Number::parse("0.8125", 10).unwrap().to_string(2),

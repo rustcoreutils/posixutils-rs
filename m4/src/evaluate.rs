@@ -20,6 +20,18 @@ pub struct State {
     pub parse_config: ParseConfig,
 }
 
+impl State {
+    fn debug_macro_definitions(&self) -> String {
+        format!(
+            "macro_definitions: {:?}",
+            self.macro_definitions
+                .iter()
+                .map(|(name, e)| (name.to_string(), e.len()))
+                .collect::<Vec<_>>()
+        )
+    }
+}
+
 impl std::fmt::Debug for State {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("State")
@@ -779,6 +791,7 @@ impl MacroImplementation for IncrMacro {
         stderror: &mut dyn Write,
         m: Macro,
     ) -> Result<State> {
+        log::debug!("IncrMacro::evaluate() {}", state.debug_macro_definitions());
         if let Some(first) = m.args.into_iter().next() {
             let number_bytes;
             (number_bytes, state) = evaluate_to_text(state, first.symbols, stderror, true)?;
@@ -983,14 +996,6 @@ pub(crate) fn evaluate(
 ) -> Result<State> {
     let symbol_debug = format!("{symbol:?}");
     log::debug!("evaluate() EVALUATING {symbol_debug}");
-    // log::debug!(
-    //     "evaluate() macro_definitions: {:?}",
-    //     state
-    //         .macro_definitions
-    //         .iter()
-    //         .map(|(name, e)| (name.to_string(), e.len()))
-    //         .collect::<Vec<_>>()
-    // );
     let mut root_symbol = Some(symbol);
     // We should never be evaluating symbols when dnl is enabled
     debug_assert!(!state.parse_config.dnl);
@@ -999,10 +1004,6 @@ pub(crate) fn evaluate(
     let mut buffer = Vec::new();
     let mut last = false;
     loop {
-        log::debug!(
-            "evaluate() begin loop buffer: {:?}",
-            String::from_utf8_lossy(&buffer)
-        );
         let symbols = if first {
             vec![root_symbol.take().expect("First iteration")]
         } else {
@@ -1021,11 +1022,6 @@ pub(crate) fn evaluate(
             last = true;
         }
         let mut new_buffer: Vec<u8> = Vec::new();
-
-        if last {
-            log::debug!("evaluate() last");
-        }
-        log::debug!("evaluate() {symbols:?}");
 
         // TODO(performance): if this is the last we could write directly to stdout
         for symbol in symbols {

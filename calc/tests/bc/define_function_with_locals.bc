@@ -1,0 +1,4 @@
+define h() {
+	auto a, b, c[]
+}
+quit

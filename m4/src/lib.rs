@@ -10,8 +10,10 @@ use clap::builder::{TypedValueParser, ValueParserFactory};
 use evaluate::State;
 
 pub mod error;
+mod eval_macro;
 mod evaluate;
 mod lexer;
+mod precedence;
 #[cfg(test)]
 mod test_utils;
 

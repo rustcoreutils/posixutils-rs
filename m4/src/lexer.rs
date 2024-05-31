@@ -554,11 +554,11 @@ fn is_word_char_start(c: u8) -> bool {
 //
 //It seems like we might want to use https://linux.die.net/man/3/mbrtowc for UTF-8 and any other
 //multibyte encodings. Then https://linux.die.net/man/3/iswblank
-fn is_whitespace(c: u8) -> bool {
+pub(crate) fn is_whitespace(c: u8) -> bool {
     (unsafe { libc::isblank(c.into()) != 0 }) || c == b'\n'
 }
 
-fn is_alphnumeric(c: u8) -> bool {
+pub(crate) fn is_alphnumeric(c: u8) -> bool {
     unsafe { libc::isalnum(c.into()) != 0 }
 }
 

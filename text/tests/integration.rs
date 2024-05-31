@@ -1831,44 +1831,11 @@ mod uniq_tests {
 
 #[cfg(test)]
 mod diff_tests {
-    use std::{
-        fs::{self, File},
-        path::PathBuf,
-    };
-
     use crate::diff_test;
+    use std::path::PathBuf;
 
     fn diff_base_path() -> PathBuf {
         PathBuf::from("tests").join("diff")
-    }
-
-    fn generate_diff_test_artifacts(
-        options: &str,
-        file1_path: &str,
-        file2_path: &str,
-        output_file_path: &str,
-    ) {
-        let output_file = File::create(&output_file_path)
-            .expect(format!("Failed to create output file: {}", output_file_path).as_str());
-
-        let args = format!(
-            "run --release --bin diff --{} {} {}",
-            options, file1_path, file2_path
-        );
-
-        let args_list = args.split(' ').collect::<Vec<&str>>();
-
-        std::process::Command::new("cargo")
-            .args(args_list)
-            .stdout(output_file)
-            .output()
-            .expect(
-                format!(
-                    "Failed to run command: cargo {} > {}",
-                    args, output_file_path
-                )
-                .as_str(),
-            );
     }
 
     fn f1_txt_path() -> String {
@@ -1911,118 +1878,31 @@ mod diff_tests {
             .to_string()
     }
 
-    #[ctor::ctor]
-    fn test_setup() {
-        let f1_txt_path = f1_txt_path();
-        let f2_txt_path = f2_txt_path();
-
-        let f1_dir_path = f1_dir_path();
-        let f2_dir_path = f2_dir_path();
-
-        let f1_txt_eols_path = f1_txt_with_eol_spaces_path();
-
-        let artifact_generation_args = vec![
-            (" -C 1", &f1_txt_path, &f2_txt_path, "context_1_output.txt"),
-            (
-                " -C 10",
-                &f1_txt_path,
-                &f2_txt_path,
-                "context_10_output.txt",
-            ),
-            (" -c", &f1_txt_path, &f2_txt_path, "context_output.txt"),
-            ("", &f1_txt_path, &f2_txt_path, "default_output.txt"),
-            (" -e", &f1_txt_path, &f2_txt_path, "edit_script_output.txt"),
-            (
-                "",
-                &f1_txt_path,
-                &f1_txt_eols_path,
-                "f1_counting_eol_spacesd_output.txt",
-            ),
-            ("", &f1_dir_path, &f2_dir_path, "f1_f2_default_output.txt"),
-            (
-                " -r -c",
-                &f1_dir_path,
-                &f2_dir_path,
-                "f1_f2_recursive_context_output.txt",
-            ),
-            (
-                " -r -e",
-                &f1_dir_path,
-                &f2_dir_path,
-                "f1_f2_recursive_ed_output.txt",
-            ),
-            (
-                " -r -f",
-                &f1_dir_path,
-                &f2_dir_path,
-                "f1_f2_recursive_f_output.txt",
-            ),
-            (
-                " -r",
-                &f1_dir_path,
-                &f2_dir_path,
-                "f1_f2_recursive_output.txt",
-            ),
-            (
-                " -r -u",
-                &f1_dir_path,
-                &f2_dir_path,
-                "f1_f2_recursive_unified_output.txt",
-            ),
-            (
-                " -b",
-                &f1_txt_path,
-                &f1_txt_eols_path,
-                "f1_ignoring_eol_spacesd_output.txt",
-            ),
-            ("", &f1_txt_path, &f2_dir_path, "file_dir_output.txt"),
-            (
-                " -f",
-                &f1_txt_path,
-                &f2_txt_path,
-                "forward_edit_script_output.txt",
-            ),
-            (
-                " -u --label F1 --label2 F2",
-                &f1_txt_path,
-                &f2_txt_path,
-                "label_output.txt",
-            ),
-            (" -U 0", &f1_txt_path, &f2_txt_path, "unified_0_output.txt"),
-            (
-                " -U 10",
-                &f1_txt_path,
-                &f2_txt_path,
-                "unified_10_output.txt",
-            ),
-            (" -u", &f1_txt_path, &f2_txt_path, "unified_output.txt"),
-        ];
-
-        for (option, f1_path, f2_path, output_path) in artifact_generation_args {
-            generate_diff_test_artifacts(
-                option,
-                f1_path,
-                f2_path,
-                &diff_base_path()
-                    .join(output_path)
-                    .to_str()
-                    .expect("Could not unwrap diff output file path!"),
-            );
-        }
-    }
-
-    struct DiffTestDataProvider {
-        output_path: PathBuf,
+    struct DiffTestHelper {
         content: String,
+        file1_path: String,
+        file2_path: String,
     }
 
-    impl DiffTestDataProvider {
-        fn new(output_path: PathBuf) -> Self {
-            let content = fs::read_to_string(&output_path)
-                .expect(format!("Could not read file: {}", output_path.to_str().unwrap()).as_str());
-            
+    impl DiffTestHelper {
+        fn new(options: &str, file1_path: String, file2_path: String) -> Self {
+            let args = format!(
+                "run --release --bin diff --{} {} {}",
+                options, file1_path, file2_path
+            );
+
+            let args_list = args.split(' ').collect::<Vec<&str>>();
+
+            let output = std::process::Command::new("cargo")
+                .args(args_list)
+                .output()
+                .expect("Could not run cargo command!");
+
+            let content = String::from_utf8(output.stdout).unwrap();
+
             Self {
-                output_path,
+                file1_path,
+                file2_path,
                 content,
             }
         }
@@ -2030,179 +1910,188 @@ mod diff_tests {
         fn content(&self) -> &str {
             &self.content
         }
-    }
 
-    impl Drop for DiffTestDataProvider {
-        fn drop(&mut self) {
-            fs::remove_file(&self.output_path).expect(
-                format!("Could not remove {}", self.output_path.to_str().unwrap()).as_str(),
-            );
+        fn file1_path(&self) -> &str {
+            &self.file1_path
+        }
+
+        fn file2_path(&self) -> &str {
+            &self.file2_path
         }
     }
 
     #[test]
     fn test_diff_default() {
-        let data = DiffTestDataProvider::new(diff_base_path().join("default_output.txt"));
-        diff_test(&[&f1_txt_path(), &f2_txt_path()], data.content());
+        let data = DiffTestHelper::new("", f1_txt_path(), f2_txt_path());
+
+        diff_test(&[data.file1_path(), data.file2_path()], data.content());
     }
 
     #[test]
     fn test_diff_context3() {
-        let data = DiffTestDataProvider::new(diff_base_path().join("context_output.txt"));
-        diff_test(&["-c", &f1_txt_path(), &f2_txt_path()], data.content());
+        let data = DiffTestHelper::new(" -c", f1_txt_path(), f2_txt_path());
+
+        diff_test(
+            &["-c", data.file1_path(), data.file2_path()],
+            data.content(),
+        );
     }
 
     #[test]
     fn test_diff_context1() {
-        let data = DiffTestDataProvider::new(diff_base_path().join("context_1_output.txt"));
-        diff_test(&["-C", "1", &f1_txt_path(), &f2_txt_path()], data.content());
+        let data = DiffTestHelper::new(" -C 1", f1_txt_path(), f2_txt_path());
+
+        diff_test(
+            &["-C", "1", data.file1_path(), data.file2_path()],
+            data.content(),
+        );
     }
 
     #[test]
     fn test_diff_context10() {
-        let data = DiffTestDataProvider::new(diff_base_path().join("context_10_output.txt"));
+        let data = DiffTestHelper::new(" -C 10", f1_txt_path(), f2_txt_path());
+
         diff_test(
-            &["-C", "10", &f1_txt_path(), &f2_txt_path()],
+            &["-C", "10", data.file1_path(), data.file2_path()],
             data.content(),
         );
     }
 
     #[test]
     fn test_diff_edit_script() {
-        let data: DiffTestDataProvider =
-            DiffTestDataProvider::new(diff_base_path().join("edit_script_output.txt"));
+        let data = DiffTestHelper::new(" -e", f1_txt_path(), f2_txt_path());
 
-        diff_test(&["-e", &f1_txt_path(), &f2_txt_path()], data.content());
+        diff_test(
+            &["-e", data.file1_path(), data.file2_path()],
+            data.content(),
+        );
     }
 
     #[test]
     fn test_diff_forward_edit_script() {
-        let data: DiffTestDataProvider =
-            DiffTestDataProvider::new(diff_base_path().join("forward_edit_script_output.txt"));
-        diff_test(&["-f", &f1_txt_path(), &f2_txt_path()], data.content());
+        let data = DiffTestHelper::new(" -f", f1_txt_path(), f2_txt_path());
+
+        diff_test(
+            &["-f", data.file1_path(), data.file2_path()],
+            data.content(),
+        );
     }
 
     #[test]
     fn test_diff_unified3() {
-        let data: DiffTestDataProvider =
-            DiffTestDataProvider::new(diff_base_path().join("unified_output.txt"));
+        let data = DiffTestHelper::new(" -u", f1_txt_path(), f2_txt_path());
 
-        diff_test(&["-u", &f1_txt_path(), &f2_txt_path()], data.content());
+        diff_test(
+            &["-u", data.file1_path(), data.file2_path()],
+            data.content(),
+        );
     }
 
     #[test]
     fn test_diff_unified0() {
-        let data: DiffTestDataProvider =
-            DiffTestDataProvider::new(diff_base_path().join("unified_0_output.txt"));
+        let data = DiffTestHelper::new(" -U 0", f1_txt_path(), f2_txt_path());
 
-        diff_test(&["-U", "0", &f1_txt_path(), &f2_txt_path()], data.content());
+        diff_test(
+            &["-U", "0", data.file1_path(), data.file2_path()],
+            data.content(),
+        );
     }
 
     #[test]
     fn test_diff_unified10() {
-        let data: DiffTestDataProvider =
-            DiffTestDataProvider::new(diff_base_path().join("unified_10_output.txt"));
+        let data = DiffTestHelper::new(" -U 10", f1_txt_path(), f2_txt_path());
 
         diff_test(
-            &["-U", "10", &f1_txt_path(), &f2_txt_path()],
+            &["-U", "10", data.file1_path(), data.file2_path()],
             data.content(),
         );
     }
 
     #[test]
     fn test_diff_file_directory() {
-        let data: DiffTestDataProvider =
-            DiffTestDataProvider::new(diff_base_path().join("file_dir_output.txt"));
-
-        diff_test(&[&f1_txt_path(), &f2_dir_path()], data.content());
+        let data = DiffTestHelper::new("", f1_txt_path(), f2_dir_path());
+        diff_test(&[data.file1_path(), data.file2_path()], data.content());
     }
 
     #[test]
     fn test_diff_directories() {
-        let data: DiffTestDataProvider =
-            DiffTestDataProvider::new(diff_base_path().join("f1_f2_default_output.txt"));
-
-        diff_test(&["tests/diff/f1", "tests/diff/f2"], data.content());
+        let data = DiffTestHelper::new("", f1_dir_path(), f2_dir_path());
+        diff_test(&[data.file1_path(), data.file2_path()], data.content());
     }
 
     #[test]
     fn test_diff_directories_recursive() {
-        let data: DiffTestDataProvider =
-            DiffTestDataProvider::new(diff_base_path().join("f1_f2_recursive_output.txt"));
+        let data = DiffTestHelper::new(" -r", f1_dir_path(), f2_dir_path());
 
-        diff_test(&["-r", "tests/diff/f1", "tests/diff/f2"], data.content());
+        diff_test(
+            &["-r", data.file1_path(), data.file2_path()],
+            data.content(),
+        );
     }
 
     #[test]
     fn test_diff_directories_recursive_context() {
-        let data: DiffTestDataProvider =
-            DiffTestDataProvider::new(diff_base_path().join("f1_f2_recursive_context_output.txt"));
+        let data = DiffTestHelper::new(" -r -c", f1_dir_path(), f2_dir_path());
 
         diff_test(
-            &["-r", "-c", "tests/diff/f1", "tests/diff/f2"],
+            &["-r", "-c", data.file1_path(), data.file2_path()],
             data.content(),
         );
     }
 
     #[test]
     fn test_diff_directories_recursive_edit_script() {
-        let data: DiffTestDataProvider =
-            DiffTestDataProvider::new(diff_base_path().join("f1_f2_recursive_ed_output.txt"));
+        let data = DiffTestHelper::new(" -r -e", f1_dir_path(), f2_dir_path());
 
         diff_test(
-            &["-r", "-e", "tests/diff/f1", "tests/diff/f2"],
+            &["-r", "-e", data.file1_path(), data.file2_path()],
             data.content(),
         );
     }
 
     #[test]
     fn test_diff_directories_recursive_forward_edit_script() {
-        let data: DiffTestDataProvider =
-            DiffTestDataProvider::new(diff_base_path().join("f1_f2_recursive_f_output.txt"));
+        let data = DiffTestHelper::new(" -r -f", f1_dir_path(), f2_dir_path());
 
         diff_test(
-            &["-r", "-f", &f1_dir_path(), &f2_dir_path()],
+            &["-r", "-f", data.file1_path(), data.file2_path()],
             data.content(),
         );
     }
 
     #[test]
     fn test_diff_directories_recursive_unified() {
-        let data: DiffTestDataProvider =
-            DiffTestDataProvider::new(diff_base_path().join("f1_f2_recursive_unified_output.txt"));
+        let data = DiffTestHelper::new(" -r -u", f1_dir_path(), f2_dir_path());
 
         diff_test(
-            &["-r", "-u", &f1_dir_path(), &f2_dir_path()],
+            &["-r", "-u", data.file1_path(), data.file2_path()],
             data.content(),
         );
     }
 
     #[test]
     fn test_diff_counting_eol_spaces() {
-        let data: DiffTestDataProvider =
-            DiffTestDataProvider::new(diff_base_path().join("f1_counting_eol_spacesd_output.txt"));
-
-        diff_test(
-            &[&f1_txt_path(), &f1_txt_with_eol_spaces_path()],
-            data.content(),
-        );
+        let data = DiffTestHelper::new("", f1_txt_path(), f1_txt_with_eol_spaces_path());
+        diff_test(&[data.file1_path(), data.file2_path()], data.content());
     }
 
     #[test]
     fn test_diff_ignoring_eol_spaces() {
-        let data: DiffTestDataProvider =
-            DiffTestDataProvider::new(diff_base_path().join("f1_ignoring_eol_spacesd_output.txt"));
+        let data = DiffTestHelper::new(" -b", f1_txt_path(), f1_txt_with_eol_spaces_path());
 
         diff_test(
-            &["-b", &f1_txt_path(), &f1_txt_with_eol_spaces_path()],
+            &["-b", data.file1_path(), data.file2_path()],
             data.content(),
         );
     }
 
     #[test]
     fn test_diff_unified_two_labels() {
-        let data: DiffTestDataProvider =
-            DiffTestDataProvider::new(diff_base_path().join("label_output.txt"));
+        let data = DiffTestHelper::new(
+            " --label F1 --label2 F2 -u",
+            f1_txt_path(),
+            f1_txt_with_eol_spaces_path(),
+        );
 
         diff_test(
             &[
@@ -2211,8 +2100,8 @@ mod diff_tests {
                 "--label2",
                 "F2",
                 "-u",
-                &f1_txt_path(),
-                &f2_txt_path(),
+                data.file1_path(),
+                data.file2_path(),
             ],
             data.content(),
         );

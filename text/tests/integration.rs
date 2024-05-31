@@ -1895,15 +1895,20 @@ mod diff_tests {
             file2_path: String,
             output_file_name: String,
         ) -> Self {
-            let output_path = diff_base_path().join(output_file_name);
+            let output_path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(output_file_name);
             let args = format!(
                 "run --release --bin diff --{} {} {}",
                 options, file1_path, file2_path
             );
 
             let args_list = args.split(' ').collect::<Vec<&str>>();
-            let output_file =
-                File::create(&output_path).expect("Could not create output file for diff test!");
+            let output_file = File::create(&output_path).expect(
+                format!(
+                    "Could not create output file<{}>",
+                    output_path.to_str().unwrap()
+                )
+                .as_str(),
+            );
 
             std::process::Command::new("cargo")
                 .args(args_list)

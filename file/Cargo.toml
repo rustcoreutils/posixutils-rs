@@ -11,7 +11,7 @@ plib = { path = "../plib" }
 clap.workspace = true
 gettext-rs.workspace = true
 libc.workspace = true
-atty = "0.2"
+atty.workspace = true
 regex = "1.10"
 
 [[bin]]

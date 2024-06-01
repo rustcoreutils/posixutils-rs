@@ -21,6 +21,7 @@ members = [
 ]
 
 [workspace.dependencies]
+atty = "0.2"
 clap = { version = "4", features = ["derive"] }
 chrono = "0.4"
 gettext-rs = { version = "0.7", features = ["gettext-system"] }

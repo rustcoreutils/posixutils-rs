@@ -1044,6 +1044,7 @@ dependencies = [
  "base64",
  "clap",
  "gettext-rs",
+ "libc",
  "plib",
 ]
 

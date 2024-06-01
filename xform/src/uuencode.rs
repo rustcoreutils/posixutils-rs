@@ -124,7 +124,7 @@ fn encode_file(args: &Args) -> io::Result<()> {
         .clone();
 
     if file_p == PathBuf::from("/dev/stdin") {
-        let mode = RW & !unsafe { libc::umask(RW) };
+        let mode = RW & (!unsafe { libc::umask(RW) } as u32);
         let perm = get_permission_values(Permissions::from_mode(mode));
         let header = format!("{header_init} {perm} {decode_path}\n");
 

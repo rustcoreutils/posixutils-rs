@@ -13,7 +13,7 @@ gettext-rs.workspace = true
 libc.workspace = true
 errno = "0.3"
 regex.workspace = true
-atty = "0.2"
+atty.workspace = true
 dirs = "5.0"
 
 [[bin]]

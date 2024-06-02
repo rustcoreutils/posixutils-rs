@@ -1,4 +1,4 @@
-begin 644 /dev/stdout
+begin #PERM# /dev/stdout
 M16-S=&%T:6,@861V86YC960@86YD('!R;V-U<F5D(&-I=FEL:71Y(&YO="!A
 M8G-O;'5T92!P=70@8V]N=&EN=64N($]V97)C86UE(&)R965D:6YG(&]R(&UY
 M(&-O;F-E<FYS(')E;6]V:6YG(&1E<VER;W5S('-O(&%B<V]L=71E+B!->2!M

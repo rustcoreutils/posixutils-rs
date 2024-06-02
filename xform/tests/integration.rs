@@ -12,12 +12,20 @@ use std::{
     fs::{remove_file, File, Permissions},
     io::Read,
     os::unix::fs::PermissionsExt,
-    sync::Mutex,
 };
 
-const UUCODE_TEST_PERMISSION: u32 = 0o644;
-static UUCODE_TXT_LOCK: Mutex<()> = Mutex::new(());
-static UUCODE_JPG_LOCK: Mutex<()> = Mutex::new(());
+const RWX: u32 = 0o7;
+const UUCODE_PERMISSION_PLACEHOLDER: &str = "#PERM#";
+
+fn get_permission_values(perm: Permissions) -> String {
+    let perm_mode = perm.mode();
+
+    let others_perm = perm_mode & RWX;
+    let group_perm = (perm_mode >> 3) & RWX;
+    let user_perm = (perm_mode >> 6) & RWX;
+
+    format!("{user_perm}{group_perm}{others_perm}")
+}
 
 fn cksum_test(test_data: &str, expected_output: &str) {
     run_test(TestPlan {
@@ -69,13 +77,13 @@ fn uuencode_test(args: &[&str], expected_output: &str, expected_error: &str) {
     })
 }
 
-fn uudecode_test(args: &[&str], expected_output: &str, expected_error: &str) {
+fn uudecode_test(args: &[&str], stdin_data: &str, expected_output: &str, expected_error: &str) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
 
     run_test(TestPlan {
         cmd: String::from("uudecode"),
         args: str_args,
-        stdin_data: String::new(),
+        stdin_data: String::from(stdin_data),
         expected_out: String::from(expected_output),
         expected_err: String::from(expected_error),
         expected_exit_code: 0,
@@ -176,22 +184,23 @@ fn test_uuencode_uudecode_with_historical_encoding_text_file() {
     let cargo_manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let source_file_path = cargo_manifest_dir.join("tests/uucode/sample.txt");
 
-    let _txt_lock = UUCODE_TXT_LOCK.lock().unwrap();
-
     let source_file = File::open(&source_file_path).unwrap();
-    let start_perm = source_file.metadata().unwrap().permissions().mode();
-    let new_perm = Permissions::from_mode(((start_perm >> 9) << 9) | UUCODE_TEST_PERMISSION);
-
-    source_file.set_permissions(new_perm.clone()).unwrap();
+    let perm = source_file.metadata().unwrap().permissions();
 
     // the "sample_historical_encoded.txt" is generated from the GNU uuencode sharutils
     let encoded_file = cargo_manifest_dir.join("tests/uucode/sample_historical_encoded.txt");
-
     let mut encoded_file_content = String::new();
+
     File::open(&encoded_file)
         .unwrap()
         .read_to_string(&mut encoded_file_content)
         .unwrap();
+
+    encoded_file_content = encoded_file_content.replacen(
+        UUCODE_PERMISSION_PLACEHOLDER,
+        &get_permission_values(perm),
+        1,
+    );
 
     uuencode_test(
         &[source_file_path.to_str().unwrap(), "/dev/stdout"],
@@ -207,11 +216,7 @@ fn test_uuencode_uudecode_with_historical_encoding_text_file() {
     let source_file_content = String::from_utf8_lossy(&source_file_content);
 
     // Decode the encoded file using uudecode
-    uudecode_test(&[encoded_file.to_str().unwrap()], &source_file_content, "");
-
-    source_file
-        .set_permissions(Permissions::from_mode(start_perm))
-        .unwrap();
+    uudecode_test(&[], &encoded_file_content, &source_file_content, "");
 }
 
 #[test]
@@ -222,21 +227,22 @@ fn test_uuencode_uudecode_with_base64_encoding_text_file() {
     let cargo_manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let source_file_path = cargo_manifest_dir.join("tests/uucode/sample.txt");
 
-    let _txt_lock = UUCODE_TXT_LOCK.lock().unwrap();
-
     let source_file = File::open(&source_file_path).unwrap();
-    let start_perm = source_file.metadata().unwrap().permissions();
-    let new_perm = Permissions::from_mode(((start_perm.mode() >> 9) << 9) | UUCODE_TEST_PERMISSION);
-
-    source_file.set_permissions(new_perm).unwrap();
+    let perm = source_file.metadata().unwrap().permissions();
 
     let encoded_file = cargo_manifest_dir.join("tests/uucode/sample_base64_encoded.txt");
-
     let mut encoded_file_content = String::new();
+
     File::open(&encoded_file)
         .unwrap()
         .read_to_string(&mut encoded_file_content)
         .unwrap();
+
+    encoded_file_content = encoded_file_content.replacen(
+        UUCODE_PERMISSION_PLACEHOLDER,
+        &get_permission_values(perm),
+        1,
+    );
 
     uuencode_test(
         &["-m", source_file_path.to_str().unwrap(), "/dev/stdout"],
@@ -251,10 +257,7 @@ fn test_uuencode_uudecode_with_base64_encoding_text_file() {
         .unwrap();
     let source_file_content = String::from_utf8_lossy(&source_file_content);
 
-    // Decode the encoded file using uudecode
-    uudecode_test(&[encoded_file.to_str().unwrap()], &source_file_content, "");
-
-    source_file.set_permissions(start_perm).unwrap();
+    uudecode_test(&[], &encoded_file_content, &source_file_content, "");
 }
 
 #[test]
@@ -265,20 +268,22 @@ fn test_uuencode_uudecode_with_historical_encoding_jpg_file() {
     let cargo_manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let source_file_path = cargo_manifest_dir.join("tests/uucode/image.jpg");
 
-    let _jpg_lock = UUCODE_JPG_LOCK.lock().unwrap();
-
     let source_file = File::open(&source_file_path).unwrap();
-    let start_perm = source_file.metadata().unwrap().permissions();
-    let new_perm = Permissions::from_mode(((start_perm.mode() >> 9) << 9) | UUCODE_TEST_PERMISSION);
+    let perm = source_file.metadata().unwrap().permissions();
 
-    source_file.set_permissions(new_perm).unwrap();
     let encoded_file = cargo_manifest_dir.join("tests/uucode/image_historical_encoded.txt");
-
     let mut encoded_file_content = String::new();
+
     File::open(&encoded_file)
         .unwrap()
         .read_to_string(&mut encoded_file_content)
         .unwrap();
+
+    encoded_file_content = encoded_file_content.replacen(
+        UUCODE_PERMISSION_PLACEHOLDER,
+        &get_permission_values(perm),
+        1,
+    );
 
     uuencode_test(
         &[source_file_path.to_str().unwrap(), "/dev/stdout"],
@@ -293,10 +298,7 @@ fn test_uuencode_uudecode_with_historical_encoding_jpg_file() {
         .unwrap();
     let source_file_content = String::from_utf8_lossy(&source_file_content);
 
-    // Decode the encoded file using uudecode
-    uudecode_test(&[encoded_file.to_str().unwrap()], &source_file_content, "");
-
-    source_file.set_permissions(start_perm).unwrap();
+    uudecode_test(&[], &encoded_file_content, &source_file_content, "");
 }
 
 #[test]
@@ -307,13 +309,9 @@ fn test_uuencode_uudecode_with_base64_encoding_jpg_file() {
     let cargo_manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let source_file_path = cargo_manifest_dir.join("tests/uucode/image.jpg");
 
-    let _jpg_lock = UUCODE_JPG_LOCK.lock().unwrap();
-
     let source_file = File::open(&source_file_path).unwrap();
-    let start_perm = source_file.metadata().unwrap().permissions();
-    let new_perm = Permissions::from_mode(((start_perm.mode() >> 9) << 9) | UUCODE_TEST_PERMISSION);
+    let perm = source_file.metadata().unwrap().permissions();
 
-    source_file.set_permissions(new_perm).unwrap();
     let encoded_file = cargo_manifest_dir.join("tests/uucode/image_base64_encoded.txt");
 
     let mut encoded_file_content = String::new();
@@ -321,6 +319,12 @@ fn test_uuencode_uudecode_with_base64_encoding_jpg_file() {
         .unwrap()
         .read_to_string(&mut encoded_file_content)
         .unwrap();
+
+    encoded_file_content = encoded_file_content.replacen(
+        UUCODE_PERMISSION_PLACEHOLDER,
+        &get_permission_values(perm),
+        1,
+    );
 
     uuencode_test(
         &["-m", source_file_path.to_str().unwrap(), "/dev/stdout"],
@@ -335,8 +339,5 @@ fn test_uuencode_uudecode_with_base64_encoding_jpg_file() {
         .unwrap();
     let source_file_content = String::from_utf8_lossy(&source_file_content);
 
-    // Decode the encoded file using uudecode
-    uudecode_test(&[encoded_file.to_str().unwrap()], &source_file_content, "");
-
-    source_file.set_permissions(start_perm).unwrap();
+    uudecode_test(&[], &encoded_file_content, &source_file_content, "");
 }

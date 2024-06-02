@@ -12,7 +12,7 @@ clap.workspace = true
 gettext-rs.workspace = true
 libc.workspace = true
 atty.workspace = true
-regex = "1.10"
+regex.workspace = true
 
 [[bin]]
 name = "cat"

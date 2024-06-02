@@ -1832,10 +1832,7 @@ mod uniq_tests {
 #[cfg(test)]
 mod diff_tests {
     use crate::diff_test;
-    use std::{
-        fs::{self, File},
-        path::PathBuf,
-    };
+    use std::{path::PathBuf, process::Stdio};
 
     fn diff_base_path() -> PathBuf {
         PathBuf::from("tests").join("diff")
@@ -1882,47 +1879,36 @@ mod diff_tests {
     }
 
     struct DiffTestHelper {
+        pub key: String,
         content: String,
         file1_path: String,
         file2_path: String,
-        output_path: PathBuf,
     }
 
     impl DiffTestHelper {
-        fn new(
-            options: &str,
-            file1_path: String,
-            file2_path: String,
-            output_file_name: String,
-        ) -> Self {
-            let output_path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(output_file_name);
+        fn new(options: &str, file1_path: String, file2_path: String, key: String) -> Self {
             let args = format!(
                 "run --release --bin diff --{} {} {}",
                 options, file1_path, file2_path
             );
 
             let args_list = args.split(' ').collect::<Vec<&str>>();
-            let output_file = File::create(&output_path).expect(
-                format!(
-                    "Could not create output file<{}>",
-                    output_path.to_str().unwrap()
-                )
-                .as_str(),
-            );
 
-            std::process::Command::new("cargo")
+            let output = std::process::Command::new("cargo")
                 .args(args_list)
-                .stdout(output_file)
+                // .stdout(output_file)
+                .stdout(Stdio::piped())
                 .output()
                 .expect("Could not run cargo command!");
 
-            let content = fs::read_to_string(&output_path).expect("Could not read diff output");
+            let content =
+                String::from_utf8(output.stdout).expect("Failed to read output of Command!");
 
             Self {
+                key,
                 file1_path,
                 file2_path,
                 content,
-                output_path,
             }
         }
 
@@ -1939,32 +1925,113 @@ mod diff_tests {
         }
     }
 
-    impl Drop for DiffTestHelper {
-        fn drop(&mut self) {
-            fs::remove_file(&self.output_path).expect("Could not remove diff test artifact");
+    static mut DIFF_TEST_INPUT: Vec<DiffTestHelper> = vec![];
+
+    fn input_by_key(key: &str) -> &DiffTestHelper {
+        unsafe {
+            DIFF_TEST_INPUT
+                .iter()
+                .filter(|data| data.key == key)
+                .nth(0)
+                .unwrap()
+        }
+    }
+
+    #[ctor::ctor]
+    fn diff_tests_setup() {
+        let diff_test_helper_init_data = [
+            ("", f1_txt_path(), f2_txt_path(), "test_diff_normal"),
+            (" -c", f1_txt_path(), f2_txt_path(), "test_diff_context3"),
+            (" -C 1", f1_txt_path(), f2_txt_path(), "test_diff_context1"),
+            (
+                " -C 10",
+                f1_txt_path(),
+                f2_txt_path(),
+                "test_diff_context10",
+            ),
+            (" -e", f1_txt_path(), f2_txt_path(), "test_diff_edit_script"),
+            (
+                " -f",
+                f1_txt_path(),
+                f2_txt_path(),
+                "test_diff_forward_edit_script",
+            ),
+            (" -u", f1_txt_path(), f2_txt_path(), "test_diff_unified3"),
+            (" -U 0", f1_txt_path(), f2_txt_path(), "test_diff_unified0"),
+            (
+                " -U 10",
+                f1_txt_path(),
+                f2_txt_path(),
+                "test_diff_unified10",
+            ),
+            ("", f1_txt_path(), f2_dir_path(), "test_diff_file_directory"),
+            ("", f1_dir_path(), f2_dir_path(), "test_diff_directories"),
+            (
+                " -r",
+                f1_dir_path(),
+                f2_dir_path(),
+                "test_diff_directories_recursive",
+            ),
+            (
+                " -r -c",
+                f1_dir_path(),
+                f2_dir_path(),
+                "test_diff_directories_recursive_context",
+            ),
+            (
+                " -r -e",
+                f1_dir_path(),
+                f2_dir_path(),
+                "test_diff_directories_recursive_edit_script",
+            ),
+            (
+                " -r -f",
+                f1_dir_path(),
+                f2_dir_path(),
+                "test_diff_directories_recursive_forward_edit_script",
+            ),
+            (
+                " -r -u",
+                f1_dir_path(),
+                f2_dir_path(),
+                "test_diff_directories_recursive_unified",
+            ),
+            (
+                "",
+                f1_txt_path(),
+                f1_txt_with_eol_spaces_path(),
+                "test_diff_counting_eol_spaces",
+            ),
+            (
+                " -b",
+                f1_txt_path(),
+                f1_txt_with_eol_spaces_path(),
+                "test_diff_ignoring_eol_spaces",
+            ),
+            (
+                " --label F1 --label2 F2 -u",
+                f1_txt_path(),
+                f1_txt_with_eol_spaces_path(),
+                "test_diff_unified_two_labels",
+            ),
+        ];
+
+        for row in diff_test_helper_init_data {
+            unsafe {
+                DIFF_TEST_INPUT.push(DiffTestHelper::new(row.0, row.1, row.2, row.3.to_string()))
+            }
         }
     }
 
     #[test]
     fn test_diff_normal() {
-        let data = DiffTestHelper::new(
-            "",
-            f1_txt_path(),
-            f2_txt_path(),
-            String::from("diff_normal_output.txt"),
-        );
-
+        let data = input_by_key("test_diff_normal");
         diff_test(&[data.file1_path(), data.file2_path()], data.content());
     }
 
     #[test]
     fn test_diff_context3() {
-        let data = DiffTestHelper::new(
-            " -c",
-            f1_txt_path(),
-            f2_txt_path(),
-            String::from("diff_context_output.txt"),
-        );
+        let data = input_by_key("test_diff_context3");
 
         diff_test(
             &["-c", data.file1_path(), data.file2_path()],
@@ -1974,12 +2041,7 @@ mod diff_tests {
 
     #[test]
     fn test_diff_context1() {
-        let data = DiffTestHelper::new(
-            " -C 1",
-            f1_txt_path(),
-            f2_txt_path(),
-            String::from("diff_context1_output.txt"),
-        );
+        let data = input_by_key("test_diff_context1");
 
         diff_test(
             &["-C", "1", data.file1_path(), data.file2_path()],
@@ -1989,12 +2051,7 @@ mod diff_tests {
 
     #[test]
     fn test_diff_context10() {
-        let data = DiffTestHelper::new(
-            " -C 10",
-            f1_txt_path(),
-            f2_txt_path(),
-            String::from("diff_context10_output.txt"),
-        );
+        let data = input_by_key("test_diff_context10");
 
         diff_test(
             &["-C", "10", data.file1_path(), data.file2_path()],
@@ -2004,12 +2061,7 @@ mod diff_tests {
 
     #[test]
     fn test_diff_edit_script() {
-        let data = DiffTestHelper::new(
-            " -e",
-            f1_txt_path(),
-            f2_txt_path(),
-            String::from("diff_ed_output.txt"),
-        );
+        let data = input_by_key("test_diff_edit_script");
 
         diff_test(
             &["-e", data.file1_path(), data.file2_path()],
@@ -2019,12 +2071,7 @@ mod diff_tests {
 
     #[test]
     fn test_diff_forward_edit_script() {
-        let data = DiffTestHelper::new(
-            " -f",
-            f1_txt_path(),
-            f2_txt_path(),
-            String::from("diff_forward_ed_output.txt"),
-        );
+        let data = input_by_key("test_diff_forward_edit_script");
 
         diff_test(
             &["-f", data.file1_path(), data.file2_path()],
@@ -2034,12 +2081,7 @@ mod diff_tests {
 
     #[test]
     fn test_diff_unified3() {
-        let data = DiffTestHelper::new(
-            " -u",
-            f1_txt_path(),
-            f2_txt_path(),
-            String::from("diff_unified_output.txt"),
-        );
+        let data = input_by_key("test_diff_unified3");
 
         diff_test(
             &["-u", data.file1_path(), data.file2_path()],
@@ -2049,12 +2091,7 @@ mod diff_tests {
 
     #[test]
     fn test_diff_unified0() {
-        let data = DiffTestHelper::new(
-            " -U 0",
-            f1_txt_path(),
-            f2_txt_path(),
-            String::from("diff_unified0_output.txt"),
-        );
+        let data = input_by_key("test_diff_unified0");
 
         diff_test(
             &["-U", "0", data.file1_path(), data.file2_path()],
@@ -2064,12 +2101,7 @@ mod diff_tests {
 
     #[test]
     fn test_diff_unified10() {
-        let data = DiffTestHelper::new(
-            " -U 10",
-            f1_txt_path(),
-            f2_txt_path(),
-            String::from("diff_unified10_output.txt"),
-        );
+        let data = input_by_key("test_diff_unified10");
 
         diff_test(
             &["-U", "10", data.file1_path(), data.file2_path()],
@@ -2079,34 +2111,19 @@ mod diff_tests {
 
     #[test]
     fn test_diff_file_directory() {
-        let data = DiffTestHelper::new(
-            "",
-            f1_txt_path(),
-            f2_dir_path(),
-            String::from("diff_file_directory_output.txt"),
-        );
+        let data = input_by_key("test_diff_file_directory");
         diff_test(&[data.file1_path(), data.file2_path()], data.content());
     }
 
     #[test]
     fn test_diff_directories() {
-        let data = DiffTestHelper::new(
-            "",
-            f1_dir_path(),
-            f2_dir_path(),
-            String::from("diff_directories_output.txt"),
-        );
+        let data = input_by_key("test_diff_directories");
         diff_test(&[data.file1_path(), data.file2_path()], data.content());
     }
 
     #[test]
     fn test_diff_directories_recursive() {
-        let data = DiffTestHelper::new(
-            " -r",
-            f1_dir_path(),
-            f2_dir_path(),
-            String::from("diff_directories_recursive_output.txt"),
-        );
+        let data = input_by_key("test_diff_directories_recursive");
 
         diff_test(
             &["-r", data.file1_path(), data.file2_path()],
@@ -2116,12 +2133,7 @@ mod diff_tests {
 
     #[test]
     fn test_diff_directories_recursive_context() {
-        let data = DiffTestHelper::new(
-            " -r -c",
-            f1_dir_path(),
-            f2_dir_path(),
-            String::from("diff_directories_recursive_context_output.txt"),
-        );
+        let data = input_by_key("test_diff_directories_recursive_context");
 
         diff_test(
             &["-r", "-c", data.file1_path(), data.file2_path()],
@@ -2131,12 +2143,7 @@ mod diff_tests {
 
     #[test]
     fn test_diff_directories_recursive_edit_script() {
-        let data = DiffTestHelper::new(
-            " -r -e",
-            f1_dir_path(),
-            f2_dir_path(),
-            String::from("diff_directories_recursive_ed_output.txt"),
-        );
+        let data = input_by_key("test_diff_directories_recursive_edit_script");
 
         diff_test(
             &["-r", "-e", data.file1_path(), data.file2_path()],
@@ -2146,12 +2153,7 @@ mod diff_tests {
 
     #[test]
     fn test_diff_directories_recursive_forward_edit_script() {
-        let data = DiffTestHelper::new(
-            " -r -f",
-            f1_dir_path(),
-            f2_dir_path(),
-            String::from("diff_directories_recursive_forward_ed_output.txt"),
-        );
+        let data = input_by_key("test_diff_directories_recursive_forward_edit_script");
 
         diff_test(
             &["-r", "-f", data.file1_path(), data.file2_path()],
@@ -2161,12 +2163,7 @@ mod diff_tests {
 
     #[test]
     fn test_diff_directories_recursive_unified() {
-        let data = DiffTestHelper::new(
-            " -r -u",
-            f1_dir_path(),
-            f2_dir_path(),
-            String::from("diff_directories_recursive_unified_output.txt"),
-        );
+        let data = input_by_key("test_diff_directories_recursive_unified");
 
         diff_test(
             &["-r", "-u", data.file1_path(), data.file2_path()],
@@ -2176,24 +2173,13 @@ mod diff_tests {
 
     #[test]
     fn test_diff_counting_eol_spaces() {
-        let data = DiffTestHelper::new(
-            "",
-            f1_txt_path(),
-            f1_txt_with_eol_spaces_path(),
-            String::from("diff_count_eols_output.txt"),
-        );
-
+        let data = input_by_key("test_diff_counting_eol_spaces");
         diff_test(&[data.file1_path(), data.file2_path()], data.content());
     }
 
     #[test]
     fn test_diff_ignoring_eol_spaces() {
-        let data = DiffTestHelper::new(
-            " -b",
-            f1_txt_path(),
-            f1_txt_with_eol_spaces_path(),
-            String::from("diff_ignore_eols_output.txt"),
-        );
+        let data = input_by_key("test_diff_ignoring_eol_spaces");
 
         diff_test(
             &["-b", data.file1_path(), data.file2_path()],
@@ -2203,12 +2189,7 @@ mod diff_tests {
 
     #[test]
     fn test_diff_unified_two_labels() {
-        let data = DiffTestHelper::new(
-            " --label F1 --label2 F2 -u",
-            f1_txt_path(),
-            f1_txt_with_eol_spaces_path(),
-            String::from("diff_unified_two_labels_output.txt"),
-        );
+        let data = input_by_key("test_diff_unified_two_labels");
 
         diff_test(
             &[

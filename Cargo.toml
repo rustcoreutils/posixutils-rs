@@ -22,8 +22,8 @@ members = [
 
 [workspace.dependencies]
 atty = "0.2"
-clap = { version = "4", features = ["derive"] }
-chrono = "0.4"
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 gettext-rs = { version = "0.7", features = ["gettext-system"] }
 libc = "0.2"
 regex = "1.10"

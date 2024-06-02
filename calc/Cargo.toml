@@ -12,7 +12,7 @@ pest = "2.7.10"
 pest_derive = "2.7.10"
 lazy_static = "1.4.0"
 bigdecimal = "0.4.3"
-rustyline = "14.0.0"
+rustyline = { version = "14.0.0", default-features = false }
 
 [[bin]]
 name = "expr"

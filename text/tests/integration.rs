@@ -1630,9 +1630,7 @@ mod unexpand_tests {
             "text        with                spaces",
             "text\twith\t\tspaces\n",
         );
-
     }
-
 }
 
 mod uniq_tests {

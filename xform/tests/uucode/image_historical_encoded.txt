@@ -1,4 +1,4 @@
-begin 644 /dev/stdout
+begin #PERM# /dev/stdout
 M_]C_VP"$``@&!@<&!0@'!P<)"0@*#!0-#`L+#!D2$P\4'1H?'AT:'!P@)"XG
 M("(L(QP<*#<I+#`Q-#0T'R<Y/3@R/"XS-#(!"0D)#`L,&`T-&#(A'"$R,C(R
 M,C(R,C(R,C(R,C(R,C(R,C(R,C(R,C(R,C(R,C(R,C(R,C(R,C(R,C(R,C(R

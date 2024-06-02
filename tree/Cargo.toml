@@ -13,7 +13,7 @@ gettext-rs.workspace = true
 libc.workspace = true
 regex.workspace = true
 chrono.workspace = true
-atty = "0.2"
+atty.workspace = true
 
 [features]
 posixutils_test_all = []

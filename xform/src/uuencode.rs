@@ -20,6 +20,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 const PERMISSION_MASK: u32 = 0o7;
+const RW: u32 = 0o666;
 
 /// uuencode - encode a binary file
 #[derive(Parser, Debug)]
@@ -123,7 +124,21 @@ fn encode_file(args: &Args) -> io::Result<()> {
         .clone();
 
     if file_p == PathBuf::from("/dev/stdin") {
-        let header = format!("{header_init} 644 {decode_path}\n");
+        let mode = {
+            #[cfg(target_os = "macos")]
+            {
+                RW & (!unsafe { libc::umask(RW as u16) } as u32)
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                RW & (!unsafe { libc::umask(RW) })
+            }
+        };
+
+        let perm = get_permission_values(Permissions::from_mode(mode));
+        let header = format!("{header_init} {perm} {decode_path}\n");
+
         io::stdout().write_all(header.as_bytes())?;
         io::stdin().lock().read_to_end(&mut buf)?;
     } else {

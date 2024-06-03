@@ -29,6 +29,10 @@ name = "comm"
 path = "src/comm.rs"
 
 [[bin]]
+name = "unexpand"
+path = "src/unexpand.rs"
+
+[[bin]]
 name = "csplit"
 path = "src/csplit.rs"
 

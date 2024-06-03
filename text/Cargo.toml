@@ -16,6 +16,7 @@ regex.workspace = true
 chrono.workspace = true
 libc.workspace = true
 inotify = "0.10.2"
+ctor = "0.2.8"
 
 [[bin]]
 name = "asa"

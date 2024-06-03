@@ -1,0 +1,30 @@
+a = sqrt(0)
+scale(a)
+a
+
+a = sqrt(1)
+scale(a)
+a
+
+a = sqrt(2)
+scale(a)
+a
+
+scale = 10
+a = sqrt(2)
+scale(a)
+a
+
+scale = 0
+a = sqrt(2.00000)
+scale(a)
+a
+
+a = sqrt(4)
+scale(a)
+a
+
+a = sqrt(0.25)
+scale(a)
+a
+quit

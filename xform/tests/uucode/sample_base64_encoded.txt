@@ -1,4 +1,4 @@
-begin-base64 644 /dev/stdout
+begin-base64 #PERM# /dev/stdout
 RWNzdGF0aWMgYWR2YW5jZWQgYW5kIHByb2N1cmVkIGNpdmlsaXR5IG5vdCBh
 YnNvbHV0ZSBwdXQgY29udGludWUuIE92ZXJjYW1lIGJyZWVkaW5nIG9yIG15
 IGNvbmNlcm5zIHJlbW92aW5nIGRlc2lyb3VzIHNvIGFic29sdXRlLiBNeSBt

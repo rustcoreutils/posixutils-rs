@@ -12,15 +12,24 @@
 // - Research and implement -f alternate output format properly
 //
 
+mod diff_util;
+
 extern crate clap;
 extern crate diff;
 extern crate plib;
 
+use std::{fs, io, path::PathBuf};
+
 use clap::Parser;
+use diff_util::{
+    common::{FormatOptions, OutputFormat},
+    diff_exit_status::DiffExitStatus,
+    dir_diff::DirDiff,
+    file_diff::FileDiff,
+    functions::check_existance,
+};
 use gettextrs::{bind_textdomain_codeset, textdomain};
 use plib::PROJECT_NAME;
-use std::fs;
-use std::io;
 
 /// diff - compare two files
 #[derive(Parser, Debug, Clone)]
@@ -55,155 +64,104 @@ struct Args {
     unified3: bool,
 
     /// Output <N> lines of unified context
-    #[arg(short='U', value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(short='U', value_parser = clap::value_parser!(u32).range(0..))]
     unified: Option<u32>,
 
     /// First comparison file (or directory, if -r is specified)
     file1: String,
 
+    #[arg(long, value_parser= clap::value_parser!(String))]
+    label: Option<String>,
+
+    #[arg(long, value_parser= clap::value_parser!(String))]
+    label2: Option<String>,
+
     /// Second comparison file (or directory, if -r is specified)
     file2: String,
 }
 
-enum OutputFormat {
-    Ed,
-    Fed,
-    Context(u32),
-    Unified(u32),
-}
+impl From<&Args> for OutputFormat {
+    fn from(args: &Args) -> Self {
+        let mut args = args.clone();
 
-fn diff_file_fed(left: &str, right: &str) {
-    let mut left_line = 0;
-    let mut right_line = 0;
+        if args.context3 {
+            args.context = Some(3);
+        }
 
-    for diff in diff::lines(&left, &right) {
-        match diff {
-            diff::Result::Left(l) => {
-                left_line += 1;
-                println!("{}a{}", left_line, right_line);
-                println!("> {}", l);
-            }
-            diff::Result::Both(_, _) => {
-                left_line += 1;
-                right_line += 1;
-            }
-            diff::Result::Right(r) => {
-                right_line += 1;
-                println!("{}c{}", left_line, right_line);
-                println!("< {}", r);
-            }
+        if args.unified3 {
+            args.unified = Some(3);
+        }
+
+        if args.ed {
+            OutputFormat::EditScript
+        } else if args.fed {
+            OutputFormat::ForwardEditScript
+        } else if let Some(n) = args.context {
+            let n = if n == 0 { 1 } else { n };
+            OutputFormat::Context(n as usize)
+        } else if let Some(n) = args.unified {
+            OutputFormat::Unified(n as usize)
+        } else {
+            OutputFormat::Default
         }
     }
 }
 
-fn diff_file_ed(left: &str, right: &str) {
-    let mut left_line = 0;
-    let mut right_line = 0;
-
-    for diff in diff::lines(&left, &right) {
-        match diff {
-            diff::Result::Left(l) => {
-                left_line += 1;
-                println!("{}a{}", left_line, right_line);
-                println!("> {}", l);
-            }
-            diff::Result::Both(_, _) => {
-                left_line += 1;
-                right_line += 1;
-            }
-            diff::Result::Right(r) => {
-                right_line += 1;
-                println!("{}c{}", left_line, right_line);
-                println!("< {}", r);
-            }
-        }
-    }
-}
-
-fn diff_file_context(left: &str, right: &str, _n: u32) {
-    for diff in diff::lines(&left, &right) {
-        match diff {
-            diff::Result::Left(l) => {
-                println!("< {}", l);
-            }
-            diff::Result::Both(l, _) => {
-                println!("  {}", l);
-            }
-            diff::Result::Right(r) => {
-                println!("> {}", r);
-            }
-        }
-    }
-}
-
-fn diff_file_unified(left: &str, right: &str, _n: u32) {
-    for diff in diff::lines(&left, &right) {
-        match diff {
-            diff::Result::Left(l) => {
-                println!("-{}", l);
-            }
-            diff::Result::Both(l, _) => {
-                println!(" {}", l);
-            }
-            diff::Result::Right(r) => {
-                println!("+{}", r);
-            }
-        }
-    }
-}
-
-fn diff_files(out_fmt: OutputFormat, filename1: &str, filename2: &str) -> io::Result<()> {
-    let left = fs::read_to_string(filename1)?;
-    let right = fs::read_to_string(filename2)?;
-
-    match out_fmt {
-        OutputFormat::Ed => diff_file_ed(&left, &right),
-        OutputFormat::Fed => diff_file_fed(&left, &right),
-        OutputFormat::Context(n) => diff_file_context(&left, &right, n),
-        OutputFormat::Unified(n) => diff_file_unified(&left, &right, n),
-    }
-
-    Ok(())
-}
-
-fn parse_output_format(args: &Args) -> OutputFormat {
-    let mut args = args.clone();
-
-    if args.context3 {
-        args.context = Some(3);
-    }
-    if args.unified3 {
-        args.unified = Some(3);
-    }
-
-    if args.ed {
-        OutputFormat::Ed
-    } else if args.fed {
-        OutputFormat::Fed
-    } else if let Some(n) = args.context {
-        OutputFormat::Context(n)
-    } else if let Some(n) = args.unified {
-        OutputFormat::Unified(n)
-    } else {
-        OutputFormat::Unified(3)
-    }
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
-    let args = Args::parse();
-
+fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
-    let mut exit_code = 0;
+    let output_format: OutputFormat = (&args).into();
 
-    let out_fmt = parse_output_format(&args);
+    let path1 = PathBuf::from(&args.file1);
+    let path2 = PathBuf::from(&args.file2);
 
-    if let Err(e) = diff_files(out_fmt, &args.file1, &args.file2) {
-        exit_code = 1;
-        eprintln!("diff: {}", e);
+    let path1_exists = check_existance(&path1)?;
+    let path2_exists = check_existance(&path2)?;
+
+    if !path1_exists || !path2_exists {
+        return Ok(DiffExitStatus::Trouble);
     }
 
-    std::process::exit(exit_code)
+    if path1 == path2 {
+        return Ok(DiffExitStatus::Trouble);
+    }
+
+    let path1_is_file = fs::metadata(&path1)?.is_file();
+    let path2_is_file = fs::metadata(&path2)?.is_file();
+
+    let format_options = FormatOptions {
+        ignore_trailing_white_spaces: args.ignore_eol_space,
+        label1: args.label,
+        label2: args.label2,
+        output_format: output_format,
+    };
+
+    if path1_is_file && path2_is_file {
+        return FileDiff::file_diff(path1, path2, &format_options, None);
+    } else if !path1_is_file && !path2_is_file {
+        return DirDiff::dir_diff(
+            PathBuf::from(path1),
+            PathBuf::from(path2),
+            &format_options,
+            args.recurse,
+        );
+    } else {
+        return FileDiff::file_dir_diff(path1, path2, &format_options);
+    }
+}
+
+fn main() -> Result<DiffExitStatus, Box<dyn std::error::Error>> {
+    // parse command line arguments
+    let args = Args::parse();
+
+    let result = check_difference(args);
+
+    if let Ok(diff_exit_status) = &result {
+        return Ok(*diff_exit_status);
+    } else if let Err(error) = &result {
+        eprintln!("diff: {}", error);
+    }
+
+    return Ok(DiffExitStatus::NotDifferent);
 }

@@ -7,6 +7,7 @@ use nom::error::{ContextError, FromExternalError};
 use nom::IResult;
 
 use crate::error::Result;
+use crate::eval_macro;
 use crate::lexer::{
     self, Macro, MacroName, MacroParseConfig, ParseConfig, Symbol, DEFAULT_QUOTE_CLOSE_TAG,
     DEFAULT_QUOTE_OPEN_TAG,
@@ -77,6 +78,7 @@ pub enum BuiltinMacro {
     Incr,
     Ifelse,
     Shift,
+    Eval,
 }
 
 impl AsRef<[u8]> for BuiltinMacro {
@@ -95,6 +97,7 @@ impl AsRef<[u8]> for BuiltinMacro {
             BuiltinMacro::Incr => b"incr",
             BuiltinMacro::Ifelse => b"ifelse",
             BuiltinMacro::Shift => b"shift",
+            BuiltinMacro::Eval => b"eval",
         }
     }
 }
@@ -115,6 +118,7 @@ impl BuiltinMacro {
             Self::Incr,
             Self::Ifelse,
             Self::Shift,
+            Self::Eval,
         ]
     }
     pub fn name(&self) -> MacroName {
@@ -138,6 +142,7 @@ impl BuiltinMacro {
             BuiltinMacro::Incr => 1,
             BuiltinMacro::Ifelse => 1,
             BuiltinMacro::Shift => 1,
+            BuiltinMacro::Eval => 1,
         }
     }
 
@@ -165,6 +170,7 @@ fn inbuilt_macro_implementation(builtin: &BuiltinMacro) -> Box<dyn MacroImplemen
         BuiltinMacro::Incr => Box::new(IncrMacro),
         BuiltinMacro::Ifelse => Box::new(IfelseMacro),
         BuiltinMacro::Shift => Box::new(ShiftMacro),
+        BuiltinMacro::Eval => Box::new(EvalMacro),
     }
 }
 
@@ -915,6 +921,26 @@ impl MacroImplementation for ShiftMacro {
             }
         }
 
+        Ok(state)
+    }
+}
+
+struct EvalMacro;
+
+impl MacroImplementation for EvalMacro {
+    fn evaluate(
+        &self,
+        state: State,
+        stdout: &mut dyn Write,
+        _stderror: &mut dyn Write,
+        m: Macro,
+    ) -> Result<State> {
+        let first_arg = m
+            .args
+            .first()
+            .ok_or_else(|| crate::Error::NotEnoughArguments)?;
+        let (_remaining, output) = eval_macro::parse_and_evaluate(first_arg.input)?;
+        stdout.write_all(output.to_string().as_bytes())?;
         Ok(state)
     }
 }

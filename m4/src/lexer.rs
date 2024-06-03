@@ -81,6 +81,7 @@ impl Default for ParseConfig {
 #[cfg_attr(test, derive(PartialEq))]
 #[derive(Clone)]
 pub struct Macro<'i> {
+    // TODO: remove later if not used
     pub input: &'i [u8],
     pub name: MacroName,
     // TODO: can also be an expression in the case of the eval macro

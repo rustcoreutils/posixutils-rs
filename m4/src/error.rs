@@ -6,6 +6,8 @@ pub enum Error {
     Parsing(String),
     #[error("Error processing io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("The macro doesn't have enough arguments")]
+    NotEnoughArguments,
 }
 
 impl<E: std::fmt::Debug> From<nom::Err<E>> for Error {

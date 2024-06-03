@@ -11,14 +11,14 @@ plib = { path = "../plib" }
 clap.workspace = true
 gettext-rs.workspace = true
 topological-sort = "0.2"
-diff = "0.1"
 regex.workspace = true
 chrono.workspace = true
 libc.workspace = true
-dirs = "5.0.1"
-atty = "0.2.14"
-deunicode = "1.6.0"
-ctor = "0.2.8"
+atty.workspace = true
+diff = "0.1"
+dirs = "5.0"
+deunicode = "1.6"
+ctor = "0.2"
 
 [[bin]]
 name = "asa"

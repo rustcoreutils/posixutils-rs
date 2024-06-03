@@ -15,6 +15,9 @@ diff = "0.1"
 regex.workspace = true
 chrono.workspace = true
 libc.workspace = true
+dirs = "5.0.1"
+atty = "0.2.14"
+deunicode = "1.6.0"
 ctor = "0.2.8"
 
 [[bin]]
@@ -24,6 +27,10 @@ path = "src/asa.rs"
 [[bin]]
 name = "comm"
 path = "src/comm.rs"
+
+[[bin]]
+name = "unexpand"
+path = "src/unexpand.rs"
 
 [[bin]]
 name = "csplit"
@@ -46,12 +53,12 @@ name = "sort"
 path = "src/sort.rs"
 
 [[bin]]
-name = "unexpand"
-path = "src/unexpand.rs"
-
-[[bin]]
 name = "expand"
 path = "src/expand.rs"
+
+[[bin]]
+name = "tr"
+path = "src/tr.rs"
 
 [[bin]]
 name = "fold"

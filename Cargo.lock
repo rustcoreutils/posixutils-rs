@@ -267,6 +267,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "deunicode"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "339544cc9e2c4dc3fc7149fd630c5f22263a4fdf18a98afd0075784968b5cf00"
+
+[[package]]
 name = "diff"
 version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -915,10 +921,13 @@ dependencies = [
 name = "posixutils-text"
 version = "0.1.10"
 dependencies = [
+ "atty",
  "chrono",
  "clap",
+ "deunicode",
  "ctor",
  "diff",
+ "dirs 5.0.1",
  "gettext-rs",
  "libc",
  "plib",

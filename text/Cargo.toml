@@ -15,6 +15,7 @@ diff = "0.1"
 regex.workspace = true
 chrono.workspace = true
 libc.workspace = true
+inotify = "0.10.2"
 
 [[bin]]
 name = "asa"
@@ -59,6 +60,10 @@ path = "src/fold.rs"
 [[bin]]
 name = "head"
 path = "src/head.rs"
+
+[[bin]]
+name = "tail"
+path = "src/tail.rs"
 
 [[bin]]
 name = "nl"

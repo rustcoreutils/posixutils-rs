@@ -657,6 +657,7 @@ fn contains_single_range(s: &str) -> bool {
 fn complement_chars(input: &str, chars1: Vec<Operand>, mut chars2: Vec<Operand>) -> String {
     // Create a variable to store the result
     let mut result = String::new();
+    let chars_2_const = chars2.clone();
 
     // Initialize the index for the chars2 vector
     let mut chars2_index = 0;
@@ -695,6 +696,7 @@ fn complement_chars(input: &str, chars1: Vec<Operand>, mut chars2: Vec<Operand>)
         // If the index has reached the end of the chars2 vector, reset it to zero
         if chars2_index >= chars2.len() {
             chars2_index = 0;
+            chars2.clone_from(&chars_2_const);
         }
     }
 

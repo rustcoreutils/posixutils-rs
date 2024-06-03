@@ -44,7 +44,7 @@ https://github.com/jgarzik/posixutils
  - [ ] awk
  - [x] basename
  - [ ] batch (cron cat.)
- - [ ] bc
+ - [x] bc
  - [ ] c99 (Development)
  - [x] cal
  - [x] cat

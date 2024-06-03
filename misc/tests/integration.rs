@@ -7,36 +7,25 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::process::Command;
+use plib::{run_test, TestPlan};
+
+fn truefalse_test(cmd: &str, expected_exit_code: i32) {
+    run_test(TestPlan {
+        cmd: cmd.to_string(),
+        args: Vec::new(),
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: String::new(),
+        expected_exit_code,
+    });
+}
 
 #[test]
 fn test_false_exit_code() {
-    let workspace_target = std::env::current_dir()
-        .unwrap()
-        .parent()
-        .unwrap() // Move up to the workspace root from the current package directory
-        .join("target/release/false"); // Adjust the path to the binary
-
-    let output = Command::new(workspace_target)
-        .output()
-        .expect("Failed to execute command");
-
-    assert!(!output.status.success());
-    assert_eq!(output.status.code(), Some(1));
+    truefalse_test("false", 1);
 }
 
 #[test]
 fn test_true_exit_code() {
-    let workspace_target = std::env::current_dir()
-        .unwrap()
-        .parent()
-        .unwrap() // Move up to the workspace root from the current package directory
-        .join("target/release/true"); // Adjust the path to the binary
-
-    let output = Command::new(workspace_target)
-        .output()
-        .expect("Failed to execute command");
-
-    assert!(output.status.success());
-    assert_eq!(output.status.code(), Some(0));
+    truefalse_test("true", 0);
 }

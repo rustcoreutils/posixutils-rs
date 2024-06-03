@@ -101,10 +101,10 @@ pub fn is_file_writable(md: Option<&fs::Metadata>) -> bool {
             // `unix::fs::MetadataExt::mode` is always a `u32`.
             let mode = md.mode() as libc::mode_t;
 
-            if same_user && (mode & libc::S_IWUSR != 0) {
-                true
-            } else if same_group && (mode & libc::S_IWGRP != 0) {
-                true
+            if same_user {
+                mode & libc::S_IWUSR != 0
+            } else if same_group {
+                mode & libc::S_IWGRP != 0
             } else {
                 mode & libc::S_IWOTH != 0
             }

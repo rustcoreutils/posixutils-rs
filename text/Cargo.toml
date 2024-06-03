@@ -18,7 +18,7 @@ libc.workspace = true
 dirs = "5.0.1"
 atty = "0.2.14"
 deunicode = "1.6.0"
-
+ctor = "0.2.8"
 
 [[bin]]
 name = "asa"

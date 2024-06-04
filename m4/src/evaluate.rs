@@ -102,6 +102,7 @@ define_enum_with_enumerate!(
         Eval,
         Decr,
         Len,
+        Index,
     }
 );
 // TODO: implement these macros:
@@ -116,7 +117,6 @@ define_enum_with_enumerate!(
 // Maketemp,
 // M4wrap,
 // M4exit,
-// Len,
 // Index,
 // Ifdef,
 // Divnum,
@@ -143,6 +143,7 @@ impl AsRef<[u8]> for BuiltinMacro {
             BuiltinMacro::Eval => b"eval",
             BuiltinMacro::Decr => b"decr",
             BuiltinMacro::Len => b"len",
+            BuiltinMacro::Index => b"index",
         }
     }
 }
@@ -172,6 +173,7 @@ impl BuiltinMacro {
             BuiltinMacro::Shift => 1,
             BuiltinMacro::Eval => 1,
             BuiltinMacro::Len => 1,
+            BuiltinMacro::Index => 1,
         }
     }
 
@@ -202,6 +204,7 @@ fn inbuilt_macro_implementation(builtin: &BuiltinMacro) -> Box<dyn MacroImplemen
         BuiltinMacro::Shift => Box::new(ShiftMacro),
         BuiltinMacro::Eval => Box::new(EvalMacro),
         BuiltinMacro::Len => Box::new(LenMacro),
+        BuiltinMacro::Index => Box::new(IndexMacro),
     }
 }
 
@@ -1002,6 +1005,8 @@ impl MacroImplementation for EvalMacro {
     }
 }
 
+/// The defining text of the len macro shall be the length (as a string) of the first argument. The
+/// behavior is unspecified if len is not immediately followed by a <left-parenthesis>.
 struct LenMacro;
 
 impl MacroImplementation for LenMacro {
@@ -1020,6 +1025,52 @@ impl MacroImplementation for LenMacro {
         let buffer;
         (buffer, state) = evaluate_to_text(state, first_arg.symbols, stderror, true)?;
         stdout.write_all(buffer.len().to_string().as_bytes())?;
+        Ok(state)
+    }
+}
+
+/// The defining text of the index macro shall be the first character position (as a string) in the
+/// first argument where a string matching the second argument begins (zero origin), or -1 if the
+/// second argument does not occur. The behavior is unspecified if index is not immediately followed
+/// by a <left-parenthesis>.
+struct IndexMacro;
+
+impl MacroImplementation for IndexMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stdout: &mut dyn Write,
+        stderror: &mut dyn Write,
+        m: Macro,
+    ) -> Result<State> {
+        let mut args = m.args.into_iter();
+        let first_arg = args
+            .next()
+            .ok_or_else(|| crate::Error::NotEnoughArguments)?;
+        let first_arg_text;
+        (first_arg_text, state) = evaluate_to_text(state, first_arg.symbols, stderror, true)?;
+        let second_arg = match args.next() {
+            Some(second_arg) => second_arg,
+            None => {
+                stderror.write_all(b"Warning too few arguments for index macro")?;
+                stdout.write_all(b"-1")?;
+                return Ok(state);
+            }
+        };
+        let second_arg_text;
+        (second_arg_text, state) = evaluate_to_text(state, second_arg.symbols, stderror, true)?;
+
+        let index = first_arg_text
+            .windows(second_arg_text.len())
+            .position(|window| window == &second_arg_text);
+        match index {
+            Some(index) => {
+                stdout.write_all(index.to_string().as_bytes())?;
+            }
+            None => {
+                stdout.write_all(b"-1")?;
+            }
+        }
         Ok(state)
     }
 }

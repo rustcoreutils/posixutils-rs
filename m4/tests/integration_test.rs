@@ -672,6 +672,52 @@ fn test_incr() {
 }
 
 #[test]
+fn test_index() {
+    init();
+    let output = run_command("fixtures/integration_tests/index.m4");
+
+    let test: TestSnapshot = read_test("fixtures/integration_tests/index.out");
+    assert_eq!(
+        output.status,
+        std::process::ExitStatus::from_raw(test.status),
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        test.stdout,
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        test.stderr,
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+}
+
+#[test]
+fn test_index_too_few_args() {
+    init();
+    let output = run_command("fixtures/integration_tests/index_too_few_args.m4");
+
+    let test: TestSnapshot = read_test("fixtures/integration_tests/index_too_few_args.out");
+    assert_eq!(
+        output.status,
+        std::process::ExitStatus::from_raw(test.status),
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        test.stdout,
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        test.stderr,
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+}
+
+#[test]
 fn test_len() {
     init();
     let output = run_command("fixtures/integration_tests/len.m4");

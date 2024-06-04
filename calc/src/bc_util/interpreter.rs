@@ -76,6 +76,7 @@ pub struct Interpreter {
     ibase: u64,
     obase: u64,
     output: String,
+    has_quit: bool,
 }
 
 impl Default for Interpreter {
@@ -89,20 +90,16 @@ impl Default for Interpreter {
             ibase: 10,
             obase: 10,
             output: String::new(),
+            has_quit: false,
         }
     }
 }
 
-pub struct Output {
-    pub has_quit: bool,
-    pub string: String,
-}
-
 impl Interpreter {
-    fn output(&mut self, has_quit: bool) -> Output {
+    fn take_and_clear_output(&mut self) -> String {
         let mut string = String::new();
         std::mem::swap(&mut self.output, &mut string);
-        Output { has_quit, string }
+        string
     }
 
     fn eval_named(&mut self, named: &NamedExpr) -> ExecutionResult<&mut Number> {
@@ -387,7 +384,7 @@ impl Interpreter {
         Ok(ControlFlow::None)
     }
 
-    pub fn exec(&mut self, program: Program) -> ExecutionResult<Output> {
+    pub fn exec(&mut self, program: Program) -> ExecutionResult<String> {
         for stmt in program {
             if let StmtInstruction::DefineFunction { name, function } = stmt {
                 // we handle this here because we need to store the function.
@@ -398,7 +395,8 @@ impl Interpreter {
                 // first we need to check if the definition contains quit,
                 // in which case we need to stop execution
                 if function.body.iter().any(contains_quit) {
-                    return Ok(self.output(true));
+                    self.has_quit = true;
+                    return Ok(self.take_and_clear_output());
                 }
 
                 self.functions[name_index(name)] = function;
@@ -416,11 +414,16 @@ impl Interpreter {
                 // unexecuted branches will not return ControlFlow::Quit,
                 // but we need still need to stop execution
                 if contains_quit(&stmt) {
-                    return Ok(self.output(true));
+                    self.has_quit = true;
+                    return Ok(self.take_and_clear_output());
                 }
             }
         }
-        Ok(self.output(false))
+        Ok(self.take_and_clear_output())
+    }
+
+    pub fn has_quit(&self) -> bool {
+        self.has_quit
     }
 }
 
@@ -439,7 +442,7 @@ mod tests {
                 "5".to_string(),
             ))])
             .unwrap();
-        assert_eq!(output.string, "5\n");
+        assert_eq!(output, "5\n");
     }
 
     #[test]
@@ -453,7 +456,7 @@ mod tests {
                 NamedExpr::VariableNumber('a'),
             ))])
             .unwrap();
-        assert_eq!(output.string, "0\n");
+        assert_eq!(output, "0\n");
     }
 
     #[test]
@@ -468,7 +471,7 @@ mod tests {
                 arg: Box::new(ExprInstruction::Number("5".to_string())),
             })])
             .unwrap();
-        assert_eq!(output.string, "0\n");
+        assert_eq!(output, "0\n");
     }
 
     #[test]
@@ -483,7 +486,7 @@ mod tests {
                 arg: Box::new(ExprInstruction::Number("25".to_string())),
             })])
             .unwrap();
-        assert_eq!(output.string, "5\n");
+        assert_eq!(output, "5\n");
     }
 
     #[test]
@@ -498,7 +501,7 @@ mod tests {
                 arg: Box::new(ExprInstruction::Number("5".to_string())),
             })])
             .unwrap();
-        assert_eq!(output.string, "1\n");
+        assert_eq!(output, "1\n");
     }
 
     #[test]
@@ -516,7 +519,7 @@ mod tests {
                 StmtInstruction::Expr(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
             ])
             .unwrap();
-        assert_eq!(output.string, "1\n1\n");
+        assert_eq!(output, "1\n1\n");
     }
 
     #[test]
@@ -534,7 +537,7 @@ mod tests {
                 StmtInstruction::Expr(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
             ])
             .unwrap();
-        assert_eq!(output.string, "-1\n-1\n");
+        assert_eq!(output, "-1\n-1\n");
     }
 
     #[test]
@@ -552,7 +555,7 @@ mod tests {
                 StmtInstruction::Expr(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
             ])
             .unwrap();
-        assert_eq!(output.string, "0\n1\n");
+        assert_eq!(output, "0\n1\n");
     }
 
     #[test]
@@ -570,7 +573,7 @@ mod tests {
                 StmtInstruction::Expr(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
             ])
             .unwrap();
-        assert_eq!(output.string, "0\n-1\n");
+        assert_eq!(output, "0\n-1\n");
     }
 
     #[test]
@@ -602,7 +605,7 @@ mod tests {
                 }),
             ])
             .unwrap();
-        assert_eq!(output.string, "5\n0\n");
+        assert_eq!(output, "5\n0\n");
     }
 
     #[test]
@@ -621,7 +624,7 @@ mod tests {
                 StmtInstruction::Expr(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
             ])
             .unwrap();
-        assert_eq!(output.string, "5\n");
+        assert_eq!(output, "5\n");
     }
 
     #[test]
@@ -631,8 +634,8 @@ mod tests {
         // quit
         // ```
         let output = interpreter.exec(vec![StmtInstruction::Quit]).unwrap();
-        assert_eq!(output.string, "");
-        assert!(output.has_quit);
+        assert_eq!(output, "");
+        assert!(interpreter.has_quit());
     }
 
     #[test]
@@ -650,7 +653,7 @@ mod tests {
                 ],
             }])
             .unwrap();
-        assert_eq!(output.string, "");
+        assert_eq!(output, "");
     }
 
     #[test]
@@ -676,7 +679,7 @@ mod tests {
                 }),
             ])
             .unwrap();
-        assert_eq!(output.string, "0\n");
+        assert_eq!(output, "0\n");
     }
 
     #[test]
@@ -708,7 +711,7 @@ mod tests {
                 }),
             ])
             .unwrap();
-        assert_eq!(output.string, "5\n");
+        assert_eq!(output, "5\n");
     }
 
     #[test]
@@ -727,7 +730,7 @@ mod tests {
                 ))],
             }])
             .unwrap();
-        assert_eq!(output.string, "5\n");
+        assert_eq!(output, "5\n");
     }
 
     #[test]
@@ -746,7 +749,7 @@ mod tests {
                 ))],
             }])
             .unwrap();
-        assert_eq!(output.string, "");
+        assert_eq!(output, "");
     }
 
     #[test]
@@ -761,7 +764,7 @@ mod tests {
                 value: Box::new(ExprInstruction::Number("5".to_string())),
             })])
             .unwrap();
-        assert_eq!(output.string, "");
+        assert_eq!(output, "");
     }
 
     #[test]
@@ -786,7 +789,7 @@ mod tests {
                 })),
             ])
             .unwrap();
-        assert_eq!(output.string, "5\n");
+        assert_eq!(output, "5\n");
     }
 
     #[test]
@@ -812,8 +815,8 @@ mod tests {
                 StmtInstruction::Expr(ExprInstruction::Number("1".to_string())),
             ])
             .unwrap();
-        assert_eq!(output.string, "");
-        assert!(output.has_quit);
+        assert_eq!(output, "");
+        assert!(interpreter.has_quit());
     }
 
     #[test]
@@ -838,8 +841,8 @@ mod tests {
                 StmtInstruction::Expr(ExprInstruction::Number("1".to_string())),
             ])
             .unwrap();
-        assert_eq!(output.string, "");
-        assert!(output.has_quit);
+        assert_eq!(output, "");
+        assert!(interpreter.has_quit());
     }
 
     #[test]
@@ -864,8 +867,8 @@ mod tests {
                 StmtInstruction::Expr(ExprInstruction::Number("1".to_string())),
             ])
             .unwrap();
-        assert_eq!(output.string, "");
-        assert!(output.has_quit);
+        assert_eq!(output, "");
+        assert!(interpreter.has_quit());
     }
 
     #[test]
@@ -901,7 +904,7 @@ mod tests {
                 StmtInstruction::Expr(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
             ])
             .unwrap();
-        assert_eq!(output.string, "0\n0\n");
+        assert_eq!(output, "0\n0\n");
     }
 
     #[test]
@@ -943,7 +946,7 @@ mod tests {
                 StmtInstruction::Expr(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
             ])
             .unwrap();
-        assert_eq!(output.string, "0\n1\n");
+        assert_eq!(output, "0\n1\n");
     }
 
     #[test]
@@ -977,7 +980,7 @@ mod tests {
                 }),
             ])
             .unwrap();
-        assert_eq!(output.string, "5\n");
+        assert_eq!(output, "5\n");
     }
 
     #[test]
@@ -1033,7 +1036,7 @@ mod tests {
                 })),
             ])
             .unwrap();
-        assert_eq!(output.string, "1\n0\n1\n");
+        assert_eq!(output, "1\n0\n1\n");
     }
 
     #[test]
@@ -1052,7 +1055,7 @@ mod tests {
                 StmtInstruction::Expr(ExprInstruction::GetRegister(Register::OBase)),
             ])
             .unwrap();
-        assert_eq!(output.string, "10\n");
+        assert_eq!(output, "10\n");
     }
 
     #[test]

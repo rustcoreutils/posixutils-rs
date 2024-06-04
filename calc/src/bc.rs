@@ -31,14 +31,11 @@ struct Args {
     files: Vec<OsString>,
 }
 
-fn exec_str(s: &str, file_path: Option<&str>, interpreter: &mut Interpreter) -> bool {
+fn exec_str(s: &str, file_path: Option<&str>, interpreter: &mut Interpreter) {
     match parse_program(s, file_path) {
         Ok(program) => match interpreter.exec(program) {
             Ok(output) => {
-                print!("{}", output.string);
-                if output.has_quit {
-                    return true;
-                }
+                print!("{}", output);
             }
             Err(e) => {
                 println!("runtime error: {}", e);
@@ -48,7 +45,6 @@ fn exec_str(s: &str, file_path: Option<&str>, interpreter: &mut Interpreter) -> 
             println!("{}", e);
         }
     }
-    false
 }
 
 fn main() -> Result<()> {
@@ -68,21 +64,20 @@ fn main() -> Result<()> {
 
     for file in args.files {
         match std::fs::read_to_string(&file) {
-            Ok(s) => {
-                if exec_str(&s, file.to_str(), &mut interpreter) {
-                    return Ok(());
-                }
-            }
+            Ok(s) => exec_str(&s, file.to_str(), &mut interpreter),
             Err(_) => {
                 eprintln!("Could not read file: {}", file.to_string_lossy());
                 return Ok(());
             }
         };
+        if interpreter.has_quit() {
+            return Ok(());
+        }
     }
 
     let mut repl = DefaultEditor::new()?;
     let mut line_buffer = String::new();
-    loop {
+    while !interpreter.has_quit() {
         let line = if line_buffer.is_empty() {
             repl.readline(">> ")
         } else {
@@ -93,9 +88,7 @@ fn main() -> Result<()> {
                 line_buffer.push_str(&line);
                 line_buffer.push('\n');
                 if !is_incomplete(&line_buffer) {
-                    if exec_str(&line_buffer, None, &mut interpreter) {
-                        return Ok(());
-                    }
+                    exec_str(&line_buffer, None, &mut interpreter);
                     line_buffer.clear();
                 }
                 repl.add_history_entry(line)?;

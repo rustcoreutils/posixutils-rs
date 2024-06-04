@@ -103,6 +103,7 @@ define_enum_with_enumerate!(
         Decr,
         Len,
         Index,
+        Ifdef,
     }
 );
 // TODO: implement these macros:
@@ -117,8 +118,6 @@ define_enum_with_enumerate!(
 // Maketemp,
 // M4wrap,
 // M4exit,
-// Index,
-// Ifdef,
 // Divnum,
 // Defn,
 // Divert,
@@ -139,6 +138,7 @@ impl AsRef<[u8]> for BuiltinMacro {
             BuiltinMacro::Popdef => b"popdef",
             BuiltinMacro::Incr => b"incr",
             BuiltinMacro::Ifelse => b"ifelse",
+            BuiltinMacro::Ifdef => b"ifdef",
             BuiltinMacro::Shift => b"shift",
             BuiltinMacro::Eval => b"eval",
             BuiltinMacro::Decr => b"decr",
@@ -170,6 +170,7 @@ impl BuiltinMacro {
             BuiltinMacro::Incr => 1,
             BuiltinMacro::Decr => 1,
             BuiltinMacro::Ifelse => 1,
+            BuiltinMacro::Ifdef => 1,
             BuiltinMacro::Shift => 1,
             BuiltinMacro::Eval => 1,
             BuiltinMacro::Len => 1,
@@ -201,6 +202,7 @@ fn inbuilt_macro_implementation(builtin: &BuiltinMacro) -> Box<dyn MacroImplemen
         BuiltinMacro::Incr => Box::new(IncrMacro),
         BuiltinMacro::Decr => Box::new(DecrMacro),
         BuiltinMacro::Ifelse => Box::new(IfelseMacro),
+        BuiltinMacro::Ifdef => Box::new(IfdefMacro),
         BuiltinMacro::Shift => Box::new(ShiftMacro),
         BuiltinMacro::Eval => Box::new(EvalMacro),
         BuiltinMacro::Len => Box::new(LenMacro),
@@ -949,6 +951,47 @@ impl MacroImplementation for IfelseMacro {
             }
             i += 1;
         }
+    }
+}
+
+/// If the first argument to the ifdef macro is defined, the defining text shall be the second
+/// argument. Otherwise, the defining text shall be the third argument, if specified, or the null
+/// string, if not. The behavior is unspecified if ifdef is not immediately followed by a
+/// <left-parenthesis>.
+struct IfdefMacro;
+
+impl MacroImplementation for IfdefMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stdout: &mut dyn Write,
+        stderror: &mut dyn Write,
+        m: Macro,
+    ) -> Result<State> {
+        let mut args = m.args.into_iter();
+        let first_arg = args
+            .next()
+            .ok_or_else(|| crate::Error::NotEnoughArguments)?;
+        let first_arg_text;
+        (first_arg_text, state) = evaluate_to_text(state, first_arg.symbols, stderror, true)?;
+        let second_arg = args
+            .next()
+            .ok_or_else(|| crate::Error::NotEnoughArguments)?;
+        let second_arg_text;
+        (second_arg_text, state) = evaluate_to_text(state, second_arg.symbols, stderror, true)?;
+        let name = MacroName::try_from_slice(&first_arg_text)?;
+
+        if state.macro_definitions.contains_key(&name) {
+            stdout.write_all(&second_arg_text)?;
+        } else {
+            if let Some(third_arg) = args.next() {
+                let third_arg_text;
+                (third_arg_text, state) =
+                    evaluate_to_text(state, third_arg.symbols, stderror, true)?;
+                stdout.write_all(&third_arg_text)?;
+            }
+        }
+        Ok(state)
     }
 }
 

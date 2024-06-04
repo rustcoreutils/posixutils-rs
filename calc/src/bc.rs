@@ -31,8 +31,8 @@ struct Args {
     files: Vec<OsString>,
 }
 
-fn exec_str(s: &str, interpreter: &mut Interpreter) -> bool {
-    match parse_program(s) {
+fn exec_str(s: &str, file_path: Option<&str>, interpreter: &mut Interpreter) -> bool {
+    match parse_program(s, file_path) {
         Ok(program) => match interpreter.exec(program) {
             Ok(output) => {
                 print!("{}", output.string);
@@ -59,7 +59,7 @@ fn main() -> Result<()> {
     let mut interpreter = Interpreter::default();
 
     if args.define_math_functions {
-        let lib = parse_program(include_str!("bc_util/math_functions.bc"))
+        let lib = parse_program(include_str!("bc_util/math_functions.bc"), None)
             .expect("error parsing standard math functions");
         interpreter
             .exec(lib)
@@ -69,7 +69,7 @@ fn main() -> Result<()> {
     for file in args.files {
         match std::fs::read_to_string(&file) {
             Ok(s) => {
-                if exec_str(&s, &mut interpreter) {
+                if exec_str(&s, file.to_str(), &mut interpreter) {
                     return Ok(());
                 }
             }
@@ -93,7 +93,7 @@ fn main() -> Result<()> {
                 line_buffer.push_str(&line);
                 line_buffer.push('\n');
                 if !is_incomplete(&line_buffer) {
-                    if exec_str(&line_buffer, &mut interpreter) {
+                    if exec_str(&line_buffer, None, &mut interpreter) {
                         return Ok(());
                     }
                     line_buffer.clear();

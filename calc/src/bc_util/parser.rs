@@ -385,8 +385,20 @@ pub struct BcParser;
 
 pub type Program = Vec<StmtInstruction>;
 
-pub fn parse_program(text: &str) -> Result<Program, pest::error::Error<Rule>> {
-    let program = BcParser::parse(Rule::program, text)?.next().unwrap();
+pub fn parse_program(
+    text: &str,
+    file_path: Option<&str>,
+) -> Result<Program, pest::error::Error<Rule>> {
+    let program = BcParser::parse(Rule::program, text)
+        .map_err(|e| {
+            if let Some(path) = file_path {
+                e.with_path(path)
+            } else {
+                e
+            }
+        })?
+        .next()
+        .unwrap();
     let mut result = Vec::new();
     for item in program.into_inner() {
         match item.as_rule() {
@@ -426,7 +438,7 @@ fn location_end(loc: InputLocation) -> usize {
 /// assert!(is_incomplete("while (c) {\n"))
 /// ```
 pub fn is_incomplete(text: &str) -> bool {
-    match parse_program(text) {
+    match parse_program(text, None) {
         Ok(_) => false,
         Err(e) => {
             let pos = location_end(e.location);
@@ -446,7 +458,7 @@ mod test {
     use super::*;
 
     fn parse_expr(input: &str) -> ExprInstruction {
-        let program = parse_program(input).expect("error parsing expression");
+        let program = parse_program(input, None).expect("error parsing expression");
         assert_eq!(program.len(), 1);
         if let StmtInstruction::Expr(expr) = program.into_iter().next().unwrap() {
             expr
@@ -456,13 +468,13 @@ mod test {
     }
 
     fn parse_stmt(input: &str) -> StmtInstruction {
-        let program = parse_program(input).expect("error parsing statement");
+        let program = parse_program(input, None).expect("error parsing statement");
         assert_eq!(program.len(), 1);
         program.into_iter().next().unwrap()
     }
 
     fn parse_function(input: &str) -> Function {
-        let program = parse_program(input).expect("error parsing function");
+        let program = parse_program(input, None).expect("error parsing function");
         assert_eq!(program.len(), 1);
         if let StmtInstruction::DefineFunction { function, .. } =
             program.into_iter().next().unwrap()
@@ -475,7 +487,7 @@ mod test {
 
     #[test]
     fn test_parse_empty_program() {
-        let instructions = parse_program("").expect("error parsing empty program");
+        let instructions = parse_program("", None).expect("error parsing empty program");
         assert_eq!(instructions.len(), 0);
     }
 
@@ -995,22 +1007,22 @@ mod test {
     #[test]
     fn test_parse_empty_braced_statement_list() {
         let instructions =
-            parse_program("{ }\n").expect("error parsing empty braced statement list");
+            parse_program("{ }\n", None).expect("error parsing empty braced statement list");
         assert_eq!(instructions.len(), 0);
         let instructions =
-            parse_program("{\n}\n").expect("error parsing empty braced statement list");
+            parse_program("{\n}\n", None).expect("error parsing empty braced statement list");
         assert_eq!(instructions.len(), 0);
         let instructions =
-            parse_program("{\n\n}\n").expect("error parsing empty braced statement list");
+            parse_program("{\n\n}\n", None).expect("error parsing empty braced statement list");
         assert_eq!(instructions.len(), 0);
         let instructions =
-            parse_program("{;\n;;}\n").expect("error parsing empty braced statement list");
+            parse_program("{;\n;;}\n", None).expect("error parsing empty braced statement list");
         assert_eq!(instructions.len(), 0);
     }
 
     #[test]
     fn test_parse_braced_statement_list() {
-        let instructions = parse_program("{ 1 + 2; 3 + 4; \"string\" }\n")
+        let instructions = parse_program("{ 1 + 2; 3 + 4; \"string\" }\n", None)
             .expect("error parsing braced statement list");
         assert_eq!(instructions.len(), 3);
         assert_eq!(
@@ -1059,8 +1071,8 @@ mod test {
 
     #[test]
     fn test_parse_multiple_statements_on_single_line() {
-        let instructions =
-            parse_program("1 + 2; 3 + 4; \"string\"\n").expect("error parsing multiple statements");
+        let instructions = parse_program("1 + 2; 3 + 4; \"string\"\n", None)
+            .expect("error parsing multiple statements");
         assert_eq!(instructions.len(), 3);
         assert_eq!(
             instructions[0],
@@ -1151,9 +1163,11 @@ mod test {
 
     #[test]
     fn test_ignore_comments() {
-        let instructions =
-            parse_program("/*line comment*/\n1 + 2; \n/*multiline\ncomment*/\n3 + 4\n")
-                .expect("error parsing multiple statements with comments");
+        let instructions = parse_program(
+            "/*line comment*/\n1 + 2; \n/*multiline\ncomment*/\n3 + 4\n",
+            None,
+        )
+        .expect("error parsing multiple statements with comments");
         assert_eq!(instructions.len(), 2);
         assert_eq!(
             instructions[0],
@@ -1185,13 +1199,13 @@ mod test {
 
     #[test]
     fn test_break_outside_of_loop_is_an_error() {
-        let result = parse_program("break\n");
+        let result = parse_program("break\n", None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_return_outside_of_function_is_an_error() {
-        let result = parse_program("return\n");
+        let result = parse_program("return\n", None);
         assert!(result.is_err());
     }
 

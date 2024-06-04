@@ -402,11 +402,13 @@ impl Interpreter {
                 self.functions[name_index(name)] = function;
             } else {
                 match self.eval_stmt(&stmt)? {
+                    // both of these should have been handled earlier
+                    // by the parser
                     ControlFlow::Return(_) => {
-                        println!("return outside of function");
+                        panic!("return outside of function");
                     }
                     ControlFlow::Break => {
-                        println!("break outside of loop");
+                        panic!("break outside of loop");
                     }
                     _ => {}
                 }

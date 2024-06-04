@@ -10,9 +10,21 @@ pub enum Error {
     NotEnoughArguments,
 }
 
-impl<E: std::fmt::Debug> From<nom::Err<E>> for Error {
-    fn from(value: nom::Err<E>) -> Self {
-        Self::Parsing(format!("{value}"))
+impl From<nom::Err<nom::error::Error<&[u8]>>> for Error {
+    fn from(error: nom::Err<nom::error::Error<&[u8]>>) -> Self {
+        Self::Parsing(match error {
+            nom::Err::Incomplete(_) => format!("{error}"),
+            nom::Err::Error(e) => format!(
+                "Error code: {:?}, input: {:?}",
+                e.code,
+                String::from_utf8(e.input.to_vec()).unwrap_or_else(|_| format!("{:?}", e.input))
+            ),
+            nom::Err::Failure(e) => format!(
+                "Failure code: {:?}, input: {:?}",
+                e.code,
+                String::from_utf8(e.input.to_vec()).unwrap_or_else(|_| format!("{:?}", e.input))
+            ),
+        })
     }
 }
 

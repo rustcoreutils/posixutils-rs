@@ -114,6 +114,7 @@ fn update_snapshots(args: &Args, update: &UpdateSnapshots) {
                 stderr: String::from_utf8(output.stderr).unwrap(),
                 status: output.status.code().unwrap(),
                 ignore: false,
+                expect_error: false,
             };
 
             if snapshot_file.exists() {

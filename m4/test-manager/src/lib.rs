@@ -4,7 +4,11 @@ pub struct TestSnapshot {
     pub stdout: String,
     pub stderr: String,
     pub status: i32,
+    /// The test should be ignored.
     pub ignore: bool,
+    /// An error is expected to occur, the stderr does not need to match exactly because error
+    /// messages may differe slightly.
+    pub expect_error: bool,
 }
 
 fn escape_newlines(input: &str) -> String {
@@ -28,7 +32,11 @@ impl TestSnapshot {
         write!(out, "status={}", self.status).unwrap();
         if self.ignore {
             write!(out, "\n").unwrap();
-            write!(out, "ignore={}", self.ignore).unwrap();
+            write!(out, "ignore=true").unwrap();
+        }
+        if self.expect_error {
+            write!(out, "\n").unwrap();
+            write!(out, "expect_error=true").unwrap();
         }
     }
 
@@ -37,6 +45,7 @@ impl TestSnapshot {
         let mut stderr: Option<String> = None;
         let mut status: Option<i32> = None;
         let mut ignore = false;
+        let mut expect_error = false;
 
         let mut buffer: String = String::new();
         input.read_to_string(&mut buffer).unwrap();
@@ -51,6 +60,7 @@ impl TestSnapshot {
                 "stderr" => stderr = Some(unescape_newlines(value)),
                 "status" => status = Some(value.parse().unwrap()),
                 "ignore" => ignore = value.parse().unwrap(),
+                "expect_error" => expect_error = value.parse().unwrap(),
                 _ => panic!("Unsupported key {name:?}"),
             }
         }
@@ -60,6 +70,7 @@ impl TestSnapshot {
             stderr: stderr.unwrap(),
             status: status.unwrap(),
             ignore,
+            expect_error,
         }
     }
 }

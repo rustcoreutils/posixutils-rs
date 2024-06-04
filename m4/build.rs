@@ -12,7 +12,11 @@ struct TestCandidate {
     name: String,
     input: Option<PathBuf>,
     output: Option<PathBuf>,
+    /// The test should be ignored.
     ignore: bool,
+    /// An error is expected to occur, the stderr does not need to match exactly because error
+    /// messages may differe slightly.
+    expect_error: bool,
 }
 
 impl TryFrom<TestCandidate> for Test {
@@ -34,6 +38,7 @@ impl TryFrom<TestCandidate> for Test {
                 .ok_or("Error converting output path to string")?
                 .to_owned(),
             ignore: value.ignore,
+            expect_error: value.expect_error,
         })
     }
 }
@@ -43,6 +48,7 @@ struct Test {
     input: String,
     output: String,
     ignore: bool,
+    expect_error: bool,
 }
 impl Test {
     fn as_code(&self) -> String {
@@ -51,6 +57,7 @@ impl Test {
             input,
             output,
             ignore,
+            expect_error,
         } = self;
         let mut s = String::new();
 
@@ -67,9 +74,22 @@ fn test_{name}() {{
     let test: TestSnapshot = read_test("{output}");
     assert_eq!(output.status, std::process::ExitStatus::from_raw(test.status), "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)");
     assert_eq!(String::from_utf8(output.stdout).unwrap(), test.stdout, "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)");
-    assert_eq!(String::from_utf8(output.stderr).unwrap(), test.stderr, "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)");
-}}"##
+"##
         ));
+
+        if self.expect_error {
+            s.push_str(
+                r##"
+    if !test.stderr.is_empty() {
+        assert!(!output.stderr.is_empty());
+    }"##,
+            );
+        } else {
+            s.push_str(r##"
+    assert_eq!(String::from_utf8(output.stderr).unwrap(), test.stderr, "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)");"##);
+        }
+
+        s.push_str("}");
 
         s
     }
@@ -92,21 +112,22 @@ fn main() {
                 let name = name_from_path(&path).unwrap();
                 let snapshot_file_name = format!("{name}.out");
                 let snapshot_file = fixtures_directory.join(snapshot_file_name);
-                let ignore = if snapshot_file.exists() {
+                let (ignore, expect_error) = if snapshot_file.exists() {
                     let mut f = std::fs::OpenOptions::new()
                         .read(true)
                         .open(&snapshot_file)
                         .unwrap();
                     let snapshot = TestSnapshot::deserialize(&mut f);
-                    snapshot.ignore
+                    (snapshot.ignore, snapshot.expect_error)
                 } else {
-                    false
+                    (false, false)
                 };
                 let candidate = test_candidates
                     .entry(name.clone())
                     .or_insert(TestCandidate {
                         name,
                         ignore,
+                        expect_error,
                         ..TestCandidate::default()
                     });
                 candidate.input = Some(path);

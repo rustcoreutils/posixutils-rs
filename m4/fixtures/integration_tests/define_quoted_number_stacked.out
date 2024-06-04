@@ -1,3 +1,4 @@
 stdout=
 stderr=m4:fixtures/integration_tests/define_quoted_number_stacked.m4:1: ERROR: end of file in argument list\n
 status=1
+expect_error=true

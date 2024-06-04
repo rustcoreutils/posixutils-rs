@@ -105,6 +105,7 @@ define_enum_with_enumerate!(
         Index,
         Ifdef,
         Translit,
+        Defn,
     }
 );
 // TODO: implement these macros:
@@ -119,7 +120,6 @@ define_enum_with_enumerate!(
 // M4wrap,
 // M4exit,
 // Divnum,
-// Defn,
 // Divert,
 // Dumpdef,
 
@@ -129,6 +129,7 @@ impl AsRef<[u8]> for BuiltinMacro {
             BuiltinMacro::Dnl => b"dnl",
             BuiltinMacro::Define => b"define",
             BuiltinMacro::Undefine => b"undefine",
+            BuiltinMacro::Defn => b"defn",
             BuiltinMacro::Errprint => b"errprint",
             BuiltinMacro::Include => b"include",
             BuiltinMacro::Sinclude => b"sinclude",
@@ -161,6 +162,7 @@ impl BuiltinMacro {
             BuiltinMacro::Dnl => 0,
             BuiltinMacro::Define => 1,
             BuiltinMacro::Undefine => 1,
+            BuiltinMacro::Defn => 1,
             BuiltinMacro::Errprint => 1,
             BuiltinMacro::Include => 1,
             BuiltinMacro::Sinclude => 1,
@@ -194,6 +196,7 @@ fn inbuilt_macro_implementation(builtin: &BuiltinMacro) -> Box<dyn MacroImplemen
         BuiltinMacro::Dnl => Box::new(DnlMacro),
         BuiltinMacro::Define => Box::new(DefineMacro),
         BuiltinMacro::Undefine => Box::new(UndefineMacro),
+        BuiltinMacro::Defn => Box::new(DefnMacro),
         BuiltinMacro::Errprint => Box::new(ErrprintMacro),
         BuiltinMacro::Include => Box::new(IncludeMacro),
         BuiltinMacro::Sinclude => Box::new(SincludeMacro),
@@ -625,6 +628,23 @@ impl MacroImplementation for UndefineMacro {
     }
 }
 
+/// The defining text of the defn macro shall be the quoted definition (using the current quoting
+/// strings) of its arguments. The behavior is unspecified if defn is not immediately followed by a
+/// `<left-parenthesis>`.
+struct DefnMacro;
+
+impl MacroImplementation for DefnMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        _stdout: &mut dyn Write,
+        stderror: &mut dyn Write,
+        m: Macro,
+    ) -> Result<State> {
+        todo!()
+    }
+}
+
 struct ErrprintMacro;
 
 impl MacroImplementation for ErrprintMacro {
@@ -820,7 +840,7 @@ impl MacroImplementation for ChangequoteMacro {
 
 /// The defining text of the incr macro shall be its first argument incremented by 1. It shall be
 /// an error to specify an argument containing any non-numeric characters. The behavior is
-/// unspecified if incr is not immediately followed by a <left-parenthesis>.
+/// unspecified if incr is not immediately followed by a `<left-parenthesis>`.
 struct IncrMacro;
 
 impl MacroImplementation for IncrMacro {
@@ -851,7 +871,7 @@ impl MacroImplementation for IncrMacro {
 
 /// The defining text of the decr macro shall be its first argument decremented by 1. It shall be
 /// an error to specify an argument containing any non-numeric characters. The behavior is
-/// unspecified if decr is not immediately followed by a <left-parenthesis>.
+/// unspecified if decr is not immediately followed by a `<left-parenthesis>`.
 struct DecrMacro;
 
 impl MacroImplementation for DecrMacro {
@@ -888,7 +908,7 @@ impl MacroImplementation for DecrMacro {
 /// If the first two arguments do not compare as equal strings and there are six or more arguments,
 /// the first three arguments shall be discarded and processing shall restart with the remaining
 /// arguments. The behavior is unspecified if ifelse is not immediately followed by a
-/// <left-parenthesis>.
+/// `<left-parenthesis>`.
 ///
 /// ifelse (string-1, string-2, equal, [not-equal])
 /// ifelse (string-1, string-2, equal-1, string-3, string-4, equal-2, …, [not-equal])
@@ -960,7 +980,7 @@ impl MacroImplementation for IfelseMacro {
 /// If the first argument to the ifdef macro is defined, the defining text shall be the second
 /// argument. Otherwise, the defining text shall be the third argument, if specified, or the null
 /// string, if not. The behavior is unspecified if ifdef is not immediately followed by a
-/// <left-parenthesis>.
+/// `<left-parenthesis>`.
 struct IfdefMacro;
 
 impl MacroImplementation for IfdefMacro {
@@ -1000,7 +1020,7 @@ impl MacroImplementation for IfdefMacro {
 
 /// The defining text for the shift macro shall be a comma-separated list of its arguments except
 /// the first one. Each argument shall be quoted using the current quoting strings. The behavior is
-/// unspecified if shift is not immediately followed by a <left-parenthesis>.
+/// unspecified if shift is not immediately followed by a `<left-parenthesis>`.
 struct ShiftMacro;
 
 impl MacroImplementation for ShiftMacro {
@@ -1052,7 +1072,7 @@ impl MacroImplementation for EvalMacro {
 }
 
 /// The defining text of the len macro shall be the length (as a string) of the first argument. The
-/// behavior is unspecified if len is not immediately followed by a <left-parenthesis>.
+/// behavior is unspecified if len is not immediately followed by a `<left-parenthesis>`.
 struct LenMacro;
 
 impl MacroImplementation for LenMacro {
@@ -1078,7 +1098,7 @@ impl MacroImplementation for LenMacro {
 /// The defining text of the index macro shall be the first character position (as a string) in the
 /// first argument where a string matching the second argument begins (zero origin), or -1 if the
 /// second argument does not occur. The behavior is unspecified if index is not immediately followed
-/// by a <left-parenthesis>.
+/// by a `<left-parenthesis>`.
 struct IndexMacro;
 
 impl MacroImplementation for IndexMacro {
@@ -1128,7 +1148,7 @@ impl MacroImplementation for IndexMacro {
 /// translit's defining text. The behavior is unspecified if the '-' character appears within the
 /// second or third argument anywhere besides the first or last character. The behavior is
 /// unspecified if the same character appears more than once in the second argument. The behavior is
-/// unspecified if translit is not immediately followed by a <left-parenthesis>.
+/// unspecified if translit is not immediately followed by a `<left-parenthesis>`.
 struct TranslitMacro;
 
 // TODO: support utf8 characters properly

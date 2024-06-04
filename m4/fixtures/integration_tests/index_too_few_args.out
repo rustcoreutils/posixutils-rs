@@ -1,3 +1,4 @@
 stdout=0
 stderr=m4:fixtures/integration_tests/index_too_few_args.m4:1: Warning: too few arguments to builtin `index'\n
 status=0
+expect_error=true

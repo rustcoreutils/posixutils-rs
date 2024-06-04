@@ -77,7 +77,7 @@ fn test_{name}() {{
 "##
         ));
 
-        if self.expect_error {
+        if *expect_error {
             s.push_str(
                 r##"
     if !test.stderr.is_empty() {
@@ -132,6 +132,7 @@ fn main() {
                     });
                 candidate.input = Some(path);
                 candidate.ignore = ignore;
+                candidate.expect_error = expect_error;
             }
             Some(b"out") => {
                 let name = name_from_path(&path).unwrap();

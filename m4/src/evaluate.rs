@@ -1096,7 +1096,7 @@ impl MacroImplementation for IndexMacro {
             Some(second_arg) => second_arg,
             None => {
                 stderror.write_all(b"Warning too few arguments for index macro")?;
-                stdout.write_all(b"-1")?;
+                stdout.write_all(b"0")?;
                 return Ok(state);
             }
         };

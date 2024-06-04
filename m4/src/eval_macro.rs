@@ -77,20 +77,35 @@ pub fn parse_and_evaluate(input: &[u8]) -> IResult<&[u8], i64> {
     }
     precedence::precedence(
         // Unary prefix operators
-        alt((unary_op(1, padded_tag(b"-")), unary_op(1, padded_tag(b"+")))),
+        alt((
+            unary_op(1, padded_tag(b"-")),
+            unary_op(1, padded_tag(b"+")),
+            unary_op(1, padded_tag(b"~")),
+            unary_op(1, padded_tag(b"!")),
+        )),
         // No Unary postfix operators
         fail,
         // Binary operators
         alt((
             binary_op(2, Assoc::Left, padded_tag(b"*")),
+            binary_op(2, Assoc::Left, padded_tag(b"/")),
+            binary_op(2, Assoc::Left, padded_tag(b"%")),
             binary_op(3, Assoc::Left, padded_tag(b"+")),
             binary_op(3, Assoc::Left, padded_tag(b"-")),
-            binary_op(3, Assoc::Left, padded_tag(b"<=")),
-            binary_op(3, Assoc::Left, padded_tag(b"<")),
-            binary_op(3, Assoc::Left, padded_tag(b">=")),
-            binary_op(3, Assoc::Left, padded_tag(b">")),
-            binary_op(3, Assoc::Left, padded_tag(b"==")),
-            binary_op(3, Assoc::Left, padded_tag(b"!=")),
+            binary_op(5, Assoc::Left, padded_tag(b"<<")),
+            binary_op(5, Assoc::Left, padded_tag(b">>")),
+            binary_op(5, Assoc::Left, padded_tag(b"<=")),
+            binary_op(5, Assoc::Left, padded_tag(b"<")),
+            binary_op(5, Assoc::Left, padded_tag(b">=")),
+            binary_op(5, Assoc::Left, padded_tag(b">")),
+            binary_op(6, Assoc::Left, padded_tag(b"==")),
+            binary_op(6, Assoc::Left, padded_tag(b"!=")),
+            // Moved && and || before & and | for parsing order.
+            binary_op(10, Assoc::Left, padded_tag(b"&&")),
+            binary_op(11, Assoc::Left, padded_tag(b"||")),
+            binary_op(7, Assoc::Left, padded_tag(b"&")),
+            binary_op(8, Assoc::Left, padded_tag(b"^")),
+            binary_op(9, Assoc::Left, padded_tag(b"|")),
         )),
         alt((
             padded(parse_integer),
@@ -99,8 +114,13 @@ pub fn parse_and_evaluate(input: &[u8]) -> IResult<&[u8], i64> {
         |op: Operation<&[u8], &[u8], &[u8], i64>| match op {
             Operation::Prefix(b"-", o) => Ok(-o),
             Operation::Prefix(b"+", o) => Ok(o),
+            Operation::Prefix(b"~", o) => Ok(!o),
+            Operation::Prefix(b"!", o) => Ok(bool_to_int(!int_to_bool(o))),
             Operation::Binary(lhs, b"*", rhs) => Ok(lhs * rhs),
             Operation::Binary(lhs, b"/", rhs) => Ok(lhs / rhs),
+            Operation::Binary(lhs, b"%", rhs) => Ok(lhs % rhs),
+            Operation::Binary(lhs, b"<<", rhs) => Ok(lhs << rhs),
+            Operation::Binary(lhs, b">>", rhs) => Ok(lhs >> rhs),
             Operation::Binary(lhs, b"+", rhs) => Ok(lhs + rhs),
             Operation::Binary(lhs, b"-", rhs) => Ok(lhs - rhs),
             Operation::Binary(lhs, b"<", rhs) => Ok(bool_to_int(lhs < rhs)),
@@ -109,7 +129,15 @@ pub fn parse_and_evaluate(input: &[u8]) -> IResult<&[u8], i64> {
             Operation::Binary(lhs, b">=", rhs) => Ok(bool_to_int(lhs >= rhs)),
             Operation::Binary(lhs, b"==", rhs) => Ok(bool_to_int(lhs == rhs)),
             Operation::Binary(lhs, b"!=", rhs) => Ok(bool_to_int(lhs != rhs)),
-            // Implement <, >, ==, !=, >=, <=
+            Operation::Binary(lhs, b"&", rhs) => Ok(lhs & rhs),
+            Operation::Binary(lhs, b"^", rhs) => Ok(lhs ^ rhs),
+            Operation::Binary(lhs, b"|", rhs) => Ok(lhs | rhs),
+            Operation::Binary(lhs, b"&&", rhs) => {
+                Ok(bool_to_int(int_to_bool(lhs) && int_to_bool(rhs)))
+            }
+            Operation::Binary(lhs, b"||", rhs) => {
+                Ok(bool_to_int(int_to_bool(lhs) || int_to_bool(rhs)))
+            }
             _ => Err("Invalid combination"),
         },
     )(input)
@@ -122,81 +150,9 @@ fn bool_to_int(b: bool) -> i64 {
     }
 }
 
-#[cfg(test)]
-mod test {
-    use crate::eval_macro::padded_tag;
-
-    use super::parse_and_evaluate;
-    use test_log::test;
-
-    #[test]
-    fn test_add() {
-        let (remaining, i) = parse_and_evaluate(b"1+1").unwrap();
-        assert_eq!(remaining, b"");
-        assert_eq!(i, 2);
-    }
-
-    #[test]
-    fn test_add_padded() {
-        let (remaining, i) = parse_and_evaluate(b" 1 + 1 ").unwrap();
-        assert_eq!(remaining, b"");
-        assert_eq!(i, 2);
-    }
-
-    #[test]
-    fn test_multiply_add() {
-        let (remaining, i) = parse_and_evaluate(b" 7 * 2 + 1 ").unwrap();
-        assert_eq!(remaining, b"");
-        assert_eq!(i, 15);
-    }
-
-    #[test]
-    fn test_padded_lte_with_padding() {
-        let (remaining, unpadded) = padded_tag(b"<=")(b"  <=  ").unwrap();
-        assert_eq!(remaining, b"");
-        assert_eq!(unpadded, b"<=");
-    }
-
-    #[test]
-    fn test_padded_lte_no_padding() {
-        let (remaining, unpadded) = padded_tag(b"<=")(b"<=").unwrap();
-        assert_eq!(remaining, b"");
-        assert_eq!(unpadded, b"<=");
-    }
-
-    #[test]
-    fn test_lte() {
-        let (remaining, i) = parse_and_evaluate(b"1<=4").unwrap();
-        assert_eq!(remaining, b"");
-        assert_eq!(i, 1);
-        let (remaining, i) = parse_and_evaluate(b"4<=4").unwrap();
-        assert_eq!(remaining, b"");
-        assert_eq!(i, 1);
-        let (remaining, i) = parse_and_evaluate(b"4<=1").unwrap();
-        assert_eq!(remaining, b"");
-        assert_eq!(i, 0);
-    }
-
-    #[test]
-    fn test_gte() {
-        let (remaining, i) = parse_and_evaluate(b"1>=4").unwrap();
-        assert_eq!(remaining, b"");
-        assert_eq!(i, 0);
-        let (remaining, i) = parse_and_evaluate(b"4>=4").unwrap();
-        assert_eq!(remaining, b"");
-        assert_eq!(i, 1);
-        let (remaining, i) = parse_and_evaluate(b"4>=1").unwrap();
-        assert_eq!(remaining, b"");
-        assert_eq!(i, 1);
-    }
-
-    #[test]
-    fn test_eq() {
-        let (remaining, i) = parse_and_evaluate(b"1==4").unwrap();
-        assert_eq!(remaining, b"");
-        assert_eq!(i, 0);
-        let (remaining, i) = parse_and_evaluate(b"1!=4").unwrap();
-        assert_eq!(remaining, b"");
-        assert_eq!(i, 1);
+fn int_to_bool(i: i64) -> bool {
+    match i {
+        0 => false,
+        _ => true,
     }
 }

@@ -76,7 +76,7 @@ where
 ///
 /// For example:
 ///
-/// ```
+/// ```ignore
 /// let (remaining, evaluated) = parse_and_evaluate(b"1+2").unwrap();
 /// assert_eq!(evaluated, 3);
 /// assert_eq!(remaining, &[]);

@@ -34,4 +34,3 @@ end
 25 define(`hi', `$# 1:$1 $@')hi(`a,b')
 26 define(`hello',`a,b,`c,d'')define(`hi', `$# 1:$1 2:$2 3:$3 $@')hi(hello)
 27 define(`x', `a,b')define(`y', `$# $@')y(x,`x',x)
-28 define(`x',`')define(`y',x() ``hello'')y

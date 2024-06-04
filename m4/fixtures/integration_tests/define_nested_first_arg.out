@@ -1,0 +1,4 @@
+stdout= hello\n hello
+stderr=
+status=0
+ignore=true

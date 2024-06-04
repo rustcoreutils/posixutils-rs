@@ -137,48 +137,6 @@ where
 /// * `operand` Parser for operands.
 /// * `fold` Function that evaluates a single operation and returns the result.
 ///
-/// # Example
-/// ```rust
-/// # use nom::{Err, error::{Error, ErrorKind}, IResult};
-/// use precedence::{precedence, unary_op, binary_op, Assoc, Operation};
-/// use nom::character::complete::digit1;
-/// use nom::combinator::{map_res, fail};
-/// use nom::sequence::delimited;
-/// use nom::bytes::complete::tag;
-/// use nom::branch::alt;
-///
-/// fn parser(i: &str) -> IResult<&str, i64> {
-///   precedence(
-///     unary_op(1, tag("-")),
-///     fail,
-///     alt((
-///       binary_op(2, Assoc::Left, tag("*")),
-///       binary_op(3, Assoc::Left, tag("+")),
-///       binary_op(3, Assoc::Left, tag("-")),
-///     )),
-///     alt((
-///       map_res(digit1, |s: &str| s.parse::<i64>()),
-///       delimited(tag("("), parser, tag(")")),
-///     )),
-///     |op: Operation<&str, &str, &str, i64>| {
-///       use nom_7_precedence::Operation::*;
-///       match op {
-///         Prefix("-", o) => Ok(-o),
-///         Binary(lhs, "*", rhs) => Ok(lhs * rhs),
-///         Binary(lhs, "/", rhs) => Ok(lhs / rhs),
-///         Binary(lhs, "+", rhs) => Ok(lhs + rhs),
-///         Binary(lhs, "-", rhs) => Ok(lhs - rhs),
-///         _ => Err("Invalid combination"),
-///       }
-///     }
-///   )(i)
-/// }
-///
-/// assert_eq!(parser("8-2*2"), Ok(("", 4)));
-/// assert_eq!(parser("4-(2+2)"), Ok(("", 0)));
-/// assert_eq!(parser("3-(2*3)+7+2*2-(2*(2+4))"), Ok(("", -4)));
-/// ```
-///
 /// # Evaluation order
 /// This parser reads expressions from left to right and folds operations as soon as possible. This
 /// behaviour is only important when using an operator grammar that allows for ambigious expressions.

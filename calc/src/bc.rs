@@ -10,8 +10,8 @@
 use std::ffi::OsString;
 
 use bc_util::{
-    interpreter::Interpreter,
-    parser::{is_incomplete, parse_program},
+    interpreter::{ExecutionResult, Interpreter},
+    parser::parse_program,
 };
 use clap::Parser;
 
@@ -31,18 +31,13 @@ struct Args {
     files: Vec<OsString>,
 }
 
-fn exec_str(s: &str, file_path: Option<&str>, interpreter: &mut Interpreter) {
-    match parse_program(s, file_path) {
-        Ok(program) => match interpreter.exec(program) {
-            Ok(output) => {
-                print!("{}", output);
-            }
-            Err(e) => {
-                println!("runtime error: {}", e);
-            }
-        },
+fn print_output_or_error(result: ExecutionResult<String>) {
+    match result {
+        Ok(output) => {
+            print!("{}", output);
+        }
         Err(e) => {
-            println!("{}", e);
+            println!("runtime error: {}", e);
         }
     }
 }
@@ -64,7 +59,10 @@ fn main() -> Result<()> {
 
     for file in args.files {
         match std::fs::read_to_string(&file) {
-            Ok(s) => exec_str(&s, file.to_str(), &mut interpreter),
+            Ok(s) => match parse_program(&s, file.to_str()) {
+                Ok(program) => print_output_or_error(interpreter.exec(program)),
+                Err(e) => println!("{}", e),
+            },
             Err(_) => {
                 eprintln!("Could not read file: {}", file.to_string_lossy());
                 return Ok(());
@@ -87,9 +85,16 @@ fn main() -> Result<()> {
             Ok(line) => {
                 line_buffer.push_str(&line);
                 line_buffer.push('\n');
-                if !is_incomplete(&line_buffer) {
-                    exec_str(&line_buffer, None, &mut interpreter);
-                    line_buffer.clear();
+                match parse_program(&line_buffer, None) {
+                    Ok(program) => {
+                        print_output_or_error(interpreter.exec(program));
+                        line_buffer.clear();
+                    }
+                    Err(e) if !e.is_incomplete => {
+                        println!("{}", e);
+                        line_buffer.clear();
+                    }
+                    _ => {}
                 }
                 repl.add_history_entry(line)?;
             }

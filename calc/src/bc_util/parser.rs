@@ -387,6 +387,24 @@ pub type Program = Vec<StmtInstruction>;
 
 pub type PestError = pest::error::Error<Rule>;
 
+fn location_end(loc: &InputLocation) -> usize {
+    match loc {
+        InputLocation::Pos(p) => *p,
+        InputLocation::Span((_, end)) => *end,
+    }
+}
+
+fn is_incomplete(text: &str, error: &PestError) -> bool {
+    let pos = location_end(&error.location);
+    // The program is incomplete if either:
+    // - we expect something after the end of the input
+    // - the error occurs at the start of and incomplete comment
+    // - the error occurs at the start of an incomplete string
+    pos == text.len()
+        || text.as_bytes()[pos..text.len().min(pos + 2)] == [b'/', b'*']
+        || text.as_bytes()[pos] == b'"'
+}
+
 fn improve_pest_error(err: PestError, file_path: Option<&str>) -> PestError {
     let err = if let Some(path) = file_path {
         err.with_path(path)
@@ -422,9 +440,47 @@ fn improve_pest_error(err: PestError, file_path: Option<&str>) -> PestError {
     })
 }
 
-pub fn parse_program(text: &str, file_path: Option<&str>) -> Result<Program, PestError> {
+#[derive(Debug)]
+pub struct ParseError {
+    err: PestError,
+    /// is `true` if the parsed program contains an incomplete expression,
+    /// statement, comment or string.
+    /// # Examples
+    /// ```
+    /// assert!(parse_program("1 + 2 *\\\n").unwrap_err().is_incomplete)
+    /// assert!(parse_program("define f() {\n").unwrap_err().is_incomplete)
+    /// assert!(parse_program("if (c) {\n").unwrap_err().is_incomplete)
+    /// assert!(parse_program("while (c) {\n").unwrap_err().is_incomplete)
+    /// ```
+    pub is_incomplete: bool,
+}
+
+impl From<PestError> for ParseError {
+    fn from(err: PestError) -> Self {
+        ParseError {
+            err,
+            is_incomplete: false,
+        }
+    }
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.err)
+    }
+}
+
+impl ParseError {
+    fn new(text: &str, file_path: Option<&str>, err: PestError) -> Self {
+        let is_incomplete = is_incomplete(text, &err);
+        let err = improve_pest_error(err, file_path);
+        ParseError { err, is_incomplete }
+    }
+}
+
+pub fn parse_program(text: &str, file_path: Option<&str>) -> Result<Program, ParseError> {
     let program = BcParser::parse(Rule::program, text)
-        .map_err(|e| improve_pest_error(e, file_path))?
+        .map_err(|e| ParseError::new(text, file_path, e))?
         .next()
         .unwrap();
     let mut result = Vec::new();
@@ -448,37 +504,6 @@ pub fn parse_program(text: &str, file_path: Option<&str>) -> Result<Program, Pes
         }
     }
     Ok(result)
-}
-
-fn location_end(loc: InputLocation) -> usize {
-    match loc {
-        InputLocation::Pos(p) => p,
-        InputLocation::Span((_, end)) => end,
-    }
-}
-
-/// Returns `true` if `text` contains an incomplete expression or statement.
-/// # Examples
-/// ```
-/// assert!(is_incomplete("1 + 2 *\\\n"))
-/// assert!(is_incomplete("define f() {\n"))
-/// assert!(is_incomplete("if (c) {\n"))
-/// assert!(is_incomplete("while (c) {\n"))
-/// ```
-pub fn is_incomplete(text: &str) -> bool {
-    match parse_program(text, None) {
-        Ok(_) => false,
-        Err(e) => {
-            let pos = location_end(e.location);
-            // The program is incomplete if either:
-            // - we expect something after the end of the input
-            // - the error occurs at the start of and incomplete comment
-            // - the error occurs at the start of an incomplete string
-            pos == text.len()
-                || text.as_bytes()[pos..text.len().min(pos + 2)] == [b'/', b'*']
-                || text.as_bytes()[pos] == b'"'
-        }
-    }
 }
 
 #[cfg(test)]
@@ -511,6 +536,10 @@ mod test {
         } else {
             panic!("expected function")
         }
+    }
+
+    fn program_err(input: &str) -> ParseError {
+        parse_program(input, None).unwrap_err()
     }
 
     #[test]
@@ -1239,35 +1268,35 @@ mod test {
 
     #[test]
     fn test_partial_comment_is_incomplete() {
-        assert!(is_incomplete("/* this is the start of a comment\n"));
-        assert!(is_incomplete("a + /* this is the start of a comment\n"));
-        assert!(is_incomplete("1 + 2;/* this is the start of a comment\n"));
+        assert!(program_err("/* this is the start of a comment\n").is_incomplete);
+        assert!(program_err("a + /* this is the start of a comment\n").is_incomplete);
+        assert!(program_err("1 + 2;/* this is the start of a comment\n").is_incomplete);
     }
 
     #[test]
     fn test_partial_string_is_incomplete() {
-        assert!(is_incomplete("\"this is the start of a string\n"));
-        assert!(is_incomplete("1 + 2;\"this is the start of a string\n"));
+        assert!(program_err("\"this is the start of a string\n").is_incomplete);
+        assert!(program_err("1 + 2;\"this is the start of a string\n").is_incomplete);
     }
 
     #[test]
     fn test_partial_function_requires_is_incomplete() {
-        assert!(is_incomplete("define f() {\n"));
-        assert!(is_incomplete("define f() {\n auto a[], b, c, d[]\n"));
-        assert!(is_incomplete("define f() {\n 1 + 2\n"));
-        assert!(is_incomplete("define f() {\n auto a, b, c[];\n1 + 2;\n"));
+        assert!(program_err("define f() {\n").is_incomplete);
+        assert!(program_err("define f() {\n auto a[], b, c, d[]\n").is_incomplete);
+        assert!(program_err("define f() {\n 1 + 2\n").is_incomplete);
+        assert!(program_err("define f() {\n auto a, b, c[];\n1 + 2;\n").is_incomplete);
     }
 
     #[test]
     fn test_unclosed_braced_statement_list_is_incomplete() {
-        assert!(is_incomplete("{\n"));
-        assert!(is_incomplete("{ 1 + 2; 3 + 4; \"string\"\n"));
+        assert!(program_err("{\n").is_incomplete);
+        assert!(program_err("{ 1 + 2; 3 + 4; \"string\"\n").is_incomplete);
     }
 
     #[test]
     fn test_statements_ending_with_a_backslash_newline_are_incomplete() {
-        assert!(is_incomplete("1 + 2 + \\\n"));
-        assert!(is_incomplete("1 + 2\\\n\\\n"));
+        assert!(program_err("1 + 2 + \\\n").is_incomplete);
+        assert!(program_err("1 + 2\\\n\\\n").is_incomplete);
     }
 
     #[test]

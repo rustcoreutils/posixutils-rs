@@ -1152,6 +1152,34 @@ mod test {
     }
 
     #[test]
+    fn test_parse_semicolon_list() {
+        let instructions = parse_program(";; ; 1 + 3 ; ;; \"string\"\n", None)
+            .expect("error parsing semicolon list");
+        assert_eq!(instructions.len(), 2);
+        assert_eq!(
+            instructions[0],
+            StmtInstruction::Expr(ExprInstruction::Add(
+                Box::new(ExprInstruction::Number("1".to_string())),
+                Box::new(ExprInstruction::Number("3".to_string()))
+            ))
+        );
+        assert_eq!(
+            instructions[1],
+            StmtInstruction::String("string".to_string())
+        );
+        let instructions =
+            parse_program("a + 2;;;;;;\n", None).expect("error parsing semicolon list");
+        assert_eq!(instructions.len(), 1);
+        assert_eq!(
+            instructions[0],
+            StmtInstruction::Expr(ExprInstruction::Add(
+                Box::new(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
+                Box::new(ExprInstruction::Number("2".to_string()))
+            ))
+        );
+    }
+
+    #[test]
     fn test_parse_function_empty_no_parameters() {
         let func = parse_function("define f() {\n }\n");
         assert_eq!(

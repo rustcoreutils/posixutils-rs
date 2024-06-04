@@ -59,7 +59,7 @@ builtin_fn = { "length" | "sqrt" | "scale" }
 
 program = { SOI ~ input_item* ~ EOI }
 input_item = _{ (semicolon_list ~ "\n") | function }
-semicolon_list = { (statement ~ (";" ~ statement)*)? ~ ";"? }
+semicolon_list = { ";"* ~ (statement ~ (";"+ ~ statement)*)? ~ ";"* }
 statement_list = { (";" | "\n")* ~ (statement ~ (";" | "\n")*)* }
 
 statement = {

@@ -101,6 +101,7 @@ define_enum_with_enumerate!(
         Shift,
         Eval,
         Decr,
+        Len,
     }
 );
 // TODO: implement these macros:
@@ -141,6 +142,7 @@ impl AsRef<[u8]> for BuiltinMacro {
             BuiltinMacro::Shift => b"shift",
             BuiltinMacro::Eval => b"eval",
             BuiltinMacro::Decr => b"decr",
+            BuiltinMacro::Len => b"len",
         }
     }
 }
@@ -169,6 +171,7 @@ impl BuiltinMacro {
             BuiltinMacro::Ifelse => 1,
             BuiltinMacro::Shift => 1,
             BuiltinMacro::Eval => 1,
+            BuiltinMacro::Len => 1,
         }
     }
 
@@ -198,6 +201,7 @@ fn inbuilt_macro_implementation(builtin: &BuiltinMacro) -> Box<dyn MacroImplemen
         BuiltinMacro::Ifelse => Box::new(IfelseMacro),
         BuiltinMacro::Shift => Box::new(ShiftMacro),
         BuiltinMacro::Eval => Box::new(EvalMacro),
+        BuiltinMacro::Len => Box::new(LenMacro),
     }
 }
 
@@ -980,17 +984,42 @@ struct EvalMacro;
 impl MacroImplementation for EvalMacro {
     fn evaluate(
         &self,
-        state: State,
+        mut state: State,
         stdout: &mut dyn Write,
-        _stderror: &mut dyn Write,
+        stderror: &mut dyn Write,
         m: Macro,
     ) -> Result<State> {
         let first_arg = m
             .args
-            .first()
+            .into_iter()
+            .next()
             .ok_or_else(|| crate::Error::NotEnoughArguments)?;
-        let (_remaining, output) = eval_macro::parse_and_evaluate(first_arg.input)?;
+        let buffer;
+        (buffer, state) = evaluate_to_text(state, first_arg.symbols, stderror, true)?;
+        let (_remaining, output) = eval_macro::parse_and_evaluate(&buffer)?;
         stdout.write_all(output.to_string().as_bytes())?;
+        Ok(state)
+    }
+}
+
+struct LenMacro;
+
+impl MacroImplementation for LenMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stdout: &mut dyn Write,
+        stderror: &mut dyn Write,
+        m: Macro,
+    ) -> Result<State> {
+        let first_arg = m
+            .args
+            .into_iter()
+            .next()
+            .ok_or_else(|| crate::Error::NotEnoughArguments)?;
+        let buffer;
+        (buffer, state) = evaluate_to_text(state, first_arg.symbols, stderror, true)?;
+        stdout.write_all(buffer.len().to_string().as_bytes())?;
         Ok(state)
     }
 }

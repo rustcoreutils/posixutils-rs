@@ -1,6 +1,7 @@
 # substitution from macro
 define(`x', 42)
 eval(x * x)
+define(`6' * 7)
 # +
 eval(1+2)
 # - prefix

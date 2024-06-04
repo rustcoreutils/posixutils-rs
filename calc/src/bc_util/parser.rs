@@ -239,13 +239,13 @@ fn parse_condition(expr: Pair<Rule>) -> ConditionInstruction {
             let left = parse_expr(inner.next().unwrap());
             let op = inner.next().unwrap();
             let right = parse_expr(inner.next().unwrap());
-            match op.as_str() {
-                "==" => ConditionInstruction::Eq(left, right),
-                "!=" => ConditionInstruction::Ne(left, right),
-                "<" => ConditionInstruction::Lt(left, right),
-                "<=" => ConditionInstruction::Leq(left, right),
-                ">" => ConditionInstruction::Gt(left, right),
-                ">=" => ConditionInstruction::Geq(left, right),
+            match op.as_rule() {
+                Rule::same => ConditionInstruction::Eq(left, right),
+                Rule::neq => ConditionInstruction::Ne(left, right),
+                Rule::lt => ConditionInstruction::Lt(left, right),
+                Rule::leq => ConditionInstruction::Leq(left, right),
+                Rule::gt => ConditionInstruction::Gt(left, right),
+                Rule::geq => ConditionInstruction::Geq(left, right),
                 _ => unreachable!(),
             }
         }
@@ -385,18 +385,50 @@ pub struct BcParser;
 
 pub type Program = Vec<StmtInstruction>;
 
+fn improve_pest_error(
+    err: pest::error::Error<Rule>,
+    file_path: Option<&str>,
+) -> pest::error::Error<Rule> {
+    let err = if let Some(path) = file_path {
+        err.with_path(path)
+    } else {
+        err
+    };
+    err.renamed_rules(|rule| {
+        match *rule {
+            Rule::add => "'+'",
+            Rule::sub => "'-'",
+            Rule::mul => "'*'",
+            Rule::div => "'/'",
+            Rule::modulus => "'%'",
+            Rule::pow => "'^'",
+            Rule::neg => "'-'",
+            Rule::assign => "'='",
+            Rule::add_assign => "'+='",
+            Rule::sub_assign => "'-='",
+            Rule::mul_assign => "'*='",
+            Rule::div_assign => "'/='",
+            Rule::mod_assign => "'%='",
+            Rule::pow_assign => "'^='",
+            Rule::same => "'=='",
+            Rule::neq => "'!='",
+            Rule::lt => "'<'",
+            Rule::leq => "'<='",
+            Rule::gt => "'>'",
+            Rule::geq => "'>='",
+            Rule::primary => "expression",
+            _ => return format!("{:?}", rule),
+        }
+        .to_string()
+    })
+}
+
 pub fn parse_program(
     text: &str,
     file_path: Option<&str>,
 ) -> Result<Program, pest::error::Error<Rule>> {
     let program = BcParser::parse(Rule::program, text)
-        .map_err(|e| {
-            if let Some(path) = file_path {
-                e.with_path(path)
-            } else {
-                e
-            }
-        })?
+        .map_err(|e| improve_pest_error(e, file_path))?
         .next()
         .unwrap();
     let mut result = Vec::new();

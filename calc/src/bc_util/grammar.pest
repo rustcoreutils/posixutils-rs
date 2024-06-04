@@ -20,7 +20,14 @@ number = @{
     | (integer ~ ".")
 	| integer
 }
-rel_op = { "==" | "<=" | ">=" | "!=" | "<" | ">" }
+rel_op = _{ same | leq | geq | neq | lt | gt }
+same = { "==" }
+leq = { "<=" }
+geq = { ">=" }
+neq = { "!=" }
+lt = { "<" }
+gt = { ">" }
+
 assign_op = _{ assign | add_assign | sub_assign | mul_assign | div_assign | mod_assign | pow_assign }
 assign = { "=" }
 add_assign = { "+=" }

@@ -258,7 +258,7 @@ fn parse_stmt(
     in_function: bool,
     in_loop: bool,
     statements: &mut Vec<StmtInstruction>,
-) -> Result<(), pest::error::Error<Rule>> {
+) -> Result<(), PestError> {
     let stmt = first_child(stmt);
     match stmt.as_rule() {
         Rule::break_stmt => {
@@ -340,7 +340,7 @@ fn parse_stmt(
     Ok(())
 }
 
-fn parse_function(func: Pair<Rule>) -> Result<Function, pest::error::Error<Rule>> {
+fn parse_function(func: Pair<Rule>) -> Result<Function, PestError> {
     let mut function = func.into_inner();
 
     // define letter ( parameter_list ) auto_define_list statement_list end
@@ -385,10 +385,9 @@ pub struct BcParser;
 
 pub type Program = Vec<StmtInstruction>;
 
-fn improve_pest_error(
-    err: pest::error::Error<Rule>,
-    file_path: Option<&str>,
-) -> pest::error::Error<Rule> {
+pub type PestError = pest::error::Error<Rule>;
+
+fn improve_pest_error(err: PestError, file_path: Option<&str>) -> PestError {
     let err = if let Some(path) = file_path {
         err.with_path(path)
     } else {
@@ -423,10 +422,7 @@ fn improve_pest_error(
     })
 }
 
-pub fn parse_program(
-    text: &str,
-    file_path: Option<&str>,
-) -> Result<Program, pest::error::Error<Rule>> {
+pub fn parse_program(text: &str, file_path: Option<&str>) -> Result<Program, PestError> {
     let program = BcParser::parse(Rule::program, text)
         .map_err(|e| improve_pest_error(e, file_path))?
         .next()

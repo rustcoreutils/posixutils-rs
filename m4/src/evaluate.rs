@@ -7,7 +7,7 @@ use nom::error::{ContextError, FromExternalError};
 use nom::IResult;
 
 use crate::error::Result;
-use crate::eval_macro;
+use crate::eval_macro::{self, parse_positive_integer};
 use crate::lexer::{
     self, Macro, MacroName, MacroParseConfig, ParseConfig, Symbol, DEFAULT_QUOTE_CLOSE_TAG,
     DEFAULT_QUOTE_OPEN_TAG,
@@ -63,23 +63,65 @@ impl Default for State {
     }
 }
 
-#[derive(Clone, Copy)]
-pub enum BuiltinMacro {
-    Dnl,
-    Define,
-    Undefine,
-    Errprint,
-    Include,
-    Sinclude,
-    Changecom,
-    Changequote,
-    Pushdef,
-    Popdef,
-    Incr,
-    Ifelse,
-    Shift,
-    Eval,
+macro_rules! define_enum_with_enumerate {
+    (
+        $(#[$meta:meta])*
+        $enum_name:ident {
+            $($variant_name:ident),* $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        pub enum $enum_name {
+            $($variant_name),*
+        }
+
+        impl $enum_name {
+            pub fn enumerate() -> &'static [$enum_name] {
+                &[$($enum_name::$variant_name),*]
+            }
+        }
+    };
 }
+
+define_enum_with_enumerate!(
+    #[derive(Clone, Copy)]
+    BuiltinMacro {
+        Dnl,
+        Define,
+        Undefine,
+        Errprint,
+        Include,
+        Sinclude,
+        Changecom,
+        Changequote,
+        Pushdef,
+        Popdef,
+        Incr,
+        Ifelse,
+        Shift,
+        Eval,
+        Decr,
+    }
+);
+// TODO: implement these macros:
+// Undivert,
+// Translit,
+// Traceoff,
+// Traceon,
+// Sysval,
+// Syscmd,
+// Substr,
+// Mkstemp,
+// Maketemp,
+// M4wrap,
+// M4exit,
+// Len,
+// Index,
+// Ifdef,
+// Divnum,
+// Defn,
+// Divert,
+// Dumpdef,
 
 impl AsRef<[u8]> for BuiltinMacro {
     fn as_ref(&self) -> &'static [u8] {
@@ -98,29 +140,12 @@ impl AsRef<[u8]> for BuiltinMacro {
             BuiltinMacro::Ifelse => b"ifelse",
             BuiltinMacro::Shift => b"shift",
             BuiltinMacro::Eval => b"eval",
+            BuiltinMacro::Decr => b"decr",
         }
     }
 }
 
 impl BuiltinMacro {
-    pub fn enumerate() -> &'static [Self] {
-        &[
-            Self::Dnl,
-            Self::Define,
-            Self::Undefine,
-            Self::Errprint,
-            Self::Include,
-            Self::Sinclude,
-            Self::Changecom,
-            Self::Changequote,
-            Self::Pushdef,
-            Self::Popdef,
-            Self::Incr,
-            Self::Ifelse,
-            Self::Shift,
-            Self::Eval,
-        ]
-    }
     pub fn name(&self) -> MacroName {
         MacroName::try_from_slice(self.as_ref()).expect("Expected valid builtin macro name")
     }
@@ -140,6 +165,7 @@ impl BuiltinMacro {
             BuiltinMacro::Pushdef => 1,
             BuiltinMacro::Popdef => 1,
             BuiltinMacro::Incr => 1,
+            BuiltinMacro::Decr => 1,
             BuiltinMacro::Ifelse => 1,
             BuiltinMacro::Shift => 1,
             BuiltinMacro::Eval => 1,
@@ -168,6 +194,7 @@ fn inbuilt_macro_implementation(builtin: &BuiltinMacro) -> Box<dyn MacroImplemen
         BuiltinMacro::Pushdef => Box::new(PushdefMacro),
         BuiltinMacro::Popdef => Box::new(PopdefMacro),
         BuiltinMacro::Incr => Box::new(IncrMacro),
+        BuiltinMacro::Decr => Box::new(DecrMacro),
         BuiltinMacro::Ifelse => Box::new(IfelseMacro),
         BuiltinMacro::Shift => Box::new(ShiftMacro),
         BuiltinMacro::Eval => Box::new(EvalMacro),
@@ -176,13 +203,6 @@ fn inbuilt_macro_implementation(builtin: &BuiltinMacro) -> Box<dyn MacroImplemen
 
 impl State {
     fn current_macro_parse_configs(&self) -> HashMap<MacroName, MacroParseConfig> {
-        // log::debug!(
-        //     "State::current_macro_parse_configs() definitions: {:?}",
-        //     self.macro_definitions
-        //         .iter()
-        //         .map(|(name, e)| (name.to_string(), e.len()))
-        //         .collect::<Vec<_>>()
-        // );
         self.macro_definitions
             .iter()
             .map(|(name, definitions)| {
@@ -803,15 +823,45 @@ impl MacroImplementation for IncrMacro {
         if let Some(first) = m.args.into_iter().next() {
             let number_bytes;
             (number_bytes, state) = evaluate_to_text(state, first.symbols, stderror, true)?;
-            let number_string = std::str::from_utf8(&number_bytes).map_err(|e| {
-                crate::Error::Parsing(format!(
-                    "Error parsing number as valid utf8 from {number_bytes:?}: {e}"
-                ))
-            })?;
-            let mut number: i64 = number_string.parse().map_err(|e| {
-                crate::Error::Parsing(format!("Error parsing number from {number_string:?}: {e}"))
-            })?;
+            let (remaining, mut number) =
+                eval_macro::padded(eval_macro::parse_integer)(&number_bytes)?;
+            if !remaining.is_empty() {
+                return Err(crate::Error::Parsing(format!(
+                    "Error parsing number from {number_bytes:?}, remaining input: {remaining:?}"
+                )));
+            }
             number += 1;
+            stdout.write_all(number.to_string().as_bytes())?;
+        }
+        Ok(state)
+    }
+}
+
+/// The defining text of the decr macro shall be its first argument decremented by 1. It shall be
+/// an error to specify an argument containing any non-numeric characters. The behavior is
+/// unspecified if decr is not immediately followed by a <left-parenthesis>.
+struct DecrMacro;
+
+impl MacroImplementation for DecrMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stdout: &mut dyn Write,
+        stderror: &mut dyn Write,
+        m: Macro,
+    ) -> Result<State> {
+        log::debug!("DecrMacro::evaluate() {}", state.debug_macro_definitions());
+        if let Some(first) = m.args.into_iter().next() {
+            let number_bytes;
+            (number_bytes, state) = evaluate_to_text(state, first.symbols, stderror, true)?;
+            let (remaining, mut number) =
+                eval_macro::padded(eval_macro::parse_integer)(&number_bytes)?;
+            if !remaining.is_empty() {
+                return Err(crate::Error::Parsing(format!(
+                    "Error parsing number from {number_bytes:?}, remaining input: {remaining:?}"
+                )));
+            }
+            number -= 1;
             stdout.write_all(number.to_string().as_bytes())?;
         }
         Ok(state)

@@ -1,21 +1,29 @@
-use std::borrow::Cow;
-
 use nom::{
     branch::alt,
     bytes::complete::{tag, take_while},
-    combinator::{fail, map_res},
+    combinator::fail,
     error::FromExternalError,
-    multi::many0,
     sequence::{delimited, tuple},
     IResult,
 };
 
 use crate::{
-    lexer::{self, is_whitespace},
+    lexer::is_whitespace,
     precedence::{self, binary_op, unary_op, Assoc, Operation},
 };
 
-fn parse_integer(input: &[u8]) -> IResult<&[u8], i64> {
+/// A complete parser for a negative integer `[`[i64::MIN],[i64::MIN]`]`
+pub(crate) fn parse_integer(input: &[u8]) -> IResult<&[u8], i64> {
+    let (remaining, negative) = nom::combinator::opt(nom::bytes::complete::tag(b"-"))(input)?;
+    let (remaining, mut i) = parse_positive_integer(remaining)?;
+    if negative.is_some() {
+        i = -i;
+    }
+    Ok((remaining, i))
+}
+
+/// A complete parser for a negative integer `[`0,[i64::MIN]`]`
+pub(crate) fn parse_positive_integer(input: &[u8]) -> IResult<&[u8], i64> {
     let (remaining, number_input) =
         nom::bytes::complete::take_while(|c| c >= b'0' && c <= b'9')(input)?;
 
@@ -37,7 +45,9 @@ fn parse_integer(input: &[u8]) -> IResult<&[u8], i64> {
     Ok((remaining, number))
 }
 
-fn padded_tag(t: &[u8]) -> impl for<'i> Fn(&'i [u8]) -> IResult<&'i [u8], &'i [u8]> + '_ {
+pub(crate) fn padded_tag(
+    t: &[u8],
+) -> impl for<'i> Fn(&'i [u8]) -> IResult<&'i [u8], &'i [u8]> + '_ {
     move |input: &[u8]| {
         let (remaining, (_, p, _)) =
             tuple((take_while(is_whitespace), tag(t), take_while(is_whitespace)))(input)?;
@@ -45,7 +55,7 @@ fn padded_tag(t: &[u8]) -> impl for<'i> Fn(&'i [u8]) -> IResult<&'i [u8], &'i [u
     }
 }
 
-fn padded<'f, F, O>(f: F) -> impl for<'i> Fn(&'i [u8]) -> IResult<&'i [u8], O> + 'f
+pub(crate) fn padded<'f, F, O>(f: F) -> impl for<'i> Fn(&'i [u8]) -> IResult<&'i [u8], O> + 'f
 where
     F: for<'i> Fn(&'i [u8]) -> IResult<&'i [u8], O> + 'f,
 {
@@ -108,7 +118,7 @@ pub fn parse_and_evaluate(input: &[u8]) -> IResult<&[u8], i64> {
             binary_op(9, Assoc::Left, padded_tag(b"|")),
         )),
         alt((
-            padded(parse_integer),
+            padded(parse_positive_integer),
             delimited(padded_tag(b"("), parse_and_evaluate, padded_tag(b")")),
         )),
         |op: Operation<&[u8], &[u8], &[u8], i64>| match op {

@@ -111,6 +111,29 @@ fn test_changequote() {
 }
 
 #[test]
+fn test_decr() {
+    init();
+    let output = run_command("fixtures/integration_tests/decr.m4");
+
+    let test: TestSnapshot = read_test("fixtures/integration_tests/decr.out");
+    assert_eq!(
+        output.status,
+        std::process::ExitStatus::from_raw(test.status),
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        test.stdout,
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        test.stderr,
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+}
+
+#[test]
 fn test_define() {
     init();
     let output = run_command("fixtures/integration_tests/define.m4");

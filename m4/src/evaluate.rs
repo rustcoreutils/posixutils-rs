@@ -7,7 +7,7 @@ use nom::error::{ContextError, FromExternalError};
 use nom::IResult;
 
 use crate::error::Result;
-use crate::eval_macro::{self, parse_positive_integer};
+use crate::eval_macro;
 use crate::lexer::{
     self, Macro, MacroName, MacroParseConfig, ParseConfig, Symbol, DEFAULT_QUOTE_CLOSE_TAG,
     DEFAULT_QUOTE_OPEN_TAG,

@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use pest::{error::InputLocation, iterators::Pair, pratt_parser::PrattParser, Parser};
+use pest::{error::InputLocation, iterators::Pair, pratt_parser::PrattParser, Parser, Position};
 
 use super::instructions::*;
 
@@ -398,19 +398,30 @@ fn is_incomplete(text: &str, error: &PestError) -> bool {
     let pos = location_end(&error.location);
     // The program is incomplete if either:
     // - we expect something after the end of the input
-    // - the error occurs at the start of and incomplete comment
+    // - the error occurs at the start of an incomplete comment
     // - the error occurs at the start of an incomplete string
     pos == text.len()
         || text.as_bytes()[pos..text.len().min(pos + 2)] == [b'/', b'*']
         || text.as_bytes()[pos] == b'"'
 }
 
-fn improve_pest_error(err: PestError, file_path: Option<&str>) -> PestError {
+fn improve_pest_error(err: PestError, text: &str, file_path: Option<&str>) -> PestError {
     let err = if let Some(path) = file_path {
         err.with_path(path)
     } else {
         err
     };
+
+    let err_loc = location_end(&err.location);
+    if err_loc == text.len() && text.as_bytes()[err_loc - 1] != b'\n' {
+        return PestError::new_from_pos(
+            pest::error::ErrorVariant::CustomError {
+                message: "missing newline".to_string(),
+            },
+            Position::new(text, err_loc).unwrap(),
+        );
+    }
+
     err.renamed_rules(|rule| {
         match *rule {
             Rule::add => "'+'",
@@ -434,6 +445,7 @@ fn improve_pest_error(err: PestError, file_path: Option<&str>) -> PestError {
             Rule::gt => "'>'",
             Rule::geq => "'>='",
             Rule::primary => "expression",
+            Rule::auto_define_list => "auto definitions",
             _ => return format!("{:?}", rule),
         }
         .to_string()
@@ -442,68 +454,113 @@ fn improve_pest_error(err: PestError, file_path: Option<&str>) -> PestError {
 
 #[derive(Debug)]
 pub struct ParseError {
-    err: PestError,
+    errors: Vec<PestError>,
     /// is `true` if the parsed program contains an incomplete expression,
     /// statement, comment or string.
     /// # Examples
     /// ```
-    /// assert!(parse_program("1 + 2 *\\\n").unwrap_err().is_incomplete)
-    /// assert!(parse_program("define f() {\n").unwrap_err().is_incomplete)
-    /// assert!(parse_program("if (c) {\n").unwrap_err().is_incomplete)
-    /// assert!(parse_program("while (c) {\n").unwrap_err().is_incomplete)
+    /// assert!(parse_program("1 + 2 *\\\n", None).unwrap_err().is_incomplete)
+    /// assert!(parse_program("define f() {\n", None).unwrap_err().is_incomplete)
+    /// assert!(parse_program("if (c) {\n", None).unwrap_err().is_incomplete)
+    /// assert!(parse_program("while (c) {\n", None).unwrap_err().is_incomplete)
     /// ```
     pub is_incomplete: bool,
 }
 
-impl From<PestError> for ParseError {
-    fn from(err: PestError) -> Self {
-        ParseError {
-            err,
-            is_incomplete: false,
-        }
-    }
-}
-
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}", self.err)
+        for err in &self.errors {
+            writeln!(f, "{}\n", err)?;
+        }
+        Ok(())
     }
 }
 
-impl ParseError {
-    fn new(text: &str, file_path: Option<&str>, err: PestError) -> Self {
-        let is_incomplete = is_incomplete(text, &err);
-        let err = improve_pest_error(err, file_path);
-        ParseError { err, is_incomplete }
+fn next_checkpoint(text: &str) -> usize {
+    let mut index = 0;
+    while index < text.len() {
+        match text.as_bytes()[index] {
+            b'\n' | b';' | b'}' | b')' => return index + 1,
+            _ => index += 1,
+        }
+    }
+    index
+}
+
+fn gather_errors(text: &str, file_path: Option<&str>, first_error: PestError) -> ParseError {
+    let last_location_end = location_end(&first_error.location);
+
+    // if the text is not from a file and the error is consistent
+    // with an incomplete program we can return early
+    if file_path.is_none() && is_incomplete(text, &first_error) {
+        return ParseError {
+            errors: vec![first_error],
+            is_incomplete: true,
+        };
+    }
+
+    let mut errors = vec![improve_pest_error(first_error, text, file_path)];
+    let mut byte_index = last_location_end + next_checkpoint(&text[last_location_end..]);
+
+    while byte_index < text.len() {
+        match BcParser::parse(Rule::program, &text[byte_index..]) {
+            Ok(_) => {
+                return ParseError {
+                    errors,
+                    is_incomplete: false,
+                }
+            }
+            Err(err) => {
+                byte_index += location_end(&err.location);
+                let err_correct_position =
+                    PestError::new_from_pos(err.variant, Position::new(text, byte_index).unwrap());
+                errors.push(improve_pest_error(err_correct_position, text, file_path));
+            }
+        }
+        byte_index += next_checkpoint(&text[byte_index..]);
+    }
+    ParseError {
+        errors,
+        is_incomplete: false,
     }
 }
 
 pub fn parse_program(text: &str, file_path: Option<&str>) -> Result<Program, ParseError> {
-    let program = BcParser::parse(Rule::program, text)
-        .map_err(|e| ParseError::new(text, file_path, e))?
-        .next()
-        .unwrap();
+    let program = match BcParser::parse(Rule::program, text) {
+        Ok(mut program) => program.next().unwrap(),
+        Err(err) => return Err(gather_errors(text, file_path, err)),
+    };
     let mut result = Vec::new();
+    let mut errors = Vec::new();
     for item in program.into_inner() {
         match item.as_rule() {
             Rule::semicolon_list => {
                 // stmt*
                 for stmt in item.into_inner() {
-                    parse_stmt(stmt, false, false, &mut result)?;
+                    if let Err(e) = parse_stmt(stmt, false, false, &mut result) {
+                        errors.push(e);
+                    }
                 }
             }
-            Rule::function => {
-                let f = parse_function(item)?;
-                result.push(StmtInstruction::DefineFunction {
+            Rule::function => match parse_function(item) {
+                Ok(f) => result.push(StmtInstruction::DefineFunction {
                     name: f.name,
                     function: f,
-                });
-            }
+                }),
+                Err(e) => errors.push(e),
+            },
             Rule::EOI => {}
             _ => unreachable!(),
         }
     }
-    Ok(result)
+    if errors.is_empty() {
+        Ok(result)
+    } else {
+        Err(ParseError {
+            errors,
+            is_incomplete: false,
+        })
+    }
 }
 
 #[cfg(test)]

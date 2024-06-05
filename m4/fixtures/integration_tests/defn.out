@@ -1,3 +1,3 @@
-stdout=1 Hello from x\n2 Hello from y\n3 this contains 4 this contains dnl not expanded!\n
-stderr=m4:fixtures/integration_tests/defn.m4:9: Warning: end of file treated as newline\n
+stdout=1 Hello from x\n2 Hello from y\n3 this contains 4 this contains dnl not expanded!\n\n5 X'X\n6 kX'\n
+stderr=
 status=0

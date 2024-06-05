@@ -53,7 +53,7 @@ impl Default for State {
                         parse_config.name.clone(),
                         vec![Rc::new(MacroDefinition {
                             parse_config,
-                            implementation: inbuilt_macro_implementation(builtin),
+                            implementation: builtin.implementation(),
                         })],
                     )
                 })
@@ -63,49 +63,75 @@ impl Default for State {
     }
 }
 
-macro_rules! define_enum_with_enumerate {
+macro_rules! macro_enums {
     (
         $(#[$meta:meta])*
-        $enum_name:ident {
-            $($variant_name:ident),* $(,)?
+        pub enum BuiltinMacroDefinition {
+            $($variant_name:ident($variant_type:ident)),* $(,)?
         }
     ) => {
         $(#[$meta])*
-        pub enum $enum_name {
+        pub enum BuiltinMacro {
             $($variant_name),*
         }
 
-        impl $enum_name {
-            pub fn enumerate() -> &'static [$enum_name] {
-                &[$($enum_name::$variant_name),*]
+        enum MacroDefinitionImplementation {
+            $($variant_name($variant_type)),*,
+            UserDefined(UserDefinedMacro),
+        }
+
+        impl MacroImplementation for MacroDefinitionImplementation {
+            fn evaluate(
+                &self,
+                state: State,
+                stdout: &mut dyn Write,
+                stderror: &mut dyn Write,
+                m: Macro,
+            ) -> Result<State> {
+                match self {
+                    $(Self::$variant_name(d) => d.evaluate(state, stdout, stderror, m)),*,
+                    Self::UserDefined(d) => d.evaluate(state, stdout, stderror, m),
+                }
+            }
+        }
+
+        impl BuiltinMacro {
+            pub fn enumerate() -> &'static [Self] {
+                &[$(Self::$variant_name),*]
+            }
+
+            fn implementation(&self) -> MacroDefinitionImplementation {
+                match self {
+                    $(Self::$variant_name => MacroDefinitionImplementation::$variant_name($variant_type)),*
+                }
             }
         }
     };
 }
 
-define_enum_with_enumerate!(
+macro_enums!(
     #[derive(Clone, Copy)]
-    BuiltinMacro {
-        Dnl,
-        Define,
-        Undefine,
-        Errprint,
-        Include,
-        Sinclude,
-        Changecom,
-        Changequote,
-        Pushdef,
-        Popdef,
-        Incr,
-        Ifelse,
-        Shift,
-        Eval,
-        Decr,
-        Len,
-        Index,
-        Ifdef,
-        Translit,
-        Defn,
+    pub enum BuiltinMacroDefinition {
+        Dnl(DnlMacro),
+        Define(DefineMacro),
+        Undefine(UndefineMacro),
+        Errprint(ErrprintMacro),
+        Include(IncludeMacro),
+        Sinclude(SincludeMacro),
+        Changecom(ChangecomMacro),
+        Changequote(ChangequoteMacro),
+        Pushdef(PushdefMacro),
+        Popdef(PopdefMacro),
+        Incr(IncrMacro),
+        Ifelse(IfelseMacro),
+        Shift(ShiftMacro),
+        Eval(EvalMacro),
+        Decr(DecrMacro),
+        Len(LenMacro),
+        Index(IndexMacro),
+        Ifdef(IfdefMacro),
+        Translit(TranslitMacro),
+        Defn(DefnMacro),
     }
 );
 // TODO: implement these macros:
@@ -190,32 +216,6 @@ impl BuiltinMacro {
     }
 }
 
-// TODO: refactor this is not great
-fn inbuilt_macro_implementation(builtin: &BuiltinMacro) -> Box<dyn MacroImplementation> {
-    match builtin {
-        BuiltinMacro::Dnl => Box::new(DnlMacro),
-        BuiltinMacro::Define => Box::new(DefineMacro),
-        BuiltinMacro::Undefine => Box::new(UndefineMacro),
-        BuiltinMacro::Defn => Box::new(DefnMacro),
-        BuiltinMacro::Errprint => Box::new(ErrprintMacro),
-        BuiltinMacro::Include => Box::new(IncludeMacro),
-        BuiltinMacro::Sinclude => Box::new(SincludeMacro),
-        BuiltinMacro::Changecom => Box::new(ChangecomMacro),
-        BuiltinMacro::Changequote => Box::new(ChangequoteMacro),
-        BuiltinMacro::Pushdef => Box::new(PushdefMacro),
-        BuiltinMacro::Popdef => Box::new(PopdefMacro),
-        BuiltinMacro::Incr => Box::new(IncrMacro),
-        BuiltinMacro::Decr => Box::new(DecrMacro),
-        BuiltinMacro::Ifelse => Box::new(IfelseMacro),
-        BuiltinMacro::Ifdef => Box::new(IfdefMacro),
-        BuiltinMacro::Shift => Box::new(ShiftMacro),
-        BuiltinMacro::Eval => Box::new(EvalMacro),
-        BuiltinMacro::Len => Box::new(LenMacro),
-        BuiltinMacro::Index => Box::new(IndexMacro),
-        BuiltinMacro::Translit => Box::new(TranslitMacro),
-    }
-}
-
 impl State {
     fn current_macro_parse_configs(&self) -> HashMap<MacroName, MacroParseConfig> {
         self.macro_definitions
@@ -234,7 +234,7 @@ impl State {
 pub(crate) struct MacroDefinition {
     pub parse_config: MacroParseConfig,
     // TODO: improve performance with enum dispatch
-    implementation: Box<dyn MacroImplementation>,
+    implementation: MacroDefinitionImplementation,
 }
 
 impl std::fmt::Debug for MacroDefinition {
@@ -319,7 +319,9 @@ impl DefineMacro {
         );
         let definition = MacroDefinition {
             parse_config: MacroParseConfig { name, min_args: 0 },
-            implementation: Box::new(UserDefinedMacro { definition }),
+            implementation: MacroDefinitionImplementation::UserDefined(UserDefinedMacro {
+                definition,
+            }),
         };
         Ok((state, Some(definition)))
     }
@@ -641,7 +643,22 @@ impl MacroImplementation for DefnMacro {
         stderror: &mut dyn Write,
         m: Macro,
     ) -> Result<State> {
-        todo!()
+        let first_arg = m
+            .args
+            .into_iter()
+            .next()
+            .ok_or_else(|| crate::Error::NotEnoughArguments)?;
+        let first_arg_text;
+        (first_arg_text, state) = evaluate_to_buffer(state, first_arg.symbols, stderror, true)?;
+        if let Some(definitions) = state
+            .macro_definitions
+            .get(&MacroName::try_from_slice(&first_arg_text)?)
+        {
+            let definition = definitions
+                .last()
+                .expect(AT_LEAST_ONE_MACRO_DEFINITION_EXPECT);
+        }
+        Ok(state)
     }
 }
 

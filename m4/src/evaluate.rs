@@ -639,7 +639,7 @@ impl MacroImplementation for DefnMacro {
     fn evaluate(
         &self,
         mut state: State,
-        _stdout: &mut dyn Write,
+        stdout: &mut dyn Write,
         stderror: &mut dyn Write,
         m: Macro,
     ) -> Result<State> {
@@ -657,6 +657,13 @@ impl MacroImplementation for DefnMacro {
             let definition = definitions
                 .last()
                 .expect(AT_LEAST_ONE_MACRO_DEFINITION_EXPECT);
+            if let MacroDefinitionImplementation::UserDefined(definition) =
+                &definition.implementation
+            {
+                stdout.write_all(&state.parse_config.quote_open_tag)?;
+                stdout.write_all(&definition.definition)?;
+                stdout.write_all(&state.parse_config.quote_close_tag)?;
+            }
         }
         Ok(state)
     }

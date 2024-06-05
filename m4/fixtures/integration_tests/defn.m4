@@ -8,5 +8,5 @@ define(`x', `this contains dnl not expanded!')dnl
 define(`x', k'k)define(`k', `X')
 5 x
 6 defn(`x')
-dnl TODO: there are some more corner cases discussed in
-dnl https://www.gnu.org/software/m4/manual/html_node/Defn.html that are worth adding tests here for.
+7 defn(`doesnotexist')
+8 defn(`define')

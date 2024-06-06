@@ -37,6 +37,7 @@ fn print_output_or_error(result: ExecutionResult<String>) {
             print!("{}", output);
         }
         Err(e) => {
+            print!("{}", e.partial_output());
             println!("{}", e);
         }
     }

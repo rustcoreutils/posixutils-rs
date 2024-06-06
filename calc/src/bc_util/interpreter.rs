@@ -30,6 +30,7 @@ struct ErrorCall {
 pub struct ExecutionError {
     message: &'static str,
     call_stack: Vec<ErrorCall>,
+    partial_output: String,
 }
 
 impl ExecutionError {
@@ -50,6 +51,10 @@ impl ExecutionError {
         });
         self
     }
+
+    pub fn partial_output(&self) -> &str {
+        &self.partial_output
+    }
 }
 
 impl From<&'static str> for ExecutionError {
@@ -57,6 +62,7 @@ impl From<&'static str> for ExecutionError {
         Self {
             message,
             call_stack: Vec::new(),
+            partial_output: String::new(),
         }
     }
 }
@@ -532,12 +538,14 @@ impl Interpreter {
 
                 self.functions[name_index(name)] = function;
             } else {
-                match self.eval_stmt(&stmt).map_err(|e| {
+                let control_flow = self.eval_stmt(&stmt).map_err(|mut e| {
+                    e.partial_output = self.take_and_clear_output();
                     e.global_source(
                         program.source_locations[self.instruction_counter],
                         program.file.clone(),
                     )
-                })? {
+                })?;
+                match control_flow {
                     // both of these should have been handled earlier
                     // by the parser
                     ControlFlow::Return(_) => {

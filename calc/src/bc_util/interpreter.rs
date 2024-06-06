@@ -73,7 +73,7 @@ impl std::fmt::Display for ExecutionError {
         }
 
         writeln!(f, "runtime error: {}", self.message)?;
-        writeln!(f, "call trace (last call first):",)?;
+        writeln!(f, "call trace:",)?;
         for call in &self.call_stack {
             let function_name = if call.function_name == '\0' {
                 "<global scope>".to_string()

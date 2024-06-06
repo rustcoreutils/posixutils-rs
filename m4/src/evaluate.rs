@@ -1325,7 +1325,7 @@ impl MacroImplementation for DumpdefMacro {
             Result::Ok(())
         };
         if m.args.is_empty() {
-            for (i, (name, definitions)) in state.macro_definitions.iter().enumerate() {
+            for (name, definitions) in state.macro_definitions.iter() {
                 dumpdef(
                     stderror,
                     &name,
@@ -1337,8 +1337,7 @@ impl MacroImplementation for DumpdefMacro {
             }
         }
 
-        let args_len = m.args.len();
-        for (i, arg) in m.args.into_iter().enumerate() {
+        for arg in m.args.into_iter() {
             let arg_text;
             (arg_text, state) = evaluate_to_buffer(state, arg.symbols, stderror, true)?;
             let name = MacroName::try_from_slice(&arg_text)?;

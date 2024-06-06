@@ -31,16 +31,19 @@ pub enum StmtInstruction {
     ReturnExpr(ExprInstruction),
     If {
         condition: ConditionInstruction,
+        instruction_count: usize,
         body: Vec<StmtInstruction>,
     },
     While {
         condition: ConditionInstruction,
+        instruction_count: usize,
         body: Vec<StmtInstruction>,
     },
     For {
         init: ExprInstruction,
         condition: ConditionInstruction,
         update: ExprInstruction,
+        instruction_count: usize,
         body: Vec<StmtInstruction>,
     },
     String(String),
@@ -117,12 +120,18 @@ pub enum Variable {
     Array(char),
 }
 
+/// A bc function.  
+/// # Body and Source Locations
+/// Statements in `body` map to source locations as
+/// described in the documentation for `Program`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Function {
     pub name: char,
     pub parameters: Rc<[Variable]>,
     pub locals: Rc<[Variable]>,
     pub body: Rc<[StmtInstruction]>,
+    pub source_locations: Rc<[usize]>,
+    pub file: Rc<str>,
 }
 
 impl Default for Function {
@@ -132,6 +141,35 @@ impl Default for Function {
             parameters: Rc::new([]),
             locals: Rc::new([]),
             body: Rc::new([]),
+            source_locations: Rc::new([]),
+            file: Rc::from(""),
+        }
+    }
+}
+
+/// A bc program
+/// # Instructions and Source Locations
+/// The `source_locations` field is a vector containing the line
+/// numbers of the statements in the program. The index of a statement
+/// is its index inside `instructions` if these were flattened into a
+/// single vector, meaning every instruction inside a compound statement
+/// (`if`, `while` or `for`) is also counted. `DefineFunction` does not
+/// count as a statement in this context.
+#[derive(Debug)]
+pub struct Program {
+    pub file: Rc<str>,
+    pub instructions: Vec<StmtInstruction>,
+    pub source_locations: Vec<usize>,
+}
+
+// This is used only for testing purposes
+#[cfg(test)]
+impl From<Vec<StmtInstruction>> for Program {
+    fn from(instructions: Vec<StmtInstruction>) -> Self {
+        Program {
+            file: Rc::from(""),
+            instructions,
+            source_locations: vec![],
         }
     }
 }

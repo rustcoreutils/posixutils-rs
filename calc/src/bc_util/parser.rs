@@ -7,7 +7,9 @@
 // SPDX-License-Identifier: MIT
 //
 
-use pest::{error::InputLocation, iterators::Pair, pratt_parser::PrattParser, Parser};
+use std::rc::Rc;
+
+use pest::{error::InputLocation, iterators::Pair, pratt_parser::PrattParser, Parser, Position};
 
 use super::instructions::*;
 
@@ -239,13 +241,13 @@ fn parse_condition(expr: Pair<Rule>) -> ConditionInstruction {
             let left = parse_expr(inner.next().unwrap());
             let op = inner.next().unwrap();
             let right = parse_expr(inner.next().unwrap());
-            match op.as_str() {
-                "==" => ConditionInstruction::Eq(left, right),
-                "!=" => ConditionInstruction::Ne(left, right),
-                "<" => ConditionInstruction::Lt(left, right),
-                "<=" => ConditionInstruction::Leq(left, right),
-                ">" => ConditionInstruction::Gt(left, right),
-                ">=" => ConditionInstruction::Geq(left, right),
+            match op.as_rule() {
+                Rule::same => ConditionInstruction::Eq(left, right),
+                Rule::neq => ConditionInstruction::Ne(left, right),
+                Rule::lt => ConditionInstruction::Lt(left, right),
+                Rule::leq => ConditionInstruction::Leq(left, right),
+                Rule::gt => ConditionInstruction::Gt(left, right),
+                Rule::geq => ConditionInstruction::Geq(left, right),
                 _ => unreachable!(),
             }
         }
@@ -253,13 +255,21 @@ fn parse_condition(expr: Pair<Rule>) -> ConditionInstruction {
     }
 }
 
+/// parses a statement appending instructions to the `statements` vector
+/// and source locations to the `source_locations` vector
+/// # Returns
+/// the number of statement instructions in created from `stmt`
 fn parse_stmt(
     stmt: Pair<Rule>,
     in_function: bool,
     in_loop: bool,
     statements: &mut Vec<StmtInstruction>,
-) -> Result<(), pest::error::Error<Rule>> {
+    source_locations: &mut Vec<usize>,
+) -> Result<usize, PestError> {
     let stmt = first_child(stmt);
+    let (line, _) = stmt.line_col();
+    source_locations.push(line);
+    let mut instruction_count = 1;
     match stmt.as_rule() {
         Rule::break_stmt => {
             if !in_loop {
@@ -297,16 +307,36 @@ fn parse_stmt(
             let mut inner = stmt.into_inner();
             let condition = parse_condition(inner.next().unwrap());
             let mut body = Vec::new();
-            parse_stmt(inner.next().unwrap(), in_function, in_loop, &mut body)?;
-            statements.push(StmtInstruction::If { condition, body });
+            instruction_count = parse_stmt(
+                inner.next().unwrap(),
+                in_function,
+                in_loop,
+                &mut body,
+                source_locations,
+            )?;
+            statements.push(StmtInstruction::If {
+                condition,
+                instruction_count,
+                body,
+            });
         }
         Rule::while_stmt => {
             // while (condition) stmt
             let mut inner = stmt.into_inner();
             let condition = parse_condition(inner.next().unwrap());
             let mut body = Vec::new();
-            parse_stmt(inner.next().unwrap(), in_function, true, &mut body)?;
-            statements.push(StmtInstruction::While { condition, body });
+            instruction_count = parse_stmt(
+                inner.next().unwrap(),
+                in_function,
+                true,
+                &mut body,
+                source_locations,
+            )?;
+            statements.push(StmtInstruction::While {
+                condition,
+                instruction_count,
+                body,
+            });
         }
         Rule::for_stmt => {
             // for (init; condition; update) stmt
@@ -315,18 +345,31 @@ fn parse_stmt(
             let condition = parse_condition(inner.next().unwrap());
             let update = parse_expr(inner.next().unwrap());
             let mut body = Vec::new();
-            parse_stmt(inner.next().unwrap(), in_function, true, &mut body)?;
+            instruction_count = parse_stmt(
+                inner.next().unwrap(),
+                in_function,
+                true,
+                &mut body,
+                source_locations,
+            )?;
             statements.push(StmtInstruction::For {
                 init,
                 condition,
                 update,
+                instruction_count,
                 body,
             });
         }
 
         Rule::braced_statement_list => {
+            // if the list has no statements instruction_count is 0
+            instruction_count = 0;
+            // remove the source location of the braced list as it
+            // doesn't directly map to a `StmtInstruction`
+            source_locations.pop();
             for stmt in first_child(stmt).into_inner() {
-                parse_stmt(stmt, in_function, in_loop, statements)?;
+                instruction_count +=
+                    parse_stmt(stmt, in_function, in_loop, statements, source_locations)?;
             }
         }
         Rule::string => {
@@ -337,10 +380,10 @@ fn parse_stmt(
         }
         _ => unreachable!(),
     }
-    Ok(())
+    Ok(instruction_count)
 }
 
-fn parse_function(func: Pair<Rule>) -> Result<Function, pest::error::Error<Rule>> {
+fn parse_function(func: Pair<Rule>, file: Rc<str>) -> Result<Function, PestError> {
     let mut function = func.into_inner();
 
     // define letter ( parameter_list ) auto_define_list statement_list end
@@ -368,14 +411,17 @@ fn parse_function(func: Pair<Rule>) -> Result<Function, pest::error::Error<Rule>
     };
 
     let mut body = Vec::new();
+    let mut source_locations = Vec::new();
     for stmt in statement_list.into_inner() {
-        parse_stmt(stmt, true, false, &mut body)?;
+        parse_stmt(stmt, true, false, &mut body, &mut source_locations)?;
     }
     Ok(Function {
         name,
+        file,
         parameters: parameters.into(),
         locals: locals.into(),
         body: body.into(),
+        source_locations: source_locations.into(),
     })
 }
 
@@ -383,61 +429,191 @@ fn parse_function(func: Pair<Rule>) -> Result<Function, pest::error::Error<Rule>
 #[grammar = "bc_util/grammar.pest"]
 pub struct BcParser;
 
-pub type Program = Vec<StmtInstruction>;
+pub type PestError = pest::error::Error<Rule>;
 
-pub fn parse_program(text: &str) -> Result<Program, pest::error::Error<Rule>> {
-    let program = BcParser::parse(Rule::program, text)?.next().unwrap();
-    let mut result = Vec::new();
+fn location_end(loc: &InputLocation) -> usize {
+    match loc {
+        InputLocation::Pos(p) => *p,
+        InputLocation::Span((_, end)) => *end,
+    }
+}
+
+fn is_incomplete(text: &str, error: &PestError) -> bool {
+    let pos = location_end(&error.location);
+    // The program is incomplete if either:
+    // - we expect something after the end of the input
+    // - the error occurs at the start of an incomplete comment
+    // - the error occurs at the start of an incomplete string
+    pos == text.len()
+        || text.as_bytes()[pos..text.len().min(pos + 2)] == [b'/', b'*']
+        || text.as_bytes()[pos] == b'"'
+}
+
+fn improve_pest_error(err: PestError, text: &str, file_path: Option<&str>) -> PestError {
+    let err = if let Some(path) = file_path {
+        err.with_path(path)
+    } else {
+        err
+    };
+
+    // special case: if the error is at the end of the input and the last character
+    // is not a newline, we can provide a more helpful error message.
+    let err_loc = location_end(&err.location);
+    if err_loc == text.len() && text.as_bytes()[err_loc - 1] != b'\n' {
+        return PestError::new_from_pos(
+            pest::error::ErrorVariant::CustomError {
+                message: "missing newline".to_string(),
+            },
+            Position::new(text, err_loc).unwrap(),
+        );
+    }
+
+    err.renamed_rules(|rule| {
+        match *rule {
+            Rule::add => "'+'",
+            Rule::sub => "'-'",
+            Rule::mul => "'*'",
+            Rule::div => "'/'",
+            Rule::modulus => "'%'",
+            Rule::pow => "'^'",
+            Rule::neg => "'-'",
+            Rule::assign => "'='",
+            Rule::add_assign => "'+='",
+            Rule::sub_assign => "'-='",
+            Rule::mul_assign => "'*='",
+            Rule::div_assign => "'/='",
+            Rule::mod_assign => "'%='",
+            Rule::pow_assign => "'^='",
+            Rule::same => "'=='",
+            Rule::neq => "'!='",
+            Rule::lt => "'<'",
+            Rule::leq => "'<='",
+            Rule::gt => "'>'",
+            Rule::geq => "'>='",
+            Rule::primary => "expression",
+            Rule::auto_define_list => "auto definitions",
+            _ => return format!("{:?}", rule),
+        }
+        .to_string()
+    })
+}
+
+#[derive(Debug)]
+pub struct ParseError {
+    errors: Vec<PestError>,
+    /// is `true` if the parsed program contains an incomplete expression,
+    /// statement, comment or string.
+    /// # Examples
+    /// ```
+    /// assert!(parse_program("1 + 2 *\\\n", None).unwrap_err().is_incomplete)
+    /// assert!(parse_program("define f() {\n", None).unwrap_err().is_incomplete)
+    /// assert!(parse_program("if (c) {\n", None).unwrap_err().is_incomplete)
+    /// assert!(parse_program("while (c) {\n", None).unwrap_err().is_incomplete)
+    /// ```
+    pub is_incomplete: bool,
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        for err in &self.errors {
+            writeln!(f, "{}\n", err)?;
+        }
+        Ok(())
+    }
+}
+
+fn next_checkpoint(text: &str) -> usize {
+    let mut index = 0;
+    while index < text.len() {
+        match text.as_bytes()[index] {
+            b'\n' | b';' | b'}' | b')' => return index + 1,
+            _ => index += 1,
+        }
+    }
+    index
+}
+
+fn gather_errors(text: &str, file_path: Option<&str>, first_error: PestError) -> ParseError {
+    let last_location_end = location_end(&first_error.location);
+
+    // if the text is not from a file and the error is consistent
+    // with an incomplete program we can return early
+    if file_path.is_none() && is_incomplete(text, &first_error) {
+        return ParseError {
+            errors: vec![first_error],
+            is_incomplete: true,
+        };
+    }
+
+    let mut errors = vec![improve_pest_error(first_error, text, file_path)];
+    let mut byte_index = last_location_end + next_checkpoint(&text[last_location_end..]);
+
+    while byte_index < text.len() {
+        match BcParser::parse(Rule::program, &text[byte_index..]) {
+            Ok(_) => {
+                return ParseError {
+                    errors,
+                    is_incomplete: false,
+                }
+            }
+            Err(err) => {
+                byte_index += location_end(&err.location);
+                let err_correct_position =
+                    PestError::new_from_pos(err.variant, Position::new(text, byte_index).unwrap());
+                errors.push(improve_pest_error(err_correct_position, text, file_path));
+            }
+        }
+        byte_index += next_checkpoint(&text[byte_index..]);
+    }
+    ParseError {
+        errors,
+        is_incomplete: false,
+    }
+}
+
+pub fn parse_program(text: &str, file_path: Option<&str>) -> Result<Program, ParseError> {
+    let program = match BcParser::parse(Rule::program, text) {
+        Ok(mut program) => program.next().unwrap(),
+        Err(err) => return Err(gather_errors(text, file_path, err)),
+    };
+    let file = Rc::<str>::from(file_path.unwrap_or(""));
+    let mut instructions = Vec::new();
+    let mut source_locations = Vec::new();
+    let mut errors = Vec::new();
     for item in program.into_inner() {
         match item.as_rule() {
             Rule::semicolon_list => {
                 // stmt*
                 for stmt in item.into_inner() {
-                    parse_stmt(stmt, false, false, &mut result)?;
+                    if let Err(e) =
+                        parse_stmt(stmt, false, false, &mut instructions, &mut source_locations)
+                    {
+                        errors.push(e);
+                    }
                 }
             }
-            Rule::function => {
-                let f = parse_function(item)?;
-                result.push(StmtInstruction::DefineFunction {
+            Rule::function => match parse_function(item, file.clone()) {
+                Ok(f) => instructions.push(StmtInstruction::DefineFunction {
                     name: f.name,
                     function: f,
-                });
-            }
+                }),
+                Err(e) => errors.push(e),
+            },
             Rule::EOI => {}
             _ => unreachable!(),
         }
     }
-    Ok(result)
-}
-
-fn location_end(loc: InputLocation) -> usize {
-    match loc {
-        InputLocation::Pos(p) => p,
-        InputLocation::Span((_, end)) => end,
-    }
-}
-
-/// Returns `true` if `text` contains an incomplete expression or statement.
-/// # Examples
-/// ```
-/// assert!(is_incomplete("1 + 2 *\\\n"))
-/// assert!(is_incomplete("define f() {\n"))
-/// assert!(is_incomplete("if (c) {\n"))
-/// assert!(is_incomplete("while (c) {\n"))
-/// ```
-pub fn is_incomplete(text: &str) -> bool {
-    match parse_program(text) {
-        Ok(_) => false,
-        Err(e) => {
-            let pos = location_end(e.location);
-            // The program is incomplete if either:
-            // - we expect something after the end of the input
-            // - the error occurs at the start of and incomplete comment
-            // - the error occurs at the start of an incomplete string
-            pos == text.len()
-                || text.as_bytes()[pos..text.len().min(pos + 2)] == [b'/', b'*']
-                || text.as_bytes()[pos] == b'"'
-        }
+    if errors.is_empty() {
+        Ok(Program {
+            file,
+            instructions,
+            source_locations,
+        })
+    } else {
+        Err(ParseError {
+            errors,
+            is_incomplete: false,
+        })
     }
 }
 
@@ -446,9 +622,9 @@ mod test {
     use super::*;
 
     fn parse_expr(input: &str) -> ExprInstruction {
-        let program = parse_program(input).expect("error parsing expression");
-        assert_eq!(program.len(), 1);
-        if let StmtInstruction::Expr(expr) = program.into_iter().next().unwrap() {
+        let program = parse_program(input, None).expect("error parsing expression");
+        assert_eq!(program.instructions.len(), 1);
+        if let StmtInstruction::Expr(expr) = program.instructions.into_iter().next().unwrap() {
             expr
         } else {
             panic!("expected expression")
@@ -456,16 +632,16 @@ mod test {
     }
 
     fn parse_stmt(input: &str) -> StmtInstruction {
-        let program = parse_program(input).expect("error parsing statement");
-        assert_eq!(program.len(), 1);
-        program.into_iter().next().unwrap()
+        let program = parse_program(input, None).expect("error parsing statement");
+        assert_eq!(program.instructions.len(), 1);
+        program.instructions.into_iter().next().unwrap()
     }
 
     fn parse_function(input: &str) -> Function {
-        let program = parse_program(input).expect("error parsing function");
-        assert_eq!(program.len(), 1);
+        let program = parse_program(input, None).expect("error parsing function");
+        assert_eq!(program.instructions.len(), 1);
         if let StmtInstruction::DefineFunction { function, .. } =
-            program.into_iter().next().unwrap()
+            program.instructions.into_iter().next().unwrap()
         {
             function
         } else {
@@ -473,10 +649,14 @@ mod test {
         }
     }
 
+    fn program_err(input: &str) -> ParseError {
+        parse_program(input, None).unwrap_err()
+    }
+
     #[test]
     fn test_parse_empty_program() {
-        let instructions = parse_program("").expect("error parsing empty program");
-        assert_eq!(instructions.len(), 0);
+        let program = parse_program("", None).expect("error parsing empty program");
+        assert_eq!(program.instructions.len(), 0);
     }
 
     #[test]
@@ -887,6 +1067,7 @@ mod test {
             stmt,
             StmtInstruction::While {
                 condition: ConditionInstruction::Expr(ExprInstruction::Number("0".to_string())),
+                instruction_count: 1,
                 body: vec![StmtInstruction::Break]
             }
         );
@@ -908,6 +1089,7 @@ mod test {
                 function: Function {
                     name: 'f',
                     body: [StmtInstruction::Return].into(),
+                    source_locations: [2].into(),
                     ..Default::default()
                 }
             }
@@ -923,6 +1105,7 @@ mod test {
                 name: 'f',
                 function: Function {
                     name: 'f',
+                    source_locations: [2].into(),
                     body: [StmtInstruction::ReturnExpr(ExprInstruction::Number(
                         "1".to_string()
                     ))]
@@ -934,8 +1117,8 @@ mod test {
     }
 
     #[test]
-    fn test_parse_if() {
-        let stmt = parse_stmt("if (x <= z) a = 2\n");
+    fn test_parse_empty_if() {
+        let stmt = parse_stmt("if (x <= z) {}\n");
         assert_eq!(
             stmt,
             StmtInstruction::If {
@@ -943,17 +1126,66 @@ mod test {
                     ExprInstruction::Named(NamedExpr::VariableNumber('x')),
                     ExprInstruction::Named(NamedExpr::VariableNumber('z'))
                 ),
-                body: vec![StmtInstruction::Expr(ExprInstruction::Assignment {
-                    named: NamedExpr::VariableNumber('a'),
-                    value: Box::new(ExprInstruction::Number("2".to_string()))
-                })]
+                instruction_count: 0,
+                body: vec![]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_if() {
+        let stmt = parse_stmt("if (x <= z) {\n a = 2 \n b = 3\n c = 3 \n}\n");
+        assert_eq!(
+            stmt,
+            StmtInstruction::If {
+                condition: ConditionInstruction::Leq(
+                    ExprInstruction::Named(NamedExpr::VariableNumber('x')),
+                    ExprInstruction::Named(NamedExpr::VariableNumber('z'))
+                ),
+                instruction_count: 3,
+                body: vec![
+                    StmtInstruction::Expr(ExprInstruction::Assignment {
+                        named: NamedExpr::VariableNumber('a'),
+                        value: Box::new(ExprInstruction::Number("2".to_string()))
+                    }),
+                    StmtInstruction::Expr(ExprInstruction::Assignment {
+                        named: NamedExpr::VariableNumber('b'),
+                        value: Box::new(ExprInstruction::Number("3".to_string()))
+                    }),
+                    StmtInstruction::Expr(ExprInstruction::Assignment {
+                        named: NamedExpr::VariableNumber('c'),
+                        value: Box::new(ExprInstruction::Number("3".to_string()))
+                    })
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_empty_while() {
+        let stmt = parse_stmt("while (x + 2 != 2 + y) {}\n");
+        assert_eq!(
+            stmt,
+            StmtInstruction::While {
+                condition: ConditionInstruction::Ne(
+                    ExprInstruction::Add(
+                        Box::new(ExprInstruction::Named(NamedExpr::VariableNumber('x'))),
+                        Box::new(ExprInstruction::Number("2".to_string()))
+                    ),
+                    ExprInstruction::Add(
+                        Box::new(ExprInstruction::Number("2".to_string())),
+                        Box::new(ExprInstruction::Named(NamedExpr::VariableNumber('y')))
+                    )
+                ),
+                instruction_count: 0,
+                body: vec![]
             }
         );
     }
 
     #[test]
     fn test_parse_while() {
-        let stmt = parse_stmt("while (x <= z) a = 2\n");
+        let stmt = parse_stmt("while (x <= z) {\n 1 + 2\n x += y / 2\n u \n}\n");
         assert_eq!(
             stmt,
             StmtInstruction::While {
@@ -961,10 +1193,45 @@ mod test {
                     ExprInstruction::Named(NamedExpr::VariableNumber('x')),
                     ExprInstruction::Named(NamedExpr::VariableNumber('z'))
                 ),
-                body: vec![StmtInstruction::Expr(ExprInstruction::Assignment {
-                    named: NamedExpr::VariableNumber('a'),
-                    value: Box::new(ExprInstruction::Number("2".to_string()))
-                })]
+                instruction_count: 3,
+                body: vec![
+                    StmtInstruction::Expr(ExprInstruction::Add(
+                        Box::new(ExprInstruction::Number("1".to_string())),
+                        Box::new(ExprInstruction::Number("2".to_string()))
+                    )),
+                    StmtInstruction::Expr(ExprInstruction::Assignment {
+                        named: NamedExpr::VariableNumber('x'),
+                        value: Box::new(ExprInstruction::Add(
+                            Box::new(ExprInstruction::Named(NamedExpr::VariableNumber('x'))),
+                            Box::new(ExprInstruction::Div(
+                                Box::new(ExprInstruction::Named(NamedExpr::VariableNumber('y'))),
+                                Box::new(ExprInstruction::Number("2".to_string()))
+                            ))
+                        ))
+                    }),
+                    StmtInstruction::Expr(ExprInstruction::Named(NamedExpr::VariableNumber('u')))
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_empty_for() {
+        let stmt = parse_stmt("for (i = 0; i < 10; i++) {}\n");
+        assert_eq!(
+            stmt,
+            StmtInstruction::For {
+                init: ExprInstruction::Assignment {
+                    named: NamedExpr::VariableNumber('i'),
+                    value: Box::new(ExprInstruction::Number("0".to_string()))
+                },
+                condition: ConditionInstruction::Lt(
+                    ExprInstruction::Named(NamedExpr::VariableNumber('i')),
+                    ExprInstruction::Number("10".to_string())
+                ),
+                update: ExprInstruction::PostIncrement(NamedExpr::VariableNumber('i')),
+                instruction_count: 0,
+                body: vec![]
             }
         );
     }
@@ -984,6 +1251,7 @@ mod test {
                     ExprInstruction::Number("10".to_string())
                 ),
                 update: ExprInstruction::PostIncrement(NamedExpr::VariableNumber('i')),
+                instruction_count: 1,
                 body: vec![StmtInstruction::Expr(ExprInstruction::Assignment {
                     named: NamedExpr::VariableNumber('a'),
                     value: Box::new(ExprInstruction::Number("2".to_string()))
@@ -994,41 +1262,41 @@ mod test {
 
     #[test]
     fn test_parse_empty_braced_statement_list() {
-        let instructions =
-            parse_program("{ }\n").expect("error parsing empty braced statement list");
-        assert_eq!(instructions.len(), 0);
-        let instructions =
-            parse_program("{\n}\n").expect("error parsing empty braced statement list");
-        assert_eq!(instructions.len(), 0);
-        let instructions =
-            parse_program("{\n\n}\n").expect("error parsing empty braced statement list");
-        assert_eq!(instructions.len(), 0);
-        let instructions =
-            parse_program("{;\n;;}\n").expect("error parsing empty braced statement list");
-        assert_eq!(instructions.len(), 0);
+        let program =
+            parse_program("{ }\n", None).expect("error parsing empty braced statement list");
+        assert_eq!(program.instructions.len(), 0);
+        let program =
+            parse_program("{\n}\n", None).expect("error parsing empty braced statement list");
+        assert_eq!(program.instructions.len(), 0);
+        let program =
+            parse_program("{\n\n}\n", None).expect("error parsing empty braced statement list");
+        assert_eq!(program.instructions.len(), 0);
+        let program =
+            parse_program("{;\n;;}\n", None).expect("error parsing empty braced statement list");
+        assert_eq!(program.instructions.len(), 0);
     }
 
     #[test]
     fn test_parse_braced_statement_list() {
-        let instructions = parse_program("{ 1 + 2; 3 + 4; \"string\" }\n")
+        let program = parse_program("{ 1 + 2; 3 + 4; \"string\" }\n", None)
             .expect("error parsing braced statement list");
-        assert_eq!(instructions.len(), 3);
+        assert_eq!(program.instructions.len(), 3);
         assert_eq!(
-            instructions[0],
+            program.instructions[0],
             StmtInstruction::Expr(ExprInstruction::Add(
                 Box::new(ExprInstruction::Number("1".to_string())),
                 Box::new(ExprInstruction::Number("2".to_string()))
             ))
         );
         assert_eq!(
-            instructions[1],
+            program.instructions[1],
             StmtInstruction::Expr(ExprInstruction::Add(
                 Box::new(ExprInstruction::Number("3".to_string())),
                 Box::new(ExprInstruction::Number("4".to_string()))
             ))
         );
         assert_eq!(
-            instructions[2],
+            program.instructions[2],
             StmtInstruction::String("string".to_string())
         );
     }
@@ -1059,26 +1327,53 @@ mod test {
 
     #[test]
     fn test_parse_multiple_statements_on_single_line() {
-        let instructions =
-            parse_program("1 + 2; 3 + 4; \"string\"\n").expect("error parsing multiple statements");
-        assert_eq!(instructions.len(), 3);
+        let program = parse_program("1 + 2; 3 + 4; \"string\"\n", None)
+            .expect("error parsing multiple statements");
+        assert_eq!(program.instructions.len(), 3);
         assert_eq!(
-            instructions[0],
+            program.instructions[0],
             StmtInstruction::Expr(ExprInstruction::Add(
                 Box::new(ExprInstruction::Number("1".to_string())),
                 Box::new(ExprInstruction::Number("2".to_string()))
             ))
         );
         assert_eq!(
-            instructions[1],
+            program.instructions[1],
             StmtInstruction::Expr(ExprInstruction::Add(
                 Box::new(ExprInstruction::Number("3".to_string())),
                 Box::new(ExprInstruction::Number("4".to_string()))
             ))
         );
         assert_eq!(
-            instructions[2],
+            program.instructions[2],
             StmtInstruction::String("string".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_semicolon_list() {
+        let program = parse_program(";; ; 1 + 3 ; ;; \"string\"\n", None)
+            .expect("error parsing semicolon list");
+        assert_eq!(program.instructions.len(), 2);
+        assert_eq!(
+            program.instructions[0],
+            StmtInstruction::Expr(ExprInstruction::Add(
+                Box::new(ExprInstruction::Number("1".to_string())),
+                Box::new(ExprInstruction::Number("3".to_string()))
+            ))
+        );
+        assert_eq!(
+            program.instructions[1],
+            StmtInstruction::String("string".to_string())
+        );
+        let program = parse_program("a + 2;;;;;;\n", None).expect("error parsing semicolon list");
+        assert_eq!(program.instructions.len(), 1);
+        assert_eq!(
+            program.instructions[0],
+            StmtInstruction::Expr(ExprInstruction::Add(
+                Box::new(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
+                Box::new(ExprInstruction::Number("2".to_string()))
+            ))
         );
     }
 
@@ -1139,6 +1434,7 @@ mod test {
             func,
             Function {
                 name: 'f',
+                source_locations: [2].into(),
                 body: [StmtInstruction::Expr(ExprInstruction::Add(
                     Box::new(ExprInstruction::Number("1".to_string())),
                     Box::new(ExprInstruction::Number("2".to_string()))
@@ -1151,19 +1447,21 @@ mod test {
 
     #[test]
     fn test_ignore_comments() {
-        let instructions =
-            parse_program("/*line comment*/\n1 + 2; \n/*multiline\ncomment*/\n3 + 4\n")
-                .expect("error parsing multiple statements with comments");
-        assert_eq!(instructions.len(), 2);
+        let program = parse_program(
+            "/*line comment*/\n1 + 2; \n/*multiline\ncomment*/\n3 + 4\n",
+            None,
+        )
+        .expect("error parsing multiple statements with comments");
+        assert_eq!(program.instructions.len(), 2);
         assert_eq!(
-            instructions[0],
+            program.instructions[0],
             StmtInstruction::Expr(ExprInstruction::Add(
                 Box::new(ExprInstruction::Number("1".to_string())),
                 Box::new(ExprInstruction::Number("2".to_string()))
             ))
         );
         assert_eq!(
-            instructions[1],
+            program.instructions[1],
             StmtInstruction::Expr(ExprInstruction::Add(
                 Box::new(ExprInstruction::Number("3".to_string())),
                 Box::new(ExprInstruction::Number("4".to_string()))
@@ -1185,47 +1483,47 @@ mod test {
 
     #[test]
     fn test_break_outside_of_loop_is_an_error() {
-        let result = parse_program("break\n");
+        let result = parse_program("break\n", None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_return_outside_of_function_is_an_error() {
-        let result = parse_program("return\n");
+        let result = parse_program("return\n", None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_partial_comment_is_incomplete() {
-        assert!(is_incomplete("/* this is the start of a comment\n"));
-        assert!(is_incomplete("a + /* this is the start of a comment\n"));
-        assert!(is_incomplete("1 + 2;/* this is the start of a comment\n"));
+        assert!(program_err("/* this is the start of a comment\n").is_incomplete);
+        assert!(program_err("a + /* this is the start of a comment\n").is_incomplete);
+        assert!(program_err("1 + 2;/* this is the start of a comment\n").is_incomplete);
     }
 
     #[test]
     fn test_partial_string_is_incomplete() {
-        assert!(is_incomplete("\"this is the start of a string\n"));
-        assert!(is_incomplete("1 + 2;\"this is the start of a string\n"));
+        assert!(program_err("\"this is the start of a string\n").is_incomplete);
+        assert!(program_err("1 + 2;\"this is the start of a string\n").is_incomplete);
     }
 
     #[test]
     fn test_partial_function_requires_is_incomplete() {
-        assert!(is_incomplete("define f() {\n"));
-        assert!(is_incomplete("define f() {\n auto a[], b, c, d[]\n"));
-        assert!(is_incomplete("define f() {\n 1 + 2\n"));
-        assert!(is_incomplete("define f() {\n auto a, b, c[];\n1 + 2;\n"));
+        assert!(program_err("define f() {\n").is_incomplete);
+        assert!(program_err("define f() {\n auto a[], b, c, d[]\n").is_incomplete);
+        assert!(program_err("define f() {\n 1 + 2\n").is_incomplete);
+        assert!(program_err("define f() {\n auto a, b, c[];\n1 + 2;\n").is_incomplete);
     }
 
     #[test]
     fn test_unclosed_braced_statement_list_is_incomplete() {
-        assert!(is_incomplete("{\n"));
-        assert!(is_incomplete("{ 1 + 2; 3 + 4; \"string\"\n"));
+        assert!(program_err("{\n").is_incomplete);
+        assert!(program_err("{ 1 + 2; 3 + 4; \"string\"\n").is_incomplete);
     }
 
     #[test]
     fn test_statements_ending_with_a_backslash_newline_are_incomplete() {
-        assert!(is_incomplete("1 + 2 + \\\n"));
-        assert!(is_incomplete("1 + 2\\\n\\\n"));
+        assert!(program_err("1 + 2 + \\\n").is_incomplete);
+        assert!(program_err("1 + 2\\\n\\\n").is_incomplete);
     }
 
     #[test]
@@ -1238,5 +1536,29 @@ mod test {
                 Box::new(ExprInstruction::Number("2".to_string()))
             )
         );
+    }
+
+    #[test]
+    fn test_generate_correct_source_info() {
+        let program = parse_program("1 + 2\n", Some("file.bc")).expect("error parsing program");
+        assert_eq!(program.file.as_ref(), "file.bc");
+        assert_eq!(program.source_locations, [1]);
+        let program = parse_program("1 + 2\n3 + 4\n", None).expect("error parsing program");
+        assert_eq!(program.file.as_ref(), "");
+        assert_eq!(program.source_locations, [1, 2]);
+        let program =
+            parse_program("1; 2; 3; 4 + 5 + 9\n", Some("file.bc")).expect("error parsing program");
+        assert_eq!(program.source_locations, [1, 1, 1, 1]);
+        let program = parse_program("{1; 2; 3}\n", None).expect("error parsing program");
+        assert_eq!(program.source_locations, [1, 1, 1]);
+        let program =
+            parse_program("if(0) {\n 1\n 2\n 3\n}\n 1 + 2\n", None).expect("error parsing program");
+        assert_eq!(program.source_locations, [1, 2, 3, 4, 6]);
+        let program =
+            parse_program("while(0) {1\n 2\n 3\n}\n", None).expect("error parsing program");
+        assert_eq!(program.source_locations, [1, 1, 2, 3]);
+        let program = parse_program("for(1; 2; 3) {\n1\n 2\n\n\n 3\n}\n", None)
+            .expect("error parsing program");
+        assert_eq!(program.source_locations, [1, 2, 3, 6]);
     }
 }

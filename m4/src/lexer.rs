@@ -671,6 +671,7 @@ fn parse_comment<'a, 'b>(
 
 /// Parse all input until either a newline or an EOF.
 pub fn parse_dnl(input: &[u8]) -> IResult<&[u8], &[u8]> {
+    log::trace!("parse_dnl() input: {:?}", String::from_utf8_lossy(input));
     let (remaining, _) = nom::bytes::streaming::take_till(|c| c == b'\0' || c == b'\n')(input)?;
     let (remaining, _) = nom::branch::alt((
         nom::bytes::streaming::tag("\n"),
@@ -726,10 +727,10 @@ pub(crate) fn process_streaming<'c, R: Read>(
                 break;
             }
 
-            let remaining = if state.parse_config.dnl {
+            let remaining = if state.parse_config.dnl && input.first() != Some(&b'\0') {
                 let result = parse_dnl(input);
                 let remaining = match result {
-                    Ok((remaining, _)) => remaining,
+                    Ok((remaining, _parsed)) => remaining,
                     Err(nom::Err::Incomplete(_)) => {
                         let new_capacity = buffer_growth_factor * buffer.capacity();
                         buffer.grow(new_capacity);
@@ -741,7 +742,11 @@ pub(crate) fn process_streaming<'c, R: Read>(
                         )))
                     }
                 };
-                state.parse_config.dnl = false;
+
+                if remaining.first() != Some(&b'\0') {
+                    log::debug!("process_streaming() disabling dnl");
+                    state.parse_config.dnl = false;
+                }
 
                 remaining
             } else {
@@ -1541,6 +1546,13 @@ mod test {
 
     #[test]
     fn test_parse_dnl() {
+        let (remaining, matched) = parse_dnl(b" hello world\0").unwrap();
+        assert_eq!(" hello world", utf8(matched));
+        assert_eq!("\0", utf8(remaining));
+    }
+
+    #[test]
+    fn test_parse_dnl_newline_eof() {
         let (remaining, matched) = parse_dnl(b" hello world\n\0").unwrap();
         assert_eq!(" hello world\n", utf8(matched));
         assert_eq!("\0", utf8(remaining));

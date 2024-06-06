@@ -1,0 +1,3 @@
+stdout=
+stderr=1 x:	hello $0\n2 x:	hello $0\ny:	goodbye $0\n
+status=0

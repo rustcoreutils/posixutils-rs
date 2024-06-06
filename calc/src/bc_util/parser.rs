@@ -456,6 +456,8 @@ fn improve_pest_error(err: PestError, text: &str, file_path: Option<&str>) -> Pe
         err
     };
 
+    // special case: if the error is at the end of the input and the last character
+    // is not a newline, we can provide a more helpful error message.
     let err_loc = location_end(&err.location);
     if err_loc == text.len() && text.as_bytes()[err_loc - 1] != b'\n' {
         return PestError::new_from_pos(

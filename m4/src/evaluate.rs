@@ -133,6 +133,7 @@ macro_enums!(
         Translit(TranslitMacro),
         Defn(DefnMacro),
         Substr(SubstrMacro),
+        Dumpdef(DumpdefMacro),
     }
 );
 // TODO: implement these macros:
@@ -147,7 +148,6 @@ macro_enums!(
 // M4exit,
 // Divnum,
 // Divert,
-// Dumpdef,
 
 impl AsRef<[u8]> for BuiltinMacro {
     fn as_ref(&self) -> &'static [u8] {
@@ -173,6 +173,7 @@ impl AsRef<[u8]> for BuiltinMacro {
             Self::Index => b"index",
             Self::Translit => b"translit",
             Self::Substr => b"substr",
+            Self::Dumpdef => b"dumpdef",
         }
     }
 }
@@ -207,6 +208,7 @@ impl BuiltinMacro {
             Self::Index => 1,
             Self::Translit => 1,
             Self::Substr => 1,
+            Self::Dumpdef => 1,
         }
     }
 
@@ -1292,6 +1294,71 @@ impl MacroImplementation for SubstrMacro {
         };
 
         stdout.write_all(&out)?;
+        Ok(state)
+    }
+}
+
+/// The dumpdef macro shall write the defined text to standard error for each of the macros
+/// specified as arguments, or, if no arguments are specified, for all macros.
+struct DumpdefMacro;
+
+impl MacroImplementation for DumpdefMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        _stdout: &mut dyn Write,
+        stderror: &mut dyn Write,
+        m: Macro,
+    ) -> Result<State> {
+        let dumpdef = |stderror: &mut dyn Write, n: &MacroName, d: &MacroDefinition| {
+            write!(stderror, "{n}:\t")?;
+            match &d.implementation {
+                MacroDefinitionImplementation::UserDefined(user_defined) => {
+                    stderror.write_all(&user_defined.definition)?;
+                }
+                _ => {
+                    stderror.write_all(b"<")?;
+                    stderror.write_all(&n.0)?;
+                    stderror.write_all(b">")?;
+                }
+            }
+            Result::Ok(())
+        };
+        if m.args.is_empty() {
+            for (i, (name, definitions)) in state.macro_definitions.iter().enumerate() {
+                dumpdef(
+                    stderror,
+                    &name,
+                    definitions
+                        .last()
+                        .expect(AT_LEAST_ONE_MACRO_DEFINITION_EXPECT),
+                )?;
+                if i < (state.macro_definitions.len() - 1) {
+                    stderror.write_all(b"\n")?;
+                }
+            }
+        }
+
+        let args_len = m.args.len();
+        for (i, arg) in m.args.into_iter().enumerate() {
+            let arg_text;
+            (arg_text, state) = evaluate_to_buffer(state, arg.symbols, stderror, true)?;
+            let name = MacroName::try_from_slice(&arg_text)?;
+            match state.macro_definitions.get(&name) {
+                Some(definition) => dumpdef(
+                    stderror,
+                    &name,
+                    definition
+                        .last()
+                        .expect(AT_LEAST_ONE_MACRO_DEFINITION_EXPECT),
+                )?,
+                None => write!(stderror, "undefined macro {name}")?,
+            }
+            if i < (args_len - 1) {
+                stderror.write_all(b"\n")?;
+            }
+        }
+
         Ok(state)
     }
 }

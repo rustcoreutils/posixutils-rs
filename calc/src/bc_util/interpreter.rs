@@ -7,20 +7,94 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::fmt::Write;
+use std::{fmt::Write, rc::Rc};
 
 use crate::bc_util::instructions::Variable;
 
 use super::{
     instructions::{
         BuiltinFunction, ConditionInstruction, ExprInstruction, Function, FunctionArgument,
-        NamedExpr, Register, StmtInstruction,
+        NamedExpr, Program, Register, StmtInstruction,
     },
     number::Number,
-    parser::Program,
 };
 
-pub type ExecutionResult<T> = Result<T, &'static str>;
+#[derive(Debug)]
+struct ErrorCall {
+    function_name: char,
+    line: usize,
+    file: Rc<str>,
+}
+
+#[derive(Debug)]
+pub struct ExecutionError {
+    message: &'static str,
+    call_stack: Vec<ErrorCall>,
+}
+
+impl ExecutionError {
+    fn add_call(mut self, function_name: char, line: usize, file: Rc<str>) -> Self {
+        self.call_stack.push(ErrorCall {
+            function_name,
+            line,
+            file,
+        });
+        self
+    }
+
+    fn global_source(mut self, line: usize, file: Rc<str>) -> Self {
+        self.call_stack.push(ErrorCall {
+            function_name: '\0',
+            line,
+            file,
+        });
+        self
+    }
+}
+
+impl From<&'static str> for ExecutionError {
+    fn from(message: &'static str) -> Self {
+        Self {
+            message,
+            call_stack: Vec::new(),
+        }
+    }
+}
+
+impl std::fmt::Display for ExecutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        if self.call_stack.len() == 1 {
+            let line = self.call_stack[0].line;
+            let file = &self.call_stack[0].file;
+            if file.is_empty() {
+                return write!(f, "runtime error (line {line}): {}", self.message);
+            }
+            return write!(f, "runtime error ({file} - line {line}): {}", self.message);
+        }
+
+        writeln!(f, "runtime error: {}", self.message)?;
+        writeln!(f, "call trace (last call first):",)?;
+        for call in &self.call_stack {
+            let function_name = if call.function_name == '\0' {
+                "<global scope>".to_string()
+            } else {
+                format!("'{}'", call.function_name)
+            };
+            if call.file.is_empty() {
+                writeln!(f, "=> {function_name} at line {}", call.line)?;
+            } else {
+                writeln!(
+                    f,
+                    "=> {function_name} ({}) at line {} ",
+                    call.file, call.line,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+pub type ExecutionResult<T> = Result<T, ExecutionError>;
 
 type NameMap<T> = [T; 26];
 
@@ -77,6 +151,7 @@ pub struct Interpreter {
     obase: u64,
     output: String,
     has_quit: bool,
+    instruction_counter: usize,
 }
 
 impl Default for Interpreter {
@@ -91,6 +166,7 @@ impl Default for Interpreter {
             obase: 10,
             output: String::new(),
             has_quit: false,
+            instruction_counter: 0,
         }
     }
 }
@@ -131,9 +207,10 @@ impl Interpreter {
     }
 
     fn call_function(&mut self, name: char, args: &[FunctionArgument]) -> ExecutionResult<Number> {
+        let saved_instruction_counter = self.instruction_counter;
         let function = &self.functions[name_index(name)].clone();
         if function.name == '\0' {
-            return Err("undefined function");
+            return Err("undefined function".into());
         }
         let mut call_frame = CallFrame::default();
 
@@ -149,9 +226,12 @@ impl Interpreter {
                     let array = self.array_variables[name_index(*arg_name)].clone();
                     call_frame.array_variables[name_index(*param_name)] = Some(array)
                 }
-                _ => return Err("argument does not match parameter"),
+                _ => return Err("argument does not match parameter".into()),
             }
         }
+        // set the instruction counter to 0 only after the arguments have been processed.
+        // this way errors in the argument expression will be reported at the call site
+        self.instruction_counter = 0;
 
         for local in function.locals.iter() {
             match local {
@@ -167,17 +247,31 @@ impl Interpreter {
 
         self.call_frames.push(call_frame);
         for stmt in body.iter() {
-            match self.eval_stmt(stmt)? {
-                ControlFlow::Return(value) => {
+            let evaluated_statement = self.eval_stmt(stmt).map_err(|e| {
+                e.add_call(
+                    function.name,
+                    function.source_locations[self.instruction_counter],
+                    function.file.clone(),
+                )
+            });
+            match evaluated_statement {
+                Err(e) => {
                     self.call_frames.pop();
+                    self.instruction_counter = saved_instruction_counter;
+                    return Err(e);
+                }
+                Ok(ControlFlow::Return(value)) => {
+                    self.call_frames.pop();
+                    self.instruction_counter = saved_instruction_counter;
                     return Ok(value);
                 }
-                ControlFlow::Quit => {
-                    // this should have been handled earlier.
+                Ok(ControlFlow::Break) | Ok(ControlFlow::Quit) => {
+                    // both of these should never happen.
                     // A quit inside of a function definition
                     // should stop execution, and we can only call
                     // a function after its definition has been processed
-                    panic!("reached quit in function call")
+                    // A break outside of a loop is a parser bug.
+                    panic!("reached quit or break in function call")
                 }
                 _ => {}
             }
@@ -193,7 +287,7 @@ impl Interpreter {
     fn eval_expr(&mut self, expr: &ExprInstruction) -> ExecutionResult<Number> {
         match expr {
             ExprInstruction::Number(x) => {
-                Number::parse(x, self.ibase).ok_or("invalid digit for the current ibase")
+                Number::parse(x, self.ibase).ok_or("invalid digit for the current ibase".into())
             }
             ExprInstruction::GetRegister(reg) => match reg {
                 Register::Scale => Ok(self.scale.into()),
@@ -203,7 +297,10 @@ impl Interpreter {
             ExprInstruction::Named(named) => self.eval_named(named).cloned(),
             ExprInstruction::Builtin { function, arg } => match function {
                 BuiltinFunction::Length => Ok(self.eval_expr(arg)?.length().into()),
-                BuiltinFunction::Sqrt => self.eval_expr(arg)?.sqrt(self.scale),
+                BuiltinFunction::Sqrt => self
+                    .eval_expr(arg)?
+                    .sqrt(self.scale)
+                    .map_err(ExecutionError::from),
                 BuiltinFunction::Scale => Ok(self.eval_expr(arg)?.scale().into()),
             },
             ExprInstruction::PreIncrement(named) => {
@@ -228,7 +325,13 @@ impl Interpreter {
                 value.dec();
                 Ok(result)
             }
-            ExprInstruction::Call { name, args } => self.call_function(*name, args),
+            ExprInstruction::Call { name, args } => {
+                let ic = self.instruction_counter;
+                self.instruction_counter = 0;
+                let call_result = self.call_function(*name, args);
+                self.instruction_counter = ic;
+                call_result
+            }
             ExprInstruction::Assignment { named, value } => {
                 let value = self.eval_expr(value)?;
                 self.eval_named(named)?.clone_from(&value);
@@ -259,17 +362,17 @@ impl Interpreter {
                                 return Ok(value);
                             }
                         }
-                        return Err("ibase must be between 2 and 16");
+                        return Err("ibase must be between 2 and 16".into());
                     }
                     Register::OBase => {
                         if let Some(new_obase) = value.as_u64() {
                             if new_obase >= 2 {
                                 self.obase = new_obase;
                             } else {
-                                return Err("obase must be greater than 1");
+                                return Err("obase must be greater than 1".into());
                             }
                         } else {
-                            return Err("value assigned to obase is too large");
+                            return Err("value assigned to obase is too large".into());
                         }
                     }
                 }
@@ -286,10 +389,12 @@ impl Interpreter {
                 .div(&self.eval_expr(rhs)?, self.scale)?),
             ExprInstruction::Mod(lhs, rhs) => self
                 .eval_expr(lhs)?
-                .modulus(&self.eval_expr(rhs)?, self.scale),
-            ExprInstruction::Pow(lhs, rhs) => {
-                self.eval_expr(lhs)?.pow(&self.eval_expr(rhs)?, self.scale)
-            }
+                .modulus(&self.eval_expr(rhs)?, self.scale)
+                .map_err(ExecutionError::from),
+            ExprInstruction::Pow(lhs, rhs) => self
+                .eval_expr(lhs)?
+                .pow(&self.eval_expr(rhs)?, self.scale)
+                .map_err(ExecutionError::from),
         }
     }
 
@@ -306,6 +411,8 @@ impl Interpreter {
     }
 
     fn eval_stmt(&mut self, stmt: &StmtInstruction) -> ExecutionResult<ControlFlow> {
+        let instruction_counter_start = self.instruction_counter;
+        let mut stmt_instruction_count = 1;
         match stmt {
             StmtInstruction::Break => {
                 return Ok(ControlFlow::Break);
@@ -320,8 +427,15 @@ impl Interpreter {
                 let value = self.eval_expr(expr)?;
                 return Ok(ControlFlow::Return(value));
             }
-            StmtInstruction::If { condition, body } => {
+            StmtInstruction::If {
+                condition,
+                instruction_count,
+                body,
+            } => {
+                stmt_instruction_count = *instruction_count + 1;
                 if self.eval_condition(condition)? {
+                    // count the condition
+                    self.instruction_counter += 1;
                     for stmt in body {
                         let control_flow = self.eval_stmt(stmt)?;
                         // any control flow instruction in the body of the
@@ -332,8 +446,15 @@ impl Interpreter {
                     }
                 }
             }
-            StmtInstruction::While { condition, body } => {
+            StmtInstruction::While {
+                condition,
+                instruction_count,
+                body,
+            } => {
+                stmt_instruction_count = *instruction_count + 1;
                 'while_loop: while self.eval_condition(condition)? {
+                    // count the condition
+                    self.instruction_counter += 1;
                     for stmt in body {
                         let control_flow = self.eval_stmt(stmt)?;
                         if control_flow == ControlFlow::Break {
@@ -345,16 +466,22 @@ impl Interpreter {
                             return Ok(control_flow);
                         }
                     }
+                    // reset the instruction counter to the start of the loop
+                    self.instruction_counter = instruction_counter_start;
                 }
             }
             StmtInstruction::For {
                 init,
                 condition,
                 update,
+                instruction_count,
                 body,
             } => {
+                stmt_instruction_count = *instruction_count + 1;
                 self.eval_expr(init)?;
                 'for_loop: while self.eval_condition(condition)? {
+                    // count init condition and update
+                    self.instruction_counter += 1;
                     for stmt in body {
                         let control_flow = self.eval_stmt(stmt)?;
                         if control_flow == ControlFlow::Break {
@@ -364,6 +491,8 @@ impl Interpreter {
                             return Ok(control_flow);
                         }
                     }
+                    // reset the instruction counter to the start of the loop
+                    self.instruction_counter = instruction_counter_start;
                     self.eval_expr(update)?;
                 }
             }
@@ -381,11 +510,13 @@ impl Interpreter {
                 panic!("function definition outside of the global scope")
             }
         }
+        self.instruction_counter = instruction_counter_start + stmt_instruction_count;
         Ok(ControlFlow::None)
     }
 
     pub fn exec(&mut self, program: Program) -> ExecutionResult<String> {
-        for stmt in program {
+        self.instruction_counter = 0;
+        for stmt in program.instructions {
             if let StmtInstruction::DefineFunction { name, function } = stmt {
                 // we handle this here because we need to store the function.
                 // doing it in eval_stmt would not work because we would need
@@ -401,7 +532,12 @@ impl Interpreter {
 
                 self.functions[name_index(name)] = function;
             } else {
-                match self.eval_stmt(&stmt)? {
+                match self.eval_stmt(&stmt).map_err(|e| {
+                    e.global_source(
+                        program.source_locations[self.instruction_counter],
+                        program.file.clone(),
+                    )
+                })? {
                     // both of these should have been handled earlier
                     // by the parser
                     ControlFlow::Return(_) => {
@@ -440,9 +576,12 @@ mod tests {
         // 5
         // ```
         let output = interpreter
-            .exec(vec![StmtInstruction::Expr(ExprInstruction::Number(
-                "5".to_string(),
-            ))])
+            .exec(
+                vec![StmtInstruction::Expr(ExprInstruction::Number(
+                    "5".to_string(),
+                ))]
+                .into(),
+            )
             .unwrap();
         assert_eq!(output, "5\n");
     }
@@ -454,9 +593,12 @@ mod tests {
         // a
         // ```
         let output = interpreter
-            .exec(vec![StmtInstruction::Expr(ExprInstruction::Named(
-                NamedExpr::VariableNumber('a'),
-            ))])
+            .exec(
+                vec![StmtInstruction::Expr(ExprInstruction::Named(
+                    NamedExpr::VariableNumber('a'),
+                ))]
+                .into(),
+            )
             .unwrap();
         assert_eq!(output, "0\n");
     }
@@ -468,10 +610,13 @@ mod tests {
         // scale(5)
         // ```
         let output = interpreter
-            .exec(vec![StmtInstruction::Expr(ExprInstruction::Builtin {
-                function: BuiltinFunction::Scale,
-                arg: Box::new(ExprInstruction::Number("5".to_string())),
-            })])
+            .exec(
+                vec![StmtInstruction::Expr(ExprInstruction::Builtin {
+                    function: BuiltinFunction::Scale,
+                    arg: Box::new(ExprInstruction::Number("5".to_string())),
+                })]
+                .into(),
+            )
             .unwrap();
         assert_eq!(output, "0\n");
     }
@@ -483,10 +628,13 @@ mod tests {
         // sqrt(25)
         // ```
         let output = interpreter
-            .exec(vec![StmtInstruction::Expr(ExprInstruction::Builtin {
-                function: BuiltinFunction::Sqrt,
-                arg: Box::new(ExprInstruction::Number("25".to_string())),
-            })])
+            .exec(
+                vec![StmtInstruction::Expr(ExprInstruction::Builtin {
+                    function: BuiltinFunction::Sqrt,
+                    arg: Box::new(ExprInstruction::Number("25".to_string())),
+                })]
+                .into(),
+            )
             .unwrap();
         assert_eq!(output, "5\n");
     }
@@ -498,10 +646,13 @@ mod tests {
         // length(5)
         // ```
         let output = interpreter
-            .exec(vec![StmtInstruction::Expr(ExprInstruction::Builtin {
-                function: BuiltinFunction::Length,
-                arg: Box::new(ExprInstruction::Number("5".to_string())),
-            })])
+            .exec(
+                vec![StmtInstruction::Expr(ExprInstruction::Builtin {
+                    function: BuiltinFunction::Length,
+                    arg: Box::new(ExprInstruction::Number("5".to_string())),
+                })]
+                .into(),
+            )
             .unwrap();
         assert_eq!(output, "1\n");
     }
@@ -514,12 +665,15 @@ mod tests {
         // a
         // ```
         let output = interpreter
-            .exec(vec![
-                StmtInstruction::Expr(ExprInstruction::PreIncrement(NamedExpr::VariableNumber(
-                    'a',
-                ))),
-                StmtInstruction::Expr(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
-            ])
+            .exec(
+                vec![
+                    StmtInstruction::Expr(ExprInstruction::PreIncrement(
+                        NamedExpr::VariableNumber('a'),
+                    )),
+                    StmtInstruction::Expr(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
+                ]
+                .into(),
+            )
             .unwrap();
         assert_eq!(output, "1\n1\n");
     }
@@ -532,12 +686,15 @@ mod tests {
         // a
         // ```
         let output = interpreter
-            .exec(vec![
-                StmtInstruction::Expr(ExprInstruction::PreDecrement(NamedExpr::VariableNumber(
-                    'a',
-                ))),
-                StmtInstruction::Expr(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
-            ])
+            .exec(
+                vec![
+                    StmtInstruction::Expr(ExprInstruction::PreDecrement(
+                        NamedExpr::VariableNumber('a'),
+                    )),
+                    StmtInstruction::Expr(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
+                ]
+                .into(),
+            )
             .unwrap();
         assert_eq!(output, "-1\n-1\n");
     }
@@ -550,12 +707,15 @@ mod tests {
         // a
         // ```
         let output = interpreter
-            .exec(vec![
-                StmtInstruction::Expr(ExprInstruction::PostIncrement(NamedExpr::VariableNumber(
-                    'a',
-                ))),
-                StmtInstruction::Expr(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
-            ])
+            .exec(
+                vec![
+                    StmtInstruction::Expr(ExprInstruction::PostIncrement(
+                        NamedExpr::VariableNumber('a'),
+                    )),
+                    StmtInstruction::Expr(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
+                ]
+                .into(),
+            )
             .unwrap();
         assert_eq!(output, "0\n1\n");
     }
@@ -568,12 +728,15 @@ mod tests {
         // a
         // ```
         let output = interpreter
-            .exec(vec![
-                StmtInstruction::Expr(ExprInstruction::PostDecrement(NamedExpr::VariableNumber(
-                    'a',
-                ))),
-                StmtInstruction::Expr(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
-            ])
+            .exec(
+                vec![
+                    StmtInstruction::Expr(ExprInstruction::PostDecrement(
+                        NamedExpr::VariableNumber('a'),
+                    )),
+                    StmtInstruction::Expr(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
+                ]
+                .into(),
+            )
             .unwrap();
         assert_eq!(output, "0\n-1\n");
     }
@@ -588,24 +751,26 @@ mod tests {
         // f()
         // ```
         let output = interpreter
-            .exec(vec![
-                StmtInstruction::DefineFunction {
-                    name: 'f',
-                    function: Function {
+            .exec(
+                vec![
+                    StmtInstruction::DefineFunction {
                         name: 'f',
-                        parameters: [].into(),
-                        locals: [].into(),
-                        body: [StmtInstruction::Expr(ExprInstruction::Number(
-                            "5".to_string(),
-                        ))]
-                        .into(),
+                        function: Function {
+                            name: 'f',
+                            body: [StmtInstruction::Expr(ExprInstruction::Number(
+                                "5".to_string(),
+                            ))]
+                            .into(),
+                            ..Default::default()
+                        },
                     },
-                },
-                StmtInstruction::Expr(ExprInstruction::Call {
-                    name: 'f',
-                    args: vec![],
-                }),
-            ])
+                    StmtInstruction::Expr(ExprInstruction::Call {
+                        name: 'f',
+                        args: vec![],
+                    }),
+                ]
+                .into(),
+            )
             .unwrap();
         assert_eq!(output, "5\n0\n");
     }
@@ -618,13 +783,16 @@ mod tests {
         // a
         // ```
         let output = interpreter
-            .exec(vec![
-                StmtInstruction::Expr(ExprInstruction::Assignment {
-                    named: NamedExpr::VariableNumber('a'),
-                    value: Box::new(ExprInstruction::Number("5".to_string())),
-                }),
-                StmtInstruction::Expr(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
-            ])
+            .exec(
+                vec![
+                    StmtInstruction::Expr(ExprInstruction::Assignment {
+                        named: NamedExpr::VariableNumber('a'),
+                        value: Box::new(ExprInstruction::Number("5".to_string())),
+                    }),
+                    StmtInstruction::Expr(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
+                ]
+                .into(),
+            )
             .unwrap();
         assert_eq!(output, "5\n");
     }
@@ -635,7 +803,9 @@ mod tests {
         // ```
         // quit
         // ```
-        let output = interpreter.exec(vec![StmtInstruction::Quit]).unwrap();
+        let output = interpreter
+            .exec(vec![StmtInstruction::Quit].into())
+            .unwrap();
         assert_eq!(output, "");
         assert!(interpreter.has_quit());
     }
@@ -647,13 +817,17 @@ mod tests {
         // while (1) { break; 1 }
         // ```
         let output = interpreter
-            .exec(vec![StmtInstruction::While {
-                condition: ConditionInstruction::Expr(ExprInstruction::Number("1".to_string())),
-                body: vec![
-                    StmtInstruction::Break,
-                    StmtInstruction::Expr(ExprInstruction::Number("1".to_string())),
-                ],
-            }])
+            .exec(
+                vec![StmtInstruction::While {
+                    condition: ConditionInstruction::Expr(ExprInstruction::Number("1".to_string())),
+                    instruction_count: 2,
+                    body: vec![
+                        StmtInstruction::Break,
+                        StmtInstruction::Expr(ExprInstruction::Number("1".to_string())),
+                    ],
+                }]
+                .into(),
+            )
             .unwrap();
         assert_eq!(output, "");
     }
@@ -667,19 +841,22 @@ mod tests {
         // f()
         // ```
         let output = interpreter
-            .exec(vec![
-                StmtInstruction::DefineFunction {
-                    name: 'f',
-                    function: Function {
+            .exec(
+                vec![
+                    StmtInstruction::DefineFunction {
                         name: 'f',
-                        ..Default::default()
+                        function: Function {
+                            name: 'f',
+                            ..Default::default()
+                        },
                     },
-                },
-                StmtInstruction::Expr(ExprInstruction::Call {
-                    name: 'f',
-                    args: vec![],
-                }),
-            ])
+                    StmtInstruction::Expr(ExprInstruction::Call {
+                        name: 'f',
+                        args: vec![],
+                    }),
+                ]
+                .into(),
+            )
             .unwrap();
         assert_eq!(output, "0\n");
     }
@@ -694,24 +871,26 @@ mod tests {
         // f()
         // ```
         let output = interpreter
-            .exec(vec![
-                StmtInstruction::DefineFunction {
-                    name: 'f',
-                    function: Function {
+            .exec(
+                vec![
+                    StmtInstruction::DefineFunction {
                         name: 'f',
-                        parameters: [].into(),
-                        locals: [].into(),
-                        body: [StmtInstruction::ReturnExpr(ExprInstruction::Number(
-                            "5".to_string(),
-                        ))]
-                        .into(),
+                        function: Function {
+                            name: 'f',
+                            body: [StmtInstruction::ReturnExpr(ExprInstruction::Number(
+                                "5".to_string(),
+                            ))]
+                            .into(),
+                            ..Default::default()
+                        },
                     },
-                },
-                StmtInstruction::Expr(ExprInstruction::Call {
-                    name: 'f',
-                    args: vec![],
-                }),
-            ])
+                    StmtInstruction::Expr(ExprInstruction::Call {
+                        name: 'f',
+                        args: vec![],
+                    }),
+                ]
+                .into(),
+            )
             .unwrap();
         assert_eq!(output, "5\n");
     }
@@ -725,12 +904,16 @@ mod tests {
         // }
         // ```
         let output = interpreter
-            .exec(vec![StmtInstruction::If {
-                condition: ConditionInstruction::Expr(ExprInstruction::Number("1".to_string())),
-                body: vec![StmtInstruction::Expr(ExprInstruction::Number(
-                    "5".to_string(),
-                ))],
-            }])
+            .exec(
+                vec![StmtInstruction::If {
+                    condition: ConditionInstruction::Expr(ExprInstruction::Number("1".to_string())),
+                    instruction_count: 1,
+                    body: vec![StmtInstruction::Expr(ExprInstruction::Number(
+                        "5".to_string(),
+                    ))],
+                }]
+                .into(),
+            )
             .unwrap();
         assert_eq!(output, "5\n");
     }
@@ -744,12 +927,16 @@ mod tests {
         // }
         // ```
         let output = interpreter
-            .exec(vec![StmtInstruction::If {
-                condition: ConditionInstruction::Expr(ExprInstruction::Number("0".to_string())),
-                body: vec![StmtInstruction::Expr(ExprInstruction::Number(
-                    "5".to_string(),
-                ))],
-            }])
+            .exec(
+                vec![StmtInstruction::If {
+                    condition: ConditionInstruction::Expr(ExprInstruction::Number("0".to_string())),
+                    instruction_count: 1,
+                    body: vec![StmtInstruction::Expr(ExprInstruction::Number(
+                        "5".to_string(),
+                    ))],
+                }]
+                .into(),
+            )
             .unwrap();
         assert_eq!(output, "");
     }
@@ -761,10 +948,13 @@ mod tests {
         // a = 5
         // ```
         let output = interpreter
-            .exec(vec![StmtInstruction::Expr(ExprInstruction::Assignment {
-                named: NamedExpr::VariableNumber('a'),
-                value: Box::new(ExprInstruction::Number("5".to_string())),
-            })])
+            .exec(
+                vec![StmtInstruction::Expr(ExprInstruction::Assignment {
+                    named: NamedExpr::VariableNumber('a'),
+                    value: Box::new(ExprInstruction::Number("5".to_string())),
+                })]
+                .into(),
+            )
             .unwrap();
         assert_eq!(output, "");
     }
@@ -777,19 +967,22 @@ mod tests {
         // a[0]
         // ```
         let output = interpreter
-            .exec(vec![
-                StmtInstruction::Expr(ExprInstruction::Assignment {
-                    named: NamedExpr::ArrayItem {
+            .exec(
+                vec![
+                    StmtInstruction::Expr(ExprInstruction::Assignment {
+                        named: NamedExpr::ArrayItem {
+                            name: 'a',
+                            index: Box::new(ExprInstruction::Number("0".to_string())),
+                        },
+                        value: Box::new(ExprInstruction::Number("5".to_string())),
+                    }),
+                    StmtInstruction::Expr(ExprInstruction::Named(NamedExpr::ArrayItem {
                         name: 'a',
                         index: Box::new(ExprInstruction::Number("0".to_string())),
-                    },
-                    value: Box::new(ExprInstruction::Number("5".to_string())),
-                }),
-                StmtInstruction::Expr(ExprInstruction::Named(NamedExpr::ArrayItem {
-                    name: 'a',
-                    index: Box::new(ExprInstruction::Number("0".to_string())),
-                })),
-            ])
+                    })),
+                ]
+                .into(),
+            )
             .unwrap();
         assert_eq!(output, "5\n");
     }
@@ -804,18 +997,20 @@ mod tests {
         // 1
         // ```
         let output = interpreter
-            .exec(vec![
-                StmtInstruction::DefineFunction {
-                    name: 'f',
-                    function: Function {
+            .exec(
+                vec![
+                    StmtInstruction::DefineFunction {
                         name: 'f',
-                        parameters: [].into(),
-                        locals: [].into(),
-                        body: [StmtInstruction::Quit].into(),
+                        function: Function {
+                            name: 'f',
+                            body: [StmtInstruction::Quit].into(),
+                            ..Default::default()
+                        },
                     },
-                },
-                StmtInstruction::Expr(ExprInstruction::Number("1".to_string())),
-            ])
+                    StmtInstruction::Expr(ExprInstruction::Number("1".to_string())),
+                ]
+                .into(),
+            )
             .unwrap();
         assert_eq!(output, "");
         assert!(interpreter.has_quit());
@@ -832,16 +1027,22 @@ mod tests {
         // 1
         // ```
         let output = interpreter
-            .exec(vec![
-                StmtInstruction::If {
-                    condition: ConditionInstruction::Expr(ExprInstruction::Number("0".to_string())),
-                    body: vec![
-                        StmtInstruction::Expr(ExprInstruction::Number("1".to_string())),
-                        StmtInstruction::Quit,
-                    ],
-                },
-                StmtInstruction::Expr(ExprInstruction::Number("1".to_string())),
-            ])
+            .exec(
+                vec![
+                    StmtInstruction::If {
+                        condition: ConditionInstruction::Expr(ExprInstruction::Number(
+                            "0".to_string(),
+                        )),
+                        instruction_count: 2,
+                        body: vec![
+                            StmtInstruction::Expr(ExprInstruction::Number("1".to_string())),
+                            StmtInstruction::Quit,
+                        ],
+                    },
+                    StmtInstruction::Expr(ExprInstruction::Number("1".to_string())),
+                ]
+                .into(),
+            )
             .unwrap();
         assert_eq!(output, "");
         assert!(interpreter.has_quit());
@@ -858,16 +1059,22 @@ mod tests {
         // 1
         // ```
         let output = interpreter
-            .exec(vec![
-                StmtInstruction::While {
-                    condition: ConditionInstruction::Expr(ExprInstruction::Number("0".to_string())),
-                    body: vec![
-                        StmtInstruction::Expr(ExprInstruction::Number("2".to_string())),
-                        StmtInstruction::Quit,
-                    ],
-                },
-                StmtInstruction::Expr(ExprInstruction::Number("1".to_string())),
-            ])
+            .exec(
+                vec![
+                    StmtInstruction::While {
+                        condition: ConditionInstruction::Expr(ExprInstruction::Number(
+                            "0".to_string(),
+                        )),
+                        instruction_count: 2,
+                        body: vec![
+                            StmtInstruction::Expr(ExprInstruction::Number("2".to_string())),
+                            StmtInstruction::Quit,
+                        ],
+                    },
+                    StmtInstruction::Expr(ExprInstruction::Number("1".to_string())),
+                ]
+                .into(),
+            )
             .unwrap();
         assert_eq!(output, "");
         assert!(interpreter.has_quit());
@@ -885,26 +1092,29 @@ mod tests {
         // a
         // ```
         let output = interpreter
-            .exec(vec![
-                StmtInstruction::DefineFunction {
-                    name: 'f',
-                    function: Function {
+            .exec(
+                vec![
+                    StmtInstruction::DefineFunction {
                         name: 'f',
-                        parameters: [].into(),
-                        locals: [Variable::Number('a')].into(),
-                        body: [StmtInstruction::Expr(ExprInstruction::Assignment {
-                            named: NamedExpr::VariableNumber('a'),
-                            value: Box::new(ExprInstruction::Number("5".to_string())),
-                        })]
-                        .into(),
+                        function: Function {
+                            name: 'f',
+                            locals: [Variable::Number('a')].into(),
+                            body: [StmtInstruction::Expr(ExprInstruction::Assignment {
+                                named: NamedExpr::VariableNumber('a'),
+                                value: Box::new(ExprInstruction::Number("5".to_string())),
+                            })]
+                            .into(),
+                            ..Default::default()
+                        },
                     },
-                },
-                StmtInstruction::Expr(ExprInstruction::Call {
-                    name: 'f',
-                    args: vec![],
-                }),
-                StmtInstruction::Expr(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
-            ])
+                    StmtInstruction::Expr(ExprInstruction::Call {
+                        name: 'f',
+                        args: vec![],
+                    }),
+                    StmtInstruction::Expr(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
+                ]
+                .into(),
+            )
             .unwrap();
         assert_eq!(output, "0\n0\n");
     }
@@ -921,32 +1131,35 @@ mod tests {
         // a
         // ```
         let output = interpreter
-            .exec(vec![
-                StmtInstruction::DefineFunction {
-                    name: 'f',
-                    function: Function {
+            .exec(
+                vec![
+                    StmtInstruction::DefineFunction {
                         name: 'f',
-                        parameters: [Variable::Number('a')].into(),
-                        locals: [].into(),
-                        body: [StmtInstruction::Expr(ExprInstruction::Assignment {
-                            named: NamedExpr::VariableNumber('a'),
-                            value: Box::new(ExprInstruction::Number("5".to_string())),
-                        })]
-                        .into(),
+                        function: Function {
+                            name: 'f',
+                            parameters: [Variable::Number('a')].into(),
+                            body: [StmtInstruction::Expr(ExprInstruction::Assignment {
+                                named: NamedExpr::VariableNumber('a'),
+                                value: Box::new(ExprInstruction::Number("5".to_string())),
+                            })]
+                            .into(),
+                            ..Default::default()
+                        },
                     },
-                },
-                StmtInstruction::Expr(ExprInstruction::Assignment {
-                    named: NamedExpr::VariableNumber('a'),
-                    value: Box::new(ExprInstruction::Number("1".to_string())),
-                }),
-                StmtInstruction::Expr(ExprInstruction::Call {
-                    name: 'f',
-                    args: vec![FunctionArgument::Expr(ExprInstruction::Named(
-                        NamedExpr::VariableNumber('a'),
-                    ))],
-                }),
-                StmtInstruction::Expr(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
-            ])
+                    StmtInstruction::Expr(ExprInstruction::Assignment {
+                        named: NamedExpr::VariableNumber('a'),
+                        value: Box::new(ExprInstruction::Number("1".to_string())),
+                    }),
+                    StmtInstruction::Expr(ExprInstruction::Call {
+                        name: 'f',
+                        args: vec![FunctionArgument::Expr(ExprInstruction::Named(
+                            NamedExpr::VariableNumber('a'),
+                        ))],
+                    }),
+                    StmtInstruction::Expr(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
+                ]
+                .into(),
+            )
             .unwrap();
         assert_eq!(output, "0\n1\n");
     }
@@ -961,26 +1174,29 @@ mod tests {
         // f(5)
         //```
         let output = interpreter
-            .exec(vec![
-                StmtInstruction::DefineFunction {
-                    name: 'f',
-                    function: Function {
+            .exec(
+                vec![
+                    StmtInstruction::DefineFunction {
                         name: 'f',
-                        parameters: [Variable::Number('a')].into(),
-                        locals: [].into(),
-                        body: [StmtInstruction::ReturnExpr(ExprInstruction::Named(
-                            NamedExpr::VariableNumber('a'),
-                        ))]
-                        .into(),
+                        function: Function {
+                            name: 'f',
+                            parameters: [Variable::Number('a')].into(),
+                            body: [StmtInstruction::ReturnExpr(ExprInstruction::Named(
+                                NamedExpr::VariableNumber('a'),
+                            ))]
+                            .into(),
+                            ..Default::default()
+                        },
                     },
-                },
-                StmtInstruction::Expr(ExprInstruction::Call {
-                    name: 'f',
-                    args: vec![FunctionArgument::Expr(ExprInstruction::Number(
-                        "5".to_string(),
-                    ))],
-                }),
-            ])
+                    StmtInstruction::Expr(ExprInstruction::Call {
+                        name: 'f',
+                        args: vec![FunctionArgument::Expr(ExprInstruction::Number(
+                            "5".to_string(),
+                        ))],
+                    }),
+                ]
+                .into(),
+            )
             .unwrap();
         assert_eq!(output, "5\n");
     }
@@ -998,45 +1214,50 @@ mod tests {
         // a[0]
         // ```
         let output = interpreter
-            .exec(vec![
-                StmtInstruction::DefineFunction {
-                    name: 'f',
-                    function: Function {
+            .exec(
+                vec![
+                    StmtInstruction::DefineFunction {
                         name: 'f',
-                        parameters: [Variable::Array('a')].into(),
-                        locals: [].into(),
-                        body: [
-                            StmtInstruction::Expr(ExprInstruction::Named(NamedExpr::ArrayItem {
-                                name: 'a',
-                                index: Box::new(ExprInstruction::Number("0".to_string())),
-                            })),
-                            StmtInstruction::Expr(ExprInstruction::Assignment {
-                                named: NamedExpr::ArrayItem {
-                                    name: 'a',
-                                    index: Box::new(ExprInstruction::Number("0".to_string())),
-                                },
-                                value: Box::new(ExprInstruction::Number("5".to_string())),
-                            }),
-                        ]
-                        .into(),
+                        function: Function {
+                            name: 'f',
+                            parameters: [Variable::Array('a')].into(),
+                            body: [
+                                StmtInstruction::Expr(ExprInstruction::Named(
+                                    NamedExpr::ArrayItem {
+                                        name: 'a',
+                                        index: Box::new(ExprInstruction::Number("0".to_string())),
+                                    },
+                                )),
+                                StmtInstruction::Expr(ExprInstruction::Assignment {
+                                    named: NamedExpr::ArrayItem {
+                                        name: 'a',
+                                        index: Box::new(ExprInstruction::Number("0".to_string())),
+                                    },
+                                    value: Box::new(ExprInstruction::Number("5".to_string())),
+                                }),
+                            ]
+                            .into(),
+                            ..Default::default()
+                        },
                     },
-                },
-                StmtInstruction::Expr(ExprInstruction::Assignment {
-                    named: NamedExpr::ArrayItem {
+                    StmtInstruction::Expr(ExprInstruction::Assignment {
+                        named: NamedExpr::ArrayItem {
+                            name: 'a',
+                            index: Box::new(ExprInstruction::Number("0".to_string())),
+                        },
+                        value: Box::new(ExprInstruction::Number("1".to_string())),
+                    }),
+                    StmtInstruction::Expr(ExprInstruction::Call {
+                        name: 'f',
+                        args: vec![FunctionArgument::ArrayVariable('a')],
+                    }),
+                    StmtInstruction::Expr(ExprInstruction::Named(NamedExpr::ArrayItem {
                         name: 'a',
                         index: Box::new(ExprInstruction::Number("0".to_string())),
-                    },
-                    value: Box::new(ExprInstruction::Number("1".to_string())),
-                }),
-                StmtInstruction::Expr(ExprInstruction::Call {
-                    name: 'f',
-                    args: vec![FunctionArgument::ArrayVariable('a')],
-                }),
-                StmtInstruction::Expr(ExprInstruction::Named(NamedExpr::ArrayItem {
-                    name: 'a',
-                    index: Box::new(ExprInstruction::Number("0".to_string())),
-                })),
-            ])
+                    })),
+                ]
+                .into(),
+            )
             .unwrap();
         assert_eq!(output, "1\n0\n1\n");
     }
@@ -1049,13 +1270,16 @@ mod tests {
         // obase
         // ```
         let output = interpreter
-            .exec(vec![
-                StmtInstruction::Expr(ExprInstruction::SetRegister {
-                    register: Register::OBase,
-                    value: Box::new(ExprInstruction::Number("F".to_string())),
-                }),
-                StmtInstruction::Expr(ExprInstruction::GetRegister(Register::OBase)),
-            ])
+            .exec(
+                vec![
+                    StmtInstruction::Expr(ExprInstruction::SetRegister {
+                        register: Register::OBase,
+                        value: Box::new(ExprInstruction::Number("F".to_string())),
+                    }),
+                    StmtInstruction::Expr(ExprInstruction::GetRegister(Register::OBase)),
+                ]
+                .into(),
+            )
             .unwrap();
         assert_eq!(output, "10\n");
     }
@@ -1066,10 +1290,400 @@ mod tests {
         // ```
         // f()
         // ```
-        let output = interpreter.exec(vec![StmtInstruction::Expr(ExprInstruction::Call {
-            name: 'f',
-            args: vec![],
-        })]);
+        let output = interpreter.exec(Program {
+            instructions: vec![StmtInstruction::Expr(ExprInstruction::Call {
+                name: 'f',
+                args: vec![],
+            })],
+            source_locations: vec![1],
+            file: "".into(),
+        });
         assert!(output.is_err());
+    }
+
+    #[test]
+    fn test_error_inside_while_loop_reports_correct_line() {
+        let mut interpreter = Interpreter::default();
+        // ```
+        // i = 1
+        // while (i > - 1) {
+        //   1
+        //   1 / i
+        //   --i
+        // }
+        // ```
+        let err = interpreter
+            .exec(Program {
+                instructions: vec![
+                    StmtInstruction::Expr(ExprInstruction::Assignment {
+                        named: NamedExpr::VariableNumber('i'),
+                        value: Box::new(ExprInstruction::Number("1".to_string())),
+                    }),
+                    StmtInstruction::While {
+                        condition: ConditionInstruction::Gt(
+                            ExprInstruction::Named(NamedExpr::VariableNumber('i')),
+                            ExprInstruction::UnaryMinus(Box::new(ExprInstruction::Number(
+                                "1".to_string(),
+                            ))),
+                        ),
+                        instruction_count: 3,
+                        body: vec![
+                            StmtInstruction::Expr(ExprInstruction::Number("1".to_string())),
+                            StmtInstruction::Expr(ExprInstruction::Div(
+                                Box::new(ExprInstruction::Number("1".to_string())),
+                                Box::new(ExprInstruction::Named(NamedExpr::VariableNumber('i'))),
+                            )),
+                            StmtInstruction::Expr(ExprInstruction::PreDecrement(
+                                NamedExpr::VariableNumber('i'),
+                            )),
+                        ],
+                    },
+                ],
+                source_locations: vec![1, 2, 3, 4, 5],
+                file: "".into(),
+            })
+            .expect_err("expected error");
+        assert_eq!(err.call_stack[0].line, 4);
+    }
+
+    #[test]
+    fn test_error_after_executed_while_loop_reports_correct_line() {
+        let mut interpreter = Interpreter::default();
+        // ```
+        // i = 0
+        // while (i < 10) {
+        //   ++i
+        // }
+        // 1 ^ 2.2
+        // ```
+        let err = interpreter
+            .exec(Program {
+                instructions: vec![
+                    StmtInstruction::Expr(ExprInstruction::Assignment {
+                        named: NamedExpr::VariableNumber('i'),
+                        value: Box::new(ExprInstruction::Number("0".to_string())),
+                    }),
+                    StmtInstruction::While {
+                        condition: ConditionInstruction::Lt(
+                            ExprInstruction::Named(NamedExpr::VariableNumber('i')),
+                            ExprInstruction::Number("10".to_string()),
+                        ),
+                        instruction_count: 1,
+                        body: vec![StmtInstruction::Expr(ExprInstruction::PreIncrement(
+                            NamedExpr::VariableNumber('i'),
+                        ))],
+                    },
+                    StmtInstruction::Expr(ExprInstruction::Pow(
+                        Box::new(ExprInstruction::Number("1".to_string())),
+                        Box::new(ExprInstruction::Number("2.2".to_string())),
+                    )),
+                ],
+                source_locations: vec![1, 2, 3, 4],
+                file: "".into(),
+            })
+            .expect_err("expected error");
+        assert_eq!(err.call_stack[0].line, 4);
+    }
+
+    #[test]
+    fn test_err_after_unexecuted_while_loop_reports_correct_line() {
+        let mut interpreter = Interpreter::default();
+        // ```
+        // while(0) {
+        //   1
+        //   2
+        //   3
+        //   4
+        // }
+        // 1 ^ 2.2
+        //```
+        let err = interpreter
+            .exec(Program {
+                instructions: vec![
+                    StmtInstruction::While {
+                        condition: ConditionInstruction::Expr(ExprInstruction::Number(
+                            "0".to_string(),
+                        )),
+                        instruction_count: 4,
+                        body: vec![
+                            StmtInstruction::Expr(ExprInstruction::Number("1".to_string())),
+                            StmtInstruction::Expr(ExprInstruction::Number("2".to_string())),
+                            StmtInstruction::Expr(ExprInstruction::Number("3".to_string())),
+                            StmtInstruction::Expr(ExprInstruction::Number("4".to_string())),
+                        ],
+                    },
+                    StmtInstruction::Expr(ExprInstruction::Pow(
+                        Box::new(ExprInstruction::Number("1".to_string())),
+                        Box::new(ExprInstruction::Number("2.2".to_string())),
+                    )),
+                ],
+                source_locations: vec![1, 2, 3, 4, 5, 6],
+                file: "".into(),
+            })
+            .expect_err("expected error");
+        assert_eq!(err.call_stack[0].line, 6);
+    }
+
+    #[test]
+    fn test_error_inside_for_loop_reports_correct_line() {
+        let mut interpreter = Interpreter::default();
+        // ```
+        // for (a = 0; a > -1; --a) {
+        //   1
+        //   1 / a
+        //   2
+        // }
+        // ```
+        let err = interpreter
+            .exec(Program {
+                instructions: vec![StmtInstruction::For {
+                    init: ExprInstruction::Assignment {
+                        named: NamedExpr::VariableNumber('a'),
+                        value: Box::new(ExprInstruction::Number("0".to_string())),
+                    },
+                    condition: ConditionInstruction::Gt(
+                        ExprInstruction::Named(NamedExpr::VariableNumber('a')),
+                        ExprInstruction::UnaryMinus(Box::new(ExprInstruction::Number(
+                            "1".to_string(),
+                        ))),
+                    ),
+                    update: ExprInstruction::PreDecrement(NamedExpr::VariableNumber('a')),
+                    instruction_count: 3,
+                    body: vec![
+                        StmtInstruction::Expr(ExprInstruction::Number("1".to_string())),
+                        StmtInstruction::Expr(ExprInstruction::Div(
+                            Box::new(ExprInstruction::Number("1".to_string())),
+                            Box::new(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
+                        )),
+                        StmtInstruction::Expr(ExprInstruction::Number("2".to_string())),
+                    ],
+                }],
+                source_locations: vec![1, 2, 3, 4, 5],
+                file: "".into(),
+            })
+            .expect_err("expected error");
+        assert_eq!(err.call_stack[0].line, 3);
+    }
+
+    #[test]
+    fn test_error_after_executed_for_loop_reports_correct_line() {
+        let mut interpreter = Interpreter::default();
+        // ```
+        // for (a = 0; a < 5; a++) {
+        //   1
+        // }
+        // 1 ^ 2.2
+        // ```
+        let err = interpreter
+            .exec(Program {
+                instructions: vec![
+                    StmtInstruction::For {
+                        init: ExprInstruction::Assignment {
+                            named: NamedExpr::VariableNumber('a'),
+                            value: Box::new(ExprInstruction::Number("0".to_string())),
+                        },
+                        condition: ConditionInstruction::Lt(
+                            ExprInstruction::Named(NamedExpr::VariableNumber('a')),
+                            ExprInstruction::Number("5".to_string()),
+                        ),
+                        update: ExprInstruction::PostIncrement(NamedExpr::VariableNumber('a')),
+                        instruction_count: 1,
+                        body: vec![StmtInstruction::Expr(ExprInstruction::Number(
+                            "1".to_string(),
+                        ))],
+                    },
+                    StmtInstruction::Expr(ExprInstruction::Pow(
+                        Box::new(ExprInstruction::Number("1".to_string())),
+                        Box::new(ExprInstruction::Number("2.2".to_string())),
+                    )),
+                ],
+                source_locations: vec![1, 2, 4],
+                file: "".into(),
+            })
+            .expect_err("expected error");
+        assert_eq!(err.call_stack[0].line, 4);
+    }
+
+    #[test]
+    fn test_error_after_unexecuted_for_loop_reports_correct_line() {
+        let mut interpreter = Interpreter::default();
+        // ```
+        // for (a = 0; 0; a++) {
+        //   1
+        //   2
+        //   3
+        //   4
+        // }
+        // 1 ^ 2.2
+        // ```
+        let err = interpreter
+            .exec(Program {
+                instructions: vec![
+                    StmtInstruction::For {
+                        init: ExprInstruction::Assignment {
+                            named: NamedExpr::VariableNumber('a'),
+                            value: Box::new(ExprInstruction::Number("0".to_string())),
+                        },
+                        condition: ConditionInstruction::Expr(ExprInstruction::Number(
+                            "0".to_string(),
+                        )),
+                        update: ExprInstruction::PostIncrement(NamedExpr::VariableNumber('a')),
+                        instruction_count: 4,
+                        body: vec![
+                            StmtInstruction::Expr(ExprInstruction::Number("1".to_string())),
+                            StmtInstruction::Expr(ExprInstruction::Number("2".to_string())),
+                            StmtInstruction::Expr(ExprInstruction::Number("3".to_string())),
+                            StmtInstruction::Expr(ExprInstruction::Number("4".to_string())),
+                        ],
+                    },
+                    StmtInstruction::Expr(ExprInstruction::Pow(
+                        Box::new(ExprInstruction::Number("1".to_string())),
+                        Box::new(ExprInstruction::Number("2.2".to_string())),
+                    )),
+                ],
+                source_locations: vec![1, 2, 3, 4, 5, 7],
+                file: "".into(),
+            })
+            .expect_err("expected error");
+        assert_eq!(err.call_stack[0].line, 7);
+    }
+
+    #[test]
+    fn test_error_inside_if_reports_correct_line() {
+        let mut interpreter = Interpreter::default();
+        // ```
+        // if (1) {
+        //   1
+        //   1 / 0
+        // }
+        // ```
+        let err = interpreter
+            .exec(Program {
+                instructions: vec![StmtInstruction::If {
+                    condition: ConditionInstruction::Expr(ExprInstruction::Number("1".to_string())),
+                    instruction_count: 2,
+                    body: vec![
+                        StmtInstruction::Expr(ExprInstruction::Number("1".to_string())),
+                        StmtInstruction::Expr(ExprInstruction::Div(
+                            Box::new(ExprInstruction::Number("1".to_string())),
+                            Box::new(ExprInstruction::Number("0".to_string())),
+                        )),
+                    ],
+                }],
+                source_locations: vec![1, 2, 3],
+                file: "".into(),
+            })
+            .expect_err("expected error");
+        assert_eq!(err.call_stack[0].line, 3);
+    }
+
+    #[test]
+    fn test_error_after_executed_if_reports_correct_line() {
+        let mut interpreter = Interpreter::default();
+        // ```
+        // if (1) {
+        //   1
+        // }
+        // 1 ^ 2.2
+        // ```
+        let err = interpreter
+            .exec(Program {
+                instructions: vec![
+                    StmtInstruction::If {
+                        condition: ConditionInstruction::Expr(ExprInstruction::Number(
+                            "1".to_string(),
+                        )),
+                        instruction_count: 1,
+                        body: vec![StmtInstruction::Expr(ExprInstruction::Number(
+                            "1".to_string(),
+                        ))],
+                    },
+                    StmtInstruction::Expr(ExprInstruction::Pow(
+                        Box::new(ExprInstruction::Number("1".to_string())),
+                        Box::new(ExprInstruction::Number("2.2".to_string())),
+                    )),
+                ],
+                source_locations: vec![1, 2, 3],
+                file: "".into(),
+            })
+            .expect_err("expected error");
+        assert_eq!(err.call_stack[0].line, 3);
+    }
+
+    #[test]
+    fn test_error_after_unexecuted_if_reports_correct_line() {
+        let mut interpreter = Interpreter::default();
+        // ```
+        // if (0) {
+        //   1
+        //   2
+        //   3
+        //   4
+        // }
+        // 1 ^ 2.2
+        // ```
+        let err = interpreter
+            .exec(Program {
+                instructions: vec![
+                    StmtInstruction::If {
+                        condition: ConditionInstruction::Expr(ExprInstruction::Number(
+                            "0".to_string(),
+                        )),
+                        instruction_count: 4,
+                        body: vec![
+                            StmtInstruction::Expr(ExprInstruction::Number("1".to_string())),
+                            StmtInstruction::Expr(ExprInstruction::Number("2".to_string())),
+                            StmtInstruction::Expr(ExprInstruction::Number("3".to_string())),
+                            StmtInstruction::Expr(ExprInstruction::Number("4".to_string())),
+                        ],
+                    },
+                    StmtInstruction::Expr(ExprInstruction::Pow(
+                        Box::new(ExprInstruction::Number("1".to_string())),
+                        Box::new(ExprInstruction::Number("2.2".to_string())),
+                    )),
+                ],
+                source_locations: vec![1, 2, 3, 4, 5, 7],
+                file: "".into(),
+            })
+            .expect_err("expected error");
+        assert_eq!(err.call_stack[0].line, 7);
+    }
+
+    #[test]
+    fn test_function_call_errors_report_correct_lines() {
+        let mut interpreter = Interpreter::default();
+        // ```
+        // f() {
+        //   1 ^ 2.2
+        // }
+        // f()
+        // ```
+        let err = interpreter
+            .exec(Program {
+                instructions: vec![
+                    StmtInstruction::DefineFunction {
+                        name: 'f',
+                        function: Function {
+                            name: 'f',
+                            source_locations: [2].into(),
+                            body: [StmtInstruction::Expr(ExprInstruction::Pow(
+                                Box::new(ExprInstruction::Number("1".to_string())),
+                                Box::new(ExprInstruction::Number("2.2".to_string())),
+                            ))]
+                            .into(),
+                            ..Default::default()
+                        },
+                    },
+                    StmtInstruction::Expr(ExprInstruction::Call {
+                        name: 'f',
+                        args: vec![],
+                    }),
+                ],
+                source_locations: vec![4],
+                file: "".into(),
+            })
+            .expect_err("expected error");
+        assert_eq!(err.call_stack[0].line, 2);
+        assert_eq!(err.call_stack[1].line, 4);
     }
 }

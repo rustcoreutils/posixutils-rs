@@ -37,7 +37,7 @@ fn print_output_or_error(result: ExecutionResult<String>) {
             print!("{}", output);
         }
         Err(e) => {
-            println!("runtime error: {}", e);
+            println!("{}", e);
         }
     }
 }

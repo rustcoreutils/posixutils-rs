@@ -7,6 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::rc::Rc;
+
 use pest::{error::InputLocation, iterators::Pair, pratt_parser::PrattParser, Parser, Position};
 
 use super::instructions::*;
@@ -253,13 +255,21 @@ fn parse_condition(expr: Pair<Rule>) -> ConditionInstruction {
     }
 }
 
+/// parses a statement appending instructions to the `statements` vector
+/// and source locations to the `source_locations` vector
+/// # Returns
+/// the number of statement instructions in created from `stmt`
 fn parse_stmt(
     stmt: Pair<Rule>,
     in_function: bool,
     in_loop: bool,
     statements: &mut Vec<StmtInstruction>,
-) -> Result<(), PestError> {
+    source_locations: &mut Vec<usize>,
+) -> Result<usize, PestError> {
     let stmt = first_child(stmt);
+    let (line, _) = stmt.line_col();
+    source_locations.push(line);
+    let mut instruction_count = 1;
     match stmt.as_rule() {
         Rule::break_stmt => {
             if !in_loop {
@@ -297,16 +307,36 @@ fn parse_stmt(
             let mut inner = stmt.into_inner();
             let condition = parse_condition(inner.next().unwrap());
             let mut body = Vec::new();
-            parse_stmt(inner.next().unwrap(), in_function, in_loop, &mut body)?;
-            statements.push(StmtInstruction::If { condition, body });
+            instruction_count = parse_stmt(
+                inner.next().unwrap(),
+                in_function,
+                in_loop,
+                &mut body,
+                source_locations,
+            )?;
+            statements.push(StmtInstruction::If {
+                condition,
+                instruction_count,
+                body,
+            });
         }
         Rule::while_stmt => {
             // while (condition) stmt
             let mut inner = stmt.into_inner();
             let condition = parse_condition(inner.next().unwrap());
             let mut body = Vec::new();
-            parse_stmt(inner.next().unwrap(), in_function, true, &mut body)?;
-            statements.push(StmtInstruction::While { condition, body });
+            instruction_count = parse_stmt(
+                inner.next().unwrap(),
+                in_function,
+                true,
+                &mut body,
+                source_locations,
+            )?;
+            statements.push(StmtInstruction::While {
+                condition,
+                instruction_count,
+                body,
+            });
         }
         Rule::for_stmt => {
             // for (init; condition; update) stmt
@@ -315,18 +345,31 @@ fn parse_stmt(
             let condition = parse_condition(inner.next().unwrap());
             let update = parse_expr(inner.next().unwrap());
             let mut body = Vec::new();
-            parse_stmt(inner.next().unwrap(), in_function, true, &mut body)?;
+            instruction_count = parse_stmt(
+                inner.next().unwrap(),
+                in_function,
+                true,
+                &mut body,
+                source_locations,
+            )?;
             statements.push(StmtInstruction::For {
                 init,
                 condition,
                 update,
+                instruction_count,
                 body,
             });
         }
 
         Rule::braced_statement_list => {
+            // if the list has no statements instruction_count is 0
+            instruction_count = 0;
+            // remove the source location of the braced list as it
+            // doesn't directly map to a `StmtInstruction`
+            source_locations.pop();
             for stmt in first_child(stmt).into_inner() {
-                parse_stmt(stmt, in_function, in_loop, statements)?;
+                instruction_count +=
+                    parse_stmt(stmt, in_function, in_loop, statements, source_locations)?;
             }
         }
         Rule::string => {
@@ -337,10 +380,10 @@ fn parse_stmt(
         }
         _ => unreachable!(),
     }
-    Ok(())
+    Ok(instruction_count)
 }
 
-fn parse_function(func: Pair<Rule>) -> Result<Function, PestError> {
+fn parse_function(func: Pair<Rule>, file: Rc<str>) -> Result<Function, PestError> {
     let mut function = func.into_inner();
 
     // define letter ( parameter_list ) auto_define_list statement_list end
@@ -368,22 +411,23 @@ fn parse_function(func: Pair<Rule>) -> Result<Function, PestError> {
     };
 
     let mut body = Vec::new();
+    let mut source_locations = Vec::new();
     for stmt in statement_list.into_inner() {
-        parse_stmt(stmt, true, false, &mut body)?;
+        parse_stmt(stmt, true, false, &mut body, &mut source_locations)?;
     }
     Ok(Function {
         name,
+        file,
         parameters: parameters.into(),
         locals: locals.into(),
         body: body.into(),
+        source_locations: source_locations.into(),
     })
 }
 
 #[derive(pest_derive::Parser)]
 #[grammar = "bc_util/grammar.pest"]
 pub struct BcParser;
-
-pub type Program = Vec<StmtInstruction>;
 
 pub type PestError = pest::error::Error<Rule>;
 
@@ -530,20 +574,24 @@ pub fn parse_program(text: &str, file_path: Option<&str>) -> Result<Program, Par
         Ok(mut program) => program.next().unwrap(),
         Err(err) => return Err(gather_errors(text, file_path, err)),
     };
-    let mut result = Vec::new();
+    let file = Rc::<str>::from(file_path.unwrap_or(""));
+    let mut instructions = Vec::new();
+    let mut source_locations = Vec::new();
     let mut errors = Vec::new();
     for item in program.into_inner() {
         match item.as_rule() {
             Rule::semicolon_list => {
                 // stmt*
                 for stmt in item.into_inner() {
-                    if let Err(e) = parse_stmt(stmt, false, false, &mut result) {
+                    if let Err(e) =
+                        parse_stmt(stmt, false, false, &mut instructions, &mut source_locations)
+                    {
                         errors.push(e);
                     }
                 }
             }
-            Rule::function => match parse_function(item) {
-                Ok(f) => result.push(StmtInstruction::DefineFunction {
+            Rule::function => match parse_function(item, file.clone()) {
+                Ok(f) => instructions.push(StmtInstruction::DefineFunction {
                     name: f.name,
                     function: f,
                 }),
@@ -554,7 +602,11 @@ pub fn parse_program(text: &str, file_path: Option<&str>) -> Result<Program, Par
         }
     }
     if errors.is_empty() {
-        Ok(result)
+        Ok(Program {
+            file,
+            instructions,
+            source_locations,
+        })
     } else {
         Err(ParseError {
             errors,
@@ -569,8 +621,8 @@ mod test {
 
     fn parse_expr(input: &str) -> ExprInstruction {
         let program = parse_program(input, None).expect("error parsing expression");
-        assert_eq!(program.len(), 1);
-        if let StmtInstruction::Expr(expr) = program.into_iter().next().unwrap() {
+        assert_eq!(program.instructions.len(), 1);
+        if let StmtInstruction::Expr(expr) = program.instructions.into_iter().next().unwrap() {
             expr
         } else {
             panic!("expected expression")
@@ -579,15 +631,15 @@ mod test {
 
     fn parse_stmt(input: &str) -> StmtInstruction {
         let program = parse_program(input, None).expect("error parsing statement");
-        assert_eq!(program.len(), 1);
-        program.into_iter().next().unwrap()
+        assert_eq!(program.instructions.len(), 1);
+        program.instructions.into_iter().next().unwrap()
     }
 
     fn parse_function(input: &str) -> Function {
         let program = parse_program(input, None).expect("error parsing function");
-        assert_eq!(program.len(), 1);
+        assert_eq!(program.instructions.len(), 1);
         if let StmtInstruction::DefineFunction { function, .. } =
-            program.into_iter().next().unwrap()
+            program.instructions.into_iter().next().unwrap()
         {
             function
         } else {
@@ -601,8 +653,8 @@ mod test {
 
     #[test]
     fn test_parse_empty_program() {
-        let instructions = parse_program("", None).expect("error parsing empty program");
-        assert_eq!(instructions.len(), 0);
+        let program = parse_program("", None).expect("error parsing empty program");
+        assert_eq!(program.instructions.len(), 0);
     }
 
     #[test]
@@ -1013,6 +1065,7 @@ mod test {
             stmt,
             StmtInstruction::While {
                 condition: ConditionInstruction::Expr(ExprInstruction::Number("0".to_string())),
+                instruction_count: 1,
                 body: vec![StmtInstruction::Break]
             }
         );
@@ -1034,6 +1087,7 @@ mod test {
                 function: Function {
                     name: 'f',
                     body: [StmtInstruction::Return].into(),
+                    source_locations: [2].into(),
                     ..Default::default()
                 }
             }
@@ -1049,6 +1103,7 @@ mod test {
                 name: 'f',
                 function: Function {
                     name: 'f',
+                    source_locations: [2].into(),
                     body: [StmtInstruction::ReturnExpr(ExprInstruction::Number(
                         "1".to_string()
                     ))]
@@ -1069,6 +1124,7 @@ mod test {
                     ExprInstruction::Named(NamedExpr::VariableNumber('x')),
                     ExprInstruction::Named(NamedExpr::VariableNumber('z'))
                 ),
+                instruction_count: 1,
                 body: vec![StmtInstruction::Expr(ExprInstruction::Assignment {
                     named: NamedExpr::VariableNumber('a'),
                     value: Box::new(ExprInstruction::Number("2".to_string()))
@@ -1087,6 +1143,7 @@ mod test {
                     ExprInstruction::Named(NamedExpr::VariableNumber('x')),
                     ExprInstruction::Named(NamedExpr::VariableNumber('z'))
                 ),
+                instruction_count: 1,
                 body: vec![StmtInstruction::Expr(ExprInstruction::Assignment {
                     named: NamedExpr::VariableNumber('a'),
                     value: Box::new(ExprInstruction::Number("2".to_string()))
@@ -1110,6 +1167,7 @@ mod test {
                     ExprInstruction::Number("10".to_string())
                 ),
                 update: ExprInstruction::PostIncrement(NamedExpr::VariableNumber('i')),
+                instruction_count: 1,
                 body: vec![StmtInstruction::Expr(ExprInstruction::Assignment {
                     named: NamedExpr::VariableNumber('a'),
                     value: Box::new(ExprInstruction::Number("2".to_string()))
@@ -1120,41 +1178,41 @@ mod test {
 
     #[test]
     fn test_parse_empty_braced_statement_list() {
-        let instructions =
+        let program =
             parse_program("{ }\n", None).expect("error parsing empty braced statement list");
-        assert_eq!(instructions.len(), 0);
-        let instructions =
+        assert_eq!(program.instructions.len(), 0);
+        let program =
             parse_program("{\n}\n", None).expect("error parsing empty braced statement list");
-        assert_eq!(instructions.len(), 0);
-        let instructions =
+        assert_eq!(program.instructions.len(), 0);
+        let program =
             parse_program("{\n\n}\n", None).expect("error parsing empty braced statement list");
-        assert_eq!(instructions.len(), 0);
-        let instructions =
+        assert_eq!(program.instructions.len(), 0);
+        let program =
             parse_program("{;\n;;}\n", None).expect("error parsing empty braced statement list");
-        assert_eq!(instructions.len(), 0);
+        assert_eq!(program.instructions.len(), 0);
     }
 
     #[test]
     fn test_parse_braced_statement_list() {
-        let instructions = parse_program("{ 1 + 2; 3 + 4; \"string\" }\n", None)
+        let program = parse_program("{ 1 + 2; 3 + 4; \"string\" }\n", None)
             .expect("error parsing braced statement list");
-        assert_eq!(instructions.len(), 3);
+        assert_eq!(program.instructions.len(), 3);
         assert_eq!(
-            instructions[0],
+            program.instructions[0],
             StmtInstruction::Expr(ExprInstruction::Add(
                 Box::new(ExprInstruction::Number("1".to_string())),
                 Box::new(ExprInstruction::Number("2".to_string()))
             ))
         );
         assert_eq!(
-            instructions[1],
+            program.instructions[1],
             StmtInstruction::Expr(ExprInstruction::Add(
                 Box::new(ExprInstruction::Number("3".to_string())),
                 Box::new(ExprInstruction::Number("4".to_string()))
             ))
         );
         assert_eq!(
-            instructions[2],
+            program.instructions[2],
             StmtInstruction::String("string".to_string())
         );
     }
@@ -1185,50 +1243,49 @@ mod test {
 
     #[test]
     fn test_parse_multiple_statements_on_single_line() {
-        let instructions = parse_program("1 + 2; 3 + 4; \"string\"\n", None)
+        let program = parse_program("1 + 2; 3 + 4; \"string\"\n", None)
             .expect("error parsing multiple statements");
-        assert_eq!(instructions.len(), 3);
+        assert_eq!(program.instructions.len(), 3);
         assert_eq!(
-            instructions[0],
+            program.instructions[0],
             StmtInstruction::Expr(ExprInstruction::Add(
                 Box::new(ExprInstruction::Number("1".to_string())),
                 Box::new(ExprInstruction::Number("2".to_string()))
             ))
         );
         assert_eq!(
-            instructions[1],
+            program.instructions[1],
             StmtInstruction::Expr(ExprInstruction::Add(
                 Box::new(ExprInstruction::Number("3".to_string())),
                 Box::new(ExprInstruction::Number("4".to_string()))
             ))
         );
         assert_eq!(
-            instructions[2],
+            program.instructions[2],
             StmtInstruction::String("string".to_string())
         );
     }
 
     #[test]
     fn test_parse_semicolon_list() {
-        let instructions = parse_program(";; ; 1 + 3 ; ;; \"string\"\n", None)
+        let program = parse_program(";; ; 1 + 3 ; ;; \"string\"\n", None)
             .expect("error parsing semicolon list");
-        assert_eq!(instructions.len(), 2);
+        assert_eq!(program.instructions.len(), 2);
         assert_eq!(
-            instructions[0],
+            program.instructions[0],
             StmtInstruction::Expr(ExprInstruction::Add(
                 Box::new(ExprInstruction::Number("1".to_string())),
                 Box::new(ExprInstruction::Number("3".to_string()))
             ))
         );
         assert_eq!(
-            instructions[1],
+            program.instructions[1],
             StmtInstruction::String("string".to_string())
         );
-        let instructions =
-            parse_program("a + 2;;;;;;\n", None).expect("error parsing semicolon list");
-        assert_eq!(instructions.len(), 1);
+        let program = parse_program("a + 2;;;;;;\n", None).expect("error parsing semicolon list");
+        assert_eq!(program.instructions.len(), 1);
         assert_eq!(
-            instructions[0],
+            program.instructions[0],
             StmtInstruction::Expr(ExprInstruction::Add(
                 Box::new(ExprInstruction::Named(NamedExpr::VariableNumber('a'))),
                 Box::new(ExprInstruction::Number("2".to_string()))
@@ -1293,6 +1350,7 @@ mod test {
             func,
             Function {
                 name: 'f',
+                source_locations: [2].into(),
                 body: [StmtInstruction::Expr(ExprInstruction::Add(
                     Box::new(ExprInstruction::Number("1".to_string())),
                     Box::new(ExprInstruction::Number("2".to_string()))
@@ -1305,21 +1363,21 @@ mod test {
 
     #[test]
     fn test_ignore_comments() {
-        let instructions = parse_program(
+        let program = parse_program(
             "/*line comment*/\n1 + 2; \n/*multiline\ncomment*/\n3 + 4\n",
             None,
         )
         .expect("error parsing multiple statements with comments");
-        assert_eq!(instructions.len(), 2);
+        assert_eq!(program.instructions.len(), 2);
         assert_eq!(
-            instructions[0],
+            program.instructions[0],
             StmtInstruction::Expr(ExprInstruction::Add(
                 Box::new(ExprInstruction::Number("1".to_string())),
                 Box::new(ExprInstruction::Number("2".to_string()))
             ))
         );
         assert_eq!(
-            instructions[1],
+            program.instructions[1],
             StmtInstruction::Expr(ExprInstruction::Add(
                 Box::new(ExprInstruction::Number("3".to_string())),
                 Box::new(ExprInstruction::Number("4".to_string()))

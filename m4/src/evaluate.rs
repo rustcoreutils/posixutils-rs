@@ -1333,9 +1333,7 @@ impl MacroImplementation for DumpdefMacro {
                         .last()
                         .expect(AT_LEAST_ONE_MACRO_DEFINITION_EXPECT),
                 )?;
-                if i < (state.macro_definitions.len() - 1) {
-                    stderror.write_all(b"\n")?;
-                }
+                stderror.write_all(b"\n")?;
             }
         }
 
@@ -1354,9 +1352,7 @@ impl MacroImplementation for DumpdefMacro {
                 )?,
                 None => write!(stderror, "undefined macro {name}")?,
             }
-            if i < (args_len - 1) {
-                stderror.write_all(b"\n")?;
-            }
+            stderror.write_all(b"\n")?;
         }
 
         Ok(state)

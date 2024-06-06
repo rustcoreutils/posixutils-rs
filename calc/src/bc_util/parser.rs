@@ -1117,8 +1117,8 @@ mod test {
     }
 
     #[test]
-    fn test_parse_if() {
-        let stmt = parse_stmt("if (x <= z) a = 2\n");
+    fn test_parse_empty_if() {
+        let stmt = parse_stmt("if (x <= z) {}\n");
         assert_eq!(
             stmt,
             StmtInstruction::If {
@@ -1126,18 +1126,66 @@ mod test {
                     ExprInstruction::Named(NamedExpr::VariableNumber('x')),
                     ExprInstruction::Named(NamedExpr::VariableNumber('z'))
                 ),
-                instruction_count: 1,
-                body: vec![StmtInstruction::Expr(ExprInstruction::Assignment {
-                    named: NamedExpr::VariableNumber('a'),
-                    value: Box::new(ExprInstruction::Number("2".to_string()))
-                })]
+                instruction_count: 0,
+                body: vec![]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_if() {
+        let stmt = parse_stmt("if (x <= z) {\n a = 2 \n b = 3\n c = 3 \n}\n");
+        assert_eq!(
+            stmt,
+            StmtInstruction::If {
+                condition: ConditionInstruction::Leq(
+                    ExprInstruction::Named(NamedExpr::VariableNumber('x')),
+                    ExprInstruction::Named(NamedExpr::VariableNumber('z'))
+                ),
+                instruction_count: 3,
+                body: vec![
+                    StmtInstruction::Expr(ExprInstruction::Assignment {
+                        named: NamedExpr::VariableNumber('a'),
+                        value: Box::new(ExprInstruction::Number("2".to_string()))
+                    }),
+                    StmtInstruction::Expr(ExprInstruction::Assignment {
+                        named: NamedExpr::VariableNumber('b'),
+                        value: Box::new(ExprInstruction::Number("3".to_string()))
+                    }),
+                    StmtInstruction::Expr(ExprInstruction::Assignment {
+                        named: NamedExpr::VariableNumber('c'),
+                        value: Box::new(ExprInstruction::Number("3".to_string()))
+                    })
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_empty_while() {
+        let stmt = parse_stmt("while (x + 2 != 2 + y) {}\n");
+        assert_eq!(
+            stmt,
+            StmtInstruction::While {
+                condition: ConditionInstruction::Ne(
+                    ExprInstruction::Add(
+                        Box::new(ExprInstruction::Named(NamedExpr::VariableNumber('x'))),
+                        Box::new(ExprInstruction::Number("2".to_string()))
+                    ),
+                    ExprInstruction::Add(
+                        Box::new(ExprInstruction::Number("2".to_string())),
+                        Box::new(ExprInstruction::Named(NamedExpr::VariableNumber('y')))
+                    )
+                ),
+                instruction_count: 0,
+                body: vec![]
             }
         );
     }
 
     #[test]
     fn test_parse_while() {
-        let stmt = parse_stmt("while (x <= z) a = 2\n");
+        let stmt = parse_stmt("while (x <= z) {\n 1 + 2\n x += y / 2\n u \n}\n");
         assert_eq!(
             stmt,
             StmtInstruction::While {
@@ -1145,11 +1193,45 @@ mod test {
                     ExprInstruction::Named(NamedExpr::VariableNumber('x')),
                     ExprInstruction::Named(NamedExpr::VariableNumber('z'))
                 ),
-                instruction_count: 1,
-                body: vec![StmtInstruction::Expr(ExprInstruction::Assignment {
-                    named: NamedExpr::VariableNumber('a'),
-                    value: Box::new(ExprInstruction::Number("2".to_string()))
-                })]
+                instruction_count: 3,
+                body: vec![
+                    StmtInstruction::Expr(ExprInstruction::Add(
+                        Box::new(ExprInstruction::Number("1".to_string())),
+                        Box::new(ExprInstruction::Number("2".to_string()))
+                    )),
+                    StmtInstruction::Expr(ExprInstruction::Assignment {
+                        named: NamedExpr::VariableNumber('x'),
+                        value: Box::new(ExprInstruction::Add(
+                            Box::new(ExprInstruction::Named(NamedExpr::VariableNumber('x'))),
+                            Box::new(ExprInstruction::Div(
+                                Box::new(ExprInstruction::Named(NamedExpr::VariableNumber('y'))),
+                                Box::new(ExprInstruction::Number("2".to_string()))
+                            ))
+                        ))
+                    }),
+                    StmtInstruction::Expr(ExprInstruction::Named(NamedExpr::VariableNumber('u')))
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_empty_for() {
+        let stmt = parse_stmt("for (i = 0; i < 10; i++) {}\n");
+        assert_eq!(
+            stmt,
+            StmtInstruction::For {
+                init: ExprInstruction::Assignment {
+                    named: NamedExpr::VariableNumber('i'),
+                    value: Box::new(ExprInstruction::Number("0".to_string()))
+                },
+                condition: ConditionInstruction::Lt(
+                    ExprInstruction::Named(NamedExpr::VariableNumber('i')),
+                    ExprInstruction::Number("10".to_string())
+                ),
+                update: ExprInstruction::PostIncrement(NamedExpr::VariableNumber('i')),
+                instruction_count: 0,
+                body: vec![]
             }
         );
     }
@@ -1454,5 +1536,29 @@ mod test {
                 Box::new(ExprInstruction::Number("2".to_string()))
             )
         );
+    }
+
+    #[test]
+    fn test_generate_correct_source_info() {
+        let program = parse_program("1 + 2\n", Some("file.bc")).expect("error parsing program");
+        assert_eq!(program.file.as_ref(), "file.bc");
+        assert_eq!(program.source_locations, [1]);
+        let program = parse_program("1 + 2\n3 + 4\n", None).expect("error parsing program");
+        assert_eq!(program.file.as_ref(), "");
+        assert_eq!(program.source_locations, [1, 2]);
+        let program =
+            parse_program("1; 2; 3; 4 + 5 + 9\n", Some("file.bc")).expect("error parsing program");
+        assert_eq!(program.source_locations, [1, 1, 1, 1]);
+        let program = parse_program("{1; 2; 3}\n", None).expect("error parsing program");
+        assert_eq!(program.source_locations, [1, 1, 1]);
+        let program =
+            parse_program("if(0) {\n 1\n 2\n 3\n}\n 1 + 2\n", None).expect("error parsing program");
+        assert_eq!(program.source_locations, [1, 2, 3, 4, 6]);
+        let program =
+            parse_program("while(0) {1\n 2\n 3\n}\n", None).expect("error parsing program");
+        assert_eq!(program.source_locations, [1, 1, 2, 3]);
+        let program = parse_program("for(1; 2; 3) {\n1\n 2\n\n\n 3\n}\n", None)
+            .expect("error parsing program");
+        assert_eq!(program.source_locations, [1, 2, 3, 6]);
     }
 }

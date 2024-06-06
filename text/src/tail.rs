@@ -1,12 +1,15 @@
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, textdomain};
-use inotify::{Inotify, WatchMask};
+use notify_debouncer_full::new_debouncer;
+use notify_debouncer_full::notify::event::{ModifyKind, RemoveKind};
+use notify_debouncer_full::notify::{EventKind, RecursiveMode, Watcher};
 use plib::PROJECT_NAME;
 use std::fs;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration;
 
 /// Wrapper type for isize that defaults to negative values if no sign is provided
 #[derive(Debug, Clone)]
@@ -57,7 +60,7 @@ impl Args {
         }
 
         if self.bytes.is_none() && self.lines.is_none() {
-            self.lines = Some(10);
+            self.lines = Some(-10);
         }
 
         Ok(())
@@ -121,6 +124,17 @@ fn print_last_n_bytes<R: Read>(buf_reader: &mut R, n: isize) -> Result<(), Strin
     Ok(())
 }
 
+fn print_bytes(bytes: &[u8]) {
+    match std::str::from_utf8(bytes) {
+        Ok(valid_str) => print!("{}", valid_str),
+        Err(_) => {
+            for byte in bytes {
+                print!("{}", *byte as char);
+            }
+        }
+    }
+}
+
 /// The main logic for the tail command.
 ///
 /// # Arguments
@@ -149,52 +163,55 @@ fn tail(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     // If follow option is specified, continue monitoring the file
     if args.follow && !(args.file == Some(PathBuf::from("-")) || args.file.is_none()) {
         let file_path = args.file.as_ref().unwrap();
-        // Initialization of inotify
-        let mut inotify = Inotify::init()?;
-
-        inotify
-            .watches()
-            .add(file_path, WatchMask::MODIFY | WatchMask::DELETE_SELF)
-            .expect("Failed to add inotify watch");
 
         // Opening a file and placing the cursor at the end of the file
         let mut file = File::open(file_path)?;
         file.seek(SeekFrom::End(0))?;
-        let mut reader = BufReader::new(file);
+        let mut reader = BufReader::new(&file);
 
-        // Buffer for inotify events
-        let mut buffer = [0u8; 4096];
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Automatically select the best implementation for your platform.
+        let mut debouncer = new_debouncer(Duration::from_millis(1), None, tx).unwrap();
 
-        loop {
-            // Read inotify events
-            let events = inotify.read_events_blocking(&mut buffer)?;
+        // Add a path to be watched.
+        // below will be monitored for changes.
+        debouncer
+            .watcher()
+            .watch(Path::new(file_path), RecursiveMode::NonRecursive)?;
 
-            // Handle each event
-            for event in events {
-                if event.mask.contains(inotify::EventMask::DELETE_SELF) {
-                    eprintln!("File {} deleted, exiting...", file_path.display());
-                    std::process::exit(1);
+        for res in rx {
+            match res {
+                Ok(events) => {
+                    let event = events.first().unwrap();
+                    match event.kind {
+                        EventKind::Modify(ModifyKind::Any)
+                        | EventKind::Modify(ModifyKind::Data(_))
+                        | EventKind::Modify(ModifyKind::Other) => {
+                            // If the file has been modified, check if the file was truncated
+                            let metadata = file.metadata()?;
+                            let current_size = metadata.len();
+
+                            if current_size < reader.stream_position()? {
+                                eprintln!("\ntail: {}: file truncated", file_path.display());
+                                reader.seek(SeekFrom::Start(0))?;
+                            }
+
+                            // Read the new lines and output them
+                            let mut new_data = vec![];
+                            let bytes_read = reader.read_to_end(&mut new_data)?;
+                            if bytes_read > 0 {
+                                print_bytes(&new_data);
+                                io::stdout().flush()?;
+                            }
+                        }
+                        EventKind::Remove(RemoveKind::File) => {
+                            debouncer.watcher().unwatch(Path::new(file_path))?
+                        }
+                        _ => {}
+                    }
                 }
-
-                if event.mask.contains(inotify::EventMask::MODIFY) {
-                    // If the file has been modified, check if the file was truncated
-                    let metadata = fs::metadata(file_path)?;
-                    let current_size = metadata.len();
-
-                    if current_size < reader.stream_position()? {
-                        eprintln!("tail: {}: file truncated", file_path.display());
-
-                        reader.seek(SeekFrom::Start(0))?;
-                        reader = BufReader::new(File::open(file_path)?);
-                    }
-
-                    // Read the new lines and output them
-                    let mut new_data = String::new();
-                    let bytes_read = reader.read_to_string(&mut new_data)?;
-                    if bytes_read > 0 {
-                        print!("{}", new_data);
-                        io::stdout().flush()?;
-                    }
+                Err(e) => {
+                    eprintln!("watch error: {:?}", e);
                 }
             }
         }

@@ -132,6 +132,7 @@ macro_enums!(
         Ifdef(IfdefMacro),
         Translit(TranslitMacro),
         Defn(DefnMacro),
+        Substr(SubstrMacro),
     }
 );
 // TODO: implement these macros:
@@ -140,7 +141,6 @@ macro_enums!(
 // Traceon,
 // Sysval,
 // Syscmd,
-// Substr,
 // Mkstemp,
 // Maketemp,
 // M4wrap,
@@ -152,26 +152,27 @@ macro_enums!(
 impl AsRef<[u8]> for BuiltinMacro {
     fn as_ref(&self) -> &'static [u8] {
         match self {
-            BuiltinMacro::Dnl => b"dnl",
-            BuiltinMacro::Define => b"define",
-            BuiltinMacro::Undefine => b"undefine",
-            BuiltinMacro::Defn => b"defn",
-            BuiltinMacro::Errprint => b"errprint",
-            BuiltinMacro::Include => b"include",
-            BuiltinMacro::Sinclude => b"sinclude",
-            BuiltinMacro::Changecom => b"changecom",
-            BuiltinMacro::Changequote => b"changequote",
-            BuiltinMacro::Pushdef => b"pushdef",
-            BuiltinMacro::Popdef => b"popdef",
-            BuiltinMacro::Incr => b"incr",
-            BuiltinMacro::Ifelse => b"ifelse",
-            BuiltinMacro::Ifdef => b"ifdef",
-            BuiltinMacro::Shift => b"shift",
-            BuiltinMacro::Eval => b"eval",
-            BuiltinMacro::Decr => b"decr",
-            BuiltinMacro::Len => b"len",
-            BuiltinMacro::Index => b"index",
-            BuiltinMacro::Translit => b"translit",
+            Self::Dnl => b"dnl",
+            Self::Define => b"define",
+            Self::Undefine => b"undefine",
+            Self::Defn => b"defn",
+            Self::Errprint => b"errprint",
+            Self::Include => b"include",
+            Self::Sinclude => b"sinclude",
+            Self::Changecom => b"changecom",
+            Self::Changequote => b"changequote",
+            Self::Pushdef => b"pushdef",
+            Self::Popdef => b"popdef",
+            Self::Incr => b"incr",
+            Self::Ifelse => b"ifelse",
+            Self::Ifdef => b"ifdef",
+            Self::Shift => b"shift",
+            Self::Eval => b"eval",
+            Self::Decr => b"decr",
+            Self::Len => b"len",
+            Self::Index => b"index",
+            Self::Translit => b"translit",
+            Self::Substr => b"substr",
         }
     }
 }
@@ -185,26 +186,27 @@ impl BuiltinMacro {
     /// macro.
     pub fn min_args(&self) -> usize {
         match self {
-            BuiltinMacro::Dnl => 0,
-            BuiltinMacro::Define => 1,
-            BuiltinMacro::Undefine => 1,
-            BuiltinMacro::Defn => 1,
-            BuiltinMacro::Errprint => 1,
-            BuiltinMacro::Include => 1,
-            BuiltinMacro::Sinclude => 1,
-            BuiltinMacro::Changecom => 0,
-            BuiltinMacro::Changequote => 0,
-            BuiltinMacro::Pushdef => 1,
-            BuiltinMacro::Popdef => 1,
-            BuiltinMacro::Incr => 1,
-            BuiltinMacro::Decr => 1,
-            BuiltinMacro::Ifelse => 1,
-            BuiltinMacro::Ifdef => 1,
-            BuiltinMacro::Shift => 1,
-            BuiltinMacro::Eval => 1,
-            BuiltinMacro::Len => 1,
-            BuiltinMacro::Index => 1,
-            BuiltinMacro::Translit => 1,
+            Self::Dnl => 0,
+            Self::Define => 1,
+            Self::Undefine => 1,
+            Self::Defn => 1,
+            Self::Errprint => 1,
+            Self::Include => 1,
+            Self::Sinclude => 1,
+            Self::Changecom => 0,
+            Self::Changequote => 0,
+            Self::Pushdef => 1,
+            Self::Popdef => 1,
+            Self::Incr => 1,
+            Self::Decr => 1,
+            Self::Ifelse => 1,
+            Self::Ifdef => 1,
+            Self::Shift => 1,
+            Self::Eval => 1,
+            Self::Len => 1,
+            Self::Index => 1,
+            Self::Translit => 1,
+            Self::Substr => 1,
         }
     }
 
@@ -1226,6 +1228,70 @@ impl MacroImplementation for TranslitMacro {
         }
 
         stdout.write_all(&output_buffer)?;
+        Ok(state)
+    }
+}
+
+/// The defining text for the substr macro shall be the substring of the first argument beginning at
+/// the zero-offset character position specified by the second argument. The third argument, if
+/// specified, shall be the number of characters to select; if not specified, the characters from
+/// the starting point to the end of the first argument shall become the defining text. It shall not
+/// be an error to specify a starting point beyond the end of the first argument and the defining
+/// text shall be null. It shall be an error to specify an argument containing any non-numeric
+/// characters. The behavior is unspecified if substr is not immediately followed by a
+/// `<left-parenthesis>`.
+struct SubstrMacro;
+
+impl MacroImplementation for SubstrMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stdout: &mut dyn Write,
+        stderror: &mut dyn Write,
+        m: Macro,
+    ) -> Result<State> {
+        let mut args = m.args.into_iter();
+        let first_arg = args
+            .next()
+            .ok_or_else(|| crate::Error::NotEnoughArguments)?;
+        let first_arg_text;
+        (first_arg_text, state) = evaluate_to_buffer(state, first_arg.symbols, stderror, true)?;
+
+        if first_arg_text.is_empty() {
+            return Ok(state);
+        }
+
+        let start_index = if let Some(second_arg) = args.next() {
+            let second_arg_text;
+            (second_arg_text, state) =
+                evaluate_to_buffer(state, second_arg.symbols, stderror, true)?;
+            let (_, i) = nom::combinator::all_consuming(parse_index)(&second_arg_text)?;
+            i
+        } else {
+            0
+        };
+
+        if start_index > (first_arg_text.len() - 1) {
+            return Ok(state);
+        }
+
+        let out = if let Some(third_arg) = args.next() {
+            let third_arg_text;
+            (third_arg_text, state) = evaluate_to_buffer(state, third_arg.symbols, stderror, true)?;
+            let (_, number_of_chars) =
+                nom::combinator::all_consuming(parse_index)(&third_arg_text)?;
+
+            if number_of_chars > 0 {
+                let end_index = usize::min(start_index + number_of_chars, first_arg_text.len());
+                &first_arg_text[start_index..end_index]
+            } else {
+                return Ok(state);
+            }
+        } else {
+            &first_arg_text[start_index..]
+        };
+
+        stdout.write_all(&out)?;
         Ok(state)
     }
 }

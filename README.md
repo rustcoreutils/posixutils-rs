@@ -158,7 +158,7 @@ https://github.com/jgarzik/posixutils
  - [ ] time
  - [x] touch
  - [x] tput
- - [ ] tr
+ - [x] tr
  - [x] true
  - [x] tsort
  - [x] tty

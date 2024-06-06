@@ -11,12 +11,15 @@ plib = { path = "../plib" }
 clap.workspace = true
 gettext-rs.workspace = true
 topological-sort = "0.2"
-diff = "0.1"
 regex.workspace = true
 chrono.workspace = true
 libc.workspace = true
 inotify = "0.10.2"
 ctor = "0.2.8"
+atty.workspace = true
+diff = "0.1"
+dirs = "5.0"
+deunicode = "1.6"
 
 [[bin]]
 name = "asa"
@@ -25,6 +28,10 @@ path = "src/asa.rs"
 [[bin]]
 name = "comm"
 path = "src/comm.rs"
+
+[[bin]]
+name = "unexpand"
+path = "src/unexpand.rs"
 
 [[bin]]
 name = "csplit"
@@ -47,12 +54,12 @@ name = "sort"
 path = "src/sort.rs"
 
 [[bin]]
-name = "unexpand"
-path = "src/unexpand.rs"
-
-[[bin]]
 name = "expand"
 path = "src/expand.rs"
+
+[[bin]]
+name = "tr"
+path = "src/tr.rs"
 
 [[bin]]
 name = "fold"

@@ -88,3 +88,6 @@ path = "src/tsort.rs"
 name = "wc"
 path = "src/wc.rs"
 
+[[bin]]
+name = "patch"
+path = "src/patch.rs"

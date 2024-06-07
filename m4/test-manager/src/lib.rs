@@ -9,6 +9,7 @@ pub struct TestSnapshot {
     /// An error is expected to occur, the stderr does not need to match exactly because error
     /// messages may differe slightly.
     pub expect_error: bool,
+    pub stdout_regex: Option<String>,
 }
 
 fn escape_newlines(input: &str) -> String {
@@ -38,6 +39,12 @@ impl TestSnapshot {
             write!(out, "\n").unwrap();
             write!(out, "expect_error=true").unwrap();
         }
+        if let Some(stdout_regex) = &self.stdout_regex {
+            write!(out, "\n").unwrap();
+            write!(out, "stdout_regex=").unwrap();
+            out.write_all(escape_newlines(stdout_regex).as_bytes())
+            .unwrap();
+        }
     }
 
     pub fn deserialize(input: &mut impl Read) -> Self {
@@ -46,6 +53,7 @@ impl TestSnapshot {
         let mut status: Option<i32> = None;
         let mut ignore = false;
         let mut expect_error = false;
+        let mut stdout_regex: Option<String> = None;
 
         let mut buffer: String = String::new();
         input.read_to_string(&mut buffer).unwrap();
@@ -61,6 +69,7 @@ impl TestSnapshot {
                 "status" => status = Some(value.parse().unwrap()),
                 "ignore" => ignore = value.parse().unwrap(),
                 "expect_error" => expect_error = value.parse().unwrap(),
+                "stdout_regex" => stdout_regex = Some(unescape_newlines(value)),
                 _ => panic!("Unsupported key {name:?}"),
             }
         }
@@ -71,6 +80,7 @@ impl TestSnapshot {
             status: status.unwrap(),
             ignore,
             expect_error,
+            stdout_regex,
         }
     }
 }

@@ -76,6 +76,7 @@ fn test_bsd() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -101,6 +102,7 @@ fn test_bsd_math() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -125,6 +127,7 @@ fn test_changecom() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -149,6 +152,7 @@ fn test_changequote() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -173,6 +177,7 @@ fn test_decr() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -197,6 +202,7 @@ fn test_define() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -222,6 +228,7 @@ fn test_define_eval_order_unquoted() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -249,6 +256,7 @@ fn test_define_eval_syntax_order_quoted_evaluated() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -275,6 +283,7 @@ fn test_define_eval_syntax_order_quoted_unevaluated() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -301,6 +310,7 @@ fn test_define_eval_syntax_order_unquoted() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -325,6 +335,7 @@ fn test_define_hanging_quotes() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -349,6 +360,7 @@ fn test_define_invalid_macro_name() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -373,6 +385,7 @@ fn test_define_nested() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -398,6 +411,7 @@ fn test_define_nested_first_arg() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -422,6 +436,7 @@ fn test_define_number_parsing() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -444,6 +459,7 @@ fn test_define_order_defined() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -468,6 +484,7 @@ fn test_define_order_undefined() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -492,6 +509,7 @@ fn test_define_pushpopdef_undefine() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -517,6 +535,7 @@ fn test_define_quoted_number_stacked() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -539,6 +558,7 @@ fn test_define_stacked() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -563,6 +583,7 @@ fn test_define_undefine_order() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -587,6 +608,7 @@ fn test_define_unquoted_number_arg() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -609,6 +631,7 @@ fn test_defn() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -633,6 +656,7 @@ fn test_dnl() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -657,6 +681,7 @@ fn test_dumpdef() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -681,6 +706,7 @@ fn test_dumpdef_notexist() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -703,6 +729,7 @@ fn test_eval() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -727,6 +754,7 @@ fn test_evaluation_order() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -751,6 +779,7 @@ fn test_forloop_nested() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -775,6 +804,7 @@ fn test_forloop_simple() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -799,6 +829,7 @@ fn test_ifdef() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -823,6 +854,7 @@ fn test_ifelse() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -847,6 +879,7 @@ fn test_include() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -871,6 +904,7 @@ fn test_incr() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -895,6 +929,7 @@ fn test_index() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -919,6 +954,7 @@ fn test_index_too_few_args() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -941,6 +977,82 @@ fn test_len() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        test.stdout,
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        test.stderr,
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+}
+
+#[test]
+fn test_m4exit_error() {
+    init();
+    let output = run_command("fixtures/integration_tests/m4exit_error.m4");
+
+    let test: TestSnapshot = read_test("fixtures/integration_tests/m4exit_error.out");
+    assert_eq!(
+        output.status,
+        std::process::ExitStatus::from_raw(test.status),
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        test.stdout,
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        test.stderr,
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+}
+
+#[test]
+fn test_m4exit_no_args() {
+    init();
+    let output = run_command("fixtures/integration_tests/m4exit_no_args.m4");
+
+    let test: TestSnapshot = read_test("fixtures/integration_tests/m4exit_no_args.out");
+    assert_eq!(
+        output.status,
+        std::process::ExitStatus::from_raw(test.status),
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        test.stdout,
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        test.stderr,
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+}
+
+#[test]
+fn test_m4exit_success() {
+    init();
+    let output = run_command("fixtures/integration_tests/m4exit_success.m4");
+
+    let test: TestSnapshot = read_test("fixtures/integration_tests/m4exit_success.out");
+    assert_eq!(
+        output.status,
+        std::process::ExitStatus::from_raw(test.status),
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -965,6 +1077,7 @@ fn test_macro_errprint_evaluation() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -990,6 +1103,7 @@ fn test_macro_errprint_no_evaluation() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -1015,10 +1129,37 @@ fn test_macro_errprint_no_evaluation_quoted() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
         "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        test.stderr,
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+}
+
+#[test]
+fn test_mkstemp() {
+    init();
+    let output = run_command("fixtures/integration_tests/mkstemp.m4");
+
+    let test: TestSnapshot = read_test("fixtures/integration_tests/mkstemp.out");
+    assert_eq!(
+        output.status,
+        std::process::ExitStatus::from_raw(test.status),
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+
+    let r = regex_lite::Regex::new(r"^/tmp/m4-.{6}$").unwrap();
+    assert!(
+        r.is_match(&String::from_utf8(output.stdout).unwrap()),
+        "stdout doesn't match regex: r\"{}\"",
+        "^/tmp/m4-.{6}$"
     );
 
     assert_eq!(
@@ -1039,6 +1180,7 @@ fn test_recurse() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -1063,6 +1205,7 @@ fn test_recursive_defines() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -1087,6 +1230,7 @@ fn test_reverse() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -1111,6 +1255,7 @@ fn test_shift() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -1135,6 +1280,7 @@ fn test_sinclude() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -1159,6 +1305,7 @@ fn test_substr() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,
@@ -1183,6 +1330,7 @@ fn test_translit() {
         std::process::ExitStatus::from_raw(test.status),
         "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
     );
+
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         test.stdout,

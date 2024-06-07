@@ -135,8 +135,9 @@ pub fn run<STDOUT: Write, STDERR: Write>(
         )
     };
 
-    if let Err(error) = &result {
-        stderr.write_all(error.to_string().as_bytes())?;
+    match &result {
+        Err(Error::Exit(_)) | Ok(_) => {}
+        Err(error) => stderr.write_all(error.to_string().as_bytes())?,
     }
 
     result.map(|_| ())

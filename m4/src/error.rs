@@ -8,6 +8,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("The macro doesn't have enough arguments")]
     NotEnoughArguments,
+    #[error("Program requested an exit with code {0}")]
+    Exit(i32),
 }
 
 impl From<nom::Err<nom::error::Error<&[u8]>>> for Error {
@@ -31,13 +33,14 @@ impl From<nom::Err<nom::error::Error<&[u8]>>> for Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 pub trait GetExitCode {
-    fn get_exit_code(&self) -> u8;
+    fn get_exit_code(&self) -> i32;
 }
 
 impl<T> GetExitCode for Result<T> {
-    fn get_exit_code(&self) -> u8 {
+    fn get_exit_code(&self) -> i32 {
         match self {
             Ok(_) => 0,
+            Err(Error::Exit(code)) => *code,
             Err(_) => 1,
         }
     }

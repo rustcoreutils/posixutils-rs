@@ -14,6 +14,7 @@ circular = "0.3.0"
 thiserror = "1.0.59"
 log = "0.4.21"
 env_logger = "0.11.3"
+errno = "0.3.9"
 
 [dev-dependencies]
 insta = { version = "1.38.0", features = ["json"] }
@@ -21,6 +22,7 @@ test-log = { version = "0.2.16", default-features=false, features=["log"]}
 env_logger = "0.11.3"
 similar-asserts = "1.5.0"
 m4-test-manager = { path = "./test-manager" }
+regex-lite = "0.1.5"
 
 [build-dependencies]
 m4-test-manager = { path = "./test-manager" }

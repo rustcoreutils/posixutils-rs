@@ -19,6 +19,7 @@ const AT_LEAST_ONE_MACRO_DEFINITION_EXPECT: &str =
 pub struct State {
     macro_definitions: HashMap<MacroName, Vec<Rc<MacroDefinition>>>,
     pub parse_config: ParseConfig,
+    exit_error: bool,
 }
 
 impl State {
@@ -59,6 +60,7 @@ impl Default for State {
                 })
                 .collect(),
             parse_config: ParseConfig::default(),
+            exit_error: false,
         }
     }
 }
@@ -134,6 +136,8 @@ macro_enums!(
         Defn(DefnMacro),
         Substr(SubstrMacro),
         Dumpdef(DumpdefMacro),
+        Mkstemp(MkstempMacro),
+        M4exit(M4exitMacro),
     }
 );
 // TODO: implement these macros:
@@ -142,8 +146,7 @@ macro_enums!(
 // Traceon,
 // Sysval,
 // Syscmd,
-// Mkstemp,
-// Maketemp,
+// Maketemp, // Obsolete apparently
 // M4wrap,
 // M4exit,
 // Divnum,
@@ -174,6 +177,8 @@ impl AsRef<[u8]> for BuiltinMacro {
             Self::Translit => b"translit",
             Self::Substr => b"substr",
             Self::Dumpdef => b"dumpdef",
+            Self::Mkstemp => b"mkstemp",
+            Self::M4exit => b"m4exit",
         }
     }
 }
@@ -209,6 +214,8 @@ impl BuiltinMacro {
             Self::Translit => 1,
             Self::Substr => 1,
             Self::Dumpdef => 1,
+            Self::Mkstemp => 1,
+            Self::M4exit => 0,
         }
     }
 
@@ -1355,6 +1362,129 @@ impl MacroImplementation for DumpdefMacro {
         }
 
         Ok(state)
+    }
+}
+
+/// The defining text shall be as if it were the resulting pathname after a successful call to the
+/// [`mkstemp()`](https://pubs.opengroup.org/onlinepubs/9699919799/functions/mkstemp.html) function
+/// defined in the System Interfaces volume of POSIX.1-2017 called with the first argument to the
+/// macro invocation. If a file is created, that file shall be closed. If a file could not be
+/// created, the m4 utility shall write a diagnostic message to standard error and shall continue
+/// processing input but its final exit status shall be non-zero; the defining text of the macro
+/// shall be the empty string. The behavior is unspecified if mkstemp is not immediately followed by
+/// a `<left-parenthesis>`.
+struct MkstempMacro;
+
+/// The mkstemp() function shall replace the contents of the `template` by a unique filename which
+/// is returned. The string in template should look like a filename with six trailing 'X' s;
+/// mkstemp() replaces each 'X' with a character from the portable filename character set. The
+/// characters are chosen such that the resulting name does not duplicate the name of an existing
+/// file at the time of a call to mkstemp().
+fn mkstemp(mut template: Vec<u8>) -> Result<Vec<u8>> {
+    if template.len() < 6 {
+        return Err(crate::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Unable to create temporary file, template should be greater than 6 characters long. template: {:?}", String::from_utf8_lossy(&template))
+        )));
+    }
+    if &template[(template.len() - 6)..] != b"XXXXXX" {
+        return Err(crate::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Unable to create temporary file, template does not finish with six trailing 'X's. template: {:?}", String::from_utf8_lossy(&template))
+        )));
+    }
+    let template_pointer = template.as_mut_ptr();
+    let file_descriptor = unsafe {
+        // Docs: https://pubs.opengroup.org/onlinepubs/009604499/functions/mkstemp.html
+        libc::mkstemp(template_pointer as *mut i8)
+    };
+    if file_descriptor < 0 {
+        let e = errno::errno();
+        return Err(crate::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!(
+                "Unable to create temporary file. template: {:?}, Error {}: {}",
+                String::from_utf8_lossy(&template),
+                e.0,
+                e
+            ),
+        )));
+    }
+    let result = unsafe { libc::close(file_descriptor) };
+    if result < 0 {
+        let e = errno::errno();
+        return Err(crate::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!(
+                "Unable to close temporary file. template: {:?}, Error {}: {}",
+                String::from_utf8_lossy(&template),
+                e.0,
+                e
+            ),
+        )));
+    }
+    Ok(template)
+}
+
+impl MacroImplementation for MkstempMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stdout: &mut dyn Write,
+        stderror: &mut dyn Write,
+        m: Macro,
+    ) -> Result<State> {
+        let first_arg = m
+            .args
+            .into_iter()
+            .next()
+            .ok_or_else(|| crate::Error::NotEnoughArguments)?;
+        let buffer;
+        (buffer, state) = evaluate_to_buffer(state, first_arg.symbols, stderror, true)?;
+        match mkstemp(buffer) {
+            Ok(pathname) => stdout.write_all(&pathname)?,
+            Err(error) => {
+                write!(stderror, "Error evaluating `mkstemp` macro: {}", error)?;
+                state.exit_error = true;
+            }
+        }
+        Ok(state)
+    }
+}
+
+/// Exit from the m4 utility. If the first argument is specified, it shall be the exit code. If no
+/// argument is specified, the exit code shall be zero. It shall be an error to specify an argument
+/// containing any non-numeric characters. If the first argument is zero or no argument is
+/// specified, and an error has previously occurred (for example, a file operand that could not be
+/// opened), it is unspecified whether the exit status is zero or non-zero.
+struct M4exitMacro;
+
+impl MacroImplementation for M4exitMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        _stdout: &mut dyn Write,
+        stderror: &mut dyn Write,
+        m: Macro,
+    ) -> Result<State> {
+        if let Some(first_arg) = m.args.into_iter().next() {
+            let buffer;
+            (buffer, state) = evaluate_to_buffer(state, first_arg.symbols, stderror, true)?;
+            let (_, exit_code) = nom::combinator::all_consuming(parse_index)(&buffer)?;
+            let exit_code: i32 =
+                i32::try_from(exit_code).map_err(|e| crate::Error::Parsing(e.to_string()))?;
+            if exit_code == 0 && state.exit_error {
+                return Err(crate::Error::Exit(1));
+            } else {
+                return Err(crate::Error::Exit(exit_code));
+            }
+        }
+
+        if state.exit_error {
+            return Err(crate::Error::Exit(1));
+        } else {
+            return Err(crate::Error::Exit(0));
+        }
     }
 }
 

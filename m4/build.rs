@@ -17,6 +17,7 @@ struct TestCandidate {
     /// An error is expected to occur, the stderr does not need to match exactly because error
     /// messages may differe slightly.
     expect_error: bool,
+    stdout_regex: Option<String>,
 }
 
 impl TryFrom<TestCandidate> for Test {
@@ -39,6 +40,7 @@ impl TryFrom<TestCandidate> for Test {
                 .to_owned(),
             ignore: value.ignore,
             expect_error: value.expect_error,
+            stdout_regex: value.stdout_regex,
         })
     }
 }
@@ -49,6 +51,7 @@ struct Test {
     output: String,
     ignore: bool,
     expect_error: bool,
+    stdout_regex: Option<String>,
 }
 impl Test {
     fn as_code(&self) -> String {
@@ -58,6 +61,7 @@ impl Test {
             output,
             ignore,
             expect_error,
+            stdout_regex,
         } = self;
         let mut s = String::new();
 
@@ -73,9 +77,22 @@ fn test_{name}() {{
 
     let test: TestSnapshot = read_test("{output}");
     assert_eq!(output.status, std::process::ExitStatus::from_raw(test.status), "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)");
-    assert_eq!(String::from_utf8(output.stdout).unwrap(), test.stdout, "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)");
+    
 "##
         ));
+
+        if let Some(stdout_regex) = stdout_regex {
+            s.push_str(&format!(
+                r##"
+    let r = regex_lite::Regex::new(r"{stdout_regex}").unwrap();
+    assert!(r.is_match(&String::from_utf8(output.stdout).unwrap()), "stdout doesn't match regex: r\"{{}}\"", "{stdout_regex}");
+            "##
+            ));
+        } else {
+            s.push_str(r##"
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), test.stdout, "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)");
+            "##);
+        }
 
         if *expect_error {
             s.push_str(
@@ -112,15 +129,19 @@ fn main() {
                 let name = name_from_path(&path).unwrap();
                 let snapshot_file_name = format!("{name}.out");
                 let snapshot_file = fixtures_directory.join(snapshot_file_name);
-                let (ignore, expect_error) = if snapshot_file.exists() {
+                let (ignore, expect_error, stdout_regex) = if snapshot_file.exists() {
                     let mut f = std::fs::OpenOptions::new()
                         .read(true)
                         .open(&snapshot_file)
                         .unwrap();
                     let snapshot = TestSnapshot::deserialize(&mut f);
-                    (snapshot.ignore, snapshot.expect_error)
+                    (
+                        snapshot.ignore,
+                        snapshot.expect_error,
+                        snapshot.stdout_regex,
+                    )
                 } else {
-                    (false, false)
+                    (false, false, None)
                 };
                 let candidate = test_candidates
                     .entry(name.clone())
@@ -128,11 +149,13 @@ fn main() {
                         name,
                         ignore,
                         expect_error,
+                        stdout_regex: stdout_regex.clone(),
                         ..TestCandidate::default()
                     });
                 candidate.input = Some(path);
                 candidate.ignore = ignore;
                 candidate.expect_error = expect_error;
+                candidate.stdout_regex = stdout_regex;
             }
             Some(b"out") => {
                 let name = name_from_path(&path).unwrap();

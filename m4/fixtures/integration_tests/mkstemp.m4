@@ -1,0 +1,1 @@
+mkstemp(`/tmp/m4-XXXXXX')

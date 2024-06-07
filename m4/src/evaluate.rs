@@ -118,6 +118,7 @@ macro_rules! macro_enums {
     };
 }
 
+// Maketemp intentionally left out, it's obsolete apparently.
 macro_enums!(
     #[derive(Clone, Copy)]
     pub enum BuiltinMacroDefinition {
@@ -148,46 +149,48 @@ macro_enums!(
         M4wrap(M4wrapMacro),
         Syscmd(SyscmdMacro),
         Sysval(SysvalMacro),
+        Divert(DivertMacro),
     }
 );
 // TODO: implement these macros:
 // Undivert,
 // Traceoff,
 // Traceon,
-// Maketemp, // Obsolete apparently
 // Divnum,
 // Divert,
 
 impl AsRef<[u8]> for BuiltinMacro {
     fn as_ref(&self) -> &'static [u8] {
+        use BuiltinMacro::*;
         match self {
-            Self::Dnl => b"dnl",
-            Self::Define => b"define",
-            Self::Undefine => b"undefine",
-            Self::Defn => b"defn",
-            Self::Errprint => b"errprint",
-            Self::Include => b"include",
-            Self::Sinclude => b"sinclude",
-            Self::Changecom => b"changecom",
-            Self::Changequote => b"changequote",
-            Self::Pushdef => b"pushdef",
-            Self::Popdef => b"popdef",
-            Self::Incr => b"incr",
-            Self::Ifelse => b"ifelse",
-            Self::Ifdef => b"ifdef",
-            Self::Shift => b"shift",
-            Self::Eval => b"eval",
-            Self::Decr => b"decr",
-            Self::Len => b"len",
-            Self::Index => b"index",
-            Self::Translit => b"translit",
-            Self::Substr => b"substr",
-            Self::Dumpdef => b"dumpdef",
-            Self::Mkstemp => b"mkstemp",
-            Self::M4exit => b"m4exit",
-            Self::M4wrap => b"m4wrap",
-            Self::Syscmd => b"syscmd",
-            Self::Sysval => b"sysval",
+            Dnl => b"dnl",
+            Define => b"define",
+            Undefine => b"undefine",
+            Defn => b"defn",
+            Errprint => b"errprint",
+            Include => b"include",
+            Sinclude => b"sinclude",
+            Changecom => b"changecom",
+            Changequote => b"changequote",
+            Pushdef => b"pushdef",
+            Popdef => b"popdef",
+            Incr => b"incr",
+            Ifelse => b"ifelse",
+            Ifdef => b"ifdef",
+            Shift => b"shift",
+            Eval => b"eval",
+            Decr => b"decr",
+            Len => b"len",
+            Index => b"index",
+            Translit => b"translit",
+            Substr => b"substr",
+            Dumpdef => b"dumpdef",
+            Mkstemp => b"mkstemp",
+            M4exit => b"m4exit",
+            M4wrap => b"m4wrap",
+            Syscmd => b"syscmd",
+            Sysval => b"sysval",
+            Divert => b"divert",
         }
     }
 }
@@ -200,34 +203,36 @@ impl BuiltinMacro {
     /// The minimum number of args that this macro requires in order for it to be parsed as a
     /// macro.
     pub fn min_args(&self) -> usize {
+        use BuiltinMacro::*;
         match self {
-            Self::Dnl => 0,
-            Self::Define => 1,
-            Self::Undefine => 1,
-            Self::Defn => 1,
-            Self::Errprint => 1,
-            Self::Include => 1,
-            Self::Sinclude => 1,
-            Self::Changecom => 0,
-            Self::Changequote => 0,
-            Self::Pushdef => 1,
-            Self::Popdef => 1,
-            Self::Incr => 1,
-            Self::Decr => 1,
-            Self::Ifelse => 1,
-            Self::Ifdef => 1,
-            Self::Shift => 1,
-            Self::Eval => 1,
-            Self::Len => 1,
-            Self::Index => 1,
-            Self::Translit => 1,
-            Self::Substr => 1,
-            Self::Dumpdef => 1,
-            Self::Mkstemp => 1,
-            Self::M4exit => 0,
-            Self::M4wrap => 1,
-            Self::Syscmd => 1,
-            Self::Sysval => 0,
+            Dnl => 0,
+            Define => 1,
+            Undefine => 1,
+            Defn => 1,
+            Errprint => 1,
+            Include => 1,
+            Sinclude => 1,
+            Changecom => 0,
+            Changequote => 0,
+            Pushdef => 1,
+            Popdef => 1,
+            Incr => 1,
+            Decr => 1,
+            Ifelse => 1,
+            Ifdef => 1,
+            Shift => 1,
+            Eval => 1,
+            Len => 1,
+            Index => 1,
+            Translit => 1,
+            Substr => 1,
+            Dumpdef => 1,
+            Mkstemp => 1,
+            M4exit => 0,
+            M4wrap => 1,
+            Syscmd => 1,
+            Sysval => 0,
+            Divert => 1,
         }
     }
 
@@ -1545,36 +1550,6 @@ fn system(command: &[u8]) -> Result<ExitStatus> {
         .status()?;
 
     Ok(status)
-    // let return_value = unsafe {
-    //     // Docs: https://pubs.opengroup.org/onlinepubs/009604599/functions/system.html
-    //     libc::system(command.as_ptr() as *const i8)
-    // };
-    // // TODO: cover this case?
-    // // If a shell could not be executed in the child process, then
-    // // the return value is as though the child shell terminated by
-    // // calling _exit(2) with the status 127.
-    // match return_value {
-    //     0 => {
-    //         return Err(crate::Error::Io(std::io::Error::new(
-    //             std::io::ErrorKind::Other,
-    //             "No shell is available",
-    //         )));
-    //     }
-    //     -1 => {
-    //         let e = errno::errno();
-    //         return Err(crate::Error::Io(std::io::Error::new(
-    //             std::io::ErrorKind::Other,
-    //             format!(
-    //                 "child process could not be created, or its status could
-    //                 not be retrieved. command: {:?}, Error {}: {}",
-    //                 String::from_utf8_lossy(&command),
-    //                 e.0,
-    //                 e
-    //             ),
-    //         )));
-    //     }
-
-    // }
 }
 
 impl MacroImplementation for SyscmdMacro {
@@ -1594,6 +1569,28 @@ impl MacroImplementation for SyscmdMacro {
         (first_arg_text, state) = evaluate_to_buffer(state, first_arg.symbols, stderror, true)?;
         let status = system(&first_arg_text)?;
         state.last_syscmd_status = Some(status);
+        Ok(state)
+    }
+}
+
+struct DivertMacro;
+
+impl MacroImplementation for DivertMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stdout: &mut dyn Write,
+        stderror: &mut dyn Write,
+        m: Macro,
+    ) -> Result<State> {
+        let first_arg = m
+            .args
+            .into_iter()
+            .next()
+            .ok_or_else(|| crate::Error::NotEnoughArguments)?;
+        let first_arg_text;
+        (first_arg_text, state) = evaluate_to_buffer(state, first_arg.symbols, stderror, true)?;
+        todo!();
         Ok(state)
     }
 }

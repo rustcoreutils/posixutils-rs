@@ -83,7 +83,7 @@ fn update_snapshots(args: &Args, update: &UpdateSnapshots) {
 
             let snapshot_file_name = format!("{test_name}.out");
             let snapshot_file = args.fixtures_directory.join(snapshot_file_name);
-            let (expect_error, stdout_regex) = if snapshot_file.exists() {
+            let (expect_error, stdout_regex, skip_update) = if snapshot_file.exists() {
                 let mut f = std::fs::OpenOptions::new()
                     .read(true)
                     .open(&snapshot_file)
@@ -93,9 +93,13 @@ fn update_snapshots(args: &Args, update: &UpdateSnapshots) {
                     println!("SKIPPING ignored snapshot for {test_name}");
                     return;
                 }
-                (snapshot.expect_error, snapshot.stdout_regex)
+                if snapshot.skip_update && update.test_case_name.is_none() {
+                    println!("SKIPPING snapshot with skip_update=true for {test_name}");
+                    return;
+                }
+                (snapshot.expect_error, snapshot.stdout_regex, snapshot.skip_update)
             } else {
-                (false, None)
+                (false, None, false)
             };
 
             println!("UPDATING snapshot for {test_name}");
@@ -119,6 +123,7 @@ fn update_snapshots(args: &Args, update: &UpdateSnapshots) {
                 ignore: false,
                 expect_error,
                 stdout_regex,
+                skip_update,
             };
 
             if snapshot_file.exists() {

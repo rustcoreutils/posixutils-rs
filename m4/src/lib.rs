@@ -137,6 +137,10 @@ pub fn run<STDOUT: Write, STDERR: Write>(
 
     match result {
         Ok(state) => {
+            for wrap in state.m4wrap {
+                stdout.write_all(&wrap)?;
+            }
+
             if state.exit_error {
                 Err(Error::Exit(1))
             } else {

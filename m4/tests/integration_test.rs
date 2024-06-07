@@ -1067,6 +1067,31 @@ fn test_m4exit_success() {
 }
 
 #[test]
+fn test_m4wrap() {
+    init();
+    let output = run_command("fixtures/integration_tests/m4wrap.m4");
+
+    let test: TestSnapshot = read_test("fixtures/integration_tests/m4wrap.out");
+    assert_eq!(
+        output.status,
+        std::process::ExitStatus::from_raw(test.status),
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        test.stdout,
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        test.stderr,
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+}
+
+#[test]
 fn test_macro_errprint_evaluation() {
     init();
     let output = run_command("fixtures/integration_tests/macro_errprint_evaluation.m4");

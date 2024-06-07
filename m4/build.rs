@@ -7,16 +7,23 @@ use std::{
 
 use m4_test_manager::TestSnapshot;
 
+/// A candididate for an integration test [`Test`], can be converted into one if both
+/// [`TestCandidate::input`] and [`TestCandidate::output`] are `Some`. This is created during the
+/// process of analyzing the available integration test files in order to pair up the input and
+/// output for the same test.
 #[derive(Default)]
 struct TestCandidate {
+    /// The name of the test.
     name: String,
+    /// Input `.m4` file. Will be `None` if has not yet been found.
     input: Option<PathBuf>,
+    /// Output `.out` file. Will be `None` if has not yet been found.
     output: Option<PathBuf>,
-    /// The test should be ignored.
+    /// See [`TestSnapshot::ignore`].
     ignore: bool,
-    /// An error is expected to occur, the stderr does not need to match exactly because error
-    /// messages may differe slightly.
+    /// See [`TestSnapshot::expect_error`].
     expect_error: bool,
+    /// See [`TestSnapshot::stdout_regex`].
     stdout_regex: Option<String>,
 }
 
@@ -46,11 +53,17 @@ impl TryFrom<TestCandidate> for Test {
 }
 
 struct Test {
+    /// The name of the test.
     name: String,
+    /// Input `.m4` file.
     input: String,
+    /// Output `.out` file
     output: String,
+    /// See [`TestSnapshot::ignore`].
     ignore: bool,
+    /// See [`TestSnapshot::expect_error`].
     expect_error: bool,
+    /// See [`TestSnapshot::stdout_regex`].
     stdout_regex: Option<String>,
 }
 impl Test {

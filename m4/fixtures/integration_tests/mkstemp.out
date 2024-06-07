@@ -2,3 +2,4 @@ stdout=/tmp/m4-TRqPxc
 stderr=
 status=0
 stdout_regex=^/tmp/m4-.{6}$
+skip_update=true

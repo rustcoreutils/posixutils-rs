@@ -1515,8 +1515,8 @@ impl MacroImplementation for M4wrapMacro {
             .ok_or_else(|| crate::Error::NotEnoughArguments)?;
         let first_arg_text;
         (first_arg_text, state) = evaluate_to_buffer(state, first_arg.symbols, stderror, true)?;
-
-        todo!();
+        state.m4wrap.push(first_arg_text);
+        Ok(state)
     }
 }
 

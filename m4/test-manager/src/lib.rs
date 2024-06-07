@@ -1,15 +1,24 @@
 use std::io::{Read, Write};
 
 pub struct TestSnapshot {
+    /// The stdout output captured from the system m4.
     pub stdout: String,
+    /// The stderr output captured from the system m4.
     pub stderr: String,
+    /// The status code output captured from the system m4.
     pub status: i32,
     /// The test should be ignored.
     pub ignore: bool,
     /// An error is expected to occur, the stderr does not need to match exactly because error
     /// messages may differe slightly.
     pub expect_error: bool,
+    /// If `Some`, instead of comparing the output to [`TestSnapshot::stdout`], it will be compared
+    /// against the regular expression specifed here, if the output contains a match then the test
+    /// will pass.
     pub stdout_regex: Option<String>,
+    /// Skip updating this test (unless the test name is manually specified during the update). This
+    /// is used for tests like `mkstemp` which generate random values during each run.
+    pub skip_update: bool
 }
 
 fn escape_newlines(input: &str) -> String {
@@ -45,6 +54,10 @@ impl TestSnapshot {
             out.write_all(escape_newlines(stdout_regex).as_bytes())
             .unwrap();
         }
+        if self.skip_update {
+            write!(out, "\n").unwrap();
+            write!(out, "skip_update=true").unwrap();
+        }
     }
 
     pub fn deserialize(input: &mut impl Read) -> Self {
@@ -54,6 +67,7 @@ impl TestSnapshot {
         let mut ignore = false;
         let mut expect_error = false;
         let mut stdout_regex: Option<String> = None;
+        let mut skip_update = false;
 
         let mut buffer: String = String::new();
         input.read_to_string(&mut buffer).unwrap();
@@ -70,6 +84,7 @@ impl TestSnapshot {
                 "ignore" => ignore = value.parse().unwrap(),
                 "expect_error" => expect_error = value.parse().unwrap(),
                 "stdout_regex" => stdout_regex = Some(unescape_newlines(value)),
+                "skip_update" => skip_update = value.parse().unwrap(),
                 _ => panic!("Unsupported key {name:?}"),
             }
         }
@@ -81,6 +96,7 @@ impl TestSnapshot {
             ignore,
             expect_error,
             stdout_regex,
+            skip_update,
         }
     }
 }

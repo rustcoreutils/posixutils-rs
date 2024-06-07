@@ -8,6 +8,9 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("The macro doesn't have enough arguments")]
     NotEnoughArguments,
+    /// NOTE: this isn't always an "error", if the code is 0, it indicates an intentional,
+    /// successful, early program exit, just hijacking the [`Result`] semantics to help enable this
+    /// in a purely functional manner.
     #[error("Program requested an exit with code {0}")]
     Exit(i32),
 }

@@ -1,0 +1,4 @@
+stdout=1 hello world\n\n2 0\n3 \n4 1\n5 hello\n  \n6 world\nhello \n
+stderr=
+status=0
+ignore=true

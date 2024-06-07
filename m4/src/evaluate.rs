@@ -1,6 +1,7 @@
-use std::ffi::OsString;
-use std::os::unix::ffi::OsStringExt;
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
+use std::process::ExitStatus;
 use std::{collections::HashMap, io::Write, rc::Rc};
 
 use nom::error::{ContextError, FromExternalError};
@@ -23,6 +24,7 @@ pub struct State {
     pub exit_error: bool,
     /// See [`M4wrapMacro`].
     pub m4wrap: Vec<Vec<u8>>,
+    pub last_syscmd_status: Option<ExitStatus>,
 }
 
 impl State {
@@ -65,6 +67,7 @@ impl Default for State {
             parse_config: ParseConfig::default(),
             exit_error: false,
             m4wrap: Vec::new(),
+            last_syscmd_status: None,
         }
     }
 }
@@ -143,16 +146,15 @@ macro_enums!(
         Mkstemp(MkstempMacro),
         M4exit(M4exitMacro),
         M4wrap(M4wrapMacro),
+        Syscmd(SyscmdMacro),
+        Sysval(SysvalMacro),
     }
 );
 // TODO: implement these macros:
 // Undivert,
 // Traceoff,
 // Traceon,
-// Sysval,
-// Syscmd,
 // Maketemp, // Obsolete apparently
-
 // Divnum,
 // Divert,
 
@@ -184,6 +186,8 @@ impl AsRef<[u8]> for BuiltinMacro {
             Self::Mkstemp => b"mkstemp",
             Self::M4exit => b"m4exit",
             Self::M4wrap => b"m4wrap",
+            Self::Syscmd => b"syscmd",
+            Self::Sysval => b"sysval",
         }
     }
 }
@@ -222,6 +226,8 @@ impl BuiltinMacro {
             Self::Mkstemp => 1,
             Self::M4exit => 0,
             Self::M4wrap => 1,
+            Self::Syscmd => 1,
+            Self::Sysval => 0,
         }
     }
 
@@ -1400,6 +1406,7 @@ fn mkstemp(mut template: Vec<u8>) -> Result<Vec<u8>> {
         )));
     }
     let template_pointer = template.as_mut_ptr();
+    // TODO: review safety and add proper comment.
     let file_descriptor = unsafe {
         // Docs: https://pubs.opengroup.org/onlinepubs/009604499/functions/mkstemp.html
         libc::mkstemp(template_pointer as *mut i8)
@@ -1416,6 +1423,7 @@ fn mkstemp(mut template: Vec<u8>) -> Result<Vec<u8>> {
             ),
         )));
     }
+    // TODO: review safety and add proper comment.
     let result = unsafe { libc::close(file_descriptor) };
     if result < 0 {
         let e = errno::errno();
@@ -1516,6 +1524,101 @@ impl MacroImplementation for M4wrapMacro {
         let first_arg_text;
         (first_arg_text, state) = evaluate_to_buffer(state, first_arg.symbols, stderror, true)?;
         state.m4wrap.push(first_arg_text);
+        Ok(state)
+    }
+}
+
+/// The `syscmd` macro shall interpret its first argument as a shell command line. The defining text
+/// shall be the string result of that command. The string result shall not be rescanned for macros
+/// while setting the defining text. No output redirection shall be performed by the m4 utility. The
+/// exit status value from the command can be retrieved using the sysval macro. The behavior is
+/// unspecified if syscmd is not immediately followed by a `<left-parenthesis>`.
+struct SyscmdMacro;
+
+fn system(command: &[u8]) -> Result<ExitStatus> {
+    let command = OsStr::from_bytes(command);
+    // TODO(security): check security of this, for shell injection? It seems to be what the GNU m4
+    // does in https://github.com/tar-mirror/gnu-m4/blob/master/src/builtin.c#L953
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .status()?;
+
+    Ok(status)
+    // let return_value = unsafe {
+    //     // Docs: https://pubs.opengroup.org/onlinepubs/009604599/functions/system.html
+    //     libc::system(command.as_ptr() as *const i8)
+    // };
+    // // TODO: cover this case?
+    // // If a shell could not be executed in the child process, then
+    // // the return value is as though the child shell terminated by
+    // // calling _exit(2) with the status 127.
+    // match return_value {
+    //     0 => {
+    //         return Err(crate::Error::Io(std::io::Error::new(
+    //             std::io::ErrorKind::Other,
+    //             "No shell is available",
+    //         )));
+    //     }
+    //     -1 => {
+    //         let e = errno::errno();
+    //         return Err(crate::Error::Io(std::io::Error::new(
+    //             std::io::ErrorKind::Other,
+    //             format!(
+    //                 "child process could not be created, or its status could
+    //                 not be retrieved. command: {:?}, Error {}: {}",
+    //                 String::from_utf8_lossy(&command),
+    //                 e.0,
+    //                 e
+    //             ),
+    //         )));
+    //     }
+
+    // }
+}
+
+impl MacroImplementation for SyscmdMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stdout: &mut dyn Write,
+        stderror: &mut dyn Write,
+        m: Macro,
+    ) -> Result<State> {
+        let first_arg = m
+            .args
+            .into_iter()
+            .next()
+            .ok_or_else(|| crate::Error::NotEnoughArguments)?;
+        let first_arg_text;
+        (first_arg_text, state) = evaluate_to_buffer(state, first_arg.symbols, stderror, true)?;
+        let status = system(&first_arg_text)?;
+        state.last_syscmd_status = Some(status);
+        Ok(state)
+    }
+}
+
+/// The defining text of the `sysval` macro shall be the exit value of the utility last invoked by the
+/// [`SyscmdMacro`] (as a string).
+struct SysvalMacro;
+
+impl MacroImplementation for SysvalMacro {
+    fn evaluate(
+        &self,
+        state: State,
+        stdout: &mut dyn Write,
+        stderror: &mut dyn Write,
+        _m: Macro,
+    ) -> Result<State> {
+        if let Some(status) = state.last_syscmd_status {
+            match status.code() {
+                Some(code) => write!(stdout, "{code}")?,
+                None => write!(
+                    stderror,
+                    "Last syscmd exited without exit code (process terminated by signal)"
+                )?,
+            }
+        }
         Ok(state)
     }
 }

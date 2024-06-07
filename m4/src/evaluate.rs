@@ -19,7 +19,10 @@ const AT_LEAST_ONE_MACRO_DEFINITION_EXPECT: &str =
 pub struct State {
     macro_definitions: HashMap<MacroName, Vec<Rc<MacroDefinition>>>,
     pub parse_config: ParseConfig,
-    exit_error: bool,
+    /// Whether the process should exit with an error once processing has completed.
+    pub exit_error: bool,
+    /// See [`M4wrapMacro`].
+    pub m4wrap: Vec<Vec<u8>>,
 }
 
 impl State {
@@ -61,6 +64,7 @@ impl Default for State {
                 .collect(),
             parse_config: ParseConfig::default(),
             exit_error: false,
+            m4wrap: Vec::new(),
         }
     }
 }
@@ -138,6 +142,7 @@ macro_enums!(
         Dumpdef(DumpdefMacro),
         Mkstemp(MkstempMacro),
         M4exit(M4exitMacro),
+        M4wrap(M4wrapMacro),
     }
 );
 // TODO: implement these macros:
@@ -147,8 +152,7 @@ macro_enums!(
 // Sysval,
 // Syscmd,
 // Maketemp, // Obsolete apparently
-// M4wrap,
-// M4exit,
+
 // Divnum,
 // Divert,
 
@@ -179,6 +183,7 @@ impl AsRef<[u8]> for BuiltinMacro {
             Self::Dumpdef => b"dumpdef",
             Self::Mkstemp => b"mkstemp",
             Self::M4exit => b"m4exit",
+            Self::M4wrap => b"m4wrap",
         }
     }
 }
@@ -216,6 +221,7 @@ impl BuiltinMacro {
             Self::Dumpdef => 1,
             Self::Mkstemp => 1,
             Self::M4exit => 0,
+            Self::M4wrap => 1,
         }
     }
 
@@ -1485,6 +1491,32 @@ impl MacroImplementation for M4exitMacro {
         } else {
             return Err(crate::Error::Exit(0));
         }
+    }
+}
+
+/// The first argument shall be processed when `EOF` is reached. If the `m4wrap` macro is used multiple
+/// times, the arguments specified shall be processed in the order in which the `m4wrap` macros were
+/// processed. The behavior is unspecified if `m4wrap` is not immediately followed by a
+/// `<left-parenthesis>`.
+struct M4wrapMacro;
+
+impl MacroImplementation for M4wrapMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        _stdout: &mut dyn Write,
+        stderror: &mut dyn Write,
+        m: Macro,
+    ) -> Result<State> {
+        let first_arg = m
+            .args
+            .into_iter()
+            .next()
+            .ok_or_else(|| crate::Error::NotEnoughArguments)?;
+        let first_arg_text;
+        (first_arg_text, state) = evaluate_to_buffer(state, first_arg.symbols, stderror, true)?;
+
+        todo!();
     }
 }
 

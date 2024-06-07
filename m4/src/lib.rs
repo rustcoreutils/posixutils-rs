@@ -135,10 +135,18 @@ pub fn run<STDOUT: Write, STDERR: Write>(
         )
     };
 
-    match &result {
-        Err(Error::Exit(_)) | Ok(_) => {}
-        Err(error) => stderr.write_all(error.to_string().as_bytes())?,
+    match result {
+        Ok(state) => {
+            if state.exit_error {
+                Err(Error::Exit(1))
+            } else {
+                Ok(())
+            }
+        }
+        Err(error @ Error::Exit(_)) => Err(error),
+        Err(error) => {
+            stderr.write_all(error.to_string().as_bytes())?;
+            Err(error)
+        }
     }
-
-    result.map(|_| ())
 }

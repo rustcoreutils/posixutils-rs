@@ -36,12 +36,20 @@ pub trait GetExitCode {
     fn get_exit_code(&self) -> i32;
 }
 
+impl GetExitCode for Error {
+    fn get_exit_code(&self) -> i32 {
+        match self {
+            Error::Exit(code) => *code,
+            _ => 1,
+        }
+    }
+}
+
 impl<T> GetExitCode for Result<T> {
     fn get_exit_code(&self) -> i32 {
         match self {
             Ok(_) => 0,
-            Err(Error::Exit(code)) => *code,
-            Err(_) => 1,
+            Err(error) => error.get_exit_code(),
         }
     }
 }

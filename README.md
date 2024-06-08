@@ -11,7 +11,7 @@ compliant, maximizing compatibility with existing shell scripts while
 minimizing bloat.
 
 Implementation goals include clean, safe Rust code and maximal use of
-Rust community crates.  This project's utilities should "look like
+small Rust community crates.  This project's utilities should "look like
 normal Rust programs."
 
 Contributions are welcome.  Developers and helpers, please read [CONTRIBUTING](CONTRIBUTING.md) for details.
@@ -29,8 +29,9 @@ bloat.
 
 ## Similar projects
 
-A similar project with the aim of GNU compatibility is
-https://github.com/uutils/coreutils
+A project with more limited ambition, with the aim of GNU compatibility, is uutils: https://github.com/uutils/coreutils
+
+As a frequent comparison, our project is far more ambitious than uutils from a breadth standpoint:  posixutils will include bc, m4, c99 compiler, fort77 compiler, a cron daemon etc.   uutils is far more limited in the scope of programs covered.   In contrast, eacbh posixutils utility _implementation_ is intentionally more minimalist than uutils, intending to avoid the bloat of supporting rarely-used, non-POSIX features.
 
 A similar project from the author, written in C++, is
 https://github.com/jgarzik/posixutils

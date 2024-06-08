@@ -32,7 +32,7 @@ bloat.
 A similar project from the author, written in C++, is
 https://github.com/jgarzik/posixutils
 
-A project with more limited ambition, with the aim of GNU compatibility, is uutils: https://github.com/uutils/coreutils
+A project with more narrow scope, with the aim of GNU coreutils compatibility, is uutils: https://github.com/uutils/coreutils
 
 Because it is a FAQ, the major differences between this project and uutils are:
 1. posixutils is far more ambitious than uutils from a breadth standpoint:  posixutils will include bc, m4, c99 compiler, fort77 compiler, a cron daemon etc.   uutils is far more limited in the scope of programs covered, mimicing GNU coreutils.

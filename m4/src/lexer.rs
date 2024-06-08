@@ -681,9 +681,13 @@ pub fn parse_dnl(input: &[u8]) -> IResult<&[u8], &[u8]> {
 }
 
 /// `evaluate` is a function which takes the current [`ParseConfig`], and evaluates the provided
-/// [`Symbol`] writing output to `writer`, and returns a [`ParseConfig`] which has been
-/// modified during the process of evaluation (for example a new macro was defined, or
-/// changequote).
+/// [`Symbol`] writing output to `writer`, and returns a [`ParseConfig`] which has been modified
+/// during the process of evaluation (for example a new macro was defined, or changequote).
+///
+/// Arguments:
+/// - `unwrap_quotes` - Whether to unwrap quotes during evaluation.
+/// - `root` - Whether this is the root invocation of this function, used for features like the
+///   [`DivertMacro`](crate::evaluate::DivertMacro).
 pub(crate) fn process_streaming<'c, R: Read>(
     mut state: State,
     evaluator: impl Evaluator,
@@ -691,6 +695,7 @@ pub(crate) fn process_streaming<'c, R: Read>(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
     unwrap_quotes: bool,
+    root: bool,
 ) -> crate::error::Result<State> {
     let buffer_size = 10;
     let buffer_growth_factor = 2;
@@ -774,7 +779,24 @@ pub(crate) fn process_streaming<'c, R: Read>(
                 if matches!(symbol, Symbol::Eof) {
                     return Ok(state);
                 }
-                state = evaluator.evaluate(state, symbol, stdout, stderr, unwrap_quotes)?;
+
+                match (state.divert_number, root) {
+                    (_, false) | (0, true) => {
+                        state = evaluator.evaluate(state, symbol, stdout, stderr, unwrap_quotes)?
+                    }
+                    (1..=9, true) => {
+                        let mut divert_buffer =
+                            state.divert_buffers[state.divert_number - 1].clone();
+                        state = evaluator.evaluate(
+                            state,
+                            symbol,
+                            &mut divert_buffer,
+                            stderr,
+                            unwrap_quotes,
+                        )?
+                    }
+                    _ => unreachable!(),
+                };
                 remaining
             };
 
@@ -890,7 +912,7 @@ mod test {
             Ok(state)
         }
         state.parse_config = initial_config;
-        process_streaming(state, evaluate, input, &mut stdout, &mut stderr, true).unwrap();
+        process_streaming(state, evaluate, input, &mut stdout, &mut stderr, true, true).unwrap();
 
         SymbolsAsStreamSnapshot {
             stdout: String::from_utf8(stdout).unwrap(),

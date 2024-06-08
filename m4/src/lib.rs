@@ -123,6 +123,7 @@ pub fn run<STDOUT: Write, STDERR: Write>(
             stdout,
             stderr,
             true,
+            true,
         )
     } else {
         lexer::process_streaming(
@@ -132,11 +133,16 @@ pub fn run<STDOUT: Write, STDERR: Write>(
             stdout,
             stderr,
             true,
+            true,
         )
     };
 
     match result {
         Ok(state) => {
+            for buffer in state.divert_buffers {
+                let buffer = buffer.0.borrow();
+                stdout.write_all(&*buffer)?;
+            }
             for wrap in state.m4wrap {
                 stdout.write_all(&wrap)?;
             }

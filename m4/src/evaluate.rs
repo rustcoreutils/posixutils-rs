@@ -180,10 +180,8 @@ macro_enums!(
     }
 );
 // TODO: implement these macros:
-// Undivert,
 // Traceoff,
 // Traceon,
-// Divert,
 
 impl AsRef<[u8]> for BuiltinMacro {
     fn as_ref(&self) -> &'static [u8] {

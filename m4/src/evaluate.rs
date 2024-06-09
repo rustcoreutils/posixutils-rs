@@ -1693,11 +1693,35 @@ impl MacroImplementation for UndivertMacro {
     fn evaluate(
         &self,
         mut state: State,
-        _stdout: &mut dyn Write,
+        stdout: &mut dyn Write,
         stderr: &mut dyn Write,
         m: Macro,
     ) -> Result<State> {
-        todo!()
+        let undivert_buffers: Vec<usize> = if m.args.is_empty() {
+            (1..=9).into_iter().collect()
+        } else {
+            let mut undivert_buffers: Vec<usize> = Vec::new();
+            for arg in m.args.into_iter() {
+                let arg_text;
+                (arg_text, state) = evaluate_to_buffer(state, arg.symbols, stderr, true)?;
+                let (_, buffer_number) = nom::combinator::all_consuming(parse_index)(&arg_text)?;
+                if buffer_number < 1 || buffer_number > 9 {
+                    return Err(crate::Error::Parsing(format!(
+                        "Unexpected buffer number: {buffer_number}. Needs to be from 1 to 9"
+                    )));
+                }
+                undivert_buffers.push(buffer_number);
+            }
+
+            undivert_buffers
+        };
+
+        for buffer_number in undivert_buffers {
+            let mut b = state.divert_buffers[buffer_number - 1].0.borrow_mut();
+            stdout.write_all(&b)?;
+            b.clear();
+        }
+        Ok(state)
     }
 }
 

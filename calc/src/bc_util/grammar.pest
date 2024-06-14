@@ -20,7 +20,14 @@ number = @{
     | (integer ~ ".")
 	| integer
 }
-rel_op = { "==" | "<=" | ">=" | "!=" | "<" | ">" }
+rel_op = _{ same | leq | geq | neq | lt | gt }
+same = { "==" }
+leq = { "<=" }
+geq = { ">=" }
+neq = { "!=" }
+lt = { "<" }
+gt = { ">" }
+
 assign_op = _{ assign | add_assign | sub_assign | mul_assign | div_assign | mod_assign | pow_assign }
 assign = { "=" }
 add_assign = { "+=" }
@@ -52,7 +59,7 @@ builtin_fn = { "length" | "sqrt" | "scale" }
 
 program = { SOI ~ input_item* ~ EOI }
 input_item = _{ (semicolon_list ~ "\n") | function }
-semicolon_list = { (statement ~ (";" ~ statement)*)? ~ ";"? }
+semicolon_list = { ";"* ~ (statement ~ (";"+ ~ statement)*)? ~ ";"* }
 statement_list = { (";" | "\n")* ~ (statement ~ (";" | "\n")*)* }
 
 statement = {

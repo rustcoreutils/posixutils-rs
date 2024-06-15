@@ -43,7 +43,7 @@ fn run_command(input: &str) -> std::process::Output {
     let mut stdout: Vec<u8> = Vec::new();
     let mut stderr: Vec<u8> = Vec::new();
     let args = m4::Args {
-        files: Some(input.into()),
+        files: vec![input.into()],
         ..m4::Args::default()
     };
     let result = m4::run(&mut stdout, &mut stderr, args);

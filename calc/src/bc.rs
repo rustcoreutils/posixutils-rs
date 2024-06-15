@@ -10,8 +10,8 @@
 use std::ffi::OsString;
 
 use bc_util::{
-    interpreter::Interpreter,
-    parser::{is_incomplete, parse_program},
+    interpreter::{ExecutionResult, Interpreter},
+    parser::parse_program,
 };
 use clap::Parser;
 
@@ -31,24 +31,16 @@ struct Args {
     files: Vec<OsString>,
 }
 
-fn exec_str(s: &str, interpreter: &mut Interpreter) -> bool {
-    match parse_program(s) {
-        Ok(program) => match interpreter.exec(program) {
-            Ok(output) => {
-                print!("{}", output.string);
-                if output.has_quit {
-                    return true;
-                }
-            }
-            Err(e) => {
-                println!("runtime error: {}", e);
-            }
-        },
+fn print_output_or_error(result: ExecutionResult<String>) {
+    match result {
+        Ok(output) => {
+            print!("{}", output);
+        }
         Err(e) => {
+            print!("{}", e.partial_output());
             println!("{}", e);
         }
     }
-    false
 }
 
 fn main() -> Result<()> {
@@ -59,7 +51,7 @@ fn main() -> Result<()> {
     let mut interpreter = Interpreter::default();
 
     if args.define_math_functions {
-        let lib = parse_program(include_str!("bc_util/math_functions.bc"))
+        let lib = parse_program(include_str!("bc_util/math_functions.bc"), None)
             .expect("error parsing standard math functions");
         interpreter
             .exec(lib)
@@ -68,21 +60,23 @@ fn main() -> Result<()> {
 
     for file in args.files {
         match std::fs::read_to_string(&file) {
-            Ok(s) => {
-                if exec_str(&s, &mut interpreter) {
-                    return Ok(());
-                }
-            }
+            Ok(s) => match parse_program(&s, file.to_str()) {
+                Ok(program) => print_output_or_error(interpreter.exec(program)),
+                Err(e) => println!("{}", e),
+            },
             Err(_) => {
                 eprintln!("Could not read file: {}", file.to_string_lossy());
                 return Ok(());
             }
         };
+        if interpreter.has_quit() {
+            return Ok(());
+        }
     }
 
     let mut repl = DefaultEditor::new()?;
     let mut line_buffer = String::new();
-    loop {
+    while !interpreter.has_quit() {
         let line = if line_buffer.is_empty() {
             repl.readline(">> ")
         } else {
@@ -92,11 +86,16 @@ fn main() -> Result<()> {
             Ok(line) => {
                 line_buffer.push_str(&line);
                 line_buffer.push('\n');
-                if !is_incomplete(&line_buffer) {
-                    if exec_str(&line_buffer, &mut interpreter) {
-                        return Ok(());
+                match parse_program(&line_buffer, None) {
+                    Ok(program) => {
+                        print_output_or_error(interpreter.exec(program));
+                        line_buffer.clear();
                     }
-                    line_buffer.clear();
+                    Err(e) if !e.is_incomplete => {
+                        println!("{}", e);
+                        line_buffer.clear();
+                    }
+                    _ => {}
                 }
                 repl.add_history_entry(line)?;
             }

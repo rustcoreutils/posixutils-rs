@@ -1,8 +1,8 @@
 
 # posixutils-rs
 
-This is a suite of Rust-native core command line utilties (cp, mv, rm,
-ls, ...) using SuSv3 as the base POSIX specification.
+This is a suite of Rust-native core command line utilties (cp, mv, c99,
+m4, make, ...) using SuSv3 as the base POSIX specification.
 
 ## Goals
 
@@ -11,7 +11,7 @@ compliant, maximizing compatibility with existing shell scripts while
 minimizing bloat.
 
 Implementation goals include clean, safe Rust code and maximal use of
-Rust community crates.  This project's utilities should "look like
+small Rust community crates.  This project's utilities should "look like
 normal Rust programs."
 
 Contributions are welcome.  Developers and helpers, please read [CONTRIBUTING](CONTRIBUTING.md) for details.
@@ -29,11 +29,15 @@ bloat.
 
 ## Similar projects
 
-A similar project with the aim of GNU compatibility is
-https://github.com/uutils/coreutils
-
 A similar project from the author, written in C++, is
 https://github.com/jgarzik/posixutils
+
+A project with more narrow scope, with the aim of GNU coreutils compatibility, is uutils: https://github.com/uutils/coreutils
+
+Because it is a FAQ, the major differences between this project and uutils are:
+1. Wider scope:  posixutils is far more ambitious than uutils from a breadth standpoint:  posixutils will include bc, m4, c99 compiler, fort77 compiler, a cron daemon etc.   uutils is far more limited in the scope of programs covered, mimicing GNU coreutils.
+2. More minimalist:  Each posixutils utility _implementation_ is intentionally more minimalist, intending to avoid the bloat of supporting rarely-used, non-POSIX features.  Our common denominator and baseline is the POSIX spec, then add non-POSIX features that users cannot live without.
+3. Transportable:  Each posixutils utility should look like normal Rust code, easily stand alone with little-or-no deps, and be used in another project.   This project is MIT-licensed, not GPL licensed, to aid in that transportability goal.
 
 ## Checklist of utilities
 
@@ -125,17 +129,6 @@ https://github.com/jgarzik/posixutils
  - [ ] prs (SCCS)
  - [ ] ps
  - [x] pwd
- - [ ] qalter (Batch cat.)
- - [ ] qdel (Batch cat.)
- - [ ] qhold (Batch cat.)
- - [ ] qmove (Batch cat.)
- - [ ] qmsg (Batch cat.)
- - [ ] qrerun (Batch cat.)
- - [ ] qrls (Batch cat.)
- - [ ] qselect (Batch cat.)
- - [ ] qsig (Batch cat.)
- - [ ] qstat (Batch cat.)
- - [ ] qsub (Batch cat.)
  - [x] renice
  - [x] rm
  - [ ] rmdel (SCCS)

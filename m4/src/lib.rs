@@ -91,21 +91,21 @@ pub struct Args {
     ///
     /// Define `name` to `val` or to `null` if `=val` is omitted.
     #[arg(short = 'D', long)]
-    pub defines: Vec<ArgumentDefine>,
+    pub define: Vec<ArgumentDefine>,
     // Undefine `name`.
     #[arg(short = 'U', long)]
-    pub undefines: Vec<ArgumentName>,
+    pub undefine: Vec<ArgumentName>,
     /// Whether to read input from a file.
-    pub file: Option<PathBuf>,
+    pub files: Vec<PathBuf>,
 }
 
 impl Default for Args {
     fn default() -> Self {
         Self {
             line_synchronization: false,
-            defines: Vec::default(),
-            undefines: Vec::default(),
-            file: None,
+            define: Vec::default(),
+            undefine: Vec::default(),
+            files: Vec::default(),
         }
     }
 }
@@ -115,7 +115,7 @@ pub fn run<STDOUT: Write, STDERR: Write>(
     stderr: &mut STDERR,
     args: Args,
 ) -> crate::error::Result<()> {
-    let result = if let Some(file_path) = args.file {
+    let result = if let Some(file_path) = args.files.into_iter().next() {
         lexer::process_streaming(
             State::default(),
             evaluate::evaluate,

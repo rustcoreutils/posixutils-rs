@@ -1,7 +1,9 @@
 pub(crate) mod constants;
 pub(crate) mod context_hunk_data;
 pub(crate) mod context_hunk_range_data;
+pub(crate) mod functions;
 pub(crate) mod hunk;
+pub(crate) mod hunks;
 pub(crate) mod patch;
 pub(crate) mod patch_file;
 pub(crate) mod patch_file_kind;

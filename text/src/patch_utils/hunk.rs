@@ -1,5 +1,8 @@
 use super::{
-    context_hunk_data::ContextHunkData, context_hunk_range_data::ContextHunkRangeData,
+    context_hunk_data::{ContextHunkData, ContextHunkOrderIndex},
+    context_hunk_range_data::ContextHunkRangeData,
+    patch_format::PatchFormat,
+    patch_line::PatchLine,
     unified_hunk_data::UnifiedHunkData,
 };
 
@@ -18,14 +21,33 @@ impl<'a> Hunk<'a> {
         Self::UnifiedHunk(data)
     }
 
-    pub fn context_hunk_data(&'a self) -> &'a ContextHunkData<'a> {
+    pub fn kind(&self) -> PatchFormat {
+        match self {
+            Hunk::UnifiedHunk(_) => PatchFormat::Unified,
+            Hunk::ContextHunk(_) => PatchFormat::Context,
+        }
+    }
+
+    pub fn context_hunk_data(&self) -> &ContextHunkData {
         match self {
             Hunk::ContextHunk(data) => data,
             _ => panic!("No context-hunk-data for variants other than ContextHunk"),
         }
     }
 
-    pub fn context_hunk_data_mut(&'a mut self) -> &'a mut ContextHunkData {
+    pub fn context_patch_line_by_index(&self, index: &ContextHunkOrderIndex) -> &PatchLine<'_> {
+        self.context_hunk_data().get_by_order_index(index)
+    }
+
+    pub fn context_hunk_ordered_lines_indeces(&self) -> &Option<Vec<ContextHunkOrderIndex>> {
+        if let Hunk::ContextHunk(data) = self {
+            data.ordered_lines_indeces()
+        } else {
+            panic!("No context-hunk-data for variants other than ContextHunk");
+        }
+    }
+
+    pub fn context_hunk_data_mut(&mut self) -> &'a mut ContextHunkData {
         match self {
             Hunk::ContextHunk(data) => data,
             _ => panic!("No context-hunk-data for variants other than ContextHunk"),
@@ -61,9 +83,15 @@ impl<'a> Hunk<'a> {
     }
 
     pub fn order_context_lines(&mut self) {
+        if let Hunk::ContextHunk(data) = self {
+            data.order_lines();
+        }
+    }
+
+    pub fn add_patch_line(&mut self, patch_line: PatchLine<'a>) {
         match self {
-            Hunk::ContextHunk(data) => data.order_lines(),
-            _ => {}
+            Hunk::UnifiedHunk(data) => data.add_patch_line(patch_line),
+            Hunk::ContextHunk(data) => data.add_patch_line(patch_line),
         }
     }
 }

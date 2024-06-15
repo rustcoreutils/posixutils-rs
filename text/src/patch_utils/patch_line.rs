@@ -1,6 +1,7 @@
 use super::{
-    constants::*, context_hunk_range_data::ContextHunkRangeData, patch_line_data::PatchLineData,
-    range::Range, unified_hunk_header_data::UnifiedHunkHeaderData,
+    constants::*, context_hunk_range_data::ContextHunkRangeData, functions::if_else,
+    patch_format::PatchFormat, patch_line_data::PatchLineData, range::Range,
+    unified_hunk_header_data::UnifiedHunkHeaderData,
 };
 
 #[derive(Debug, Clone)]
@@ -14,11 +15,25 @@ pub enum PatchLine<'a> {
     ContextInserted(PatchLineData<'a>),
     ContextDeleted(PatchLineData<'a>),
     ContextUnchanged(PatchLineData<'a>),
-    ContextSubstituted(PatchLineData<'a>),
     ContextHunkRange(ContextHunkRangeData),
 }
 
 impl<'a> PatchLine<'a> {
+    pub fn kind(&self) -> PatchFormat {
+        match self {
+            PatchLine::UnifiedHunkHeader(data) => PatchFormat::Unified,
+            PatchLine::UnifiedUnchanged(data) => data.kind(),
+            PatchLine::UnifiedInserted(data) => data.kind(),
+            PatchLine::UnifiedDeleted(data) => data.kind(),
+            PatchLine::NoNewLine(data) => data.kind(),
+            PatchLine::ContextHunkSeparator(data) => data.kind(),
+            PatchLine::ContextInserted(data) => data.kind(),
+            PatchLine::ContextDeleted(data) => data.kind(),
+            PatchLine::ContextUnchanged(data) => data.kind(),
+            PatchLine::ContextHunkRange(data) => PatchFormat::Context,
+        }
+    }
+
     pub fn original_line(&self) -> &str {
         match self {
             PatchLine::UnifiedHunkHeader(data) => data.line(),
@@ -30,7 +45,6 @@ impl<'a> PatchLine<'a> {
             PatchLine::ContextInserted(data) => &data.line()[2..],
             PatchLine::ContextDeleted(data) => &data.line()[2..],
             PatchLine::ContextUnchanged(data) => &data.line()[2..],
-            PatchLine::ContextSubstituted(data) => &data.line()[2..],
             PatchLine::ContextHunkRange(data) => data.line(),
         }
     }
@@ -46,7 +60,6 @@ impl<'a> PatchLine<'a> {
             PatchLine::ContextInserted(data) => data.line(),
             PatchLine::ContextDeleted(data) => data.line(),
             PatchLine::ContextUnchanged(data) => data.line(),
-            PatchLine::ContextSubstituted(data) => data.line(),
             PatchLine::ContextHunkRange(data) => data.line(),
         }
     }
@@ -71,6 +84,7 @@ impl<'a> PatchLine<'a> {
                 return Ok(PatchLine::NoNewLine(PatchLineData::new(
                     line,
                     line_in_patch,
+                    PatchFormat::Unified,
                 )));
             }
 
@@ -80,10 +94,12 @@ impl<'a> PatchLine<'a> {
                 '+' => Ok(Self::UnifiedInserted(PatchLineData::new(
                     line,
                     line_in_patch,
+                    PatchFormat::Unified,
                 ))),
                 '-' => Ok(Self::UnifiedDeleted(PatchLineData::new(
                     line,
                     line_in_patch,
+                    PatchFormat::Unified,
                 ))),
                 '@' => {
                     let invalid_hunk_error = Err(PatchError::InvalidUnifiedHunkHeader);
@@ -121,6 +137,7 @@ impl<'a> PatchLine<'a> {
                 ' ' => Ok(Self::UnifiedUnchanged(PatchLineData::new(
                     line,
                     line_in_patch,
+                    PatchFormat::Unified,
                 ))),
                 _ => Err(PatchError::InvalidUnifiedPatchLine),
             };
@@ -131,12 +148,17 @@ impl<'a> PatchLine<'a> {
         Err(PatchError::EmptyLineNotAllowed)
     }
 
-    pub fn try_from_context(line: &'a str, line_in_patch: usize) -> Result<Self, PatchError> {
+    pub fn try_from_context(
+        line: &'a str,
+        line_in_patch: usize,
+        is_original_line: bool,
+    ) -> Result<Self, PatchError> {
         if line.len() >= 2 {
             if line == CONTEXT_HUNK_SEPARATOR {
                 return Ok(PatchLine::ContextHunkSeparator(PatchLineData::new(
                     line,
                     line_in_patch,
+                    PatchFormat::Context,
                 )));
             }
 
@@ -144,6 +166,7 @@ impl<'a> PatchLine<'a> {
                 return Ok(PatchLine::NoNewLine(PatchLineData::new(
                     line,
                     line_in_patch,
+                    PatchFormat::Context,
                 )));
             }
 
@@ -188,19 +211,31 @@ impl<'a> PatchLine<'a> {
                 "+ " => Ok(Self::ContextInserted(PatchLineData::new(
                     line,
                     line_in_patch,
+                    PatchFormat::Context,
                 ))),
                 "- " => Ok(Self::ContextDeleted(PatchLineData::new(
                     line,
                     line_in_patch,
+                    PatchFormat::Context,
                 ))),
                 "  " => Ok(Self::ContextUnchanged(PatchLineData::new(
                     line,
                     line_in_patch,
+                    PatchFormat::Context,
                 ))),
-                "! " => Ok(Self::ContextSubstituted(PatchLineData::new(
-                    line,
-                    line_in_patch,
-                ))),
+                "! " => if_else(
+                    is_original_line,
+                    Ok(Self::ContextDeleted(PatchLineData::new(
+                        line,
+                        line_in_patch,
+                        PatchFormat::Context,
+                    ))),
+                    Ok(Self::ContextInserted(PatchLineData::new(
+                        line,
+                        line_in_patch,
+                        PatchFormat::Context,
+                    ))),
+                ),
                 _ => Err(PatchError::InvalidContextPatchLine),
             };
 

@@ -45,6 +45,10 @@ name = "cut"
 path = "src/cut.rs"
 
 [[bin]]
+name = "od"
+path = "src/od.rs"
+
+[[bin]]
 name = "uniq"
 path = "src/uniq.rs"
 

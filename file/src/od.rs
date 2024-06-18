@@ -264,48 +264,72 @@ fn parse_offset(offset: &str) -> Result<u64, Box<dyn std::error::Error>> {
     Ok(parsed_offset * multiplier)
 }
 
-/// Prints data from a buffer according to the given configuration.
-///
-/// This function processes a byte buffer and prints its contents in various formats as specified
-/// by the `config` parameter. It handles different address bases, byte representation formats,
-/// and various data types such as characters, integers, and floating-point numbers.
+/// Reads data from a reader and prints it based on the provided configuration.
 ///
 /// # Parameters
 ///
-/// - `buffer: &[u8]`: A slice of bytes representing the data to be printed.
-/// - `config: &Args`: A reference to a configuration object that determines the printing format.
-///   The `Args` struct should include fields like `address_base`, `bytes_char`, `type_strings`, and `verbose`.
+/// - `reader`: A mutable reference to an object implementing the `Read` trait. This is the source from which data will be read.
+/// - `config`: A reference to an `Args` struct that holds configuration options for printing the data.
 ///
 /// # Returns
 ///
-/// - `Result<(), Box<dyn std::error::Error>>`: This function returns a `Result` which is:
-///   - `Ok(())`: On success.
-///   - `Err(Box<dyn std::error::Error>)`: On failure, an error boxed as a `dyn std::error::Error`.
+/// Returns a `Result` which is:
+/// - `Ok(())` if the function completes successfully.
+/// - `Err(Box<dyn std::error::Error>)` if there is an error during reading or processing data.
+///
+/// # Errors
+///
+/// This function can return an error if:
+/// - There is an issue reading from the `reader`.
+/// - There is an invalid type string specified in `config.type_strings`.
+///
+/// # Behavior
+///
+/// 1. Initializes the offset to 0 for printing addresses.
+/// 2. Defines a buffer of 16 bytes to read data in chunks.
+/// 3. Checks if a count limit is specified in the configuration and parses it.
+/// 4. Enters a loop to read and process data until the reader is exhausted or the count limit is reached.
+/// 5. Reads up to 16 bytes into the buffer. If fewer than 16 bytes are read, it attempts to read the remaining bytes.
+/// 6. Exits the loop if no more bytes can be read.
+/// 7. Truncates the buffer if a count limit is specified and reached.
+/// 8. Prints the address in the specified base format (decimal, octal, hexadecimal, or none).
+/// 9. Processes the buffer according to the specified format in the configuration:
+///     - If `bytes_char` is true, it processes and prints bytes as characters.
+///     - If no specific type strings are provided, it processes the buffer in chunks of 2 bytes.
+///     - For each type string, processes and prints the buffer in the specified format (e.g., unsigned integer, float, etc.).
+/// 10. Increments the offset by the number of bytes read and processed.
+/// 11. Prints a newline after processing each line of bytes.
+/// 12. Continues until all data is read or the count limit is reached.
+/// 13. Prints the final address in the specified base format.
 ///
 fn print_data<R: Read>(reader: &mut R, config: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut offset = 0; // Initialize offset for printing addresses.
 
-    let mut buffer = [0; 16];
+    let mut buffer = [0; 16]; // Buffer to read data in chunks of 16 bytes.
+
+    // Parse count limit from config, if specified.
     let count = if let Some(count) = config.count.as_ref() {
         Some(parse_count::<usize>(count)?)
     } else {
         None
     };
 
-    let mut run = true; // Flag to indicate if the reader should be closed.
+    let mut run = true; // Flag to indicate if the reader should continue reading.
 
     while run {
-        let mut bytes_read = reader.read(&mut buffer)?;
+        let mut bytes_read = reader.read(&mut buffer)?; // Read up to 16 bytes into the buffer.
 
         if bytes_read != 16 {
+            // If fewer than 16 bytes are read, attempt to read the remaining bytes.
             let bytes_read_2 = reader.read(&mut buffer[bytes_read..])?;
             bytes_read += bytes_read_2;
         }
         if bytes_read == 0 {
-            break; // Exit loop when reader is exhausted.
+            break; // Exit loop if no more bytes can be read.
         }
 
-        let mut local_buf = &buffer[..bytes_read];
+        let mut local_buf = &buffer[..bytes_read]; // Create a slice of the buffer up to the number of bytes read.
+
         // Truncate the buffer to the specified count, if provided.
         if let Some(count) = count {
             let all_bytes = offset + bytes_read;
@@ -315,38 +339,40 @@ fn print_data<R: Read>(reader: &mut R, config: &Args) -> Result<(), Box<dyn std:
                 run = false;
             }
         }
+
         // Print the address in the specified base format.
         if let Some(base) = config.address_base {
             match base {
-                'd' => print!("{:07} ", offset),
-                'o' => print!("{:07o} ", offset),
-                'x' => print!("{:07x} ", offset),
-                'n' => (),
-                _ => print!("{:07} ", offset),
+                'd' => print!("{:07} ", offset),  // Decimal format
+                'o' => print!("{:07o} ", offset), // Octal format
+                'x' => print!("{:07x} ", offset), // Hexadecimal format
+                'n' => (),                        // No address printed
+                _ => print!("{:07} ", offset),    // Default to decimal if invalid base
             }
         } else {
             print!("{:07} ", offset); // Default to octal if no base is specified.
         }
 
+        // Process and print the buffer based on configuration.
         if config.bytes_char {
+            // Print bytes as characters.
             process_formatter(&BCFormatter, local_buf, config.verbose);
-
             println!(); // Print a newline after each line of bytes.
         } else if config.type_strings.is_empty() {
+            // Process the buffer in chunks of 2 bytes.
             let chunks = local_buf.chunks(2);
             process_chunks_formatter(&OFormatter, chunks, config.verbose);
-
             println!(); // Print a newline after each line of bytes.
         } else {
+            // Process the buffer according to specified type strings.
             for type_string in &config.type_strings {
                 // Determine the number of bytes to read for this type.
                 let mut chars = type_string.chars();
-
                 let type_char = chars.next().unwrap();
                 let num_bytes: usize = chars.as_str().parse().unwrap_or(match type_char {
-                    'd' | 'u' | 'o' | 'x' => 2,
-                    'f' => 4,
-                    _ => 1,
+                    'd' | 'u' | 'o' | 'x' => 2, // Default to 2 bytes for integers
+                    'f' => 4,                   // Default to 4 bytes for floats
+                    _ => 1,                     // Default to 1 byte for unknown types
                 });
 
                 let chunks = local_buf.chunks(num_bytes);
@@ -358,6 +384,7 @@ fn print_data<R: Read>(reader: &mut R, config: &Args) -> Result<(), Box<dyn std:
                         process_formatter(&CFormatter, local_buf, config.verbose);
                     }
                     'u' => {
+                        // Check if the number of bytes is valid for unsigned integers.
                         if !(num_bytes == 1 || num_bytes == 2 || num_bytes == 4 || num_bytes == 8) {
                             return Err(Box::new(Error::new(
                                 ErrorKind::Other,
@@ -367,6 +394,7 @@ fn print_data<R: Read>(reader: &mut R, config: &Args) -> Result<(), Box<dyn std:
                         process_chunks_formatter(&UFormatter, chunks, config.verbose);
                     }
                     'd' => {
+                        // Check if the number of bytes is valid for signed integers.
                         if !(num_bytes == 1 || num_bytes == 2 || num_bytes == 4 || num_bytes == 8) {
                             return Err(Box::new(Error::new(
                                 ErrorKind::Other,
@@ -376,6 +404,7 @@ fn print_data<R: Read>(reader: &mut R, config: &Args) -> Result<(), Box<dyn std:
                         process_chunks_formatter(&DFormatter, chunks, config.verbose);
                     }
                     'x' => {
+                        // Check if the number of bytes is valid for hexadecimal format.
                         if !(num_bytes == 1 || num_bytes == 2 || num_bytes == 4 || num_bytes == 8) {
                             return Err(Box::new(Error::new(
                                 ErrorKind::Other,
@@ -385,6 +414,7 @@ fn print_data<R: Read>(reader: &mut R, config: &Args) -> Result<(), Box<dyn std:
                         process_chunks_formatter(&XFormatter, chunks, config.verbose);
                     }
                     'o' => {
+                        // Check if the number of bytes is valid for octal format.
                         if !(num_bytes == 1 || num_bytes == 2 || num_bytes == 4 || num_bytes == 8) {
                             return Err(Box::new(Error::new(
                                 ErrorKind::Other,
@@ -394,6 +424,7 @@ fn print_data<R: Read>(reader: &mut R, config: &Args) -> Result<(), Box<dyn std:
                         process_chunks_formatter(&OFormatter, chunks, config.verbose);
                     }
                     'f' => {
+                        // Check if the number of bytes is valid for floats.
                         if !(num_bytes == 4 || num_bytes == 8) {
                             return Err(Box::new(Error::new(
                                 ErrorKind::Other,
@@ -403,6 +434,7 @@ fn print_data<R: Read>(reader: &mut R, config: &Args) -> Result<(), Box<dyn std:
                         process_chunks_formatter(&FFormatter, chunks, config.verbose);
                     }
                     _ => {
+                        // Default formatter for unknown types.
                         process_formatter(&DefaultFormatter, local_buf, config.verbose);
                     }
                 }
@@ -414,13 +446,14 @@ fn print_data<R: Read>(reader: &mut R, config: &Args) -> Result<(), Box<dyn std:
         offset += bytes_read; // Move to the next line of bytes.
     }
 
+    // Print the final address in the specified base format.
     if let Some(base) = config.address_base {
         match base {
-            'd' => print!("{:07} ", offset),
-            'o' => print!("{:07o} ", offset),
-            'x' => print!("{:07x} ", offset),
-            'n' => (),
-            _ => print!("{:07} ", offset),
+            'd' => print!("{:07} ", offset),  // Decimal format
+            'o' => print!("{:07o} ", offset), // Octal format
+            'x' => print!("{:07x} ", offset), // Hexadecimal format
+            'n' => (),                        // No address printed
+            _ => print!("{:07} ", offset),    // Default to decimal if invalid base
         }
     } else {
         print!("{:07} ", offset); // Default to octal if no base is specified.
@@ -801,96 +834,113 @@ fn get_named_char(byte: u8) -> Option<&'static str> {
     }
 }
 
-/// Main function to process the files based on the arguments.
+/// Processes and prints data from one or more input sources according to the specified arguments.
 ///
-/// This function takes the arguments provided by the user, processes each specified file,
-/// and prints the content in the desired format. The processing includes optional byte-skipping,
-/// reading a specific number of bytes, and displaying the content according to various formatting options.
+/// # Parameters
 ///
-/// # Arguments
+/// - `args`: A reference to an `Args` struct that holds the configuration options for reading and printing data.
 ///
-/// * `args` - A reference to the `Args` struct containing the user's configuration options.
+/// # Returns
+///
+/// Returns a `Result` which is:
+/// - `Ok(())` if the function completes successfully.
+/// - `Err(Box<dyn std::error::Error>)` if there is an error during reading or processing data.
+///
+/// # Errors
+///
+/// This function can return an error if:
+/// - There is an issue opening or reading from the specified files.
+/// - There is an error with the skip or offset options.
+/// - There is an issue chaining multiple file readers.
 ///
 /// # Behavior
 ///
-/// For each file specified in the `args`:
-/// - The file is opened and read.
-/// - If the `-j` (skip) option is provided, the function skips the specified number of bytes at the beginning of the file.
-/// - If the `offset` option is provided, the function skips the specified number of bytes according to the parsed offset.
-/// - The function reads the specified number of bytes (or the entire file if not specified).
-/// - The read data is then truncated to the specified count if provided.
-/// - The data is printed using the `print_data` function with the provided configuration options.
-///
-/// If the verbose flag is set in the configuration, the function prints additional information such as the number of bytes skipped and read.
+/// 1. Initializes `bytes_to_skip` and `bytes_skipped` to manage byte skipping.
+/// 2. Prepares a vector to hold all file readers.
+/// 3. Parses and sets the number of bytes to skip based on the `-j` option or offset.
+/// 4. Determines the source of the input:
+///     - If there is one file and it is "-" (stdin) or no files, reads from stdin and skips the specified bytes.
+///     - Otherwise, processes each specified file:
+///         - If the cumulative bytes skipped are less than the bytes to skip, skips entire files or parts of them.
+///         - Adds each file to the vector of readers.
+/// 5. Combines multiple file readers into a single reader if necessary.
+/// 6. Calls `print_data` to read and print the data from the combined reader according to the configuration in `args`.
 ///
 fn od(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    let mut bytes_to_skip = 0;
-    let mut bytes_skipped = 0;
+    let mut bytes_to_skip = 0; // Initialize the number of bytes to skip.
+    let mut bytes_skipped = 0; // Initialize the number of bytes already skipped.
 
-    let mut all_files: Vec<Box<dyn Read>> = Vec::new();
+    let mut all_files: Vec<Box<dyn Read>> = Vec::new(); // Vector to hold file readers.
 
     // Skip bytes if the -j option is specified.
     if let Some(skip) = &args.skip {
-        bytes_to_skip = parse_skip(skip)?;
+        bytes_to_skip = parse_skip(skip)?; // Parse the skip option.
     }
 
+    // Override skip bytes with offset if specified.
     if let Some(offset) = &args.offset {
-        bytes_to_skip = parse_offset(offset)?;
+        bytes_to_skip = parse_offset(offset)?; // Parse the offset option.
     }
 
     let mut reader: Box<dyn Read> = if (args.files.len() == 1
         && args.files[0] == PathBuf::from("-"))
         || args.files.is_empty()
     {
+        // If there is one file and it is "-" (stdin) or no files, read from stdin.
         let mut stdin: Box<dyn Read> = Box::new(io::stdin().lock());
 
-        // Buffer of size 1 byte for reading char by char
+        // Buffer of size 1 byte for reading char by char to skip bytes.
         let mut empty_buffer = [0; 1];
 
+        // Skip the specified number of bytes from stdin.
         while bytes_to_skip > 0 {
             stdin.read_exact(&mut empty_buffer)?;
             bytes_to_skip -= 1;
         }
-        stdin
+        stdin // Use stdin as the reader.
     } else {
+        // Otherwise, process each specified file.
         for file in &args.files {
-            let mut file = File::open(file)?;
+            let mut file = File::open(file)?; // Open the file.
 
             if bytes_skipped < bytes_to_skip {
-                let metadata = file.metadata()?;
-                let file_size = metadata.len();
+                // If the cumulative bytes skipped are less than the bytes to skip, process the file for skipping.
+                let metadata = file.metadata()?; // Get file metadata.
+                let file_size = metadata.len(); // Get file size.
 
                 if bytes_skipped + file_size <= bytes_to_skip {
-                    // Skip the entire file
+                    // Skip the entire file if it is within the range of bytes to skip.
                     bytes_skipped += file_size;
-                    continue;
+                    continue; // Move to the next file.
                 } else {
-                    // Skip part of the file
+                    // Skip part of the file if only a portion of it is within the range of bytes to skip.
                     let remaining_skip = bytes_to_skip - bytes_skipped;
-                    file.seek(SeekFrom::Start(remaining_skip))?;
-                    bytes_skipped = bytes_to_skip;
+                    file.seek(SeekFrom::Start(remaining_skip))?; // Seek to the remaining bytes.
+                    bytes_skipped = bytes_to_skip; // Update the bytes skipped.
                 }
             }
 
+            // Add the file reader to the vector of readers.
             all_files.push(Box::new(BufReader::new(file)));
         }
 
         if all_files.len() > 1 {
-            // Combine all files into one stream
-
+            // Combine multiple file readers into a single reader.
             all_files
                 .into_iter()
                 .reduce(|acc, file| Box::new(acc.chain(file)) as Box<dyn Read>)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "No files to chain"))?
+        // Handle error if no files to chain.
         } else {
+            // If only one file, use it as the reader.
             match all_files.pop() {
-                None => return Ok(()),
-                Some(f) => f,
+                None => return Ok(()), // Return Ok if no files.
+                Some(f) => f,          // Use the single file as the reader.
             }
         }
     };
 
-    // Print the data.
+    // Print the data using the reader.
     print_data(&mut reader, args)?;
 
     Ok(())

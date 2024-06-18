@@ -1,6 +1,17 @@
+use std::path::Path;
+
+use crate::patch_utils::functions::is_normal_range;
+
 use super::{
-    constants::*, context_hunk_range_data::ContextHunkRangeData, functions::if_else,
-    patch_format::PatchFormat, patch_line_data::PatchLineData, range::Range,
+    constants::*,
+    context_hunk_range_data::ContextHunkRangeData,
+    edit_script_range_data::{EditScriptHunkKind, EditScriptRangeData},
+    functions::{if_else, is_edit_script_range, is_no_new_line},
+    normal_range_data::NormalRangeData,
+    patch::PatchResult,
+    patch_format::PatchFormat,
+    patch_line_data::PatchLineData,
+    range::Range,
     unified_hunk_header_data::UnifiedHunkHeaderData,
 };
 
@@ -16,12 +27,19 @@ pub enum PatchLine<'a> {
     ContextDeleted(PatchLineData<'a>),
     ContextUnchanged(PatchLineData<'a>),
     ContextHunkRange(ContextHunkRangeData),
+    EditScriptRange(EditScriptRangeData<'a>),
+    EditScriptInsert(PatchLineData<'a>),
+    EditScriptChange(PatchLineData<'a>),
+    NormalRange(NormalRangeData<'a>),
+    NormalChangeSeparator(PatchLineData<'a>),
+    NormalNewLine(PatchLineData<'a>),
+    NormalOldLine(PatchLineData<'a>),
 }
 
 impl<'a> PatchLine<'a> {
     pub fn kind(&self) -> PatchFormat {
         match self {
-            PatchLine::UnifiedHunkHeader(data) => PatchFormat::Unified,
+            PatchLine::UnifiedHunkHeader(_) => PatchFormat::Unified,
             PatchLine::UnifiedUnchanged(data) => data.kind(),
             PatchLine::UnifiedInserted(data) => data.kind(),
             PatchLine::UnifiedDeleted(data) => data.kind(),
@@ -30,7 +48,14 @@ impl<'a> PatchLine<'a> {
             PatchLine::ContextInserted(data) => data.kind(),
             PatchLine::ContextDeleted(data) => data.kind(),
             PatchLine::ContextUnchanged(data) => data.kind(),
-            PatchLine::ContextHunkRange(data) => PatchFormat::Context,
+            PatchLine::ContextHunkRange(_) => PatchFormat::Context,
+            PatchLine::EditScriptRange(_) => PatchFormat::EditScript,
+            PatchLine::EditScriptInsert(data) => data.kind(),
+            PatchLine::EditScriptChange(data) => data.kind(),
+            PatchLine::NormalRange(_) => PatchFormat::Normal,
+            PatchLine::NormalChangeSeparator(data) => data.kind(),
+            PatchLine::NormalNewLine(data) => data.kind(),
+            PatchLine::NormalOldLine(data) => data.kind(),
         }
     }
 
@@ -46,6 +71,13 @@ impl<'a> PatchLine<'a> {
             PatchLine::ContextDeleted(data) => &data.line()[2..],
             PatchLine::ContextUnchanged(data) => &data.line()[2..],
             PatchLine::ContextHunkRange(data) => data.line(),
+            PatchLine::EditScriptRange(data) => data.line(),
+            PatchLine::EditScriptInsert(data) => data.line(),
+            PatchLine::EditScriptChange(data) => data.line(),
+            PatchLine::NormalRange(data) => data.line(),
+            PatchLine::NormalChangeSeparator(data) => data.line(),
+            PatchLine::NormalNewLine(data) => &data.line()[2..],
+            PatchLine::NormalOldLine(data) => &data.line()[2..],
         }
     }
 
@@ -61,6 +93,13 @@ impl<'a> PatchLine<'a> {
             PatchLine::ContextDeleted(data) => data.line(),
             PatchLine::ContextUnchanged(data) => data.line(),
             PatchLine::ContextHunkRange(data) => data.line(),
+            PatchLine::EditScriptRange(data) => data.line(),
+            PatchLine::EditScriptInsert(data) => data.line(),
+            PatchLine::EditScriptChange(data) => data.line(),
+            PatchLine::NormalRange(data) => data.line(),
+            PatchLine::NormalChangeSeparator(data) => data.line(),
+            PatchLine::NormalNewLine(data) => data.line(),
+            PatchLine::NormalOldLine(data) => data.line(),
         }
     }
 
@@ -78,9 +117,23 @@ impl<'a> PatchLine<'a> {
         }
     }
 
+    pub fn edit_script_range_data(&self) -> Option<&EditScriptRangeData> {
+        match self {
+            PatchLine::EditScriptRange(data) => Some(data),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn normal_hunk_range_data(&self) -> Option<&NormalRangeData> {
+        match self {
+            PatchLine::NormalRange(data) => Some(data),
+            _ => None,
+        }
+    }
+
     pub fn try_from_unified(line: &'a str, line_in_patch: usize) -> Result<Self, PatchError> {
         if !line.is_empty() {
-            if Self::is_no_new_line(line) {
+            if is_no_new_line(line) {
                 return Ok(PatchLine::NoNewLine(PatchLineData::new(
                     line,
                     line_in_patch,
@@ -148,6 +201,35 @@ impl<'a> PatchLine<'a> {
         Err(PatchError::EmptyLineNotAllowed)
     }
 
+    pub fn try_from_normal(line: &'a str, line_in_patch: usize) -> Result<Self, PatchError> {
+        if is_normal_range(line) {
+            let possible_data = NormalRangeData::try_from(line, line_in_patch);
+
+            if let Ok(data) = possible_data {
+                return Ok(PatchLine::NormalRange(data));
+            }
+
+            return Err(PatchError::InvalidNormalRange);
+        }
+
+        let patch_line_data = PatchLineData::new(line, line_in_patch, PatchFormat::Normal);
+
+        if line.starts_with(NORMAL_CHANGE_SEPARATOR) {
+            return Ok(PatchLine::NormalChangeSeparator(patch_line_data));
+        }
+
+        if line.starts_with(NORMAL_NEW_LINE_IDENT) {
+            return Ok(PatchLine::NormalNewLine(patch_line_data));
+        }
+
+        if line.starts_with(NORMAL_OLD_LINE_IDENT) {
+            return Ok(PatchLine::NormalOldLine(patch_line_data));
+        }
+
+        dbg!(line);
+        panic!("Could not classify line in Normal PatchLine groups!")
+    }
+
     pub fn try_from_context(
         line: &'a str,
         line_in_patch: usize,
@@ -162,7 +244,7 @@ impl<'a> PatchLine<'a> {
                 )));
             }
 
-            if Self::is_no_new_line(line) {
+            if is_no_new_line(line) {
                 return Ok(PatchLine::NoNewLine(PatchLineData::new(
                     line,
                     line_in_patch,
@@ -245,8 +327,46 @@ impl<'a> PatchLine<'a> {
         Err(PatchError::InvalidContextPatchLine)
     }
 
-    fn is_no_new_line(line: &str) -> bool {
-        line.trim_end() == NO_NEW_LINE
+    pub(crate) fn try_from_edit_script(
+        line: &'a str,
+        line_in_patch: usize,
+        current_ed_hunk_kind: EditScriptHunkKind,
+    ) -> Result<Self, PatchError> {
+        if is_no_new_line(line) {
+            return Ok(PatchLine::NoNewLine(PatchLineData::new(
+                line,
+                line_in_patch,
+                PatchFormat::EditScript,
+            )));
+        }
+
+        if is_edit_script_range(line) {
+            let range = Range::try_from_edit_script(line);
+            if let Ok(range) = range {
+                return Ok(PatchLine::EditScriptRange(EditScriptRangeData::new(
+                    line,
+                    line_in_patch,
+                    range,
+                    Range::edit_script_range_kind(line),
+                )));
+            } else {
+                return Err(PatchError::InvalidEditScriptRange);
+            }
+        }
+
+        match current_ed_hunk_kind {
+            EditScriptHunkKind::Insert => Ok(PatchLine::EditScriptInsert(PatchLineData::new(
+                line,
+                line_in_patch,
+                PatchFormat::EditScript,
+            ))),
+            EditScriptHunkKind::Delete => panic!("ed has not lines in delete hunks."),
+            EditScriptHunkKind::Change => Ok(PatchLine::EditScriptChange(PatchLineData::new(
+                line,
+                line_in_patch,
+                PatchFormat::EditScript,
+            ))),
+        }
     }
 
     pub fn is_unified_hunk_header(&self) -> bool {
@@ -259,6 +379,14 @@ impl<'a> PatchLine<'a> {
 
     pub fn is_context_range(&self) -> bool {
         matches!(self, PatchLine::ContextHunkRange(_))
+    }
+
+    pub(crate) fn is_edit_script_range(&self) -> bool {
+        matches!(self, PatchLine::EditScriptRange(_))
+    }
+
+    pub(crate) fn is_normal_range(&self) -> bool {
+        matches!(self, PatchLine::NormalRange(_))
     }
 }
 
@@ -276,4 +404,7 @@ pub enum PatchError {
     PatchFormatUnavailable,
     InvalidContextHunkRange,
     ContextOrderedLinesUnavailable,
+    InvalidEditScriptRange,
+    InvalidEditScriptPatch,
+    InvalidNormalRange,
 }

@@ -59,10 +59,6 @@ impl<'a> Hunks<'a> {
         }
     }
 
-    fn add_unified_patch_line(&mut self, patch_line: PatchLine) {
-        todo!()
-    }
-
     pub fn modify_hunks(&mut self, operator: fn(&mut Vec<Hunk>)) {
         operator(&mut self.data);
     }

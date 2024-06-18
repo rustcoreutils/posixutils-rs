@@ -1,33 +1,6 @@
+use crate::patch_utils::order_index::OrderIndex;
+
 use super::{patch_line::PatchLine, range::Range};
-
-#[derive(Debug)]
-pub struct OrderIndex {
-    index: usize,
-    original_line_number: usize,
-    modified_line_number: usize,
-}
-
-impl OrderIndex {
-    pub fn new(index: usize, original_line_number: usize, modified_line_number: usize) -> Self {
-        Self {
-            index,
-            original_line_number,
-            modified_line_number,
-        }
-    }
-
-    pub fn index(&self) -> usize {
-        self.index
-    }
-
-    pub fn original_line_number(&self) -> usize {
-        self.original_line_number
-    }
-
-    pub fn modified_line_number(&self) -> usize {
-        self.modified_line_number
-    }
-}
 
 #[derive(Debug)]
 pub enum ContextHunkOrderIndex {
@@ -142,14 +115,23 @@ impl<'a> ContextHunkData<'a> {
             return;
         }
 
-        let original_skip = 2;// 0 is Hunk separator; 1 is original range
-        let modified_skip = 1;// 0 is original range
+        let original_skip = 2; // 0 is Hunk separator; 1 is original range
+        let modified_skip = 1; // 0 is original range
 
         let is_original_empty = self.is_original_empty(original_skip);
         let is_modified_empty = self.is_modified_empty(modified_skip);
 
-        let mut original_index: usize = original_skip; 
-        let mut modified_index: usize = modified_skip; 
+        let mut original_index: usize = original_skip;
+        let mut modified_index: usize = modified_skip;
+
+        let f1_range_start = self.f1_range().unwrap().start();
+        let f2_range_start = self.f2_range().unwrap().start();
+
+        let original_line_number_by_index =
+            |index: usize| -> usize { index - original_skip + f1_range_start };
+
+        let modified_line_number_by_index =
+            |index: usize| -> usize { index - modified_skip + f2_range_start };
 
         assert!(
             !is_original_empty || !is_modified_empty,
@@ -162,16 +144,16 @@ impl<'a> ContextHunkData<'a> {
             for i in modified_index..self.modified_lines.len() {
                 ordered_lines_indices.push(ContextHunkOrderIndex::Modified(OrderIndex::new(
                     i,
-                    original_index + self.f1_range().unwrap().start() - original_skip,
-                    i + self.f2_range().unwrap().start() - modified_skip,
+                    original_line_number_by_index(original_index),
+                    modified_line_number_by_index(i),
                 )));
             }
         } else if is_modified_empty {
             for i in original_index..self.original_lines.len() {
                 ordered_lines_indices.push(ContextHunkOrderIndex::Original(OrderIndex::new(
                     i,
-                    i + self.f1_range().unwrap().start() - original_skip,
-                    modified_index + self.f2_range().unwrap().start() - modified_skip,
+                    original_line_number_by_index(i),
+                    modified_line_number_by_index(modified_index),
                 )));
             }
         } else {
@@ -188,8 +170,8 @@ impl<'a> ContextHunkData<'a> {
                         ordered_lines_indices.push(ContextHunkOrderIndex::Modified(
                             OrderIndex::new(
                                 modified_index,
-                                original_index + self.f1_range().unwrap().start(),
-                                modified_index + self.f2_range().unwrap().start(),
+                                original_line_number_by_index(original_index),
+                                modified_line_number_by_index(modified_index),
                             ),
                         ));
                     }
@@ -203,8 +185,8 @@ impl<'a> ContextHunkData<'a> {
                         ordered_lines_indices.push(ContextHunkOrderIndex::Original(
                             OrderIndex::new(
                                 original_index,
-                                original_index + self.f1_range().unwrap().start(),
-                                modified_index + self.f2_range().unwrap().start(),
+                                original_line_number_by_index(original_index),
+                                modified_line_number_by_index(modified_index),
                             ),
                         ));
                     }
@@ -216,8 +198,8 @@ impl<'a> ContextHunkData<'a> {
                 if self.is_proper_original_to_order(original_index) {
                     ordered_lines_indices.push(ContextHunkOrderIndex::Original(OrderIndex::new(
                         original_index,
-                        original_index + self.f1_range().unwrap().start(),
-                        modified_index + self.f2_range().unwrap().start(),
+                        original_line_number_by_index(original_index),
+                        modified_line_number_by_index(modified_index),
                     )));
                 }
 
@@ -226,8 +208,8 @@ impl<'a> ContextHunkData<'a> {
                 if self.is_proper_modified_to_order(modified_index) {
                     ordered_lines_indices.push(ContextHunkOrderIndex::Modified(OrderIndex::new(
                         modified_index,
-                        original_index + self.f1_range().unwrap().start(),
-                        modified_index + self.f2_range().unwrap().start(),
+                        original_line_number_by_index(original_index),
+                        modified_line_number_by_index(modified_index),
                     )));
                 }
 

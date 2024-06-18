@@ -1,7 +1,7 @@
 #[derive(Clone, Copy, Debug)]
 pub enum PatchFormat {
     None,
-    Default,
+    Normal,
     Unified,
     Context,
     EditScript,

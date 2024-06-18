@@ -4,7 +4,6 @@ use notify_debouncer_full::new_debouncer;
 use notify_debouncer_full::notify::event::{ModifyKind, RemoveKind};
 use notify_debouncer_full::notify::{EventKind, RecursiveMode, Watcher};
 use plib::PROJECT_NAME;
-use std::fs;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -33,7 +32,7 @@ impl FromStr for SignedIsize {
 struct Args {
     /// The number of lines to print from the end of the file
     #[arg(short = 'n')]
-    lines: Option<isize>,
+    lines: Option<SignedIsize>,
 
     /// The number of bytes to print from the end of the file
     #[arg(short = 'c')]
@@ -60,34 +59,72 @@ impl Args {
         }
 
         if self.bytes.is_none() && self.lines.is_none() {
-            self.lines = Some(-10);
+            self.lines = Some(SignedIsize(-10));
         }
 
         Ok(())
     }
 }
 
-/// Prints the last `n` lines from the given buffered reader.
+/// Prints the last `n` lines from the given reader.
 ///
 /// # Arguments
-/// * `reader` - A buffered reader to read lines from.
+/// * `reader` - A mutable reference to a reader to read bytes from.
 /// * `n` - The number of lines to print from the end. Negative values indicate counting from the end.
-
-fn print_last_n_lines<R: BufRead>(reader: R, n: isize) -> Result<(), String> {
-    let lines: Vec<_> = reader.lines().map_while(Result::ok).collect();
-
-    let mut start = if n < 0 {
-        (lines.len() as isize + n).max(0) as usize
+fn print_last_n_lines<R: Read + BufRead>(
+    reader: &mut R,
+    n: isize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if n < 0 {
+        let n = n.unsigned_abs();
+        let mut lines = Vec::with_capacity(n);
+        let mut line = String::new();
+        while reader.read_line(&mut line).map_err(|e| e.to_string())? != 0 {
+            if lines.len() == n {
+                lines.remove(0);
+            }
+            lines.push(line.clone());
+            line.clear();
+        }
+        for line in lines {
+            println!("{}", line.trim_end());
+        }
     } else {
-        (n - 1).max(0) as usize
-    };
+        let mut n = n as usize;
+        if n == 0 {
+            n = 1;
+        }
+        let mut empty_buffer = [0; 1];
+        let mut line_count = 0;
 
-    start = start.min(lines.len());
+        if n != 1 {
+            'a: loop {
+                let bytes_read = reader.read(&mut empty_buffer)?;
+                if bytes_read == 0 {
+                    break;
+                }
 
-    for line in &lines[start..] {
-        println!("{}", line);
+                if empty_buffer[0] == b'\n' {
+                    line_count += 1;
+                    if line_count == n - 1 {
+                        break 'a;
+                    }
+                }
+            }
+        }
+        let mut buffer = [0; 1024];
+        loop {
+            let bytes_read = reader
+                .read(&mut buffer)
+                .map_err(|e| format!("Failed to read: {}", e))?;
+
+            if bytes_read == 0 {
+                break;
+            }
+
+            print_bytes(&buffer[..bytes_read]);
+        }
     }
-
     Ok(())
 }
 
@@ -96,28 +133,56 @@ fn print_last_n_lines<R: BufRead>(reader: R, n: isize) -> Result<(), String> {
 /// # Arguments
 /// * `buf_reader` - A mutable reference to a reader to read bytes from.
 /// * `n` - The number of bytes to print from the end. Negative values indicate counting from the end.
+fn print_last_n_bytes<R: Read>(
+    buf_reader: &mut R,
+    n: isize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if n < 0 {
+        let n = n.unsigned_abs();
+        let mut buffer_1 = vec![0; n];
+        let mut buffer_2 = vec![];
+        loop {
+            let bytes_read = buf_reader
+                .read(&mut buffer_1)
+                .map_err(|e| format!("Failed to read: {}", e))?;
 
-fn print_last_n_bytes<R: Read>(buf_reader: &mut R, n: isize) -> Result<(), String> {
-    let mut buffer = Vec::new();
+            if bytes_read < buffer_1.len() {
+                buffer_2.extend(&buffer_1[..bytes_read]);
+                if buffer_2.len() < n {
+                    print_bytes(&buffer_2);
+                } else {
+                    let start = buffer_2.len() - n;
+                    print_bytes(&buffer_2[start..]);
+                }
 
-    buf_reader
-        .read_to_end(&mut buffer)
-        .map_err(|e| format!("Failed to read file: {}", e))?;
-
-    let start = if n < 0 {
-        (buffer.len() as isize + n).max(0) as usize
-    } else {
-        (n - 1).max(0) as usize
-    }
-    .min(buffer.len());
-
-    let slice = &buffer[start..];
-    match std::str::from_utf8(slice) {
-        Ok(valid_str) => print!("{}", valid_str),
-        Err(_) => {
-            for &byte in slice {
-                print!("{}", byte as char);
+                break;
             }
+            buffer_2.clone_from(&buffer_1);
+        }
+    } else {
+        let mut skip = n as usize;
+
+        let mut empty_buffer = [0; 1];
+
+        while skip > 1 {
+            let bytes_read = buf_reader.read(&mut empty_buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            skip -= 1;
+        }
+
+        let mut buffer = [0; 1024];
+        loop {
+            let bytes_read = buf_reader
+                .read(&mut buffer)
+                .map_err(|e| format!("Failed to read: {}", e))?;
+
+            if bytes_read == 0 {
+                break;
+            }
+
+            print_bytes(&buffer[..bytes_read]);
         }
     }
 
@@ -149,15 +214,16 @@ fn tail(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         if args.file == Some(PathBuf::from("-")) || args.file.is_none() {
             Box::new(io::stdin().lock())
         } else {
-            Box::new(fs::File::open(args.file.as_ref().unwrap())?)
+            Box::new(File::open(args.file.as_ref().unwrap())?)
         }
     };
+
     let mut reader = io::BufReader::new(file);
 
     if let Some(bytes) = &args.bytes {
         print_last_n_bytes(&mut reader, bytes.0)?;
     } else {
-        print_last_n_lines(reader, args.lines.unwrap())?;
+        print_last_n_lines(&mut reader, args.lines.as_ref().unwrap().0)?;
     }
 
     // If follow option is specified, continue monitoring the file

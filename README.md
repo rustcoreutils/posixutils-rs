@@ -39,142 +39,165 @@ Because it is a FAQ, the major differences between this project and uutils are:
 2. More minimalist:  Each posixutils utility _implementation_ is intentionally more minimalist, intending to avoid the bloat of supporting rarely-used, non-POSIX features.  Our common denominator and baseline is the POSIX spec, then add non-POSIX features that users cannot live without.
 3. Transportable:  Each posixutils utility should look like normal Rust code, easily stand alone with little-or-no deps, and be used in another project.   This project is MIT-licensed, not GPL licensed, to aid in that transportability goal.
 
-## Checklist of utilities
+## Utility status
 
- - [ ] admin (SCCS)
+## Stage 6 - Audited
+
+(none)
+
+## Stage 5 - Fully Translated to 2+ languages
+
+(none)
+
+## Stage 4 - Code coverage
+
+(none)
+
+## Stage 3 - Test coverage
+
+ - [x] cp
+ - [x] ls
+ - [x] mv
+ - [x] nm (Development)
+ - [x] paste
+ - [x] pr
+ - [x] rm
+
+## Stage 2 - Feature-complete and POSIX compliant
+
  - [x] ar (Development)
- - [x] asa
- - [ ] at (cron cat.)
- - [ ] awk
- - [x] basename
- - [ ] batch (cron cat.)
  - [x] bc
- - [ ] c99 (Development)
- - [x] cal
  - [x] cat
- - [ ] cflow (Development)
+ - [x] compress (compress cat.)
+ - [x] csplit
+ - [x] cut
+ - [x] expr
+ - [x] false
+ - [x] fold
+ - [x] head
+ - [x] link
+ - [x] ln
+ - [x] logger
+ - [x] logname
+ - [x] mesg
+ - [x] mkdir
+ - [x] mkfifo
+ - [x] nice
+ - [x] nl
+ - [x] nohup
+ - [x] pwd
+ - [x] renice
+ - [x] rmdir
+ - [x] sleep
+ - [x] sort
+ - [x] split
+ - [x] strings
+ - [x] strip (Development)
+ - [x] tr
+ - [x] true
+ - [x] tty
+ - [x] uncompress (compress cat.)
+ - [x] unexpand
+ - [x] uniq
+ - [x] unlink
+ - [x] uudecode (uue)
+ - [x] uuencode (uue)
+ - [x] wc
+ - [x] zcat (compress cat.)
+
+## Stage 1 - Rough draft
+
+ - [x] asa
+ - [x] basename
+ - [x] cal
  - [x] chgrp
  - [x] chmod
  - [x] chown
  - [x] cksum
  - [x] cmp
  - [x] comm
- - [x] compress (compress cat.)
- - [x] cp
- - [ ] crontab (cron cat.)
- - [x] csplit
- - [ ] ctags (Development)
- - [x] cut
- - [ ] cxref (Development)
  - [x] date
- - [x] dd
- - [ ] delta (SCCS)
  - [x] df
  - [x] diff
  - [x] dirname
  - [x] du
  - [x] echo
- - [ ] ed
+ - [x] dd
  - [x] env
- - [ ] ex
  - [x] expand
- - [x] expr
- - [x] false
  - [x] file
- - [ ] find
- - [x] fold
- - [ ] fort77 (Development)
- - [ ] fuser
- - [ ] gencat (i18n)
- - [ ] get (SCCS)
- - [ ] getconf
- - [ ] grep
- - [x] head
- - [ ] iconv (i18n)
  - [x] id
  - [x] ipcrm (IPC)
+ - [x] kill
+ - [x] pathchk
+ - [x] printf
+ - [x] stty
+ - [x] tabs
+ - [x] tee
+ - [x] touch
+ - [x] tput
+ - [x] tsort
+ - [x] uname
+ - [x] who
+ - [x] xargs
+
+## Stage 0 - Not started
+
+ - [ ] at (cron cat.)
+ - [ ] batch (cron cat.)
+ - [ ] crontab (cron cat.)
+ - [ ] c99 (Development)
+ - [ ] cflow (Development)
+ - [ ] ctags (Development)
+ - [ ] cxref (Development)
+ - [ ] fort77 (Development)
+ - [ ] lex (Development)
+ - [ ] yacc (Development)
+ - [ ] admin (SCCS)
+ - [ ] delta (SCCS)
+ - [ ] get (SCCS)
+ - [ ] prs (SCCS)
+ - [ ] rmdel (SCCS)
+ - [ ] sact (SCCS)
+ - [ ] sccs (SCCS)
+ - [ ] gencat (i18n)
+ - [ ] iconv (i18n)
+ - [ ] unget (SCCS)
+ - [ ] val (SCCS)
+ - [ ] what (SCCS)
+ - [ ] uucp (UUCP)
+ - [ ] uustat (UUCP)
+ - [ ] uux (UUCP)
+ - [ ] ed (Editors)
+ - [ ] ex (Editors)
+ - [ ] vi (Editors)
+ - [ ] awk
+ - [ ] find
+ - [ ] fuser
+ - [ ] getconf
+ - [ ] grep
  - [ ] ipcs (IPC)
  - [ ] join
- - [x] kill
- - [ ] lex (Development)
- - [x] link
- - [x] ln
  - [ ] locale
  - [ ] localedef
- - [x] logger
- - [x] logname
  - [ ] lp
- - [x] ls
  - [ ] m4
  - [ ] mailx
  - [ ] make
  - [ ] man
- - [x] mesg
- - [x] mkdir
- - [x] mkfifo
  - [ ] more
- - [x] mv
  - [ ] newgrp
- - [x] nice
- - [x] nl
- - [x] nm (Development)
- - [x] nohup
  - [ ] od
- - [x] paste
  - [ ] patch
- - [x] pathchk
  - [ ] pax
- - [x] pr
- - [x] printf
- - [ ] prs (SCCS)
  - [ ] ps
- - [x] pwd
- - [x] renice
- - [x] rm
- - [ ] rmdel (SCCS)
- - [x] rmdir
- - [ ] sact (SCCS)
- - [ ] sccs (SCCS)
  - [ ] sed
  - [ ] sh
- - [x] sleep
- - [x] sort
- - [x] split
- - [x] strings
- - [x] strip (Development)
- - [x] stty
- - [x] tabs
  - [ ] tail
  - [ ] talk
- - [x] tee
  - [ ] test
  - [ ] time
- - [x] touch
- - [x] tput
- - [x] tr
- - [x] true
- - [x] tsort
- - [x] tty
- - [x] uname
- - [x] uncompress (compress cat.)
- - [x] unexpand
- - [ ] unget (SCCS)
- - [x] uniq
- - [x] unlink
- - [ ] uucp (UUCP)
- - [x] uudecode (uue)
- - [x] uuencode (uue)
- - [ ] uustat (UUCP)
- - [ ] uux (UUCP)
- - [ ] val (SCCS)
- - [ ] vi
- - [x] wc
- - [ ] what (SCCS)
- - [x] who
  - [ ] write
- - [x] xargs
- - [ ] yacc (Development)
- - [x] zcat (compress cat.)
 
 ## Testing
 

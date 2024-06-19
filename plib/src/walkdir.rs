@@ -189,6 +189,7 @@ pub enum FileType {
 enum Origin {
     Parent,
     FileDescriptor(FileDescriptor),
+    Cwd,
 }
 
 #[derive(Debug)]
@@ -313,9 +314,11 @@ where
             }
         };
 
-        if let Some(loc) = last.dir_last_position {
-            dir.seek(loc);
+        if let Some(last_pos) = last.dir_last_position {
+            dir.seek(last_pos);
         }
+
+        let at_cwd = cwd.fd == libc::AT_FDCWD;
 
         // Enter the directory. The value of `cwd` set here is used in the while loop.
         cwd = FileDescriptor::open_at(&cwd, last.pathname.as_ptr(), libc::O_RDONLY);
@@ -388,7 +391,9 @@ where
 
                     stack.push(TreeNode {
                         pathname: next_pathname,
-                        origin: Some(if is_symlink {
+                        origin: Some(if at_cwd {
+                            Origin::Cwd
+                        } else if is_symlink {
                             Origin::FileDescriptor(dir.file_descriptor())
                         } else {
                             Origin::Parent
@@ -415,10 +420,11 @@ where
 
         if let Some(origin) = last.origin {
             match origin {
+                Origin::Cwd => cwd = FileDescriptor::cwd(),
+                Origin::FileDescriptor(fd) => cwd = fd,
                 Origin::Parent => {
                     cwd = FileDescriptor::open_at(&cwd, c"..".as_ptr(), libc::O_RDONLY);
                 }
-                Origin::FileDescriptor(fd) => cwd = fd,
             }
         }
         display_buf.pop();

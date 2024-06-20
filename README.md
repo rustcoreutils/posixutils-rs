@@ -35,7 +35,7 @@ https://github.com/jgarzik/posixutils
 A project with more narrow scope, with the aim of GNU coreutils compatibility, is uutils: https://github.com/uutils/coreutils
 
 Because it is a FAQ, the major differences between this project and uutils are:
-1. Wider scope:  posixutils is far more ambitious than uutils from a breadth standpoint:  posixutils will include bc, m4, c99 compiler, fort77 compiler, a cron daemon etc.   uutils is far more limited in the scope of programs covered, mimicing GNU coreutils.
+1. Wider scope:  posixutils is far more ambitious than uutils from a breadth standpoint:  posixutils will include bc, m4, c99 compiler, a cron daemon etc.   uutils is far more limited in the scope of programs covered, mimicing GNU coreutils.
 2. More minimalist:  Each posixutils utility _implementation_ is intentionally more minimalist, intending to avoid the bloat of supporting rarely-used, non-POSIX features.  Our common denominator and baseline is the POSIX spec, then add non-POSIX features that users cannot live without.
 3. Transportable:  Each posixutils utility should look like normal Rust code, easily stand alone with little-or-no deps, and be used in another project.   This project is MIT-licensed, not GPL licensed, to aid in that transportability goal.
 
@@ -55,86 +55,86 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
 ## Stage 3 - Test coverage
 
+ - [x] ar (Development)
+ - [x] bc
+ - [x] cksum
+ - [x] cmp
+ - [x] compress (compress cat.)
  - [x] cp
+ - [x] csplit
+ - [x] cut
+ - [x] diff
+ - [x] expand
+ - [x] expr
+ - [x] file
+ - [x] false
+ - [x] head
  - [x] ls
  - [x] mv
+ - [x] nl
  - [x] nm (Development)
  - [x] paste
  - [x] pr
  - [x] rm
-
-## Stage 2 - Feature-complete and POSIX compliant
-
- - [x] ar (Development)
- - [x] bc
- - [x] cat
- - [x] compress (compress cat.)
- - [x] csplit
- - [x] cut
- - [x] expr
- - [x] false
- - [x] fold
- - [x] head
- - [x] link
- - [x] ln
- - [x] logger
- - [x] logname
- - [x] mesg
- - [x] mkdir
- - [x] mkfifo
- - [x] nice
- - [x] nl
- - [x] nohup
- - [x] pwd
- - [x] renice
- - [x] rmdir
- - [x] sleep
  - [x] sort
  - [x] split
  - [x] strings
  - [x] strip (Development)
  - [x] tr
  - [x] true
- - [x] tty
  - [x] uncompress (compress cat.)
- - [x] unexpand
- - [x] uniq
- - [x] unlink
  - [x] uudecode (uue)
  - [x] uuencode (uue)
+ - [x] unexpand
+ - [x] uniq
  - [x] wc
  - [x] zcat (compress cat.)
+
+## Stage 2 - Feature-complete and POSIX compliant
+
+ - [x] basename
+ - [x] cat
+ - [x] chgrp
+ - [x] chmod
+ - [x] chown
+ - [x] date
+ - [x] dirname
+ - [x] env
+ - [x] fold
+ - [x] ipcrm (IPC)
+ - [x] link
+ - [x] ln
+ - [x] logname
+ - [x] mesg
+ - [x] mkdir
+ - [x] mkfifo
+ - [x] nice
+ - [x] nohup
+ - [x] pathchk
+ - [x] pwd
+ - [x] renice
+ - [x] rmdir
+ - [x] sleep
+ - [x] tee
+ - [x] touch
+ - [x] tty
+ - [x] unlink
 
 ## Stage 1 - Rough draft
 
  - [x] asa
- - [x] basename
  - [x] cal
- - [x] chgrp
- - [x] chmod
- - [x] chown
- - [x] cksum
- - [x] cmp
  - [x] comm
- - [x] date
  - [x] df
- - [x] diff
- - [x] dirname
  - [x] du
  - [x] echo
  - [x] dd
- - [x] env
- - [x] expand
- - [x] file
  - [x] id
- - [x] ipcrm (IPC)
  - [x] kill
- - [x] pathchk
+ - [x] logger
  - [x] printf
  - [x] stty
  - [x] tabs
- - [x] tee
- - [x] touch
  - [x] tput
  - [x] tsort
  - [x] uname
@@ -146,11 +146,10 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] at (cron cat.)
  - [ ] batch (cron cat.)
  - [ ] crontab (cron cat.)
- - [ ] c99 (Development)
+ - [ ] c17 (Development)
  - [ ] cflow (Development)
  - [ ] ctags (Development)
  - [ ] cxref (Development)
- - [ ] fort77 (Development)
  - [ ] lex (Development)
  - [ ] yacc (Development)
  - [ ] admin (SCCS)
@@ -161,7 +160,13 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] sact (SCCS)
  - [ ] sccs (SCCS)
  - [ ] gencat (i18n)
+ - [ ] gettext (i18n)
  - [ ] iconv (i18n)
+ - [ ] locale (i18n)
+ - [ ] localedef (i18n)
+ - [ ] msgfmt (i18n)
+ - [ ] ngettext (i18n)
+ - [ ] xgettext (i18n)
  - [ ] unget (SCCS)
  - [ ] val (SCCS)
  - [ ] what (SCCS)
@@ -178,8 +183,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] grep
  - [ ] ipcs (IPC)
  - [ ] join
- - [ ] locale
- - [ ] localedef
  - [ ] lp
  - [ ] m4
  - [ ] mailx
@@ -191,12 +194,15 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] patch
  - [ ] pax
  - [ ] ps
+ - [ ] readlink
+ - [ ] realpath
  - [ ] sed
  - [ ] sh
  - [ ] tail
  - [ ] talk
  - [ ] test
  - [ ] time
+ - [ ] timeout
  - [ ] write
 
 ## Testing

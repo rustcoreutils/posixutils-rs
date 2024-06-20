@@ -113,6 +113,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] nohup
  - [x] pathchk
  - [x] pwd
+ - [x] readlink
  - [x] renice
  - [x] rmdir
  - [x] sleep
@@ -195,7 +196,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] patch
  - [ ] pax
  - [ ] ps
- - [ ] readlink
  - [ ] realpath
  - [ ] sed
  - [ ] sh

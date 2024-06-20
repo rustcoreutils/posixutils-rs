@@ -148,12 +148,14 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] at (cron cat.)
  - [ ] batch (cron cat.)
  - [ ] crontab (cron cat.)
+
  - [ ] c17 (Development)
  - [ ] cflow (Development)
  - [ ] ctags (Development)
  - [ ] cxref (Development)
  - [ ] lex (Development)
  - [ ] yacc (Development)
+
  - [ ] admin (SCCS)
  - [ ] delta (SCCS)
  - [ ] get (SCCS)
@@ -161,6 +163,10 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] rmdel (SCCS)
  - [ ] sact (SCCS)
  - [ ] sccs (SCCS)
+ - [ ] unget (SCCS)
+ - [ ] val (SCCS)
+ - [ ] what (SCCS)
+ 
  - [ ] gencat (i18n)
  - [ ] gettext (i18n)
  - [ ] iconv (i18n)
@@ -169,15 +175,15 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] msgfmt (i18n)
  - [ ] ngettext (i18n)
  - [ ] xgettext (i18n)
- - [ ] unget (SCCS)
- - [ ] val (SCCS)
- - [ ] what (SCCS)
+ 
  - [ ] uucp (UUCP)
  - [ ] uustat (UUCP)
  - [ ] uux (UUCP)
+
  - [ ] ed (Editors)
  - [ ] ex (Editors)
  - [ ] vi (Editors)
+
  - [ ] awk
  - [ ] find
  - [ ] fuser

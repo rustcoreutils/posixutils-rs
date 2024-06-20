@@ -64,6 +64,10 @@ name = "mv"
 path = "src/mv.rs"
 
 [[bin]]
+name = "readlink"
+path = "src/readlink.rs"
+
+[[bin]]
 name = "rm"
 path = "src/rm.rs"
 

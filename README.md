@@ -145,10 +145,12 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
 ## Stage 0 - Not started
 
+### Cron category
  - [ ] at (cron cat.)
  - [ ] batch (cron cat.)
  - [ ] crontab (cron cat.)
 
+### Development category
  - [ ] c17 (Development)
  - [ ] cflow (Development)
  - [ ] ctags (Development)
@@ -156,6 +158,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] lex (Development)
  - [ ] yacc (Development)
 
+### SCCS category
  - [ ] admin (SCCS)
  - [ ] delta (SCCS)
  - [ ] get (SCCS)
@@ -166,7 +169,8 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] unget (SCCS)
  - [ ] val (SCCS)
  - [ ] what (SCCS)
- 
+
+ ### i18n category
  - [ ] gencat (i18n)
  - [ ] gettext (i18n)
  - [ ] iconv (i18n)
@@ -175,15 +179,18 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] msgfmt (i18n)
  - [ ] ngettext (i18n)
  - [ ] xgettext (i18n)
- 
+
+### UUCP category 
  - [ ] uucp (UUCP)
  - [ ] uustat (UUCP)
  - [ ] uux (UUCP)
 
+### Editors category
  - [ ] ed (Editors)
  - [ ] ex (Editors)
  - [ ] vi (Editors)
 
+### Misc. category
  - [ ] awk
  - [ ] find
  - [ ] fuser

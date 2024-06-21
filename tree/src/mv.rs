@@ -17,7 +17,7 @@ mod common;
 
 use self::common::{copy_characteristics, error_string, is_file_writable};
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, textdomain};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
@@ -449,6 +449,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     // Initialize translation system
+    setlocale(LocaleCategory::LcAll, "");
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 

@@ -8,7 +8,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, textdomain};
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use std::io::{self, ErrorKind, Read};
 use std::path::PathBuf;
@@ -120,6 +120,7 @@ fn main() -> ExitCode {
     let args = Args::parse();
 
     // Initialize translation system
+    setlocale(LocaleCategory::LcAll, "");
     textdomain(PROJECT_NAME).unwrap();
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8").unwrap();
 

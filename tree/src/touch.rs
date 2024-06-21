@@ -13,7 +13,7 @@ extern crate plib;
 
 use chrono::{DateTime, Datelike, LocalResult, TimeZone, Utc};
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, textdomain};
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 
 /// touch - change file access and modification times
@@ -256,6 +256,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = Args::parse();
 
     // initialize translations
+    setlocale(LocaleCategory::LcAll, "");
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 

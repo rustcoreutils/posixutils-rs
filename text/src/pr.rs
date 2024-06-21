@@ -10,7 +10,7 @@
 mod pr_util;
 
 use chrono::{DateTime, Local};
-use gettextrs::{bind_textdomain_codeset, gettext, textdomain};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use std::fmt::Write as _;
 use std::fs;
@@ -533,6 +533,7 @@ fn pr_merged(paths: &[PathBuf], params: &Parameters) -> io::Result<()> {
 
 fn main() -> ExitCode {
     // Initialize translation system
+    setlocale(LocaleCategory::LcAll, "");
     textdomain(PROJECT_NAME).unwrap();
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8").unwrap();
 

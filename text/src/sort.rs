@@ -19,7 +19,7 @@ use std::{
 };
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, textdomain};
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 
 /// Sort, merge, or sequence check text files
@@ -1020,6 +1020,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     args.validate_args()?;
 
+    setlocale(LocaleCategory::LcAll, "");
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 

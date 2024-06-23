@@ -3,6 +3,7 @@ use std::{fs, io, path::PathBuf};
 use super::patch_file_kind::PatchFileKind;
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct PatchFile {
     lines: Vec<String>,
     kind: PatchFileKind,
@@ -15,7 +16,7 @@ impl PatchFile {
         let content = fs::read_to_string(&path)?;
         let ends_with_newline = content.ends_with('\n');
 
-        if kind == PatchFileKind::Patch && content.is_empty() {
+        if matches!(kind, PatchFileKind::Patch) && content.is_empty() {
             std::process::exit(0);
         }
 

@@ -19,3 +19,8 @@ pub mod regex {
     pub const NORMAL_FORMAT_RANGE_CHANGE_REGEX: &str = r"^(\d+(,\d+)?|\d+)c(\d+(,\d+)?|\d+)$";
     pub const NORMAL_FORMAT_RANGE_DELETE_REGEX: &str = r"^(\d+(,\d+)?|\d+)d\d+$";
 }
+
+pub mod context {
+    pub const ORIGINAL_SKIP: usize = 2; // 0 is Hunk separator; 1 is original range
+    pub const MODIFIED_SKIP: usize = 1; // 0 is original range
+}

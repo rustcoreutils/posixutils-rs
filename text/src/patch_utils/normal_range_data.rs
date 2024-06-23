@@ -1,7 +1,5 @@
-use std::sync::mpsc::RecvError;
-
 use super::{
-    functions::{is_no_new_line, is_normal_range},
+    functions::is_normal_range,
     patch_format::PatchFormat,
     range::{Range, RangeError},
 };
@@ -10,10 +8,11 @@ use super::{
 pub enum NormalRangeKind {
     Insert,
     Change,
-    Remove,
+    Delete,
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct NormalRangeData<'a> {
     line: &'a str,
     line_in_patch: usize,
@@ -96,7 +95,7 @@ impl<'a> NormalRangeData<'a> {
             let range_kind = match line.chars().nth(ident_index) {
                 Some('a') => NormalRangeKind::Insert,
                 Some('c') => NormalRangeKind::Change,
-                Some('d') => NormalRangeKind::Remove,
+                Some('d') => NormalRangeKind::Delete,
                 _ => {
                     return Err(RangeError::InvalidRangeWithError(
                         "NormalRange identifier should be one of `a` or `d` or `c`!".to_string(),

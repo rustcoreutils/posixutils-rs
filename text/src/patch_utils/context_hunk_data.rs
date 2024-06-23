@@ -1,4 +1,7 @@
-use crate::patch_utils::order_index::OrderIndex;
+use crate::patch_utils::{
+    constants::context::{MODIFIED_SKIP, ORIGINAL_SKIP},
+    order_index::OrderIndex,
+};
 
 use super::{patch_line::PatchLine, range::Range};
 
@@ -19,6 +22,14 @@ pub struct ContextHunkData<'a> {
 }
 
 impl<'a> ContextHunkData<'a> {
+    pub fn original_lines(&self) -> &Vec<PatchLine<'a>> {
+        &self.original_lines
+    }
+
+    pub fn modified_lines(&self) -> &Vec<PatchLine<'a>> {
+        &self.modified_lines
+    }
+
     pub fn new(
         f1_range: Option<Range>,
         f2_range: Option<Range>,
@@ -33,10 +44,6 @@ impl<'a> ContextHunkData<'a> {
             add_to_modified: false,
             ordered_lines_indeces: None,
         }
-    }
-
-    pub fn enable_add_to_modified(&mut self) {
-        self.add_to_modified = true
     }
 
     pub fn add_patch_line(&mut self, patch_line: PatchLine<'a>) {
@@ -76,7 +83,7 @@ impl<'a> ContextHunkData<'a> {
         &self.f2_range
     }
 
-    fn is_original_empty(&self, skip: usize) -> bool {
+    pub fn is_original_empty(&self, skip: usize) -> bool {
         self.original_lines
             .iter()
             .skip(skip)
@@ -84,14 +91,14 @@ impl<'a> ContextHunkData<'a> {
                 matches!(
                     patch_line,
                     PatchLine::NoNewLine(_)
-                        | PatchLine::ContextDeleted(_)
+                        | PatchLine::ContextDeleted(_, _)
                         | PatchLine::ContextUnchanged(_)
                 )
             })
             .all(|mached| !mached)
     }
 
-    fn is_modified_empty(&self, skip: usize) -> bool {
+    pub fn is_modified_empty(&self, skip: usize) -> bool {
         self.modified_lines
             .iter()
             .skip(skip)
@@ -99,14 +106,14 @@ impl<'a> ContextHunkData<'a> {
                 matches!(
                     patch_line,
                     PatchLine::NoNewLine(_)
-                        | PatchLine::ContextInserted(_)
+                        | PatchLine::ContextInserted(_, _)
                         | PatchLine::ContextUnchanged(_)
                 )
             })
             .all(|mached| !mached)
     }
 
-    pub fn ordered_lines_indeces(&self) -> &Option<Vec<ContextHunkOrderIndex>> {
+    pub fn ordered_lines_indices(&self) -> &Option<Vec<ContextHunkOrderIndex>> {
         &self.ordered_lines_indeces
     }
 
@@ -115,23 +122,20 @@ impl<'a> ContextHunkData<'a> {
             return;
         }
 
-        let original_skip = 2; // 0 is Hunk separator; 1 is original range
-        let modified_skip = 1; // 0 is original range
+        let is_original_empty = self.is_original_empty(ORIGINAL_SKIP);
+        let is_modified_empty = self.is_modified_empty(MODIFIED_SKIP);
 
-        let is_original_empty = self.is_original_empty(original_skip);
-        let is_modified_empty = self.is_modified_empty(modified_skip);
-
-        let mut original_index: usize = original_skip;
-        let mut modified_index: usize = modified_skip;
+        let mut original_index: usize = ORIGINAL_SKIP;
+        let mut modified_index: usize = MODIFIED_SKIP;
 
         let f1_range_start = self.f1_range().unwrap().start();
         let f2_range_start = self.f2_range().unwrap().start();
 
         let original_line_number_by_index =
-            |index: usize| -> usize { index - original_skip + f1_range_start };
+            |index: usize| -> usize { index - ORIGINAL_SKIP + f1_range_start };
 
         let modified_line_number_by_index =
-            |index: usize| -> usize { index - modified_skip + f2_range_start };
+            |index: usize| -> usize { index - MODIFIED_SKIP + f2_range_start };
 
         assert!(
             !is_original_empty || !is_modified_empty,
@@ -236,7 +240,7 @@ impl<'a> ContextHunkData<'a> {
         matches!(
             self.modified_lines[modified_index],
             PatchLine::NoNewLine(_)
-                | PatchLine::ContextInserted(_)
+                | PatchLine::ContextInserted(_, _)
                 | PatchLine::ContextUnchanged(_)
         )
     }
@@ -244,7 +248,11 @@ impl<'a> ContextHunkData<'a> {
     pub fn is_proper_original_to_order(&self, original_index: usize) -> bool {
         matches!(
             self.original_lines[original_index],
-            PatchLine::NoNewLine(_) | PatchLine::ContextDeleted(_)
+            PatchLine::NoNewLine(_) | PatchLine::ContextDeleted(_, _)
         )
+    }
+
+    pub(crate) fn verify_hunk(&self) {
+        // TODO
     }
 }

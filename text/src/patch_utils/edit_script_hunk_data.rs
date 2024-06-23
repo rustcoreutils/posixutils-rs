@@ -27,4 +27,8 @@ impl<'a> EditScriptHunkData<'a> {
     pub fn lines(&self) -> &Vec<PatchLine<'a>> {
         &self.lines
     }
+
+    pub(crate) fn verify_hunk(&self) {
+        // TODO
+    }
 }

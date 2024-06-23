@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::fmt::Display;
 
 use crate::patch_utils::functions::is_normal_range;
 
@@ -8,7 +8,6 @@ use super::{
     edit_script_range_data::{EditScriptHunkKind, EditScriptRangeData},
     functions::{if_else, is_edit_script_range, is_no_new_line},
     normal_range_data::NormalRangeData,
-    patch::PatchResult,
     patch_format::PatchFormat,
     patch_line_data::PatchLineData,
     range::Range,
@@ -23,8 +22,16 @@ pub enum PatchLine<'a> {
     UnifiedDeleted(PatchLineData<'a>),
     NoNewLine(PatchLineData<'a>),
     ContextHunkSeparator(PatchLineData<'a>),
-    ContextInserted(PatchLineData<'a>),
-    ContextDeleted(PatchLineData<'a>),
+    ContextInserted(
+        PatchLineData<'a>,
+        /// is Change
+        bool,
+    ),
+    ContextDeleted(
+        PatchLineData<'a>,
+        // is Change
+        bool,
+    ),
     ContextUnchanged(PatchLineData<'a>),
     ContextHunkRange(ContextHunkRangeData),
     EditScriptRange(EditScriptRangeData<'a>),
@@ -45,8 +52,8 @@ impl<'a> PatchLine<'a> {
             PatchLine::UnifiedDeleted(data) => data.kind(),
             PatchLine::NoNewLine(data) => data.kind(),
             PatchLine::ContextHunkSeparator(data) => data.kind(),
-            PatchLine::ContextInserted(data) => data.kind(),
-            PatchLine::ContextDeleted(data) => data.kind(),
+            PatchLine::ContextInserted(data, _) => data.kind(),
+            PatchLine::ContextDeleted(data, _) => data.kind(),
             PatchLine::ContextUnchanged(data) => data.kind(),
             PatchLine::ContextHunkRange(_) => PatchFormat::Context,
             PatchLine::EditScriptRange(_) => PatchFormat::EditScript,
@@ -67,8 +74,8 @@ impl<'a> PatchLine<'a> {
             PatchLine::UnifiedDeleted(data) => &data.line()[1..],
             PatchLine::NoNewLine(data) => data.line(),
             PatchLine::ContextHunkSeparator(data) => data.line(),
-            PatchLine::ContextInserted(data) => &data.line()[2..],
-            PatchLine::ContextDeleted(data) => &data.line()[2..],
+            PatchLine::ContextInserted(data, _) => &data.line()[2..],
+            PatchLine::ContextDeleted(data, _) => &data.line()[2..],
             PatchLine::ContextUnchanged(data) => &data.line()[2..],
             PatchLine::ContextHunkRange(data) => data.line(),
             PatchLine::EditScriptRange(data) => data.line(),
@@ -89,8 +96,8 @@ impl<'a> PatchLine<'a> {
             PatchLine::UnifiedDeleted(data) => data.line(),
             PatchLine::NoNewLine(data) => data.line(),
             PatchLine::ContextHunkSeparator(data) => data.line(),
-            PatchLine::ContextInserted(data) => data.line(),
-            PatchLine::ContextDeleted(data) => data.line(),
+            PatchLine::ContextInserted(data, _) => data.line(),
+            PatchLine::ContextDeleted(data, _) => data.line(),
             PatchLine::ContextUnchanged(data) => data.line(),
             PatchLine::ContextHunkRange(data) => data.line(),
             PatchLine::EditScriptRange(data) => data.line(),
@@ -214,6 +221,10 @@ impl<'a> PatchLine<'a> {
 
         let patch_line_data = PatchLineData::new(line, line_in_patch, PatchFormat::Normal);
 
+        if is_no_new_line(line) {
+            return Ok(PatchLine::NoNewLine(patch_line_data));
+        }
+
         if line.starts_with(NORMAL_CHANGE_SEPARATOR) {
             return Ok(PatchLine::NormalChangeSeparator(patch_line_data));
         }
@@ -290,16 +301,14 @@ impl<'a> PatchLine<'a> {
             let context_identifier = &line[0..2];
 
             let result = match context_identifier {
-                "+ " => Ok(Self::ContextInserted(PatchLineData::new(
-                    line,
-                    line_in_patch,
-                    PatchFormat::Context,
-                ))),
-                "- " => Ok(Self::ContextDeleted(PatchLineData::new(
-                    line,
-                    line_in_patch,
-                    PatchFormat::Context,
-                ))),
+                "+ " => Ok(Self::ContextInserted(
+                    PatchLineData::new(line, line_in_patch, PatchFormat::Context),
+                    false,
+                )),
+                "- " => Ok(Self::ContextDeleted(
+                    PatchLineData::new(line, line_in_patch, PatchFormat::Context),
+                    false,
+                )),
                 "  " => Ok(Self::ContextUnchanged(PatchLineData::new(
                     line,
                     line_in_patch,
@@ -307,16 +316,14 @@ impl<'a> PatchLine<'a> {
                 ))),
                 "! " => if_else(
                     is_original_line,
-                    Ok(Self::ContextDeleted(PatchLineData::new(
-                        line,
-                        line_in_patch,
-                        PatchFormat::Context,
-                    ))),
-                    Ok(Self::ContextInserted(PatchLineData::new(
-                        line,
-                        line_in_patch,
-                        PatchFormat::Context,
-                    ))),
+                    Ok(Self::ContextDeleted(
+                        PatchLineData::new(line, line_in_patch, PatchFormat::Context),
+                        true,
+                    )),
+                    Ok(Self::ContextInserted(
+                        PatchLineData::new(line, line_in_patch, PatchFormat::Context),
+                        true,
+                    )),
                 ),
                 _ => Err(PatchError::InvalidContextPatchLine),
             };
@@ -391,6 +398,7 @@ impl<'a> PatchLine<'a> {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum PatchError {
     EmptyLineNotAllowed,
     InvalidUnifiedHunkHeader,
@@ -407,4 +415,28 @@ pub enum PatchError {
     InvalidEditScriptRange,
     InvalidEditScriptPatch,
     InvalidNormalRange,
+}
+
+impl Display for PatchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            PatchError::EmptyLineNotAllowed => "EmptyLineNotAllowed",
+            PatchError::InvalidUnifiedHunkHeader => "InvalidUnifiedHunkHeader",
+            PatchError::InvalidUnifiedPatchLine => "InvalidUnifiedPatchLine",
+            PatchError::InvalidPatchHeader => "InvalidPatchHeader",
+            PatchError::InvalidPatchFile => "InvalidPatchFile",
+            PatchError::InvalidPatchLineWithData(_) => "InvalidPatchLineWithData",
+            PatchError::CouldNotGuessPatchFormat => "CouldNotGuessPatchFormat",
+            PatchError::InvalidContextPatchLine => "InvalidContextPatchLine",
+            PatchError::InvalidContextRangeHeader => "InvalidContextRangeHeader",
+            PatchError::PatchFormatUnavailable => "PatchFormatUnavailable",
+            PatchError::InvalidContextHunkRange => "InvalidContextHunkRange",
+            PatchError::ContextOrderedLinesUnavailable => "ContextOrderedLinesUnavailable",
+            PatchError::InvalidEditScriptRange => "InvalidEditScriptRange",
+            PatchError::InvalidEditScriptPatch => "InvalidEditScriptPatch",
+            PatchError::InvalidNormalRange => "InvalidNormalRange",
+        };
+
+        write!(formatter, "{}", message)
+    }
 }

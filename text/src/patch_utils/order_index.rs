@@ -1,4 +1,5 @@
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct OrderIndex {
     index: usize,
     original_line_number: usize,
@@ -16,13 +17,5 @@ impl OrderIndex {
 
     pub fn index(&self) -> usize {
         self.index
-    }
-
-    pub fn original_line_number(&self) -> usize {
-        self.original_line_number
-    }
-
-    pub fn modified_line_number(&self) -> usize {
-        self.modified_line_number
     }
 }

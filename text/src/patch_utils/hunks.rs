@@ -1,7 +1,3 @@
-use std::marker::PhantomData;
-
-use crate::patch_utils::{patch, patch_line};
-
 use super::{hunk::Hunk, patch_format::PatchFormat, patch_line::PatchLine};
 
 #[derive(Debug)]
@@ -32,9 +28,9 @@ impl<'a> Hunks<'a> {
     }
 
     pub fn add_hunk(&mut self, hunk: Hunk<'a>) {
-        let hunk_kind = hunk.kind();
+        let _hunk_kind = hunk.kind();
         assert!(
-            matches!(self.kind, hunk_kind),
+            matches!(self.kind, _hunk_kind),
             "Only hunks with the same kind are allowed!"
         );
 
@@ -42,10 +38,10 @@ impl<'a> Hunks<'a> {
     }
 
     pub fn add_patch_line(&mut self, patch_line: PatchLine<'a>) {
-        let patch_line_kind = patch_line.kind();
+        let _patch_line_kind = patch_line.kind();
 
         assert!(
-            matches!(self.kind, patch_line_kind),
+            matches!(self.kind, _patch_line_kind),
             "Adding PatchLine with different kind to Hunks is not allowed!"
         );
 
@@ -65,5 +61,9 @@ impl<'a> Hunks<'a> {
 
     pub fn hunks(&self) -> &Vec<Hunk<'a>> {
         &self.data
+    }
+
+    pub fn hunks_mut(&mut self) -> &mut Vec<Hunk<'a>> {
+        &mut self.data
     }
 }

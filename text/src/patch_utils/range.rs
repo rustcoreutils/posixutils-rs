@@ -1,5 +1,3 @@
-use std::panic::PanicInfo;
-
 use super::{edit_script_range_data::EditScriptHunkKind, patch_format::PatchFormat};
 
 type RangeResult = Result<Range, RangeError>;
@@ -13,10 +11,12 @@ pub struct Range {
 
 impl Range {
     pub fn new(start: usize, end: usize, kind: PatchFormat) -> Self {
-        assert!(
-            start <= end,
-            "Range creation failed! start should be less than or equal to end."
-        );
+        if !matches!(kind, PatchFormat::Unified) {
+            assert!(
+                start <= end,
+                "Range creation failed! start should be less than or equal to end."
+            );
+        }
 
         Self { start, end, kind }
     }
@@ -46,10 +46,6 @@ impl Range {
         }
     }
 
-    pub fn kind(&self) -> &PatchFormat {
-        &self.kind
-    }
-
     pub fn start(&self) -> usize {
         self.start
     }
@@ -58,7 +54,7 @@ impl Range {
     pub fn end(&self) -> usize {
         match self.kind {
             PatchFormat::None => panic!("Range should belong to one of the four formats!"),
-            PatchFormat::Normal => todo!(),
+            PatchFormat::Normal => self.end,
             PatchFormat::Unified => self.start + self.end,
             PatchFormat::Context => self.end,
             PatchFormat::EditScript => self.end,
@@ -152,68 +148,10 @@ impl Range {
             _ => Err(RangeError::InvalidRange),
         }
     }
-
-    pub fn try_from_normal(line: &str) -> Result<(), RangeError> {
-        fn is_ident(ch: char) -> bool {
-            ['a', 'd', 'c'].iter().any(|ident| *ident == ch)
-        }
-
-        fn is_comma(ch: char) -> bool {
-            ch == ','
-        }
-
-        fn is_numeric(ch: char) -> bool {
-            ch.is_numeric()
-        }
-
-        let validators = vec![is_ident, is_comma, is_numeric];
-
-        let mut tokens: Vec<String> = vec![];
-        let mut current_token = String::new();
-        let ident_charset = "adc";
-        let comma_char = ",";
-        let numeric_charset = "0123456789";
-        let allowed_charset = format!("{}{}{}", numeric_charset, comma_char, ident_charset);
-        let mut ident_visited = false;
-
-        for ch in line.chars() {
-            if !validators.iter().any(|validator| validator(ch)) {
-                return Err(RangeError::InvalidRange);
-            }
-
-            if is_ident(ch) {
-                if ident_visited
-                    || tokens.is_empty()
-                    || tokens[tokens.len().wrapping_sub(1)]
-                        .parse::<usize>()
-                        .is_err()
-                {
-                    return Err(RangeError::InvalidRange);
-                }
-
-                ident_visited = true;
-                tokens.push(current_token.to_string());
-                tokens.push(ch.to_string());
-                current_token.clear();
-            } else if is_comma(ch) {
-            } else if is_numeric(ch) {
-            }
-
-            if current_token.is_empty() {
-                current_token.push(ch)
-            } else {
-                let last_char = current_token
-                    .chars()
-                    .last()
-                    .expect("There should be at least one character in current_token");
-            }
-        }
-
-        todo!()
-    }
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum RangeError {
     InvalidRange,
     InvalidRangeWithError(String),

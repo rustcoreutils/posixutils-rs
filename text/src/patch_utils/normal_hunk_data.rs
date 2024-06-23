@@ -6,6 +6,7 @@ pub struct NormalHunkData<'a> {
     range_left: Range,
     range_right: Range,
     lines: Vec<PatchLine<'a>>,
+    #[allow(dead_code)]
     kind: NormalRangeKind,
 }
 
@@ -35,5 +36,17 @@ impl<'a> NormalHunkData<'a> {
 
     pub fn lines(&self) -> &Vec<PatchLine<'a>> {
         &self.lines
+    }
+
+    pub fn range_left(&self) -> Range {
+        self.range_left
+    }
+
+    pub fn range_right(&self) -> Range {
+        self.range_right
+    }
+
+    pub(crate) fn verify_hunk(&self) {
+        // TODO
     }
 }

@@ -1,24 +1,24 @@
-use std::{borrow::BorrowMut, sync::Arc, vec};
+use std::{fs::File, io::BufWriter};
 
 use crate::patch_utils::{context_hunk_data::ContextHunkOrderIndex, patch_line::PatchLine};
 
 use super::{
     constants::{
-        CONTEXT_FIRST_LINE_STARTER, CONTEXT_SECOND_LINE_STARTER, UNIFIED_FIRST_LINE_STARTER,
-        UNIFIED_SECOND_LINE_STARTER,
+        context::ORIGINAL_SKIP, CONTEXT_FIRST_LINE_STARTER, CONTEXT_SECOND_LINE_STARTER,
+        UNIFIED_FIRST_LINE_STARTER, UNIFIED_SECOND_LINE_STARTER,
     },
     context_hunk_data::ContextHunkData,
     context_hunk_range_data::ContextHunkRangeData,
     edit_script_hunk_data::EditScriptHunkData,
     edit_script_range_data::EditScriptHunkKind,
     functions::{is_edit_script_range, is_normal_range},
-    hunk::{self, Hunk},
+    hunk::Hunk,
     hunks::Hunks,
     normal_hunk_data::NormalHunkData,
     patch_file::PatchFile,
     patch_file_kind::PatchFileKind,
     patch_format::PatchFormat,
-    patch_line::{self, PatchError},
+    patch_line::PatchError,
     patch_options::PatchOptions,
     unified_hunk_data::UnifiedHunkData,
 };
@@ -26,6 +26,7 @@ use super::{
 pub type PatchResult<T> = Result<T, PatchError>;
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct Patch<'a> {
     patch: &'a PatchFile,
     file: &'a PatchFile,
@@ -33,6 +34,7 @@ pub struct Patch<'a> {
     patch_f1_header: Option<&'a String>,
     patch_f2_header: Option<&'a String>,
     patch_options: PatchOptions,
+    output: Option<BufWriter<File>>,
 }
 
 impl<'a> Patch<'a> {
@@ -41,7 +43,9 @@ impl<'a> Patch<'a> {
         main_file: &'a PatchFile,
         patch_options: PatchOptions,
     ) -> Result<Self, PatchError> {
-        if patch_file.kind() == PatchFileKind::Patch && main_file.kind() != PatchFileKind::Patch {
+        if matches!(patch_file.kind(), PatchFileKind::Patch)
+            && !matches!(main_file.kind(), PatchFileKind::Patch)
+        {
             let patch_format = if let Some(patch_format) = patch_options.patch_format() {
                 *patch_format
             } else {
@@ -50,10 +54,10 @@ impl<'a> Patch<'a> {
 
             let hunks = match &patch_format {
                 PatchFormat::None => return Err(PatchError::CouldNotGuessPatchFormat),
+                PatchFormat::Normal => Self::parse_normal_patch(patch_file.lines())?,
                 PatchFormat::Unified => Self::parse_unified_patch(patch_file.lines())?,
                 PatchFormat::Context => Self::parse_context_patch(patch_file.lines())?,
                 PatchFormat::EditScript => Self::parse_ed_patch(patch_file.lines())?,
-                PatchFormat::Normal => Self::parse_normal_patch(patch_file.lines())?,
             };
 
             let (patch_f1_header, patch_f2_header) = match patch_format {
@@ -78,9 +82,10 @@ impl<'a> Patch<'a> {
                 patch_f1_header,
                 patch_f2_header,
                 patch_options,
+                output: None,
             };
 
-            possible_self.validate_hunks()?;
+            possible_self.verify_hunks();
 
             match possible_self.hunks.kind() {
                 PatchFormat::None => {}
@@ -105,13 +110,18 @@ impl<'a> Patch<'a> {
     /// panics if patch_format is NONE
     pub fn apply(&'a mut self) -> PatchResult<()> {
         if let Some(patch_format) = self.patch_options.patch_format() {
-            match patch_format {
-                PatchFormat::None => panic!("PatchFormat should be valid!"),
-                PatchFormat::Normal => self.apply_normal(),
-                PatchFormat::Unified => self.apply_unified(),
-                PatchFormat::Context => self.apply_context(),
-                PatchFormat::EditScript => self.apply_edit_script(),
-                _ => todo!(),
+            match (patch_format, self.patch_options.reverse()) {
+                (PatchFormat::None, _) => panic!("PatchFormat should be valid!"),
+                (PatchFormat::Normal, false) => self.apply_normal(),
+                (PatchFormat::Normal, true) => self.apply_normal_reverse(),
+                (PatchFormat::Unified, false) => self.apply_unified(),
+                (PatchFormat::Unified, true) => self.apply_unified_reverse(),
+                (PatchFormat::Context, false) => self.apply_context(),
+                (PatchFormat::Context, true) => self.apply_context_reverse(),
+                (PatchFormat::EditScript, false) => self.apply_edit_script(),
+                (PatchFormat::EditScript, true) => {
+                    panic!("Applying patch of ed format, reversed, is not possible!")
+                }
             }
         } else {
             Err(PatchError::PatchFormatUnavailable)
@@ -279,44 +289,44 @@ impl<'a> Patch<'a> {
         Ok(hunks)
     }
 
-    pub fn apply_unified(&'a mut self) -> PatchResult<()> {
+    fn apply_unified(&'a mut self) -> PatchResult<()> {
         self.hunks.modify_hunks(|hunks_mut| {
             hunks_mut.sort_by_key(|hunk| hunk.unified_hunk_data().f1_range().start())
         });
 
-        let mut new_file_line = 1usize;
+        let mut _new_file_line = 1usize;
         let mut old_file_line = 1usize;
         let mut no_new_line_count = 0usize;
 
         let hunks = self.hunks.hunks();
 
-        for (i, hunk) in hunks.iter().enumerate() {
+        for hunk in hunks.iter() {
             let f1_range = hunk.unified_hunk_data().f1_range();
-            let f2_range = hunk.unified_hunk_data().f2_range();
+            let _f2_range = hunk.unified_hunk_data().f2_range();
 
             if f1_range.start() > old_file_line {
                 let start = old_file_line;
                 for j in start..f1_range.start() {
                     println!("{}", self.file.lines()[j - 1]);
                     old_file_line += 1;
-                    new_file_line += 1;
+                    _new_file_line += 1;
                 }
             }
 
             for patch_line in hunk.unified_hunk_data().lines() {
                 match patch_line {
                     PatchLine::UnifiedHunkHeader(_) => {}
-                    PatchLine::UnifiedDeleted(data) => {
+                    PatchLine::UnifiedDeleted(_) => {
                         old_file_line += 1;
                     }
-                    PatchLine::UnifiedUnchanged(data) => {
+                    PatchLine::UnifiedUnchanged(_) => {
                         println!("{}", patch_line.original_line());
-                        new_file_line += 1;
+                        _new_file_line += 1;
                         old_file_line += 1;
                     }
-                    PatchLine::UnifiedInserted(data) => {
+                    PatchLine::UnifiedInserted(_) => {
                         println!("{}", patch_line.original_line());
-                        new_file_line += 1;
+                        _new_file_line += 1;
                     }
                     PatchLine::NoNewLine(_) => no_new_line_count += 1,
                     _ => return Err(PatchError::InvalidUnifiedPatchLine),
@@ -327,7 +337,9 @@ impl<'a> Patch<'a> {
         match no_new_line_count {
             0 => println!(),
             1 => {
-                if self.file.kind() == PatchFileKind::Original && !self.file.ends_with_newline() {
+                if matches!(self.file.kind(), PatchFileKind::Original)
+                    && !self.file.ends_with_newline()
+                {
                     println!();
                 }
             }
@@ -347,10 +359,10 @@ impl<'a> Patch<'a> {
             })
         });
 
-        let mut new_file_line = 1usize;
+        let mut _new_file_line = 1usize;
         let mut old_file_line = 1usize;
 
-        for (i, hunk) in self.hunks.hunks().iter().enumerate() {
+        for hunk in self.hunks.hunks().iter() {
             let f2_range = hunk.context_hunk_data().f2_range();
             let f1_range = hunk.context_hunk_data().f1_range();
 
@@ -358,46 +370,44 @@ impl<'a> Patch<'a> {
                 return Err(PatchError::InvalidContextHunkRange);
             }
 
-            let (f1_range, f2_range) = (f1_range.unwrap(), f2_range.unwrap());
+            let (f1_range, _f2_range) = (f1_range.unwrap(), f2_range.unwrap());
 
             if f1_range.start() > old_file_line {
                 let start = old_file_line;
                 for j in start..f1_range.start() {
                     println!("{}", self.file.lines()[j - 1]);
                     old_file_line += 1;
-                    new_file_line += 1;
+                    _new_file_line += 1;
                 }
             }
 
             let ordered_lines_indeces = hunk.context_hunk_ordered_lines_indeces();
 
             if let Some(ordered_lines_indeces) = ordered_lines_indeces {
-                let x = ordered_lines_indeces.iter().map(|order_index| {});
-
                 for order_line_index in ordered_lines_indeces {
                     let patch_line = hunk
                         .context_hunk_data()
                         .get_by_order_index(order_line_index);
 
                     match patch_line {
-                        PatchLine::ContextInserted(_) => {
+                        PatchLine::ContextInserted(_, _) => {
                             println!("{}", patch_line.original_line());
-                            new_file_line += 1;
+                            _new_file_line += 1;
                         }
-                        PatchLine::ContextDeleted(data) => {
+                        PatchLine::ContextDeleted(_, _) => {
                             old_file_line += 1;
                         }
-                        PatchLine::ContextUnchanged(data) => {
+                        PatchLine::ContextUnchanged(_) => {
                             println!("{}", patch_line.original_line());
                             old_file_line += 1;
-                            new_file_line += 1;
+                            _new_file_line += 1;
                         }
-                        PatchLine::NoNewLine(data) => {
+                        PatchLine::NoNewLine(_) => {
                             if matches!(order_line_index, ContextHunkOrderIndex::Original(_)) {
                                 old_file_line += 1;
                             }
 
-                            new_file_line += 1;
+                            _new_file_line += 1;
                         }
 
                         _ => {
@@ -414,9 +424,81 @@ impl<'a> Patch<'a> {
         Ok(())
     }
 
-    fn apply_normal(&self) -> PatchResult<()> {
-        println!("{:?}" , self);
-        std::process::exit(0);
+    fn apply_normal(&mut self) -> PatchResult<()> {
+        self.hunks.modify_hunks(|hunks_mut| {
+            hunks_mut.sort_by_key(|hunk| hunk.normal_hunk_data().range_right().start())
+        });
+
+        let mut _new_file_line = 1usize;
+        let mut old_file_line = 1usize;
+        let mut no_new_line_count = 0usize;
+
+        for hunk in self.hunks.hunks().iter() {
+            let range_left = hunk.normal_hunk_data().range_left();
+            let _range_right = hunk.normal_hunk_data().range_right();
+
+            if range_left.start() > old_file_line {
+                let start = old_file_line;
+
+                for j in start..range_left.start() {
+                    println!("{}", self.file.lines()[j - 1]);
+                    old_file_line += 1;
+                    _new_file_line += 1;
+                }
+            }
+
+            for patch_line in hunk.normal_hunk_data().lines() {
+                match patch_line {
+                    PatchLine::NormalRange(data) => {
+                        let range_left = data.range_left();
+                        let range_right = data.range_right();
+
+                        let left_diff = range_left.end() - range_left.start();
+                        let right_diff = range_right.end() - range_right.start();
+
+                        match data.kind() {
+                            super::normal_range_data::NormalRangeKind::Insert => {
+                                if old_file_line <= range_left.start() {
+                                    println!("{}", self.file.lines()[old_file_line - 1]);
+                                }
+
+                                _new_file_line += left_diff + 1;
+                            }
+                            super::normal_range_data::NormalRangeKind::Change => {
+                                old_file_line += left_diff + 1;
+                                _new_file_line += right_diff + 1;
+                            }
+                            super::normal_range_data::NormalRangeKind::Delete => {
+                                old_file_line += left_diff + 1;
+                            }
+                        }
+                    }
+                    PatchLine::NormalChangeSeparator(_) => {}
+                    PatchLine::NormalNewLine(_) => {
+                        println!("{}", patch_line.original_line());
+                    }
+                    PatchLine::NormalOldLine(_) => {}
+                    PatchLine::NoNewLine(_) => {
+                        no_new_line_count += 1;
+                    }
+                    _ => panic!("Only PatchLines that start with Normal are allowed!"),
+                }
+            }
+        }
+
+        match no_new_line_count {
+            0 => println!(),
+            1 => {
+                if matches!(self.file.kind(), PatchFileKind::Original)
+                    && !self.file.ends_with_newline()
+                {
+                    println!();
+                }
+            }
+            _ => {}
+        };
+
+        Ok(())
     }
 
     fn apply_edit_script(&mut self) -> PatchResult<()> {
@@ -424,13 +506,13 @@ impl<'a> Patch<'a> {
             hunks_mut.sort_by_key(|hunk| hunk.edit_script_hunk_data().range().end())
         });
 
-        let mut new_file_line = 1usize;
+        let mut _new_file_line = 1usize;
         let mut old_file_line = 1usize;
         let mut no_new_line_count = 0usize;
 
         let hunks = self.hunks.hunks();
 
-        for (i, hunk) in hunks.iter().enumerate() {
+        for hunk in hunks.iter() {
             let range = hunk.edit_script_hunk_data().range();
 
             if (old_file_line - 1) <= range.start() {
@@ -445,7 +527,7 @@ impl<'a> Patch<'a> {
                 while old_file_line < old_file_boundry {
                     println!("{}", self.file.lines()[old_file_line - 1]);
                     old_file_line += 1;
-                    new_file_line += 1;
+                    _new_file_line += 1;
                 }
             }
 
@@ -469,11 +551,11 @@ impl<'a> Patch<'a> {
                     }
                     PatchLine::EditScriptInsert(data) => {
                         println!("{}", data.line());
-                        new_file_line += 1;
+                        _new_file_line += 1;
                     }
                     PatchLine::EditScriptChange(data) => {
                         println!("{}", data.line());
-                        new_file_line += 1;
+                        _new_file_line += 1;
                     }
                     PatchLine::NoNewLine(_) => no_new_line_count += 1,
                     _ => panic!("Invalid PatchLine detected in EditScriptHunkData"),
@@ -485,15 +567,17 @@ impl<'a> Patch<'a> {
             while old_file_line <= self.file.lines().len() {
                 println!("{}", self.file.lines()[old_file_line - 1]);
                 old_file_line += 1;
-                new_file_line += 1;
+                _new_file_line += 1;
             }
         }
 
         match no_new_line_count {
-            0 => println!(""),
+            0 => println!(),
             1 => {
-                if self.file.kind() == PatchFileKind::Original && !self.file.ends_with_newline() {
-                    println!("");
+                if matches!(self.file.kind(), PatchFileKind::Original)
+                    && !self.file.ends_with_newline()
+                {
+                    println!();
                 }
             }
             _ => {}
@@ -502,8 +586,211 @@ impl<'a> Patch<'a> {
         Ok(())
     }
 
-    fn validate_hunks(&self) -> PatchResult<()> {
-        // TODO
+    fn verify_hunks(&self) {
+        self.hunks.hunks().iter().for_each(|hunk| {
+            hunk.verify_hunk();
+        });
+    }
+
+    fn apply_normal_reverse(&mut self) -> Result<(), PatchError> {
+        self.hunks.modify_hunks(|hunks_mut| {
+            hunks_mut.sort_by_key(|hunk| hunk.normal_hunk_data().range_left().start())
+        });
+
+        let mut new_file_line = 1usize;
+        let mut no_new_line_count = 0usize;
+
+        for hunk in self.hunks.hunks().iter() {
+            let range_right = hunk.normal_hunk_data().range_right();
+
+            if range_right.start() > new_file_line {
+                let start = new_file_line;
+
+                for j in start..range_right.start() {
+                    println!("{}", self.file.lines()[j - 1]);
+                    new_file_line += 1;
+                }
+            }
+
+            for patch_line in hunk.normal_hunk_data().lines() {
+                match patch_line {
+                    PatchLine::NormalRange(data) => {
+                        let range_right = data.range_right();
+                        let right_diff = range_right.end() - range_right.start();
+
+                        match data.kind() {
+                            super::normal_range_data::NormalRangeKind::Insert => {
+                                new_file_line += right_diff + 1;
+                            }
+                            super::normal_range_data::NormalRangeKind::Change => {
+                                new_file_line += right_diff + 1;
+                            }
+                            super::normal_range_data::NormalRangeKind::Delete => {
+                                if new_file_line <= range_right.start() {
+                                    println!("{}", self.file.lines()[new_file_line - 1]);
+                                    new_file_line += 1;
+                                }
+                            }
+                        }
+                    }
+                    PatchLine::NormalChangeSeparator(_) => {}
+                    PatchLine::NormalNewLine(_) => {}
+                    PatchLine::NormalOldLine(_) => println!("{}", patch_line.original_line()),
+                    PatchLine::NoNewLine(_) => no_new_line_count += 1,
+                    _ => panic!("Only PatchLines that start with Normal are allowed!"),
+                }
+            }
+        }
+
+        match no_new_line_count {
+            0 => println!(),
+            1 => {
+                if matches!(self.file.kind(), PatchFileKind::Original)
+                    && !self.file.ends_with_newline()
+                {
+                    println!();
+                }
+            }
+            _ => {}
+        };
+
+        Ok(())
+    }
+
+    fn apply_unified_reverse(&mut self) -> Result<(), PatchError> {
+        self.hunks.modify_hunks(|hunks_mut| {
+            hunks_mut.sort_by_key(|hunk| hunk.unified_hunk_data().f2_range().end())
+        });
+
+        let mut new_file_line = 1usize;
+        let mut no_new_line_count = 0usize;
+
+        let hunks = self.hunks.hunks();
+
+        for hunk in hunks.iter() {
+            let f2_range = hunk.unified_hunk_data().f2_range();
+
+            if f2_range.start() > new_file_line {
+                let start = new_file_line;
+                for j in start..f2_range.start() {
+                    println!("{}", self.file.lines()[j - 1]);
+                    new_file_line += 1;
+                }
+            }
+
+            for patch_line in hunk.unified_hunk_data().lines() {
+                // println!("{:?}" , patch_line);
+                match patch_line {
+                    PatchLine::UnifiedHunkHeader(_) => {}
+                    PatchLine::UnifiedDeleted(_) => {
+                        println!("{}", patch_line.original_line());
+                    }
+                    PatchLine::UnifiedUnchanged(_) => {
+                        println!("{}", patch_line.original_line());
+                        new_file_line += 1;
+                    }
+                    PatchLine::UnifiedInserted(_) => {
+                        new_file_line += 1;
+                    }
+                    PatchLine::NoNewLine(_) => no_new_line_count += 1,
+                    _ => return Err(PatchError::InvalidUnifiedPatchLine),
+                }
+            }
+        }
+
+        match no_new_line_count {
+            0 => println!(),
+            1 => {
+                if matches!(self.file.kind(), PatchFileKind::Original)
+                    && !self.file.ends_with_newline()
+                {
+                    println!();
+                }
+            }
+            _ => {}
+        };
+
+        Ok(())
+    }
+
+    fn apply_context_reverse(&mut self) -> Result<(), PatchError> {
+        self.hunks.modify_hunks(|hunks_mut| {
+            hunks_mut.sort_by_key(|hunk| {
+                hunk.context_hunk_data()
+                    .f1_range()
+                    .expect("Invalid f1_range for ContextHunkData!")
+                    .start()
+            })
+        });
+
+        let mut new_file_line = 1usize;
+        let mut no_newline_count = 0usize;
+
+        for hunk in self.hunks.hunks_mut().iter_mut() {
+            let f2_range = hunk.context_hunk_data().f2_range();
+            let f1_range = hunk.context_hunk_data().f1_range();
+
+            if f1_range.is_none() || f2_range.is_none() {
+                return Err(PatchError::InvalidContextHunkRange);
+            }
+
+            let (_, f2_range) = (f1_range.unwrap(), f2_range.unwrap());
+
+            if f2_range.start() > new_file_line {
+                let start = new_file_line;
+                for _ in start..f2_range.start() {
+                    println!("{}",  self.file.lines()[new_file_line - 1]);
+                    new_file_line += 1;
+                }
+            }
+
+            let original_is_empty = hunk.context_hunk_data().is_original_empty(ORIGINAL_SKIP);
+            let lines: &Vec<PatchLine> = if original_is_empty {
+                hunk.context_hunk_data().modified_lines()
+            } else {
+                hunk.context_hunk_data().original_lines()
+            };
+
+            for patch_line in lines {
+                match patch_line {
+                    PatchLine::ContextInserted(_, _) => {
+                        new_file_line += 1;
+                    }
+                    PatchLine::ContextDeleted(_, is_change) => {
+                        println!("{}", patch_line.original_line());
+
+                        if *is_change {
+                            new_file_line += 1;
+                        }
+                    }
+                    PatchLine::ContextUnchanged(_) => {
+                        println!("{}", patch_line.original_line());
+                        new_file_line += 1;
+                    }
+                    PatchLine::ContextHunkRange(_) => {}
+                    PatchLine::ContextHunkSeparator(_) => {}
+                    PatchLine::NoNewLine(_) => {
+                        no_newline_count += 1;
+                    }
+                    _ => {
+                        return Err(PatchError::InvalidContextPatchLine);
+                    }
+                }
+            }
+        }
+
+        match no_newline_count {
+            0 => println!(),
+            1 => {
+                if matches!(self.file.kind(), PatchFileKind::Modified)
+                    && !self.file.ends_with_newline()
+                {
+                    println!();
+                }
+            }
+            _ => {}
+        }
+
         Ok(())
     }
 }

@@ -1,6 +1,7 @@
 use super::patch_format::PatchFormat;
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct PatchLineData<'a> {
     line: &'a str,
     line_in_patch: usize,

@@ -1,10 +1,13 @@
-use rand::{distributions::Standard, rngs::StdRng, Rng, SeedableRng};
+use rand::{distributions::Standard, rngs::StdRng, SeedableRng};
 use std::{fs, path::PathBuf};
 
-// Tests if the algorithm properly closes all file descriptors. Must run by itself.
+// Tests if the algorithm properly closes all file descriptors. Must run by itself to avoid counting
+// file descriptors opened in other test threads.
 #[cfg(target_os = "linux")]
 #[test]
 fn test_walkdir_fd_raii() {
+    use rand::Rng;
+
     let test_dir = &format!("{}/test_walkdir_fd_raii", env!("CARGO_TARGET_TMPDIR"));
 
     let starting_fd_count = count_open_fds();

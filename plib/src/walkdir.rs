@@ -268,6 +268,7 @@ impl<'a> Entry<'a> {
     }
 }
 
+// TODO: Cycle detection for cp
 pub fn traverse_directory<P, F, G, H>(
     dir: P,
     mut file_handler: F,
@@ -358,6 +359,24 @@ where
                     Error::new(e, ErrorKind::OpenDir),
                 );
                 success = false;
+
+                // TODO: Refactor this duplicated code
+                path_stack.pop();
+                let last = stack.pop().unwrap();
+                if let Some(origin) = last.origin {
+                    match origin {
+                        Origin::Cwd => {
+                            cwd = FileDescriptor::cwd();
+                        }
+                        Origin::FileDescriptor(fd) => {
+                            cwd = fd;
+                        }
+                        Origin::Parent => {
+                            cwd = FileDescriptor::open_at(&cwd, c"..".as_ptr(), libc::O_RDONLY);
+                        }
+                    }
+                }
+
                 continue;
             }
         };
@@ -368,33 +387,30 @@ where
 
         // Check if the CWD hasn't been changed yet. This requires special handling because the CWD
         // may not be reachable by moving up the directory chain with "..".
-        let at_cwd = cwd.fd == libc::AT_FDCWD;
+        let at_original_cwd = cwd.fd == libc::AT_FDCWD;
 
         // Enter the directory. The value of `cwd` set here is used in the while loop.
-        cwd = FileDescriptor::open_at(&cwd, last.filename.as_ptr(), libc::O_RDONLY);
+        let dir_fd = dir.file_descriptor();
         path_stack.push(last.filename.clone());
 
         while let Some(entry_or_err) = dir.read() {
             let entry = match entry_or_err {
                 Ok(entry) => entry,
                 Err(e) => {
-                    // Temporarily go back to the previous directory to get the correct file
-                    // descriptor for `Entry`.
-                    cwd = FileDescriptor::open_at(&cwd, c"..".as_ptr(), libc::O_RDONLY);
-
                     err_reporter(
                         Entry::new(&cwd, &path_stack, &last.filename, Some(&last.metadata)),
                         Error::new(e, ErrorKind::ReadDir),
                     );
-
-                    // Enter the directory again.
-                    cwd = FileDescriptor::open_at(&cwd, last.filename.as_ptr(), libc::O_RDONLY);
 
                     success = false;
                     continue;
                 }
             };
             let entry_filename = entry.filename();
+
+            // let cstr = unsafe { CStr::from_ptr(entry_filename.as_ptr()) };
+            // let os_str = OsStr::from_bytes(cstr.to_bytes());
+            // eprintln!("* {}", os_str.to_string_lossy());
 
             const DOT: i8 = b'.' as i8;
 
@@ -410,7 +426,7 @@ where
                 Err(e) => {
                     err_reporter(
                         Entry::new(
-                            &cwd,
+                            &dir_fd,
                             &path_stack,
                             &filename_slice_to_rc(&entry_filename),
                             None,
@@ -432,7 +448,7 @@ where
                     Err(e) => {
                         err_reporter(
                             Entry::new(
-                                &cwd,
+                                &dir_fd,
                                 &path_stack,
                                 &filename_slice_to_rc(&entry_filename),
                                 Some(&entry_metadata),
@@ -446,15 +462,15 @@ where
                 file_type = entry_metadata.file_type();
             }
 
-            // If `follow_symlinks` is enabled, use the filename of the file refereed by the symlink
+            // If `follow_symlinks` is enabled, use the filename of the file referred by the symlink
             // else use the filename of the symlink.
             let next_filename = if is_symlink {
-                match read_link_at(cwd.fd, entry_filename.as_ptr(), &entry_metadata) {
+                match read_link_at(dir_fd.fd, entry_filename.as_ptr(), &entry_metadata) {
                     Ok(p) => p,
                     Err(e) => {
                         err_reporter(
                             Entry::new(
-                                &cwd,
+                                &dir_fd,
                                 &path_stack,
                                 &filename_slice_to_rc(&entry_filename),
                                 Some(&entry_metadata),
@@ -470,7 +486,7 @@ where
             };
 
             if file_handler(Entry::new(
-                &cwd,
+                &dir_fd,
                 &path_stack,
                 &next_filename,
                 Some(&entry_metadata),
@@ -480,10 +496,10 @@ where
 
                     stack.push(TreeNode {
                         filename: next_filename,
-                        origin: Some(if at_cwd {
+                        origin: Some(if at_original_cwd {
                             Origin::Cwd
                         } else if is_symlink {
-                            Origin::FileDescriptor(dir.file_descriptor())
+                            Origin::FileDescriptor(cwd.clone())
                         } else {
                             Origin::Parent
                         }),
@@ -491,13 +507,11 @@ where
                         metadata: entry_metadata,
                     });
 
+                    cwd = dir_fd;
                     continue 'outer;
                 }
             }
         }
-
-        // Exit the directory, resetting `cwd` to its value before entering the directory.
-        cwd = FileDescriptor::open_at(&cwd, c"..".as_ptr(), libc::O_RDONLY);
 
         path_stack.pop();
         postprocess_dir(Entry::new(
@@ -507,18 +521,22 @@ where
             Some(&last.metadata),
         ));
 
+        path_stack.pop();
         let last = stack.pop().unwrap();
 
         if let Some(origin) = last.origin {
             match origin {
-                Origin::Cwd => cwd = FileDescriptor::cwd(),
-                Origin::FileDescriptor(fd) => cwd = fd,
+                Origin::Cwd => {
+                    cwd = FileDescriptor::cwd();
+                }
+                Origin::FileDescriptor(fd) => {
+                    cwd = fd;
+                }
                 Origin::Parent => {
                     cwd = FileDescriptor::open_at(&cwd, c"..".as_ptr(), libc::O_RDONLY);
                 }
             }
         }
-        path_stack.pop();
     }
 
     success

@@ -1035,6 +1035,9 @@ dependencies = [
 name = "posixutils-misc"
 version = "0.1.11"
 dependencies = [
+ "atty",
+ "gettext-rs",
+ "libc",
  "plib",
 ]
 

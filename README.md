@@ -137,6 +137,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] printf
  - [x] stty
  - [x] tabs
+ - [x] test
  - [x] tput
  - [x] tsort
  - [x] uname
@@ -213,7 +214,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] sed
  - [ ] sh
  - [ ] talk
- - [ ] test
  - [ ] time
  - [ ] timeout
  - [ ] write

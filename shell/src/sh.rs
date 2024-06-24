@@ -74,10 +74,10 @@ fn tokenize(input: &str) -> Vec<Token> {
                 operator.push(chars.next().unwrap());
                 if let Some(&next_ch) = chars.peek() {
                     if operator == "<" && next_ch == '<' {
-                        operator.push(chars.next().unwrap());
+                        chars.next();
                         if let Some(&next_ch) = chars.peek() {
                             if next_ch == '-' {
-                                operator.push(chars.next().unwrap());
+                                chars.next();
                                 tokens.push(Token::DLessDash);
                             } else {
                                 tokens.push(Token::DLess);
@@ -86,29 +86,29 @@ fn tokenize(input: &str) -> Vec<Token> {
                             tokens.push(Token::DLess);
                         }
                     } else if operator == "<" && next_ch == '&' {
-                        operator.push(chars.next().unwrap());
+                        chars.next();
                         tokens.push(Token::LessAnd);
                     } else if operator == "<" && next_ch == '>' {
-                        operator.push(chars.next().unwrap());
+                        chars.next();
                         tokens.push(Token::LessGreat);
                     } else if operator == ">" && next_ch == '>' {
-                        operator.push(chars.next().unwrap());
+                        chars.next();
                         tokens.push(Token::DGreat);
                     } else if operator == ">" && next_ch == '&' {
-                        operator.push(chars.next().unwrap());
+                        chars.next();
                         tokens.push(Token::GreatAnd);
                     } else if operator == ">" && next_ch == '|' {
-                        operator.push(chars.next().unwrap());
+                        chars.next();
                         tokens.push(Token::Clobber);
                     } else if operator == "|" && next_ch == '|' {
-                        operator.push(chars.next().unwrap());
+                        chars.next();
                         tokens.push(Token::OrIf);
                     } else if operator == "&" && next_ch == '&' {
-                        operator.push(chars.next().unwrap());
+                        chars.next();
                         tokens.push(Token::AndIf);
                     } else if operator == ";" {
                         if next_ch == ';' {
-                            operator.push(chars.next().unwrap());
+                            chars.next();
                             tokens.push(Token::DSemi);
                         } else {
                             tokens.push(Token::Semicolon);

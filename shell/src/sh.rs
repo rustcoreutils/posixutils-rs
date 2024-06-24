@@ -35,7 +35,7 @@ struct Args {
 
 #[derive(Debug, PartialEq)]
 enum Token {
-    Word(String),
+    Generic(String),
     Operator(String),
     AndIf,     // &&
     OrIf,      // ||
@@ -61,13 +61,13 @@ fn tokenize(input: &str) -> Vec<Token> {
             ' ' => {
                 chars.next();
                 if !current_token.is_empty() {
-                    tokens.push(Token::Word(current_token.clone()));
+                    tokens.push(Token::Generic(current_token.clone()));
                     current_token.clear();
                 }
             }
             '<' | '>' | '|' | '&' | ';' => {
                 if !current_token.is_empty() {
-                    tokens.push(Token::Word(current_token.clone()));
+                    tokens.push(Token::Generic(current_token.clone()));
                     current_token.clear();
                 }
                 let mut operator = String::new();
@@ -126,7 +126,7 @@ fn tokenize(input: &str) -> Vec<Token> {
             }
             '#' => {
                 if !current_token.is_empty() {
-                    tokens.push(Token::Word(current_token.clone()));
+                    tokens.push(Token::Generic(current_token.clone()));
                     current_token.clear();
                 }
                 chars.next(); // Skip the '#'
@@ -163,7 +163,7 @@ fn tokenize(input: &str) -> Vec<Token> {
     }
 
     if !current_token.is_empty() {
-        tokens.push(Token::Word(current_token));
+        tokens.push(Token::Generic(current_token));
     }
 
     tokens.push(Token::EndOfLine);
@@ -258,10 +258,10 @@ fn parse_simple(tokens: &[Token]) -> (Command, &[Token]) {
 
     while i < tokens.len() {
         match &tokens[i] {
-            Token::Word(word) => {
+            Token::Generic(word) => {
                 if word == "cd" {
                     if i + 1 < tokens.len() {
-                        if let Token::Word(dir) = &tokens[i + 1] {
+                        if let Token::Generic(dir) = &tokens[i + 1] {
                             return (
                                 Command::BuiltIn(BuiltInCommand::Cd(dir.clone())),
                                 &tokens[i + 2..],
@@ -280,7 +280,7 @@ fn parse_simple(tokens: &[Token]) -> (Command, &[Token]) {
                 }
             }
             Token::DGreat => {
-                if let Some(Token::Word(file)) = tokens.get(i + 1) {
+                if let Some(Token::Generic(file)) = tokens.get(i + 1) {
                     let (_, remaining_tokens) = parse_simple(&tokens[i + 2..]);
                     return (
                         Command::RedirectOut(
@@ -295,7 +295,7 @@ fn parse_simple(tokens: &[Token]) -> (Command, &[Token]) {
             Token::Operator(op) => {
                 match op.as_str() {
                     "<" => {
-                        if let Some(Token::Word(file)) = tokens.get(i + 1) {
+                        if let Some(Token::Generic(file)) = tokens.get(i + 1) {
                             let (_, remaining_tokens) = parse_simple(&tokens[i + 2..]);
                             return (
                                 Command::RedirectIn(
@@ -307,7 +307,7 @@ fn parse_simple(tokens: &[Token]) -> (Command, &[Token]) {
                         }
                     }
                     ">" => {
-                        if let Some(Token::Word(file)) = tokens.get(i + 1) {
+                        if let Some(Token::Generic(file)) = tokens.get(i + 1) {
                             let (_, remaining_tokens) = parse_simple(&tokens[i + 2..]);
                             return (
                                 Command::RedirectOut(
@@ -320,7 +320,7 @@ fn parse_simple(tokens: &[Token]) -> (Command, &[Token]) {
                         }
                     }
                     ">>" => {
-                        if let Some(Token::Word(file)) = tokens.get(i + 1) {
+                        if let Some(Token::Generic(file)) = tokens.get(i + 1) {
                             let (_, remaining_tokens) = parse_simple(&tokens[i + 2..]);
                             return (
                                 Command::RedirectOut(

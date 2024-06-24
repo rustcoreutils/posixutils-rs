@@ -37,12 +37,16 @@ struct Args {
 enum Token {
     Word(String),
     Operator(String),
-    RedirectIn,
-    // RedirectOut,
-    RedirectAppend,
-    AndIf,
-    OrIf,
-    DSemi,
+    AndIf,     // &&
+    OrIf,      // ||
+    DSemi,     // ;;
+    DLess,     // <<
+    LessAnd,   // <&
+    LessGreat, // <>
+    DLessDash, // <<-
+    DGreat,    // >>
+    GreatAnd,  // >&
+    Clobber,   // >|
     Semicolon,
     EndOfLine,
 }
@@ -71,10 +75,31 @@ fn tokenize(input: &str) -> Vec<Token> {
                 if let Some(&next_ch) = chars.peek() {
                     if operator == "<" && next_ch == '<' {
                         operator.push(chars.next().unwrap());
-                        tokens.push(Token::RedirectIn);
+                        if let Some(&next_ch) = chars.peek() {
+                            if next_ch == '-' {
+                                operator.push(chars.next().unwrap());
+                                tokens.push(Token::DLessDash);
+                            } else {
+                                tokens.push(Token::DLess);
+                            }
+                        } else {
+                            tokens.push(Token::DLess);
+                        }
+                    } else if operator == "<" && next_ch == '&' {
+                        operator.push(chars.next().unwrap());
+                        tokens.push(Token::LessAnd);
+                    } else if operator == "<" && next_ch == '>' {
+                        operator.push(chars.next().unwrap());
+                        tokens.push(Token::LessGreat);
                     } else if operator == ">" && next_ch == '>' {
                         operator.push(chars.next().unwrap());
-                        tokens.push(Token::RedirectAppend);
+                        tokens.push(Token::DGreat);
+                    } else if operator == ">" && next_ch == '&' {
+                        operator.push(chars.next().unwrap());
+                        tokens.push(Token::GreatAnd);
+                    } else if operator == ">" && next_ch == '|' {
+                        operator.push(chars.next().unwrap());
+                        tokens.push(Token::Clobber);
                     } else if operator == "|" && next_ch == '|' {
                         operator.push(chars.next().unwrap());
                         tokens.push(Token::OrIf);
@@ -254,7 +279,7 @@ fn parse_simple(tokens: &[Token]) -> (Command, &[Token]) {
                     i += 1;
                 }
             }
-            Token::RedirectAppend => {
+            Token::DGreat => {
                 if let Some(Token::Word(file)) = tokens.get(i + 1) {
                     let (_, remaining_tokens) = parse_simple(&tokens[i + 2..]);
                     return (

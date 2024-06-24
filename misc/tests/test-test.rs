@@ -74,4 +74,3 @@ fn test_str_basic() {
     test_test(&["-n", ""], 1);
     test_test(&["-n", "a"], 0);
 }
-

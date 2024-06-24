@@ -40,8 +40,9 @@ enum Token {
     RedirectIn,
     // RedirectOut,
     RedirectAppend,
-    And,
-    Or,
+    AndIf,
+    OrIf,
+    DSemi,
     Semicolon,
     EndOfLine,
 }
@@ -67,9 +68,7 @@ fn tokenize(input: &str) -> Vec<Token> {
                 }
                 let mut operator = String::new();
                 operator.push(chars.next().unwrap());
-                if operator == ";" {
-                    tokens.push(Token::Semicolon);
-                } else if let Some(&next_ch) = chars.peek() {
+                if let Some(&next_ch) = chars.peek() {
                     if operator == "<" && next_ch == '<' {
                         operator.push(chars.next().unwrap());
                         tokens.push(Token::RedirectIn);
@@ -78,15 +77,26 @@ fn tokenize(input: &str) -> Vec<Token> {
                         tokens.push(Token::RedirectAppend);
                     } else if operator == "|" && next_ch == '|' {
                         operator.push(chars.next().unwrap());
-                        tokens.push(Token::Or);
+                        tokens.push(Token::OrIf);
                     } else if operator == "&" && next_ch == '&' {
                         operator.push(chars.next().unwrap());
-                        tokens.push(Token::And);
+                        tokens.push(Token::AndIf);
+                    } else if operator == ";" {
+                        if next_ch == ';' {
+                            operator.push(chars.next().unwrap());
+                            tokens.push(Token::DSemi);
+                        } else {
+                            tokens.push(Token::Semicolon);
+                        }
                     } else {
                         tokens.push(Token::Operator(operator.clone()));
                     }
                 } else {
-                    tokens.push(Token::Operator(operator.clone()));
+                    if operator == ";" {
+                        tokens.push(Token::Semicolon);
+                    } else {
+                        tokens.push(Token::Operator(operator.clone()));
+                    }
                 }
             }
             '#' => {
@@ -169,12 +179,12 @@ fn parse_expr(tokens: &[Token]) -> (Command, &[Token]) {
                 left = right;
                 tokens = new_tokens;
             }
-            Token::And => {
+            Token::AndIf => {
                 let (right, new_tokens) = parse_pipe(&tokens[1..]);
                 left = Command::And(Box::new(left), Box::new(right));
                 tokens = new_tokens;
             }
-            Token::Or => {
+            Token::OrIf => {
                 let (right, new_tokens) = parse_pipe(&tokens[1..]);
                 left = Command::Or(Box::new(left), Box::new(right));
                 tokens = new_tokens;

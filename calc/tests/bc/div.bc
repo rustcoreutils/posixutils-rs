@@ -1,0 +1,22 @@
+scale = 1
+a = 1/2
+scale(a)
+a
+
+scale = 0
+a = 1/2
+scale(a)
+a
+
+scale = 10
+a = 1/2
+scale(a)
+a
+
+scale = 10
+4 / 2
+10 / 5
+3.4578 / 20
+1234 / 245.8909
+
+quit

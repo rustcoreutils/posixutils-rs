@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2024 Jeff Garzik
+// Copyright (c) 2024 Hemi Labs, Inc.
 //
 // This file is part of the posixutils-rs project covered under
 // the MIT License.  For the full license text, please see the LICENSE
@@ -15,7 +15,7 @@ mod common;
 
 use self::common::{copy_characteristics, error_string, is_file_writable};
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, textdomain};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use std::collections::HashSet;
 use std::ffi::CString;
@@ -358,7 +358,7 @@ fn copy_file(
             }
 
             // 3.a.i
-            let target_is_writable = is_file_writable(&target_symlink_md);
+            let target_is_writable = is_file_writable(target_symlink_md.as_ref());
             // Different prompt if the target is not writable
             if !target_is_writable && (cfg.interactive || cfg.force) {
                 let mode = target_symlink_md.as_ref().unwrap().mode();
@@ -527,6 +527,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     // Initialize translation system
+    setlocale(LocaleCategory::LcAll, "");
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 

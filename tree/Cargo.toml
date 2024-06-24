@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-tree"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2021"
 authors = ["Jeff Garzik"]
 license = "MIT"
@@ -10,13 +10,10 @@ repository = "https://github.com/rustcoreutils/posixutils-rs.git"
 plib = { path = "../plib" }
 clap.workspace = true
 gettext-rs.workspace = true
-walkdir = "2.5"
 libc.workspace = true
-chrono = "0.4"
-atty = "0.2"
-
-[dev-dependencies]
 regex.workspace = true
+chrono.workspace = true
+atty.workspace = true
 
 [features]
 posixutils_test_all = []
@@ -65,6 +62,10 @@ path = "src/mkfifo.rs"
 [[bin]]
 name = "mv"
 path = "src/mv.rs"
+
+[[bin]]
+name = "readlink"
+path = "src/readlink.rs"
 
 [[bin]]
 name = "rm"

@@ -13,7 +13,7 @@ use std::{
 };
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, textdomain};
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use object::{
     archive,
     build::elf::{Builder, Section, SectionData},
@@ -145,6 +145,7 @@ fn strip_file(file: &OsStr) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    setlocale(LocaleCategory::LcAll, "");
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 

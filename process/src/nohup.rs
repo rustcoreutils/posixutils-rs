@@ -1,4 +1,13 @@
-use gettextrs::{bind_textdomain_codeset, textdomain};
+//
+// Copyright (c) 2024 Hemi Labs, Inc.
+//
+// This file is part of the posixutils-rs project covered under
+// the MIT License.  For the full license text, please see the LICENSE
+// file in the root directory of this project.
+// SPDX-License-Identifier: MIT
+//
+
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use libc::signal;
 use libc::{dup, dup2, SIGHUP, SIG_IGN};
 use plib::PROJECT_NAME;
@@ -9,6 +18,7 @@ use std::os::unix::io::AsRawFd;
 use std::process::{self, Command};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    setlocale(LocaleCategory::LcAll, "");
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 

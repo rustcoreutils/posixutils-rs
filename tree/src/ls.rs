@@ -10,7 +10,7 @@
 mod ls_util;
 
 use clap::{CommandFactory, FromArgMatches, Parser};
-use gettextrs::{bind_textdomain_codeset, gettext, textdomain};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsStr, OsString};
@@ -1222,6 +1222,7 @@ fn ls(paths: Vec<PathBuf>, config: &Config) -> io::Result<u8> {
 }
 
 fn main() -> ExitCode {
+    setlocale(LocaleCategory::LcAll, "");
     textdomain(PROJECT_NAME).unwrap();
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8").unwrap();
 

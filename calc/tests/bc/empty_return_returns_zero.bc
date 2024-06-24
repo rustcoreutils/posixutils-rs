@@ -1,0 +1,5 @@
+define m() {
+	return
+}
+m()
+quit

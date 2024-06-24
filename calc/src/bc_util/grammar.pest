@@ -1,0 +1,135 @@
+//
+// Copyright (c) 2024 Hemi Labs, Inc.
+//
+// This file is part of the posixutils-rs project covered under
+// the MIT License.  For the full license text, please see the LICENSE
+// file in the root directory of this project.
+// SPDX-License-Identifier: MIT
+//
+
+WHITESPACE = _{ " " | "\t" | "\\\n" }
+COMMENT = _{ ("/*" ~ (!"*/" ~ ANY)* ~ "*/") }
+
+letter = { 'a'..'z' }
+digit = _{ '0'..'9' | 'A' .. 'F' }
+string = { "\"" ~ (!("\"") ~ ANY)* ~  "\"" }
+integer = { ( digit | "\\\n" )+ }
+number = @{
+    | (integer ~ "." ~ integer)
+    | ("." ~ integer)
+    | (integer ~ ".")
+	| integer
+}
+rel_op = _{ same | leq | geq | neq | lt | gt }
+same = { "==" }
+leq = { "<=" }
+geq = { ">=" }
+neq = { "!=" }
+lt = { "<" }
+gt = { ">" }
+
+assign_op = _{ assign | add_assign | sub_assign | mul_assign | div_assign | mod_assign | pow_assign }
+assign = { "=" }
+add_assign = { "+=" }
+sub_assign = { "-=" }
+mul_assign = { "*=" }
+div_assign = { "/=" }
+mod_assign = { "%=" }
+pow_assign = { "^=" }
+
+
+neg = { "-" }
+
+binary_op = _{
+    | add
+    | sub
+    | mul
+    | div
+    | modulus
+    | pow
+}
+add = { "+" }
+sub = { "-" }
+mul = { "*" }
+div = { "/" }
+modulus = { "%" }
+pow = { "^" }
+
+builtin_fn = { "length" | "sqrt" | "scale" }
+
+program = { SOI ~ input_item* ~ EOI }
+input_item = _{ (semicolon_list ~ "\n") | function }
+semicolon_list = { ";"* ~ (statement ~ (";"+ ~ statement)*)? ~ ";"* }
+statement_list = { (";" | "\n")* ~ (statement ~ (";" | "\n")*)* }
+
+statement = {
+    | break_stmt
+    | quit
+    | return_stmt
+    | if_stmt
+    | while_stmt
+   	| for_stmt
+    | braced_statement_list
+    | string
+	| expression
+}
+break_stmt = { "break" }
+quit = { "quit" }
+return_stmt = { "return" ~ ( "(" ~ expression? ~ ")" )? }
+for_stmt = { "for" ~ "(" ~ expression ~ ";" ~ condition ~ ";" ~ expression ~ ")" ~ statement }
+if_stmt = { "if" ~ "(" ~ condition ~ ")" ~ statement }
+while_stmt = { "while" ~ "(" ~ condition ~ ")" ~ statement }
+braced_statement_list = { "{" ~ statement_list ~ "}" }
+condition = { relational_expression | expression }
+relational_expression = { expression ~ rel_op ~ expression }
+
+function = { "define" ~ letter ~ "(" ~ parameter_list? ~ ")" ~ "{" ~ "\n" ~ auto_define_list? ~ statement_list ~ "}" }
+parameter_list = { variable ~ ("," ~ variable)* }
+variable = _{ array | variable_number }
+variable_number = { letter }
+array = { letter ~ "[" ~ "]" }
+
+auto_define_list = { "auto" ~ define_list ~ ("\n" | ";") }
+define_list = { variable ~ ("," ~ variable)* }
+argument_list = { argument ~ ("," ~ argument)* }
+argument = _{ array | expression }
+
+expression = { primary ~ (binary_op ~ primary)* }
+primary = {
+	number
+    | paren
+    | builtin_call
+    | fn_call
+    | prefix_increment
+    | prefix_decrement
+    | postfix_increment
+    | postfix_decrement
+    | negation
+    | register_assignment
+    | register
+    | assignment
+	| named_expression
+}
+paren = { "(" ~ expression ~ ")" }
+builtin_call = { builtin_fn ~ "(" ~ expression ~ ")" }
+fn_call = { letter ~ "(" ~ argument_list? ~ ")" }
+prefix_increment = { "++" ~ named_expression }
+prefix_decrement = { "--" ~ named_expression }
+postfix_increment = { named_expression ~ "++" }
+postfix_decrement = { named_expression ~ "--" }
+negation = { "-" ~ primary }
+assignment = { named_expression ~ assign_op ~ expression }
+register_assignment = { register ~ assign_op ~ expression }
+named_expression = {
+    | array_item
+	| variable_number
+}
+array_item = { letter ~ "[" ~ expression ~ "]" }
+register = {
+    | scale
+    | ibase
+    | obase
+}
+scale = { "scale" }
+ibase = { "ibase" }
+obase = { "obase" }

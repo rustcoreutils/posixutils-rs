@@ -63,6 +63,19 @@ fn csplit_test(args: &[&str], test_data: &str, expected_output: &str) {
     });
 }
 
+fn tr_test(args: &[&str], test_data: &str, expected_output: &str) {
+    let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
+
+    run_test(TestPlan {
+        cmd: String::from("tr"),
+        args: str_args,
+        stdin_data: String::from(test_data),
+        expected_out: String::from(expected_output),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
 fn nl_test(args: &[&str], test_data: &str, expected_output: &str) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
 
@@ -89,11 +102,37 @@ fn pr_test(args: &[&str], test_data: &str, expected_output: &str) {
     });
 }
 
+fn diff_test(args: &[&str], expected_output: &str) {
+    let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
+
+    run_test(TestPlan {
+        cmd: String::from("diff"),
+        args: str_args,
+        stdin_data: String::from(""),
+        expected_out: String::from(expected_output),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
 fn cut_test(args: &[&str], test_data: &str, expected_output: &str) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
 
     run_test(TestPlan {
         cmd: String::from("cut"),
+        args: str_args,
+        stdin_data: String::from(test_data),
+        expected_out: String::from(expected_output),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+fn unexpand_test(args: &[&str], test_data: &str, expected_output: &str) {
+    let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
+
+    run_test(TestPlan {
+        cmd: String::from("unexpand"),
         args: str_args,
         stdin_data: String::from(test_data),
         expected_out: String::from(expected_output),
@@ -118,6 +157,32 @@ fn sort_test(
         expected_out: String::from(expected_output),
         expected_err: String::from(expected_err),
         expected_exit_code,
+    });
+}
+
+fn uniq_test(args: &[&str], test_data: &str, expected_output: &str) {
+    let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
+
+    run_test(TestPlan {
+        cmd: String::from("uniq"),
+        args: str_args,
+        stdin_data: String::from(test_data),
+        expected_out: String::from(expected_output),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+fn tail_test(args: &[&str], test_data: &str, expected_output: &str) {
+    let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
+
+    run_test(TestPlan {
+        cmd: String::from("tail"),
+        args: str_args,
+        stdin_data: String::from(test_data),
+        expected_out: String::from(expected_output),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
     });
 }
 
@@ -635,7 +700,7 @@ fn test_pr_expand_and_replace() {
 }
 
 #[cfg(test)]
-mod tests {
+mod cut_tests {
     use crate::cut_test;
 
     #[test]
@@ -1549,5 +1614,1059 @@ mod sort_tests {
             0,
             "",
         );
+    }
+}
+
+#[cfg(test)]
+mod tr_tests {
+    use crate::tr_test;
+
+    #[test]
+    fn test_tr_1() {
+        tr_test(&["abcd", "[]*]"], "abcd", "]]]]");
+    }
+
+    #[test]
+    fn test_tr_2() {
+        tr_test(&["abc", "[%*]xyz"], "abc", "xyz");
+    }
+
+    #[test]
+    fn test_tr_3() {
+        tr_test(&["abcd", "xy"], "abcde", "xyyye");
+    }
+
+    #[test]
+    fn test_tr_4() {
+        tr_test(&["abcd", "x[y*]"], "abcde", "xyyye");
+    }
+
+    #[test]
+    fn test_tr_5() {
+        tr_test(&["-s", "a-p", "%[.*]$"], "abcdefghijklmnop", "%.$");
+    }
+
+    #[test]
+    fn test_tr_6() {
+        tr_test(&["-s", "a-p", "[.*]$"], "abcdefghijklmnop", ".$");
+    }
+
+    #[test]
+    fn test_tr_7() {
+        tr_test(&["-s", "a-p", "%[.*]"], "abcdefghijklmnop", "%.");
+    }
+
+    #[test]
+    fn test_tr_a() {
+        tr_test(&["-s", "[a-z]"], "aabbcc", "abc");
+    }
+
+    #[test]
+    fn test_tr_b() {
+        tr_test(&["-s", "[a-c]"], "aabbcc", "abc");
+    }
+
+    #[test]
+    fn test_tr_c() {
+        tr_test(&["-s", "[a-b]"], "aabbcc", "abcc");
+    }
+
+    #[test]
+    fn test_tr_d() {
+        tr_test(&["-s", "[b-c]"], "aabbcc", "aabc");
+    }
+
+    #[test]
+    fn test_tr_f() {
+        tr_test(&["-d", "[=[=]"], "[[[[[[[[]]]]]]]]", "]]]]]]]]");
+    }
+
+    #[test]
+    fn test_tr_g() {
+        tr_test(&["-d", "[=]=]"], "[[[[[[[[]]]]]]]]", "[[[[[[[[");
+    }
+
+    #[test]
+    fn test_tr_h() {
+        tr_test(&["-d", "[:xdigit:]"], "0123456789acbdefABCDEF", "");
+    }
+
+    #[test]
+    fn test_tr_i() {
+        tr_test(
+            &["-d", "[:xdigit:]"],
+            "w0x1y2z3456789acbdefABCDEFz",
+            "wxyzz",
+        );
+    }
+
+    #[test]
+    fn test_tr_j() {
+        tr_test(&["-d", "[:digit:]"], "0123456789", "");
+    }
+
+    #[test]
+    fn test_tr_k() {
+        tr_test(&["-d", "[:digit:]"], "a0b1c2d3e4f5g6h7i8j9k", "abcdefghijk");
+    }
+
+    #[test]
+    fn test_tr_l() {
+        tr_test(&["-d", "[:lower:]"], "abcdefghijklmnopqrstuvwxyz", "");
+    }
+
+    #[test]
+    fn test_tr_m() {
+        tr_test(&["-d", "[:upper:]"], "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "");
+    }
+
+    #[test]
+    fn test_tr_n() {
+        tr_test(
+            &["-d", "[:lower:][:upper:]"],
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            "",
+        );
+    }
+
+    #[test]
+    fn test_tr_o() {
+        tr_test(
+            &["-d", "[:alpha:]"],
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            "",
+        );
+    }
+
+    #[test]
+    fn test_tr_p() {
+        tr_test(
+            &["-d", "[:alnum:]"],
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+            "",
+        );
+    }
+
+    #[test]
+    fn test_tr_q() {
+        tr_test(
+            &["-d", "[:alnum:]"],
+            ".abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.",
+            "..",
+        );
+    }
+
+    #[test]
+    fn test_tr_r() {
+        tr_test(
+            &["-ds", "[:alnum:]", "."],
+            ".abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.",
+            ".",
+        );
+    }
+
+    #[test]
+    fn test_tr_s() {
+        tr_test(
+            &["-c", "[:alnum:]", "\n"],
+            "The big black fox jumped over the fence.",
+            "The\nbig\nblack\nfox\njumped\nover\nthe\nfence\n",
+        );
+    }
+
+    #[test]
+    fn test_tr_t() {
+        tr_test(
+            &["-c", "[:alnum:]", "[\n*]"],
+            "The big black fox jumped over the fence.",
+            "The\nbig\nblack\nfox\njumped\nover\nthe\nfence\n",
+        );
+    }
+
+    #[test]
+    fn test_tr_u() {
+        tr_test(&["-ds", "b", "a"], "aabbaa", "a");
+    }
+
+    #[test]
+    fn test_tr_v() {
+        tr_test(
+            &["-ds", "[:xdigit:]", "Z"],
+            "ZZ0123456789acbdefABCDEFZZ",
+            "Z",
+        );
+    }
+
+    #[test]
+    fn test_tr_w() {
+        tr_test(
+            &["-ds", "\u{350}", "\u{345}"],
+            "\u{300}\u{301}\u{377}\u{345}\u{345}\u{350}\u{345}",
+            "\u{300}\u{301}\u{377}\u{345}",
+        );
+    }
+
+    #[test]
+    fn test_tr_x() {
+        tr_test(
+            &["-s", "abcdefghijklmn", "[:*016]"],
+            "abcdefghijklmnop",
+            ":op",
+        );
+    }
+
+    #[test]
+    fn test_tr_y() {
+        tr_test(&["-d", "a-z"], "abc $code", " $");
+    }
+
+    #[test]
+    fn test_tr_z() {
+        tr_test(&["-ds", "a-z", "$."], "a.b.c $$$$code\\", ". $\\");
+    }
+
+    #[test]
+    fn test_tr_range_a_a() {
+        tr_test(&["a-a", "z"], "abc", "zbc");
+    }
+
+    #[test]
+    fn test_tr_upcase() {
+        tr_test(&["[:lower:]", "[:upper:]"], "abcxyzABCXYZ", "ABCXYZABCXYZ");
+    }
+
+    #[test]
+    fn test_tr_dncase() {
+        tr_test(&["[:upper:]", "[:lower:]"], "abcxyzABCXYZ", "abcxyzabcxyz");
+    }
+
+    #[test]
+    fn test_tr_rep_2() {
+        tr_test(&["a[b*512]c", "1[x*]2"], "abc", "1x2");
+    }
+
+    #[test]
+    fn test_tr_rep_3() {
+        tr_test(&["a[b*513]c", "1[x*]2"], "abc", "1x2");
+    }
+
+    #[test]
+    fn test_tr_o_rep_2() {
+        tr_test(&["[b*010]cd", "[a*7]BC[x*]"], "bcd", "BCx");
+    }
+
+    #[test]
+    fn test_tr_ross_1a() {
+        tr_test(&["-cs", "[:upper:]", "[X*]"], "AMZamz123.-+AMZ", "AMZXAMZ");
+    }
+
+    #[test]
+    fn test_tr_ross_1b() {
+        tr_test(&["-cs", "[:upper:][:digit:]", "[Z*]"], "", "");
+    }
+
+    #[test]
+    fn test_tr_ross_2() {
+        tr_test(&["-dcs", "[:lower:]", "n-rs-z"], "amzAMZ123.-+amz", "amzam");
+    }
+
+    #[test]
+    fn test_tr_ross_3() {
+        tr_test(
+            &["-ds", "[:xdigit:]", "[:alnum:]"],
+            ".ZABCDEFzabcdefg.0123456788899.GG",
+            ".Zzg..G",
+        );
+    }
+
+    #[test]
+    fn test_tr_ross_4() {
+        tr_test(&["-dcs", "[:alnum:]", "[:digit:]"], "", "");
+    }
+
+    #[test]
+    fn test_tr_ross_5() {
+        tr_test(&["-dc", "[:lower:]"], "", "");
+    }
+
+    #[test]
+    fn test_tr_ross_6() {
+        tr_test(&["-dc", "[:upper:]"], "", "");
+    }
+
+    #[test]
+    fn test_tr_repeat_0() {
+        tr_test(&["abc", "[b*0]"], "abcd", "bbbd");
+    }
+
+    #[test]
+    fn test_tr_repeat_zeros() {
+        tr_test(&["abc", "[b*00000000000000000000]"], "abcd", "bbbd");
+    }
+
+    #[test]
+    fn test_tr_repeat_compl() {
+        tr_test(&["-c", "[a*65536]\n", "[b*]"], "abcd", "abbb");
+    }
+
+    #[test]
+    fn test_tr_repeat_xc() {
+        tr_test(&["-C", "[a*65536]\n", "[b*]"], "abcd", "abbb");
+    }
+
+    #[test]
+    fn test_tr_no_abort_1() {
+        tr_test(&["-c", "a", "[b*256]"], "abc", "abb");
+    }
+}
+
+#[cfg(test)]
+mod unexpand_tests {
+    use crate::unexpand_test;
+
+    #[test]
+    fn unexpand_test_1() {
+        unexpand_test(
+            &["-t", "4,8,12"],
+            "    Apple\n        Banana\n            Cherry\n                Date",
+            "\tApple\n\t\tBanana\n\t\t\tCherry\n\t\t\t    Date\n",
+        );
+    }
+
+    #[test]
+    fn unexpand_test_2() {
+        unexpand_test(
+            &["-"],
+            "    Apple\n        Banana\n            Cherry\n                Date",
+            "    Apple\n\tBanana\n\t    Cherry\n\t        Date\n",
+        );
+    }
+
+    #[test]
+    fn unexpand_test_3() {
+        unexpand_test(
+            &["-t", "8"],
+            "        leading spaces\n",
+            "\tleading spaces\n",
+        );
+    }
+
+    #[test]
+    fn unexpand_test_4() {
+        unexpand_test(&["-t", "4"], "    leading spaces\n", "\tleading spaces\n");
+    }
+
+    #[test]
+    fn unexpand_test_5() {
+        unexpand_test(
+            &["-t", "8"],
+            "text    with spaces\n",
+            "text    with spaces\n",
+        );
+    }
+
+    #[test]
+    fn unexpand_test_6() {
+        unexpand_test(
+            &["-a"],
+            "text        with                spaces",
+            "text\twith\t\tspaces\n",
+        );
+    }
+}
+
+mod uniq_tests {
+    use crate::uniq_test;
+    #[test]
+    fn test_uniq_2() {
+        uniq_test(&[], "a\na\n", "a\n");
+    }
+
+    #[test]
+    fn test_uniq_3() {
+        uniq_test(&[], "a\na", "a\n");
+    }
+
+    #[test]
+    fn test_uniq_4() {
+        uniq_test(&[], "a\nb", "a\nb\n");
+    }
+
+    #[test]
+    fn test_uniq_5() {
+        uniq_test(&[], "a\na\nb", "a\nb\n");
+    }
+
+    #[test]
+    fn test_uniq_6() {
+        uniq_test(&[], "b\na\na\n", "b\na\n");
+    }
+
+    #[test]
+    fn test_uniq_7() {
+        uniq_test(&[], "a\nb\nc\n", "a\nb\nc\n");
+    }
+
+    #[test]
+    fn test_uniq_8() {
+        uniq_test(&[], "ö\nv\n", "ö\nv\n");
+    }
+
+    #[test]
+    fn test_uniq_9() {
+        uniq_test(&["-u"], "a\na\n", "");
+    }
+
+    #[test]
+    fn test_uniq_10() {
+        uniq_test(&["-u"], "a\nb\n", "a\nb\n");
+    }
+
+    #[test]
+    fn test_uniq_11() {
+        uniq_test(&["-u"], "a\nb\na\n", "a\nb\na\n");
+    }
+
+    #[test]
+    fn test_uniq_12() {
+        uniq_test(&["-u"], "a\na\n", "");
+    }
+
+    #[test]
+    fn test_uniq_13() {
+        uniq_test(&["-u"], "a\na\n", "");
+    }
+
+    #[test]
+    fn test_uniq_20() {
+        uniq_test(&["-d"], "a\na\n", "a\n");
+    }
+
+    #[test]
+    fn test_uniq_21() {
+        uniq_test(&["-d"], "a\nb\n", "");
+    }
+
+    #[test]
+    fn test_uniq_22() {
+        uniq_test(&["-d"], "a\nb\na\n", "");
+    }
+
+    #[test]
+    fn test_uniq_23() {
+        uniq_test(&["-d"], "a\na\nb\n", "a\n");
+    }
+
+    #[test]
+    fn test_uniq_24() {
+        uniq_test(&["-f", "1"], "a a\nb a\n", "a a\n");
+    }
+
+    #[test]
+    fn test_uniq_25() {
+        uniq_test(&["-f", "1"], "a a\nb b\n", "a a\nb b\n");
+    }
+
+    #[test]
+    fn test_uniq_26() {
+        uniq_test(&["-f", "1"], "a a a\nb a c\n", "a a a\nb a c\n");
+    }
+
+    #[test]
+    fn test_uniq_27() {
+        uniq_test(&["-f", "1"], "b a\na a\n", "b a\n");
+    }
+
+    #[test]
+    fn test_uniq_28() {
+        uniq_test(&["-f", "2"], "a a c\nb a c\n", "a a c\n");
+    }
+
+    #[test]
+    fn test_uniq_29() {
+        uniq_test(&["-s", "1"], "aaa\naaa\n", "aaa\n");
+    }
+
+    #[test]
+    fn test_uniq_30() {
+        uniq_test(&["-s", "2"], "baa\naaa\n", "baa\n");
+    }
+
+    #[test]
+    fn test_uniq_31() {
+        uniq_test(&["-f", "1", "-s", "1"], "a aaa\nb ab\n", "a aaa\nb ab\n");
+    }
+
+    #[test]
+    fn test_uniq_32() {
+        uniq_test(&["-f", "1", "-s", "1"], "a aaa\nb aaa\n", "a aaa\n");
+    }
+
+    #[test]
+    fn test_uniq_33() {
+        uniq_test(&["-f", "1", "-s", "1"], "a aaa\nb ab\n", "a aaa\nb ab\n");
+    }
+
+    #[test]
+    fn test_uniq_34() {
+        uniq_test(&["-f", "1", "-s", "1"], "a aaa\nb aaa\n", "a aaa\n");
+    }
+
+    #[test]
+    fn test_uniq_35() {
+        uniq_test(&["-s", "0"], "abc\nabcd\n", "abc\nabcd\n");
+    }
+
+    #[test]
+    fn test_uniq_36() {
+        uniq_test(&["-s", "0"], "abc\n", "abc\n");
+    }
+
+    #[test]
+    fn test_uniq_37() {
+        uniq_test(&[], "a\0a\na\n", "a\0a\na\n");
+    }
+
+    #[test]
+    fn test_uniq_38() {
+        uniq_test(&[], "a\ta\na a\n", "a\ta\na a\n");
+    }
+
+    #[test]
+    fn test_uniq_39() {
+        uniq_test(&["-f", "1"], "a\ta\na a\n", "a\ta\na a\n");
+    }
+
+    #[test]
+    fn test_uniq_40() {
+        uniq_test(&["-f", "2"], "a\ta a\na a a\n", "a\ta a\n");
+    }
+
+    #[test]
+    fn test_uniq_41() {
+        uniq_test(&["-f", "1"], "a\ta\na\ta\n", "a\ta\n");
+    }
+
+    #[test]
+    fn test_uniq_42() {
+        uniq_test(&["-c"], "a\nb\n", "1 a\n1 b\n");
+    }
+
+    #[test]
+    fn test_uniq_43() {
+        uniq_test(&["-c"], "a\na\n", "2 a\n");
+    }
+}
+
+#[cfg(test)]
+mod diff_tests {
+    use crate::diff_test;
+    use std::{path::PathBuf, process::Stdio};
+
+    fn diff_base_path() -> PathBuf {
+        PathBuf::from("tests").join("diff")
+    }
+
+    fn f1_txt_path() -> String {
+        diff_base_path()
+            .join("f1.txt")
+            .to_str()
+            .expect("Could not unwrap f1_txt_path")
+            .to_string()
+    }
+
+    fn f2_txt_path() -> String {
+        diff_base_path()
+            .join("f2.txt")
+            .to_str()
+            .expect("Could not unwrap f2_txt_path")
+            .to_string()
+    }
+
+    fn f1_dir_path() -> String {
+        diff_base_path()
+            .join("f1")
+            .to_str()
+            .expect("Could not unwrap f1_dir_path")
+            .to_string()
+    }
+
+    fn f2_dir_path() -> String {
+        diff_base_path()
+            .join("f2")
+            .to_str()
+            .expect("Could not unwrap f2_dir_path")
+            .to_string()
+    }
+
+    fn f1_txt_with_eol_spaces_path() -> String {
+        diff_base_path()
+            .join("f1_with_eol_spaces.txt")
+            .to_str()
+            .expect("Could not unwrap f1_txt_with_eol_spaces_path")
+            .to_string()
+    }
+
+    struct DiffTestHelper {
+        pub key: String,
+        content: String,
+        file1_path: String,
+        file2_path: String,
+    }
+
+    impl DiffTestHelper {
+        fn new(options: &str, file1_path: String, file2_path: String, key: String) -> Self {
+            let args = format!(
+                "run --release --bin diff --{} {} {}",
+                options, file1_path, file2_path
+            );
+
+            let args_list = args.split(' ').collect::<Vec<&str>>();
+
+            let output = std::process::Command::new("cargo")
+                .args(args_list)
+                // .stdout(output_file)
+                .stdout(Stdio::piped())
+                .output()
+                .expect("Could not run cargo command!");
+
+            let content =
+                String::from_utf8(output.stdout).expect("Failed to read output of Command!");
+
+            Self {
+                key,
+                file1_path,
+                file2_path,
+                content,
+            }
+        }
+
+        fn content(&self) -> &str {
+            &self.content
+        }
+
+        fn file1_path(&self) -> &str {
+            &self.file1_path
+        }
+
+        fn file2_path(&self) -> &str {
+            &self.file2_path
+        }
+    }
+
+    static mut DIFF_TEST_INPUT: Vec<DiffTestHelper> = vec![];
+
+    fn input_by_key(key: &str) -> &DiffTestHelper {
+        unsafe {
+            DIFF_TEST_INPUT
+                .iter()
+                .filter(|data| data.key == key)
+                .nth(0)
+                .unwrap()
+        }
+    }
+
+    #[ctor::ctor]
+    fn diff_tests_setup() {
+        let diff_test_helper_init_data = [
+            ("", f1_txt_path(), f2_txt_path(), "test_diff_normal"),
+            (" -c", f1_txt_path(), f2_txt_path(), "test_diff_context3"),
+            (" -C 1", f1_txt_path(), f2_txt_path(), "test_diff_context1"),
+            (
+                " -C 10",
+                f1_txt_path(),
+                f2_txt_path(),
+                "test_diff_context10",
+            ),
+            (" -e", f1_txt_path(), f2_txt_path(), "test_diff_edit_script"),
+            (
+                " -f",
+                f1_txt_path(),
+                f2_txt_path(),
+                "test_diff_forward_edit_script",
+            ),
+            (" -u", f1_txt_path(), f2_txt_path(), "test_diff_unified3"),
+            (" -U 0", f1_txt_path(), f2_txt_path(), "test_diff_unified0"),
+            (
+                " -U 10",
+                f1_txt_path(),
+                f2_txt_path(),
+                "test_diff_unified10",
+            ),
+            ("", f1_txt_path(), f2_dir_path(), "test_diff_file_directory"),
+            ("", f1_dir_path(), f2_dir_path(), "test_diff_directories"),
+            (
+                " -r",
+                f1_dir_path(),
+                f2_dir_path(),
+                "test_diff_directories_recursive",
+            ),
+            (
+                " -r -c",
+                f1_dir_path(),
+                f2_dir_path(),
+                "test_diff_directories_recursive_context",
+            ),
+            (
+                " -r -e",
+                f1_dir_path(),
+                f2_dir_path(),
+                "test_diff_directories_recursive_edit_script",
+            ),
+            (
+                " -r -f",
+                f1_dir_path(),
+                f2_dir_path(),
+                "test_diff_directories_recursive_forward_edit_script",
+            ),
+            (
+                " -r -u",
+                f1_dir_path(),
+                f2_dir_path(),
+                "test_diff_directories_recursive_unified",
+            ),
+            (
+                "",
+                f1_txt_path(),
+                f1_txt_with_eol_spaces_path(),
+                "test_diff_counting_eol_spaces",
+            ),
+            (
+                " -b",
+                f1_txt_path(),
+                f1_txt_with_eol_spaces_path(),
+                "test_diff_ignoring_eol_spaces",
+            ),
+            (
+                " --label F1 --label2 F2 -u",
+                f1_txt_path(),
+                f1_txt_with_eol_spaces_path(),
+                "test_diff_unified_two_labels",
+            ),
+        ];
+
+        for row in diff_test_helper_init_data {
+            unsafe {
+                DIFF_TEST_INPUT.push(DiffTestHelper::new(row.0, row.1, row.2, row.3.to_string()))
+            }
+        }
+    }
+
+    #[test]
+    fn test_diff_normal() {
+        let data = input_by_key("test_diff_normal");
+        diff_test(&[data.file1_path(), data.file2_path()], data.content());
+    }
+
+    #[test]
+    fn test_diff_context3() {
+        let data = input_by_key("test_diff_context3");
+
+        diff_test(
+            &["-c", data.file1_path(), data.file2_path()],
+            data.content(),
+        );
+    }
+
+    #[test]
+    fn test_diff_context1() {
+        let data = input_by_key("test_diff_context1");
+
+        diff_test(
+            &["-C", "1", data.file1_path(), data.file2_path()],
+            data.content(),
+        );
+    }
+
+    #[test]
+    fn test_diff_context10() {
+        let data = input_by_key("test_diff_context10");
+
+        diff_test(
+            &["-C", "10", data.file1_path(), data.file2_path()],
+            data.content(),
+        );
+    }
+
+    #[test]
+    fn test_diff_edit_script() {
+        let data = input_by_key("test_diff_edit_script");
+
+        diff_test(
+            &["-e", data.file1_path(), data.file2_path()],
+            data.content(),
+        );
+    }
+
+    #[test]
+    fn test_diff_forward_edit_script() {
+        let data = input_by_key("test_diff_forward_edit_script");
+
+        diff_test(
+            &["-f", data.file1_path(), data.file2_path()],
+            data.content(),
+        );
+    }
+
+    #[test]
+    fn test_diff_unified3() {
+        let data = input_by_key("test_diff_unified3");
+
+        diff_test(
+            &["-u", data.file1_path(), data.file2_path()],
+            data.content(),
+        );
+    }
+
+    #[test]
+    fn test_diff_unified0() {
+        let data = input_by_key("test_diff_unified0");
+
+        diff_test(
+            &["-U", "0", data.file1_path(), data.file2_path()],
+            data.content(),
+        );
+    }
+
+    #[test]
+    fn test_diff_unified10() {
+        let data = input_by_key("test_diff_unified10");
+
+        diff_test(
+            &["-U", "10", data.file1_path(), data.file2_path()],
+            data.content(),
+        );
+    }
+
+    #[test]
+    fn test_diff_file_directory() {
+        let data = input_by_key("test_diff_file_directory");
+        diff_test(&[data.file1_path(), data.file2_path()], data.content());
+    }
+
+    #[test]
+    fn test_diff_directories() {
+        let data = input_by_key("test_diff_directories");
+        diff_test(&[data.file1_path(), data.file2_path()], data.content());
+    }
+
+    #[test]
+    fn test_diff_directories_recursive() {
+        let data = input_by_key("test_diff_directories_recursive");
+
+        diff_test(
+            &["-r", data.file1_path(), data.file2_path()],
+            data.content(),
+        );
+    }
+
+    #[test]
+    fn test_diff_directories_recursive_context() {
+        let data = input_by_key("test_diff_directories_recursive_context");
+
+        diff_test(
+            &["-r", "-c", data.file1_path(), data.file2_path()],
+            data.content(),
+        );
+    }
+
+    #[test]
+    fn test_diff_directories_recursive_edit_script() {
+        let data = input_by_key("test_diff_directories_recursive_edit_script");
+
+        diff_test(
+            &["-r", "-e", data.file1_path(), data.file2_path()],
+            data.content(),
+        );
+    }
+
+    #[test]
+    fn test_diff_directories_recursive_forward_edit_script() {
+        let data = input_by_key("test_diff_directories_recursive_forward_edit_script");
+
+        diff_test(
+            &["-r", "-f", data.file1_path(), data.file2_path()],
+            data.content(),
+        );
+    }
+
+    #[test]
+    fn test_diff_directories_recursive_unified() {
+        let data = input_by_key("test_diff_directories_recursive_unified");
+
+        diff_test(
+            &["-r", "-u", data.file1_path(), data.file2_path()],
+            data.content(),
+        );
+    }
+
+    #[test]
+    fn test_diff_counting_eol_spaces() {
+        let data = input_by_key("test_diff_counting_eol_spaces");
+        diff_test(&[data.file1_path(), data.file2_path()], data.content());
+    }
+
+    #[test]
+    fn test_diff_ignoring_eol_spaces() {
+        let data = input_by_key("test_diff_ignoring_eol_spaces");
+
+        diff_test(
+            &["-b", data.file1_path(), data.file2_path()],
+            data.content(),
+        );
+    }
+
+    #[test]
+    fn test_diff_unified_two_labels() {
+        let data = input_by_key("test_diff_unified_two_labels");
+
+        diff_test(
+            &[
+                "--label",
+                "F1",
+                "--label2",
+                "F2",
+                "-u",
+                data.file1_path(),
+                data.file2_path(),
+            ],
+            data.content(),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tail_tests {
+    use crate::tail_test;
+
+    #[test]
+    fn test_tail() {
+        tail_test(&["-n2"], "a\nb\nc\n", "b\nc\n");
+    }
+
+    #[test]
+    fn test_tail_1() {
+        tail_test(&["-c+2"], "abcd", "bcd");
+    }
+
+    #[test]
+    fn test_tail_2() {
+        tail_test(&["-c+8"], "abcd", "");
+    }
+
+    #[test]
+    fn test_tail_3() {
+        tail_test(&["-c-1"], "abcd", "d");
+    }
+
+    #[test]
+    fn test_tail_4() {
+        tail_test(&["-c-9"], "abcd", "abcd");
+    }
+
+    #[test]
+    fn test_tail_5() {
+        tail_test(
+            &["-c-12"],
+            &("x".to_string() + &"y".repeat(12) + "z"),
+            &("y".repeat(11) + "z"),
+        );
+    }
+
+    #[test]
+    fn test_tail_6() {
+        tail_test(&["-n-1"], "x\n", "x\n");
+    }
+
+    #[test]
+    fn test_tail_7() {
+        tail_test(&["-n-1"], "x\ny\n", "y\n");
+    }
+
+    #[test]
+    fn test_tail_8() {
+        tail_test(&["-n-1"], "x\ny\n", "y\n");
+    }
+
+    #[test]
+    fn test_tail_9() {
+        tail_test(&["-n+1"], "x\ny\n", "x\ny\n");
+    }
+
+    #[test]
+    fn test_tail_10() {
+        tail_test(&["-n+2"], "x\ny\n", "y\n");
+    }
+
+    #[test]
+    fn test_tail_11() {
+        tail_test(
+            &["-c+10"],
+            &("x".to_string() + &"y".repeat(10) + "z\n"),
+            "yyz\n",
+        );
+    }
+
+    #[test]
+    fn test_tail_12() {
+        tail_test(
+            &["-n+10"],
+            &("x\n".to_string() + &"y\n".repeat(10) + "z\n"),
+            "y\ny\nz\n",
+        );
+    }
+
+    #[test]
+    fn test_tail_13() {
+        tail_test(
+            &["-n-10"],
+            &("x\n".to_string() + &"y\n".repeat(10) + "z\n"),
+            &("y\n".repeat(9) + "z\n"),
+        );
+    }
+
+    #[test]
+    fn test_tail_14() {
+        let input = &("x\n".repeat(512 * 10 / 2 + 1));
+        let expected_output = &("x\n".repeat(10));
+        tail_test(&["-n-10"], input, expected_output);
+    }
+
+    #[test]
+    fn test_tail_15() {
+        tail_test(&["-c2"], "abcd\n", "d\n");
+    }
+
+    #[test]
+    fn test_tail_16() {
+        tail_test(
+            &["-n-10"],
+            &("x\n".to_string() + &"y\n".repeat(10) + "z\n"),
+            &("y\n".repeat(9) + "z\n"),
+        );
+    }
+
+    #[test]
+    fn test_tail_17() {
+        tail_test(
+            &["-n+10"],
+            &("x\n".to_string() + &"y\n".repeat(10) + "z\n"),
+            "y\ny\nz\n",
+        );
+    }
+
+    #[test]
+    fn test_tail_18() {
+        tail_test(&["-n+0"], &("y\n".repeat(5)), &("y\n".repeat(5)));
+    }
+
+    #[test]
+    fn test_tail_19() {
+        tail_test(&["-n+1"], &("y\n".repeat(5)), &("y\n".repeat(5)));
+    }
+
+    #[test]
+    fn test_tail_20() {
+        tail_test(&["-n-1"], &("y\n".repeat(5)), "y\n");
     }
 }

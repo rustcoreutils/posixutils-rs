@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2024 Jeff Garzik
+// Copyright (c) 2024 Hemi Labs, Inc.
 //
 // This file is part of the posixutils-rs project covered under
 // the MIT License.  For the full license text, please see the LICENSE
@@ -17,7 +17,7 @@ mod common;
 
 use self::common::{copy_characteristics, error_string, is_file_writable};
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, textdomain};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
@@ -192,7 +192,7 @@ fn move_file(
         Some(md) => md.is_dir(),
         None => false,
     };
-    let target_is_writable = is_file_writable(&target_md);
+    let target_is_writable = is_file_writable(target_md.as_ref());
 
     let source_md = match fs::metadata(source) {
         Ok(md) => Some(md),
@@ -449,6 +449,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     // Initialize translation system
+    setlocale(LocaleCategory::LcAll, "");
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 

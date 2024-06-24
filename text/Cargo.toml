@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-text"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2021"
 authors = ["Jeff Garzik"]
 license = "MIT"
@@ -11,12 +11,15 @@ plib = { path = "../plib" }
 clap.workspace = true
 gettext-rs.workspace = true
 topological-sort = "0.2"
-diff = "0.1"
 regex.workspace = true
-chrono = "0.4"
-dirs = "5.0.1"
-atty = "0.2.14"
-libc = "0.2.155"
+chrono.workspace = true
+libc.workspace = true
+notify-debouncer-full = "0.3"
+ctor = "0.2"
+atty.workspace = true
+diff = "0.1"
+dirs = "5.0"
+deunicode = "1.6"
 
 [[bin]]
 name = "asa"
@@ -25,6 +28,10 @@ path = "src/asa.rs"
 [[bin]]
 name = "comm"
 path = "src/comm.rs"
+
+[[bin]]
+name = "unexpand"
+path = "src/unexpand.rs"
 
 [[bin]]
 name = "csplit"
@@ -39,8 +46,8 @@ name = "cut"
 path = "src/cut.rs"
 
 [[bin]]
-name = "nohup"
-path = "src/nohup.rs"
+name = "uniq"
+path = "src/uniq.rs"
 
 [[bin]]
 name = "sort"
@@ -51,12 +58,20 @@ name = "expand"
 path = "src/expand.rs"
 
 [[bin]]
+name = "tr"
+path = "src/tr.rs"
+
+[[bin]]
 name = "fold"
 path = "src/fold.rs"
 
 [[bin]]
 name = "head"
 path = "src/head.rs"
+
+[[bin]]
+name = "tail"
+path = "src/tail.rs"
 
 [[bin]]
 name = "nl"

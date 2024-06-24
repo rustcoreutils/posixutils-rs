@@ -1,0 +1,288 @@
+/*
+* Copyright (c) 2024 Hemi Labs, Inc.
+*
+* This file is part of the posixutils-rs project covered under
+* the MIT License.  For the full license text, please see the LICENSE
+* file in the root directory of this project.
+* SPDX-License-Identifier: MIT
+*/
+
+
+/*
+Uses sin(x) = x - x^3/3! + x^5/5! - x^7/7! + ...
+(http://www.hvks.com/Numerical/Downloads/HVE%20Fast%20Trigonometric%20functions%20for%20arbitrary%20precision.pdf)
+*/
+define s(x) {
+	auto b, y, f, i, v, r, z, p, s, m;
+
+	/* b: previous ibase */
+	/* y: x^i */
+	/* f: i! */
+	/* i: index of the current Taylor term */
+	/* v: y / f */
+	/* r: current estimate for sin(x) */
+	/* z: -x^2 */
+	/* p: the value of pi */
+	/* s: previous scale */
+	/* m: 1 if pi has been subtracted from x */
+
+	b = ibase;
+	ibase = A;
+
+	p = 4 * a(1);
+
+	/* sin(x) = sin(x mod (2 * pi)) */
+	s = scale;
+	scale = 0;
+	x %= 2 * p;
+	scale = s;
+
+	/* sin(x) = -sin(x - pi) for x >= pi */
+	if (x >= p) {
+		x -= p;
+		m = 1;
+	}
+
+	r = y = x;
+	z = -(x * x);
+	v = 1;
+	f = 1;
+	for (i = 3; v; i += 2) {
+		y *= z;
+		f *= (i - 1) * i;
+		v = y / f;
+		r += v;
+	}
+
+	ibase = b;
+
+	if (m) return(-r);
+	return(r);
+}
+
+/*
+Uses cos(x) = sin(x + pi/2)
+*/
+define c(x) {
+	auto b, r;
+	b = ibase;
+	ibase = A;
+	r = s(x + 2 * a(1))
+	ibase = b;
+	return(r);
+}
+
+/*
+Uses atan(x) = x - x^3/3 + x^5/5 - x^7/7 + ...
+The function uses the identity atan(x) = 2 * atan(y / (1 + sqrt(1 + y^2)))
+to get the value of |x| below 1.
+(http://www.hvks.com/Numerical/Downloads/HVE%20Fast%20Trigonometric%20functions%20for%20arbitrary%20precision.pdf)
+*/
+define a(x) {
+	auto b, r, i, y, d, m, z, v;
+
+	/* b: previous ibase */
+	/* r: current estimate for atan(x) */
+	/* i: index of the current Taylor term */
+	/* y: x^i */
+	/* d: 2 if x has been scaled, 1 otherwise */
+	/* m: 1 if x is negative */
+	/* z: -x^2 */
+	/* v: y / i */
+
+
+	b = ibase;
+	ibase = A;
+
+	if (x < 0) {
+		m = 1;
+		x = -x;
+	}
+
+	d = 1;
+	if (x >= 1) {
+		x = x / (1 + sqrt(1 + x * x));
+		d = 2;
+	}
+
+	y = r = x;
+	z = -(x * x);
+	v = 1;
+	for (i = 3; v; i += 2) {
+		y *= z;
+		v = y / i;
+		r += v;
+	}
+
+	ibase = b;
+
+	r *= d;
+	if (m) return(-r);
+	return(r);
+}
+
+/*
+Uses ln(x) = 2 * artanh(y) = 2 * (y + y^3/3 + y^5/5 + ...)
+where y = (x - 1) / (x + 1).
+The function uses the identity l(x) = 2 * l(sqrt(x)) to get the value of x
+between 0.9 and 1.2 (values chosen through testing).
+(http://www.hvks.com/Numerical/Downloads/HVE%20Fast%20Log()%20calculation%20for%20arbitrary%20precision.pdf)
+*/
+define l(x) {
+	auto b, r, i, d, v, y, z;
+
+	/* b: previous ibase */
+	/* r: current estimate for ln(x) */
+	/* i: index of the current Taylor term */
+	/* d: the exponent of the result */
+	/* v: y / i */
+	/* y: ((x - 1) / (x + 1))^i */
+	/* z: y^2 */
+
+	b = ibase;
+	ibase = A;
+
+	/* the function is not defined for x < 0
+	   this matches the behavior of GNU bc */
+	if(x <= 0) return((1 - 10^scale) / 1)
+
+	d = 1;
+	while(x > 1.2) {
+		x = sqrt(x);
+		d *= 2;
+	}
+	while (x < 0.9) {
+		x = sqrt(x);
+		d *= 2;
+	}
+
+	y = (x - 1) / (x + 1);
+	z = y * y;
+	r = y;
+	v = 1;
+	for(i = 3; v; i += 2) {
+		y *= z;
+		v = y / i;
+		r += v;
+	}
+
+	ibase = b;
+
+	return (d * 2 * r)
+}
+
+/*
+Uses e ^ x = 1 + x + x/2! + x/3! + ...
+For x > 1, the Taylor series converges very slowly, so the
+function uses the identity e(x) = e(x/2)^2 to get the value of x
+under 1.
+If x is negative we negate x and divide compute the reciprocal of
+the result at the end.
+(http://www.hvks.com/Numerical/Downloads/HVE%20Fast%20Exp()%20calculation%20for%20arbitrary%20precision.pdf)
+*/
+define e(x) {
+	auto f, y, v, i, r, d, s, b, m;
+
+	/* f: i! */
+	/* y: x^i */
+	/* v: y / f */
+	/* i: index of the current Taylor term */
+	/* r: current estimate for e^x */
+	/* d: the exponent of the result */
+	/* s: previous scale */
+	/* b: previous ibase */
+	/* m: 1 if x is negative */
+
+	b = ibase;
+	s = scale;
+	ibase = A;
+
+	if (x < 1) {
+		m = 1;
+		x = -x;
+	}
+
+	/* each division by 2 can add at most one fractional digit to
+	   x so we need to increase scale by one on every iteration */
+	scale = scale(x) + 1;
+	d = 1;
+	while (x > 1) {
+		x /= 2;
+		d *= 2;
+		scale += 1;
+	}
+
+	scale = s;
+
+	f = 1;
+	v = 1;
+	y = x;
+	r = 1 + x;
+	/* the loop runs until y / f is not 0, meaning
+	   until the number can be represented using the current scale */
+	for (i = 2; v; ++i) {
+		f *= i;
+		y *= x;
+		v = y / f;
+		r += v;
+	}
+	r ^= d;
+
+	ibase = b;
+	scale = s;
+
+	if (m) return(1 / r);
+	return(r/1);
+}
+
+/*
+Uses j(n, x) = x^n / (2^n * n!) * (1 - x^2/(2^2*1!*(n+1)) + x^4/(2^4*2!*(n+1)*(n+2)) - x^6/(2^6*3!*(n+1)*(n+2)*(n+3)) ...)
+and j(-n, x) = (-1)^n * j(n, x)
+*/
+define j(n, x) {
+	auto b, r, y, v, z, i, d, g, m, s;
+
+	/* b: previous ibase */
+	/* r: current estimate for j(n, x) */
+	/* y: x^(2i) */
+	/* v: y / d */
+	/* z: -x^2 */
+	/* i: index of the current Taylor term */
+	/* d: the denominator of the above series */
+	/* g: x^n / (2^n * n!) */
+	/* m: 1 if n is negative */
+	/* s: previous scale */
+
+	b = ibase;
+
+	s = scale;
+	scale = 0;
+	/* make n an integer */
+	n /= 1;
+	if (n < 0) {
+		n = -n;
+		if (n % 2) m = 1;
+	}
+	scale = s;
+
+	y = r = v = 1;
+	z = -(x * x);
+	d = 1;
+	for (i = 1; v; ++i) {
+		y *= z;
+		d *= 4 * i * (n + i);
+		v = y / d;
+		r += v;
+	}
+
+	g = 1;
+	for (i = 1; i <= n; ++i) g *= i;
+	g = x^n / (2^n * g);
+
+	ibase = b;
+
+	if (m) return(-g * r);
+	return(g * r);
+}
+
+scale = 20;

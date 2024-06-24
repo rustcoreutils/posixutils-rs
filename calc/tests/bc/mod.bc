@@ -1,0 +1,24 @@
+scale = 0
+a = 4 % 2
+scale(a)
+a
+
+scale = 1
+a = 4.000 % 2
+scale(a)
+a
+
+scale = 4
+a = 4 % 2
+scale(a)
+a
+
+scale = 2
+a = 4.000 % 2.00
+scale(a)
+a
+
+scale = 0
+23.234 % 7.8902
+
+quit

@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2024 Jeff Garzik
+// Copyright (c) 2024 Hemi Labs, Inc.
 //
 // This file is part of the posixutils-rs project covered under
 // the MIT License.  For the full license text, please see the LICENSE
@@ -8,7 +8,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, textdomain};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::lzw::UnixLZWWriter;
 use plib::PROJECT_NAME;
 use std::fs::{self, File};
@@ -117,6 +117,7 @@ fn compress_file(args: &Args, pathname: &PathBuf) -> io::Result<i32> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = Args::parse();
 
+    setlocale(LocaleCategory::LcAll, "");
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 

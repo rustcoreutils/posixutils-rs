@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2024 Jeff Garzik
+// Copyright (c) 2024 Hemi Labs, Inc.
 //
 // This file is part of the posixutils-rs project covered under
 // the MIT License.  For the full license text, please see the LICENSE
@@ -9,7 +9,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, textdomain};
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use regex::Regex;
 use std::{
@@ -643,6 +643,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     // Initialize translation system
+    setlocale(LocaleCategory::LcAll, "");
     textdomain(PROJECT_NAME).unwrap();
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8").unwrap();
 

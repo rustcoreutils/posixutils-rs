@@ -1,0 +1,6 @@
+define f() {
+}
+
+f()
+
+quit

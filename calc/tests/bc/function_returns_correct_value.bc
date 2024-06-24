@@ -1,0 +1,6 @@
+define f() {
+	return(999)
+}
+
+f()
+quit

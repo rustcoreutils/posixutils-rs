@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-process"
-version = "0.1.7"
+version = "0.1.11"
 edition = "2021"
 authors = ["Jeff Garzik"]
 license = "MIT"
@@ -13,6 +13,8 @@ gettext-rs.workspace = true
 libc.workspace = true
 errno = "0.3"
 regex.workspace = true
+atty.workspace = true
+dirs = "5.0"
 
 [[bin]]
 name = "env"
@@ -25,6 +27,10 @@ path = "src/kill.rs"
 [[bin]]
 name = "nice"
 path = "src/nice.rs"
+
+[[bin]]
+name = "nohup"
+path = "src/nohup.rs"
 
 [[bin]]
 name = "renice"

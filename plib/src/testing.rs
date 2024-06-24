@@ -20,7 +20,11 @@ pub struct TestPlan {
 }
 
 fn run_test_base(plan: TestPlan) -> (TestPlan, Output) {
-    let relpath = format!("target/release/{}", plan.cmd);
+    let relpath = if cfg!(debug_assertions) {
+        format!("target/debug/{}", plan.cmd)
+    } else {
+        format!("target/release/{}", plan.cmd)
+    };
     let test_bin_path = std::env::current_dir()
         .unwrap()
         .parent()

@@ -1,0 +1,9 @@
+define x() {
+	quit
+}
+if (0) quit
+while (0) quit
+for (0; 0; 0) quit
+1
+2
+3

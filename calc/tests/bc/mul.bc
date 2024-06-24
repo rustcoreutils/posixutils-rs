@@ -1,0 +1,28 @@
+a = 2 * 2
+scale(a)
+a
+
+scale = 2
+a = 2.000 * 2.000
+scale(a)
+a
+
+scale = 10
+a = 2.000 * 2.000
+scale(a)
+a
+
+scale = 10
+a = 2.000 * 2.0
+scale(a)
+a
+
+scale = 10
+a = 2.0 * 2.000
+scale(a)
+a
+
+scale = 100
+890901.1340 * 234.93124012384009
+
+quit

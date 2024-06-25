@@ -1,6 +1,10 @@
-use std::{fs::File, io::BufWriter};
+use std::io::Write;
+use std::{
+    fs::{self, File},
+    io::{self, BufWriter},
+};
 
-use crate::patch_utils::{context_hunk_data::ContextHunkOrderIndex, patch_line::PatchLine};
+use crate::patch_utils::patch_line::PatchLine;
 
 use super::{
     constants::{
@@ -11,7 +15,7 @@ use super::{
     context_hunk_range_data::ContextHunkRangeData,
     edit_script_hunk_data::EditScriptHunkData,
     edit_script_range_data::EditScriptHunkKind,
-    functions::{is_edit_script_range, is_normal_range},
+    functions::{is_edit_script_range, is_normal_range, print_error},
     hunk::Hunk,
     hunks::Hunks,
     normal_hunk_data::NormalHunkData,
@@ -34,7 +38,7 @@ pub struct Patch<'a> {
     patch_f1_header: Option<&'a String>,
     patch_f2_header: Option<&'a String>,
     patch_options: PatchOptions,
-    output: Option<BufWriter<File>>,
+    output: BufWriter<File>,
 }
 
 impl<'a> Patch<'a> {
@@ -46,6 +50,11 @@ impl<'a> Patch<'a> {
         if matches!(patch_file.kind(), PatchFileKind::Patch)
             && !matches!(main_file.kind(), PatchFileKind::Patch)
         {
+            println!(
+                "patching file {}",
+                main_file.path().file_name().unwrap().to_str().unwrap()
+            );
+
             let patch_format = if let Some(patch_format) = patch_options.patch_format() {
                 *patch_format
             } else {
@@ -75,31 +84,26 @@ impl<'a> Patch<'a> {
             let mut patch_options = patch_options;
             patch_options.update_patch_format(patch_format);
 
-            let mut possible_self = Self {
+            let output_file = File::open(main_file.path());
+
+            if output_file.is_err() {
+                return Err(PatchError::CouldNotOpenPatchDestinationFile);
+            }
+
+            let output =
+                BufWriter::new(output_file.expect("failed to open patch destination file!"));
+
+            let possible_self = Self {
                 patch: patch_file,
                 file: main_file,
                 hunks,
                 patch_f1_header,
                 patch_f2_header,
                 patch_options,
-                output: None,
+                output: output,
             };
 
-            possible_self.verify_hunks();
-
-            match possible_self.hunks.kind() {
-                PatchFormat::None => {}
-                PatchFormat::Normal => {}
-                PatchFormat::Unified => {}
-                PatchFormat::Context => {
-                    possible_self.hunks.modify_hunks(|hunks_mut| {
-                        for hunk in hunks_mut {
-                            hunk.order_context_lines();
-                        }
-                    });
-                }
-                PatchFormat::EditScript => {}
-            }
+            possible_self.verify();
 
             return Ok(possible_self);
         }
@@ -107,7 +111,7 @@ impl<'a> Patch<'a> {
         Err(PatchError::InvalidPatchFile)
     }
 
-    /// panics if patch_format is NONE
+    /// panics if patch_format is NONE or reversed is enabled with ed script
     pub fn apply(&'a mut self) -> PatchResult<()> {
         if let Some(patch_format) = self.patch_options.patch_format() {
             match (patch_format, self.patch_options.reverse()) {
@@ -120,7 +124,8 @@ impl<'a> Patch<'a> {
                 (PatchFormat::Context, true) => self.apply_context_reverse(),
                 (PatchFormat::EditScript, false) => self.apply_edit_script(),
                 (PatchFormat::EditScript, true) => {
-                    panic!("Applying patch of ed format, reversed, is not possible!")
+                    print_error("ed format + reverse option is not possible!");
+                    std::process::exit(0);
                 }
             }
         } else {
@@ -359,10 +364,11 @@ impl<'a> Patch<'a> {
             })
         });
 
-        let mut _new_file_line = 1usize;
-        let mut old_file_line = 1usize;
+        let mut original_file_line = 1usize;
+        let mut change_index = 0usize;
+        let mut no_newline_count = 0usize;
 
-        for hunk in self.hunks.hunks().iter() {
+        for hunk in self.hunks.hunks_mut().iter_mut() {
             let f2_range = hunk.context_hunk_data().f2_range();
             let f1_range = hunk.context_hunk_data().f1_range();
 
@@ -370,55 +376,71 @@ impl<'a> Patch<'a> {
                 return Err(PatchError::InvalidContextHunkRange);
             }
 
-            let (f1_range, _f2_range) = (f1_range.unwrap(), f2_range.unwrap());
+            let range1 = f1_range.unwrap();
 
-            if f1_range.start() > old_file_line {
-                let start = old_file_line;
-                for j in start..f1_range.start() {
-                    println!("{}", self.file.lines()[j - 1]);
-                    old_file_line += 1;
-                    _new_file_line += 1;
+            if range1.start() > original_file_line {
+                let start = original_file_line;
+                for _ in start..range1.start() {
+                    println!("{}", self.file.lines()[original_file_line - 1]);
+                    original_file_line += 1;
                 }
             }
 
-            let ordered_lines_indeces = hunk.context_hunk_ordered_lines_indeces();
+            let hunk_data = hunk.context_hunk_data();
+            let original_is_empty = hunk_data.is_original_empty(ORIGINAL_SKIP);
 
-            if let Some(ordered_lines_indeces) = ordered_lines_indeces {
-                for order_line_index in ordered_lines_indeces {
-                    let patch_line = hunk
-                        .context_hunk_data()
-                        .get_by_order_index(order_line_index);
+            let patch_lines: &Vec<PatchLine> = if original_is_empty {
+                hunk.context_hunk_data().modified_lines()
+            } else {
+                hunk.context_hunk_data().original_lines()
+            };
 
-                    match patch_line {
-                        PatchLine::ContextInserted(_, _) => {
-                            println!("{}", patch_line.original_line());
-                            _new_file_line += 1;
-                        }
-                        PatchLine::ContextDeleted(_, _) => {
-                            old_file_line += 1;
-                        }
-                        PatchLine::ContextUnchanged(_) => {
-                            println!("{}", patch_line.original_line());
-                            old_file_line += 1;
-                            _new_file_line += 1;
-                        }
-                        PatchLine::NoNewLine(_) => {
-                            if matches!(order_line_index, ContextHunkOrderIndex::Original(_)) {
-                                old_file_line += 1;
-                            }
+            for patch_line in patch_lines {
+                match patch_line {
+                    PatchLine::ContextInserted(_, is_change) => {
+                        println!("{}", patch_line.original_line());
 
-                            _new_file_line += 1;
-                        }
-
-                        _ => {
-                            dbg!(&patch_line);
-                            return Err(PatchError::InvalidContextPatchLine);
+                        if *is_change {
+                            original_file_line += 1;
                         }
                     }
+                    PatchLine::ContextDeleted(_, is_change) => {
+                        if *is_change {
+                            println!(
+                                "{}",
+                                hunk_data.change_by_index(change_index).original_line()
+                            );
+                            change_index += 1;
+                        }
+
+                        original_file_line += 1;
+                    }
+                    PatchLine::ContextUnchanged(_) => {
+                        println!("{}", patch_line.original_line());
+                        original_file_line += 1;
+                    }
+                    PatchLine::ContextHunkRange(_) => {}
+                    PatchLine::ContextHunkSeparator(_) => {}
+                    PatchLine::NoNewLine(_) => {
+                        no_newline_count += 1;
+                    }
+                    _ => {
+                        return Err(PatchError::InvalidContextPatchLine);
+                    }
                 }
-            } else {
-                panic!("ContextHunkData.ordered_lines should not be None!");
             }
+        }
+
+        match no_newline_count {
+            0 => println!(),
+            1 => {
+                if matches!(self.file.kind(), PatchFileKind::Original)
+                    && !self.file.ends_with_newline()
+                {
+                    println!();
+                }
+            }
+            _ => {}
         }
 
         Ok(())
@@ -441,7 +463,7 @@ impl<'a> Patch<'a> {
                 let start = old_file_line;
 
                 for j in start..range_left.start() {
-                    println!("{}", self.file.lines()[j - 1]);
+                    writeln!(self.output, "{}", self.file.lines()[j - 1])?;
                     old_file_line += 1;
                     _new_file_line += 1;
                 }
@@ -459,7 +481,11 @@ impl<'a> Patch<'a> {
                         match data.kind() {
                             super::normal_range_data::NormalRangeKind::Insert => {
                                 if old_file_line <= range_left.start() {
-                                    println!("{}", self.file.lines()[old_file_line - 1]);
+                                    writeln!(
+                                        self.output,
+                                        "{}",
+                                        self.file.lines()[old_file_line - 1]
+                                    )?;
                                 }
 
                                 _new_file_line += left_diff + 1;
@@ -475,7 +501,7 @@ impl<'a> Patch<'a> {
                     }
                     PatchLine::NormalChangeSeparator(_) => {}
                     PatchLine::NormalNewLine(_) => {
-                        println!("{}", patch_line.original_line());
+                        writeln!(self.output, "{}", patch_line.original_line())?;
                     }
                     PatchLine::NormalOldLine(_) => {}
                     PatchLine::NoNewLine(_) => {
@@ -492,7 +518,7 @@ impl<'a> Patch<'a> {
                 if matches!(self.file.kind(), PatchFileKind::Original)
                     && !self.file.ends_with_newline()
                 {
-                    println!();
+                    writeln!(self.output, "")?;
                 }
             }
             _ => {}
@@ -525,7 +551,7 @@ impl<'a> Patch<'a> {
                     range.start()
                 };
                 while old_file_line < old_file_boundry {
-                    println!("{}", self.file.lines()[old_file_line - 1]);
+                    writeln!(self.output, "{}", self.file.lines()[old_file_line - 1])?;
                     old_file_line += 1;
                     _new_file_line += 1;
                 }
@@ -550,11 +576,11 @@ impl<'a> Patch<'a> {
                         }
                     }
                     PatchLine::EditScriptInsert(data) => {
-                        println!("{}", data.line());
+                        writeln!(self.output, "{}", data.line())?;
                         _new_file_line += 1;
                     }
                     PatchLine::EditScriptChange(data) => {
-                        println!("{}", data.line());
+                        writeln!(self.output, "{}", data.line())?;
                         _new_file_line += 1;
                     }
                     PatchLine::NoNewLine(_) => no_new_line_count += 1,
@@ -565,7 +591,7 @@ impl<'a> Patch<'a> {
 
         if self.file.lines().len() > old_file_line {
             while old_file_line <= self.file.lines().len() {
-                println!("{}", self.file.lines()[old_file_line - 1]);
+                writeln!(self.output, "{}", self.file.lines()[old_file_line - 1])?;
                 old_file_line += 1;
                 _new_file_line += 1;
             }
@@ -586,10 +612,13 @@ impl<'a> Patch<'a> {
         Ok(())
     }
 
-    fn verify_hunks(&self) {
+    fn verify(&self) {
         self.hunks.hunks().iter().for_each(|hunk| {
             hunk.verify_hunk();
         });
+
+        let reversed = self.patch_options.reverse();
+        self.verify_file(reversed)
     }
 
     fn apply_normal_reverse(&mut self) -> Result<(), PatchError> {
@@ -607,7 +636,7 @@ impl<'a> Patch<'a> {
                 let start = new_file_line;
 
                 for j in start..range_right.start() {
-                    println!("{}", self.file.lines()[j - 1]);
+                    writeln!(self.output, "{}", self.file.lines()[j - 1])?;
                     new_file_line += 1;
                 }
             }
@@ -627,7 +656,11 @@ impl<'a> Patch<'a> {
                             }
                             super::normal_range_data::NormalRangeKind::Delete => {
                                 if new_file_line <= range_right.start() {
-                                    println!("{}", self.file.lines()[new_file_line - 1]);
+                                    writeln!(
+                                        self.output,
+                                        "{}",
+                                        self.file.lines()[new_file_line - 1]
+                                    )?;
                                     new_file_line += 1;
                                 }
                             }
@@ -635,7 +668,9 @@ impl<'a> Patch<'a> {
                     }
                     PatchLine::NormalChangeSeparator(_) => {}
                     PatchLine::NormalNewLine(_) => {}
-                    PatchLine::NormalOldLine(_) => println!("{}", patch_line.original_line()),
+                    PatchLine::NormalOldLine(_) => {
+                        writeln!(self.output, "{}", patch_line.original_line())?;
+                    }
                     PatchLine::NoNewLine(_) => no_new_line_count += 1,
                     _ => panic!("Only PatchLines that start with Normal are allowed!"),
                 }
@@ -673,7 +708,7 @@ impl<'a> Patch<'a> {
             if f2_range.start() > new_file_line {
                 let start = new_file_line;
                 for j in start..f2_range.start() {
-                    println!("{}", self.file.lines()[j - 1]);
+                    writeln!(self.output, "{}", self.file.lines()[j - 1])?;
                     new_file_line += 1;
                 }
             }
@@ -683,10 +718,10 @@ impl<'a> Patch<'a> {
                 match patch_line {
                     PatchLine::UnifiedHunkHeader(_) => {}
                     PatchLine::UnifiedDeleted(_) => {
-                        println!("{}", patch_line.original_line());
+                        writeln!(self.output, "{}", patch_line.original_line())?;
                     }
                     PatchLine::UnifiedUnchanged(_) => {
-                        println!("{}", patch_line.original_line());
+                        writeln!(self.output, "{}", patch_line.original_line())?;
                         new_file_line += 1;
                     }
                     PatchLine::UnifiedInserted(_) => {
@@ -704,7 +739,7 @@ impl<'a> Patch<'a> {
                 if matches!(self.file.kind(), PatchFileKind::Original)
                     && !self.file.ends_with_newline()
                 {
-                    println!();
+                    writeln!(self.output, "")?;
                 }
             }
             _ => {}
@@ -734,17 +769,18 @@ impl<'a> Patch<'a> {
                 return Err(PatchError::InvalidContextHunkRange);
             }
 
-            let (_, f2_range) = (f1_range.unwrap(), f2_range.unwrap());
+            let f2_range = f2_range.unwrap();
 
             if f2_range.start() > new_file_line {
                 let start = new_file_line;
                 for _ in start..f2_range.start() {
-                    println!("{}",  self.file.lines()[new_file_line - 1]);
+                    writeln!(self.output, "{}", self.file.lines()[new_file_line - 1])?;
                     new_file_line += 1;
                 }
             }
 
             let original_is_empty = hunk.context_hunk_data().is_original_empty(ORIGINAL_SKIP);
+
             let lines: &Vec<PatchLine> = if original_is_empty {
                 hunk.context_hunk_data().modified_lines()
             } else {
@@ -757,14 +793,14 @@ impl<'a> Patch<'a> {
                         new_file_line += 1;
                     }
                     PatchLine::ContextDeleted(_, is_change) => {
-                        println!("{}", patch_line.original_line());
+                        writeln!(self.output, "{}", patch_line.original_line())?;
 
                         if *is_change {
                             new_file_line += 1;
                         }
                     }
                     PatchLine::ContextUnchanged(_) => {
-                        println!("{}", patch_line.original_line());
+                        writeln!(self.output, "{}", patch_line.original_line())?;
                         new_file_line += 1;
                     }
                     PatchLine::ContextHunkRange(_) => {}
@@ -785,12 +821,43 @@ impl<'a> Patch<'a> {
                 if matches!(self.file.kind(), PatchFileKind::Modified)
                     && !self.file.ends_with_newline()
                 {
-                    println!();
+                    writeln!(self.output, "")?;
                 }
             }
             _ => {}
         }
 
         Ok(())
+    }
+
+    fn verify_file(&self, reversed: bool) {
+        for hunk in self.hunks.hunks() {
+            if let Err(()) = hunk.verify_file(self.file, reversed) {
+                self.reject();
+                print_error("garbage patch detected!");
+                std::process::exit(0);
+            }
+        }
+    }
+
+    fn reject(&self) {
+        let reject_file_name = format!(
+            "{}.rej",
+            self.file.path().file_name().unwrap().to_str().unwrap()
+        );
+        if fs::copy(
+            self.patch.path(),
+            self.patch.path().with_file_name(reject_file_name),
+        )
+        .is_err()
+        {
+            print_error("failed to write reject file!");
+        }
+    }
+}
+
+impl From<io::Error> for PatchError {
+    fn from(value: io::Error) -> Self {
+        PatchError::IOError(value.kind())
     }
 }

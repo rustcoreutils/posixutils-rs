@@ -1,4 +1,7 @@
-use super::{normal_range_data::NormalRangeKind, patch_line::PatchLine, range::Range};
+use super::{
+    functions::verify_patch_line, normal_range_data::NormalRangeKind, patch_line::PatchLine,
+    range::Range,
+};
 use crate::patch_utils::patch_format::PatchFormat;
 
 #[derive(Debug)]
@@ -48,5 +51,70 @@ impl<'a> NormalHunkData<'a> {
 
     pub(crate) fn verify_hunk(&self) {
         // TODO
+    }
+
+    pub(crate) fn verify_file(
+        &self,
+        file: &super::patch_file::PatchFile,
+        reversed: bool,
+    ) -> Result<(), ()> {
+        let mut original_file_line = usize::max(1, self.range_left.start());
+        let mut modified_file_line = usize::max(1, self.range_right.start());
+
+        match self.kind {
+            NormalRangeKind::Insert => {
+                for line in self
+                    .lines()
+                    .iter()
+                    .filter(|&patch_line| matches!(patch_line, PatchLine::NormalNewLine(_)))
+                {
+                    if reversed {
+                        verify_patch_line(
+                            line.original_line(),
+                            &file.lines()[modified_file_line - 1],
+                        )?;
+                    }
+
+                    modified_file_line += 1;
+                }
+            }
+            NormalRangeKind::Change => {
+                for line in self.lines() {
+                    if matches!(line, PatchLine::NormalNewLine(_)) && reversed {
+                        verify_patch_line(
+                            line.original_line(),
+                            &file.lines()[modified_file_line - 1],
+                        )?;
+                        modified_file_line += 1;
+                    }
+
+                    if matches!(line, PatchLine::NormalOldLine(_)) && !reversed {
+                        verify_patch_line(
+                            line.original_line(),
+                            &file.lines()[original_file_line - 1],
+                        )?;
+                        original_file_line += 1;
+                    }
+                }
+            }
+            NormalRangeKind::Delete => {
+                for line in self
+                    .lines()
+                    .iter()
+                    .filter(|&patch_line| matches!(patch_line, PatchLine::NormalOldLine(_)))
+                {
+                    if !reversed {
+                        verify_patch_line(
+                            line.original_line(),
+                            &file.lines()[original_file_line - 1],
+                        )?;
+                    }
+
+                    original_file_line += 1;
+                }
+            }
+        }
+
+        Ok(())
     }
 }

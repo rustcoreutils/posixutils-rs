@@ -1,9 +1,6 @@
 use super::{
-    context_hunk_data::{ContextHunkData, ContextHunkOrderIndex},
-    edit_script_hunk_data::EditScriptHunkData,
-    normal_hunk_data::NormalHunkData,
-    patch_format::PatchFormat,
-    patch_line::PatchLine,
+    context_hunk_data::ContextHunkData, edit_script_hunk_data::EditScriptHunkData,
+    normal_hunk_data::NormalHunkData, patch_format::PatchFormat, patch_line::PatchLine,
     unified_hunk_data::UnifiedHunkData,
 };
 
@@ -48,14 +45,6 @@ impl<'a> Hunk<'a> {
         }
     }
 
-    pub fn context_hunk_ordered_lines_indeces(&self) -> &Option<Vec<ContextHunkOrderIndex>> {
-        if let Hunk::Context(data) = self {
-            data.ordered_lines_indices()
-        } else {
-            panic!("No context-hunk-data for variants other than ContextHunk");
-        }
-    }
-
     pub fn unified_hunk_data(&self) -> &UnifiedHunkData<'a> {
         match self {
             Hunk::Unified(data) => data,
@@ -77,12 +66,6 @@ impl<'a> Hunk<'a> {
         }
     }
 
-    pub fn order_context_lines(&mut self) {
-        if let Hunk::Context(data) = self {
-            data.order_lines();
-        }
-    }
-
     pub fn add_patch_line(&mut self, patch_line: PatchLine<'a>) {
         match self {
             Hunk::Unified(data) => data.add_patch_line(patch_line),
@@ -98,6 +81,19 @@ impl<'a> Hunk<'a> {
             Hunk::Context(data) => data.verify_hunk(),
             Hunk::EditScript(data) => data.verify_hunk(),
             Hunk::Normal(data) => data.verify_hunk(),
+        }
+    }
+
+    pub(crate) fn verify_file(
+        &self,
+        file: &super::patch_file::PatchFile,
+        reversed: bool,
+    ) -> Result<(), ()> {
+        match self {
+            Hunk::Unified(data) => data.verify_file(file, reversed),
+            Hunk::Context(data) => data.verify_file(file, reversed),
+            Hunk::EditScript(data) => data.verify_file(file),
+            Hunk::Normal(data) => data.verify_file(file, reversed),
         }
     }
 }

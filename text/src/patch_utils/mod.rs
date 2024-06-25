@@ -8,7 +8,6 @@ pub(crate) mod hunk;
 pub(crate) mod hunks;
 pub(crate) mod normal_hunk_data;
 pub(crate) mod normal_range_data;
-pub(crate) mod order_index;
 pub(crate) mod patch;
 pub(crate) mod patch_file;
 pub(crate) mod patch_file_kind;

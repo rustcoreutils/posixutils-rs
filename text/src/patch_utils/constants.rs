@@ -22,5 +22,5 @@ pub mod regex {
 
 pub mod context {
     pub const ORIGINAL_SKIP: usize = 2; // 0 is Hunk separator; 1 is original range
-    pub const MODIFIED_SKIP: usize = 1; // 0 is original range
+                                        // pub const MODIFIED_SKIP: usize = 1; // 0 is original range
 }

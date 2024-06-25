@@ -1,15 +1,6 @@
-use crate::patch_utils::{
-    constants::context::{MODIFIED_SKIP, ORIGINAL_SKIP},
-    order_index::OrderIndex,
-};
+use crate::patch_utils::constants::context::ORIGINAL_SKIP;
 
-use super::{patch_line::PatchLine, range::Range};
-
-#[derive(Debug)]
-pub enum ContextHunkOrderIndex {
-    Original(OrderIndex),
-    Modified(OrderIndex),
-}
+use super::{functions::verify_patch_line, patch_line::PatchLine, range::Range};
 
 #[derive(Debug)]
 pub struct ContextHunkData<'a> {
@@ -18,7 +9,7 @@ pub struct ContextHunkData<'a> {
     original_lines: Vec<PatchLine<'a>>,
     modified_lines: Vec<PatchLine<'a>>,
     add_to_modified: bool,
-    ordered_lines_indeces: Option<Vec<ContextHunkOrderIndex>>,
+    change_indices: Vec<usize>,
 }
 
 impl<'a> ContextHunkData<'a> {
@@ -42,7 +33,7 @@ impl<'a> ContextHunkData<'a> {
             original_lines,
             modified_lines,
             add_to_modified: false,
-            ordered_lines_indeces: None,
+            change_indices: vec![],
         }
     }
 
@@ -61,10 +52,18 @@ impl<'a> ContextHunkData<'a> {
         }
 
         if self.add_to_modified {
+            if matches!(patch_line, PatchLine::ContextInserted(_, true)) {
+                self.change_indices.push(self.modified_lines.len());
+            }
+
             self.modified_lines.push(patch_line);
         } else {
             self.original_lines.push(patch_line);
         }
+    }
+
+    pub fn change_by_index(&self, index: usize) -> &PatchLine<'a> {
+        &self.modified_lines[self.change_indices[index]]
     }
 
     pub fn update_f1_range(&mut self, f1_range: Range) {
@@ -98,161 +97,87 @@ impl<'a> ContextHunkData<'a> {
             .all(|mached| !mached)
     }
 
-    pub fn is_modified_empty(&self, skip: usize) -> bool {
-        self.modified_lines
-            .iter()
-            .skip(skip)
-            .map(|patch_line| {
-                matches!(
-                    patch_line,
-                    PatchLine::NoNewLine(_)
-                        | PatchLine::ContextInserted(_, _)
-                        | PatchLine::ContextUnchanged(_)
-                )
-            })
-            .all(|mached| !mached)
-    }
-
-    pub fn ordered_lines_indices(&self) -> &Option<Vec<ContextHunkOrderIndex>> {
-        &self.ordered_lines_indeces
-    }
-
-    pub fn order_lines(&mut self) {
-        if self.ordered_lines_indeces.is_some() {
-            return;
-        }
-
-        let is_original_empty = self.is_original_empty(ORIGINAL_SKIP);
-        let is_modified_empty = self.is_modified_empty(MODIFIED_SKIP);
-
-        let mut original_index: usize = ORIGINAL_SKIP;
-        let mut modified_index: usize = MODIFIED_SKIP;
-
-        let f1_range_start = self.f1_range().unwrap().start();
-        let f2_range_start = self.f2_range().unwrap().start();
-
-        let original_line_number_by_index =
-            |index: usize| -> usize { index - ORIGINAL_SKIP + f1_range_start };
-
-        let modified_line_number_by_index =
-            |index: usize| -> usize { index - MODIFIED_SKIP + f2_range_start };
-
-        assert!(
-            !is_original_empty || !is_modified_empty,
-            "In a context hunk, both original and modified sections can not be empty!"
-        );
-
-        let mut ordered_lines_indices = Vec::<ContextHunkOrderIndex>::new();
-
-        if is_original_empty {
-            for i in modified_index..self.modified_lines.len() {
-                ordered_lines_indices.push(ContextHunkOrderIndex::Modified(OrderIndex::new(
-                    i,
-                    original_line_number_by_index(original_index),
-                    modified_line_number_by_index(i),
-                )));
-            }
-        } else if is_modified_empty {
-            for i in original_index..self.original_lines.len() {
-                ordered_lines_indices.push(ContextHunkOrderIndex::Original(OrderIndex::new(
-                    i,
-                    original_line_number_by_index(i),
-                    modified_line_number_by_index(modified_index),
-                )));
-            }
-        } else {
-            loop {
-                let original_finished = original_index >= self.original_lines.len();
-                let modified_finished = modified_index >= self.modified_lines.len();
-
-                if original_finished && modified_finished {
-                    break;
-                }
-
-                if original_finished {
-                    if self.is_proper_modified_to_order(modified_index) {
-                        ordered_lines_indices.push(ContextHunkOrderIndex::Modified(
-                            OrderIndex::new(
-                                modified_index,
-                                original_line_number_by_index(original_index),
-                                modified_line_number_by_index(modified_index),
-                            ),
-                        ));
-                    }
-
-                    modified_index += 1;
-                    continue;
-                }
-
-                if modified_finished {
-                    if self.is_proper_original_to_order(original_index) {
-                        ordered_lines_indices.push(ContextHunkOrderIndex::Original(
-                            OrderIndex::new(
-                                original_index,
-                                original_line_number_by_index(original_index),
-                                modified_line_number_by_index(modified_index),
-                            ),
-                        ));
-                    }
-
-                    original_index += 1;
-                    continue;
-                }
-
-                if self.is_proper_original_to_order(original_index) {
-                    ordered_lines_indices.push(ContextHunkOrderIndex::Original(OrderIndex::new(
-                        original_index,
-                        original_line_number_by_index(original_index),
-                        modified_line_number_by_index(modified_index),
-                    )));
-                }
-
-                original_index += 1;
-
-                if self.is_proper_modified_to_order(modified_index) {
-                    ordered_lines_indices.push(ContextHunkOrderIndex::Modified(OrderIndex::new(
-                        modified_index,
-                        original_line_number_by_index(original_index),
-                        modified_line_number_by_index(modified_index),
-                    )));
-                }
-
-                modified_index += 1;
-            }
-        }
-
-        assert!(
-            !ordered_lines_indices.is_empty(),
-            "At least 1 original or modified ContextHunkOrderIndex is required."
-        );
-
-        self.ordered_lines_indeces = Some(ordered_lines_indices);
-    }
-
-    pub fn get_by_order_index(&self, index: &ContextHunkOrderIndex) -> &PatchLine {
-        match index {
-            ContextHunkOrderIndex::Original(index) => &self.original_lines[index.index()],
-            ContextHunkOrderIndex::Modified(index) => &self.modified_lines[index.index()],
-        }
-    }
-
-    pub fn is_proper_modified_to_order(&self, modified_index: usize) -> bool {
-        matches!(
-            self.modified_lines[modified_index],
-            PatchLine::NoNewLine(_)
-                | PatchLine::ContextInserted(_, _)
-                | PatchLine::ContextUnchanged(_)
-        )
-    }
-
-    pub fn is_proper_original_to_order(&self, original_index: usize) -> bool {
-        matches!(
-            self.original_lines[original_index],
-            PatchLine::NoNewLine(_) | PatchLine::ContextDeleted(_, _)
-        )
-    }
-
     pub(crate) fn verify_hunk(&self) {
         // TODO
+    }
+
+    pub(crate) fn verify_file(
+        &self,
+        file: &super::patch_file::PatchFile,
+        reversed: bool,
+    ) -> Result<(), ()> {
+        let r1 = self.f1_range.unwrap();
+        let r2 = self.f2_range.unwrap();
+
+        let mut current_original_line = r1.start();
+        let mut current_modified_line = r2.start();
+
+        let original_is_empty = self.is_original_empty(ORIGINAL_SKIP);
+
+        let lines: &Vec<PatchLine> = if original_is_empty {
+            self.modified_lines()
+        } else {
+            self.original_lines()
+        };
+
+        for line in lines {
+            match line {
+                PatchLine::ContextHunkSeparator(_) => {}
+                PatchLine::ContextInserted(_, is_change) => {
+                    if reversed {
+                        verify_patch_line(
+                            line.original_line(),
+                            &file.lines()[current_modified_line - 1],
+                        )?;
+                    } else if *is_change {
+                        verify_patch_line(
+                            line.original_line(),
+                            &file.lines()[current_original_line - 1],
+                        )?;
+                    }
+
+                    current_modified_line += 1;
+
+                    if *is_change {
+                        current_original_line += 1;
+                    }
+                }
+                PatchLine::ContextDeleted(_, is_change) => {
+                    if !reversed {
+                        verify_patch_line(
+                            line.original_line(),
+                            &file.lines()[current_original_line - 1],
+                        )?;
+                    }
+
+                    current_original_line += 1;
+
+                    if *is_change {
+                        current_modified_line += 1;
+                    }
+                }
+                PatchLine::ContextUnchanged(_) => {
+                    if reversed {
+                        verify_patch_line(
+                            line.original_line(),
+                            &file.lines()[current_modified_line - 1],
+                        )?;
+                    } else {
+                        verify_patch_line(
+                            line.original_line(),
+                            &file.lines()[current_original_line - 1],
+                        )?;
+                    }
+
+                    current_modified_line += 1;
+                    current_original_line += 1;
+                }
+                PatchLine::ContextHunkRange(_) => {}
+                PatchLine::NoNewLine(_) => {}
+                _ => panic!("Invalid PatchLine detected in context hunk!"),
+            }
+        }
+
+        Ok(())
     }
 }

@@ -31,4 +31,12 @@ impl<'a> EditScriptHunkData<'a> {
     pub(crate) fn verify_hunk(&self) {
         // TODO
     }
+
+    pub(crate) fn verify_file(&self, file: &super::patch_file::PatchFile) -> Result<(), ()> {
+        if file.lines().len() >= self.range.end() {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
 }

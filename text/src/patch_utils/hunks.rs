@@ -7,10 +7,6 @@ pub struct Hunks<'a> {
 }
 
 impl<'a> Hunks<'a> {
-    pub fn kind(&self) -> PatchFormat {
-        self.kind
-    }
-
     pub fn new(kind: PatchFormat) -> Self {
         assert!(
             !matches!(kind, PatchFormat::None),

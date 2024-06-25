@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::{fmt::Display, io};
 
 use crate::patch_utils::functions::is_normal_range;
 
@@ -415,6 +415,8 @@ pub enum PatchError {
     InvalidEditScriptRange,
     InvalidEditScriptPatch,
     InvalidNormalRange,
+    CouldNotOpenPatchDestinationFile,
+    IOError(io::ErrorKind),
 }
 
 impl Display for PatchError {
@@ -435,6 +437,8 @@ impl Display for PatchError {
             PatchError::InvalidEditScriptRange => "InvalidEditScriptRange",
             PatchError::InvalidEditScriptPatch => "InvalidEditScriptPatch",
             PatchError::InvalidNormalRange => "InvalidNormalRange",
+            PatchError::CouldNotOpenPatchDestinationFile => "CouldNotOpenPatchDestinationFile",
+            PatchError::IOError(_error_kind) => "IOError",
         };
 
         write!(formatter, "{}", message)

@@ -1,4 +1,8 @@
-use std::{fs, io, path::PathBuf};
+use std::{
+    fs,
+    io::{self},
+    path::PathBuf,
+};
 
 use super::patch_file_kind::PatchFileKind;
 
@@ -62,6 +66,18 @@ impl PatchFile {
 
     pub fn ends_with_newline(&self) -> bool {
         self.ends_with_newline
+    }
+
+    pub(crate) fn copy_to(&self, path: PathBuf) -> io::Result<()> {
+        if let Err(error) = fs::copy(&self.path, path) {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn path(&self) -> &PathBuf {
+        &self.path
     }
 }
 

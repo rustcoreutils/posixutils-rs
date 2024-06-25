@@ -44,3 +44,15 @@ pub fn is_normal_range(line: &str) -> bool {
             .is_match(line)
     })
 }
+
+pub fn verify_patch_line(left: &str, right: &str) -> Result<(), ()> {
+    if left != right {
+        Err(())
+    } else {
+        Ok(())
+    }
+}
+
+pub fn print_error(error: impl Into<String>) {
+    eprintln!("patch: {}", error.into())
+}

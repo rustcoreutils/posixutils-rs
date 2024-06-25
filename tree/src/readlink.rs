@@ -13,19 +13,29 @@ extern crate plib;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
+use std::path::PathBuf;
 use std::{fs, io};
 
-/// link - call link function
+/// readlink — display the contents of a symbolic link
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about)]
 struct Args {
-    file1: String,
+    /// Do not output a trailing <newline> character.
+    #[arg(short, long)]
+    no_newline: bool,
 
-    file2: String,
+    /// The pathname of an existing symbolic link
+    pathname: PathBuf,
 }
 
-fn do_link(file1: &str, file2: &str) -> io::Result<()> {
-    fs::hard_link(file1, file2)?;
+fn do_readlink(args: &Args) -> io::Result<()> {
+    let path = fs::read_link(args.pathname.clone())?;
+
+    if args.no_newline {
+        print!("{}", path.display());
+    } else {
+        println!("{}", path.display());
+    }
 
     Ok(())
 }
@@ -40,9 +50,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut exit_code = 0;
 
-    if let Err(e) = do_link(&args.file1, &args.file2) {
+    if let Err(e) = do_readlink(&args) {
         exit_code = 1;
-        eprintln!("{} -> {}: {}", args.file1, args.file2, e);
+        eprintln!("{}: {}", args.pathname.display(), e);
     }
 
     std::process::exit(exit_code)

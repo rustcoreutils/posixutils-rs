@@ -10,7 +10,7 @@
 use std::ffi::OsString;
 
 use clap::{Parser, ValueEnum};
-use gettextrs::{bind_textdomain_codeset, textdomain};
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use object::{Object, ObjectSection};
 use plib::PROJECT_NAME;
 
@@ -187,6 +187,7 @@ where
 }
 
 fn main() -> StringsResult {
+    setlocale(LocaleCategory::LcAll, "");
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 

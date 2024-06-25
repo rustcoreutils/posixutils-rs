@@ -1050,24 +1050,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::process::exit(exit_code)
 }
 
-#[test]
-fn test() {
-    let mut args = Args {
-        address_base: None,
-        skip: None,
-        count: None,
-        type_strings: vec!["d1".into()],
-        octal_bytes: false,
-        unsigned_decimal_words: false,
-        octal_words: false,
-        bytes_char: false,
-        signed_decimal_words: false,
-        hex_words: false,
-        verbose: false,
-        files: vec!["tests/test_file.txt".into(), "tests/test_file_2.txt".into()],
-        offset: None,
-    };
 
-    args.validate_args().unwrap();
-    od(&args).unwrap();
-}

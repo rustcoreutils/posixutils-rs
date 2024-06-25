@@ -73,6 +73,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] mv
  - [x] nl
  - [x] nm (Development)
+ - [x] od
  - [x] paste
  - [x] pr
  - [x] rm
@@ -206,7 +207,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] man
  - [ ] more
  - [ ] newgrp
- - [ ] od
  - [ ] patch
  - [ ] pax
  - [ ] ps

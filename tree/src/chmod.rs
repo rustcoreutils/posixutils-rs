@@ -11,7 +11,7 @@ extern crate clap;
 extern crate plib;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, textdomain};
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use modestr::{ChmodMode, ChmodSymbolic};
 use plib::{modestr, PROJECT_NAME};
 use std::os::unix::fs::PermissionsExt;
@@ -82,6 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     // initialize translations
+    setlocale(LocaleCategory::LcAll, "");
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 

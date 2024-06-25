@@ -14,11 +14,12 @@ topological-sort = "0.2"
 regex.workspace = true
 chrono.workspace = true
 libc.workspace = true
+notify-debouncer-full = "0.3"
+ctor = "0.2"
 atty.workspace = true
 diff = "0.1"
 dirs = "5.0"
 deunicode = "1.6"
-ctor = "0.2"
 
 [[bin]]
 name = "asa"
@@ -67,6 +68,10 @@ path = "src/fold.rs"
 [[bin]]
 name = "head"
 path = "src/head.rs"
+
+[[bin]]
+name = "tail"
+path = "src/tail.rs"
 
 [[bin]]
 name = "nl"

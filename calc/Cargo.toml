@@ -8,11 +8,11 @@ plib = { path = "../plib" }
 gettext-rs.workspace = true
 regex.workspace = true
 clap.workspace = true
-pest = { version = "2.7.10", default-features = false }
-pest_derive = "2.7.10"
-lazy_static = "1.4.0"
-bigdecimal = "0.4.3"
-rustyline = { version = "14.0.0", default-features = false }
+pest = { version = "2.7", default-features = false }
+pest_derive = "2.7"
+lazy_static = "1.4"
+bigdecimal = "0.4"
+rustyline = { version = "14.0", default-features = false }
 
 [[bin]]
 name = "expr"

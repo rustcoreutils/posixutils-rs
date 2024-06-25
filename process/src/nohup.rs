@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use gettextrs::{bind_textdomain_codeset, textdomain};
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use libc::signal;
 use libc::{dup, dup2, SIGHUP, SIG_IGN};
 use plib::PROJECT_NAME;
@@ -18,6 +18,7 @@ use std::os::unix::io::AsRawFd;
 use std::process::{self, Command};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    setlocale(LocaleCategory::LcAll, "");
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 

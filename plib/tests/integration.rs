@@ -1,4 +1,143 @@
-use std::{ffi::CString, fs, io, os::unix};
+use std::{
+    ffi::{CStr, CString},
+    fs, io,
+    os::unix,
+};
+
+// Test the correctness of using the result of telldir under various conditions.
+#[test]
+fn test_walkdir_telldir() {
+    let test_dir = &format!("{}/test_walkdir_telldir", env!("CARGO_TARGET_TMPDIR"));
+    let target_dir = &format!("{test_dir}/target_dir");
+    let renamed_dir = &format!("{test_dir}/renamed_dir");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::create_dir(target_dir).unwrap();
+
+    struct Dir(*mut libc::DIR);
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            unsafe {
+                libc::closedir(self.0);
+            }
+        }
+    }
+
+    fn open_dir(target_dir: &str) -> Dir {
+        let target_dir_cstr = CString::new(target_dir.as_bytes()).unwrap();
+        let dirp = unsafe { libc::opendir(target_dir_cstr.as_ptr()) };
+        if dirp.is_null() {
+            panic!("{}", io::Error::last_os_error());
+        }
+        Dir(dirp)
+    }
+
+    fn eval(target_dir: &str, filename_next: &CStr, telldir_val: libc::c_long) {
+        let dir = open_dir(target_dir);
+
+        unsafe { libc::seekdir(dir.0, telldir_val) };
+        let dirent = unsafe { libc::readdir(dir.0) };
+        assert!(!dirent.is_null());
+
+        let cstr = unsafe { CStr::from_ptr((&*dirent).d_name.as_ptr()) };
+        assert_eq!(filename_next.to_bytes(), cstr.to_bytes());
+    }
+
+    const NUM_FILES: usize = 10;
+
+    for i in 0..NUM_FILES {
+        fs::File::create(format!("{target_dir}/{i}")).unwrap();
+    }
+
+    // File returned by `readdir` after calling `seekdir`
+    let mut filename_next = CString::default();
+    let mut telldir_val = 0;
+
+    {
+        let dir = open_dir(&target_dir);
+
+        let target = CString::new(format!("{}", NUM_FILES - 1).as_bytes()).unwrap();
+
+        loop {
+            let dirent = unsafe { libc::readdir(dir.0) };
+            if dirent.is_null() {
+                // Ignoring the case when errno is 0
+                panic!("{}", io::Error::last_os_error());
+            }
+
+            let name = unsafe { (&*dirent).d_name };
+            let cstr = unsafe { CStr::from_ptr(name.as_ptr()) };
+
+            if cstr.to_bytes() == target.to_bytes() {
+                filename_next = cstr.to_owned();
+                break;
+            }
+
+            telldir_val = unsafe { libc::telldir(dir.0) };
+        }
+    }
+
+    // Sanity check, no modification to target_dir
+    eval(&target_dir, &filename_next, telldir_val);
+
+    // Add new files to target_dir
+    {
+        for i in NUM_FILES..(2 * NUM_FILES) {
+            fs::File::create(format!("{target_dir}/{i}")).unwrap();
+        }
+
+        eval(&target_dir, &filename_next, telldir_val);
+    }
+
+    // Remove files from target_dir
+    {
+        {
+            let dir = open_dir(&target_dir);
+            loop {
+                let dirent = unsafe { libc::readdir(dir.0) };
+                if dirent.is_null() {
+                    let last_err = io::Error::last_os_error();
+                    let errno = last_err.raw_os_error().unwrap();
+                    if errno == 0 {
+                        break;
+                    } else {
+                        panic!("{}", last_err);
+                    }
+                }
+
+                let name = unsafe { (&*dirent).d_name };
+                let cstr = unsafe { CStr::from_ptr(name.as_ptr()) };
+
+                let dot = c".";
+                let dotdot = c"..";
+
+                // Skip . and ..
+                if cstr.to_bytes() == dot.to_bytes() || cstr.to_bytes() == dotdot.to_bytes() {
+                    continue;
+                }
+
+                if cstr.to_bytes() != filename_next.to_bytes() {
+                    fs::remove_file(format!("{target_dir}/{}", cstr.to_string_lossy())).unwrap();
+                }
+            }
+        }
+
+        eval(&target_dir, &filename_next, telldir_val);
+    }
+
+    // Rename target_dir
+    {
+        for i in NUM_FILES..(2 * NUM_FILES) {
+            fs::File::create(format!("{target_dir}/{i}")).unwrap();
+        }
+        fs::rename(target_dir, renamed_dir).unwrap();
+
+        eval(&renamed_dir, &filename_next, telldir_val);
+    }
+
+    std::fs::remove_dir_all(test_dir).unwrap();
+}
 
 #[test]
 fn test_walkdir_simple() {
@@ -162,6 +301,7 @@ fn test_walkdir_deep() {
     std::fs::remove_dir_all(test_dir).unwrap();
 }
 
+// Same as `test_walkdir_deep` but using symlinks.
 #[test]
 fn test_walkdir_deep_symlinks() {
     let test_dir = &format!("{}/test_walkdir_deep_symlinks", env!("CARGO_TARGET_TMPDIR"));

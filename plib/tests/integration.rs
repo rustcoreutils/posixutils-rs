@@ -2,6 +2,7 @@ use std::{
     ffi::{CStr, CString},
     fs, io,
     os::unix,
+    path::Path,
 };
 
 // Test the correctness of using the result of telldir under various conditions.
@@ -50,11 +51,10 @@ fn test_walkdir_telldir() {
         fs::File::create(format!("{target_dir}/{i}")).unwrap();
     }
 
-    // File returned by `readdir` after calling `seekdir`
-    let mut filename_next = CString::default();
     let mut telldir_val = 0;
 
-    {
+    // The next file returned by `libc::readdir` after calling `libc::seekdir` with `telldir_val`.
+    let filename_next = {
         let dir = open_dir(&target_dir);
 
         let target = CString::new(format!("{}", NUM_FILES - 1).as_bytes()).unwrap();
@@ -70,13 +70,12 @@ fn test_walkdir_telldir() {
             let cstr = unsafe { CStr::from_ptr(name.as_ptr()) };
 
             if cstr.to_bytes() == target.to_bytes() {
-                filename_next = cstr.to_owned();
-                break;
+                break cstr.to_owned();
             }
 
             telldir_val = unsafe { libc::telldir(dir.0) };
         }
-    }
+    };
 
     // Sanity check, no modification to target_dir
     eval(&target_dir, &filename_next, telldir_val);
@@ -151,7 +150,7 @@ fn test_walkdir_simple() {
         std::fs::create_dir_all(dir).unwrap();
     }
 
-    let mut filenames = [
+    let mut expected_filenames = [
         format!("{test_dir}"),
         format!("{test_dir}/b"),
         format!("{test_dir}/b/1"),
@@ -161,13 +160,13 @@ fn test_walkdir_simple() {
         format!("{test_dir}/a/2"),
     ];
 
-    let mut resulting_filenames = Vec::new();
+    let mut filenames = Vec::new();
 
     plib::walkdir::traverse_directory(
         test_dir,
         |entry| {
             let s = format!("{}", entry.path().display());
-            resulting_filenames.push(s);
+            filenames.push(s);
             true
         },
         |_| {},
@@ -176,9 +175,9 @@ fn test_walkdir_simple() {
         false,
     );
 
+    expected_filenames.sort();
     filenames.sort();
-    resulting_filenames.sort();
-    assert_eq!(filenames.as_slice(), resulting_filenames.as_slice());
+    assert_eq!(expected_filenames.as_slice(), filenames.as_slice());
 
     std::fs::remove_dir_all(test_dir).unwrap();
 }
@@ -205,7 +204,7 @@ fn test_walkdir_symlinks() {
     // 0 -> 1 -> 2
     // 1 -> 2
     // 2
-    let mut filenames = [
+    let mut expected_filenames = [
         format!("{test_dir}"),
         format!("{test_dir}/0"),
         format!("{test_dir}/1"),
@@ -215,13 +214,13 @@ fn test_walkdir_symlinks() {
         format!("{test_dir}/2"),
     ];
 
-    let mut resulting_filenames = Vec::new();
+    let mut filenames = Vec::new();
 
     plib::walkdir::traverse_directory(
         test_dir,
         |entry| {
             let s = format!("{}", entry.path().display());
-            resulting_filenames.push(s);
+            filenames.push(s);
             true
         },
         |_| {},
@@ -230,9 +229,9 @@ fn test_walkdir_symlinks() {
         true,
     );
 
+    expected_filenames.sort();
     filenames.sort();
-    resulting_filenames.sort();
-    assert_eq!(filenames.as_slice(), resulting_filenames.as_slice());
+    assert_eq!(expected_filenames.as_slice(), filenames.as_slice());
 
     std::fs::remove_dir_all(test_dir).unwrap();
 }
@@ -345,6 +344,90 @@ fn test_walkdir_deep_symlinks() {
     );
 
     assert_eq!(count, DEPTH);
+
+    std::fs::remove_dir_all(test_dir).unwrap();
+}
+
+// Tests the resilience against making the search go to a different directory by modifying the path.
+#[test]
+fn test_walkdir_path_prefix_modification() {
+    let test_dir = &format!(
+        "{}/test_walkdir_path_prefix_modification",
+        env!("CARGO_TARGET_TMPDIR")
+    );
+    let correct_dir = format!("{test_dir}/correct_dir");
+    let wrong_dir = format!("{test_dir}/wrong_dir");
+    let a_b = format!("{test_dir}/a/b");
+
+    fs::create_dir(test_dir).unwrap();
+
+    fs::create_dir_all(format!("{correct_dir}/c/d/e/f/g/h/i/j")).unwrap();
+    fs::create_dir_all(format!("{wrong_dir}/x/x/x/x/x/x/x/x")).unwrap();
+
+    // a/b -> correct_dir
+    fs::create_dir(format!("{test_dir}/a")).unwrap();
+    unix::fs::symlink(&correct_dir, format!("{test_dir}/a/b")).unwrap();
+
+    let mut entered_dir_a_b: Option<bool> = Some(false);
+    let mut filenames = Vec::new();
+
+    plib::walkdir::traverse_directory(
+        &a_b,
+        |entry| {
+            let path = entry.path();
+            let filename = path.file_name().unwrap();
+            filenames.push(filename.to_str().unwrap().to_owned());
+
+            if entered_dir_a_b == Some(true) {
+                // Symbolic link to a different directory
+                // a/new -> wrong_dir
+                let new_symlink = format!("{test_dir}/a/new");
+                unix::fs::symlink(&wrong_dir, &new_symlink).unwrap();
+
+                // Overwrite a/b with a/new
+                fs::rename(&new_symlink, &a_b).unwrap();
+
+                // a/b now points to wrong_dir
+                assert_eq!(fs::read_link(&a_b).unwrap(), Path::new(&wrong_dir));
+
+                // Prevents doing the rename again
+                entered_dir_a_b = None;
+            }
+
+            // Wait until a/b is entered before changing the symbolic link
+            if entered_dir_a_b == Some(false) {
+                entered_dir_a_b = Some(true);
+            }
+
+            true
+        },
+        |_| {},
+        |_, _| {},
+        true,
+        true,
+    );
+
+    // Once a/b is reached, traverse_directory should not go down the wrong directory even if a/b is
+    // changed
+    assert!(!filenames.contains(&String::from("x")));
+
+    filenames.clear();
+    plib::walkdir::traverse_directory(
+        &a_b,
+        |entry| {
+            let path = entry.path();
+            let filename = path.file_name().unwrap();
+            filenames.push(filename.to_str().unwrap().to_owned());
+            true
+        },
+        |_| {},
+        |_, _| {},
+        true,
+        true,
+    );
+
+    // Rerunning the directory traversal should now follow the "wrong" directory.
+    assert_eq!(filenames.iter().filter(|f| f.as_str() == "x").count(), 8);
 
     std::fs::remove_dir_all(test_dir).unwrap();
 }

@@ -1,0 +1,23 @@
+--- file1.txt	2024-06-25 16:48:31.840752300 +0300
++++ file2.txt	2024-06-25 16:48:46.889122200 +0300
+@@ -1,17 +1,13 @@
+ line 1
+ line 2
+ 
+ line 4
+ line 5
+-line 6 will change
++line 6 is updated
+ line 7
+ 
+-This line will be removed
+-
+ line 8
+-line 9 will change
+-line 10 will change
++line 9 is updated
++line 10 is updated
+ 
+ line 11
+-
+-This will be removed, too

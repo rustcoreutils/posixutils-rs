@@ -11,12 +11,85 @@ extern crate clap;
 extern crate libc;
 extern crate plib;
 
-mod osdata;
-
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use regex::Regex;
 use std::collections::HashMap;
+
+#[cfg(target_os = "macos")]
+pub fn get_sigmap() -> HashMap<&'static str, u32> {
+    HashMap::from([
+        ("HUP", 1),
+        ("INT", 2),
+        ("QUIT", 3),
+        ("ILL", 4),
+        ("TRAP", 5),
+        ("ABRT", 6),
+        ("EMT", 7),
+        ("FPE", 8),
+        ("KILL", 9),
+        ("BUS", 10),
+        ("SEGV", 11),
+        ("SYS", 12),
+        ("PIPE", 13),
+        ("ALRM", 14),
+        ("TERM", 15),
+        ("URG", 16),
+        ("STOP", 17),
+        ("TSTP", 18),
+        ("CONT", 19),
+        ("CHLD", 20),
+        ("TTIN", 21),
+        ("TTOU", 22),
+        ("IO", 23),
+        ("XCPU", 24),
+        ("XFSZ", 25),
+        ("VTALRM", 26),
+        ("PROF", 27),
+        ("WINCH", 28),
+        ("INFO", 29),
+        ("USR1", 30),
+        ("USR2", 31),
+    ])
+}
+
+#[cfg(target_os = "linux")]
+pub fn get_sigmap() -> HashMap<&'static str, u32> {
+    HashMap::from([
+        ("HUP", 1),
+        ("INT", 2),
+        ("QUIT", 3),
+        ("ILL", 4),
+        ("TRAP", 5),
+        ("ABRT", 6),
+        ("IOT", 6),
+        ("BUS", 7),
+        ("FPE", 8),
+        ("KILL", 9),
+        ("USR1", 10),
+        ("SEGV", 11),
+        ("USR2", 12),
+        ("PIPE", 13),
+        ("ALRM", 14),
+        ("TERM", 15),
+        ("STKFLT", 16),
+        ("CHLD", 17),
+        ("CONT", 18),
+        ("STOP", 19),
+        ("TSTP", 20),
+        ("TTIN", 21),
+        ("TTOU", 22),
+        ("URG", 23),
+        ("XCPU", 24),
+        ("XFSZ", 25),
+        ("VTALRM", 26),
+        ("PROF", 27),
+        ("WINCH", 28),
+        ("IO", 29),
+        ("PWR", 30),
+        ("SYS", 31),
+    ])
+}
 
 fn lookup_signum(sigmap: &HashMap<&str, u32>, signame: &str) -> Result<u32, &'static str> {
     if signame == "0" {
@@ -121,7 +194,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
-    let sigmap = osdata::get_sigmap();
+    let sigmap = get_sigmap();
     let prog_cfg = parse_cmdline(&sigmap)?;
 
     let exit_code = match prog_cfg.mode {

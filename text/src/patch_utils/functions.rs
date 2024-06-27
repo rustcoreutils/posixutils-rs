@@ -1,3 +1,5 @@
+use std::{fs, path::PathBuf};
+
 use regex::Regex;
 
 use super::constants::{
@@ -55,4 +57,8 @@ pub fn verify_patch_line(left: &str, right: &str) -> Result<(), ()> {
 
 pub fn print_error(error: impl Into<String>) {
     eprintln!("patch: {}", error.into())
+}
+
+pub fn file_exists(path: impl Into<PathBuf>) -> bool {
+    fs::metadata(path.into()).is_ok()
 }

@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+pub mod curuser;
 pub mod group;
 pub mod io;
 pub mod lzw;

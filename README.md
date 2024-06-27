@@ -122,6 +122,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] touch
  - [x] tty
  - [x] unlink
+ - [x] write
 
 ## Stage 1 - Rough draft
 
@@ -216,7 +217,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] talk
  - [ ] time
  - [ ] timeout
- - [ ] write
 
 ## Testing
 

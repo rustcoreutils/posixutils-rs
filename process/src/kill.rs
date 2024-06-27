@@ -13,7 +13,6 @@ extern crate plib;
 
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
-use regex::Regex;
 
 #[cfg(target_os = "macos")]
 const SIGLIST: [(&str, u32); 31] = [
@@ -118,9 +117,6 @@ struct Config {
 }
 
 fn parse_cmdline() -> Result<Config, &'static str> {
-    let signame_re = Regex::new(r"^-(\w+)$").unwrap();
-    let signum_re = Regex::new(r"^-(\d+)$").unwrap();
-
     let mut pids = Vec::new();
     let mut mode = ConfigMode::Signal(libc::SIGTERM as u32);
     let mut in_args = true;
@@ -137,13 +133,12 @@ fn parse_cmdline() -> Result<Config, &'static str> {
                 mode = ConfigMode::List;
             } else if arg == "--" {
                 in_args = false;
-            } else if let Some(caps) = signum_re.captures(&arg) {
-                let numstr = caps.get(1).unwrap().as_str();
-                let sig_no = numstr.parse::<u32>().unwrap();
-                mode = ConfigMode::Signal(sig_no);
-            } else if let Some(caps) = signame_re.captures(&arg) {
-                let namestr = caps.get(1).unwrap().as_str();
-                let sig_no = lookup_signum(namestr)?;
+            } else if arg.starts_with("-") {
+		let argstr = &arg[1..];
+		let sig_no = match argstr.parse::<u32>() {
+		    Ok(signo) => signo,
+		    Err(_) => lookup_signum(argstr)?,
+		};
                 mode = ConfigMode::Signal(sig_no);
             } else {
                 in_args = false;

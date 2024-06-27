@@ -1062,7 +1062,6 @@ dependencies = [
  "gettext-rs",
  "libc",
  "plib",
- "regex",
 ]
 
 [[package]]

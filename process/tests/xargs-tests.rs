@@ -33,3 +33,12 @@ fn test_xargs_with_maxnum() {
         vec!["-n", "1", "echo"],
     );
 }
+
+#[test]
+fn test_xargs_with_maxsize() {
+    xargs_test(
+        "one two three four five\n",
+        "one\ntwo\nthree\nfour\nfive\n",
+        vec!["-s", "11", "echo"],
+    );
+}

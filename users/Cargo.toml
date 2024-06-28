@@ -11,8 +11,9 @@ plib = { path = "../plib" }
 clap.workspace = true
 gettext-rs.workspace = true
 libc.workspace = true
-syslog = "6.1"
 atty.workspace = true
+chrono.workspace = true
+syslog = "6.1"
 
 [[bin]]
 name = "id"
@@ -37,4 +38,8 @@ path = "src/pwd.rs"
 [[bin]]
 name = "tty"
 path = "src/tty.rs"
+
+[[bin]]
+name = "write"
+path = "src/write.rs"
 

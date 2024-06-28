@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2024 Jeff Garzik
+// Copyright (c) 2024 Hemi Labs, Inc.
 //
 // This file is part of the posixutils-rs project covered under
 // the MIT License.  For the full license text, please see the LICENSE
@@ -27,7 +27,7 @@ const EOF_CHAR: char = '\u{04}';
 const ERASE_CHAR: char = '\u{08}';
 const KILL_CHAR: char = '\u{15}';
 
-/// cat - concatenate and print files
+/// write - write to another user
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about)]
 struct Args {
@@ -98,7 +98,12 @@ fn check_write_permission(terminal: &str) -> bool {
             false
         }
         Err(err) => {
-            eprintln!("{} {}: {}", gettext("Error checking metadata for terminal"), terminal, err);
+            eprintln!(
+                "{} {}: {}",
+                gettext("Error checking metadata for terminal"),
+                terminal,
+                err
+            );
             false
         }
     }

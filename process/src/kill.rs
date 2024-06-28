@@ -134,11 +134,11 @@ fn parse_cmdline() -> Result<Config, &'static str> {
             } else if arg == "--" {
                 in_args = false;
             } else if arg.starts_with("-") {
-		let argstr = &arg[1..];
-		let sig_no = match argstr.parse::<u32>() {
-		    Ok(signo) => signo,
-		    Err(_) => lookup_signum(argstr)?,
-		};
+                let argstr = &arg[1..];
+                let sig_no = match argstr.parse::<u32>() {
+                    Ok(signo) => signo,
+                    Err(_) => lookup_signum(argstr)?,
+                };
                 mode = ConfigMode::Signal(sig_no);
             } else {
                 in_args = false;

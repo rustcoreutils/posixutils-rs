@@ -42,3 +42,12 @@ fn test_xargs_with_maxsize() {
         vec!["-s", "11", "echo"],
     );
 }
+
+#[test]
+fn test_xargs_with_eofstr() {
+    xargs_test(
+        "one two three STOP four five\n",
+        "one two three\n",
+        vec!["-E", "STOP", "echo"],
+    );
+}

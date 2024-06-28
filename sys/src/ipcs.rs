@@ -90,7 +90,11 @@ fn display_message_queues(_args: &Args) {
                 break;
             }
 
+            #[cfg(target_os = "macos")]
             let key = msg_ds.msg_perm._key; // Check for the correct field name on your system
+            #[cfg(not(target_os = "macos"))]
+            let key = msg_ds.msg_perm.__key; // Check for the correct field name on your system
+
             let mode = msg_ds.msg_perm.mode;
             let uid = msg_ds.msg_perm.uid;
             let gid = msg_ds.msg_perm.gid;
@@ -162,7 +166,10 @@ fn display_shared_memory(_args: &Args) {
             break;
         }
 
+        #[cfg(target_os = "macos")]
         let key = shm_ds.shm_perm._key; // Check for the correct field name on your system
+        #[cfg(not(target_os = "macos"))]
+        let key = shm_ds.shm_perm.__key; // Check for the correct field name on your system
         let mode = shm_ds.shm_perm.mode;
         let uid = shm_ds.shm_perm.uid;
         let gid = shm_ds.shm_perm.gid;
@@ -209,7 +216,11 @@ fn display_semaphores(_args: &Args) {
             break;
         }
 
+        #[cfg(not(target_os = "macos"))]
+        let key = sem_ds.sem_perm.__key; // Check for the correct field name on your system
+        #[cfg(target_os = "macos")]
         let key = sem_ds.sem_perm._key; // Check for the correct field name on your system
+
         let mode = sem_ds.sem_perm.mode;
         let uid = sem_ds.sem_perm.uid;
         let gid = sem_ds.sem_perm.gid;

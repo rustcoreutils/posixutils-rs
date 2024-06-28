@@ -1295,6 +1295,31 @@ fn test_recursive_defines() {
 }
 
 #[test]
+fn test_redefine_inbuilt() {
+    init();
+    let output = run_command("fixtures/integration_tests/redefine_inbuilt.m4");
+
+    let test: TestSnapshot = read_test("fixtures/integration_tests/redefine_inbuilt.out");
+    assert_eq!(
+        output.status,
+        std::process::ExitStatus::from_raw(test.status),
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        test.stdout,
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        test.stderr,
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+}
+
+#[test]
 fn test_reverse() {
     init();
     let output = run_command("fixtures/integration_tests/reverse.m4");

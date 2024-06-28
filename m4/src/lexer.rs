@@ -481,6 +481,7 @@ impl<'i> Quoted<'i> {
 }
 
 // TODO: small vec optimization could be possible
+/// The name of a macro.
 #[derive(PartialEq, Clone, Hash, Eq)]
 pub struct MacroName(pub Vec<u8>);
 

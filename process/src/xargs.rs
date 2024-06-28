@@ -113,7 +113,7 @@ impl ParseState {
     fn new(args: &Args) -> ParseState {
         let mut total = args.util.len();
         for arg in &args.util_args {
-            total += arg.len();
+            total += arg.len() + 1; // +1 for space
         }
 
         ParseState {
@@ -132,12 +132,12 @@ impl ParseState {
     }
 
     fn full(&self) -> bool {
-        let mut total = 0;
+        let mut total = self.util_size;
         for arg in &self.args {
-            total += arg.len();
+            total += arg.len() + 1; // +1 for space
         }
 
-        if (self.util_size + total) >= self.max_bytes {
+        if total > self.max_bytes {
             true
         } else if let Some(max_args) = self.max_args {
             (self.util_n_args + self.args.len()) >= max_args
@@ -151,13 +151,13 @@ impl ParseState {
         let mut ret = Vec::new();
         while !self.args.is_empty() {
             // stop if adding the next arg would exceed the max size
-            if (total + self.args[0].len()) > self.max_bytes {
+            if (total + self.args[0].len() + 1) > self.max_bytes {
                 break;
             }
 
             // add the next arg
             let arg = self.args.remove(0);
-            total += arg.len();
+            total += arg.len() + 1; // +1 for space
             ret.push(arg);
 
             // stop if we have reached the max number of args
@@ -176,15 +176,15 @@ impl ParseState {
             return Ok(());
         }
 
-        for c8 in buf {
-            let ch = *c8 as char;
+        for &c8 in buf {
+            let ch = c8 as char;
 
             if self.in_quote {
                 if ch == self.quote_char {
                     self.in_quote = false;
                     self.in_arg = false;
                     self.args.push(self.tmp_arg.clone());
-                    self.tmp_arg = String::new();
+                    self.tmp_arg.clear();
                 } else {
                     self.tmp_arg.push(ch);
                 }
@@ -194,7 +194,7 @@ impl ParseState {
             } else if self.in_arg && ch.is_whitespace() {
                 self.in_arg = false;
                 self.args.push(self.tmp_arg.clone());
-                self.tmp_arg = String::new();
+                self.tmp_arg.clear();
             } else if ch == '\'' || ch == '"' {
                 self.in_arg = true;
                 self.in_quote = true;
@@ -216,7 +216,7 @@ impl ParseState {
         if self.in_arg {
             self.in_arg = false;
             self.args.push(self.tmp_arg.clone());
-            self.tmp_arg = String::new();
+            self.tmp_arg.clear();
         }
     }
 
@@ -252,7 +252,7 @@ fn read_and_spawn(args: &Args) -> io::Result<()> {
         state.postprocess(args)?;
 
         // if enough args, spawn the utility
-        if state.full() {
+        while state.full() {
             let mut util_args = args.util_args.clone();
             util_args.append(&mut state.remove_args());
             exec_util(&args.util, util_args)?;

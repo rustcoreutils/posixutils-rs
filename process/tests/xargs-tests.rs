@@ -24,3 +24,12 @@ fn xargs_test(test_data: &str, expected_output: &str, args: Vec<&str>) {
 fn test_xargs_basic() {
     xargs_test("one two three\n", "one two three\n", vec!["echo"]);
 }
+
+#[test]
+fn test_xargs_with_maxnum() {
+    xargs_test(
+        "one two three\n",
+        "one\ntwo\nthree\n",
+        vec!["-n", "1", "echo"],
+    );
+}

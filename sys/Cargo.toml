@@ -19,6 +19,10 @@ name = "ipcrm"
 path = "src/ipcrm.rs"
 
 [[bin]]
+name = "ipcs"
+path = "src/ipcs.rs"
+
+[[bin]]
 name = "uname"
 path = "src/uname.rs"
 

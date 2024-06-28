@@ -134,6 +134,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] echo
  - [x] dd
  - [x] id
+ - [x] ipcs (IPC)
  - [x] kill
  - [x] logger
  - [x] printf
@@ -199,7 +200,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] fuser
  - [ ] getconf
  - [ ] grep
- - [ ] ipcs (IPC)
  - [ ] join
  - [ ] lp
  - [ ] m4

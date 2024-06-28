@@ -90,7 +90,7 @@ fn display_message_queues(_args: &Args) {
                 break;
             }
 
-            let key = msg_ds.msg_perm.__key;  // Ensure the correct field name for your system
+            let key = msg_ds.msg_perm.__key; // Ensure the correct field name for your system
             let mode = msg_ds.msg_perm.mode;
             let uid = msg_ds.msg_perm.uid;
             let gid = msg_ds.msg_perm.gid;

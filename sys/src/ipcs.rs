@@ -90,11 +90,7 @@ fn display_message_queues(_args: &Args) {
                 break;
             }
 
-            #[cfg(target_os = "macos")]
-            let key = msg_ds.msg_perm._key; // Check for the correct field name on your system
-            #[cfg(not(target_os = "macos"))]
-            let key = msg_ds.msg_perm.__key; // Check for the correct field name on your system
-
+            let key = msg_ds.msg_perm.__key;  // Ensure the correct field name for your system
             let mode = msg_ds.msg_perm.mode;
             let uid = msg_ds.msg_perm.uid;
             let gid = msg_ds.msg_perm.gid;
@@ -136,43 +132,35 @@ fn display_shared_memory(_args: &Args) {
     use libc::{shmctl, shmid_ds, IPC_STAT};
     use std::ffi::CStr;
 
-    #[cfg(not(target_os = "macos"))]
-    use libc::{shminfo, SHM_INFO};
-
-    let mut shmid: i32 = 0;
-    let mut shm_ds: shmid_ds = unsafe { std::mem::zeroed() };
+    #[cfg(target_os = "macos")]
+    const SHM_INFO: libc::c_int = 14; // SHM_INFO is typically 14 in Linux but this is not standard
 
     #[cfg(not(target_os = "macos"))]
-    let mut shm_info: shminfo = unsafe { std::mem::zeroed() };
+    const SHM_INFO: libc::c_int = 14;
 
-    #[cfg(not(target_os = "macos"))]
-    if unsafe {
-        shmctl(
-            shmid,
-            SHM_INFO,
-            &mut shm_info as *mut shminfo as *mut libc::c_void,
-        )
-    } == -1
-    {
-        eprintln!("{}", gettext("Shared Memory facility not in system."));
+    let mut shmbuf: shmid_ds = unsafe { std::mem::zeroed() };
+
+    let maxid = unsafe { shmctl(0, SHM_INFO, &mut shmbuf) };
+    if maxid < 0 {
+        println!("{}", gettext("Shared Memory facility not in system."));
         return;
     }
 
     println!("Shared Memory:");
     println!("T     ID     KEY        MODE       OWNER    GROUP");
 
-    loop {
-        if unsafe { shmctl(shmid, IPC_STAT, &mut shm_ds) } == -1 {
-            break;
+    for shmid in 0..=maxid {
+        if unsafe { shmctl(shmid, IPC_STAT, &mut shmbuf) } == -1 {
+            continue;
         }
 
         #[cfg(target_os = "macos")]
-        let key = shm_ds.shm_perm._key; // Check for the correct field name on your system
+        let key = shmbuf.shm_perm._key; // Check for the correct field name on your system
         #[cfg(not(target_os = "macos"))]
-        let key = shm_ds.shm_perm.__key; // Check for the correct field name on your system
-        let mode = shm_ds.shm_perm.mode;
-        let uid = shm_ds.shm_perm.uid;
-        let gid = shm_ds.shm_perm.gid;
+        let key = shmbuf.shm_perm.__key; // Check for the correct field name on your system
+        let mode = shmbuf.shm_perm.mode;
+        let uid = shmbuf.shm_perm.uid;
+        let gid = shmbuf.shm_perm.gid;
 
         let owner = unsafe {
             CStr::from_ptr(libc::getpwuid(uid).as_ref().unwrap().pw_name)
@@ -196,8 +184,6 @@ fn display_shared_memory(_args: &Args) {
             "m     {:<5}  0x{:08x}  {:<10}  {:<8}  {:<8}",
             shmid, key, mode_str, owner, group
         );
-
-        shmid += 1;
     }
 }
 

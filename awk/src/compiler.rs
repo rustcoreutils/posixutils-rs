@@ -1687,6 +1687,21 @@ mod test {
     }
 
     #[test]
+    fn test_compile_next() {
+        let (instructions, _) = compile_stmt("next;");
+        assert_eq!(instructions, vec![OpCode::Next]);
+    }
+
+    #[test]
+    fn test_compile_exit() {
+        let (instructions, _) = compile_stmt("exit;");
+        assert_eq!(instructions, vec![OpCode::Exit]);
+
+        let (instructions, constant) = compile_stmt("exit 1;");
+        assert_eq!(instructions, vec![OpCode::PushConstant(0), OpCode::Exit]);
+    }
+
+    #[test]
     fn test_compile_do_while() {
         let (instructions, constant) = compile_stmt("do 1; while (1);");
         assert_eq!(

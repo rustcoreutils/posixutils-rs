@@ -148,22 +148,36 @@ impl Expr {
     }
 }
 
-#[derive(Clone, Copy)]
-pub struct Name {
-    pub id: VarId,
-    pub is_function: bool,
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum GlobalNameKind {
+    Function,
+    SpecialVar,
+    Var,
 }
 
-impl Name {
+#[derive(Clone, Copy)]
+pub struct GlobalName {
+    pub id: VarId,
+    pub kind: GlobalNameKind,
+}
+
+impl GlobalName {
+    fn special_var(var: SpecialVar) -> Self {
+        GlobalName {
+            id: var as u32,
+            kind: GlobalNameKind::SpecialVar,
+        }
+    }
+
     fn var(id: VarId) -> Self {
-        Name {
+        GlobalName {
             id,
-            is_function: false,
+            kind: GlobalNameKind::Var,
         }
     }
 }
 
-type NameMap = HashMap<String, Name>;
+type NameMap = HashMap<String, GlobalName>;
 type LocalMap = HashMap<String, VarId>;
 
 struct Compiler {
@@ -176,23 +190,44 @@ struct Compiler {
 impl Default for Compiler {
     fn default() -> Self {
         let default_globals = HashMap::from([
-            ("ARGC".to_string(), Name::var(SpecialVar::Argc as u32)),
-            ("ARGV".to_string(), Name::var(SpecialVar::Argv as u32)),
-            ("CONVFMT".to_string(), Name::var(SpecialVar::Convfmt as u32)),
-            ("ENVIRON".to_string(), Name::var(SpecialVar::Environ as u32)),
+            (
+                "ARGC".to_string(),
+                GlobalName::special_var(SpecialVar::Argc),
+            ),
+            (
+                "ARGV".to_string(),
+                GlobalName::special_var(SpecialVar::Argv),
+            ),
+            (
+                "CONVFMT".to_string(),
+                GlobalName::special_var(SpecialVar::Convfmt),
+            ),
+            (
+                "ENVIRON".to_string(),
+                GlobalName::special_var(SpecialVar::Environ),
+            ),
             (
                 "FILENAME".to_string(),
-                Name::var(SpecialVar::Filename as u32),
+                GlobalName::special_var(SpecialVar::Filename),
             ),
-            ("FNR".to_string(), Name::var(SpecialVar::Fnr as u32)),
-            ("NF".to_string(), Name::var(SpecialVar::Nf as u32)),
-            ("NR".to_string(), Name::var(SpecialVar::Nr as u32)),
-            ("OFMT".to_string(), Name::var(SpecialVar::Ofmt as u32)),
-            ("OFS".to_string(), Name::var(SpecialVar::Ofs as u32)),
-            ("ORS".to_string(), Name::var(SpecialVar::Ors as u32)),
-            ("RS".to_string(), Name::var(SpecialVar::Rs as u32)),
-            ("RSTART".to_string(), Name::var(SpecialVar::Rstart as u32)),
-            ("SUBSEP".to_string(), Name::var(SpecialVar::Subsep as u32)),
+            ("FNR".to_string(), GlobalName::special_var(SpecialVar::Fnr)),
+            ("NF".to_string(), GlobalName::special_var(SpecialVar::Nf)),
+            ("NR".to_string(), GlobalName::special_var(SpecialVar::Nr)),
+            (
+                "OFMT".to_string(),
+                GlobalName::special_var(SpecialVar::Ofmt),
+            ),
+            ("OFS".to_string(), GlobalName::special_var(SpecialVar::Ofs)),
+            ("ORS".to_string(), GlobalName::special_var(SpecialVar::Ors)),
+            ("RS".to_string(), GlobalName::special_var(SpecialVar::Rs)),
+            (
+                "RSTART".to_string(),
+                GlobalName::special_var(SpecialVar::Rstart),
+            ),
+            (
+                "SUBSEP".to_string(),
+                GlobalName::special_var(SpecialVar::Subsep),
+            ),
         ]);
         Compiler {
             constants: RefCell::new(Vec::new()),
@@ -223,7 +258,7 @@ impl Compiler {
         } else {
             let entry = self.names.borrow().get(name).copied();
             if let Some(var) = entry {
-                if var.is_function {
+                if var.kind == GlobalNameKind::Function {
                     Err(format!(
                         "cannot use function '{}' used as a variable or array",
                         name
@@ -233,13 +268,9 @@ impl Compiler {
                 }
             } else {
                 let id = post_increment(&self.last_global_var_id);
-                self.names.borrow_mut().insert(
-                    name.to_string(),
-                    Name {
-                        id,
-                        is_function: false,
-                    },
-                );
+                self.names
+                    .borrow_mut()
+                    .insert(name.to_string(), GlobalName::var(id));
                 Ok(global_ref(id))
             }
         }

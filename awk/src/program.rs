@@ -122,6 +122,7 @@ pub enum NameType {
 
 #[derive(Debug, PartialEq)]
 pub struct Function {
+    pub parameters_count: usize,
     pub instructions: Vec<OpCode>,
 }
 

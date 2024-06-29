@@ -311,34 +311,10 @@ impl Compiler {
                     vec![OpCode::PushConstant(index)],
                 ))
             }
-            Rule::name => {
-                let get_instruction = self
-                    .get_var(
-                        primary.as_str(),
-                        locals,
-                        OpCode::LocalVarRef,
-                        OpCode::VarRef,
-                    )
-                    .map_err(|msg| pest_error_from_span(primary.as_span(), msg))?;
-                Ok(Expr::new(ExprKind::LValue, vec![get_instruction]))
-            }
-            Rule::array_element => {
-                let mut inner = primary.into_inner();
-                let name = inner.next().unwrap();
-                // FIXME: only supports expression lists of one element
-                let index = inner.next().unwrap().into_inner().next().unwrap();
-                let mut index_expr = Vec::new();
-                self.compile_expr(index, &mut index_expr, locals)?;
-                let get_instruction = self
-                    .get_var(
-                        name.as_str(),
-                        locals,
-                        OpCode::LocalArrayRef,
-                        OpCode::ArrayRef,
-                    )
-                    .map_err(|msg| pest_error_from_span(name.as_span(), msg))?;
-                index_expr.push(get_instruction);
-                Ok(Expr::new(ExprKind::LValue, index_expr))
+            Rule::name | Rule::array_element => {
+                let mut instructions = Vec::new();
+                self.compile_lvalue(primary, &mut instructions, locals)?;
+                Ok(Expr::new(ExprKind::LValue, instructions))
             }
             _ => unreachable!(),
         }
@@ -516,19 +492,18 @@ impl Compiler {
         instructions: &mut Vec<OpCode>,
         locals: &LocalMap,
     ) -> Result<(), PestError> {
-        let lvalue = first_child(lvalue);
         match lvalue.as_rule() {
             Rule::name => {
-                let name = lvalue.as_str();
                 let get_instruction = self
-                    .get_var(name, locals, OpCode::LocalVarRef, OpCode::VarRef)
+                    .get_var(lvalue.as_str(), locals, OpCode::LocalVarRef, OpCode::VarRef)
                     .map_err(|msg| pest_error_from_span(lvalue.as_span(), msg))?;
                 instructions.push(get_instruction);
             }
             Rule::array_element => {
                 let mut inner = lvalue.into_inner();
                 let name = inner.next().unwrap();
-                let index = inner.next().unwrap();
+                // FIXME: only supports expression lists of one element
+                let index = inner.next().unwrap().into_inner().next().unwrap();
                 self.compile_expr(index, instructions, locals)?;
                 let get_instruction = self
                     .get_var(
@@ -818,7 +793,49 @@ impl Compiler {
     }
 
     fn compile_function_definition(&mut self, function: Pair<Rule>) -> Result<Function, PestError> {
-        todo!()
+        let mut inner = function.into_inner();
+        let name = inner.next().unwrap().as_str();
+        let mut param_map = HashMap::new();
+        let mut parameters_count = 0;
+        let maybe_param_list = inner.next().unwrap();
+        let body = if maybe_param_list.as_rule() == Rule::param_list {
+            for param in maybe_param_list.into_inner() {
+                match self.names.get_mut().get(param.as_str()) {
+                    Some(GlobalName { kind, .. })
+                        if *kind == GlobalNameKind::Function
+                            || *kind == GlobalNameKind::SpecialVar =>
+                    {
+                        return Err(pest_error_from_span(
+                            param.as_span(),
+                            "cannot use function name or special variable as a parameter"
+                                .to_string(),
+                        ));
+                    }
+                    _ => {}
+                }
+                param_map.insert(param.as_str().to_string(), parameters_count as u32);
+                parameters_count += 1;
+            }
+            inner.next().unwrap()
+        } else {
+            maybe_param_list
+        };
+        let mut instructions = Vec::new();
+        for stmt in body.into_inner() {
+            self.compile_stmt(stmt, &mut instructions, &param_map)?;
+        }
+        let id = post_increment(&self.last_global_function_id);
+        self.names.get_mut().insert(
+            name.to_string(),
+            GlobalName {
+                id,
+                kind: GlobalNameKind::Function,
+            },
+        );
+        Ok(Function {
+            parameters_count,
+            instructions,
+        })
     }
 }
 
@@ -1907,6 +1924,64 @@ mod test {
                 Constant::Number(2.0),
                 Constant::String("and".to_string()),
                 Constant::Number(3.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_compile_empty_function() {
+        let program = compile_correct_program(
+            r#"
+            function fun() {}
+            "#,
+        );
+        assert_eq!(program.functions.len(), 1);
+        assert_eq!(program.functions[0].parameters_count, 0);
+    }
+
+    #[test]
+    fn test_compile_function_with_no_parameters() {
+        let program = compile_correct_program(
+            r#"
+            function fun() {
+                x + 2;
+            }
+            "#,
+        );
+        assert_eq!(program.functions.len(), 1);
+        assert_eq!(program.functions[0].parameters_count, 0);
+        assert_eq!(
+            program.functions[0].instructions,
+            vec![
+                OpCode::VarRef(FIRST_GLOBAL_VAR),
+                OpCode::PushConstant(0),
+                OpCode::Add,
+                OpCode::Pop,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_compile_function_with_parameters() {
+        let program = compile_correct_program(
+            r#"
+            function fun(a, b, c) {
+                a["1"] = b + c;
+            }
+            "#,
+        );
+        assert_eq!(program.functions.len(), 1);
+        assert_eq!(program.functions[0].parameters_count, 3);
+        assert_eq!(
+            program.functions[0].instructions,
+            vec![
+                OpCode::PushConstant(0),
+                OpCode::LocalArrayRef(0),
+                OpCode::LocalVarRef(1),
+                OpCode::LocalVarRef(2),
+                OpCode::Add,
+                OpCode::Assign,
+                OpCode::Pop,
             ]
         );
     }

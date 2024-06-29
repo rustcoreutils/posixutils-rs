@@ -318,9 +318,9 @@ expr = {
   | input_function
 }
 
-lvalue = {
-    name
-  | array_element
+lvalue = _{
+    array_element
+  | name
   | "$" ~ expr
 }
 

@@ -21,6 +21,9 @@ diff = "0.1"
 dirs = "5.0"
 deunicode = "1.6"
 
+[dev-dependencies]
+tempfile = "3.10"
+
 [[bin]]
 name = "asa"
 path = "src/asa.rs"
@@ -68,6 +71,10 @@ path = "src/fold.rs"
 [[bin]]
 name = "head"
 path = "src/head.rs"
+
+[[bin]]
+name = "join"
+path = "src/join.rs"
 
 [[bin]]
 name = "tail"

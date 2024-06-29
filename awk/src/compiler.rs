@@ -156,25 +156,10 @@ pub enum GlobalNameKind {
 }
 
 #[derive(Clone, Copy)]
-pub struct GlobalName {
-    pub id: VarId,
-    pub kind: GlobalNameKind,
-}
-
-impl GlobalName {
-    fn special_var(var: SpecialVar) -> Self {
-        GlobalName {
-            id: var as u32,
-            kind: GlobalNameKind::SpecialVar,
-        }
-    }
-
-    fn var(id: VarId) -> Self {
-        GlobalName {
-            id,
-            kind: GlobalNameKind::Var,
-        }
-    }
+pub enum GlobalName {
+    Variable(VarId),
+    SpecialVar(VarId),
+    Function { id: u32, parameter_count: u32 },
 }
 
 type NameMap = HashMap<String, GlobalName>;
@@ -192,41 +177,59 @@ impl Default for Compiler {
         let default_globals = HashMap::from([
             (
                 "ARGC".to_string(),
-                GlobalName::special_var(SpecialVar::Argc),
+                GlobalName::SpecialVar(SpecialVar::Argc as u32),
             ),
             (
                 "ARGV".to_string(),
-                GlobalName::special_var(SpecialVar::Argv),
+                GlobalName::SpecialVar(SpecialVar::Argv as u32),
             ),
             (
                 "CONVFMT".to_string(),
-                GlobalName::special_var(SpecialVar::Convfmt),
+                GlobalName::SpecialVar(SpecialVar::Convfmt as u32),
             ),
             (
                 "ENVIRON".to_string(),
-                GlobalName::special_var(SpecialVar::Environ),
+                GlobalName::SpecialVar(SpecialVar::Environ as u32),
             ),
             (
                 "FILENAME".to_string(),
-                GlobalName::special_var(SpecialVar::Filename),
+                GlobalName::SpecialVar(SpecialVar::Filename as u32),
             ),
-            ("FNR".to_string(), GlobalName::special_var(SpecialVar::Fnr)),
-            ("NF".to_string(), GlobalName::special_var(SpecialVar::Nf)),
-            ("NR".to_string(), GlobalName::special_var(SpecialVar::Nr)),
+            (
+                "FNR".to_string(),
+                GlobalName::SpecialVar(SpecialVar::Fnr as u32),
+            ),
+            (
+                "NF".to_string(),
+                GlobalName::SpecialVar(SpecialVar::Nf as u32),
+            ),
+            (
+                "NR".to_string(),
+                GlobalName::SpecialVar(SpecialVar::Nr as u32),
+            ),
             (
                 "OFMT".to_string(),
-                GlobalName::special_var(SpecialVar::Ofmt),
+                GlobalName::SpecialVar(SpecialVar::Ofmt as u32),
             ),
-            ("OFS".to_string(), GlobalName::special_var(SpecialVar::Ofs)),
-            ("ORS".to_string(), GlobalName::special_var(SpecialVar::Ors)),
-            ("RS".to_string(), GlobalName::special_var(SpecialVar::Rs)),
+            (
+                "OFS".to_string(),
+                GlobalName::SpecialVar(SpecialVar::Ofs as u32),
+            ),
+            (
+                "ORS".to_string(),
+                GlobalName::SpecialVar(SpecialVar::Ors as u32),
+            ),
+            (
+                "RS".to_string(),
+                GlobalName::SpecialVar(SpecialVar::Rs as u32),
+            ),
             (
                 "RSTART".to_string(),
-                GlobalName::special_var(SpecialVar::Rstart),
+                GlobalName::SpecialVar(SpecialVar::Rstart as u32),
             ),
             (
                 "SUBSEP".to_string(),
-                GlobalName::special_var(SpecialVar::Subsep),
+                GlobalName::SpecialVar(SpecialVar::Subsep as u32),
             ),
         ]);
         Compiler {
@@ -258,19 +261,18 @@ impl Compiler {
         } else {
             let entry = self.names.borrow().get(name).copied();
             if let Some(var) = entry {
-                if var.kind == GlobalNameKind::Function {
-                    Err(format!(
-                        "cannot use function '{}' used as a variable or array",
-                        name
-                    ))
-                } else {
-                    Ok(global_ref(var.id))
+                match var {
+                    GlobalName::Variable(id) => Ok(global_ref(id)),
+                    GlobalName::SpecialVar(id) => Ok(global_ref(id)),
+                    GlobalName::Function { .. } => {
+                        Err(format!("'{}' function used in variable context", name))
+                    }
                 }
             } else {
                 let id = post_increment(&self.last_global_var_id);
                 self.names
                     .borrow_mut()
-                    .insert(name.to_string(), GlobalName::var(id));
+                    .insert(name.to_string(), GlobalName::Variable(id));
                 Ok(global_ref(id))
             }
         }
@@ -325,20 +327,30 @@ impl Compiler {
                 for arg in inner {
                     self.compile_expr(arg, &mut instructions, locals)?;
                     argc += 1;
+                    if argc > u16::MAX {
+                        return Err(pest_error_from_span(
+                            span,
+                            "function call with too many arguments".to_string(),
+                        ));
+                    }
                 }
-                let id = match self.names.borrow().get(name) {
-                    Some(GlobalName {
-                        id,
-                        kind: GlobalNameKind::Function,
-                    }) => *id,
-                    _ => {
+                match self.names.borrow().get(name) {
+                    Some(GlobalName::Function { id, .. }) => {
+                        instructions.push(OpCode::Call { id: *id, argc });
+                    }
+                    Some(_) => {
+                        return Err(pest_error_from_span(
+                            span,
+                            format!("'{}' is not a function", name),
+                        ))
+                    }
+                    None => {
                         return Err(pest_error_from_span(
                             span,
                             format!("call to undefined function '{}'", name),
                         ))
                     }
-                };
-                instructions.push(OpCode::Call { id, argc });
+                }
                 Ok(Expr::new(ExprKind::Number, instructions))
             }
             Rule::builtin_func => {
@@ -829,10 +841,7 @@ impl Compiler {
         let body = if maybe_param_list.as_rule() == Rule::param_list {
             for param in maybe_param_list.into_inner() {
                 match self.names.get_mut().get(param.as_str()) {
-                    Some(GlobalName { kind, .. })
-                        if *kind == GlobalNameKind::Function
-                            || *kind == GlobalNameKind::SpecialVar =>
-                    {
+                    Some(GlobalName::Function { .. }) | Some(GlobalName::SpecialVar(_)) => {
                         return Err(pest_error_from_span(
                             param.as_span(),
                             "cannot use function name or special variable as a parameter"
@@ -855,9 +864,9 @@ impl Compiler {
         let id = post_increment(&self.last_global_function_id);
         self.names.get_mut().insert(
             name.to_string(),
-            GlobalName {
+            GlobalName::Function {
                 id,
-                kind: GlobalNameKind::Function,
+                parameter_count: parameters_count as u32,
             },
         );
         Ok(Function {

@@ -105,13 +105,18 @@ impl From<ScalarValue> for StackValue {
     }
 }
 
+struct CallFrame {
+    ip: usize,
+    bp: usize,
+}
+
 #[derive(Default)]
 struct Interpreter {
     globals: Vec<GlobalValue>,
     constants: Vec<Constant>,
     stack: Vec<StackValue>,
-    functions: Vec<Function>,
     fields: Vec<String>,
+    bp: usize,
 }
 macro_rules! numeric_op {
     ($s:ident, $op:tt) => {
@@ -194,7 +199,7 @@ impl Interpreter {
             },
             Reference::GlobalArrayRef(idx) => self.get_array_element(idx),
             Reference::FieldRef(index) => Ok(ScalarValue::String(self.fields[index].clone())),
-            Reference::LocalVarRef(idx) => match &self.stack[idx] {
+            Reference::LocalVarRef(idx) => match &self.stack[self.bp + idx] {
                 StackValue::Scalar(scalar) => Ok(scalar.clone()),
                 _ => Err("array used in scalar context".to_string()),
             },
@@ -238,8 +243,15 @@ impl Interpreter {
         }
     }
 
-    fn run(&mut self, instructions: &[OpCode], row: &mut [String]) -> Result<(), String> {
+    fn run(
+        &mut self,
+        main: &[OpCode],
+        functions: &[Function],
+        row: &mut [String],
+    ) -> Result<(), String> {
         let mut ip = 0i64;
+        let mut instructions = main;
+        let mut call_frames = vec![];
         while (ip as usize) < instructions.len() {
             let mut ip_increment = 1i64;
             match instructions[ip as usize] {
@@ -396,6 +408,17 @@ impl Interpreter {
                 OpCode::Jump(offset) => {
                     ip_increment = offset as i64;
                 }
+                OpCode::Call { id, argc } => {
+                    let function = &functions[id as usize];
+                    self.bp = self.stack.len() - argc as usize;
+                    instructions = &function.instructions;
+                    call_frames.push(CallFrame {
+                        ip: ip as usize,
+                        bp: self.bp,
+                    });
+                    ip = 0;
+                    ip_increment = 0;
+                }
                 OpCode::PushConstant(idx) => {
                     self.push(self.constants[idx as usize].clone());
                 }
@@ -413,7 +436,6 @@ impl Interpreter {
 
 pub fn interpret(program: Program, files: Vec<String>) -> Result<(), String> {
     let mut interpreter = Interpreter {
-        functions: program.functions,
         constants: program.constants,
         globals: vec![GlobalValue::Uninitialized; program.globals_count],
         ..Default::default()
@@ -436,7 +458,7 @@ mod tests {
             ..Default::default()
         };
         interpreter
-            .run(&instructions, &mut vec![])
+            .run(&instructions, &[], &mut vec![])
             .expect("error running test");
         interpreter.pop_scalar().unwrap()
     }
@@ -448,9 +470,26 @@ mod tests {
             ..Default::default()
         };
         interpreter
-            .run(&instructions, &mut vec![])
+            .run(&instructions, &[], &mut vec![])
             .expect("error running test");
         interpreter.globals[0].clone()
+    }
+
+    fn interpret_with_functions(
+        main: Vec<OpCode>,
+        constant: Vec<Constant>,
+        global_count: usize,
+        functions: Vec<Function>,
+    ) -> ScalarValue {
+        let mut interpreter = Interpreter {
+            globals: vec![GlobalValue::Uninitialized; global_count],
+            constants: constant,
+            ..Default::default()
+        };
+        interpreter
+            .run(&main, &functions, &mut vec![])
+            .expect("error running test");
+        interpreter.pop_scalar().unwrap()
     }
 
     #[test]
@@ -883,6 +922,78 @@ mod tests {
         assert_eq!(
             interpret_expr(instructions, constant, 0),
             ScalarValue::Number(3.0)
+        );
+    }
+
+    #[test]
+    fn test_call_function_without_args() {
+        let main = vec![OpCode::Call { id: 0, argc: 0 }];
+        let functions = vec![Function {
+            parameters_count: 0,
+            instructions: vec![OpCode::PushConstant(0)],
+        }];
+        let constant = vec![Constant::Number(123.0)];
+        assert_eq!(
+            interpret_with_functions(main, constant, 0, functions),
+            ScalarValue::Number(123.0)
+        );
+    }
+
+    #[test]
+    fn test_call_function() {
+        let main = vec![OpCode::PushConstant(0), OpCode::Call { id: 0, argc: 1 }];
+        let functions = vec![Function {
+            parameters_count: 1,
+            instructions: vec![OpCode::LocalVarRef(0), OpCode::PushOne, OpCode::Add],
+        }];
+        let constant = vec![Constant::Number(0.0)];
+        assert_eq!(
+            interpret_with_functions(main, constant, 0, functions),
+            ScalarValue::Number(1.0)
+        );
+
+        let main = vec![OpCode::ArrayRef(0), OpCode::Call { id: 0, argc: 1 }];
+        let functions = vec![Function {
+            parameters_count: 1,
+            instructions: vec![
+                OpCode::PushConstant(0),
+                OpCode::LocalArrayRef(0),
+                OpCode::PushOne,
+                OpCode::Assign,
+            ],
+        }];
+        let constants = vec![Constant::String("key".to_string())];
+        assert_eq!(
+            interpret_with_functions(main, constants, 1, functions),
+            ScalarValue::Number(1.0)
+        );
+
+        let main = vec![
+            OpCode::PushConstant(0),
+            OpCode::PushConstant(0),
+            OpCode::PushConstant(0),
+            OpCode::PushConstant(0),
+            OpCode::PushConstant(0),
+            OpCode::Call { id: 0, argc: 5 },
+        ];
+        let functions = vec![Function {
+            parameters_count: 5,
+            instructions: vec![
+                OpCode::LocalVarRef(0),
+                OpCode::LocalVarRef(1),
+                OpCode::LocalVarRef(2),
+                OpCode::LocalVarRef(3),
+                OpCode::LocalVarRef(4),
+                OpCode::Add,
+                OpCode::Add,
+                OpCode::Add,
+                OpCode::Add,
+            ],
+        }];
+        let constants = vec![Constant::Number(1.0)];
+        assert_eq!(
+            interpret_with_functions(main, constants, 0, functions),
+            ScalarValue::Number(5.0)
         );
     }
 }

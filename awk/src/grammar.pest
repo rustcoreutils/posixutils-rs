@@ -187,20 +187,20 @@ delete_element = {
 }
 
 print_stmt = {
-    (print_call | simple_print |  printf_call | simple_printf ) ~ output_redirection?
+    (print_call | simple_print | printf_call | simple_printf) ~ output_redirection?
 }
 
 simple_print       = { "print" ~ print_expr_list? }
-print_call    = { "print" ~ "(" ~ multiple_expr_list ~ ")" }
+print_call         = { "print" ~ "(" ~ multiple_expr_list ~ ")" }
 simple_printf      = { "printf" ~ print_expr_list? }
-printf_call   = { "printf" ~ "(" ~ multiple_expr_list ~ ")" }
+printf_call        = { "printf" ~ "(" ~ multiple_expr_list ~ ")" }
 output_redirection = {
     ">" ~ expr
   | ">>" ~ expr
   | "|" ~ expr
 }
 
-print_expr_list = { print_expr ~ ("," ~ opt_newline ~ print_expr)* }
+print_expr_list    = { print_expr ~ ("," ~ opt_newline ~ print_expr)* }
 expr_list          = { expr | multiple_expr_list }
 multiple_expr_list = { expr ~ ("," ~ opt_newline ~ expr)+ }
 
@@ -347,12 +347,12 @@ print_infix_op = _{
   | concat
 }
 
-binary_print_expr = {prefix_op? ~ primary ~ postfix_op? ~ (print_infix_op ~ prefix_op? ~ primary ~ postfix_op?)*}
-print_assignment  = { lvalue ~ assignment_op ~ print_expr }
+binary_print_expr  = { prefix_op? ~ primary ~ postfix_op? ~ (print_infix_op ~ prefix_op? ~ primary ~ postfix_op?)* }
+print_assignment   = { lvalue ~ assignment_op ~ print_expr }
 ternary_print_expr = { binary_print_expr ~ "?" ~ print_expr ~ ":" ~ print_expr }
 
 print_expr = {
-      assignment
-    | ternary_print_expr
-    | binary_print_expr
+    assignment
+  | ternary_print_expr
+  | binary_print_expr
 }

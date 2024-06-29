@@ -283,6 +283,13 @@ impl Compiler {
                 self.compile_expr(primary, &mut instructions, locals)?;
                 Ok(Expr::new(ExprKind::Number, instructions))
             }
+            Rule::ere => {
+                let index = self.push_constant(Constant::Regex(primary.as_str().to_string()));
+                Ok(Expr::new(
+                    ExprKind::Regex,
+                    vec![OpCode::PushConstant(index)],
+                ))
+            }
             Rule::number => {
                 // the standard rust parse doesn't fully support the awk number format
                 // (C number format), so we use the parsing function provided by libc
@@ -304,17 +311,38 @@ impl Compiler {
                     vec![OpCode::PushConstant(index)],
                 ))
             }
-            Rule::ere => {
-                let index = self.push_constant(Constant::Regex(primary.as_str().to_string()));
-                Ok(Expr::new(
-                    ExprKind::Regex,
-                    vec![OpCode::PushConstant(index)],
-                ))
-            }
             Rule::name | Rule::array_element => {
                 let mut instructions = Vec::new();
                 self.compile_lvalue(primary, &mut instructions, locals)?;
                 Ok(Expr::new(ExprKind::LValue, instructions))
+            }
+            Rule::function_call => {
+                let span = primary.as_span();
+                let mut inner = primary.into_inner();
+                let name = inner.next().unwrap().as_str();
+                let mut instructions = Vec::new();
+                let mut argc = 0;
+                for arg in inner {
+                    self.compile_expr(arg, &mut instructions, locals)?;
+                    argc += 1;
+                }
+                let id = match self.names.borrow().get(name) {
+                    Some(GlobalName {
+                        id,
+                        kind: GlobalNameKind::Function,
+                    }) => *id,
+                    _ => {
+                        return Err(pest_error_from_span(
+                            span,
+                            format!("call to undefined function '{}'", name),
+                        ))
+                    }
+                };
+                instructions.push(OpCode::Call { id, argc });
+                Ok(Expr::new(ExprKind::Number, instructions))
+            }
+            Rule::builtin_func => {
+                todo!();
             }
             _ => unreachable!(),
         }
@@ -503,7 +531,7 @@ impl Compiler {
                 let mut inner = lvalue.into_inner();
                 let name = inner.next().unwrap();
                 // FIXME: only supports expression lists of one element
-                let index = inner.next().unwrap().into_inner().next().unwrap();
+                let index = inner.next().unwrap();
                 self.compile_expr(index, instructions, locals)?;
                 let get_instruction = self
                     .get_var(
@@ -602,7 +630,7 @@ impl Compiler {
                 let print = inner.next().unwrap();
                 match print.as_rule() {
                     Rule::simple_print | Rule::print_call => {
-                        let mut expressions = first_child(print).into_inner();
+                        let mut expressions = print.into_inner();
                         if expressions.len() == 0 {
                             todo!()
                         } else {
@@ -1981,6 +2009,51 @@ mod test {
                 OpCode::LocalVarRef(2),
                 OpCode::Add,
                 OpCode::Assign,
+                OpCode::Pop,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_compile_function_call_no_params() {
+        let program = compile_correct_program(
+            r#"
+            function fun() {
+            }
+            BEGIN {fun()}
+            "#,
+        );
+        assert_eq!(
+            program.begin_instructions,
+            vec![OpCode::Call { id: 0, argc: 0 }, OpCode::Pop]
+        );
+    }
+
+    #[test]
+    fn test_compile_function_call() {
+        let program = compile_correct_program(
+            r#"
+            function fun(a, b) {
+                a + b;
+            }
+            BEGIN {fun(1, 2)}
+            "#,
+        );
+        assert_eq!(
+            program.functions[0].instructions,
+            vec![
+                OpCode::LocalVarRef(0),
+                OpCode::LocalVarRef(1),
+                OpCode::Add,
+                OpCode::Pop,
+            ]
+        );
+        assert_eq!(
+            program.begin_instructions,
+            vec![
+                OpCode::PushConstant(0),
+                OpCode::PushConstant(1),
+                OpCode::Call { id: 0, argc: 2 },
                 OpCode::Pop,
             ]
         );

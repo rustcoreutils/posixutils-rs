@@ -73,7 +73,7 @@ pub enum OpCode {
     JumpIfTrue(i32),
     Jump(i32),
 
-    Call(u32),
+    Call { id: u32, argc: u16 },
 
     // Push the constant value on top of the stack
     PushConstant(u32),

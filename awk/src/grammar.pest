@@ -200,9 +200,9 @@ output_redirection = {
   | "|" ~ expr
 }
 
-print_expr_list    = { print_expr ~ ("," ~ opt_newline ~ print_expr)* }
-expr_list          = { expr | multiple_expr_list }
-multiple_expr_list = { expr ~ ("," ~ opt_newline ~ expr)+ }
+print_expr_list    = _{ print_expr ~ ("," ~ opt_newline ~ print_expr)* }
+expr_list          = _{ multiple_expr_list | expr }
+multiple_expr_list = _{ expr ~ ("," ~ opt_newline ~ expr)+ }
 
 primary = _{
     "(" ~ expr ~ ")"
@@ -210,13 +210,14 @@ primary = _{
   | number
   | string
   | array_element
+  | function_call
+  | builtin_function_call
   | name
-  | func_name ~ "(" ~ expr_list? ~ ")"
-  | builtin_func ~ "(" ~ expr_list? ~ ")"
-  | builtin_func
 }
 
-array_element = { name ~ "[" ~ expr_list ~ "]" }
+array_element         = { name ~ "[" ~ expr_list ~ "]" }
+function_call         = { func_name ~ "(" ~ expr_list? ~ ")" }
+builtin_function_call = { builtin_func ~ ("(" ~ expr_list? ~ ")")? }
 
 prefix_op = _{
     dollarsign

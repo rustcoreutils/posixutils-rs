@@ -2,7 +2,7 @@
 
 This document outlines notes about compatibility of this software with other software that uses m4.
 
-## autoconf
+## [`autoconf`](https://www.gnu.org/software/autoconf/)
 
 [GNU m4](https://www.gnu.org/software/m4/) is probably the most widely used version of m4. The place where it perhaps receives the most use is in [autoconf](https://www.gnu.org/software/autoconf/). `autoconf` is a very popular tool for building software and perhaps the place where m4 is used the most in practice today. As such priority has been placed on establishing what would be needed for this version of m4 to provide compatibility with the [GNU specific m4 features/behaviours](https://www.gnu.org/software/m4/manual/html_node/Extensions.html#Extensions) to allow it to be used as a drop-in replacement to use with autoconf. The first goal was to run autoconf with the GNU [hello project](https://www.gnu.org/software/hello/)
 
@@ -50,3 +50,7 @@ GNU m4 specific builtin macros likely to be necessary (there are probably more) 
 * [fatal_error](https://www.gnu.org/software/m4/manual/m4.html#index-fatal_005ferror)
 * [esyscmd](https://www.gnu.org/software/m4/manual/m4.html#index-esyscmd)
 * [foreach](https://www.gnu.org/software/m4/manual/m4.html#index-foreach)
+
+## [`sendmail`](https://www.proofpoint.com/us/products/email-protection/open-source-email-solution)
+
+TODO

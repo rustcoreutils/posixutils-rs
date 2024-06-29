@@ -23,31 +23,31 @@ use std::path::PathBuf;
 #[command(author, version, about, long_about)]
 struct Args {
     /// Produce a line for each unpairable line in file1 or file2
-    #[arg(short = 'a', long)]
+    #[arg(short)]
     a_file: Option<u8>,
 
     /// Replace empty output fields with this string
-    #[arg(short = 'e', long)]
+    #[arg(short = 'e', long = "empty")]
     replace_empty: Option<String>,
 
     /// Construct the output line to comprise the specified fields
-    #[arg(short = 'o', long)]
+    #[arg(short)]
     output_format: Option<String>,
 
     /// Use the specified character as the input and output field separator
-    #[arg(short = 't', long)]
+    #[arg(short = 't')]
     field_separator: Option<char>,
 
     /// Produce a line only for each unpairable line in file1 or file2
-    #[arg(short = 'v', long)]
+    #[arg(short = 'v')]
     v_file: Option<u8>,
 
     /// Join on the specified field of file1
-    #[arg(short = '1', long)]
+    #[arg(short = '1')]
     field1: Option<usize>,
 
     /// Join on the specified field of file2
-    #[arg(short = '2', long)]
+    #[arg(short = '2')]
     field2: Option<usize>,
 
     /// Path to file1

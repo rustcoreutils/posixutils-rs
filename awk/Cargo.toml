@@ -1,0 +1,13 @@
+[package]
+name = "posixutils-awk"
+version = "0.1.7"
+edition = "2021"
+
+[dependencies]
+plib = { path = "../plib" }
+regex.workspace = true
+clap.workspace = true
+libc.workspace = true
+pest = "2.7.10"
+pest_derive = "2.7.10"
+lazy_static = "1.4.0"

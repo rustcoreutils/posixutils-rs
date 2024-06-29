@@ -21,7 +21,7 @@ use pest::{
     Parser,
 };
 
-use crate::program::{AwkRule, Constant, Function, OpCode, Program, VarId};
+use crate::program::{AwkRule, Constant, Function, OpCode, Program, SpecialVar, VarId};
 
 lazy_static::lazy_static! {
     static ref PRATT_PARSER: PrattParser<Rule> = {
@@ -154,15 +154,53 @@ pub struct Name {
     pub is_function: bool,
 }
 
+impl Name {
+    fn var(id: VarId) -> Self {
+        Name {
+            id,
+            is_function: false,
+        }
+    }
+}
+
 type NameMap = HashMap<String, Name>;
 type LocalMap = HashMap<String, VarId>;
 
-#[derive(Default)]
 struct Compiler {
     constants: RefCell<Vec<Constant>>,
     names: RefCell<NameMap>,
     last_global_var_id: Cell<u32>,
     last_global_function_id: Cell<u32>,
+}
+
+impl Default for Compiler {
+    fn default() -> Self {
+        let default_globals = HashMap::from([
+            ("ARGC".to_string(), Name::var(SpecialVar::Argc as u32)),
+            ("ARGV".to_string(), Name::var(SpecialVar::Argv as u32)),
+            ("CONVFMT".to_string(), Name::var(SpecialVar::Convfmt as u32)),
+            ("ENVIRON".to_string(), Name::var(SpecialVar::Environ as u32)),
+            (
+                "FILENAME".to_string(),
+                Name::var(SpecialVar::Filename as u32),
+            ),
+            ("FNR".to_string(), Name::var(SpecialVar::Fnr as u32)),
+            ("NF".to_string(), Name::var(SpecialVar::Nf as u32)),
+            ("NR".to_string(), Name::var(SpecialVar::Nr as u32)),
+            ("OFMT".to_string(), Name::var(SpecialVar::Ofmt as u32)),
+            ("OFS".to_string(), Name::var(SpecialVar::Ofs as u32)),
+            ("ORS".to_string(), Name::var(SpecialVar::Ors as u32)),
+            ("RS".to_string(), Name::var(SpecialVar::Rs as u32)),
+            ("RSTART".to_string(), Name::var(SpecialVar::Rstart as u32)),
+            ("SUBSEP".to_string(), Name::var(SpecialVar::Subsep as u32)),
+        ]);
+        Compiler {
+            constants: RefCell::new(Vec::new()),
+            names: RefCell::new(default_globals),
+            last_global_var_id: Cell::new(SpecialVar::Count as u32),
+            last_global_function_id: Cell::new(0),
+        }
+    }
 }
 
 impl Compiler {
@@ -805,6 +843,8 @@ pub fn compile_program(text: &str) -> Result<Program, PestError> {
 mod test {
     use super::*;
 
+    const FIRST_GLOBAL_VAR: u32 = SpecialVar::Count as u32;
+
     fn compile_expr(expr: &str) -> (Vec<OpCode>, Vec<Constant>) {
         let mut program = compile_program(format!("BEGIN {{ {} }}", expr).as_str())
             .expect("error compiling expression");
@@ -954,16 +994,28 @@ mod test {
         assert_eq!(instructions, vec![OpCode::PushConstant(0), OpCode::Not]);
 
         let (instructions, _) = compile_expr("++a");
-        assert_eq!(instructions, vec![OpCode::VarRef(0), OpCode::PreInc]);
+        assert_eq!(
+            instructions,
+            vec![OpCode::VarRef(FIRST_GLOBAL_VAR), OpCode::PreInc]
+        );
 
         let (instructions, _) = compile_expr("--a");
-        assert_eq!(instructions, vec![OpCode::VarRef(0), OpCode::PreDec]);
+        assert_eq!(
+            instructions,
+            vec![OpCode::VarRef(FIRST_GLOBAL_VAR), OpCode::PreDec]
+        );
 
         let (instructions, _) = compile_expr("a++");
-        assert_eq!(instructions, vec![OpCode::VarRef(0), OpCode::PostInc]);
+        assert_eq!(
+            instructions,
+            vec![OpCode::VarRef(FIRST_GLOBAL_VAR), OpCode::PostInc]
+        );
 
         let (instructions, _) = compile_expr("a--");
-        assert_eq!(instructions, vec![OpCode::VarRef(0), OpCode::PostDec]);
+        assert_eq!(
+            instructions,
+            vec![OpCode::VarRef(FIRST_GLOBAL_VAR), OpCode::PostDec]
+        );
     }
 
     #[test]
@@ -1308,7 +1360,11 @@ mod test {
         let (instructions, constants) = compile_expr(r#""a" in map"#);
         assert_eq!(
             instructions,
-            vec![OpCode::PushConstant(0), OpCode::ArrayRef(0), OpCode::In]
+            vec![
+                OpCode::PushConstant(0),
+                OpCode::ArrayRef(FIRST_GLOBAL_VAR),
+                OpCode::In
+            ]
         );
         assert_eq!(constants, vec![Constant::String("a".to_string())]);
     }
@@ -1423,13 +1479,13 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::VarRef(0),
+                OpCode::VarRef(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(0),
                 OpCode::Eq,
                 OpCode::JumpIfFalse(3),
                 OpCode::PushConstant(1),
                 OpCode::Jump(8),
-                OpCode::VarRef(0),
+                OpCode::VarRef(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(2),
                 OpCode::Eq,
                 OpCode::JumpIfFalse(3),
@@ -1455,7 +1511,11 @@ mod test {
         let (instructions, constants) = compile_expr("a = 1");
         assert_eq!(
             instructions,
-            vec![OpCode::VarRef(0), OpCode::PushConstant(0), OpCode::Assign,]
+            vec![
+                OpCode::VarRef(FIRST_GLOBAL_VAR),
+                OpCode::PushConstant(0),
+                OpCode::Assign,
+            ]
         );
         assert_eq!(constants, vec![Constant::Number(1.0)]);
 
@@ -1463,8 +1523,8 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::VarRef(0),
-                OpCode::VarRef(1),
+                OpCode::VarRef(FIRST_GLOBAL_VAR),
+                OpCode::VarRef(FIRST_GLOBAL_VAR + 1),
                 OpCode::PushConstant(0),
                 OpCode::Assign,
                 OpCode::Assign,
@@ -1479,7 +1539,7 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::VarRef(0),
+                OpCode::VarRef(FIRST_GLOBAL_VAR),
                 OpCode::Dup,
                 OpCode::PushConstant(0),
                 OpCode::Add,
@@ -1492,7 +1552,7 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::VarRef(0),
+                OpCode::VarRef(FIRST_GLOBAL_VAR),
                 OpCode::Dup,
                 OpCode::PushConstant(0),
                 OpCode::Sub,
@@ -1505,7 +1565,7 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::VarRef(0),
+                OpCode::VarRef(FIRST_GLOBAL_VAR),
                 OpCode::Dup,
                 OpCode::PushConstant(0),
                 OpCode::Mul,
@@ -1518,7 +1578,7 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::VarRef(0),
+                OpCode::VarRef(FIRST_GLOBAL_VAR),
                 OpCode::Dup,
                 OpCode::PushConstant(0),
                 OpCode::Div,
@@ -1531,7 +1591,7 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::VarRef(0),
+                OpCode::VarRef(FIRST_GLOBAL_VAR),
                 OpCode::Dup,
                 OpCode::PushConstant(0),
                 OpCode::Mod,
@@ -1544,7 +1604,7 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::VarRef(0),
+                OpCode::VarRef(FIRST_GLOBAL_VAR),
                 OpCode::Dup,
                 OpCode::PushConstant(0),
                 OpCode::Pow,
@@ -1557,9 +1617,9 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::VarRef(0),
+                OpCode::VarRef(FIRST_GLOBAL_VAR),
                 OpCode::Dup,
-                OpCode::VarRef(1),
+                OpCode::VarRef(FIRST_GLOBAL_VAR + 1),
                 OpCode::Dup,
                 OpCode::PushConstant(0),
                 OpCode::Add,
@@ -1655,17 +1715,17 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::VarRef(0),
+                OpCode::VarRef(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(0),
                 OpCode::Assign,
                 OpCode::Pop,
-                OpCode::VarRef(0),
+                OpCode::VarRef(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(1),
                 OpCode::Lt,
                 OpCode::JumpIfFalse(7),
                 OpCode::PushConstant(2),
                 OpCode::Pop,
-                OpCode::VarRef(0),
+                OpCode::VarRef(FIRST_GLOBAL_VAR),
                 OpCode::PostInc,
                 OpCode::Pop,
                 OpCode::Jump(-9),

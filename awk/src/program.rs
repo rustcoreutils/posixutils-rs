@@ -146,3 +146,26 @@ impl fmt::Debug for Program {
         write!(f, "}}")
     }
 }
+
+#[repr(u32)]
+pub enum SpecialVar {
+    Argc,
+    Argv,
+    Convfmt,
+    Environ,
+    Filename,
+    Fnr,
+    Fs,
+    Nf,
+    Nr,
+    Ofmt,
+    Ofs,
+    Ors,
+    Rlength,
+    Rs,
+    Rstart,
+    Subsep,
+
+    /// the total number of special variables
+    Count,
+}

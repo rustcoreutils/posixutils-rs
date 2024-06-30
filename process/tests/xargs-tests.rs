@@ -51,3 +51,13 @@ fn test_xargs_with_eofstr() {
         vec!["-E", "STOP", "echo"],
     );
 }
+
+#[test]
+fn test_xargs_with_null_delimiter() {
+    xargs_test("one\0two\0three\0", "one two three\n", vec!["-0", "echo"]);
+}
+
+#[test]
+fn test_xargs_with_null_delimiter_trailing_non_null() {
+    xargs_test("one\0two\0three", "one two three\n", vec!["-0", "echo"]);
+}

@@ -115,22 +115,26 @@ pub fn run<STDOUT: Write, STDERR: Write>(
     stderr: &mut STDERR,
     args: Args,
 ) -> crate::error::Result<()> {
-    fn map_err<STDERR: Write>(
-        stderr: &mut STDERR,
-    ) -> impl FnMut(crate::error::Error) -> crate::error::Error + '_ {
-        |error| match error {
-            Error::Exit(_) => error,
-            _ => {
-                if let Err(error) = stderr.write_all(error.to_string().as_bytes()) {
-                    return error.into();
-                }
-                error
+    match run_impl(stdout, stderr, args) {
+        Ok(_) => Ok(()),
+        Err(error @ Error::Exit(_)) => Err(error),
+        Err(error) => {
+            if let Err(error) = stderr.write_all(error.to_string().as_bytes()) {
+                return Err(error.into());
             }
+            Err(error)
         }
     }
+}
 
+pub fn run_impl<STDOUT: Write, STDERR: Write>(
+    stdout: &mut STDOUT,
+    stderr: &mut STDERR,
+    args: Args,
+) -> crate::error::Result<()> {
     let mut state = State::default();
     if args.files.is_empty() {
+        log::info!("Processing input from STDIN");
         state = lexer::process_streaming(
             state,
             evaluate::evaluate,
@@ -139,10 +143,10 @@ pub fn run<STDOUT: Write, STDERR: Write>(
             stderr,
             true,
             true,
-        )
-        .map_err(map_err(stderr))?;
+        )?;
     } else {
         for file_path in args.files {
+            log::info!("Processing input from {file_path:?}");
             state = lexer::process_streaming(
                 state,
                 evaluate::evaluate,
@@ -151,8 +155,7 @@ pub fn run<STDOUT: Write, STDERR: Write>(
                 stderr,
                 true,
                 true,
-            )
-            .map_err(map_err(stderr))?;
+            )?;
         }
     }
 

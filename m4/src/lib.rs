@@ -115,19 +115,24 @@ pub fn run<STDOUT: Write, STDERR: Write>(
     stderr: &mut STDERR,
     args: Args,
 ) -> crate::error::Result<()> {
-    let result = if let Some(file_path) = args.files.into_iter().next() {
-        lexer::process_streaming(
-            State::default(),
-            evaluate::evaluate,
-            std::fs::File::open(file_path)?,
-            stdout,
-            stderr,
-            true,
-            true,
-        )
-    } else {
-        lexer::process_streaming(
-            State::default(),
+    fn map_err<STDERR: Write>(
+        stderr: &mut STDERR,
+    ) -> impl FnMut(crate::error::Error) -> crate::error::Error + '_ {
+        |error| match error {
+            Error::Exit(_) => error,
+            _ => {
+                if let Err(error) = stderr.write_all(error.to_string().as_bytes()) {
+                    return error.into();
+                }
+                error
+            }
+        }
+    }
+
+    let mut state = State::default();
+    if args.files.is_empty() {
+        state = lexer::process_streaming(
+            state,
             evaluate::evaluate,
             std::io::stdin(),
             stdout,
@@ -135,28 +140,28 @@ pub fn run<STDOUT: Write, STDERR: Write>(
             true,
             true,
         )
-    };
-
-    match result {
-        Ok(state) => {
-            for buffer in state.divert_buffers {
-                let buffer = buffer.0.borrow();
-                stdout.write_all(&*buffer)?;
-            }
-            for wrap in state.m4wrap {
-                stdout.write_all(&wrap)?;
-            }
-
-            if state.exit_error {
-                Err(Error::Exit(1))
-            } else {
-                Ok(())
-            }
-        }
-        Err(error @ Error::Exit(_)) => Err(error),
-        Err(error) => {
-            stderr.write_all(error.to_string().as_bytes())?;
-            Err(error)
+        .map_err(map_err(stderr))?;
+    } else {
+        for file_path in args.files {
+            state = lexer::process_streaming(
+                state,
+                evaluate::evaluate,
+                std::fs::File::open(file_path)?,
+                stdout,
+                stderr,
+                true,
+                true,
+            )
+            .map_err(map_err(stderr))?;
         }
     }
+
+    for buffer in state.divert_buffers {
+        let buffer = buffer.0.borrow();
+        stdout.write_all(&*buffer)?;
+    }
+    for wrap in state.m4wrap {
+        stdout.write_all(&wrap)?;
+    }
+    Ok(())
 }

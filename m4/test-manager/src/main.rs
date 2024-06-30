@@ -59,7 +59,11 @@ fn update_snapshots(args: &Args, update: &UpdateSnapshots) {
     dir.map(|result| result.unwrap())
         .filter(|entry| {
             if !(entry.path().is_file()
-                && entry.path().extension() == Some(&OsStr::from_bytes(b"m4")))
+                && match entry.path().extension().map(|e| e.as_bytes()) {
+                    Some(b"m4") => true,
+                    Some(b"args") => true,
+                    _ => false,
+                })
             {
                 return false;
             }
@@ -72,8 +76,8 @@ fn update_snapshots(args: &Args, update: &UpdateSnapshots) {
 
             true
         })
-        .for_each(|m4_file| {
-            let test_name = m4_file
+        .for_each(|input_file| {
+            let test_name = input_file
                 .path()
                 .file_stem()
                 .unwrap()
@@ -97,16 +101,34 @@ fn update_snapshots(args: &Args, update: &UpdateSnapshots) {
                     println!("SKIPPING snapshot with skip_update=true for {test_name}");
                     return;
                 }
-                (snapshot.expect_error, snapshot.stdout_regex, snapshot.skip_update)
+                (
+                    snapshot.expect_error,
+                    snapshot.stdout_regex,
+                    snapshot.skip_update,
+                )
             } else {
                 (false, None, false)
             };
 
             println!("UPDATING snapshot for {test_name}");
-            let output = std::process::Command::new(&update.reference_command)
-                .arg(m4_file.path())
-                .output()
-                .unwrap();
+            let output = match input_file.path().extension().expect("Input file should have extension").as_bytes() {
+                b"m4" => {
+                    std::process::Command::new(&update.reference_command)
+                        .arg(input_file.path())
+                        .output()
+                        .unwrap()
+                },
+                b"args" => {
+                    let args = std::fs::read_to_string(input_file.path()).unwrap();
+                    std::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(format!("{} {args}", update.reference_command))
+                        .output()
+                        .unwrap()
+                }
+                _ => panic!("Unsupported input extension {input_file:?}"),
+            };
+            
 
             if update.debug_output {
                 println!("stdout:");

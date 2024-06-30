@@ -15,7 +15,7 @@ use m4_test_manager::TestSnapshot;
 struct TestCandidate {
     /// The name of the test.
     name: String,
-    /// Input `.m4` file. Will be `None` if has not yet been found.
+    /// Input `.m4` or `.args` file. Will be `None` if has not yet been found.
     input: Option<PathBuf>,
     /// Output `.out` file. Will be `None` if has not yet been found.
     output: Option<PathBuf>,
@@ -41,7 +41,7 @@ impl TryFrom<TestCandidate> for Test {
                 .to_owned(),
             output: value
                 .output
-                .ok_or("No output file provided")?
+                .ok_or("No output file provided, please run m4-test-manager update-snapshots")?
                 .to_str()
                 .ok_or("Error converting output path to string")?
                 .to_owned(),
@@ -86,7 +86,7 @@ impl Test {
             r##"#[test]
 fn test_{name}() {{
     init();
-    let output = run_command("{input}");
+    let output = run_command(&Path::new("{input}"));
 
     let test: TestSnapshot = read_test("{output}");
     assert_eq!(output.status, std::process::ExitStatus::from_raw(test.status), "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)");
@@ -138,7 +138,7 @@ fn main() {
         let path = entry.path();
 
         match path.extension().map(|e| e.as_bytes()) {
-            Some(b"m4") => {
+            Some(b"m4") | Some(b"args") => {
                 let name = name_from_path(&path).unwrap();
                 let snapshot_file_name = format!("{name}.out");
                 let snapshot_file = fixtures_directory.join(snapshot_file_name);
@@ -190,8 +190,10 @@ fn main() {
 //! `cargo run -p m4-test-manager update-snapshots`
 use similar_asserts::assert_eq;
 use std::process::ExitStatus;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::fs::read_to_string;
+use std::path::Path;
 use m4::error::GetExitCode;
 use m4_test_manager::TestSnapshot;
 
@@ -221,27 +223,59 @@ fn read_test(path: impl AsRef<std::path::Path>) -> TestSnapshot {
     snapshot
 }
 
-fn run_command(input: &str) -> std::process::Output {
-    // std::process::Command::new("cargo")
-    //     .arg("run")
-    //     .arg("--")
-    //     .arg(input)
-    //     .output()
-    //     .unwrap()
+fn run_command(input: &Path) -> std::process::Output {
+    let input_string = read_to_string(input).unwrap();
+    log::info!(
+        "Running command with input {input:?}:\n\x1b[34m{}\x1b[0m",
+        input_string,
+    );
+    let (stdout, stderr, status) = match input.extension().expect("Input file should have extension").as_bytes() {
+        b"m4" => {
+            // The reason why we run the command using this as a library is so we can run with it built in
+            // test configuration, with all the associated conditionally compiled test log instrumentation.
+            
+            let mut stdout: Vec<u8> = Vec::new();
+            let mut stderr: Vec<u8> = Vec::new();
+            let args = m4::Args {
+                files: vec![input.into()],
+                ..m4::Args::default()
+            };
+            let result = m4::run(&mut stdout, &mut stderr, args);
+            let status = ExitStatus::from_raw(result.get_exit_code() as i32);
+            (stdout, stderr, status)
+        },
+        b"args" => {
+            let args = input_string;
+            let _cargo_build_output = std::process::Command::new("cargo")
+                .arg("build")
+                .output()
+                .unwrap();
+
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("../target/debug/m4 {args}"))
+                .output()
+                .unwrap();
+
+            (output.stdout, output.stderr, output.status)
+        }
+        _ => panic!("Unsupported input extension {input:?}"),
+    };
+
     
-    // The reason why we run the command using this as a library is so we can run with it built in
-    // test configuration, with all the associated conditionally compiled test log instrumentation.
-    log::info!("Running command with input {input:?}:\n\x1b[34m{}\x1b[0m", read_to_string(input).unwrap());
-    let mut stdout: Vec<u8> = Vec::new();
-    let mut stderr: Vec<u8> = Vec::new();
-    let args = m4::Args { files: vec![input.into()], ..m4::Args::default()};
-    let result = m4::run(&mut stdout, &mut stderr, args);
-    let status = ExitStatus::from_raw(result.get_exit_code() as i32);
     log::info!("Received status: {status}");
-    log::info!("Received stdout:\n\x1b[34m{}\x1b[0m", String::from_utf8_lossy(&stdout));
-    log::info!("Received stderr:\n\x1b[34m{}\x1b[0m", String::from_utf8_lossy(&stderr));
+    log::info!(
+        "Received stdout:\n\x1b[34m{}\x1b[0m",
+        String::from_utf8_lossy(&stdout)
+    );
+    log::info!(
+        "Received stderr:\n\x1b[34m{}\x1b[0m",
+        String::from_utf8_lossy(&stderr)
+    );
     std::process::Output {
-        stdout, stderr, status
+        stdout,
+        stderr,
+        status,
     }
 }
 "#

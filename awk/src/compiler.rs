@@ -335,8 +335,25 @@ impl Compiler {
                     }
                 }
                 match self.names.borrow().get(name) {
-                    Some(GlobalName::Function { id, .. }) => {
-                        instructions.push(OpCode::Call { id: *id, argc });
+                    Some(GlobalName::Function {
+                        id,
+                        parameter_count,
+                    }) => {
+                        if argc > *parameter_count as u16 {
+                            // TODO: other implementations simply issue a warning
+                            return Err(pest_error_from_span(
+                                span,
+                                format!("function '{}' called with too many arguments", name),
+                            ));
+                        } else if argc < *parameter_count as u16 {
+                            for _ in argc..*parameter_count as u16 {
+                                instructions.push(OpCode::PushUndefined);
+                            }
+                        }
+                        instructions.push(OpCode::Call {
+                            id: *id,
+                            argc: *parameter_count as u16,
+                        });
                     }
                     Some(_) => {
                         return Err(pest_error_from_span(
@@ -2062,6 +2079,36 @@ mod test {
             vec![
                 OpCode::PushConstant(0),
                 OpCode::PushConstant(1),
+                OpCode::Call { id: 0, argc: 2 },
+                OpCode::Pop,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_compile_function_call_with_too_few_arguments() {
+        let program = compile_correct_program(
+            r#"
+            function fun(a, b) {
+                a + b;
+            }
+            BEGIN {fun(1)}
+            "#,
+        );
+        assert_eq!(
+            program.functions[0].instructions,
+            vec![
+                OpCode::LocalVarRef(0),
+                OpCode::LocalVarRef(1),
+                OpCode::Add,
+                OpCode::Pop,
+            ]
+        );
+        assert_eq!(
+            program.begin_instructions,
+            vec![
+                OpCode::PushConstant(0),
+                OpCode::PushUndefined,
                 OpCode::Call { id: 0, argc: 2 },
                 OpCode::Pop,
             ]

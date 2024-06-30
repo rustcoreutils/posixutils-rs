@@ -7,8 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 // TODO:
-// - the -0 argument used in conjunction with find -print0
-// - trace mode (-t)
 // - prompt mode (-p)
 // - insert mode (-I)
 // - split by lines (-L)
@@ -81,7 +79,13 @@ fn find_str(needle: &str, haystack: &[String]) -> Option<usize> {
 }
 
 // execute the utility
-fn exec_util(util: &str, util_args: Vec<String>) -> io::Result<()> {
+fn exec_util(util: &str, util_args: Vec<String>, trace: bool) -> io::Result<()> {
+    // if tracing, Each generated command line shall be written to
+    // standard error just prior to invocation.
+    if trace {
+        eprintln!("{} {}", util, util_args.join(" "));
+    }
+
     let _output = Command::new(util)
         .args(util_args)
         .stdin(Stdio::null())
@@ -305,7 +309,7 @@ fn read_and_spawn(args: &Args) -> io::Result<()> {
         while state.full() {
             let mut util_args = args.util_args.clone();
             util_args.append(&mut state.remove_args());
-            exec_util(&args.util, util_args)?;
+            exec_util(&args.util, util_args, args.trace)?;
         }
     }
 
@@ -316,7 +320,7 @@ fn read_and_spawn(args: &Args) -> io::Result<()> {
     if !state.args.is_empty() {
         let mut util_args = args.util_args.clone();
         util_args.append(&mut state.remove_args());
-        exec_util(&args.util, util_args)?;
+        exec_util(&args.util, util_args, args.trace)?;
     }
 
     Ok(())

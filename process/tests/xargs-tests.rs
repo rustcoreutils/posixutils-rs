@@ -51,3 +51,25 @@ fn test_xargs_with_eofstr() {
         vec!["-E", "STOP", "echo"],
     );
 }
+
+#[test]
+fn test_xargs_with_null_delimiter() {
+    xargs_test("one\0two\0three\0", "one two three\n", vec!["-0", "echo"]);
+}
+
+#[test]
+fn test_xargs_with_null_delimiter_trailing_non_null() {
+    xargs_test("one\0two\0three", "one two three\n", vec!["-0", "echo"]);
+}
+
+#[test]
+fn test_xargs_trace() {
+    run_test(TestPlan {
+        cmd: String::from("xargs"),
+        args: vec!["-t".to_string(), "echo".to_string()],
+        stdin_data: String::from("one two three\n"),
+        expected_err: String::from("echo one two three\n"),
+        expected_out: String::from("one two three\n"),
+        expected_exit_code: 0,
+    });
+}

@@ -19,7 +19,7 @@ use std::io::{self, BufRead, BufReader};
 use std::path::PathBuf;
 
 /// join - relational database operator
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// Produce a line for each unpairable line in file1 or file2
@@ -55,6 +55,72 @@ struct Args {
 
     /// Path to file2
     file2: PathBuf,
+}
+
+struct OutputField {
+    file_number: usize,
+    field_number: usize,
+}
+
+struct Config {
+    args: Args,
+    ofld: Vec<OutputField>,
+}
+
+impl Config {
+    fn new(args: &Args) -> Config {
+        let ofld = {
+            if args.output_format.is_none() {
+                Vec::new()
+            } else {
+                parse_output_fields(
+                    &args
+                        .output_format
+                        .as_ref()
+                        .expect("output_format is required"),
+                )
+                .expect("Invalid output format")
+            }
+        };
+        Config {
+            args: args.clone(),
+            ofld,
+        }
+    }
+}
+
+fn parse_output_fields(o_arg: &str) -> Result<Vec<OutputField>, String> {
+    let mut output_fields = Vec::new();
+
+    for field in o_arg.split(',') {
+        let mut parts = field.split('.');
+        let file_number = match parts.next() {
+            Some(num) => match num.parse::<usize>() {
+                Ok(n) => n,
+                Err(_) => return Err(format!("Invalid file number: {}", num)),
+            },
+            None => return Err("Missing file number".to_string()),
+        };
+
+        let field_number = match parts.next() {
+            Some(num) => match num.parse::<usize>() {
+                Ok(n) => n,
+                Err(_) => return Err(format!("Invalid field number: {}", num)),
+            },
+            None => return Err("Missing field number".to_string()),
+        };
+
+        if parts.next().is_some() {
+            return Err("Too many parts in field specification".to_string());
+        }
+
+        output_fields.push(OutputField {
+            file_number,
+            field_number,
+        });
+    }
+
+    Ok(output_fields)
 }
 
 fn print_unpaired_line(line: &str, args: &Args) -> io::Result<()> {
@@ -106,7 +172,7 @@ fn join_files<R: BufRead>(
     separator: char,
     field1: usize,
     field2: usize,
-    args: &Args,
+    cfg: &Config,
 ) -> io::Result<()> {
     let mut file1_lines = file1.lines().peekable();
     let mut file2_lines = file2.lines().peekable();
@@ -120,22 +186,22 @@ fn join_files<R: BufRead>(
 
         match key1.cmp(key2) {
             std::cmp::Ordering::Less => {
-                if let Some(1) = args.a_file {
+                if let Some(1) = cfg.args.a_file {
                     // Print unpaired line from file1
-                    print_unpaired_line(line1.as_ref().unwrap(), args)?;
+                    print_unpaired_line(line1.as_ref().unwrap(), &cfg.args)?;
                 }
                 file1_lines.next();
             }
             std::cmp::Ordering::Greater => {
-                if let Some(2) = args.a_file {
+                if let Some(2) = cfg.args.a_file {
                     // Print unpaired line from file2
-                    print_unpaired_line(line2.as_ref().unwrap(), args)?;
+                    print_unpaired_line(line2.as_ref().unwrap(), &cfg.args)?;
                 }
                 file2_lines.next();
             }
             std::cmp::Ordering::Equal => {
                 // Print the joined line
-                print_joined_line(fields1, fields2, separator, args)?;
+                print_joined_line(fields1, fields2, separator, &cfg.args)?;
                 file1_lines.next();
                 file2_lines.next();
             }
@@ -143,14 +209,14 @@ fn join_files<R: BufRead>(
     }
 
     // Handle remaining unpaired lines
-    if let Some(1) = args.a_file {
+    if let Some(1) = cfg.args.a_file {
         for line1 in file1_lines {
-            print_unpaired_line(&line1?, args)?;
+            print_unpaired_line(&line1?, &cfg.args)?;
         }
     }
-    if let Some(2) = args.a_file {
+    if let Some(2) = cfg.args.a_file {
         for line2 in file2_lines {
-            print_unpaired_line(&line2?, args)?;
+            print_unpaired_line(&line2?, &cfg.args)?;
         }
     }
 
@@ -160,6 +226,7 @@ fn join_files<R: BufRead>(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments
     let args = Args::parse();
+    let config = Config::new(&args);
 
     // Set locale and text domain for localization
     setlocale(LocaleCategory::LcAll, "");
@@ -176,7 +243,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let field2 = args.field2.unwrap_or(1) - 1;
 
     // TODO: Implement the streaming join logic
-    join_files(file1, file2, field_separator, field1, field2, &args)?;
+    join_files(file1, file2, field_separator, field1, field2, &config)?;
 
     Ok(())
 }

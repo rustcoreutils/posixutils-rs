@@ -146,6 +146,7 @@ pub fn run_impl<STDOUT: Write, STDERR: Write>(
         )?;
     } else {
         for file_path in args.files {
+            state.file.push(file_path.clone());
             log::info!("Processing input from {file_path:?}");
             state = lexer::process_streaming(
                 state,
@@ -156,6 +157,7 @@ pub fn run_impl<STDOUT: Write, STDERR: Write>(
                 true,
                 true,
             )?;
+            state.file.pop();
         }
     }
 

@@ -30,6 +30,8 @@ pub struct State {
     pub divert_buffers: [DivertableBuffer; 9],
     /// See [`DivertMacro`].
     pub divert_number: usize,
+    /// Stack of filenames. Used in [`FileMacro`].
+    pub file: Vec<PathBuf>,
 }
 
 impl State {
@@ -75,6 +77,7 @@ impl Default for State {
             last_syscmd_status: None,
             divert_buffers: [(); 9].map(|_| DivertableBuffer::default()),
             divert_number: 0,
+            file: Vec::new(),
         }
     }
 }
@@ -177,6 +180,7 @@ macro_enums!(
         Divert(DivertMacro),
         Divnum(DivnumMacro),
         Undivert(UndivertMacro),
+        File(FileMacro),
     }
 );
 // TODO: implement these macros:
@@ -217,6 +221,7 @@ impl AsRef<[u8]> for BuiltinMacro {
             Divert => b"divert",
             Divnum => b"divnum",
             Undivert => b"undivert",
+            File => b"__file__",
         }
     }
 }
@@ -261,6 +266,7 @@ impl BuiltinMacro {
             Divert => 0,
             Divnum => 0,
             Undivert => 0,
+            File => 0,
         }
     }
 
@@ -766,14 +772,16 @@ impl IncludeMacro {
 impl MacroImplementation for IncludeMacro {
     fn evaluate(
         &self,
-        state: State,
+        mut state: State,
         stdout: &mut dyn Write,
         stderr: &mut dyn Write,
         m: Macro,
     ) -> Result<State> {
-        let (path, state) = Self::get_file_path(m, state, stderr)?;
+        let path;
+        (path, state) = Self::get_file_path(m, state, stderr)?;
         if let Some(path) = path {
-            lexer::process_streaming(
+            state.file.push(path.clone());
+            state = lexer::process_streaming(
                 state,
                 evaluate,
                 std::fs::File::open(path)?,
@@ -781,10 +789,11 @@ impl MacroImplementation for IncludeMacro {
                 stderr,
                 false,
                 false,
-            )
-        } else {
-            Ok(state)
+            )?;
+            state.file.pop();
         }
+
+        Ok(state)
     }
 }
 
@@ -796,15 +805,17 @@ struct SincludeMacro;
 impl MacroImplementation for SincludeMacro {
     fn evaluate(
         &self,
-        state: State,
+        mut state: State,
         stdout: &mut dyn Write,
         stderr: &mut dyn Write,
         m: Macro,
     ) -> Result<State> {
-        let (path, state) = IncludeMacro::get_file_path(m, state, stderr)?;
+        let path;
+        (path, state) = IncludeMacro::get_file_path(m, state, stderr)?;
         if let Some(path) = path {
             if path.is_file() {
-                return lexer::process_streaming(
+                state.file.push(path.clone());
+                state = lexer::process_streaming(
                     state,
                     evaluate,
                     std::fs::File::open(path)?,
@@ -812,7 +823,8 @@ impl MacroImplementation for SincludeMacro {
                     stderr,
                     false,
                     false,
-                );
+                )?;
+                state.file.pop();
             }
         }
 
@@ -1718,6 +1730,32 @@ impl MacroImplementation for UndivertMacro {
             let mut b = state.divert_buffers[buffer_number - 1].0.borrow_mut();
             stdout.write_all(&b)?;
             b.clear();
+        }
+        Ok(state)
+    }
+}
+
+struct FileMacro;
+
+impl MacroImplementation for FileMacro {
+    fn evaluate(
+        &self,
+        state: State,
+        stdout: &mut dyn Write,
+        _stderr: &mut dyn Write,
+        _m: Macro,
+    ) -> Result<State> {
+        if state.file.is_empty() {
+            stdout.write_all(b"stdin")?;
+        } else {
+            stdout.write_all(
+                state
+                    .file
+                    .last()
+                    .expect("At least one file")
+                    .as_os_str()
+                    .as_bytes(),
+            )?;
         }
         Ok(state)
     }

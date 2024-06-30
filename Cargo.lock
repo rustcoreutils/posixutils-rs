@@ -1062,7 +1062,6 @@ dependencies = [
  "gettext-rs",
  "libc",
  "plib",
- "regex",
 ]
 
 [[package]]
@@ -1126,6 +1125,7 @@ name = "posixutils-users"
 version = "0.1.11"
 dependencies = [
  "atty",
+ "chrono",
  "clap",
  "gettext-rs",
  "libc",

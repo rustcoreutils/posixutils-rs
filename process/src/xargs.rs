@@ -7,8 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 // TODO:
-// - the -0 argument used in conjunction with find -print0
-// - trace mode (-t)
 // - prompt mode (-p)
 // - insert mode (-I)
 // - split by lines (-L)
@@ -60,6 +58,10 @@ struct Args {
     #[arg(short, long)]
     trace: bool,
 
+    /// null-based processing
+    #[arg(short = '0', long = "null")]
+    null_mode: bool,
+
     /// Terminate if a constructed command line will not fit in the implied or specified size
     #[arg(short = 'x', long)]
     exit: bool,
@@ -77,7 +79,13 @@ fn find_str(needle: &str, haystack: &[String]) -> Option<usize> {
 }
 
 // execute the utility
-fn exec_util(util: &str, util_args: Vec<String>) -> io::Result<()> {
+fn exec_util(util: &str, util_args: Vec<String>, trace: bool) -> io::Result<()> {
+    // if tracing, Each generated command line shall be written to
+    // standard error just prior to invocation.
+    if trace {
+        eprintln!("{} {}", util, util_args.join(" "));
+    }
+
     let _output = Command::new(util)
         .args(util_args)
         .stdin(Stdio::null())
@@ -100,6 +108,7 @@ struct ParseState {
     in_escape: bool,
     quote_char: char,
     skip_remainder: bool,
+    null_slop: Vec<u8>,
 
     // output state
     max_bytes: usize,
@@ -113,7 +122,7 @@ impl ParseState {
     fn new(args: &Args) -> ParseState {
         let mut total = args.util.len();
         for arg in &args.util_args {
-            total += arg.len();
+            total += arg.len() + 1; // +1 for space
         }
 
         ParseState {
@@ -125,6 +134,7 @@ impl ParseState {
             in_escape: false,
             quote_char: '"',
             skip_remainder: false,
+            null_slop: Vec::new(),
             max_bytes: args.maxsize.unwrap_or(MAX_ARGS_BYTES),
             max_args: args.maxnum,
             args: Vec::new(),
@@ -132,12 +142,12 @@ impl ParseState {
     }
 
     fn full(&self) -> bool {
-        let mut total = 0;
+        let mut total = self.util_size;
         for arg in &self.args {
-            total += arg.len();
+            total += arg.len() + 1; // +1 for space
         }
 
-        if (self.util_size + total) >= self.max_bytes {
+        if total > self.max_bytes {
             true
         } else if let Some(max_args) = self.max_args {
             (self.util_n_args + self.args.len()) >= max_args
@@ -151,13 +161,13 @@ impl ParseState {
         let mut ret = Vec::new();
         while !self.args.is_empty() {
             // stop if adding the next arg would exceed the max size
-            if (total + self.args[0].len()) > self.max_bytes {
+            if (total + self.args[0].len() + 1) > self.max_bytes {
                 break;
             }
 
             // add the next arg
             let arg = self.args.remove(0);
-            total += arg.len();
+            total += arg.len() + 1; // +1 for space
             ret.push(arg);
 
             // stop if we have reached the max number of args
@@ -171,20 +181,54 @@ impl ParseState {
         ret
     }
 
+    // args are null-separated, without any further processing.
+    // if the input data crosses a null boundary, the remainder is
+    // stored as state for the next call to parse_buf_null.
+    fn parse_buf_null(&mut self, in_buf: &[u8]) -> io::Result<()> {
+        if self.skip_remainder {
+            return Ok(());
+        }
+
+        // pull prior state into current buffer
+        let mut buf = Vec::with_capacity(self.null_slop.len() + in_buf.len());
+        buf.extend_from_slice(&self.null_slop);
+        buf.extend_from_slice(in_buf);
+        self.null_slop.clear();
+
+        // divide buffer into null-terminated strings, with remainder
+        let mut start = 0;
+        let mut end = 0;
+        while end < buf.len() {
+            if buf[end] == 0 {
+                let s = String::from_utf8_lossy(&buf[start..end]).to_string();
+                self.args.push(s);
+                start = end + 1;
+            }
+            end += 1;
+        }
+
+        // remember remainder, if any, for next call
+        if start < buf.len() {
+            self.null_slop.extend_from_slice(&buf[start..]);
+        }
+
+        Ok(())
+    }
+
     fn parse_buf(&mut self, buf: &[u8]) -> io::Result<()> {
         if self.skip_remainder {
             return Ok(());
         }
 
-        for c8 in buf {
-            let ch = *c8 as char;
+        for &c8 in buf {
+            let ch = c8 as char;
 
             if self.in_quote {
                 if ch == self.quote_char {
                     self.in_quote = false;
                     self.in_arg = false;
                     self.args.push(self.tmp_arg.clone());
-                    self.tmp_arg = String::new();
+                    self.tmp_arg.clear();
                 } else {
                     self.tmp_arg.push(ch);
                 }
@@ -194,7 +238,7 @@ impl ParseState {
             } else if self.in_arg && ch.is_whitespace() {
                 self.in_arg = false;
                 self.args.push(self.tmp_arg.clone());
-                self.tmp_arg = String::new();
+                self.tmp_arg.clear();
             } else if ch == '\'' || ch == '"' {
                 self.in_arg = true;
                 self.in_quote = true;
@@ -216,7 +260,13 @@ impl ParseState {
         if self.in_arg {
             self.in_arg = false;
             self.args.push(self.tmp_arg.clone());
-            self.tmp_arg = String::new();
+            self.tmp_arg.clear();
+        }
+
+        if !self.null_slop.is_empty() {
+            let s = String::from_utf8_lossy(&self.null_slop).to_string();
+            self.args.push(s);
+            self.null_slop.clear();
         }
     }
 
@@ -245,17 +295,21 @@ fn read_and_spawn(args: &Args) -> io::Result<()> {
             break;
         }
 
-        // parse the line
-        state.parse_buf(&buffer[..n_read])?;
+        if args.null_mode {
+            state.parse_buf_null(&buffer[..n_read])?;
+        } else {
+            // parse the line
+            state.parse_buf(&buffer[..n_read])?;
 
-        // handle eofstr and other details
-        state.postprocess(args)?;
+            // handle eofstr and other details
+            state.postprocess(args)?;
+        }
 
         // if enough args, spawn the utility
-        if state.full() {
+        while state.full() {
             let mut util_args = args.util_args.clone();
             util_args.append(&mut state.remove_args());
-            exec_util(&args.util, util_args)?;
+            exec_util(&args.util, util_args, args.trace)?;
         }
     }
 
@@ -266,7 +320,7 @@ fn read_and_spawn(args: &Args) -> io::Result<()> {
     if !state.args.is_empty() {
         let mut util_args = args.util_args.clone();
         util_args.append(&mut state.remove_args());
-        exec_util(&args.util, util_args)?;
+        exec_util(&args.util, util_args, args.trace)?;
     }
 
     Ok(())

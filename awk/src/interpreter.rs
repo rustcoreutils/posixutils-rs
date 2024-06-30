@@ -85,12 +85,15 @@ enum Reference {
     GlobalArrayRef(usize),
     FieldRef(usize),
     LocalVarRef(usize),
+    LocalArrayRef(usize),
+    TempArray(usize),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 enum StackValue {
     Scalar(ScalarValue),
     Reference(Reference),
+    Uninitialized,
 }
 
 impl From<Constant> for StackValue {
@@ -105,9 +108,16 @@ impl From<ScalarValue> for StackValue {
     }
 }
 
+impl From<Reference> for StackValue {
+    fn from(value: Reference) -> Self {
+        StackValue::Reference(value)
+    }
+}
+
 struct CallFrame {
     ip: usize,
     bp: usize,
+    last_temp_array: usize,
 }
 
 #[derive(Default)]
@@ -116,6 +126,7 @@ struct Interpreter {
     constants: Vec<Constant>,
     stack: Vec<StackValue>,
     fields: Vec<String>,
+    temp_arrays: Vec<HashMap<String, ScalarValue>>,
     bp: usize,
 }
 macro_rules! numeric_op {
@@ -159,6 +170,14 @@ impl Interpreter {
         self.stack.push(val.into());
     }
 
+    fn get_from_stack_mut(&mut self, index: usize) -> &mut StackValue {
+        &mut self.stack[self.bp + index]
+    }
+
+    fn get_from_stack(&self, index: usize) -> &StackValue {
+        &self.stack[self.bp + index]
+    }
+
     fn get_array_element(&mut self, global_index: usize) -> Result<ScalarValue, String> {
         let key = self.pop_scalar()?.to_string();
         match &mut self.globals[global_index] {
@@ -199,10 +218,38 @@ impl Interpreter {
             },
             Reference::GlobalArrayRef(idx) => self.get_array_element(idx),
             Reference::FieldRef(index) => Ok(ScalarValue::String(self.fields[index].clone())),
-            Reference::LocalVarRef(idx) => match &self.stack[self.bp + idx] {
+            Reference::LocalVarRef(idx) => match self.get_from_stack_mut(idx) {
                 StackValue::Scalar(scalar) => Ok(scalar.clone()),
+                value @ StackValue::Uninitialized => {
+                    *value = ScalarValue::Uninitialized.into();
+                    Ok(ScalarValue::Uninitialized)
+                }
                 _ => Err("array used in scalar context".to_string()),
             },
+            Reference::LocalArrayRef(idx) => match &mut self.stack[idx + self.bp] {
+                StackValue::Reference(Reference::GlobalArrayRef(global_index)) => {
+                    let global_index = *global_index;
+                    self.get_array_element(global_index)
+                }
+                StackValue::Reference(Reference::TempArray(temp_idx)) => {
+                    let temp_idx = *temp_idx;
+                    let key = self.pop_scalar()?.to_string();
+                    Ok(get_or_insert(&mut self.temp_arrays[temp_idx], key).clone())
+                }
+                value @ StackValue::Uninitialized => {
+                    let index = self.temp_arrays.len();
+                    *value = Reference::TempArray(index).into();
+                    let key = self.pop_scalar()?.to_string();
+                    self.temp_arrays
+                        .push(HashMap::from([(key, ScalarValue::Uninitialized)]));
+                    Ok(ScalarValue::Uninitialized)
+                }
+                _ => Err("scalar used in array context".to_string()),
+            },
+            Reference::TempArray(idx) => {
+                let key = self.pop_scalar()?.to_string();
+                Ok(get_or_insert(&mut self.temp_arrays[idx], key).clone())
+            }
         }
     }
 
@@ -210,6 +257,7 @@ impl Interpreter {
         match value {
             StackValue::Scalar(val) => Ok(val),
             StackValue::Reference(reference) => self.deref(reference),
+            StackValue::Uninitialized => Ok(ScalarValue::Uninitialized),
         }
     }
 
@@ -237,10 +285,70 @@ impl Interpreter {
                     StackValue::Scalar(scalar) => Ok(scalar),
                     _ => Err("array used in scalar context".to_string()),
                 },
-                _ => todo!(),
+                Reference::LocalArrayRef(idx) => match self.stack[idx] {
+                    StackValue::Reference(Reference::GlobalArrayRef(global_index)) => {
+                        self.get_array_element_mut(global_index)
+                    }
+                    StackValue::Reference(Reference::TempArray(temp_idx)) => {
+                        let key = self.pop_scalar()?.to_string();
+                        Ok(get_or_insert(&mut self.temp_arrays[temp_idx], key))
+                    }
+                    _ => Err("scalar used in array context".to_string()),
+                },
+                Reference::FieldRef(_) => todo!(),
+                Reference::TempArray(_) => {
+                    unreachable!("temp arrays should only be accessed through LocalArrayRef")
+                }
             },
-            StackValue::Scalar(_) => panic!("trying to pop a scalar as reference"),
+            _ => panic!("trying to pop a value as reference"),
         }
+    }
+
+    fn in_op(&mut self) -> Result<(), String> {
+        let array_ref = if let StackValue::Reference(array_ref) = self.pop() {
+            array_ref
+        } else {
+            panic!("array reference expected");
+        };
+
+        let key = self.pop_scalar()?.to_string();
+        match array_ref {
+            Reference::GlobalArrayRef(id) => match &mut self.globals[id] {
+                GlobalValue::Array(map) => {
+                    let value = map.contains_key(&key) as i32 as f64;
+                    self.push(ScalarValue::Number(value))
+                }
+                global @ GlobalValue::Uninitialized => {
+                    *global = GlobalValue::Array(HashMap::new());
+                    self.push(ScalarValue::Number(0.0));
+                }
+                _ => return Err("scalar used in array context".to_string()),
+            },
+            Reference::LocalArrayRef(id) => match self.stack[self.bp + id] {
+                StackValue::Reference(Reference::GlobalArrayRef(global_index)) => {
+                    let value = match &mut self.globals[global_index] {
+                        GlobalValue::Array(map) => map.contains_key(&key),
+                        global @ GlobalValue::Uninitialized => {
+                            *global = GlobalValue::Array(HashMap::new());
+                            false
+                        }
+                        _ => return Err("scalar used in array context".to_string()),
+                    };
+                    self.push(ScalarValue::Number(value as i32 as f64));
+                }
+                StackValue::Reference(Reference::TempArray(temp_idx)) => {
+                    let value = self.temp_arrays[temp_idx].contains_key(&key);
+                    self.push(ScalarValue::Number(value as i32 as f64));
+                }
+                _ => return Err("scalar used in array context".to_string()),
+            },
+            Reference::TempArray(_) => {
+                unreachable!("temp arrays should only be accessed through LocalArrayRef")
+            }
+            _ => return Err("scalar used in array context".to_string()),
+        }
+
+        Ok(())
     }
 
     fn run(
@@ -300,25 +408,7 @@ impl Interpreter {
                     let lhs = self.pop_scalar()?.to_string();
                     self.push(ScalarValue::String(lhs + &rhs));
                 }
-                OpCode::In => match self.pop() {
-                    StackValue::Reference(Reference::GlobalArrayRef(global_index)) => {
-                        let key = self.pop_scalar()?.to_string();
-                        match &mut self.globals[global_index] {
-                            GlobalValue::Array(map) => {
-                                self.stack.push(
-                                    ScalarValue::Number(map.contains_key(&key) as i32 as f64)
-                                        .into(),
-                                );
-                            }
-                            global @ GlobalValue::Uninitialized => {
-                                *global = GlobalValue::Array(HashMap::new());
-                                self.push(ScalarValue::Number(0.0));
-                            }
-                            _ => return Err("scalar used in array context".to_string()),
-                        };
-                    }
-                    _ => return Err("scalar used in array context".to_string()),
-                },
+                OpCode::In => self.in_op()?,
                 OpCode::Negate => {
                     let value = self.pop_scalar()?.as_f64_or_err()?;
                     self.push(ScalarValue::Number(-value));
@@ -378,14 +468,9 @@ impl Interpreter {
                 OpCode::LocalVarRef(idx) => {
                     self.push(StackValue::Reference(Reference::LocalVarRef(idx as usize)));
                 }
-                OpCode::LocalArrayRef(idx) => match self.stack[idx as usize] {
-                    StackValue::Reference(Reference::GlobalArrayRef(global_index)) => {
-                        self.push(StackValue::Reference(Reference::GlobalArrayRef(
-                            global_index,
-                        )));
-                    }
-                    _ => return Err("scalar used in array context".to_string()),
-                },
+                OpCode::LocalArrayRef(idx) => {
+                    self.push(Reference::LocalArrayRef(idx as usize));
+                }
                 OpCode::Delete(id) => {
                     let key = self.pop_scalar()?.to_string();
                     match &mut self.globals[id as usize] {
@@ -415,6 +500,7 @@ impl Interpreter {
                     call_frames.push(CallFrame {
                         ip: ip as usize,
                         bp: self.bp,
+                        last_temp_array: self.temp_arrays.len(),
                     });
                     ip = 0;
                     ip_increment = 0;
@@ -424,6 +510,9 @@ impl Interpreter {
                 }
                 OpCode::PushOne => {
                     self.push(ScalarValue::Number(1.0));
+                }
+                OpCode::PushUndefined => {
+                    self.push(StackValue::Uninitialized);
                 }
                 OpCode::Invalid => panic!("invalid opcode"),
                 other => todo!("{:?}", other),
@@ -936,6 +1025,25 @@ mod tests {
         assert_eq!(
             interpret_with_functions(main, constant, 0, functions),
             ScalarValue::Number(123.0)
+        );
+    }
+
+    #[test]
+    fn test_call_with_undefined_argument() {
+        let main = vec![OpCode::PushUndefined, OpCode::Call { id: 0, argc: 1 }];
+        let functions = vec![Function {
+            parameters_count: 1,
+            instructions: vec![
+                OpCode::PushConstant(0),
+                OpCode::LocalArrayRef(0),
+                OpCode::PushOne,
+                OpCode::Add,
+            ],
+        }];
+        let constant = vec![Constant::String("key".to_string())];
+        assert_eq!(
+            interpret_with_functions(main, constant, 1, functions),
+            ScalarValue::Number(1.0)
         );
     }
 

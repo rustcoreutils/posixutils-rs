@@ -79,6 +79,8 @@ pub enum OpCode {
     PushConstant(u32),
     // Push 1 on top of the stack
     PushOne,
+    // Push the undefined value on top of the stack
+    PushUndefined,
 
     Print,
 

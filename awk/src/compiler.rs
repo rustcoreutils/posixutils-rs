@@ -1168,11 +1168,6 @@ mod test {
     }
 
     #[test]
-    fn test_compile_regex() {
-        todo!()
-    }
-
-    #[test]
     fn test_compile_unary_numeric_ops() {
         let (instructions, _) = compile_expr("-1");
         assert_eq!(instructions, vec![OpCode::PushConstant(0), OpCode::Negate]);
@@ -1541,11 +1536,6 @@ mod test {
             constants,
             vec![Constant::Number(1.0), Constant::Number(2.0)]
         );
-    }
-
-    #[test]
-    fn test_compile_match() {
-        todo!()
     }
 
     #[test]
@@ -1932,11 +1922,6 @@ mod test {
                 Constant::Number(1.0),
             ]
         );
-    }
-
-    #[test]
-    fn test_compile_terminated_foreach() {
-        todo!()
     }
 
     #[test]

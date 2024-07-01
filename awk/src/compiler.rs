@@ -808,6 +808,18 @@ impl Compiler {
         Ok(())
     }
 
+    fn compile_action(
+        &mut self,
+        action: Pair<Rule>,
+        instructions: &mut Vec<OpCode>,
+        locals: &LocalMap,
+    ) -> Result<(), PestError> {
+        for stmt in action.into_inner() {
+            self.compile_stmt(stmt, instructions, locals)?;
+        }
+        Ok(())
+    }
+
     fn compile_stmt(
         &mut self,
         stmt: Pair<Rule>,
@@ -815,10 +827,7 @@ impl Compiler {
         locals: &LocalMap,
     ) -> Result<(), PestError> {
         match stmt.as_rule() {
-            Rule::action => stmt
-                .into_inner()
-                .map(|stmt| self.compile_stmt(stmt, instructions, locals))
-                .try_fold((), |_, x| x),
+            Rule::action => self.compile_action(stmt, instructions, locals),
             Rule::t_if => self.compile_if(stmt, instructions, locals),
             Rule::t_while => self.compile_while(stmt, instructions, locals),
             Rule::t_for => self.compile_for(stmt, instructions, locals),
@@ -897,10 +906,7 @@ impl Compiler {
         match rule.as_rule() {
             Rule::action => {
                 let mut instructions = Vec::new();
-                let locals = HashMap::new();
-                for stmt in rule.into_inner() {
-                    self.compile_stmt(stmt, &mut instructions, &locals)?;
-                }
+                self.compile_action(rule, &mut instructions, &HashMap::new())?;
                 Ok(AwkRule {
                     pattern: Pattern::All,
                     instructions,
@@ -952,9 +958,7 @@ impl Compiler {
         };
         let mut instructions = Vec::new();
         self.in_function = true;
-        for stmt in body.into_inner() {
-            self.compile_stmt(stmt, &mut instructions, &param_map)?;
-        }
+        self.compile_action(body, &mut instructions, &param_map)?;
         self.in_function = false;
 
         // ensure that functions always return
@@ -990,24 +994,22 @@ pub fn compile_program(text: &str) -> Result<Program, PestError> {
     for item in program.into_inner() {
         match item.as_rule() {
             Rule::begin_action => {
-                first_child(item)
-                    .into_inner()
-                    .map(|stmt| {
-                        compiler.compile_stmt(stmt, &mut begin_instructions, &HashMap::new())
-                    })
-                    .try_fold((), |_, x| x)?;
+                compiler.compile_action(
+                    first_child(item),
+                    &mut begin_instructions,
+                    &HashMap::new(),
+                )?;
             }
             Rule::end_action => {
-                // TODO: cleanup, the below code is repeated multiple times
-                first_child(item)
-                    .into_inner()
-                    .map(|stmt| compiler.compile_stmt(stmt, &mut end_instructions, &HashMap::new()))
-                    .try_fold((), |_, x| x)?;
+                compiler.compile_action(
+                    first_child(item),
+                    &mut end_instructions,
+                    &HashMap::new(),
+                )?;
             }
             Rule::rule => {
                 rules.push(compiler.compile_rule(item)?);
             }
-
             Rule::function_definition => {
                 functions.push(compiler.compile_function_definition(item)?);
             }

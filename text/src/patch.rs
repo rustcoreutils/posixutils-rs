@@ -8,7 +8,7 @@ use std::{
     path::PathBuf,
 };
 
-use clap::{command, Arg, Parser};
+use clap::Parser;
 use patch_utils::{
     functions::{file_exists, if_else, print_error},
     patch::Patch,

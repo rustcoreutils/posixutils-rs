@@ -114,10 +114,11 @@ impl From<Reference> for StackValue {
     }
 }
 
-struct CallFrame {
+struct CallFrame<'i> {
     ip: usize,
     bp: usize,
     last_temp_array: usize,
+    instructions: &'i [OpCode],
 }
 
 #[derive(Default)]
@@ -496,12 +497,13 @@ impl Interpreter {
                 OpCode::Call { id, argc } => {
                     let function = &functions[id as usize];
                     self.bp = self.stack.len() - argc as usize;
-                    instructions = &function.instructions;
                     call_frames.push(CallFrame {
                         ip: ip as usize,
                         bp: self.bp,
                         last_temp_array: self.temp_arrays.len(),
+                        instructions,
                     });
+                    instructions = &function.instructions;
                     ip = 0;
                     ip_increment = 0;
                 }
@@ -513,6 +515,16 @@ impl Interpreter {
                 }
                 OpCode::PushUndefined => {
                     self.push(StackValue::Uninitialized);
+                }
+                OpCode::Return => {
+                    let return_value = self.pop_scalar()?;
+                    let frame = call_frames.pop().expect("return outside of function");
+                    self.bp = frame.bp;
+                    self.stack.truncate(self.bp);
+                    self.temp_arrays.truncate(frame.last_temp_array);
+                    self.push(return_value);
+                    instructions = frame.instructions;
+                    ip = frame.ip as i64;
                 }
                 OpCode::Invalid => panic!("invalid opcode"),
                 other => todo!("{:?}", other),
@@ -1102,6 +1114,20 @@ mod tests {
         assert_eq!(
             interpret_with_functions(main, constants, 0, functions),
             ScalarValue::Number(5.0)
+        );
+    }
+
+    #[test]
+    fn test_return_value_from_function() {
+        let main = vec![OpCode::Call { id: 0, argc: 0 }];
+        let functions = vec![Function {
+            parameters_count: 0,
+            instructions: vec![OpCode::PushConstant(0), OpCode::Return],
+        }];
+        let constant = vec![Constant::String("test".to_string())];
+        assert_eq!(
+            interpret_with_functions(main, constant, 0, functions),
+            ScalarValue::String("test".to_string())
         );
     }
 }

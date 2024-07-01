@@ -21,7 +21,7 @@ use pest::{
     Parser,
 };
 
-use crate::program::{AwkRule, Constant, Function, OpCode, Program, SpecialVar, VarId};
+use crate::program::{AwkRule, Constant, Function, OpCode, Pattern, Program, SpecialVar, VarId};
 
 lazy_static::lazy_static! {
     static ref PRATT_PARSER: PrattParser<Rule> = {
@@ -861,8 +861,68 @@ impl Compiler {
         }
     }
 
+    fn compile_normal_pattern(&mut self, pattern: Pair<Rule>) -> Result<Pattern, PestError> {
+        let pattern = first_child(pattern);
+        match pattern.as_rule() {
+            Rule::expr => {
+                let mut instructions = Vec::new();
+                self.compile_expr(pattern, &mut instructions, &HashMap::new())?;
+                Ok(Pattern::Expr(instructions))
+            }
+            Rule::range_pattern => {
+                let mut inner = pattern.into_inner();
+
+                let start = inner.next().unwrap();
+                let mut start_instructions = Vec::new();
+                self.compile_expr(start, &mut start_instructions, &HashMap::new())?;
+
+                let end = inner.next().unwrap();
+                let mut end_instructions = Vec::new();
+                self.compile_expr(end, &mut end_instructions, &HashMap::new())?;
+
+                Ok(Pattern::Range {
+                    start: start_instructions,
+                    end: end_instructions,
+                })
+            }
+            _ => unreachable!(
+                "encountered {:?} while compiling pattern",
+                pattern.as_rule()
+            ),
+        }
+    }
+
     fn compile_rule(&mut self, rule: Pair<Rule>) -> Result<AwkRule, PestError> {
-        todo!()
+        let rule = first_child(rule);
+        match rule.as_rule() {
+            Rule::action => {
+                let mut instructions = Vec::new();
+                let locals = HashMap::new();
+                for stmt in rule.into_inner() {
+                    self.compile_stmt(stmt, &mut instructions, &locals)?;
+                }
+                Ok(AwkRule {
+                    pattern: Pattern::All,
+                    instructions,
+                })
+            }
+            Rule::pattern_and_action => {
+                let mut inner = rule.into_inner();
+                let pattern = self.compile_normal_pattern(inner.next().unwrap())?;
+                let action = inner.next().unwrap();
+                let mut instructions = Vec::new();
+                let locals = HashMap::new();
+                self.compile_stmt(action, &mut instructions, &locals)?;
+                Ok(AwkRule {
+                    pattern,
+                    instructions,
+                })
+            }
+            Rule::normal_pattern => {
+                todo!("needs to be implemented after printing and fields are implemented");
+            }
+            _ => unreachable!("encountered {:?} while compiling rule", rule.as_rule()),
+        }
     }
 
     fn compile_function_definition(&mut self, function: Pair<Rule>) -> Result<Function, PestError> {
@@ -2185,5 +2245,91 @@ mod test {
     #[test]
     fn test_return_statement_outside_of_function_is_err() {
         does_not_compile("BEGIN { return 1; }");
+    }
+
+    #[test]
+    fn compile_rule_with_expression_pattern() {
+        let program = compile_correct_program(
+            r#"
+            1 {
+                1 + 2;
+            }
+            "#,
+        );
+        assert_eq!(program.rules.len(), 1);
+        assert_eq!(
+            program.rules[0].pattern,
+            Pattern::Expr(vec![OpCode::PushConstant(0)])
+        );
+        assert_eq!(
+            program.rules[0].instructions,
+            vec![
+                OpCode::PushConstant(1),
+                OpCode::PushConstant(2),
+                OpCode::Add,
+                OpCode::Pop,
+            ]
+        );
+        assert_eq!(
+            program.constants,
+            vec![
+                Constant::Number(1.0),
+                Constant::Number(1.0),
+                Constant::Number(2.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn compile_rule_with_range_pattern() {
+        let program = compile_correct_program(
+            r#"
+            1, 2 {
+                1 + 2;
+            }
+            "#,
+        );
+        assert_eq!(program.rules.len(), 1);
+        assert_eq!(
+            program.rules[0].pattern,
+            Pattern::Range {
+                start: vec![OpCode::PushConstant(0)],
+                end: vec![OpCode::PushConstant(1)]
+            }
+        );
+        assert_eq!(
+            program.rules[0].instructions,
+            vec![
+                OpCode::PushConstant(2),
+                OpCode::PushConstant(3),
+                OpCode::Add,
+                OpCode::Pop,
+            ]
+        );
+        assert_eq!(
+            program.constants,
+            vec![
+                Constant::Number(1.0),
+                Constant::Number(2.0),
+                Constant::Number(1.0),
+                Constant::Number(2.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn compile_rule_without_pattern() {
+        let program = compile_correct_program(
+            r#"
+            {1}
+            "#,
+        );
+        assert_eq!(program.rules.len(), 1);
+        assert_eq!(program.rules[0].pattern, Pattern::All);
+        assert_eq!(
+            program.rules[0].instructions,
+            vec![OpCode::PushConstant(0), OpCode::Pop,]
+        );
+        assert_eq!(program.constants, vec![Constant::Number(1.0)]);
     }
 }

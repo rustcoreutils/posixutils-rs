@@ -121,7 +121,8 @@ function_definition = { "function" ~ name ~ "(" ~ param_list? ~ ")" ~ opt_newlin
 
 param_list = { name ~ ("," ~ name)* }
 
-normal_pattern = { expr | (expr ~ "," ~ opt_newline ~ expr) }
+normal_pattern = { range_pattern | expr }
+range_pattern = { expr ~ "," ~ opt_newline ~ expr }
 
 action = {
     "{" ~ opt_newline ~ "}"

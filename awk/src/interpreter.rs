@@ -1031,36 +1031,48 @@ mod tests {
         let main = vec![OpCode::Call { id: 0, argc: 0 }];
         let functions = vec![Function {
             parameters_count: 0,
-            instructions: vec![OpCode::PushConstant(0)],
+            instructions: vec![OpCode::PushConstant(0), OpCode::Return],
         }];
-        let constant = vec![Constant::Number(123.0)];
+        let constant = vec![Constant::String("test".to_string())];
         assert_eq!(
             interpret_with_functions(main, constant, 0, functions),
-            ScalarValue::Number(123.0)
+            ScalarValue::String("test".to_string())
         );
     }
 
     #[test]
-    fn test_call_with_undefined_argument() {
+    fn test_call_with_undefined_scalar_argument() {
+        let main = vec![OpCode::PushUndefined, OpCode::Call { id: 0, argc: 1 }];
+        let functions = vec![Function {
+            parameters_count: 1,
+            instructions: vec![OpCode::LocalVarRef(0), OpCode::Return],
+        }];
+        assert_eq!(
+            interpret_with_functions(main, vec![], 1, functions),
+            ScalarValue::Uninitialized
+        );
+    }
+
+    #[test]
+    fn test_call_with_undefined_array_argument() {
         let main = vec![OpCode::PushUndefined, OpCode::Call { id: 0, argc: 1 }];
         let functions = vec![Function {
             parameters_count: 1,
             instructions: vec![
                 OpCode::PushConstant(0),
                 OpCode::LocalArrayRef(0),
-                OpCode::PushOne,
-                OpCode::Add,
+                OpCode::Return,
             ],
         }];
         let constant = vec![Constant::String("key".to_string())];
         assert_eq!(
             interpret_with_functions(main, constant, 1, functions),
-            ScalarValue::Number(1.0)
+            ScalarValue::Uninitialized
         );
     }
 
     #[test]
-    fn test_call_function() {
+    fn test_call_function_with_scalar_argument() {
         let main = vec![OpCode::PushConstant(0), OpCode::Call { id: 0, argc: 1 }];
         let functions = vec![Function {
             parameters_count: 1,
@@ -1071,7 +1083,10 @@ mod tests {
             interpret_with_functions(main, constant, 0, functions),
             ScalarValue::Number(1.0)
         );
+    }
 
+    #[test]
+    fn test_call_function_with_array_argument() {
         let main = vec![OpCode::ArrayRef(0), OpCode::Call { id: 0, argc: 1 }];
         let functions = vec![Function {
             parameters_count: 1,
@@ -1087,7 +1102,10 @@ mod tests {
             interpret_with_functions(main, constants, 1, functions),
             ScalarValue::Number(1.0)
         );
+    }
 
+    #[test]
+    fn test_call_function_with_multiple_scalar_arguments() {
         let main = vec![
             OpCode::PushConstant(0),
             OpCode::PushConstant(0),
@@ -1108,26 +1126,13 @@ mod tests {
                 OpCode::Add,
                 OpCode::Add,
                 OpCode::Add,
+                OpCode::Return,
             ],
         }];
         let constants = vec![Constant::Number(1.0)];
         assert_eq!(
             interpret_with_functions(main, constants, 0, functions),
             ScalarValue::Number(5.0)
-        );
-    }
-
-    #[test]
-    fn test_return_value_from_function() {
-        let main = vec![OpCode::Call { id: 0, argc: 0 }];
-        let functions = vec![Function {
-            parameters_count: 0,
-            instructions: vec![OpCode::PushConstant(0), OpCode::Return],
-        }];
-        let constant = vec![Constant::String("test".to_string())];
-        assert_eq!(
-            interpret_with_functions(main, constant, 0, functions),
-            ScalarValue::String("test".to_string())
         );
     }
 }

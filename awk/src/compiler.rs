@@ -349,7 +349,7 @@ impl Compiler {
                             ));
                         } else if argc < *parameter_count as u16 {
                             for _ in argc..*parameter_count as u16 {
-                                instructions.push(OpCode::PushUndefined);
+                                instructions.push(OpCode::PushUninitialized);
                             }
                         }
                         instructions.push(OpCode::Call {
@@ -851,7 +851,7 @@ impl Compiler {
                 if let Some(expr) = stmt.into_inner().next() {
                     self.compile_expr(expr, instructions, locals)?;
                 } else {
-                    instructions.push(OpCode::PushUndefinedScalar);
+                    instructions.push(OpCode::PushUninitializedScalar);
                 }
                 instructions.push(OpCode::Return);
                 Ok(())
@@ -899,7 +899,7 @@ impl Compiler {
 
         // ensure that functions always return
         if !matches!(instructions.last(), Some(OpCode::Return)) {
-            instructions.push(OpCode::PushUndefinedScalar);
+            instructions.push(OpCode::PushUninitializedScalar);
             instructions.push(OpCode::Return);
         }
 
@@ -2040,7 +2040,7 @@ mod test {
                 OpCode::PushConstant(0),
                 OpCode::Add,
                 OpCode::Pop,
-                OpCode::PushUndefinedScalar,
+                OpCode::PushUninitializedScalar,
                 OpCode::Return,
             ]
         );
@@ -2067,7 +2067,7 @@ mod test {
                 OpCode::Add,
                 OpCode::Assign,
                 OpCode::Pop,
-                OpCode::PushUndefinedScalar,
+                OpCode::PushUninitializedScalar,
                 OpCode::Return,
             ]
         );
@@ -2105,7 +2105,7 @@ mod test {
                 OpCode::LocalVarRef(1),
                 OpCode::Add,
                 OpCode::Pop,
-                OpCode::PushUndefinedScalar,
+                OpCode::PushUninitializedScalar,
                 OpCode::Return,
             ]
         );
@@ -2137,7 +2137,7 @@ mod test {
                 OpCode::LocalVarRef(1),
                 OpCode::Add,
                 OpCode::Pop,
-                OpCode::PushUndefinedScalar,
+                OpCode::PushUninitializedScalar,
                 OpCode::Return,
             ]
         );
@@ -2145,7 +2145,7 @@ mod test {
             program.begin_instructions,
             vec![
                 OpCode::PushConstant(0),
-                OpCode::PushUndefined,
+                OpCode::PushUninitialized,
                 OpCode::Call { id: 0, argc: 2 },
                 OpCode::Pop,
             ]
@@ -2163,7 +2163,7 @@ mod test {
         );
         assert_eq!(
             program.functions[0].instructions,
-            vec![OpCode::PushUndefinedScalar, OpCode::Return]
+            vec![OpCode::PushUninitializedScalar, OpCode::Return]
         );
     }
 

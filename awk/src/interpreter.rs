@@ -513,7 +513,7 @@ impl Interpreter {
                 OpCode::PushOne => {
                     self.push(ScalarValue::Number(1.0));
                 }
-                OpCode::PushUndefined => {
+                OpCode::PushUninitialized => {
                     self.push(StackValue::Uninitialized);
                 }
                 OpCode::Return => {
@@ -1041,8 +1041,8 @@ mod tests {
     }
 
     #[test]
-    fn test_call_with_undefined_scalar_argument() {
-        let main = vec![OpCode::PushUndefined, OpCode::Call { id: 0, argc: 1 }];
+    fn test_call_with_uninitialized_scalar_argument() {
+        let main = vec![OpCode::PushUninitialized, OpCode::Call { id: 0, argc: 1 }];
         let functions = vec![Function {
             parameters_count: 1,
             instructions: vec![OpCode::LocalVarRef(0), OpCode::Return],
@@ -1054,8 +1054,8 @@ mod tests {
     }
 
     #[test]
-    fn test_call_with_undefined_array_argument() {
-        let main = vec![OpCode::PushUndefined, OpCode::Call { id: 0, argc: 1 }];
+    fn test_call_with_uninitialized_array_argument() {
+        let main = vec![OpCode::PushUninitialized, OpCode::Call { id: 0, argc: 1 }];
         let functions = vec![Function {
             parameters_count: 1,
             instructions: vec![

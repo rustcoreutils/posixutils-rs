@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use crate::program::{Constant, Function, OpCode, Program};
+use crate::program::{Constant, Function, OpCode, Program, SpecialVar};
 
 fn get_or_insert(array: &mut HashMap<String, ScalarValue>, key: String) -> &mut ScalarValue {
     array.entry(key).or_insert(ScalarValue::Uninitialized)
@@ -121,15 +121,15 @@ struct CallFrame<'i> {
     instructions: &'i [OpCode],
 }
 
-#[derive(Default)]
 struct Interpreter {
     globals: Vec<GlobalValue>,
     constants: Vec<Constant>,
     stack: Vec<StackValue>,
-    fields: Vec<String>,
+    fields: Vec<ScalarValue>,
     temp_arrays: Vec<HashMap<String, ScalarValue>>,
     bp: usize,
 }
+
 macro_rules! numeric_op {
     ($s:ident, $op:tt) => {
         let rhs = $s.pop_scalar()?.as_f64_or_err()?;
@@ -218,7 +218,16 @@ impl Interpreter {
                 _ => Err("array used in scalar context".to_string()),
             },
             Reference::GlobalArrayRef(idx) => self.get_array_element(idx),
-            Reference::FieldRef(index) => Ok(ScalarValue::String(self.fields[index].clone())),
+            Reference::FieldRef(index) => {
+                if let Some(value) = self.fields.get(index) {
+                    return Ok(value.clone());
+                } else {
+                    self.fields.resize(index + 1, ScalarValue::Uninitialized);
+                    self.globals[SpecialVar::Nf as usize] =
+                        ScalarValue::Number(index as f64 + 1.0).into();
+                    Ok(ScalarValue::Uninitialized)
+                }
+            }
             Reference::LocalVarRef(idx) => match self.get_from_stack_mut(idx) {
                 StackValue::Scalar(scalar) => Ok(scalar.clone()),
                 value @ StackValue::Uninitialized => {
@@ -296,7 +305,16 @@ impl Interpreter {
                     }
                     _ => Err("scalar used in array context".to_string()),
                 },
-                Reference::FieldRef(_) => todo!(),
+                Reference::FieldRef(idx) => {
+                    if self.fields.len() > idx {
+                        Ok(&mut self.fields[idx])
+                    } else {
+                        self.fields.resize(idx + 1, ScalarValue::Uninitialized);
+                        self.globals[SpecialVar::Nf as usize] =
+                            ScalarValue::Number(idx as f64 + 1.0).into();
+                        Ok(&mut self.fields[idx])
+                    }
+                }
                 Reference::TempArray(_) => {
                     unreachable!("temp arrays should only be accessed through LocalArrayRef")
                 }
@@ -356,8 +374,14 @@ impl Interpreter {
         &mut self,
         main: &[OpCode],
         functions: &[Function],
-        row: &mut [String],
+        record: &[String],
     ) -> Result<(), String> {
+        self.globals[SpecialVar::Nf as usize] = ScalarValue::Number(record.len() as f64).into();
+        self.fields.resize(record.len(), ScalarValue::Uninitialized);
+        for (i, field) in record.iter().enumerate() {
+            self.fields[i] = ScalarValue::String(field.clone());
+        }
+
         let mut ip = 0i64;
         let mut instructions = main;
         let mut call_frames = vec![];
@@ -533,62 +557,107 @@ impl Interpreter {
         }
         Ok(())
     }
+
+    fn new(
+        args: HashMap<String, String>,
+        env: HashMap<String, String>,
+        constants: Vec<Constant>,
+        program_globals: usize,
+    ) -> Self {
+        let mut globals =
+            vec![GlobalValue::Uninitialized; SpecialVar::Count as usize + program_globals];
+
+        globals[SpecialVar::Argc as usize] = GlobalValue::Scalar(ScalarValue::Number(0.0));
+        globals[SpecialVar::Argv as usize] = GlobalValue::Array(HashMap::new());
+        globals[SpecialVar::Convfmt as usize] =
+            GlobalValue::Scalar(ScalarValue::String("%.6g".to_string()));
+        globals[SpecialVar::Environ as usize] = GlobalValue::Array(HashMap::new());
+        globals[SpecialVar::Filename as usize] =
+            GlobalValue::Scalar(ScalarValue::String("-".to_string()));
+        globals[SpecialVar::Fnr as usize] = GlobalValue::Scalar(ScalarValue::Number(0.0));
+        globals[SpecialVar::Fs as usize] =
+            GlobalValue::Scalar(ScalarValue::String(" ".to_string()));
+        globals[SpecialVar::Nf as usize] = GlobalValue::Scalar(ScalarValue::Number(0.0));
+        globals[SpecialVar::Nr as usize] = GlobalValue::Scalar(ScalarValue::Number(0.0));
+        globals[SpecialVar::Ofmt as usize] =
+            GlobalValue::Scalar(ScalarValue::String("%.6g".to_string()));
+        globals[SpecialVar::Ofs as usize] =
+            GlobalValue::Scalar(ScalarValue::String(" ".to_string()));
+        globals[SpecialVar::Ors as usize] =
+            GlobalValue::Scalar(ScalarValue::String("\n".to_string()));
+        globals[SpecialVar::Rlength as usize] = GlobalValue::Scalar(ScalarValue::Number(0.0));
+        globals[SpecialVar::Rs as usize] =
+            GlobalValue::Scalar(ScalarValue::String("\n".to_string()));
+        globals[SpecialVar::Rstart as usize] = GlobalValue::Scalar(ScalarValue::Number(0.0));
+        globals[SpecialVar::Subsep as usize] =
+            GlobalValue::Scalar(ScalarValue::String("\034".to_string()));
+
+        Self {
+            globals,
+            constants,
+            bp: 0,
+            stack: vec![],
+            fields: vec![],
+            temp_arrays: vec![],
+        }
+    }
 }
 
 pub fn interpret(program: Program, files: Vec<String>) -> Result<(), String> {
-    let mut interpreter = Interpreter {
-        constants: program.constants,
-        globals: vec![GlobalValue::Uninitialized; program.globals_count],
-        ..Default::default()
-    };
-    Ok(())
+    todo!();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const FIRST_GLOBAL_VAR: u32 = SpecialVar::Count as u32;
+
     fn interpret_expr(
         instructions: Vec<OpCode>,
         constants: Vec<Constant>,
         global_count: usize,
     ) -> ScalarValue {
-        let mut interpreter = Interpreter {
-            globals: vec![GlobalValue::Uninitialized; global_count],
-            constants,
-            ..Default::default()
-        };
+        let mut interpreter =
+            Interpreter::new(HashMap::new(), HashMap::new(), constants, global_count);
         interpreter
-            .run(&instructions, &[], &mut vec![])
+            .run(&instructions, &[], &[])
+            .expect("error running test");
+        interpreter.pop_scalar().unwrap()
+    }
+
+    fn interpret_expr_with_record(
+        instructions: Vec<OpCode>,
+        constants: Vec<Constant>,
+        global_count: usize,
+        record: Vec<String>,
+    ) -> ScalarValue {
+        let mut interpreter =
+            Interpreter::new(HashMap::new(), HashMap::new(), constants, global_count);
+        interpreter
+            .run(&instructions, &[], &record)
             .expect("error running test");
         interpreter.pop_scalar().unwrap()
     }
 
     fn test_global(instructions: Vec<OpCode>, constants: Vec<Constant>) -> GlobalValue {
-        let mut interpreter = Interpreter {
-            globals: vec![GlobalValue::Uninitialized],
-            constants,
-            ..Default::default()
-        };
+        let mut interpreter = Interpreter::new(HashMap::new(), HashMap::new(), constants, 1);
         interpreter
-            .run(&instructions, &[], &mut vec![])
+            .run(&instructions, &[], &[])
             .expect("error running test");
-        interpreter.globals[0].clone()
+        interpreter.globals[FIRST_GLOBAL_VAR as usize].clone()
     }
 
     fn interpret_with_functions(
         main: Vec<OpCode>,
-        constant: Vec<Constant>,
+        constants: Vec<Constant>,
         global_count: usize,
         functions: Vec<Function>,
     ) -> ScalarValue {
-        let mut interpreter = Interpreter {
-            globals: vec![GlobalValue::Uninitialized; global_count],
-            constants: constant,
-            ..Default::default()
-        };
+        let mut interpreter =
+            Interpreter::new(HashMap::new(), HashMap::new(), constants, global_count);
         interpreter
-            .run(&main, &functions, &mut vec![])
+            .run(&main, &functions, &[])
             .expect("error running test");
         interpreter.pop_scalar().unwrap()
     }
@@ -771,7 +840,11 @@ mod tests {
 
     #[test]
     fn test_compare_number_uninitialized() {
-        let instructions = vec![OpCode::PushConstant(0), OpCode::VarRef(0), OpCode::Ge];
+        let instructions = vec![
+            OpCode::PushConstant(0),
+            OpCode::VarRef(FIRST_GLOBAL_VAR),
+            OpCode::Ge,
+        ];
         let constant = vec![Constant::Number(2.0)];
         assert_eq!(
             interpret_expr(instructions, constant, 1),
@@ -781,7 +854,11 @@ mod tests {
 
     #[test]
     fn test_interpret_in_for_global_array() {
-        let instructions = vec![OpCode::PushConstant(0), OpCode::ArrayRef(0), OpCode::In];
+        let instructions = vec![
+            OpCode::PushConstant(0),
+            OpCode::ArrayRef(FIRST_GLOBAL_VAR),
+            OpCode::In,
+        ];
         let constant = vec![Constant::String("key".to_string())];
         assert_eq!(
             interpret_expr(instructions, constant, 1),
@@ -790,11 +867,11 @@ mod tests {
 
         let instructions = vec![
             OpCode::PushConstant(0),
-            OpCode::ArrayRef(0),
+            OpCode::ArrayRef(FIRST_GLOBAL_VAR),
             OpCode::PushOne,
             OpCode::Assign,
             OpCode::PushConstant(0),
-            OpCode::ArrayRef(0),
+            OpCode::ArrayRef(FIRST_GLOBAL_VAR),
             OpCode::In,
         ];
         let constant = vec![Constant::String("key".to_string())];
@@ -807,7 +884,7 @@ mod tests {
     #[test]
     fn test_interpret_in_for_local_array_ref() {
         let instructions = vec![
-            OpCode::ArrayRef(0),
+            OpCode::ArrayRef(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(0),
             OpCode::LocalArrayRef(0),
             OpCode::In,
@@ -819,9 +896,9 @@ mod tests {
         );
 
         let instructions = vec![
-            OpCode::ArrayRef(0),
+            OpCode::ArrayRef(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(0),
-            OpCode::ArrayRef(0),
+            OpCode::ArrayRef(FIRST_GLOBAL_VAR),
             OpCode::PushOne,
             OpCode::Assign,
             OpCode::Pop,
@@ -858,7 +935,7 @@ mod tests {
 
     #[test]
     fn test_postinc() {
-        let instructions = vec![OpCode::VarRef(0), OpCode::PostInc];
+        let instructions = vec![OpCode::VarRef(FIRST_GLOBAL_VAR), OpCode::PostInc];
         assert_eq!(
             test_global(instructions, vec![]),
             ScalarValue::Number(1.0).into()
@@ -867,7 +944,7 @@ mod tests {
 
     #[test]
     fn test_postdec() {
-        let instructions = vec![OpCode::VarRef(0), OpCode::PostDec];
+        let instructions = vec![OpCode::VarRef(FIRST_GLOBAL_VAR), OpCode::PostDec];
         assert_eq!(
             test_global(instructions, vec![]),
             ScalarValue::Number(-1.0).into()
@@ -876,7 +953,7 @@ mod tests {
 
     #[test]
     fn test_preinc() {
-        let instructions = vec![OpCode::VarRef(0), OpCode::PreInc];
+        let instructions = vec![OpCode::VarRef(FIRST_GLOBAL_VAR), OpCode::PreInc];
         assert_eq!(
             test_global(instructions, vec![]),
             ScalarValue::Number(1.0).into()
@@ -885,7 +962,7 @@ mod tests {
 
     #[test]
     fn test_predec() {
-        let instructions = vec![OpCode::VarRef(0), OpCode::PreDec];
+        let instructions = vec![OpCode::VarRef(FIRST_GLOBAL_VAR), OpCode::PreDec];
         assert_eq!(
             test_global(instructions, vec![]),
             ScalarValue::Number(-1.0).into()
@@ -894,7 +971,11 @@ mod tests {
 
     #[test]
     fn test_assign_to_global_var() {
-        let instructions = vec![OpCode::VarRef(0), OpCode::PushConstant(0), OpCode::Assign];
+        let instructions = vec![
+            OpCode::VarRef(FIRST_GLOBAL_VAR),
+            OpCode::PushConstant(0),
+            OpCode::Assign,
+        ];
         let constant = vec![Constant::Number(123.0)];
         assert_eq!(
             test_global(instructions, constant),
@@ -906,7 +987,7 @@ mod tests {
     fn test_assign_to_array_element() {
         let instructions = vec![
             OpCode::PushConstant(0),
-            OpCode::ArrayRef(0),
+            OpCode::ArrayRef(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(1),
             OpCode::Assign,
         ];
@@ -924,11 +1005,11 @@ mod tests {
     fn test_delete_array_element_after_insertion() {
         let instructions = vec![
             OpCode::PushConstant(0),
-            OpCode::ArrayRef(0),
+            OpCode::ArrayRef(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(1),
             OpCode::Assign,
             OpCode::PushConstant(0),
-            OpCode::Delete(0),
+            OpCode::Delete(FIRST_GLOBAL_VAR),
         ];
         let constant = vec![Constant::String("key".to_string()), Constant::Number(123.0)];
         assert_eq!(
@@ -958,7 +1039,7 @@ mod tests {
     #[test]
     fn test_assign_to_array_through_local_ref() {
         let instructions = vec![
-            OpCode::ArrayRef(0),
+            OpCode::ArrayRef(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(0),
             OpCode::LocalArrayRef(0),
             OpCode::PushConstant(1),
@@ -1087,7 +1168,10 @@ mod tests {
 
     #[test]
     fn test_call_function_with_array_argument() {
-        let main = vec![OpCode::ArrayRef(0), OpCode::Call { id: 0, argc: 1 }];
+        let main = vec![
+            OpCode::ArrayRef(FIRST_GLOBAL_VAR),
+            OpCode::Call { id: 0, argc: 1 },
+        ];
         let functions = vec![Function {
             parameters_count: 1,
             instructions: vec![
@@ -1133,6 +1217,46 @@ mod tests {
         assert_eq!(
             interpret_with_functions(main, constants, 0, functions),
             ScalarValue::Number(5.0)
+        );
+    }
+
+    #[test]
+    fn test_access_whole_record_field() {
+        let instructions = vec![OpCode::PushConstant(0), OpCode::FieldRef];
+        let constant = vec![Constant::Number(0.0)];
+        assert_eq!(
+            interpret_expr_with_record(
+                instructions,
+                constant,
+                0,
+                vec!["hello".to_string(), "hello".to_string()]
+            ),
+            ScalarValue::String("hello".to_string())
+        );
+    }
+
+    #[test]
+    fn test_assign_to_out_of_bounds_field() {
+        let instructions = vec![
+            OpCode::PushConstant(0),
+            OpCode::FieldRef,
+            OpCode::PushConstant(0),
+            OpCode::Assign,
+        ];
+        let constants = vec![Constant::Number(9.0)];
+
+        let mut interpreter = Interpreter::new(HashMap::new(), HashMap::new(), constants, 0);
+        interpreter
+            .run(
+                &instructions,
+                &[],
+                &["test".to_string(), "test".to_string()],
+            )
+            .unwrap();
+        assert_eq!(interpreter.fields.len(), 10);
+        assert_eq!(
+            interpreter.globals[SpecialVar::Nf as usize],
+            ScalarValue::Number(10.0).into()
         );
     }
 }

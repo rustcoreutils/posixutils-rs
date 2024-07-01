@@ -918,7 +918,7 @@ impl Compiler {
                 let action = inner.next().unwrap();
                 let mut instructions = Vec::new();
                 let locals = HashMap::new();
-                self.compile_stmt(action, &mut instructions, &locals)?;
+                self.compile_action(action, &mut instructions, &locals)?;
                 Ok(AwkRule {
                     pattern,
                     instructions,

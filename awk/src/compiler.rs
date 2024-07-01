@@ -896,6 +896,13 @@ impl Compiler {
             self.compile_stmt(stmt, &mut instructions, &param_map)?;
         }
         self.in_function = false;
+
+        // ensure that functions always return
+        if !matches!(instructions.last(), Some(OpCode::Return)) {
+            instructions.push(OpCode::PushUndefinedScalar);
+            instructions.push(OpCode::Return);
+        }
+
         let id = post_increment(&self.last_global_function_id);
         self.names.get_mut().insert(
             name.to_string(),
@@ -2033,6 +2040,8 @@ mod test {
                 OpCode::PushConstant(0),
                 OpCode::Add,
                 OpCode::Pop,
+                OpCode::PushUndefinedScalar,
+                OpCode::Return,
             ]
         );
     }
@@ -2058,6 +2067,8 @@ mod test {
                 OpCode::Add,
                 OpCode::Assign,
                 OpCode::Pop,
+                OpCode::PushUndefinedScalar,
+                OpCode::Return,
             ]
         );
     }
@@ -2094,6 +2105,8 @@ mod test {
                 OpCode::LocalVarRef(1),
                 OpCode::Add,
                 OpCode::Pop,
+                OpCode::PushUndefinedScalar,
+                OpCode::Return,
             ]
         );
         assert_eq!(
@@ -2124,6 +2137,8 @@ mod test {
                 OpCode::LocalVarRef(1),
                 OpCode::Add,
                 OpCode::Pop,
+                OpCode::PushUndefinedScalar,
+                OpCode::Return,
             ]
         );
         assert_eq!(

@@ -170,6 +170,7 @@ struct Compiler {
     names: RefCell<NameMap>,
     last_global_var_id: Cell<u32>,
     last_global_function_id: Cell<u32>,
+    in_function: bool,
 }
 
 impl Default for Compiler {
@@ -237,6 +238,7 @@ impl Default for Compiler {
             names: RefCell::new(default_globals),
             last_global_var_id: Cell::new(SpecialVar::Count as u32),
             last_global_function_id: Cell::new(0),
+            in_function: false,
         }
     }
 }
@@ -839,7 +841,21 @@ impl Compiler {
                 instructions.push(OpCode::Exit);
                 Ok(())
             }
-            Rule::return_stmt => todo!(),
+            Rule::return_stmt => {
+                if !self.in_function {
+                    return Err(pest_error_from_span(
+                        stmt.as_span(),
+                        "return statement outside of function".to_string(),
+                    ));
+                }
+                if let Some(expr) = stmt.into_inner().next() {
+                    self.compile_expr(expr, instructions, locals)?;
+                } else {
+                    instructions.push(OpCode::PushUndefinedScalar);
+                }
+                instructions.push(OpCode::Return);
+                Ok(())
+            }
             Rule::do_while => self.compile_do_while(stmt, instructions, locals),
             _ => unreachable!("encountered {:?} while compiling statement", stmt.as_rule()),
         }
@@ -875,9 +891,11 @@ impl Compiler {
             maybe_param_list
         };
         let mut instructions = Vec::new();
+        self.in_function = true;
         for stmt in body.into_inner() {
             self.compile_stmt(stmt, &mut instructions, &param_map)?;
         }
+        self.in_function = false;
         let id = post_increment(&self.last_global_function_id);
         self.names.get_mut().insert(
             name.to_string(),
@@ -963,6 +981,10 @@ mod test {
 
     fn compile_correct_program(text: &str) -> Program {
         compile_program(text).expect("error compiling program")
+    }
+
+    fn does_not_compile(text: &str) {
+        compile_program(text).expect_err("expected error compiling program");
     }
 
     #[test]
@@ -2113,5 +2135,40 @@ mod test {
                 OpCode::Pop,
             ]
         );
+    }
+
+    #[test]
+    fn test_compile_empty_return_statement() {
+        let program = compile_correct_program(
+            r#"
+            function fun() {
+                return;
+            }
+            "#,
+        );
+        assert_eq!(
+            program.functions[0].instructions,
+            vec![OpCode::PushUndefinedScalar, OpCode::Return]
+        );
+    }
+
+    #[test]
+    fn test_compile_return_statement_with_expression() {
+        let program = compile_correct_program(
+            r#"
+            function fun() {
+                return 1;
+            }
+            "#,
+        );
+        assert_eq!(
+            program.functions[0].instructions,
+            vec![OpCode::PushConstant(0), OpCode::Return]
+        );
+    }
+
+    #[test]
+    fn test_return_statement_outside_of_function_is_err() {
+        does_not_compile("BEGIN { return 1; }");
     }
 }

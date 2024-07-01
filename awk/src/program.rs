@@ -81,6 +81,8 @@ pub enum OpCode {
     PushOne,
     // Push the undefined value on top of the stack
     PushUndefined,
+    // Push the undefined scalar value on top of the stack
+    PushUndefinedScalar,
 
     Print,
 

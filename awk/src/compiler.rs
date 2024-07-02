@@ -21,7 +21,127 @@ use pest::{
     Parser,
 };
 
-use crate::program::{AwkRule, Constant, Function, OpCode, Pattern, Program, SpecialVar, VarId};
+use crate::program::{
+    AwkRule, BuiltinFunction, Constant, Function, OpCode, Pattern, Program, SpecialVar, VarId,
+};
+
+struct BuiltinFunctionInfo {
+    function: BuiltinFunction,
+    min_args: u32,
+    max_args: u32,
+}
+
+lazy_static::lazy_static! {
+    static ref BUILTIN_FUNCTIONS: HashMap<Rule, BuiltinFunctionInfo> = HashMap::from([
+        (Rule::atan2, BuiltinFunctionInfo {
+            function: BuiltinFunction::Atan2,
+            min_args: 2,
+            max_args: 2,
+        }),
+        (Rule::cos, BuiltinFunctionInfo {
+            function: BuiltinFunction::Cos,
+            min_args: 1,
+            max_args: 1,
+        }),
+        (Rule::sin, BuiltinFunctionInfo {
+            function: BuiltinFunction::Sin,
+            min_args: 1,
+            max_args: 1,
+        }),
+        (Rule::exp, BuiltinFunctionInfo {
+            function: BuiltinFunction::Exp,
+            min_args: 1,
+            max_args: 1,
+        }),
+        (Rule::log, BuiltinFunctionInfo {
+            function: BuiltinFunction::Log,
+            min_args: 1,
+            max_args: 1,
+        }),
+        (Rule::sqrt, BuiltinFunctionInfo {
+            function: BuiltinFunction::Sqrt,
+            min_args: 1,
+            max_args: 1,
+        }),
+        (Rule::int, BuiltinFunctionInfo {
+            function: BuiltinFunction::Int,
+            min_args: 1,
+            max_args: 1,
+        }),
+        (Rule::rand, BuiltinFunctionInfo {
+            function: BuiltinFunction::Rand,
+            min_args: 0,
+            max_args: 0,
+        }),
+        (Rule::srand, BuiltinFunctionInfo {
+            function: BuiltinFunction::Srand,
+            min_args: 0,
+            max_args: 1,
+        }),
+
+        (Rule::gsub, BuiltinFunctionInfo {
+            function: BuiltinFunction::Gsub,
+            min_args: 2,
+            max_args: 3,
+        }),
+        (Rule::index, BuiltinFunctionInfo {
+            function: BuiltinFunction::Index,
+            min_args: 2,
+            max_args: 2,
+        }),
+        (Rule::length, BuiltinFunctionInfo {
+            function: BuiltinFunction::Length,
+            min_args: 0,
+            max_args: 1,
+        }),
+        (Rule::match_fn, BuiltinFunctionInfo {
+            function: BuiltinFunction::Match,
+            min_args: 2,
+            max_args: 2,
+        }),
+        (Rule::split, BuiltinFunctionInfo {
+            function: BuiltinFunction::Split,
+            min_args: 2,
+            max_args: 3,
+        }),
+        (Rule::sprintf, BuiltinFunctionInfo {
+            function: BuiltinFunction::Sprintf,
+            min_args: 1,
+            max_args: u32::MAX,
+        }),
+        (Rule::sub, BuiltinFunctionInfo {
+            function: BuiltinFunction::Sub,
+            min_args: 2,
+            max_args: 3,
+        }),
+        (Rule::substr, BuiltinFunctionInfo {
+            function: BuiltinFunction::Substr,
+            min_args: 2,
+            max_args: 3,
+        }),
+        (Rule::tolower, BuiltinFunctionInfo {
+            function: BuiltinFunction::ToLower,
+            min_args: 1,
+            max_args: 1,
+        }),
+        (Rule::toupper, BuiltinFunctionInfo {
+            function: BuiltinFunction::ToUpper,
+            min_args: 1,
+            max_args: 1,
+        }),
+
+        (Rule::close, BuiltinFunctionInfo {
+            function: BuiltinFunction::Close,
+            min_args: 1,
+            max_args: 1,
+        }),
+        (Rule::system, BuiltinFunctionInfo {
+            function: BuiltinFunction::System,
+            min_args: 1,
+            max_args: 1,
+        })
+    ]);
+}
 
 lazy_static::lazy_static! {
     static ref PRATT_PARSER: PrattParser<Rule> = {
@@ -160,6 +280,7 @@ pub enum GlobalName {
     Variable(VarId),
     SpecialVar(VarId),
     Function { id: u32, parameter_count: u32 },
+    BuiltinFunction,
 }
 
 type NameMap = HashMap<String, GlobalName>;
@@ -266,7 +387,7 @@ impl Compiler {
                 match var {
                     GlobalName::Variable(id) => Ok(global_ref(id)),
                     GlobalName::SpecialVar(id) => Ok(global_ref(id)),
-                    GlobalName::Function { .. } => {
+                    GlobalName::Function { .. } | GlobalName::BuiltinFunction => {
                         Err(format!("'{}' function used in variable context", name))
                     }
                 }
@@ -372,8 +493,40 @@ impl Compiler {
                 }
                 Ok(Expr::new(ExprKind::Number, instructions))
             }
-            Rule::builtin_func => {
-                todo!();
+            Rule::builtin_function_call => {
+                let span = primary.as_span();
+                let mut inner = primary.into_inner();
+                let function = inner.next().unwrap();
+                let mut instructions = Vec::new();
+                let mut argc = 0;
+                for arg in inner {
+                    self.compile_expr(arg, &mut instructions, locals)?;
+                    argc += 1;
+                    if argc > u32::MAX {
+                        return Err(pest_error_from_span(
+                            span,
+                            "function call with too many arguments".to_string(),
+                        ));
+                    }
+                }
+                let fn_info = BUILTIN_FUNCTIONS
+                    .get(&function.as_rule())
+                    .expect("missing builtin");
+                if (fn_info.min_args..=fn_info.max_args).contains(&argc) {
+                    instructions.push(OpCode::CallBuiltin {
+                        function: fn_info.function,
+                        argc: argc as u16,
+                    });
+                } else {
+                    return Err(pest_error_from_span(
+                        span,
+                        format!(
+                            "incorrect number of arguments for builtin function '{}'",
+                            function.as_str()
+                        ),
+                    ));
+                }
+                Ok(Expr::new(ExprKind::Number, instructions))
             }
             _ => unreachable!(),
         }
@@ -2318,5 +2471,270 @@ mod test {
             vec![OpCode::PushConstant(0), OpCode::Pop,]
         );
         assert_eq!(program.constants, vec![Constant::Number(1.0)]);
+    }
+
+    #[test]
+    fn compile_builtin_arithmetic_functions() {
+        let program = compile_correct_program(
+            r#"
+            BEGIN {
+                atan2(1, 2);
+                cos(1);
+                sin(1);
+                exp(1);
+                log(1);
+                sqrt(1);
+                int(1);
+                rand();
+                srand();
+                srand(1);
+            }
+            "#,
+        );
+        assert_eq!(
+            program.begin_instructions,
+            vec![
+                OpCode::PushConstant(0),
+                OpCode::PushConstant(1),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Atan2,
+                    argc: 2
+                },
+                OpCode::Pop,
+                OpCode::PushConstant(2),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Cos,
+                    argc: 1
+                },
+                OpCode::Pop,
+                OpCode::PushConstant(3),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Sin,
+                    argc: 1
+                },
+                OpCode::Pop,
+                OpCode::PushConstant(4),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Exp,
+                    argc: 1
+                },
+                OpCode::Pop,
+                OpCode::PushConstant(5),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Log,
+                    argc: 1
+                },
+                OpCode::Pop,
+                OpCode::PushConstant(6),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Sqrt,
+                    argc: 1
+                },
+                OpCode::Pop,
+                OpCode::PushConstant(7),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Int,
+                    argc: 1
+                },
+                OpCode::Pop,
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Rand,
+                    argc: 0
+                },
+                OpCode::Pop,
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Srand,
+                    argc: 0
+                },
+                OpCode::Pop,
+                OpCode::PushConstant(8),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Srand,
+                    argc: 1
+                },
+                OpCode::Pop,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_compile_bultin_string_functions() {
+        let program = compile_correct_program(
+            r#"
+            BEGIN {
+                gsub("a", "b");
+                gsub("a", "b", "c");
+                index("a", "b");
+                match("a", "b");
+                split("a", "b");
+                split("a", "b", "c");
+                length;
+                length();
+                length("a");
+                sprintf("a", 1);
+                sprintf("a", 1, 2, 3, 4, 5);
+                sub("a", "b");
+                sub("a", "b", "c");
+                substr("a", 1);
+                substr("a", 1, 2);
+                tolower("A");
+                toupper("a");
+            }
+        "#,
+        );
+        assert_eq!(
+            program.begin_instructions,
+            vec![
+                OpCode::PushConstant(0),
+                OpCode::PushConstant(1),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Gsub,
+                    argc: 2,
+                },
+                OpCode::Pop,
+                OpCode::PushConstant(2),
+                OpCode::PushConstant(3),
+                OpCode::PushConstant(4),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Gsub,
+                    argc: 3,
+                },
+                OpCode::Pop,
+                OpCode::PushConstant(5),
+                OpCode::PushConstant(6),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Index,
+                    argc: 2,
+                },
+                OpCode::Pop,
+                OpCode::PushConstant(7),
+                OpCode::PushConstant(8),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Match,
+                    argc: 2,
+                },
+                OpCode::Pop,
+                OpCode::PushConstant(9),
+                OpCode::PushConstant(10),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Split,
+                    argc: 2,
+                },
+                OpCode::Pop,
+                OpCode::PushConstant(11),
+                OpCode::PushConstant(12),
+                OpCode::PushConstant(13),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Split,
+                    argc: 3,
+                },
+                OpCode::Pop,
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Length,
+                    argc: 0,
+                },
+                OpCode::Pop,
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Length,
+                    argc: 0,
+                },
+                OpCode::Pop,
+                OpCode::PushConstant(14),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Length,
+                    argc: 1,
+                },
+                OpCode::Pop,
+                OpCode::PushConstant(15),
+                OpCode::PushConstant(16),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Sprintf,
+                    argc: 2,
+                },
+                OpCode::Pop,
+                OpCode::PushConstant(17),
+                OpCode::PushConstant(18),
+                OpCode::PushConstant(19),
+                OpCode::PushConstant(20),
+                OpCode::PushConstant(21),
+                OpCode::PushConstant(22),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Sprintf,
+                    argc: 6,
+                },
+                OpCode::Pop,
+                OpCode::PushConstant(23),
+                OpCode::PushConstant(24),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Sub,
+                    argc: 2,
+                },
+                OpCode::Pop,
+                OpCode::PushConstant(25),
+                OpCode::PushConstant(26),
+                OpCode::PushConstant(27),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Sub,
+                    argc: 3,
+                },
+                OpCode::Pop,
+                OpCode::PushConstant(28),
+                OpCode::PushConstant(29),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Substr,
+                    argc: 2,
+                },
+                OpCode::Pop,
+                OpCode::PushConstant(30),
+                OpCode::PushConstant(31),
+                OpCode::PushConstant(32),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Substr,
+                    argc: 3,
+                },
+                OpCode::Pop,
+                OpCode::PushConstant(33),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::ToLower,
+                    argc: 1,
+                },
+                OpCode::Pop,
+                OpCode::PushConstant(34),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::ToUpper,
+                    argc: 1,
+                },
+                OpCode::Pop,
+            ],
+        );
+    }
+
+    #[test]
+    fn test_compile_builtin_io_functions() {
+        let program = compile_correct_program(
+            r#"
+            BEGIN {
+                close("file");
+                system("ls");
+            }
+        "#,
+        );
+        assert_eq!(
+            program.begin_instructions,
+            vec![
+                OpCode::PushConstant(0),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Close,
+                    argc: 1,
+                },
+                OpCode::Pop,
+                OpCode::PushConstant(1),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::System,
+                    argc: 1,
+                },
+                OpCode::Pop,
+            ]
+        );
     }
 }

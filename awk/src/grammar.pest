@@ -25,7 +25,7 @@ letter    =  { ('a'..'z') | ('A'..'Z') }
 name      = @{ !(keyword | builtin_func) ~ (letter | "_") ~ (letter | "_" | digit)* }
 func_name = @{ !(keyword | builtin_func) ~ name ~ &"(" }
 
-builtin_func = {
+builtin_func = _{
     atan2
   | cos
   | sin
@@ -38,11 +38,11 @@ builtin_func = {
   | gsub
   | index
   | length
-  | match
+  | match_fn
   | split
   | sprintf
-  | sub
   | substr
+  | sub
   | tolower
   | toupper
   | close
@@ -61,7 +61,7 @@ srand   = { "srand" }
 gsub    = { "gsub" }
 index   = { "index" }
 length  = { "length" }
-match   = { "match" }
+match_fn   = { "match" }
 split   = { "split" }
 sprintf = { "sprintf" }
 sub     = { "sub" }

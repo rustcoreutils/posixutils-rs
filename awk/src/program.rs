@@ -73,7 +73,14 @@ pub enum OpCode {
     JumpIfTrue(i32),
     Jump(i32),
 
-    Call { id: u32, argc: u16 },
+    Call {
+        id: u32,
+        argc: u16,
+    },
+    CallBuiltin {
+        function: BuiltinFunction,
+        argc: u16,
+    },
 
     // Push the constant value on top of the stack
     PushConstant(u32),
@@ -172,5 +179,42 @@ pub enum SpecialVar {
     Subsep,
 
     /// the total number of special variables
+    Count,
+}
+
+#[repr(u32)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum BuiltinFunction {
+    // arithmetic functions
+    Atan2,
+    Cos,
+    Sin,
+    Exp,
+    Log,
+    Sqrt,
+    Int,
+    Rand,
+    Srand,
+
+    // string functions
+    Gsub,
+    Index,
+    Length,
+    Match,
+    Split,
+    Sprintf,
+    Sub,
+    Substr,
+    ToLower,
+    ToUpper,
+
+    // I/O functions
+    Close,
+    GetLine,
+    System,
+    Print,
+    Printf,
+
+    /// the total number of builtin functions
     Count,
 }

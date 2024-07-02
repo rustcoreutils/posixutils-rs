@@ -63,9 +63,9 @@ pub enum OpCode {
     LocalVarRef(u32),
     LocalArrayRef(u32),
 
-    // delete an element from the array with the given id.
-    // The index of the element is on top of the stack.
-    Delete(u32),
+    // delete an element from the array with reference on top of the stack
+    // using the index preceding it
+    Delete,
 
     // jump forwards or backwards by the given offset.
     // Offset 0 is the jump instruction

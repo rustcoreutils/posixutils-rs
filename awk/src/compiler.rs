@@ -804,7 +804,16 @@ impl Compiler {
                 let name = inner.next().unwrap();
                 let index = inner.next().unwrap();
                 self.compile_expr(index, instructions, locals)?;
-                instructions.push(OpCode::Delete(0));
+                let get_instruction = self
+                    .get_var(
+                        name.as_str(),
+                        locals,
+                        OpCode::LocalArrayRef,
+                        OpCode::ArrayRef,
+                    )
+                    .map_err(|msg| pest_error_from_span(name.as_span(), msg))?;
+                instructions.push(get_instruction);
+                instructions.push(OpCode::Delete);
             }
             Rule::expr => {
                 self.compile_expr(stmt, instructions, locals)?;
@@ -2113,7 +2122,11 @@ mod test {
         let (instructions, constant) = compile_stmt("delete a[1];");
         assert_eq!(
             instructions,
-            vec![OpCode::PushConstant(0), OpCode::Delete(0),]
+            vec![
+                OpCode::PushConstant(0),
+                OpCode::ArrayRef(FIRST_GLOBAL_VAR),
+                OpCode::Delete,
+            ]
         );
     }
 

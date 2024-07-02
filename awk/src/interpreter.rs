@@ -276,7 +276,7 @@ impl Interpreter {
         self.stack_value_to_scalar(value)
     }
 
-    fn pop_ref(&mut self) -> Result<&mut ScalarValue, String> {
+    fn pop_scalar_ref(&mut self) -> Result<&mut ScalarValue, String> {
         match self.pop() {
             StackValue::Reference(reference) => match reference {
                 Reference::GlobalVarRef(idx) => match &mut self.globals[idx] {
@@ -323,41 +323,44 @@ impl Interpreter {
         }
     }
 
-    fn in_op(&mut self) -> Result<(), String> {
-        let array_ref = if let StackValue::Reference(array_ref) = self.pop() {
+    fn get_array_ref(
+        &mut self,
+        value: StackValue,
+    ) -> Result<&mut HashMap<String, ScalarValue>, String> {
+        let array_ref = if let StackValue::Reference(array_ref) = value {
             array_ref
         } else {
-            panic!("array reference expected");
+            panic!("expected reference");
         };
 
-        let key = self.pop_scalar()?.to_string();
         match array_ref {
             Reference::GlobalArrayRef(id) => match &mut self.globals[id] {
-                GlobalValue::Array(map) => {
-                    let value = map.contains_key(&key) as i32 as f64;
-                    self.push(ScalarValue::Number(value))
-                }
+                GlobalValue::Array(map) => Ok(map),
                 global @ GlobalValue::Uninitialized => {
                     *global = GlobalValue::Array(HashMap::new());
-                    self.push(ScalarValue::Number(0.0));
+                    match global {
+                        GlobalValue::Array(map) => Ok(map),
+                        _ => unreachable!(),
+                    }
                 }
-                _ => return Err("scalar used in array context".to_string()),
+                _ => Err("scalar used in array context".to_string()),
             },
             Reference::LocalArrayRef(id) => match self.stack[self.bp + id] {
                 StackValue::Reference(Reference::GlobalArrayRef(global_index)) => {
-                    let value = match &mut self.globals[global_index] {
-                        GlobalValue::Array(map) => map.contains_key(&key),
+                    match &mut self.globals[global_index] {
+                        GlobalValue::Array(map) => Ok(map),
                         global @ GlobalValue::Uninitialized => {
                             *global = GlobalValue::Array(HashMap::new());
-                            false
+                            match global {
+                                GlobalValue::Array(map) => Ok(map),
+                                _ => unreachable!(),
+                            }
                         }
-                        _ => return Err("scalar used in array context".to_string()),
-                    };
-                    self.push(ScalarValue::Number(value as i32 as f64));
+                        _ => Err("scalar used in array context".to_string()),
+                    }
                 }
                 StackValue::Reference(Reference::TempArray(temp_idx)) => {
-                    let value = self.temp_arrays[temp_idx].contains_key(&key);
-                    self.push(ScalarValue::Number(value as i32 as f64));
+                    Ok(&mut self.temp_arrays[temp_idx])
                 }
                 _ => return Err("scalar used in array context".to_string()),
             },
@@ -366,7 +369,22 @@ impl Interpreter {
             }
             _ => return Err("scalar used in array context".to_string()),
         }
+    }
 
+    fn in_op(&mut self) -> Result<(), String> {
+        let array_ref = self.pop();
+        let key = self.pop_scalar()?.to_string();
+        let array = self.get_array_ref(array_ref)?;
+        let contained = array.contains_key(&key) as i32 as f64;
+        self.push(ScalarValue::Number(contained as i32 as f64));
+        Ok(())
+    }
+
+    fn delete_op(&mut self) -> Result<(), String> {
+        let array_ref = self.pop();
+        let key = self.pop_scalar()?.to_string();
+        let array = self.get_array_ref(array_ref)?;
+        array.remove(&key);
         Ok(())
     }
 
@@ -443,25 +461,25 @@ impl Interpreter {
                     self.push(ScalarValue::Number(value as i32 as f64));
                 }
                 OpCode::PostInc => {
-                    let reference = self.pop_ref()?;
+                    let reference = self.pop_scalar_ref()?;
                     let num = reference.as_f64_or_err()?;
                     *reference = ScalarValue::Number(num + 1.0);
                     self.push(ScalarValue::Number(num));
                 }
                 OpCode::PostDec => {
-                    let reference = self.pop_ref()?;
+                    let reference = self.pop_scalar_ref()?;
                     let num = reference.as_f64_or_err()?;
                     *reference = ScalarValue::Number(num - 1.0);
                     self.push(ScalarValue::Number(num));
                 }
                 OpCode::PreInc => {
-                    let reference = self.pop_ref()?;
+                    let reference = self.pop_scalar_ref()?;
                     let num = reference.as_f64_or_err()? + 1.0;
                     *reference = ScalarValue::Number(num);
                     self.push(ScalarValue::Number(num));
                 }
                 OpCode::PreDec => {
-                    let reference = self.pop_ref()?;
+                    let reference = self.pop_scalar_ref()?;
                     let num = reference.as_f64_or_err()? - 1.0;
                     *reference = ScalarValue::Number(num);
                     self.push(ScalarValue::Number(num));
@@ -486,7 +504,7 @@ impl Interpreter {
                 }
                 OpCode::Assign => {
                     let value = self.pop_scalar()?;
-                    let reference = self.pop_ref()?;
+                    let reference = self.pop_scalar_ref()?;
                     *reference = value.clone();
                     self.push(value);
                 }
@@ -496,15 +514,7 @@ impl Interpreter {
                 OpCode::LocalArrayRef(idx) => {
                     self.push(Reference::LocalArrayRef(idx as usize));
                 }
-                OpCode::Delete(id) => {
-                    let key = self.pop_scalar()?.to_string();
-                    match &mut self.globals[id as usize] {
-                        GlobalValue::Array(map) => {
-                            map.remove(&key);
-                        }
-                        _ => return Err("scalar used in array context".to_string()),
-                    }
-                }
+                OpCode::Delete => self.delete_op()?,
                 OpCode::JumpIfFalse(offset) => {
                     if !self.pop_scalar()?.is_true() {
                         ip_increment = offset as i64;
@@ -1002,16 +1012,51 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_array_element_after_insertion() {
+    fn test_delete_global_array_element_after_insertion() {
         let instructions = vec![
             OpCode::PushConstant(0),
             OpCode::ArrayRef(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(1),
             OpCode::Assign,
             OpCode::PushConstant(0),
-            OpCode::Delete(FIRST_GLOBAL_VAR),
+            OpCode::ArrayRef(FIRST_GLOBAL_VAR),
+            OpCode::Delete,
         ];
         let constant = vec![Constant::String("key".to_string()), Constant::Number(123.0)];
+        assert_eq!(
+            test_global(instructions, constant),
+            GlobalValue::Array(HashMap::new())
+        );
+    }
+
+    #[test]
+    fn test_delete_global_array_element_after_insertion_through_local_ref() {
+        let instructions = vec![
+            OpCode::PushConstant(0),
+            OpCode::ArrayRef(FIRST_GLOBAL_VAR),
+            OpCode::PushConstant(1),
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::ArrayRef(FIRST_GLOBAL_VAR),
+            OpCode::PushConstant(0),
+            OpCode::LocalArrayRef(0),
+            OpCode::Delete,
+        ];
+        let constant = vec![Constant::String("key".to_string()), Constant::Number(123.0)];
+        assert_eq!(
+            test_global(instructions, constant),
+            GlobalValue::Array(HashMap::new())
+        );
+    }
+
+    #[test]
+    fn test_delete_from_empty_global_array() {
+        let instructions = vec![
+            OpCode::PushConstant(0),
+            OpCode::ArrayRef(FIRST_GLOBAL_VAR),
+            OpCode::Delete,
+        ];
+        let constant = vec![Constant::String("key".to_string())];
         assert_eq!(
             test_global(instructions, constant),
             GlobalValue::Array(HashMap::new())

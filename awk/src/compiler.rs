@@ -27,8 +27,8 @@ use crate::program::{
 
 struct BuiltinFunctionInfo {
     function: BuiltinFunction,
-    min_args: u32,
-    max_args: u32,
+    min_args: u16,
+    max_args: u16,
 }
 
 lazy_static::lazy_static! {
@@ -107,7 +107,7 @@ lazy_static::lazy_static! {
         (Rule::sprintf, BuiltinFunctionInfo {
             function: BuiltinFunction::Sprintf,
             min_args: 1,
-            max_args: u32::MAX,
+            max_args: u16::MAX,
         }),
         (Rule::sub, BuiltinFunctionInfo {
             function: BuiltinFunction::Sub,
@@ -401,6 +401,27 @@ impl Compiler {
         }
     }
 
+    fn compile_function_args(
+        &self,
+        args: Pairs<Rule>,
+        instructions: &mut Vec<OpCode>,
+        call_span: pest::Span,
+        locals: &LocalMap,
+    ) -> Result<u16, PestError> {
+        let mut argc: u16 = 0;
+        for arg in args {
+            self.compile_expr(arg, instructions, locals)?;
+            argc += 1;
+            if argc > u16::MAX {
+                return Err(pest_error_from_span(
+                    call_span,
+                    "function call with too many arguments".to_string(),
+                ));
+            }
+        }
+        Ok(argc)
+    }
+
     fn map_primary(&self, primary: Pair<Rule>, locals: &LocalMap) -> Result<Expr, PestError> {
         match primary.as_rule() {
             Rule::expr => {
@@ -446,17 +467,7 @@ impl Compiler {
                 let mut inner = primary.into_inner();
                 let name = inner.next().unwrap().as_str();
                 let mut instructions = Vec::new();
-                let mut argc = 0;
-                for arg in inner {
-                    self.compile_expr(arg, &mut instructions, locals)?;
-                    argc += 1;
-                    if argc > u16::MAX {
-                        return Err(pest_error_from_span(
-                            span,
-                            "function call with too many arguments".to_string(),
-                        ));
-                    }
-                }
+                let argc = self.compile_function_args(inner, &mut instructions, span, locals)?;
                 match self.names.borrow().get(name) {
                     Some(GlobalName::Function {
                         id,
@@ -498,24 +509,14 @@ impl Compiler {
                 let mut inner = primary.into_inner();
                 let function = inner.next().unwrap();
                 let mut instructions = Vec::new();
-                let mut argc = 0;
-                for arg in inner {
-                    self.compile_expr(arg, &mut instructions, locals)?;
-                    argc += 1;
-                    if argc > u32::MAX {
-                        return Err(pest_error_from_span(
-                            span,
-                            "function call with too many arguments".to_string(),
-                        ));
-                    }
-                }
+                let argc = self.compile_function_args(inner, &mut instructions, span, locals)?;
                 let fn_info = BUILTIN_FUNCTIONS
                     .get(&function.as_rule())
                     .expect("missing builtin");
                 if (fn_info.min_args..=fn_info.max_args).contains(&argc) {
                     instructions.push(OpCode::CallBuiltin {
                         function: fn_info.function,
-                        argc: argc as u16,
+                        argc,
                     });
                 } else {
                     return Err(pest_error_from_span(

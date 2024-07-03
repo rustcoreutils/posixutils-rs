@@ -11,6 +11,9 @@ use std::collections::HashMap;
 
 use crate::program::{BuiltinFunction, Constant, Function, OpCode, Program, SpecialVar};
 
+use clap::arg;
+use std::fmt::Write;
+
 fn get_or_insert(array: &mut HashMap<String, ScalarValue>, key: String) -> &mut ScalarValue {
     array.entry(key).or_insert(ScalarValue::Uninitialized)
 }
@@ -397,6 +400,110 @@ impl Interpreter {
         Ok(())
     }
 
+    fn sprintf(&mut self, argc: u16) -> Result<String, String> {
+        let arg_start = self.stack.len() - argc as usize;
+        self.stack[arg_start..].reverse();
+        let format = self.pop_scalar()?.to_string();
+        let mut result = String::with_capacity(format.len());
+        let mut remaining_args = argc - 1;
+        let mut iter = format.chars();
+
+        let iter_next =
+            |iter: &mut std::str::Chars| iter.next().ok_or("invalid format string".to_string());
+
+        let parse_number =
+            |next: &mut char, iter: &mut std::str::Chars| -> Result<Option<usize>, String> {
+                let mut number = 0;
+                loop {
+                    match *next {
+                        c if c.is_digit(10) => {
+                            number = number * 10 + c.to_digit(10).unwrap() as usize;
+                        }
+                        _ => break,
+                    }
+                    *next = iter_next(iter)?;
+                }
+                if number == 0 {
+                    Ok(None)
+                } else {
+                    Ok(Some(number))
+                }
+            };
+
+        while let Some(c) = iter.next() {
+            if c == '%' {
+                let mut next = iter_next(&mut iter)?;
+                let mut left_justified = false;
+                let mut signed = false;
+                let mut prefix_space = false;
+                let mut alternative_form = false;
+                let mut zero_padded = false;
+                loop {
+                    match next {
+                        '-' => left_justified = true,
+                        '+' => signed = true,
+                        ' ' => prefix_space = true,
+                        '#' => alternative_form = true,
+                        '0' => zero_padded = true,
+                        _ => break,
+                    }
+                    next = iter_next(&mut iter)?;
+                }
+
+                let field_width = parse_number(&mut next, &mut iter)?.unwrap_or(0);
+
+                let precision = if next == '.' {
+                    next = iter_next(&mut iter)?;
+                    parse_number(&mut next, &mut iter)?.unwrap_or(0)
+                } else {
+                    usize::MAX
+                };
+
+                if next == '%' {
+                    result.push('%');
+                    continue;
+                }
+                if remaining_args == 0 {
+                    return Err("not enough arguments for format string".to_string());
+                }
+                remaining_args -= 1;
+                match next {
+                    c if "aA".contains(c) => {
+                        todo!()
+                    }
+                    c if "diouxX".contains(c) => {
+                        todo!()
+                    }
+                    c if "fF".contains(c) => {
+                        todo!()
+                    }
+                    c if "eE".contains(c) => {
+                        todo!()
+                    }
+                    c if "gG".contains(c) => {
+                        todo!()
+                    }
+                    'c' => {
+                        todo!()
+                    }
+                    's' => {
+                        let value = self.pop_scalar()?.to_string();
+                        if left_justified {
+                            write!(result, "{:<w$.p$}", value, w = field_width, p = precision)
+                        } else {
+                            write!(result, "{:>w$.p$}", value, w = field_width, p = precision)
+                        }
+                        .expect("error formatting string");
+                    }
+                    _ => return Err("invalid conversion specifier".to_string()),
+                }
+            } else {
+                result.push(c);
+            }
+        }
+        Ok(result)
+    }
+
     fn call_builtin(&mut self, function: BuiltinFunction, argc: u16) -> Result<(), String> {
         match function {
             BuiltinFunction::Atan2 => {
@@ -475,7 +582,8 @@ impl Interpreter {
                 self.push(ScalarValue::Number(n as f64));
             }
             BuiltinFunction::Sprintf => {
-                todo!()
+                let result = self.sprintf(argc)?;
+                self.push(ScalarValue::String(result));
             }
             BuiltinFunction::Sub => {
                 todo!()
@@ -818,6 +926,26 @@ mod tests {
             .run(&main, &functions, &[])
             .expect("error running test");
         interpreter.pop_scalar().unwrap()
+    }
+
+    fn test_sprintf(format: &str, args: Vec<Constant>) -> String {
+        let mut instructions = vec![OpCode::PushConstant(0)];
+        let mut constants = vec![Constant::String(format.to_string())];
+        let argc = args.len() + 1;
+        for (i, c) in args.into_iter().enumerate() {
+            instructions.push(OpCode::PushConstant(i as u32 + 1));
+            constants.push(c);
+        }
+        instructions.push(OpCode::CallBuiltin {
+            function: BuiltinFunction::Sprintf,
+            argc: argc as u16,
+        });
+        let result = interpret_expr(instructions, constants, 0);
+        if let ScalarValue::String(s) = result {
+            s
+        } else {
+            panic!("expected string, got {:?}", result);
+        }
     }
 
     #[test]
@@ -1540,6 +1668,54 @@ mod tests {
         assert_eq!(
             interpret_expr(instructions, constant, 0),
             ScalarValue::String("lo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_builtin_sprintf_with_string_args() {
+        assert_eq!(test_sprintf("hello", vec![]), "hello");
+        assert_eq!(
+            test_sprintf("hello %s", vec![Constant::String("world".to_string())]),
+            "hello world"
+        );
+        assert_eq!(
+            test_sprintf(
+                "%s:%s:%s",
+                vec![
+                    Constant::String("a".to_string()),
+                    Constant::String("b".to_string()),
+                    Constant::String("c".to_string())
+                ]
+            ),
+            "a:b:c"
+        );
+        assert_eq!(
+            test_sprintf("%10s", vec![Constant::String("test".to_string())]),
+            "      test"
+        );
+        assert_eq!(
+            test_sprintf("%-10s", vec![Constant::String("test".to_string())]),
+            "test      "
+        );
+        assert_eq!(
+            test_sprintf("%.2s", vec![Constant::String("test".to_string())]),
+            "te"
+        );
+        assert_eq!(
+            test_sprintf("%.20s", vec![Constant::String("test".to_string())]),
+            "test"
+        );
+        assert_eq!(
+            test_sprintf("%10.2s", vec![Constant::String("test".to_string())]),
+            "        te"
+        );
+        assert_eq!(
+            test_sprintf("%-10.2s", vec![Constant::String("test".to_string())]),
+            "te        "
+        );
+        assert_eq!(
+            test_sprintf("%10.20s", vec![Constant::String("test".to_string())]),
+            "      test"
         );
     }
 }

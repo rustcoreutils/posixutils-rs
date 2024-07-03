@@ -5,3 +5,6 @@ This is another line
 
 3 define(`x', `dnl')y x y
 y
+
+ifdef(`A',,`dnl
+ifdef(`B',,)')

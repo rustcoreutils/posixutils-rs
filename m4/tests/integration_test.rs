@@ -772,6 +772,31 @@ fn test_dnl() {
 }
 
 #[test]
+fn test_dnl_nested() {
+    init();
+    let output = run_command(&Path::new("fixtures/integration_tests/dnl_nested.m4"));
+
+    let test: TestSnapshot = read_test("fixtures/integration_tests/dnl_nested.out");
+    assert_eq!(
+        output.status,
+        std::process::ExitStatus::from_raw(test.status),
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        test.stdout,
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        test.stderr,
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+}
+
+#[test]
 fn test_dumpdef() {
     init();
     let output = run_command(&Path::new("fixtures/integration_tests/dumpdef.m4"));

@@ -411,24 +411,19 @@ impl Interpreter {
         let iter_next =
             |iter: &mut std::str::Chars| iter.next().ok_or("invalid format string".to_string());
 
-        let parse_number =
-            |next: &mut char, iter: &mut std::str::Chars| -> Result<Option<usize>, String> {
-                let mut number = 0;
-                loop {
-                    match *next {
-                        c if c.is_digit(10) => {
-                            number = number * 10 + c.to_digit(10).unwrap() as usize;
-                        }
-                        _ => break,
+        let parse_number = |next: &mut char, iter: &mut std::str::Chars| -> Result<usize, String> {
+            let mut number = 0;
+            loop {
+                match *next {
+                    c if c.is_digit(10) => {
+                        number = number * 10 + c.to_digit(10).unwrap() as usize;
                     }
-                    *next = iter_next(iter)?;
+                    _ => break,
                 }
-                if number == 0 {
-                    Ok(None)
-                } else {
-                    Ok(Some(number))
-                }
-            };
+                *next = iter_next(iter)?;
+            }
+            Ok(number)
+        };
 
         while let Some(c) = iter.next() {
             if c == '%' {
@@ -450,11 +445,11 @@ impl Interpreter {
                     next = iter_next(&mut iter)?;
                 }
 
-                let field_width = parse_number(&mut next, &mut iter)?.unwrap_or(0);
+                let field_width = parse_number(&mut next, &mut iter)?;
 
                 let precision = if next == '.' {
                     next = iter_next(&mut iter)?;
-                    parse_number(&mut next, &mut iter)?.unwrap_or(0)
+                    parse_number(&mut next, &mut iter)?
                 } else {
                     usize::MAX
                 };

@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use crate::program::{Constant, Function, OpCode, Program, SpecialVar};
+use crate::program::{BuiltinFunction, Constant, Function, OpCode, Program, SpecialVar};
 
 fn get_or_insert(array: &mut HashMap<String, ScalarValue>, key: String) -> &mut ScalarValue {
     array.entry(key).or_insert(ScalarValue::Uninitialized)
@@ -71,6 +71,15 @@ enum GlobalValue {
     Scalar(ScalarValue),
     Array(HashMap<String, ScalarValue>),
     Uninitialized,
+}
+
+impl GlobalValue {
+    fn unwrap_scalar(&self) -> &ScalarValue {
+        match self {
+            GlobalValue::Scalar(scalar) => scalar,
+            _ => unreachable!("expected scalar value"),
+        }
+    }
 }
 
 impl From<ScalarValue> for GlobalValue {
@@ -388,6 +397,142 @@ impl Interpreter {
         Ok(())
     }
 
+    fn call_builtin(&mut self, function: BuiltinFunction, argc: u16) -> Result<(), String> {
+        match function {
+            BuiltinFunction::Atan2 => {
+                let y = self.pop_scalar()?.as_f64_or_err()?;
+                let x = self.pop_scalar()?.as_f64_or_err()?;
+                self.push(ScalarValue::Number(y.atan2(x)));
+            }
+            BuiltinFunction::Cos => {
+                let value = self.pop_scalar()?.as_f64_or_err()?;
+                self.push(ScalarValue::Number(value.cos()));
+            }
+            BuiltinFunction::Sin => {
+                let value = self.pop_scalar()?.as_f64_or_err()?;
+                self.push(ScalarValue::Number(value.sin()));
+            }
+            BuiltinFunction::Exp => {
+                let value = self.pop_scalar()?.as_f64_or_err()?;
+                self.push(ScalarValue::Number(value.exp()));
+            }
+            BuiltinFunction::Log => {
+                let value = self.pop_scalar()?.as_f64_or_err()?;
+                self.push(ScalarValue::Number(value.ln()));
+            }
+            BuiltinFunction::Sqrt => {
+                let value = self.pop_scalar()?.as_f64_or_err()?;
+                self.push(ScalarValue::Number(value.sqrt()));
+            }
+            BuiltinFunction::Int => {
+                let value = self.pop_scalar()?.as_f64_or_err()?;
+                self.push(ScalarValue::Number(value.trunc()));
+            }
+            BuiltinFunction::Rand => {
+                todo!()
+            }
+            BuiltinFunction::Srand => {
+                todo!()
+            }
+            BuiltinFunction::Gsub => {
+                todo!()
+            }
+            BuiltinFunction::Index => {
+                let t = self.pop_scalar()?.to_string();
+                let s = self.pop_scalar()?.to_string();
+                let index = s.find(&t).map(|i| i as f64 + 1.0).unwrap_or(0.0);
+                self.push(ScalarValue::Number(index));
+            }
+            BuiltinFunction::Length => {
+                if argc == 0 {
+                    let value = self.fields[0].to_string();
+                    self.push(ScalarValue::Number(value.len() as f64));
+                } else {
+                    let value = self.pop_scalar()?.to_string();
+                    self.push(ScalarValue::Number(value.len() as f64));
+                }
+            }
+            BuiltinFunction::Match => {
+                todo!()
+            }
+            BuiltinFunction::Split => {
+                let s = self.pop_scalar()?.to_string();
+                let array_ref = self.pop();
+                let separator = if argc == 2 {
+                    self.globals[SpecialVar::Fs as usize]
+                        .unwrap_scalar()
+                        .to_string()
+                } else {
+                    assert_eq!(argc, 3);
+                    todo!()
+                };
+                let array = self.get_array_ref(array_ref)?;
+                array.clear();
+                for (i, part) in s.split(&separator).enumerate() {
+                    array.insert(i.to_string(), ScalarValue::String(part.to_string()));
+                }
+                let n = array.len();
+                self.push(ScalarValue::Number(n as f64));
+            }
+            BuiltinFunction::Sprintf => {
+                todo!()
+            }
+            BuiltinFunction::Sub => {
+                todo!()
+            }
+            BuiltinFunction::Substr => {
+                let n = if argc == 2 {
+                    usize::MAX
+                } else {
+                    self.pop_scalar()?.as_f64_or_err()? as usize
+                };
+                let m = self.pop_scalar()?.as_f64_or_err()? as usize;
+                let s = self.pop_scalar()?.to_string();
+                let substr = s.chars().skip(m).take(n).collect::<String>();
+                self.push(ScalarValue::String(substr));
+            }
+            BuiltinFunction::ToLower => {
+                let value = self.pop_scalar()?.to_string();
+                self.push(ScalarValue::String(value.to_lowercase()));
+            }
+            BuiltinFunction::ToUpper => {
+                let value = self.pop_scalar()?.to_string();
+                self.push(ScalarValue::String(value.to_uppercase()));
+            }
+            BuiltinFunction::Close => {
+                todo!()
+            }
+            BuiltinFunction::GetLine => {
+                todo!()
+            }
+            BuiltinFunction::System => {
+                todo!()
+            }
+            BuiltinFunction::Print => {
+                let field_separator = self.globals[SpecialVar::Ofs as usize]
+                    .unwrap_scalar()
+                    .to_string();
+                let record_separator = self.globals[SpecialVar::Ors as usize]
+                    .unwrap_scalar()
+                    .to_string();
+                let mut output = String::new();
+                for i in 0..argc {
+                    let value = self.pop_scalar()?.to_string();
+                    output.push_str(&value);
+                    if i < argc - 1 {
+                        output.push_str(&field_separator);
+                    }
+                }
+                print!("{}{}", output, record_separator);
+            }
+            BuiltinFunction::Printf => {
+                todo!()
+            }
+            BuiltinFunction::Count => unreachable!("invalid builtin function"),
+        }
+        Ok(())
+    }
+
     fn run(
         &mut self,
         main: &[OpCode],
@@ -540,6 +685,9 @@ impl Interpreter {
                     instructions = &function.instructions;
                     ip = 0;
                     ip_increment = 0;
+                }
+                OpCode::CallBuiltin { function, argc } => {
+                    self.call_builtin(function, argc)?;
                 }
                 OpCode::PushConstant(idx) => {
                     self.push(self.constants[idx as usize].clone());
@@ -1302,6 +1450,96 @@ mod tests {
         assert_eq!(
             interpreter.globals[SpecialVar::Nf as usize],
             ScalarValue::Number(10.0).into()
+        );
+    }
+
+    #[test]
+    fn test_builtin_index() {
+        let instructions = vec![
+            OpCode::PushConstant(0),
+            OpCode::PushConstant(1),
+            OpCode::CallBuiltin {
+                function: BuiltinFunction::Index,
+                argc: 2,
+            },
+        ];
+        let constant = vec![
+            Constant::String("hello".to_string()),
+            Constant::String("l".to_string()),
+        ];
+        assert_eq!(
+            interpret_expr(instructions.clone(), constant, 0),
+            ScalarValue::Number(3.0)
+        );
+
+        let constant = vec![
+            Constant::String("hello".to_string()),
+            Constant::String("z".to_string()),
+        ];
+        assert_eq!(
+            interpret_expr(instructions, constant, 0),
+            ScalarValue::Number(0.0)
+        );
+    }
+
+    #[test]
+    fn test_builtin_length() {
+        let instructions = vec![
+            OpCode::PushConstant(0),
+            OpCode::CallBuiltin {
+                function: BuiltinFunction::Length,
+                argc: 1,
+            },
+        ];
+        let constant = vec![Constant::String("hello".to_string())];
+        assert_eq!(
+            interpret_expr(instructions, constant, 0),
+            ScalarValue::Number(5.0)
+        );
+
+        let instructions = vec![OpCode::CallBuiltin {
+            function: BuiltinFunction::Length,
+            argc: 0,
+        }];
+        assert_eq!(
+            interpret_expr_with_record(instructions, vec![], 0, vec!["test record".to_string()]),
+            ScalarValue::Number(11.0)
+        );
+    }
+
+    #[test]
+    fn test_builtin_substr() {
+        let instructions = vec![
+            OpCode::PushConstant(0),
+            OpCode::PushConstant(1),
+            OpCode::PushConstant(2),
+            OpCode::CallBuiltin {
+                function: BuiltinFunction::Substr,
+                argc: 3,
+            },
+        ];
+        let constant = vec![
+            Constant::String("hello".to_string()),
+            Constant::Number(1.0),
+            Constant::Number(2.0),
+        ];
+        assert_eq!(
+            interpret_expr(instructions, constant, 0),
+            ScalarValue::String("el".to_string())
+        );
+
+        let instructions = vec![
+            OpCode::PushConstant(0),
+            OpCode::PushConstant(1),
+            OpCode::CallBuiltin {
+                function: BuiltinFunction::Substr,
+                argc: 2,
+            },
+        ];
+        let constant = vec![Constant::String("hello".to_string()), Constant::Number(3.0)];
+        assert_eq!(
+            interpret_expr(instructions, constant, 0),
+            ScalarValue::String("lo".to_string())
         );
     }
 }

@@ -824,25 +824,19 @@ impl Compiler {
                 let print = inner.next().unwrap();
                 match print.as_rule() {
                     Rule::simple_print | Rule::print_call => {
-                        let mut expressions = print.into_inner();
+                        let expressions = print.into_inner();
+                        let argc = expressions.len() as u16;
                         if expressions.len() == 0 {
                             todo!()
                         } else {
-                            self.compile_expr(expressions.next().unwrap(), instructions, locals)?;
-                            if expressions.len() > 0 {
-                                self.compile_expr(
-                                    expressions.next().unwrap(),
-                                    instructions,
-                                    locals,
-                                )?;
-                                instructions.push(OpCode::Concat);
-                                for expr in expressions {
-                                    self.compile_expr(expr, instructions, locals)?;
-                                    instructions.push(OpCode::Concat);
-                                }
+                            for expr in expressions {
+                                self.compile_expr(expr, instructions, locals)?;
                             }
+                            instructions.push(OpCode::CallBuiltin {
+                                function: BuiltinFunction::Print,
+                                argc,
+                            });
                         }
-                        instructions.push(OpCode::Print);
                     }
                     _ => unreachable!(),
                 }
@@ -2133,20 +2127,17 @@ mod test {
     #[test]
     fn test_compile_simple_print() {
         let (instructions, constant) = compile_stmt("print 1;");
-        assert_eq!(instructions, vec![OpCode::PushConstant(0), OpCode::Print,]);
-        assert_eq!(constant, vec![Constant::Number(1.0),]);
-
-        let (instructions, constant) = compile_stmt("print 1, 2;");
         assert_eq!(
             instructions,
             vec![
                 OpCode::PushConstant(0),
-                OpCode::PushConstant(1),
-                OpCode::Concat,
-                OpCode::Print,
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Print,
+                    argc: 1
+                },
             ]
         );
-        assert_eq!(constant, vec![Constant::Number(1.0), Constant::Number(2.0)]);
+        assert_eq!(constant, vec![Constant::Number(1.0),]);
 
         let (instructions, constant) = compile_stmt(r#"print "number", 1, 2, "and", 3;"#);
         assert_eq!(
@@ -2154,14 +2145,13 @@ mod test {
             vec![
                 OpCode::PushConstant(0),
                 OpCode::PushConstant(1),
-                OpCode::Concat,
                 OpCode::PushConstant(2),
-                OpCode::Concat,
                 OpCode::PushConstant(3),
-                OpCode::Concat,
                 OpCode::PushConstant(4),
-                OpCode::Concat,
-                OpCode::Print,
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Print,
+                    argc: 5
+                },
             ]
         );
         assert_eq!(
@@ -2179,23 +2169,17 @@ mod test {
     #[test]
     fn test_compile_print_call() {
         let (instructions, constant) = compile_stmt("print (\"hello\");");
-        assert_eq!(instructions, vec![OpCode::PushConstant(0), OpCode::Print,]);
-        assert_eq!(constant, vec![Constant::String("hello".to_string())]);
-
-        let (instructions, constants) = compile_stmt("print (\"hello\", 1);");
         assert_eq!(
             instructions,
             vec![
                 OpCode::PushConstant(0),
-                OpCode::PushConstant(1),
-                OpCode::Concat,
-                OpCode::Print,
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Print,
+                    argc: 1
+                },
             ]
         );
-        assert_eq!(
-            constants,
-            vec![Constant::String("hello".to_string()), Constant::Number(1.0)]
-        );
+        assert_eq!(constant, vec![Constant::String("hello".to_string())]);
 
         let (instructions, constants) = compile_stmt(r#"print ("hello", 1, 2, "and", 3);"#);
         assert_eq!(
@@ -2203,14 +2187,13 @@ mod test {
             vec![
                 OpCode::PushConstant(0),
                 OpCode::PushConstant(1),
-                OpCode::Concat,
                 OpCode::PushConstant(2),
-                OpCode::Concat,
                 OpCode::PushConstant(3),
-                OpCode::Concat,
                 OpCode::PushConstant(4),
-                OpCode::Concat,
-                OpCode::Print,
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Print,
+                    argc: 5
+                },
             ]
         );
         assert_eq!(

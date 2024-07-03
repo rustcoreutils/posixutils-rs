@@ -91,8 +91,6 @@ pub enum OpCode {
     // Push the uninitialized scalar value on top of the stack
     PushUninitializedScalar,
 
-    Print,
-
     Next,
     Exit,
     Return,

@@ -787,11 +787,20 @@ pub(crate) fn process_streaming<'c, R: Read>(
                     }
                     (1..=9, true) => {
                         let mut divert_buffer =
-                            state.divert_buffers[state.divert_number - 1].clone();
+                            state.divert_buffers[state.divert_number as usize - 1].clone();
                         state = evaluator.evaluate(
                             state,
                             symbol,
                             &mut divert_buffer,
+                            stderr,
+                            unwrap_quotes,
+                        )?
+                    }
+                    (i, true) if i < 0 => {
+                        state = evaluator.evaluate(
+                            state,
+                            symbol,
+                            &mut DiscardStdout,
                             stderr,
                             unwrap_quotes,
                         )?
@@ -806,6 +815,18 @@ pub(crate) fn process_streaming<'c, R: Read>(
     }
 
     Ok(state)
+}
+
+struct DiscardStdout;
+
+impl Write for DiscardStdout {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// NOTE: This will append a b'\0' to the end of `input`

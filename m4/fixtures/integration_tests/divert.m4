@@ -9,3 +9,7 @@ divert dnl
 divnum incredible
 divert(9)dnl
 divnum that was something!
+divert(-1)dnl
+divnum This output will be not be output
+divert(0)dnl
+divnum And we're back again

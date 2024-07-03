@@ -9,7 +9,7 @@ use nom::error::{ContextError, FromExternalError};
 use nom::IResult;
 
 use crate::error::Result;
-use crate::eval_macro;
+use crate::eval_macro::{self, parse_integer};
 use crate::lexer::{
     self, Macro, MacroName, MacroParseConfig, ParseConfig, Symbol, DEFAULT_QUOTE_CLOSE_TAG,
     DEFAULT_QUOTE_OPEN_TAG,
@@ -29,7 +29,7 @@ pub struct State {
     /// Divert buffers 1 through to 9. See [`DivertMacro`].
     pub divert_buffers: [DivertableBuffer; 9],
     /// See [`DivertMacro`].
-    pub divert_number: usize,
+    pub divert_number: i64,
     /// Stack of filenames. Used in [`FileMacro`].
     pub file: Vec<PathBuf>,
 }
@@ -1661,7 +1661,7 @@ impl MacroImplementation for DivertMacro {
                 0
             } else {
                 let (_, divert_number) =
-                    nom::combinator::all_consuming(parse_index)(&first_arg_text)?;
+                    nom::combinator::all_consuming(parse_integer)(&first_arg_text)?;
                 if divert_number > 9 {
                     return Err(crate::Error::Parsing(format!(
                         "Error parsing first argument for `divert` macro with value {divert_number}, should be between 0 and 9"

@@ -60,7 +60,9 @@ fn run_command(input: &Path) -> std::process::Output {
                 .output()
                 .unwrap();
 
+            log::info!("RUST_LOG is ignored for this test because it interferes with output");
             let output = std::process::Command::new("sh")
+                .env("RUST_LOG", "") // Disable rust log output because it interferes with the test.
                 .arg("-c")
                 .arg(format!("../target/debug/m4 {args}"))
                 .output()

@@ -1,2 +1,3 @@
+define(`x',`b')
 ifdef(`A',,dnl a
-errprint(`hello')b)
+x c)

@@ -121,6 +121,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] tee
  - [x] touch
  - [x] tty
+ - [x] uname
  - [x] unlink
  - [x] write
 
@@ -143,7 +144,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] test
  - [x] tput
  - [x] tsort
- - [x] uname
  - [x] who
  - [x] xargs
 

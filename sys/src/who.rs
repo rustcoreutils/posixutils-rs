@@ -6,13 +6,17 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
+// TODO:
+// - implement -f option (requires updates to utmpx module)
+// - implement -T, -u options
+//
 
 extern crate chrono;
 extern crate clap;
 extern crate plib;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use std::path::PathBuf;
 
@@ -106,13 +110,31 @@ fn print_fmt_term(entry: &plib::utmpx::Utmpx, line: &str) {
     );
 }
 
+fn current_terminal() -> String {
+    let s = plib::curuser::tty();
+    if s.starts_with("/dev/") {
+        s[5..].to_string()
+    } else {
+        s
+    }
+}
+
 fn print_entry(args: &Args, entry: &plib::utmpx::Utmpx) {
+    // Skip if current_terminal option is set and this entry is not for the current terminal
+    if args.current_terminal {
+        let current_tty = current_terminal();
+        if entry.line != current_tty {
+            return;
+        }
+    }
+
     let mut selected = false;
     if (args.boot && entry.typ == libc::BOOT_TIME)
         || (args.userproc && entry.typ == libc::USER_PROCESS)
         || (args.dead && entry.typ == libc::DEAD_PROCESS)
         || (args.login && entry.typ == libc::LOGIN_PROCESS)
         || (args.runlevel && entry.typ == libc::RUN_LVL)
+        || (args.process && entry.typ == libc::INIT_PROCESS)
     {
         selected = true;
     }
@@ -133,6 +155,35 @@ fn print_entry(args: &Args, entry: &plib::utmpx::Utmpx) {
     }
 }
 
+fn show_utmpx_entries(args: &Args) {
+    if args.heading {
+        println!(
+            "{:<16} {:<12} {}",
+            gettext("USER"),
+            gettext("LINE"),
+            gettext("TIME")
+        );
+    }
+
+    let entries = plib::utmpx::load();
+    for entry in &entries {
+        print_entry(&args, entry);
+    }
+}
+
+fn show_utmpx_summary() {
+    let mut count = 0;
+    let entries = plib::utmpx::load();
+    for entry in &entries {
+        if entry.user.len() > 0 {
+            println!("{}", entry.user);
+            count += 1;
+        }
+    }
+
+    println!("# users = {}", count);
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // manual CLI parse for special "who am i" case
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -141,7 +192,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // parse command line arguments; if "who am i", use special args
     let mut args = {
         if am_i {
-            Args::parse_from(&["-m"])
+            Args::parse_from(&["who", "-m"])
         } else {
             Args::parse()
         }
@@ -167,13 +218,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut exit_code = 0;
 
     if args.file.is_some() {
-        eprintln!("who: -f option not yet implemented");
+        eprintln!("{}", gettext("who: -f option not yet implemented"));
         exit_code = 1;
-    }
-
-    let entries = plib::utmpx::load();
-    for entry in &entries {
-        print_entry(&args, entry);
+    } else if args.summary {
+        show_utmpx_summary();
+    } else {
+        show_utmpx_entries(&args);
     }
 
     std::process::exit(exit_code)

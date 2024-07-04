@@ -94,3 +94,31 @@ fn test_ascii_to_ibm_conversion() {
         expected_exit_code: 0,
     });
 }
+
+#[test]
+fn test_ascii_to_swab_conversion() {
+    let input_file_path = get_test_file_path("dd.ascii");
+    let reference_file_path = get_test_file_path("dd.swab");
+
+    let mut input_file = File::open(input_file_path).expect("Unable to open input test file");
+    let mut input_data = Vec::new();
+    input_file
+        .read_to_end(&mut input_data)
+        .expect("Unable to read input test file");
+
+    let mut reference_file =
+        File::open(reference_file_path).expect("Unable to open reference test file");
+    let mut reference_data = Vec::new();
+    reference_file
+        .read_to_end(&mut reference_data)
+        .expect("Unable to read reference test file");
+
+    run_test_u8(TestPlanU8 {
+        cmd: String::from("dd"),
+        args: vec![String::from("conv=swab")],
+        stdin_data: input_data,
+        expected_out: reference_data,
+        expected_err: Vec::new(),
+        expected_exit_code: 0,
+    });
+}

@@ -126,6 +126,107 @@ impl Config {
     }
 }
 
+fn convert_ascii(data: &mut [u8], ascii_conv: &AsciiConv) {
+    match ascii_conv {
+        AsciiConv::Ascii => {
+            for byte in data.iter_mut() {
+                *byte = CONV_EBCDIC_ASCII[*byte as usize];
+            }
+        }
+        AsciiConv::EBCDIC => {
+            for byte in data.iter_mut() {
+                *byte = CONV_ASCII_EBCDIC[*byte as usize];
+            }
+        }
+        AsciiConv::IBM => {
+            for byte in data.iter_mut() {
+                *byte = CONV_ASCII_IBM[*byte as usize];
+            }
+        }
+    }
+}
+
+fn convert_swab(data: &mut [u8]) {
+    for chunk in data.chunks_exact_mut(2) {
+        chunk.swap(0, 1);
+    }
+}
+
+fn apply_conversions(data: &mut [u8], config: &Config) {
+    if let Some(ascii_conv) = &config.ascii {
+        convert_ascii(data, ascii_conv);
+    }
+    if config.swab {
+        convert_swab(data);
+    }
+    // Additional conversions like lcase, ucase can be added here
+}
+
+fn copy_convert_file(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    let mut ifile: Box<dyn Read>;
+    if config.ifile == "-" {
+        ifile = Box::new(io::stdin().lock());
+    } else {
+        ifile = Box::new(fs::File::open(&config.ifile)?);
+    }
+    let mut ofile: Box<dyn Write>;
+    if config.ofile == "-" {
+        ofile = Box::new(io::stdout().lock())
+    } else {
+        ofile = Box::new(fs::File::create(&config.ofile)?)
+    }
+
+    let mut ibuf = vec![0u8; config.ibs];
+    let mut obuf = vec![0u8; config.obs];
+
+    let mut count = 0;
+    let mut skip = config.skip;
+    let mut seek = config.seek;
+
+    loop {
+        if skip > 0 {
+            let n = ifile.read(&mut ibuf)?;
+            if n == 0 {
+                break;
+            }
+            skip -= n;
+            continue;
+        }
+
+        if seek > 0 {
+            let n = ifile.read(&mut ibuf)?;
+            if n == 0 {
+                break;
+            }
+            seek -= n;
+            continue;
+        }
+
+        let n = ifile.read(&mut ibuf)?;
+        if n == 0 {
+            break;
+        }
+
+        if config.count > 0 {
+            if count >= config.count {
+                break;
+            }
+            count += 1;
+        }
+
+        let ibuf = &mut ibuf[..n];
+        let obuf = &mut obuf[..n];
+
+        apply_conversions(ibuf, config);
+
+        obuf.copy_from_slice(ibuf);
+
+        ofile.write(&obuf)?;
+    }
+
+    Ok(())
+}
+
 fn parse_conv_list(config: &mut Config, s: &str) -> Result<(), Box<dyn std::error::Error>> {
     for convstr in s.split(",") {
         match convstr {
@@ -212,92 +313,6 @@ fn parse_cmdline(args: &[String]) -> Result<Config, Box<dyn std::error::Error>> 
         }
     }
     Ok(config)
-}
-
-fn copy_convert_file(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
-    let mut ifile: Box<dyn Read>;
-    if config.ifile == "-" {
-        ifile = Box::new(io::stdin().lock());
-    } else {
-        ifile = Box::new(fs::File::open(&config.ifile)?);
-    }
-    let mut ofile: Box<dyn Write>;
-    if config.ofile == "-" {
-        ofile = Box::new(io::stdout().lock())
-    } else {
-        ofile = Box::new(fs::File::create(&config.ofile)?)
-    }
-
-    let mut ibuf = vec![0u8; config.ibs];
-    let mut obuf = vec![0u8; config.obs];
-
-    let mut count = 0;
-    let mut skip = config.skip;
-    let mut seek = config.seek;
-
-    loop {
-        if skip > 0 {
-            let n = ifile.read(&mut ibuf)?;
-            if n == 0 {
-                break;
-            }
-            skip -= n;
-            continue;
-        }
-
-        if seek > 0 {
-            let n = ifile.read(&mut ibuf)?;
-            if n == 0 {
-                break;
-            }
-            seek -= n;
-            continue;
-        }
-
-        let n = ifile.read(&mut ibuf)?;
-        if n == 0 {
-            break;
-        }
-
-        if config.count > 0 {
-            if count >= config.count {
-                break;
-            }
-            count += 1;
-        }
-
-        let ibuf = &ibuf[..n];
-        let obuf = &mut obuf[..n];
-
-        if let Some(ascii) = &config.ascii {
-            match ascii {
-                AsciiConv::Ascii => {
-                    // convert EBCDIC to ASCII
-                    for i in 0..n {
-                        obuf[i] = CONV_EBCDIC_ASCII[ibuf[i] as usize];
-                    }
-                }
-                AsciiConv::EBCDIC => {
-                    // convert ASCII to EBCDIC
-                    for i in 0..n {
-                        obuf[i] = CONV_ASCII_EBCDIC[ibuf[i] as usize];
-                    }
-                }
-                AsciiConv::IBM => {
-                    // convert ASCII to IBM
-                    for i in 0..n {
-                        obuf[i] = CONV_ASCII_IBM[ibuf[i] as usize];
-                    }
-                }
-            }
-        } else {
-            obuf.copy_from_slice(ibuf);
-        }
-
-        ofile.write(&obuf)?;
-    }
-
-    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

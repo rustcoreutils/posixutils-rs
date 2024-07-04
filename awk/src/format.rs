@@ -178,7 +178,9 @@ pub fn fmt_write_unsigned(
         }
         copy_buffer_to_target(&buffer[index..], target);
         pad_target(target, args.width.saturating_sub(number_length), b' ');
-    } else if args.zero_padded {
+    } else if args.precision.is_none() && args.zero_padded {
+        // > For d, i, o, u, x, and X conversion specifiers, if a precision
+        // > is specified, the '0' flag shall be ignored
         insert_hex_identifier(target, integer_format, args);
         pad_target(target, args.width.saturating_sub(number_length), b'0');
         if precision > buffer_length {
@@ -397,6 +399,23 @@ mod tests {
             },
         );
         assert_eq!(target, "");
+    }
+
+    #[test]
+    fn test_write_unsigned_with_precision_ignores_zero_padding() {
+        let mut target = String::new();
+        fmt_write_unsigned(
+            &mut target,
+            123,
+            IntegerFormat::Decimal,
+            &FormatArgs {
+                precision: Some(5),
+                width: 10,
+                zero_padded: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "     00123");
     }
 
     #[test]

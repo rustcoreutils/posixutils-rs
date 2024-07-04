@@ -1,5 +1,6 @@
-define(`x',divert(1)hello)dnl
+define(`x',divert(2)hello)dnl
 wow
 x
-define(`y',`divert(2)fantastic')dnl
+define(`y',`divert(1)fantastic')dnl
 y
+end

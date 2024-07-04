@@ -6,9 +6,6 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// TODO:
-// - the "-v" option is specified by POSIX and cannot be clap default -v
-//
 
 extern crate clap;
 extern crate plib;
@@ -43,7 +40,7 @@ struct Args {
     system: bool,
 
     /// Write the current version level of this release of the operating system implementation.
-    #[arg(short, long)]
+    #[arg(short = 'v', long)]
     osversion: bool,
 }
 
@@ -79,6 +76,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.release = true;
         args.system = true;
         args.osversion = true;
+    } else if !args.machine && !args.node && !args.release && !args.system && !args.osversion {
+        args.system = true;
     }
 
     setlocale(LocaleCategory::LcAll, "");

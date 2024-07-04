@@ -11,7 +11,10 @@ use std::collections::HashMap;
 
 use crate::program::{BuiltinFunction, Constant, Function, OpCode, Program, SpecialVar};
 
-use clap::arg;
+use crate::format::{
+    fmt_write_signed, fmt_write_string, fmt_write_unsigned, parse_conversion_specifier_args,
+    IntegerFormat,
+};
 use std::fmt::Write;
 
 fn get_or_insert(array: &mut HashMap<String, ScalarValue>, key: String) -> &mut ScalarValue {
@@ -427,70 +430,37 @@ impl Interpreter {
 
         while let Some(c) = iter.next() {
             if c == '%' {
-                let mut next = iter_next(&mut iter)?;
-                let mut left_justified = false;
-                let mut signed = false;
-                let mut prefix_space = false;
-                let mut alternative_form = false;
-                let mut zero_padded = false;
-                loop {
-                    match next {
-                        '-' => left_justified = true,
-                        '+' => signed = true,
-                        ' ' => prefix_space = true,
-                        '#' => alternative_form = true,
-                        '0' => zero_padded = true,
-                        _ => break,
-                    }
-                    next = iter_next(&mut iter)?;
-                }
-
-                let field_width = parse_number(&mut next, &mut iter)?;
-
-                let precision = if next == '.' {
-                    next = iter_next(&mut iter)?;
-                    parse_number(&mut next, &mut iter)?
-                } else {
-                    usize::MAX
-                };
-
-                if next == '%' {
+                let (specifier, args) = parse_conversion_specifier_args(&mut iter)?;
+                if specifier == '%' {
                     result.push('%');
                     continue;
                 }
+
                 if remaining_args == 0 {
                     return Err("not enough arguments for format string".to_string());
                 }
                 remaining_args -= 1;
-                match next {
-                    c if "aA".contains(c) => {
-                        todo!()
+                match specifier {
+                    'd' | 'i' => {
+                        let value = self.pop_scalar()?.as_f64_or_err()?;
+                        fmt_write_signed(&mut result, value as i64, &args);
                     }
-                    c if "diouxX".contains(c) => {
-                        todo!()
-                    }
-                    c if "fF".contains(c) => {
-                        todo!()
-                    }
-                    c if "eE".contains(c) => {
-                        todo!()
-                    }
-                    c if "gG".contains(c) => {
-                        todo!()
-                    }
-                    'c' => {
-                        todo!()
+                    'u' | 'o' | 'x' | 'X' => {
+                        let value = self.pop_scalar()?.as_f64_or_err()? as u64;
+                        let format = match specifier {
+                            'u' => IntegerFormat::Decimal,
+                            'o' => IntegerFormat::Octal,
+                            'x' => IntegerFormat::HexLower,
+                            'X' => IntegerFormat::HexUpper,
+                            _ => unreachable!(),
+                        };
+                        fmt_write_unsigned(&mut result, value, format, &args);
                     }
                     's' => {
                         let value = self.pop_scalar()?.to_string();
-                        if left_justified {
-                            write!(result, "{:<w$.p$}", value, w = field_width, p = precision)
-                        } else {
-                            write!(result, "{:>w$.p$}", value, w = field_width, p = precision)
-                        }
-                        .expect("error formatting string");
+                        fmt_write_string(&mut result, &value, &args);
                     }
-                    _ => return Err("invalid conversion specifier".to_string()),
+                    _ => return Err(format!("unsupported format specifier '{}'", specifier)),
                 }
             } else {
                 result.push(c);

@@ -10,6 +10,7 @@
 use compiler::compile_program;
 
 mod compiler;
+mod format;
 mod interpreter;
 mod program;
 

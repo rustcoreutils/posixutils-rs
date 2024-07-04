@@ -152,6 +152,22 @@ fn convert_swab(data: &mut [u8]) {
     }
 }
 
+fn convert_lcase(data: &mut [u8]) {
+    for byte in data.iter_mut() {
+        if *byte >= b'A' && *byte <= b'Z' {
+            *byte = *byte + 32;
+        }
+    }
+}
+
+fn convert_ucase(data: &mut [u8]) {
+    for byte in data.iter_mut() {
+        if *byte >= b'a' && *byte <= b'z' {
+            *byte = *byte - 32;
+        }
+    }
+}
+
 fn apply_conversions(data: &mut [u8], config: &Config) {
     if let Some(ascii_conv) = &config.ascii {
         convert_ascii(data, ascii_conv);
@@ -159,7 +175,12 @@ fn apply_conversions(data: &mut [u8], config: &Config) {
     if config.swab {
         convert_swab(data);
     }
-    // Additional conversions like lcase, ucase can be added here
+    if config.lcase {
+        convert_lcase(data);
+    }
+    if config.ucase {
+        convert_ucase(data);
+    }
 }
 
 fn copy_convert_file(config: &Config) -> Result<(), Box<dyn std::error::Error>> {

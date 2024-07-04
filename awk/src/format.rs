@@ -19,12 +19,11 @@ const BASE_16_DIGITS_UPPER: [char; 16] = [
 ];
 
 fn insert_hex_identifier(target: &mut String, integer_format: IntegerFormat, args: &FormatArgs) {
-    if args.alternative_form && integer_format == IntegerFormat::HexLower {
+    if args.alternative_form
+        && (integer_format == IntegerFormat::HexLower || integer_format == IntegerFormat::HexUpper)
+    {
         target.push('0');
         target.push('x');
-    } else if args.alternative_form && integer_format == IntegerFormat::HexUpper {
-        target.push('0');
-        target.push('X');
     }
 }
 
@@ -668,7 +667,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(target, "0X7B");
+        assert_eq!(target, "0x7B");
     }
 
     #[test]

@@ -19,11 +19,20 @@ pub struct TestPlan {
     pub expected_exit_code: i32,
 }
 
-fn run_test_base(plan: TestPlan) -> (TestPlan, Output) {
+pub struct TestPlanU8 {
+    pub cmd: String,
+    pub args: Vec<String>,
+    pub stdin_data: Vec<u8>,
+    pub expected_out: Vec<u8>,
+    pub expected_err: Vec<u8>,
+    pub expected_exit_code: i32,
+}
+
+fn run_test_base(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> Output {
     let relpath = if cfg!(debug_assertions) {
-        format!("target/debug/{}", plan.cmd)
+        format!("target/debug/{}", cmd)
     } else {
-        format!("target/release/{}", plan.cmd)
+        format!("target/release/{}", cmd)
     };
     let test_bin_path = std::env::current_dir()
         .unwrap()
@@ -33,7 +42,7 @@ fn run_test_base(plan: TestPlan) -> (TestPlan, Output) {
 
     let mut command = Command::new(test_bin_path);
     let mut child = command
-        .args(&plan.args)
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -42,15 +51,15 @@ fn run_test_base(plan: TestPlan) -> (TestPlan, Output) {
 
     let stdin = child.stdin.as_mut().expect("failed to get stdin");
     stdin
-        .write_all(plan.stdin_data.as_bytes())
+        .write_all(stdin_data)
         .expect("failed to write to stdin");
 
     let output = child.wait_with_output().expect("failed to wait for child");
-    (plan, output)
+    output
 }
 
 pub fn run_test(plan: TestPlan) {
-    let (plan, output) = run_test_base(plan);
+    let output = run_test_base(&plan.cmd, &plan.args, plan.stdin_data.as_bytes());
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(stdout, plan.expected_out);
@@ -64,7 +73,20 @@ pub fn run_test(plan: TestPlan) {
     }
 }
 
+pub fn run_test_u8(plan: TestPlanU8) {
+    let output = run_test_base(&plan.cmd, &plan.args, &plan.stdin_data);
+
+    assert_eq!(output.stdout, plan.expected_out);
+
+    assert_eq!(output.stderr, plan.expected_err);
+
+    assert_eq!(output.status.code(), Some(plan.expected_exit_code));
+    if plan.expected_exit_code == 0 {
+        assert!(output.status.success());
+    }
+}
+
 pub fn run_test_with_checker<F: FnMut(&TestPlan, &Output)>(plan: TestPlan, mut checker: F) {
-    let (plan, output) = run_test_base(plan);
+    let output = run_test_base(&plan.cmd, &plan.args, plan.stdin_data.as_bytes());
     checker(&plan, &output);
 }

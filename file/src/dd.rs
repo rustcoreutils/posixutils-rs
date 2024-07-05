@@ -109,8 +109,8 @@ struct Config {
 impl Config {
     fn new() -> Config {
         Config {
-            ifile: String::from("-"),
-            ofile: String::from("-"),
+            ifile: String::new(),
+            ofile: String::new(),
             ibs: DEF_BLOCK_SIZE,
             obs: DEF_BLOCK_SIZE,
             cbs: 0,
@@ -228,13 +228,13 @@ fn apply_conversions(data: &mut Vec<u8>, config: &Config) {
 
 fn copy_convert_file(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let mut ifile: Box<dyn Read>;
-    if config.ifile == "-" {
+    if config.ifile == "" {
         ifile = Box::new(io::stdin().lock());
     } else {
         ifile = Box::new(fs::File::open(&config.ifile)?);
     }
     let mut ofile: Box<dyn Write>;
-    if config.ofile == "-" {
+    if config.ofile == "" {
         ofile = Box::new(io::stdout().lock())
     } else {
         ofile = Box::new(fs::File::create(&config.ofile)?)

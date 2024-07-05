@@ -1093,6 +1093,13 @@ mod tests {
     }
 
     #[test]
+    fn test_write_float_hex_lower_integer_number() {
+        let mut target = String::new();
+        fmt_write_hex_float(&mut target, 2.0, true, &FormatArgs::default());
+        assert_eq!(target, "0x1p+1");
+    }
+
+    #[test]
     fn test_write_float_hex_lower_with_lower_precision() {
         let mut target = String::new();
         fmt_write_hex_float(
@@ -1105,6 +1112,21 @@ mod tests {
             },
         );
         assert_eq!(target, "0x1.edd2fp+6");
+    }
+
+    #[test]
+    fn test_write_float_hex_lower_with_higher_precision() {
+        let mut target = String::new();
+        fmt_write_hex_float(
+            &mut target,
+            123.5,
+            true,
+            &FormatArgs {
+                precision: Some(15),
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "0x1.ee0000000000000p+6");
     }
 
     #[test]

@@ -285,7 +285,7 @@ pub fn fmt_write_hex_float(
         first_digit = '1';
     };
     let exponent_sign = if exponent < 0 { '-' } else { '+' };
-    let mut exponent_buffer = [0u8; 3];
+    let mut exponent_buffer = [0u8; 4];
     let exponent_buffer_length = number_to_digits(
         &mut exponent_buffer,
         exponent.unsigned_abs(),
@@ -295,30 +295,26 @@ pub fn fmt_write_hex_float(
     let exponent_buffer_start = exponent_buffer.len() - exponent_buffer_length;
 
     let fraction = bits & 0x000f_ffff_ffff_ffff;
-    let mut fraction_buffer = [0u8; 13];
+    // leading 0s are significant in this case
+    let mut fraction_buffer = [b'0'; 13];
     let x_char;
     let p_char;
-    let last_fractional_digit_index;
     if lowercase_version {
         x_char = 'x';
         p_char = 'p';
-        last_fractional_digit_index =
-            number_to_digits(&mut fraction_buffer, fraction, 16, &BASE_16_DIGITS_LOWER);
+        number_to_digits(&mut fraction_buffer, fraction, 16, &BASE_16_DIGITS_LOWER);
     } else {
         x_char = 'X';
         p_char = 'P';
-        last_fractional_digit_index =
-            number_to_digits(&mut fraction_buffer, fraction, 16, &BASE_16_DIGITS_UPPER);
+        number_to_digits(&mut fraction_buffer, fraction, 16, &BASE_16_DIGITS_UPPER);
     };
-    let fraction_buffer_start = fraction_buffer.len() - last_fractional_digit_index;
     // > if the precision is missing and FLT_RADIX is a power of 2, then the
     // > precision shall be sufficient for an exact representation of the value
     let fraction_buffer_length = if let Some(precision) = args.precision {
-        last_fractional_digit_index.min(precision)
+        fraction_buffer.len().min(precision)
     } else {
-        last_fractional_digit_index
+        fraction_buffer.len()
     };
-    let fraction_buffer_end = fraction_buffer_start + fraction_buffer_length;
 
     let number_length = sign.len() + 4 + fraction_buffer_length + 2 + exponent_buffer_length;
 
@@ -335,10 +331,7 @@ pub fn fmt_write_hex_float(
         target.push(first_digit);
         // TODO: use locale specific decimal point
         target.push('.');
-        copy_buffer_to_target(
-            &fraction_buffer[fraction_buffer_start..fraction_buffer_end],
-            target,
-        );
+        copy_buffer_to_target(&fraction_buffer[..fraction_buffer_length], target);
         target.push(p_char);
         target.push(exponent_sign);
         copy_buffer_to_target(&exponent_buffer[exponent_buffer_start..], target);
@@ -358,10 +351,7 @@ pub fn fmt_write_hex_float(
         target.push(first_digit);
         // TODO: use locale specific decimal point
         target.push('.');
-        copy_buffer_to_target(
-            &fraction_buffer[fraction_buffer_start..fraction_buffer_end],
-            target,
-        );
+        copy_buffer_to_target(&fraction_buffer[..fraction_buffer_length], target);
         target.push(p_char);
         target.push(exponent_sign);
         copy_buffer_to_target(&exponent_buffer[exponent_buffer_start..], target);

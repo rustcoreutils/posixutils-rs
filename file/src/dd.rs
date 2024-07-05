@@ -95,7 +95,6 @@ enum Conversion {
 struct Config {
     ifile: String,
     ofile: String,
-    bs: usize,
     ibs: usize,
     obs: usize,
     cbs: usize,
@@ -112,7 +111,6 @@ impl Config {
         Config {
             ifile: String::from("-"),
             ofile: String::from("-"),
-            bs: DEF_BLOCK_SIZE,
             ibs: DEF_BLOCK_SIZE,
             obs: DEF_BLOCK_SIZE,
             cbs: 0,
@@ -168,22 +166,62 @@ fn convert_ucase(data: &mut [u8]) {
     }
 }
 
-fn apply_conversions(data: &mut [u8], config: &Config) {
+fn convert_sync(data: &mut Vec<u8>, block_size: usize) {
+    let current_len = data.len();
+    if current_len < block_size {
+        data.resize(block_size, 0); // Pad with null bytes (0x00)
+    }
+}
+
+fn convert_block(data: &mut Vec<u8>, cbs: usize) {
+    let mut result = Vec::new();
+    let mut line = Vec::new();
+
+    for &byte in data.iter() {
+        if byte == b'\n' {
+            while line.len() < cbs {
+                line.push(b' ');
+            }
+            result.extend_from_slice(&line[..cbs]);
+            line.clear();
+        } else {
+            line.push(byte);
+        }
+    }
+
+    if !line.is_empty() {
+        while line.len() < cbs {
+            line.push(b' ');
+        }
+        result.extend_from_slice(&line[..cbs]);
+    }
+
+    *data = result;
+}
+
+fn convert_unblock(data: &mut Vec<u8>, cbs: usize) {
+    let mut result = Vec::new();
+    for chunk in data.chunks(cbs) {
+        let trimmed_chunk = chunk
+            .iter()
+            .rposition(|&b| b != b' ')
+            .map_or(chunk, |pos| &chunk[..=pos]);
+        result.extend_from_slice(trimmed_chunk);
+        result.push(b'\n');
+    }
+    *data = result;
+}
+
+fn apply_conversions(data: &mut Vec<u8>, config: &Config) {
     for conversion in &config.conversions {
         match conversion {
             Conversion::Ascii(ascii_conv) => convert_ascii(data, ascii_conv),
             Conversion::Lcase => convert_lcase(data),
             Conversion::Ucase => convert_ucase(data),
             Conversion::Swab => convert_swab(data),
-            Conversion::Block => {
-                todo!()
-            } // implement block conversion
-            Conversion::Unblock => {
-                todo!()
-            } // implement unblock conversion
-            Conversion::Sync => {
-                todo!()
-            } // implement sync conversion
+            Conversion::Sync => convert_sync(data, config.ibs),
+            Conversion::Block => convert_block(data, config.cbs),
+            Conversion::Unblock => convert_unblock(data, config.cbs),
         }
     }
 }
@@ -203,23 +241,22 @@ fn copy_convert_file(config: &Config) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     let mut ibuf = vec![0u8; config.ibs];
-    let mut obuf = vec![0u8; config.obs];
-
-    // Skip the specified number of bytes
-    let mut skipped = 0;
-    while skipped < config.skip {
-        let bytes_to_skip = std::cmp::min(config.skip - skipped, config.ibs);
-        let n = ifile.read(&mut ibuf[..bytes_to_skip])?;
-        if n == 0 {
-            break;
-        }
-        skipped += n;
-    }
+    let obuf = vec![0u8; config.obs];
 
     let mut count = 0;
+    let mut skip = config.skip;
     let mut seek = config.seek;
 
     loop {
+        if skip > 0 {
+            let n = ifile.read(&mut ibuf)?;
+            if n == 0 {
+                break;
+            }
+            skip -= n;
+            continue;
+        }
+
         if seek > 0 {
             let n = ifile.read(&mut ibuf)?;
             if n == 0 {
@@ -241,14 +278,15 @@ fn copy_convert_file(config: &Config) -> Result<(), Box<dyn std::error::Error>> 
             count += 1;
         }
 
-        let ibuf = &mut ibuf[..n];
-        let obuf = &mut obuf[..n];
+        let mut ibuf = ibuf[..n].to_vec();
 
-        apply_conversions(ibuf, config);
+        apply_conversions(&mut ibuf, config);
 
-        obuf.copy_from_slice(ibuf);
-
-        ofile.write(&obuf)?;
+        if config.obs != 0 {
+            ofile.write_all(&ibuf)?;
+        } else {
+            ofile.write_all(&obuf[..n])?;
+        }
     }
 
     Ok(())
@@ -331,9 +369,9 @@ fn parse_cmdline(args: &[String]) -> Result<Config, Box<dyn std::error::Error>> 
             "ibs" => config.ibs = parse_block_size(&oparg)?,
             "obs" => config.obs = parse_block_size(&oparg)?,
             "bs" => {
-                config.bs = parse_block_size(&oparg)?;
-                config.ibs = config.bs;
-                config.obs = config.bs;
+                let block_sz = parse_block_size(&oparg)?;
+                config.ibs = block_sz;
+                config.obs = block_sz;
             }
             "cbs" => config.cbs = parse_block_size(&oparg)?,
             "skip" => config.skip = oparg.parse::<usize>()?,

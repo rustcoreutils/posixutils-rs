@@ -178,3 +178,28 @@ fn test_lcase_conversion() {
         expected_exit_code: 0,
     });
 }
+
+#[test]
+fn test_skip_n() {
+    let input_file_path = get_test_file_path("dd.ascii");
+
+    let mut input_file = File::open(input_file_path).expect("Unable to open input test file");
+    let mut input_data = Vec::new();
+    input_file
+        .read_to_end(&mut input_data)
+        .expect("Unable to read input test file");
+
+    let expected_output = b"world! {[ $&chars ]}\nAlas, poor Yorick, I knew him well.\n";
+
+    run_test_u8(TestPlanU8 {
+        cmd: String::from("dd"),
+        args: vec![
+            String::from("ibs=1"),
+            String::from("skip=7"), // Adjusting skip to 7 bytes to reach the correct output
+        ],
+        stdin_data: input_data,
+        expected_out: expected_output.to_vec(),
+        expected_err: Vec::new(),
+        expected_exit_code: 0,
+    });
+}

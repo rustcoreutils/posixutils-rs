@@ -81,6 +81,17 @@ enum AsciiConv {
 }
 
 #[derive(Debug)]
+enum Conversion {
+    Ascii(AsciiConv),
+    Lcase,
+    Ucase,
+    Swab,
+    Block,
+    Unblock,
+    Sync,
+}
+
+#[derive(Debug)]
 struct Config {
     ifile: String,
     ofile: String,
@@ -91,15 +102,9 @@ struct Config {
     seek: usize,
     skip: usize,
     count: usize,
-
-    ascii: Option<AsciiConv>,
-    block: Option<bool>,
-    lcase: bool,
-    ucase: bool,
-    swab: bool,
+    conversions: Vec<Conversion>,
     noerror: bool,
     notrunc: bool,
-    sync: bool,
 }
 
 impl Config {
@@ -114,14 +119,9 @@ impl Config {
             seek: 0,
             skip: 0,
             count: 0,
-            ascii: None,
-            block: None,
-            lcase: false,
-            ucase: false,
-            swab: false,
+            conversions: Vec::new(),
             noerror: false,
             notrunc: false,
-            sync: false,
         }
     }
 }
@@ -169,17 +169,22 @@ fn convert_ucase(data: &mut [u8]) {
 }
 
 fn apply_conversions(data: &mut [u8], config: &Config) {
-    if let Some(ascii_conv) = &config.ascii {
-        convert_ascii(data, ascii_conv);
-    }
-    if config.swab {
-        convert_swab(data);
-    }
-    if config.lcase {
-        convert_lcase(data);
-    }
-    if config.ucase {
-        convert_ucase(data);
+    for conversion in &config.conversions {
+        match conversion {
+            Conversion::Ascii(ascii_conv) => convert_ascii(data, ascii_conv),
+            Conversion::Lcase => convert_lcase(data),
+            Conversion::Ucase => convert_ucase(data),
+            Conversion::Swab => convert_swab(data),
+            Conversion::Block => {
+                todo!()
+            } // implement block conversion
+            Conversion::Unblock => {
+                todo!()
+            } // implement unblock conversion
+            Conversion::Sync => {
+                todo!()
+            } // implement sync conversion
+        }
     }
 }
 
@@ -200,20 +205,21 @@ fn copy_convert_file(config: &Config) -> Result<(), Box<dyn std::error::Error>> 
     let mut ibuf = vec![0u8; config.ibs];
     let mut obuf = vec![0u8; config.obs];
 
+    // Skip the specified number of bytes
+    let mut skipped = 0;
+    while skipped < config.skip {
+        let bytes_to_skip = std::cmp::min(config.skip - skipped, config.ibs);
+        let n = ifile.read(&mut ibuf[..bytes_to_skip])?;
+        if n == 0 {
+            break;
+        }
+        skipped += n;
+    }
+
     let mut count = 0;
-    let mut skip = config.skip;
     let mut seek = config.seek;
 
     loop {
-        if skip > 0 {
-            let n = ifile.read(&mut ibuf)?;
-            if n == 0 {
-                break;
-            }
-            skip -= n;
-            continue;
-        }
-
         if seek > 0 {
             let n = ifile.read(&mut ibuf)?;
             if n == 0 {
@@ -250,23 +256,30 @@ fn copy_convert_file(config: &Config) -> Result<(), Box<dyn std::error::Error>> 
 
 fn parse_conv_list(config: &mut Config, s: &str) -> Result<(), Box<dyn std::error::Error>> {
     for convstr in s.split(",") {
-        match convstr {
-            "ascii" => config.ascii = Some(AsciiConv::Ascii),
-            "ebcdic" => config.ascii = Some(AsciiConv::EBCDIC),
-            "ibm" => config.ascii = Some(AsciiConv::IBM),
-            "block" => config.block = Some(true),
-            "unblock" => config.block = Some(false),
-            "lcase" => config.lcase = true,
-            "ucase" => config.ucase = true,
-            "swab" => config.swab = true,
-            "noerror" => config.noerror = true,
-            "notrunc" => config.notrunc = true,
-            "sync" => config.sync = true,
+        let conversion = match convstr {
+            "ascii" => Conversion::Ascii(AsciiConv::Ascii),
+            "ebcdic" => Conversion::Ascii(AsciiConv::EBCDIC),
+            "ibm" => Conversion::Ascii(AsciiConv::IBM),
+            "block" => Conversion::Block,
+            "unblock" => Conversion::Unblock,
+            "lcase" => Conversion::Lcase,
+            "ucase" => Conversion::Ucase,
+            "swab" => Conversion::Swab,
+            "sync" => Conversion::Sync,
+            "noerror" => {
+                config.noerror = true;
+                continue;
+            }
+            "notrunc" => {
+                config.notrunc = true;
+                continue;
+            }
             _ => {
                 eprintln!("{}: {}", gettext("invalid conv option"), convstr);
                 return Err("invalid conv option".into());
             }
-        }
+        };
+        config.conversions.push(conversion);
     }
     Ok(())
 }

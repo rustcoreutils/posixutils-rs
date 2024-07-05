@@ -166,22 +166,27 @@ fn convert_ucase(data: &mut [u8]) {
     }
 }
 
-fn apply_conversions(data: &mut [u8], config: &Config) {
+fn convert_sync(data: &mut Vec<u8>, block_size: usize) {
+    let current_len = data.len();
+    if current_len < block_size {
+        data.resize(block_size, 0); // Pad with null bytes (0x00)
+    }
+}
+
+fn apply_conversions(data: &mut Vec<u8>, config: &Config) {
     for conversion in &config.conversions {
         match conversion {
             Conversion::Ascii(ascii_conv) => convert_ascii(data, ascii_conv),
             Conversion::Lcase => convert_lcase(data),
             Conversion::Ucase => convert_ucase(data),
             Conversion::Swab => convert_swab(data),
+            Conversion::Sync => convert_sync(data, config.ibs), // Add this line
             Conversion::Block => {
                 todo!()
-            } // implement block conversion
+            }
             Conversion::Unblock => {
                 todo!()
-            } // implement unblock conversion
-            Conversion::Sync => {
-                todo!()
-            } // implement sync conversion
+            }
         }
     }
 }
@@ -201,23 +206,22 @@ fn copy_convert_file(config: &Config) -> Result<(), Box<dyn std::error::Error>> 
     }
 
     let mut ibuf = vec![0u8; config.ibs];
-    let mut obuf = vec![0u8; config.obs];
-
-    // Skip the specified number of bytes
-    let mut skipped = 0;
-    while skipped < config.skip {
-        let bytes_to_skip = std::cmp::min(config.skip - skipped, config.ibs);
-        let n = ifile.read(&mut ibuf[..bytes_to_skip])?;
-        if n == 0 {
-            break;
-        }
-        skipped += n;
-    }
+    let obuf = vec![0u8; config.obs];
 
     let mut count = 0;
+    let mut skip = config.skip;
     let mut seek = config.seek;
 
     loop {
+        if skip > 0 {
+            let n = ifile.read(&mut ibuf)?;
+            if n == 0 {
+                break;
+            }
+            skip -= n;
+            continue;
+        }
+
         if seek > 0 {
             let n = ifile.read(&mut ibuf)?;
             if n == 0 {
@@ -239,14 +243,15 @@ fn copy_convert_file(config: &Config) -> Result<(), Box<dyn std::error::Error>> 
             count += 1;
         }
 
-        let ibuf = &mut ibuf[..n];
-        let obuf = &mut obuf[..n];
+        let mut ibuf = ibuf[..n].to_vec();
 
-        apply_conversions(ibuf, config);
+        apply_conversions(&mut ibuf, config);
 
-        obuf.copy_from_slice(ibuf);
-
-        ofile.write(&obuf)?;
+        if config.obs != 0 {
+            ofile.write_all(&ibuf)?;
+        } else {
+            ofile.write_all(&obuf[..n])?;
+        }
     }
 
     Ok(())

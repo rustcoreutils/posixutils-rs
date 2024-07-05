@@ -161,10 +161,8 @@ pub fn run_impl<STDOUT: Write, STDERR: Write>(
         }
     }
 
-    for buffer in state.divert_buffers {
-        let buffer = buffer.0.borrow();
-        stdout.write_all(&*buffer)?;
-    }
+    state.output.borrow_mut().undivert_all()?;
+
     for wrap in state.m4wrap {
         stdout.write_all(&wrap)?;
     }

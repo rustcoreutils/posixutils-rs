@@ -829,18 +829,6 @@ pub(crate) fn process_streaming<'c, R: Read>(
     Ok(state)
 }
 
-struct DiscardStdout;
-
-impl Write for DiscardStdout {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 /// NOTE: This will append a b'\0' to the end of `input`
 pub fn parse_symbols_complete<'i>(
     config: &ParseConfig,

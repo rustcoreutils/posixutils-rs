@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
+use std::io::Read;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::process::ExitStatus;
@@ -26,15 +27,83 @@ pub struct State {
     /// See [`M4wrapMacro`].
     pub m4wrap: Vec<Vec<u8>>,
     pub last_syscmd_status: Option<ExitStatus>,
-    /// Divert buffers 1 through to 9. See [`DivertMacro`].
-    pub divert_buffers: [DivertableBuffer; 9],
-    /// See [`DivertMacro`].
-    pub divert_number: i64,
     /// Stack of filenames. Used in [`FileMacro`].
     pub file: Vec<PathBuf>,
+    pub output: Rc<RefCell<Output>>,
+}
+
+/// Output that implements [`Write`] and will write to stdout if [`Output::divert_number`] is 0, to
+/// one of the [`Output::divert_buffers`] if [`Output::divert_number`] is greater than 0, and will
+/// discard if it is < 0.
+///
+/// NOTE: This currently uses an in-memory set of divert buffers, other implementations use
+/// temporary files, so this might change in the future, or become an optional feature.
+pub(crate) struct Output {
+    /// Divert buffers 1 through to 9. See [`DivertMacro`].
+    divert_buffers: [DivertableBuffer; 9],
+    /// See [`DivertMacro`].
+    divert_number: i64,
+    /// The real output, usually [`std::io::stdout`].
+    stdout: Box<dyn Write>,
+}
+
+impl Default for Output {
+    fn default() -> Self {
+        Self {
+            divert_buffers: Default::default(),
+            divert_number: Default::default(),
+            stdout: Box::new(std::io::stdout()),
+        }
+    }
+}
+
+impl Output {
+    pub fn divert(&mut self, divert_number: i64) -> Result<()> {
+        if divert_number > 9 {
+            return Err(crate::error::Error::InvalidDivertNumber(divert_number));
+        }
+        self.divert_number = divert_number;
+        Ok(())
+    }
+
+    pub fn undivert_all(&mut self) -> Result<()> {
+        for buffer in &mut self.divert_buffers {
+            std::io::copy(buffer, &mut self.stdout)?;
+        }
+        Ok(())
+    }
+}
+
+impl Write for Output {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.divert_number {
+            0 => self.stdout.write(buf),
+            1..=9 => self.divert_buffers[self.divert_number as usize].write(buf),
+            i if i < 0 => Ok(buf.len()),
+            _ => unreachable!("unreachable, was checked in Self::divert()"),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.divert_number {
+            0 => self.stdout.flush(),
+            1..=9 => self.divert_buffers[self.divert_number as usize].flush(),
+            i if i < 0 => Ok(()),
+            _ => unreachable!("unreachable, was checked in Self::divert()"),
+        }
+    }
 }
 
 impl State {
+    fn new(stdout: Box<dyn Write>) -> Self {
+        Self {
+            output: Rc::new(RefCell::new(Output {
+                stdout,
+                ..Output::default()
+            })),
+            ..Self::default()
+        }
+    }
     fn debug_macro_definitions(&self) -> String {
         format!(
             "macro_definitions: {:?}",
@@ -75,8 +144,7 @@ impl Default for State {
             exit_error: false,
             m4wrap: Vec::new(),
             last_syscmd_status: None,
-            divert_buffers: [(); 9].map(|_| DivertableBuffer::default()),
-            divert_number: 0,
+            output: Rc::default(),
             file: Vec::new(),
         }
     }
@@ -84,19 +152,25 @@ impl Default for State {
 
 /// TODO: This is a little wild west in terms of panic occurance and usability
 #[derive(Default, Clone)]
-pub(crate) struct DivertableBuffer(pub Rc<RefCell<Vec<u8>>>);
+pub(crate) struct DivertableBuffer(Vec<u8>);
 
 impl Write for DivertableBuffer {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.borrow_mut().write(buf)
+        self.0.write(buf)
     }
 
     fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        self.0.borrow_mut().write_all(buf)
+        self.0.write_all(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.0.borrow_mut().flush()
+        self.0.flush()
+    }
+}
+
+impl Read for DivertableBuffer {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.as_slice().read(buf)
     }
 }
 

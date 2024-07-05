@@ -6,6 +6,8 @@ pub enum Error {
     Parsing(String),
     #[error("Error processing io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("Invalid divert number: {0}")]
+    InvalidDivertNumber(i64),
     #[error("The macro doesn't have enough arguments")]
     NotEnoughArguments,
     /// NOTE: this isn't always an "error", if the code is 0, it indicates an intentional,

@@ -247,6 +247,99 @@ pub fn fmt_write_signed(target: &mut String, value: i64, args: &FormatArgs) {
     }
 }
 
+pub fn fmt_write_hex_float(
+    target: &mut String,
+    value: f64,
+    lowercase_version: bool,
+    args: &FormatArgs,
+) {
+    let sign = sign_str(value.is_sign_negative(), args);
+    let bits = value.to_bits();
+    let exponent = ((bits >> 52) & 0x7ff) as i64 - 1023;
+    let exponent_sign = if exponent < 0 { '-' } else { '+' };
+    let mut exponent_buffer = [0u8; 3];
+    let exponent_buffer_length = number_to_digits(
+        &mut exponent_buffer,
+        exponent.unsigned_abs(),
+        10,
+        &BASE_10_DIGITS,
+    );
+    let exponent_buffer_start = exponent_buffer.len() - exponent_buffer_length;
+
+    let fraction = bits & 0x000f_ffff_ffff_ffff;
+    let mut fraction_buffer = [0u8; 13];
+    let x_char;
+    let p_char;
+    let last_fractional_digit_index;
+    if lowercase_version {
+        x_char = 'x';
+        p_char = 'p';
+        last_fractional_digit_index =
+            number_to_digits(&mut fraction_buffer, fraction, 16, &BASE_16_DIGITS_LOWER);
+    } else {
+        x_char = 'X';
+        p_char = 'P';
+        last_fractional_digit_index =
+            number_to_digits(&mut fraction_buffer, fraction, 16, &BASE_16_DIGITS_UPPER);
+    };
+    let fraction_buffer_start = fraction_buffer.len() - last_fractional_digit_index;
+    // > if the precision is missing and FLT_RADIX is a power of 2, then the
+    // > precision shall be sufficient for an exact representation of the value
+    let fraction_buffer_length = if let Some(precision) = args.precision {
+        last_fractional_digit_index.min(precision)
+    } else {
+        last_fractional_digit_index
+    };
+    let fraction_buffer_end = fraction_buffer_start + fraction_buffer_length;
+
+    let number_length = sign.len() + 4 + fraction_buffer_length + 2 + exponent_buffer_length;
+
+    // left justified
+    //   sign 0x 1 <decimal point> fraction p exponent_sign exponent padding
+    // right justified zero padded
+    //   sign 0x padding 1 <decimal point> fraction p exponent_sign exponent
+    // right justified space padded
+    //   padding sign 0x 1 <decimal point> fraction p exponent_sign exponent
+    if args.left_justified {
+        target.push_str(sign);
+        target.push('0');
+        target.push(x_char);
+        target.push('1');
+        // TODO: use locale specific decimal point
+        target.push('.');
+        copy_buffer_to_target(
+            &fraction_buffer[fraction_buffer_start..fraction_buffer_end],
+            target,
+        );
+        target.push(p_char);
+        target.push(exponent_sign);
+        copy_buffer_to_target(&exponent_buffer[exponent_buffer_start..], target);
+        pad_target(target, args.width.saturating_sub(number_length), b' ');
+    } else {
+        if args.zero_padded {
+            target.push_str(sign);
+            target.push('0');
+            target.push(x_char);
+            pad_target(target, args.width.saturating_sub(number_length), b'0');
+        } else {
+            pad_target(target, args.width.saturating_sub(number_length), b' ');
+            target.push_str(sign);
+            target.push('0');
+            target.push(x_char);
+        }
+        target.push('1');
+        // TODO: use locale specific decimal point
+        target.push('.');
+        copy_buffer_to_target(
+            &fraction_buffer[fraction_buffer_start..fraction_buffer_end],
+            target,
+        );
+        target.push(p_char);
+        target.push(exponent_sign);
+        copy_buffer_to_target(&exponent_buffer[exponent_buffer_start..], target);
+    }
+}
+
 pub fn fmt_write_string(target: &mut String, value: &str, args: &FormatArgs) {
     let precision = args.precision.unwrap_or(usize::MAX);
     let str_len = value.len().min(precision);
@@ -965,5 +1058,98 @@ mod tests {
             },
         );
         assert_eq!(target, "       hel");
+    }
+
+    #[test]
+    fn test_write_float_hex_lower() {
+        let mut target = String::new();
+        fmt_write_hex_float(&mut target, 123.456, true, &FormatArgs::default());
+        assert_eq!(target, "0x1.edd2f1a9fbe77p+6");
+    }
+
+    #[test]
+    fn test_write_float_hex_lower_with_precision() {
+        let mut target = String::new();
+        fmt_write_hex_float(
+            &mut target,
+            123.456,
+            true,
+            &FormatArgs {
+                precision: Some(5),
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "0x1.edd2fp+6");
+    }
+
+    #[test]
+    fn test_write_float_hex_lower_with_width() {
+        let mut target = String::new();
+        fmt_write_hex_float(
+            &mut target,
+            123.456,
+            true,
+            &FormatArgs {
+                width: 22,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "  0x1.edd2f1a9fbe77p+6");
+    }
+
+    #[test]
+    fn test_write_float_hex_lower_left_justified() {
+        let mut target = String::new();
+        fmt_write_hex_float(
+            &mut target,
+            123.456,
+            true,
+            &FormatArgs {
+                left_justified: true,
+                width: 22,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "0x1.edd2f1a9fbe77p+6  ");
+    }
+
+    #[test]
+    fn test_write_float_hex_lower_left_justified_zero_padded() {
+        let mut target = String::new();
+        fmt_write_hex_float(
+            &mut target,
+            123.456,
+            true,
+            &FormatArgs {
+                left_justified: true,
+                zero_padded: true,
+                width: 22,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "0x1.edd2f1a9fbe77p+6  ");
+    }
+
+    #[test]
+    fn test_write_float_hex_lower_zero_padded() {
+        let mut target = String::new();
+        fmt_write_hex_float(
+            &mut target,
+            123.456,
+            true,
+            &FormatArgs {
+                zero_padded: true,
+                width: 22,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "0x001.edd2f1a9fbe77p+6");
+    }
+
+    #[test]
+    fn test_write_hex_upper_float() {
+        let mut target = String::new();
+        fmt_write_hex_float(&mut target, 123.456, false, &FormatArgs::default());
+        assert_eq!(target, "0X1.EDD2F1A9FBE77P+6");
     }
 }

@@ -205,20 +205,21 @@ fn copy_convert_file(config: &Config) -> Result<(), Box<dyn std::error::Error>> 
     let mut ibuf = vec![0u8; config.ibs];
     let mut obuf = vec![0u8; config.obs];
 
+    // Skip the specified number of bytes
+    let mut skipped = 0;
+    while skipped < config.skip {
+        let bytes_to_skip = std::cmp::min(config.skip - skipped, config.ibs);
+        let n = ifile.read(&mut ibuf[..bytes_to_skip])?;
+        if n == 0 {
+            break;
+        }
+        skipped += n;
+    }
+
     let mut count = 0;
-    let mut skip = config.skip;
     let mut seek = config.seek;
 
     loop {
-        if skip > 0 {
-            let n = ifile.read(&mut ibuf)?;
-            if n == 0 {
-                break;
-            }
-            skip -= n;
-            continue;
-        }
-
         if seek > 0 {
             let n = ifile.read(&mut ibuf)?;
             if n == 0 {

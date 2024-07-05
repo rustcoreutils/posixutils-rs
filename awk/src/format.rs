@@ -18,16 +18,15 @@ const BASE_16_DIGITS_UPPER: [char; 16] = [
     '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F',
 ];
 
-fn insert_hex_identifier(target: &mut String, integer_format: IntegerFormat, args: &FormatArgs) {
+fn integer_hex_prefix_str(integer_format: IntegerFormat, args: &FormatArgs) -> &'static str {
     if args.alternative_form {
         if integer_format == IntegerFormat::HexLower {
-            target.push('0');
-            target.push('x');
+            return "0x";
         } else if integer_format == IntegerFormat::HexUpper {
-            target.push('0');
-            target.push('X');
+            return "0X";
         }
     }
+    ""
 }
 
 fn copy_buffer_to_target(buffer: &[u8], target: &mut String) {
@@ -188,22 +187,19 @@ pub fn fmt_write_unsigned(
         precision = buffer_length + 1;
     }
 
-    // left justified:
-    //    (Ox | OX)? precision buffer padding
-    // right justified zero padded:
-    //    (Ox | OX)? padding precision buffer
-    // right justified space padded:
-    //    padding (Ox | OX)? precision buffer
+    let hex_prefix = integer_hex_prefix_str(integer_format, args);
 
-    let number_length = match integer_format {
-        IntegerFormat::HexLower | IntegerFormat::HexUpper if args.alternative_form => {
-            buffer_length.max(precision) + 2
-        }
-        _ => buffer_length.max(precision),
-    };
+    // left justified:
+    //    hex_prefix precision buffer padding
+    // right justified zero padded:
+    //    hex_prefix padding precision buffer
+    // right justified space padded:
+    //    padding hex_prefix precision buffer
+
+    let number_length = buffer_length.max(precision) + hex_prefix.len();
 
     if args.left_justified {
-        insert_hex_identifier(target, integer_format, args);
+        target.push_str(hex_prefix);
         if precision > buffer_length {
             pad_target(target, precision - buffer_length, b'0');
         }
@@ -212,7 +208,7 @@ pub fn fmt_write_unsigned(
     } else if args.precision.is_none() && args.zero_padded {
         // > For d, i, o, u, x, and X conversion specifiers, if a precision
         // > is specified, the '0' flag shall be ignored
-        insert_hex_identifier(target, integer_format, args);
+        target.push_str(hex_prefix);
         pad_target(target, args.width.saturating_sub(number_length), b'0');
         if precision > buffer_length {
             pad_target(target, precision - buffer_length, b'0');
@@ -220,7 +216,7 @@ pub fn fmt_write_unsigned(
         copy_buffer_to_target(&buffer[buffer_start..], target);
     } else {
         pad_target(target, args.width.saturating_sub(number_length), b' ');
-        insert_hex_identifier(target, integer_format, args);
+        target.push_str(hex_prefix);
         if precision > buffer_length {
             pad_target(target, precision - buffer_length, b'0');
         }

@@ -203,3 +203,47 @@ fn test_skip_n() {
         expected_exit_code: 0,
     });
 }
+
+#[test]
+fn test_basic_block_processing() {
+    let input_file_path = get_test_file_path("dd_test_input.txt");
+    let mut input_file = File::open(input_file_path).expect("Unable to open input test file");
+    let mut input_data = Vec::new();
+    input_file.read_to_end(&mut input_data).expect("Unable to read input test file");
+
+    // Expected output is the same as input for this simple block size test
+    let expected_output_data = input_data.clone();
+
+    run_test_u8(TestPlanU8 {
+        cmd: String::from("dd"),
+        args: vec![String::from("ibs=32"), String::from("obs=32")],
+        stdin_data: input_data,
+        expected_out: expected_output_data,
+        expected_err: Vec::new(),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn test_different_ibs_obs() {
+    let input_file_path = get_test_file_path("dd_test_input.txt");
+    let mut input_file = File::open(input_file_path).expect("Unable to open input test file");
+    let mut input_data = Vec::new();
+    input_file.read_to_end(&mut input_data).expect("Unable to read input test file");
+
+    // Expected output is the combination of each pair of 32-byte blocks from input
+    let mut expected_output_data = Vec::new();
+    for chunk in input_data.chunks(32) {
+        expected_output_data.extend_from_slice(chunk);
+    }
+
+    run_test_u8(TestPlanU8 {
+        cmd: String::from("dd"),
+        args: vec![String::from("ibs=32"), String::from("obs=64")],
+        stdin_data: input_data,
+        expected_out: expected_output_data,
+        expected_err: Vec::new(),
+        expected_exit_code: 0,
+    });
+}
+

@@ -1,4 +1,4 @@
-use std::{ffi::OsStr, io::Write, os::unix::ffi::OsStrExt, path::PathBuf, process::Stdio};
+use std::{io::Write, os::unix::ffi::OsStrExt, path::PathBuf, process::Stdio};
 
 use clap::Parser;
 use m4_test_manager::TestSnapshot;

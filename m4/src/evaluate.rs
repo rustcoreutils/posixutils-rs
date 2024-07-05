@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
@@ -29,7 +30,38 @@ pub struct State {
     pub last_syscmd_status: Option<ExitStatus>,
     /// Stack of filenames. Used in [`FileMacro`].
     pub file: Vec<PathBuf>,
-    pub output: Rc<RefCell<Output>>,
+    pub output: OutputRef,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct OutputRef(Rc<RefCell<Output>>);
+
+impl OutputRef {
+    pub fn divert_number(&self) -> i64 {
+        (*self.0).borrow().divert_number()
+    }
+
+    pub fn divert(&mut self, divert_number: i64) -> Result<()> {
+        self.0.borrow_mut().divert(divert_number)
+    }
+
+    pub fn undivert_all(&mut self) -> Result<()> {
+        self.0.borrow_mut().undivert_all()
+    }
+
+    pub fn undivert(&mut self, buffer_number: BufferNumber) -> Result<()> {
+        self.0.borrow_mut().undivert(buffer_number)
+    }
+}
+
+impl Write for OutputRef {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.borrow_mut().flush()
+    }
 }
 
 /// Output that implements [`Write`] and will write to stdout if [`Output::divert_number`] is 0, to
@@ -58,6 +90,21 @@ impl Default for Output {
 }
 
 impl Output {
+    pub fn new(stdout: Box<dyn Write>) -> Self {
+        Self {
+            stdout,
+            ..Self::default()
+        }
+    }
+
+    pub fn into_ref(self) -> OutputRef {
+        OutputRef(Rc::new(RefCell::new(self)))
+    }
+
+    pub fn divert_number(&self) -> i64 {
+        self.divert_number
+    }
+
     pub fn divert(&mut self, divert_number: i64) -> Result<()> {
         if divert_number > 9 {
             return Err(crate::error::Error::InvalidDivertNumber(divert_number));
@@ -67,10 +114,33 @@ impl Output {
     }
 
     pub fn undivert_all(&mut self) -> Result<()> {
-        for buffer in &mut self.divert_buffers {
-            std::io::copy(buffer, &mut self.stdout)?;
+        for buffer_number in (1..self.divert_buffers.len()).map(BufferNumber) {
+            self.undivert(buffer_number)?;
         }
         Ok(())
+    }
+
+    pub fn undivert(&mut self, buffer_number: BufferNumber) -> Result<()> {
+        // TODO: not really sure if this should alter the buffer number?
+        let buffer = &mut self.divert_buffers[buffer_number.0 - 1];
+        std::io::copy(buffer, &mut self.stdout)?;
+        debug_assert!(buffer.is_empty());
+        Ok(())
+    }
+}
+
+pub struct BufferNumber(usize);
+
+impl TryFrom<usize> for BufferNumber {
+    type Error = crate::Error;
+
+    fn try_from(value: usize) -> std::prelude::v1::Result<Self, Self::Error> {
+        if value < 1 || value > 9 {
+            return Err(crate::Error::Parsing(format!(
+                "Unexpected buffer number: {value}. Needs to be from 1 to 9"
+            )));
+        }
+        Ok(Self(value))
     }
 }
 
@@ -95,12 +165,9 @@ impl Write for Output {
 }
 
 impl State {
-    fn new(stdout: Box<dyn Write>) -> Self {
+    pub fn new(stdout: Box<dyn Write>) -> Self {
         Self {
-            output: Rc::new(RefCell::new(Output {
-                stdout,
-                ..Output::default()
-            })),
+            output: Output::new(stdout).into_ref(),
             ..Self::default()
         }
     }
@@ -144,7 +211,7 @@ impl Default for State {
             exit_error: false,
             m4wrap: Vec::new(),
             last_syscmd_status: None,
-            output: Rc::default(),
+            output: OutputRef::default(),
             file: Vec::new(),
         }
     }
@@ -153,6 +220,12 @@ impl Default for State {
 /// TODO: This is a little wild west in terms of panic occurance and usability
 #[derive(Default, Clone)]
 pub(crate) struct DivertableBuffer(Vec<u8>);
+
+impl DivertableBuffer {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
 
 impl Write for DivertableBuffer {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -730,7 +803,7 @@ impl MacroImplementation for UserDefinedMacro {
             String::from_utf8_lossy(&self.definition),
             String::from_utf8_lossy(&buffer)
         );
-        state = lexer::process_streaming(state, evaluate, &*buffer, stdout, stderr, false, false)?;
+        state = lexer::process_streaming(state, evaluate, &*buffer, stdout, stderr, false)?;
         Ok(state)
     }
 }
@@ -862,7 +935,6 @@ impl MacroImplementation for IncludeMacro {
                 stdout,
                 stderr,
                 false,
-                false,
             )?;
             state.file.pop();
         }
@@ -895,7 +967,6 @@ impl MacroImplementation for SincludeMacro {
                     std::fs::File::open(path)?,
                     stdout,
                     stderr,
-                    false,
                     false,
                 )?;
                 state.file.pop();
@@ -1748,7 +1819,7 @@ impl MacroImplementation for DivertMacro {
         } else {
             0
         };
-        state.divert_number = divert_number;
+        state.output.divert(divert_number);
         Ok(state)
     }
 }
@@ -1764,7 +1835,7 @@ impl MacroImplementation for DivnumMacro {
         _stderr: &mut dyn Write,
         _m: Macro,
     ) -> Result<State> {
-        write!(stdout, "{}", state.divert_number)?;
+        write!(stdout, "{}", state.output.divert_number())?;
         Ok(state)
     }
 }
@@ -1783,29 +1854,28 @@ impl MacroImplementation for UndivertMacro {
         stderr: &mut dyn Write,
         m: Macro,
     ) -> Result<State> {
-        let undivert_buffers: Vec<usize> = if m.args.is_empty() {
-            (1..=9).into_iter().collect()
+        let undivert_buffers: Vec<BufferNumber> = if m.args.is_empty() {
+            (1..=9)
+                .into_iter()
+                .map(BufferNumber::try_from)
+                .collect::<Result<Vec<_>>>()?
         } else {
-            let mut undivert_buffers: Vec<usize> = Vec::new();
+            let mut undivert_buffers: Vec<BufferNumber> = Vec::new();
             for arg in m.args.into_iter() {
                 let arg_text;
                 (arg_text, state) = evaluate_to_buffer(state, arg.symbols, stderr, true)?;
                 let (_, buffer_number) = nom::combinator::all_consuming(parse_index)(&arg_text)?;
-                if buffer_number < 1 || buffer_number > 9 {
-                    return Err(crate::Error::Parsing(format!(
-                        "Unexpected buffer number: {buffer_number}. Needs to be from 1 to 9"
-                    )));
+                match BufferNumber::try_from(buffer_number) {
+                    Ok(n) => undivert_buffers.push(n),
+                    Err(error) => write!(stderr, "WARNING: {error}")?,
                 }
-                undivert_buffers.push(buffer_number);
             }
 
             undivert_buffers
         };
 
         for buffer_number in undivert_buffers {
-            let mut b = state.divert_buffers[buffer_number - 1].0.borrow_mut();
-            stdout.write_all(&b)?;
-            b.clear();
+            state.output.undivert(buffer_number);
         }
         Ok(state)
     }

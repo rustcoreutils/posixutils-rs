@@ -229,21 +229,41 @@ fn run_command(input: &Path) -> std::process::Output {
         "Running command with input {input:?}:\n\x1b[34m{}\x1b[0m",
         input_string,
     );
-    let (stdout, stderr, status) = match input.extension().expect("Input file should have extension").as_bytes() {
+    #[derive(Default, Clone)]
+    struct StdoutRef(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+    impl std::io::Write for StdoutRef {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.borrow_mut().flush()
+        }
+    }
+    impl StdoutRef {
+        fn into_inner(self) -> Vec<u8> {
+            std::rc::Rc::into_inner(self.0).unwrap().into_inner()
+        }
+    }
+    let (stdout, stderr, status) = match input
+        .extension()
+        .expect("Input file should have extension")
+        .as_bytes()
+    {
         b"m4" => {
             // The reason why we run the command using this as a library is so we can run with it built in
             // test configuration, with all the associated conditionally compiled test log instrumentation.
-            
-            let mut stdout: Vec<u8> = Vec::new();
+
+            let stdout = StdoutRef::default();
             let mut stderr: Vec<u8> = Vec::new();
             let args = m4::Args {
                 files: vec![input.into()],
                 ..m4::Args::default()
             };
-            let result = m4::run(&mut stdout, &mut stderr, args);
+            let result = m4::run(stdout.clone(), &mut stderr, args);
             let status = ExitStatus::from_raw(result.get_exit_code() as i32);
-            (stdout, stderr, status)
-        },
+            (stdout.into_inner(), stderr, status)
+        }
         b"args" => {
             let args = input_string;
             let _cargo_build_output = std::process::Command::new("cargo")
@@ -264,7 +284,6 @@ fn run_command(input: &Path) -> std::process::Output {
         _ => panic!("Unsupported input extension {input:?}"),
     };
 
-    
     log::info!("Received status: {status}");
     log::info!(
         "Received stdout:\n\x1b[34m{}\x1b[0m",

@@ -701,7 +701,6 @@ pub(crate) fn process_streaming<'c, R: Read>(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
     unwrap_quotes: bool,
-    root: bool,
 ) -> crate::error::Result<State> {
     let buffer_size = 10;
     let buffer_growth_factor = 2;
@@ -789,36 +788,7 @@ pub(crate) fn process_streaming<'c, R: Read>(
                     return Ok(state);
                 }
 
-                match (state.divert_number, root) {
-                    (_, false) | (0, true) => {
-                        state = evaluator.evaluate(state, symbol, stdout, stderr, unwrap_quotes)?
-                    }
-                    (1..=9, true) => {
-                        // BUG: If the divert number is changed during this evaluation, it won't
-                        // take effect until the next symbol is evaluated, so the output of this
-                        // evaluation will go to the wrong place!
-                        log::debug!("Evalating into divert buffer {}", state.divert_number);
-                        let mut divert_buffer =
-                            state.divert_buffers[state.divert_number as usize - 1].clone();
-                        state = evaluator.evaluate(
-                            state,
-                            symbol,
-                            &mut divert_buffer,
-                            stderr,
-                            unwrap_quotes,
-                        )?
-                    }
-                    (i, true) if i < 0 => {
-                        state = evaluator.evaluate(
-                            state,
-                            symbol,
-                            &mut DiscardStdout,
-                            stderr,
-                            unwrap_quotes,
-                        )?
-                    }
-                    _ => unreachable!(),
-                };
+                state = evaluator.evaluate(state, symbol, stdout, stderr, unwrap_quotes)?;
                 remaining
             };
 
@@ -934,7 +904,7 @@ mod test {
             Ok(state)
         }
         state.parse_config = initial_config;
-        process_streaming(state, evaluate, input, &mut stdout, &mut stderr, true, true).unwrap();
+        process_streaming(state, evaluate, input, &mut stdout, &mut stderr, true).unwrap();
 
         SymbolsAsStreamSnapshot {
             stdout: String::from_utf8(stdout).unwrap(),

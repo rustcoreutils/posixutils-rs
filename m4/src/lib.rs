@@ -110,12 +110,12 @@ impl Default for Args {
     }
 }
 
-pub fn run<STDOUT: Write, STDERR: Write>(
-    stdout: &mut STDOUT,
-    stderr: &mut STDERR,
+pub fn run<STDOUT: Write + 'static, STDERR: Write>(
+    stdout: STDOUT,
+    mut stderr: STDERR,
     args: Args,
 ) -> crate::error::Result<()> {
-    match run_impl(stdout, stderr, args) {
+    match run_impl(stdout, &mut stderr, args) {
         Ok(_) => Ok(()),
         Err(error @ Error::Exit(_)) => Err(error),
         Err(error) => {
@@ -127,21 +127,21 @@ pub fn run<STDOUT: Write, STDERR: Write>(
     }
 }
 
-pub fn run_impl<STDOUT: Write, STDERR: Write>(
-    stdout: &mut STDOUT,
-    stderr: &mut STDERR,
+pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
+    stdout: STDOUT,
+    mut stderr: STDERR,
     args: Args,
 ) -> crate::error::Result<()> {
-    let mut state = State::default();
+    let mut state = State::new(Box::new(stdout));
+    let mut output = state.output.clone();
     if args.files.is_empty() {
         log::info!("Processing input from STDIN");
         state = lexer::process_streaming(
             state,
             evaluate::evaluate,
             std::io::stdin(),
-            stdout,
-            stderr,
-            true,
+            &mut output,
+            &mut stderr,
             true,
         )?;
     } else {
@@ -152,19 +152,18 @@ pub fn run_impl<STDOUT: Write, STDERR: Write>(
                 state,
                 evaluate::evaluate,
                 std::fs::File::open(file_path)?,
-                stdout,
-                stderr,
-                true,
+                &mut output,
+                &mut stderr,
                 true,
             )?;
             state.file.pop();
         }
     }
 
-    state.output.borrow_mut().undivert_all()?;
+    state.output.undivert_all()?;
 
     for wrap in state.m4wrap {
-        stdout.write_all(&wrap)?;
+        output.write_all(&wrap)?;
     }
     Ok(())
 }

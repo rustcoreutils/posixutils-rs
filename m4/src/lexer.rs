@@ -794,6 +794,10 @@ pub(crate) fn process_streaming<'c, R: Read>(
                         state = evaluator.evaluate(state, symbol, stdout, stderr, unwrap_quotes)?
                     }
                     (1..=9, true) => {
+                        // BUG: If the divert number is changed during this evaluation, it won't
+                        // take effect until the next symbol is evaluated, so the output of this
+                        // evaluation will go to the wrong place!
+                        log::debug!("Evalating into divert buffer {}", state.divert_number);
                         let mut divert_buffer =
                             state.divert_buffers[state.divert_number as usize - 1].clone();
                         state = evaluator.evaluate(

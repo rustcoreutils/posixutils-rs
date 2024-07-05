@@ -310,16 +310,21 @@ pub fn fmt_write_hex_float(
     };
     // > if the precision is missing and FLT_RADIX is a power of 2, then the
     // > precision shall be sufficient for an exact representation of the value
-    let fraction_buffer_length = if let Some(precision) = args.precision {
-        fraction_buffer.len().min(precision)
+    let fraction_buffer_length;
+    let extra_trailing_zeros;
+    if let Some(precision) = args.precision {
+        fraction_buffer_length = fraction_buffer.len().min(precision);
+        extra_trailing_zeros = precision.saturating_sub(fraction_buffer_length);
     } else {
-        fraction_buffer
+        fraction_buffer_length = fraction_buffer
             .iter()
             .rposition(|&c| c != b'0')
-            .map_or(0, |i| i + 1)
+            .map_or(0, |i| i + 1);
+        extra_trailing_zeros = 0;
     };
 
-    let number_length = sign.len() + 4 + fraction_buffer_length + 2 + exponent_buffer_length;
+    let number_length =
+        sign.len() + 4 + fraction_buffer_length + extra_trailing_zeros + 2 + exponent_buffer_length;
 
     // left justified
     //   sign 0x first_digit <decimal point> fraction p exponent_sign exponent padding
@@ -335,6 +340,7 @@ pub fn fmt_write_hex_float(
         if fraction_buffer_length != 0 {
             target.push('.');
             copy_buffer_to_target(&fraction_buffer[..fraction_buffer_length], target);
+            pad_target(target, extra_trailing_zeros, b'0');
         }
         // TODO: use locale specific decimal point
         target.push(p_char);
@@ -358,6 +364,7 @@ pub fn fmt_write_hex_float(
         if fraction_buffer_length != 0 {
             target.push('.');
             copy_buffer_to_target(&fraction_buffer[..fraction_buffer_length], target);
+            pad_target(target, extra_trailing_zeros, b'0');
         }
         target.push(p_char);
         target.push(exponent_sign);

@@ -13,6 +13,7 @@ extern crate plib;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
+use std::io::Write;
 use std::path::PathBuf;
 use std::{fs, io};
 
@@ -28,16 +29,31 @@ struct Args {
     pathname: PathBuf,
 }
 
-fn do_readlink(args: &Args) -> io::Result<()> {
-    let path = fs::read_link(args.pathname.clone())?;
+fn do_readlink(args: &Args) -> Result<String, String> {
+    let path = PathBuf::from(&args.pathname);
 
-    if args.no_newline {
-        print!("{}", path.display());
-    } else {
-        println!("{}", path.display());
+    match fs::read_link(&path) {
+        Ok(target) => {
+            let output = target.display().to_string();
+            if args.no_newline {
+                Ok(output)
+            } else {
+                Ok(output + "\n")
+            }
+        }
+        Err(e) => {
+            let err_message = match e.kind() {
+                io::ErrorKind::NotFound => {
+                    format!("readlink: {}: No such file or directory\n", path.display())
+                }
+                io::ErrorKind::InvalidInput => {
+                    format!("readlink: {}: Not a symbolic link\n", path.display())
+                }
+                _ => format!("readlink: {}: {}\n", path.display(), e),
+            };
+            Err(err_message)
+        }
     }
-
-    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -50,10 +66,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut exit_code = 0;
 
-    if let Err(e) = do_readlink(&args) {
-        exit_code = 1;
-        eprintln!("{}: {}", args.pathname.display(), e);
+    match do_readlink(&args) {
+        Ok(output) => {
+            print!("{}", output);
+            io::stdout().flush().unwrap();
+        }
+        Err(err) => {
+            eprint!("{}", err);
+            io::stderr().flush().unwrap();
+            exit_code = 1;
+        }
     }
 
-    std::process::exit(exit_code)
+    std::process::exit(exit_code);
 }

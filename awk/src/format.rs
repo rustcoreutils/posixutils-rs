@@ -313,7 +313,10 @@ pub fn fmt_write_hex_float(
     let fraction_buffer_length = if let Some(precision) = args.precision {
         fraction_buffer.len().min(precision)
     } else {
-        fraction_buffer.len()
+        fraction_buffer
+            .iter()
+            .rposition(|&c| c != b'0')
+            .map_or(0, |i| i + 1)
     };
 
     let number_length = sign.len() + 4 + fraction_buffer_length + 2 + exponent_buffer_length;
@@ -329,9 +332,11 @@ pub fn fmt_write_hex_float(
         target.push('0');
         target.push(x_char);
         target.push(first_digit);
+        if fraction_buffer_length != 0 {
+            target.push('.');
+            copy_buffer_to_target(&fraction_buffer[..fraction_buffer_length], target);
+        }
         // TODO: use locale specific decimal point
-        target.push('.');
-        copy_buffer_to_target(&fraction_buffer[..fraction_buffer_length], target);
         target.push(p_char);
         target.push(exponent_sign);
         copy_buffer_to_target(&exponent_buffer[exponent_buffer_start..], target);
@@ -350,8 +355,10 @@ pub fn fmt_write_hex_float(
         }
         target.push(first_digit);
         // TODO: use locale specific decimal point
-        target.push('.');
-        copy_buffer_to_target(&fraction_buffer[..fraction_buffer_length], target);
+        if fraction_buffer_length != 0 {
+            target.push('.');
+            copy_buffer_to_target(&fraction_buffer[..fraction_buffer_length], target);
+        }
         target.push(p_char);
         target.push(exponent_sign);
         copy_buffer_to_target(&exponent_buffer[exponent_buffer_start..], target);

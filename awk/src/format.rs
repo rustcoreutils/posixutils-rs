@@ -38,6 +38,28 @@ fn pad_target(target: &mut String, padding: usize, byte: u8) {
     }
 }
 
+fn number_to_digits(buffer: &mut [u8], mut value: u64, base: u64, digits: &[char]) -> usize {
+    let mut index = buffer.len();
+    while value != 0 {
+        index -= 1;
+        buffer[index] = digits[(value % base) as usize] as u8;
+        value /= base;
+    }
+    buffer.len() - index
+}
+
+fn sign_str(is_negative: bool, args: &FormatArgs) -> &str {
+    if is_negative {
+        "-"
+    } else if args.signed {
+        "+"
+    } else if args.prefix_space {
+        " "
+    } else {
+        ""
+    }
+}
+
 #[derive(Default)]
 pub struct FormatArgs {
     left_justified: bool,
@@ -133,27 +155,20 @@ pub fn fmt_write_unsigned(
         }
     }
 
-    let mut value = value;
     // 22 is the maximum number of digits needed to represent a u64 in base 8 (the lowest base)
     // 22 = ceil(log8(u64::MAX))
     let mut buffer = [0u8; 22];
-    let mut index = buffer.len();
-    while value != 0 {
-        index -= 1;
-        buffer[index] = digits[(value % base) as usize] as u8;
-        value /= base;
-    }
+    let buffer_length = number_to_digits(&mut buffer, value, base, digits);
+    let buffer_start = buffer.len() - buffer_length;
 
     let mut precision = args.precision.unwrap_or(1);
 
     // regarding the alternative form for octal numbers:
     // > For the o conversion specifier, it shall increase
     // > the precision to force the first digit of the result to be a zero
-    if args.alternative_form
-        && integer_format == IntegerFormat::Octal
-        && precision < buffer.len() - index
+    if args.alternative_form && integer_format == IntegerFormat::Octal && precision < buffer_length
     {
-        precision = buffer.len() - index + 1;
+        precision = buffer_length + 1;
     }
 
     // left justified:
@@ -163,7 +178,6 @@ pub fn fmt_write_unsigned(
     // right justified space padded:
     //    padding (Ox | OX)? precision buffer
 
-    let buffer_length = buffer.len() - index;
     let number_length = match integer_format {
         IntegerFormat::HexLower | IntegerFormat::HexUpper if args.alternative_form => {
             buffer_length.max(precision) + 2
@@ -176,7 +190,7 @@ pub fn fmt_write_unsigned(
         if precision > buffer_length {
             pad_target(target, precision - buffer_length, b'0');
         }
-        copy_buffer_to_target(&buffer[index..], target);
+        copy_buffer_to_target(&buffer[buffer_start..], target);
         pad_target(target, args.width.saturating_sub(number_length), b' ');
     } else if args.precision.is_none() && args.zero_padded {
         // > For d, i, o, u, x, and X conversion specifiers, if a precision
@@ -186,40 +200,27 @@ pub fn fmt_write_unsigned(
         if precision > buffer_length {
             pad_target(target, precision - buffer_length, b'0');
         }
-        copy_buffer_to_target(&buffer[index..], target);
+        copy_buffer_to_target(&buffer[buffer_start..], target);
     } else {
         pad_target(target, args.width.saturating_sub(number_length), b' ');
         insert_hex_identifier(target, integer_format, args);
         if precision > buffer_length {
             pad_target(target, precision - buffer_length, b'0');
         }
-        copy_buffer_to_target(&buffer[index..], target);
+        copy_buffer_to_target(&buffer[buffer_start..], target);
     }
 }
 
 pub fn fmt_write_signed(target: &mut String, value: i64, args: &FormatArgs) {
-    let mut unsigned_value = value.unsigned_abs();
+    let unsigned_value = value.unsigned_abs();
     // 20 is the maximum number of digits needed to represent a u64 in base 10
     let mut buffer = [0u8; 20];
-    let mut index = buffer.len();
-    while unsigned_value != 0 {
-        index -= 1;
-        buffer[index] = BASE_10_DIGITS[(unsigned_value % 10) as usize] as u8;
-        unsigned_value /= 10;
-    }
+    let buffer_length = number_to_digits(&mut buffer, unsigned_value, 10, &BASE_10_DIGITS);
+    let buffer_start = buffer.len() - buffer_length;
 
     let precision = args.precision.unwrap_or(1);
-    let buffer_length = buffer.len() - index;
 
-    let sign = if value < 0 {
-        "-"
-    } else if args.signed {
-        "+"
-    } else if args.prefix_space {
-        " "
-    } else {
-        ""
-    };
+    let sign = sign_str(value.is_negative(), args);
     let number_length = buffer_length.max(precision) + sign.len();
 
     // left justified:
@@ -230,25 +231,19 @@ pub fn fmt_write_signed(target: &mut String, value: i64, args: &FormatArgs) {
     //    padding sign precision buffer
     if args.left_justified {
         target.push_str(sign);
-        if precision > buffer_length {
-            pad_target(target, precision - buffer_length, b'0');
-        }
-        copy_buffer_to_target(&buffer[index..], target);
+        pad_target(target, precision.saturating_sub(buffer_length), b'0');
+        copy_buffer_to_target(&buffer[buffer_start..], target);
         pad_target(target, args.width.saturating_sub(number_length), b' ');
     } else if args.zero_padded {
         target.push_str(sign);
         pad_target(target, args.width.saturating_sub(number_length), b'0');
-        if precision > buffer_length {
-            pad_target(target, precision - buffer_length, b'0');
-        }
-        copy_buffer_to_target(&buffer[index..], target);
+        pad_target(target, precision.saturating_sub(buffer_length), b'0');
+        copy_buffer_to_target(&buffer[buffer_start..], target);
     } else {
         pad_target(target, args.width.saturating_sub(number_length), b' ');
         target.push_str(sign);
-        if precision > buffer_length {
-            pad_target(target, precision - buffer_length, b'0');
-        }
-        copy_buffer_to_target(&buffer[index..], target);
+        pad_target(target, precision.saturating_sub(buffer_length), b'0');
+        copy_buffer_to_target(&buffer[buffer_start..], target);
     }
 }
 

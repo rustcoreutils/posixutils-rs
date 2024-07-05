@@ -54,3 +54,70 @@ GNU m4 specific builtin macros likely to be necessary (there are probably more) 
 ## [`sendmail`](https://www.proofpoint.com/us/products/email-protection/open-source-email-solution)
 
 TODO
+
+### Notes
+
+Currently it's incompatible due to problems with the way this m4 works.
+
+The BSD implementation of m4, when calling macros their arguments are already fully expanded[1][1]
+It actually makes them very simple to test and reason about, and that's something I'd like to aim for with this implementation.
+
+`pbstr` in their impelementation is used push argument strings onto the input stack to be evaluated[2][2][3][3]. The implementation of this stack growth seems very similar to Rust's `Vec`[4][4].
+
+There are some notes about how the macro call stack works [5][here], it can be seen in action [6][here] and [7][here]
+
+The main question here is how can we mix our parsing implementation with this without completely rewriting it?
+
+Okay something I learned is that the input keeps track of its line number, has a name [8][8].
+
+Output is controlled by [active](https://github.com/freebsd/freebsd-src/blob/main/usr.bin/m4/main.c#L86) file pointer. outfile[] is used for diverts.
+
+Summary of the main loop (not 100 percent precise, but close enough):
+
+First get the next character (either from pushback buffer or current input file).
+
+Next do one of the following:
+
+* Unwrap Quotes if requred
+  a) If we're at the top level output to the currently active output.
+  b) Otherwise output onto the stack?
+* If we're at the top level of the stack and this is a comment, output the comment to currently active output.
+* Parse as macro
+  a) If it's not a current macro name or there are no arguments when the macro requires it, then continue.
+  b) Otherwise create a stack for the macro invocation, and push the first argument (name of macro). If it's macro without arguments then evaluate it.
+* Do some stuff if it's end of file.
+* If we're not in a macro, put the character in active output.
+* If the character is left parenthesis, increase the `PARLEV`, put in active output.
+* If the character is right parenthesis, decrease the `PARLEV`
+  a) If `PARLEV > 0` Put the char to output.
+  b) If the `PARLEV <= 0` we are at the end of argument list, evaluate macro.
+* If the char is a comma
+  a) If we're at `PARLEV == 1` (inside the first level of a macro invocation), skip all the spaces, then push the character onto the macro argument stack?
+  b) ?
+* If it's a comment, consume input until end comment and put on macro stack.
+* Put the character on the macro stack.
+
+To evaluate the macro:
+
+1. If it's a recursive definition, exit with error?
+2. Trace the macro if required.
+3. Check if macro is user defined, and expand the macro (different implementation for builtin or user defined).
+4. Finish tracing.
+
+To evaluate user defined macro:
+
+Go through the definition characters, if we find a match to replacement characters, then push the replacement to the input stack, otherwise just push definition character to the input stack.
+
+
+So in the end I think we get a functionality that iteratively, depth-first evaluates macro arguments.
+
+- [1]: https://github.com/freebsd/freebsd-src/blob/main/usr.bin/m4/eval.c#L123
+- [2]: https://github.com/freebsd/freebsd-src/blob/main/usr.bin/m4/eval.c#L207-L217
+- [3]: https://github.com/freebsd/freebsd-src/blob/main/usr.bin/m4/misc.c#L94-L109
+- [4]: https://github.com/freebsd/freebsd-src/blob/main/usr.bin/m4/misc.c#L199-L212
+- [5]: https://github.com/freebsd/freebsd-src/blob/main/usr.bin/m4/NOTES#L32
+- [6]: https://github.com/freebsd/freebsd-src/blob/main/usr.bin/m4/main.c#L434
+- [7]: https://github.com/freebsd/freebsd-src/blob/main/usr.bin/m4/main.c#L480
+- [8]: https://github.com/freebsd/freebsd-src/blob/main/usr.bin/m4/misc.c#L406-L413
+- [9]: https://github.com/freebsd/freebsd-src/blob/main/usr.bin/m4/main.c#L341
+

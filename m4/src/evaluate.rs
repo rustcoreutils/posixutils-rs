@@ -1019,6 +1019,8 @@ impl MacroImplementation for IfelseMacro {
         let mut args = m.args.into_iter();
         let mut i = 0;
         loop {
+            // TODO: there's a bug here, when we originally parsed this as a set of macro args we
+            // didn't evaluate it as we parsed it.
             let symbols = args.next().expect("at least 3 args").symbols;
             let arg_0;
             (arg_0, state) = evaluate_to_buffer(state, symbols, stderr, true)?;

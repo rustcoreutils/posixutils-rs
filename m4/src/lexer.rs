@@ -47,6 +47,11 @@ pub(crate) struct ParseConfig {
     pub comment_open_tag: Vec<u8>,
     pub comment_close_tag: Vec<u8>,
     pub symbol_recursion_limit: usize,
+    // TODO: There is a bug with this, it remains true across a newline while parsing nested input.
+    // The problem is here that when parsing the inside of a macro as symbols, dnl didn't work.
+    // This is because the symbols here are not being evaluated as they are parsed. Really if a
+    // macro is parsed it should be evaluated at that moment.
+    //
     // While this is true, we skip all following input until the end of the line.
     pub dnl: bool,
 }
@@ -703,6 +708,9 @@ pub(crate) fn process_streaming<'c, R: Read>(
     let mut buffer = circular::Buffer::with_capacity(buffer_size);
     let mut eof = false;
 
+    // Here we have a buffer of input which we attempt to parse as a Symbol. If parsing fails as
+    // Incomplete, then we enlarge the buffer and pull in more input, and retry until success, or
+    // we reach the end of input.
     loop {
         if eof {
             break;
@@ -750,7 +758,7 @@ pub(crate) fn process_streaming<'c, R: Read>(
                 };
 
                 if remaining.first() != Some(&b'\0') {
-                    log::debug!("process_streaming() disabling dnl");
+                    log::debug!("process_streaming() we are at EOF, disabling dnl");
                     state.parse_config.dnl = false;
                 }
 

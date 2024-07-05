@@ -60,6 +60,20 @@ fn sign_str(is_negative: bool, args: &FormatArgs) -> &str {
     }
 }
 
+fn write_inf_or_nan(target: &mut String, value: f64, lowercase_version: bool, sign: &str) -> bool {
+    if value.is_nan() {
+        target.push_str(sign);
+        target.push_str(if lowercase_version { "nan" } else { "NAN" });
+        true
+    } else if value.is_infinite() {
+        target.push_str(sign);
+        target.push_str(if lowercase_version { "inf" } else { "INF" });
+        true
+    } else {
+        false
+    }
+}
+
 #[derive(Default)]
 pub struct FormatArgs {
     left_justified: bool,
@@ -254,8 +268,22 @@ pub fn fmt_write_hex_float(
     args: &FormatArgs,
 ) {
     let sign = sign_str(value.is_sign_negative(), args);
+    if write_inf_or_nan(target, value, lowercase_version, sign) {
+        return;
+    }
+
     let bits = value.to_bits();
-    let exponent = ((bits >> 52) & 0x7ff) as i64 - 1023;
+    let biased_exponent = ((bits >> 52) & 0x7ff) as i64;
+    let first_digit;
+    let exponent;
+    if biased_exponent == 0 {
+        // subnormal number
+        exponent = -1022;
+        first_digit = '0';
+    } else {
+        exponent = biased_exponent - 1023;
+        first_digit = '1';
+    };
     let exponent_sign = if exponent < 0 { '-' } else { '+' };
     let mut exponent_buffer = [0u8; 3];
     let exponent_buffer_length = number_to_digits(
@@ -295,16 +323,16 @@ pub fn fmt_write_hex_float(
     let number_length = sign.len() + 4 + fraction_buffer_length + 2 + exponent_buffer_length;
 
     // left justified
-    //   sign 0x 1 <decimal point> fraction p exponent_sign exponent padding
+    //   sign 0x first_digit <decimal point> fraction p exponent_sign exponent padding
     // right justified zero padded
-    //   sign 0x padding 1 <decimal point> fraction p exponent_sign exponent
+    //   sign 0x padding first_digit <decimal point> fraction p exponent_sign exponent
     // right justified space padded
-    //   padding sign 0x 1 <decimal point> fraction p exponent_sign exponent
+    //   padding sign 0x first_digit <decimal point> fraction p exponent_sign exponent
     if args.left_justified {
         target.push_str(sign);
         target.push('0');
         target.push(x_char);
-        target.push('1');
+        target.push(first_digit);
         // TODO: use locale specific decimal point
         target.push('.');
         copy_buffer_to_target(
@@ -327,7 +355,7 @@ pub fn fmt_write_hex_float(
             target.push('0');
             target.push(x_char);
         }
-        target.push('1');
+        target.push(first_digit);
         // TODO: use locale specific decimal point
         target.push('.');
         copy_buffer_to_target(
@@ -1147,9 +1175,93 @@ mod tests {
     }
 
     #[test]
+    fn test_write_float_hex_lower_inf() {
+        let mut target = String::new();
+        fmt_write_hex_float(&mut target, f64::INFINITY, true, &FormatArgs::default());
+        assert_eq!(target, "inf");
+
+        target.clear();
+        fmt_write_hex_float(&mut target, f64::NEG_INFINITY, true, &FormatArgs::default());
+        assert_eq!(target, "-inf");
+
+        target.clear();
+        fmt_write_hex_float(
+            &mut target,
+            f64::INFINITY,
+            true,
+            &FormatArgs {
+                signed: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "+inf");
+
+        target.clear();
+        fmt_write_hex_float(
+            &mut target,
+            f64::INFINITY,
+            true,
+            &FormatArgs {
+                prefix_space: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, " inf");
+    }
+
+    #[test]
+    fn test_write_float_hex_lower_nan() {
+        let mut target = String::new();
+        fmt_write_hex_float(&mut target, f64::NAN, true, &FormatArgs::default());
+        assert_eq!(target, "nan");
+
+        target.clear();
+        fmt_write_hex_float(&mut target, -f64::NAN, true, &FormatArgs::default());
+        assert_eq!(target, "-nan");
+
+        target.clear();
+        fmt_write_hex_float(
+            &mut target,
+            f64::NAN,
+            true,
+            &FormatArgs {
+                signed: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "+nan");
+
+        target.clear();
+        fmt_write_hex_float(
+            &mut target,
+            f64::NAN,
+            true,
+            &FormatArgs {
+                prefix_space: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, " nan");
+    }
+
+    #[test]
     fn test_write_hex_upper_float() {
         let mut target = String::new();
         fmt_write_hex_float(&mut target, 123.456, false, &FormatArgs::default());
         assert_eq!(target, "0X1.EDD2F1A9FBE77P+6");
+    }
+
+    #[test]
+    fn test_write_float_hex_upper_inf() {
+        let mut target = String::new();
+        fmt_write_hex_float(&mut target, f64::INFINITY, false, &FormatArgs::default());
+        assert_eq!(target, "INF");
+    }
+
+    #[test]
+    fn test_write_float_hex_upper_nan() {
+        let mut target = String::new();
+        fmt_write_hex_float(&mut target, f64::NAN, false, &FormatArgs::default());
+        assert_eq!(target, "NAN");
     }
 }

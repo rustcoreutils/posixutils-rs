@@ -173,6 +173,45 @@ fn convert_sync(data: &mut Vec<u8>, block_size: usize) {
     }
 }
 
+fn convert_block(data: &mut Vec<u8>, cbs: usize) {
+    let mut result = Vec::new();
+    let mut line = Vec::new();
+
+    for &byte in data.iter() {
+        if byte == b'\n' {
+            while line.len() < cbs {
+                line.push(b' ');
+            }
+            result.extend_from_slice(&line[..cbs]);
+            line.clear();
+        } else {
+            line.push(byte);
+        }
+    }
+
+    if !line.is_empty() {
+        while line.len() < cbs {
+            line.push(b' ');
+        }
+        result.extend_from_slice(&line[..cbs]);
+    }
+
+    *data = result;
+}
+
+fn convert_unblock(data: &mut Vec<u8>, cbs: usize) {
+    let mut result = Vec::new();
+    for chunk in data.chunks(cbs) {
+        let trimmed_chunk = chunk
+            .iter()
+            .rposition(|&b| b != b' ')
+            .map_or(chunk, |pos| &chunk[..=pos]);
+        result.extend_from_slice(trimmed_chunk);
+        result.push(b'\n');
+    }
+    *data = result;
+}
+
 fn apply_conversions(data: &mut Vec<u8>, config: &Config) {
     for conversion in &config.conversions {
         match conversion {
@@ -180,13 +219,9 @@ fn apply_conversions(data: &mut Vec<u8>, config: &Config) {
             Conversion::Lcase => convert_lcase(data),
             Conversion::Ucase => convert_ucase(data),
             Conversion::Swab => convert_swab(data),
-            Conversion::Sync => convert_sync(data, config.ibs), // Add this line
-            Conversion::Block => {
-                todo!()
-            }
-            Conversion::Unblock => {
-                todo!()
-            }
+            Conversion::Sync => convert_sync(data, config.ibs),
+            Conversion::Block => convert_block(data, config.cbs),
+            Conversion::Unblock => convert_unblock(data, config.cbs),
         }
     }
 }

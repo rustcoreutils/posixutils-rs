@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use crate::program::{BuiltinFunction, Constant, Function, OpCode, Program, SpecialVar};
 
 use crate::format::{
-    fmt_write_signed, fmt_write_string, fmt_write_unsigned, parse_conversion_specifier_args,
-    IntegerFormat,
+    fmt_write_hex_float, fmt_write_signed, fmt_write_string, fmt_write_unsigned,
+    parse_conversion_specifier_args, IntegerFormat,
 };
 use std::fmt::Write;
 
@@ -410,24 +410,6 @@ impl Interpreter {
         let mut result = String::with_capacity(format.len());
         let mut remaining_args = argc - 1;
         let mut iter = format.chars();
-
-        let iter_next =
-            |iter: &mut std::str::Chars| iter.next().ok_or("invalid format string".to_string());
-
-        let parse_number = |next: &mut char, iter: &mut std::str::Chars| -> Result<usize, String> {
-            let mut number = 0;
-            loop {
-                match *next {
-                    c if c.is_digit(10) => {
-                        number = number * 10 + c.to_digit(10).unwrap() as usize;
-                    }
-                    _ => break,
-                }
-                *next = iter_next(iter)?;
-            }
-            Ok(number)
-        };
-
         while let Some(c) = iter.next() {
             if c == '%' {
                 let (specifier, args) = parse_conversion_specifier_args(&mut iter)?;
@@ -455,6 +437,10 @@ impl Interpreter {
                             _ => unreachable!(),
                         };
                         fmt_write_unsigned(&mut result, value, format, &args);
+                    }
+                    'a' | 'A' => {
+                        let value = self.pop_scalar()?.as_f64_or_err()?;
+                        fmt_write_hex_float(&mut result, value, specifier == 'a', &args);
                     }
                     's' => {
                         let value = self.pop_scalar()?.to_string();
@@ -1681,6 +1667,34 @@ mod tests {
         assert_eq!(
             test_sprintf("%10.20s", vec![Constant::String("test".to_string())]),
             "      test"
+        );
+    }
+
+    #[test]
+    fn test_builtin_sprintf_with_float_args_hex_format() {
+        assert_eq!(
+            test_sprintf("%a", vec![Constant::Number(255.34)]),
+            "0x1.feae147ae147bp+7"
+        );
+        assert_eq!(
+            test_sprintf("%.5a", vec![Constant::Number(255.34)]),
+            "0x1.feae1p+7"
+        );
+        assert_eq!(
+            test_sprintf("%35a", vec![Constant::Number(255.34)]),
+            "               0x1.feae147ae147bp+7"
+        );
+        assert_eq!(
+            test_sprintf("%-35a", vec![Constant::Number(255.34)]),
+            "0x1.feae147ae147bp+7               "
+        );
+        assert_eq!(
+            test_sprintf("float value: %a", vec![Constant::Number(49.67)]),
+            "float value: 0x1.8d5c28f5c28f6p+5"
+        );
+        assert_eq!(
+            test_sprintf("%10.3a", vec![Constant::Number(255.34)]),
+            "0x1.feap+7"
         );
     }
 }

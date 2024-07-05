@@ -95,7 +95,6 @@ enum Conversion {
 struct Config {
     ifile: String,
     ofile: String,
-    bs: usize,
     ibs: usize,
     obs: usize,
     cbs: usize,
@@ -112,7 +111,6 @@ impl Config {
         Config {
             ifile: String::from("-"),
             ofile: String::from("-"),
-            bs: DEF_BLOCK_SIZE,
             ibs: DEF_BLOCK_SIZE,
             obs: DEF_BLOCK_SIZE,
             cbs: 0,
@@ -331,9 +329,9 @@ fn parse_cmdline(args: &[String]) -> Result<Config, Box<dyn std::error::Error>> 
             "ibs" => config.ibs = parse_block_size(&oparg)?,
             "obs" => config.obs = parse_block_size(&oparg)?,
             "bs" => {
-                config.bs = parse_block_size(&oparg)?;
-                config.ibs = config.bs;
-                config.obs = config.bs;
+                let block_sz = parse_block_size(&oparg)?;
+                config.ibs = block_sz;
+                config.obs = block_sz;
             }
             "cbs" => config.cbs = parse_block_size(&oparg)?,
             "skip" => config.skip = oparg.parse::<usize>()?,

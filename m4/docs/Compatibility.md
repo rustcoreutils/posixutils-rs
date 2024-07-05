@@ -108,8 +108,11 @@ To evaluate user defined macro:
 
 Go through the definition characters, if we find a match to replacement characters, then push the replacement to the input stack, otherwise just push definition character to the input stack.
 
+Their builtin dnl macro actually just consumes input directly until newline, no external configuration! In contrast to ours which works on the parsing level.
 
 So in the end I think we get a functionality that iteratively, depth-first evaluates macro arguments.
+
+To make our approach similar I think we should probably go back to a stack based approach. Previously when I went with a stack approach I ended up doing it breadth first by mistake. But first I'll check exactly why our divert nested test is failing and see if there can't be some short term workaround.
 
 - [1]: https://github.com/freebsd/freebsd-src/blob/main/usr.bin/m4/eval.c#L123
 - [2]: https://github.com/freebsd/freebsd-src/blob/main/usr.bin/m4/eval.c#L207-L217

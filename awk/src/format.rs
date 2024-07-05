@@ -1086,7 +1086,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_float_hex_lower_with_precision() {
+    fn test_write_float_hex_lower_with_lower_precision() {
         let mut target = String::new();
         fmt_write_hex_float(
             &mut target,

@@ -329,6 +329,17 @@ pub fn fmt_write_hex_float(
     let number_length =
         sign.len() + 4 + fraction_buffer_length + extra_trailing_zeros + 2 + exponent_buffer_length;
 
+    let copy_fraction = |target: &mut String| {
+        if fraction_buffer_length != 0 {
+            // TODO: use locale specific decimal point
+            target.push('.');
+            copy_buffer_to_target(&fraction_buffer[..fraction_buffer_length], target);
+            pad_target(target, extra_trailing_zeros, b'0');
+        } else if args.alternative_form {
+            target.push('.');
+        }
+    };
+
     // left justified
     //   sign 0x first_digit <decimal point> fraction p exponent_sign exponent padding
     // right justified zero padded
@@ -340,14 +351,7 @@ pub fn fmt_write_hex_float(
         target.push('0');
         target.push(x_char);
         target.push(first_digit);
-        if fraction_buffer_length != 0 {
-            // TODO: use locale specific decimal point
-            target.push('.');
-            copy_buffer_to_target(&fraction_buffer[..fraction_buffer_length], target);
-            pad_target(target, extra_trailing_zeros, b'0');
-        } else if args.alternative_form {
-            target.push('.');
-        }
+        copy_fraction(target);
         target.push(p_char);
         target.push(exponent_sign);
         copy_buffer_to_target(&exponent_buffer[exponent_buffer_start..], target);
@@ -365,13 +369,7 @@ pub fn fmt_write_hex_float(
             target.push(x_char);
         }
         target.push(first_digit);
-        if fraction_buffer_length != 0 {
-            target.push('.');
-            copy_buffer_to_target(&fraction_buffer[..fraction_buffer_length], target);
-            pad_target(target, extra_trailing_zeros, b'0');
-        } else if args.alternative_form {
-            target.push('.');
-        }
+        copy_fraction(target);
         target.push(p_char);
         target.push(exponent_sign);
         copy_buffer_to_target(&exponent_buffer[exponent_buffer_start..], target);

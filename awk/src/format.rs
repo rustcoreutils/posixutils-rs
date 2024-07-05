@@ -19,11 +19,14 @@ const BASE_16_DIGITS_UPPER: [char; 16] = [
 ];
 
 fn insert_hex_identifier(target: &mut String, integer_format: IntegerFormat, args: &FormatArgs) {
-    if args.alternative_form
-        && (integer_format == IntegerFormat::HexLower || integer_format == IntegerFormat::HexUpper)
-    {
-        target.push('0');
-        target.push('x');
+    if args.alternative_form {
+        if integer_format == IntegerFormat::HexLower {
+            target.push('0');
+            target.push('x');
+        } else if integer_format == IntegerFormat::HexUpper {
+            target.push('0');
+            target.push('X');
+        }
     }
 }
 
@@ -338,11 +341,13 @@ pub fn fmt_write_hex_float(
         target.push(x_char);
         target.push(first_digit);
         if fraction_buffer_length != 0 {
+            // TODO: use locale specific decimal point
             target.push('.');
             copy_buffer_to_target(&fraction_buffer[..fraction_buffer_length], target);
             pad_target(target, extra_trailing_zeros, b'0');
+        } else if args.alternative_form {
+            target.push('.');
         }
-        // TODO: use locale specific decimal point
         target.push(p_char);
         target.push(exponent_sign);
         copy_buffer_to_target(&exponent_buffer[exponent_buffer_start..], target);
@@ -360,11 +365,12 @@ pub fn fmt_write_hex_float(
             target.push(x_char);
         }
         target.push(first_digit);
-        // TODO: use locale specific decimal point
         if fraction_buffer_length != 0 {
             target.push('.');
             copy_buffer_to_target(&fraction_buffer[..fraction_buffer_length], target);
             pad_target(target, extra_trailing_zeros, b'0');
+        } else if args.alternative_form {
+            target.push('.');
         }
         target.push(p_char);
         target.push(exponent_sign);
@@ -806,7 +812,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(target, "0x7B");
+        assert_eq!(target, "0X7B");
     }
 
     #[test]
@@ -1104,6 +1110,21 @@ mod tests {
         let mut target = String::new();
         fmt_write_hex_float(&mut target, 2.0, true, &FormatArgs::default());
         assert_eq!(target, "0x1p+1");
+    }
+
+    #[test]
+    fn test_write_float_hex_lower_alternative_form() {
+        let mut target = String::new();
+        fmt_write_hex_float(
+            &mut target,
+            2.0,
+            true,
+            &FormatArgs {
+                alternative_form: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "0x1.p+1");
     }
 
     #[test]

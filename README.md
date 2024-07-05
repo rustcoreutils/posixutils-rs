@@ -76,6 +76,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] od
  - [x] paste
  - [x] pr
+ - [x] readlink
  - [x] rm
  - [x] sort
  - [x] split
@@ -114,7 +115,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] nohup
  - [x] pathchk
  - [x] pwd
- - [x] readlink
  - [x] renice
  - [x] rmdir
  - [x] sleep

@@ -542,6 +542,31 @@ fn test_define_order_undefined() {
 }
 
 #[test]
+fn test_define_parse_brackets() {
+    init();
+    let output = run_command(&Path::new(
+        "fixtures/integration_tests/define_parse_brackets.m4",
+    ));
+
+    let test: TestSnapshot = read_test("fixtures/integration_tests/define_parse_brackets.out");
+    assert_eq!(
+        output.status,
+        std::process::ExitStatus::from_raw(test.status),
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        test.stdout,
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+
+    if !test.stderr.is_empty() {
+        assert!(!output.stderr.is_empty());
+    }
+}
+
+#[test]
 fn test_define_pushpopdef_undefine() {
     init();
     let output = run_command(&Path::new(

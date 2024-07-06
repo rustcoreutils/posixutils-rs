@@ -7,6 +7,7 @@ use plib::{run_test_u8, TestPlanU8};
 fn get_test_file_path(filename: &str) -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("tests");
+    path.push("dd");
     path.push(filename);
     path
 }

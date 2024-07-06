@@ -24,21 +24,21 @@ fn wc_test(args: &[&str], test_data: &str, expected_output: &str) {
 }
 
 #[test]
-fn test_wc_empty() {
+fn wc_empty() {
     wc_test(&["-c"], "", "0\n");
     wc_test(&["-l"], "", "0\n");
     wc_test(&["-w"], "", "0\n");
 }
 
 #[test]
-fn test_wc_one() {
+fn wc_one() {
     wc_test(&["-c"], "x", "1\n");
     wc_test(&["-l"], "x", "0\n");
     wc_test(&["-w"], "x", "1\n");
 }
 
 #[test]
-fn test_wc_two() {
+fn wc_two() {
     wc_test(&["-c"], "x y\n", "4\n");
     wc_test(&["-l"], "x y\n", "1\n");
     wc_test(&["-w"], "x y\n", "2\n");

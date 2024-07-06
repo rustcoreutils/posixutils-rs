@@ -1,0 +1,3 @@
+apple,1
+banana,2
+carrot,3

@@ -37,6 +37,11 @@ fn show_basename(args: &Args) {
         },
     }
 
+    if pathname.is_empty() || pathname == "." {
+        println!("{}", pathname);
+        return;
+    }
+
     let path = Path::new(&pathname);
 
     println!(

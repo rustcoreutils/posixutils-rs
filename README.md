@@ -60,6 +60,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] bc
  - [x] cksum
  - [x] cmp
+ - [x] comm
  - [x] compress (compress cat.)
  - [x] cp
  - [x] csplit
@@ -129,7 +130,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
  - [x] asa
  - [x] cal
- - [x] comm
  - [x] df
  - [x] du
  - [x] echo

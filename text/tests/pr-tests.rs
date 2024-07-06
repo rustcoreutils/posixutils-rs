@@ -60,7 +60,7 @@ fn pr_read_test_file(
 }
 
 #[test]
-fn test_pr_single_column() {
+fn pr_single_column() {
     let input = "tests/pr/lorem_ipsum.txt";
     let output = pr_read_test_file(
         "tests/pr/lorem_ipsum_output_single_column.txt",
@@ -72,14 +72,14 @@ fn test_pr_single_column() {
 }
 
 #[test]
-fn test_pr_multi_column() {
+fn pr_multi_column() {
     let input = "tests/pr/lorem_ipsum.txt";
     let output = pr_read_test_file("tests/pr/lorem_ipsum_output_9_cols.txt", input, None, None);
     pr_test(&["-9", &input], "", &output);
 }
 
 #[test]
-fn test_pr_multi_column_across() {
+fn pr_multi_column_across() {
     let input = "tests/pr/lorem_ipsum.txt";
     let output = pr_read_test_file(
         "tests/pr/lorem_ipsum_output_2_cols_across.txt",
@@ -91,7 +91,7 @@ fn test_pr_multi_column_across() {
 }
 
 #[test]
-fn test_pr_multi_column_merge() {
+fn pr_multi_column_merge() {
     // This test requires the current timestamp.
     //
     // It's possible to inject the current timestamp to the expected output
@@ -135,7 +135,7 @@ fn test_pr_multi_column_merge() {
 }
 
 #[test]
-fn test_pr_page_skip() {
+fn pr_page_skip() {
     let input = "tests/pr/numbers.txt";
     let output = pr_read_test_file(
         "tests/pr/numbers_output_9_cols_page15.txt",
@@ -147,7 +147,7 @@ fn test_pr_page_skip() {
 }
 
 #[test]
-fn test_pr_header_replacement() {
+fn pr_header_replacement() {
     let header = "custom";
     let input = "tests/pr/lorem_ipsum.txt";
     let output = pr_read_test_file(
@@ -160,14 +160,14 @@ fn test_pr_header_replacement() {
 }
 
 #[test]
-fn test_pr_limit_lines() {
+fn pr_limit_lines() {
     let input = "tests/pr/numbers.txt";
     let output = pr_read_test_file("tests/pr/numbers_output_l20.txt", input, None, None);
     pr_test(&["+1:1", "-l20", &input], "", &output);
 }
 
 #[test]
-fn test_pr_limit_lines_trim() {
+fn pr_limit_lines_trim() {
     // Lines <= 10 behave like -t is used
     let input = "tests/pr/numbers.txt";
     let output = pr_read_test_file("tests/pr/numbers_output_l10.txt", input, None, None);
@@ -175,21 +175,21 @@ fn test_pr_limit_lines_trim() {
 }
 
 #[test]
-fn test_pr_omit_header() {
+fn pr_omit_header() {
     let input = "tests/pr/numbers.txt";
     let output = pr_read_test_file("tests/pr/numbers_output_omit_header.txt", input, None, None);
     pr_test(&["+1:1", "-l20", "-t", &input], "", &output);
 }
 
 #[test]
-fn test_pr_offset() {
+fn pr_offset() {
     let input = "tests/pr/numbers.txt";
     let output = pr_read_test_file("tests/pr/numbers_output_offset.txt", input, None, None);
     pr_test(&["+1:1", "-o7", &input], "", &output);
 }
 
 #[test]
-fn test_pr_width() {
+fn pr_width() {
     let input = "tests/pr/long_line.txt";
     let output = pr_read_test_file("tests/pr/long_line_output_w72.txt", input, None, None);
     pr_test(&["-2", "-t", "-w72", &input], "", &output);
@@ -203,7 +203,7 @@ fn test_pr_width() {
 }
 
 #[test]
-fn test_pr_number_line() {
+fn pr_number_line() {
     let input = "tests/pr/lorem_ipsum.txt";
     let output = pr_read_test_file(
         "tests/pr/lorem_ipsum_output_number_line.txt",
@@ -215,7 +215,7 @@ fn test_pr_number_line() {
 }
 
 #[test]
-fn test_pr_expand_and_replace() {
+fn pr_expand_and_replace() {
     let input = "tests/pr/spaces_and_tabs.txt";
     let output = pr_read_test_file(
         "tests/pr/spaces_and_tabs_expand_and_replace.txt",

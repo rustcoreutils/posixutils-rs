@@ -29,176 +29,176 @@ fn test_uniq_2() {
 }
 
 #[test]
-fn test_uniq_3() {
+fn uniq_3() {
     uniq_test(&[], "a\na", "a\n");
 }
 
 #[test]
-fn test_uniq_4() {
+fn uniq_4() {
     uniq_test(&[], "a\nb", "a\nb\n");
 }
 
 #[test]
-fn test_uniq_5() {
+fn uniq_5() {
     uniq_test(&[], "a\na\nb", "a\nb\n");
 }
 
 #[test]
-fn test_uniq_6() {
+fn uniq_6() {
     uniq_test(&[], "b\na\na\n", "b\na\n");
 }
 
 #[test]
-fn test_uniq_7() {
+fn uniq_7() {
     uniq_test(&[], "a\nb\nc\n", "a\nb\nc\n");
 }
 
 #[test]
-fn test_uniq_8() {
+fn uniq_8() {
     uniq_test(&[], "ö\nv\n", "ö\nv\n");
 }
 
 #[test]
-fn test_uniq_9() {
+fn uniq_9() {
     uniq_test(&["-u"], "a\na\n", "");
 }
 
 #[test]
-fn test_uniq_10() {
+fn uniq_10() {
     uniq_test(&["-u"], "a\nb\n", "a\nb\n");
 }
 
 #[test]
-fn test_uniq_11() {
+fn uniq_11() {
     uniq_test(&["-u"], "a\nb\na\n", "a\nb\na\n");
 }
 
 #[test]
-fn test_uniq_12() {
+fn uniq_12() {
     uniq_test(&["-u"], "a\na\n", "");
 }
 
 #[test]
-fn test_uniq_13() {
+fn uniq_13() {
     uniq_test(&["-u"], "a\na\n", "");
 }
 
 #[test]
-fn test_uniq_20() {
+fn uniq_20() {
     uniq_test(&["-d"], "a\na\n", "a\n");
 }
 
 #[test]
-fn test_uniq_21() {
+fn uniq_21() {
     uniq_test(&["-d"], "a\nb\n", "");
 }
 
 #[test]
-fn test_uniq_22() {
+fn uniq_22() {
     uniq_test(&["-d"], "a\nb\na\n", "");
 }
 
 #[test]
-fn test_uniq_23() {
+fn uniq_23() {
     uniq_test(&["-d"], "a\na\nb\n", "a\n");
 }
 
 #[test]
-fn test_uniq_24() {
+fn uniq_24() {
     uniq_test(&["-f", "1"], "a a\nb a\n", "a a\n");
 }
 
 #[test]
-fn test_uniq_25() {
+fn uniq_25() {
     uniq_test(&["-f", "1"], "a a\nb b\n", "a a\nb b\n");
 }
 
 #[test]
-fn test_uniq_26() {
+fn uniq_26() {
     uniq_test(&["-f", "1"], "a a a\nb a c\n", "a a a\nb a c\n");
 }
 
 #[test]
-fn test_uniq_27() {
+fn uniq_27() {
     uniq_test(&["-f", "1"], "b a\na a\n", "b a\n");
 }
 
 #[test]
-fn test_uniq_28() {
+fn uniq_28() {
     uniq_test(&["-f", "2"], "a a c\nb a c\n", "a a c\n");
 }
 
 #[test]
-fn test_uniq_29() {
+fn uniq_29() {
     uniq_test(&["-s", "1"], "aaa\naaa\n", "aaa\n");
 }
 
 #[test]
-fn test_uniq_30() {
+fn uniq_30() {
     uniq_test(&["-s", "2"], "baa\naaa\n", "baa\n");
 }
 
 #[test]
-fn test_uniq_31() {
+fn uniq_31() {
     uniq_test(&["-f", "1", "-s", "1"], "a aaa\nb ab\n", "a aaa\nb ab\n");
 }
 
 #[test]
-fn test_uniq_32() {
+fn uniq_32() {
     uniq_test(&["-f", "1", "-s", "1"], "a aaa\nb aaa\n", "a aaa\n");
 }
 
 #[test]
-fn test_uniq_33() {
+fn uniq_33() {
     uniq_test(&["-f", "1", "-s", "1"], "a aaa\nb ab\n", "a aaa\nb ab\n");
 }
 
 #[test]
-fn test_uniq_34() {
+fn uniq_34() {
     uniq_test(&["-f", "1", "-s", "1"], "a aaa\nb aaa\n", "a aaa\n");
 }
 
 #[test]
-fn test_uniq_35() {
+fn uniq_35() {
     uniq_test(&["-s", "0"], "abc\nabcd\n", "abc\nabcd\n");
 }
 
 #[test]
-fn test_uniq_36() {
+fn uniq_36() {
     uniq_test(&["-s", "0"], "abc\n", "abc\n");
 }
 
 #[test]
-fn test_uniq_37() {
+fn uniq_37() {
     uniq_test(&[], "a\0a\na\n", "a\0a\na\n");
 }
 
 #[test]
-fn test_uniq_38() {
+fn uniq_38() {
     uniq_test(&[], "a\ta\na a\n", "a\ta\na a\n");
 }
 
 #[test]
-fn test_uniq_39() {
+fn uniq_39() {
     uniq_test(&["-f", "1"], "a\ta\na a\n", "a\ta\na a\n");
 }
 
 #[test]
-fn test_uniq_40() {
+fn uniq_40() {
     uniq_test(&["-f", "2"], "a\ta a\na a a\n", "a\ta a\n");
 }
 
 #[test]
-fn test_uniq_41() {
+fn uniq_41() {
     uniq_test(&["-f", "1"], "a\ta\na\ta\n", "a\ta\n");
 }
 
 #[test]
-fn test_uniq_42() {
+fn uniq_42() {
     uniq_test(&["-c"], "a\nb\n", "1 a\n1 b\n");
 }
 
 #[test]
-fn test_uniq_43() {
+fn uniq_43() {
     uniq_test(&["-c"], "a\na\n", "2 a\n");
 }

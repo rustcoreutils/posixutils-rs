@@ -56,6 +56,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
 ## Stage 3 - Test coverage
 
  - [x] ar (Development)
+ - [x] basename
  - [x] bc
  - [x] cksum
  - [x] cmp
@@ -64,6 +65,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] csplit
  - [x] cut
  - [x] diff
+ - [x] dirname
  - [x] expand
  - [x] expr
  - [x] file
@@ -95,13 +97,11 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
 ## Stage 2 - Feature-complete and POSIX compliant
 
- - [x] basename
  - [x] cat
  - [x] chgrp
  - [x] chmod
  - [x] chown
  - [x] date
- - [x] dirname
  - [x] env
  - [x] fold
  - [x] ipcrm (IPC)

@@ -13,20 +13,31 @@ extern crate plib;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 /// dirname - return the directory portion of a pathname
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about)]
 struct Args {
-    pathname: PathBuf,
+    pathname: OsString,
 }
 
 fn show_dirname(args: &Args) {
-    let mut pb = args.pathname.clone();
+    if args.pathname.is_empty() {
+        println!(".");
+        return;
+    }
+
+    let mut pb = PathBuf::from(&args.pathname);
     pb.pop();
 
-    println!("{}", pb.to_string_lossy());
+    let mut dn = pb.to_string_lossy();
+    if dn.is_empty() {
+        dn = String::from(".").into();
+    }
+
+    println!("{}", dn);
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -22,7 +22,7 @@ fn expand_test_noargs(test_data: &str, expected_output: &str) {
 }
 
 #[test]
-fn test_expand_basic() {
+fn expand_basic() {
     expand_test_noargs("", "");
     expand_test_noargs("a\tb\tc\n", "a       b       c\n");
 }

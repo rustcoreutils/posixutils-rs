@@ -69,8 +69,9 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] dirname
  - [x] expand
  - [x] expr
- - [x] file
  - [x] false
+ - [x] file
+ - [x] fold
  - [x] head
  - [x] ls
  - [x] mv
@@ -104,7 +105,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] chown
  - [x] date
  - [x] env
- - [x] fold
  - [x] ipcrm (IPC)
  - [x] link
  - [x] ln

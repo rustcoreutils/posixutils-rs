@@ -88,6 +88,18 @@ fn handle_sysconf(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn handle_confstr(
+    var: &str,
+    confstr_mappings: &HashMap<&'static str, libc::c_int>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    Err(Box::new(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        "Not implemented (pls update libc crate)",
+    )))
+}
+
+#[cfg(not(target_os = "linux"))]
 fn handle_confstr(
     var: &str,
     confstr_mappings: &HashMap<&'static str, libc::c_int>,
@@ -192,17 +204,23 @@ fn load_confstr_mapping() -> HashMap<&'static str, libc::c_int> {
         ])
     }
 
+    // upstream libc crate needs Linux confstr definitions
     #[cfg(target_os = "linux")]
     {
-        HashMap::from([
-            ("_CS_GNU_LIBC_VERSION", libc::_CS_GNU_LIBC_VERSION),
-            (
-                "_CS_GNU_LIBPTHREAD_VERSION",
-                libc::_CS_GNU_LIBPTHREAD_VERSION,
-            ),
-            ("_CS_PATH", libc::_CS_PATH),
-        ])
+        HashMap::new()
     }
+
+    //    #[cfg(target_os = "linux")]
+    //    {
+    //        HashMap::from([
+    //            ("_CS_GNU_LIBC_VERSION", libc::_CS_GNU_LIBC_VERSION),
+    //            (
+    //                "_CS_GNU_LIBPTHREAD_VERSION",
+    //                libc::_CS_GNU_LIBPTHREAD_VERSION,
+    //            ),
+    //            ("_CS_PATH", libc::_CS_PATH),
+    //        ])
+    //    }
 }
 
 fn is_confstr_var(var: &str, mapping: &HashMap<&'static str, libc::c_int>) -> bool {

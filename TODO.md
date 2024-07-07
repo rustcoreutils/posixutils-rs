@@ -1,5 +1,9 @@
 # General TODO and future implementation notes
 
+## Upstream fixes wanted
+
+* libc: missing confstr support on linux
+
 ## Translations
 
 * Standard OS error texts must be translated

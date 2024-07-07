@@ -75,6 +75,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] head
  - [x] link
  - [x] ls
+ - [x] mkdir
  - [x] mv
  - [x] nl
  - [x] nm (Development)
@@ -112,7 +113,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] ln
  - [x] logname
  - [x] mesg
- - [x] mkdir
  - [x] mkfifo
  - [x] nice
  - [x] nohup

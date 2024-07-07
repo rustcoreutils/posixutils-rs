@@ -91,12 +91,12 @@ fn uudecode_test(args: &[&str], stdin_data: &str, expected_output: &str, expecte
 }
 
 #[test]
-fn test_cksum() {
+fn cksum_basic() {
     cksum_test("foo\n", "3915528286 4\n");
 }
 
 #[test]
-fn test_magic_header_compress_file() {
+fn magic_header_compress_file() {
     use std::env;
     use std::fs;
     use std::path::PathBuf;
@@ -139,7 +139,7 @@ fn test_magic_header_compress_file() {
 }
 
 #[test]
-fn test_compression_compress_file() {
+fn compression_compress_file() {
     use std::env;
     use std::fs;
     use std::path::PathBuf;
@@ -177,7 +177,7 @@ fn test_compression_compress_file() {
 }
 
 #[test]
-fn test_uuencode_uudecode_with_historical_encoding_text_file() {
+fn uuencode_uudecode_with_historical_encoding_text_file() {
     use std::env;
     use std::path::PathBuf;
 
@@ -220,7 +220,7 @@ fn test_uuencode_uudecode_with_historical_encoding_text_file() {
 }
 
 #[test]
-fn test_uuencode_uudecode_with_base64_encoding_text_file() {
+fn uuencode_uudecode_with_base64_encoding_text_file() {
     use std::env;
     use std::path::PathBuf;
 
@@ -261,7 +261,7 @@ fn test_uuencode_uudecode_with_base64_encoding_text_file() {
 }
 
 #[test]
-fn test_uuencode_uudecode_with_historical_encoding_jpg_file() {
+fn uuencode_uudecode_with_historical_encoding_jpg_file() {
     use std::env;
     use std::path::PathBuf;
 
@@ -302,7 +302,7 @@ fn test_uuencode_uudecode_with_historical_encoding_jpg_file() {
 }
 
 #[test]
-fn test_uuencode_uudecode_with_base64_encoding_jpg_file() {
+fn uuencode_uudecode_with_base64_encoding_jpg_file() {
     use std::env;
     use std::path::PathBuf;
 

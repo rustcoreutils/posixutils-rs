@@ -13,7 +13,7 @@ use std::fs;
 use tempfile::tempdir;
 
 #[test]
-fn test_remove_existing_file() {
+fn unlink_remove_existing_file() {
     let temp_dir = tempdir().expect("Unable to create temporary directory");
     let file_path = temp_dir.path().join("testfile.txt");
 
@@ -36,7 +36,7 @@ fn test_remove_existing_file() {
 }
 
 #[test]
-fn test_remove_non_existing_file() {
+fn unlink_remove_non_existing_file() {
     let temp_dir = tempdir().expect("Unable to create temporary directory");
     let file_path = temp_dir.path().join("non_existing.txt");
 
@@ -56,7 +56,7 @@ fn test_remove_non_existing_file() {
 }
 
 #[test]
-fn test_remove_directory() {
+fn unlink_remove_directory() {
     let temp_dir = tempdir().expect("Unable to create temporary directory");
     let dir_path = temp_dir.path().join("testdir");
 

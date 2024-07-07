@@ -15,6 +15,10 @@ libc.workspace = true
 chrono.workspace = true
 
 [[bin]]
+name = "getconf"
+path = "src/getconf.rs"
+
+[[bin]]
 name = "ipcrm"
 path = "src/ipcrm.rs"
 

@@ -7,8 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 // TODO:
-// - How to obtain a complete list of sysconf and pathconf variables?
-// - confstr
+// - How to obtain a complete list of sysconf and pathconf variables,
+//   POSIX spec, OS headers, or another source?
 // - Proper -v specification support.  is it even necessary?
 //
 
@@ -88,6 +88,59 @@ fn handle_sysconf(
     Ok(())
 }
 
+fn handle_confstr(
+    var: &str,
+    confstr_mappings: &HashMap<&'static str, libc::c_int>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let value = match get_mapping("_CS_", var, confstr_mappings) {
+        Some(value) => value,
+        None => {
+            let errstr = format!(
+                "{}: {}",
+                gettext("Error: Unknown configuration string variable"),
+                var
+            );
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                errstr,
+            )));
+        }
+    };
+
+    // Get the value using confstr
+    let buflen = unsafe { libc::confstr(value, std::ptr::null_mut(), 0) };
+    if buflen == 0 {
+        eprintln!(
+            "{}: {}",
+            gettext("Error: Unknown configuration string variable"),
+            var
+        );
+        std::process::exit(1);
+    }
+
+    let mut buf = vec![0u8; buflen as usize];
+    let value = unsafe {
+        libc::confstr(
+            value,
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len() as libc::size_t,
+        )
+    };
+    if value == 0 {
+        eprintln!(
+            "{}: {}",
+            gettext("Error: Unknown configuration string variable"),
+            var
+        );
+        std::process::exit(1);
+    } else {
+        let s = std::str::from_utf8(&buf).unwrap();
+        println!("{}", s);
+    }
+
+    Ok(())
+}
+
 fn handle_pathconf(
     var: &str,
     pathname: &str,
@@ -126,6 +179,42 @@ fn handle_pathconf(
     }
 
     Ok(())
+}
+
+fn load_confstr_mapping() -> HashMap<&'static str, libc::c_int> {
+    #[cfg(target_os = "macos")]
+    {
+        HashMap::from([
+            ("_CS_DARWIN_USER_DIR", libc::_CS_DARWIN_USER_DIR),
+            ("_CS_DARWIN_USER_TEMP_DIR", libc::_CS_DARWIN_USER_TEMP_DIR),
+            ("_CS_DARWIN_USER_CACHE_DIR", libc::_CS_DARWIN_USER_CACHE_DIR),
+            ("_CS_PATH", libc::_CS_PATH),
+        ])
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        HashMap::from([
+            ("_CS_GNU_LIBC_VERSION", libc::_CS_GNU_LIBC_VERSION),
+            (
+                "_CS_GNU_LIBPTHREAD_VERSION",
+                libc::_CS_GNU_LIBPTHREAD_VERSION,
+            ),
+            ("_CS_PATH", libc::_CS_PATH),
+        ])
+    }
+}
+
+fn is_confstr_var(var: &str, mapping: &HashMap<&'static str, libc::c_int>) -> bool {
+    let mut key = var.to_string();
+    if !mapping.contains_key(&key.as_str()) {
+        key = format!("_CS_{}", var);
+        if !mapping.contains_key(&key.as_str()) {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn load_sysconf_mapping() -> HashMap<&'static str, libc::c_int> {
@@ -227,13 +316,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
     if let Some(pathname) = args.pathname {
-        // Handle path configuration variables
         let pathconf_mappings = load_pathconf_mapping();
         handle_pathconf(&args.var, &pathname, &pathconf_mappings)?;
     } else {
-        // Handle system configuration variables
-        let sysconf_mappings = load_sysconf_mapping();
-        handle_sysconf(&args.var, &sysconf_mappings)?;
+        let confstr_mappings = load_confstr_mapping();
+
+        if is_confstr_var(&args.var, &confstr_mappings) {
+            handle_confstr(&args.var, &confstr_mappings)?;
+        } else {
+            let sysconf_mappings = load_sysconf_mapping();
+            handle_sysconf(&args.var, &sysconf_mappings)?;
+        }
     }
 
     Ok(())

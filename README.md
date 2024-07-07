@@ -83,6 +83,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] pr
  - [x] readlink
  - [x] rm
+ - [x] rmdir
  - [x] sort
  - [x] split
  - [x] strings
@@ -118,7 +119,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] pathchk
  - [x] pwd
  - [x] renice
- - [x] rmdir
  - [x] sleep
  - [x] tee
  - [x] touch

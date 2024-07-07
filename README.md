@@ -73,7 +73,9 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] file
  - [x] fold
  - [x] head
+ - [x] link
  - [x] ls
+ - [x] mkdir
  - [x] mv
  - [x] nl
  - [x] nm (Development)
@@ -82,6 +84,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] pr
  - [x] readlink
  - [x] rm
+ - [x] rmdir
  - [x] sort
  - [x] split
  - [x] strings
@@ -94,6 +97,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] uuencode (uue)
  - [x] unexpand
  - [x] uniq
+ - [x] unlink
  - [x] wc
  - [x] zcat (compress cat.)
 
@@ -106,24 +110,20 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] date
  - [x] env
  - [x] ipcrm (IPC)
- - [x] link
  - [x] ln
  - [x] logname
  - [x] mesg
- - [x] mkdir
  - [x] mkfifo
  - [x] nice
  - [x] nohup
  - [x] pathchk
  - [x] pwd
  - [x] renice
- - [x] rmdir
  - [x] sleep
  - [x] tee
  - [x] touch
  - [x] tty
  - [x] uname
- - [x] unlink
  - [x] write
 
 ## Stage 1 - Rough draft

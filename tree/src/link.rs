@@ -19,14 +19,15 @@ use std::{fs, io};
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about)]
 struct Args {
+    /// Link source
     file1: String,
 
+    /// Link target
     file2: String,
 }
 
 fn do_link(file1: &str, file2: &str) -> io::Result<()> {
     fs::hard_link(file1, file2)?;
-
     Ok(())
 }
 
@@ -42,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Err(e) = do_link(&args.file1, &args.file2) {
         exit_code = 1;
-        eprintln!("{} -> {}: {}", args.file1, args.file2, e);
+        eprintln!("link: {} -> {}: {}", args.file1, args.file2, e);
     }
 
     std::process::exit(exit_code)

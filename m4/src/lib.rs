@@ -160,6 +160,7 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
         }
     }
 
+    state.output.divert(0)?;
     state.output.undivert_all()?;
 
     for wrap in state.m4wrap {

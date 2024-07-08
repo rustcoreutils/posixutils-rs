@@ -1937,6 +1937,7 @@ fn evaluate_to_buffer(
     unwrap_quotes: bool,
 ) -> Result<(Vec<u8>, State)> {
     let mut buffer = Vec::new();
+    // BUG: what happens if we create a new macro while evaluating here, now the subsequent symbols will be wrong!
     for symbol in symbols {
         state = evaluate(state, symbol, &mut buffer, stderr, unwrap_quotes)?;
     }

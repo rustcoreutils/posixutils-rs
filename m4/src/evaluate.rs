@@ -1,7 +1,8 @@
 use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
-use std::io::Read;
+use std::io::{Read, Seek};
+use std::ops::{Deref, DerefMut, Div};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::process::ExitStatus;
@@ -49,7 +50,7 @@ impl OutputRef {
         self.0.borrow_mut().undivert_all()
     }
 
-    pub fn undivert(&mut self, buffer_number: BufferNumber) -> Result<()> {
+    pub fn undivert(&mut self, buffer_number: DivertBufferNumber) -> Result<()> {
         self.0.borrow_mut().undivert(buffer_number)
     }
 }
@@ -72,7 +73,10 @@ impl Write for OutputRef {
 /// temporary files, so this might change in the future, or become an optional feature.
 pub(crate) struct Output {
     /// Divert buffers 1 through to 9. See [`DivertMacro`].
-    divert_buffers: [DivertableBuffer; 9],
+    ///
+    /// NOTE: [`Rc`] and [`RefCell`] required because buffers can be diverted into each other via
+    /// [`Output`].
+    divert_buffers: [Rc<RefCell<DivertableBuffer>>; 9],
     /// See [`DivertMacro`].
     divert_number: i64,
     /// The real output, usually [`std::io::stdout`].
@@ -105,6 +109,10 @@ impl Output {
         self.divert_number
     }
 
+    pub fn divert_buffer_number(&self) -> Option<DivertBufferNumber> {
+        DivertBufferNumber::try_from(usize::try_from(self.divert_number).ok()?).ok()
+    }
+
     pub fn divert(&mut self, divert_number: i64) -> Result<()> {
         if divert_number > 9 {
             return Err(crate::error::Error::InvalidDivertNumber(divert_number));
@@ -114,24 +122,46 @@ impl Output {
     }
 
     pub fn undivert_all(&mut self) -> Result<()> {
-        for buffer_number in (1..self.divert_buffers.len()).map(BufferNumber) {
-            self.undivert(buffer_number)?;
+        for buffer_number in (1..=self.divert_buffers.len()).map(DivertBufferNumber::try_from) {
+            self.undivert(buffer_number?)?;
         }
         Ok(())
     }
 
-    pub fn undivert(&mut self, buffer_number: BufferNumber) -> Result<()> {
+    pub fn undivert(&mut self, buffer_number: DivertBufferNumber) -> Result<()> {
+        if self.divert_buffer_number() == Some(buffer_number) {
+            // It would cause a panic anyway on buffer.borrow_mut()
+            log::warn!("Skipping recursive divert");
+            return Ok(());
+        }
         // TODO: not really sure if this should alter the buffer number?
-        let buffer = &mut self.divert_buffers[buffer_number.0 - 1];
-        std::io::copy(buffer, &mut self.stdout)?;
-        debug_assert!(buffer.is_empty());
+        let buffer = self.divert_buffers[buffer_number.index()].clone();
+        let mut buffer = buffer.borrow_mut();
+        buffer.0.rewind()?;
+        let n = std::io::copy(&mut buffer.0, self)?;
+        log::debug!("Output::undivert({buffer_number:?}): Undiverted {n} bytes.");
+        buffer.0.get_mut().clear();
+        debug_assert!(buffer.0.get_ref().is_empty());
         Ok(())
     }
 }
 
-pub struct BufferNumber(usize);
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct DivertBufferNumber(usize);
 
-impl TryFrom<usize> for BufferNumber {
+impl DivertBufferNumber {
+    fn index(&self) -> usize {
+        self.0 - 1
+    }
+}
+
+impl std::fmt::Display for DivertBufferNumber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl TryFrom<usize> for DivertBufferNumber {
     type Error = crate::Error;
 
     fn try_from(value: usize) -> std::prelude::v1::Result<Self, Self::Error> {
@@ -148,7 +178,20 @@ impl Write for Output {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self.divert_number {
             0 => self.stdout.write(buf),
-            1..=9 => self.divert_buffers[self.divert_number as usize].write(buf),
+            1..=9 => {
+                let n = self.divert_buffers[self
+                    .divert_buffer_number()
+                    .expect("valid divert buffer number")
+                    .index()]
+                .borrow_mut()
+                .0
+                .write(buf)?;
+                log::debug!(
+                    "Output::write(): Wrote {n} bytes to divert buffer {}",
+                    self.divert_number
+                );
+                Ok(n)
+            }
             i if i < 0 => Ok(buf.len()),
             _ => unreachable!("unreachable, was checked in Self::divert()"),
         }
@@ -157,7 +200,13 @@ impl Write for Output {
     fn flush(&mut self) -> std::io::Result<()> {
         match self.divert_number {
             0 => self.stdout.flush(),
-            1..=9 => self.divert_buffers[self.divert_number as usize].flush(),
+            1..=9 => self.divert_buffers[self
+                .divert_buffer_number()
+                .expect("valid divert buffer number")
+                .index()]
+            .borrow_mut()
+            .0
+            .flush(),
             i if i < 0 => Ok(()),
             _ => unreachable!("unreachable, was checked in Self::divert()"),
         }
@@ -219,33 +268,7 @@ impl Default for State {
 
 /// TODO: This is a little wild west in terms of panic occurance and usability
 #[derive(Default, Clone)]
-pub(crate) struct DivertableBuffer(Vec<u8>);
-
-impl DivertableBuffer {
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
-
-impl Write for DivertableBuffer {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.write(buf)
-    }
-
-    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        self.0.write_all(buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.0.flush()
-    }
-}
-
-impl Read for DivertableBuffer {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0.as_slice().read(buf)
-    }
-}
+pub(crate) struct DivertableBuffer(std::io::Cursor<Vec<u8>>);
 
 macro_rules! macro_enums {
     (
@@ -1854,18 +1877,18 @@ impl MacroImplementation for UndivertMacro {
         stderr: &mut dyn Write,
         m: Macro,
     ) -> Result<State> {
-        let undivert_buffers: Vec<BufferNumber> = if m.args.is_empty() {
+        let undivert_buffers: Vec<DivertBufferNumber> = if m.args.is_empty() {
             (1..=9)
                 .into_iter()
-                .map(BufferNumber::try_from)
+                .map(DivertBufferNumber::try_from)
                 .collect::<Result<Vec<_>>>()?
         } else {
-            let mut undivert_buffers: Vec<BufferNumber> = Vec::new();
+            let mut undivert_buffers: Vec<DivertBufferNumber> = Vec::new();
             for arg in m.args.into_iter() {
                 let arg_text;
                 (arg_text, state) = evaluate_to_buffer(state, arg.symbols, stderr, true)?;
                 let (_, buffer_number) = nom::combinator::all_consuming(parse_index)(&arg_text)?;
-                match BufferNumber::try_from(buffer_number) {
+                match DivertBufferNumber::try_from(buffer_number) {
                     Ok(n) => undivert_buffers.push(n),
                     Err(error) => write!(stderr, "WARNING: {error}")?,
                 }
@@ -1875,7 +1898,7 @@ impl MacroImplementation for UndivertMacro {
         };
 
         for buffer_number in undivert_buffers {
-            state.output.undivert(buffer_number);
+            state.output.undivert(buffer_number)?;
         }
         Ok(state)
     }

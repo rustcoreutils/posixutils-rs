@@ -14,7 +14,9 @@ Implementation goals include clean, safe Rust code and maximal use of
 small Rust community crates.  This project's utilities should "look like
 normal Rust programs."
 
-Contributions are welcome.  Developers and helpers, please read [CONTRIBUTING](CONTRIBUTING.md) for details.
+## WANTED:  Volunteers!
+
+Contributions are welcome.  Developers and non-developers alike, please read [CONTRIBUTING](CONTRIBUTING.md) for details.
 
 Core specification: https://pubs.opengroup.org/onlinepubs/9699919799/
 

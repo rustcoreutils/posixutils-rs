@@ -1905,6 +1905,7 @@ pub(crate) fn evaluate(
         let mut new_buffer: Vec<u8> = Vec::new();
 
         // TODO(performance): if this is the last we could write directly to stdout
+        // BUG: what happens if the parsing should have changed between iterations? Such as with the dnl macro.
         for symbol in symbols {
             match symbol {
                 Symbol::Comment(comment) => new_buffer.write_all(comment)?,

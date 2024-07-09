@@ -101,6 +101,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] uniq
  - [x] unlink
  - [x] wc
+ - [x] what (SCCS)
  - [x] zcat (compress cat.)
 
 ## Stage 2 - Feature-complete and POSIX compliant
@@ -175,7 +176,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] sccs (SCCS)
  - [ ] unget (SCCS)
  - [ ] val (SCCS)
- - [ ] what (SCCS)
 
  ### i18n category
  - [ ] gencat (i18n)

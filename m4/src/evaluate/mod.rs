@@ -11,7 +11,8 @@ use output::{DivertBufferNumber, Output, OutputRef};
 use crate::error::Result;
 use crate::eval_macro::{self, parse_integer};
 use crate::lexer::{
-    self, parse_dnl, Macro, MacroName, MacroParseConfig, ParseConfig, Symbol, DEFAULT_QUOTE_CLOSE_TAG, DEFAULT_QUOTE_OPEN_TAG
+    self, parse_dnl, Macro, MacroName, MacroParseConfig, ParseConfig, Symbol,
+    DEFAULT_QUOTE_CLOSE_TAG, DEFAULT_QUOTE_OPEN_TAG,
 };
 
 mod output;
@@ -1082,8 +1083,7 @@ impl MacroImplementation for IfdefMacro {
         } else {
             if let Some(third_arg) = args.next() {
                 let third_arg_text;
-                (third_arg_text, state) =
-                    evaluate_to_buffer(state, third_arg.input, stderr, true)?;
+                (third_arg_text, state) = evaluate_to_buffer(state, third_arg.input, stderr, true)?;
                 stdout.write_all(&third_arg_text)?;
             }
         }
@@ -1769,14 +1769,16 @@ fn evaluate_to_buffer(
             state.parse_config.dnl = false;
             input = remaining.to_vec();
         } else {
-            log::debug!("evaluate_to_buffer() parsing input {}", String::from_utf8_lossy(&input));
+            log::debug!(
+                "evaluate_to_buffer() parsing input {}",
+                String::from_utf8_lossy(&input)
+            );
             let (remaining, symbol) = Symbol::parse(&state.parse_config)(&input)?;
             log::debug!("evaluate_to_buffer() evaluating {symbol:?}");
             state = evaluate(state, symbol, &mut output, stderr, unwrap_quotes)?;
-            
+
             input = remaining.to_vec();
         }
-        
     }
 
     if !input_eof && output.last() == Some(&b'\0') {
@@ -1907,7 +1909,7 @@ pub(crate) fn evaluate(
                             //   ^^^^^ should not be evaluated
                             (buffer, state) = evaluate_to_buffer(state, arg.input, stderr, false)?;
                             arg_buffer.extend(buffer.into_iter());
-                            
+
                             if i < args_length - 1 {
                                 arg_buffer.push(b',');
                             }

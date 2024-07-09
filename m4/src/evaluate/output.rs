@@ -1,5 +1,9 @@
-use std::{cell::RefCell, io::{Seek, Write}, rc::Rc};
 use crate::error::Result;
+use std::{
+    cell::RefCell,
+    io::{Seek, Write},
+    rc::Rc,
+};
 
 #[derive(Clone, Default)]
 pub(crate) struct OutputRef(Rc<RefCell<Output>>);

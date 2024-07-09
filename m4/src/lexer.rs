@@ -357,7 +357,9 @@ where
 }
 
 impl<'c, 'i: 'c> Symbol<'i> {
-    pub fn parse(config: &'c ParseConfig) -> impl Fn(&'i [u8]) -> IResult<&'i [u8], Symbol<'i>> + 'c {
+    pub fn parse(
+        config: &'c ParseConfig,
+    ) -> impl Fn(&'i [u8]) -> IResult<&'i [u8], Symbol<'i>> + 'c {
         move |input: &'i [u8]| {
             if config.symbol_recursion_limit == 0 {
                 log::error!("Symbol recursion limit reached");
@@ -435,6 +437,13 @@ impl<'i> Quoted<'i> {
                 "Quoted::parse() input: {:?}",
                 String::from_utf8_lossy(input)
             );
+            if input.first() == Some(&b'\0') {
+                return Err(nom::Err::Failure(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::Eof,
+                )));
+            }
+
             let mut nest_level = 0;
 
             let (mut remaining, _) = nom::bytes::streaming::tag(&*open_tag)(input)?;
@@ -446,7 +455,12 @@ impl<'i> Quoted<'i> {
                 if remaining.is_empty() {
                     return Err(nom::Err::Incomplete(nom::Needed::Unknown));
                 }
-
+                if remaining[0] == b'\0' {
+                    return Err(nom::Err::Failure(nom::error::Error::new(
+                        input,
+                        nom::error::ErrorKind::Eof,
+                    )));
+                }
                 if remaining.starts_with(&*close_tag) {
                     if nest_level == 1 {
                         break input.len() - remaining.len();
@@ -1307,6 +1321,13 @@ mod test {
         let error =
             Quoted::parse(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_QUOTE_CLOSE_TAG)(b"`hello").unwrap_err();
         assert!(matches!(error, nom::Err::Incomplete(_)));
+    }
+
+    #[test]
+    fn test_parse_quoted_eof_inside() {
+        let error = Quoted::parse(DEFAULT_QUOTE_OPEN_TAG, DEFAULT_QUOTE_CLOSE_TAG)(b"`hello\0")
+            .unwrap_err();
+        assert!(matches!(error, nom::Err::Failure(_)));
     }
 
     #[test]

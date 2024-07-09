@@ -1395,6 +1395,32 @@ fn test_mkstemp() {
 }
 
 #[test]
+fn test_quoted_nested_eof_in_string() {
+    init();
+    let output = run_command(&Path::new(
+        "fixtures/integration_tests/quoted_nested_eof_in_string.m4",
+    ));
+
+    let test: TestSnapshot =
+        read_test("fixtures/integration_tests/quoted_nested_eof_in_string.out");
+    assert_eq!(
+        output.status,
+        std::process::ExitStatus::from_raw(test.status),
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        test.stdout,
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+
+    if !test.stderr.is_empty() {
+        assert!(!output.stderr.is_empty());
+    }
+}
+
+#[test]
 fn test_recurse() {
     init();
     let output = run_command(&Path::new("fixtures/integration_tests/recurse.m4"));

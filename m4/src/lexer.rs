@@ -357,7 +357,7 @@ where
 }
 
 impl<'c, 'i: 'c> Symbol<'i> {
-    fn parse(config: &'c ParseConfig) -> impl Fn(&'i [u8]) -> IResult<&'i [u8], Symbol<'i>> + 'c {
+    pub fn parse(config: &'c ParseConfig) -> impl Fn(&'i [u8]) -> IResult<&'i [u8], Symbol<'i>> + 'c {
         move |input: &'i [u8]| {
             if config.symbol_recursion_limit == 0 {
                 log::error!("Symbol recursion limit reached");
@@ -740,6 +740,8 @@ pub(crate) fn process_streaming<'c, R: Read>(
                 break;
             }
 
+            // dnl is active, so we need to parse the input until the moment when it should be
+            // disabled (and skip evaluating this input).
             let remaining = if state.parse_config.dnl && input.first() != Some(&b'\0') {
                 let result = parse_dnl(input);
                 let remaining = match result {
@@ -756,8 +758,9 @@ pub(crate) fn process_streaming<'c, R: Read>(
                     }
                 };
 
+                // We don't want to disable dnl if we're evaluating something nested.
                 if remaining.first() != Some(&b'\0') {
-                    log::debug!("process_streaming() we are at EOF, disabling dnl");
+                    log::debug!("process_streaming() we are at end of dnl, disabling dnl");
                     state.parse_config.dnl = false;
                 }
 

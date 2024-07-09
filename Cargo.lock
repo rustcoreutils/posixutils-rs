@@ -1077,6 +1077,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "posixutils-sccs"
+version = "0.1.12"
+dependencies = [
+ "clap",
+ "gettext-rs",
+ "plib",
+]
+
+[[package]]
 name = "posixutils-screen"
 version = "0.1.12"
 dependencies = [

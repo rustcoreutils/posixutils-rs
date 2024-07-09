@@ -585,10 +585,7 @@ impl MacroImplementation for UserDefinedMacro {
                             new_buffer.write_all(&m.name.0)?;
                         } else {
                             let arg = m.args.get(i - 1).expect("Checked args length");
-                            for symbol in &arg.symbols {
-                                state =
-                                    evaluate(state, symbol.clone(), &mut new_buffer, stderr, true)?;
-                            }
+                            state = evaluate(state, arg.input, &mut new_buffer, stderr, true)?;
                         }
                         log::debug!(
                             "UserDefinedMacro::evaluate() Replacing ${i} with {:?}",
@@ -603,9 +600,7 @@ impl MacroImplementation for UserDefinedMacro {
                         m.args
                     );
                     for (i, arg) in m.args.iter().enumerate() {
-                        for symbol in &arg.symbols {
-                            state = evaluate(state, symbol.clone(), &mut buffer, stderr, true)?;
-                        }
+                        state = evaluate(state, arg.input, &mut buffer, stderr, true)?;
                         if i < m.args.len() - 1 {
                             buffer.write_all(b",")?;
                         }
@@ -616,9 +611,7 @@ impl MacroImplementation for UserDefinedMacro {
                     let mut new_buffer: Vec<u8> = Vec::new();
                     for (i, arg) in m.args.iter().enumerate() {
                         new_buffer.write_all(&state.parse_config.quote_open_tag)?;
-                        for symbol in &arg.symbols {
-                            state = evaluate(state, symbol.clone(), &mut new_buffer, stderr, true)?;
-                        }
+                        state = evaluate(state, arg.input, &mut new_buffer, stderr, true)?;
                         new_buffer.write_all(&state.parse_config.quote_close_tag)?;
                         if i < m.args.len() - 1 {
                             new_buffer.write_all(b",")?;
@@ -1033,10 +1026,8 @@ impl MacroImplementation for IfelseMacro {
                     4 | 5 => {
                         args.next();
                         log::debug!("IfelseMacro::evaluate() evaluating argument {}", i * 3 + 3);
-                        let symbols = args.next().expect("at least 4 args").symbols;
-                        for symbol in symbols {
-                            state = evaluate(state, symbol, stdout, stderr, true)?;
-                        }
+                        let input = args.next().expect("at least 4 args").input;
+                        state = evaluate(state, input, stdout, stderr, true)?;
                         if args_len == 5 {
                             write!(
                                 stderr,
@@ -1768,43 +1759,12 @@ fn evaluate_to_buffer(
     stderr: &mut dyn Write,
     unwrap_quotes: bool,
 ) -> Result<(Vec<u8>, State)> {
-    let mut input = input.to_vec();
-    // To make the streaming parsers happy.
-    let input_eof = if input.last() != Some(&b'\0') {
-        input.push(b'\0');
-        false
-    } else {
-        true
-    };
-
     let mut output = Vec::with_capacity(input.len());
-
-    while !input.is_empty() && input.first() != Some(&b'\0') {
-        if state.parse_config.dnl {
-            let (remaining, _) = parse_dnl(&input)?;
-            state.parse_config.dnl = false;
-            input = remaining.to_vec();
-        } else {
-            log::debug!(
-                "evaluate_to_buffer() parsing input {}",
-                String::from_utf8_lossy(&input)
-            );
-            let (remaining, symbol) = Symbol::parse(&state.parse_config)(&input)?;
-            log::debug!("evaluate_to_buffer() evaluating {symbol:?}");
-            state = evaluate(state, symbol, &mut output, stderr, unwrap_quotes)?;
-            log::debug!(
-                "evaluate_to_buffer() finished evaluating to output buffer {:?}",
-                String::from_utf8_lossy(&output)
-            );
-
-            input = remaining.to_vec();
-        }
-    }
-
-    if !input_eof && output.last() == Some(&b'\0') {
-        output.pop();
-    }
-
+    state = evaluate(state, input, &mut output, stderr, unwrap_quotes)?;
+    log::debug!(
+        "evaluate_to_buffer() Evaluated to buffer {:?}",
+        String::from_utf8_lossy(&output)
+    );
     Ok((output, state))
 }
 
@@ -1812,7 +1772,7 @@ pub(crate) trait Evaluator {
     fn evaluate(
         &self,
         state: State,
-        symbol: Symbol,
+        input: &[u8],
         stdout: &mut dyn Write,
         stderr: &mut dyn Write,
         unwrap_quotes: bool,
@@ -1821,17 +1781,17 @@ pub(crate) trait Evaluator {
 
 impl<T> Evaluator for T
 where
-    T: Fn(State, Symbol, &mut dyn Write, &mut dyn Write, bool) -> Result<State>,
+    T: Fn(State, &[u8], &mut dyn Write, &mut dyn Write, bool) -> Result<State>,
 {
     fn evaluate(
         &self,
         state: State,
-        symbol: Symbol,
+        input: &[u8],
         stdout: &mut dyn Write,
         stderr: &mut dyn Write,
         unwrap_quotes: bool,
     ) -> Result<State> {
-        self(state, symbol, stdout, stderr, unwrap_quotes)
+        self(state, input, stdout, stderr, unwrap_quotes)
     }
 }
 
@@ -1867,120 +1827,114 @@ where
 /// First question, why are the quotes evaluated after being unwrapped for macro arguments?
 pub(crate) fn evaluate(
     mut state: State,
-    symbol: Symbol,
+    input: &[u8],
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
     unwrap_quotes: bool,
 ) -> Result<State> {
-    let symbol_debug = format!("{symbol:?}");
-    log::debug!("evaluate() EVALUATING {symbol_debug}");
-    let mut root_symbol = Some(symbol);
+    log::debug!("evaluate() EVALUATING {:?}", String::from_utf8_lossy(input));
     // We should never be evaluating symbols when dnl is enabled
     debug_assert!(!state.parse_config.dnl);
 
-    let mut first = true;
-    let mut buffer = Vec::new();
-    let mut last = false;
+    // Parse input as a symbol
+    // Evaluate the symbol and use the output to replace the symbol in the input.
+    // If the input was not a macro we want to somehow skip this in the next iteration.
+    let mut buffer = input.to_vec();
+
+    let input_eof = if buffer.last() != Some(&b'\0') {
+        buffer.push(b'\0');
+        false
+    } else {
+        true
+    };
+
+    let mut i = 0;
     loop {
-        let symbols = if first {
-            vec![root_symbol.take().expect("First iteration")]
-        } else {
-            if buffer.last() != Some(&b'\0') {
-                buffer.push(b'\0');
-            }
-            // TODO: parses symbols twice, not ideal! Need to find a way to make an owned
-            // Symbol so it can be used in this loop. Or put some kind of self rererential
-            // struct in the stack containing the symbol and the buffer it came from.
-            let symbols = lexer::parse_symbols_complete(&state.parse_config, &mut buffer)?;
-            symbols
-        };
-        // No symbols which require evaluation are remaining.
-        if !symbols
-            .iter()
-            .find(|s| matches!(s, Symbol::Macro(_)))
-            .is_some()
-        {
-            last = true;
-        }
+        let mut last = false;
+        log::debug!("Looping {i} {:?}", String::from_utf8_lossy(&buffer));
         let mut new_buffer: Vec<u8> = Vec::new();
-
-        // TODO(performance): if this is the last we could write directly to stdout
-        // BUG: what happens if the parsing should have changed between iterations? Such as with the dnl macro.
-        for symbol in symbols {
-            match symbol {
-                Symbol::Comment(comment) => new_buffer.write_all(comment)?,
-                Symbol::Text(text) => new_buffer.write_all(text)?,
-                Symbol::Quoted(quoted) => {
-                    log::debug!("evaluate() writing quoted {quoted:?}");
-                    if last && unwrap_quotes {
-                        new_buffer.write_all(quoted.contents)?;
-                    } else {
-                        new_buffer.write_all(quoted.all)?;
-                    }
+        let (remaining, symbol) = Symbol::parse(&state.parse_config)(&buffer)?;
+        let is_macro = matches!(symbol, Symbol::Macro(_));
+        match symbol {
+            Symbol::Comment(comment) => new_buffer.write_all(comment)?,
+            Symbol::Text(text) => new_buffer.write_all(text)?,
+            Symbol::Quoted(quoted) => {
+                log::debug!("evaluate() writing quoted {quoted:?}");
+                if unwrap_quotes {
+                    new_buffer.write_all(quoted.contents)?;
+                } else {
+                    new_buffer.write_all(quoted.all)?;
                 }
-                Symbol::Macro(mut m) => {
-                    let mut arg_buffer: Vec<u8> = Vec::new();
-                    if !m.args.is_empty() {
-                        // Here we need to expand the macros which may form additional arguments which
-                        // were not picked up in the initial round of parsing.
-                        let args_length = m.args.len();
-                        for (i, arg) in m.args.into_iter().enumerate() {
-                            let buffer;
-                            // Important that we don't evaluate quotes.
-                            // x(y)
-                            //   ^ should be evaluated
-                            // x(`a,b`)
-                            //   ^^^^^ should not be evaluated
-                            (buffer, state) = evaluate_to_buffer(state, arg.input, stderr, false)?;
-                            arg_buffer.extend(buffer.into_iter());
-
-                            if i < args_length - 1 {
-                                arg_buffer.push(b',');
-                            }
-                        }
-                        log::debug!(
-                            "evaluate() arg_buffer {:?}",
-                            String::from_utf8_lossy(&arg_buffer)
-                        );
-                        // Necessary for the streaming args parser to terminate.
-                        arg_buffer.push(b')');
-                        let (remaining, args) =
-                            lexer::parse_macro_args(&state.parse_config)(&arg_buffer)?;
-                        debug_assert_eq!(remaining, b")");
-                        log::debug!("evaluate() updated args {args:?}");
-                        m.args = args;
-                    }
-
-                    let name = m.name.to_string();
-                    log::debug!("evaluate() evaluating macro {name:?}");
-                    let definition = state
-                        .macro_definitions
-                        .get(&m.name)
-                        .and_then(|e| e.last().cloned())
-                        .expect("There should always be a definition for a parsed macro");
-                    state = definition
-                        .implementation
-                        .evaluate(state, &mut new_buffer, stderr, m)
-                        .add_context(|| format!("Error evaluating macro {name:?}"))?;
-                    log::debug!(
-                        "evaluate() finished evaluating macro {name:?}, new_buffer: {:?}",
-                        String::from_utf8_lossy(&new_buffer)
-                    );
-                }
-                Symbol::Newline => new_buffer.write_all(b"\n")?,
-                Symbol::Eof => {}
             }
+            Symbol::Macro(mut m) => {
+                let mut arg_buffer: Vec<u8> = Vec::new();
+                if !m.args.is_empty() {
+                    // Here we need to expand the macros which may form additional arguments which
+                    // were not picked up in the initial round of parsing.
+                    let args_length = m.args.len();
+                    for (i, arg) in m.args.into_iter().enumerate() {
+                        let buffer;
+                        // Important that we don't evaluate quotes.
+                        // x(y)
+                        //   ^ should be evaluated
+                        // x(`a,b`)
+                        //   ^^^^^ should not be evaluated
+                        (buffer, state) = evaluate_to_buffer(state, arg.input, stderr, false)?;
+                        arg_buffer.extend(buffer.into_iter());
+
+                        if i < args_length - 1 {
+                            arg_buffer.push(b',');
+                        }
+                    }
+                    log::debug!(
+                        "evaluate() arg_buffer {:?}",
+                        String::from_utf8_lossy(&arg_buffer)
+                    );
+                    // Necessary for the streaming args parser to terminate.
+                    arg_buffer.push(b')');
+                    let (remaining, args) =
+                        lexer::parse_macro_args(&state.parse_config)(&arg_buffer)?;
+                    debug_assert_eq!(remaining, b")");
+                    log::debug!("evaluate() updated args {args:?}");
+                    m.args = args;
+                }
+
+                let name = m.name.to_string();
+                log::debug!("evaluate() evaluating macro {name:?}");
+                let definition = state
+                    .macro_definitions
+                    .get(&m.name)
+                    .and_then(|e| e.last().cloned())
+                    .expect("There should always be a definition for a parsed macro");
+                state = definition
+                    .implementation
+                    .evaluate(state, &mut new_buffer, stderr, m)
+                    .add_context(|| format!("Error evaluating macro {name:?}"))?;
+                log::debug!(
+                    "evaluate() finished evaluating macro {name:?}, new_buffer: {:?}",
+                    String::from_utf8_lossy(&new_buffer)
+                );
+            }
+            Symbol::Newline => new_buffer.write_all(b"\n")?,
+            Symbol::Eof => {
+                if input_eof {
+                    new_buffer.write_all(b"\0")?;
+                }
+                last = true;
+            }
+        }
+
+        if is_macro {
+            new_buffer.extend(remaining.into_iter());
+            buffer = new_buffer;
+        } else {
+            stdout.write_all(&new_buffer)?;
+            buffer = remaining.to_vec();
         }
         if last {
-            log::debug!(
-                "evaluate() FINISHED {symbol_debug}: new_buffer: {:?}",
-                String::from_utf8_lossy(&new_buffer)
-            );
-            stdout.write_all(&mut new_buffer)?;
             break;
         }
-        first = false;
-        buffer = new_buffer;
+        i += 1;
     }
 
     Ok(state)

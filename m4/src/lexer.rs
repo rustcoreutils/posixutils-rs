@@ -805,12 +805,13 @@ pub(crate) fn process_streaming<'c, R: Read>(
                             }));
                     }
                 };
+                let symbol_input = &input[..(input.len() - remaining.len())];
 
                 if matches!(symbol, Symbol::Eof) {
                     return Ok(state);
                 }
 
-                state = evaluator.evaluate(state, symbol, stdout, stderr, unwrap_quotes)?;
+                state = evaluator.evaluate(state, symbol_input, stdout, stderr, unwrap_quotes)?;
                 remaining
             };
 
@@ -867,8 +868,8 @@ pub fn unquote<'c, 'i>(config: &'c ParseConfig, input: &'i [u8]) -> Vec<u8> {
 mod test {
     use crate::evaluate::State;
     use crate::lexer::{
-        parse_inside_brackets, parse_macro_args, unquote, Symbol, DEFAULT_COMMENT_CLOSE_TAG,
-        DEFAULT_COMMENT_OPEN_TAG,
+        parse_inside_brackets, parse_macro_args, parse_symbols_complete, unquote, Symbol,
+        DEFAULT_COMMENT_CLOSE_TAG, DEFAULT_COMMENT_OPEN_TAG,
     };
     use crate::test_utils::{macro_parse_config, macro_parse_configs, utf8};
     use std::collections::HashMap;
@@ -910,12 +911,25 @@ mod test {
 
         fn evaluate(
             state: State,
-            symbol: Symbol,
+            input: &[u8],
             stdout: &mut dyn Write,
             _stderror: &mut dyn Write,
             _unwrap_quotes: bool,
         ) -> crate::error::Result<State> {
-            stdout.write_all(format!("{symbol:#?}").as_bytes()).unwrap();
+            let mut input = input.to_vec();
+            let input_eof = if input.last() != Some(&b'\0') {
+                input.push(b'\0');
+                false
+            } else {
+                true
+            };
+            let mut symbols = parse_symbols_complete(&state.parse_config, &input)?;
+            if !input_eof {
+                symbols.pop();
+            }
+            stdout
+                .write_all(format!("{symbols:#?}").as_bytes())
+                .unwrap();
             stdout.write(b"\n").unwrap();
             Ok(state)
         }

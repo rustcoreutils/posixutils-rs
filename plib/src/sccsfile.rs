@@ -108,21 +108,27 @@ fn parse_header(lines: &[&str]) -> Result<SccsHeader, &'static str> {
 }
 
 fn parse_edits(lines: &[&str]) -> Result<Vec<SccsEdit>, &'static str> {
-    // Simplified edit parsing
     let mut edits = Vec::new();
-    for line in lines.iter().skip_while(|l| !l.starts_with("edits")).skip(1) {
-        if line.starts_with("insert") {
-            edits.push(SccsEdit::Insert(line.to_string()));
-        } else if line.starts_with("delete") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 2 {
-                return Err("Invalid delete format");
-            }
-            edits.push(SccsEdit::Delete(
-                usize::from_str(parts[1]).map_err(|_| "Invalid number format")?,
-            ));
+    let mut current_insert = String::new();
+    let mut in_insert_section = false;
+
+    for line in lines.iter() {
+        if line.starts_with("I ") {
+            in_insert_section = true;
+            current_insert.push_str(line);
+            current_insert.push('\n');
+        } else if line.starts_with("E ") && in_insert_section {
+            current_insert.push_str(line);
+            current_insert.push('\n');
+            edits.push(SccsEdit::Insert(current_insert.clone()));
+            current_insert.clear();
+            in_insert_section = false;
+        } else if in_insert_section {
+            current_insert.push_str(line);
+            current_insert.push('\n');
         }
     }
+
     Ok(edits)
 }
 
@@ -158,14 +164,17 @@ fn parse_deltas(lines: &[&str]) -> Result<Vec<SccsDelta>, &'static str> {
                 author: parts[5].to_string(),
                 added_lines: usize::from_str(parts[6]).map_err(|_| "Invalid number format")?,
                 deleted_lines: usize::from_str(parts[7]).map_err(|_| "Invalid number format")?,
-                comments: current_comments.clone(),
+                comments: String::new(),
             });
-            current_comments.clear();
         } else if in_delta_section {
             if line.starts_with("c ") {
                 current_comments.push_str(&line[2..]);
                 current_comments.push('\n');
             } else if line.starts_with("e") {
+                if let Some(last_delta) = deltas.last_mut() {
+                    last_delta.comments = current_comments.clone();
+                }
+                current_comments.clear();
                 in_delta_section = false;
             }
         }
@@ -270,16 +279,57 @@ E 2
 "#;
 
         let sccs_file = SccsFile::from_string(simple).expect("Failed to parse SCCS file");
-	assert_eq!(sccs_file.header.format_version, "h23005");
-	assert_eq!(sccs_file.header.creation_date, "s 00003/00000/00013");
-	assert_eq!(sccs_file.header.author, "");
-	assert_eq!(sccs_file.header.description, "");
 
-	assert_eq!(sccs_file.deltas.len(), 2);
+        // Verify header
+        assert_eq!(sccs_file.header.format_version, "h23005");
+        assert_eq!(sccs_file.header.creation_date, "s 00003/00000/00013");
+        assert_eq!(sccs_file.header.author, "");
+        assert_eq!(sccs_file.header.description, "");
 
-	assert_eq!(sccs_file.user_info.users.len(), 0);
+        // Verify deltas
+        assert_eq!(sccs_file.deltas.len(), 2);
 
-	assert_eq!(sccs_file.stats.total_deltas, 2);
+        assert_eq!(sccs_file.deltas[0].sid, "1.2");
+        assert_eq!(sccs_file.deltas[0].date, "24/07/09");
+        assert_eq!(sccs_file.deltas[0].time, "19:42:04");
+        assert_eq!(sccs_file.deltas[0].author, "jgarzik");
+        assert_eq!(sccs_file.deltas[0].added_lines, 2);
+        assert_eq!(sccs_file.deltas[0].deleted_lines, 1);
+        assert_eq!(sccs_file.deltas[0].comments, "added more data\n");
+
+        assert_eq!(sccs_file.deltas[1].sid, "1.1");
+        assert_eq!(sccs_file.deltas[1].date, "24/07/09");
+        assert_eq!(sccs_file.deltas[1].time, "19:38:28");
+        assert_eq!(sccs_file.deltas[1].author, "jgarzik");
+        assert_eq!(sccs_file.deltas[1].added_lines, 1);
+        assert_eq!(sccs_file.deltas[1].deleted_lines, 0);
+        assert_eq!(
+            sccs_file.deltas[1].comments,
+            "date and time created 24/07/09 19:38:28 by jgarzik\n"
+        );
+
+        // Verify edits
+        assert_eq!(sccs_file.edits.len(), 2);
+
+        match &sccs_file.edits[0] {
+            SccsEdit::Insert(line) => {
+                assert_eq!(line, "I 1\napple\nbanana\ncharlie\ndelta\necho\nfoxtrot\ngolf\nhotel\nindia\njuliet\nkilo\nlima\nmike\nE 1\n");
+            }
+            _ => panic!("Unexpected edit type"),
+        }
+
+        match &sccs_file.edits[1] {
+            SccsEdit::Insert(line) => {
+                assert_eq!(line, "I 2\nnovember\noctober\npauly\nE 2\n");
+            }
+            _ => panic!("Unexpected edit type"),
+        }
+
+        // Verify user info
+        assert_eq!(sccs_file.user_info.users.len(), 0);
+
+        // Verify stats
+        assert_eq!(sccs_file.stats.total_deltas, 2);
+        assert_eq!(sccs_file.stats.total_lines, 4);
     }
 }
-

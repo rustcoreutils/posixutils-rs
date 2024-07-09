@@ -549,13 +549,15 @@ impl MacroName {
     pub fn try_from_slice(input: &[u8]) -> crate::error::Result<Self> {
         let mut input = input.to_vec();
         input.push(b'\0');
-        let (remaining, name) =
-            Self::parse(input.as_slice()).map_err(|e| crate::Error::Parsing(e.to_string()))?;
+        let (remaining, name) = Self::parse(input.as_slice())
+            .map_err(|e| crate::Error::new(crate::ErrorKind::Parsing).add_context(e.to_string()))?;
         if remaining != &[b'\0'] {
-            return Err(crate::Error::Parsing(format!(
-                "Could not completely parse input as macro name. Remaining: {:?}",
-                String::from_utf8_lossy(&input)
-            )));
+            return Err(
+                crate::Error::new(crate::ErrorKind::Parsing).add_context(format!(
+                    "Could not completely parse input as macro name. Remaining: {:?}",
+                    String::from_utf8_lossy(&input)
+                )),
+            );
         }
         Ok(name)
     }
@@ -766,9 +768,8 @@ pub(crate) fn process_streaming<'c, R: Read>(
                         break;
                     }
                     Err(error) => {
-                        return Err(crate::error::Error::Parsing(format!(
-                            "Error parsing dnl {error}"
-                        )))
+                        return Err(crate::error::Error::new(crate::ErrorKind::Parsing)
+                            .add_context(format!("Error parsing dnl {error}")))
                     }
                 };
 
@@ -789,15 +790,19 @@ pub(crate) fn process_streaming<'c, R: Read>(
                         break;
                     }
                     Err(error) => {
-                        return Err(crate::error::Error::Parsing(match error {
-                            nom::Err::Error(error) | nom::Err::Failure(error) => {
-                                let input = std::str::from_utf8(error.input)
-                                    .map(|s| format!("{s:?}"))
-                                    .unwrap_or_else(|_| format!("{:?}", error.input));
-                                format!("Parsing Error for input {}, code: {:?}", input, error.code)
-                            }
-                            nom::Err::Incomplete(_) => error.to_string(),
-                        }));
+                        return Err(crate::error::Error::new(crate::ErrorKind::Parsing)
+                            .add_context(match error {
+                                nom::Err::Error(error) | nom::Err::Failure(error) => {
+                                    let input = std::str::from_utf8(error.input)
+                                        .map(|s| format!("{s:?}"))
+                                        .unwrap_or_else(|_| format!("{:?}", error.input));
+                                    format!(
+                                        "Parsing Error for input {}, code: {:?}",
+                                        input, error.code
+                                    )
+                                }
+                                nom::Err::Incomplete(_) => error.to_string(),
+                            }));
                     }
                 };
 
@@ -831,8 +836,8 @@ pub fn parse_symbols_complete<'i>(
     let mut symbols = Vec::new();
     while !remaining.is_empty() {
         let symbol;
-        (remaining, symbol) =
-            Symbol::parse(&config)(remaining).map_err(|e| crate::Error::Parsing(e.to_string()))?;
+        (remaining, symbol) = Symbol::parse(&config)(remaining)
+            .map_err(|e| crate::Error::new(crate::ErrorKind::Parsing).add_context(e.to_string()))?;
         symbols.push(symbol)
     }
     Ok(symbols)
@@ -849,7 +854,7 @@ pub fn unquote<'c, 'i>(config: &'c ParseConfig, input: &'i [u8]) -> Vec<u8> {
     while !remaining.is_empty() {
         let symbol;
         (remaining, symbol) = Symbol::parse(&config)(remaining)
-            .map_err(|e| crate::Error::Parsing(e.to_string()))
+            .map_err(|e| crate::Error::new(crate::ErrorKind::Parsing).add_context(e.to_string()))
             .unwrap();
         let current_index = input.len() - remaining.len();
         match symbol {

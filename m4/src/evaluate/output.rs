@@ -86,7 +86,9 @@ impl Output {
 
     pub fn divert(&mut self, divert_number: i64) -> Result<()> {
         if divert_number > 9 {
-            return Err(crate::error::Error::InvalidDivertNumber(divert_number));
+            return Err(crate::error::Error::new(
+                crate::ErrorKind::InvalidDivertNumber(divert_number),
+            ));
         }
         self.divert_number = divert_number;
         Ok(())
@@ -137,9 +139,11 @@ impl TryFrom<usize> for DivertBufferNumber {
 
     fn try_from(value: usize) -> std::prelude::v1::Result<Self, Self::Error> {
         if value < 1 || value > 9 {
-            return Err(crate::Error::Parsing(format!(
-                "Unexpected buffer number: {value}. Needs to be from 1 to 9"
-            )));
+            return Err(
+                crate::Error::new(crate::ErrorKind::Parsing).add_context(format!(
+                    "Unexpected buffer number: {value}. Needs to be from 1 to 9"
+                )),
+            );
         }
         Ok(Self(value))
     }

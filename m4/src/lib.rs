@@ -1,4 +1,4 @@
-use error::Error;
+use error::{Error, ErrorKind};
 use std::{
     ffi::{OsStr, OsString},
     io::Write,
@@ -117,13 +117,15 @@ pub fn run<STDOUT: Write + 'static, STDERR: Write>(
 ) -> crate::error::Result<()> {
     match run_impl(stdout, &mut stderr, args) {
         Ok(_) => Ok(()),
-        Err(error @ Error::Exit(_)) => Err(error),
-        Err(error) => {
-            if let Err(error) = stderr.write_all(error.to_string().as_bytes()) {
-                return Err(error.into());
+        Err(error) => match error.kind {
+            ErrorKind::Exit(_) => Err(error),
+            _ => {
+                if let Err(error) = stderr.write_all(format!("{error:#}").as_bytes()) {
+                    return Err(error.into());
+                }
+                Err(error)
             }
-            Err(error)
-        }
+        },
     }
 }
 

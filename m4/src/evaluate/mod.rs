@@ -8,7 +8,7 @@ use nom::error::{ContextError, FromExternalError};
 use nom::IResult;
 use output::{DivertBufferNumber, Output, OutputRef};
 
-use crate::error::Result;
+use crate::error::{Result, ResultExt};
 use crate::eval_macro::{self, parse_integer};
 use crate::lexer::{
     self, parse_dnl, Macro, MacroName, MacroParseConfig, ParseConfig, Symbol,
@@ -689,7 +689,7 @@ impl MacroImplementation for DefnMacro {
             .args
             .into_iter()
             .next()
-            .ok_or_else(|| crate::Error::NotEnoughArguments)?;
+            .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
         let first_arg_text;
         (first_arg_text, state) = evaluate_to_buffer(state, first_arg.input, stderr, true)?;
         if let Some(definitions) = state
@@ -770,7 +770,9 @@ impl MacroImplementation for IncludeMacro {
             state = lexer::process_streaming(
                 state,
                 evaluate,
-                std::fs::File::open(path)?,
+                std::fs::File::open(&path)
+                    .map_err(crate::Error::from)
+                    .add_context(|| format!("Error opening file {path:?}"))?,
                 stdout,
                 stderr,
                 false,
@@ -803,7 +805,9 @@ impl MacroImplementation for SincludeMacro {
                 state = lexer::process_streaming(
                     state,
                     evaluate,
-                    std::fs::File::open(path)?,
+                    std::fs::File::open(&path)
+                        .map_err(crate::Error::from)
+                        .add_context(|| format!("Error opening file {path:?}"))?,
                     stdout,
                     stderr,
                     false,
@@ -930,9 +934,11 @@ impl MacroImplementation for IncrMacro {
             let (remaining, mut number) =
                 eval_macro::padded(eval_macro::parse_integer)(&number_bytes)?;
             if !remaining.is_empty() {
-                return Err(crate::Error::Parsing(format!(
+                return Err(
+                    crate::Error::new(crate::ErrorKind::Parsing).add_context(format!(
                     "Error parsing number from {number_bytes:?}, remaining input: {remaining:?}"
-                )));
+                )),
+                );
             }
             number += 1;
             stdout.write_all(number.to_string().as_bytes())?;
@@ -961,9 +967,11 @@ impl MacroImplementation for DecrMacro {
             let (remaining, mut number) =
                 eval_macro::padded(eval_macro::parse_integer)(&number_bytes)?;
             if !remaining.is_empty() {
-                return Err(crate::Error::Parsing(format!(
+                return Err(
+                    crate::Error::new(crate::ErrorKind::Parsing).add_context(format!(
                     "Error parsing number from {number_bytes:?}, remaining input: {remaining:?}"
-                )));
+                )),
+                );
             }
             number -= 1;
             stdout.write_all(number.to_string().as_bytes())?;
@@ -1068,17 +1076,19 @@ impl MacroImplementation for IfdefMacro {
         let mut args = m.args.into_iter();
         let first_arg = args
             .next()
-            .ok_or_else(|| crate::Error::NotEnoughArguments)?;
+            .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
         let first_arg_text;
         (first_arg_text, state) = evaluate_to_buffer(state, first_arg.input, stderr, true)?;
         let second_arg = args
             .next()
-            .ok_or_else(|| crate::Error::NotEnoughArguments)?;
+            .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
         let second_arg_text;
         (second_arg_text, state) = evaluate_to_buffer(state, second_arg.input, stderr, true)?;
-        let name = MacroName::try_from_slice(&first_arg_text)?;
-
-        if state.macro_definitions.contains_key(&name) {
+        let name = MacroName::try_from_slice(&first_arg_text).ok();
+        if name
+            .map(|name| state.macro_definitions.contains_key(&name))
+            .unwrap_or(false)
+        {
             stdout.write_all(&second_arg_text)?;
         } else {
             if let Some(third_arg) = args.next() {
@@ -1087,6 +1097,7 @@ impl MacroImplementation for IfdefMacro {
                 stdout.write_all(&third_arg_text)?;
             }
         }
+        log::debug!("IfdefMacro::evaluate() finished");
         Ok(state)
     }
 }
@@ -1135,7 +1146,7 @@ impl MacroImplementation for EvalMacro {
             .args
             .into_iter()
             .next()
-            .ok_or_else(|| crate::Error::NotEnoughArguments)?;
+            .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
         let buffer;
         (buffer, state) = evaluate_to_buffer(state, first_arg.input, stderr, true)?;
         let (_remaining, output) = eval_macro::parse_and_evaluate(&buffer)?;
@@ -1160,7 +1171,7 @@ impl MacroImplementation for LenMacro {
             .args
             .into_iter()
             .next()
-            .ok_or_else(|| crate::Error::NotEnoughArguments)?;
+            .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
         let buffer;
         (buffer, state) = evaluate_to_buffer(state, first_arg.input, stderr, true)?;
         stdout.write_all(buffer.len().to_string().as_bytes())?;
@@ -1185,7 +1196,7 @@ impl MacroImplementation for IndexMacro {
         let mut args = m.args.into_iter();
         let first_arg = args
             .next()
-            .ok_or_else(|| crate::Error::NotEnoughArguments)?;
+            .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
         let first_arg_text;
         (first_arg_text, state) = evaluate_to_buffer(state, first_arg.input, stderr, true)?;
         let second_arg = match args.next() {
@@ -1236,7 +1247,7 @@ impl MacroImplementation for TranslitMacro {
         let mut args = m.args.into_iter();
         let first_arg = args
             .next()
-            .ok_or_else(|| crate::Error::NotEnoughArguments)?;
+            .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
         let mut output_buffer;
         (output_buffer, state) = evaluate_to_buffer(state, first_arg.input, stderr, true)?;
         let second_arg = match args.next() {
@@ -1300,7 +1311,7 @@ impl MacroImplementation for SubstrMacro {
         let mut args = m.args.into_iter();
         let first_arg = args
             .next()
-            .ok_or_else(|| crate::Error::NotEnoughArguments)?;
+            .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
         let first_arg_text;
         (first_arg_text, state) = evaluate_to_buffer(state, first_arg.input, stderr, true)?;
 
@@ -1419,13 +1430,13 @@ struct MkstempMacro;
 /// file at the time of a call to mkstemp().
 fn mkstemp(mut template: Vec<u8>) -> Result<Vec<u8>> {
     if template.len() < 6 {
-        return Err(crate::Error::Io(std::io::Error::new(
+        return Err(crate::Error::new(crate::ErrorKind::Io).with_source(std::io::Error::new(
             std::io::ErrorKind::Other,
             format!("Unable to create temporary file, template should be greater than 6 characters long. template: {:?}", String::from_utf8_lossy(&template))
         )));
     }
     if &template[(template.len() - 6)..] != b"XXXXXX" {
-        return Err(crate::Error::Io(std::io::Error::new(
+        return Err(crate::Error::new(crate::ErrorKind::Io).with_source(std::io::Error::new(
             std::io::ErrorKind::Other,
             format!("Unable to create temporary file, template does not finish with six trailing 'X's. template: {:?}", String::from_utf8_lossy(&template))
         )));
@@ -1438,29 +1449,33 @@ fn mkstemp(mut template: Vec<u8>) -> Result<Vec<u8>> {
     };
     if file_descriptor < 0 {
         let e = errno::errno();
-        return Err(crate::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!(
-                "Unable to create temporary file. template: {:?}, Error {}: {}",
-                String::from_utf8_lossy(&template),
-                e.0,
-                e
-            ),
-        )));
+        return Err(
+            crate::Error::new(crate::ErrorKind::Io).with_source(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "Unable to create temporary file. template: {:?}, Error {}: {}",
+                    String::from_utf8_lossy(&template),
+                    e.0,
+                    e
+                ),
+            )),
+        );
     }
     // TODO: review safety and add proper comment.
     let result = unsafe { libc::close(file_descriptor) };
     if result < 0 {
         let e = errno::errno();
-        return Err(crate::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!(
-                "Unable to close temporary file. template: {:?}, Error {}: {}",
-                String::from_utf8_lossy(&template),
-                e.0,
-                e
-            ),
-        )));
+        return Err(
+            crate::Error::new(crate::ErrorKind::Io).with_source(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "Unable to close temporary file. template: {:?}, Error {}: {}",
+                    String::from_utf8_lossy(&template),
+                    e.0,
+                    e
+                ),
+            )),
+        );
     }
     Ok(template)
 }
@@ -1477,7 +1492,7 @@ impl MacroImplementation for MkstempMacro {
             .args
             .into_iter()
             .next()
-            .ok_or_else(|| crate::Error::NotEnoughArguments)?;
+            .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
         let buffer;
         (buffer, state) = evaluate_to_buffer(state, first_arg.input, stderr, true)?;
         match mkstemp(buffer) {
@@ -1510,19 +1525,20 @@ impl MacroImplementation for M4exitMacro {
             let buffer;
             (buffer, state) = evaluate_to_buffer(state, first_arg.input, stderr, true)?;
             let (_, exit_code) = nom::combinator::all_consuming(parse_index)(&buffer)?;
-            let exit_code: i32 =
-                i32::try_from(exit_code).map_err(|e| crate::Error::Parsing(e.to_string()))?;
+            let exit_code: i32 = i32::try_from(exit_code).map_err(|e| {
+                crate::Error::new(crate::ErrorKind::Parsing).add_context(e.to_string())
+            })?;
             if exit_code == 0 && state.exit_error {
-                return Err(crate::Error::Exit(1));
+                return Err(crate::Error::new(crate::ErrorKind::Exit(1)));
             } else {
-                return Err(crate::Error::Exit(exit_code));
+                return Err(crate::Error::new(crate::ErrorKind::Exit(exit_code)));
             }
         }
 
         if state.exit_error {
-            return Err(crate::Error::Exit(1));
+            return Err(crate::Error::new(crate::ErrorKind::Exit(1)));
         } else {
-            return Err(crate::Error::Exit(0));
+            return Err(crate::Error::new(crate::ErrorKind::Exit(0)));
         }
     }
 }
@@ -1545,7 +1561,7 @@ impl MacroImplementation for M4wrapMacro {
             .args
             .into_iter()
             .next()
-            .ok_or_else(|| crate::Error::NotEnoughArguments)?;
+            .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
         let first_arg_text;
         (first_arg_text, state) = evaluate_to_buffer(state, first_arg.input, stderr, true)?;
         state.m4wrap.push(first_arg_text);
@@ -1584,7 +1600,7 @@ impl MacroImplementation for SyscmdMacro {
             .args
             .into_iter()
             .next()
-            .ok_or_else(|| crate::Error::NotEnoughArguments)?;
+            .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
         let first_arg_text;
         (first_arg_text, state) = evaluate_to_buffer(state, first_arg.input, stderr, true)?;
         let status = system(&first_arg_text)?;
@@ -1648,7 +1664,7 @@ impl MacroImplementation for DivertMacro {
                 let (_, divert_number) =
                     nom::combinator::all_consuming(parse_integer)(&first_arg_text)?;
                 if divert_number > 9 {
-                    return Err(crate::Error::Parsing(format!(
+                    return Err(crate::Error::new(crate::ErrorKind::Parsing).add_context(format!(
                         "Error parsing first argument for `divert` macro with value {divert_number}, should be between 0 and 9"
                     )));
                 }
@@ -1776,6 +1792,10 @@ fn evaluate_to_buffer(
             let (remaining, symbol) = Symbol::parse(&state.parse_config)(&input)?;
             log::debug!("evaluate_to_buffer() evaluating {symbol:?}");
             state = evaluate(state, symbol, &mut output, stderr, unwrap_quotes)?;
+            log::debug!(
+                "evaluate_to_buffer() finished evaluating to output buffer {:?}",
+                String::from_utf8_lossy(&output)
+            );
 
             input = remaining.to_vec();
         }
@@ -1934,10 +1954,10 @@ pub(crate) fn evaluate(
                         .get(&m.name)
                         .and_then(|e| e.last().cloned())
                         .expect("There should always be a definition for a parsed macro");
-                    state =
-                        definition
-                            .implementation
-                            .evaluate(state, &mut new_buffer, stderr, m)?;
+                    state = definition
+                        .implementation
+                        .evaluate(state, &mut new_buffer, stderr, m)
+                        .add_context(|| format!("Error evaluating macro {name:?}"))?;
                     log::debug!(
                         "evaluate() finished evaluating macro {name:?}, new_buffer: {:?}",
                         String::from_utf8_lossy(&new_buffer)

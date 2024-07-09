@@ -821,17 +821,11 @@ pub(crate) fn process_streaming<'c, R: Read>(
     Ok(state)
 }
 
-/// NOTE: This will append a b'\0' to the end of `input`
 pub fn parse_symbols_complete<'i>(
     config: &ParseConfig,
     // Needs to be a reference so can return a Symbol<'i>.
-    // Needs to be a Vec so we can insert a b'0' in it so it will be considered a complete string
-    // for parsing purposes.
-    input: &'i mut Vec<u8>,
+    input: &'i [u8],
 ) -> crate::error::Result<Vec<Symbol<'i>>> {
-    if input.last() != Some(&b'\0') {
-        input.push(b'\0');
-    }
     let mut remaining: &[u8] = input;
     let mut symbols = Vec::new();
     while !remaining.is_empty() {
@@ -1599,6 +1593,13 @@ mod test {
         let (remaining, matched) = parse_dnl(b" hello world\n\0").unwrap();
         assert_eq!(" hello world\n", utf8(matched));
         assert_eq!("\0", utf8(remaining));
+    }
+
+    #[test]
+    fn test_parse_dnl_end_newline() {
+        let (remaining, matched) = parse_dnl(b"hello world\n").unwrap();
+        assert_eq!("hello world\n", utf8(matched));
+        assert_eq!("", utf8(remaining));
     }
 
     #[test]

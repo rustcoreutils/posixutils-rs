@@ -5,6 +5,7 @@ use std::{
     rc::Rc,
 };
 
+/// A reference counted reference to [`Output`] which can be cloned.
 #[derive(Clone, Default)]
 pub(crate) struct OutputRef(Rc<RefCell<Output>>);
 

@@ -1885,6 +1885,9 @@ pub(crate) fn evaluate(
         let symbols = if first {
             vec![root_symbol.take().expect("First iteration")]
         } else {
+            if buffer.last() != Some(&b'\0') {
+                buffer.push(b'\0');
+            }
             // TODO: parses symbols twice, not ideal! Need to find a way to make an owned
             // Symbol so it can be used in this loop. Or put some kind of self rererential
             // struct in the stack containing the symbol and the buffer it came from.

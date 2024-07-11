@@ -3,6 +3,6 @@ wow
 x
 define(`y',`divert(1)fantastic')dnl
 y
-define(`z',`divert(-1)helloagain')dnl
+define(`z',`divert(-1)again divert(0) wow')dnl
 z
 end

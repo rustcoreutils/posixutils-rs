@@ -17,7 +17,6 @@ env_logger = "0.11.3"
 errno = "0.3.9"
 
 [dev-dependencies]
-insta = { version = "1.38.0", features = ["json"] }
 test-log = { version = "0.2.16", default-features=false, features=["log"]}
 env_logger = "0.11.3"
 similar-asserts = "1.5.0"

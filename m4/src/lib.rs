@@ -138,21 +138,14 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
     let mut output = state.output.clone();
     if args.files.is_empty() {
         log::info!("Processing input from STDIN");
-        state = lexer::process_streaming(
-            state,
-            evaluate::evaluate,
-            std::io::stdin(),
-            &mut output,
-            &mut stderr,
-            true,
-        )?;
+        state =
+            evaluate::process_streaming(state, std::io::stdin(), &mut output, &mut stderr, true)?;
     } else {
         for file_path in args.files {
             state.file.push(file_path.clone());
             log::info!("Processing input from {file_path:?}");
-            state = lexer::process_streaming(
+            state = evaluate::process_streaming(
                 state,
-                evaluate::evaluate,
                 std::fs::File::open(file_path)?,
                 &mut output,
                 &mut stderr,

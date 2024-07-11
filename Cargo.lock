@@ -440,19 +440,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "insta"
-version = "1.38.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3eab73f58e59ca6526037208f0e98851159ec1633cf17b6cd2e1f2c3fd5d53cc"
-dependencies = [
- "console",
- "lazy_static",
- "linked-hash-map",
- "serde",
- "similar",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -490,12 +477,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "linked-hash-map"
-version = "0.5.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0717cef1bc8b636c6e1c1bbdefc09e6322da8a9321966e8928ef80d20f7f770f"
-
-[[package]]
 name = "locale_config"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -522,7 +503,6 @@ dependencies = [
  "clap",
  "env_logger",
  "errno",
- "insta",
  "libc",
  "log",
  "m4-test-manager",

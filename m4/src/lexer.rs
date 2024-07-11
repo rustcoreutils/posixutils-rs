@@ -17,12 +17,9 @@
 //!
 use nom::IResult;
 
-use std::{
-    collections::HashMap,
-    io::{Read, Write},
-};
+use std::{collections::HashMap, io::Write};
 
-use crate::evaluate::{BuiltinMacro, Evaluator, State};
+use crate::evaluate::BuiltinMacro;
 
 #[derive(Clone, Hash, Debug)]
 #[cfg_attr(test, derive(PartialEq))]
@@ -707,126 +704,6 @@ pub fn parse_dnl(input: &[u8]) -> IResult<&[u8], &[u8]> {
     Ok((remaining, &input[0..(input.len() - remaining.len())]))
 }
 
-/// `evaluate` is a function which takes the current [`ParseConfig`], and evaluates the provided
-/// [`Symbol`] writing output to `writer`, and returns a [`ParseConfig`] which has been modified
-/// during the process of evaluation (for example a new macro was defined, or changequote).
-///
-/// Arguments:
-/// - `unwrap_quotes` - Whether to unwrap quotes during evaluation.
-/// - `root` - Whether this is the root invocation of this function, used for features like the
-///   [`DivertMacro`](crate::evaluate::DivertMacro).
-pub(crate) fn process_streaming<'c, R: Read>(
-    mut state: State,
-    evaluator: impl Evaluator,
-    mut reader: R,
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-    unwrap_quotes: bool,
-) -> crate::error::Result<State> {
-    let buffer_size = 10;
-    let buffer_growth_factor = 2;
-    let mut buffer = circular::Buffer::with_capacity(buffer_size);
-    let mut eof = false;
-
-    // Here we have a buffer of input which we attempt to parse as a Symbol. If parsing fails as
-    // Incomplete, then we enlarge the buffer and pull in more input, and retry until success, or
-    // we reach the end of input.
-    loop {
-        if eof {
-            break;
-        }
-        let read = reader.read(buffer.space()).unwrap();
-
-        // Insert an EOF null byte, this should not be used in any string encoding so it should be
-        // fine, the streaming parsers rely on this to know whether they have reached the end of
-        // the input.
-        let fill_amount = if read == 0 {
-            log::trace!("process_streaming() inserting EOF");
-            let eof_bytes = &[b'\0'];
-            let space = buffer.space();
-            assert!(space.len() > eof_bytes.len());
-            space[0..eof_bytes.len()].copy_from_slice(eof_bytes);
-            eof = true;
-            eof_bytes.len()
-        } else {
-            read
-        };
-        buffer.fill(fill_amount);
-
-        loop {
-            // TODO: what to do if the buffer is empty after previous iteration?
-            let input = buffer.data();
-
-            if input.is_empty() {
-                break;
-            }
-
-            // dnl is active, so we need to parse the input until the moment when it should be
-            // disabled (and skip evaluating this input).
-            let remaining = if state.parse_config.dnl && input.first() != Some(&b'\0') {
-                let result = parse_dnl(input);
-                let remaining = match result {
-                    Ok((remaining, _parsed)) => remaining,
-                    Err(nom::Err::Incomplete(_)) => {
-                        let new_capacity = buffer_growth_factor * buffer.capacity();
-                        buffer.grow(new_capacity);
-                        break;
-                    }
-                    Err(error) => {
-                        return Err(crate::error::Error::new(crate::ErrorKind::Parsing)
-                            .add_context(format!("Error parsing dnl {error}")))
-                    }
-                };
-
-                // We don't want to disable dnl if we're evaluating something nested.
-                if remaining.first() != Some(&b'\0') {
-                    log::debug!("process_streaming() we are at end of dnl, disabling dnl");
-                    state.parse_config.dnl = false;
-                }
-
-                remaining
-            } else {
-                let result = Symbol::parse(&state.parse_config)(input);
-                let (remaining, symbol) = match result {
-                    Ok(ok) => ok,
-                    Err(nom::Err::Incomplete(_)) => {
-                        let new_capacity = buffer_growth_factor * buffer.capacity();
-                        buffer.grow(new_capacity);
-                        break;
-                    }
-                    Err(error) => {
-                        return Err(crate::error::Error::new(crate::ErrorKind::Parsing)
-                            .add_context(match error {
-                                nom::Err::Error(error) | nom::Err::Failure(error) => {
-                                    let input = std::str::from_utf8(error.input)
-                                        .map(|s| format!("{s:?}"))
-                                        .unwrap_or_else(|_| format!("{:?}", error.input));
-                                    format!(
-                                        "Parsing Error for input {}, code: {:?}",
-                                        input, error.code
-                                    )
-                                }
-                                nom::Err::Incomplete(_) => error.to_string(),
-                            }));
-                    }
-                };
-                let symbol_input = &input[..(input.len() - remaining.len())];
-
-                if matches!(symbol, Symbol::Eof) {
-                    return Ok(state);
-                }
-
-                state = evaluator.evaluate(state, symbol_input, stdout, stderr, unwrap_quotes)?;
-                remaining
-            };
-
-            buffer.consume(input.len() - remaining.len());
-        }
-    }
-
-    Ok(state)
-}
-
 pub fn parse_symbols_complete<'i>(
     config: &ParseConfig,
     // Needs to be a reference so can return a Symbol<'i>.
@@ -871,19 +748,17 @@ pub fn unquote<'c, 'i>(config: &'c ParseConfig, input: &'i [u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod test {
-    use crate::evaluate::State;
     use crate::lexer::{
-        parse_inside_brackets, parse_macro_args, parse_symbols_complete, unquote, Symbol,
-        DEFAULT_COMMENT_CLOSE_TAG, DEFAULT_COMMENT_OPEN_TAG,
+        parse_inside_brackets, parse_macro_args, unquote, Symbol, DEFAULT_COMMENT_CLOSE_TAG,
+        DEFAULT_COMMENT_OPEN_TAG,
     };
     use crate::test_utils::{macro_parse_config, macro_parse_configs, utf8};
     use std::collections::HashMap;
-    use std::io::Write;
     use test_log::test;
 
     use super::{
-        parse_comment, parse_dnl, parse_text, process_streaming, Macro, MacroName, ParseConfig,
-        Quoted, DEFAULT_QUOTE_CLOSE_TAG, DEFAULT_QUOTE_OPEN_TAG,
+        parse_comment, parse_dnl, parse_text, Macro, MacroName, ParseConfig, Quoted,
+        DEFAULT_QUOTE_CLOSE_TAG, DEFAULT_QUOTE_OPEN_TAG,
     };
 
     struct SymbolsAsStreamSnapshot {
@@ -899,51 +774,6 @@ mod test {
             write!(f, "STDERR:\n")?;
             self.stderr.fmt(f)?;
             Ok(())
-        }
-    }
-
-    fn snapshot_symbols_as_stream(
-        initial_config: ParseConfig,
-        input: &[u8],
-    ) -> SymbolsAsStreamSnapshot {
-        // TODO: looks as though GNU m4 might drop the newline? Or is it due to the different way
-        // that we call it in the integration tests, it gets lost through piping? Will it show if
-        // we run with pipe with cargo run?
-        log::debug!("snapshot_symbols_as_stream() input: {:?}", utf8(input));
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        let mut state = State::default();
-
-        fn evaluate(
-            state: State,
-            input: &[u8],
-            stdout: &mut dyn Write,
-            _stderror: &mut dyn Write,
-            _unwrap_quotes: bool,
-        ) -> crate::error::Result<State> {
-            let mut input = input.to_vec();
-            let input_eof = if input.last() != Some(&b'\0') {
-                input.push(b'\0');
-                false
-            } else {
-                true
-            };
-            let mut symbols = parse_symbols_complete(&state.parse_config, &input)?;
-            if !input_eof {
-                symbols.pop();
-            }
-            stdout
-                .write_all(format!("{symbols:#?}").as_bytes())
-                .unwrap();
-            stdout.write(b"\n").unwrap();
-            Ok(state)
-        }
-        state.parse_config = initial_config;
-        process_streaming(state, evaluate, input, &mut stdout, &mut stderr, true).unwrap();
-
-        SymbolsAsStreamSnapshot {
-            stdout: String::from_utf8(stdout).unwrap(),
-            stderr: String::from_utf8(stderr).unwrap(),
         }
     }
 
@@ -1675,22 +1505,6 @@ mod test {
     }
 
     #[test]
-    fn test_parse_stream_symbols_dnl() {
-        insta::assert_snapshot!(snapshot_symbols_as_stream(
-            ParseConfig {
-                dnl: true,
-                ..ParseConfig::default()
-            },
-            b" this is some text\n"),
-            @r###"
-        STDOUT:
-
-        STDERR:
-        "###
-        );
-    }
-
-    #[test]
     fn test_parse_macro_args() {
         let (remaining, args) = parse_macro_args(&ParseConfig::default())(b"a,b,c)").unwrap();
         assert_eq!(")", utf8(remaining));
@@ -1704,12 +1518,6 @@ mod test {
             .collect();
         let args_refs = args.iter().map(|arg| arg.as_str()).collect::<Vec<_>>();
         assert_eq!(vec!["a", "b", "c"], args_refs);
-    }
-
-    #[test]
-    fn test_parse_stream_symbols_evaluation_order() {
-        let f = std::fs::read("fixtures/integration_tests/evaluation_order.m4").unwrap();
-        insta::assert_snapshot!(snapshot_symbols_as_stream(ParseConfig::default(), &f));
     }
 
     #[test]

@@ -1,3 +1,3 @@
-stdout=\n# This will be included\n\n# divert 1\n\n# divert 2\n\n# divert 2\n\n# This will be included\n
+stdout=\n# divert 0 root 1\n# This will be included\n\n# divert 0 root 2\n\n# divert 1\n\n# divert 2 include\n\n# divert 2 include\n\n# divert 3 root\n# This will be included\n
 stderr=
 status=0

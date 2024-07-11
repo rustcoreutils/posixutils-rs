@@ -34,8 +34,8 @@ fn test_bc_with_math_library(program: &str, expected_output: &str) {
 macro_rules! test_bc {
     ($test_name:ident) => {
         test_bc(
-            include_str!(concat!("bc/", stringify!($test_name), ".bc")),
-            include_str!(concat!("bc/", stringify!($test_name), ".out")),
+            include_str!(concat!("./", stringify!($test_name), ".bc")),
+            include_str!(concat!("./", stringify!($test_name), ".out")),
         )
     };
 }
@@ -43,8 +43,8 @@ macro_rules! test_bc {
 macro_rules! test_bc_l {
     ($test_name:ident) => {
         test_bc_with_math_library(
-            include_str!(concat!("bc/", stringify!($test_name), ".bc")),
-            include_str!(concat!("bc/", stringify!($test_name), ".out")),
+            include_str!(concat!("./", stringify!($test_name), ".bc")),
+            include_str!(concat!("./", stringify!($test_name), ".out")),
         )
     };
 }

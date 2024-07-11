@@ -1916,6 +1916,7 @@ pub(crate) fn evaluate(
                 // BUG: diverts here don't work
                 // Diverts that occur during evaluation here don't take effect because we aren't using Output as stdout.
                 // To solve this we should use Output as stdout with its own stdout temporarily directed into this buffer.
+                // Oh perhaps we only want this to happen on include macros
                 state = definition
                     .implementation
                     .evaluate(state, &mut new_buffer, stderr, m)

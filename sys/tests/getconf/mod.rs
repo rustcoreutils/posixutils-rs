@@ -34,11 +34,11 @@ fn check_output_is_positive_integer(_: &TestPlan, output: &Output) {
 }
 
 #[test]
-fn test_sysconf_arg_max() {
+fn sysconf_arg_max() {
     run_getconf_test(vec!["ARG_MAX"], 0, check_output_is_positive_integer);
 }
 
 #[test]
-fn test_pathconf_link_max() {
+fn pathconf_link_max() {
     run_getconf_test(vec!["LINK_MAX", "/"], 0, check_output_is_positive_integer);
 }

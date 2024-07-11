@@ -1853,6 +1853,7 @@ pub(crate) fn evaluate(
         true
     };
 
+    // Loop to evaluate iteratively expand macros.
     let mut i = 0;
     loop {
         let mut last = false;
@@ -1913,18 +1914,34 @@ pub(crate) fn evaluate(
                     .get(&m.name)
                     .and_then(|e| e.last().cloned())
                     .expect("There should always be a definition for a parsed macro");
-                // BUG: diverts here don't work
-                // Diverts that occur during evaluation here don't take effect because we aren't using Output as stdout.
-                // To solve this we should use Output as stdout with its own stdout temporarily directed into this buffer.
-                // Oh perhaps we only want this to happen on include macros
+
+                // BUG: diverts here don't work Diverts that occur during evaluation here don't take
+                // effect because we aren't using Output as stdout. To solve this perhaps we should
+                // use Output as stdout with its own stdout temporarily directed into this buffer.
+                // That's what I'm trying here.
+                let temp_output_buffer = output::TemporaryOutputBuffer::new();
+                let old_output = state
+                    .output
+                    .replace_output(Box::new(temp_output_buffer.clone()));
+                let mut output = state.output.clone();
                 state = definition
                     .implementation
-                    .evaluate(state, &mut new_buffer, stderr, m)
+                    .evaluate(state, &mut output, stderr, m)
                     .add_context(|| format!("Error evaluating macro {name:?}"))?;
+                
+                // BUG: This doesn't work because now the state contains the last divert number, which
+                // gets used for the `stdout` in this context.
+                // What happens when the include is nested in a define?
+
+                // What if the state changes to output are delayed until after writing?
+
+                state.output.replace_output(old_output);
+                new_buffer.extend_from_slice(&temp_output_buffer.into_inner().unwrap());
                 log::debug!(
                     "evaluate() finished evaluating macro {name:?}, new_buffer: {:?}",
                     String::from_utf8_lossy(&new_buffer)
                 );
+
                 if state.parse_config.dnl {
                     let matched;
                     (remaining, matched) = parse_dnl(remaining)?;

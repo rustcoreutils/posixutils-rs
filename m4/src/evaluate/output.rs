@@ -218,6 +218,10 @@ impl Write for TemporaryOutputBuffer {
 }
 
 impl TemporaryOutputBuffer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     pub fn with_capacity(capacity: usize) -> Self {
         Self(Rc::new(RefCell::new(Vec::with_capacity(capacity))))
     }

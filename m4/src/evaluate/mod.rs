@@ -1841,6 +1841,9 @@ pub(crate) fn evaluate(
     // If the input was not a macro we want to somehow skip this in the next iteration.
     let mut buffer = input.to_vec();
 
+    // Whether the end of the input is EOF.
+    // TODO: we could refactor this to be either a complete or not complete parser
+    // based on an argument so that we can avoid parsing symbols twice.
     let input_eof = if buffer.last() != Some(&b'\0') {
         buffer.push(b'\0');
         false
@@ -1853,7 +1856,8 @@ pub(crate) fn evaluate(
         let mut last = false;
         log::debug!("Looping {i} {:?}", String::from_utf8_lossy(&buffer));
         let mut new_buffer: Vec<u8> = Vec::new();
-        let (remaining, symbol) = Symbol::parse(&state.parse_config)(&buffer)?;
+
+        let (mut remaining, symbol) = Symbol::parse(&state.parse_config)(&buffer)?;
         let is_macro = matches!(symbol, Symbol::Macro(_));
         match symbol {
             Symbol::Comment(comment) => new_buffer.write_all(comment)?,
@@ -1914,6 +1918,13 @@ pub(crate) fn evaluate(
                     "evaluate() finished evaluating macro {name:?}, new_buffer: {:?}",
                     String::from_utf8_lossy(&new_buffer)
                 );
+                if state.parse_config.dnl {
+                    let matched;
+                    (remaining, matched) = parse_dnl(remaining)?;
+                    if input_eof || matched.last() == Some(&b'\n') {
+                        state.parse_config.dnl = false;
+                    }
+                }
             }
             Symbol::Newline => new_buffer.write_all(b"\n")?,
             Symbol::Eof => {

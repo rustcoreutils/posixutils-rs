@@ -361,6 +361,7 @@ impl<'c, 'i: 'c> Symbol<'i> {
         config: &'c ParseConfig,
     ) -> impl Fn(&'i [u8]) -> IResult<&'i [u8], Symbol<'i>> + 'c {
         move |input: &'i [u8]| {
+            log::debug!("Symbol::parse() dnl {}", config.dnl);
             if config.symbol_recursion_limit == 0 {
                 log::error!("Symbol recursion limit reached");
                 return Err(nom::Err::Failure(nom::error::Error::new(
@@ -371,19 +372,7 @@ impl<'c, 'i: 'c> Symbol<'i> {
             let mut config = config.clone();
             config.symbol_recursion_limit -= 1;
 
-            log::trace!(
-                "Symbol::parse() {:?}, current_macro_names: {:?}",
-                String::from_utf8_lossy(input),
-                {
-                    let mut names = config
-                        .macro_parse_configs
-                        .iter()
-                        .map(|n| String::from_utf8_lossy(&n.0 .0))
-                        .collect::<Vec<_>>();
-                    names.sort();
-                    names
-                }
-            );
+            log::trace!("Symbol::parse() {:?}", String::from_utf8_lossy(input),);
             if input.is_empty() {
                 return Err(nom::Err::Incomplete(nom::Needed::Unknown));
             }
@@ -693,7 +682,7 @@ fn parse_comment<'a, 'b>(
 
 /// Parse all input until either a newline or an EOF.
 pub fn parse_dnl(input: &[u8]) -> IResult<&[u8], &[u8]> {
-    log::trace!("parse_dnl() input: {:?}", String::from_utf8_lossy(input));
+    log::debug!("parse_dnl() input: {:?}", String::from_utf8_lossy(input));
     let (remaining, _) = nom::bytes::streaming::take_till(|c| c == b'\0' || c == b'\n')(input)?;
     let (remaining, _) = nom::branch::alt((
         nom::bytes::streaming::tag("\n"),

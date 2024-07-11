@@ -1885,6 +1885,7 @@ pub(crate) fn evaluate(
                         //   ^ should be evaluated
                         // x(`a,b`)
                         //   ^^^^^ should not be evaluated
+                        // BUG: diverts here don't work
                         (buffer, state) = evaluate_to_buffer(state, arg.input, stderr, false)?;
                         arg_buffer.extend(buffer.into_iter());
 
@@ -1912,6 +1913,9 @@ pub(crate) fn evaluate(
                     .get(&m.name)
                     .and_then(|e| e.last().cloned())
                     .expect("There should always be a definition for a parsed macro");
+                // BUG: diverts here don't work
+                // Diverts that occur during evaluation here don't take effect because we aren't using Output as stdout.
+                // To solve this we should use Output as stdout with its own stdout temporarily directed into this buffer.
                 state = definition
                     .implementation
                     .evaluate(state, &mut new_buffer, stderr, m)

@@ -749,6 +749,28 @@ impl IncludeMacro {
             Ok((None, state))
         }
     }
+
+    fn evaluate_impl(
+        path: PathBuf,
+        mut state: State,
+        stdout: &mut dyn Write,
+        stderr: &mut dyn Write,
+    ) -> crate::error::Result<State> {
+        state.file.push(path.clone());
+        state = lexer::process_streaming(
+            state,
+            evaluate,
+            std::fs::File::open(&path)
+                .map_err(crate::Error::from)
+                .add_context(|| format!("Error opening file {path:?}"))?,
+            stdout,
+            stderr,
+            false,
+        )
+        .add_context(|| format!("Error processing included file {path:?}"))?;
+        state.file.pop();
+        Ok(state)
+    }
 }
 
 impl MacroImplementation for IncludeMacro {
@@ -762,21 +784,8 @@ impl MacroImplementation for IncludeMacro {
         let path;
         (path, state) = Self::get_file_path(m, state, stderr)?;
         if let Some(path) = path {
-            state.file.push(path.clone());
-            state = lexer::process_streaming(
-                state,
-                evaluate,
-                std::fs::File::open(&path)
-                    .map_err(crate::Error::from)
-                    .add_context(|| format!("Error opening file {path:?}"))?,
-                stdout,
-                stderr,
-                false,
-            )
-            .add_context(|| format!("Error processing included file {path:?}"))?;
-            state.file.pop();
+            state = Self::evaluate_impl(path, state, stdout, stderr)?;
         }
-
         Ok(state)
     }
 }
@@ -798,19 +807,7 @@ impl MacroImplementation for SincludeMacro {
         (path, state) = IncludeMacro::get_file_path(m, state, stderr)?;
         if let Some(path) = path {
             if path.is_file() {
-                state.file.push(path.clone());
-                state = lexer::process_streaming(
-                    state,
-                    evaluate,
-                    std::fs::File::open(&path)
-                        .map_err(crate::Error::from)
-                        .add_context(|| format!("Error opening file {path:?}"))?,
-                    stdout,
-                    stderr,
-                    false,
-                )
-                .add_context(|| format!("Error processing included file {path:?}"))?;
-                state.file.pop();
+                state = IncludeMacro::evaluate_impl(path, state, stdout, stderr)?;
             }
         }
 

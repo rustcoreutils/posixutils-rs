@@ -361,7 +361,7 @@ impl<'c, 'i: 'c> Symbol<'i> {
         config: &'c ParseConfig,
     ) -> impl Fn(&'i [u8]) -> IResult<&'i [u8], Symbol<'i>> + 'c {
         move |input: &'i [u8]| {
-            log::debug!("Symbol::parse() dnl {}", config.dnl);
+            log::trace!("Symbol::parse() {:?}", String::from_utf8_lossy(input),);
             if config.symbol_recursion_limit == 0 {
                 log::error!("Symbol recursion limit reached");
                 return Err(nom::Err::Failure(nom::error::Error::new(
@@ -372,7 +372,6 @@ impl<'c, 'i: 'c> Symbol<'i> {
             let mut config = config.clone();
             config.symbol_recursion_limit -= 1;
 
-            log::trace!("Symbol::parse() {:?}", String::from_utf8_lossy(input),);
             if input.is_empty() {
                 return Err(nom::Err::Incomplete(nom::Needed::Unknown));
             }

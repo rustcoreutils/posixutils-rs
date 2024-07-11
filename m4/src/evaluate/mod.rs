@@ -1919,24 +1919,31 @@ pub(crate) fn evaluate(
                 // effect because we aren't using Output as stdout. To solve this perhaps we should
                 // use Output as stdout with its own stdout temporarily directed into this buffer.
                 // That's what I'm trying here.
-                let temp_output_buffer = output::TemporaryOutputBuffer::new();
-                let old_output = state
-                    .output
-                    .replace_output(Box::new(temp_output_buffer.clone()));
-                let mut output = state.output.clone();
                 state = definition
                     .implementation
-                    .evaluate(state, &mut output, stderr, m)
+                    .evaluate(state, &mut new_buffer, stderr, m)
                     .add_context(|| format!("Error evaluating macro {name:?}"))?;
-                
+
                 // BUG: This doesn't work because now the state contains the last divert number, which
                 // gets used for the `stdout` in this context.
                 // What happens when the include is nested in a define?
 
                 // What if the state changes to output are delayed until after writing?
 
-                state.output.replace_output(old_output);
-                new_buffer.extend_from_slice(&temp_output_buffer.into_inner().unwrap());
+                // THIS ENTIRE FUNCTION IS WRONG?????????????????????????????????????????
+
+                // If we restore the state of the divert after the macro call, then that will be wrong.
+
+                // Content in new_buffer only goes to stdout
+
+                // buffer contains FUCK ME
+
+                // 1. buffer = " end" new_buffer = ""
+                // 2. buffer = " end" new_buffer = "hello divert(-1)\0"
+                // 2. new_buffer = "hello divert(-1) end"
+
+                // Content only goes into new_buffer if it is intended to go into stdout.
+                // This can only be decided correctly at the time of evaluation. This is the only place where output is actually written.
                 log::debug!(
                     "evaluate() finished evaluating macro {name:?}, new_buffer: {:?}",
                     String::from_utf8_lossy(&new_buffer)
@@ -1960,9 +1967,11 @@ pub(crate) fn evaluate(
         }
 
         if is_macro {
+            // It was a macro, and we should re-evaluate the output of the macro.
             new_buffer.extend(remaining.into_iter());
             buffer = new_buffer;
         } else {
+            // It wasn't a macro, we can write it to output.
             stdout.write_all(&new_buffer)?;
             buffer = remaining.to_vec();
         }

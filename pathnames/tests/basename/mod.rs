@@ -10,58 +10,46 @@
 use plib::{run_test, TestPlan};
 
 #[test]
-fn test_dirname_basic() {
+fn basename_basic() {
     run_test(TestPlan {
-        cmd: String::from("dirname"),
+        cmd: String::from("basename"),
         args: vec![String::from("/usr/bin/env")],
         stdin_data: String::new(),
-        expected_out: String::from("/usr/bin\n"),
+        expected_out: String::from("env\n"),
         expected_err: String::new(),
         expected_exit_code: 0,
     });
 }
 
 #[test]
-fn test_dirname_root() {
+fn basename_trailing_slash() {
     run_test(TestPlan {
-        cmd: String::from("dirname"),
-        args: vec![String::from("/")],
-        stdin_data: String::new(),
-        expected_out: String::from("/\n"),
-        expected_err: String::new(),
-        expected_exit_code: 0,
-    });
-}
-
-#[test]
-fn test_dirname_no_directory_component() {
-    run_test(TestPlan {
-        cmd: String::from("dirname"),
-        args: vec![String::from("filename")],
-        stdin_data: String::new(),
-        expected_out: String::from(".\n"),
-        expected_err: String::new(),
-        expected_exit_code: 0,
-    });
-}
-
-#[test]
-fn test_dirname_trailing_slash() {
-    run_test(TestPlan {
-        cmd: String::from("dirname"),
+        cmd: String::from("basename"),
         args: vec![String::from("/usr/bin/")],
         stdin_data: String::new(),
-        expected_out: String::from("/usr\n"),
+        expected_out: String::from("bin\n"),
         expected_err: String::new(),
         expected_exit_code: 0,
     });
 }
 
 #[test]
-fn test_dirname_empty_path() {
+fn basename_with_suffix() {
     run_test(TestPlan {
-        cmd: String::from("dirname"),
-        args: vec![String::from("")],
+        cmd: String::from("basename"),
+        args: vec![String::from("/usr/bin/env"), String::from("v")],
+        stdin_data: String::new(),
+        expected_out: String::from("en\n"),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn basename_current_directory() {
+    run_test(TestPlan {
+        cmd: String::from("basename"),
+        args: vec![String::from(".")],
         stdin_data: String::new(),
         expected_out: String::from(".\n"),
         expected_err: String::new(),
@@ -70,12 +58,12 @@ fn test_dirname_empty_path() {
 }
 
 #[test]
-fn test_dirname_special_characters() {
+fn basename_empty_path() {
     run_test(TestPlan {
-        cmd: String::from("dirname"),
-        args: vec![String::from("/path/to/some$special&chars*file")],
+        cmd: String::from("basename"),
+        args: vec![String::from("")],
         stdin_data: String::new(),
-        expected_out: String::from("/path/to\n"),
+        expected_out: String::from("\n"),
         expected_err: String::new(),
         expected_exit_code: 0,
     });

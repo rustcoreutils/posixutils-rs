@@ -1,6 +1,7 @@
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::process;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::{collections::HashMap, io::Write, rc::Rc};
@@ -589,7 +590,13 @@ impl MacroImplementation for UserDefinedMacro {
                             new_buffer.write_all(&m.name.0)?;
                         } else {
                             let arg = m.args.get(i - 1).expect("Checked args length");
-                            state = evaluate(state, arg.input, &mut new_buffer, stderr, true)?;
+                            state = process_streaming(
+                                state,
+                                std::io::Cursor::new(arg.input),
+                                &mut new_buffer,
+                                stderr,
+                                true,
+                            )?;
                         }
                         log::debug!(
                             "UserDefinedMacro::evaluate() Replacing ${i} with {:?}",
@@ -604,7 +611,13 @@ impl MacroImplementation for UserDefinedMacro {
                         m.args
                     );
                     for (i, arg) in m.args.iter().enumerate() {
-                        state = evaluate(state, arg.input, &mut buffer, stderr, true)?;
+                        state = process_streaming(
+                            state,
+                            std::io::Cursor::new(arg.input),
+                            &mut buffer,
+                            stderr,
+                            true,
+                        )?;
                         if i < m.args.len() - 1 {
                             buffer.write_all(b",")?;
                         }
@@ -615,7 +628,13 @@ impl MacroImplementation for UserDefinedMacro {
                     let mut new_buffer: Vec<u8> = Vec::new();
                     for (i, arg) in m.args.iter().enumerate() {
                         new_buffer.write_all(&state.parse_config.quote_open_tag)?;
-                        state = evaluate(state, arg.input, &mut new_buffer, stderr, true)?;
+                        state = process_streaming(
+                            state,
+                            std::io::Cursor::new(arg.input),
+                            &mut new_buffer,
+                            stderr,
+                            true,
+                        )?;
                         new_buffer.write_all(&state.parse_config.quote_close_tag)?;
                         if i < m.args.len() - 1 {
                             new_buffer.write_all(b",")?;
@@ -1029,8 +1048,9 @@ impl MacroImplementation for IfelseMacro {
                     4 | 5 => {
                         args.next();
                         log::debug!("IfelseMacro::evaluate() evaluating argument {}", i * 3 + 3);
-                        let input = args.next().expect("at least 4 args").input;
-                        state = evaluate(state, input, stdout, stderr, true)?;
+                        let input =
+                            std::io::Cursor::new(args.next().expect("at least 4 args").input);
+                        state = process_streaming(state, input, stdout, stderr, true)?;
                         if args_len == 5 {
                             write!(
                                 stderr,
@@ -1763,7 +1783,8 @@ fn evaluate_to_buffer(
     unwrap_quotes: bool,
 ) -> Result<(Vec<u8>, State)> {
     let mut output = Vec::with_capacity(input.len());
-    state = evaluate(state, input, &mut output, stderr, unwrap_quotes)?;
+    let input = std::io::Cursor::new(input);
+    state = process_streaming(state, input, &mut output, stderr, unwrap_quotes)?;
     log::debug!(
         "evaluate_to_buffer() Evaluated to buffer {:?}",
         String::from_utf8_lossy(&output)
@@ -1771,64 +1792,6 @@ fn evaluate_to_buffer(
     Ok((output, state))
 }
 
-pub(crate) trait Evaluator {
-    fn evaluate(
-        &self,
-        state: State,
-        input: &[u8],
-        stdout: &mut dyn Write,
-        stderr: &mut dyn Write,
-        unwrap_quotes: bool,
-    ) -> Result<State>;
-}
-
-impl<T> Evaluator for T
-where
-    T: Fn(State, &[u8], &mut dyn Write, &mut dyn Write, bool) -> Result<State>,
-{
-    fn evaluate(
-        &self,
-        state: State,
-        input: &[u8],
-        stdout: &mut dyn Write,
-        stderr: &mut dyn Write,
-        unwrap_quotes: bool,
-    ) -> Result<State> {
-        self(state, input, stdout, stderr, unwrap_quotes)
-    }
-}
-
-/// It seems like macro arguments are parsed in their entirety including unwrapping quotes inside a
-/// define
-///
-///
-/// From the manual:
-///
-/// > If the token matches the name of a macro, then the token shall be replaced by the macro's
-/// defining text, if any, and rescanned for matching macro names. Once no portion of the token
-/// matches the name of a macro, it shall be written to standard output. Macros may have arguments,
-/// in which case the arguments shall be substituted into the defining text before it is rescanned.
-///
-/// great(fantastic)
-///
-/// It's a macro so evaluate it.
-///
-/// "hello fantastic"
-/// contains a macro so don't output, and evaluate the symbols
-///
-/// "hello" it's a macro so evaluate it
-/// "world world fantastic"
-/// "world" it's a macro so evaluate it
-/// "amazing amazing fantastic"
-/// contains no macros so break and output to stdout
-///
-///
-/// The input to the define macro should only have its quotes unwrapped, not subsequently
-/// evaluated. Perhaps input from unwrapping quotes should never be evaluated?
-/// Ahh perhaps unwrapping quotes should be a separate step after there are no macros remaining.
-///
-/// First question, why are the quotes evaluated after being unwrapped for macro arguments?
-///
 /// // Example divert_nested_2:
 // buffer = "x(y) end\0" stdout = "" divnum = 0
 // x args buffer ->
@@ -1865,123 +1828,7 @@ where
 // buffer = " end\0" stdout = "wow[hi  hidden?] bye" divnum = 0
 // buffer = "end\0" stdout = "wow[hi  hidden?] bye " divnum = 0
 // buffer = "\0" stdout = "wow[hi  hidden?] bye end" divnum = 0
-pub(crate) fn evaluate(
-    mut state: State,
-    input: &[u8],
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-    unwrap_quotes: bool,
-) -> Result<State> {
-    log::debug!("evaluate() EVALUATING {:?}", String::from_utf8_lossy(input));
-    // We should never be evaluating symbols when dnl is enabled
-    debug_assert!(!state.parse_config.dnl);
 
-    // Parse input as a symbol
-    // Evaluate the symbol and use the output to replace the symbol in the input.
-    // If the input was not a macro we want to somehow skip this in the next iteration.
-    let mut buffer = input.to_vec();
-
-    // Whether the end of the input is EOF.
-    // TODO: we could refactor this to be either a complete or not complete parser
-    // based on an argument so that we can avoid parsing symbols twice.
-    let input_eof = if buffer.last() != Some(&b'\0') {
-        buffer.push(b'\0');
-        false
-    } else {
-        true
-    };
-
-    // Loop to evaluate iteratively expand macros.
-    let mut i = 0;
-    loop {
-        log::debug!("Looping {i} {:?}", String::from_utf8_lossy(&buffer));
-
-        let symbol_buffer = buffer.clone();
-        let (remaining, symbol) = Symbol::parse(&state.parse_config)(&symbol_buffer)?;
-        buffer = remaining.to_vec();
-        // let is_macro = matches!(symbol, Symbol::Macro(_));
-        match symbol {
-            Symbol::Comment(comment) => stdout.write_all(comment)?,
-            Symbol::Text(text) => stdout.write_all(text)?,
-            Symbol::Quoted(quoted) => {
-                log::debug!("evaluate() writing quoted {quoted:?}");
-                if unwrap_quotes {
-                    stdout.write_all(quoted.contents)?;
-                } else {
-                    stdout.write_all(quoted.all)?;
-                }
-            }
-            Symbol::Macro(mut m) => {
-                let mut args_input_buffer = Vec::new();
-                if !m.args.is_empty() {
-                    // Important that we don't evaluate quotes.
-                    // x(y)
-                    //   ^ should be evaluated
-                    // x(`a,b`)
-                    //   ^^^^^ should not be evaluated
-                    // BUG: diverts here don't work
-                    (args_input_buffer, state) =
-                        evaluate_to_buffer(state, m.args_input, stderr, false)?;
-                    log::debug!(
-                        "evaluate() arg_buffer {:?}",
-                        String::from_utf8_lossy(&args_input_buffer)
-                    );
-                    // Necessary for the streaming args parser to terminate.
-                    args_input_buffer.push(b')');
-                    let (remaining, args) =
-                        lexer::parse_macro_args(&state.parse_config)(&args_input_buffer)?;
-                    debug_assert_eq!(remaining, b")");
-                    log::debug!("evaluate() updated args {args:?}");
-                    m.args = args;
-                }
-                m.args_input = &args_input_buffer;
-
-                let name = m.name.to_string();
-                log::debug!("evaluate() evaluating macro {name:?}");
-                let definition = state
-                    .macro_definitions
-                    .get(&m.name)
-                    .and_then(|e| e.last().cloned())
-                    .expect("There should always be a definition for a parsed macro");
-
-                let mut macro_buffer = Vec::new();
-                // BUG: diverts here don't work Diverts that occur during evaluation here don't take
-                // effect because we aren't using Output as stdout. To solve this perhaps we should
-                // use Output as stdout with its own stdout temporarily directed into this buffer.
-                // That's what I'm trying here.
-                state = definition
-                    .implementation
-                    .evaluate(state, &mut macro_buffer, stderr, m)
-                    .add_context(|| format!("Error evaluating macro {name:?}"))?;
-
-                log::debug!(
-                    "evaluate() finished evaluating macro {name:?}, macro_buffer: {:?}",
-                    String::from_utf8_lossy(&macro_buffer)
-                );
-
-                if state.parse_config.dnl {
-                    let (remaining, matched) = parse_dnl(&buffer)?;
-                    if input_eof || matched.last() == Some(&b'\n') {
-                        state.parse_config.dnl = false;
-                    }
-                    buffer = remaining.to_vec();
-                }
-
-                macro_buffer.extend(buffer.into_iter());
-                buffer = macro_buffer;
-            }
-            Symbol::Newline => stdout.write_all(b"\n")?,
-            Symbol::Eof => {
-                break;
-            }
-        }
-        i += 1;
-    }
-
-    Ok(state)
-}
-
-/// `evaluate` is a function which takes the current [`ParseConfig`], and evaluates the provided
 /// [`Symbol`] writing output to `writer`, and returns a [`ParseConfig`] which has been modified
 /// during the process of evaluation (for example a new macro was defined, or changequote).
 ///

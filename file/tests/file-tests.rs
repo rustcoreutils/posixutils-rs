@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2024 Hemi Labs, Inc.
+// Copyright (c) 2024 Jeff Garzik
 //
 // This file is part of the posixutils-rs project covered under
 // the MIT License.  For the full license text, please see the LICENSE
@@ -7,4 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-mod rm;
+mod cmp;
+mod dd;
+mod file;
+mod od;

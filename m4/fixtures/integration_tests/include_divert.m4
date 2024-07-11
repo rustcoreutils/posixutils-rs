@@ -1,0 +1,1 @@
+include(`fixtures/integration_tests/include/divert.m4')

@@ -25,6 +25,10 @@ impl OutputRef {
     pub fn undivert(&mut self, buffer_number: DivertBufferNumber) -> Result<()> {
         self.0.borrow_mut().undivert(buffer_number)
     }
+
+    pub fn replace_output(&mut self, new_output: Box<dyn Write>) -> Box<dyn Write> {
+        self.0.borrow_mut().replace_output(new_output)
+    }
 }
 
 impl Write for OutputRef {
@@ -52,7 +56,7 @@ pub(crate) struct Output {
     /// See [`DivertMacro`].
     divert_number: i64,
     /// The real output, usually [`std::io::stdout`].
-    stdout: Box<dyn Write>,
+    output: Box<dyn Write>,
 }
 
 impl Default for Output {
@@ -60,17 +64,21 @@ impl Default for Output {
         Self {
             divert_buffers: Default::default(),
             divert_number: Default::default(),
-            stdout: Box::new(std::io::stdout()),
+            output: Box::new(std::io::stdout()),
         }
     }
 }
 
 impl Output {
-    pub fn new(stdout: Box<dyn Write>) -> Self {
+    pub fn new(output: Box<dyn Write>) -> Self {
         Self {
-            stdout,
+            output,
             ..Self::default()
         }
+    }
+
+    pub fn replace_output(&mut self, new_output: Box<dyn Write>) -> Box<dyn Write> {
+        std::mem::replace(&mut self.output, new_output)
     }
 
     pub fn into_ref(self) -> OutputRef {
@@ -153,7 +161,7 @@ impl TryFrom<usize> for DivertBufferNumber {
 impl Write for Output {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self.divert_number {
-            0 => self.stdout.write(buf),
+            0 => self.output.write(buf),
             1..=9 => {
                 let n = self.divert_buffers[self
                     .divert_buffer_number()
@@ -175,7 +183,7 @@ impl Write for Output {
 
     fn flush(&mut self) -> std::io::Result<()> {
         match self.divert_number {
-            0 => self.stdout.flush(),
+            0 => self.output.flush(),
             1..=9 => self.divert_buffers[self
                 .divert_buffer_number()
                 .expect("valid divert buffer number")
@@ -192,3 +200,30 @@ impl Write for Output {
 /// TODO: This is a little wild west in terms of panic occurance and usability
 #[derive(Default, Clone)]
 pub(crate) struct DivertableBuffer(std::io::Cursor<Vec<u8>>);
+
+/// This is designed to be used with [`Output::replace_output`], it's using an `Rc` so the caller
+/// can keep a reference to the concrete type because while passing through [`Output`] the type gets
+/// erased in [`Box`].
+#[derive(Clone, Default)]
+pub struct TemporaryOutputBuffer(Rc<RefCell<Vec<u8>>>);
+
+impl Write for TemporaryOutputBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.borrow_mut().flush()
+    }
+}
+
+impl TemporaryOutputBuffer {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self(Rc::new(RefCell::new(Vec::with_capacity(capacity))))
+    }
+    /// If there are no other active references to the same TemporaryOutputBuffer this will return
+    /// `Some` of the contents of the buffer, otherwise `None`.
+    pub fn into_inner(self) -> Option<Vec<u8>> {
+        Rc::into_inner(self.0).map(|cell| cell.into_inner())
+    }
+}

@@ -29,7 +29,7 @@ fn generate_test_plan(args: Vec<&str>, expected_out: &str) -> TestPlan {
 }
 
 #[test]
-fn test_single_identification() {
+fn single_identification() {
     let file_path = test_file_path("single_identification.txt");
     let plan = generate_test_plan(
         vec![file_path.to_str().unwrap()],
@@ -39,7 +39,7 @@ fn test_single_identification() {
 }
 
 #[test]
-fn test_multiple_identifications() {
+fn multiple_identifications() {
     let file_path = test_file_path("multiple_identifications.txt");
     let plan = generate_test_plan(
         vec![file_path.to_str().unwrap()],
@@ -49,7 +49,7 @@ fn test_multiple_identifications() {
 }
 
 #[test]
-fn test_single_identification_flag() {
+fn single_identification_flag() {
     let file_path = test_file_path("single_identification_flag.txt");
     let plan = generate_test_plan(
         vec!["-s", file_path.to_str().unwrap()],
@@ -59,21 +59,21 @@ fn test_single_identification_flag() {
 }
 
 #[test]
-fn test_no_identification() {
+fn no_identification() {
     let file_path = test_file_path("no_identification.txt");
     let plan = generate_test_plan(vec![file_path.to_str().unwrap()], "");
     run_test(plan);
 }
 
 #[test]
-fn test_empty_file() {
+fn empty_file() {
     let file_path = test_file_path("empty_file.txt");
     let plan = generate_test_plan(vec![file_path.to_str().unwrap()], "");
     run_test(plan);
 }
 
 #[test]
-fn test_special_characters() {
+fn special_characters() {
     let file_path = test_file_path("special_characters.txt");
     let plan = generate_test_plan(
         vec![file_path.to_str().unwrap()],

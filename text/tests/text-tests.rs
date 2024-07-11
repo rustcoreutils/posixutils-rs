@@ -12,6 +12,7 @@ mod csplit;
 mod cut;
 mod expand;
 mod fold;
+mod grep;
 mod head;
 mod nl;
 mod paste;

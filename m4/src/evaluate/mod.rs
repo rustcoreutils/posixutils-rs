@@ -1,7 +1,6 @@
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::process;
 use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::{collections::HashMap, io::Write, rc::Rc};
@@ -13,7 +12,7 @@ use output::{DivertBufferNumber, Output, OutputRef};
 use crate::error::{Result, ResultExt};
 use crate::eval_macro::{self, parse_integer};
 use crate::lexer::{
-    self, parse_dnl, parse_macro_args, Macro, MacroName, MacroParseConfig, ParseConfig, Symbol,
+    parse_dnl, parse_macro_args, Macro, MacroName, MacroParseConfig, ParseConfig, Symbol,
     DEFAULT_QUOTE_CLOSE_TAG, DEFAULT_QUOTE_OPEN_TAG,
 };
 
@@ -1964,10 +1963,7 @@ pub(crate) fn process_streaming<'c, R: Read>(
                             .and_then(|e| e.last().cloned())
                             .expect("There should always be a definition for a parsed macro");
 
-                        // BUG: diverts here don't work Diverts that occur during evaluation here don't take
-                        // effect because we aren't using Output as stdout. To solve this perhaps we should
-                        // use Output as stdout with its own stdout temporarily directed into this buffer.
-                        // That's what I'm trying here.
+                        // BUG: Something about diverts here doesn't work.
                         state = definition
                             .implementation
                             .evaluate(state, &mut macro_buffer, stderr, m)

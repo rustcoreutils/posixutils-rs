@@ -33,8 +33,8 @@ pub enum Operation<P1, P2, P3, O> {
 pub enum Assoc {
     /// Left associative.
     Left,
-    /// Right associative.
-    Right,
+    // /// Right associative.
+    // Right,
 }
 
 /// Element for operator stack.

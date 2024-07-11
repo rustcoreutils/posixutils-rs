@@ -17,7 +17,7 @@
 //!
 use nom::IResult;
 
-use std::{collections::HashMap, io::Write};
+use std::collections::HashMap;
 
 use crate::evaluate::BuiltinMacro;
 
@@ -704,52 +704,10 @@ pub fn parse_dnl(input: &[u8]) -> IResult<&[u8], &[u8]> {
     Ok((remaining, &input[0..(input.len() - remaining.len())]))
 }
 
-pub fn parse_symbols_complete<'i>(
-    config: &ParseConfig,
-    // Needs to be a reference so can return a Symbol<'i>.
-    input: &'i [u8],
-) -> crate::error::Result<Vec<Symbol<'i>>> {
-    let mut remaining: &[u8] = input;
-    let mut symbols = Vec::new();
-    while !remaining.is_empty() {
-        let symbol;
-        (remaining, symbol) = Symbol::parse(&config)(remaining)
-            .map_err(|e| crate::Error::new(crate::ErrorKind::Parsing).add_context(e.to_string()))?;
-        symbols.push(symbol)
-    }
-    Ok(symbols)
-}
-
-pub fn unquote<'c, 'i>(config: &'c ParseConfig, input: &'i [u8]) -> Vec<u8> {
-    let mut input = input.to_vec();
-    let mut output = Vec::new();
-    if input.last() != Some(&b'\0') {
-        input.push(b'\0');
-    }
-    let mut remaining: &[u8] = &input;
-    let mut previous_index = 0;
-    while !remaining.is_empty() {
-        let symbol;
-        (remaining, symbol) = Symbol::parse(&config)(remaining)
-            .map_err(|e| crate::Error::new(crate::ErrorKind::Parsing).add_context(e.to_string()))
-            .unwrap();
-        let current_index = input.len() - remaining.len();
-        match symbol {
-            Symbol::Quoted(quoted) => output.write_all(quoted.contents).unwrap(),
-            Symbol::Eof => {}
-            _ => output
-                .write_all(&input[previous_index..current_index])
-                .unwrap(),
-        }
-        previous_index = current_index;
-    }
-    output
-}
-
 #[cfg(test)]
 mod test {
     use crate::lexer::{
-        parse_inside_brackets, parse_macro_args, unquote, Symbol, DEFAULT_COMMENT_CLOSE_TAG,
+        parse_inside_brackets, parse_macro_args, Symbol, DEFAULT_COMMENT_CLOSE_TAG,
         DEFAULT_COMMENT_OPEN_TAG,
     };
     use crate::test_utils::{macro_parse_config, macro_parse_configs, utf8};
@@ -760,22 +718,6 @@ mod test {
         parse_comment, parse_dnl, parse_text, Macro, MacroName, ParseConfig, Quoted,
         DEFAULT_QUOTE_CLOSE_TAG, DEFAULT_QUOTE_OPEN_TAG,
     };
-
-    struct SymbolsAsStreamSnapshot {
-        stdout: String,
-        stderr: String,
-    }
-
-    impl std::fmt::Display for SymbolsAsStreamSnapshot {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "STDOUT:\n")?;
-            self.stdout.fmt(f)?;
-            write!(f, "\n")?;
-            write!(f, "STDERR:\n")?;
-            self.stderr.fmt(f)?;
-            Ok(())
-        }
-    }
 
     #[test]
     fn test_parse_macro_name_end_eof() {
@@ -1518,15 +1460,5 @@ mod test {
             .collect();
         let args_refs = args.iter().map(|arg| arg.as_str()).collect::<Vec<_>>();
         assert_eq!(vec!["a", "b", "c"], args_refs);
-    }
-
-    #[test]
-    fn test_unquote() {
-        let unquoted = unquote(&ParseConfig::default(), b"test");
-        assert_eq!("test", utf8(&unquoted));
-        let unquoted = unquote(&ParseConfig::default(), b"`test'");
-        assert_eq!("test", utf8(&unquoted));
-        let unquoted = unquote(&ParseConfig::default(), b"`test' `test'");
-        assert_eq!("test test", utf8(&unquoted));
     }
 }

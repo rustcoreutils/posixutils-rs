@@ -1827,6 +1827,43 @@ where
 /// Ahh perhaps unwrapping quotes should be a separate step after there are no macros remaining.
 ///
 /// First question, why are the quotes evaluated after being unwrapped for macro arguments?
+///
+/// // Example divert_nested_2:
+// buffer = "x(y) end\0" stdout = "" divnum = 0
+// x args buffer ->
+//   buffer = "y" out = "" divnum = 0
+//   buffer = "j(z),k" out = "" divnum = 0
+// j args buffer ->
+//   buffer = "z" out = "" divnum = 0
+//   buffer = "hi divert(-1) hidden?" out = "" divnum = 0
+//   buffer = " divert(-1) hidden?" out = "hi" divnum = 0
+//   buffer = "divert(-1) hidden?" out = "hi " divnum = 0
+//   buffer = "hidden?" out = "hi " divnum = -1
+//   buffer = "" out = "hi  hidden?" divnum = -1
+// x args buffer ->
+//   buffer = "hi  hidden?,k" out = "" divnum = -1
+//   buffer = "  hidden?,k" out = "hi" divnum = -1
+//   buffer = " hidden?,k" out = "hi " divnum = -1
+//   buffer = "hidden?,k" out = "hi  " divnum = -1
+//   buffer = ",k" out = "hi  hidden?" divnum = -1
+//   buffer = "k" out = "hi  hidden?," divnum = -1
+//   buffer = "divert(0) bye" out = "hi  hidden?," divnum = -1
+//   buffer = " bye" out = "hi  hidden?," divnum = 0
+//   buffer = "bye" out = "hi  hidden?, " divnum = 0
+//   buffer = "" out = "hi  hidden?, bye" divnum = 0
+// buffer = "wow[hi  hidden?] bye end\0" stdout = "" divnum = 0
+// buffer = "wow[hi  hidden?] end\0" stdout = "" divnum = 0
+// buffer = "[hi  hidden?] bye end\0" stdout = "wow" divnum = 0
+// buffer = "hi  hidden?] bye end\0" stdout = "wow[" divnum = 0
+// buffer = "  hidden?] bye end\0" stdout = "wow[hi" divnum = 0
+// buffer = " hidden?] bye end\0" stdout = "wow[hi " divnum = 0
+// buffer = "hidden?] bye end\0" stdout = "wow[hi  " divnum = 0
+// buffer = "] bye end\0" stdout = "wow[hi  hidden?" divnum = 0
+// buffer = " bye end\0" stdout = "wow[hi  hidden?]" divnum = 0
+// buffer = "bye end\0" stdout = "wow[hi  hidden?] " divnum = 0
+// buffer = " end\0" stdout = "wow[hi  hidden?] bye" divnum = 0
+// buffer = "end\0" stdout = "wow[hi  hidden?] bye " divnum = 0
+// buffer = "\0" stdout = "wow[hi  hidden?] bye end" divnum = 0
 pub(crate) fn evaluate(
     mut state: State,
     input: &[u8],
@@ -1856,56 +1893,47 @@ pub(crate) fn evaluate(
     // Loop to evaluate iteratively expand macros.
     let mut i = 0;
     loop {
-        let mut last = false;
         log::debug!("Looping {i} {:?}", String::from_utf8_lossy(&buffer));
-        let mut new_buffer: Vec<u8> = Vec::new();
 
-        let (mut remaining, symbol) = Symbol::parse(&state.parse_config)(&buffer)?;
-        let is_macro = matches!(symbol, Symbol::Macro(_));
+        let symbol_buffer = buffer.clone();
+        let (remaining, symbol) = Symbol::parse(&state.parse_config)(&symbol_buffer)?;
+        buffer = remaining.to_vec();
+        // let is_macro = matches!(symbol, Symbol::Macro(_));
         match symbol {
-            Symbol::Comment(comment) => new_buffer.write_all(comment)?,
-            Symbol::Text(text) => new_buffer.write_all(text)?,
+            Symbol::Comment(comment) => stdout.write_all(comment)?,
+            Symbol::Text(text) => stdout.write_all(text)?,
             Symbol::Quoted(quoted) => {
                 log::debug!("evaluate() writing quoted {quoted:?}");
                 if unwrap_quotes {
-                    new_buffer.write_all(quoted.contents)?;
+                    stdout.write_all(quoted.contents)?;
                 } else {
-                    new_buffer.write_all(quoted.all)?;
+                    stdout.write_all(quoted.all)?;
                 }
             }
             Symbol::Macro(mut m) => {
-                let mut arg_buffer: Vec<u8> = Vec::new();
+                let mut args_input_buffer = Vec::new();
                 if !m.args.is_empty() {
-                    // Here we need to expand the macros which may form additional arguments which
-                    // were not picked up in the initial round of parsing.
-                    let args_length = m.args.len();
-                    for (i, arg) in m.args.into_iter().enumerate() {
-                        let buffer;
-                        // Important that we don't evaluate quotes.
-                        // x(y)
-                        //   ^ should be evaluated
-                        // x(`a,b`)
-                        //   ^^^^^ should not be evaluated
-                        // BUG: diverts here don't work
-                        (buffer, state) = evaluate_to_buffer(state, arg.input, stderr, false)?;
-                        arg_buffer.extend(buffer.into_iter());
-
-                        if i < args_length - 1 {
-                            arg_buffer.push(b',');
-                        }
-                    }
+                    // Important that we don't evaluate quotes.
+                    // x(y)
+                    //   ^ should be evaluated
+                    // x(`a,b`)
+                    //   ^^^^^ should not be evaluated
+                    // BUG: diverts here don't work
+                    (args_input_buffer, state) =
+                        evaluate_to_buffer(state, m.args_input, stderr, false)?;
                     log::debug!(
                         "evaluate() arg_buffer {:?}",
-                        String::from_utf8_lossy(&arg_buffer)
+                        String::from_utf8_lossy(&args_input_buffer)
                     );
                     // Necessary for the streaming args parser to terminate.
-                    arg_buffer.push(b')');
+                    args_input_buffer.push(b')');
                     let (remaining, args) =
-                        lexer::parse_macro_args(&state.parse_config)(&arg_buffer)?;
+                        lexer::parse_macro_args(&state.parse_config)(&args_input_buffer)?;
                     debug_assert_eq!(remaining, b")");
                     log::debug!("evaluate() updated args {args:?}");
                     m.args = args;
                 }
+                m.args_input = &args_input_buffer;
 
                 let name = m.name.to_string();
                 log::debug!("evaluate() evaluating macro {name:?}");
@@ -1915,68 +1943,36 @@ pub(crate) fn evaluate(
                     .and_then(|e| e.last().cloned())
                     .expect("There should always be a definition for a parsed macro");
 
+                let mut macro_buffer = Vec::new();
                 // BUG: diverts here don't work Diverts that occur during evaluation here don't take
                 // effect because we aren't using Output as stdout. To solve this perhaps we should
                 // use Output as stdout with its own stdout temporarily directed into this buffer.
                 // That's what I'm trying here.
                 state = definition
                     .implementation
-                    .evaluate(state, &mut new_buffer, stderr, m)
+                    .evaluate(state, &mut macro_buffer, stderr, m)
                     .add_context(|| format!("Error evaluating macro {name:?}"))?;
 
-                // BUG: This doesn't work because now the state contains the last divert number, which
-                // gets used for the `stdout` in this context.
-                // What happens when the include is nested in a define?
-
-                // What if the state changes to output are delayed until after writing?
-
-                // THIS ENTIRE FUNCTION IS WRONG?????????????????????????????????????????
-
-                // If we restore the state of the divert after the macro call, then that will be wrong.
-
-                // Content in new_buffer only goes to stdout
-
-                // buffer contains FUCK ME
-
-                // 1. buffer = " end" new_buffer = ""
-                // 2. buffer = " end" new_buffer = "hello divert(-1)\0"
-                // 2. new_buffer = "hello divert(-1) end"
-
-                // Content only goes into new_buffer if it is intended to go into stdout.
-                // This can only be decided correctly at the time of evaluation. This is the only place where output is actually written.
                 log::debug!(
-                    "evaluate() finished evaluating macro {name:?}, new_buffer: {:?}",
-                    String::from_utf8_lossy(&new_buffer)
+                    "evaluate() finished evaluating macro {name:?}, macro_buffer: {:?}",
+                    String::from_utf8_lossy(&macro_buffer)
                 );
 
                 if state.parse_config.dnl {
-                    let matched;
-                    (remaining, matched) = parse_dnl(remaining)?;
+                    let (remaining, matched) = parse_dnl(&buffer)?;
                     if input_eof || matched.last() == Some(&b'\n') {
                         state.parse_config.dnl = false;
                     }
+                    buffer = remaining.to_vec();
                 }
-            }
-            Symbol::Newline => new_buffer.write_all(b"\n")?,
-            Symbol::Eof => {
-                if input_eof {
-                    new_buffer.write_all(b"\0")?;
-                }
-                last = true;
-            }
-        }
 
-        if is_macro {
-            // It was a macro, and we should re-evaluate the output of the macro.
-            new_buffer.extend(remaining.into_iter());
-            buffer = new_buffer;
-        } else {
-            // It wasn't a macro, we can write it to output.
-            stdout.write_all(&new_buffer)?;
-            buffer = remaining.to_vec();
-        }
-        if last {
-            break;
+                macro_buffer.extend(buffer.into_iter());
+                buffer = macro_buffer;
+            }
+            Symbol::Newline => stdout.write_all(b"\n")?,
+            Symbol::Eof => {
+                break;
+            }
         }
         i += 1;
     }

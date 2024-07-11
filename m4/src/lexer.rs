@@ -91,6 +91,7 @@ pub struct Macro<'i> {
     pub name: MacroName,
     // TODO: can also be an expression in the case of the eval macro
     pub args: Vec<MacroArg<'i>>,
+    pub args_input: &'i [u8],
 }
 
 impl std::fmt::Debug for Macro<'_> {
@@ -244,7 +245,7 @@ impl<'i> Macro<'i> {
         move |input: &[u8]| {
             #[cfg(test)]
             log::trace!("Macro::parse() input: {:?}", String::from_utf8_lossy(input));
-            let (remaining, name) = MacroName::parse(input)?;
+            let (remaining_after_name, name) = MacroName::parse(input)?;
             #[cfg(test)]
             log::trace!("Macro::parse() successfully parsed macro name {name:?}");
             // TODO: this should be ignored inside the define macro's second argument, or perhaps
@@ -262,10 +263,10 @@ impl<'i> Macro<'i> {
 
             log::trace!(
                 "Macro::parse() macro_args: {:?}",
-                String::from_utf8_lossy(remaining)
+                String::from_utf8_lossy(remaining_after_name)
             );
 
-            let (remaining, args) = nom::combinator::opt(nom::sequence::delimited(
+            let (remaining_after_args, args) = nom::combinator::opt(nom::sequence::delimited(
                 nom::bytes::streaming::tag("("),
                 nom::multi::separated_list0(
                     nom::bytes::streaming::tag(","),
@@ -275,7 +276,22 @@ impl<'i> Macro<'i> {
                 // Make sure we fail for input that is missing the closing tag, this is what GNU m4 does
                 // anyway.
                 nom::combinator::cut(nom::bytes::streaming::tag(")")),
-            ))(remaining)?;
+            ))(remaining_after_name)?;
+
+            let args_input = if args.is_some() {
+                log::trace!(
+                    "remaining_after_name: {:?}",
+                    String::from_utf8_lossy(&remaining_after_name)
+                );
+                log::trace!(
+                    "remaining_after_args: {:?}",
+                    String::from_utf8_lossy(&remaining_after_args)
+                );
+                &input[(input.len() - remaining_after_name.len() + 1)
+                    ..(input.len() - remaining_after_args.len() - 1)]
+            } else {
+                &[]
+            };
 
             let args = args.unwrap_or_default();
             if args.len() < macro_parse_config.min_args {
@@ -290,11 +306,12 @@ impl<'i> Macro<'i> {
             }
 
             Ok((
-                remaining,
+                remaining_after_args,
                 Macro {
-                    input: &input[..(input.len() - remaining.len())],
+                    input: &input[..(input.len() - remaining_after_args.len())],
                     name,
                     args,
+                    args_input,
                 },
             ))
         }
@@ -1173,6 +1190,7 @@ mod test {
         let (remaining, m) = Macro::parse(&ParseConfig::default())(b"define(hello)m1").unwrap();
         assert_eq!(m.name, MacroName(b"define".into()));
         assert_eq!(m.args.len(), 1);
+        assert_eq!(utf8(m.args_input), "hello");
         assert_eq!("m1", utf8(remaining));
         match m.args.get(0).unwrap().symbols.get(0).unwrap() {
             Symbol::Text(text) => {
@@ -1190,6 +1208,7 @@ mod test {
             Macro::parse(&ParseConfig::default())(b"define(hello,   goodbye   )").unwrap();
         assert_eq!(m.name, MacroName(b"define".into()));
         assert_eq!(m.args.len(), 2);
+        assert_eq!(utf8(m.args_input), "hello,   goodbye   ");
         assert!(remaining.is_empty());
         let second_arg = m.args.get(1).unwrap();
         assert_eq!(second_arg.symbols.len(), 1);
@@ -1213,6 +1232,7 @@ mod test {
         let (remaining, m) = Macro::parse(config)(b"some_word_23(`hello')").unwrap();
         assert_eq!(m.name, MacroName(b"some_word_23".into()));
         assert_eq!(m.args.len(), 1);
+        assert_eq!(utf8(m.args_input), "`hello'");
         assert!(remaining.is_empty());
         let q = match m.args.get(0).unwrap().symbols.get(0).unwrap() {
             Symbol::Quoted(q) => q,

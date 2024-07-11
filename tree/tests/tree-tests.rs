@@ -7,4 +7,12 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod cp;
+mod link;
+mod ls;
+mod mkdir;
 mod mv;
+mod readlink;
+mod rm;
+mod rmdir;
+mod unlink;

@@ -158,6 +158,7 @@ macro_enums!(
         Defn(DefnMacro),
         Substr(SubstrMacro),
         Dumpdef(DumpdefMacro),
+        Maketemp(MkstempMacro),
         Mkstemp(MkstempMacro),
         M4exit(M4exitMacro),
         M4wrap(M4wrapMacro),
@@ -200,6 +201,7 @@ impl AsRef<[u8]> for BuiltinMacro {
             Substr => b"substr",
             Dumpdef => b"dumpdef",
             Mkstemp => b"mkstemp",
+            Maketemp => b"maketemp",
             M4exit => b"m4exit",
             M4wrap => b"m4wrap",
             Syscmd => b"syscmd",
@@ -245,6 +247,7 @@ impl BuiltinMacro {
             Substr => 1,
             Dumpdef => 1,
             Mkstemp => 1,
+            Maketemp => 1,
             M4exit => 0,
             M4wrap => 1,
             Syscmd => 1,
@@ -769,7 +772,8 @@ impl MacroImplementation for IncludeMacro {
                 stdout,
                 stderr,
                 false,
-            )?;
+            )
+            .add_context(|| format!("Error processing included file {path:?}"))?;
             state.file.pop();
         }
 
@@ -804,7 +808,8 @@ impl MacroImplementation for SincludeMacro {
                     stdout,
                     stderr,
                     false,
-                )?;
+                )
+                .add_context(|| format!("Error processing included file {path:?}"))?;
                 state.file.pop();
             }
         }

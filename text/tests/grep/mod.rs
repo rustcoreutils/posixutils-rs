@@ -963,7 +963,7 @@ fn test_stdin_and_file_input() {
     grep_test(
             &[BRE, "-", INPUT_FILE_1, INPUT_FILE_2],
             LINES_INPUT,
-            "(standard input):line_{1}\n(standard input):p_line_{2}_s\n(standard input):  line_{3}  \n(standard input):line_{70}\ntests/grep/f_1:line_{1}\r\ntests/grep/f_1:p_line_{2}_s\r\ntests/grep/f_1:  line_{3}  \r\ntests/grep/f_1:line_{70}\r\n",
+            "(standard input):line_{1}\n(standard input):p_line_{2}_s\n(standard input):  line_{3}  \n(standard input):line_{70}\ntests/grep/f_1:line_{1}\ntests/grep/f_1:p_line_{2}_s\ntests/grep/f_1:  line_{3}  \ntests/grep/f_1:line_{70}\n",
             "",
             0,
         );
@@ -1004,13 +1004,13 @@ fn test_stdin_and_input_files_quiet() {
 
 #[test]
 fn test_stdin_and_input_files_other_options() {
-    grep_test(&["-insvx", BRE, "-", INPUT_FILE_1, BAD_INPUT_FILE], LINES_INPUT, "(standard input):2:p_line_{2}_s\n(standard input):3:  line_{3}  \n(standard input):5:p_LINE_{5}_s\n(standard input):6:l_{6}\ntests/grep/f_1:1:line_{1}\r\ntests/grep/f_1:2:p_line_{2}_s\r\ntests/grep/f_1:3:  line_{3}  \r\ntests/grep/f_1:4:LINE_{4}\r\ntests/grep/f_1:5:p_LINE_{5}_s\r\ntests/grep/f_1:6:l_{6}\r\ntests/grep/f_1:7:line_{70}\r\n", "", 2);
+    grep_test(&["-insvx", BRE, "-", INPUT_FILE_1, BAD_INPUT_FILE], LINES_INPUT, "(standard input):2:p_line_{2}_s\n(standard input):3:  line_{3}  \n(standard input):5:p_LINE_{5}_s\n(standard input):6:l_{6}\ntests/grep/f_1:2:p_line_{2}_s\ntests/grep/f_1:3:  line_{3}  \ntests/grep/f_1:5:p_LINE_{5}_s\ntests/grep/f_1:6:l_{6}\n", "", 2);
 }
 
 #[test]
 fn test_multiple_input_files() {
     grep_test(&[r#"2[[:punct:]]"#, INPUT_FILE_1, INPUT_FILE_2, INPUT_FILE_3], LINES_INPUT,
-        "tests/grep/f_1:p_line_{2}_s\r\ntests/grep/f_2:void func2() {\r\ntests/grep/f_2:    printf(\"This is function 2\\n\");\r\n", "", 0);
+        "tests/grep/f_1:p_line_{2}_s\ntests/grep/f_2:void func2() {\ntests/grep/f_2:    printf(\"This is function 2\\n\");\n", "", 0);
 }
 
 #[test]
@@ -1067,7 +1067,7 @@ fn test_multiple_input_files_quiet() {
 #[test]
 fn test_multiple_input_files_line_number() {
     grep_test(&["-n", r#"2[[:punct:]]"#, INPUT_FILE_1, INPUT_FILE_2, INPUT_FILE_3], LINES_INPUT,
-        "tests/grep/f_1:2:p_line_{2}_s\r\ntests/grep/f_2:12:void func2() {\r\ntests/grep/f_2:13:    printf(\"This is function 2\\n\");\r\n", "", 0);
+        "tests/grep/f_1:2:p_line_{2}_s\ntests/grep/f_2:12:void func2() {\ntests/grep/f_2:13:    printf(\"This is function 2\\n\");\n", "", 0);
 }
 
 #[test]
@@ -1075,7 +1075,7 @@ fn test_duplicate_input_files() {
     grep_test(
         &["-n", r#"2[[:punct:]]"#, INPUT_FILE_1, INPUT_FILE_1],
         LINES_INPUT,
-        "tests/grep/f_1:2:p_line_{2}_s\r\ntests/grep/f_1:2:p_line_{2}_s\r\n",
+        "tests/grep/f_1:2:p_line_{2}_s\ntests/grep/f_1:2:p_line_{2}_s\n",
         "",
         0,
     );
@@ -1116,7 +1116,7 @@ fn test_duplicate_input_files_quiet() {
 
 #[test]
 fn test_muptiple_pattern_files_multiple_input_files() {
-    grep_test(&["-f", BRE_FILE_1, "-f", BRE_FILE_2, INPUT_FILE_1, INPUT_FILE_2, INPUT_FILE_3], LINES_INPUT, "tests/grep/f_1:line_{1}\r\ntests/grep/f_1:p_line_{2}_s\r\ntests/grep/f_1:  line_{3}  \r\ntests/grep/f_1:line_{70}\r\ntests/grep/f_2:#include <stdio.h>\r\ntests/grep/f_2:void func1() {\r\ntests/grep/f_2:void func2() {\r\n", "", 0);
+    grep_test(&["-f", BRE_FILE_1, "-f", BRE_FILE_2, INPUT_FILE_1, INPUT_FILE_2, INPUT_FILE_3], LINES_INPUT, "tests/grep/f_1:line_{1}\ntests/grep/f_1:p_line_{2}_s\ntests/grep/f_1:  line_{3}  \ntests/grep/f_1:line_{70}\ntests/grep/f_2:#include <stdio.h>\ntests/grep/f_2:void func1() {\ntests/grep/f_2:void func2() {\n", "", 0);
 }
 
 #[test]
@@ -1181,7 +1181,7 @@ fn test_muptiple_pattern_files_multiple_input_files_quiet() {
 
 #[test]
 fn test_muptiple_pattern_files_multiple_input_files_line_number() {
-    grep_test(&["-n", "-f", BRE_FILE_1, "-f", BRE_FILE_2, INPUT_FILE_1, INPUT_FILE_2, INPUT_FILE_3], LINES_INPUT, "tests/grep/f_1:1:line_{1}\r\ntests/grep/f_1:2:p_line_{2}_s\r\ntests/grep/f_1:3:  line_{3}  \r\ntests/grep/f_1:7:line_{70}\r\ntests/grep/f_2:1:#include <stdio.h>\r\ntests/grep/f_2:8:void func1() {\r\ntests/grep/f_2:12:void func2() {\r\n", "", 0);
+    grep_test(&["-n", "-f", BRE_FILE_1, "-f", BRE_FILE_2, INPUT_FILE_1, INPUT_FILE_2, INPUT_FILE_3], LINES_INPUT, "tests/grep/f_1:1:line_{1}\ntests/grep/f_1:2:p_line_{2}_s\ntests/grep/f_1:3:  line_{3}  \ntests/grep/f_1:7:line_{70}\ntests/grep/f_2:1:#include <stdio.h>\ntests/grep/f_2:8:void func1() {\ntests/grep/f_2:12:void func2() {\n", "", 0);
 }
 
 #[test]
@@ -1368,7 +1368,7 @@ fn test_long_names_files() {
                 INPUT_FILE_2,
             ],
             LINES_INPUT,
-            "tests/grep/f_1:line_{1}\r\ntests/grep/f_1:p_line_{2}_s\r\ntests/grep/f_1:  line_{3}  \r\ntests/grep/f_1:line_{70}\r\n",
+            "tests/grep/f_1:line_{1}\ntests/grep/f_1:p_line_{2}_s\ntests/grep/f_1:  line_{3}  \ntests/grep/f_1:line_{70}\n",
             "",
             0,
         );

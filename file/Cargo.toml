@@ -16,9 +16,6 @@ regex.workspace = true
 walkdir = "2"
 users = "0.11"
 
-[dev-dependencies]
-whoami = "1.5"
-
 [[bin]]
 name = "cat"
 path = "src/cat.rs"

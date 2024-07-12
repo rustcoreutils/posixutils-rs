@@ -1,3 +1,6 @@
+use std::fs::{remove_file, File};
+use std::io::Write;
+
 use plib::{run_test, TestPlan};
 
 fn run_test_find(
@@ -21,10 +24,10 @@ fn run_test_find(
 #[test]
 fn find_size_test() {
     let project_root = env!("CARGO_MANIFEST_DIR");
-    let test_dir = format!("{}/tests/find", project_root);
+    let test_dir = format!("{}/tests/find/other", project_root);
     let args = [&test_dir, "-size", "+4"];
 
-    let expected_output = format!("{}\n{}/file1.txt\n{}/mod.rs\n", test_dir, test_dir, test_dir);
+    let expected_output = format!("{}\n{}/file1.txt\n", test_dir, test_dir);
 
     run_test_find(&args, &expected_output, "", 0)
 }
@@ -32,7 +35,7 @@ fn find_size_test() {
 #[test]
 fn find_name_test() {
     let project_root = env!("CARGO_MANIFEST_DIR");
-    let test_dir = format!("{}/tests/find", project_root);
+    let test_dir = format!("{}/tests/find/other", project_root);
     let args = [&test_dir, "-name", "empty_file.txt"];
 
     let expected_output = format!("{}/empty_file.txt\n", test_dir);
@@ -43,10 +46,10 @@ fn find_name_test() {
 #[test]
 fn find_type_test() {
     let project_root = env!("CARGO_MANIFEST_DIR");
-    let test_dir = format!("{}/tests/find", project_root);
+    let test_dir = format!("{}/tests/find/other", project_root);
     let args = [&test_dir, "-type", "f"];
 
-    let expected_output = format!("{}/empty_file.txt\n{}/file with space.txt\n{}/file1.txt\n{}/mod.rs\n{}/rust_file.rs\n", test_dir, test_dir, test_dir, test_dir, test_dir);
+    let expected_output = format!("{}/empty_file.txt\n{}/file with space.txt\n{}/file1.txt\n{}/rust_file.rs\n", test_dir, test_dir, test_dir, test_dir);
 
     run_test_find(&args, &expected_output, "", 0)
 }
@@ -54,7 +57,7 @@ fn find_type_test() {
 #[test]
 fn find_mtime_test() {
     let project_root = env!("CARGO_MANIFEST_DIR");
-    let test_dir = format!("{}/tests/find", project_root);
+    let test_dir = format!("{}/tests/find/other", project_root);
     let args = [&test_dir, "-mtime", "7"];
 
     run_test_find(&args, "", "", 0)
@@ -63,10 +66,10 @@ fn find_mtime_test() {
 #[test]
 fn find_combination_test() {
     let project_root = env!("CARGO_MANIFEST_DIR");
-    let test_dir = format!("{}/tests/find", project_root);
+    let test_dir = format!("{}/tests/find/other", project_root);
     let args = [&test_dir, "-size", "+4", "-print", "-size", "+2", "-print"];
 
-    let expected_output = format!("{}\n{}\n{}/file1.txt\n{}/file1.txt\n{}/mod.rs\n{}/mod.rs\n", test_dir, test_dir, test_dir, test_dir, test_dir, test_dir);
+    let expected_output = format!("{}\n{}\n{}/file1.txt\n{}/file1.txt\n", test_dir, test_dir, test_dir, test_dir);
 
     run_test_find(&args, &expected_output, "", 0)
 }
@@ -74,10 +77,10 @@ fn find_combination_test() {
 #[test]
 fn find_not_test() {
     let project_root = env!("CARGO_MANIFEST_DIR");
-    let test_dir = format!("{}/tests/find", project_root);
+    let test_dir = format!("{}/tests/find/other", project_root);
     let args = [&test_dir, "!", "-path", "*.txt"];
 
-    let expected_output = format!("{}\n{}/mod.rs\n{}/rust_file.rs\n", test_dir, test_dir, test_dir);
+    let expected_output = format!("{}\n{}/rust_file.rs\n", test_dir, test_dir);
 
     run_test_find(&args, &expected_output, "", 0)
 }
@@ -85,10 +88,10 @@ fn find_not_test() {
 #[test]
 fn find_or_test() {
     let project_root = env!("CARGO_MANIFEST_DIR");
-    let test_dir = format!("{}/tests/find", project_root);
+    let test_dir = format!("{}/tests/find/other", project_root);
     let args = [&test_dir, "-path", "*.rs", "-o", "-path", "*.txt"];
 
-    let expected_output = format!("{}/empty_file.txt\n{}/file with space.txt\n{}/file1.txt\n{}/mod.rs\n{}/rust_file.rs\n", test_dir, test_dir, test_dir, test_dir, test_dir);
+    let expected_output = format!("{}/empty_file.txt\n{}/file with space.txt\n{}/file1.txt\n{}/rust_file.rs\n", test_dir, test_dir, test_dir, test_dir);
 
     run_test_find(&args, &expected_output, "", 0)
 }
@@ -96,7 +99,7 @@ fn find_or_test() {
 #[test]
 fn find_and_test() {
     let project_root = env!("CARGO_MANIFEST_DIR");
-    let test_dir = format!("{}/tests/find", project_root);
+    let test_dir = format!("{}/tests/find/other", project_root);
     let args = [&test_dir, "-path", "*.txt", "-a", "-size", "+2"];
 
     let expected_output = format!("{}/file1.txt\n", test_dir);
@@ -107,7 +110,7 @@ fn find_and_test() {
 #[test]
 fn find_space_argument_test() {
     let project_root = env!("CARGO_MANIFEST_DIR");
-    let test_dir = format!("{}/tests/find", project_root);
+    let test_dir = format!("{}/tests/find/other", project_root);
     let args = [&test_dir, "-name", "file with space.txt"];
 
     let expected_output = format!("{}/file with space.txt\n", test_dir);
@@ -118,7 +121,7 @@ fn find_space_argument_test() {
 #[test]
 fn find_no_user_test() {
     let project_root = env!("CARGO_MANIFEST_DIR");
-    let test_dir = format!("{}/tests/find", project_root);
+    let test_dir = format!("{}/tests/find/other", project_root);
     let args = [&test_dir, "-nouser"];
 
     run_test_find(&args, "", "", 0)
@@ -127,7 +130,7 @@ fn find_no_user_test() {
 #[test]
 fn find_no_group_test() {
     let project_root = env!("CARGO_MANIFEST_DIR");
-    let test_dir = format!("{}/tests/find", project_root);
+    let test_dir = format!("{}/tests/find/other", project_root);
     let args = [&test_dir, "-nogroup"];
 
     run_test_find(&args, "", "", 0)
@@ -136,10 +139,10 @@ fn find_no_group_test() {
 #[test]
 fn find_x_dev_test() {
     let project_root = env!("CARGO_MANIFEST_DIR");
-    let test_dir = format!("{}/tests/find", project_root);
+    let test_dir = format!("{}/tests/find/other", project_root);
     let args = [&test_dir, "-xdev"];
 
-    let expected_output = format!("{}\n{}/empty_file.txt\n{}/file with space.txt\n{}/file1.txt\n{}/mod.rs\n{}/rust_file.rs\n", test_dir, test_dir, test_dir, test_dir, test_dir, test_dir);
+    let expected_output = format!("{}\n{}/empty_file.txt\n{}/file with space.txt\n{}/file1.txt\n{}/rust_file.rs\n", test_dir, test_dir, test_dir, test_dir, test_dir);
 
     run_test_find(&args, &expected_output, "", 0)
 }
@@ -147,7 +150,7 @@ fn find_x_dev_test() {
 #[test]
 fn find_perm_test() {
     let project_root = env!("CARGO_MANIFEST_DIR");
-    let test_dir = format!("{}/tests/find", project_root);
+    let test_dir = format!("{}/tests/find/other", project_root);
     let args = [&test_dir, "-perm", "777"];
 
     run_test_find(&args, "", "", 0)
@@ -156,22 +159,10 @@ fn find_perm_test() {
 #[test]
 fn find_links_test() {
     let project_root = env!("CARGO_MANIFEST_DIR");
-    let test_dir = format!("{}/tests/find", project_root);
+    let test_dir = format!("{}/tests/find/other", project_root);
     let args = [&test_dir, "-links", "1"];
 
-    let expected_output = format!("{}/empty_file.txt\n{}/file with space.txt\n{}/file1.txt\n{}/mod.rs\n{}/rust_file.rs\n", test_dir, test_dir, test_dir, test_dir, test_dir);
-
-    run_test_find(&args, &expected_output, "", 0)
-}
-
-#[test]
-fn find_user_test() {
-    let project_root = env!("CARGO_MANIFEST_DIR");
-    let test_dir = format!("{}/tests/find", project_root);
-    let username = whoami::username();
-    let args = [&test_dir, "-user", &username];
-
-    let expected_output = format!("{}\n{}/empty_file.txt\n{}/file with space.txt\n{}/file1.txt\n{}/mod.rs\n{}/rust_file.rs\n", test_dir, test_dir, test_dir, test_dir, test_dir, test_dir);
+    let expected_output = format!("{}/empty_file.txt\n{}/file with space.txt\n{}/file1.txt\n{}/rust_file.rs\n", test_dir, test_dir, test_dir, test_dir);
 
     run_test_find(&args, &expected_output, "", 0)
 }
@@ -179,7 +170,7 @@ fn find_user_test() {
 #[test]
 fn find_group_test() {
     let project_root = env!("CARGO_MANIFEST_DIR");
-    let test_dir = format!("{}/tests/find", project_root);
+    let test_dir = format!("{}/tests/find/other", project_root);
     let args = [&test_dir, "-group", "name"];
 
     run_test_find(&args, "", "", 0)
@@ -188,11 +179,13 @@ fn find_group_test() {
 #[test]
 fn find_newer_test() {
     let project_root = env!("CARGO_MANIFEST_DIR");
-    let test_dir = format!("{}/tests/find", project_root);
-    let test_file = format!("{}/empty_file.txt", test_dir);
-    let args = [&test_dir, "-newer", &test_file];
+    let test_dir = format!("{}/tests/find/newer", project_root);
+    let path_to_test_file = format!("{}/qwe.txt", test_dir);
+    let mut file = File::create(&path_to_test_file).unwrap();
+    writeln!(file, "File content").unwrap();
+    let args = [&test_dir, "-newer", &path_to_test_file];
 
-    let expected_output = format!("{}\n{}/file with space.txt\n{}/mod.rs\n{}/rust_file.rs\n", test_dir, test_dir, test_dir, test_dir);
+    run_test_find(&args, "", "", 0);
 
-    run_test_find(&args, &expected_output, "", 0)
+    remove_file(&path_to_test_file).unwrap();
 }

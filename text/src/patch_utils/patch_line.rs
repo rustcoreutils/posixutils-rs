@@ -1,12 +1,15 @@
 use std::{fmt::Display, io};
 
-use crate::patch_utils::functions::is_normal_range;
+use crate::patch_utils::{
+    constants::normal::{normal_regex_cache, NormalRegexKind},
+    functions::is_normal_head,
+};
 
 use super::{
-    constants::*,
+    // constants::unified::UNIFIED_HUNK_HEADER_IDENTIFIER,
     context_hunk_range_data::ContextHunkRangeData,
     edit_script_range_data::{EditScriptHunkKind, EditScriptRangeData},
-    functions::{if_else, is_edit_script_range, is_no_new_line},
+    functions::{is_edit_script_range, is_no_new_line},
     normal_range_data::NormalRangeData,
     patch_format::PatchFormat,
     patch_line_data::PatchLineData,
@@ -29,7 +32,7 @@ pub enum PatchLine<'a> {
     ),
     ContextDeleted(
         PatchLineData<'a>,
-        // is Change
+        /// is Change
         bool,
     ),
     ContextUnchanged(PatchLineData<'a>),
@@ -139,84 +142,90 @@ impl<'a> PatchLine<'a> {
     }
 
     pub fn try_from_unified(line: &'a str, line_in_patch: usize) -> Result<Self, PatchError> {
-        if !line.is_empty() {
-            if is_no_new_line(line) {
-                return Ok(PatchLine::NoNewLine(PatchLineData::new(
-                    line,
-                    line_in_patch,
-                    PatchFormat::Unified,
-                )));
-            }
+        todo!();
 
-            let unified_identifier = line.chars().nth(0).unwrap();
+        // if !line.is_empty() {
+        //     if is_no_new_line(line) {
+        //         return Ok(PatchLine::NoNewLine(PatchLineData::new(
+        //             line,
+        //             line_in_patch,
+        //             PatchFormat::Unified,
+        //         )));
+        //     }
 
-            let result = match unified_identifier {
-                '+' => Ok(Self::UnifiedInserted(PatchLineData::new(
-                    line,
-                    line_in_patch,
-                    PatchFormat::Unified,
-                ))),
-                '-' => Ok(Self::UnifiedDeleted(PatchLineData::new(
-                    line,
-                    line_in_patch,
-                    PatchFormat::Unified,
-                ))),
-                '@' => {
-                    let invalid_hunk_error = Err(PatchError::InvalidUnifiedHunkHeader);
-                    let splited_hunk_header = line.trim().split(' ').collect::<Vec<&str>>();
+        //     let unified_identifier = line.chars().nth(0).unwrap();
 
-                    if splited_hunk_header.len() != 4 {
-                        return invalid_hunk_error;
-                    }
+        //     let result = match unified_identifier {
+        //         '+' => Ok(Self::UnifiedInserted(PatchLineData::new(
+        //             line,
+        //             line_in_patch,
+        //             PatchFormat::Unified,
+        //         ))),
+        //         '-' => Ok(Self::UnifiedDeleted(PatchLineData::new(
+        //             line,
+        //             line_in_patch,
+        //             PatchFormat::Unified,
+        //         ))),
+        //         '@' => {
+        //             let invalid_hunk_error = Err(PatchError::InvalidUnifiedHunkHeader);
+        //             let splited_hunk_header = line.trim().split(' ').collect::<Vec<&str>>();
 
-                    let hunk_header = if splited_hunk_header[0] == UNIFIED_HUNK_HEADER_IDENTIFIER
-                        && splited_hunk_header[3] == UNIFIED_HUNK_HEADER_IDENTIFIER
-                    {
-                        let f1_range = Range::try_from_unified(splited_hunk_header[1]);
-                        let f2_range = Range::try_from_unified(splited_hunk_header[2]);
+        //             if splited_hunk_header.len() != 4 {
+        //                 return invalid_hunk_error;
+        //             }
 
-                        let hunk_header = match (f1_range, f2_range) {
-                            (Ok(f1_range), Ok(f2_range)) => {
-                                Ok(Self::UnifiedHunkHeader(UnifiedHunkHeaderData::new(
-                                    line.to_string(),
-                                    line_in_patch,
-                                    f1_range,
-                                    f2_range,
-                                )))
-                            }
-                            _ => invalid_hunk_error,
-                        };
+        //             let hunk_header = if splited_hunk_header[0] == UNIFIED_HUNK_HEADER_IDENTIFIER
+        //                 && splited_hunk_header[3] == UNIFIED_HUNK_HEADER_IDENTIFIER
+        //             {
+        //                 let f1_range = Range::try_from_unified(splited_hunk_header[1]);
+        //                 let f2_range = Range::try_from_unified(splited_hunk_header[2]);
 
-                        hunk_header
-                    } else {
-                        invalid_hunk_error
-                    };
+        //                 let hunk_header = match (f1_range, f2_range) {
+        //                     (Ok(f1_range), Ok(f2_range)) => {
+        //                         Ok(Self::UnifiedHunkHeader(UnifiedHunkHeaderData::new(
+        //                             line.to_string(),
+        //                             line_in_patch,
+        //                             f1_range,
+        //                             f2_range,
+        //                         )))
+        //                     }
+        //                     _ => invalid_hunk_error,
+        //                 };
 
-                    hunk_header
-                }
-                ' ' => Ok(Self::UnifiedUnchanged(PatchLineData::new(
-                    line,
-                    line_in_patch,
-                    PatchFormat::Unified,
-                ))),
-                _ => Err(PatchError::InvalidUnifiedPatchLine),
-            };
+        //                 hunk_header
+        //             } else {
+        //                 invalid_hunk_error
+        //             };
 
-            return result;
-        }
+        //             hunk_header
+        //         }
+        //         ' ' => Ok(Self::UnifiedUnchanged(PatchLineData::new(
+        //             line,
+        //             line_in_patch,
+        //             PatchFormat::Unified,
+        //         ))),
+        //         _ => Err(PatchError::InvalidUnifiedPatchLine),
+        //     };
 
-        Err(PatchError::EmptyLineNotAllowed)
+        //     return result;
+        // }
+
+        // Err(PatchError::EmptyLineNotAllowed)
     }
 
     pub fn try_from_normal(line: &'a str, line_in_patch: usize) -> Result<Self, PatchError> {
-        if is_normal_range(line) {
+        let normal_regex = normal_regex_cache();
+
+        if is_normal_head(line) {
             let possible_data = NormalRangeData::try_from(line, line_in_patch);
 
             if let Ok(data) = possible_data {
                 return Ok(PatchLine::NormalRange(data));
             }
 
-            return Err(PatchError::InvalidNormalRange);
+            return Err(PatchError::NormalPatch(
+                NormalPatchError::InvalidPatchRange(line.to_owned()),
+            ));
         }
 
         let patch_line_data = PatchLineData::new(line, line_in_patch, PatchFormat::Normal);
@@ -225,20 +234,22 @@ impl<'a> PatchLine<'a> {
             return Ok(PatchLine::NoNewLine(patch_line_data));
         }
 
-        if line.starts_with(NORMAL_CHANGE_SEPARATOR) {
+        if normal_regex[&NormalRegexKind::LineChangeSeparator].is_match(line) {
             return Ok(PatchLine::NormalChangeSeparator(patch_line_data));
         }
 
-        if line.starts_with(NORMAL_NEW_LINE_IDENT) {
+        if normal_regex[&NormalRegexKind::LineInsert].is_match(line) {
             return Ok(PatchLine::NormalNewLine(patch_line_data));
         }
 
-        if line.starts_with(NORMAL_OLD_LINE_IDENT) {
+        if normal_regex[&NormalRegexKind::LineDelete].is_match(line) {
             return Ok(PatchLine::NormalOldLine(patch_line_data));
         }
 
         dbg!(line);
-        panic!("Could not classify line in Normal PatchLine groups!")
+        return Err(PatchError::NormalPatch(NormalPatchError::InvalidPatchLine(
+            line.to_owned(),
+        )));
     }
 
     pub fn try_from_context(
@@ -246,92 +257,93 @@ impl<'a> PatchLine<'a> {
         line_in_patch: usize,
         is_original_line: bool,
     ) -> Result<Self, PatchError> {
-        if line.len() >= 2 {
-            if line == CONTEXT_HUNK_SEPARATOR {
-                return Ok(PatchLine::ContextHunkSeparator(PatchLineData::new(
-                    line,
-                    line_in_patch,
-                    PatchFormat::Context,
-                )));
-            }
+        todo!()
+        // if line.len() >= 2 {
+        //     if line == CONTEXT_HUNK_SEPARATOR {
+        //         return Ok(PatchLine::ContextHunkSeparator(PatchLineData::new(
+        //             line,
+        //             line_in_patch,
+        //             PatchFormat::Context,
+        //         )));
+        //     }
 
-            if is_no_new_line(line) {
-                return Ok(PatchLine::NoNewLine(PatchLineData::new(
-                    line,
-                    line_in_patch,
-                    PatchFormat::Context,
-                )));
-            }
+        //     if is_no_new_line(line) {
+        //         return Ok(PatchLine::NoNewLine(PatchLineData::new(
+        //             line,
+        //             line_in_patch,
+        //             PatchFormat::Context,
+        //         )));
+        //     }
 
-            let is_context_original_range = line.starts_with(CONTEXT_ORIGINAL_RANGE_STARTER)
-                && line.ends_with(CONTEXT_ORIGINAL_RANGE_FINISHER);
+        //     let is_context_original_range = line.starts_with(CONTEXT_ORIGINAL_RANGE_STARTER)
+        //         && line.ends_with(CONTEXT_ORIGINAL_RANGE_FINISHER);
 
-            let is_context_modified_range = line.starts_with(CONTEXT_MODIFIED_RANGE_STARTER)
-                && line.ends_with(CONTEXT_MODIFIED_RANGE_FINISHER);
+        //     let is_context_modified_range = line.starts_with(CONTEXT_MODIFIED_RANGE_STARTER)
+        //         && line.ends_with(CONTEXT_MODIFIED_RANGE_FINISHER);
 
-            let is_original = if is_context_original_range {
-                Some(true)
-            } else if is_context_modified_range {
-                Some(false)
-            } else {
-                if line.starts_with(CONTEXT_ORIGINAL_RANGE_STARTER)
-                    || line.starts_with(CONTEXT_MODIFIED_RANGE_STARTER)
-                {
-                    return Err(PatchError::InvalidContextRangeHeader);
-                }
+        //     let is_original = if is_context_original_range {
+        //         Some(true)
+        //     } else if is_context_modified_range {
+        //         Some(false)
+        //     } else {
+        //         if line.starts_with(CONTEXT_ORIGINAL_RANGE_STARTER)
+        //             || line.starts_with(CONTEXT_MODIFIED_RANGE_STARTER)
+        //         {
+        //             return Err(PatchError::InvalidContextRangeHeader);
+        //         }
 
-                None
-            };
+        //         None
+        //     };
 
-            if let Some(is_original) = is_original {
-                let range_result = Range::try_from_context(line);
+        //     if let Some(is_original) = is_original {
+        //         let range_result = Range::try_from_context(line);
 
-                if let Ok(range) = range_result {
-                    return Ok(PatchLine::ContextHunkRange(ContextHunkRangeData::new(
-                        line.to_string(),
-                        line_in_patch,
-                        range,
-                        is_original,
-                    )));
-                } else if let Err(_error) = range_result {
-                    return Err(PatchError::InvalidContextRangeHeader);
-                };
-            }
+        //         if let Ok(range) = range_result {
+        //             return Ok(PatchLine::ContextHunkRange(ContextHunkRangeData::new(
+        //                 line.to_string(),
+        //                 line_in_patch,
+        //                 range,
+        //                 is_original,
+        //             )));
+        //         } else if let Err(_error) = range_result {
+        //             return Err(PatchError::InvalidContextRangeHeader);
+        //         };
+        //     }
 
-            let context_identifier = &line[0..2];
+        //     let context_identifier = &line[0..2];
 
-            let result = match context_identifier {
-                "+ " => Ok(Self::ContextInserted(
-                    PatchLineData::new(line, line_in_patch, PatchFormat::Context),
-                    false,
-                )),
-                "- " => Ok(Self::ContextDeleted(
-                    PatchLineData::new(line, line_in_patch, PatchFormat::Context),
-                    false,
-                )),
-                "  " => Ok(Self::ContextUnchanged(PatchLineData::new(
-                    line,
-                    line_in_patch,
-                    PatchFormat::Context,
-                ))),
-                "! " => if_else(
-                    is_original_line,
-                    Ok(Self::ContextDeleted(
-                        PatchLineData::new(line, line_in_patch, PatchFormat::Context),
-                        true,
-                    )),
-                    Ok(Self::ContextInserted(
-                        PatchLineData::new(line, line_in_patch, PatchFormat::Context),
-                        true,
-                    )),
-                ),
-                _ => Err(PatchError::InvalidContextPatchLine),
-            };
+        //     let result = match context_identifier {
+        //         "+ " => Ok(Self::ContextInserted(
+        //             PatchLineData::new(line, line_in_patch, PatchFormat::Context),
+        //             false,
+        //         )),
+        //         "- " => Ok(Self::ContextDeleted(
+        //             PatchLineData::new(line, line_in_patch, PatchFormat::Context),
+        //             false,
+        //         )),
+        //         "  " => Ok(Self::ContextUnchanged(PatchLineData::new(
+        //             line,
+        //             line_in_patch,
+        //             PatchFormat::Context,
+        //         ))),
+        //         "! " => if_else(
+        //             is_original_line,
+        //             Ok(Self::ContextDeleted(
+        //                 PatchLineData::new(line, line_in_patch, PatchFormat::Context),
+        //                 true,
+        //             )),
+        //             Ok(Self::ContextInserted(
+        //                 PatchLineData::new(line, line_in_patch, PatchFormat::Context),
+        //                 true,
+        //             )),
+        //         ),
+        //         _ => Err(PatchError::InvalidContextPatchLine),
+        //     };
 
-            return result;
-        }
+        //     return result;
+        // }
 
-        Err(PatchError::InvalidContextPatchLine)
+        // Err(PatchError::InvalidContextPatchLine)
     }
 
     pub(crate) fn try_from_edit_script(
@@ -399,6 +411,13 @@ impl<'a> PatchLine<'a> {
 
 #[derive(Debug)]
 #[allow(dead_code)]
+pub enum NormalPatchError {
+    InvalidPatchLine(String),
+    InvalidPatchRange(String),
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
 pub enum PatchError {
     EmptyLineNotAllowed,
     InvalidUnifiedHunkHeader,
@@ -414,9 +433,9 @@ pub enum PatchError {
     ContextOrderedLinesUnavailable,
     InvalidEditScriptRange,
     InvalidEditScriptPatch,
-    InvalidNormalRange,
     CouldNotOpenPatchDestinationFile,
     IOError(io::ErrorKind),
+    NormalPatch(NormalPatchError),
 }
 
 impl Display for PatchError {
@@ -436,7 +455,12 @@ impl Display for PatchError {
             PatchError::ContextOrderedLinesUnavailable => "ContextOrderedLinesUnavailable",
             PatchError::InvalidEditScriptRange => "InvalidEditScriptRange",
             PatchError::InvalidEditScriptPatch => "InvalidEditScriptPatch",
-            PatchError::InvalidNormalRange => "InvalidNormalRange",
+            PatchError::NormalPatch(normal_patch_error) => match normal_patch_error {
+                NormalPatchError::InvalidPatchLine(line) => "Could not classify normal patch line.",
+                NormalPatchError::InvalidPatchRange(line) => {
+                    "This line supposed to be normal patch range."
+                }
+            },
             PatchError::CouldNotOpenPatchDestinationFile => "CouldNotOpenPatchDestinationFile",
             PatchError::IOError(_error_kind) => "IOError",
         };

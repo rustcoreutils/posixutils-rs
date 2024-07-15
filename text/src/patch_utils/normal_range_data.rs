@@ -1,5 +1,5 @@
 use super::{
-    functions::is_normal_range,
+    functions::is_normal_head,
     patch_format::PatchFormat,
     range::{Range, RangeError},
 };
@@ -55,7 +55,7 @@ impl<'a> NormalRangeData<'a> {
     }
 
     pub fn try_from(line: &'a str, line_in_patch: usize) -> Result<Self, RangeError> {
-        if !is_normal_range(line) {
+        if !is_normal_head(line) {
             Err(RangeError::InvalidRange)
         } else {
             fn parse_side_range(comma_separated_numeric_string: &str) -> Range {

@@ -7,23 +7,11 @@ use std::{
 use crate::patch_utils::patch_line::PatchLine;
 
 use super::{
-    constants::{
-        context::ORIGINAL_SKIP, CONTEXT_FIRST_LINE_STARTER, CONTEXT_SECOND_LINE_STARTER,
-        UNIFIED_FIRST_LINE_STARTER, UNIFIED_SECOND_LINE_STARTER,
-    },
-    context_hunk_data::ContextHunkData,
-    context_hunk_range_data::ContextHunkRangeData,
-    edit_script_hunk_data::EditScriptHunkData,
-    edit_script_range_data::EditScriptHunkKind,
-    functions::{is_edit_script_range, is_normal_range, print_error},
-    hunk::Hunk,
-    hunks::Hunks,
-    normal_hunk_data::NormalHunkData,
-    patch_file::PatchFile,
-    patch_file_kind::PatchFileKind,
-    patch_format::PatchFormat,
-    patch_line::PatchError,
-    patch_options::PatchOptions,
+    constants::context::ORIGINAL_SKIP, context_hunk_data::ContextHunkData,
+    context_hunk_range_data::ContextHunkRangeData, edit_script_hunk_data::EditScriptHunkData,
+    edit_script_range_data::EditScriptHunkKind, functions::print_error, hunk::Hunk, hunks::Hunks,
+    normal_hunk_data::NormalHunkData, patch_file::PatchFile, patch_file_kind::FileKind,
+    patch_format::PatchFormat, patch_line::PatchError, patch_options::PatchOptions,
     unified_hunk_data::UnifiedHunkData,
 };
 
@@ -47,18 +35,19 @@ impl<'a> Patch<'a> {
         main_file: &'a PatchFile,
         patch_options: PatchOptions,
     ) -> Result<Self, PatchError> {
-        if matches!(patch_file.kind(), PatchFileKind::Patch)
-            && !matches!(main_file.kind(), PatchFileKind::Patch)
+        if matches!(patch_file.kind(), FileKind::Patch)
+            && !matches!(main_file.kind(), FileKind::Patch)
         {
-            println!(
-                "patching file {}",
-                main_file.path().file_name().unwrap().to_str().unwrap()
-            );
+            // println!(
+            //     "patching file {}",
+            //     main_file.path().file_name().unwrap().to_str().unwrap()
+            // );
 
-            let patch_format = if let Some(patch_format) = patch_options.patch_format() {
-                *patch_format
+            let patch_format = if patch_options.patch_format.is(&PatchFormat::None) {
+                // Self::guess_patch_format(patch_file.lines())
+                todo!()
             } else {
-                Self::guess_patch_format(patch_file.lines())
+                patch_options.patch_format
             };
 
             let hunks = match &patch_format {
@@ -82,7 +71,7 @@ impl<'a> Patch<'a> {
             };
 
             let mut patch_options = patch_options;
-            patch_options.update_patch_format(patch_format);
+            patch_options.patch_format = patch_format;
 
             let output_file = File::open(main_file.path());
 
@@ -113,48 +102,20 @@ impl<'a> Patch<'a> {
 
     /// panics if patch_format is NONE or reversed is enabled with ed script
     pub fn apply(&'a mut self) -> PatchResult<()> {
-        if let Some(patch_format) = self.patch_options.patch_format() {
-            match (patch_format, self.patch_options.reverse()) {
-                (PatchFormat::None, _) => panic!("PatchFormat should be valid!"),
-                (PatchFormat::Normal, false) => self.apply_normal(),
-                (PatchFormat::Normal, true) => self.apply_normal_reverse(),
-                (PatchFormat::Unified, false) => self.apply_unified(),
-                (PatchFormat::Unified, true) => self.apply_unified_reverse(),
-                (PatchFormat::Context, false) => self.apply_context(),
-                (PatchFormat::Context, true) => self.apply_context_reverse(),
-                (PatchFormat::EditScript, false) => self.apply_edit_script(),
-                (PatchFormat::EditScript, true) => {
-                    print_error("ed format + reverse option is not possible!");
-                    std::process::exit(0);
-                }
+        match (self.patch_options.patch_format, self.patch_options.reversed) {
+            (PatchFormat::None, _) => panic!("PatchFormat should be valid!"),
+            (PatchFormat::Normal, false) => self.apply_normal(),
+            (PatchFormat::Normal, true) => self.apply_normal_reverse(),
+            (PatchFormat::Unified, false) => self.apply_unified(),
+            (PatchFormat::Unified, true) => self.apply_unified_reverse(),
+            (PatchFormat::Context, false) => self.apply_context(),
+            (PatchFormat::Context, true) => self.apply_context_reverse(),
+            (PatchFormat::EditScript, false) => self.apply_edit_script(),
+            (PatchFormat::EditScript, true) => {
+                print_error("ed format + reverse option is not possible!");
+                std::process::exit(0);
             }
-        } else {
-            Err(PatchError::PatchFormatUnavailable)
         }
-    }
-
-    fn guess_patch_format(lines: &[String]) -> PatchFormat {
-        if lines[0].starts_with(UNIFIED_FIRST_LINE_STARTER)
-            && lines[1].starts_with(UNIFIED_SECOND_LINE_STARTER)
-        {
-            return PatchFormat::Unified;
-        }
-
-        if lines[0].starts_with(CONTEXT_FIRST_LINE_STARTER)
-            && lines[1].starts_with(CONTEXT_SECOND_LINE_STARTER)
-        {
-            return PatchFormat::Context;
-        }
-
-        if is_edit_script_range(&lines[0]) {
-            return PatchFormat::EditScript;
-        }
-
-        if is_normal_range(&lines[0]) {
-            return PatchFormat::Normal;
-        }
-
-        PatchFormat::None
     }
 
     fn parse_unified_patch(lines: &'a [String]) -> PatchResult<Hunks> {
@@ -342,8 +303,7 @@ impl<'a> Patch<'a> {
         match no_new_line_count {
             0 => println!(),
             1 => {
-                if matches!(self.file.kind(), PatchFileKind::Original)
-                    && !self.file.ends_with_newline()
+                if matches!(self.file.kind(), FileKind::Original) && !self.file.ends_with_newline()
                 {
                     println!();
                 }
@@ -434,8 +394,7 @@ impl<'a> Patch<'a> {
         match no_newline_count {
             0 => println!(),
             1 => {
-                if matches!(self.file.kind(), PatchFileKind::Original)
-                    && !self.file.ends_with_newline()
+                if matches!(self.file.kind(), FileKind::Original) && !self.file.ends_with_newline()
                 {
                     println!();
                 }
@@ -515,8 +474,7 @@ impl<'a> Patch<'a> {
         match no_new_line_count {
             0 => println!(),
             1 => {
-                if matches!(self.file.kind(), PatchFileKind::Original)
-                    && !self.file.ends_with_newline()
+                if matches!(self.file.kind(), FileKind::Original) && !self.file.ends_with_newline()
                 {
                     writeln!(self.output, "")?;
                 }
@@ -600,8 +558,7 @@ impl<'a> Patch<'a> {
         match no_new_line_count {
             0 => println!(),
             1 => {
-                if matches!(self.file.kind(), PatchFileKind::Original)
-                    && !self.file.ends_with_newline()
+                if matches!(self.file.kind(), FileKind::Original) && !self.file.ends_with_newline()
                 {
                     println!();
                 }
@@ -617,8 +574,7 @@ impl<'a> Patch<'a> {
             hunk.verify_hunk();
         });
 
-        let reversed = self.patch_options.reverse();
-        self.verify_file(reversed)
+        self.verify_file(self.patch_options.reversed)
     }
 
     fn apply_normal_reverse(&mut self) -> Result<(), PatchError> {
@@ -680,8 +636,7 @@ impl<'a> Patch<'a> {
         match no_new_line_count {
             0 => println!(),
             1 => {
-                if matches!(self.file.kind(), PatchFileKind::Original)
-                    && !self.file.ends_with_newline()
+                if matches!(self.file.kind(), FileKind::Original) && !self.file.ends_with_newline()
                 {
                     println!();
                 }
@@ -736,8 +691,7 @@ impl<'a> Patch<'a> {
         match no_new_line_count {
             0 => println!(),
             1 => {
-                if matches!(self.file.kind(), PatchFileKind::Original)
-                    && !self.file.ends_with_newline()
+                if matches!(self.file.kind(), FileKind::Original) && !self.file.ends_with_newline()
                 {
                     writeln!(self.output, "")?;
                 }
@@ -818,8 +772,7 @@ impl<'a> Patch<'a> {
         match no_newline_count {
             0 => println!(),
             1 => {
-                if matches!(self.file.kind(), PatchFileKind::Modified)
-                    && !self.file.ends_with_newline()
+                if matches!(self.file.kind(), FileKind::Modified) && !self.file.ends_with_newline()
                 {
                     writeln!(self.output, "")?;
                 }

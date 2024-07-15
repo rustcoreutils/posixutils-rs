@@ -4,23 +4,24 @@ use std::{
     path::PathBuf,
 };
 
-use super::patch_file_kind::PatchFileKind;
+use super::patch_file_kind::FileKind;
 
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct PatchFile {
+    content: String,
     lines: Vec<String>,
-    kind: PatchFileKind,
+    kind: FileKind,
     path: PathBuf,
     ends_with_newline: bool,
 }
 
 impl PatchFile {
-    pub fn load_file(path: PathBuf, kind: PatchFileKind) -> io::Result<Self> {
+    pub fn load_file(path: PathBuf, kind: FileKind) -> io::Result<Self> {
         let content = fs::read_to_string(&path)?;
         let ends_with_newline = content.ends_with('\n');
 
-        if matches!(kind, PatchFileKind::Patch) && content.is_empty() {
+        if matches!(kind, FileKind::Patch) && content.is_empty() {
             std::process::exit(0);
         }
 
@@ -49,6 +50,7 @@ impl PatchFile {
         };
 
         Ok(Self {
+            content,
             lines,
             kind,
             path,
@@ -56,11 +58,11 @@ impl PatchFile {
         })
     }
 
-    pub fn lines(&self) -> &Vec<String> {
+    pub fn lines(&self) -> &[String] {
         &self.lines
     }
 
-    pub fn kind(&self) -> PatchFileKind {
+    pub fn kind(&self) -> FileKind {
         self.kind
     }
 
@@ -78,6 +80,10 @@ impl PatchFile {
 
     pub fn path(&self) -> &PathBuf {
         &self.path
+    }
+
+    pub fn content(&self) -> &str {
+        &self.content
     }
 }
 

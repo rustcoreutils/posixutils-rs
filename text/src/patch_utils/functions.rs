@@ -1,12 +1,10 @@
 use std::{fs, path::PathBuf};
 
-use regex::Regex;
+use crate::patch_utils::constants::context::{context_regex_cache, ContextRegexKind};
 
 use super::constants::{
-    regex::{
-        NORMAL_FORMAT_RANGE_CHANGE_REGEX, NORMAL_FORMAT_RANGE_DELETE_REGEX,
-        NORMAL_FORMAT_RANGE_INSERT_REGEX,
-    },
+    normal::{get_normal_regex_list, NormalRegexKind},
+    unified::{unified_regex_cache, UnifiedRegexKind},
     NO_NEW_LINE, NO_NEW_LINE_ED,
 };
 
@@ -33,18 +31,14 @@ pub fn is_no_new_line(line: &str) -> bool {
     line.trim_end() == NO_NEW_LINE || line.trim_end() == NO_NEW_LINE_ED
 }
 
-pub fn is_normal_range(line: &str) -> bool {
-    let patterns = [
-        NORMAL_FORMAT_RANGE_INSERT_REGEX,
-        NORMAL_FORMAT_RANGE_CHANGE_REGEX,
-        NORMAL_FORMAT_RANGE_DELETE_REGEX,
-    ];
-
-    patterns.iter().any(|pattern| {
-        Regex::new(pattern)
-            .expect("NORMAL-FORMAT patterns are supposed to be correct!")
-            .is_match(line)
-    })
+pub fn is_normal_head(line: &str) -> bool {
+    get_normal_regex_list(&[
+        NormalRegexKind::RangeInsert,
+        NormalRegexKind::RangeChange,
+        NormalRegexKind::RangeDelete,
+    ])
+    .iter()
+    .any(|regex| regex.is_match(line))
 }
 
 pub fn verify_patch_line(left: &str, right: &str) -> Result<(), ()> {
@@ -61,4 +55,55 @@ pub fn print_error(error: impl Into<String>) {
 
 pub fn file_exists(path: impl Into<PathBuf>) -> bool {
     fs::metadata(path.into()).is_ok()
+}
+
+pub fn look_for_hunk_head(operator: fn(&str, &str) -> bool, lines: &[String]) -> Option<usize> {
+    if lines.is_empty() {
+        return None;
+    }
+
+    for i in 0..lines.len().wrapping_sub(1) {
+        if operator(&lines[i], &lines[i + 1]) {
+            return Some(i);
+        }
+    }
+
+    None
+}
+
+pub fn is_normal_diff_line(line: &str) -> bool {
+    get_normal_regex_list(&[
+        NormalRegexKind::RangeInsert,
+        NormalRegexKind::RangeChange,
+        NormalRegexKind::RangeDelete,
+        NormalRegexKind::LineInsert,
+        NormalRegexKind::LineChangeSeparator,
+        NormalRegexKind::LineDelete,
+    ])
+    .iter()
+    .any(|regex| regex.is_match(line))
+}
+
+pub fn is_context_header(l0: &str, l1: &str) -> bool {
+    let regex_cache = context_regex_cache();
+
+    if regex_cache[&ContextRegexKind::FirstLine].is_match(l0)
+        && regex_cache[&ContextRegexKind::SecondLine].is_match(l1)
+    {
+        true
+    } else {
+        false
+    }
+}
+
+pub fn is_unfied_header(l0: &str, l1: &str) -> bool {
+    let regex_cache = unified_regex_cache();
+
+    if regex_cache[&UnifiedRegexKind::FirstLine].is_match(l0)
+        && regex_cache[&UnifiedRegexKind::SecondLine].is_match(l1)
+    {
+        true
+    } else {
+        false
+    }
 }

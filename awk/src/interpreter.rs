@@ -129,6 +129,14 @@ impl From<Reference> for StackValue {
     }
 }
 
+fn f64_to_i64_or_err(value: f64) -> Result<i64, String> {
+    if value.is_finite() {
+        Ok(value as i64)
+    } else {
+        Err(format!("cannot convert {} to integer", value))
+    }
+}
+
 struct CallFrame<'i> {
     ip: usize,
     bp: usize,
@@ -424,11 +432,14 @@ impl Interpreter {
                 remaining_args -= 1;
                 match specifier {
                     'd' | 'i' => {
-                        let value = self.pop_scalar()?.as_f64_or_err()?;
-                        fmt_write_signed(&mut result, value as i64, &args);
+                        let value = f64_to_i64_or_err(self.pop_scalar()?.as_f64_or_err()?)?;
+                        fmt_write_signed(&mut result, value, &args);
                     }
                     'u' | 'o' | 'x' | 'X' => {
-                        let value = self.pop_scalar()?.as_f64_or_err()? as u64;
+                        let value = f64_to_i64_or_err(self.pop_scalar()?.as_f64_or_err()?)?;
+                        if value.is_negative() {
+                            return Err("negative value for unsigned format specifier".to_string());
+                        }
                         let format = match specifier {
                             'u' => IntegerFormat::Decimal,
                             'o' => IntegerFormat::Octal,
@@ -436,7 +447,7 @@ impl Interpreter {
                             'X' => IntegerFormat::HexUpper,
                             _ => unreachable!(),
                         };
-                        fmt_write_unsigned(&mut result, value, format, &args);
+                        fmt_write_unsigned(&mut result, value as u64, format, &args);
                     }
                     'a' | 'A' => {
                         let value = self.pop_scalar()?.as_f64_or_err()?;
@@ -704,8 +715,8 @@ impl Interpreter {
                     self.push(StackValue::Reference(Reference::GlobalVarRef(idx as usize)));
                 }
                 OpCode::FieldRef => {
-                    let index = self.pop_scalar()?.as_f64_or_err()?;
-                    if index.is_sign_negative() {
+                    let index = f64_to_i64_or_err(self.pop_scalar()?.as_f64_or_err()?)?;
+                    if index.is_negative() {
                         return Err("negative field index".to_string());
                     }
                     self.push(StackValue::Reference(Reference::FieldRef(index as usize)));

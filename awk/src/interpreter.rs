@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use crate::program::{BuiltinFunction, Constant, Function, OpCode, Program, SpecialVar};
 
 use crate::format::{
-    fmt_write_hex_float, fmt_write_signed, fmt_write_string, fmt_write_unsigned,
-    parse_conversion_specifier_args, IntegerFormat,
+    fmt_write_decimal_float, fmt_write_hex_float, fmt_write_signed, fmt_write_string,
+    fmt_write_unsigned, parse_conversion_specifier_args, IntegerFormat,
 };
 use std::fmt::Write;
 
@@ -441,6 +441,10 @@ impl Interpreter {
                     'a' | 'A' => {
                         let value = self.pop_scalar()?.as_f64_or_err()?;
                         fmt_write_hex_float(&mut result, value, specifier == 'a', &args);
+                    }
+                    'f' | 'F' => {
+                        let value = self.pop_scalar()?.as_f64_or_err()?;
+                        fmt_write_decimal_float(&mut result, value, specifier == 'f', &args);
                     }
                     's' => {
                         let value = self.pop_scalar()?.to_string();
@@ -1695,6 +1699,34 @@ mod tests {
         assert_eq!(
             test_sprintf("%10.3a", vec![Constant::Number(255.34)]),
             "0x1.feap+7"
+        );
+    }
+
+    #[test]
+    fn test_builtin_sprintf_with_float_args() {
+        assert_eq!(
+            test_sprintf("%f", vec![Constant::Number(255.34)]),
+            "255.340000"
+        );
+        assert_eq!(
+            test_sprintf("%.1f", vec![Constant::Number(255.34)]),
+            "255.3"
+        );
+        assert_eq!(
+            test_sprintf("%15f", vec![Constant::Number(255.34)]),
+            "     255.340000"
+        );
+        assert_eq!(
+            test_sprintf("%-15f", vec![Constant::Number(255.34)]),
+            "255.340000     "
+        );
+        assert_eq!(
+            test_sprintf("float value: %f", vec![Constant::Number(49.67)]),
+            "float value: 49.670000"
+        );
+        assert_eq!(
+            test_sprintf("%10.3f", vec![Constant::Number(255.34)]),
+            "   255.340"
         );
     }
 }

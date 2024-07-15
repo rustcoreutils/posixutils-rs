@@ -26,6 +26,7 @@ impl OutputRef {
         self.0.borrow_mut().undivert(buffer_number)
     }
 
+    // TODO: remove this capability if not necessary.
     pub fn replace_output(&mut self, new_output: Box<dyn Write>) -> Box<dyn Write> {
         self.0.borrow_mut().replace_output(new_output)
     }

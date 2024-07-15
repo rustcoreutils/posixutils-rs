@@ -1200,6 +1200,23 @@ mod tests {
     }
 
     #[test]
+    fn test_write_float_hex_lower_left_justified_space_padded() {
+        let mut target = String::new();
+        fmt_write_hex_float(
+            &mut target,
+            123.456,
+            true,
+            &FormatArgs {
+                left_justified: true,
+                zero_padded: true,
+                width: 22,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "0x1.edd2f1a9fbe77p+6  ");
+    }
+
+    #[test]
     fn test_write_float_hex_lower_zero_padded() {
         let mut target = String::new();
         fmt_write_hex_float(

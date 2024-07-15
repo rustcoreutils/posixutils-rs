@@ -1,4 +1,4 @@
-use error::{Error, ErrorKind};
+use error::{Error, ErrorKind, Result};
 use std::{
     ffi::{OsStr, OsString},
     io::Write,
@@ -16,6 +16,8 @@ mod lexer;
 mod precedence;
 #[cfg(test)]
 mod test_utils;
+
+pub const EOF: u8 = b'\0';
 
 // TODO: potentially we can use a reference here to avoid allocation
 #[derive(Debug, Clone)]

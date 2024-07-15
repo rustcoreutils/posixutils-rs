@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -15,6 +16,7 @@ use crate::lexer::{
     parse_dnl, parse_macro_args, Macro, MacroName, MacroParseConfig, ParseConfig, Symbol,
     DEFAULT_QUOTE_CLOSE_TAG, DEFAULT_QUOTE_OPEN_TAG,
 };
+use crate::EOF;
 
 mod output;
 
@@ -32,15 +34,40 @@ pub struct State {
     /// Stack of filenames. Used in [`FileMacro`].
     /// TODO: fold into input
     pub file: Vec<PathBuf>,
+    pub output: OutputState,
+    pub input: InputState,
+    
+}
+
+#[derive(Default)]
+struct OutputState {
     pub output: OutputRef,
-    pub input: Vec<Box<dyn Read>>,
+    pub stack: Vec<StackFrame>,
+}
+
+impl OutputState {
+    /// Write either to output, or to the buffer for the macro arg currently being parsed.
+    pub fn write_all(&mut self, buf: &[u8]) -> crate::Result<()> {
+        if self.stack.is_empty() {
+            self.output.write_all(buf)?;
+        } else {
+            self.stack
+                .last_mut()
+                .expect("Stack not empty")
+                .args
+                .last_mut()
+                .expect("Always at least one arg")
+                .extend(buf.into_iter());
+        }
+        Ok(())
+    }
 }
 
 impl State {
-    pub fn new(output: Box<dyn Write>, input: Vec<Box<dyn Read>>) -> Self {
+    pub fn new(output: Box<dyn Write>, input: Vec<Input>) -> Self {
         Self {
-            output: Output::new(output).into_ref(),
-            input,
+            output: OutputState{ output: Output::new(output).into_ref(), ..OutputState::default() },
+            input: InputState { input },
             ..Self::default()
         }
     }
@@ -84,11 +111,160 @@ impl Default for State {
             exit_error: false,
             m4wrap: Vec::new(),
             last_syscmd_status: None,
-            output: OutputRef::default(),
+            output: OutputState::default(),
             file: Vec::new(),
-            input: Vec::new(),
+            input: InputState::default(),
         }
     }
+}
+
+pub struct StackFrame {
+    parenthesis_level: usize,
+    args: Vec<Vec<u8>>,
+    // Macro type
+}
+
+#[derive(Default)]
+struct InputState {
+    pub input: Vec<Input>,
+}
+
+impl InputState {
+    /// Get the next character to be parsed. First it tries to get one from the pushback buffer,
+    /// otherwise it gets one from the input file.
+    pub fn get_next_character(&mut self) -> crate::error::Result<u8> {
+        let input = self.input.last_mut().unwrap();
+        if let Some(c) = input.pushback_buffer.pop() {
+            return Ok(c);
+        }
+
+        let mut buf: [u8; 1] = [0; 1];
+        let n = input.input.read(&mut buf)?;
+        if n == 0 {
+            Ok(EOF)
+        } else {
+            Ok(buf[0])
+        }
+    }
+
+    pub fn pushback_character(&mut self, c: u8) {
+        self.input.last_mut().unwrap().pushback_buffer.push(c);
+    }
+
+    /// Fetch new characters attempting to match them all to token. If any character doesn't match
+    /// the token, then all the characters previously fetched are placed onto the pushback buffer.
+    ///
+    /// **NOTE:** Will panic if token is not length of at least 1.
+    pub fn look_ahead(&mut self, token: &[u8]) -> crate::error::Result<bool> {
+        let mut i = 0;
+        let mut t;
+        while i < token.len() {
+            t = self.get_next_character()?;
+            if t != token[i] {
+                loop {
+                    self.pushback_character(token[i]);
+                    if i == 0 {
+                        break;
+                    }
+                    i -= 1;
+                }
+                return Ok(false);
+            }
+
+            i += 1;
+        }
+
+        Ok(true)
+    }
+}
+
+pub struct Input {
+    pub input: InputRead,
+    pub name: String,
+    pub current_char: Option<u8>,
+    pub pushback_buffer: Vec<u8>,
+}
+
+enum InputRead {
+    File(std::fs::File),
+    Stdin(std::io::Stdin),
+}
+
+impl Read for InputRead {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            InputRead::File(f) => f.read(buf),
+            InputRead::Stdin(s) => s.read(buf),
+        }
+    }
+}
+
+/// [`Symbol`] writing output to `writer`, and returns a [`ParseConfig`] which has been modified
+/// during the process of evaluation (for example a new macro was defined, or changequote).
+///
+/// Arguments:
+/// - `unwrap_quotes` - Whether to unwrap quotes during evaluation.
+/// - `all_inputs` - Whether to process all the inputs in `state.input` (`true`), or just the top of
+///   the stack (`false`).
+pub(crate) fn process_streaming<'c>(
+    mut state: State,
+    stderr: &mut dyn Write,
+    unwrap_quotes: bool,
+    all_inputs: bool,
+) -> crate::error::Result<State> {
+    let mut quotation_level;
+
+    loop {
+        // Strip quotes
+        if state.input.look_ahead(&state.parse_config.quote_open_tag)? {
+            quotation_level = 1;
+
+            'inside_quote: loop {
+                if state
+                    .input
+                    .look_ahead(&state.parse_config.quote_close_tag)?
+                {
+                    quotation_level -= 1;
+                    if quotation_level >= 0 {
+                        // Encountered within the quote, so we output it.
+                        state
+                            .output
+                            .write_all(&state.parse_config.quote_close_tag)?;
+                    }
+                } else if state.input.look_ahead(&state.parse_config.quote_open_tag)? {
+                    quotation_level += 1;
+                } else {
+                    let t = state.input.get_next_character()?;
+                    if t == EOF {
+                        return Err(crate::Error::new(crate::ErrorKind::UnclosedQuote));
+                    } else {
+                        state.output.write_all(&[t])?;
+                    }
+                }
+
+                if quotation_level == 0 {
+                    break 'inside_quote;
+                }
+            }
+        } else if state.output.stack.is_empty() && state.input.look_ahead(&state.parse_config.comment_open_tag)? {
+            state.output.write_all(&state.parse_config.comment_open_tag)?;
+
+            'inside_comment: loop {
+                if state.input.look_ahead(&state.parse_config.comment_close_tag)? {
+                    state.output.write_all(&state.parse_config.comment_close_tag)?;
+                    break 'inside_comment
+                }
+                let t = state.input.get_next_character()?;
+                if t == EOF {
+                    break 'inside_comment;
+                }
+                state.output.write_all(&[t])?;
+            }
+        }
+        // TODO
+    }
+
+    Ok(state)
 }
 
 macro_rules! macro_enums {
@@ -1763,263 +1939,5 @@ impl MacroImplementation for FileMacro {
             )?;
         }
         Ok(state)
-    }
-}
-
-// TODO: move to lexer module?
-fn evaluate_to_buffer(
-    mut state: State,
-    input: &[u8],
-    stderr: &mut dyn Write,
-    unwrap_quotes: bool,
-) -> Result<(Vec<u8>, State)> {
-    let mut output = Vec::with_capacity(input.len());
-    let input = std::io::Cursor::new(input.to_vec());
-    state.input.push(Box::new(input));
-    state = process_streaming(state, &mut output, stderr, unwrap_quotes, false)?;
-    log::debug!(
-        "evaluate_to_buffer() Evaluated to buffer {:?}",
-        String::from_utf8_lossy(&output)
-    );
-    Ok((output, state))
-}
-
-// Example divert_nested_2:
-// buffer = "x(y) end\0" stdout = "" divnum = 0
-// x args buffer ->
-//   buffer = "y" out = "" divnum = 0
-//   buffer = "j(z),k" out = "" divnum = 0
-// j args buffer ->
-//   buffer = "z" out = "" divnum = 0
-//   buffer = "hi divert(-1) hidden?" out = "" divnum = 0
-//   buffer = " divert(-1) hidden?" out = "hi" divnum = 0
-//   buffer = "divert(-1) hidden?" out = "hi " divnum = 0
-//   buffer = "hidden?" out = "hi " divnum = -1
-//   buffer = "" out = "hi  hidden?" divnum = -1
-// x args buffer ->
-//   buffer = "hi  hidden?,k" out = "" divnum = -1
-//   buffer = "  hidden?,k" out = "hi" divnum = -1
-//   buffer = " hidden?,k" out = "hi " divnum = -1
-//   buffer = "hidden?,k" out = "hi  " divnum = -1
-//   buffer = ",k" out = "hi  hidden?" divnum = -1
-//   buffer = "k" out = "hi  hidden?," divnum = -1
-//   buffer = "divert(0) bye" out = "hi  hidden?," divnum = -1
-//   buffer = " bye" out = "hi  hidden?," divnum = 0
-//   buffer = "bye" out = "hi  hidden?, " divnum = 0
-//   buffer = "" out = "hi  hidden?, bye" divnum = 0
-// buffer = "wow[hi  hidden?] bye end\0" stdout = "" divnum = 0
-// buffer = "wow[hi  hidden?] end\0" stdout = "" divnum = 0
-// buffer = "[hi  hidden?] bye end\0" stdout = "wow" divnum = 0
-// buffer = "hi  hidden?] bye end\0" stdout = "wow[" divnum = 0
-// buffer = "  hidden?] bye end\0" stdout = "wow[hi" divnum = 0
-// buffer = " hidden?] bye end\0" stdout = "wow[hi " divnum = 0
-// buffer = "hidden?] bye end\0" stdout = "wow[hi  " divnum = 0
-// buffer = "] bye end\0" stdout = "wow[hi  hidden?" divnum = 0
-// buffer = " bye end\0" stdout = "wow[hi  hidden?]" divnum = 0
-// buffer = "bye end\0" stdout = "wow[hi  hidden?] " divnum = 0
-// buffer = " end\0" stdout = "wow[hi  hidden?] bye" divnum = 0
-// buffer = "end\0" stdout = "wow[hi  hidden?] bye " divnum = 0
-// buffer = "\0" stdout = "wow[hi  hidden?] bye end" divnum = 0
-//
-// Based on this I'm still very confused as to why evaluate_to_buffer recursion is required for
-// user defined macros and ifelse, etc.
-
-/// [`Symbol`] writing output to `writer`, and returns a [`ParseConfig`] which has been modified
-/// during the process of evaluation (for example a new macro was defined, or changequote).
-///
-/// Arguments:
-/// - `unwrap_quotes` - Whether to unwrap quotes during evaluation.
-/// - `all_inputs` - Whether to process all the inputs in `state.input` (`true`), or just the top of
-///   the stack (`false`).
-pub(crate) fn process_streaming<'c>(
-    mut state: State,
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
-    unwrap_quotes: bool,
-    all_inputs: bool,
-) -> crate::error::Result<State> {
-    // A buffer for reading data from `reader`.
-    let mut read_buffer: [u8; 7] = [0; 7];
-
-    // A buffer per state.input (except the current input which is stored in `buffer`) so that
-    // unparsed/un-evaluated symbols remain in the correct order.
-    debug_assert!(!state.input.is_empty());
-    let mut buffers: Vec<Vec<u8>> = (0..(state.input.len() - 1))
-        .into_iter()
-        .map(|_| Vec::new())
-        .collect();
-    let mut buffer: Vec<u8> = Vec::new();
-
-    // Here we have a buffer of input `buffer` which we attempt to parse as a Symbol. If parsing
-    // fails as Incomplete, then we enlarge the buffer and pull in a bunch more input via
-    // `read_buffer`, and retry until success, or we reach the end of input.
-    'read_data: loop {
-        log::debug!("'read_data: buffer: {:?}", String::from_utf8_lossy(&buffer));
-        // TODO(performance): Perhaps there's a way we can read directly into the end of buffer
-        // using a slice range index?
-        let n = state.input.last_mut().unwrap().read(&mut read_buffer)?;
-
-        if n == 0 {
-            // Reached EOF
-            buffer.push(b'\0');
-        } else {
-            buffer.extend_from_slice(&read_buffer[0..n])
-        }
-
-        // Parse and evaluate the symbols in the buffer, when it parses as incomplete break the loop
-        // to fetch more data.
-        'evaluate_symbols: loop {
-            log::debug!(
-                "'evaluate_symbols: buffer: {:?}",
-                String::from_utf8_lossy(&buffer)
-            );
-            if buffer.first() == Some(&b'\0') {
-                state.input.pop();
-                buffer.pop();
-
-                if !all_inputs || state.input.is_empty() {
-                    break 'read_data Ok(state);
-                } else {
-                    buffer = buffers.pop().unwrap();
-                    break 'evaluate_symbols;
-                }
-            }
-
-            let mut macro_buffer = Vec::new();
-            let remaining = if state.parse_config.dnl {
-                // dnl is active, so we need to parse the input until the moment when it should be
-                // disabled (and skip evaluating this input).
-                let result = parse_dnl(&buffer);
-                let remaining = match result {
-                    Ok((remaining, _parsed)) => remaining,
-                    Err(nom::Err::Incomplete(_)) => {
-                        log::debug!("parse_dnl() incomplete, requesting more data");
-                        break 'evaluate_symbols; // request more data
-                    }
-                    Err(error) => {
-                        return Err(crate::error::Error::new(crate::ErrorKind::Parsing)
-                            .add_context(match error {
-                                nom::Err::Error(error) | nom::Err::Failure(error) => {
-                                    let input = std::str::from_utf8(error.input)
-                                        .map(|s| format!("{s:?}"))
-                                        .unwrap_or_else(|_| format!("{:?}", error.input));
-                                    format!(
-                                        "Parsing Error for input {}, code: {:?}",
-                                        input, error.code
-                                    )
-                                }
-                                nom::Err::Incomplete(_) => error.to_string(),
-                            }));
-                    }
-                };
-                state.parse_config.dnl = false;
-
-                remaining
-            } else {
-                let result = Symbol::parse(&state.parse_config)(&buffer);
-                let (remaining_after_symbol, symbol) = match result {
-                    Ok(ok) => ok,
-                    Err(nom::Err::Incomplete(_)) => {
-                        log::debug!("Symbol::parse() incomplete, requesting more data");
-                        break 'evaluate_symbols; // request more data
-                    }
-                    Err(error) => {
-                        return Err(crate::error::Error::new(crate::ErrorKind::Parsing)
-                            .add_context(match error {
-                                nom::Err::Error(error) | nom::Err::Failure(error) => {
-                                    let input = std::str::from_utf8(error.input)
-                                        .map(|s| format!("{s:?}"))
-                                        .unwrap_or_else(|_| format!("{:?}", error.input));
-                                    format!(
-                                        "Parsing Error for input {}, code: {:?}",
-                                        input, error.code
-                                    )
-                                }
-                                nom::Err::Incomplete(_) => error.to_string(),
-                            }));
-                    }
-                };
-
-                match symbol {
-                    Symbol::Comment(comment) => stdout.write_all(comment)?,
-                    Symbol::Text(text) => {
-                        log::debug!(
-                            "process_streaming(): Symbol::Text {:?}",
-                            String::from_utf8_lossy(text)
-                        );
-                        stdout.write_all(text)?
-                    }
-                    Symbol::Quoted(quoted) => {
-                        log::debug!("evaluate() writing quoted {quoted:?}");
-                        if unwrap_quotes {
-                            stdout.write_all(quoted.contents)?;
-                        } else {
-                            stdout.write_all(quoted.all)?;
-                        }
-                    }
-                    Symbol::Macro(mut m) => {
-                        let mut args_input_buffer = Vec::new();
-                        if !m.args.is_empty() {
-                            // Important that we don't evaluate quotes.
-                            // x(y)
-                            //   ^ should be evaluated
-                            // x(`a,b`)
-                            //   ^^^^^ should not be evaluated
-                            // BUG: diverts here don't work
-                            (args_input_buffer, state) =
-                                evaluate_to_buffer(state, m.args_input, stderr, false)?;
-                            log::debug!(
-                                "evaluate() arg_buffer {:?}",
-                                String::from_utf8_lossy(&args_input_buffer)
-                            );
-                            // Necessary for the streaming args parser to terminate.
-                            args_input_buffer.push(b')');
-                            let (remaining, args) =
-                                parse_macro_args(&state.parse_config)(&args_input_buffer)?;
-                            debug_assert_eq!(remaining, b")");
-                            log::debug!("evaluate() updated args {args:?}");
-                            m.args = args;
-                        }
-                        m.args_input = &args_input_buffer;
-
-                        let name = m.name.to_string();
-                        log::debug!("evaluate() evaluating macro {name:?}");
-                        let definition = state
-                            .macro_definitions
-                            .get(&m.name)
-                            .and_then(|e| e.last().cloned())
-                            .expect("There should always be a definition for a parsed macro");
-
-                        // BUG: Something about diverts here doesn't work.
-                        state = definition
-                            .implementation
-                            .evaluate(state, &mut macro_buffer, stderr, m)
-                            .add_context(|| format!("Error evaluating macro {name:?}"))?;
-
-                        log::debug!(
-                            "evaluate() finished evaluating macro {name:?}, macro_buffer: {:?}",
-                            String::from_utf8_lossy(&macro_buffer)
-                        );
-                    }
-                    Symbol::Newline => stdout.write_all(b"\n")?,
-                    Symbol::Eof => unreachable!(),
-                }
-
-                remaining_after_symbol
-            };
-
-            // If any macros were evaluated, their output needs to be placed at the beginning of the
-            // buffer, followed by any remaining symbols that have not yet been parsed and
-            // evaluated.
-            macro_buffer.extend_from_slice(remaining);
-            buffer = macro_buffer;
-
-            if state.input.len() > (buffers.len() + 1) {
-                buffers.push(std::mem::replace(&mut buffer, Vec::new()));
-            }
-            if state.input.len() < (buffers.len() + 1) {
-                buffer = buffers.pop().unwrap();
-            }
-        }
     }
 }

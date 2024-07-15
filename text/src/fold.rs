@@ -6,10 +6,6 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// TODO:
-// - integration tests
-// - verify break-with-spaces correctness
-//
 
 extern crate clap;
 extern crate plib;

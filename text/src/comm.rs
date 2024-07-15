@@ -158,15 +158,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mask = args_mask(&args);
 
-    const MASK2: u32 = NO1 | NO2;
-    let lead_dup = {
-        if (mask & MASK2) == 0 {
-            "\t\t"
-        } else if (mask & MASK2) == MASK2 {
-            ""
-        } else {
-            "\t"
-        }
+    let lead_dup = match (args.no1, args.no2) {
+        (false, false) => "\t\t",
+        (false, true) => "\t",
+        (true, false) => "\t",
+        (true, true) => "",
     };
 
     let mut exit_code = 0;

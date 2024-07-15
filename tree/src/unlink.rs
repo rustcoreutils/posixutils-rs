@@ -19,7 +19,7 @@ use std::{fs, io};
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about)]
 struct Args {
-    /// The pathname of an existing file.
+    /// An existing pathname to be unlinked (removed).
     pathname: String,
 }
 
@@ -41,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Err(e) = do_unlink(&args.pathname) {
         exit_code = 1;
-        eprintln!("{}: {}", args.pathname, e);
+        eprintln!("unlink: {}: {}", args.pathname, e);
     }
 
     std::process::exit(exit_code)

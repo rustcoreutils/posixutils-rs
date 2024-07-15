@@ -9,23 +9,18 @@
 
 use plib::{run_test, TestPlan};
 
-fn truefalse_test(cmd: &str, expected_exit_code: i32) {
+fn cksum_test(test_data: &str, expected_output: &str) {
     run_test(TestPlan {
-        cmd: cmd.to_string(),
+        cmd: String::from("cksum"),
         args: Vec::new(),
-        stdin_data: String::new(),
-        expected_out: String::new(),
-        expected_err: String::new(),
-        expected_exit_code,
+        stdin_data: String::from(test_data),
+        expected_out: String::from(expected_output),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
     });
 }
 
 #[test]
-fn test_false_exit_code() {
-    truefalse_test("false", 1);
-}
-
-#[test]
-fn test_true_exit_code() {
-    truefalse_test("true", 0);
+fn cksum_basic() {
+    cksum_test("foo\n", "3915528286 4\n");
 }

@@ -81,70 +81,243 @@ enum AsciiConv {
 }
 
 #[derive(Debug)]
+enum Conversion {
+    Ascii(AsciiConv),
+    Lcase,
+    Ucase,
+    Swab,
+    Block,
+    Unblock,
+    Sync,
+}
+
+#[derive(Debug)]
 struct Config {
     ifile: String,
     ofile: String,
-    bs: usize,
     ibs: usize,
     obs: usize,
     cbs: usize,
     seek: usize,
     skip: usize,
     count: usize,
-
-    ascii: Option<AsciiConv>,
-    block: Option<bool>,
-    lcase: bool,
-    ucase: bool,
-    swab: bool,
+    conversions: Vec<Conversion>,
     noerror: bool,
     notrunc: bool,
-    sync: bool,
 }
 
 impl Config {
     fn new() -> Config {
         Config {
-            ifile: String::from("-"),
-            ofile: String::from("-"),
-            bs: DEF_BLOCK_SIZE,
+            ifile: String::new(),
+            ofile: String::new(),
             ibs: DEF_BLOCK_SIZE,
             obs: DEF_BLOCK_SIZE,
             cbs: 0,
             seek: 0,
             skip: 0,
             count: 0,
-            ascii: None,
-            block: None,
-            lcase: false,
-            ucase: false,
-            swab: false,
+            conversions: Vec::new(),
             noerror: false,
             notrunc: false,
-            sync: false,
         }
     }
 }
 
+fn convert_ascii(data: &mut [u8], ascii_conv: &AsciiConv) {
+    match ascii_conv {
+        AsciiConv::Ascii => {
+            for byte in data.iter_mut() {
+                *byte = CONV_EBCDIC_ASCII[*byte as usize];
+            }
+        }
+        AsciiConv::EBCDIC => {
+            for byte in data.iter_mut() {
+                *byte = CONV_ASCII_EBCDIC[*byte as usize];
+            }
+        }
+        AsciiConv::IBM => {
+            for byte in data.iter_mut() {
+                *byte = CONV_ASCII_IBM[*byte as usize];
+            }
+        }
+    }
+}
+
+fn convert_swab(data: &mut [u8]) {
+    for chunk in data.chunks_exact_mut(2) {
+        chunk.swap(0, 1);
+    }
+}
+
+fn convert_lcase(data: &mut [u8]) {
+    for byte in data.iter_mut() {
+        if *byte >= b'A' && *byte <= b'Z' {
+            *byte = *byte + 32;
+        }
+    }
+}
+
+fn convert_ucase(data: &mut [u8]) {
+    for byte in data.iter_mut() {
+        if *byte >= b'a' && *byte <= b'z' {
+            *byte = *byte - 32;
+        }
+    }
+}
+
+fn convert_sync(data: &mut Vec<u8>, block_size: usize) {
+    let current_len = data.len();
+    if current_len < block_size {
+        data.resize(block_size, 0); // Pad with null bytes (0x00)
+    }
+}
+
+fn convert_block(data: &mut Vec<u8>, cbs: usize) {
+    let mut result = Vec::new();
+    let mut line = Vec::new();
+
+    for &byte in data.iter() {
+        if byte == b'\n' {
+            while line.len() < cbs {
+                line.push(b' ');
+            }
+            result.extend_from_slice(&line[..cbs]);
+            line.clear();
+        } else {
+            line.push(byte);
+        }
+    }
+
+    if !line.is_empty() {
+        while line.len() < cbs {
+            line.push(b' ');
+        }
+        result.extend_from_slice(&line[..cbs]);
+    }
+
+    *data = result;
+}
+
+fn convert_unblock(data: &mut Vec<u8>, cbs: usize) {
+    let mut result = Vec::new();
+    for chunk in data.chunks(cbs) {
+        let trimmed_chunk = chunk
+            .iter()
+            .rposition(|&b| b != b' ')
+            .map_or(chunk, |pos| &chunk[..=pos]);
+        result.extend_from_slice(trimmed_chunk);
+        result.push(b'\n');
+    }
+    *data = result;
+}
+
+fn apply_conversions(data: &mut Vec<u8>, config: &Config) {
+    for conversion in &config.conversions {
+        match conversion {
+            Conversion::Ascii(ascii_conv) => convert_ascii(data, ascii_conv),
+            Conversion::Lcase => convert_lcase(data),
+            Conversion::Ucase => convert_ucase(data),
+            Conversion::Swab => convert_swab(data),
+            Conversion::Sync => convert_sync(data, config.ibs),
+            Conversion::Block => convert_block(data, config.cbs),
+            Conversion::Unblock => convert_unblock(data, config.cbs),
+        }
+    }
+}
+
+fn copy_convert_file(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    let mut ifile: Box<dyn Read>;
+    if config.ifile == "" {
+        ifile = Box::new(io::stdin().lock());
+    } else {
+        ifile = Box::new(fs::File::open(&config.ifile)?);
+    }
+    let mut ofile: Box<dyn Write>;
+    if config.ofile == "" {
+        ofile = Box::new(io::stdout().lock())
+    } else {
+        ofile = Box::new(fs::File::create(&config.ofile)?)
+    }
+
+    let mut ibuf = vec![0u8; config.ibs];
+    let obuf = vec![0u8; config.obs];
+
+    let mut count = 0;
+    let mut skip = config.skip;
+    let mut seek = config.seek;
+
+    loop {
+        if skip > 0 {
+            let n = ifile.read(&mut ibuf)?;
+            if n == 0 {
+                break;
+            }
+            skip -= n;
+            continue;
+        }
+
+        if seek > 0 {
+            let n = ifile.read(&mut ibuf)?;
+            if n == 0 {
+                break;
+            }
+            seek -= n;
+            continue;
+        }
+
+        let n = ifile.read(&mut ibuf)?;
+        if n == 0 {
+            break;
+        }
+
+        if config.count > 0 {
+            if count >= config.count {
+                break;
+            }
+            count += 1;
+        }
+
+        let mut ibuf = ibuf[..n].to_vec();
+
+        apply_conversions(&mut ibuf, config);
+
+        if config.obs != 0 {
+            ofile.write_all(&ibuf)?;
+        } else {
+            ofile.write_all(&obuf[..n])?;
+        }
+    }
+
+    Ok(())
+}
+
 fn parse_conv_list(config: &mut Config, s: &str) -> Result<(), Box<dyn std::error::Error>> {
     for convstr in s.split(",") {
-        match convstr {
-            "ascii" => config.ascii = Some(AsciiConv::Ascii),
-            "ebcdic" => config.ascii = Some(AsciiConv::EBCDIC),
-            "ibm" => config.ascii = Some(AsciiConv::IBM),
-            "block" => config.block = Some(true),
-            "unblock" => config.block = Some(false),
-            "lcase" => config.lcase = true,
-            "ucase" => config.ucase = true,
-            "swab" => config.swab = true,
-            "noerror" => config.noerror = true,
-            "notrunc" => config.notrunc = true,
-            "sync" => config.sync = true,
+        let conversion = match convstr {
+            "ascii" => Conversion::Ascii(AsciiConv::Ascii),
+            "ebcdic" => Conversion::Ascii(AsciiConv::EBCDIC),
+            "ibm" => Conversion::Ascii(AsciiConv::IBM),
+            "block" => Conversion::Block,
+            "unblock" => Conversion::Unblock,
+            "lcase" => Conversion::Lcase,
+            "ucase" => Conversion::Ucase,
+            "swab" => Conversion::Swab,
+            "sync" => Conversion::Sync,
+            "noerror" => {
+                config.noerror = true;
+                continue;
+            }
+            "notrunc" => {
+                config.notrunc = true;
+                continue;
+            }
             _ => {
                 eprintln!("{}: {}", gettext("invalid conv option"), convstr);
                 return Err("invalid conv option".into());
             }
-        }
+        };
+        config.conversions.push(conversion);
     }
     Ok(())
 }
@@ -196,9 +369,9 @@ fn parse_cmdline(args: &[String]) -> Result<Config, Box<dyn std::error::Error>> 
             "ibs" => config.ibs = parse_block_size(&oparg)?,
             "obs" => config.obs = parse_block_size(&oparg)?,
             "bs" => {
-                config.bs = parse_block_size(&oparg)?;
-                config.ibs = config.bs;
-                config.obs = config.bs;
+                let block_sz = parse_block_size(&oparg)?;
+                config.ibs = block_sz;
+                config.obs = block_sz;
             }
             "cbs" => config.cbs = parse_block_size(&oparg)?,
             "skip" => config.skip = oparg.parse::<usize>()?,
@@ -212,92 +385,6 @@ fn parse_cmdline(args: &[String]) -> Result<Config, Box<dyn std::error::Error>> 
         }
     }
     Ok(config)
-}
-
-fn copy_convert_file(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
-    let mut ifile: Box<dyn Read>;
-    if config.ifile == "-" {
-        ifile = Box::new(io::stdin().lock());
-    } else {
-        ifile = Box::new(fs::File::open(&config.ifile)?);
-    }
-    let mut ofile: Box<dyn Write>;
-    if config.ofile == "-" {
-        ofile = Box::new(io::stdout().lock())
-    } else {
-        ofile = Box::new(fs::File::create(&config.ofile)?)
-    }
-
-    let mut ibuf = vec![0u8; config.ibs];
-    let mut obuf = vec![0u8; config.obs];
-
-    let mut count = 0;
-    let mut skip = config.skip;
-    let mut seek = config.seek;
-
-    loop {
-        if skip > 0 {
-            let n = ifile.read(&mut ibuf)?;
-            if n == 0 {
-                break;
-            }
-            skip -= n;
-            continue;
-        }
-
-        if seek > 0 {
-            let n = ifile.read(&mut ibuf)?;
-            if n == 0 {
-                break;
-            }
-            seek -= n;
-            continue;
-        }
-
-        let n = ifile.read(&mut ibuf)?;
-        if n == 0 {
-            break;
-        }
-
-        if config.count > 0 {
-            if count >= config.count {
-                break;
-            }
-            count += 1;
-        }
-
-        let ibuf = &ibuf[..n];
-        let obuf = &mut obuf[..n];
-
-        if let Some(ascii) = &config.ascii {
-            match ascii {
-                AsciiConv::Ascii => {
-                    // convert EBCDIC to ASCII
-                    for i in 0..n {
-                        obuf[i] = CONV_EBCDIC_ASCII[ibuf[i] as usize];
-                    }
-                }
-                AsciiConv::EBCDIC => {
-                    // convert ASCII to EBCDIC
-                    for i in 0..n {
-                        obuf[i] = CONV_ASCII_EBCDIC[ibuf[i] as usize];
-                    }
-                }
-                AsciiConv::IBM => {
-                    // convert ASCII to IBM
-                    for i in 0..n {
-                        obuf[i] = CONV_ASCII_IBM[ibuf[i] as usize];
-                    }
-                }
-            }
-        } else {
-            obuf.copy_from_slice(ibuf);
-        }
-
-        ofile.write(&obuf)?;
-    }
-
-    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-sys"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2021"
 authors = ["Jeff Garzik"]
 license = "MIT"
@@ -13,6 +13,10 @@ gettext-rs.workspace = true
 uname = "0.1"
 libc.workspace = true
 chrono.workspace = true
+
+[[bin]]
+name = "getconf"
+path = "src/getconf.rs"
 
 [[bin]]
 name = "ipcrm"

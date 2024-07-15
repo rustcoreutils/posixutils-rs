@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-tree"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2021"
 authors = ["Jeff Garzik"]
 license = "MIT"
@@ -14,6 +14,9 @@ libc.workspace = true
 regex.workspace = true
 chrono.workspace = true
 atty.workspace = true
+
+[dev-dependencies]
+tempfile = "3.10"
 
 [features]
 posixutils_test_all = []

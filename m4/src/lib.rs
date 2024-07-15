@@ -134,32 +134,30 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
     mut stderr: STDERR,
     args: Args,
 ) -> crate::error::Result<()> {
-    let mut state = State::new(Box::new(stdout));
-    let mut output = state.output.clone();
-    if args.files.is_empty() {
+    let mut state = if args.files.is_empty() {
         log::info!("Processing input from STDIN");
-        state =
-            evaluate::process_streaming(state, std::io::stdin(), &mut output, &mut stderr, true)?;
+        let mut state = State::new(Box::new(stdout), vec![Box::new(std::io::stdin())]);
+        let mut output = state.output.clone();
+        state = evaluate::process_streaming(state, &mut output, &mut stderr, true, true)?;
+        state
     } else {
+        let mut state = State::new(Box::new(stdout), Vec::new());
         for file_path in args.files {
-            state.file.push(file_path.clone());
+            state.input.push(Box::new(std::fs::File::open(&file_path)?));
+            let mut output = state.output.clone();
             log::info!("Processing input from {file_path:?}");
-            state = evaluate::process_streaming(
-                state,
-                std::fs::File::open(file_path)?,
-                &mut output,
-                &mut stderr,
-                true,
-            )?;
+            state.file.push(file_path);
+            state = evaluate::process_streaming(state, &mut output, &mut stderr, true, true)?;
             state.file.pop();
         }
-    }
+        state
+    };
 
     state.output.divert(0)?;
     state.output.undivert_all()?;
 
     for wrap in state.m4wrap {
-        output.write_all(&wrap)?;
+        state.output.write_all(&wrap)?;
     }
     Ok(())
 }

@@ -30,14 +30,17 @@ pub struct State {
     pub m4wrap: Vec<Vec<u8>>,
     pub last_syscmd_status: Option<ExitStatus>,
     /// Stack of filenames. Used in [`FileMacro`].
+    /// TODO: fold into input
     pub file: Vec<PathBuf>,
     pub output: OutputRef,
+    pub input: Vec<Box<dyn Read>>,
 }
 
 impl State {
-    pub fn new(stdout: Box<dyn Write>) -> Self {
+    pub fn new(output: Box<dyn Write>, input: Vec<Box<dyn Read>>) -> Self {
         Self {
-            output: Output::new(stdout).into_ref(),
+            output: Output::new(output).into_ref(),
+            input,
             ..Self::default()
         }
     }
@@ -83,6 +86,7 @@ impl Default for State {
             last_syscmd_status: None,
             output: OutputRef::default(),
             file: Vec::new(),
+            input: Vec::new(),
         }
     }
 }
@@ -589,13 +593,10 @@ impl MacroImplementation for UserDefinedMacro {
                             new_buffer.write_all(&m.name.0)?;
                         } else {
                             let arg = m.args.get(i - 1).expect("Checked args length");
-                            state = process_streaming(
-                                state,
-                                std::io::Cursor::new(arg.input),
-                                &mut new_buffer,
-                                stderr,
-                                true,
-                            )?;
+                            state
+                                .input
+                                .push(Box::new(std::io::Cursor::new(arg.input.to_vec())));
+                            state = process_streaming(state, &mut new_buffer, stderr, true, false)?;
                         }
                         log::debug!(
                             "UserDefinedMacro::evaluate() Replacing ${i} with {:?}",
@@ -610,13 +611,10 @@ impl MacroImplementation for UserDefinedMacro {
                         m.args
                     );
                     for (i, arg) in m.args.iter().enumerate() {
-                        state = process_streaming(
-                            state,
-                            std::io::Cursor::new(arg.input),
-                            &mut buffer,
-                            stderr,
-                            true,
-                        )?;
+                        state
+                            .input
+                            .push(Box::new(std::io::Cursor::new(arg.input.to_vec())));
+                        state = process_streaming(state, &mut buffer, stderr, true, false)?;
                         if i < m.args.len() - 1 {
                             buffer.write_all(b",")?;
                         }
@@ -627,13 +625,10 @@ impl MacroImplementation for UserDefinedMacro {
                     let mut new_buffer: Vec<u8> = Vec::new();
                     for (i, arg) in m.args.iter().enumerate() {
                         new_buffer.write_all(&state.parse_config.quote_open_tag)?;
-                        state = process_streaming(
-                            state,
-                            std::io::Cursor::new(arg.input),
-                            &mut new_buffer,
-                            stderr,
-                            true,
-                        )?;
+                        state
+                            .input
+                            .push(Box::new(std::io::Cursor::new(arg.input.to_vec())));
+                        state = process_streaming(state, &mut new_buffer, stderr, true, false)?;
                         new_buffer.write_all(&state.parse_config.quote_close_tag)?;
                         if i < m.args.len() - 1 {
                             new_buffer.write_all(b",")?;
@@ -658,7 +653,8 @@ impl MacroImplementation for UserDefinedMacro {
             String::from_utf8_lossy(&buffer)
         );
         let reader = std::io::Cursor::new(buffer);
-        state = process_streaming(state, reader, stdout, stderr, false)?;
+        state.input.push(Box::new(reader));
+        state = process_streaming(state, stdout, stderr, false, false)?;
         Ok(state)
     }
 }
@@ -773,20 +769,15 @@ impl IncludeMacro {
     fn evaluate_impl(
         path: PathBuf,
         mut state: State,
-        stdout: &mut dyn Write,
-        stderr: &mut dyn Write,
+        _stdout: &mut dyn Write,
+        _stderr: &mut dyn Write,
     ) -> crate::error::Result<State> {
         state.file.push(path.clone());
-        state = process_streaming(
-            state,
-            std::fs::File::open(&path)
-                .map_err(crate::Error::from)
-                .add_context(|| format!("Error opening file {path:?}"))?,
-            stdout,
-            stderr,
-            false,
-        )
-        .add_context(|| format!("Error processing included file {path:?}"))?;
+        let f = std::fs::File::open(&path)
+            .map_err(crate::Error::from)
+            .add_context(|| format!("Error opening file {path:?}"))?;
+        state.input.push(Box::new(f));
+
         state.file.pop();
         Ok(state)
     }
@@ -1047,9 +1038,11 @@ impl MacroImplementation for IfelseMacro {
                     4 | 5 => {
                         args.next();
                         log::debug!("IfelseMacro::evaluate() evaluating argument {}", i * 3 + 3);
-                        let input =
-                            std::io::Cursor::new(args.next().expect("at least 4 args").input);
-                        state = process_streaming(state, input, stdout, stderr, true)?;
+                        let input = std::io::Cursor::new(
+                            args.next().expect("at least 4 args").input.to_vec(),
+                        );
+                        state.input.push(Box::new(input));
+                        state = process_streaming(state, stdout, stderr, true, false)?;
                         if args_len == 5 {
                             write!(
                                 stderr,
@@ -1747,7 +1740,6 @@ impl MacroImplementation for UndivertMacro {
         Ok(state)
     }
 }
-
 struct FileMacro;
 
 impl MacroImplementation for FileMacro {
@@ -1782,8 +1774,9 @@ fn evaluate_to_buffer(
     unwrap_quotes: bool,
 ) -> Result<(Vec<u8>, State)> {
     let mut output = Vec::with_capacity(input.len());
-    let input = std::io::Cursor::new(input);
-    state = process_streaming(state, input, &mut output, stderr, unwrap_quotes)?;
+    let input = std::io::Cursor::new(input.to_vec());
+    state.input.push(Box::new(input));
+    state = process_streaming(state, &mut output, stderr, unwrap_quotes, false)?;
     log::debug!(
         "evaluate_to_buffer() Evaluated to buffer {:?}",
         String::from_utf8_lossy(&output)
@@ -1791,7 +1784,7 @@ fn evaluate_to_buffer(
     Ok((output, state))
 }
 
-/// // Example divert_nested_2:
+// Example divert_nested_2:
 // buffer = "x(y) end\0" stdout = "" divnum = 0
 // x args buffer ->
 //   buffer = "y" out = "" divnum = 0
@@ -1827,29 +1820,44 @@ fn evaluate_to_buffer(
 // buffer = " end\0" stdout = "wow[hi  hidden?] bye" divnum = 0
 // buffer = "end\0" stdout = "wow[hi  hidden?] bye " divnum = 0
 // buffer = "\0" stdout = "wow[hi  hidden?] bye end" divnum = 0
+//
+// Based on this I'm still very confused as to why evaluate_to_buffer recursion is required for
+// user defined macros and ifelse, etc.
 
 /// [`Symbol`] writing output to `writer`, and returns a [`ParseConfig`] which has been modified
 /// during the process of evaluation (for example a new macro was defined, or changequote).
 ///
 /// Arguments:
 /// - `unwrap_quotes` - Whether to unwrap quotes during evaluation.
-/// - `root` - Whether this is the root invocation of this function, used for features like the
-///   [`DivertMacro`](crate::evaluate::DivertMacro).
-pub(crate) fn process_streaming<'c, R: Read>(
+/// - `all_inputs` - Whether to process all the inputs in `state.input` (`true`), or just the top of
+///   the stack (`false`).
+pub(crate) fn process_streaming<'c>(
     mut state: State,
-    mut reader: R,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
     unwrap_quotes: bool,
+    all_inputs: bool,
 ) -> crate::error::Result<State> {
-    let mut read_buffer: [u8; 32] = [0; 32];
+    // A buffer for reading data from `reader`.
+    let mut read_buffer: [u8; 7] = [0; 7];
+
+    // A buffer per state.input (except the current input which is stored in `buffer`) so that
+    // unparsed/un-evaluated symbols remain in the correct order.
+    debug_assert!(!state.input.is_empty());
+    let mut buffers: Vec<Vec<u8>> = (0..(state.input.len() - 1))
+        .into_iter()
+        .map(|_| Vec::new())
+        .collect();
     let mut buffer: Vec<u8> = Vec::new();
 
-    // Here we have a buffer of input which we attempt to parse as a Symbol. If parsing fails as
-    // Incomplete, then we enlarge the buffer and pull in more input, and retry until success, or
-    // we reach the end of input.
+    // Here we have a buffer of input `buffer` which we attempt to parse as a Symbol. If parsing
+    // fails as Incomplete, then we enlarge the buffer and pull in a bunch more input via
+    // `read_buffer`, and retry until success, or we reach the end of input.
     'read_data: loop {
-        let n = reader.read(&mut read_buffer)?;
+        log::debug!("'read_data: buffer: {:?}", String::from_utf8_lossy(&buffer));
+        // TODO(performance): Perhaps there's a way we can read directly into the end of buffer
+        // using a slice range index?
+        let n = state.input.last_mut().unwrap().read(&mut read_buffer)?;
 
         if n == 0 {
             // Reached EOF
@@ -1858,10 +1866,23 @@ pub(crate) fn process_streaming<'c, R: Read>(
             buffer.extend_from_slice(&read_buffer[0..n])
         }
 
-        // Parse and evaluate the symbols in the buffer, when it parses as incomplete break the loop to fetch more data.
+        // Parse and evaluate the symbols in the buffer, when it parses as incomplete break the loop
+        // to fetch more data.
         'evaluate_symbols: loop {
+            log::debug!(
+                "'evaluate_symbols: buffer: {:?}",
+                String::from_utf8_lossy(&buffer)
+            );
             if buffer.first() == Some(&b'\0') {
-                break 'read_data;
+                state.input.pop();
+                buffer.pop();
+
+                if !all_inputs || state.input.is_empty() {
+                    break 'read_data Ok(state);
+                } else {
+                    buffer = buffers.pop().unwrap();
+                    break 'evaluate_symbols;
+                }
             }
 
             let mut macro_buffer = Vec::new();
@@ -1921,7 +1942,13 @@ pub(crate) fn process_streaming<'c, R: Read>(
 
                 match symbol {
                     Symbol::Comment(comment) => stdout.write_all(comment)?,
-                    Symbol::Text(text) => stdout.write_all(text)?,
+                    Symbol::Text(text) => {
+                        log::debug!(
+                            "process_streaming(): Symbol::Text {:?}",
+                            String::from_utf8_lossy(text)
+                        );
+                        stdout.write_all(text)?
+                    }
                     Symbol::Quoted(quoted) => {
                         log::debug!("evaluate() writing quoted {quoted:?}");
                         if unwrap_quotes {
@@ -1986,8 +2013,13 @@ pub(crate) fn process_streaming<'c, R: Read>(
             // evaluated.
             macro_buffer.extend_from_slice(remaining);
             buffer = macro_buffer;
+
+            if state.input.len() > (buffers.len() + 1) {
+                buffers.push(std::mem::replace(&mut buffer, Vec::new()));
+            }
+            if state.input.len() < (buffers.len() + 1) {
+                buffer = buffers.pop().unwrap();
+            }
         }
     }
-
-    Ok(state)
 }

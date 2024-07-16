@@ -383,10 +383,14 @@ pub fn fmt_write_decimal_float(
     if write_inf_or_nan(target, value, lowercase_version, sign) {
         return;
     }
+
     let value = value.abs();
     let precision = args.precision.unwrap_or(6);
     let write_starting_index = target.len();
     let should_add_dot_after_number = precision == 0 && args.alternative_form;
+    let width = args
+        .width
+        .saturating_sub(sign.len() + should_add_dot_after_number as usize);
 
     // left justified
     //   sign integer_part <decimal_point> fractional_part padding
@@ -404,9 +408,6 @@ pub fn fmt_write_decimal_float(
         let number_length = target.len() - write_starting_index;
         pad_target(target, args.width.saturating_sub(number_length), b' ');
     } else {
-        let width = args
-            .width
-            .saturating_sub(sign.len() + should_add_dot_after_number as usize);
         if args.zero_padded {
             target.push_str(sign);
             write!(target, "{:01$.2$}", value, width, precision).expect("error writing to string");
@@ -432,6 +433,114 @@ pub fn fmt_write_decimal_float(
         }
     }
     // FIXME: replace decimal point with locale specific decimal point
+}
+
+pub fn fmt_write_scientific_float(
+    target: &mut String,
+    value: f64,
+    lowercase_version: bool,
+    args: &FormatArgs,
+) {
+    let sign = sign_str(value.is_sign_negative(), args);
+    if write_inf_or_nan(target, value, lowercase_version, sign) {
+        return;
+    }
+
+    let value = value.abs();
+
+    let exponent = value.log10().trunc();
+    let mut additional_exponent_length = 0;
+    // if the exponent is not negative, we need to add a '+' sign to the exponent part
+    if !exponent.is_sign_negative() {
+        additional_exponent_length += 1;
+    }
+    // if the exponent value is only one digit, we need to pad it with a zero
+    if exponent.abs() < 10.0 {
+        additional_exponent_length += 1;
+    }
+
+    let value = value.abs();
+    let precision = args.precision.unwrap_or(6);
+    let write_starting_index = target.len();
+    let should_add_dot_after_number = precision == 0 && args.alternative_form;
+    let width = args.width.saturating_sub(
+        sign.len() + should_add_dot_after_number as usize + additional_exponent_length,
+    );
+
+    // left justified
+    //   sign integer_part <decimal_point> fractional_part padding
+    // right justified zero padded
+    //   sign padding integer_part <decimal point> fractional_part
+    // right justified space padded
+    //  padding sign integer_part <decimal point> fractional_part
+
+    if args.left_justified {
+        target.push_str(sign);
+        write!(target, "{:.1$e}", value, precision).expect("error writing to string");
+    } else if args.zero_padded {
+        target.push_str(sign);
+        write!(target, "{:01$.2$e}", value, width, precision).expect("error writing to string")
+    } else {
+        target.push_str(sign);
+        write!(target, "{:1$.2$e}", value, width, precision).expect("error writing to string");
+        // if the number is space padded, the sign goes after the padding. The following code
+        // swaps the sign with the first space before the number or with the sign itself
+        if sign.len() > 0 {
+            let sign_index = write_starting_index;
+            // we know that at least one digit is written, so we can safely unwrap
+            let first_digit_in_substring = target[write_starting_index..]
+                .find(|c: char| c.is_digit(10))
+                .unwrap();
+            let final_sign_index = write_starting_index + first_digit_in_substring - 1;
+            // both the value at sign_index and final_sign_index are ASCII characters
+            // (they are either: b' ', b'+' or b'-'), so it's safe to swap them
+            unsafe { target.as_bytes_mut().swap(sign_index, final_sign_index) };
+        }
+    }
+
+    // we need to fix the exponent part of the number, as the rust conventions are different
+    let mut exponent_buffer = [0u8; 10];
+    let mut exponent_buffer_length = 0;
+    while matches!(target.as_bytes().last(), Some(c) if *c != b'e') {
+        exponent_buffer[exponent_buffer_length] = target.pop().unwrap() as u8;
+        exponent_buffer_length += 1;
+    }
+    // pop the 'e' character
+    target.pop();
+
+    // FIXME: replace decimal point with locale specific decimal point
+    if should_add_dot_after_number {
+        target.push('.');
+    }
+
+    // push the exponent character
+    if lowercase_version {
+        target.push('e');
+    } else {
+        target.push('E');
+    }
+
+    // push the sign character
+    if exponent_buffer[exponent_buffer_length - 1] != b'-' {
+        target.push('+');
+    } else {
+        target.push('-');
+        exponent_buffer_length -= 1;
+    }
+
+    // the exponent value should have at least two digits
+    if exponent_buffer_length <= 1 {
+        target.push('0');
+    }
+    // copy the rest of the buffer
+    for c in exponent_buffer[0..exponent_buffer_length].iter().rev() {
+        target.push(*c as char);
+    }
+
+    if args.left_justified {
+        let number_length = target.len() - write_starting_index;
+        pad_target(target, args.width.saturating_sub(number_length), b' ');
+    }
 }
 
 pub fn fmt_write_string(target: &mut String, value: &str, args: &FormatArgs) {
@@ -1645,6 +1754,285 @@ mod tests {
     fn test_write_decimal_float_upper_nan() {
         let mut target = String::new();
         fmt_write_decimal_float(&mut target, f64::NAN, false, &FormatArgs::default());
+        assert_eq!(target, "NAN");
+    }
+
+    #[test]
+    fn test_write_scientific_float() {
+        let mut target = String::new();
+        fmt_write_scientific_float(&mut target, 123.456, true, &FormatArgs::default());
+        assert_eq!(target, "1.234560e+02");
+    }
+
+    #[test]
+    fn test_write_scientific_float_less_than_one() {
+        let mut target = String::new();
+        fmt_write_scientific_float(&mut target, 0.789, true, &FormatArgs::default());
+        assert_eq!(target, "7.890000e-01");
+    }
+
+    #[test]
+    fn test_write_scientific_float_two_digit_exponent() {
+        let mut target = String::new();
+        fmt_write_scientific_float(&mut target, 123e20, true, &FormatArgs::default());
+        assert_eq!(target, "1.230000e+22");
+    }
+
+    #[test]
+    fn test_write_scientific_float_three_digit_exponent() {
+        let mut target = String::new();
+        fmt_write_scientific_float(&mut target, 123e125, true, &FormatArgs::default());
+        assert_eq!(target, "1.230000e+127");
+    }
+
+    #[test]
+    fn test_write_scientific_float_integer_value() {
+        let mut target = String::new();
+        fmt_write_scientific_float(&mut target, 123.0, true, &FormatArgs::default());
+        assert_eq!(target, "1.230000e+02");
+    }
+
+    #[test]
+    fn test_write_scientific_float_zero_value() {
+        let mut target = String::new();
+        fmt_write_scientific_float(&mut target, 0.0, true, &FormatArgs::default());
+        assert_eq!(target, "0.000000e+00");
+    }
+
+    #[test]
+    fn test_wite_scientific_float_negative_value() {
+        let mut target = String::new();
+        fmt_write_scientific_float(&mut target, -123.456, true, &FormatArgs::default());
+        assert_eq!(target, "-1.234560e+02");
+    }
+
+    #[test]
+    fn test_write_scientific_float_with_sign() {
+        let mut target = String::new();
+        fmt_write_scientific_float(
+            &mut target,
+            123.456,
+            true,
+            &FormatArgs {
+                signed: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "+1.234560e+02");
+    }
+
+    #[test]
+    fn test_write_scientific_float_with_prefix_space() {
+        let mut target = String::new();
+        fmt_write_scientific_float(
+            &mut target,
+            123.456,
+            true,
+            &FormatArgs {
+                prefix_space: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, " 1.234560e+02");
+    }
+
+    #[test]
+    fn test_write_scientific_float_zero_precision() {
+        let mut target = String::new();
+        fmt_write_scientific_float(
+            &mut target,
+            123.456,
+            true,
+            &FormatArgs {
+                precision: Some(0),
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "1e+02");
+    }
+
+    #[test]
+    fn test_write_scientific_float_with_limited_precision() {
+        let mut target = String::new();
+        fmt_write_scientific_float(
+            &mut target,
+            123.456,
+            true,
+            &FormatArgs {
+                precision: Some(2),
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "1.23e+02");
+    }
+
+    #[test]
+    fn test_write_scientific_float_with_width() {
+        let mut target = String::new();
+        fmt_write_scientific_float(
+            &mut target,
+            123.456,
+            true,
+            &FormatArgs {
+                width: 15,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "   1.234560e+02");
+    }
+
+    #[test]
+    fn test_write_negative_scientific_float_with_width() {
+        let mut target = String::new();
+        fmt_write_scientific_float(
+            &mut target,
+            -123.456,
+            true,
+            &FormatArgs {
+                width: 15,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "  -1.234560e+02");
+    }
+
+    #[test]
+    fn test_write_negative_scientific_float_with_width_into_non_empty_string() {
+        let mut target = "value: ".to_string();
+        fmt_write_scientific_float(
+            &mut target,
+            -123.456,
+            true,
+            &FormatArgs {
+                width: 15,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "value:   -1.234560e+02");
+    }
+
+    #[test]
+    fn test_write_scientific_float_with_width_zero_padded() {
+        let mut target = String::new();
+        fmt_write_scientific_float(
+            &mut target,
+            123.456,
+            true,
+            &FormatArgs {
+                width: 15,
+                zero_padded: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "0001.234560e+02");
+    }
+
+    #[test]
+    fn test_write_negative_scientific_float_with_width_zero_padded() {
+        let mut target = String::new();
+        fmt_write_scientific_float(
+            &mut target,
+            -123.456,
+            true,
+            &FormatArgs {
+                width: 15,
+                zero_padded: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "-001.234560e+02");
+    }
+
+    #[test]
+    fn test_write_scientific_float_with_width_with_precision() {
+        let mut target = String::new();
+        fmt_write_scientific_float(
+            &mut target,
+            123.456,
+            true,
+            &FormatArgs {
+                width: 15,
+                precision: Some(3),
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "      1.235e+02");
+    }
+
+    #[test]
+    fn test_write_scientific_float_with_width_left_justified() {
+        let mut target = String::new();
+        fmt_write_scientific_float(
+            &mut target,
+            123.456,
+            true,
+            &FormatArgs {
+                left_justified: true,
+                width: 15,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "1.234560e+02   ");
+    }
+
+    #[test]
+    fn test_write_scientific_float_alternate_form() {
+        let mut target = String::new();
+        fmt_write_scientific_float(
+            &mut target,
+            123.456,
+            true,
+            &FormatArgs {
+                alternative_form: true,
+                precision: Some(0),
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "1.e+02");
+    }
+
+    #[test]
+    fn test_write_scientific_float_alternate_form_with_width() {
+        let mut target = String::new();
+        fmt_write_scientific_float(
+            &mut target,
+            123.0,
+            true,
+            &FormatArgs {
+                alternative_form: true,
+                width: 5,
+                precision: Some(0),
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "1.e+02");
+    }
+
+    #[test]
+    fn test_write_scientific_float_lower_inf() {
+        let mut target = String::new();
+        fmt_write_scientific_float(&mut target, f64::INFINITY, true, &FormatArgs::default());
+        assert_eq!(target, "inf");
+    }
+
+    #[test]
+    fn test_write_scientific_float_lower_nan() {
+        let mut target = String::new();
+        fmt_write_scientific_float(&mut target, f64::NAN, true, &FormatArgs::default());
+        assert_eq!(target, "nan");
+    }
+
+    #[test]
+    fn test_write_scientific_float_upper_inf() {
+        let mut target = String::new();
+        fmt_write_scientific_float(&mut target, f64::INFINITY, false, &FormatArgs::default());
+        assert_eq!(target, "INF");
+    }
+
+    #[test]
+    fn test_write_scientific_float_upper_nan() {
+        let mut target = String::new();
+        fmt_write_scientific_float(&mut target, f64::NAN, false, &FormatArgs::default());
         assert_eq!(target, "NAN");
     }
 }

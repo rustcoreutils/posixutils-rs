@@ -77,6 +77,40 @@ fn write_inf_or_nan(target: &mut String, value: f64, lowercase_version: bool, si
     }
 }
 
+/// swaps the sign at `target[write_starting_index]` with the last space
+/// padding character before the number
+/// # Panics
+/// Panics if:
+/// - `sign` is neither an empty string nor a single ASCII character
+/// - `sign` is not the first character in the string
+/// - the character before the first digit in the substring starting at `write_starting_index`
+/// is not an ASCII character
+fn swap_sign_in_front_of_number(target: &mut String, sign: &str, write_starting_index: usize) {
+    // sign is ASCII or empty string
+    assert!(sign.len() <= 1);
+    if sign.len() > 0 {
+        // sign is the first character in the string
+        assert_eq!(
+            target[write_starting_index..write_starting_index + 1],
+            *sign
+        );
+
+        let sign_index = write_starting_index;
+        // we know that at least one digit is written, so we can safely unwrap
+        let first_digit_in_substring = target[write_starting_index..]
+            .find(|c: char| c.is_digit(10))
+            .unwrap();
+        let final_sign_index = write_starting_index + first_digit_in_substring - 1;
+
+        // the first byte before the start of the number is ASCII
+        assert!(target.as_bytes()[final_sign_index].is_ascii());
+
+        // both the value at sign_index and final_sign_index are single byte ASCII character,
+        // so it's safe to swap them
+        unsafe { target.as_bytes_mut().swap(sign_index, final_sign_index) };
+    }
+}
+
 #[derive(Default)]
 pub struct FormatArgs {
     left_justified: bool,
@@ -414,19 +448,7 @@ pub fn fmt_write_decimal_float(
         } else {
             target.push_str(sign);
             write!(target, "{:1$.2$}", value, width, precision).expect("error writing to string");
-            // if the number is space padded, the sign goes after the padding. The following code
-            // swaps the sign with the first space before the number or with the sign itself
-            if sign.len() > 0 {
-                let sign_index = write_starting_index;
-                // we know that at least one digit is written, so we can safely unwrap
-                let first_digit_in_substring = target[write_starting_index..]
-                    .find(|c: char| c.is_digit(10))
-                    .unwrap();
-                let final_sign_index = write_starting_index + first_digit_in_substring - 1;
-                // both the value at sign_index and final_sign_index are ASCII characters
-                // (they are either: b' ', b'+' or b'-'), so it's safe to swap them
-                unsafe { target.as_bytes_mut().swap(sign_index, final_sign_index) };
-            }
+            swap_sign_in_front_of_number(target, sign, write_starting_index);
         }
         if should_add_dot_after_number {
             target.push('.');
@@ -468,11 +490,11 @@ pub fn fmt_write_scientific_float(
     );
 
     // left justified
-    //   sign integer_part <decimal_point> fractional_part padding
+    //   sign integer_part <decimal_point> fractional_part e exponent_sign exponent_value padding
     // right justified zero padded
-    //   sign padding integer_part <decimal point> fractional_part
+    //   sign padding integer_part <decimal point> fractional_part e exponent_sign exponent_value
     // right justified space padded
-    //  padding sign integer_part <decimal point> fractional_part
+    //  padding sign integer_part <decimal point> fractional_part e exponent_sign exponent_value
 
     if args.left_justified {
         target.push_str(sign);
@@ -483,19 +505,7 @@ pub fn fmt_write_scientific_float(
     } else {
         target.push_str(sign);
         write!(target, "{:1$.2$e}", value, width, precision).expect("error writing to string");
-        // if the number is space padded, the sign goes after the padding. The following code
-        // swaps the sign with the first space before the number or with the sign itself
-        if sign.len() > 0 {
-            let sign_index = write_starting_index;
-            // we know that at least one digit is written, so we can safely unwrap
-            let first_digit_in_substring = target[write_starting_index..]
-                .find(|c: char| c.is_digit(10))
-                .unwrap();
-            let final_sign_index = write_starting_index + first_digit_in_substring - 1;
-            // both the value at sign_index and final_sign_index are ASCII characters
-            // (they are either: b' ', b'+' or b'-'), so it's safe to swap them
-            unsafe { target.as_bytes_mut().swap(sign_index, final_sign_index) };
-        }
+        swap_sign_in_front_of_number(target, sign, write_starting_index);
     }
 
     // we need to fix the exponent part of the number, as the rust conventions are different

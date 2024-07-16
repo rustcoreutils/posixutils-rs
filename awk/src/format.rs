@@ -509,7 +509,10 @@ pub fn fmt_write_scientific_float(
     }
 
     // we need to fix the exponent part of the number, as the rust conventions are different
-    let mut exponent_buffer = [0u8; 10];
+
+    // there are at most 5 characters after the 'e'. One for the sign and four for the exponent
+    // (4 = ceil(log10(2^11)), where 11 is the number of bits in the exponent of an f64)
+    let mut exponent_buffer = [0u8; 5];
     let mut exponent_buffer_length = 0;
     while matches!(target.as_bytes().last(), Some(c) if *c != b'e') {
         exponent_buffer[exponent_buffer_length] = target.pop().unwrap() as u8;

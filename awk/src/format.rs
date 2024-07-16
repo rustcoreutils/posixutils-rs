@@ -1514,21 +1514,21 @@ mod tests {
     }
 
     #[test]
-    fn test_wite_decimal_float_integer_value() {
+    fn test_write_decimal_float_integer_value() {
         let mut target = String::new();
         fmt_write_decimal_float(&mut target, 123.0, true, &FormatArgs::default());
         assert_eq!(target, "123.000000");
     }
 
     #[test]
-    fn test_wite_decimal_float_negative_value() {
+    fn test_write_decimal_float_negative_value() {
         let mut target = String::new();
         fmt_write_decimal_float(&mut target, -123.456, true, &FormatArgs::default());
         assert_eq!(target, "-123.456000");
     }
 
     #[test]
-    fn test_wite_decimal_float_with_sign() {
+    fn test_write_decimal_float_with_sign() {
         let mut target = String::new();
         fmt_write_decimal_float(
             &mut target,
@@ -1543,7 +1543,7 @@ mod tests {
     }
 
     #[test]
-    fn test_wite_decimal_float_with_prefix_space() {
+    fn test_write_decimal_float_with_prefix_space() {
         let mut target = String::new();
         fmt_write_decimal_float(
             &mut target,
@@ -1558,7 +1558,7 @@ mod tests {
     }
 
     #[test]
-    fn test_wite_decimal_float_zero_precision() {
+    fn test_write_decimal_float_zero_precision() {
         let mut target = String::new();
         fmt_write_decimal_float(
             &mut target,
@@ -1800,7 +1800,7 @@ mod tests {
     }
 
     #[test]
-    fn test_wite_scientific_float_negative_value() {
+    fn test_write_scientific_float_negative_value() {
         let mut target = String::new();
         fmt_write_scientific_float(&mut target, -123.456, true, &FormatArgs::default());
         assert_eq!(target, "-1.234560e+02");

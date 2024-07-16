@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use crate::program::{BuiltinFunction, Constant, Function, OpCode, Program, SpecialVar};
 
 use crate::format::{
-    fmt_write_decimal_float, fmt_write_hex_float, fmt_write_signed, fmt_write_string,
-    fmt_write_unsigned, parse_conversion_specifier_args, IntegerFormat,
+    fmt_write_decimal_float, fmt_write_hex_float, fmt_write_scientific_float, fmt_write_signed,
+    fmt_write_string, fmt_write_unsigned, parse_conversion_specifier_args, IntegerFormat,
 };
 use std::fmt::Write;
 
@@ -456,6 +456,10 @@ impl Interpreter {
                     'f' | 'F' => {
                         let value = self.pop_scalar()?.as_f64_or_err()?;
                         fmt_write_decimal_float(&mut result, value, specifier == 'f', &args);
+                    }
+                    'e' | 'E' => {
+                        let value = self.pop_scalar()?.as_f64_or_err()?;
+                        fmt_write_scientific_float(&mut result, value, specifier == 'e', &args);
                     }
                     's' => {
                         let value = self.pop_scalar()?.to_string();
@@ -1738,6 +1742,34 @@ mod tests {
         assert_eq!(
             test_sprintf("%10.3f", vec![Constant::Number(255.34)]),
             "   255.340"
+        );
+    }
+
+    #[test]
+    fn test_builtin_sprintf_scientific_float() {
+        assert_eq!(
+            test_sprintf("%e", vec![Constant::Number(255.34)]),
+            "2.553400e+02"
+        );
+        assert_eq!(
+            test_sprintf("%.1e", vec![Constant::Number(255.34)]),
+            "2.6e+02"
+        );
+        assert_eq!(
+            test_sprintf("%15e", vec![Constant::Number(255.34)]),
+            "   2.553400e+02"
+        );
+        assert_eq!(
+            test_sprintf("%-15e", vec![Constant::Number(255.34)]),
+            "2.553400e+02   "
+        );
+        assert_eq!(
+            test_sprintf("float value: %e", vec![Constant::Number(49.67)]),
+            "float value: 4.967000e+01"
+        );
+        assert_eq!(
+            test_sprintf("%10.3e", vec![Constant::Number(255.34)]),
+            " 2.553e+02"
         );
     }
 }

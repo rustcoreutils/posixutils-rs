@@ -2265,7 +2265,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_float_general_as_decimal_right_space_padded() {
+    fn test_write_float_general_as_decimal_left_space_padded() {
         let mut target = String::new();
         fmt_write_float_general(
             &mut target,
@@ -2280,7 +2280,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_float_general_as_decimal_right_zero_padded() {
+    fn test_write_float_general_as_decimal_left_zero_padded() {
         let mut target = String::new();
         fmt_write_float_general(
             &mut target,
@@ -2296,7 +2296,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_float_general_as_decimal_right_space_padded_with_precision() {
+    fn test_write_float_general_as_decimal_left_space_padded_with_precision() {
         let mut target = String::new();
         fmt_write_float_general(
             &mut target,
@@ -2312,7 +2312,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_float_general_as_decimal_right_zero_padded_with_precision() {
+    fn test_write_float_general_as_decimal_left_zero_padded_with_precision() {
         let mut target = String::new();
         fmt_write_float_general(
             &mut target,
@@ -2329,7 +2329,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_signed_float_general_as_decimal_right_space_padded() {
+    fn test_write_signed_float_general_as_decimal_left_space_padded() {
         let mut target = String::new();
         fmt_write_float_general(
             &mut target,
@@ -2345,7 +2345,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_signed_float_general_as_decimal_right_zero_padded() {
+    fn test_write_signed_float_general_as_decimal_left_zero_padded() {
         let mut target = String::new();
         fmt_write_float_general(
             &mut target,
@@ -2362,7 +2362,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_signed_float_general_as_decimal_right_space_padded_with_precision() {
+    fn test_write_signed_float_general_as_decimal_left_space_padded_with_precision() {
         let mut target = String::new();
         fmt_write_float_general(
             &mut target,
@@ -2379,7 +2379,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_signed_float_general_as_decimal_right_zero_padded_with_precision() {
+    fn test_write_signed_float_general_as_decimal_left_zero_padded_with_precision() {
         let mut target = String::new();
         fmt_write_float_general(
             &mut target,
@@ -2413,7 +2413,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_signed_float_general_as_scientific_right_space_padded() {
+    fn test_write_signed_float_general_as_scientific_left_space_padded() {
         let mut target = String::new();
         fmt_write_float_general(
             &mut target,
@@ -2430,7 +2430,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_float_general_as_scientific_right_zero_padded() {
+    fn test_write_float_general_as_scientific_left_zero_padded() {
         let mut target = String::new();
         fmt_write_float_general(
             &mut target,
@@ -2447,7 +2447,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_signed_float_general_as_scientific_right_zero_padded() {
+    fn test_write_signed_float_general_as_scientific_left_zero_padded() {
         let mut target = String::new();
         fmt_write_float_general(
             &mut target,

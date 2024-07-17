@@ -12,8 +12,9 @@ use std::collections::HashMap;
 use crate::program::{BuiltinFunction, Constant, Function, OpCode, Program, SpecialVar};
 
 use crate::format::{
-    fmt_write_decimal_float, fmt_write_hex_float, fmt_write_scientific_float, fmt_write_signed,
-    fmt_write_string, fmt_write_unsigned, parse_conversion_specifier_args, IntegerFormat,
+    fmt_write_decimal_float, fmt_write_float_general, fmt_write_hex_float,
+    fmt_write_scientific_float, fmt_write_signed, fmt_write_string, fmt_write_unsigned,
+    parse_conversion_specifier_args, IntegerFormat,
 };
 use std::fmt::Write;
 
@@ -460,6 +461,10 @@ impl Interpreter {
                     'e' | 'E' => {
                         let value = self.pop_scalar()?.as_f64_or_err()?;
                         fmt_write_scientific_float(&mut result, value, specifier == 'e', &args);
+                    }
+                    'g' | 'G' => {
+                        let value = self.pop_scalar()?.as_f64_or_err()?;
+                        fmt_write_float_general(&mut result, value, specifier == 'g', &args);
                     }
                     's' => {
                         let value = self.pop_scalar()?.to_string();
@@ -1770,6 +1775,31 @@ mod tests {
         assert_eq!(
             test_sprintf("%10.3e", vec![Constant::Number(255.34)]),
             " 2.553e+02"
+        );
+    }
+
+    #[test]
+    fn test_builtin_sprintf_float_general() {
+        assert_eq!(test_sprintf("%g", vec![Constant::Number(255.34)]), "255.34");
+        assert_eq!(
+            test_sprintf("%.1g", vec![Constant::Number(255.34)]),
+            "3e+02"
+        );
+        assert_eq!(
+            test_sprintf("%15g", vec![Constant::Number(255.34)]),
+            "         255.34"
+        );
+        assert_eq!(
+            test_sprintf("%-15g", vec![Constant::Number(255.34)]),
+            "255.34         "
+        );
+        assert_eq!(
+            test_sprintf("float value: %g", vec![Constant::Number(49.67)]),
+            "float value: 49.67"
+        );
+        assert_eq!(
+            test_sprintf("%10.3g", vec![Constant::Number(255.34)]),
+            "       255"
         );
     }
 }

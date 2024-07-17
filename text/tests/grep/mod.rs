@@ -12,6 +12,7 @@ use plib::testing::{run_test, TestPlan};
 
 const LINES_INPUT: &str =
     "line_{1}\np_line_{2}_s\n  line_{3}  \nLINE_{4}\np_LINE_{5}_s\nl_{6}\nline_{70}\n";
+const EMPTY_LINES_INPUT: &str = "\n\n\n";
 const BAD_INPUT: &str = "(some text)\n";
 
 const INPUT_FILE_1: &str = "tests/grep/f_1";
@@ -1191,26 +1192,31 @@ fn test_empty_basic_regexp_01() {
 
 #[test]
 fn test_empty_basic_regexp_02() {
-    grep_test(&["-e", ""], LINES_INPUT, LINES_INPUT, "", 0);
+    grep_test(&[""], EMPTY_LINES_INPUT, EMPTY_LINES_INPUT, "", 0);
 }
 
 #[test]
 fn test_empty_basic_regexp_03() {
-    grep_test(&["-f", EMPTY_PATTERN_FILE], LINES_INPUT, LINES_INPUT, "", 0);
+    grep_test(&["-e", ""], LINES_INPUT, LINES_INPUT, "", 0);
 }
 
 #[test]
 fn test_empty_basic_regexp_04() {
-    grep_test(&[""], "", "", "", 1);
+    grep_test(&["-f", EMPTY_PATTERN_FILE], LINES_INPUT, LINES_INPUT, "", 0);
 }
 
 #[test]
 fn test_empty_basic_regexp_05() {
-    grep_test(&["-e", ""], "", "", "", 1);
+    grep_test(&[""], "", "", "", 1);
 }
 
 #[test]
 fn test_empty_basic_regexp_06() {
+    grep_test(&["-e", ""], "", "", "", 1);
+}
+
+#[test]
+fn test_empty_basic_regexp_07() {
     grep_test(&["-f", EMPTY_PATTERN_FILE], "", "", "", 1);
 }
 
@@ -1221,11 +1227,16 @@ fn test_empty_extended_regexp_01() {
 
 #[test]
 fn test_empty_extended_regexp_02() {
-    grep_test(&["-E", "-e", ""], LINES_INPUT, LINES_INPUT, "", 0);
+    grep_test(&["-E", ""], EMPTY_LINES_INPUT, EMPTY_LINES_INPUT, "", 0);
 }
 
 #[test]
 fn test_empty_extended_regexp_03() {
+    grep_test(&["-E", "-e", ""], LINES_INPUT, LINES_INPUT, "", 0);
+}
+
+#[test]
+fn test_empty_extended_regexp_04() {
     grep_test(
         &["-E", "-f", EMPTY_PATTERN_FILE],
         LINES_INPUT,
@@ -1236,17 +1247,17 @@ fn test_empty_extended_regexp_03() {
 }
 
 #[test]
-fn test_empty_extended_regexp_04() {
+fn test_empty_extended_regexp_05() {
     grep_test(&["-E", ""], "", "", "", 1);
 }
 
 #[test]
-fn test_empty_extended_regexp_05() {
+fn test_empty_extended_regexp_06() {
     grep_test(&["-E", "-e", ""], "", "", "", 1);
 }
 
 #[test]
-fn test_empty_extended_regexp_06() {
+fn test_empty_extended_regexp_07() {
     grep_test(&["-E", "-f", EMPTY_PATTERN_FILE], "", "", "", 1);
 }
 
@@ -1257,11 +1268,16 @@ fn test_empty_fixed_strings_01() {
 
 #[test]
 fn test_empty_fixed_strings_02() {
-    grep_test(&["-F", "-e", ""], LINES_INPUT, LINES_INPUT, "", 0);
+    grep_test(&["-E", ""], EMPTY_LINES_INPUT, EMPTY_LINES_INPUT, "", 0);
 }
 
 #[test]
 fn test_empty_fixed_strings_03() {
+    grep_test(&["-F", "-e", ""], LINES_INPUT, LINES_INPUT, "", 0);
+}
+
+#[test]
+fn test_empty_fixed_strings_04() {
     grep_test(
         &["-F", "-f", EMPTY_PATTERN_FILE],
         LINES_INPUT,
@@ -1272,17 +1288,17 @@ fn test_empty_fixed_strings_03() {
 }
 
 #[test]
-fn test_empty_fixed_strings_04() {
+fn test_empty_fixed_strings_05() {
     grep_test(&["-F", ""], "", "", "", 1);
 }
 
 #[test]
-fn test_empty_fixed_strings_05() {
+fn test_empty_fixed_strings_06() {
     grep_test(&["-F", "-e", ""], "", "", "", 1);
 }
 
 #[test]
-fn test_empty_fixed_strings_06() {
+fn test_empty_fixed_strings_07() {
     grep_test(&["-F", "-f", EMPTY_PATTERN_FILE], "", "", "", 1);
 }
 

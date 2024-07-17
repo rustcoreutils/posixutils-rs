@@ -27,7 +27,14 @@ fn find_size_test() {
     let test_dir = format!("{}/tests/find/other", project_root);
     let args = [&test_dir, "-size", "+4"];
 
+    // The different result of the command is due to a feature of the linux and macos operating systems, 
+    // namely the use of different file systems (ext4 on linux and APFS on macos). 
+    // Therefore, the size of folders differs depending on the operating system. 
+    #[cfg(not(target_os = "macos"))]
     let expected_output = format!("{}\n{}/file1.txt\n", test_dir, test_dir);
+
+    #[cfg(target_os = "macos")]
+    let expected_output = format!("{}/file1.txt\n", test_dir);
 
     run_test_find(&args, &expected_output, "", 0)
 }
@@ -69,8 +76,15 @@ fn find_combination_test() {
     let test_dir = format!("{}/tests/find/other", project_root);
     let args = [&test_dir, "-size", "+4", "-print", "-size", "+2", "-print"];
 
+    // The different result of the command is due to a feature of the linux and macos operating systems, 
+    // namely the use of different file systems (ext4 on linux and APFS on macos). 
+    // Therefore, the size of folders differs depending on the operating system. 
+    #[cfg(not(target_os = "macos"))]
     let expected_output = format!("{}\n{}\n{}/file1.txt\n{}/file1.txt\n", test_dir, test_dir, test_dir, test_dir);
 
+    #[cfg(target_os = "macos")]
+    let expected_output = format!("{}/file1.txt\n{}/file1.txt\n", test_dir, test_dir);
+    
     run_test_find(&args, &expected_output, "", 0)
 }
 

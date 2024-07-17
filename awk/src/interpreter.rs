@@ -14,7 +14,7 @@ use crate::program::{BuiltinFunction, Constant, Function, OpCode, Program, Speci
 use crate::format::{
     fmt_write_decimal_float, fmt_write_float_general, fmt_write_hex_float,
     fmt_write_scientific_float, fmt_write_signed, fmt_write_string, fmt_write_unsigned,
-    parse_conversion_specifier_args, IntegerFormat,
+    parse_conversion_specifier_args, parse_escape_sequence, IntegerFormat,
 };
 use std::fmt::Write;
 
@@ -419,65 +419,79 @@ impl Interpreter {
         let mut result = String::with_capacity(format.len());
         let mut remaining_args = argc - 1;
         let mut iter = format.chars();
-        while let Some(c) = iter.next() {
-            if c == '%' {
-                let (specifier, args) = parse_conversion_specifier_args(&mut iter)?;
-                if specifier == '%' {
-                    result.push('%');
-                    continue;
-                }
+        let mut next = iter.next();
+        while let Some(c) = next {
+            match c {
+                '%' => {
+                    let (specifier, args) = parse_conversion_specifier_args(&mut iter)?;
+                    if specifier == '%' {
+                        result.push('%');
+                        continue;
+                    }
 
-                if remaining_args == 0 {
-                    return Err("not enough arguments for format string".to_string());
-                }
-                remaining_args -= 1;
-                match specifier {
-                    'd' | 'i' => {
-                        let value = f64_to_i64_or_err(self.pop_scalar()?.as_f64_or_err()?)?;
-                        fmt_write_signed(&mut result, value, &args);
+                    if remaining_args == 0 {
+                        return Err("not enough arguments for format string".to_string());
                     }
-                    'u' | 'o' | 'x' | 'X' => {
-                        let value = f64_to_i64_or_err(self.pop_scalar()?.as_f64_or_err()?)?;
-                        if value.is_negative() {
-                            return Err("negative value for unsigned format specifier".to_string());
+                    remaining_args -= 1;
+                    match specifier {
+                        'd' | 'i' => {
+                            let value = f64_to_i64_or_err(self.pop_scalar()?.as_f64_or_err()?)?;
+                            fmt_write_signed(&mut result, value, &args);
                         }
-                        let format = match specifier {
-                            'u' => IntegerFormat::Decimal,
-                            'o' => IntegerFormat::Octal,
-                            'x' => IntegerFormat::HexLower,
-                            'X' => IntegerFormat::HexUpper,
-                            _ => unreachable!(),
-                        };
-                        fmt_write_unsigned(&mut result, value as u64, format, &args);
+                        'u' | 'o' | 'x' | 'X' => {
+                            let value = f64_to_i64_or_err(self.pop_scalar()?.as_f64_or_err()?)?;
+                            if value.is_negative() {
+                                return Err(
+                                    "negative value for unsigned format specifier".to_string()
+                                );
+                            }
+                            let format = match specifier {
+                                'u' => IntegerFormat::Decimal,
+                                'o' => IntegerFormat::Octal,
+                                'x' => IntegerFormat::HexLower,
+                                'X' => IntegerFormat::HexUpper,
+                                _ => unreachable!(),
+                            };
+                            fmt_write_unsigned(&mut result, value as u64, format, &args);
+                        }
+                        'a' | 'A' => {
+                            let value = self.pop_scalar()?.as_f64_or_err()?;
+                            fmt_write_hex_float(&mut result, value, specifier == 'a', &args);
+                        }
+                        'f' | 'F' => {
+                            let value = self.pop_scalar()?.as_f64_or_err()?;
+                            fmt_write_decimal_float(&mut result, value, specifier == 'f', &args);
+                        }
+                        'e' | 'E' => {
+                            let value = self.pop_scalar()?.as_f64_or_err()?;
+                            fmt_write_scientific_float(&mut result, value, specifier == 'e', &args);
+                        }
+                        'g' | 'G' => {
+                            let value = self.pop_scalar()?.as_f64_or_err()?;
+                            fmt_write_float_general(&mut result, value, specifier == 'g', &args);
+                        }
+                        'c' => {
+                            let value =
+                                f64_to_i64_or_err(self.pop_scalar()?.as_f64_or_err()?)? as u8;
+                            result.push(value as char);
+                        }
+                        's' => {
+                            let value = self.pop_scalar()?.to_string();
+                            fmt_write_string(&mut result, &value, &args);
+                        }
+                        _ => return Err(format!("unsupported format specifier '{}'", specifier)),
                     }
-                    'a' | 'A' => {
-                        let value = self.pop_scalar()?.as_f64_or_err()?;
-                        fmt_write_hex_float(&mut result, value, specifier == 'a', &args);
-                    }
-                    'f' | 'F' => {
-                        let value = self.pop_scalar()?.as_f64_or_err()?;
-                        fmt_write_decimal_float(&mut result, value, specifier == 'f', &args);
-                    }
-                    'e' | 'E' => {
-                        let value = self.pop_scalar()?.as_f64_or_err()?;
-                        fmt_write_scientific_float(&mut result, value, specifier == 'e', &args);
-                    }
-                    'g' | 'G' => {
-                        let value = self.pop_scalar()?.as_f64_or_err()?;
-                        fmt_write_float_general(&mut result, value, specifier == 'g', &args);
-                    }
-                    'c' => {
-                        let value = f64_to_i64_or_err(self.pop_scalar()?.as_f64_or_err()?)? as u8;
-                        result.push(value as char);
-                    }
-                    's' => {
-                        let value = self.pop_scalar()?.to_string();
-                        fmt_write_string(&mut result, &value, &args);
-                    }
-                    _ => return Err(format!("unsupported format specifier '{}'", specifier)),
+                    next = iter.next();
                 }
-            } else {
-                result.push(c);
+                '\\' => {
+                    let (escaped_char, next_char) = parse_escape_sequence(&mut iter)?;
+                    result.push(escaped_char);
+                    next = next_char;
+                }
+                other => {
+                    result.push(other);
+                    next = iter.next();
+                }
             }
         }
         Ok(result)
@@ -1811,5 +1825,11 @@ mod tests {
     fn test_builtin_sprintf_char() {
         assert_eq!(test_sprintf("%c", vec![Constant::Number(55.0)]), "7");
         assert_eq!(test_sprintf("%c", vec![Constant::Number(548.0)]), "$");
+    }
+
+    #[test]
+    fn test_builtin_sprintf_escape_sequences() {
+        assert_eq!(test_sprintf("\\n hello world", vec![]), "\n hello world");
+        assert_eq!(test_sprintf("\\056", vec![]), ".");
     }
 }

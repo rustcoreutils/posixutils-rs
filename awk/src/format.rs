@@ -111,7 +111,89 @@ fn swap_sign_in_front_of_number(target: &mut String, sign: &str, write_starting_
     }
 }
 
-#[derive(Default)]
+fn fix_exponent(target: &mut String, lowercase_version: bool, should_add_dot_after_number: bool) {
+    // there are at most 5 characters after the 'e'. One for the sign and four for the exponent
+    // (4 = ceil(log10(2^11)), where 11 is the number of bits in the exponent of an f64)
+    let mut exponent_buffer = [0u8; 5];
+    let mut exponent_buffer_length = 0;
+    while matches!(target.as_bytes().last(), Some(c) if *c != b'e') {
+        exponent_buffer[exponent_buffer_length] = target.pop().unwrap() as u8;
+        exponent_buffer_length += 1;
+    }
+    // pop the 'e' character
+    target.pop();
+
+    // FIXME: replace decimal point with locale specific decimal point
+    if should_add_dot_after_number {
+        target.push('.');
+    }
+
+    // push the exponent character
+    if lowercase_version {
+        target.push('e');
+    } else {
+        target.push('E');
+    }
+
+    // push the sign character
+    if exponent_buffer[exponent_buffer_length - 1] != b'-' {
+        target.push('+');
+    } else {
+        target.push('-');
+        exponent_buffer_length -= 1;
+    }
+
+    // the exponent value should have at least two digits
+    if exponent_buffer_length <= 1 {
+        target.push('0');
+    }
+    // copy the rest of the buffer
+    for c in exponent_buffer[0..exponent_buffer_length].iter().rev() {
+        target.push(*c as char);
+    }
+}
+
+fn remove_trailing_zeros(
+    target: &mut String,
+    sign: &str,
+    write_starting_index: usize,
+    width: usize,
+    zero_padded: bool,
+) {
+    // cases:
+    // - the number is zero padded we need to rotate the zeros after the sign
+    // - the number is space padded we need to rotate the zeros before the sign and turn them into
+    // spaces
+    // - the number is not padded
+    let trailing_zeros = target.chars().rev().take_while(|c| *c == '0').count();
+    let final_number_length = target.len() - write_starting_index - trailing_zeros;
+
+    if final_number_length >= width {
+        // the doesn't need to be padded
+        target.truncate(target.len() - trailing_zeros);
+    } else if zero_padded {
+        // we need to rotate the zeros after the sign
+        let first = write_starting_index + sign.is_empty() as usize;
+        // we know that the last `trailing_zeros` bytes of `target` are b'0',
+        // so it's safe to rotate them (no multibyte chars are split)
+        unsafe { target[first..].as_bytes_mut().rotate_right(trailing_zeros) };
+    } else {
+        unsafe {
+            let bytes = target.as_bytes_mut();
+            // rotate is safe, see above
+            bytes.rotate_right(trailing_zeros);
+            // we just replace b'0' with b' '. No multibyte chars are involved
+            for i in 0..trailing_zeros {
+                bytes[i] = b' ';
+            }
+        }
+    }
+    if let Some('.') = target.chars().last() {
+        target.pop();
+    }
+}
+
+#[derive(Default, Clone)]
 pub struct FormatArgs {
     left_justified: bool,
     signed: bool,
@@ -508,51 +590,170 @@ pub fn fmt_write_scientific_float(
         swap_sign_in_front_of_number(target, sign, write_starting_index);
     }
 
-    // we need to fix the exponent part of the number, as the rust conventions are different
-
-    // there are at most 5 characters after the 'e'. One for the sign and four for the exponent
-    // (4 = ceil(log10(2^11)), where 11 is the number of bits in the exponent of an f64)
-    let mut exponent_buffer = [0u8; 5];
-    let mut exponent_buffer_length = 0;
-    while matches!(target.as_bytes().last(), Some(c) if *c != b'e') {
-        exponent_buffer[exponent_buffer_length] = target.pop().unwrap() as u8;
-        exponent_buffer_length += 1;
-    }
-    // pop the 'e' character
-    target.pop();
-
-    // FIXME: replace decimal point with locale specific decimal point
-    if should_add_dot_after_number {
-        target.push('.');
-    }
-
-    // push the exponent character
-    if lowercase_version {
-        target.push('e');
-    } else {
-        target.push('E');
-    }
-
-    // push the sign character
-    if exponent_buffer[exponent_buffer_length - 1] != b'-' {
-        target.push('+');
-    } else {
-        target.push('-');
-        exponent_buffer_length -= 1;
-    }
-
-    // the exponent value should have at least two digits
-    if exponent_buffer_length <= 1 {
-        target.push('0');
-    }
-    // copy the rest of the buffer
-    for c in exponent_buffer[0..exponent_buffer_length].iter().rev() {
-        target.push(*c as char);
-    }
+    fix_exponent(target, lowercase_version, should_add_dot_after_number);
 
     if args.left_justified {
         let number_length = target.len() - write_starting_index;
         pad_target(target, args.width.saturating_sub(number_length), b' ');
+    }
+}
+
+pub fn fmt_write_float_general(
+    target: &mut String,
+    value: f64,
+    lowercase_version: bool,
+    args: &FormatArgs,
+) {
+    // TODO: refactor copied duplicate code
+
+    let sign = sign_str(value.is_sign_negative(), args);
+    if write_inf_or_nan(target, value, lowercase_version, sign) {
+        return;
+    }
+
+    let abs_value = value.abs();
+    let exponent = abs_value.log10().trunc() as i64;
+
+    // the POSIX standard doesn't specify a default value. Here we follow the C standard
+    // which uses 6. This also matches other implementations
+    // We also want to always print at least one digit
+    let significant_digits = args.precision.unwrap_or(6).max(1);
+
+    if exponent < -4 || significant_digits <= exponent.max(0) as usize {
+        // in scientific notation, the number of significant digits is the precision plus one
+        let precision = significant_digits - 1;
+
+        let mut additional_exponent_length = 0;
+        // if the exponent is not negative, we need to add a '+' sign to the exponent part
+        if !exponent.is_negative() {
+            additional_exponent_length += 1;
+        }
+        // if the exponent value is only one digit, we need to pad it with a zero
+        if exponent.abs() < 10 {
+            additional_exponent_length += 1;
+        }
+
+        let value = value.abs();
+        let write_starting_index = target.len();
+        let should_add_dot_after_number = precision == 0 && args.alternative_form;
+        let width = args.width.saturating_sub(
+            sign.len() + should_add_dot_after_number as usize + additional_exponent_length,
+        );
+
+        // left justified
+        //   sign integer_part <decimal_point> fractional_part e exponent_sign exponent_value padding
+        // right justified zero padded
+        //   sign padding integer_part <decimal point> fractional_part e exponent_sign exponent_value
+        // right justified space padded
+        //  padding sign integer_part <decimal point> fractional_part e exponent_sign exponent_value
+
+        if args.left_justified {
+            target.push_str(sign);
+            write!(target, "{:.1$e}", value, precision).expect("error writing to string");
+        } else if args.zero_padded {
+            target.push_str(sign);
+            write!(target, "{:01$.2$e}", value, width, precision).expect("error writing to string")
+        } else {
+            target.push_str(sign);
+
+            write!(target, "{:1$.2$e}", value, width, precision).expect("error writing to string");
+
+            swap_sign_in_front_of_number(target, sign, write_starting_index);
+        }
+
+        // there are at most 5 characters after the 'e'. One for the sign and four for the exponent
+        // (4 = ceil(log10(2^11)), where 11 is the number of bits in the exponent of an f64)
+        let mut exponent_buffer = [0u8; 5];
+        let mut exponent_buffer_length = 0;
+        while matches!(target.as_bytes().last(), Some(c) if *c != b'e') {
+            exponent_buffer[exponent_buffer_length] = target.pop().unwrap() as u8;
+            exponent_buffer_length += 1;
+        }
+        // pop the 'e' character
+        target.pop();
+
+        if !args.alternative_form {
+            remove_trailing_zeros(target, sign, write_starting_index, width, args.zero_padded);
+        }
+
+        // FIXME: replace decimal point with locale specific decimal point
+        if should_add_dot_after_number {
+            target.push('.');
+        }
+
+        // push the exponent character
+        if lowercase_version {
+            target.push('e');
+        } else {
+            target.push('E');
+        }
+
+        // push the sign character
+        if exponent_buffer[exponent_buffer_length - 1] != b'-' {
+            target.push('+');
+        } else {
+            target.push('-');
+            exponent_buffer_length -= 1;
+        }
+
+        // the exponent value should have at least two digits
+        if exponent_buffer_length <= 1 {
+            target.push('0');
+        }
+        // copy the rest of the buffer
+        for c in exponent_buffer[0..exponent_buffer_length].iter().rev() {
+            target.push(*c as char);
+        }
+
+        if args.left_justified {
+            let number_length = target.len() - write_starting_index;
+            pad_target(target, args.width.saturating_sub(number_length), b' ');
+        }
+    } else {
+        // in decimal notation, the number of significant digits is the precision plus the number of
+        // digits in the integer part of the number
+        let precision = significant_digits.saturating_sub(exponent.max(0) as usize + 1);
+
+        let value = value.abs();
+        let write_starting_index = target.len();
+        let should_add_dot_after_number = precision == 0 && args.alternative_form;
+        let width = args
+            .width
+            .saturating_sub(sign.len() + should_add_dot_after_number as usize);
+
+        // left justified
+        //   sign integer_part <decimal_point> fractional_part padding
+        // right justified zero padded
+        //   sign padding integer_part <decimal point> fractional_part
+        // right justified space padded
+        //  padding sign integer_part <decimal point> fractional_part
+
+        if args.left_justified {
+            target.push_str(sign);
+            write!(target, "{:.1$}", value, precision).expect("error writing to string");
+        } else if args.zero_padded {
+            target.push_str(sign);
+            write!(target, "{:01$.2$}", value, width, precision).expect("error writing to string");
+        } else {
+            target.push_str(sign);
+            write!(target, "{:1$.2$}", value, width, precision).expect("error writing to string");
+            swap_sign_in_front_of_number(target, sign, write_starting_index);
+        }
+
+        // in this case `precision` is an upper bound on the number of decimal digits
+        if !args.alternative_form {
+            remove_trailing_zeros(target, sign, write_starting_index, width, args.zero_padded);
+        }
+
+        if should_add_dot_after_number {
+            target.push('.');
+        }
+
+        if args.left_justified {
+            let number_length = target.len() - write_starting_index;
+            pad_target(target, args.width.saturating_sub(number_length), b' ');
+        }
+        // FIXME: replace decimal point with locale specific decimal point
     }
 }
 
@@ -2047,5 +2248,296 @@ mod tests {
         let mut target = String::new();
         fmt_write_scientific_float(&mut target, f64::NAN, false, &FormatArgs::default());
         assert_eq!(target, "NAN");
+    }
+
+    #[test]
+    fn test_write_float_general_as_decimal() {
+        let mut target = String::new();
+        fmt_write_float_general(&mut target, 123.456, true, &FormatArgs::default());
+        assert_eq!(target, "123.456");
+    }
+
+    #[test]
+    fn test_write_float_general_as_scientific_small() {
+        let mut target = String::new();
+        fmt_write_float_general(&mut target, 0.00001, true, &FormatArgs::default());
+        assert_eq!(target, "1e-05");
+    }
+
+    #[test]
+    fn test_write_float_general_as_decimal_right_space_padded() {
+        let mut target = String::new();
+        fmt_write_float_general(
+            &mut target,
+            123.456,
+            true,
+            &FormatArgs {
+                width: 10,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "   123.456");
+    }
+
+    #[test]
+    fn test_write_float_general_as_decimal_right_zero_padded() {
+        let mut target = String::new();
+        fmt_write_float_general(
+            &mut target,
+            123.456,
+            true,
+            &FormatArgs {
+                width: 10,
+                zero_padded: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "000123.456");
+    }
+
+    #[test]
+    fn test_write_float_general_as_decimal_right_space_padded_with_precision() {
+        let mut target = String::new();
+        fmt_write_float_general(
+            &mut target,
+            123.456,
+            true,
+            &FormatArgs {
+                width: 10,
+                precision: Some(3),
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "       123");
+    }
+
+    #[test]
+    fn test_write_float_general_as_decimal_right_zero_padded_with_precision() {
+        let mut target = String::new();
+        fmt_write_float_general(
+            &mut target,
+            123.456,
+            true,
+            &FormatArgs {
+                width: 10,
+                precision: Some(3),
+                zero_padded: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "0000000123");
+    }
+
+    #[test]
+    fn test_write_signed_float_general_as_decimal_right_space_padded() {
+        let mut target = String::new();
+        fmt_write_float_general(
+            &mut target,
+            123.456,
+            true,
+            &FormatArgs {
+                width: 10,
+                signed: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "  +123.456");
+    }
+
+    #[test]
+    fn test_write_signed_float_general_as_decimal_right_zero_padded() {
+        let mut target = String::new();
+        fmt_write_float_general(
+            &mut target,
+            123.456,
+            true,
+            &FormatArgs {
+                width: 10,
+                zero_padded: true,
+                signed: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "+00123.456");
+    }
+
+    #[test]
+    fn test_write_signed_float_general_as_decimal_right_space_padded_with_precision() {
+        let mut target = String::new();
+        fmt_write_float_general(
+            &mut target,
+            123.456,
+            true,
+            &FormatArgs {
+                width: 10,
+                signed: true,
+                precision: Some(3),
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "      +123");
+    }
+
+    #[test]
+    fn test_write_signed_float_general_as_decimal_right_zero_padded_with_precision() {
+        let mut target = String::new();
+        fmt_write_float_general(
+            &mut target,
+            123.456,
+            true,
+            &FormatArgs {
+                width: 10,
+                precision: Some(3),
+                signed: true,
+                zero_padded: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "+000000123");
+    }
+
+    #[test]
+    fn test_write_float_general_as_scientific_right_space_padded() {
+        let mut target = String::new();
+        fmt_write_float_general(
+            &mut target,
+            123456.0,
+            true,
+            &FormatArgs {
+                width: 10,
+                precision: Some(3),
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "  1.23e+05");
+    }
+
+    #[test]
+    fn test_write_signed_float_general_as_scientific_right_space_padded() {
+        let mut target = String::new();
+        fmt_write_float_general(
+            &mut target,
+            123456.0,
+            true,
+            &FormatArgs {
+                width: 10,
+                precision: Some(3),
+                signed: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, " +1.23e+05");
+    }
+
+    #[test]
+    fn test_write_float_general_as_scientific_right_zero_padded() {
+        let mut target = String::new();
+        fmt_write_float_general(
+            &mut target,
+            123456.0,
+            true,
+            &FormatArgs {
+                width: 10,
+                precision: Some(3),
+                zero_padded: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "001.23e+05");
+    }
+
+    #[test]
+    fn test_write_signed_float_general_as_scientific_right_zero_padded() {
+        let mut target = String::new();
+        fmt_write_float_general(
+            &mut target,
+            123456.0,
+            true,
+            &FormatArgs {
+                width: 10,
+                precision: Some(3),
+                signed: true,
+                zero_padded: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "+01.23e+05");
+    }
+
+    #[test]
+    fn test_write_float_general_as_scientific_with_precision() {
+        let mut target = String::new();
+        fmt_write_float_general(
+            &mut target,
+            123456.0,
+            true,
+            &FormatArgs {
+                precision: Some(3),
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "1.23e+05");
+    }
+
+    #[test]
+    fn test_write_float_general_as_decimal_with_precision() {
+        let mut target = String::new();
+        fmt_write_float_general(
+            &mut target,
+            123.0,
+            true,
+            &FormatArgs {
+                precision: Some(3),
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "123");
+    }
+
+    #[test]
+    fn test_write_float_general_as_scientific_alternative_form() {
+        let mut target = String::new();
+        fmt_write_float_general(
+            &mut target,
+            1000000.0,
+            true,
+            &FormatArgs {
+                alternative_form: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "1.00000e+06");
+    }
+
+    #[test]
+    fn test_write_float_general_as_scientific_alternative_form_with_one_precision() {
+        let mut target = String::new();
+        fmt_write_float_general(
+            &mut target,
+            1000000.0,
+            true,
+            &FormatArgs {
+                alternative_form: true,
+                precision: Some(1),
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "1.e+06");
+    }
+
+    #[test]
+    fn test_write_float_general_as_decimal_alternative_form() {
+        let mut target = String::new();
+        fmt_write_float_general(
+            &mut target,
+            1.234,
+            true,
+            &FormatArgs {
+                alternative_form: true,
+                precision: Some(1),
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "1.");
     }
 }

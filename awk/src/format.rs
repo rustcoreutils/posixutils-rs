@@ -159,18 +159,35 @@ fn remove_trailing_zeros(
     write_starting_index: usize,
     width: usize,
     zero_padded: bool,
+    left_justified: bool,
 ) {
-    // cases:
-    // - the number is zero padded we need to rotate the zeros after the sign
-    // - the number is space padded we need to rotate the zeros before the sign and turn them into
-    // spaces
-    // - the number is not padded
-    let trailing_zeros = target.chars().rev().take_while(|c| *c == '0').count();
+    let trailing_spaces = target.chars().rev().take_while(|c| *c == ' ').count();
+    let trailing_zeros = target
+        .chars()
+        .rev()
+        .skip(trailing_spaces)
+        .take_while(|c| *c == '0')
+        .count();
     let final_number_length = target.len() - write_starting_index - trailing_zeros;
 
     if final_number_length >= width {
-        // the doesn't need to be padded
+        // the number cannot have trailing spaces and trailing zeros, otherwise it would mean that
+        // even if we remove chars we could still stay under width, but this cannot be, as any padding
+        // chars mean that the number alone was not wide enough
+        assert!(trailing_spaces == 0 || trailing_zeros == 0);
+
         target.truncate(target.len() - trailing_zeros);
+    } else if left_justified {
+        let first_trailing_zero = target.len() - trailing_spaces - trailing_zeros;
+        // this is safe as we just swap ascii bytes for other ascii bytes. No multibyte chars
+        // involved
+        unsafe {
+            let bytes =
+                target[first_trailing_zero..first_trailing_zero + trailing_zeros].as_bytes_mut();
+            for c in bytes {
+                *c = b' ';
+            }
+        }
     } else if zero_padded {
         // we need to rotate the zeros after the sign
         let first = write_starting_index + sign.is_empty() as usize;
@@ -673,7 +690,14 @@ pub fn fmt_write_float_general(
         target.pop();
 
         if !args.alternative_form {
-            remove_trailing_zeros(target, sign, write_starting_index, width, args.zero_padded);
+            remove_trailing_zeros(
+                target,
+                sign,
+                write_starting_index,
+                width,
+                args.zero_padded,
+                args.left_justified,
+            );
         }
 
         // FIXME: replace decimal point with locale specific decimal point
@@ -742,7 +766,14 @@ pub fn fmt_write_float_general(
 
         // in this case `precision` is an upper bound on the number of decimal digits
         if !args.alternative_form {
-            remove_trailing_zeros(target, sign, write_starting_index, width, args.zero_padded);
+            remove_trailing_zeros(
+                target,
+                sign,
+                write_starting_index,
+                width,
+                args.zero_padded,
+                args.left_justified,
+            );
         }
 
         if should_add_dot_after_number {
@@ -2397,7 +2428,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_float_general_as_scientific_right_space_padded() {
+    fn test_write_float_general_as_scientific_left_space_padded() {
         let mut target = String::new();
         fmt_write_float_general(
             &mut target,
@@ -2462,6 +2493,109 @@ mod tests {
             },
         );
         assert_eq!(target, "+01.23e+05");
+    }
+
+    #[test]
+    fn test_write_float_general_as_decimal_right_space_padded() {
+        let mut target = String::new();
+        fmt_write_float_general(
+            &mut target,
+            123.456,
+            true,
+            &FormatArgs {
+                width: 10,
+                left_justified: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "123.456   ");
+    }
+
+    #[test]
+    fn test_write_float_general_as_decimal_right_space_padded_with_precision() {
+        let mut target = String::new();
+        fmt_write_float_general(
+            &mut target,
+            123.456,
+            true,
+            &FormatArgs {
+                width: 10,
+                precision: Some(3),
+                left_justified: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "123       ");
+    }
+
+    #[test]
+    fn test_write_signed_float_general_as_decimal_right_space_padded() {
+        let mut target = String::new();
+        fmt_write_float_general(
+            &mut target,
+            123.456,
+            true,
+            &FormatArgs {
+                width: 10,
+                signed: true,
+                left_justified: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "+123.456  ");
+    }
+
+    #[test]
+    fn test_write_signed_float_general_as_decimal_right_space_padded_with_precision() {
+        let mut target = String::new();
+        fmt_write_float_general(
+            &mut target,
+            123.456,
+            true,
+            &FormatArgs {
+                width: 10,
+                signed: true,
+                precision: Some(3),
+                left_justified: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "+123      ");
+    }
+
+    #[test]
+    fn test_write_float_general_as_scientific_right_space_padded() {
+        let mut target = String::new();
+        fmt_write_float_general(
+            &mut target,
+            123456.0,
+            true,
+            &FormatArgs {
+                width: 10,
+                precision: Some(3),
+                left_justified: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "1.23e+05  ");
+    }
+
+    #[test]
+    fn test_write_signed_float_general_as_scientific_right_space_padded() {
+        let mut target = String::new();
+        fmt_write_float_general(
+            &mut target,
+            123456.0,
+            true,
+            &FormatArgs {
+                width: 10,
+                precision: Some(3),
+                signed: true,
+                left_justified: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "+1.23e+05 ");
     }
 
     #[test]

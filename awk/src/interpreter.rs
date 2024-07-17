@@ -466,6 +466,10 @@ impl Interpreter {
                         let value = self.pop_scalar()?.as_f64_or_err()?;
                         fmt_write_float_general(&mut result, value, specifier == 'g', &args);
                     }
+                    'c' => {
+                        let value = f64_to_i64_or_err(self.pop_scalar()?.as_f64_or_err()?)? as u8;
+                        result.push(value as char);
+                    }
                     's' => {
                         let value = self.pop_scalar()?.to_string();
                         fmt_write_string(&mut result, &value, &args);
@@ -1801,5 +1805,11 @@ mod tests {
             test_sprintf("%10.3g", vec![Constant::Number(255.34)]),
             "       255"
         );
+    }
+
+    #[test]
+    fn test_builtin_sprintf_char() {
+        assert_eq!(test_sprintf("%c", vec![Constant::Number(55.0)]), "7");
+        assert_eq!(test_sprintf("%c", vec![Constant::Number(548.0)]), "$");
     }
 }

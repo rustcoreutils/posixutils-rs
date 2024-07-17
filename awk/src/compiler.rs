@@ -15,14 +15,14 @@ use std::{
     str::FromStr,
 };
 
+use crate::format::parse_escape_sequence;
+use crate::program::{
+    AwkRule, BuiltinFunction, Constant, Function, OpCode, Pattern, Program, SpecialVar, VarId,
+};
 use pest::{
     iterators::{Pair, Pairs},
     pratt_parser::PrattParser,
     Parser,
-};
-
-use crate::program::{
-    AwkRule, BuiltinFunction, Constant, Function, OpCode, Pattern, Program, SpecialVar, VarId,
 };
 
 struct BuiltinFunctionInfo {
@@ -191,10 +191,6 @@ fn distance(start: usize, end: usize) -> i32 {
     (end as i32) - (start as i32)
 }
 
-fn is_octal_digit(c: char) -> bool {
-    ('0'..='7').contains(&c)
-}
-
 fn escape_string(s: &str) -> Result<String, String> {
     let mut result = String::new();
     let s = s.trim_matches('"');
@@ -202,38 +198,10 @@ fn escape_string(s: &str) -> Result<String, String> {
     while let Some(c) = chars.next() {
         match c {
             '\\' => {
-                // there has to be a next character, otherwise the input is invalid
-                match chars.next().unwrap() {
-                    '"' => result.push('"'),
-                    '/' => result.push('/'),
-                    'a' => result.push('\x07'),
-                    'b' => result.push('\x08'),
-                    'f' => result.push('\x0C'),
-                    'n' => result.push('\n'),
-                    'r' => result.push('\r'),
-                    't' => result.push('\t'),
-                    'v' => result.push('\x0B'),
-                    '\\' => result.push('\\'),
-                    n if is_octal_digit(n) => {
-                        let mut char_code = n.to_digit(8).unwrap();
-                        let mut first_char = '\0';
-                        for _ in 0..2 {
-                            if let Some(c) = chars.next() {
-                                if is_octal_digit(c) {
-                                    char_code = char_code * 8 + c.to_digit(8).unwrap();
-                                } else {
-                                    first_char = c;
-                                    break;
-                                }
-                            }
-                        }
-                        // FIXME: I don't think this is correct. We should also consider multi-byte characters
-                        result.push(char::from_u32(char_code).ok_or("invalid character")?);
-                        if first_char != '\0' {
-                            result.push(first_char);
-                        }
-                    }
-                    other => return Err(format!("invalid escape sequence: \\{}", other)),
+                let (escaped_char, next) = parse_escape_sequence(&mut chars)?;
+                result.push(escaped_char);
+                if let Some(next) = next {
+                    result.push(next);
                 }
             }
             other => result.push(other),

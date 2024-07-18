@@ -13,6 +13,8 @@ gettext-rs.workspace = true
 libc.workspace = true
 atty.workspace = true
 regex.workspace = true
+walkdir = "2"
+users = "0.11"
 
 [[bin]]
 name = "cat"
@@ -41,3 +43,7 @@ path = "src/tee.rs"
 [[bin]]
 name = "file"
 path = "src/file.rs"
+
+[[bin]]
+name = "find"
+path = "src/find.rs"

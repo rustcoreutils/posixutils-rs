@@ -524,6 +524,7 @@ impl MacroName {
     /// Macro names shall consist of letters, digits, and underscores, where the first character is
     /// not a digit. Tokens not of this form shall not be treated as macros.
     /// `[_a-zA-Z][_a-zA-Z0-9]*`
+    // TODO: change to complete parser
     pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
         log::trace!(
             "MacroName::parse() input {:?}",
@@ -583,8 +584,16 @@ pub(crate) fn is_whitespace(c: u8) -> bool {
     (unsafe { libc::isblank(c.into()) != 0 }) || c == b'\n'
 }
 
+pub(crate) fn is_space(c: u8) -> bool {
+    unsafe { libc::isspace(c.into()) != 0 }
+}
+
 pub(crate) fn is_alphnumeric(c: u8) -> bool {
     unsafe { libc::isalnum(c.into()) != 0 }
+}
+
+pub(crate) fn is_alpha(c: u8) -> bool {
+    unsafe { libc::isalpha(c.into()) != 0 }
 }
 
 /// Parse input that we already know is not quoted and not a macro, consume input until it could

@@ -14,13 +14,13 @@ gettext-rs.workspace = true
 
 [[bin]]
 name = "true"
-path = "src/true.rs"
+path = "./true.rs"
 
 [[bin]]
 name = "false"
-path = "src/false.rs"
+path = "./false.rs"
 
 [[bin]]
 name = "test"
-path = "src/test.rs"
+path = "./test.rs"
 

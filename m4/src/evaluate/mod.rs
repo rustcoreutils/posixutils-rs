@@ -123,7 +123,7 @@ impl Default for State {
 pub struct StackFrame {
     parenthesis_level: usize,
     args: Vec<Vec<u8>>,
-    // Macro type
+    definition: Rc<MacroDefinition>,
 }
 
 #[derive(Default)]
@@ -151,6 +151,10 @@ impl InputState {
 
     pub fn pushback_character(&mut self, c: u8) {
         self.input.last_mut().unwrap().pushback_buffer.push(c);
+    }
+
+    pub fn pushback_string(&mut self, s: &[u8]) {
+        self.input.last_mut().unwrap().pushback_buffer.extend_from_slice(s);
     }
 
     /// Fetch new characters attempting to match them all to token. If any character doesn't match
@@ -193,7 +197,7 @@ pub struct Input {
     pub pushback_buffer: Vec<u8>,
 }
 
-enum InputRead {
+pub enum InputRead {
     File(std::fs::File),
     Stdin(std::io::Stdin),
 }
@@ -221,7 +225,7 @@ pub(crate) fn process_streaming<'c>(
     let mut quotation_level;
     let mut token: Vec<u8> = Vec::new();
     let mut l: u8 = 0;
-    let mut t: u8 = 0;
+    let mut t: u8;
 
     loop {
         t = state.input.get_next_character()?;
@@ -280,12 +284,34 @@ pub(crate) fn process_streaming<'c>(
                 state.output.write_all(&[t])?;
             }
         } else if t == b'_' || is_alpha(t)  {
-            if let Some(definition) = inspect(&mut state, t, &mut token)? {
-                //pushback
-            } else {
-                
+            let definition = parse_macro(&mut state, t, &mut token)?;
+            if definition.is_some() {
+                l = state.input.get_next_character()?;
+                state.input.pushback_character(l);
             }
-            // parse token that could be a macro. If it's not then output it.
+
+            // Check to see whether it's currently defined macro or it needs some arguments but
+            // there's no open bracket.
+            if definition.is_none() || (l != b'(' && (definition.as_ref().unwrap().parse_config.min_args > 0)) {
+                state.output.write_all(&token)?;
+            } else {
+                let definition = definition.unwrap();
+
+                let frame = StackFrame {
+                    parenthesis_level: 0,
+                    args: vec![],
+                    definition: definition.clone(),
+                };
+
+                
+                // TODO: check if BSD implemenation really requires PARLEV == 0
+                if l == b'(' {
+                    state.output.stack.push(frame);
+                } else {
+                    state = definition.implementation.evaluate(state, stderr, frame)?;
+                    todo!();
+                }
+            }
         } else if t == EOF {
             todo!()
         } else if state.output.stack.is_empty() {
@@ -346,7 +372,9 @@ pub(crate) fn process_streaming<'c>(
     }
 }
 
-fn inspect<'s>(
+/// Attempt to parse `state.input` as a macro name, into `token`. If it is a current macro name in
+/// `state.macro_definitions`, then it will return `Some` of [`MacroDefinition`].
+fn parse_macro<'s>(
     state: &'s mut State,
     mut c: u8,
     token: &mut Vec<u8>,
@@ -392,13 +420,12 @@ macro_rules! macro_enums {
             fn evaluate(
                 &self,
                 state: State,
-                stdout: &mut dyn Write,
                 stderr: &mut dyn Write,
                 f: StackFrame,
             ) -> Result<State> {
                 match self {
-                    $(Self::$variant_name(d) => d.evaluate(state, stdout, stderr, f)),*,
-                    Self::UserDefined(d) => d.evaluate(state, stdout, stderr, f),
+                    $(Self::$variant_name(d) => d.evaluate(state, stderr, f)),*,
+                    Self::UserDefined(d) => d.evaluate(state, stderr, f),
                 }
             }
         }
@@ -585,7 +612,6 @@ trait MacroImplementation {
     fn evaluate(
         &self,
         state: State,
-        stdout: &mut dyn Write,
         stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State>;
@@ -599,7 +625,6 @@ impl MacroImplementation for DnlMacro {
     fn evaluate(
         &self,
         mut state: State,
-        _stdout: &mut dyn Write,
         _stderr: &mut dyn Write,
         _f: StackFrame,
     ) -> Result<State> {
@@ -662,7 +687,6 @@ impl MacroImplementation for DefineMacro {
     fn evaluate(
         &self,
         state: State,
-        _stdout: &mut dyn Write,
         stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
@@ -695,7 +719,6 @@ impl MacroImplementation for PushdefMacro {
     fn evaluate(
         &self,
         state: State,
-        _stdout: &mut dyn Write,
         stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
@@ -726,7 +749,6 @@ impl MacroImplementation for PopdefMacro {
     fn evaluate(
         &self,
         mut state: State,
-        _stdout: &mut dyn Write,
         _stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
@@ -769,165 +791,73 @@ struct UserDefinedMacro {
     definition: Vec<u8>,
 }
 
-fn parse_index(input: &[u8]) -> IResult<&[u8], usize> {
-    log::trace!("parse_index() {}", String::from_utf8_lossy(input));
-    let (remaining, found) = nom::bytes::complete::take_while(|c| c >= b'0' && c <= b'9')(input)?;
-    let s = std::str::from_utf8(found).expect("Should be valid utf8 betweeen b'0' and b'9'");
-    let i: usize = s.parse().map_err(|e| {
-        let e = nom::error::Error::from_external_error(found, nom::error::ErrorKind::Digit, e);
-        nom::Err::Error(nom::error::Error::add_context(
-            found,
-            "Error parsing user defined macro argument as an index",
-            e,
-        ))
-    })?;
-    log::trace!("parse_index() successfully parsed: {i}");
-
-    Ok((remaining, i))
-}
-
-fn parse_user_defined_macro_arg(input: &[u8]) -> IResult<&[u8], UserDefinedMacroArg> {
-    log::trace!(
-        "parse_user_defined_macro_arg() {}",
-        String::from_utf8_lossy(input)
-    );
-    let (remaining, _) = nom::bytes::complete::tag(b"$")(input)?;
-    if remaining.is_empty() {
-        return Err(nom::Err::Error(nom::error::Error::new(
-            input,
-            nom::error::ErrorKind::NonEmpty,
-        )));
-    }
-
-    nom::branch::alt((
-        nom::combinator::map(nom::bytes::complete::tag(b"*"), |_| {
-            UserDefinedMacroArg::List
-        }),
-        nom::combinator::map(nom::bytes::complete::tag(b"@"), |_| {
-            UserDefinedMacroArg::QuotedList
-        }),
-        nom::combinator::map(nom::bytes::complete::tag(b"#"), |_| {
-            UserDefinedMacroArg::NumberOfArgs
-        }),
-        nom::combinator::map(parse_index, UserDefinedMacroArg::Index),
-    ))(remaining)
-}
-
 impl MacroImplementation for UserDefinedMacro {
     fn evaluate(
         &self,
         mut state: State,
-        stdout: &mut dyn Write,
-        stderr: &mut dyn Write,
+        _stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
         log::debug!(
             "UserDefinedMacro::evaluate() evaluating {:?}: {:?}",
-            m.name.to_string(),
+            frame.definition.parse_config.name.to_string(),
             String::from_utf8_lossy(&self.definition)
         );
-        let mut buffer: Vec<u8> = Vec::with_capacity(self.definition.len());
-        let mut remaining = self.definition.as_slice();
-        let mut found: &[u8];
 
-        loop {
-            if remaining.is_empty() {
-                break;
-            }
-            (remaining, found) =
-                nom::bytes::complete::take_till::<_, _, ()>(|c| c == b'$')(remaining)
-                    .expect("Expect this to always succeed");
-            buffer.extend_from_slice(found);
-            if remaining.is_empty() {
-                break;
-            }
-            let arg;
-            (remaining, arg) = match parse_user_defined_macro_arg(remaining) {
-                Ok((remaining, arg)) => (remaining, arg),
-                Err(_) => {
-                    buffer.push(b'$');
-                    if remaining.len() > 1 {
-                        remaining = &remaining[1..];
-                        continue;
-                    } else {
-                        break;
-                    }
-                }
-            };
-
-            match arg {
-                UserDefinedMacroArg::Index(i) => {
-                    if m.args.len() < i {
-                        log::warn!("UserDefinedMacro::evaluate() Cannot find arg with index {i}");
-                    } else {
-                        // TODO: remove new_buffer
-                        let mut new_buffer: Vec<u8> = Vec::new();
-                        if i == 0 {
-                            new_buffer.write_all(&m.name.0)?;
-                        } else {
-                            let arg = m.args.get(i - 1).expect("Checked args length");
-                            state
-                                .input
-                                .push(Box::new(std::io::Cursor::new(arg.input.to_vec())));
-                            state = process_streaming(state, &mut new_buffer, stderr, true, false)?;
-                        }
-                        log::debug!(
-                            "UserDefinedMacro::evaluate() Replacing ${i} with {:?}",
-                            String::from_utf8_lossy(&new_buffer)
-                        );
-                        buffer.append(&mut new_buffer);
-                    }
-                }
-                UserDefinedMacroArg::List => {
-                    log::debug!(
-                        "UserDefinedMacro::evaluate() Replacing $* with {:?}",
-                        m.args
-                    );
-                    for (i, arg) in m.args.iter().enumerate() {
-                        state
-                            .input
-                            .push(Box::new(std::io::Cursor::new(arg.input.to_vec())));
-                        state = process_streaming(state, &mut buffer, stderr, true, false)?;
-                        if i < m.args.len() - 1 {
-                            buffer.write_all(b",")?;
-                        }
-                    }
-                }
-                UserDefinedMacroArg::QuotedList => {
-                    // TODO: remove new_buffer
-                    let mut new_buffer: Vec<u8> = Vec::new();
-                    for (i, arg) in m.args.iter().enumerate() {
-                        new_buffer.write_all(&state.parse_config.quote_open_tag)?;
-                        state
-                            .input
-                            .push(Box::new(std::io::Cursor::new(arg.input.to_vec())));
-                        state = process_streaming(state, &mut new_buffer, stderr, true, false)?;
-                        new_buffer.write_all(&state.parse_config.quote_close_tag)?;
-                        if i < m.args.len() - 1 {
-                            new_buffer.write_all(b",")?;
-                        }
-                    }
-                    log::debug!(
-                        "UserDefinedMacro::evaluate() Replacing $@ with {:?}",
-                        String::from_utf8_lossy(&new_buffer)
-                    );
-                    buffer.append(&mut new_buffer);
-                }
-                UserDefinedMacroArg::NumberOfArgs => {
-                    buffer.extend_from_slice(m.args.len().to_string().as_bytes());
-                }
-            }
+        if self.definition.len() == 0 {
+            return Ok(state);
         }
-        log::debug!(
-            "UserDefinedMacro::evaluate() substituted {:?}\nargs: {:?}\nold: {:?}\nnew: {:?}",
-            m.name.to_string(),
-            &m.args,
-            String::from_utf8_lossy(&self.definition),
-            String::from_utf8_lossy(&buffer)
-        );
-        let reader = std::io::Cursor::new(buffer);
-        state.input.push(Box::new(reader));
-        state = process_streaming(state, stdout, stderr, false, false)?;
+
+        let mut i = self.definition.len() - 1;
+        loop {
+            if i == 0 || self.definition[i-1] != b'$' {
+                state.input.pushback_character(self.definition[i]);
+            } else {
+                let t = self.definition[i];
+                match t {
+                    b'#' => state.input.pushback_string(frame.args.len().to_string().as_bytes()),
+                    b'0'..=b'9' => {
+                        let arg_index = (t - b'0') as usize;
+                        if arg_index < frame.args.len() {
+                            state.input.pushback_string(&frame.args[arg_index]);
+                        }
+                    },
+                    b'*' => {
+                        for (arg_index, arg) in frame.args.iter().enumerate().rev() {
+                            state.input.pushback_string(&arg);
+                            if arg_index > 0 {
+                                state.input.pushback_character(b',');
+                            }
+                        }
+                    },
+                    b'@' => {
+                        for (arg_index, arg) in frame.args.iter().enumerate().rev() {
+                            state.input.pushback_string(&state.parse_config.quote_close_tag);
+                            state.input.pushback_string(&arg);
+                            state.input.pushback_string(&state.parse_config.quote_open_tag);
+                            if arg_index > 0 {
+                                state.input.pushback_character(b',');
+                            }
+                        }
+                    },
+                    _ => {
+                        state.input.pushback_character(t);
+                        state.input.pushback_character(b'$');
+                    }
+                }
+                if i == 1 {
+                    break;
+                }
+                i -= 1;
+            }
+            if i == 0 {
+                break;
+            }
+            i -= 1;
+        }
+
+        todo!();
+
         Ok(state)
     }
 }
@@ -941,8 +871,7 @@ impl MacroImplementation for UndefineMacro {
     fn evaluate(
         &self,
         mut state: State,
-        _stdout: &mut dyn Write,
-        stderr: &mut dyn Write,
+        _stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
         if let Some(arg) = frame.args.into_iter().next() {
@@ -963,8 +892,7 @@ struct DefnMacro;
 impl MacroImplementation for DefnMacro {
     fn evaluate(
         &self,
-        state: State,
-        stdout: &mut dyn Write,
+        mut state: State,
         _stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
@@ -983,9 +911,10 @@ impl MacroImplementation for DefnMacro {
             if let MacroDefinitionImplementation::UserDefined(definition) =
                 &definition.implementation
             {
-                stdout.write_all(&state.parse_config.quote_open_tag)?;
-                stdout.write_all(&definition.definition)?;
-                stdout.write_all(&state.parse_config.quote_close_tag)?;
+                state.input.pushback_string(&state.parse_config.quote_close_tag);
+                state.input.pushback_string(&definition.definition);
+                state.input.pushback_string(&state.parse_config.quote_open_tag);
+                
             }
         }
         Ok(state)

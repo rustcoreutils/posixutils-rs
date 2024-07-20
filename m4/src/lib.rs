@@ -7,7 +7,7 @@ use std::{
 };
 
 use clap::builder::{TypedValueParser, ValueParserFactory};
-use evaluate::State;
+use evaluate::{InputRead, State};
 
 pub mod error;
 mod eval_macro;
@@ -140,16 +140,21 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
         log::info!("Processing input from STDIN");
         let mut state = State::new(Box::new(stdout), vec![Box::new(std::io::stdin())]);
         let mut output = state.output.clone();
-        state = evaluate::process_streaming(state, &mut output, &mut stderr, true, true)?;
+        state = evaluate::process_streaming(state, &mut stderr)?;
         state
     } else {
         let mut state = State::new(Box::new(stdout), Vec::new());
         for file_path in args.files {
-            state.input.push(Box::new(std::fs::File::open(&file_path)?));
+            state.input.input.push(evaluate::Input {
+                input: InputRead::File(std::fs::File::open(&file_path)?),
+                name: todo!(),
+                current_char: todo!(),
+                pushback_buffer: todo!(),
+            });
             let mut output = state.output.clone();
             log::info!("Processing input from {file_path:?}");
             state.file.push(file_path);
-            state = evaluate::process_streaming(state, &mut output, &mut stderr, true, true)?;
+            state = evaluate::process_streaming(state, &mut stderr)?;
             state.file.pop();
         }
         state

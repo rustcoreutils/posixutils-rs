@@ -15,20 +15,20 @@ base64 = "0.21"
 
 [[bin]]
 name = "cksum"
-path = "src/cksum.rs"
+path = "./cksum.rs"
 
 [[bin]]
 name = "uncompress"
-path = "src/uncompress.rs"
+path = "./uncompress.rs"
 
 [[bin]]
 name = "compress"
-path = "src/compress.rs"
+path = "./compress.rs"
 
 [[bin]]
 name = "uudecode"
-path = "src/uudecode.rs"
+path = "./uudecode.rs"
 
 [[bin]]
 name = "uuencode"
-path = "src/uuencode.rs"
+path = "./uuencode.rs"

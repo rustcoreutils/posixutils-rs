@@ -16,8 +16,8 @@ rustyline = { version = "14.0", default-features = false }
 
 [[bin]]
 name = "expr"
-path = "src/expr.rs"
+path = "./expr.rs"
 
 [[bin]]
 name = "bc"
-path = "src/bc.rs"
+path = "./bc.rs"

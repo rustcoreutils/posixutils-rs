@@ -17,25 +17,25 @@ dirs = "5.0"
 
 [[bin]]
 name = "env"
-path = "src/env.rs"
+path = "./env.rs"
 
 [[bin]]
 name = "kill"
-path = "src/kill.rs"
+path = "./kill.rs"
 
 [[bin]]
 name = "nice"
-path = "src/nice.rs"
+path = "./nice.rs"
 
 [[bin]]
 name = "nohup"
-path = "src/nohup.rs"
+path = "./nohup.rs"
 
 [[bin]]
 name = "renice"
-path = "src/renice.rs"
+path = "./renice.rs"
 
 [[bin]]
 name = "xargs"
-path = "src/xargs.rs"
+path = "./xargs.rs"
 

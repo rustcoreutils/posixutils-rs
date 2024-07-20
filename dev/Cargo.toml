@@ -16,17 +16,17 @@ ar = "0.9"
 
 [[bin]]
 name = "nm"
-path = "src/nm.rs"
+path = "./nm.rs"
 
 [[bin]]
 name = "ar"
-path = "src/ar.rs"
+path = "./ar.rs"
 required-features = ["object/read_core", "object/archive"]
 
 [[bin]]
 name = "strip"
-path = "src/strip.rs"
+path = "./strip.rs"
 
 [[bin]]
 name = "strings"
-path = "src/strings.rs"
+path = "./strings.rs"

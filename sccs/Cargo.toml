@@ -13,5 +13,5 @@ gettext-rs.workspace = true
 
 [[bin]]
 name = "what"
-path = "src/what.rs"
+path = "./what.rs"
 

@@ -13,9 +13,9 @@ gettext-rs.workspace = true
 
 [[bin]]
 name = "echo"
-path = "src/echo.rs"
+path = "./echo.rs"
 
 [[bin]]
 name = "printf"
-path = "src/printf.rs"
+path = "./printf.rs"
 

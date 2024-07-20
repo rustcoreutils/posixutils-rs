@@ -18,32 +18,32 @@ users = "0.11"
 
 [[bin]]
 name = "cat"
-path = "src/cat.rs"
+path = "./cat.rs"
 
 [[bin]]
 name = "od"
-path = "src/od.rs"
+path = "./od.rs"
 
 [[bin]]
 name = "cmp"
-path = "src/cmp.rs"
+path = "./cmp.rs"
 
 [[bin]]
 name = "dd"
-path = "src/dd.rs"
+path = "./dd.rs"
 
 [[bin]]
 name = "split"
-path = "src/split.rs"
+path = "./split.rs"
 
 [[bin]]
 name = "tee"
-path = "src/tee.rs"
+path = "./tee.rs"
 
 [[bin]]
 name = "file"
-path = "src/file.rs"
+path = "./file.rs"
 
 [[bin]]
 name = "find"
-path = "src/find.rs"
+path = "./find.rs"

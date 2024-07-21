@@ -52,13 +52,16 @@ impl OutputState {
                 "Writing to macro arg in stack: {:?}",
                 String::from_utf8_lossy(buf)
             );
-            self.stack
-                .last_mut()
-                .expect("Stack not empty")
-                .args
-                .last_mut()
-                .expect("Always at least one arg")
-                .extend(buf.into_iter());
+
+            let frame = self.stack.last_mut().expect("Stack not empty");
+            let arg_buffer = if let Some(arg_buffer) = frame.args.last_mut() {
+                arg_buffer
+            } else {
+                frame.args.push(Vec::new());
+                frame.args.last_mut().expect("At least one arg")
+            };
+
+            arg_buffer.extend(buf.into_iter());
         }
         Ok(())
     }
@@ -132,7 +135,7 @@ impl StackFrame {
     pub fn new(parenthesis_level: usize, definition: Rc<MacroDefinition>) -> Self {
         Self {
             parenthesis_level,
-            args: vec![Vec::new()],
+            args: Vec::new(),
             definition,
         }
     }
@@ -166,11 +169,10 @@ impl InputState {
     }
 
     pub fn pushback_string(&mut self, s: &[u8]) {
-        self.input
-            .last_mut()
-            .unwrap()
-            .pushback_buffer
-            .extend_from_slice(s);
+        let pushback_buffer = &mut self.input.last_mut().unwrap().pushback_buffer;
+        for c in s.iter().rev() {
+            pushback_buffer.push(*c);
+        }
     }
 
     /// Fetch new characters attempting to match them all to token. If any character doesn't match
@@ -842,9 +844,14 @@ impl MacroImplementation for UserDefinedMacro {
         frame: StackFrame,
     ) -> Result<State> {
         log::debug!(
-            "UserDefinedMacro::evaluate() evaluating {:?}: {:?}",
+            "UserDefinedMacro::evaluate() evaluating {:?}: definition:{:?} args:{:?}",
             frame.definition.parse_config.name.to_string(),
-            String::from_utf8_lossy(&self.definition)
+            String::from_utf8_lossy(&self.definition),
+            frame
+                .args
+                .iter()
+                .map(|a| String::from_utf8_lossy(a))
+                .collect::<Vec<_>>(),
         );
 
         if self.definition.len() == 0 {
@@ -861,8 +868,11 @@ impl MacroImplementation for UserDefinedMacro {
                     b'#' => state
                         .input
                         .pushback_string(frame.args.len().to_string().as_bytes()),
-                    b'0'..=b'9' => {
-                        let arg_index = (t - b'0') as usize;
+                    b'0' => state
+                        .input
+                        .pushback_string(&frame.definition.parse_config.name.0),
+                    b'1'..=b'9' => {
+                        let arg_index = (t - b'1') as usize;
                         if arg_index < frame.args.len() {
                             state.input.pushback_string(&frame.args[arg_index]);
                         }

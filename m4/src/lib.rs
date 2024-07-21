@@ -136,32 +136,25 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
     mut stderr: STDERR,
     args: Args,
 ) -> crate::error::Result<()> {
-    let mut state = if args.files.is_empty() {
-        log::info!("Processing input from STDIN");
-        let mut state = State::new(Box::new(stdout), vec![Box::new(std::io::stdin())]);
-        let mut output = state.output.clone();
-        state = evaluate::process_streaming(state, &mut stderr)?;
-        state
+    let mut state = State::new(Box::new(stdout), Vec::new());
+    if args.files.is_empty() {
+        state.input.input.push(evaluate::Input::new(InputRead::Stdin(std::io::stdin()), "stdin".to_owned()))
     } else {
-        let mut state = State::new(Box::new(stdout), Vec::new());
         for file_path in args.files {
-            state.input.input.push(evaluate::Input {
-                input: InputRead::File(std::fs::File::open(&file_path)?),
-                name: todo!(),
-                current_char: todo!(),
-                pushback_buffer: todo!(),
-            });
-            let mut output = state.output.clone();
-            log::info!("Processing input from {file_path:?}");
-            state.file.push(file_path);
-            state = evaluate::process_streaming(state, &mut stderr)?;
-            state.file.pop();
+            state.input.input.push(evaluate::Input::new(
+                InputRead::File(std::fs::File::open(&file_path)?),
+                file_path.file_name().ok_or_else(|| {
+                    Error::new(ErrorKind::Io)
+                        .add_context(format!("file path {file_path:?} doesn't have a file name"))
+                })?.to_string_lossy().to_string(),
+            ));
         }
-        state
     };
 
-    state.output.divert(0)?;
-    state.output.undivert_all()?;
+    state = evaluate::process_streaming(state, &mut stderr)?;
+
+    state.output.output.divert(0)?;
+    state.output.output.undivert_all()?;
 
     for wrap in state.m4wrap {
         state.output.write_all(&wrap)?;

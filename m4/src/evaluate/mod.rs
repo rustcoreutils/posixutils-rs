@@ -39,7 +39,7 @@ pub struct State {
 }
 
 #[derive(Default)]
-struct OutputState {
+pub struct OutputState {
     pub output: OutputRef,
     pub stack: Vec<StackFrame>,
 }
@@ -127,7 +127,7 @@ pub struct StackFrame {
 }
 
 #[derive(Default)]
-struct InputState {
+pub struct InputState {
     pub input: Vec<Input>,
 }
 
@@ -154,7 +154,11 @@ impl InputState {
     }
 
     pub fn pushback_string(&mut self, s: &[u8]) {
-        self.input.last_mut().unwrap().pushback_buffer.extend_from_slice(s);
+        self.input
+            .last_mut()
+            .unwrap()
+            .pushback_buffer
+            .extend_from_slice(s);
     }
 
     /// Fetch new characters attempting to match them all to token. If any character doesn't match
@@ -166,7 +170,7 @@ impl InputState {
     /// * `token` - Token to match against.
     pub fn look_ahead(&mut self, mut c: u8, token: &[u8]) -> crate::error::Result<bool> {
         if c == EOF || c != token[0] {
-            return Ok(false)
+            return Ok(false);
         }
 
         let mut i = 1;
@@ -195,6 +199,17 @@ pub struct Input {
     pub name: String,
     pub current_char: Option<u8>,
     pub pushback_buffer: Vec<u8>,
+}
+
+impl Input {
+    pub fn new(input: InputRead, name: String) -> Self {
+        Self {
+            input,
+            name,
+            current_char: None,
+            pushback_buffer: Vec::new(),
+        }
+    }
 }
 
 pub enum InputRead {
@@ -227,10 +242,13 @@ pub(crate) fn process_streaming<'c>(
     let mut l: u8 = 0;
     let mut t: u8;
 
-    loop {
+    'main_loop: loop {
         t = state.input.get_next_character()?;
         // Strip quotes
-        if state.input.look_ahead(t, &state.parse_config.quote_open_tag)? {
+        if state
+            .input
+            .look_ahead(t, &state.parse_config.quote_open_tag)?
+        {
             quotation_level = 1;
 
             'inside_quote: loop {
@@ -246,7 +264,10 @@ pub(crate) fn process_streaming<'c>(
                             .output
                             .write_all(&state.parse_config.quote_close_tag)?;
                     }
-                } else if state.input.look_ahead(l, &state.parse_config.quote_open_tag)? {
+                } else if state
+                    .input
+                    .look_ahead(l, &state.parse_config.quote_open_tag)?
+                {
                     quotation_level += 1;
                 } else if l == EOF {
                     return Err(crate::Error::new(crate::ErrorKind::UnclosedQuote));
@@ -283,7 +304,7 @@ pub(crate) fn process_streaming<'c>(
                 }
                 state.output.write_all(&[t])?;
             }
-        } else if t == b'_' || is_alpha(t)  {
+        } else if t == b'_' || is_alpha(t) {
             let definition = parse_macro(&mut state, t, &mut token)?;
             if definition.is_some() {
                 l = state.input.get_next_character()?;
@@ -292,7 +313,9 @@ pub(crate) fn process_streaming<'c>(
 
             // Check to see whether it's currently defined macro or it needs some arguments but
             // there's no open bracket.
-            if definition.is_none() || (l != b'(' && (definition.as_ref().unwrap().parse_config.min_args > 0)) {
+            if definition.is_none()
+                || (l != b'(' && (definition.as_ref().unwrap().parse_config.min_args > 0))
+            {
                 state.output.write_all(&token)?;
             } else {
                 let definition = definition.unwrap();
@@ -303,17 +326,19 @@ pub(crate) fn process_streaming<'c>(
                     definition: definition.clone(),
                 };
 
-                
                 // TODO: check if BSD implemenation really requires PARLEV == 0
                 if l == b'(' {
                     state.output.stack.push(frame);
                 } else {
                     state = definition.implementation.evaluate(state, stderr, frame)?;
-                    todo!();
                 }
             }
         } else if t == EOF {
-            todo!()
+            if state.input.input.len() == 1 {
+                break 'main_loop;
+            }
+            state.input.input.pop();
+            continue 'main_loop;
         } else if state.output.stack.is_empty() {
             // not in a macro
             state.output.write_all(&[t])?;
@@ -341,12 +366,14 @@ pub(crate) fn process_streaming<'c>(
                     state.output.stack.last_mut().unwrap().parenthesis_level -= 1;
                     if state.output.stack.last_mut().unwrap().parenthesis_level > 0 {
                         state.output.write_all(&[t])?;
-                        // chrsave
-                        todo!()
                     } else {
                         // end of argument list
                         let frame = state.output.stack.pop().unwrap();
-                        todo!() // evaluate macro
+                        state = frame
+                            .definition
+                            .clone()
+                            .implementation
+                            .evaluate(state, stderr, frame)?;
                     }
                 }
                 b',' => {
@@ -362,14 +389,50 @@ pub(crate) fn process_streaming<'c>(
                     } else {
                         state.output.write_all(&[t])?;
                     }
-                },
+                }
                 _ => {
-                    
-                },
+                    // Output comment
+                    if state
+                        .input
+                        .look_ahead(t, &state.parse_config.comment_open_tag)?
+                    {
+                        state
+                            .output
+                            .write_all(&state.parse_config.comment_open_tag)?;
+                        'comment: loop {
+                            t = state.input.get_next_character()?;
+                            if t == EOF {
+                                // TODO: should this break the main loop instead? What happens with multiple inputs?
+                                break 'comment;
+                            }
+                            if state
+                                .input
+                                .look_ahead(t, &state.parse_config.comment_close_tag)?
+                            {
+                                state
+                                    .output
+                                    .write_all(&state.parse_config.comment_close_tag)?;
+                                break 'comment;
+                            }
+                            state.output.write_all(&[t])?;
+                        }
+                    } else {
+                        state.output.write_all(&[t])?;
+                    }
+                }
             }
         }
         // TODO
     }
+
+    state.output.output.divert(0)?;
+    state.output.output.undivert_all()?;
+
+    for wrap in &state.m4wrap {
+        state.output.write_all(wrap)?;
+    }
+
+    Ok(state)
 }
 
 /// Attempt to parse `state.input` as a macro name, into `token`. If it is a current macro name in
@@ -396,7 +459,9 @@ fn parse_macro<'s>(
     Ok(state
         .macro_definitions
         .get(&MacroName::try_from_slice(&token).expect("valid macro name"))
-        .map(|v| v.last()).unwrap_or_default().cloned())
+        .map(|v| v.last())
+        .unwrap_or_default()
+        .cloned())
 }
 
 macro_rules! macro_enums {
@@ -609,12 +674,7 @@ impl std::fmt::Debug for MacroDefinition {
 }
 
 trait MacroImplementation {
-    fn evaluate(
-        &self,
-        state: State,
-        stderr: &mut dyn Write,
-        frame: StackFrame,
-    ) -> Result<State>;
+    fn evaluate(&self, state: State, stderr: &mut dyn Write, frame: StackFrame) -> Result<State>;
 }
 
 /// The dnl macro shall cause m4 to discard all input characters up to and including the next
@@ -622,12 +682,7 @@ trait MacroImplementation {
 struct DnlMacro;
 
 impl MacroImplementation for DnlMacro {
-    fn evaluate(
-        &self,
-        mut state: State,
-        _stderr: &mut dyn Write,
-        _f: StackFrame,
-    ) -> Result<State> {
+    fn evaluate(&self, mut state: State, _stderr: &mut dyn Write, _f: StackFrame) -> Result<State> {
         state.parse_config.dnl = true;
         Ok(state)
     }
@@ -684,12 +739,7 @@ impl DefineMacro {
 }
 
 impl MacroImplementation for DefineMacro {
-    fn evaluate(
-        &self,
-        state: State,
-        stderr: &mut dyn Write,
-        frame: StackFrame,
-    ) -> Result<State> {
+    fn evaluate(&self, state: State, stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
         let (mut state, definition) = DefineMacro::define(state, stderr, frame)?;
         let definition = match definition {
             Some(definition) => definition,
@@ -716,12 +766,7 @@ impl MacroImplementation for DefineMacro {
 struct PushdefMacro;
 
 impl MacroImplementation for PushdefMacro {
-    fn evaluate(
-        &self,
-        state: State,
-        stderr: &mut dyn Write,
-        frame: StackFrame,
-    ) -> Result<State> {
+    fn evaluate(&self, state: State, stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
         let (mut state, definition) = DefineMacro::define(state, stderr, frame)?;
         let definition = match definition {
             Some(definition) => definition,
@@ -810,18 +855,20 @@ impl MacroImplementation for UserDefinedMacro {
 
         let mut i = self.definition.len() - 1;
         loop {
-            if i == 0 || self.definition[i-1] != b'$' {
+            if i == 0 || self.definition[i - 1] != b'$' {
                 state.input.pushback_character(self.definition[i]);
             } else {
                 let t = self.definition[i];
                 match t {
-                    b'#' => state.input.pushback_string(frame.args.len().to_string().as_bytes()),
+                    b'#' => state
+                        .input
+                        .pushback_string(frame.args.len().to_string().as_bytes()),
                     b'0'..=b'9' => {
                         let arg_index = (t - b'0') as usize;
                         if arg_index < frame.args.len() {
                             state.input.pushback_string(&frame.args[arg_index]);
                         }
-                    },
+                    }
                     b'*' => {
                         for (arg_index, arg) in frame.args.iter().enumerate().rev() {
                             state.input.pushback_string(&arg);
@@ -829,17 +876,21 @@ impl MacroImplementation for UserDefinedMacro {
                                 state.input.pushback_character(b',');
                             }
                         }
-                    },
+                    }
                     b'@' => {
                         for (arg_index, arg) in frame.args.iter().enumerate().rev() {
-                            state.input.pushback_string(&state.parse_config.quote_close_tag);
+                            state
+                                .input
+                                .pushback_string(&state.parse_config.quote_close_tag);
                             state.input.pushback_string(&arg);
-                            state.input.pushback_string(&state.parse_config.quote_open_tag);
+                            state
+                                .input
+                                .pushback_string(&state.parse_config.quote_open_tag);
                             if arg_index > 0 {
                                 state.input.pushback_character(b',');
                             }
                         }
-                    },
+                    }
                     _ => {
                         state.input.pushback_character(t);
                         state.input.pushback_character(b'$');
@@ -911,10 +962,13 @@ impl MacroImplementation for DefnMacro {
             if let MacroDefinitionImplementation::UserDefined(definition) =
                 &definition.implementation
             {
-                state.input.pushback_string(&state.parse_config.quote_close_tag);
+                state
+                    .input
+                    .pushback_string(&state.parse_config.quote_close_tag);
                 state.input.pushback_string(&definition.definition);
-                state.input.pushback_string(&state.parse_config.quote_open_tag);
-                
+                state
+                    .input
+                    .pushback_string(&state.parse_config.quote_open_tag);
             }
         }
         Ok(state)

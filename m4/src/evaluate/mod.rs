@@ -12,10 +12,7 @@ use output::{DivertBufferNumber, Output, OutputRef};
 
 use crate::error::{Result, ResultExt};
 use crate::eval_macro::{self, parse_integer};
-use crate::lexer::{
-    is_alpha, is_alphnumeric, is_space, parse_dnl, parse_macro_args, Macro, MacroName,
-    MacroParseConfig, ParseConfig, Symbol, DEFAULT_QUOTE_CLOSE_TAG, DEFAULT_QUOTE_OPEN_TAG,
-};
+use crate::lexer::{is_alpha, is_alphnumeric, is_space, MacroName, MacroParseConfig, ParseConfig};
 use crate::EOF;
 
 mod output;
@@ -683,7 +680,13 @@ struct DnlMacro;
 
 impl MacroImplementation for DnlMacro {
     fn evaluate(&self, mut state: State, _stderr: &mut dyn Write, _f: StackFrame) -> Result<State> {
-        state.parse_config.dnl = true;
+        let mut c: u8;
+        loop {
+            c = state.input.get_next_character()?;
+            if c == b'\n' || c == EOF {
+                break;
+            }
+        }
         Ok(state)
     }
 }
@@ -755,7 +758,6 @@ impl MacroImplementation for DefineMacro {
         } else {
             state.macro_definitions.insert(name, vec![definition]);
         }
-        state.parse_config.macro_parse_configs = state.current_macro_parse_configs();
         Ok(state)
     }
 }
@@ -780,7 +782,6 @@ impl MacroImplementation for PushdefMacro {
         } else {
             state.macro_definitions.insert(name, vec![definition]);
         }
-        state.parse_config.macro_parse_configs = state.current_macro_parse_configs();
         Ok(state)
     }
 }
@@ -809,7 +810,6 @@ impl MacroImplementation for PopdefMacro {
                     if n_remaining_definitions == 0 {
                         state.macro_definitions.remove(&name);
                     }
-                    state.parse_config.macro_parse_configs = state.current_macro_parse_configs();
                 }
             }
         }
@@ -896,7 +896,8 @@ impl MacroImplementation for UserDefinedMacro {
                         state.input.pushback_character(b'$');
                     }
                 }
-                if i == 1 {
+                // TODO: this might be able to skip an iteration with i==1?
+                if i == 0 {
                     break;
                 }
                 i -= 1;
@@ -906,8 +907,6 @@ impl MacroImplementation for UserDefinedMacro {
             }
             i -= 1;
         }
-
-        todo!();
 
         Ok(state)
     }
@@ -928,7 +927,6 @@ impl MacroImplementation for UndefineMacro {
         if let Some(arg) = frame.args.into_iter().next() {
             if let Ok(name) = MacroName::try_from_slice(&arg) {
                 state.macro_definitions.remove(&name);
-                state.parse_config.macro_parse_configs = state.current_macro_parse_configs();
             }
         }
         return Ok(state);

@@ -41,6 +41,7 @@ pub(crate) struct ParseConfig {
     pub quote_close_tag: Vec<u8>,
     pub comment_open_tag: Vec<u8>,
     pub comment_close_tag: Vec<u8>,
+    pub comment_enabled: bool,
 }
 
 pub const DEFAULT_QUOTE_OPEN_TAG: &[u8] = b"`";
@@ -56,6 +57,7 @@ impl Default for ParseConfig {
             quote_close_tag: DEFAULT_QUOTE_CLOSE_TAG.to_vec(),
             comment_open_tag: DEFAULT_COMMENT_OPEN_TAG.to_vec(),
             comment_close_tag: DEFAULT_COMMENT_CLOSE_TAG.to_vec(),
+            comment_enabled: true,
         }
     }
 }

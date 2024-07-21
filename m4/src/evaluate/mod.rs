@@ -12,7 +12,10 @@ use output::{DivertBufferNumber, Output, OutputRef};
 
 use crate::error::{Error, ErrorKind, Result, ResultExt};
 use crate::eval_macro::{self, parse_integer};
-use crate::lexer::{is_alpha, is_alphnumeric, is_space, MacroName, MacroParseConfig, ParseConfig};
+use crate::lexer::{
+    is_alpha, is_alphnumeric, is_space, MacroName, MacroParseConfig, ParseConfig,
+    DEFAULT_QUOTE_CLOSE_TAG, DEFAULT_QUOTE_OPEN_TAG,
+};
 use crate::EOF;
 
 mod output;
@@ -302,7 +305,7 @@ pub(crate) fn process_streaming<'c>(
                 }
             }
         } else if state.output.stack.is_empty() // Parse comments
-            && state
+            && state.parse_config.comment_enabled && state
                 .input
                 .look_ahead(t, &state.parse_config.comment_open_tag)?
         {
@@ -407,7 +410,11 @@ pub(crate) fn process_streaming<'c>(
                             }
                         }
                         state.input.pushback_character(l);
-                        state.output.stack.last_mut().unwrap().args.push(Vec::new());
+                        let args = &mut state.output.stack.last_mut().unwrap().args;
+                        if args.is_empty() {
+                            args.push(Vec::new());
+                        }
+                        args.push(Vec::new());
                     } else {
                         state.output.write_all(&[t])?;
                     }
@@ -541,21 +548,21 @@ macro_enums!(
         Pushdef(PushdefMacro),
         Popdef(PopdefMacro),
         Defn(DefnMacro),
-        // Errprint(ErrprintMacro),
+        Errprint(ErrprintMacro),
         Include(IncludeMacro),
         Sinclude(SincludeMacro),
-        // Changecom(ChangecomMacro),
-        // Changequote(ChangequoteMacro),
-        // Incr(IncrMacro),
-        // Ifelse(IfelseMacro),
-        // Shift(ShiftMacro),
-        // Eval(EvalMacro),
-        // Decr(DecrMacro),
-        // Len(LenMacro),
-        // Index(IndexMacro),
-        // Ifdef(IfdefMacro),
-        // Translit(TranslitMacro),
-        // Substr(SubstrMacro),
+        Changecom(ChangecomMacro),
+        Changequote(ChangequoteMacro),
+        Incr(IncrMacro),
+        Decr(DecrMacro),
+        Ifelse(IfelseMacro),
+        Ifdef(IfdefMacro),
+        Shift(ShiftMacro),
+        Eval(EvalMacro),
+        Len(LenMacro),
+        Index(IndexMacro),
+        Translit(TranslitMacro),
+        Substr(SubstrMacro),
         // Dumpdef(DumpdefMacro),
         // Maketemp(MkstempMacro),
         // Mkstemp(MkstempMacro),
@@ -583,21 +590,21 @@ impl AsRef<[u8]> for BuiltinMacro {
             Defn => b"defn",
             Pushdef => b"pushdef",
             Popdef => b"popdef",
-            // Errprint => b"errprint",
+            Errprint => b"errprint",
             Include => b"include",
             Sinclude => b"sinclude",
-            // Changecom => b"changecom",
-            // Changequote => b"changequote",
-            // Incr => b"incr",
-            // Ifelse => b"ifelse",
-            // Ifdef => b"ifdef",
-            // Shift => b"shift",
-            // Eval => b"eval",
-            // Decr => b"decr",
-            // Len => b"len",
-            // Index => b"index",
-            // Translit => b"translit",
-            // Substr => b"substr",
+            Changecom => b"changecom",
+            Changequote => b"changequote",
+            Incr => b"incr",
+            Decr => b"decr",
+            Ifelse => b"ifelse",
+            Ifdef => b"ifdef",
+            Shift => b"shift",
+            Eval => b"eval",
+            Len => b"len",
+            Index => b"index",
+            Translit => b"translit",
+            Substr => b"substr",
             // Dumpdef => b"dumpdef",
             // Mkstemp => b"mkstemp",
             // Maketemp => b"maketemp",
@@ -629,21 +636,21 @@ impl BuiltinMacro {
             Defn => 1,
             Pushdef => 1,
             Popdef => 1,
-            // Errprint => 1,
+            Errprint => 1,
             Include => 1,
             Sinclude => 1,
-            // Changecom => 0,
-            // Changequote => 0,
-            // Incr => 1,
-            // Decr => 1,
-            // Ifelse => 1,
-            // Ifdef => 1,
-            // Shift => 1,
-            // Eval => 1,
-            // Len => 1,
-            // Index => 1,
-            // Translit => 1,
-            // Substr => 1,
+            Changecom => 0,
+            Changequote => 0,
+            Incr => 1,
+            Decr => 1,
+            Ifelse => 1,
+            Ifdef => 1,
+            Shift => 1,
+            Eval => 1,
+            Len => 1,
+            Index => 1,
+            Translit => 1,
+            Substr => 1,
             // Dumpdef => 1,
             // Mkstemp => 1,
             // Maketemp => 1,
@@ -984,28 +991,25 @@ impl MacroImplementation for DefnMacro {
     }
 }
 
-// struct ErrprintMacro;
+struct ErrprintMacro;
 
-// impl MacroImplementation for ErrprintMacro {
-//     fn evaluate(
-//         &self,
-//         mut state: State,
-//         _stdout: &mut dyn Write,
-//         stderr: &mut dyn Write,
-//         m: Macro,
-//     ) -> Result<State> {
-//         let args_len = m.args.len();
-//         for (i, arg) in m.args.into_iter().enumerate() {
-//             let text: Vec<u8>;
-//             (text, state) = evaluate_to_buffer(state, arg.input, stderr, true)?;
-//             stderr.write_all(&text)?;
-//             if i < (args_len - 1) {
-//                 stderr.write_all(b" ")?;
-//             }
-//         }
-//         return Ok(state);
-//     }
-// }
+impl MacroImplementation for ErrprintMacro {
+    fn evaluate(
+        &self,
+        state: State,
+        stderr: &mut dyn Write,
+        frame: StackFrame
+    ) -> Result<State> {
+        let args_len = frame.args.len();
+        for (i, arg) in frame.args.into_iter().enumerate() {
+            stderr.write_all(&arg)?;
+            if i < (args_len - 1) {
+                stderr.write_all(b" ")?;
+            }
+        }
+        return Ok(state);
+    }
+}
 
 /// The defining text for the include macro shall be the contents of the file named by the first
 /// argument. It shall be an error if the file cannot be read. The behavior is unspecified if
@@ -1078,341 +1082,299 @@ impl MacroImplementation for SincludeMacro {
     }
 }
 
-// struct ChangecomMacro;
+struct ChangecomMacro;
 
-// impl MacroImplementation for ChangecomMacro {
-//     fn evaluate(
-//         &self,
-//         mut state: State,
-//         _stdout: &mut dyn Write,
-//         stderr: &mut dyn Write,
-//         m: Macro,
-//     ) -> Result<State> {
-//         let args_len = m.args.len();
+impl MacroImplementation for ChangecomMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<State> {
+        let args_len = frame.args.len();
 
-//         if args_len == 0 {
-//             state.parse_config.comment_enabled = false;
-//             log::trace!("ChangecomMacro::evaluate() reset to default");
-//             return Ok(state);
-//         }
+        if args_len == 0 {
+            state.parse_config.comment_enabled = false;
+            log::trace!("ChangecomMacro::evaluate() reset to default");
+            return Ok(state);
+        }
 
-//         let mut args = m.args.into_iter();
-//         let open = args.next().expect("1 argument should be present");
-//         let open_tag;
-//         (open_tag, state) = evaluate_to_buffer(state, open.input, stderr, true)?;
-//         if !open_tag.is_empty() {
-//             log::trace!(
-//                 "ChangecomMacro::evaluate() comment_open_tag set to {:?}",
-//                 String::from_utf8_lossy(&open_tag)
-//             );
-//             state.parse_config.comment_enabled = true;
-//             state.parse_config.comment_open_tag = open_tag;
-//         }
+        let mut args = frame.args.into_iter();
+        let open_tag = args.next().expect("1 argument should be present");
+        if !open_tag.is_empty() {
+            log::trace!(
+                "ChangecomMacro::evaluate() comment_open_tag set to {:?}",
+                String::from_utf8_lossy(&open_tag)
+            );
+            state.parse_config.comment_enabled = true;
+            state.parse_config.comment_open_tag = open_tag;
+        }
 
-//         if args_len >= 2 {
-//             let close = args.next().expect("2 arguments should be present");
-//             let close_tag;
-//             (close_tag, state) = evaluate_to_buffer(state, close.input, stderr, true)?;
-//             if !close_tag.is_empty() {
-//                 log::trace!(
-//                     "ChangecomMacro::evaluate() comment_close_tag set to {:?}",
-//                     String::from_utf8_lossy(&close_tag)
-//                 );
-//                 state.parse_config.comment_close_tag = close_tag;
-//             }
-//         }
+        if args_len >= 2 {
+            let close_tag = args.next().expect("2 arguments should be present");
+            if !close_tag.is_empty() {
+                log::trace!(
+                    "ChangecomMacro::evaluate() comment_close_tag set to {:?}",
+                    String::from_utf8_lossy(&close_tag)
+                );
+                state.parse_config.comment_close_tag = close_tag;
+            }
+        }
 
-//         if args_len > 2 {
-//             stderr.write_all(b"Warning: excess arguments to builtin `changecom' ignored")?;
-//         }
+        if args_len > 2 {
+            stderr.write_all(b"Warning: excess arguments to builtin `changecom' ignored")?;
+        }
 
-//         Ok(state)
-//     }
-// }
+        Ok(state)
+    }
+}
 
-// struct ChangequoteMacro;
+struct ChangequoteMacro;
 
-// impl MacroImplementation for ChangequoteMacro {
-//     fn evaluate(
-//         &self,
-//         mut state: State,
-//         _stdout: &mut dyn Write,
-//         stderr: &mut dyn Write,
-//         m: Macro,
-//     ) -> Result<State> {
-//         match m.args.len() {
-//             0 => {
-//                 state.parse_config.quote_open_tag = DEFAULT_QUOTE_OPEN_TAG.to_owned();
-//                 state.parse_config.quote_close_tag = DEFAULT_QUOTE_CLOSE_TAG.to_owned();
-//             }
-//             1 => {}
-//             args_len @ 2.. => {
-//                 if args_len > 2 {
-//                     stderr
-//                         .write_all(b"Warning: excess arguments to builtin `changequote' ignored")?;
-//                 }
-//                 let mut args = m.args.into_iter();
-//                 let open = args.next().expect("2 arguments should be present");
-//                 let close = args.next().expect("2 arguments should be present");
-//                 let open_tag;
-//                 (open_tag, state) = evaluate_to_buffer(state, open.input, stderr, true)?;
-//                 let close_tag;
-//                 (close_tag, state) = evaluate_to_buffer(state, close.input, stderr, true)?;
-//                 // The behavior is unspecified if there is a single argument or either argument is null.
-//                 if !open_tag.is_empty() && !close_tag.is_empty() {
-//                     // TODO: it looks like GNU m4 only allows quote strings using non-alphanumeric
-//                     // characters. The spec I'm following doesn't mention anything about that.
-//                     state.parse_config.quote_open_tag = open_tag;
-//                     state.parse_config.quote_close_tag = close_tag;
-//                 }
-//             } //TODO what about when there are more arguments? Add integration test for this.
-//         }
+impl MacroImplementation for ChangequoteMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<State> {
+        match frame.args.len() {
+            0 => {
+                state.parse_config.quote_open_tag = DEFAULT_QUOTE_OPEN_TAG.to_owned();
+                state.parse_config.quote_close_tag = DEFAULT_QUOTE_CLOSE_TAG.to_owned();
+            }
+            1 => {}
+            args_len @ 2.. => {
+                if args_len > 2 {
+                    stderr
+                        .write_all(b"Warning: excess arguments to builtin `changequote' ignored")?;
+                }
+                let mut args = frame.args.into_iter();
+                let open_tag = args.next().expect("2 arguments should be present");
+                let close_tag = args.next().expect("2 arguments should be present");
+                // The behavior is unspecified if there is a single argument or either argument is null.
+                if !open_tag.is_empty() && !close_tag.is_empty() {
+                    // TODO: it looks like GNU m4 only allows quote strings using non-alphanumeric
+                    // characters. The spec I'm following doesn't mention anything about that.
+                    state.parse_config.quote_open_tag = open_tag;
+                    state.parse_config.quote_close_tag = close_tag;
+                }
+            } //TODO what about when there are more arguments? Add integration test for this.
+        }
 
-//         Ok(state)
-//     }
-// }
+        Ok(state)
+    }
+}
 
-// /// The defining text of the incr macro shall be its first argument incremented by 1. It shall be
-// /// an error to specify an argument containing any non-numeric characters. The behavior is
-// /// unspecified if incr is not immediately followed by a `<left-parenthesis>`.
-// struct IncrMacro;
+/// The defining text of the incr macro shall be its first argument incremented by 1. It shall be
+/// an error to specify an argument containing any non-numeric characters. The behavior is
+/// unspecified if incr is not immediately followed by a `<left-parenthesis>`.
+struct IncrMacro;
 
-// impl MacroImplementation for IncrMacro {
-//     fn evaluate(
-//         &self,
-//         mut state: State,
-//         stdout: &mut dyn Write,
-//         stderr: &mut dyn Write,
-//         m: Macro,
-//     ) -> Result<State> {
-//         log::debug!("IncrMacro::evaluate() {}", state.debug_macro_definitions());
-//         if let Some(first) = m.args.into_iter().next() {
-//             let number_bytes;
-//             (number_bytes, state) = evaluate_to_buffer(state, first.input, stderr, true)?;
-//             let (remaining, mut number) =
-//                 eval_macro::padded(eval_macro::parse_integer)(&number_bytes)?;
-//             if !remaining.is_empty() {
-//                 return Err(
-//                     crate::Error::new(crate::ErrorKind::Parsing).add_context(format!(
-//                     "Error parsing number from {number_bytes:?}, remaining input: {remaining:?}"
-//                 )),
-//                 );
-//             }
-//             number += 1;
-//             stdout.write_all(number.to_string().as_bytes())?;
-//         }
-//         Ok(state)
-//     }
-// }
+impl MacroImplementation for IncrMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        _stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<State> {
+        log::debug!("IncrMacro::evaluate() {}", state.debug_macro_definitions());
+        if let Some(first) = frame.args.into_iter().next() {
+            let (remaining, mut number) = eval_macro::padded(eval_macro::parse_integer)(&first)?;
+            if !remaining.is_empty() {
+                return Err(
+                    crate::Error::new(crate::ErrorKind::Parsing).add_context(format!(
+                        "Error parsing number from {first:?}, remaining input: {remaining:?}"
+                    )),
+                );
+            }
+            number += 1;
+            state.input.pushback_string(number.to_string().as_bytes());
+        }
+        Ok(state)
+    }
+}
 
-// /// The defining text of the decr macro shall be its first argument decremented by 1. It shall be
-// /// an error to specify an argument containing any non-numeric characters. The behavior is
-// /// unspecified if decr is not immediately followed by a `<left-parenthesis>`.
-// struct DecrMacro;
+/// The defining text of the decr macro shall be its first argument decremented by 1. It shall be
+/// an error to specify an argument containing any non-numeric characters. The behavior is
+/// unspecified if decr is not immediately followed by a `<left-parenthesis>`.
+struct DecrMacro;
 
-// impl MacroImplementation for DecrMacro {
-//     fn evaluate(
-//         &self,
-//         mut state: State,
-//         stdout: &mut dyn Write,
-//         stderr: &mut dyn Write,
-//         m: Macro,
-//     ) -> Result<State> {
-//         log::debug!("DecrMacro::evaluate() {}", state.debug_macro_definitions());
-//         if let Some(first) = m.args.into_iter().next() {
-//             let number_bytes;
-//             (number_bytes, state) = evaluate_to_buffer(state, first.input, stderr, true)?;
-//             let (remaining, mut number) =
-//                 eval_macro::padded(eval_macro::parse_integer)(&number_bytes)?;
-//             if !remaining.is_empty() {
-//                 return Err(
-//                     crate::Error::new(crate::ErrorKind::Parsing).add_context(format!(
-//                     "Error parsing number from {number_bytes:?}, remaining input: {remaining:?}"
-//                 )),
-//                 );
-//             }
-//             number -= 1;
-//             stdout.write_all(number.to_string().as_bytes())?;
-//         }
-//         Ok(state)
-//     }
-// }
+impl MacroImplementation for DecrMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        _stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<State> {
+        log::debug!("DecrMacro::evaluate() {}", state.debug_macro_definitions());
+        if let Some(first) = frame.args.into_iter().next() {
+            let (remaining, mut number) = eval_macro::padded(eval_macro::parse_integer)(&first)?;
+            if !remaining.is_empty() {
+                return Err(
+                    crate::Error::new(crate::ErrorKind::Parsing).add_context(format!(
+                        "Error parsing number from {first:?}, remaining input: {remaining:?}"
+                    )),
+                );
+            }
+            number -= 1;
+            state.input.pushback_string(number.to_string().as_bytes());
+        }
+        Ok(state)
+    }
+}
 
-// /// The ifelse macro takes three or more arguments. If the first two arguments compare as equal
-// /// strings (after macro expansion of both arguments), the defining text shall be the third
-// /// argument. If the first two arguments do not compare as equal strings and there are three
-// /// arguments, the defining text shall be null. If the first two arguments do not compare as equal
-// /// strings and there are four or five arguments, the defining text shall be the fourth argument.
-// /// If the first two arguments do not compare as equal strings and there are six or more arguments,
-// /// the first three arguments shall be discarded and processing shall restart with the remaining
-// /// arguments. The behavior is unspecified if ifelse is not immediately followed by a
-// /// `<left-parenthesis>`.
-// ///
-// /// ifelse (string-1, string-2, equal, [not-equal])
-// /// ifelse (string-1, string-2, equal-1, string-3, string-4, equal-2, …, [not-equal])
-// struct IfelseMacro;
+/// The ifelse macro takes three or more arguments. If the first two arguments compare as equal
+/// strings (after macro expansion of both arguments), the defining text shall be the third
+/// argument. If the first two arguments do not compare as equal strings and there are three
+/// arguments, the defining text shall be null. If the first two arguments do not compare as equal
+/// strings and there are four or five arguments, the defining text shall be the fourth argument.
+/// If the first two arguments do not compare as equal strings and there are six or more arguments,
+/// the first three arguments shall be discarded and processing shall restart with the remaining
+/// arguments. The behavior is unspecified if ifelse is not immediately followed by a
+/// `<left-parenthesis>`.
+///
+/// ifelse (string-1, string-2, equal, [not-equal])
+/// ifelse (string-1, string-2, equal-1, string-3, string-4, equal-2, …, [not-equal])
+struct IfelseMacro;
 
-// impl MacroImplementation for IfelseMacro {
-//     fn evaluate(
-//         &self,
-//         mut state: State,
-//         stdout: &mut dyn Write,
-//         stderr: &mut dyn Write,
-//         m: Macro,
-//     ) -> Result<State> {
-//         if m.args.len() < 3 {
-//             write!(stderr, "Too few arguments to builtin `ifelse'")?;
-//             return Ok(state);
-//         }
+impl MacroImplementation for IfelseMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<State> {
+        let mut args_len = frame.args.len();
+        if args_len < 3 {
+            write!(stderr, "Too few arguments to builtin `ifelse'")?;
+            return Ok(state);
+        }
 
-//         let mut args_len = m.args.len();
-//         let mut args = m.args.into_iter();
-//         let mut i = 0;
-//         loop {
-//             // TODO: there's a bug here, when we originally parsed this as a set of macro args we
-//             // didn't evaluate it as we parsed it.
-//             let input = args.next().expect("at least 3 args").input;
-//             let arg_0;
-//             (arg_0, state) = evaluate_to_buffer(state, input, stderr, true)?;
-//             let input = args.next().expect("at least 3 args").input;
-//             let arg_1;
-//             (arg_1, state) = evaluate_to_buffer(state, input, stderr, true)?;
-//             if arg_0 == arg_1 {
-//                 log::debug!("IfelseMacro::evaluate() evaluating argument {}", i * 3 + 2);
-//                 let input = args.next().expect("at least 3 args").input;
-//                 let buffer;
-//                 (buffer, state) = evaluate_to_buffer(state, input, stderr, true)?;
-//                 stdout.write_all(&buffer)?;
-//                 return Ok(state);
-//             } else {
-//                 match args_len {
-//                     0 | 1 | 2 => panic!("at least 3 args"),
-//                     3 => return Ok(state),
-//                     4 | 5 => {
-//                         args.next();
-//                         log::debug!("IfelseMacro::evaluate() evaluating argument {}", i * 3 + 3);
-//                         let input = std::io::Cursor::new(
-//                             args.next().expect("at least 4 args").input.to_vec(),
-//                         );
-//                         state.input.push(Box::new(input));
-//                         state = process_streaming(state, stdout, stderr, true, false)?;
-//                         if args_len == 5 {
-//                             write!(
-//                                 stderr,
-//                                 "Excess argument {:?} to builtin `ifelse' will be ignored",
-//                                 args.next().expect("5 arguments")
-//                             )?;
-//                         }
-//                         return Ok(state);
-//                     }
-//                     6.. => {
-//                         // the first three arguments shall be discarded and processing shall
-//                         // restart with the remaining arguments.
-//                         args.next();
-//                         args_len -= 3;
-//                     }
-//                 }
-//             }
-//             i += 1;
-//         }
-//     }
-// }
+        let mut args = frame.args.into_iter();
+        let mut i = 0;
+        loop {
+            // TODO: there's a bug here, when we originally parsed this as a set of macro args we
+            // didn't evaluate it as we parsed it.
+            let arg_0 = args.next().expect("at least 3 args");
+            let arg_1 = args.next().expect("at least 3 args");
+            if arg_0 == arg_1 {
+                log::debug!("IfelseMacro::evaluate() evaluating argument {}", i * 3 + 2);
+                let arg = args.next().expect("at least 3 args");
+                state.input.pushback_string(&arg);
+                return Ok(state);
+            } else {
+                match args_len {
+                    0 | 1 | 2 => panic!("at least 3 args"),
+                    3 => return Ok(state),
+                    4 | 5 => {
+                        args.next();
+                        log::debug!("IfelseMacro::evaluate() evaluating argument {}", i * 3 + 3);
+                        let arg = args.next().expect("at least 4 args");
+                        state.input.pushback_string(&arg);
+                        if args_len == 5 {
+                            write!(
+                                stderr,
+                                "Excess argument {:?} to builtin `ifelse' will be ignored",
+                                args.next().expect("5 arguments")
+                            )?;
+                        }
+                        return Ok(state);
+                    }
+                    6.. => {
+                        // the first three arguments shall be discarded and processing shall
+                        // restart with the remaining arguments.
+                        args.next();
+                        args_len -= 3;
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+}
 
-// /// If the first argument to the ifdef macro is defined, the defining text shall be the second
-// /// argument. Otherwise, the defining text shall be the third argument, if specified, or the null
-// /// string, if not. The behavior is unspecified if ifdef is not immediately followed by a
-// /// `<left-parenthesis>`.
-// struct IfdefMacro;
+/// If the first argument to the ifdef macro is defined, the defining text shall be the second
+/// argument. Otherwise, the defining text shall be the third argument, if specified, or the null
+/// string, if not. The behavior is unspecified if ifdef is not immediately followed by a
+/// `<left-parenthesis>`.
+struct IfdefMacro;
 
-// impl MacroImplementation for IfdefMacro {
-//     fn evaluate(
-//         &self,
-//         mut state: State,
-//         stdout: &mut dyn Write,
-//         stderr: &mut dyn Write,
-//         m: Macro,
-//     ) -> Result<State> {
-//         let mut args = m.args.into_iter();
-//         let first_arg = args
-//             .next()
-//             .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
-//         let first_arg_text;
-//         (first_arg_text, state) = evaluate_to_buffer(state, first_arg.input, stderr, true)?;
-//         let second_arg = args
-//             .next()
-//             .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
-//         let second_arg_text;
-//         (second_arg_text, state) = evaluate_to_buffer(state, second_arg.input, stderr, true)?;
-//         let name = MacroName::try_from_slice(&first_arg_text).ok();
-//         if name
-//             .map(|name| state.macro_definitions.contains_key(&name))
-//             .unwrap_or(false)
-//         {
-//             stdout.write_all(&second_arg_text)?;
-//         } else {
-//             if let Some(third_arg) = args.next() {
-//                 let third_arg_text;
-//                 (third_arg_text, state) = evaluate_to_buffer(state, third_arg.input, stderr, true)?;
-//                 stdout.write_all(&third_arg_text)?;
-//             }
-//         }
-//         log::debug!("IfdefMacro::evaluate() finished");
-//         Ok(state)
-//     }
-// }
+impl MacroImplementation for IfdefMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<State> {
+        let mut args = frame.args.into_iter();
+        let first_arg = args
+            .next()
+            .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
+        let second_arg = args
+            .next()
+            .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
+        let name = MacroName::try_from_slice(&first_arg).ok();
+        if name
+            .map(|name| state.macro_definitions.contains_key(&name))
+            .unwrap_or(false)
+        {
+            state.input.pushback_string(&second_arg);
+        } else {
+            if let Some(third_arg) = args.next() {
+                state.input.pushback_string(&third_arg);
+            }
+        }
+        log::debug!("IfdefMacro::evaluate() finished");
+        Ok(state)
+    }
+}
 
-// /// The defining text for the shift macro shall be a comma-separated list of its arguments except
-// /// the first one. Each argument shall be quoted using the current quoting strings. The behavior is
-// /// unspecified if shift is not immediately followed by a `<left-parenthesis>`.
-// struct ShiftMacro;
+/// The defining text for the shift macro shall be a comma-separated list of its arguments except
+/// the first one. Each argument shall be quoted using the current quoting strings. The behavior is
+/// unspecified if shift is not immediately followed by a `<left-parenthesis>`.
+struct ShiftMacro;
 
-// impl MacroImplementation for ShiftMacro {
-//     fn evaluate(
-//         &self,
-//         mut state: State,
-//         stdout: &mut dyn Write,
-//         stderr: &mut dyn Write,
-//         m: Macro,
-//     ) -> Result<State> {
-//         let args_len = m.args.len();
-//         for (i, arg) in m.args.into_iter().enumerate() {
-//             if i == 0 {
-//                 continue;
-//             }
-//             let buffer;
-//             (buffer, state) = evaluate_to_buffer(state, arg.input, stderr, true)?;
-//             stdout.write_all(&buffer)?;
-//             if i < (args_len - 1) {
-//                 stdout.write_all(b",")?;
-//             }
-//         }
+impl MacroImplementation for ShiftMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        _stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<State> {
+        if frame.args.len() > 1 {
+            let args = &frame.args[1..];
+            for (i, arg) in args.iter().enumerate().rev() {
+                state.input.pushback_string(&arg);
+                if i != 0 {
+                    state.input.pushback_character(b',');
+                }
+            }
+        }
+        Ok(state)
+    }
+}
 
-//         Ok(state)
-//     }
-// }
+struct EvalMacro;
 
-// struct EvalMacro;
-
-// impl MacroImplementation for EvalMacro {
-//     fn evaluate(
-//         &self,
-//         mut state: State,
-//         stdout: &mut dyn Write,
-//         stderr: &mut dyn Write,
-//         m: Macro,
-//     ) -> Result<State> {
-//         let first_arg = m
-//             .args
-//             .into_iter()
-//             .next()
-//             .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
-//         let buffer;
-//         (buffer, state) = evaluate_to_buffer(state, first_arg.input, stderr, true)?;
-//         let (_remaining, output) = eval_macro::parse_and_evaluate(&buffer)?;
-//         stdout.write_all(output.to_string().as_bytes())?;
-//         Ok(state)
-//     }
-// }
+impl MacroImplementation for EvalMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stderr: &mut dyn Write,
+        frame: StackFrame
+    ) -> Result<State> {
+        let first_arg = frame
+            .args
+            .into_iter()
+            .next()
+            .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
+        
+        let (_remaining, output) = eval_macro::parse_and_evaluate(&buffer)?;
+        stdout.write_all(output.to_string().as_bytes())?;
+        Ok(state)
+    }
+}
 
 // /// The defining text of the len macro shall be the length (as a string) of the first argument. The
 // /// behavior is unspecified if len is not immediately followed by a `<left-parenthesis>`.
@@ -1484,70 +1446,62 @@ impl MacroImplementation for SincludeMacro {
 //     }
 // }
 
-// /// The defining text of the translit macro shall be the first argument with every character that
-// /// occurs in the second argument replaced with the corresponding character from the third argument.
-// /// If no replacement character is specified for some source character because the second argument
-// /// is longer than the third argument, that character shall be deleted from the first argument in
-// /// translit's defining text. The behavior is unspecified if the '-' character appears within the
-// /// second or third argument anywhere besides the first or last character. The behavior is
-// /// unspecified if the same character appears more than once in the second argument. The behavior is
-// /// unspecified if translit is not immediately followed by a `<left-parenthesis>`.
-// struct TranslitMacro;
+/// The defining text of the translit macro shall be the first argument with every character that
+/// occurs in the second argument replaced with the corresponding character from the third argument.
+/// If no replacement character is specified for some source character because the second argument
+/// is longer than the third argument, that character shall be deleted from the first argument in
+/// translit's defining text. The behavior is unspecified if the '-' character appears within the
+/// second or third argument anywhere besides the first or last character. The behavior is
+/// unspecified if the same character appears more than once in the second argument. The behavior is
+/// unspecified if translit is not immediately followed by a `<left-parenthesis>`.
+struct TranslitMacro;
 
-// // TODO: support utf8 characters properly
-// impl MacroImplementation for TranslitMacro {
-//     fn evaluate(
-//         &self,
-//         mut state: State,
-//         stdout: &mut dyn Write,
-//         stderr: &mut dyn Write,
-//         m: Macro,
-//     ) -> Result<State> {
-//         let mut args = m.args.into_iter();
-//         let first_arg = args
-//             .next()
-//             .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
-//         let mut output_buffer;
-//         (output_buffer, state) = evaluate_to_buffer(state, first_arg.input, stderr, true)?;
-//         let second_arg = match args.next() {
-//             Some(second_arg) => second_arg,
-//             None => {
-//                 stderr.write_all(b"Warning too few arguments for index macro")?;
-//                 stdout.write_all(b"0")?;
-//                 return Ok(state);
-//             }
-//         };
-//         let second_arg_text;
-//         (second_arg_text, state) = evaluate_to_buffer(state, second_arg.input, stderr, true)?;
+// TODO: support utf8 characters properly
+impl MacroImplementation for TranslitMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stderr: &mut dyn Write,
+        frame: StackFrame
+    ) -> Result<State> {
+        let mut args = frame.args.into_iter();
+        let mut output_buffer = args
+            .next()
+            .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
 
-//         let third_arg_text = match args.next() {
-//             Some(arg) => {
-//                 let arg_text;
-//                 (arg_text, state) = evaluate_to_buffer(state, arg.input, stderr, true)?;
-//                 arg_text
-//             }
-//             None => Vec::new(),
-//         };
+        log::debug!("TranslitMacro::evaluate() transliterating {:?}", String::from_utf8_lossy(&output_buffer));
+        
+        let second_arg = match args.next() {
+            Some(second_arg) => second_arg,
+            None => {
+                stderr.write_all(b"Warning too few arguments for index macro")?;
+                state.input.pushback_character(b'0');
+                return Ok(state);
+            }
+        };
 
-//         for (i, source_char) in second_arg_text.into_iter().enumerate() {
-//             if let Some(replacement_char) = third_arg_text.get(i) {
-//                 for current_char in output_buffer.iter_mut() {
-//                     if *current_char == source_char {
-//                         *current_char = *replacement_char;
-//                     }
-//                 }
-//             } else {
-//                 output_buffer = output_buffer
-//                     .into_iter()
-//                     .filter(|current_char| *current_char != source_char)
-//                     .collect();
-//             }
-//         }
+        let third_arg = args.next().unwrap_or_default();
 
-//         stdout.write_all(&output_buffer)?;
-//         Ok(state)
-//     }
-// }
+        for (i, source_char) in second_arg.into_iter().enumerate() {
+            if let Some(replacement_char) = third_arg.get(i) {
+                for current_char in output_buffer.iter_mut() {
+                    if *current_char == source_char {
+                        *current_char = *replacement_char;
+                    }
+                }
+            } else {
+                output_buffer = output_buffer
+                    .into_iter()
+                    .filter(|current_char| *current_char != source_char)
+                    .collect();
+            }
+        }
+
+
+        state.input.pushback_string(&output_buffer);
+        Ok(state)
+    }
+}
 
 // /// The defining text for the substr macro shall be the substring of the first argument beginning at
 // /// the zero-offset character position specified by the second argument. The third argument, if

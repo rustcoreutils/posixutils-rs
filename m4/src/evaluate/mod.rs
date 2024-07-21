@@ -283,6 +283,7 @@ pub(crate) fn process_streaming<'c>(
                     .look_ahead(l, &state.parse_config.quote_open_tag)?
                 {
                     quotation_level += 1;
+                    state.output.write_all(&state.parse_config.quote_open_tag)?;
                 } else if l == EOF {
                     return Err(crate::Error::new(crate::ErrorKind::UnclosedQuote));
                 } else if quotation_level > 0 {

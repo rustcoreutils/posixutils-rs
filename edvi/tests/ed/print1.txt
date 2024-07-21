@@ -1,0 +1,11 @@
+64
+apple
+banana
+charlie
+delta
+echo
+foxtrot
+golf
+hotel
+india
+juliet

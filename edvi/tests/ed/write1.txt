@@ -1,0 +1,13 @@
+apple
+banana
+one
+two
+three
+charlie
+delta
+echo
+foxtrot
+golf
+hotel
+india
+juliet

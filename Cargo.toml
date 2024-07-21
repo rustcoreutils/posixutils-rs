@@ -6,6 +6,7 @@ members = [
 	"datetime",
 	"dev",
 	"display",
+	"edvi",
 	"file",
 	"fs",
 	"misc",

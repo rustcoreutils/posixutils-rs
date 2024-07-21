@@ -542,8 +542,8 @@ macro_enums!(
         Popdef(PopdefMacro),
         Defn(DefnMacro),
         // Errprint(ErrprintMacro),
-        // Include(IncludeMacro),
-        // Sinclude(SincludeMacro),
+        Include(IncludeMacro),
+        Sinclude(SincludeMacro),
         // Changecom(ChangecomMacro),
         // Changequote(ChangequoteMacro),
         // Incr(IncrMacro),
@@ -563,9 +563,9 @@ macro_enums!(
         // M4wrap(M4wrapMacro),
         // Syscmd(SyscmdMacro),
         // Sysval(SysvalMacro),
-        // Divert(DivertMacro),
-        // Divnum(DivnumMacro),
-        // Undivert(UndivertMacro),
+        Divert(DivertMacro),
+        Divnum(DivnumMacro),
+        Undivert(UndivertMacro),
         // File(FileMacro),
     }
 );
@@ -584,8 +584,8 @@ impl AsRef<[u8]> for BuiltinMacro {
             Pushdef => b"pushdef",
             Popdef => b"popdef",
             // Errprint => b"errprint",
-            // Include => b"include",
-            // Sinclude => b"sinclude",
+            Include => b"include",
+            Sinclude => b"sinclude",
             // Changecom => b"changecom",
             // Changequote => b"changequote",
             // Incr => b"incr",
@@ -605,9 +605,9 @@ impl AsRef<[u8]> for BuiltinMacro {
             // M4wrap => b"m4wrap",
             // Syscmd => b"syscmd",
             // Sysval => b"sysval",
-            // Divert => b"divert",
-            // Divnum => b"divnum",
-            // Undivert => b"undivert",
+            Divert => b"divert",
+            Divnum => b"divnum",
+            Undivert => b"undivert",
             // File => b"__file__",
         }
     }
@@ -630,8 +630,8 @@ impl BuiltinMacro {
             Pushdef => 1,
             Popdef => 1,
             // Errprint => 1,
-            // Include => 1,
-            // Sinclude => 1,
+            Include => 1,
+            Sinclude => 1,
             // Changecom => 0,
             // Changequote => 0,
             // Incr => 1,
@@ -651,9 +651,9 @@ impl BuiltinMacro {
             // M4wrap => 1,
             // Syscmd => 1,
             // Sysval => 0,
-            // Divert => 0,
-            // Divnum => 0,
-            // Undivert => 0,
+            Divert => 0,
+            Divnum => 0,
+            Undivert => 0,
             // File => 0,
         }
     }
@@ -1007,84 +1007,76 @@ impl MacroImplementation for DefnMacro {
 //     }
 // }
 
-// /// The defining text for the include macro shall be the contents of the file named by the first
-// /// argument. It shall be an error if the file cannot be read. The behavior is unspecified if
-// /// include is not immediately followed by a `<left-parenthesis>`.
-// struct IncludeMacro;
+/// The defining text for the include macro shall be the contents of the file named by the first
+/// argument. It shall be an error if the file cannot be read. The behavior is unspecified if
+/// include is not immediately followed by a `<left-parenthesis>`.
+struct IncludeMacro;
 
-// impl IncludeMacro {
-//     fn get_file_path(
-//         m: Macro,
-//         state: State,
-//         stderr: &mut dyn Write,
-//     ) -> Result<(Option<PathBuf>, State)> {
-//         if let Some(arg) = m.args.into_iter().next() {
-//             let (buffer, state) = evaluate_to_buffer(state, arg.input, stderr, true)?;
-//             let path = PathBuf::from(OsString::from_vec(buffer));
-//             Ok((Some(path), state))
-//         } else {
-//             Ok((None, state))
-//         }
-//     }
+impl IncludeMacro {
+    fn get_file_path(frame: StackFrame, state: State) -> Result<(Option<PathBuf>, State)> {
+        if let Some(arg) = frame.args.into_iter().next() {
+            let path = PathBuf::from(OsString::from_vec(arg));
+            Ok((Some(path), state))
+        } else {
+            Ok((None, state))
+        }
+    }
 
-//     fn evaluate_impl(
-//         path: PathBuf,
-//         mut state: State,
-//         _stdout: &mut dyn Write,
-//         _stderr: &mut dyn Write,
-//     ) -> crate::error::Result<State> {
-//         state.file.push(path.clone());
-//         let f = std::fs::File::open(&path)
-//             .map_err(crate::Error::from)
-//             .add_context(|| format!("Error opening file {path:?}"))?;
-//         state.input.push(Box::new(f));
+    fn evaluate_impl(
+        path: PathBuf,
+        mut state: State,
+        _stderr: &mut dyn Write,
+    ) -> crate::error::Result<State> {
+        let f = std::fs::File::open(&path)
+            .map_err(crate::Error::from)
+            .add_context(|| format!("Error opening file {path:?}"))?;
+        state.input.input.push(Input::new(
+            InputRead::File(f),
+            path.to_string_lossy().to_string(),
+        ));
+        Ok(state)
+    }
+}
 
-//         state.file.pop();
-//         Ok(state)
-//     }
-// }
+impl MacroImplementation for IncludeMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<State> {
+        let path;
+        (path, state) = Self::get_file_path(frame, state)?;
+        if let Some(path) = path {
+            state = Self::evaluate_impl(path, state, stderr)?;
+        }
+        Ok(state)
+    }
+}
 
-// impl MacroImplementation for IncludeMacro {
-//     fn evaluate(
-//         &self,
-//         mut state: State,
-//         stdout: &mut dyn Write,
-//         stderr: &mut dyn Write,
-//         m: Macro,
-//     ) -> Result<State> {
-//         let path;
-//         (path, state) = Self::get_file_path(m, state, stderr)?;
-//         if let Some(path) = path {
-//             state = Self::evaluate_impl(path, state, stdout, stderr)?;
-//         }
-//         Ok(state)
-//     }
-// }
+/// The sinclude macro shall be equivalent to the [`IncludeMacro`], except that it shall not be an
+/// error if the file is inaccessible. The behavior is unspecified if sinclude is not immediately
+/// followed by a `<left-parenthesis>`.
+struct SincludeMacro;
 
-// /// The sinclude macro shall be equivalent to the [`IncludeMacro`], except that it shall not be an
-// /// error if the file is inaccessible. The behavior is unspecified if sinclude is not immediately
-// /// followed by a `<left-parenthesis>`.
-// struct SincludeMacro;
+impl MacroImplementation for SincludeMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<State> {
+        let path;
+        (path, state) = IncludeMacro::get_file_path(frame, state)?;
+        if let Some(path) = path {
+            if path.is_file() {
+                state = IncludeMacro::evaluate_impl(path, state, stderr)?;
+            }
+        }
 
-// impl MacroImplementation for SincludeMacro {
-//     fn evaluate(
-//         &self,
-//         mut state: State,
-//         stdout: &mut dyn Write,
-//         stderr: &mut dyn Write,
-//         m: Macro,
-//     ) -> Result<State> {
-//         let path;
-//         (path, state) = IncludeMacro::get_file_path(m, state, stderr)?;
-//         if let Some(path) = path {
-//             if path.is_file() {
-//                 state = IncludeMacro::evaluate_impl(path, state, stdout, stderr)?;
-//             }
-//         }
-
-//         Ok(state)
-//     }
-// }
+        Ok(state)
+    }
+}
 
 // struct ChangecomMacro;
 
@@ -1901,106 +1893,119 @@ impl MacroImplementation for DefnMacro {
 //     }
 // }
 
-// /// The m4 utility maintains nine temporary buffers, numbered 1 to 9, inclusive. When the last of
-// /// the input has been processed, any output that has been placed in these buffers shall be written
-// /// to standard output in buffer-numerical order. The `divert` macro shall divert future output to the
-// /// buffer specified by its argument. Specifying no argument or an argument of 0 shall resume the
-// /// normal output process. Output diverted to a stream with a negative number shall be discarded.
-// /// Behavior is implementation-defined if a stream number larger than 9 is specified. It shall be an
-// /// error to specify an argument containing any non-numeric characters.
-// struct DivertMacro;
+/// The m4 utility maintains nine temporary buffers, numbered 1 to 9, inclusive. When the last of
+/// the input has been processed, any output that has been placed in these buffers shall be written
+/// to standard output in buffer-numerical order. The `divert` macro shall divert future output to the
+/// buffer specified by its argument. Specifying no argument or an argument of 0 shall resume the
+/// normal output process. Output diverted to a stream with a negative number shall be discarded.
+/// Behavior is implementation-defined if a stream number larger than 9 is specified. It shall be an
+/// error to specify an argument containing any non-numeric characters.
+struct DivertMacro;
 
-// impl MacroImplementation for DivertMacro {
-//     fn evaluate(
-//         &self,
-//         mut state: State,
-//         _stdout: &mut dyn Write,
-//         stderr: &mut dyn Write,
-//         m: Macro,
-//     ) -> Result<State> {
-//         let divert_number = if let Some(first_arg) = m.args.into_iter().next() {
-//             let first_arg_text;
-//             (first_arg_text, state) = evaluate_to_buffer(state, first_arg.input, stderr, true)?;
-//             if first_arg_text.is_empty() {
-//                 write!(
-//                     stderr,
-//                     "WARNING: treating empty first argument of `divert` macro as 0"
-//                 )?;
-//                 0
-//             } else {
-//                 let (_, divert_number) =
-//                     nom::combinator::all_consuming(parse_integer)(&first_arg_text)?;
-//                 if divert_number > 9 {
-//                     return Err(crate::Error::new(crate::ErrorKind::Parsing).add_context(format!(
-//                         "Error parsing first argument for `divert` macro with value {divert_number}, should be between 0 and 9"
-//                     )));
-//                 }
-//                 divert_number
-//             }
-//         } else {
-//             0
-//         };
-//         state.output.divert(divert_number)?;
-//         Ok(state)
-//     }
-// }
+impl MacroImplementation for DivertMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<State> {
+        let divert_number = if let Some(first_arg) = frame.args.into_iter().next() {
+            if first_arg.is_empty() {
+                write!(
+                    stderr,
+                    "WARNING: treating empty first argument of `divert` macro as 0"
+                )?;
+                0
+            } else {
+                let (_, divert_number) = nom::combinator::all_consuming(parse_integer)(&first_arg)?;
+                if divert_number > 9 {
+                    return Err(crate::Error::new(crate::ErrorKind::Parsing).add_context(format!(
+                        "Error parsing first argument for `divert` macro with value {divert_number}, should be between 0 and 9"
+                    )));
+                }
+                divert_number
+            }
+        } else {
+            0
+        };
+        state.output.output.divert(divert_number)?;
+        Ok(state)
+    }
+}
 
-// /// The defining text of the divnum macro shall be the number of the current output stream as a string.
-// struct DivnumMacro;
+/// The defining text of the divnum macro shall be the number of the current output stream as a string.
+struct DivnumMacro;
 
-// impl MacroImplementation for DivnumMacro {
-//     fn evaluate(
-//         &self,
-//         state: State,
-//         stdout: &mut dyn Write,
-//         _stderr: &mut dyn Write,
-//         _m: Macro,
-//     ) -> Result<State> {
-//         write!(stdout, "{}", state.output.divert_number())?;
-//         Ok(state)
-//     }
-// }
+impl MacroImplementation for DivnumMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        _stderr: &mut dyn Write,
+        _frame: StackFrame,
+    ) -> Result<State> {
+        state
+            .input
+            .pushback_string(state.output.output.divert_number().to_string().as_bytes());
+        Ok(state)
+    }
+}
 
-// /// The undivert macro shall cause immediate output of any text in temporary buffers named as
-// /// arguments, or all temporary buffers if no arguments are specified. Buffers can be undiverted
-// /// into other temporary buffers. Undiverting shall discard the contents of the temporary buffer.
-// /// The behavior is unspecified if an argument contains any non-numeric characters.
-// struct UndivertMacro;
+/// The undivert macro shall cause immediate output of any text in temporary buffers named as
+/// arguments, or all temporary buffers if no arguments are specified. Buffers can be undiverted
+/// into other temporary buffers. Undiverting shall discard the contents of the temporary buffer.
+/// The behavior is unspecified if an argument contains any non-numeric characters.
+struct UndivertMacro;
 
-// impl MacroImplementation for UndivertMacro {
-//     fn evaluate(
-//         &self,
-//         mut state: State,
-//         _stdout: &mut dyn Write,
-//         stderr: &mut dyn Write,
-//         m: Macro,
-//     ) -> Result<State> {
-//         let undivert_buffers: Vec<DivertBufferNumber> = if m.args.is_empty() {
-//             (1..=9)
-//                 .into_iter()
-//                 .map(DivertBufferNumber::try_from)
-//                 .collect::<Result<Vec<_>>>()?
-//         } else {
-//             let mut undivert_buffers: Vec<DivertBufferNumber> = Vec::new();
-//             for arg in m.args.into_iter() {
-//                 let arg_text;
-//                 (arg_text, state) = evaluate_to_buffer(state, arg.input, stderr, true)?;
-//                 let (_, buffer_number) = nom::combinator::all_consuming(parse_index)(&arg_text)?;
-//                 match DivertBufferNumber::try_from(buffer_number) {
-//                     Ok(n) => undivert_buffers.push(n),
-//                     Err(error) => write!(stderr, "WARNING: {error}")?,
-//                 }
-//             }
+// TODO: rewrite to be more performant and remove the need to parse as `str`.
+fn parse_index(input: &[u8]) -> IResult<&[u8], usize> {
+    log::trace!("parse_index() {}", String::from_utf8_lossy(input));
+    let (remaining, found) = nom::bytes::complete::take_while(|c| c >= b'0' && c <= b'9')(input)?;
+    let s = std::str::from_utf8(found).expect("Should be valid utf8 betweeen b'0' and b'9'");
+    let i: usize = s.parse().map_err(|e| {
+        let e = nom::error::Error::from_external_error(found, nom::error::ErrorKind::Digit, e);
+        nom::Err::Error(nom::error::Error::add_context(
+            found,
+            "Error parsing user defined macro argument as an index",
+            e,
+        ))
+    })?;
+    log::trace!("parse_index() successfully parsed: {i}");
 
-//             undivert_buffers
-//         };
+    Ok((remaining, i))
+}
 
-//         for buffer_number in undivert_buffers {
-//             state.output.undivert(buffer_number)?;
-//         }
-//         Ok(state)
-//     }
-// }
+impl MacroImplementation for UndivertMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<State> {
+        let undivert_buffers: Vec<DivertBufferNumber> = if frame.args.is_empty() {
+            (1..=9)
+                .into_iter()
+                .map(DivertBufferNumber::try_from)
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            let mut undivert_buffers: Vec<DivertBufferNumber> = Vec::new();
+            for arg in frame.args.into_iter() {
+                let (_, buffer_number) = nom::combinator::all_consuming(parse_index)(&arg)?;
+                match DivertBufferNumber::try_from(buffer_number) {
+                    Ok(n) => undivert_buffers.push(n),
+                    Err(error) => write!(stderr, "WARNING: {error}")?,
+                }
+            }
+
+            undivert_buffers
+        };
+
+        for buffer_number in undivert_buffers {
+            state.output.output.undivert(buffer_number)?;
+        }
+        Ok(state)
+    }
+}
+
 // struct FileMacro;
 
 // impl MacroImplementation for FileMacro {

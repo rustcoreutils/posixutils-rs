@@ -45,8 +45,13 @@ impl OutputState {
     /// Write either to output, or to the buffer for the macro arg currently being parsed.
     pub fn write_all(&mut self, buf: &[u8]) -> crate::Result<()> {
         if self.stack.is_empty() {
+            log::trace!("Writing to output: {}", String::from_utf8_lossy(buf));
             self.output.write_all(buf)?;
         } else {
+            log::trace!(
+                "Writing to macro arg in stack: {:?}",
+                String::from_utf8_lossy(buf)
+            );
             self.stack
                 .last_mut()
                 .expect("Stack not empty")
@@ -121,6 +126,16 @@ pub struct StackFrame {
     parenthesis_level: usize,
     args: Vec<Vec<u8>>,
     definition: Rc<MacroDefinition>,
+}
+
+impl StackFrame {
+    pub fn new(parenthesis_level: usize, definition: Rc<MacroDefinition>) -> Self {
+        Self {
+            parenthesis_level,
+            args: vec![Vec::new()],
+            definition,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -234,8 +249,9 @@ pub(crate) fn process_streaming<'c>(
     mut state: State,
     stderr: &mut dyn Write,
 ) -> crate::error::Result<State> {
-    let mut quotation_level;
     let mut token: Vec<u8> = Vec::new();
+
+    // TODO: rename these to something sensible.
     let mut l: u8 = 0;
     let mut t: u8;
 
@@ -246,7 +262,8 @@ pub(crate) fn process_streaming<'c>(
             .input
             .look_ahead(t, &state.parse_config.quote_open_tag)?
         {
-            quotation_level = 1;
+            log::trace!("Stripping quotes");
+            let mut quotation_level: usize = 1;
 
             'inside_quote: loop {
                 l = state.input.get_next_character()?;
@@ -255,8 +272,8 @@ pub(crate) fn process_streaming<'c>(
                     .look_ahead(l, &state.parse_config.quote_close_tag)?
                 {
                     quotation_level -= 1;
-                    if quotation_level >= 0 {
-                        // Encountered within the quote, so we output it.
+                    if quotation_level > 0 {
+                        // Encountered closing quote within the quote, so we output it.
                         state
                             .output
                             .write_all(&state.parse_config.quote_close_tag)?;
@@ -269,10 +286,15 @@ pub(crate) fn process_streaming<'c>(
                 } else if l == EOF {
                     return Err(crate::Error::new(crate::ErrorKind::UnclosedQuote));
                 } else if quotation_level > 0 {
-                    state.output.write_all(&[t])?;
+                    log::trace!(
+                        "Writing quoted content to output: {:?}",
+                        String::from_utf8_lossy(&[l])
+                    );
+                    state.output.write_all(&[l])?;
                 }
 
                 if quotation_level == 0 {
+                    log::trace!("Finished stripping quotes");
                     break 'inside_quote;
                 }
             }
@@ -302,6 +324,7 @@ pub(crate) fn process_streaming<'c>(
                 state.output.write_all(&[t])?;
             }
         } else if t == b'_' || is_alpha(t) {
+            // Possibly a macro to be evaluated.
             let definition = parse_macro(&mut state, t, &mut token)?;
             if definition.is_some() {
                 l = state.input.get_next_character()?;
@@ -317,11 +340,7 @@ pub(crate) fn process_streaming<'c>(
             } else {
                 let definition = definition.unwrap();
 
-                let frame = StackFrame {
-                    parenthesis_level: 0,
-                    args: vec![],
-                    definition: definition.clone(),
-                };
+                let frame = StackFrame::new(0, definition.clone());
 
                 // TODO: check if BSD implemenation really requires PARLEV == 0
                 if l == b'(' {
@@ -345,7 +364,6 @@ pub(crate) fn process_streaming<'c>(
                     if state.output.stack.last_mut().unwrap().parenthesis_level > 0 {
                         state.output.write_all(&[t])?;
                     }
-                    let mut l: u8;
                     'skip_whitespace: loop {
                         l = state.input.get_next_character()?;
                         if is_space(l) {
@@ -382,6 +400,7 @@ pub(crate) fn process_streaming<'c>(
                                 break;
                             }
                         }
+                        state.input.pushback_character(l);
                         state.output.stack.last_mut().unwrap().args.push(Vec::new());
                     } else {
                         state.output.write_all(&[t])?;
@@ -556,34 +575,34 @@ impl AsRef<[u8]> for BuiltinMacro {
             Define => b"define",
             Undefine => b"undefine",
             Defn => b"defn",
-            Errprint => b"errprint",
-            Include => b"include",
-            Sinclude => b"sinclude",
-            Changecom => b"changecom",
-            Changequote => b"changequote",
             Pushdef => b"pushdef",
             Popdef => b"popdef",
-            Incr => b"incr",
-            Ifelse => b"ifelse",
-            Ifdef => b"ifdef",
-            Shift => b"shift",
-            Eval => b"eval",
-            Decr => b"decr",
-            Len => b"len",
-            Index => b"index",
-            Translit => b"translit",
-            Substr => b"substr",
-            Dumpdef => b"dumpdef",
-            Mkstemp => b"mkstemp",
-            Maketemp => b"maketemp",
-            M4exit => b"m4exit",
-            M4wrap => b"m4wrap",
-            Syscmd => b"syscmd",
-            Sysval => b"sysval",
-            Divert => b"divert",
-            Divnum => b"divnum",
-            Undivert => b"undivert",
-            File => b"__file__",
+            // Errprint => b"errprint",
+            // Include => b"include",
+            // Sinclude => b"sinclude",
+            // Changecom => b"changecom",
+            // Changequote => b"changequote",
+            // Incr => b"incr",
+            // Ifelse => b"ifelse",
+            // Ifdef => b"ifdef",
+            // Shift => b"shift",
+            // Eval => b"eval",
+            // Decr => b"decr",
+            // Len => b"len",
+            // Index => b"index",
+            // Translit => b"translit",
+            // Substr => b"substr",
+            // Dumpdef => b"dumpdef",
+            // Mkstemp => b"mkstemp",
+            // Maketemp => b"maketemp",
+            // M4exit => b"m4exit",
+            // M4wrap => b"m4wrap",
+            // Syscmd => b"syscmd",
+            // Sysval => b"sysval",
+            // Divert => b"divert",
+            // Divnum => b"divnum",
+            // Undivert => b"undivert",
+            // File => b"__file__",
         }
     }
 }
@@ -602,34 +621,34 @@ impl BuiltinMacro {
             Define => 1,
             Undefine => 1,
             Defn => 1,
-            Errprint => 1,
-            Include => 1,
-            Sinclude => 1,
-            Changecom => 0,
-            Changequote => 0,
             Pushdef => 1,
             Popdef => 1,
-            Incr => 1,
-            Decr => 1,
-            Ifelse => 1,
-            Ifdef => 1,
-            Shift => 1,
-            Eval => 1,
-            Len => 1,
-            Index => 1,
-            Translit => 1,
-            Substr => 1,
-            Dumpdef => 1,
-            Mkstemp => 1,
-            Maketemp => 1,
-            M4exit => 0,
-            M4wrap => 1,
-            Syscmd => 1,
-            Sysval => 0,
-            Divert => 0,
-            Divnum => 0,
-            Undivert => 0,
-            File => 0,
+            // Errprint => 1,
+            // Include => 1,
+            // Sinclude => 1,
+            // Changecom => 0,
+            // Changequote => 0,
+            // Incr => 1,
+            // Decr => 1,
+            // Ifelse => 1,
+            // Ifdef => 1,
+            // Shift => 1,
+            // Eval => 1,
+            // Len => 1,
+            // Index => 1,
+            // Translit => 1,
+            // Substr => 1,
+            // Dumpdef => 1,
+            // Mkstemp => 1,
+            // Maketemp => 1,
+            // M4exit => 0,
+            // M4wrap => 1,
+            // Syscmd => 1,
+            // Sysval => 0,
+            // Divert => 0,
+            // Divnum => 0,
+            // Undivert => 0,
+            // File => 0,
         }
     }
 
@@ -638,21 +657,6 @@ impl BuiltinMacro {
             name: self.name(),
             min_args: self.min_args(),
         }
-    }
-}
-
-impl State {
-    fn current_macro_parse_configs(&self) -> HashMap<MacroName, MacroParseConfig> {
-        self.macro_definitions
-            .iter()
-            .map(|(name, definitions)| {
-                let current_definition = definitions
-                    .last()
-                    .expect(AT_LEAST_ONE_MACRO_DEFINITION_EXPECT);
-                let config = current_definition.parse_config.clone();
-                (name.clone(), config)
-            })
-            .collect()
     }
 }
 
@@ -702,8 +706,8 @@ struct DefineMacro;
 
 impl DefineMacro {
     fn define(
-        mut state: State,
-        stderr: &mut dyn Write,
+        state: State,
+        _stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<(State, Option<MacroDefinition>)> {
         let mut args = frame.args.into_iter();
@@ -825,13 +829,6 @@ impl MacroImplementation for PopdefMacro {
 /// characters. The string "$@" is replaced by a list of all of the arguments separated by <comma>
 /// characters, and each argument is quoted using the current left and right quoting strings. The
 /// string "${" produces unspecified behavior.
-enum UserDefinedMacroArg {
-    Index(usize),
-    List,
-    QuotedList,
-    NumberOfArgs,
-}
-
 struct UserDefinedMacro {
     definition: Vec<u8>,
 }

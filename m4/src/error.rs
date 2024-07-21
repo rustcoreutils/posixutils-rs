@@ -54,6 +54,7 @@ pub enum ErrorKind {
     InvalidDivertNumber(i64),
     NotEnoughArguments,
     UnclosedQuote,
+    UnclosedParenthesis,
     /// NOTE: this isn't always an "error", if the code is 0, it indicates an intentional,
     /// successful, early program exit, just hijacking the [`Result`] semantics to help enable this
     /// in a purely functional manner.
@@ -74,6 +75,7 @@ impl std::fmt::Display for Error {
             ErrorKind::NotEnoughArguments => write!(f, "The macro doesn't have enough arguments"),
             ErrorKind::Exit(code) => write!(f, "Program requested an exit with code {code}"),
             ErrorKind::UnclosedQuote => write!(f, "Unclosed quote"),
+            ErrorKind::UnclosedParenthesis => write!(f, "Unclosed parenthesis"),
         }?;
 
         if f.alternate() {

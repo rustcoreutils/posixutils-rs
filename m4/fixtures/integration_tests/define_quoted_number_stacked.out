@@ -1,4 +1,4 @@
-stdout=
-stderr=m4:fixtures/integration_tests/define_quoted_number_stacked.m4:1: ERROR: end of file in argument list\n
+stdout=1 2,#\n2 hello,goodbye\n3 
+stderr=m4:fixtures/integration_tests/define_quoted_number_stacked.m4:5: ERROR: end of file in argument list\n
 status=1
 expect_error=true

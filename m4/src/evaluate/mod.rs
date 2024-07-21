@@ -10,7 +10,7 @@ use nom::error::{ContextError, FromExternalError};
 use nom::IResult;
 use output::{DivertBufferNumber, Output, OutputRef};
 
-use crate::error::{Result, ResultExt};
+use crate::error::{Error, ErrorKind, Result, ResultExt};
 use crate::eval_macro::{self, parse_integer};
 use crate::lexer::{is_alpha, is_alphnumeric, is_space, MacroName, MacroParseConfig, ParseConfig};
 use crate::EOF;
@@ -354,6 +354,9 @@ pub(crate) fn process_streaming<'c>(
             }
         } else if t == EOF {
             if state.input.input.len() == 1 {
+                if !state.output.stack.is_empty() {
+                    return Err(Error::new(ErrorKind::UnclosedParenthesis));
+                }
                 break 'main_loop;
             }
             state.input.input.pop();

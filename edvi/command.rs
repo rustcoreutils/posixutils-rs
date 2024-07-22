@@ -188,6 +188,7 @@ pub enum DefaultAddressing {
 pub const DEFAULT_ADDRESSING: [DefaultAddressing; 256] = {
     let mut array = [DefaultAddressing::None; 256];
 
+    array[b'd' as usize] = DefaultAddressing::Current; // 'd' -> Default to current line
     array[b'p' as usize] = DefaultAddressing::Current; // 'p' -> Default to current line
     array[b'w' as usize] = DefaultAddressing::Full; // 'w' -> Default to full range
 
@@ -209,7 +210,7 @@ pub enum Command {
     Insert(Address, bool),
     // Change(String),
     // Copy(usize),
-    // Delete,
+    Delete(Address, Address),
     // Global(String, String, bool, bool, bool),
     // GlobalNotMatched(String, Vec<Command>),
     // InteractiveGlobalNotMatched(String, Vec<Command>),
@@ -339,6 +340,10 @@ impl Command {
                     Token::Command('a') => {
                         normalize_addrvec(&mut addrvec, 1, separator, DefaultAddressing::Current);
                         return Ok(Command::Insert(addrvec[0].clone(), false));
+                    }
+                    Token::Command('d') => {
+                        normalize_addrvec(&mut addrvec, 2, separator, DefaultAddressing::Current);
+                        return Ok(Command::Delete(addrvec[0].clone(), addrvec[1].clone()));
                     }
                     Token::Command('i') => {
                         normalize_addrvec(&mut addrvec, 1, separator, DefaultAddressing::Current);
@@ -862,6 +867,82 @@ mod tests {
                 },
                 Address {
                     info: AddressInfo::Line(222),
+                    offsets: Vec::new(),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn delete_1() {
+        let line = "d";
+        let cmd = Command::from_line(line).expect("parse error");
+        assert_eq!(
+            cmd,
+            Command::Delete(
+                Address {
+                    info: AddressInfo::Current,
+                    offsets: Vec::new(),
+                },
+                Address {
+                    info: AddressInfo::Current,
+                    offsets: Vec::new(),
+                },
+            )
+        );
+    }
+
+    #[test]
+    fn delete_1d() {
+        let line = "1d";
+        let cmd = Command::from_line(line).expect("parse error");
+        assert_eq!(
+            cmd,
+            Command::Delete(
+                Address {
+                    info: AddressInfo::Line(1),
+                    offsets: Vec::new(),
+                },
+                Address {
+                    info: AddressInfo::Line(1),
+                    offsets: Vec::new(),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn delete_2() {
+        let line = "2,d";
+        let cmd = Command::from_line(line).expect("parse error");
+        assert_eq!(
+            cmd,
+            Command::Delete(
+                Address {
+                    info: AddressInfo::Line(2),
+                    offsets: Vec::new(),
+                },
+                Address {
+                    info: AddressInfo::Line(2),
+                    offsets: Vec::new(),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn delete_dotdollar() {
+        let line = ".,$d";
+        let cmd = Command::from_line(line).expect("parse error");
+        assert_eq!(
+            cmd,
+            Command::Delete(
+                Address {
+                    info: AddressInfo::Current,
+                    offsets: Vec::new(),
+                },
+                Address {
+                    info: AddressInfo::Last,
                     offsets: Vec::new(),
                 }
             )

@@ -44,6 +44,7 @@ enum EdOp {
     ReadInputLines,
     GotoLine(usize),
     Insert(bool),
+    DeleteLines(usize, usize),
     DisplayLines(usize, usize, command::PrintMode),
 }
 
@@ -79,6 +80,10 @@ impl Editor {
 
                 EdOp::GotoLine(line_no) => {
                     self.buf.set_cur_line(line_no);
+                }
+
+                EdOp::DeleteLines(start_line, end_line) => {
+                    self.buf.delete(start_line, end_line);
                 }
 
                 EdOp::Insert(insert_before) => {
@@ -168,6 +173,19 @@ impl Editor {
         match cmd {
             Command::Quit => {
                 retval = false;
+            }
+
+            Command::Delete(addr1, addr2) => {
+                let (start_line, end_line) = match self.get_address_range('d', addr1, addr2) {
+                    Ok(range) => range,
+                    Err(_) => {
+                        println!("{}", ERR_STR);
+                        return true;
+                    }
+                };
+
+                self.exec_queue
+                    .push(EdOp::DeleteLines(start_line, end_line));
             }
 
             Command::Insert(addr, mut insert_before) => {

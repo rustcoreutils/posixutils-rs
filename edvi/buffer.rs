@@ -95,6 +95,36 @@ impl Buffer {
         let mut file = fs::File::create(pathname)?;
         self.write_lines(start_line, end_line, &mut file)
     }
+
+    /// Deletes lines from start to end (inclusive) from the buffer.
+    pub fn delete(&mut self, start: usize, end: usize) {
+        assert!(
+            start > 0 && start <= end && end <= self.lines.len(),
+            "Invalid line range"
+        );
+        self.lines.drain(start - 1..end);
+        if self.cur_line > self.lines.len() {
+            self.cur_line = self.lines.len();
+        }
+    }
+
+    // Helper function to generate test data
+    #[cfg(test)]
+    fn generate_test_data(data: &[&str]) -> Buffer {
+        let lines: Vec<String> = data.iter().map(|&s| s.to_string()).collect();
+        Buffer {
+            pathname: String::new(),
+            cur_line: if lines.is_empty() { 0 } else { 1 },
+            lines,
+        }
+    }
+
+    // Helper function to compare Vec<String> with &[&str]
+    #[cfg(test)]
+    fn compare_lines(lines: &Vec<String>, expected: &[&str]) {
+        let expected_strings: Vec<String> = expected.iter().map(|&s| s.to_string()).collect();
+        assert_eq!(lines, &expected_strings);
+    }
 }
 
 #[cfg(test)]
@@ -173,5 +203,35 @@ mod tests {
         let mut buffer = Buffer::new();
         let mut data = vec!["line 1".to_string()];
         buffer.insert(1, true, &mut data);
+    }
+
+    const TEST_DATA: &[&str] = &["Line 1", "Line 2", "Line 3", "Line 4", "Line 5"];
+
+    #[test]
+    fn test_delete_single_line() {
+        let mut buffer = Buffer::generate_test_data(TEST_DATA);
+        buffer.delete(2, 2);
+        Buffer::compare_lines(&buffer.lines, &["Line 1", "Line 3", "Line 4", "Line 5"]);
+    }
+
+    #[test]
+    fn test_delete_multiple_lines() {
+        let mut buffer = Buffer::generate_test_data(TEST_DATA);
+        buffer.delete(2, 3);
+        Buffer::compare_lines(&buffer.lines, &["Line 1", "Line 4", "Line 5"]);
+    }
+
+    #[test]
+    fn test_delete_all_lines() {
+        let mut buffer = Buffer::generate_test_data(TEST_DATA);
+        buffer.delete(1, 5);
+        Buffer::compare_lines(&buffer.lines, &[]);
+    }
+
+    #[test]
+    fn test_delete_invalid_range() {
+        let mut buffer = Buffer::generate_test_data(TEST_DATA);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| buffer.delete(0, 2)));
+        assert!(result.is_err());
     }
 }

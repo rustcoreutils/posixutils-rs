@@ -79,6 +79,13 @@ impl GlobalValue {
             _ => unreachable!("expected scalar value"),
         }
     }
+
+    fn unwrap_ere(&self) -> Rc<Regex> {
+        match self {
+            GlobalValue::Regex(re) => re.clone(),
+            _ => unreachable!("expected ere"),
+        }
+    }
 }
 
 impl From<ScalarValue> for GlobalValue {
@@ -578,21 +585,32 @@ impl Interpreter {
                 self.push(ScalarValue::Number(start as f64))
             }
             BuiltinFunction::Split => {
-                let s = self.pop_scalar()?.to_string();
-                let array_ref = self.pop();
-                let separator = if argc == 2 {
-                    self.globals[SpecialVar::Fs as usize]
-                        .unwrap_scalar()
-                        .to_string()
+                let separator_ere = if argc == 2 {
+                    self.globals[SpecialVar::Fs as usize].unwrap_ere()
                 } else {
                     assert_eq!(argc, 3);
-                    todo!()
+                    self.pop_ere()?
                 };
+                let array_ref = self.pop();
+                let s = self.pop_scalar()?.to_string();
                 let array = self.get_array_ref(array_ref)?;
                 array.clear();
-                for (i, part) in s.split(&separator).enumerate() {
-                    array.insert(i.to_string(), ScalarValue::String(part.to_string()));
+
+                let mut split_start = 0;
+                for (i, separator_range) in separator_ere
+                    .match_locations(CString::new(s.clone()).unwrap())
+                    .enumerate()
+                {
+                    array.insert(
+                        i.to_string(),
+                        ScalarValue::String(s[split_start..separator_range.start].to_string()),
+                    );
+                    split_start = separator_range.end;
                 }
+                array.insert(
+                    array.len().to_string(),
+                    ScalarValue::String(s[split_start..].to_string()),
+                );
                 let n = array.len();
                 self.push(ScalarValue::Number(n as f64));
             }
@@ -1907,6 +1925,33 @@ mod tests {
         assert_eq!(
             interpreter.globals[SpecialVar::Rlength as usize],
             ScalarValue::Number(4.0).into()
+        );
+    }
+
+    #[test]
+    fn test_builtin_split_with_split_ere() {
+        let instructions = vec![
+            OpCode::PushConstant(0),
+            OpCode::ArrayRef(FIRST_GLOBAL_VAR),
+            OpCode::PushConstant(1),
+            OpCode::CallBuiltin {
+                function: BuiltinFunction::Split,
+                argc: 3,
+            },
+        ];
+        let constants = vec![
+            Constant::String("a, b, c".to_string()),
+            Constant::Regex(Rc::new(regex_from_str(","))),
+        ];
+
+        let global = test_global(instructions, constants);
+        assert_eq!(
+            global,
+            GlobalValue::Array(HashMap::from([
+                ("0".to_string(), ScalarValue::String("a".to_string())),
+                ("1".to_string(), ScalarValue::String(" b".to_string())),
+                ("2".to_string(), ScalarValue::String(" c".to_string()))
+            ]))
         );
     }
 }

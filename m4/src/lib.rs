@@ -1,13 +1,11 @@
 use error::{Error, ErrorKind, Result};
-use std::{
-    ffi::{OsStr, OsString},
-    io::Write,
-    os::unix::ffi::OsStrExt,
-    path::PathBuf,
-};
+use lexer::{MacroName, MacroParseConfig};
+use std::{io::Write, path::PathBuf, rc::Rc};
 
 use clap::builder::{TypedValueParser, ValueParserFactory};
-use evaluate::{InputRead, State};
+use evaluate::{
+    InputRead, MacroDefinition, MacroDefinitionImplementation, State, UserDefinedMacro,
+};
 
 pub mod error;
 mod eval_macro;
@@ -19,30 +17,37 @@ mod test_utils;
 
 pub const EOF: u8 = b'\0';
 
-// TODO: potentially we can use a reference here to avoid allocation
-#[derive(Debug, Clone)]
-pub struct ArgumentName(OsString);
-
-impl From<OsString> for ArgumentName {
-    fn from(value: OsString) -> Self {
-        Self(value)
-    }
-}
-
-impl From<OsString> for ArgumentValue {
-    fn from(value: OsString) -> Self {
-        Self(value)
-    }
-}
-
-// TODO: potentially we can use a reference here to avoid allocation
-#[derive(Debug, Clone)]
-pub struct ArgumentValue(OsString);
-
 #[derive(Debug, Clone)]
 pub struct ArgumentDefine {
-    pub name: ArgumentName,
-    pub value: Option<ArgumentValue>,
+    pub name: MacroName,
+    pub definition: Vec<u8>,
+}
+
+#[derive(Clone)]
+pub struct MacroNameParser;
+
+impl TypedValueParser for MacroNameParser {
+    type Value = MacroName;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        _arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> std::result::Result<Self::Value, clap::Error> {
+        let value_bytes = value.as_encoded_bytes();
+        MacroName::try_from_slice(value_bytes).map_err(|_error| {
+            clap::Error::new(clap::error::ErrorKind::ValueValidation).with_cmd(cmd)
+        })
+    }
+}
+
+impl ValueParserFactory for MacroName {
+    type Parser = MacroNameParser;
+
+    fn value_parser() -> Self::Parser {
+        MacroNameParser
+    }
 }
 
 #[derive(Clone)]
@@ -53,7 +58,7 @@ impl TypedValueParser for ArgumentDefineParser {
 
     fn parse_ref(
         &self,
-        _cmd: &clap::Command,
+        cmd: &clap::Command,
         _arg: Option<&clap::Arg>,
         value: &std::ffi::OsStr,
     ) -> std::result::Result<Self::Value, clap::Error> {
@@ -61,16 +66,21 @@ impl TypedValueParser for ArgumentDefineParser {
         // TODO: do we need to support stripping whitespace after or before the `=`
         let mut split = value_bytes.splitn(2, |b| *b == b'=');
         // TODO: use error
-        let name = OsStr::from_bytes(split.next().unwrap()).to_owned().into();
+        let name = MacroName::try_from_slice(value_bytes).map_err(|_error| {
+            clap::Error::new(clap::error::ErrorKind::ValueValidation).with_cmd(cmd)
+        })?;
 
         let value = match split.next() {
             // TODO: perhaps we should use
             // https://doc.rust-lang.org/std/ffi/struct.OsStr.html#method.from_encoded_bytes_unchecked
             // instead?
-            Some(value) => Some(OsStr::from_bytes(value).to_owned().into()),
-            None => None,
+            Some(value) => value.to_vec(),
+            None => Vec::default(),
         };
-        Ok(ArgumentDefine { name, value })
+        Ok(ArgumentDefine {
+            name,
+            definition: value,
+        })
     }
 }
 
@@ -96,7 +106,7 @@ pub struct Args {
     pub define: Vec<ArgumentDefine>,
     // Undefine `name`.
     #[arg(short = 'U', long)]
-    pub undefine: Vec<ArgumentName>,
+    pub undefine: Vec<MacroName>,
     /// Whether to read input from a file.
     pub files: Vec<PathBuf>,
 }
@@ -153,6 +163,28 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
                 }));
         }
     };
+
+    // TODO: add test for this.
+    for define in args.define {
+        // TODO: probably need to move this into evaluate module.
+        let definition = Rc::new(MacroDefinition {
+            parse_config: MacroParseConfig {
+                name: define.name.clone(),
+                min_args: 0,
+            },
+            implementation: MacroDefinitionImplementation::UserDefined(UserDefinedMacro {
+                definition: define.definition,
+            }),
+        });
+        state
+            .macro_definitions
+            .insert(define.name, vec![definition]);
+    }
+
+    // TODO: add test for this.
+    for name in args.undefine {
+        state.macro_definitions.remove(&name);
+    }
 
     evaluate::process_streaming(state, &mut stderr)?;
 

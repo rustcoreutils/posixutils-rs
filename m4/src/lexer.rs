@@ -17,10 +17,6 @@
 //!
 use nom::IResult;
 
-use std::collections::HashMap;
-
-use crate::evaluate::BuiltinMacro;
-
 #[derive(Clone, Hash, Debug)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct MacroParseConfig {
@@ -48,7 +44,6 @@ pub const DEFAULT_QUOTE_OPEN_TAG: &[u8] = b"`";
 pub const DEFAULT_QUOTE_CLOSE_TAG: &[u8] = b"'";
 pub const DEFAULT_COMMENT_OPEN_TAG: &[u8] = b"#";
 pub const DEFAULT_COMMENT_CLOSE_TAG: &[u8] = b"\n";
-const DEFAULT_SYMBOL_RECURSION_LIMIT: usize = 100;
 
 impl Default for ParseConfig {
     fn default() -> Self {
@@ -85,7 +80,6 @@ impl MacroName {
     /// Macro names shall consist of letters, digits, and underscores, where the first character is
     /// not a digit. Tokens not of this form shall not be treated as macros.
     /// `[_a-zA-Z][_a-zA-Z0-9]*`
-    // TODO: change to complete parser
     pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
         log::trace!(
             "MacroName::parse() input {:?}",
@@ -93,15 +87,18 @@ impl MacroName {
         );
         if input.is_empty() {
             log::trace!("MacroName::parse() empty macro name");
-            return Err(nom::Err::Incomplete(nom::Needed::Unknown));
+            return Err(nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::NonEmpty,
+            )));
         }
         log::trace!("MacroName::parse() parsing the start of the macro name");
-        let (remaining, start) = nom::bytes::streaming::take_while1(is_word_char_start)(input)?;
+        let (remaining, start) = nom::bytes::complete::take_while1(is_word_char_start)(input)?;
         log::trace!(
             "MacroName::parse() found macro name start: {:?}",
             String::from_utf8_lossy(input)
         );
-        let (remaining, rest) = nom::bytes::streaming::take_while(is_word_char_end)(remaining)?;
+        let (remaining, rest) = nom::bytes::complete::take_while(is_word_char_end)(remaining)?;
         Ok((
             remaining,
             Self(input[..(start.len() + rest.len())].to_vec()),
@@ -111,18 +108,8 @@ impl MacroName {
     /// Parse macro name from a complete slice, not including the EOF byte.
     /// Mostly used for testing, use [`MacroName::parse`] instead for parsing.
     pub fn try_from_slice(input: &[u8]) -> crate::error::Result<Self> {
-        let mut input = input.to_vec();
-        input.push(b'\0');
-        let (remaining, name) = Self::parse(input.as_slice())
+        let (_remaining, name) = Self::parse(input)
             .map_err(|e| crate::Error::new(crate::ErrorKind::Parsing).add_context(e.to_string()))?;
-        if remaining != &[b'\0'] {
-            return Err(
-                crate::Error::new(crate::ErrorKind::Parsing).add_context(format!(
-                    "Could not completely parse input as macro name. Remaining: {:?}",
-                    String::from_utf8_lossy(&input)
-                )),
-            );
-        }
         Ok(name)
     }
 }

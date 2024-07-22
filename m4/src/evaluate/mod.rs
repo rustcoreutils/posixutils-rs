@@ -23,7 +23,7 @@ const AT_LEAST_ONE_MACRO_DEFINITION_EXPECT: &str =
     "There should always be at least one macro definition";
 
 pub struct State {
-    macro_definitions: HashMap<MacroName, Vec<Rc<MacroDefinition>>>,
+    pub macro_definitions: HashMap<MacroName, Vec<Rc<MacroDefinition>>>,
     pub parse_config: ParseConfig,
     /// Whether the process should exit with an error once processing has completed.
     pub exit_error: bool,
@@ -67,10 +67,10 @@ impl OutputState {
 }
 
 impl State {
-    pub fn new(output: Box<dyn Write>, input: Vec<Input>) -> Self {
+    pub fn new(stdout: Box<dyn Write>, input: Vec<Input>) -> Self {
         Self {
             output: OutputState {
-                output: Output::new(output).into_ref(),
+                output: Output::new(stdout).into_ref(),
                 ..OutputState::default()
             },
             input: InputState { input },
@@ -496,7 +496,7 @@ macro_rules! macro_enums {
             $($variant_name),*
         }
 
-        enum MacroDefinitionImplementation {
+        pub enum MacroDefinitionImplementation {
             $($variant_name($variant_type)),*,
             UserDefined(UserDefinedMacro),
         }
@@ -667,7 +667,7 @@ impl BuiltinMacro {
 pub(crate) struct MacroDefinition {
     pub parse_config: MacroParseConfig,
     // TODO: improve performance with enum dispatch
-    implementation: MacroDefinitionImplementation,
+    pub implementation: MacroDefinitionImplementation,
 }
 
 impl std::fmt::Debug for MacroDefinition {
@@ -833,8 +833,8 @@ impl MacroImplementation for PopdefMacro {
 /// characters. The string "$@" is replaced by a list of all of the arguments separated by <comma>
 /// characters, and each argument is quoted using the current left and right quoting strings. The
 /// string "${" produces unspecified behavior.
-struct UserDefinedMacro {
-    definition: Vec<u8>,
+pub struct UserDefinedMacro {
+    pub definition: Vec<u8>,
 }
 
 impl MacroImplementation for UserDefinedMacro {
@@ -1290,7 +1290,7 @@ impl MacroImplementation for IfdefMacro {
     fn evaluate(
         &self,
         mut state: State,
-        stderr: &mut dyn Write,
+        _stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
         let mut args = frame.args.into_iter();

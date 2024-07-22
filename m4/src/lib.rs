@@ -161,11 +161,5 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
 
     state = evaluate::process_streaming(state, &mut stderr)?;
 
-    state.output.output.divert(0)?;
-    state.output.output.undivert_all()?;
-
-    for wrap in state.m4wrap {
-        state.output.write_all(&wrap)?;
-    }
     Ok(())
 }

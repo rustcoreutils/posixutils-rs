@@ -994,12 +994,7 @@ impl MacroImplementation for DefnMacro {
 struct ErrprintMacro;
 
 impl MacroImplementation for ErrprintMacro {
-    fn evaluate(
-        &self,
-        state: State,
-        stderr: &mut dyn Write,
-        frame: StackFrame
-    ) -> Result<State> {
+    fn evaluate(&self, state: State, stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
         let args_len = frame.args.len();
         for (i, arg) in frame.args.into_iter().enumerate() {
             stderr.write_all(&arg)?;
@@ -1361,90 +1356,86 @@ impl MacroImplementation for EvalMacro {
     fn evaluate(
         &self,
         mut state: State,
-        stderr: &mut dyn Write,
-        frame: StackFrame
+        _stderr: &mut dyn Write,
+        frame: StackFrame,
     ) -> Result<State> {
         let first_arg = frame
             .args
             .into_iter()
             .next()
             .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
-        
-        let (_remaining, output) = eval_macro::parse_and_evaluate(&buffer)?;
-        stdout.write_all(output.to_string().as_bytes())?;
+
+        let (_, output) = nom::combinator::all_consuming(nom::combinator::complete(
+            eval_macro::parse_and_evaluate,
+        ))(&first_arg)?;
+        state.input.pushback_string(output.to_string().as_bytes());
         Ok(state)
     }
 }
 
-// /// The defining text of the len macro shall be the length (as a string) of the first argument. The
-// /// behavior is unspecified if len is not immediately followed by a `<left-parenthesis>`.
-// struct LenMacro;
+/// The defining text of the len macro shall be the length (as a string) of the first argument. The
+/// behavior is unspecified if len is not immediately followed by a `<left-parenthesis>`.
+struct LenMacro;
 
-// impl MacroImplementation for LenMacro {
-//     fn evaluate(
-//         &self,
-//         mut state: State,
-//         stdout: &mut dyn Write,
-//         stderr: &mut dyn Write,
-//         m: Macro,
-//     ) -> Result<State> {
-//         let first_arg = m
-//             .args
-//             .into_iter()
-//             .next()
-//             .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
-//         let buffer;
-//         (buffer, state) = evaluate_to_buffer(state, first_arg.input, stderr, true)?;
-//         stdout.write_all(buffer.len().to_string().as_bytes())?;
-//         Ok(state)
-//     }
-// }
+impl MacroImplementation for LenMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        _stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<State> {
+        let first_arg = frame
+            .args
+            .into_iter()
+            .next()
+            .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
+        state
+            .input
+            .pushback_string(first_arg.len().to_string().as_bytes());
+        Ok(state)
+    }
+}
 
-// /// The defining text of the index macro shall be the first character position (as a string) in the
-// /// first argument where a string matching the second argument begins (zero origin), or -1 if the
-// /// second argument does not occur. The behavior is unspecified if index is not immediately followed
-// /// by a `<left-parenthesis>`.
-// struct IndexMacro;
+/// The defining text of the index macro shall be the first character position (as a string) in the
+/// first argument where a string matching the second argument begins (zero origin), or -1 if the
+/// second argument does not occur. The behavior is unspecified if index is not immediately followed
+/// by a `<left-parenthesis>`.
+struct IndexMacro;
 
-// impl MacroImplementation for IndexMacro {
-//     fn evaluate(
-//         &self,
-//         mut state: State,
-//         stdout: &mut dyn Write,
-//         stderr: &mut dyn Write,
-//         m: Macro,
-//     ) -> Result<State> {
-//         let mut args = m.args.into_iter();
-//         let first_arg = args
-//             .next()
-//             .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
-//         let first_arg_text;
-//         (first_arg_text, state) = evaluate_to_buffer(state, first_arg.input, stderr, true)?;
-//         let second_arg = match args.next() {
-//             Some(second_arg) => second_arg,
-//             None => {
-//                 stderr.write_all(b"Warning too few arguments for index macro")?;
-//                 stdout.write_all(b"0")?;
-//                 return Ok(state);
-//             }
-//         };
-//         let second_arg_text;
-//         (second_arg_text, state) = evaluate_to_buffer(state, second_arg.input, stderr, true)?;
+impl MacroImplementation for IndexMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<State> {
+        let mut args = frame.args.into_iter();
+        let first_arg = args
+            .next()
+            .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
+        let second_arg = match args.next() {
+            Some(second_arg) => second_arg,
+            None => {
+                stderr.write_all(b"Warning too few arguments for index macro")?;
+                state.input.pushback_character(b'0');
+                return Ok(state);
+            }
+        };
 
-//         let index = first_arg_text
-//             .windows(second_arg_text.len())
-//             .position(|window| window == &second_arg_text);
-//         match index {
-//             Some(index) => {
-//                 stdout.write_all(index.to_string().as_bytes())?;
-//             }
-//             None => {
-//                 stdout.write_all(b"-1")?;
-//             }
-//         }
-//         Ok(state)
-//     }
-// }
+        let index = first_arg
+            .windows(second_arg.len())
+            .position(|window| window == &second_arg);
+        match index {
+            Some(index) => {
+                state.input.pushback_string(index.to_string().as_bytes());
+            }
+            None => {
+                state.input.pushback_string(b"-1");
+            }
+        }
+        Ok(state)
+    }
+}
 
 /// The defining text of the translit macro shall be the first argument with every character that
 /// occurs in the second argument replaced with the corresponding character from the third argument.
@@ -1462,15 +1453,18 @@ impl MacroImplementation for TranslitMacro {
         &self,
         mut state: State,
         stderr: &mut dyn Write,
-        frame: StackFrame
+        frame: StackFrame,
     ) -> Result<State> {
         let mut args = frame.args.into_iter();
         let mut output_buffer = args
             .next()
             .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
 
-        log::debug!("TranslitMacro::evaluate() transliterating {:?}", String::from_utf8_lossy(&output_buffer));
-        
+        log::debug!(
+            "TranslitMacro::evaluate() transliterating {:?}",
+            String::from_utf8_lossy(&output_buffer)
+        );
+
         let second_arg = match args.next() {
             Some(second_arg) => second_arg,
             None => {
@@ -1497,74 +1491,65 @@ impl MacroImplementation for TranslitMacro {
             }
         }
 
-
         state.input.pushback_string(&output_buffer);
         Ok(state)
     }
 }
 
-// /// The defining text for the substr macro shall be the substring of the first argument beginning at
-// /// the zero-offset character position specified by the second argument. The third argument, if
-// /// specified, shall be the number of characters to select; if not specified, the characters from
-// /// the starting point to the end of the first argument shall become the defining text. It shall not
-// /// be an error to specify a starting point beyond the end of the first argument and the defining
-// /// text shall be null. It shall be an error to specify an argument containing any non-numeric
-// /// characters. The behavior is unspecified if substr is not immediately followed by a
-// /// `<left-parenthesis>`.
-// struct SubstrMacro;
+/// The defining text for the substr macro shall be the substring of the first argument beginning at
+/// the zero-offset character position specified by the second argument. The third argument, if
+/// specified, shall be the number of characters to select; if not specified, the characters from
+/// the starting point to the end of the first argument shall become the defining text. It shall not
+/// be an error to specify a starting point beyond the end of the first argument and the defining
+/// text shall be null. It shall be an error to specify an argument containing any non-numeric
+/// characters. The behavior is unspecified if substr is not immediately followed by a
+/// `<left-parenthesis>`.
+struct SubstrMacro;
 
-// impl MacroImplementation for SubstrMacro {
-//     fn evaluate(
-//         &self,
-//         mut state: State,
-//         stdout: &mut dyn Write,
-//         stderr: &mut dyn Write,
-//         m: Macro,
-//     ) -> Result<State> {
-//         let mut args = m.args.into_iter();
-//         let first_arg = args
-//             .next()
-//             .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
-//         let first_arg_text;
-//         (first_arg_text, state) = evaluate_to_buffer(state, first_arg.input, stderr, true)?;
+impl MacroImplementation for SubstrMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        _stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<State> {
+        let mut args = frame.args.into_iter();
+        let first_arg = args
+            .next()
+            .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
 
-//         if first_arg_text.is_empty() {
-//             return Ok(state);
-//         }
+        if first_arg.is_empty() {
+            return Ok(state);
+        }
 
-//         let start_index = if let Some(second_arg) = args.next() {
-//             let second_arg_text;
-//             (second_arg_text, state) = evaluate_to_buffer(state, second_arg.input, stderr, true)?;
-//             let (_, i) = nom::combinator::all_consuming(parse_index)(&second_arg_text)?;
-//             i
-//         } else {
-//             0
-//         };
+        let start_index = if let Some(second_arg) = args.next() {
+            let (_, i) = nom::combinator::all_consuming(parse_index)(&second_arg)?;
+            i
+        } else {
+            0
+        };
 
-//         if start_index > (first_arg_text.len() - 1) {
-//             return Ok(state);
-//         }
+        if start_index > (first_arg.len() - 1) {
+            return Ok(state);
+        }
 
-//         let out = if let Some(third_arg) = args.next() {
-//             let third_arg_text;
-//             (third_arg_text, state) = evaluate_to_buffer(state, third_arg.input, stderr, true)?;
-//             let (_, number_of_chars) =
-//                 nom::combinator::all_consuming(parse_index)(&third_arg_text)?;
+        let out = if let Some(third_arg) = args.next() {
+            let (_, number_of_chars) = nom::combinator::all_consuming(parse_index)(&third_arg)?;
 
-//             if number_of_chars > 0 {
-//                 let end_index = usize::min(start_index + number_of_chars, first_arg_text.len());
-//                 &first_arg_text[start_index..end_index]
-//             } else {
-//                 return Ok(state);
-//             }
-//         } else {
-//             &first_arg_text[start_index..]
-//         };
+            if number_of_chars > 0 {
+                let end_index = usize::min(start_index + number_of_chars, first_arg.len());
+                &first_arg[start_index..end_index]
+            } else {
+                return Ok(state);
+            }
+        } else {
+            &first_arg[start_index..]
+        };
 
-//         stdout.write_all(&out)?;
-//         Ok(state)
-//     }
-// }
+        state.input.pushback_string(&out);
+        Ok(state)
+    }
+}
 
 // /// The dumpdef macro shall write the defined text to standard error for each of the macros
 // /// specified as arguments, or, if no arguments are specified, for all macros.

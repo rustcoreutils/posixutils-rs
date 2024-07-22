@@ -7,16 +7,17 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::collections::HashMap;
-
 use crate::program::{BuiltinFunction, Constant, Function, OpCode, Program, SpecialVar};
+use std::collections::HashMap;
+use std::ffi::CString;
 
 use crate::format::{
     fmt_write_decimal_float, fmt_write_float_general, fmt_write_hex_float,
     fmt_write_scientific_float, fmt_write_signed, fmt_write_string, fmt_write_unsigned,
     parse_conversion_specifier_args, parse_escape_sequence, IntegerFormat,
 };
-use std::fmt::Write;
+use crate::regex::Regex;
+use std::rc::Rc;
 
 fn get_or_insert(array: &mut HashMap<String, ScalarValue>, key: String) -> &mut ScalarValue {
     array.entry(key).or_insert(ScalarValue::Uninitialized)
@@ -27,16 +28,6 @@ enum ScalarValue {
     Number(f64),
     String(String),
     Uninitialized,
-}
-
-impl From<Constant> for ScalarValue {
-    fn from(value: Constant) -> Self {
-        match value {
-            Constant::Number(n) => ScalarValue::Number(n),
-            Constant::String(s) => ScalarValue::String(s),
-            _ => todo!(),
-        }
-    }
 }
 
 impl ScalarValue {
@@ -77,6 +68,7 @@ impl ScalarValue {
 enum GlobalValue {
     Scalar(ScalarValue),
     Array(HashMap<String, ScalarValue>),
+    Regex(Rc<Regex>),
     Uninitialized,
 }
 
@@ -105,16 +97,21 @@ enum Reference {
     TempArray(usize),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 enum StackValue {
     Scalar(ScalarValue),
     Reference(Reference),
+    Regex(Rc<Regex>),
     Uninitialized,
 }
 
 impl From<Constant> for StackValue {
     fn from(value: Constant) -> Self {
-        ScalarValue::from(value).into()
+        match value {
+            Constant::Number(n) => StackValue::Scalar(ScalarValue::Number(n)),
+            Constant::String(s) => StackValue::Scalar(ScalarValue::String(s)),
+            Constant::Regex(re) => StackValue::Regex(re),
+        }
     }
 }
 
@@ -292,6 +289,7 @@ impl Interpreter {
             StackValue::Scalar(val) => Ok(val),
             StackValue::Reference(reference) => self.deref(reference),
             StackValue::Uninitialized => Ok(ScalarValue::Uninitialized),
+            StackValue::Regex(_) => todo!("match with $0"),
         }
     }
 
@@ -344,6 +342,14 @@ impl Interpreter {
                 }
             },
             _ => panic!("trying to pop a value as reference"),
+        }
+    }
+
+    fn pop_ere(&mut self) -> Result<Rc<Regex>, String> {
+        let top = self.pop();
+        match top {
+            StackValue::Regex(re) => Ok(re),
+            _ => Err("expected regular expression".to_string()),
         }
     }
 
@@ -690,7 +696,13 @@ impl Interpreter {
                 OpCode::Ne => {
                     compare_op!(self, !=);
                 }
-                OpCode::Match => todo!(),
+                OpCode::Match => {
+                    let ere = self.pop_ere()?;
+                    let str = self.pop_scalar()?.to_string();
+                    self.push(ScalarValue::Number(
+                        ere.matches(CString::new(str).unwrap()) as i32 as f64,
+                    ));
+                }
                 OpCode::NotMatch => todo!(),
                 OpCode::Concat => {
                     let rhs = self.pop_scalar()?.to_string();
@@ -1831,5 +1843,24 @@ mod tests {
     fn test_builtin_sprintf_escape_sequences() {
         assert_eq!(test_sprintf("\\n hello world", vec![]), "\n hello world");
         assert_eq!(test_sprintf("\\056", vec![]), ".");
+    }
+
+    #[test]
+    fn test_match_op() {
+        let instructions = vec![
+            OpCode::PushConstant(0),
+            OpCode::PushConstant(1),
+            OpCode::Match,
+        ];
+        let constant = vec![
+            Constant::String("hello".to_string()),
+            Constant::Regex(Rc::new(
+                Regex::new(CString::new("e").unwrap()).expect("failed to compile regex"),
+            )),
+        ];
+        assert_eq!(
+            interpret_expr(instructions, constant, 0),
+            ScalarValue::Number(1.0)
+        );
     }
 }

@@ -7,22 +7,23 @@
 // SPDX-License-Identifier: MIT
 //
 
+use crate::format::parse_escape_sequence;
+use crate::program::{
+    AwkRule, BuiltinFunction, Constant, Function, OpCode, Pattern, Program, SpecialVar, VarId,
+};
+use crate::regex::Regex;
+use pest::{
+    iterators::{Pair, Pairs},
+    pratt_parser::PrattParser,
+    Parser,
+};
 use std::ffi::CString;
+use std::rc::Rc;
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     hash::Hash,
     str::FromStr,
-};
-
-use crate::format::parse_escape_sequence;
-use crate::program::{
-    AwkRule, BuiltinFunction, Constant, Function, OpCode, Pattern, Program, SpecialVar, VarId,
-};
-use pest::{
-    iterators::{Pair, Pairs},
-    pratt_parser::PrattParser,
-    Parser,
 };
 
 struct BuiltinFunctionInfo {
@@ -398,7 +399,10 @@ impl Compiler {
                 Ok(Expr::new(ExprKind::Number, instructions))
             }
             Rule::ere => {
-                let index = self.push_constant(Constant::Regex(primary.as_str().to_string()));
+                let ere_c_str = CString::new(primary.as_str()).unwrap();
+                let regex = Regex::new(ere_c_str)
+                    .map_err(|e| pest_error_from_span(primary.as_span(), e))?;
+                let index = self.push_constant(Constant::Regex(Rc::new(regex)));
                 Ok(Expr::new(
                     ExprKind::Regex,
                     vec![OpCode::PushConstant(index)],

@@ -7,7 +7,9 @@
 // SPDX-License-Identifier: MIT
 //
 
+use crate::regex::Regex;
 use core::fmt;
+use std::rc::Rc;
 
 pub type VarId = u32;
 
@@ -103,7 +105,7 @@ pub enum OpCode {
 pub enum Constant {
     Number(f64),
     String(String),
-    Regex(String),
+    Regex(Rc<Regex>),
 }
 
 #[derive(Debug, PartialEq)]

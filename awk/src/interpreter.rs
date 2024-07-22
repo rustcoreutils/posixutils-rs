@@ -559,7 +559,23 @@ impl Interpreter {
                 }
             }
             BuiltinFunction::Match => {
-                todo!()
+                let ere = self.pop_ere()?;
+                let string = self.pop_scalar()?.to_string();
+                // TODO: should look into this unwrap
+                let mut locations = ere.match_locations(CString::new(string).unwrap());
+                let start;
+                let len;
+                if let Some(first_match) = locations.next() {
+                    start = first_match.start as i64 + 1;
+                    len = first_match.end as i64 - start + 1;
+                } else {
+                    start = 0;
+                    len = -1;
+                }
+                self.globals[SpecialVar::Rstart as usize] =
+                    ScalarValue::Number(start as f64).into();
+                self.globals[SpecialVar::Rlength as usize] = ScalarValue::Number(len as f64).into();
+                self.push(ScalarValue::Number(start as f64))
             }
             BuiltinFunction::Split => {
                 let s = self.pop_scalar()?.to_string();
@@ -880,6 +896,7 @@ pub fn interpret(program: Program, files: Vec<String>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::regex::regex_from_str;
 
     const FIRST_GLOBAL_VAR: u32 = SpecialVar::Count as u32;
 
@@ -1860,6 +1877,36 @@ mod tests {
         assert_eq!(
             interpret_expr(instructions, constant, 0),
             ScalarValue::Number(1.0)
+        );
+    }
+
+    #[test]
+    fn test_builtin_match() {
+        let instructions = vec![
+            OpCode::PushConstant(0),
+            OpCode::PushConstant(1),
+            OpCode::CallBuiltin {
+                function: BuiltinFunction::Match,
+                argc: 2,
+            },
+        ];
+        let constants = vec![
+            Constant::String("this is a test".to_string()),
+            Constant::Regex(Rc::new(regex_from_str("is* a"))),
+        ];
+
+        let mut interpreter = Interpreter::new(HashMap::new(), HashMap::new(), constants, 0);
+        interpreter
+            .run(&instructions, &[], &[])
+            .expect("error running test");
+        assert_eq!(interpreter.pop_scalar().unwrap(), ScalarValue::Number(6.0));
+        assert_eq!(
+            interpreter.globals[SpecialVar::Rstart as usize],
+            ScalarValue::Number(6.0).into()
+        );
+        assert_eq!(
+            interpreter.globals[SpecialVar::Rlength as usize],
+            ScalarValue::Number(4.0).into()
         );
     }
 }

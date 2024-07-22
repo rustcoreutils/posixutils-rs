@@ -1,6 +1,5 @@
 use std::process::ExitCode;
 
-use clap::Parser;
 use m4::error::GetExitCode;
 
 fn main() -> ExitCode {

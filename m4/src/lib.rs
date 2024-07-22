@@ -1,19 +1,15 @@
 use error::{Error, ErrorKind, Result};
-use lexer::{MacroName, MacroParseConfig};
-use std::{io::Write, path::PathBuf, rc::Rc};
-
-use clap::builder::{TypedValueParser, ValueParserFactory};
 use evaluate::{
     InputRead, MacroDefinition, MacroDefinitionImplementation, State, UserDefinedMacro,
 };
+use lexer::{MacroName, MacroParseConfig};
+use std::{ffi::OsStr, io::Write, path::PathBuf, rc::Rc};
 
 pub mod error;
 mod eval_macro;
 mod evaluate;
 mod lexer;
 mod precedence;
-#[cfg(test)]
-mod test_utils;
 
 pub const EOF: u8 = b'\0';
 
@@ -23,57 +19,15 @@ pub struct ArgumentDefine {
     pub definition: Vec<u8>,
 }
 
-#[derive(Clone)]
-pub struct MacroNameParser;
-
-impl TypedValueParser for MacroNameParser {
-    type Value = MacroName;
-
-    fn parse_ref(
-        &self,
-        cmd: &clap::Command,
-        _arg: Option<&clap::Arg>,
-        value: &std::ffi::OsStr,
-    ) -> std::result::Result<Self::Value, clap::Error> {
-        let value_bytes = value.as_encoded_bytes();
-        MacroName::try_from_slice(value_bytes).map_err(|_error| {
-            let mut e = clap::Error::new(clap::error::ErrorKind::ValueValidation).with_cmd(cmd);
-            e.insert(
-                clap::error::ContextKind::InvalidValue,
-                clap::error::ContextValue::String(String::from_utf8_lossy(value_bytes).to_string()),
-            );
-            e
-        })
-    }
-}
-
-impl ValueParserFactory for MacroName {
-    type Parser = MacroNameParser;
-
-    fn value_parser() -> Self::Parser {
-        MacroNameParser
-    }
-}
-
-#[derive(Clone)]
-pub struct ArgumentDefineParser;
-
-impl TypedValueParser for ArgumentDefineParser {
-    type Value = ArgumentDefine;
-
-    fn parse_ref(
-        &self,
-        cmd: &clap::Command,
-        _arg: Option<&clap::Arg>,
-        value: &std::ffi::OsStr,
-    ) -> std::result::Result<Self::Value, clap::Error> {
+impl ArgumentDefine {
+    pub fn parse(value: &OsStr) -> std::result::Result<Self, clap::Error> {
         let value_bytes = value.as_encoded_bytes();
         // TODO: do we need to support stripping whitespace after or before the `=`
         let mut split = value_bytes.splitn(2, |b| *b == b'=');
         // TODO: use error
         let name =
             MacroName::try_from_slice(&split.next().unwrap_or_default()).map_err(|_error| {
-                let mut e = clap::Error::new(clap::error::ErrorKind::ValueValidation).with_cmd(cmd);
+                let mut e = clap::Error::new(clap::error::ErrorKind::ValueValidation);
                 e.insert(
                     clap::error::ContextKind::InvalidValue,
                     clap::error::ContextValue::String(
@@ -97,39 +51,83 @@ impl TypedValueParser for ArgumentDefineParser {
     }
 }
 
-impl ValueParserFactory for ArgumentDefine {
-    type Parser = ArgumentDefineParser;
-
-    fn value_parser() -> Self::Parser {
-        ArgumentDefineParser
-    }
-}
-
-#[derive(Debug, clap::Parser, Clone)]
-#[command(version, about)]
-pub struct Args {
-    /// Enable line synchronization output for the c99 preprocessor phase (that is, #line
-    /// directives).
-    #[arg(short = 's', long)]
-    pub line_synchronization: bool,
+#[derive(Debug, Clone)]
+pub enum DefineDirective {
     /// `name[=val]`
     ///
     /// Define `name` to `val` or to `null` if `=val` is omitted.
-    #[arg(short = 'D', long)]
-    pub define: Vec<ArgumentDefine>,
+    Define(ArgumentDefine),
     // Undefine `name`.
-    #[arg(short = 'U', long)]
-    pub undefine: Vec<MacroName>,
+    Undefine(MacroName),
+}
+
+#[derive(Debug, Clone)]
+pub struct Args {
+    /// Enable line synchronization output for the c99 preprocessor phase (that is, #line
+    /// directives).
+    /// TODO: not yet implemented
+    pub line_synchronization: bool,
+    pub define_directives: Vec<DefineDirective>,
     /// Whether to read input from a file.
     pub files: Vec<PathBuf>,
+}
+
+impl Args {
+    pub fn parse() -> Self {
+        let matches = clap::command!()
+            .arg(
+                clap::Arg::new("define")
+                    .short('D')
+                    .value_name("name[=val]")
+                    .num_args(1)
+                    .action(clap::ArgAction::Append),
+            )
+            .arg(
+                clap::Arg::new("undefine")
+                    .short('U')
+                    .value_name("name")
+                    .num_args(1)
+                    .action(clap::ArgAction::Append),
+            )
+            .arg(clap::Arg::new("file").action(clap::ArgAction::Append))
+            .get_matches();
+
+        let files = matches
+            .get_raw("file")
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| PathBuf::from(p))
+            .collect();
+
+        // Order of defines and undefines is important, so we need to do this, otherwise we'd just
+        // use the clap derive macro instead.
+        let mut define_directives = Vec::new();
+        let defines = matches.get_raw("define").unwrap_or_default();
+        for (value, index) in defines.zip(matches.indices_of("define").unwrap_or_default()) {
+            let value = ArgumentDefine::parse(value).expect("Invalid -D argument definition");
+            define_directives.push((index, DefineDirective::Define(value)));
+        }
+        let undefines = matches.get_raw("undefine").unwrap_or_default();
+        for (value, index) in undefines.zip(matches.indices_of("undefine").unwrap_or_default()) {
+            let value = MacroName::parse_cmd(value).expect("Invalid -U argument undefine");
+            define_directives.push((index, DefineDirective::Undefine(value)));
+        }
+        define_directives.sort_by_key(|d| d.0);
+        let define_directives = define_directives.into_iter().map(|d| d.1).collect();
+
+        Self {
+            line_synchronization: false,
+            define_directives,
+            files,
+        }
+    }
 }
 
 impl Default for Args {
     fn default() -> Self {
         Self {
             line_synchronization: false,
-            define: Vec::default(),
-            undefine: Vec::default(),
+            define_directives: Vec::default(),
             files: Vec::default(),
         }
     }
@@ -178,25 +176,28 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
     };
 
     // TODO: add test for this.
-    for define in args.define {
-        // TODO: probably need to move this into evaluate module.
-        let definition = Rc::new(MacroDefinition {
-            parse_config: MacroParseConfig {
-                name: define.name.clone(),
-                min_args: 0,
-            },
-            implementation: MacroDefinitionImplementation::UserDefined(UserDefinedMacro {
-                definition: define.definition,
-            }),
-        });
-        state
-            .macro_definitions
-            .insert(define.name, vec![definition]);
-    }
+    for directive in args.define_directives {
+        match directive {
+            DefineDirective::Define(define) => {
+                // TODO: probably need to move this into evaluate module.
+                let definition = Rc::new(MacroDefinition {
+                    parse_config: MacroParseConfig {
+                        name: define.name.clone(),
+                        min_args: 0,
+                    },
+                    implementation: MacroDefinitionImplementation::UserDefined(UserDefinedMacro {
+                        definition: define.definition,
+                    }),
+                });
 
-    // TODO: add test for this.
-    for name in args.undefine {
-        state.macro_definitions.remove(&name);
+                state
+                    .macro_definitions
+                    .insert(define.name, vec![definition]);
+            }
+            DefineDirective::Undefine(name) => {
+                state.macro_definitions.remove(&name);
+            }
+        }
     }
 
     evaluate::process_streaming(state, &mut stderr)?;

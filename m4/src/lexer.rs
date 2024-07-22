@@ -15,6 +15,8 @@
 //!
 //! TODO: should quotes support alphanumeric characters? Seems like GNU m4 at least doesn't.
 //!
+use std::ffi::OsStr;
+
 use nom::IResult;
 
 #[derive(Clone, Hash, Debug)]
@@ -103,6 +105,18 @@ impl MacroName {
             remaining,
             Self(input[..(start.len() + rest.len())].to_vec()),
         ))
+    }
+
+    pub fn parse_cmd(input: &OsStr) -> std::result::Result<Self, clap::Error> {
+        let input_bytes = input.as_encoded_bytes();
+        MacroName::try_from_slice(input_bytes).map_err(|_error| {
+            let mut e = clap::Error::new(clap::error::ErrorKind::ValueValidation);
+            e.insert(
+                clap::error::ContextKind::InvalidValue,
+                clap::error::ContextValue::String(String::from_utf8_lossy(input_bytes).to_string()),
+            );
+            e
+        })
     }
 
     /// Parse macro name from a complete slice, not including the EOF byte.

@@ -399,7 +399,7 @@ impl Compiler {
                 Ok(Expr::new(ExprKind::Number, instructions))
             }
             Rule::ere => {
-                let ere_c_str = CString::new(primary.as_str()).unwrap();
+                let ere_c_str = CString::new(primary.as_str().trim_matches('/')).unwrap();
                 let regex = Regex::new(ere_c_str)
                     .map_err(|e| pest_error_from_span(primary.as_span(), e))?;
                 let index = self.push_constant(Constant::Regex(Rc::new(regex)));

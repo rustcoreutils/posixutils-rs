@@ -651,7 +651,8 @@ impl Compiler {
                 Ok(Expr::new(ExprKind::Number, instructions))
             }
             Rule::not_match => {
-                instructions.push(OpCode::NotMatch);
+                instructions.push(OpCode::Match);
+                instructions.push(OpCode::Not);
                 Ok(Expr::new(ExprKind::Number, instructions))
             }
             Rule::concat => {
@@ -1160,6 +1161,7 @@ pub fn compile_program(text: &str) -> Result<Program, PestError> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::regex::regex_from_str;
 
     const FIRST_GLOBAL_VAR: u32 = SpecialVar::Count as u32;
 
@@ -1679,6 +1681,47 @@ mod test {
             ]
         );
         assert_eq!(constants, vec![Constant::String("a".to_string())]);
+    }
+
+    #[test]
+    fn test_compile_match() {
+        let (instructions, constants) = compile_expr(r#" "hello" ~ /hello/ "#);
+        assert_eq!(
+            instructions,
+            vec![
+                OpCode::PushConstant(0),
+                OpCode::PushConstant(1),
+                OpCode::Match
+            ]
+        );
+        assert_eq!(
+            constants,
+            vec![
+                Constant::String("hello".to_string()),
+                Constant::Regex(Rc::new(regex_from_str("hello")))
+            ]
+        )
+    }
+
+    #[test]
+    fn test_compile_not_match() {
+        let (instructions, constants) = compile_expr(r#" "test" !~ /te?s+t*/"#);
+        assert_eq!(
+            instructions,
+            vec![
+                OpCode::PushConstant(0),
+                OpCode::PushConstant(1),
+                OpCode::Match,
+                OpCode::Not
+            ]
+        );
+        assert_eq!(
+            constants,
+            vec![
+                Constant::String("test".to_string()),
+                Constant::Regex(Rc::new(regex_from_str("te?s+t*")))
+            ]
+        )
     }
 
     #[test]

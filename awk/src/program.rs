@@ -29,7 +29,6 @@ pub enum OpCode {
     Eq,
     Ne,
     Match,
-    NotMatch,
     Concat,
 
     // check if the array with reference on top of the stack contains the value

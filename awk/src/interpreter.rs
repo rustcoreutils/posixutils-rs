@@ -703,7 +703,6 @@ impl Interpreter {
                         ere.matches(CString::new(str).unwrap()) as i32 as f64,
                     ));
                 }
-                OpCode::NotMatch => todo!(),
                 OpCode::Concat => {
                     let rhs = self.pop_scalar()?.to_string();
                     let lhs = self.pop_scalar()?.to_string();

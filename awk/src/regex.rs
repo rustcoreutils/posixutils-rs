@@ -136,20 +136,24 @@ impl PartialEq for Regex {
 mod tests {
     use super::*;
 
+    pub fn regex_from_str(re: &str) -> Regex {
+        Regex::new(CString::new(re).unwrap()).expect("error compiling ere")
+    }
+
     #[test]
     fn test_create_regex() {
-        Regex::new(CString::new("a").unwrap()).expect("error compiling ere");
+        regex_from_str("test");
     }
 
     #[test]
     fn test_regex_matches() {
-        let ere = Regex::new(CString::new("ab*c").unwrap()).expect("error compiling ere");
+        let ere = regex_from_str("ab*c");
         assert!(ere.matches(CString::new("abbbbc").unwrap()));
     }
 
     #[test]
     fn test_regex_match_locations() {
-        let ere = Regex::new(CString::new("match").unwrap()).expect("error compiling ere");
+        let ere = regex_from_str("match");
         let mut match_buffer = Vec::new();
         ere.match_locations(
             CString::new("match 12345 match2 matchmatch").unwrap(),

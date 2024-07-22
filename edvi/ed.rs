@@ -13,7 +13,7 @@ extern crate plib;
 mod buffer;
 mod command;
 
-use buffer::{Buffer, Chunk};
+use buffer::Buffer;
 use clap::Parser;
 use command::{Address, AddressInfo, Command, DEFAULT_ADDRESSING};
 use gettextrs::{bind_textdomain_codeset, textdomain};
@@ -85,15 +85,14 @@ impl Editor {
                     if self.inputs.len() == 0 {
                         continue;
                     }
-                    let chunks = buffer::as_chunks(&self.inputs);
-                    self.inputs.clear();
-                    self.buf.insert(self.buf.cur_line, insert_before, &chunks);
+                    self.buf
+                        .insert(self.buf.cur_line, insert_before, &mut self.inputs);
                 }
 
                 EdOp::DisplayLines(start_line, end_line, _print_mode) => {
                     if let Err(e) = self
                         .buf
-                        .write_chunks(start_line, end_line, &mut io::stdout())
+                        .write_lines(start_line, end_line, &mut io::stdout())
                     {
                         eprintln!("{}", e);
                         println!("{}", ERR_STR);
@@ -128,7 +127,7 @@ impl Editor {
     fn resolve_address(&self, addr: &Address, default_addr: AddressInfo) -> Result<usize, String> {
         match addr.info {
             AddressInfo::Current => Ok(self.buf.cur_line),
-            AddressInfo::Last => Ok(self.buf.last_line),
+            AddressInfo::Last => Ok(self.buf.last_line()),
             AddressInfo::Line(line_no) => Ok(line_no),
             AddressInfo::Offset(offset) => {
                 let line_no = self.buf.cur_line as isize + offset;
@@ -259,7 +258,7 @@ impl Editor {
     fn read_file(&mut self, pathname: &str) -> io::Result<()> {
         let file = fs::File::open(pathname)?;
         let mut reader = BufReader::new(file);
-        let mut cur_chunk = Chunk::new();
+        let mut lines = Vec::new();
 
         loop {
             let mut line = String::new();
@@ -268,15 +267,11 @@ impl Editor {
                 break;
             }
 
-            if (cur_chunk.len() + line.len()) > buffer::MAX_CHUNK {
-                self.buf.append(cur_chunk);
-                cur_chunk = Chunk::new();
-            }
-            cur_chunk.push_line(&line);
+            lines.push(line);
         }
 
-        if cur_chunk.len() > 0 {
-            self.buf.append(cur_chunk);
+        if lines.len() > 0 {
+            self.buf.append(&mut lines);
         }
 
         self.buf.pathname = String::from(pathname);

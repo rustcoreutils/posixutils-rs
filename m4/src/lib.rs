@@ -176,7 +176,6 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
     for directive in args.define_directives {
         match directive {
             DefineDirective::Define(define) => {
-                // TODO: probably need to move this into evaluate module.
                 let definition = Rc::new(MacroDefinition::new_user_defined(
                     define.name.clone(),
                     define.definition,

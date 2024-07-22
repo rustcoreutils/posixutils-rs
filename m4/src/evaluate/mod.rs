@@ -496,7 +496,7 @@ macro_rules! macro_enums {
             $($variant_name),*
         }
 
-        pub enum MacroDefinitionImplementation {
+        enum MacroDefinitionImplementation {
             $($variant_name($variant_type)),*,
             UserDefined(UserDefinedMacro),
         }
@@ -667,7 +667,18 @@ impl BuiltinMacro {
 pub(crate) struct MacroDefinition {
     pub parse_config: MacroParseConfig,
     // TODO: improve performance with enum dispatch
-    pub implementation: MacroDefinitionImplementation,
+    implementation: MacroDefinitionImplementation,
+}
+
+impl MacroDefinition {
+    pub fn new_user_defined(name: MacroName, definition: Vec<u8>) -> Self {
+        Self {
+            parse_config: MacroParseConfig { name, min_args: 0 },
+            implementation: MacroDefinitionImplementation::UserDefined(UserDefinedMacro {
+                definition,
+            }),
+        }
+    }
 }
 
 impl std::fmt::Debug for MacroDefinition {

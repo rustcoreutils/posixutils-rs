@@ -1,8 +1,6 @@
 use error::{Error, ErrorKind, Result};
-use evaluate::{
-    InputRead, MacroDefinition, MacroDefinitionImplementation, State, UserDefinedMacro,
-};
-use lexer::{MacroName, MacroParseConfig};
+use evaluate::{InputRead, MacroDefinition, State};
+use lexer::MacroName;
 use std::{ffi::OsStr, io::Write, path::PathBuf, rc::Rc};
 
 pub mod error;
@@ -175,20 +173,14 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
         }
     };
 
-    // TODO: add test for this.
     for directive in args.define_directives {
         match directive {
             DefineDirective::Define(define) => {
                 // TODO: probably need to move this into evaluate module.
-                let definition = Rc::new(MacroDefinition {
-                    parse_config: MacroParseConfig {
-                        name: define.name.clone(),
-                        min_args: 0,
-                    },
-                    implementation: MacroDefinitionImplementation::UserDefined(UserDefinedMacro {
-                        definition: define.definition,
-                    }),
-                });
+                let definition = Rc::new(MacroDefinition::new_user_defined(
+                    define.name.clone(),
+                    define.definition,
+                ));
 
                 state
                     .macro_definitions

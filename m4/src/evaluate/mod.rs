@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -31,9 +30,6 @@ pub struct State {
     /// See [`M4wrapMacro`].
     pub m4wrap: Vec<Vec<u8>>,
     pub last_syscmd_status: Option<ExitStatus>,
-    /// Stack of filenames. Used in [`FileMacro`].
-    /// TODO: fold into input
-    pub file: Vec<PathBuf>,
     pub output: OutputState,
     pub input: InputState,
 }
@@ -122,7 +118,6 @@ impl Default for State {
             m4wrap: Vec::new(),
             last_syscmd_status: None,
             output: OutputState::default(),
-            file: Vec::new(),
             input: InputState::default(),
         }
     }
@@ -213,31 +208,27 @@ impl InputState {
 
 pub struct Input {
     pub input: InputRead,
-    pub name: String,
-    pub current_char: Option<u8>,
     pub pushback_buffer: Vec<u8>,
 }
 
 impl Input {
-    pub fn new(input: InputRead, name: String) -> Self {
+    pub fn new(input: InputRead) -> Self {
         Self {
             input,
-            name,
-            current_char: None,
             pushback_buffer: Vec::new(),
         }
     }
 }
 
 pub enum InputRead {
-    File(std::fs::File),
+    File { file: std::fs::File, path: PathBuf },
     Stdin(std::io::Stdin),
 }
 
 impl Read for InputRead {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
-            InputRead::File(f) => f.read(buf),
+            InputRead::File { file, .. } => file.read(buf),
             InputRead::Stdin(s) => s.read(buf),
         }
     }
@@ -542,38 +533,38 @@ macro_rules! macro_enums {
 macro_enums!(
     #[derive(Clone, Copy)]
     pub enum BuiltinMacroDefinition {
-        Dnl(DnlMacro),
-        Define(DefineMacro),
-        Undefine(UndefineMacro),
-        Pushdef(PushdefMacro),
-        Popdef(PopdefMacro),
-        Defn(DefnMacro),
-        Errprint(ErrprintMacro),
-        Include(IncludeMacro),
-        Sinclude(SincludeMacro),
         Changecom(ChangecomMacro),
         Changequote(ChangequoteMacro),
-        Incr(IncrMacro),
         Decr(DecrMacro),
-        Ifelse(IfelseMacro),
-        Ifdef(IfdefMacro),
-        Shift(ShiftMacro),
-        Eval(EvalMacro),
-        Len(LenMacro),
-        Index(IndexMacro),
-        Translit(TranslitMacro),
-        Substr(SubstrMacro),
-        // Dumpdef(DumpdefMacro),
-        // Maketemp(MkstempMacro),
-        // Mkstemp(MkstempMacro),
-        // M4exit(M4exitMacro),
-        // M4wrap(M4wrapMacro),
-        // Syscmd(SyscmdMacro),
-        // Sysval(SysvalMacro),
+        Define(DefineMacro),
+        Defn(DefnMacro),
         Divert(DivertMacro),
         Divnum(DivnumMacro),
+        Dnl(DnlMacro),
+        Dumpdef(DumpdefMacro),
+        Errprint(ErrprintMacro),
+        Eval(EvalMacro),
+        File(FileMacro),
+        Ifdef(IfdefMacro),
+        Ifelse(IfelseMacro),
+        Include(IncludeMacro),
+        Incr(IncrMacro),
+        Index(IndexMacro),
+        Len(LenMacro),
+        M4exit(M4exitMacro),
+        M4wrap(M4wrapMacro),
+        Maketemp(MkstempMacro),
+        Mkstemp(MkstempMacro),
+        Popdef(PopdefMacro),
+        Pushdef(PushdefMacro),
+        Shift(ShiftMacro),
+        Sinclude(SincludeMacro),
+        Substr(SubstrMacro),
+        Syscmd(SyscmdMacro),
+        Sysval(SysvalMacro),
+        Translit(TranslitMacro),
+        Undefine(UndefineMacro),
         Undivert(UndivertMacro),
-        // File(FileMacro),
     }
 );
 // TODO: implement these macros:
@@ -584,38 +575,38 @@ impl AsRef<[u8]> for BuiltinMacro {
     fn as_ref(&self) -> &'static [u8] {
         use BuiltinMacro::*;
         match self {
-            Dnl => b"dnl",
-            Define => b"define",
-            Undefine => b"undefine",
-            Defn => b"defn",
-            Pushdef => b"pushdef",
-            Popdef => b"popdef",
-            Errprint => b"errprint",
-            Include => b"include",
-            Sinclude => b"sinclude",
             Changecom => b"changecom",
             Changequote => b"changequote",
-            Incr => b"incr",
             Decr => b"decr",
-            Ifelse => b"ifelse",
-            Ifdef => b"ifdef",
-            Shift => b"shift",
-            Eval => b"eval",
-            Len => b"len",
-            Index => b"index",
-            Translit => b"translit",
-            Substr => b"substr",
-            // Dumpdef => b"dumpdef",
-            // Mkstemp => b"mkstemp",
-            // Maketemp => b"maketemp",
-            // M4exit => b"m4exit",
-            // M4wrap => b"m4wrap",
-            // Syscmd => b"syscmd",
-            // Sysval => b"sysval",
+            Define => b"define",
+            Defn => b"defn",
             Divert => b"divert",
             Divnum => b"divnum",
+            Dnl => b"dnl",
+            Dumpdef => b"dumpdef",
+            Errprint => b"errprint",
+            Eval => b"eval",
+            File => b"__file__",
+            Ifdef => b"ifdef",
+            Ifelse => b"ifelse",
+            Include => b"include",
+            Incr => b"incr",
+            Index => b"index",
+            Len => b"len",
+            M4exit => b"m4exit",
+            M4wrap => b"m4wrap",
+            Maketemp => b"maketemp",
+            Mkstemp => b"mkstemp",
+            Popdef => b"popdef",
+            Pushdef => b"pushdef",
+            Shift => b"shift",
+            Sinclude => b"sinclude",
+            Substr => b"substr",
+            Syscmd => b"syscmd",
+            Sysval => b"sysval",
+            Translit => b"translit",
+            Undefine => b"undefine",
             Undivert => b"undivert",
-            // File => b"__file__",
         }
     }
 }
@@ -651,17 +642,17 @@ impl BuiltinMacro {
             Index => 1,
             Translit => 1,
             Substr => 1,
-            // Dumpdef => 1,
-            // Mkstemp => 1,
-            // Maketemp => 1,
-            // M4exit => 0,
-            // M4wrap => 1,
-            // Syscmd => 1,
-            // Sysval => 0,
+            Dumpdef => 1,
+            Mkstemp => 1,
+            Maketemp => 1,
+            M4exit => 0,
+            M4wrap => 1,
+            Syscmd => 1,
+            Sysval => 0,
             Divert => 0,
             Divnum => 0,
             Undivert => 0,
-            // File => 0,
+            File => 0,
         }
     }
 
@@ -1026,13 +1017,13 @@ impl IncludeMacro {
         mut state: State,
         _stderr: &mut dyn Write,
     ) -> crate::error::Result<State> {
-        let f = std::fs::File::open(&path)
+        let file = std::fs::File::open(&path)
             .map_err(crate::Error::from)
             .add_context(|| format!("Error opening file {path:?}"))?;
-        state.input.input.push(Input::new(
-            InputRead::File(f),
-            path.to_string_lossy().to_string(),
-        ));
+        state
+            .input
+            .input
+            .push(Input::new(InputRead::File { file, path }));
         Ok(state)
     }
 }
@@ -1551,286 +1542,260 @@ impl MacroImplementation for SubstrMacro {
     }
 }
 
-// /// The dumpdef macro shall write the defined text to standard error for each of the macros
-// /// specified as arguments, or, if no arguments are specified, for all macros.
-// struct DumpdefMacro;
+/// The dumpdef macro shall write the defined text to standard error for each of the macros
+/// specified as arguments, or, if no arguments are specified, for all macros.
+struct DumpdefMacro;
 
-// impl MacroImplementation for DumpdefMacro {
-//     fn evaluate(
-//         &self,
-//         mut state: State,
-//         _stdout: &mut dyn Write,
-//         stderr: &mut dyn Write,
-//         m: Macro,
-//     ) -> Result<State> {
-//         let dumpdef = |stderr: &mut dyn Write, n: &MacroName, d: &MacroDefinition| {
-//             write!(stderr, "{n}:\t")?;
-//             match &d.implementation {
-//                 MacroDefinitionImplementation::UserDefined(user_defined) => {
-//                     stderr.write_all(&user_defined.definition)?;
-//                 }
-//                 _ => {
-//                     stderr.write_all(b"<")?;
-//                     stderr.write_all(&n.0)?;
-//                     stderr.write_all(b">")?;
-//                 }
-//             }
-//             Result::Ok(())
-//         };
-//         if m.args.is_empty() {
-//             for (name, definitions) in state.macro_definitions.iter() {
-//                 dumpdef(
-//                     stderr,
-//                     &name,
-//                     definitions
-//                         .last()
-//                         .expect(AT_LEAST_ONE_MACRO_DEFINITION_EXPECT),
-//                 )?;
-//                 stderr.write_all(b"\n")?;
-//             }
-//         }
+impl MacroImplementation for DumpdefMacro {
+    fn evaluate(&self, state: State, stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
+        let dumpdef = |stderr: &mut dyn Write, n: &MacroName, d: &MacroDefinition| {
+            write!(stderr, "{n}:\t")?;
+            match &d.implementation {
+                MacroDefinitionImplementation::UserDefined(user_defined) => {
+                    stderr.write_all(&user_defined.definition)?;
+                }
+                _ => {
+                    stderr.write_all(b"<")?;
+                    stderr.write_all(&n.0)?;
+                    stderr.write_all(b">")?;
+                }
+            }
+            Result::Ok(())
+        };
+        if frame.args.is_empty() {
+            for (name, definitions) in state.macro_definitions.iter() {
+                dumpdef(
+                    stderr,
+                    &name,
+                    definitions
+                        .last()
+                        .expect(AT_LEAST_ONE_MACRO_DEFINITION_EXPECT),
+                )?;
+                stderr.write_all(b"\n")?;
+            }
+        }
 
-//         for arg in m.args.into_iter() {
-//             let arg_text;
-//             (arg_text, state) = evaluate_to_buffer(state, arg.input, stderr, true)?;
-//             let name = MacroName::try_from_slice(&arg_text)?;
-//             match state.macro_definitions.get(&name) {
-//                 Some(definition) => dumpdef(
-//                     stderr,
-//                     &name,
-//                     definition
-//                         .last()
-//                         .expect(AT_LEAST_ONE_MACRO_DEFINITION_EXPECT),
-//                 )?,
-//                 None => write!(stderr, "undefined macro {name}")?,
-//             }
-//             stderr.write_all(b"\n")?;
-//         }
+        for arg in frame.args.into_iter() {
+            let name = MacroName::try_from_slice(&arg)?;
+            match state.macro_definitions.get(&name) {
+                Some(definition) => dumpdef(
+                    stderr,
+                    &name,
+                    definition
+                        .last()
+                        .expect(AT_LEAST_ONE_MACRO_DEFINITION_EXPECT),
+                )?,
+                None => write!(stderr, "undefined macro {name}")?,
+            }
+            stderr.write_all(b"\n")?;
+        }
 
-//         Ok(state)
-//     }
-// }
+        Ok(state)
+    }
+}
 
-// /// The defining text shall be as if it were the resulting pathname after a successful call to the
-// /// [`mkstemp()`](https://pubs.opengroup.org/onlinepubs/9699919799/functions/mkstemp.html) function
-// /// defined in the System Interfaces volume of POSIX.1-2017 called with the first argument to the
-// /// macro invocation. If a file is created, that file shall be closed. If a file could not be
-// /// created, the m4 utility shall write a diagnostic message to standard error and shall continue
-// /// processing input but its final exit status shall be non-zero; the defining text of the macro
-// /// shall be the empty string. The behavior is unspecified if mkstemp is not immediately followed by
-// /// a `<left-parenthesis>`.
-// struct MkstempMacro;
+/// The defining text shall be as if it were the resulting pathname after a successful call to the
+/// [`mkstemp()`](https://pubs.opengroup.org/onlinepubs/9699919799/functions/mkstemp.html) function
+/// defined in the System Interfaces volume of POSIX.1-2017 called with the first argument to the
+/// macro invocation. If a file is created, that file shall be closed. If a file could not be
+/// created, the m4 utility shall write a diagnostic message to standard error and shall continue
+/// processing input but its final exit status shall be non-zero; the defining text of the macro
+/// shall be the empty string. The behavior is unspecified if mkstemp is not immediately followed by
+/// a `<left-parenthesis>`.
+struct MkstempMacro;
 
-// /// The mkstemp() function shall replace the contents of the `template` by a unique filename which
-// /// is returned. The string in template should look like a filename with six trailing 'X' s;
-// /// mkstemp() replaces each 'X' with a character from the portable filename character set. The
-// /// characters are chosen such that the resulting name does not duplicate the name of an existing
-// /// file at the time of a call to mkstemp().
-// fn mkstemp(mut template: Vec<u8>) -> Result<Vec<u8>> {
-//     if template.len() < 6 {
-//         return Err(crate::Error::new(crate::ErrorKind::Io).with_source(std::io::Error::new(
-//             std::io::ErrorKind::Other,
-//             format!("Unable to create temporary file, template should be greater than 6 characters long. template: {:?}", String::from_utf8_lossy(&template))
-//         )));
-//     }
-//     if &template[(template.len() - 6)..] != b"XXXXXX" {
-//         return Err(crate::Error::new(crate::ErrorKind::Io).with_source(std::io::Error::new(
-//             std::io::ErrorKind::Other,
-//             format!("Unable to create temporary file, template does not finish with six trailing 'X's. template: {:?}", String::from_utf8_lossy(&template))
-//         )));
-//     }
-//     let template_pointer = template.as_mut_ptr();
-//     // TODO: review safety and add proper comment.
-//     let file_descriptor = unsafe {
-//         // Docs: https://pubs.opengroup.org/onlinepubs/009604499/functions/mkstemp.html
-//         libc::mkstemp(template_pointer as *mut i8)
-//     };
-//     if file_descriptor < 0 {
-//         let e = errno::errno();
-//         return Err(
-//             crate::Error::new(crate::ErrorKind::Io).with_source(std::io::Error::new(
-//                 std::io::ErrorKind::Other,
-//                 format!(
-//                     "Unable to create temporary file. template: {:?}, Error {}: {}",
-//                     String::from_utf8_lossy(&template),
-//                     e.0,
-//                     e
-//                 ),
-//             )),
-//         );
-//     }
-//     // TODO: review safety and add proper comment.
-//     let result = unsafe { libc::close(file_descriptor) };
-//     if result < 0 {
-//         let e = errno::errno();
-//         return Err(
-//             crate::Error::new(crate::ErrorKind::Io).with_source(std::io::Error::new(
-//                 std::io::ErrorKind::Other,
-//                 format!(
-//                     "Unable to close temporary file. template: {:?}, Error {}: {}",
-//                     String::from_utf8_lossy(&template),
-//                     e.0,
-//                     e
-//                 ),
-//             )),
-//         );
-//     }
-//     Ok(template)
-// }
+/// The mkstemp() function shall replace the contents of the `template` by a unique filename which
+/// is returned. The string in template should look like a filename with six trailing 'X' s;
+/// mkstemp() replaces each 'X' with a character from the portable filename character set. The
+/// characters are chosen such that the resulting name does not duplicate the name of an existing
+/// file at the time of a call to mkstemp().
+fn mkstemp(mut template: Vec<u8>) -> Result<Vec<u8>> {
+    if template.len() < 6 {
+        return Err(crate::Error::new(crate::ErrorKind::Io).with_source(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Unable to create temporary file, template should be greater than 6 characters long. template: {:?}", String::from_utf8_lossy(&template))
+        )));
+    }
+    if &template[(template.len() - 6)..] != b"XXXXXX" {
+        return Err(crate::Error::new(crate::ErrorKind::Io).with_source(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Unable to create temporary file, template does not finish with six trailing 'X's. template: {:?}", String::from_utf8_lossy(&template))
+        )));
+    }
+    let template_pointer = template.as_mut_ptr();
+    // TODO: review safety and add proper comment.
+    let file_descriptor = unsafe {
+        // Docs: https://pubs.opengroup.org/onlinepubs/009604499/functions/mkstemp.html
+        libc::mkstemp(template_pointer as *mut i8)
+    };
+    if file_descriptor < 0 {
+        let e = errno::errno();
+        return Err(
+            crate::Error::new(crate::ErrorKind::Io).with_source(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "Unable to create temporary file. template: {:?}, Error {}: {}",
+                    String::from_utf8_lossy(&template),
+                    e.0,
+                    e
+                ),
+            )),
+        );
+    }
+    // TODO: review safety and add proper comment.
+    let result = unsafe { libc::close(file_descriptor) };
+    if result < 0 {
+        let e = errno::errno();
+        return Err(
+            crate::Error::new(crate::ErrorKind::Io).with_source(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "Unable to close temporary file. template: {:?}, Error {}: {}",
+                    String::from_utf8_lossy(&template),
+                    e.0,
+                    e
+                ),
+            )),
+        );
+    }
+    Ok(template)
+}
 
-// impl MacroImplementation for MkstempMacro {
-//     fn evaluate(
-//         &self,
-//         mut state: State,
-//         stdout: &mut dyn Write,
-//         stderr: &mut dyn Write,
-//         m: Macro,
-//     ) -> Result<State> {
-//         let first_arg = m
-//             .args
-//             .into_iter()
-//             .next()
-//             .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
-//         let buffer;
-//         (buffer, state) = evaluate_to_buffer(state, first_arg.input, stderr, true)?;
-//         match mkstemp(buffer) {
-//             Ok(pathname) => stdout.write_all(&pathname)?,
-//             Err(error) => {
-//                 write!(stderr, "Error evaluating `mkstemp` macro: {}", error)?;
-//                 state.exit_error = true;
-//             }
-//         }
-//         Ok(state)
-//     }
-// }
+impl MacroImplementation for MkstempMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<State> {
+        let first_arg = frame
+            .args
+            .into_iter()
+            .next()
+            .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
+        match mkstemp(first_arg) {
+            Ok(pathname) => state.input.pushback_string(&pathname),
+            Err(error) => {
+                write!(stderr, "Error evaluating `mkstemp` macro: {}", error)?;
+                state.exit_error = true;
+            }
+        }
+        Ok(state)
+    }
+}
 
-// /// Exit from the m4 utility. If the first argument is specified, it shall be the exit code. If no
-// /// argument is specified, the exit code shall be zero. It shall be an error to specify an argument
-// /// containing any non-numeric characters. If the first argument is zero or no argument is
-// /// specified, and an error has previously occurred (for example, a file operand that could not be
-// /// opened), it is unspecified whether the exit status is zero or non-zero.
-// struct M4exitMacro;
+/// Exit from the m4 utility. If the first argument is specified, it shall be the exit code. If no
+/// argument is specified, the exit code shall be zero. It shall be an error to specify an argument
+/// containing any non-numeric characters. If the first argument is zero or no argument is
+/// specified, and an error has previously occurred (for example, a file operand that could not be
+/// opened), it is unspecified whether the exit status is zero or non-zero.
+struct M4exitMacro;
 
-// impl MacroImplementation for M4exitMacro {
-//     fn evaluate(
-//         &self,
-//         mut state: State,
-//         _stdout: &mut dyn Write,
-//         stderr: &mut dyn Write,
-//         m: Macro,
-//     ) -> Result<State> {
-//         if let Some(first_arg) = m.args.into_iter().next() {
-//             let buffer;
-//             (buffer, state) = evaluate_to_buffer(state, first_arg.input, stderr, true)?;
-//             let (_, exit_code) = nom::combinator::all_consuming(parse_index)(&buffer)?;
-//             let exit_code: i32 = i32::try_from(exit_code).map_err(|e| {
-//                 crate::Error::new(crate::ErrorKind::Parsing).add_context(e.to_string())
-//             })?;
-//             if exit_code == 0 && state.exit_error {
-//                 return Err(crate::Error::new(crate::ErrorKind::Exit(1)));
-//             } else {
-//                 return Err(crate::Error::new(crate::ErrorKind::Exit(exit_code)));
-//             }
-//         }
+impl MacroImplementation for M4exitMacro {
+    fn evaluate(&self, state: State, _stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
+        if let Some(first_arg) = frame.args.into_iter().next() {
+            let (_, exit_code) = nom::combinator::all_consuming(parse_index)(&first_arg)?;
+            let exit_code: i32 = i32::try_from(exit_code).map_err(|e| {
+                crate::Error::new(crate::ErrorKind::Parsing).add_context(e.to_string())
+            })?;
+            if exit_code == 0 && state.exit_error {
+                return Err(crate::Error::new(crate::ErrorKind::Exit(1)));
+            } else {
+                return Err(crate::Error::new(crate::ErrorKind::Exit(exit_code)));
+            }
+        }
 
-//         if state.exit_error {
-//             return Err(crate::Error::new(crate::ErrorKind::Exit(1)));
-//         } else {
-//             return Err(crate::Error::new(crate::ErrorKind::Exit(0)));
-//         }
-//     }
-// }
+        if state.exit_error {
+            return Err(crate::Error::new(crate::ErrorKind::Exit(1)));
+        } else {
+            return Err(crate::Error::new(crate::ErrorKind::Exit(0)));
+        }
+    }
+}
 
-// /// The first argument shall be processed when `EOF` is reached. If the `m4wrap` macro is used multiple
-// /// times, the arguments specified shall be processed in the order in which the `m4wrap` macros were
-// /// processed. The behavior is unspecified if `m4wrap` is not immediately followed by a
-// /// `<left-parenthesis>`.
-// struct M4wrapMacro;
+/// The first argument shall be processed when `EOF` is reached. If the `m4wrap` macro is used multiple
+/// times, the arguments specified shall be processed in the order in which the `m4wrap` macros were
+/// processed. The behavior is unspecified if `m4wrap` is not immediately followed by a
+/// `<left-parenthesis>`.
+struct M4wrapMacro;
 
-// impl MacroImplementation for M4wrapMacro {
-//     fn evaluate(
-//         &self,
-//         mut state: State,
-//         _stdout: &mut dyn Write,
-//         stderr: &mut dyn Write,
-//         m: Macro,
-//     ) -> Result<State> {
-//         let first_arg = m
-//             .args
-//             .into_iter()
-//             .next()
-//             .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
-//         let first_arg_text;
-//         (first_arg_text, state) = evaluate_to_buffer(state, first_arg.input, stderr, true)?;
-//         state.m4wrap.push(first_arg_text);
-//         Ok(state)
-//     }
-// }
+impl MacroImplementation for M4wrapMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        _stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<State> {
+        let first_arg = frame
+            .args
+            .into_iter()
+            .next()
+            .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
+        state.m4wrap.push(first_arg);
+        Ok(state)
+    }
+}
 
-// /// The `syscmd` macro shall interpret its first argument as a shell command line. The defining text
-// /// shall be the string result of that command. The string result shall not be rescanned for macros
-// /// while setting the defining text. No output redirection shall be performed by the m4 utility. The
-// /// exit status value from the command can be retrieved using the sysval macro. The behavior is
-// /// unspecified if syscmd is not immediately followed by a `<left-parenthesis>`.
-// struct SyscmdMacro;
+/// The `syscmd` macro shall interpret its first argument as a shell command line. The defining text
+/// shall be the string result of that command. The string result shall not be rescanned for macros
+/// while setting the defining text. No output redirection shall be performed by the m4 utility. The
+/// exit status value from the command can be retrieved using the sysval macro. The behavior is
+/// unspecified if syscmd is not immediately followed by a `<left-parenthesis>`.
+struct SyscmdMacro;
 
-// fn system(command: &[u8]) -> Result<ExitStatus> {
-//     let command = OsStr::from_bytes(command);
-//     // TODO(security): check security of this, for shell injection? It seems to be what the GNU m4
-//     // does in https://github.com/tar-mirror/gnu-m4/blob/master/src/builtin.c#L953
-//     let status = std::process::Command::new("sh")
-//         .arg("-c")
-//         .arg(command)
-//         .status()?;
+fn system(command: &[u8]) -> Result<ExitStatus> {
+    let command = OsStr::from_bytes(command);
+    // TODO(security): check security of this, for shell injection? It seems to be what the GNU m4
+    // does in https://github.com/tar-mirror/gnu-m4/blob/master/src/builtin.c#L953
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .status()?;
 
-//     Ok(status)
-// }
+    Ok(status)
+}
 
-// impl MacroImplementation for SyscmdMacro {
-//     fn evaluate(
-//         &self,
-//         mut state: State,
-//         _stdout: &mut dyn Write,
-//         stderr: &mut dyn Write,
-//         m: Macro,
-//     ) -> Result<State> {
-//         let first_arg = m
-//             .args
-//             .into_iter()
-//             .next()
-//             .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
-//         let first_arg_text;
-//         (first_arg_text, state) = evaluate_to_buffer(state, first_arg.input, stderr, true)?;
-//         let status = system(&first_arg_text)?;
-//         state.last_syscmd_status = Some(status);
-//         Ok(state)
-//     }
-// }
+impl MacroImplementation for SyscmdMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        _stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<State> {
+        let first_arg = frame
+            .args
+            .into_iter()
+            .next()
+            .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
+        let status = system(&first_arg)?;
+        state.last_syscmd_status = Some(status);
+        Ok(state)
+    }
+}
 
-// /// The defining text of the `sysval` macro shall be the exit value of the utility last invoked by the
-// /// [`SyscmdMacro`] (as a string).
-// struct SysvalMacro;
+/// The defining text of the `sysval` macro shall be the exit value of the utility last invoked by the
+/// [`SyscmdMacro`] (as a string).
+struct SysvalMacro;
 
-// impl MacroImplementation for SysvalMacro {
-//     fn evaluate(
-//         &self,
-//         state: State,
-//         stdout: &mut dyn Write,
-//         stderr: &mut dyn Write,
-//         _m: Macro,
-//     ) -> Result<State> {
-//         if let Some(status) = state.last_syscmd_status {
-//             match status.code() {
-//                 Some(code) => write!(stdout, "{code}")?,
-//                 None => write!(
-//                     stderr,
-//                     "Last syscmd exited without exit code (process terminated by signal)"
-//                 )?,
-//             }
-//         }
-//         Ok(state)
-//     }
-// }
+impl MacroImplementation for SysvalMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        stderr: &mut dyn Write,
+        _frame: StackFrame,
+    ) -> Result<State> {
+        if let Some(status) = state.last_syscmd_status {
+            match status.code() {
+                Some(code) => state.input.pushback_string(code.to_string().as_bytes()),
+                None => write!(
+                    stderr,
+                    "Last syscmd exited without exit code (process terminated by signal)"
+                )?,
+            }
+        }
+        Ok(state)
+    }
+}
 
 /// The m4 utility maintains nine temporary buffers, numbered 1 to 9, inclusive. When the last of
 /// the input has been processed, any output that has been placed in these buffers shall be written
@@ -1945,28 +1910,22 @@ impl MacroImplementation for UndivertMacro {
     }
 }
 
-// struct FileMacro;
+struct FileMacro;
 
-// impl MacroImplementation for FileMacro {
-//     fn evaluate(
-//         &self,
-//         state: State,
-//         stdout: &mut dyn Write,
-//         _stderr: &mut dyn Write,
-//         _m: Macro,
-//     ) -> Result<State> {
-//         if state.file.is_empty() {
-//             stdout.write_all(b"stdin")?;
-//         } else {
-//             stdout.write_all(
-//                 state
-//                     .file
-//                     .last()
-//                     .expect("At least one file")
-//                     .as_os_str()
-//                     .as_bytes(),
-//             )?;
-//         }
-//         Ok(state)
-//     }
-// }
+impl MacroImplementation for FileMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        _stderr: &mut dyn Write,
+        _frame: StackFrame,
+    ) -> Result<State> {
+        let input = state.input.input.last().expect("At least one input");
+        match &input.input {
+            InputRead::File { path, .. } => state
+                .input
+                .pushback_string(path.clone().as_os_str().as_bytes()),
+            InputRead::Stdin(_) => state.input.pushback_string(b"stdin"),
+        }
+        Ok(state)
+    }
+}

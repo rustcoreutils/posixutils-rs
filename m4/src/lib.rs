@@ -138,28 +138,23 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
 ) -> crate::error::Result<()> {
     let mut state = State::new(Box::new(stdout), Vec::new());
     if args.files.is_empty() {
-        state.input.input.push(evaluate::Input::new(
-            InputRead::Stdin(std::io::stdin()),
-            "stdin".to_owned(),
-        ))
+        state
+            .input
+            .input
+            .push(evaluate::Input::new(InputRead::Stdin(std::io::stdin())))
     } else {
         for file_path in args.files {
-            state.input.input.push(evaluate::Input::new(
-                InputRead::File(std::fs::File::open(&file_path)?),
-                file_path
-                    .file_name()
-                    .ok_or_else(|| {
-                        Error::new(ErrorKind::Io).add_context(format!(
-                            "file path {file_path:?} doesn't have a file name"
-                        ))
-                    })?
-                    .to_string_lossy()
-                    .to_string(),
-            ));
+            state
+                .input
+                .input
+                .push(evaluate::Input::new(InputRead::File {
+                    file: std::fs::File::open(&file_path)?,
+                    path: file_path,
+                }));
         }
     };
 
-    state = evaluate::process_streaming(state, &mut stderr)?;
+    evaluate::process_streaming(state, &mut stderr)?;
 
     Ok(())
 }

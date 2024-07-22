@@ -108,7 +108,7 @@ impl MacroName {
     /// Parse macro name from a complete slice, not including the EOF byte.
     /// Mostly used for testing, use [`MacroName::parse`] instead for parsing.
     pub fn try_from_slice(input: &[u8]) -> crate::error::Result<Self> {
-        let (_remaining, name) = Self::parse(input)
+        let (_remaining, name) = nom::combinator::all_consuming(Self::parse)(input)
             .map_err(|e| crate::Error::new(crate::ErrorKind::Parsing).add_context(e.to_string()))?;
         Ok(name)
     }

@@ -37,7 +37,12 @@ impl TypedValueParser for MacroNameParser {
     ) -> std::result::Result<Self::Value, clap::Error> {
         let value_bytes = value.as_encoded_bytes();
         MacroName::try_from_slice(value_bytes).map_err(|_error| {
-            clap::Error::new(clap::error::ErrorKind::ValueValidation).with_cmd(cmd)
+            let mut e = clap::Error::new(clap::error::ErrorKind::ValueValidation).with_cmd(cmd);
+            e.insert(
+                clap::error::ContextKind::InvalidValue,
+                clap::error::ContextValue::String(String::from_utf8_lossy(value_bytes).to_string()),
+            );
+            e
         })
     }
 }
@@ -66,9 +71,17 @@ impl TypedValueParser for ArgumentDefineParser {
         // TODO: do we need to support stripping whitespace after or before the `=`
         let mut split = value_bytes.splitn(2, |b| *b == b'=');
         // TODO: use error
-        let name = MacroName::try_from_slice(value_bytes).map_err(|_error| {
-            clap::Error::new(clap::error::ErrorKind::ValueValidation).with_cmd(cmd)
-        })?;
+        let name =
+            MacroName::try_from_slice(&split.next().unwrap_or_default()).map_err(|_error| {
+                let mut e = clap::Error::new(clap::error::ErrorKind::ValueValidation).with_cmd(cmd);
+                e.insert(
+                    clap::error::ContextKind::InvalidValue,
+                    clap::error::ContextValue::String(
+                        String::from_utf8_lossy(value_bytes).to_string(),
+                    ),
+                );
+                e
+            })?;
 
         let value = match split.next() {
             // TODO: perhaps we should use

@@ -13,6 +13,7 @@ mod compiler;
 mod format;
 mod interpreter;
 mod program;
+mod regex;
 
 fn main() {
     let text = r#"

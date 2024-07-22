@@ -1,5 +1,3 @@
-use clap::Parser;
-
 use super::patch_format::PatchFormat;
 
 #[derive(Debug)]

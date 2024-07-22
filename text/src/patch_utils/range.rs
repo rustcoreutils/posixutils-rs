@@ -1,6 +1,10 @@
-use super::{edit_script_range_data::EditScriptHunkKind, patch_format::PatchFormat};
+use super::{
+    edit_script_range_data::EditScriptHunkKind,
+    patch_error::{PatchError, PatchResult},
+    patch_format::PatchFormat,
+};
 
-type RangeResult = Result<Range, RangeError>;
+type RangeResult = PatchResult<Range>;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Range {
@@ -21,31 +25,6 @@ impl Range {
         Self { start, end, kind }
     }
 
-    pub fn try_from_unified(unified_range: &str) -> RangeResult {
-        let range_error = Err(RangeError::InvalidRange);
-        let comma_separated_numbers = unified_range
-            .chars()
-            .filter(|ch| *ch != '+' && *ch != '-')
-            .collect::<String>();
-        let str_numbers = comma_separated_numbers.split(',');
-        let mut numbers = Vec::<usize>::new();
-        let radix = 10;
-
-        for str_number in str_numbers {
-            if let Ok(line_number) = usize::from_str_radix(str_number, radix) {
-                numbers.push(line_number)
-            } else {
-                return range_error;
-            }
-        }
-
-        match numbers.len() {
-            1 => Ok(Range::new(numbers[0], 0, PatchFormat::Unified)),
-            2 => Ok(Range::new(numbers[0], numbers[1], PatchFormat::Unified)),
-            _ => range_error,
-        }
-    }
-
     pub fn start(&self) -> usize {
         self.start
     }
@@ -61,35 +40,43 @@ impl Range {
         }
     }
 
+    pub fn try_from_unified(unified_raw_range: &str) -> RangeResult {
+        let str_numbers = unified_raw_range[1..].split(',').collect::<Vec<&str>>();
+        let mut numbers = Vec::<usize>::new();
+        let radix = 10;
+
+        for str_number in str_numbers {
+            let number = usize::from_str_radix(str_number, radix)?;
+            numbers.push(number);
+        }
+
+        match numbers.len() {
+            1 => Ok(Range::new(numbers[0], 0, PatchFormat::Unified)),
+            2 => Ok(Range::new(numbers[0], numbers[1], PatchFormat::Unified)),
+            _ => Err(PatchError::Error(
+                "Invalid Unified range numbers list length!",
+            )),
+        }
+    }
+
     pub fn try_from_context(line: &str) -> RangeResult {
-        let range_error = Err(RangeError::InvalidRange);
         let splitted = line.split(' ').collect::<Vec<&str>>();
+        let range_numbers = splitted[1].split(',').collect::<Vec<&str>>();
+        let radix = 10;
 
-        match splitted.len() {
-            3 => {
-                let range_numbers = splitted[1].split(',').collect::<Vec<&str>>();
-                let radix = 10;
-                let mut numbers = Vec::<usize>::new();
+        let mut numbers = Vec::<usize>::new();
 
-                if [1usize, 2usize].contains(&range_numbers.len()) {
-                    for str_number in range_numbers {
-                        if let Ok(number) = usize::from_str_radix(str_number, radix) {
-                            numbers.push(number)
-                        } else {
-                            return range_error;
-                        }
-                    }
+        for str_number in range_numbers {
+            let number = usize::from_str_radix(str_number, radix)?;
+            numbers.push(number);
+        }
 
-                    match numbers.len() {
-                        1 => Ok(Range::new(numbers[0], numbers[0], PatchFormat::Context)),
-                        2 => Ok(Range::new(numbers[0], numbers[1], PatchFormat::Context)),
-                        _ => range_error,
-                    }
-                } else {
-                    range_error
-                }
-            }
-            _ => range_error,
+        match numbers.len() {
+            1 => Ok(Range::new(numbers[0], numbers[0], PatchFormat::Context)),
+            2 => Ok(Range::new(numbers[0], numbers[1], PatchFormat::Context)),
+            _ => Err(PatchError::Error(
+                "Invalid Context range numbers list length!",
+            )),
         }
     }
 
@@ -114,45 +101,17 @@ impl Range {
 
         match numeric_strings.len() {
             1 => {
-                let number = numeric_strings[0].parse::<usize>();
-
-                if let Ok(number) = number {
-                    return Ok(Range::new(number, number, PatchFormat::EditScript));
-                }
-
-                let error = number.unwrap_err();
-                Err(RangeError::InvalidRangeWithError(error.to_string()))
+                let number = numeric_strings[0].parse::<usize>()?;
+                return Ok(Range::new(number, number, PatchFormat::EditScript));
             }
             2 => {
-                let number1 = numeric_strings[0].parse::<usize>();
-                let number2 = numeric_strings[1].parse::<usize>();
-
-                if number1.is_ok() && number2.is_ok() {
-                    let (number1, number2) = (number1.unwrap(), number2.unwrap());
-                    return Ok(Range::new(number1, number2, PatchFormat::EditScript));
-                }
-
-                let mut error_data = String::new();
-
-                if let Err(error) = number1 {
-                    error_data.push_str(error.to_string().as_str());
-                    error_data.push('\n');
-                }
-
-                if let Err(error) = number2 {
-                    error_data.push_str(error.to_string().as_str());
-                }
-
-                Err(RangeError::InvalidRangeWithError(error_data))
+                let number1 = numeric_strings[0].parse::<usize>()?;
+                let number2 = numeric_strings[1].parse::<usize>()?;
+                return Ok(Range::new(number1, number2, PatchFormat::EditScript));
             }
-            _ => Err(RangeError::InvalidRange),
+            _ => Err(PatchError::Error(
+                "Invalid ED range numeric string list length!",
+            )),
         }
     }
-}
-
-#[derive(Debug)]
-#[allow(dead_code)]
-pub enum RangeError {
-    InvalidRange,
-    InvalidRangeWithError(String),
 }

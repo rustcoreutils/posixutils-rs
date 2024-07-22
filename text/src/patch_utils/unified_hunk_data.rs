@@ -2,7 +2,9 @@ use core::panic;
 
 use crate::patch_utils::patch_format::PatchFormat;
 
-use super::{functions::verify_patch_line, patch_line::PatchLine, range::Range};
+use super::{
+    functions::verify_patch_line, patch_file::PatchFile, patch_line::PatchLine, range::Range,
+};
 
 #[derive(Debug)]
 pub struct UnifiedHunkData<'a> {
@@ -65,11 +67,7 @@ impl<'a> UnifiedHunkData<'a> {
         }
     }
 
-    pub(crate) fn verify_file(
-        &self,
-        file: &super::patch_file::PatchFile,
-        reversed: bool,
-    ) -> Result<(), ()> {
+    pub(crate) fn verify_file(&self, file: &PatchFile, reversed: bool) -> Result<(), ()> {
         let mut original_file_line = self.f1_range.start();
         let mut modified_file_line = self.f2_range.start();
 

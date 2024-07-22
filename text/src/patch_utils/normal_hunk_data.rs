@@ -66,7 +66,7 @@ impl<'a> NormalHunkData<'a> {
                 for line in self
                     .lines()
                     .iter()
-                    .filter(|&patch_line| matches!(patch_line, PatchLine::NormalNewLine(_)))
+                    .filter(|&patch_line| matches!(patch_line, PatchLine::NormalLineInsert(_)))
                 {
                     if reversed {
                         verify_patch_line(
@@ -80,7 +80,7 @@ impl<'a> NormalHunkData<'a> {
             }
             NormalRangeKind::Change => {
                 for line in self.lines() {
-                    if matches!(line, PatchLine::NormalNewLine(_)) && reversed {
+                    if matches!(line, PatchLine::NormalLineInsert(_)) && reversed {
                         verify_patch_line(
                             line.original_line(),
                             &file.lines()[modified_file_line - 1],
@@ -88,7 +88,7 @@ impl<'a> NormalHunkData<'a> {
                         modified_file_line += 1;
                     }
 
-                    if matches!(line, PatchLine::NormalOldLine(_)) && !reversed {
+                    if matches!(line, PatchLine::NormalLineDelete(_)) && !reversed {
                         verify_patch_line(
                             line.original_line(),
                             &file.lines()[original_file_line - 1],
@@ -101,7 +101,7 @@ impl<'a> NormalHunkData<'a> {
                 for line in self
                     .lines()
                     .iter()
-                    .filter(|&patch_line| matches!(patch_line, PatchLine::NormalOldLine(_)))
+                    .filter(|&patch_line| matches!(patch_line, PatchLine::NormalLineDelete(_)))
                 {
                     if !reversed {
                         verify_patch_line(

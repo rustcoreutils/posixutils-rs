@@ -1,6 +1,8 @@
 use regex::Regex;
 use std::{collections::HashMap, sync::Once};
 
+use crate::patch_utils::patch_unit::PatchUnitKind;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EdRegexKind {
     LineDot,
@@ -13,11 +15,34 @@ pub enum EdRegexKind {
 const INITIALIZE_ED_REGEX_CACHE_ONCE: Once = Once::new();
 static mut ED_REGEX_CACHE: Option<HashMap<EdRegexKind, Regex>> = None;
 
+const ORDERED_KINDS: &[EdRegexKind] = &[
+    EdRegexKind::RangeAdd,
+    EdRegexKind::RangeChange,
+    EdRegexKind::RangeDelete,
+    EdRegexKind::Line,
+    EdRegexKind::LineDot,
+];
+
 pub const ED_FORMAT_DOT_REGEX: &str = r"^\s*\.\s*$";
 pub const ED_FORMAT_RANGE_ADD_REGEX: &str = r"^\s*\d+a\s*$";
 pub const ED_FORMAT_RANGE_CHANGE_REGEX: &str = r"^\s*\d+(,\d+)?c\s*$";
 pub const ED_FORMAT_RANGE_DELETE_REGEX: &str = r"^\s*\d+(,\d+)?d\s*$";
 pub const ED_FORMAT_LINE_REGEX: &str = r"^\s*.*\s*";
+
+pub fn ed_match(line: &str) -> PatchUnitKind {
+    let cache = ed_regex_cache();
+
+    for kind in ORDERED_KINDS {
+        if cache[&kind].is_match(line) {
+            return PatchUnitKind::Ed(*kind);
+        }
+    }
+
+    // TODO: NewLine,
+    // TODO: NoNewLine
+
+    return PatchUnitKind::Unkonw;
+}
 
 pub fn initialize_ed_regex_cache() {
     INITIALIZE_ED_REGEX_CACHE_ONCE.call_once(|| unsafe {

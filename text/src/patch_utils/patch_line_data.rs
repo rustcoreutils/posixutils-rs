@@ -4,17 +4,12 @@ use super::patch_format::PatchFormat;
 #[allow(dead_code)]
 pub struct PatchLineData<'a> {
     line: &'a str,
-    line_in_patch: usize,
     kind: PatchFormat,
 }
 
 impl<'a> PatchLineData<'a> {
-    pub fn new(line: &'a str, line_in_patch: usize, kind: PatchFormat) -> Self {
-        Self {
-            line,
-            line_in_patch,
-            kind,
-        }
+    pub fn new(line: &'a str, kind: PatchFormat) -> Self {
+        Self { line, kind }
     }
 
     pub fn line(&self) -> &str {

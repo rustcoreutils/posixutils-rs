@@ -2,18 +2,16 @@ use super::range::Range;
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-pub struct UnifiedHunkHeaderData {
-    line: String,
-    line_in_patch: usize,
+pub struct UnifiedHunkHeaderData<'a> {
+    line: &'a str,
     f1_range: Range,
     f2_range: Range,
 }
 
-impl UnifiedHunkHeaderData {
-    pub fn new(line: String, line_in_patch: usize, f1_range: Range, f2_range: Range) -> Self {
+impl<'a> UnifiedHunkHeaderData<'a> {
+    pub fn new(line: &'a str, f1_range: Range, f2_range: Range) -> Self {
         Self {
             line,
-            line_in_patch,
             f1_range,
             f2_range,
         }
@@ -28,6 +26,6 @@ impl UnifiedHunkHeaderData {
     }
 
     pub fn line(&self) -> &str {
-        &self.line
+        self.line
     }
 }

@@ -7,15 +7,12 @@ use std::{
 use crate::patch_utils::patch_line::PatchLine;
 
 use super::{
-    constants::context::ORIGINAL_SKIP, context_hunk_data::ContextHunkData,
-    context_hunk_range_data::ContextHunkRangeData, edit_script_hunk_data::EditScriptHunkData,
-    edit_script_range_data::EditScriptHunkKind, functions::print_error, hunk::Hunk, hunks::Hunks,
-    normal_hunk_data::NormalHunkData, patch_file::PatchFile, patch_file_kind::FileKind,
-    patch_format::PatchFormat, patch_line::PatchError, patch_options::PatchOptions,
-    unified_hunk_data::UnifiedHunkData,
+    constants::context::ORIGINAL_SKIP, edit_script_range_data::EditScriptHunkKind,
+    functions::print_error, hunks::Hunks, patch_file::PatchFile, patch_file_kind::FileKind,
+    patch_format::PatchFormat, patch_line::PatchLineError, patch_options::PatchOptions,
 };
 
-pub type PatchResult<T> = Result<T, PatchError>;
+pub type PatchResult<T> = Result<T, PatchLineError>;
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -34,70 +31,45 @@ impl<'a> Patch<'a> {
         patch_file: &'a PatchFile,
         main_file: &'a PatchFile,
         patch_options: PatchOptions,
-    ) -> Result<Self, PatchError> {
-        if matches!(patch_file.kind(), FileKind::Patch)
-            && !matches!(main_file.kind(), FileKind::Patch)
-        {
-            // println!(
-            //     "patching file {}",
-            //     main_file.path().file_name().unwrap().to_str().unwrap()
-            // );
+    ) -> Result<Self, PatchLineError> {
+        todo!()
+        // if matches!(patch_file.kind(), FileKind::Patch)
+        //     && !matches!(main_file.kind(), FileKind::Patch)
+        // {
+        //     let patch_format = patch_options.patch_format;
 
-            let patch_format = if patch_options.patch_format.is(&PatchFormat::None) {
-                // Self::guess_patch_format(patch_file.lines())
-                todo!()
-            } else {
-                patch_options.patch_format
-            };
+        //     let hunks = match &patch_format {
+        //         _ => panic!("you should use other implementations"),
+        //     };
 
-            let hunks = match &patch_format {
-                PatchFormat::None => return Err(PatchError::CouldNotGuessPatchFormat),
-                PatchFormat::Normal => Self::parse_normal_patch(patch_file.lines())?,
-                PatchFormat::Unified => Self::parse_unified_patch(patch_file.lines())?,
-                PatchFormat::Context => Self::parse_context_patch(patch_file.lines())?,
-                PatchFormat::EditScript => Self::parse_ed_patch(patch_file.lines())?,
-            };
+        //     let mut patch_options = patch_options;
+        //     patch_options.patch_format = patch_format;
 
-            let (patch_f1_header, patch_f2_header) = match patch_format {
-                PatchFormat::None => (None, None),
-                PatchFormat::Normal => (None, None),
-                PatchFormat::Unified => {
-                    (Some(&patch_file.lines()[0]), Some(&patch_file.lines()[1]))
-                }
-                PatchFormat::Context => {
-                    (Some(&patch_file.lines()[0]), Some(&patch_file.lines()[1]))
-                }
-                PatchFormat::EditScript => (None, None),
-            };
+        //     let output_file = File::open(main_file.path());
 
-            let mut patch_options = patch_options;
-            patch_options.patch_format = patch_format;
+        //     if output_file.is_err() {
+        //         return Err(PatchLineError::CouldNotOpenPatchDestinationFile);
+        //     }
 
-            let output_file = File::open(main_file.path());
+        //     let output =
+        //         BufWriter::new(output_file.expect("failed to open patch destination file!"));
 
-            if output_file.is_err() {
-                return Err(PatchError::CouldNotOpenPatchDestinationFile);
-            }
+        //     let possible_self = Self {
+        //         patch: patch_file,
+        //         file: main_file,
+        //         hunks,
+        //         patch_f1_header,
+        //         patch_f2_header,
+        //         patch_options,
+        //         output: output,
+        //     };
 
-            let output =
-                BufWriter::new(output_file.expect("failed to open patch destination file!"));
+        //     possible_self.verify();
 
-            let possible_self = Self {
-                patch: patch_file,
-                file: main_file,
-                hunks,
-                patch_f1_header,
-                patch_f2_header,
-                patch_options,
-                output: output,
-            };
+        //     return Ok(possible_self);
+        // }
 
-            possible_self.verify();
-
-            return Ok(possible_self);
-        }
-
-        Err(PatchError::InvalidPatchFile)
+        // Err(PatchLineError::InvalidPatchFile)
     }
 
     /// panics if patch_format is NONE or reversed is enabled with ed script
@@ -116,143 +88,6 @@ impl<'a> Patch<'a> {
                 std::process::exit(0);
             }
         }
-    }
-
-    fn parse_unified_patch(lines: &'a [String]) -> PatchResult<Hunks> {
-        let mut hunks = Hunks::new(PatchFormat::Unified);
-
-        for (i, line) in lines.iter().enumerate().skip(2) {
-            let patch_line = PatchLine::try_from_unified(line, i + 1);
-
-            if let Ok(patch_line) = patch_line {
-                if patch_line.is_unified_hunk_header() {
-                    let hunk_header_data = patch_line.unified_hunk_header_data().unwrap();
-                    hunks.add_hunk(Hunk::new_unified_hunk(UnifiedHunkData::new(
-                        hunk_header_data.f1_range(),
-                        hunk_header_data.f2_range(),
-                        vec![patch_line],
-                    )));
-                } else if hunks.has_no_hunks() {
-                    return Err(PatchError::InvalidPatchLineWithData(
-                        patch_line.line().to_string(),
-                    ));
-                } else {
-                    hunks.add_patch_line(patch_line);
-                }
-            } else if let Err(error) = patch_line {
-                return Err(error);
-            }
-        }
-
-        Ok(hunks)
-    }
-
-    fn parse_context_patch(lines: &'a [String]) -> PatchResult<Hunks> {
-        let mut hunks = Hunks::new(PatchFormat::Context);
-        let mut is_original_line = true;
-
-        for (i, line) in lines.iter().enumerate().skip(2) {
-            let patch_line = PatchLine::try_from_context(line, i + 1, is_original_line);
-
-            if let Ok(patch_line) = patch_line {
-                if patch_line.is_context_hunk_separator() {
-                    hunks.add_hunk(Hunk::new_context_hunk(ContextHunkData::new(
-                        None,
-                        None,
-                        vec![],
-                        vec![],
-                    )));
-
-                    hunks.add_patch_line(patch_line);
-                } else if hunks.has_no_hunks() {
-                    return Err(PatchError::InvalidPatchLineWithData(
-                        patch_line.line().to_string(),
-                    ));
-                } else if patch_line.is_context_range() {
-                    let context_range_data = patch_line.context_hunk_range_data().unwrap();
-                    is_original_line = context_range_data.is_original();
-
-                    hunks.add_patch_line(PatchLine::ContextHunkRange(ContextHunkRangeData::new(
-                        line.to_string(),
-                        context_range_data.line_in_patch(),
-                        context_range_data.range(),
-                        context_range_data.is_original(),
-                    )));
-                } else {
-                    hunks.add_patch_line(patch_line);
-                }
-            } else if let Err(error) = patch_line {
-                return Err(error);
-            }
-        }
-
-        Ok(hunks)
-    }
-
-    fn parse_ed_patch(lines: &'a [String]) -> PatchResult<Hunks<'a>> {
-        let mut hunks = Hunks::new(PatchFormat::EditScript);
-        let mut last_ed_hunk_kind = EditScriptHunkKind::Change;
-
-        for (i, line) in lines.iter().enumerate() {
-            let patch_line = PatchLine::try_from_edit_script(line, i + 1, last_ed_hunk_kind);
-
-            if let Ok(patch_line) = patch_line {
-                if patch_line.is_edit_script_range() {
-                    let edit_script_range_data = patch_line.edit_script_range_data().unwrap();
-                    last_ed_hunk_kind = edit_script_range_data.kind();
-                    let range = edit_script_range_data.range();
-
-                    hunks.add_hunk(Hunk::new_edit_script_hunk(EditScriptHunkData::new(
-                        vec![],
-                        range,
-                        edit_script_range_data.kind(),
-                    )));
-                }
-
-                if hunks.has_no_hunks() {
-                    return Err(PatchError::InvalidEditScriptPatch);
-                }
-
-                hunks.add_patch_line(patch_line);
-            } else if let Err(error) = patch_line {
-                return Err(error);
-            }
-        }
-
-        Ok(hunks)
-    }
-
-    fn parse_normal_patch(lines: &'a [String]) -> PatchResult<Hunks<'a>> {
-        let mut hunks = Hunks::new(PatchFormat::Normal);
-
-        for (i, line) in lines.iter().enumerate() {
-            let patch_line = PatchLine::try_from_normal(line, i + 1);
-
-            if let Ok(patch_line) = patch_line {
-                if patch_line.is_normal_range() {
-                    let normal_range_data = patch_line
-                        .normal_hunk_range_data()
-                        .expect("NormalRangeData can not be None here!");
-
-                    hunks.add_hunk(Hunk::new_normal_hunk(NormalHunkData::new(
-                        normal_range_data.range_left(),
-                        normal_range_data.range_right(),
-                        vec![],
-                        normal_range_data.kind(),
-                    )));
-                }
-
-                if hunks.has_no_hunks() {
-                    panic!("NormalHunk should not be empty at this point.");
-                }
-
-                hunks.add_patch_line(patch_line);
-            } else if let Err(error) = patch_line {
-                return Err(error);
-            }
-        }
-
-        Ok(hunks)
     }
 
     fn apply_unified(&'a mut self) -> PatchResult<()> {
@@ -295,7 +130,7 @@ impl<'a> Patch<'a> {
                         _new_file_line += 1;
                     }
                     PatchLine::NoNewLine(_) => no_new_line_count += 1,
-                    _ => return Err(PatchError::InvalidUnifiedPatchLine),
+                    _ => return Err(PatchLineError::InvalidUnifiedPatchLine),
                 }
             }
         }
@@ -333,7 +168,7 @@ impl<'a> Patch<'a> {
             let f1_range = hunk.context_hunk_data().f1_range();
 
             if f1_range.is_none() || f2_range.is_none() {
-                return Err(PatchError::InvalidContextHunkRange);
+                return Err(PatchLineError::InvalidContextHunkRange);
             }
 
             let range1 = f1_range.unwrap();
@@ -385,7 +220,7 @@ impl<'a> Patch<'a> {
                         no_newline_count += 1;
                     }
                     _ => {
-                        return Err(PatchError::InvalidContextPatchLine);
+                        return Err(PatchLineError::InvalidContextPatchLine);
                     }
                 }
             }
@@ -459,10 +294,10 @@ impl<'a> Patch<'a> {
                         }
                     }
                     PatchLine::NormalChangeSeparator(_) => {}
-                    PatchLine::NormalNewLine(_) => {
+                    PatchLine::NormalLineInsert(_) => {
                         writeln!(self.output, "{}", patch_line.original_line())?;
                     }
-                    PatchLine::NormalOldLine(_) => {}
+                    PatchLine::NormalLineDelete(_) => {}
                     PatchLine::NoNewLine(_) => {
                         no_new_line_count += 1;
                     }
@@ -577,7 +412,7 @@ impl<'a> Patch<'a> {
         self.verify_file(self.patch_options.reversed)
     }
 
-    fn apply_normal_reverse(&mut self) -> Result<(), PatchError> {
+    fn apply_normal_reverse(&mut self) -> Result<(), PatchLineError> {
         self.hunks.modify_hunks(|hunks_mut| {
             hunks_mut.sort_by_key(|hunk| hunk.normal_hunk_data().range_left().start())
         });
@@ -623,8 +458,8 @@ impl<'a> Patch<'a> {
                         }
                     }
                     PatchLine::NormalChangeSeparator(_) => {}
-                    PatchLine::NormalNewLine(_) => {}
-                    PatchLine::NormalOldLine(_) => {
+                    PatchLine::NormalLineInsert(_) => {}
+                    PatchLine::NormalLineDelete(_) => {
                         writeln!(self.output, "{}", patch_line.original_line())?;
                     }
                     PatchLine::NoNewLine(_) => no_new_line_count += 1,
@@ -647,7 +482,7 @@ impl<'a> Patch<'a> {
         Ok(())
     }
 
-    fn apply_unified_reverse(&mut self) -> Result<(), PatchError> {
+    fn apply_unified_reverse(&mut self) -> Result<(), PatchLineError> {
         self.hunks.modify_hunks(|hunks_mut| {
             hunks_mut.sort_by_key(|hunk| hunk.unified_hunk_data().f2_range().end())
         });
@@ -669,7 +504,6 @@ impl<'a> Patch<'a> {
             }
 
             for patch_line in hunk.unified_hunk_data().lines() {
-                // println!("{:?}" , patch_line);
                 match patch_line {
                     PatchLine::UnifiedHunkHeader(_) => {}
                     PatchLine::UnifiedDeleted(_) => {
@@ -683,7 +517,7 @@ impl<'a> Patch<'a> {
                         new_file_line += 1;
                     }
                     PatchLine::NoNewLine(_) => no_new_line_count += 1,
-                    _ => return Err(PatchError::InvalidUnifiedPatchLine),
+                    _ => return Err(PatchLineError::InvalidUnifiedPatchLine),
                 }
             }
         }
@@ -702,7 +536,7 @@ impl<'a> Patch<'a> {
         Ok(())
     }
 
-    fn apply_context_reverse(&mut self) -> Result<(), PatchError> {
+    fn apply_context_reverse(&mut self) -> Result<(), PatchLineError> {
         self.hunks.modify_hunks(|hunks_mut| {
             hunks_mut.sort_by_key(|hunk| {
                 hunk.context_hunk_data()
@@ -720,7 +554,7 @@ impl<'a> Patch<'a> {
             let f1_range = hunk.context_hunk_data().f1_range();
 
             if f1_range.is_none() || f2_range.is_none() {
-                return Err(PatchError::InvalidContextHunkRange);
+                return Err(PatchLineError::InvalidContextHunkRange);
             }
 
             let f2_range = f2_range.unwrap();
@@ -763,7 +597,7 @@ impl<'a> Patch<'a> {
                         no_newline_count += 1;
                     }
                     _ => {
-                        return Err(PatchError::InvalidContextPatchLine);
+                        return Err(PatchLineError::InvalidContextPatchLine);
                     }
                 }
             }
@@ -809,8 +643,8 @@ impl<'a> Patch<'a> {
     }
 }
 
-impl From<io::Error> for PatchError {
+impl From<io::Error> for PatchLineError {
     fn from(value: io::Error) -> Self {
-        PatchError::IOError(value.kind())
+        PatchLineError::IOError(value.kind())
     }
 }

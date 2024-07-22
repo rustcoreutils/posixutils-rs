@@ -1,3 +1,6 @@
+// TODO: Handle no new lines
+// TODO: detects loops!
+// TODO: handle new ed PatchLine variants
 // TODO: Check if patch is in ED or NORMAL format, if yes, output file should be Some(path)
 // TODO: Determine patch kind and read to end of patch, do this again until all patches are extracted and pushed to patch list
 // TODO: if number fo patches is more than 1, then they should be in either Context copied format or unified format, otherwise it is not possible to handle it
@@ -13,20 +16,23 @@ mod patch_utils;
 
 extern crate clap;
 
-use std::io::{self};
+use std::{
+    io::{self},
+    path::PathBuf,
+};
 
 use clap::Parser;
 use patch_utils::{
     constants::{
-        context::{context_regex_cache, initialize_context_regex_cache, ContextRegexKind},
-        ed::{ed_regex_cache, initialize_ed_regex_cache, EdRegexKind},
-        normal::{initialize_normal_regex_cache, normal_regex_cache, NormalRegexKind},
-        unified::{initialize_unified_regex_cache, unified_regex_cache, UnifiedRegexKind},
+        context::initialize_context_regex_cache, ed::initialize_ed_regex_cache,
+        normal::initialize_normal_regex_cache, unified::initialize_unified_regex_cache,
     },
     functions::{file_exists, if_else, print_error},
-    patch_builder::PatchBuilder,
+    patch_file::PatchFile,
+    patch_file_kind::FileKind,
     patch_format::PatchFormat,
     patch_options::PatchOptions,
+    patch_units::PatchUnits,
 };
 
 /// patch - convert original file to modified file and vice versa using result of diff
@@ -165,58 +171,10 @@ impl Args {
 }
 
 fn main() {
-    // test_regex();
-    main_operation().expect("Failed!");
+    patch_operation().expect("Failed!");
 }
 
-fn test_regex() {
-    initialize_normal_regex_cache();
-    initialize_ed_regex_cache();
-    initialize_context_regex_cache();
-    initialize_unified_regex_cache();
-
-    let context_regex_cache = context_regex_cache();
-    let ed_regex_cache = ed_regex_cache();
-    let normal_regex_cache = normal_regex_cache();
-    let unified_regex_cache = unified_regex_cache();
-
-    assert!(unified_regex_cache[&UnifiedRegexKind::RangeHeader].is_match("@@ -3,15 +3,11 @@"));
-    assert!(unified_regex_cache[&UnifiedRegexKind::FirstLine]
-        .is_match("--- file1.txt	2024-06-25 16:48:31.840752300 +0300"));
-    assert!(unified_regex_cache[&UnifiedRegexKind::SecondLine]
-        .is_match("+++ file2.txt	2024-06-25 16:48:46.889122200 +0300"));
-    assert!(unified_regex_cache[&UnifiedRegexKind::RemovedLine].is_match("-line 6 will change"));
-    assert!(unified_regex_cache[&UnifiedRegexKind::InsertedLine].is_match("+line 6 is updated"));
-    assert!(unified_regex_cache[&UnifiedRegexKind::UnchangedLine].is_match(" line 4"));
-
-    assert!(normal_regex_cache[&NormalRegexKind::RangeInsert].is_match("11a11,13"));
-    assert!(normal_regex_cache[&NormalRegexKind::RangeChange].is_match("4c2,3"));
-    assert!(normal_regex_cache[&NormalRegexKind::RangeDelete].is_match("1,2d0"));
-    assert!(normal_regex_cache[&NormalRegexKind::LineInsert]
-        .is_match("> The named is the mother of all things."));
-    assert!(normal_regex_cache[&NormalRegexKind::LineDelete]
-        .is_match("< The Way that can be told of is not the eternal Way;"));
-    assert!(normal_regex_cache[&NormalRegexKind::LineChangeSeparator].is_match("---"));
-
-    assert!(context_regex_cache[&ContextRegexKind::HunkSeparator].is_match("***************"));
-    assert!(context_regex_cache[&ContextRegexKind::OriginalRange].is_match("*** 3,17 ****"));
-    assert!(context_regex_cache[&ContextRegexKind::ModifiedRange].is_match("--- 3,13 ----"));
-    assert!(context_regex_cache[&ContextRegexKind::FirstLine]
-        .is_match("*** file1.txt	2024-06-25 16:48:31.840752300 +0300"));
-    assert!(context_regex_cache[&ContextRegexKind::SecondLine]
-        .is_match("--- file2.txt	2024-06-25 16:48:46.889122200 +0300"));
-    assert!(context_regex_cache[&ContextRegexKind::InsertedLine].is_match("+ line 6 will change"));
-    assert!(context_regex_cache[&ContextRegexKind::DeletedLine].is_match("- line 6 will change"));
-    assert!(context_regex_cache[&ContextRegexKind::ChangedLine].is_match("! line 6 is updated"));
-    assert!(context_regex_cache[&ContextRegexKind::UnchangedLine].is_match("  line 4"));
-
-    assert!(ed_regex_cache[&EdRegexKind::LineDot].is_match("."));
-    assert!(ed_regex_cache[&EdRegexKind::RangeAdd].is_match("11a"));
-    assert!(ed_regex_cache[&EdRegexKind::RangeChange].is_match("12,13c"));
-    assert!(ed_regex_cache[&EdRegexKind::RangeDelete].is_match("9,10d"));
-}
-
-fn main_operation() -> io::Result<()> {
+fn patch_operation<'a>() -> io::Result<()> {
     initialize_normal_regex_cache();
     initialize_ed_regex_cache();
     initialize_context_regex_cache();
@@ -230,7 +188,19 @@ fn main_operation() -> io::Result<()> {
         .try_verify_format_and_output_file()?;
 
     let patch_options: PatchOptions = args.into();
-    let _ = PatchBuilder::from_patch_options(patch_options);
+    let patch_file =
+        PatchFile::load_file(PathBuf::from(&patch_options.patch_path), FileKind::Patch)?;
+
+    let patch = PatchUnits::try_build(&patch_options, &patch_file)?;
+
+    dbg!(&patch);
+
+    match patch {
+        Some(patch_units) => {
+            patch_units.into_hunks()?;
+        }
+        None => {}
+    }
 
     return Ok(());
     // let patch_path = PathBuf::from("patch_normal.diff");

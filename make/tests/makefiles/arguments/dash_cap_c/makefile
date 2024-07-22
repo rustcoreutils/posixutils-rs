@@ -1,0 +1,2 @@
+rule:
+	cat works.txt

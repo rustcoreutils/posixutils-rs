@@ -132,13 +132,15 @@ impl PartialEq for Regex {
     }
 }
 
+/// utility function for writing tests
+#[cfg(test)]
+pub fn regex_from_str(re: &str) -> Regex {
+    Regex::new(CString::new(re).unwrap()).expect("error compiling ere")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    pub fn regex_from_str(re: &str) -> Regex {
-        Regex::new(CString::new(re).unwrap()).expect("error compiling ere")
-    }
 
     #[test]
     fn test_create_regex() {

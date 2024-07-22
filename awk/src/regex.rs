@@ -41,10 +41,47 @@ pub struct Regex {
     regex_string: CString,
 }
 
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct RegexMatch {
     pub start: usize,
     pub end: usize,
+}
+
+pub struct MatchIter<'re> {
+    string: CString,
+    next_start: usize,
+    regex: &'re Regex,
+}
+
+impl Iterator for MatchIter<'_> {
+    type Item = RegexMatch;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next_start >= self.string.as_bytes().len() {
+            return None;
+        }
+        let mut match_range = libc::regmatch_t {
+            rm_so: -1,
+            rm_eo: -1,
+        };
+        let exec_status = unsafe {
+            libc::regexec(
+                ptr::from_ref(&self.regex.raw_regex),
+                self.string.as_ptr().add(self.next_start),
+                1,
+                ptr::from_mut(&mut match_range),
+                0,
+            )
+        };
+        if exec_status == libc::REG_NOMATCH {
+            return None;
+        }
+        let result = RegexMatch {
+            start: self.next_start + match_range.rm_so as usize,
+            end: self.next_start + match_range.rm_eo as usize,
+        };
+        self.next_start += match_range.rm_eo as usize;
+        Some(result)
+    }
 }
 
 impl Regex {
@@ -59,36 +96,11 @@ impl Regex {
         })
     }
 
-    pub fn match_locations(
-        &self,
-        string: CString,
-        match_buffer: &mut Vec<RegexMatch>,
-        max_count: usize,
-    ) {
-        match_buffer.clear();
-        let mut next_start = 0;
-        for _ in 0..max_count {
-            let mut match_range = libc::regmatch_t {
-                rm_so: -1,
-                rm_eo: -1,
-            };
-            let exec_status = unsafe {
-                libc::regexec(
-                    ptr::from_ref(&self.raw_regex),
-                    string.as_ptr().add(next_start),
-                    1,
-                    ptr::from_mut(&mut match_range),
-                    0,
-                )
-            };
-            if exec_status == libc::REG_NOMATCH {
-                break;
-            }
-            match_buffer.push(RegexMatch {
-                start: next_start + match_range.rm_so as usize,
-                end: next_start + match_range.rm_eo as usize,
-            });
-            next_start += match_range.rm_eo as usize;
+    pub fn match_locations(&self, string: CString) -> MatchIter {
+        MatchIter {
+            next_start: 0,
+            regex: self,
+            string,
         }
     }
 
@@ -156,19 +168,11 @@ mod tests {
     #[test]
     fn test_regex_match_locations() {
         let ere = regex_from_str("match");
-        let mut match_buffer = Vec::new();
-        ere.match_locations(
-            CString::new("match 12345 match2 matchmatch").unwrap(),
-            &mut match_buffer,
-            4,
-        );
-        assert_eq!(match_buffer[0].start, 0);
-        assert_eq!(match_buffer[0].end, 5);
-        assert_eq!(match_buffer[1].start, 12);
-        assert_eq!(match_buffer[1].end, 17);
-        assert_eq!(match_buffer[2].start, 19);
-        assert_eq!(match_buffer[2].end, 24);
-        assert_eq!(match_buffer[3].start, 24);
-        assert_eq!(match_buffer[3].end, 29);
+        let mut iter = ere.match_locations(CString::new("match 12345 match2 matchmatch").unwrap());
+        assert_eq!(iter.next(), Some(RegexMatch { start: 0, end: 5 }));
+        assert_eq!(iter.next(), Some(RegexMatch { start: 12, end: 17 }));
+        assert_eq!(iter.next(), Some(RegexMatch { start: 19, end: 24 }));
+        assert_eq!(iter.next(), Some(RegexMatch { start: 24, end: 29 }));
+        assert_eq!(iter.next(), None);
     }
 }

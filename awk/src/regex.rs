@@ -38,6 +38,7 @@ fn regex_compilation_result(
 
 pub struct Regex {
     raw_regex: libc::regex_t,
+    regex_string: CString,
 }
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -52,7 +53,10 @@ impl Regex {
         let compilation_status =
             unsafe { libc::regcomp(ptr::from_mut(&mut raw), regex.as_ptr(), libc::REG_EXTENDED) };
         regex_compilation_result(compilation_status, &raw)?;
-        Ok(Self { raw_regex: raw })
+        Ok(Self {
+            raw_regex: raw,
+            regex_string: regex,
+        })
     }
 
     pub fn match_locations(
@@ -100,6 +104,12 @@ impl Regex {
         };
         exec_status != libc::REG_NOMATCH
     }
+
+    pub fn str(&self) -> &str {
+        self.regex_string
+            .to_str()
+            .expect("regex string contains invalid utf8")
+    }
 }
 
 impl Drop for Regex {
@@ -112,13 +122,13 @@ impl Drop for Regex {
 
 impl fmt::Debug for Regex {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        writeln!(f, "<compiled regex>")
+        writeln!(f, "/{}/", self.regex_string.to_str().unwrap())
     }
 }
 
 impl PartialEq for Regex {
-    fn eq(&self, _: &Self) -> bool {
-        false
+    fn eq(&self, other: &Self) -> bool {
+        self.regex_string == other.regex_string
     }
 }
 

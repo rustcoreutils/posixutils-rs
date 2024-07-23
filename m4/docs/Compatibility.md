@@ -53,7 +53,7 @@ GNU m4 specific builtin macros likely to be necessary (there are probably more) 
 
 ## [`sendmail`](https://www.proofpoint.com/us/products/email-protection/open-source-email-solution)
 
-TODO
+- [x] Checked generating default configuration.
 
 ### Notes
 

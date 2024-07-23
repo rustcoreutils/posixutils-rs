@@ -81,7 +81,7 @@ where
 /// ```
 pub fn parse_and_evaluate(input: &[u8]) -> IResult<&[u8], i64> {
     if input.is_empty() {
-        // TODO: return a nice error
+        return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::NonEmpty)));
     }
     precedence::precedence(
         // Unary prefix operators

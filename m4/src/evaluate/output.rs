@@ -122,7 +122,6 @@ impl Output {
             log::warn!("Skipping recursive divert");
             return Ok(());
         }
-        // TODO: not really sure if this should alter the buffer number?
         let buffer = self.divert_buffers[buffer_number.index()].clone();
         let mut buffer = buffer.borrow_mut();
         buffer.0.rewind()?;
@@ -216,6 +215,5 @@ impl Write for Output {
     }
 }
 
-/// TODO: This is a little wild west in terms of panic occurance and usability
 #[derive(Default, Clone)]
 pub(crate) struct DivertableBuffer(std::io::Cursor<Vec<u8>>);

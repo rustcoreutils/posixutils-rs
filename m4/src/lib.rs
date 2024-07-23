@@ -20,9 +20,7 @@ pub struct ArgumentDefine {
 impl ArgumentDefine {
     pub fn parse(value: &OsStr) -> std::result::Result<Self, clap::Error> {
         let value_bytes = value.as_encoded_bytes();
-        // TODO: do we need to support stripping whitespace after or before the `=`
         let mut split = value_bytes.splitn(2, |b| *b == b'=');
-        // TODO: use error
         let name =
             MacroName::try_from_slice(split.next().unwrap_or_default()).map_err(|_error| {
                 let mut e = clap::Error::new(clap::error::ErrorKind::ValueValidation);
@@ -36,7 +34,7 @@ impl ArgumentDefine {
             })?;
 
         let value = match split.next() {
-            // TODO: perhaps we should use
+            // TODO(performance): perhaps we should use
             // https://doc.rust-lang.org/std/ffi/struct.OsStr.html#method.from_encoded_bytes_unchecked
             // instead?
             Some(value) => value.to_vec(),

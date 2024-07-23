@@ -415,7 +415,7 @@ pub(crate) fn process_streaming(
 ) -> crate::error::Result<State> {
     let mut token: Vec<u8> = Vec::new();
 
-    // TODO: rename these to something sensible.
+    // TODO(style): rename these to something sensible.
     let mut l: u8 = 0;
     let mut t: u8;
 
@@ -595,7 +595,7 @@ pub(crate) fn process_streaming(
                         'comment: loop {
                             t = state.input.get_next_character()?;
                             if t == EOF {
-                                // TODO: should this break the main loop instead? What happens with multiple inputs?
+                                // TODO: What happens with multiple inputs?
                                 break 'comment;
                             }
                             if state
@@ -615,7 +615,6 @@ pub(crate) fn process_streaming(
                 }
             }
         }
-        // TODO
     }
 
     state.output.output.divert(0)?;
@@ -843,7 +842,6 @@ impl BuiltinMacro {
 
 pub(crate) struct MacroDefinition {
     pub parse_config: MacroParseConfig,
-    // TODO: improve performance with enum dispatch
     implementation: MacroDefinitionImplementation,
 }
 
@@ -1088,7 +1086,7 @@ impl MacroImplementation for UserDefinedMacro {
                         state.input.pushback_character(b'$');
                     }
                 }
-                // TODO: this might be able to skip an iteration with i==1?
+                // TODO(performance): this might be able to skip an iteration with i==1?
                 if i == 0 {
                     break;
                 }
@@ -1314,12 +1312,12 @@ impl MacroImplementation for ChangequoteMacro {
                 let close_tag = args.next().expect("2 arguments should be present");
                 // The behavior is unspecified if there is a single argument or either argument is null.
                 if !open_tag.is_empty() && !close_tag.is_empty() {
-                    // TODO: it looks like GNU m4 only allows quote strings using non-alphanumeric
+                    // It looks like GNU m4 only allows quote strings using non-alphanumeric
                     // characters. The spec I'm following doesn't mention anything about that.
                     state.parse_config.quote_open_tag = open_tag;
                     state.parse_config.quote_close_tag = close_tag;
                 }
-            } //TODO what about when there are more arguments? Add integration test for this.
+            }
         }
 
         Ok(state)
@@ -1570,7 +1568,7 @@ impl MacroImplementation for IndexMacro {
 /// unspecified if translit is not immediately followed by a `<left-parenthesis>`.
 struct TranslitMacro;
 
-// TODO: support utf8 characters properly
+// TODO(utf8): support utf8 multibyte characters properly
 impl MacroImplementation for TranslitMacro {
     fn evaluate(&self, state: State, stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
         let mut args = frame.args.into_iter();
@@ -1742,7 +1740,7 @@ fn mkstemp(mut template: Vec<u8>) -> Result<Vec<u8>> {
         )));
     }
     let template_pointer = template.as_mut_ptr();
-    // TODO: review safety and add proper comment.
+    // SAFETY: According to https://man7.org/linux/man-pages/man3/mkstemp.3.html it seems like this is correct.
     let file_descriptor = unsafe {
         // Docs: https://pubs.opengroup.org/onlinepubs/009604499/functions/mkstemp.html
         libc::mkstemp(template_pointer as *mut i8)
@@ -1761,7 +1759,7 @@ fn mkstemp(mut template: Vec<u8>) -> Result<Vec<u8>> {
             )),
         );
     }
-    // TODO: review safety and add proper comment.
+    // SAFETY: According to https://linux.die.net/man/2/close it seems like this is correct.
     let result = unsafe { libc::close(file_descriptor) };
     if result < 0 {
         let e = errno::errno();
@@ -1969,7 +1967,7 @@ impl MacroImplementation for DivnumMacro {
 /// The behavior is unspecified if an argument contains any non-numeric characters.
 struct UndivertMacro;
 
-// TODO: rewrite to be more performant and remove the need to parse as `str`.
+// TODO(performance): rewrite to be more performant and remove the need to parse as `str`.
 fn parse_index(input: &[u8]) -> IResult<&[u8], usize> {
     log::trace!("parse_index() {}", String::from_utf8_lossy(input));
     let (remaining, found) = nom::bytes::complete::take_while(|c: u8| c.is_ascii_digit())(input)?;

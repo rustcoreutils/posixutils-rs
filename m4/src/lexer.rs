@@ -34,7 +34,7 @@ pub struct MacroParseConfig {
 #[derive(Clone, Debug)]
 #[cfg_attr(test, derive(PartialEq))]
 pub(crate) struct ParseConfig {
-    // TODO: Can probably optimize using something like smallvec
+    // TODO(performance): Can probably optimize using something like smallvec
     pub quote_open_tag: Vec<u8>,
     pub quote_close_tag: Vec<u8>,
     pub comment_open_tag: Vec<u8>,
@@ -59,7 +59,7 @@ impl Default for ParseConfig {
     }
 }
 
-// TODO: small vec optimization could be possible
+// TODO(performance): small vec optimization could be possible
 /// The name of a macro.
 #[derive(PartialEq, Clone, Hash, Eq)]
 pub struct MacroName(pub Vec<u8>);
@@ -129,16 +129,16 @@ impl MacroName {
 }
 
 fn is_word_char_end(c: u8) -> bool {
-    // TODO: check safety!
+    // TODO(safety): check safety!
     (unsafe { libc::isalnum(c.into()) } != 0) || c == b'_'
 }
 
 fn is_word_char_start(c: u8) -> bool {
-    // TODO: check safety!
+    // TODO(safety): check safety!
     (unsafe { libc::isalpha(c.into()) } != 0) || c == b'_'
 }
 
-//TODO: these don't handle multibyte characters!
+//TODO(utf8): these don't handle multibyte characters!
 //
 //It seems like we might want to use https://linux.die.net/man/3/mbrtowc for UTF-8 and any other
 //multibyte encodings. Then https://linux.die.net/man/3/iswblank

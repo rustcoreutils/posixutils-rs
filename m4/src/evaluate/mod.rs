@@ -22,6 +22,29 @@ mod output;
 const AT_LEAST_ONE_MACRO_DEFINITION_EXPECT: &str =
     "There should always be at least one macro definition";
 
+#[derive(Default)]
+pub struct Trace {
+    all: bool,
+    exclude: Vec<MacroName>,
+    include: Vec<MacroName>,
+}
+
+impl Trace {
+    fn trace(
+        &self,
+        stack: &[StackFrame],
+        current_frame: &StackFrame,
+        stderr: &mut dyn Write,
+    ) -> crate::Result<()> {
+        let name = &current_frame.definition.parse_config.name;
+        let level = stack.len() + 1;
+        if (self.all && !self.exclude.contains(name)) || self.include.contains(name) {
+            writeln!(stderr, "m4trace: -{level}- {name}")?;
+        }
+        Ok(())
+    }
+}
+
 pub struct State {
     pub macro_definitions: HashMap<MacroName, Vec<Rc<MacroDefinition>>>,
     pub parse_config: ParseConfig,
@@ -32,6 +55,7 @@ pub struct State {
     pub last_syscmd_status: Option<ExitStatus>,
     pub output: OutputState,
     pub input: InputState,
+    pub trace: Trace,
 }
 
 #[derive(Default)]
@@ -119,6 +143,7 @@ impl Default for State {
             last_syscmd_status: None,
             output: OutputState::default(),
             input: InputState::default(),
+            trace: Trace::default(),
         }
     }
 }
@@ -339,7 +364,6 @@ pub(crate) fn process_streaming(
 
                 let frame = StackFrame::new(0, definition.clone());
 
-                // TODO: check if BSD implemenation really requires PARLEV == 0
                 if l == b'(' {
                     state.output.stack.push(frame);
                 } else {
@@ -508,6 +532,7 @@ macro_rules! macro_enums {
                 stderr: &mut dyn Write,
                 f: StackFrame,
             ) -> Result<State> {
+                state.trace.trace(&state.output.stack, &f, stderr)?;
                 match self {
                     $(Self::$variant_name(d) => d.evaluate(state, stderr, f)),*,
                     Self::UserDefined(d) => d.evaluate(state, stderr, f),
@@ -562,14 +587,13 @@ macro_enums!(
         Substr(SubstrMacro),
         Syscmd(SyscmdMacro),
         Sysval(SysvalMacro),
+        Traceoff(TraceoffMacro),
+        Traceon(TraceonMacro),
         Translit(TranslitMacro),
         Undefine(UndefineMacro),
         Undivert(UndivertMacro),
     }
 );
-// TODO: implement these macros:
-// Traceoff,
-// Traceon,
 
 impl AsRef<[u8]> for BuiltinMacro {
     fn as_ref(&self) -> &'static [u8] {
@@ -604,6 +628,8 @@ impl AsRef<[u8]> for BuiltinMacro {
             Substr => b"substr",
             Syscmd => b"syscmd",
             Sysval => b"sysval",
+            Traceoff => b"traceoff",
+            Traceon => b"traceon",
             Translit => b"translit",
             Undefine => b"undefine",
             Undivert => b"undivert",
@@ -621,38 +647,40 @@ impl BuiltinMacro {
     pub fn min_args(&self) -> usize {
         use BuiltinMacro::*;
         match self {
-            Dnl => 0,
-            Define => 1,
-            Undefine => 1,
-            Defn => 1,
-            Pushdef => 1,
-            Popdef => 1,
-            Errprint => 1,
-            Include => 1,
-            Sinclude => 1,
             Changecom => 0,
             Changequote => 0,
-            Incr => 1,
             Decr => 1,
-            Ifelse => 1,
-            Ifdef => 1,
-            Shift => 1,
-            Eval => 1,
-            Len => 1,
-            Index => 1,
-            Translit => 1,
-            Substr => 1,
-            Dumpdef => 1,
-            Mkstemp => 1,
-            Maketemp => 1,
-            M4exit => 0,
-            M4wrap => 1,
-            Syscmd => 1,
-            Sysval => 0,
+            Define => 1,
+            Defn => 1,
             Divert => 0,
             Divnum => 0,
-            Undivert => 0,
+            Dnl => 0,
+            Dumpdef => 1,
+            Errprint => 1,
+            Eval => 1,
             File => 0,
+            Ifdef => 1,
+            Ifelse => 1,
+            Include => 1,
+            Incr => 1,
+            Index => 1,
+            Len => 1,
+            M4exit => 0,
+            M4wrap => 1,
+            Maketemp => 1,
+            Mkstemp => 1,
+            Popdef => 1,
+            Pushdef => 1,
+            Shift => 1,
+            Sinclude => 1,
+            Substr => 1,
+            Syscmd => 1,
+            Sysval => 0,
+            Traceoff => 0,
+            Traceon => 0,
+            Translit => 1,
+            Undefine => 1,
+            Undivert => 0,
         }
     }
 
@@ -1930,6 +1958,52 @@ impl MacroImplementation for FileMacro {
                 .input
                 .pushback_string(path.clone().as_os_str().as_bytes()),
             InputRead::Stdin(_) => state.input.pushback_string(b"stdin"),
+        }
+        Ok(state)
+    }
+}
+
+struct TraceoffMacro;
+
+impl MacroImplementation for TraceoffMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        _stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<State> {
+        if frame.args.is_empty() {
+            state.trace = Trace::default();
+        } else {
+            for arg in frame.args {
+                let exclude = MacroName::try_from_slice(&arg)?;
+                state.trace.include.retain(|include| include != &exclude);
+                state.trace.exclude.push(exclude);
+            }
+        }
+
+        Ok(state)
+    }
+}
+
+struct TraceonMacro;
+
+impl MacroImplementation for TraceonMacro {
+    fn evaluate(
+        &self,
+        mut state: State,
+        _stderr: &mut dyn Write,
+        frame: StackFrame,
+    ) -> Result<State> {
+        if frame.args.is_empty() {
+            state.trace.all = true;
+            state.trace.exclude.clear();
+        } else {
+            for arg in frame.args {
+                let include = MacroName::try_from_slice(&arg)?;
+                state.trace.exclude.retain(|exclude| exclude != &include);
+                state.trace.include.push(include);
+            }
         }
         Ok(state)
     }

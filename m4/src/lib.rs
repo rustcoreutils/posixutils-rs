@@ -1,7 +1,7 @@
 use error::{Error, ErrorKind, Result};
 use evaluate::{InputRead, MacroDefinition, State};
 use lexer::MacroName;
-use std::{ffi::OsStr, io::Write, path::PathBuf, rc::Rc};
+use std::{cell::RefCell, ffi::OsStr, io::Write, path::PathBuf, rc::Rc};
 
 pub mod error;
 mod eval_macro;
@@ -72,7 +72,11 @@ pub struct Args {
 impl Args {
     pub fn parse() -> Self {
         let matches = clap::command!()
-            .arg(clap::Arg::new("line_synchronization").short('s').action(clap::ArgAction::SetTrue))
+            .arg(
+                clap::Arg::new("line_synchronization")
+                    .short('s')
+                    .action(clap::ArgAction::SetTrue),
+            )
             .arg(
                 clap::Arg::new("define")
                     .short('D')
@@ -146,19 +150,22 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
     mut stderr: STDERR,
     args: Args,
 ) -> crate::error::Result<()> {
-    let mut state = State::new(Box::new(stdout), Vec::new(), args.line_synchronization);
+    let stdout = Rc::new(RefCell::new(stdout));
+    let mut state = State::try_new(stdout.clone(), Vec::new(), args.line_synchronization)?;
     if args.files.is_empty() {
-        state
-            .input
-            .input_push(evaluate::Input::new(InputRead::Stdin(std::io::stdin())))
+        state.input.input_push(
+            evaluate::Input::new(InputRead::Stdin(std::io::stdin())),
+            &mut *stdout.borrow_mut(),
+        )?;
     } else {
         for file_path in args.files {
-            state
-                .input
-                .input_push(evaluate::Input::new(InputRead::File {
+            state.input.input_push(
+                evaluate::Input::new(InputRead::File {
                     file: std::fs::File::open(&file_path)?,
                     path: file_path,
-                }));
+                }),
+                &mut *stdout.borrow_mut(),
+            )?;
         }
     };
 

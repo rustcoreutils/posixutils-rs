@@ -27,6 +27,10 @@ impl OutputRef {
     pub fn undivert(&mut self, buffer_number: DivertBufferNumber) -> Result<()> {
         self.0.borrow_mut().undivert(buffer_number)
     }
+
+    pub fn stdout(&self) -> Rc<RefCell<dyn Write>> {
+        self.0.borrow().stdout()
+    }
 }
 
 impl Write for OutputRef {
@@ -54,7 +58,7 @@ pub struct Output {
     /// See [`DivertMacro`].
     divert_number: i64,
     /// The real output, usually [`std::io::stdout`].
-    stdout: Box<dyn Write>,
+    stdout: Rc<RefCell<dyn Write>>,
     input: InputStateRef,
 }
 
@@ -63,20 +67,24 @@ impl Default for Output {
         Self {
             divert_buffers: Default::default(),
             divert_number: Default::default(),
-            stdout: Box::new(std::io::stdout()),
+            stdout: Rc::new(RefCell::new(std::io::stdout())),
             input: InputStateRef::default(),
         }
     }
 }
 
 impl Output {
-    pub fn new(stdout: Box<dyn Write>, input: InputStateRef) -> Self {
+    pub fn new(stdout: Rc<RefCell<dyn Write>>, input: InputStateRef) -> Self {
         Self {
             stdout,
             input,
             divert_buffers: Default::default(),
             divert_number: Default::default(),
         }
+    }
+
+    pub fn stdout(&self) -> Rc<RefCell<dyn Write>> {
+        self.stdout.clone()
     }
 
     pub fn into_ref(self) -> OutputRef {
@@ -159,7 +167,7 @@ impl TryFrom<usize> for DivertBufferNumber {
 impl Write for Output {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let output: &mut dyn Write = match self.divert_number {
-            0 => &mut *self.stdout,
+            0 => &mut *self.stdout.borrow_mut(),
             1..=9 => {
                 &mut self.divert_buffers[self
                     .divert_buffer_number()
@@ -174,11 +182,10 @@ impl Write for Output {
 
         if self.input.sync_lines() {
             let mut n = 0;
-            for i in 0..buf.len() {
-                let c = buf[i];
-                n += output.write(&[c])?;
-                if (buf.len() == 1 && c == b'\n') || (i < (buf.len() - 1) && buf[i + 1] == b'\n') {
-                    self.input.emit_syncline(output)?;
+            for c in buf {
+                n += output.write(&[*c])?;
+                if *c == b'\n' {
+                    self.input.emit_syncline(output, true)?;
                 }
             }
             Ok(n)
@@ -189,7 +196,7 @@ impl Write for Output {
 
     fn flush(&mut self) -> std::io::Result<()> {
         match self.divert_number {
-            0 => self.stdout.flush(),
+            0 => self.stdout.borrow_mut().flush(),
             1..=9 => self.divert_buffers[self
                 .divert_buffer_number()
                 .expect("valid divert buffer number")

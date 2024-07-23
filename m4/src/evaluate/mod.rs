@@ -38,7 +38,8 @@ impl Trace {
     ) -> crate::Result<()> {
         let name = &current_frame.definition.parse_config.name;
         let level = stack.len() + 1;
-        if (self.all && !self.exclude.contains(name)) || self.include.contains(name) {
+        if (self.all && !self.exclude.contains(name)) || (!self.all && self.include.contains(name))
+        {
             writeln!(stderr, "m4trace: -{level}- {name}")?;
         }
         Ok(())

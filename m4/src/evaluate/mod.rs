@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -55,7 +56,7 @@ pub struct State {
     pub m4wrap: Vec<Vec<u8>>,
     pub last_syscmd_status: Option<ExitStatus>,
     pub output: OutputState,
-    pub input: InputState,
+    pub input: InputStateRef,
     pub trace: Trace,
 }
 
@@ -92,13 +93,14 @@ impl OutputState {
 }
 
 impl State {
-    pub fn new(stdout: Box<dyn Write>, input: Vec<Input>) -> Self {
+    pub fn new(stdout: Box<dyn Write>, input: Vec<Input>, line_synchronization: bool) -> Self {
+        let input = InputStateRef::new(InputState { input, line_synchronization });
         Self {
             output: OutputState {
-                output: Output::new(stdout).into_ref(),
+                output: Output::new(stdout, input.clone()).into_ref(),
                 ..OutputState::default()
             },
-            input: InputState { input },
+            input,
             ..Self::default()
         }
     }
@@ -143,7 +145,7 @@ impl Default for State {
             m4wrap: Vec::new(),
             last_syscmd_status: None,
             output: OutputState::default(),
-            input: InputState::default(),
+            input: InputStateRef::default(),
             trace: Trace::default(),
         }
     }
@@ -167,8 +169,55 @@ impl StackFrame {
 
 #[derive(Default)]
 pub struct InputState {
+    pub line_synchronization: bool,
     pub input: Vec<Input>,
 }
+
+#[derive(Clone, Default)]
+pub struct InputStateRef(Rc<RefCell<InputState>>);
+
+impl InputStateRef {
+    pub fn new(input_state: InputState) -> Self {
+        Self(Rc::new(RefCell::new(input_state)))
+    }
+
+    pub fn input_pop(&self) -> Option<Input> {
+        self.0.borrow_mut().input.pop()
+    }
+
+    pub fn input_push(&self, input: Input) {
+        self.0.borrow_mut().input.push(input)
+    }
+
+    pub fn input_len(&self) -> usize {
+        self.0.borrow().input.len()
+    }
+
+    pub fn get_next_character(&self) -> crate::error::Result<u8> {
+        self.0.borrow_mut().get_next_character()
+    }
+
+    pub fn pushback_character(&self, c: u8) {
+        self.0.borrow_mut().pushback_character(c)
+    }
+
+    pub fn pushback_string(&self, s: &[u8]) {
+        self.0.borrow_mut().pushback_string(s)
+    }
+
+    pub fn look_ahead(&self, c: u8, token: &[u8]) -> crate::error::Result<bool> {
+        self.0.borrow_mut().look_ahead(c, token)
+    }
+
+    fn emit_syncline(&self, output: &mut dyn Write) -> std::io::Result<()> {
+        self.0.borrow_mut().emit_syncline(output)
+    }
+
+    fn sync_lines(&self) -> bool {
+        self.0.borrow().line_synchronization
+    }
+}
+
 
 impl InputState {
     /// Get the next character to be parsed. First it tries to get one from the pushback buffer,
@@ -178,14 +227,7 @@ impl InputState {
         if let Some(c) = input.pushback_buffer.pop() {
             return Ok(c);
         }
-
-        let mut buf: [u8; 1] = [0; 1];
-        let n = input.input.read(&mut buf)?;
-        if n == 0 {
-            Ok(EOF)
-        } else {
-            Ok(buf[0])
-        }
+        Ok(input.get_next_character()?)
     }
 
     pub fn pushback_character(&mut self, c: u8) {
@@ -230,11 +272,17 @@ impl InputState {
 
         Ok(true)
     }
+
+    fn emit_syncline(&mut self, output: &mut dyn Write) -> std::io::Result<()> {
+        self.input.last_mut().expect("at least one input").emit_syncline(output)
+    }
 }
 
 pub struct Input {
-    pub input: InputRead,
+    input: InputRead,
     pub pushback_buffer: Vec<u8>,
+    pub line_number: usize,
+    pub syncline_line_number: usize,
 }
 
 impl Input {
@@ -242,22 +290,55 @@ impl Input {
         Self {
             input,
             pushback_buffer: Vec::new(),
+            line_number: 0,
+            syncline_line_number: 0,
         }
+    }
+
+    fn get_next_character(&mut self) -> std::io::Result<u8> {
+        let mut buf: [u8; 1] = [0; 1];
+        let n = match &mut self.input {
+            InputRead::File { file, .. } => file.read(&mut buf),
+            InputRead::Stdin(s) => s.read(&mut buf),
+        }?;
+
+        if n == 0 {
+            return Ok(EOF);
+        }
+
+        let c = buf[0];
+        
+        if c == b'\n' {
+            self.line_number += 1;
+        }
+
+        Ok(c)
+    }
+
+    fn emit_syncline(&mut self, output: &mut dyn Write) -> std::io::Result<()> {
+        self.syncline_line_number += 1;
+        if self.syncline_line_number == self.line_number {
+            return Ok(())
+        }
+        let name = match &self.input {
+            InputRead::File { path, .. } => path.as_os_str().as_encoded_bytes(),
+            InputRead::Stdin(_) => b"stdin",
+        };
+
+        output.write_all(b"#line ")?;
+        write!(output, "{}", self.line_number)?;
+        output.write_all(b" \"")?;
+        output.write_all(&name)?;
+        output.write_all(b"\"\n")?;
+
+        self.syncline_line_number = self.line_number;
+        Ok(())
     }
 }
 
 pub enum InputRead {
     File { file: std::fs::File, path: PathBuf },
     Stdin(std::io::Stdin),
-}
-
-impl Read for InputRead {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            InputRead::File { file, .. } => file.read(buf),
-            InputRead::Stdin(s) => s.read(buf),
-        }
-    }
 }
 
 /// [`Symbol`] writing output to `writer`, and returns a [`ParseConfig`] which has been modified
@@ -372,13 +453,13 @@ pub(crate) fn process_streaming(
                 }
             }
         } else if t == EOF {
-            if state.input.input.len() == 1 {
+            if state.input.input_len() == 1 {
                 if !state.output.stack.is_empty() {
                     return Err(Error::new(ErrorKind::UnclosedParenthesis));
                 }
                 break 'main_loop;
             }
-            state.input.input.pop();
+            state.input.input_pop();
             continue 'main_loop;
         } else if state.output.stack.is_empty() {
             // not in a macro
@@ -727,7 +808,7 @@ trait MacroImplementation {
 struct DnlMacro;
 
 impl MacroImplementation for DnlMacro {
-    fn evaluate(&self, mut state: State, _stderr: &mut dyn Write, _f: StackFrame) -> Result<State> {
+    fn evaluate(&self, state: State, _stderr: &mut dyn Write, _f: StackFrame) -> Result<State> {
         let mut c: u8;
         loop {
             c = state.input.get_next_character()?;
@@ -880,7 +961,7 @@ pub struct UserDefinedMacro {
 impl MacroImplementation for UserDefinedMacro {
     fn evaluate(
         &self,
-        mut state: State,
+        state: State,
         _stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
@@ -990,7 +1071,7 @@ struct DefnMacro;
 impl MacroImplementation for DefnMacro {
     fn evaluate(
         &self,
-        mut state: State,
+        state: State,
         _stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
@@ -1054,7 +1135,7 @@ impl IncludeMacro {
 
     fn evaluate_impl(
         path: PathBuf,
-        mut state: State,
+        state: State,
         _stderr: &mut dyn Write,
     ) -> crate::error::Result<State> {
         let file = std::fs::File::open(&path)
@@ -1062,8 +1143,7 @@ impl IncludeMacro {
             .add_context(|| format!("Error opening file {path:?}"))?;
         state
             .input
-            .input
-            .push(Input::new(InputRead::File { file, path }));
+            .input_push(Input::new(InputRead::File { file, path }));
         Ok(state)
     }
 }
@@ -1200,7 +1280,7 @@ struct IncrMacro;
 impl MacroImplementation for IncrMacro {
     fn evaluate(
         &self,
-        mut state: State,
+        state: State,
         _stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
@@ -1229,7 +1309,7 @@ struct DecrMacro;
 impl MacroImplementation for DecrMacro {
     fn evaluate(
         &self,
-        mut state: State,
+        state: State,
         _stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
@@ -1267,7 +1347,7 @@ struct IfelseMacro;
 impl MacroImplementation for IfelseMacro {
     fn evaluate(
         &self,
-        mut state: State,
+        state: State,
         stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
@@ -1329,7 +1409,7 @@ struct IfdefMacro;
 impl MacroImplementation for IfdefMacro {
     fn evaluate(
         &self,
-        mut state: State,
+        state: State,
         _stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
@@ -1362,7 +1442,7 @@ struct ShiftMacro;
 impl MacroImplementation for ShiftMacro {
     fn evaluate(
         &self,
-        mut state: State,
+        state: State,
         _stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
@@ -1384,7 +1464,7 @@ struct EvalMacro;
 impl MacroImplementation for EvalMacro {
     fn evaluate(
         &self,
-        mut state: State,
+        state: State,
         _stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
@@ -1409,7 +1489,7 @@ struct LenMacro;
 impl MacroImplementation for LenMacro {
     fn evaluate(
         &self,
-        mut state: State,
+        state: State,
         _stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
@@ -1434,7 +1514,7 @@ struct IndexMacro;
 impl MacroImplementation for IndexMacro {
     fn evaluate(
         &self,
-        mut state: State,
+        state: State,
         stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
@@ -1480,7 +1560,7 @@ struct TranslitMacro;
 impl MacroImplementation for TranslitMacro {
     fn evaluate(
         &self,
-        mut state: State,
+        state: State,
         stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
@@ -1535,7 +1615,7 @@ struct SubstrMacro;
 impl MacroImplementation for SubstrMacro {
     fn evaluate(
         &self,
-        mut state: State,
+        state: State,
         _stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
@@ -1815,7 +1895,7 @@ struct SysvalMacro;
 impl MacroImplementation for SysvalMacro {
     fn evaluate(
         &self,
-        mut state: State,
+        state: State,
         stderr: &mut dyn Write,
         _frame: StackFrame,
     ) -> Result<State> {
@@ -1878,7 +1958,7 @@ struct DivnumMacro;
 impl MacroImplementation for DivnumMacro {
     fn evaluate(
         &self,
-        mut state: State,
+        state: State,
         _stderr: &mut dyn Write,
         _frame: StackFrame,
     ) -> Result<State> {
@@ -1949,17 +2029,18 @@ struct FileMacro;
 impl MacroImplementation for FileMacro {
     fn evaluate(
         &self,
-        mut state: State,
+        state: State,
         _stderr: &mut dyn Write,
         _frame: StackFrame,
     ) -> Result<State> {
-        let input = state.input.input.last().expect("At least one input");
-        match &input.input {
-            InputRead::File { path, .. } => state
-                .input
-                .pushback_string(path.clone().as_os_str().as_bytes()),
-            InputRead::Stdin(_) => state.input.pushback_string(b"stdin"),
-        }
+        let name = match &state.input.0.borrow().input.last().expect("At least one input").input {
+            InputRead::File { path, .. } => path.as_os_str().as_encoded_bytes().to_vec(),
+            InputRead::Stdin(_) => b"stdin".to_vec(),
+        };
+
+        state
+            .input
+            .pushback_string(&name);
         Ok(state)
     }
 }

@@ -5,6 +5,8 @@ use std::{
     rc::Rc,
 };
 
+use super::InputStateRef;
+
 /// A reference counted reference to [`Output`] which can be cloned.
 #[derive(Clone, Default)]
 pub(crate) struct OutputRef(Rc<RefCell<Output>>);
@@ -53,6 +55,7 @@ pub struct Output {
     divert_number: i64,
     /// The real output, usually [`std::io::stdout`].
     stdout: Box<dyn Write>,
+    input: InputStateRef,
 }
 
 impl Default for Output {
@@ -61,15 +64,18 @@ impl Default for Output {
             divert_buffers: Default::default(),
             divert_number: Default::default(),
             stdout: Box::new(std::io::stdout()),
+            input: InputStateRef::default(),
         }
     }
 }
 
 impl Output {
-    pub fn new(stdout: Box<dyn Write>) -> Self {
+    pub fn new(stdout: Box<dyn Write>, input: InputStateRef) -> Self {
         Self {
             stdout,
-            ..Self::default()
+            input,
+            divert_buffers: Default::default(),
+            divert_number: Default::default(),
         }
     }
 
@@ -152,24 +158,32 @@ impl TryFrom<usize> for DivertBufferNumber {
 
 impl Write for Output {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self.divert_number {
-            0 => self.stdout.write(buf),
+        let output: &mut dyn Write = match self.divert_number {
+            0 => &mut *self.stdout,
             1..=9 => {
-                let n = self.divert_buffers[self
+                &mut self.divert_buffers[self
                     .divert_buffer_number()
                     .expect("valid divert buffer number")
                     .index()]
                 .borrow_mut()
                 .0
-                .write(buf)?;
-                log::debug!(
-                    "Output::write(): Wrote {n} bytes to divert buffer {}",
-                    self.divert_number
-                );
-                Ok(n)
             }
-            i if i < 0 => Ok(buf.len()),
+            i if i < 0 => return Ok(buf.len()),
             _ => unreachable!("unreachable, was checked in Self::divert()"),
+        };
+
+
+        if self.input.sync_lines() {
+            let mut n = 0;
+            for c in buf {
+                n += output.write(&[*c])?;
+                if *c == b'\n' {
+                    self.input.emit_syncline(output)?;
+                }
+            }
+            Ok(n)
+        } else {
+            output.write(buf)
         }
     }
 

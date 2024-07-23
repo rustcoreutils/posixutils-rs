@@ -63,7 +63,6 @@ pub enum DefineDirective {
 pub struct Args {
     /// Enable line synchronization output for the c99 preprocessor phase (that is, #line
     /// directives).
-    /// TODO: not yet implemented
     pub line_synchronization: bool,
     pub define_directives: Vec<DefineDirective>,
     /// Whether to read input from a file.
@@ -73,6 +72,7 @@ pub struct Args {
 impl Args {
     pub fn parse() -> Self {
         let matches = clap::command!()
+            .arg(clap::Arg::new("line_synchronization").short('s').action(clap::ArgAction::SetTrue))
             .arg(
                 clap::Arg::new("define")
                     .short('D')
@@ -89,6 +89,8 @@ impl Args {
             )
             .arg(clap::Arg::new("file").action(clap::ArgAction::Append))
             .get_matches();
+
+        let line_synchronization = matches.get_flag("line_synchronization");
 
         let files = matches
             .get_raw("file")
@@ -113,7 +115,7 @@ impl Args {
         let define_directives = define_directives.into_iter().map(|d| d.1).collect();
 
         Self {
-            line_synchronization: false,
+            line_synchronization,
             define_directives,
             files,
         }
@@ -144,18 +146,16 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
     mut stderr: STDERR,
     args: Args,
 ) -> crate::error::Result<()> {
-    let mut state = State::new(Box::new(stdout), Vec::new());
+    let mut state = State::new(Box::new(stdout), Vec::new(), args.line_synchronization);
     if args.files.is_empty() {
         state
             .input
-            .input
-            .push(evaluate::Input::new(InputRead::Stdin(std::io::stdin())))
+            .input_push(evaluate::Input::new(InputRead::Stdin(std::io::stdin())))
     } else {
         for file_path in args.files {
             state
                 .input
-                .input
-                .push(evaluate::Input::new(InputRead::File {
+                .input_push(evaluate::Input::new(InputRead::File {
                     file: std::fs::File::open(&file_path)?,
                     path: file_path,
                 }));

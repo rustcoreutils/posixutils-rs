@@ -1800,6 +1800,31 @@ fn test_substr() {
     );
 }
 
+#[test]
+fn test_synclines() {
+    init();
+    let output = run_command(&Path::new("fixtures/integration_tests/synclines.args"));
+
+    let test: TestSnapshot = read_test("fixtures/integration_tests/synclines.out");
+    assert_eq!(
+        output.status,
+        std::process::ExitStatus::from_raw(test.status),
+        "status (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        test.stdout,
+        "stdout (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        test.stderr,
+        "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)"
+    );
+}
+
 #[ignore]
 #[test]
 fn test_syscmd_sysval() {

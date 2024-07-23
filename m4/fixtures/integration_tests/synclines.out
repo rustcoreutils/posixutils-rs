@@ -1,0 +1,3 @@
+stdout=#line 1 "fixtures/integration_tests/include.m4"\nfrom include.m4\n#line 6 "fixtures/integration_tests/evaluation_order.m4"\nm1 goodbye m1 hi\n#line 2 "fixtures/integration_tests/include.m4"\n\n
+stderr=
+status=0

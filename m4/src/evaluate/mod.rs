@@ -290,7 +290,7 @@ impl Input {
         Self {
             input,
             pushback_buffer: Vec::new(),
-            line_number: 0,
+            line_number: 1,
             syncline_line_number: 0,
         }
     }

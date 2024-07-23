@@ -172,12 +172,12 @@ impl Write for Output {
             _ => unreachable!("unreachable, was checked in Self::divert()"),
         };
 
-
         if self.input.sync_lines() {
             let mut n = 0;
-            for c in buf {
-                n += output.write(&[*c])?;
-                if *c == b'\n' {
+            for i in 0..buf.len() {
+                let c = buf[i];
+                n += output.write(&[c])?;
+                if (buf.len() == 1 && c == b'\n') || (i < (buf.len() - 1) && buf[i + 1] == b'\n') {
                     self.input.emit_syncline(output)?;
                 }
             }

@@ -119,14 +119,14 @@ fn test_{name}() {{
     assert_eq!(String::from_utf8(output.stderr).unwrap(), test.stderr, "stderr (\x1b[31mcurrent\x1b[0m|\x1b[32mexpected\x1b[0m)");"##);
         }
 
-        s.push_str("}");
+        s.push('}');
 
         s
     }
 }
 
 fn name_from_path(path: &Path) -> Option<String> {
-    Some(path.file_name()?.to_str()?.split(".").next()?.to_owned())
+    Some(path.file_name()?.to_str()?.split('.').next()?.to_owned())
 }
 
 fn main() {
@@ -302,9 +302,9 @@ fn run_command(input: &Path) -> std::process::Output {
 "#
         .to_owned();
     for (name, candidate) in test_candidates {
-        let test: Test = candidate
-            .try_into()
-            .expect(&format!("Error creating test from candidate for {name}"));
+        let test: Test = candidate.try_into().unwrap_or_else(|error| {
+            panic!("Error creating test from candidate for {name}: {error}")
+        });
 
         integration_test.push('\n');
         integration_test.push_str(&test.as_code());

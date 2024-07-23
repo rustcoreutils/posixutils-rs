@@ -57,10 +57,7 @@ where
     }
 
     fn is_postfix(&self) -> bool {
-        match self {
-            Operator::Postfix(_, _) => true,
-            _ => false,
-        }
+        matches!(self, Operator::Postfix(_, _))
     }
 }
 
@@ -297,7 +294,7 @@ where
             i = i1.clone();
         }
 
-        while operators.len() > 0 {
+        while !operators.is_empty() {
             let value = match operands.pop() {
                 Some(o) => o,
                 None => return Err(Err::Error(E::from_error_kind(i, ErrorKind::Tag))),
@@ -318,9 +315,9 @@ where
         }
 
         if operands.len() == 1 {
-            return Ok((i1, operands.pop().unwrap()));
+            Ok((i1, operands.pop().unwrap()))
         } else {
-            return Err(Err::Error(E::from_error_kind(i, ErrorKind::Tag)));
+            Err(Err::Error(E::from_error_kind(i, ErrorKind::Tag)))
         }
     }
 }

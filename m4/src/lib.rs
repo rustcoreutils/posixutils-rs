@@ -24,7 +24,7 @@ impl ArgumentDefine {
         let mut split = value_bytes.splitn(2, |b| *b == b'=');
         // TODO: use error
         let name =
-            MacroName::try_from_slice(&split.next().unwrap_or_default()).map_err(|_error| {
+            MacroName::try_from_slice(split.next().unwrap_or_default()).map_err(|_error| {
                 let mut e = clap::Error::new(clap::error::ErrorKind::ValueValidation);
                 e.insert(
                     clap::error::ContextKind::InvalidValue,
@@ -59,7 +59,7 @@ pub enum DefineDirective {
     Undefine(MacroName),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Args {
     /// Enable line synchronization output for the c99 preprocessor phase (that is, #line
     /// directives).
@@ -93,8 +93,7 @@ impl Args {
         let files = matches
             .get_raw("file")
             .unwrap_or_default()
-            .into_iter()
-            .map(|p| PathBuf::from(p))
+            .map(PathBuf::from)
             .collect();
 
         // Order of defines and undefines is important, so we need to do this, otherwise we'd just
@@ -117,16 +116,6 @@ impl Args {
             line_synchronization: false,
             define_directives,
             files,
-        }
-    }
-}
-
-impl Default for Args {
-    fn default() -> Self {
-        Self {
-            line_synchronization: false,
-            define_directives: Vec::default(),
-            files: Vec::default(),
         }
     }
 }

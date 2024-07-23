@@ -139,7 +139,7 @@ impl TryFrom<usize> for DivertBufferNumber {
     type Error = crate::Error;
 
     fn try_from(value: usize) -> std::prelude::v1::Result<Self, Self::Error> {
-        if value < 1 || value > 9 {
+        if !(1..=9).contains(&value) {
             return Err(
                 crate::Error::new(crate::ErrorKind::Parsing).add_context(format!(
                     "Unexpected buffer number: {value}. Needs to be from 1 to 9"

@@ -60,7 +60,7 @@ impl OutputState {
                 frame.args.last_mut().expect("At least one arg")
             };
 
-            arg_buffer.extend(buf.into_iter());
+            arg_buffer.extend(buf);
         }
         Ok(())
     }
@@ -101,7 +101,7 @@ impl Default for State {
     fn default() -> Self {
         Self {
             macro_definitions: BuiltinMacro::enumerate()
-                .into_iter()
+                .iter()
                 .map(|builtin| {
                     let parse_config = builtin.parse_config();
                     (
@@ -241,7 +241,7 @@ impl Read for InputRead {
 /// - `unwrap_quotes` - Whether to unwrap quotes during evaluation.
 /// - `all_inputs` - Whether to process all the inputs in `state.input` (`true`), or just the top of
 ///   the stack (`false`).
-pub(crate) fn process_streaming<'c>(
+pub(crate) fn process_streaming(
     mut state: State,
     stderr: &mut dyn Write,
 ) -> crate::error::Result<State> {
@@ -457,8 +457,8 @@ pub(crate) fn process_streaming<'c>(
 
 /// Attempt to parse `state.input` as a macro name, into `token`. If it is a current macro name in
 /// `state.macro_definitions`, then it will return `Some` of [`MacroDefinition`].
-fn parse_macro<'s>(
-    state: &'s mut State,
+fn parse_macro(
+    state: &mut State,
     mut c: u8,
     token: &mut Vec<u8>,
 ) -> crate::Result<Option<Rc<MacroDefinition>>> {
@@ -478,7 +478,7 @@ fn parse_macro<'s>(
 
     Ok(state
         .macro_definitions
-        .get(&MacroName::try_from_slice(&token).expect("valid macro name"))
+        .get(&MacroName::try_from_slice(token).expect("valid macro name"))
         .map(|v| v.last())
         .unwrap_or_default()
         .cloned())
@@ -832,7 +832,7 @@ impl MacroImplementation for PopdefMacro {
                 }
             }
         }
-        return Ok(state);
+        Ok(state)
     }
 }
 
@@ -866,7 +866,7 @@ impl MacroImplementation for UserDefinedMacro {
                 .collect::<Vec<_>>(),
         );
 
-        if self.definition.len() == 0 {
+        if self.definition.is_empty() {
             return Ok(state);
         }
 
@@ -891,7 +891,7 @@ impl MacroImplementation for UserDefinedMacro {
                     }
                     b'*' => {
                         for (arg_index, arg) in frame.args.iter().enumerate().rev() {
-                            state.input.pushback_string(&arg);
+                            state.input.pushback_string(arg);
                             if arg_index > 0 {
                                 state.input.pushback_character(b',');
                             }
@@ -902,7 +902,7 @@ impl MacroImplementation for UserDefinedMacro {
                             state
                                 .input
                                 .pushback_string(&state.parse_config.quote_close_tag);
-                            state.input.pushback_string(&arg);
+                            state.input.pushback_string(arg);
                             state
                                 .input
                                 .pushback_string(&state.parse_config.quote_open_tag);
@@ -949,7 +949,7 @@ impl MacroImplementation for UndefineMacro {
                 state.macro_definitions.remove(&name);
             }
         }
-        return Ok(state);
+        Ok(state)
     }
 }
 
@@ -1004,7 +1004,7 @@ impl MacroImplementation for ErrprintMacro {
                 stderr.write_all(b" ")?;
             }
         }
-        return Ok(state);
+        Ok(state)
     }
 }
 
@@ -1137,8 +1137,8 @@ impl MacroImplementation for ChangequoteMacro {
     ) -> Result<State> {
         match frame.args.len() {
             0 => {
-                state.parse_config.quote_open_tag = DEFAULT_QUOTE_OPEN_TAG.to_owned();
-                state.parse_config.quote_close_tag = DEFAULT_QUOTE_CLOSE_TAG.to_owned();
+                DEFAULT_QUOTE_OPEN_TAG.clone_into(&mut state.parse_config.quote_open_tag);
+                DEFAULT_QUOTE_CLOSE_TAG.clone_into(&mut state.parse_config.quote_close_tag);
             }
             1 => {}
             args_len @ 2.. => {
@@ -1262,7 +1262,7 @@ impl MacroImplementation for IfelseMacro {
                 return Ok(state);
             } else {
                 match args_len {
-                    0 | 1 | 2 => panic!("at least 3 args"),
+                    0..=2 => panic!("at least 3 args"),
                     3 => return Ok(state),
                     4 | 5 => {
                         args.next();
@@ -1317,10 +1317,8 @@ impl MacroImplementation for IfdefMacro {
             .unwrap_or(false)
         {
             state.input.pushback_string(&second_arg);
-        } else {
-            if let Some(third_arg) = args.next() {
-                state.input.pushback_string(&third_arg);
-            }
+        } else if let Some(third_arg) = args.next() {
+            state.input.pushback_string(&third_arg);
         }
         log::debug!("IfdefMacro::evaluate() finished");
         Ok(state)
@@ -1342,7 +1340,7 @@ impl MacroImplementation for ShiftMacro {
         if frame.args.len() > 1 {
             let args = &frame.args[1..];
             for (i, arg) in args.iter().enumerate().rev() {
-                state.input.pushback_string(&arg);
+                state.input.pushback_string(arg);
                 if i != 0 {
                     state.input.pushback_character(b',');
                 }
@@ -1426,7 +1424,7 @@ impl MacroImplementation for IndexMacro {
 
         let index = first_arg
             .windows(second_arg.len())
-            .position(|window| window == &second_arg);
+            .position(|window| window == second_arg);
         match index {
             Some(index) => {
                 state.input.pushback_string(index.to_string().as_bytes());
@@ -1486,10 +1484,7 @@ impl MacroImplementation for TranslitMacro {
                     }
                 }
             } else {
-                output_buffer = output_buffer
-                    .into_iter()
-                    .filter(|current_char| *current_char != source_char)
-                    .collect();
+                output_buffer.retain(|current_char| *current_char != source_char);
             }
         }
 
@@ -1548,7 +1543,7 @@ impl MacroImplementation for SubstrMacro {
             &first_arg[start_index..]
         };
 
-        state.input.pushback_string(&out);
+        state.input.pushback_string(out);
         Ok(state)
     }
 }
@@ -1577,7 +1572,7 @@ impl MacroImplementation for DumpdefMacro {
             for (name, definitions) in state.macro_definitions.iter() {
                 dumpdef(
                     stderr,
-                    &name,
+                    name,
                     definitions
                         .last()
                         .expect(AT_LEAST_ONE_MACRO_DEFINITION_EXPECT),
@@ -1717,9 +1712,9 @@ impl MacroImplementation for M4exitMacro {
         }
 
         if state.exit_error {
-            return Err(crate::Error::new(crate::ErrorKind::Exit(1)));
+            Err(crate::Error::new(crate::ErrorKind::Exit(1)))
         } else {
-            return Err(crate::Error::new(crate::ErrorKind::Exit(0)));
+            Err(crate::Error::new(crate::ErrorKind::Exit(0)))
         }
     }
 }
@@ -1874,7 +1869,7 @@ struct UndivertMacro;
 // TODO: rewrite to be more performant and remove the need to parse as `str`.
 fn parse_index(input: &[u8]) -> IResult<&[u8], usize> {
     log::trace!("parse_index() {}", String::from_utf8_lossy(input));
-    let (remaining, found) = nom::bytes::complete::take_while(|c| c >= b'0' && c <= b'9')(input)?;
+    let (remaining, found) = nom::bytes::complete::take_while(|c: u8| c.is_ascii_digit())(input)?;
     let s = std::str::from_utf8(found).expect("Should be valid utf8 betweeen b'0' and b'9'");
     let i: usize = s.parse().map_err(|e| {
         let e = nom::error::Error::from_external_error(found, nom::error::ErrorKind::Digit, e);
@@ -1898,7 +1893,6 @@ impl MacroImplementation for UndivertMacro {
     ) -> Result<State> {
         let undivert_buffers: Vec<DivertBufferNumber> = if frame.args.is_empty() {
             (1..=9)
-                .into_iter()
                 .map(DivertBufferNumber::try_from)
                 .collect::<Result<Vec<_>>>()?
         } else {

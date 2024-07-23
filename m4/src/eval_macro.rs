@@ -25,7 +25,7 @@ pub(crate) fn parse_integer(input: &[u8]) -> IResult<&[u8], i64> {
 /// A complete parser for a negative integer `[`0,[i64::MIN]`]`
 pub(crate) fn parse_positive_integer(input: &[u8]) -> IResult<&[u8], i64> {
     let (remaining, number_input) =
-        nom::bytes::complete::take_while(|c| c >= b'0' && c <= b'9')(input)?;
+        nom::bytes::complete::take_while(|c: u8| c.is_ascii_digit())(input)?;
 
     let s = std::str::from_utf8(number_input).map_err(|e| {
         nom::Err::Error(nom::error::Error::from_external_error(
@@ -60,11 +60,9 @@ where
     F: for<'i> Fn(&'i [u8]) -> IResult<&'i [u8], O> + 'f,
 {
     move |input: &[u8]| {
-        let (remaining, (_, p, _)) = tuple((
-            take_while(is_whitespace),
-            |i| f(i),
-            take_while(is_whitespace),
-        ))(input)?;
+        let f = &f;
+        let (remaining, (_, p, _)) =
+            tuple((take_while(is_whitespace), f, take_while(is_whitespace)))(input)?;
         Ok((remaining, p))
     }
 }
@@ -161,8 +159,5 @@ fn bool_to_int(b: bool) -> i64 {
 }
 
 fn int_to_bool(i: i64) -> bool {
-    match i {
-        0 => false,
-        _ => true,
-    }
+    i != 0
 }

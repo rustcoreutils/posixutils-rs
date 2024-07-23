@@ -22,7 +22,7 @@ pub struct TestSnapshot {
 }
 
 fn escape_newlines(input: &str) -> String {
-    input.replace("\n", "\\n")
+    input.replace('\n', "\\n")
 }
 
 fn unescape_newlines(input: &str) -> String {
@@ -34,28 +34,28 @@ impl TestSnapshot {
         write!(out, "stdout=").unwrap();
         out.write_all(escape_newlines(&self.stdout).as_bytes())
             .unwrap();
-        write!(out, "\n").unwrap();
+        writeln!(out).unwrap();
         write!(out, "stderr=").unwrap();
         out.write_all(escape_newlines(&self.stderr).as_bytes())
             .unwrap();
-        write!(out, "\n").unwrap();
+        writeln!(out).unwrap();
         write!(out, "status={}", self.status).unwrap();
         if self.ignore {
-            write!(out, "\n").unwrap();
+            writeln!(out).unwrap();
             write!(out, "ignore=true").unwrap();
         }
         if self.expect_error {
-            write!(out, "\n").unwrap();
+            writeln!(out).unwrap();
             write!(out, "expect_error=true").unwrap();
         }
         if let Some(stdout_regex) = &self.stdout_regex {
-            write!(out, "\n").unwrap();
+            writeln!(out).unwrap();
             write!(out, "stdout_regex=").unwrap();
             out.write_all(escape_newlines(stdout_regex).as_bytes())
             .unwrap();
         }
         if self.skip_update {
-            write!(out, "\n").unwrap();
+            writeln!(out).unwrap();
             write!(out, "skip_update=true").unwrap();
         }
     }
@@ -73,10 +73,10 @@ impl TestSnapshot {
         input.read_to_string(&mut buffer).unwrap();
 
         for line in buffer.lines() {
-            if line.is_empty() || line.starts_with("#") {
+            if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let (name, value) = line.split_once("=").unwrap();
+            let (name, value) = line.split_once('=').unwrap();
             match name {
                 "stdout" => stdout = Some(unescape_newlines(value)),
                 "stderr" => stderr = Some(unescape_newlines(value)),

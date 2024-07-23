@@ -2,4 +2,5 @@ stdout=#line 1 "fixtures/integration_tests/include.m4"\nfrom include.m4\n#line 6
 stderr=
 status=0
 # Currently this matches the BSD algorithm which differs considerably from GNU
+# Perhaps due to what's mentioned here https://web.mit.edu/gnu/doc/html/m4_15.html
 ignore=true

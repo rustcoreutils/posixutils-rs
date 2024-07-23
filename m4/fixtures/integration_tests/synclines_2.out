@@ -2,4 +2,5 @@ stdout=#line 2 "fixtures/integration_tests/args/synclines_2.m4"\n\n\n#line 5\n\n
 stderr=
 status=0
 # Currently this matches the BSD algorithm which differs considerably from GNU
+# Perhaps due to what's mentioned here https://web.mit.edu/gnu/doc/html/m4_15.html
 ignore=true

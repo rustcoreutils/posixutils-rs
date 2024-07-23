@@ -388,7 +388,7 @@ impl Input {
         output.write_all(b"#line ")?;
         write!(output, "{}", self.line_number)?;
         output.write_all(b" \"")?;
-        output.write_all(&name)?;
+        output.write_all(name)?;
         output.write_all(b"\"\n")?;
 
         self.syncline_line_number = self.line_number;

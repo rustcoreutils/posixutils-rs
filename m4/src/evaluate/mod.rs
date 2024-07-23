@@ -196,6 +196,7 @@ impl InputState {
         if self.line_synchronization {
             input.emit_syncline(syncline_output, false)?;
         }
+
         self.input.push(input);
 
         Ok(())
@@ -363,17 +364,26 @@ impl Input {
         output: &mut dyn Write,
         check_line_numbers: bool,
     ) -> std::io::Result<()> {
+        let name = match &self.input {
+            InputRead::File { path, .. } => path.as_os_str().as_encoded_bytes(),
+            InputRead::Stdin(_) => b"stdin",
+        };
+
+        log::debug!(
+            "Input::emit_syncline(): {} {check_line_numbers}",
+            String::from_utf8_lossy(name)
+        );
         if check_line_numbers {
+            log::debug!(
+                "Input::emit_syncline(): syncline_line_number:{},line_number:{}",
+                self.syncline_line_number,
+                self.line_number
+            );
             self.syncline_line_number += 1;
             if self.syncline_line_number == self.line_number {
                 return Ok(());
             }
         }
-
-        let name = match &self.input {
-            InputRead::File { path, .. } => path.as_os_str().as_encoded_bytes(),
-            InputRead::Stdin(_) => b"stdin",
-        };
 
         output.write_all(b"#line ")?;
         write!(output, "{}", self.line_number)?;
@@ -386,6 +396,7 @@ impl Input {
     }
 }
 
+#[derive(Debug)]
 pub enum InputRead {
     File { file: std::fs::File, path: PathBuf },
     Stdin(std::io::Stdin),
@@ -510,6 +521,12 @@ pub(crate) fn process_streaming(
                 break 'main_loop;
             }
             state.input.input_pop();
+            log::debug!("EOF synclines");
+            if state.input.sync_lines() {
+                state
+                    .input
+                    .emit_syncline(&mut *state.output.output.stdout().borrow_mut(), false)?;
+            }
             continue 'main_loop;
         } else if state.output.stack.is_empty() {
             // not in a macro
@@ -1173,11 +1190,7 @@ impl IncludeMacro {
         }
     }
 
-    fn evaluate_impl(
-        path: PathBuf,
-        state: State,
-        _stderr: &mut dyn Write,
-    ) -> crate::error::Result<State> {
+    fn include_impl(path: PathBuf, state: State) -> crate::error::Result<State> {
         let file = std::fs::File::open(&path)
             .map_err(crate::Error::from)
             .add_context(|| format!("Error opening file {path:?}"))?;
@@ -1193,13 +1206,13 @@ impl MacroImplementation for IncludeMacro {
     fn evaluate(
         &self,
         mut state: State,
-        stderr: &mut dyn Write,
+        _stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
         let path;
         (path, state) = Self::get_file_path(frame, state)?;
         if let Some(path) = path {
-            state = Self::evaluate_impl(path, state, stderr)?;
+            state = Self::include_impl(path, state)?;
         }
         Ok(state)
     }
@@ -1214,14 +1227,14 @@ impl MacroImplementation for SincludeMacro {
     fn evaluate(
         &self,
         mut state: State,
-        stderr: &mut dyn Write,
+        _stderr: &mut dyn Write,
         frame: StackFrame,
     ) -> Result<State> {
         let path;
         (path, state) = IncludeMacro::get_file_path(frame, state)?;
         if let Some(path) = path {
             if path.is_file() {
-                state = IncludeMacro::evaluate_impl(path, state, stderr)?;
+                state = IncludeMacro::include_impl(path, state)?;
             }
         }
 

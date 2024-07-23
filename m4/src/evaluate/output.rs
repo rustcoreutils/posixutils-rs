@@ -180,6 +180,12 @@ impl Write for Output {
             _ => unreachable!("unreachable, was checked in Self::divert()"),
         };
 
+        log::debug!(
+            "writing[{}] {:?}",
+            self.divert_number,
+            String::from_utf8_lossy(buf)
+        );
+
         if self.input.sync_lines() {
             let mut n = 0;
             for c in buf {

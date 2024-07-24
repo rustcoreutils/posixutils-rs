@@ -7,16 +7,15 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::program::{BuiltinFunction, Constant, Function, OpCode, Program, SpecialVar};
-use std::collections::HashMap;
-use std::ffi::CString;
-
 use crate::format::{
     fmt_write_decimal_float, fmt_write_float_general, fmt_write_hex_float,
     fmt_write_scientific_float, fmt_write_signed, fmt_write_string, fmt_write_unsigned,
     parse_conversion_specifier_args, parse_escape_sequence, IntegerFormat,
 };
+use crate::program::{BuiltinFunction, Constant, Function, OpCode, Pattern, Program, SpecialVar};
 use crate::regex::Regex;
+use std::collections::HashMap;
+use std::ffi::CString;
 use std::rc::Rc;
 
 fn get_or_insert(array: &mut HashMap<String, ScalarValue>, key: String) -> &mut ScalarValue {
@@ -84,6 +83,13 @@ impl GlobalValue {
         match self {
             GlobalValue::Regex(re) => re.clone(),
             _ => unreachable!("expected ere"),
+        }
+    }
+
+    fn unwrap_array(&self) -> &HashMap<String, ScalarValue> {
+        match self {
+            GlobalValue::Array(a) => a,
+            _ => unreachable!("expected array"),
         }
     }
 }
@@ -863,7 +869,7 @@ impl Interpreter {
     }
 
     fn new(
-        args: HashMap<String, String>,
+        args: HashMap<String, ScalarValue>,
         env: HashMap<String, String>,
         constants: Vec<Constant>,
         program_globals: usize,
@@ -871,8 +877,9 @@ impl Interpreter {
         let mut globals =
             vec![GlobalValue::Uninitialized; SpecialVar::Count as usize + program_globals];
 
-        globals[SpecialVar::Argc as usize] = GlobalValue::Scalar(ScalarValue::Number(0.0));
-        globals[SpecialVar::Argv as usize] = GlobalValue::Array(HashMap::new());
+        globals[SpecialVar::Argc as usize] =
+            GlobalValue::Scalar(ScalarValue::Number(args.len() as f64));
+        globals[SpecialVar::Argv as usize] = GlobalValue::Array(args);
         globals[SpecialVar::Convfmt as usize] =
             GlobalValue::Scalar(ScalarValue::String("%.6g".to_string()));
         globals[SpecialVar::Environ as usize] = GlobalValue::Array(HashMap::new());
@@ -880,7 +887,7 @@ impl Interpreter {
             GlobalValue::Scalar(ScalarValue::String("-".to_string()));
         globals[SpecialVar::Fnr as usize] = GlobalValue::Scalar(ScalarValue::Number(0.0));
         globals[SpecialVar::Fs as usize] =
-            GlobalValue::Scalar(ScalarValue::String(" ".to_string()));
+            GlobalValue::Regex(Rc::new(Regex::new(CString::new(" ").unwrap()).unwrap()));
         globals[SpecialVar::Nf as usize] = GlobalValue::Scalar(ScalarValue::Number(0.0));
         globals[SpecialVar::Nr as usize] = GlobalValue::Scalar(ScalarValue::Number(0.0));
         globals[SpecialVar::Ofmt as usize] =
@@ -907,8 +914,121 @@ impl Interpreter {
     }
 }
 
-pub fn interpret(program: Program, files: Vec<String>) -> Result<(), String> {
-    todo!();
+pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
+    let args = HashMap::from_iter(
+        args.into_iter()
+            .enumerate()
+            .map(|(idx, arg)| (idx.to_string(), ScalarValue::String(arg))),
+    );
+
+    let mut interpreter = Interpreter::new(
+        args,
+        HashMap::new(),
+        program.constants,
+        program.globals_count,
+    );
+    interpreter.run(&program.begin_instructions, &program.functions, &[])?;
+
+    let mut current_arg_index = 0;
+    let mut nr = 0;
+    let mut fields_buffer = Vec::new();
+    loop {
+        let argc = interpreter.globals[SpecialVar::Argc as usize]
+            .unwrap_scalar()
+            .as_f64_or_none()
+            .unwrap() as usize;
+
+        if current_arg_index >= argc {
+            break;
+        }
+
+        let arg = interpreter.globals[SpecialVar::Argv as usize]
+            .unwrap_array()
+            .get(&current_arg_index.to_string())
+            .unwrap_or(&ScalarValue::Uninitialized)
+            .to_string();
+
+        if arg.is_empty() {
+            current_arg_index += 1;
+            continue;
+        }
+
+        interpreter.globals[SpecialVar::Filename as usize] =
+            ScalarValue::String(arg.clone()).into();
+
+        if arg == "-" {
+            todo!("read from stdin")
+        }
+
+        // TODO: check if the arg is an assignment
+
+        // TODO: should probably figure out something better
+        let file_contents =
+            std::fs::read_to_string(&arg).map_err(|_| format!("could not read file {}", &arg))?;
+
+        let mut fnr = 0;
+        let mut next_record_start = 0;
+        while next_record_start < file_contents.len() {
+            fields_buffer.clear();
+
+            let rs = interpreter.globals[SpecialVar::Rs as usize]
+                .unwrap_scalar()
+                .to_string()
+                .as_bytes()[0];
+
+            let record = file_contents[next_record_start..]
+                .chars()
+                // '\n' is always a record separator, regardless of the value of rs
+                .take_while(|c| *c != rs as char || *c != '\n')
+                .collect::<String>();
+
+            // skip the record separator
+            next_record_start += record.len() + 1;
+
+            // will be replaced later with record
+            fields_buffer.push(String::new());
+
+            let fs = interpreter.globals[SpecialVar::Fs as usize].unwrap_ere();
+
+            let mut current_field_start = 0;
+
+            // TODO: fix unwrap
+            for sep_range in fs.match_locations(CString::new(record.clone()).unwrap()) {
+                fields_buffer.push(record[current_field_start..sep_range.start].to_string());
+                current_field_start = sep_range.end;
+            }
+            if current_field_start != 0 {
+                fields_buffer.push(record[current_field_start..].to_string())
+            }
+
+            fields_buffer[0] = record;
+
+            interpreter.globals[SpecialVar::Fnr as usize] = ScalarValue::Number(fnr as f64).into();
+            interpreter.globals[SpecialVar::Nr as usize] = ScalarValue::Number(nr as f64).into();
+
+            for rule in &program.rules {
+                let should_execute = match &rule.pattern {
+                    Pattern::All => true,
+                    Pattern::Expr(e) => {
+                        interpreter.run(&e, &program.functions, &fields_buffer)?;
+                        interpreter.pop_scalar()?.is_true()
+                    }
+                    Pattern::Range { .. } => todo!(),
+                };
+                if should_execute {
+                    interpreter.run(&rule.instructions, &program.functions, &fields_buffer)?
+                }
+            }
+
+            fnr += 1;
+            nr += 1;
+        }
+
+        current_arg_index += 1;
+    }
+
+    interpreter.run(&program.end_instructions, &program.functions, &[])?;
+    Ok(())
 }
 
 #[cfg(test)]

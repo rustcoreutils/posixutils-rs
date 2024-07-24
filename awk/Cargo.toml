@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 plib = { path = "../plib" }
-regex.workspace = true
+gettext-rs.workspace = true
 clap.workspace = true
 libc.workspace = true
 pest = "2.7.10"

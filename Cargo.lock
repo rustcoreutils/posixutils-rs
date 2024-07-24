@@ -1065,12 +1065,12 @@ name = "posixutils-awk"
 version = "0.1.7"
 dependencies = [
  "clap",
+ "gettext-rs",
  "lazy_static",
  "libc",
  "pest",
  "pest_derive",
  "plib",
- "regex",
 ]
 
 [[package]]

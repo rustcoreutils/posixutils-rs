@@ -7,7 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
-use compiler::compile_program;
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, textdomain};
+use plib::PROJECT_NAME;
+use std::error::Error;
 
 mod compiler;
 mod format;
@@ -15,14 +18,34 @@ mod interpreter;
 mod program;
 mod regex;
 
-fn main() {
-    let text = r#"
-    BEGIN {
-        a[1]
-    }
-    "#;
-    let program = compile_program(text)
-        .inspect_err(|e| println!("{}", e))
-        .unwrap();
-    println!("{:?}", program);
+/// awk - pattern scanning and processing language
+#[derive(Debug, Parser)]
+struct Args {
+    /// Define the input field separator
+    #[arg(short = 'F')]
+    separator_string: Option<String>,
+
+    /// Specify the program files
+    #[arg(short = 'f', action = clap::ArgAction::Append, required_unless_present = "program", conflicts_with = "program")]
+    program_files: Vec<String>,
+
+    /// Globals assignments, executed before the start of the program
+    #[arg(short = 'v', action = clap::ArgAction::Append)]
+    assignments: Vec<String>,
+
+    #[arg(
+        required_unless_present = "program_files",
+        conflicts_with = "program_files"
+    )]
+    program: Option<String>,
+
+    arguments: Vec<String>,
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    textdomain(PROJECT_NAME)?;
+    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+
+    let args = Args::parse();
+    Ok(())
 }

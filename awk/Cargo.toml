@@ -11,3 +11,7 @@ libc.workspace = true
 pest = "2.7.10"
 pest_derive = "2.7.10"
 lazy_static = "1.4.0"
+
+[[bin]]
+name = "awk"
+path = "src/main.rs"

@@ -9,5 +9,8 @@ repository = "https://github.com/rustcoreutils/posixutils-rs.git"
 [dependencies]
 libc.workspace = true
 
+[dev-dependencies]
+rand = "0.8.5"
+
 [lib]
 doctest = false

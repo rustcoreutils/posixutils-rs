@@ -164,7 +164,7 @@ struct DirEntry<'a> {
 }
 
 impl<'a> DirEntry<'a> {
-    fn filename(&self) -> &[libc::c_char; 256] {
+    fn filename(&self) -> &[libc::c_char] {
         unsafe { &self.dirent.as_ref().d_name }
     }
 
@@ -728,7 +728,7 @@ fn cstring_to_rc(filename: &CString) -> Rc<[libc::c_char]> {
     }
 }
 
-fn filename_slice_to_rc(filename: &[libc::c_char; 256]) -> Rc<[libc::c_char]> {
+fn filename_slice_to_rc(filename: &[libc::c_char]) -> Rc<[libc::c_char]> {
     Rc::from(filename.to_vec().into_boxed_slice())
 }
 

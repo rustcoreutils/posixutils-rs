@@ -782,6 +782,10 @@ impl Interpreter {
                     *reference = ScalarValue::Number(num);
                     self.push(ScalarValue::Number(num));
                 }
+                OpCode::AsNumber => {
+                    let value = self.pop_scalar()?.as_f64_or_err()?;
+                    self.push(ScalarValue::Number(value));
+                }
                 OpCode::Pop => {
                     self.stack.pop();
                 }

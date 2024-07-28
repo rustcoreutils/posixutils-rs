@@ -103,3 +103,28 @@ fn ed_write_basic() {
         "The output file does not match the expected output file."
     );
 }
+
+#[test]
+fn ed_delete_single_line() {
+    run_ed_test("input1.txt", "delete_1.ed", "delete_1.txt");
+}
+
+#[test]
+fn ed_delete_multiple_lines() {
+    run_ed_test("input1.txt", "delete_2_to_4.ed", "delete_2_to_4.txt");
+}
+
+// #[test]
+// fn ed_delete_all_lines() {
+//     run_ed_test("input1.txt", "delete_all.ed", "delete_all.txt");
+// }
+
+#[test]
+fn ed_delete_first_line() {
+    run_ed_test("input1.txt", "delete_1.ed", "delete_1.txt");
+}
+
+#[test]
+fn ed_delete_last_line() {
+    run_ed_test("input1.txt", "delete_10.ed", "delete_10.txt");
+}

@@ -1,0 +1,8 @@
+64
+apple
+echo
+foxtrot
+golf
+hotel
+india
+juliet

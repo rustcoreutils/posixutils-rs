@@ -1862,7 +1862,7 @@ mod test {
     }
 
     #[test]
-    fn test_compile_simple_assignment() {
+    fn test_compile_simple_variable_assignment() {
         let (instructions, constants) = compile_expr("a = 1");
         assert_eq!(
             instructions,
@@ -1889,7 +1889,7 @@ mod test {
     }
 
     #[test]
-    fn test_compile_compound_assignment() {
+    fn test_compile_compound_variable_assignment() {
         let (instructions, constants) = compile_expr("a += 1");
         assert_eq!(
             instructions,

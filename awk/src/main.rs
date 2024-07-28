@@ -57,15 +57,25 @@ fn compile_soruces(args: &Args) -> Result<Program, String> {
     }
 }
 
+fn exit_if_error<T>(r: Result<T, String>) -> T {
+    match r {
+        Ok(v) => v,
+        Err(err) => {
+            eprintln!("{}", err);
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
     let args = Args::parse();
 
-    let program = compile_soruces(&args)?;
+    let program = exit_if_error(compile_soruces(&args));
 
-    interpret(program, args.arguments)?;
+    exit_if_error(interpret(program, args.arguments));
 
     Ok(())
 }

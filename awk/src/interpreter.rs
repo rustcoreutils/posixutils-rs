@@ -930,7 +930,7 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
     interpreter.run(&program.begin_instructions, &program.functions, &[])?;
 
     let mut current_arg_index = 0;
-    let mut nr = 0;
+    let mut nr = 1;
     let mut fields_buffer = Vec::new();
     loop {
         let argc = interpreter.globals[SpecialVar::Argc as usize]
@@ -966,7 +966,7 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
         let file_contents =
             std::fs::read_to_string(&arg).map_err(|_| format!("could not read file {}", &arg))?;
 
-        let mut fnr = 0;
+        let mut fnr = 1;
         let mut next_record_start = 0;
         while next_record_start < file_contents.len() {
             fields_buffer.clear();

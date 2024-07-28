@@ -16,6 +16,7 @@ use crate::program::{BuiltinFunction, Constant, Function, OpCode, Pattern, Progr
 use crate::regex::Regex;
 use std::collections::HashMap;
 use std::ffi::CString;
+use std::iter;
 use std::rc::Rc;
 
 fn get_or_insert(array: &mut HashMap<String, ScalarValue>, key: String) -> &mut ScalarValue {
@@ -916,8 +917,8 @@ impl Interpreter {
 
 pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
     let args = HashMap::from_iter(
-        args.into_iter()
-            .enumerate()
+        iter::once((0, "awk".to_string()))
+            .chain(args.into_iter().enumerate().map(|(idx, s)| (idx + 1, s)))
             .map(|(idx, arg)| (idx.to_string(), ScalarValue::String(arg))),
     );
 
@@ -929,7 +930,7 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
     );
     interpreter.run(&program.begin_instructions, &program.functions, &[])?;
 
-    let mut current_arg_index = 0;
+    let mut current_arg_index = 1;
     let mut nr = 1;
     let mut fields_buffer = Vec::new();
     loop {

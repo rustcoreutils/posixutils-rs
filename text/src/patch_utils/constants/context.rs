@@ -129,14 +129,3 @@ pub fn context_regex_cache() -> &'static HashMap<ContextRegexKind, Regex> {
 
     panic!("NORMAL_REGEX_CACHE should not be empty!");
 }
-
-pub fn get_context_regex_list(kind_list: &[ContextRegexKind]) -> Vec<&Regex> {
-    let original_regex_list = context_regex_cache();
-    let mut regex_list = Vec::<&Regex>::new();
-
-    for kind in kind_list {
-        regex_list.push(&original_regex_list[kind]);
-    }
-
-    regex_list
-}

@@ -12,7 +12,6 @@ pub enum NormalRangeKind {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct NormalRangeData<'a> {
     line: &'a str,
     range_left: Range,

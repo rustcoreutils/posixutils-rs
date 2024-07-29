@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Once};
 
 use regex::Regex;
 
-use crate::patch_utils::{functions::if_else, patch_unit::PatchUnitKind};
+use crate::patch_utils::patch_unit::PatchUnitKind;
 
 pub const UNIFIED_FORMAT_RANGE_HEADER_REGEX: &str = r"^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@$";
 pub const UNIFIED_FORMAT_FIRST_LINE_REGEX: &str = r"^\s*---\s*.+\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{9} [+-]\d{4}|\w{3} \w{3} \d{1,2} \d{2}:\d{2}:\d{2} \d{4})?\s*$";
@@ -84,17 +84,6 @@ pub fn unified_regex_cache() -> &'static HashMap<UnifiedRegexKind, Regex> {
     }
 
     panic!("UNIFIED_REGEX_CACHE should not be empty!");
-}
-
-pub fn get_unified_regex_list(kind_list: &[UnifiedRegexKind]) -> Vec<&Regex> {
-    let original_regex_list = unified_regex_cache();
-    let mut regex_list = Vec::<&Regex>::new();
-
-    for kind in kind_list {
-        regex_list.push(&original_regex_list[kind]);
-    }
-
-    regex_list
 }
 
 pub fn unified_match(line: &str) -> PatchUnitKind {

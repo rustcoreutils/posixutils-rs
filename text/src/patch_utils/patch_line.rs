@@ -203,14 +203,12 @@ impl<'a> PatchLine<'a> {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum NormalPatchError {
     InvalidPatchLine(String),
     InvalidPatchRange(String),
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum PatchLineError {
     EmptyLineNotAllowed,
     InvalidUnifiedHunkHeader,

@@ -42,7 +42,7 @@ pub fn is_normal_head(line: &str) -> bool {
 }
 
 pub fn verify_patch_line(left: &str, right: &str) -> Result<(), ()> {
-    if left != right {
+    if left.trim() != right.trim() {
         Err(())
     } else {
         Ok(())
@@ -55,33 +55,6 @@ pub fn print_error(error: impl Into<String>) {
 
 pub fn file_exists(path: impl Into<PathBuf>) -> bool {
     fs::metadata(path.into()).is_ok()
-}
-
-pub fn look_for_hunk_head(operator: fn(&str, &str) -> bool, lines: &[String]) -> Option<usize> {
-    if lines.is_empty() {
-        return None;
-    }
-
-    for i in 0..lines.len().wrapping_sub(1) {
-        if operator(&lines[i], &lines[i + 1]) {
-            return Some(i);
-        }
-    }
-
-    None
-}
-
-pub fn is_normal_diff_line(line: &str) -> bool {
-    get_normal_regex_list(&[
-        NormalRegexKind::RangeInsert,
-        NormalRegexKind::RangeChange,
-        NormalRegexKind::RangeDelete,
-        NormalRegexKind::LineInsert,
-        NormalRegexKind::LineChangeSeparator,
-        NormalRegexKind::LineDelete,
-    ])
-    .iter()
-    .any(|regex| regex.is_match(line))
 }
 
 pub fn is_context_header(l0: &str, l1: &str) -> bool {

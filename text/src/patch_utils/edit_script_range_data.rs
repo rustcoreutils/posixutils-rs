@@ -10,7 +10,6 @@ pub enum EditScriptHunkKind {
 #[derive(Debug, Clone)]
 pub struct EditScriptRangeData<'a> {
     line: &'a str,
-    #[allow(dead_code)]
     range: Range,
     kind: EditScriptHunkKind,
 }

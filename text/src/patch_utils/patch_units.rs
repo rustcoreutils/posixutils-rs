@@ -9,8 +9,8 @@ use crate::patch_utils::{
 };
 
 use super::{
-    functions::is_normal_head, patch_file::PatchFile, patch_format::PatchFormat,
-    patch_options::PatchOptions, patch_unit::PatchUnit,
+    functions::is_normal_head, hunks::Hunks, patch_file::PatchFile,
+    patch_format::PatchFormat, patch_options::PatchOptions, patch_unit::PatchUnit,
 };
 
 #[derive(Debug)]
@@ -150,7 +150,6 @@ impl<'a> PatchUnits<'a> {
         lines: &'a [String],
         options: &'a PatchOptions,
     ) -> io::Result<(PatchUnit<'a>, PatchUnitStatus<'a>)> {
-        println!("get_normal_patch_units visited!");
         let regex_cache = normal_regex_cache();
         let mut parsed_lines = Vec::<&str>::new();
         let mut kinds = Vec::<PatchUnitKind>::new();
@@ -303,25 +302,19 @@ impl<'a> PatchUnits<'a> {
         options: &'a PatchOptions,
     ) -> io::Result<(PatchUnit<'a>, PatchUnitStatus<'a>)> {
         for (index, line) in lines.iter().enumerate() {
-            println!("line: {} ", line);
-
             if ed_normal_allowed && is_normal_head(line) {
-                println!("normal detected !");
                 return Self::get_normal_patch_unit(&lines[index..], options);
             }
 
             if ed_normal_allowed && is_edit_script_range(line) {
-                println!("edit script detected !");
                 return Self::get_ed_patch_units(&lines[index..], options);
             }
 
             if index + 1 < lines.len() && is_context_header(line, &lines[index + 1]) {
-                println!("context detected !");
                 return Self::get_context_patch_unit(&lines[index..], options);
             }
 
             if index + 1 < lines.len() && is_unfied_header(line, &lines[index + 1]) {
-                println!("unified detected !");
                 return Self::get_unified_patch_unit(&lines[index..], options);
             }
         }
@@ -384,11 +377,13 @@ impl<'a> PatchUnits<'a> {
         ))
     }
 
-    pub fn into_hunks(&self) -> io::Result<()> {
+    pub fn into_hunks(&self) -> io::Result<Vec<Hunks<'a>>> {
+        let mut hunks_collection: Vec<Hunks<'a>> = vec![];
+
         for unit in &self.patches {
-            unit.into_hunks();
+            hunks_collection.push(unit.into_hunks());
         }
 
-        Ok(())
+        Ok(hunks_collection)
     }
 }

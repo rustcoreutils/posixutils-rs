@@ -7,7 +7,6 @@ use std::{
 use super::patch_file_kind::FileKind;
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct PatchFile {
     content: String,
     lines: Vec<String>,

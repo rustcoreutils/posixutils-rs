@@ -1,7 +1,6 @@
 use super::range::Range;
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct UnifiedHunkHeaderData<'a> {
     line: &'a str,
     f1_range: Range,

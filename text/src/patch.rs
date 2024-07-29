@@ -11,7 +11,6 @@
 //////////////////////////////////////////////////////////////////////////
 // TODO : if hunks validation failed, write reject files.
 // TODO : update modified_data of new file according to the patch
-#![allow(dead_code)]
 mod patch_utils;
 
 extern crate clap;
@@ -28,6 +27,7 @@ use patch_utils::{
         normal::initialize_normal_regex_cache, unified::initialize_unified_regex_cache,
     },
     functions::{file_exists, if_else, print_error},
+    hunks::Apply,
     patch_file::PatchFile,
     patch_file_kind::FileKind,
     patch_format::PatchFormat,
@@ -52,7 +52,7 @@ struct Args {
 
     /// change the working directory to dir first
     #[arg(short = 'd', long = "dir")]
-    dir: Option<String>,
+    dir: Option<PathBuf>,
 
     /// make merged if-then-else output using NAME
     #[arg(short = 'D', long = "ifdef")]
@@ -64,19 +64,19 @@ struct Args {
 
     /// output rejects to REJECT_FILE
     #[arg(short = 'r', long = "reject-file")]
-    reject_file: Option<String>,
+    reject_file: Option<PathBuf>,
 
     /// output patched files to OUTPUT_FILE
     #[arg(short = 'o', long = "output")]
-    output_file: Option<String>,
+    output_file: Option<PathBuf>,
 
     /// file to apply patch to, empty for copied context and unified formats
     #[arg(short, long)]
-    file: Option<String>,
+    file: Option<PathBuf>,
 
     /// read file from PATCHFILE instead of stdin
     #[arg(short = 'i', long = "input")]
-    patchfile: String,
+    patchfile: PathBuf,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -121,18 +121,19 @@ impl Into<PatchOptions> for Args {
             strip: self.num,
             patch_format,
             patch_path: self.patchfile,
+            reject_file: self.reject_file,
         }
     }
 }
 
 impl Args {
     fn verify_patchfile_exists(self) -> io::Result<Self> {
-        let if_true: fn(&str) = |_| {};
+        let if_true: fn(&PathBuf) = |_| {};
 
-        let if_false: fn(&str) = |file_name: &str| {
+        let if_false: fn(&PathBuf) = |file_name: &PathBuf| {
             print_error(format!(
                 " **** Can't open patch file {} : No such file or directory",
-                file_name
+                file_name.to_str().expect("Could not unwrap file_name")
             ));
         };
 
@@ -193,20 +194,19 @@ fn patch_operation<'a>() -> io::Result<()> {
 
     let patch = PatchUnits::try_build(&patch_options, &patch_file)?;
 
-    dbg!(&patch);
-
     match patch {
         Some(patch_units) => {
-            patch_units.into_hunks()?;
+            let mut hunks_collection = patch_units.into_hunks()?;
+
+            for hunks in hunks_collection.iter_mut() {
+                let result = hunks.apply();
+                result.expect("Failed to apply hunk!");
+            }
         }
         None => {}
     }
 
     return Ok(());
-    // let patch_path = PathBuf::from("patch_normal.diff");
-
-    // let patch_file = PatchFile::load_file(patch_path, Some(PatchFileKind::Patch))?;
-
     // let file = PatchFile::load_file(
     //     patch_options.file_path.clone(),
     //     if_else(

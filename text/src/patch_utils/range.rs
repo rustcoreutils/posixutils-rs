@@ -1,5 +1,4 @@
 use super::{
-    edit_script_range_data::EditScriptHunkKind,
     patch_error::{PatchError, PatchResult},
     patch_format::PatchFormat,
 };
@@ -78,21 +77,6 @@ impl Range {
                 "Invalid Context range numbers list length!",
             )),
         }
-    }
-
-    pub(crate) fn edit_script_range_kind(line: &str) -> EditScriptHunkKind {
-        let last_char = line.trim().chars().last();
-
-        if let Some(last_char) = last_char {
-            return match last_char {
-                'a' => EditScriptHunkKind::Insert,
-                'c' => EditScriptHunkKind::Change,
-                'd' => EditScriptHunkKind::Delete,
-                _ => panic!("Invalid ed hunk range!"),
-            };
-        }
-
-        panic!("Invalid ed hunk range!");
     }
 
     pub(crate) fn try_from_edit_script(line: &str) -> RangeResult {

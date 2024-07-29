@@ -9,7 +9,6 @@ pub struct NormalHunkData<'a> {
     range_left: Range,
     range_right: Range,
     lines: Vec<PatchLine<'a>>,
-    #[allow(dead_code)]
     kind: NormalRangeKind,
 }
 

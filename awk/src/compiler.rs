@@ -170,7 +170,6 @@ lazy_static::lazy_static! {
             | Op::prefix(Rule::pre_dec))
         .op(Op::postfix(Rule::post_inc)
             | Op::postfix(Rule::post_dec))
-        .op(Op::prefix(Rule::dollarsign))
     };
 }
 
@@ -429,9 +428,9 @@ impl Compiler {
                     vec![OpCode::PushConstant(index)],
                 ))
             }
-            Rule::name | Rule::array_element => {
+            Rule::lvalue => {
                 let mut instructions = Vec::new();
-                self.compile_lvalue(primary, &mut instructions, locals)?;
+                self.compile_lvalue(first_child(primary), &mut instructions, locals)?;
                 Ok(Expr::new(ExprKind::LValue, instructions))
             }
             Rule::function_call => {
@@ -509,10 +508,6 @@ impl Compiler {
         let kind = rhs.kind;
         let mut instructions = rhs.instructions;
         match op.as_rule() {
-            Rule::dollarsign => {
-                instructions.push(OpCode::FieldRef);
-                Ok(Expr::new(ExprKind::Number, instructions))
-            }
             Rule::negate => {
                 instructions.push(OpCode::Negate);
                 Ok(Expr::new(ExprKind::Number, instructions))
@@ -701,7 +696,11 @@ impl Compiler {
                     .map_err(|msg| pest_error_from_span(name.as_span(), msg))?;
                 instructions.push(get_instruction);
             }
-            _ => unreachable!(),
+            Rule::field_var => {
+                self.compile_expr(first_child(lvalue), instructions, locals)?;
+                instructions.push(OpCode::FieldRef);
+            }
+            _ => unreachable!("encountered {:?} while compiling lvalue", lvalue.as_rule()),
         }
         Ok(())
     }
@@ -716,7 +715,7 @@ impl Compiler {
         match expr.as_rule() {
             Rule::assignment => {
                 let mut inner = expr.into_inner();
-                self.compile_lvalue(inner.next().unwrap(), instructions, locals)?;
+                self.compile_lvalue(first_child(inner.next().unwrap()), instructions, locals)?;
                 let assignment_op = first_child(inner.next().unwrap());
                 if assignment_op.as_rule() != Rule::assign {
                     instructions.push(OpCode::Dup);
@@ -1334,6 +1333,22 @@ mod test {
         assert_eq!(
             instructions,
             vec![OpCode::VarRef(FIRST_GLOBAL_VAR), OpCode::PostDec]
+        );
+
+        let (instructions, _) = compile_expr("++a[0]");
+        assert_eq!(
+            instructions,
+            vec![
+                OpCode::PushConstant(0),
+                OpCode::ArrayRef(FIRST_GLOBAL_VAR),
+                OpCode::PreInc
+            ]
+        );
+
+        let (instructions, _) = compile_expr("++$3");
+        assert_eq!(
+            instructions,
+            vec![OpCode::PushConstant(0), OpCode::FieldRef, OpCode::PreInc]
         );
     }
 
@@ -1984,6 +1999,42 @@ mod test {
             ]
         );
         assert_eq!(constants, vec![Constant::Number(1.0)]);
+    }
+
+    #[test]
+    fn compile_array_element_assignment() {
+        let (instructions, constants) = compile_expr("a[1] = 1");
+        assert_eq!(
+            instructions,
+            vec![
+                OpCode::PushConstant(0),
+                OpCode::ArrayRef(FIRST_GLOBAL_VAR),
+                OpCode::PushConstant(1),
+                OpCode::Assign,
+            ]
+        );
+        assert_eq!(
+            constants,
+            vec![Constant::Number(1.0), Constant::Number(1.0)]
+        );
+    }
+
+    #[test]
+    fn compile_filed_var_assignment() {
+        let (instructions, constants) = compile_expr("$1 = 1");
+        assert_eq!(
+            instructions,
+            vec![
+                OpCode::PushConstant(0),
+                OpCode::FieldRef,
+                OpCode::PushConstant(1),
+                OpCode::Assign,
+            ]
+        );
+        assert_eq!(
+            constants,
+            vec![Constant::Number(1.0), Constant::Number(1.0)]
+        );
     }
 
     #[test]

@@ -210,10 +210,9 @@ primary = _{
   | ere
   | number
   | string
-  | array_element
   | function_call
   | builtin_function_call
-  | name
+  | lvalue
 }
 
 array_element         = { name ~ "[" ~ expr_list ~ "]" }
@@ -221,15 +220,13 @@ function_call         = { func_name ~ "(" ~ expr_list? ~ ")" }
 builtin_function_call = { builtin_func ~ ("(" ~ expr_list? ~ ")")? }
 
 prefix_op = _{
-    dollarsign
-  | pre_inc
+  pre_inc
   | pre_dec
   | not
   | unary_plus
   | negate
 }
 
-dollarsign = { "$" }
 pre_inc    = { "++" }
 pre_dec    = { "--" }
 not        = { "!" }
@@ -320,11 +317,13 @@ expr = {
   | input_function
 }
 
-lvalue = _{
+lvalue = {
     array_element
   | name
-  | "$" ~ expr
+  | field_var
 }
+
+field_var = { "$" ~ expr }
 
 input_function = {
     simple_get

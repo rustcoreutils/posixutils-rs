@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-tree"
-version = "0.1.12"
+version = "0.2.0"
 edition = "2021"
 authors = ["Jeff Garzik"]
 license = "MIT"
@@ -24,65 +24,65 @@ requires_root = []
 
 [[bin]]
 name = "chgrp"
-path = "src/chgrp.rs"
+path = "./chgrp.rs"
 
 [[bin]]
 name = "chmod"
-path = "src/chmod.rs"
+path = "./chmod.rs"
 
 [[bin]]
 name = "chown"
-path = "src/chown.rs"
+path = "./chown.rs"
 
 [[bin]]
 name = "cp"
-path = "src/cp.rs"
+path = "./cp.rs"
 
 [[bin]]
 name = "du"
-path = "src/du.rs"
+path = "./du.rs"
 
 [[bin]]
 name = "link"
-path = "src/link.rs"
+path = "./link.rs"
 
 [[bin]]
 name = "ln"
-path = "src/ln.rs"
+path = "./ln.rs"
 
 [[bin]]
 name = "ls"
-path = "src/ls.rs"
+path = "./ls.rs"
 
 [[bin]]
 name = "mkdir"
-path = "src/mkdir.rs"
+path = "./mkdir.rs"
 
 [[bin]]
 name = "mkfifo"
-path = "src/mkfifo.rs"
+path = "./mkfifo.rs"
 
 [[bin]]
 name = "mv"
-path = "src/mv.rs"
+path = "./mv.rs"
 
 [[bin]]
 name = "readlink"
-path = "src/readlink.rs"
+path = "./readlink.rs"
 
 [[bin]]
 name = "rm"
-path = "src/rm.rs"
+path = "./rm.rs"
 
 [[bin]]
 name = "rmdir"
-path = "src/rmdir.rs"
+path = "./rmdir.rs"
 
 [[bin]]
 name = "touch"
-path = "src/touch.rs"
+path = "./touch.rs"
 
 [[bin]]
 name = "unlink"
-path = "src/unlink.rs"
+path = "./unlink.rs"
 

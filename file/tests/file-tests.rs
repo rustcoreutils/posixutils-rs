@@ -10,4 +10,5 @@
 mod cmp;
 mod dd;
 mod file;
+mod find;
 mod od;

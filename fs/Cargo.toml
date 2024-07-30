@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-fs"
-version = "0.1.12"
+version = "0.2.0"
 edition = "2021"
 authors = ["Jeff Garzik"]
 license = "MIT"
@@ -14,5 +14,5 @@ libc.workspace = true
 
 [[bin]]
 name = "df"
-path = "src/df.rs"
+path = "./df.rs"
 

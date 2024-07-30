@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-pathnames"
-version = "0.1.12"
+version = "0.2.0"
 edition = "2021"
 authors = ["Jeff Garzik"]
 license = "MIT"
@@ -14,13 +14,13 @@ libc.workspace = true
 
 [[bin]]
 name = "basename"
-path = "src/basename.rs"
+path = "./basename.rs"
 
 [[bin]]
 name = "dirname"
-path = "src/dirname.rs"
+path = "./dirname.rs"
 
 [[bin]]
 name = "pathchk"
-path = "src/pathchk.rs"
+path = "./pathchk.rs"
 

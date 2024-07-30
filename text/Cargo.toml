@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-text"
-version = "0.1.12"
+version = "0.2.0"
 edition = "2021"
 authors = ["Jeff Garzik"]
 license = "MIT"
@@ -23,75 +23,79 @@ deunicode = "1.6"
 
 [[bin]]
 name = "asa"
-path = "src/asa.rs"
+path = "./asa.rs"
 
 [[bin]]
 name = "comm"
-path = "src/comm.rs"
+path = "./comm.rs"
 
 [[bin]]
 name = "unexpand"
-path = "src/unexpand.rs"
+path = "./unexpand.rs"
 
 [[bin]]
 name = "csplit"
-path = "src/csplit.rs"
+path = "./csplit.rs"
 
 [[bin]]
 name = "diff"
-path = "src/diff.rs"
+path = "./diff.rs"
 
 [[bin]]
 name = "cut"
-path = "src/cut.rs"
+path = "./cut.rs"
 
 [[bin]]
 name = "uniq"
-path = "src/uniq.rs"
+path = "./uniq.rs"
 
 [[bin]]
 name = "sort"
-path = "src/sort.rs"
+path = "./sort.rs"
 
 [[bin]]
 name = "expand"
-path = "src/expand.rs"
+path = "./expand.rs"
 
 [[bin]]
 name = "tr"
-path = "src/tr.rs"
+path = "./tr.rs"
 
 [[bin]]
 name = "fold"
-path = "src/fold.rs"
+path = "./fold.rs"
+
+[[bin]]
+name = "grep"
+path = "./grep.rs"
 
 [[bin]]
 name = "head"
-path = "src/head.rs"
+path = "./head.rs"
 
 [[bin]]
 name = "tail"
-path = "src/tail.rs"
+path = "./tail.rs"
 
 [[bin]]
 name = "nl"
-path = "src/nl.rs"
+path = "./nl.rs"
 
 [[bin]]
 name = "paste"
-path = "src/paste.rs"
+path = "./paste.rs"
 
 [[bin]]
 name = "pr"
-path = "src/pr.rs"
+path = "./pr.rs"
 
 [[bin]]
 name = "tsort"
-path = "src/tsort.rs"
+path = "./tsort.rs"
 
 [[bin]]
 name = "wc"
-path = "src/wc.rs"
+path = "./wc.rs"
 
 [[bin]]
 name = "patch"

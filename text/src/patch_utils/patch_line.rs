@@ -247,12 +247,8 @@ impl Display for PatchLineError {
             PatchLineError::InvalidEditScriptRange => "InvalidEditScriptRange",
             PatchLineError::InvalidEditScriptPatch => "InvalidEditScriptPatch",
             PatchLineError::NormalPatch(normal_patch_error) => match normal_patch_error {
-                NormalPatchError::InvalidPatchLine(line) => {
-                    &format!("Could not classify normal patch line: {}", line)
-                }
-                NormalPatchError::InvalidPatchRange(line) => {
-                    &format!("This line supposed to be normal patch range: {}", line)
-                }
+                NormalPatchError::InvalidPatchLine(line) => "Could not classify normal patch line!",
+                NormalPatchError::InvalidPatchRange(line) => "This line supposed to be normal patch range: "
             },
             PatchLineError::CouldNotOpenPatchDestinationFile => "CouldNotOpenPatchDestinationFile",
             PatchLineError::IOError(_error_kind) => "IOError",

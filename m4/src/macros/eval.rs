@@ -1,3 +1,5 @@
+use std::io::Write;
+
 use nom::{
     branch::alt,
     bytes::complete::{tag, take_while},
@@ -10,7 +12,29 @@ use nom::{
 use crate::{
     lexer::is_whitespace,
     precedence::{self, binary_op, unary_op, Assoc, Operation},
+    state::{StackFrame, State},
+    Result,
 };
+
+use super::MacroImplementation;
+
+pub struct EvalMacro;
+
+impl MacroImplementation for EvalMacro {
+    fn evaluate(&self, state: State, _stderr: &mut dyn Write, frame: StackFrame) -> Result<State> {
+        let first_arg = frame
+            .args
+            .into_iter()
+            .next()
+            .ok_or_else(|| crate::Error::new(crate::ErrorKind::NotEnoughArguments))?;
+
+        let (_, output) = nom::combinator::all_consuming(nom::combinator::complete(
+            parse_and_evaluate,
+        ))(&first_arg)?;
+        state.input.pushback_string(output.to_string().as_bytes());
+        Ok(state)
+    }
+}
 
 /// A complete parser for a negative integer `[`[i64::MIN],[i64::MIN]`]`
 pub(crate) fn parse_integer(input: &[u8]) -> IResult<&[u8], i64> {

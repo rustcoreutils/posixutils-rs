@@ -1,11 +1,41 @@
-use crate::error::Result;
+use crate::{error::Result, input::InputStateRef, state::StackFrame};
 use std::{
     cell::RefCell,
     io::{Seek, Write},
     rc::Rc,
 };
 
-use super::InputStateRef;
+#[derive(Default)]
+pub struct OutputState {
+    pub output: OutputRef,
+    pub stack: Vec<StackFrame>,
+}
+
+impl OutputState {
+    /// Write either to output, or to the buffer for the macro arg currently being parsed.
+    pub fn write_all(&mut self, buf: &[u8]) -> crate::Result<()> {
+        if self.stack.is_empty() {
+            log::trace!("Writing to output: {}", String::from_utf8_lossy(buf));
+            self.output.write_all(buf)?;
+        } else {
+            log::trace!(
+                "Writing to macro arg in stack: {:?}",
+                String::from_utf8_lossy(buf)
+            );
+
+            let frame = self.stack.last_mut().expect("Stack not empty");
+            let arg_buffer = if let Some(arg_buffer) = frame.args.last_mut() {
+                arg_buffer
+            } else {
+                frame.args.push(Vec::new());
+                frame.args.last_mut().expect("At least one arg")
+            };
+
+            arg_buffer.extend(buf);
+        }
+        Ok(())
+    }
+}
 
 /// A reference counted reference to [`Output`] which can be cloned.
 #[derive(Clone, Default)]

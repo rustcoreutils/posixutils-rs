@@ -1,14 +1,18 @@
 use error::{Error, ErrorKind, Result};
-use evaluate::{InputRead, MacroDefinition, State};
+use input::{Input, InputRead};
 use lexer::MacroName;
+use macros::MacroDefinition;
+use state::State;
 use std::{cell::RefCell, ffi::OsStr, io::Write, path::PathBuf, rc::Rc};
 
 pub mod error;
-mod eval_macro;
 mod evaluate;
+mod input;
 mod lexer;
+mod macros;
+mod output;
 mod precedence;
-
+mod state;
 pub const EOF: u8 = b'\0';
 
 #[derive(Debug, Clone)]
@@ -152,13 +156,13 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
     let mut state = State::try_new(stdout.clone(), Vec::new(), args.line_synchronization)?;
     if args.files.is_empty() {
         state.input.input_push(
-            evaluate::Input::new(InputRead::Stdin(std::io::stdin())),
+            Input::new(InputRead::Stdin(std::io::stdin())),
             &mut *stdout.borrow_mut(),
         )?;
     } else {
         for file_path in args.files {
             state.input.input_push(
-                evaluate::Input::new(InputRead::File {
+                Input::new(InputRead::File {
                     file: std::fs::File::open(&file_path)?,
                     path: file_path,
                 }),

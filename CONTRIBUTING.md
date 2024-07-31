@@ -50,8 +50,9 @@ There are several ways to contribute to posixutils-rs:
 * If a system has an OS-specific feature that _must_ be
   exposed through a given utility, do so.
 * Race-free userland.  `walker` crate should be able to help.
+* Push small crates out:  Create tiny, light-dep crates from common functionality (such as Lex or Yacc file parsing), and publish via cargo.  Remove from main posixutils tree and set of crates.
 
-### Testing and Bug Reporting
+### Testing and Bug Reporting: Info to provide in GH issue
 
 * Include information about your system (`uname -a`) in every issue.
 * Provide any input data can that be used to reproduce the bug.

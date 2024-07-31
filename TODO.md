@@ -1,5 +1,9 @@
 # General TODO and future implementation notes
 
+## Upstream fixes wanted
+
+* libc: missing confstr support on linux
+
 ## Translations
 
 * Standard OS error texts must be translated
@@ -11,9 +15,4 @@
 ```
 	filename: OS error message
 ```
-
-## Testing
-
-Tests hardcode `release/` directory for binaries.  Should instead detect
---release and run the debug/release tests accordingly.
 

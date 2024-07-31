@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-users"
-version = "0.1.6"
+version = "0.2.0"
 edition = "2021"
 authors = ["Jeff Garzik"]
 license = "MIT"
@@ -8,33 +8,38 @@ repository = "https://github.com/rustcoreutils/posixutils-rs.git"
 
 [dependencies]
 plib = { path = "../plib" }
-clap = { version = "4", features = ["derive"] }
-gettext-rs = { version = "0.7", features = ["gettext-system"] }
-libc = "0.2"
+clap.workspace = true
+gettext-rs.workspace = true
+libc.workspace = true
+atty.workspace = true
+chrono.workspace = true
 syslog = "6.1"
-atty = "0.2"
 
 [[bin]]
 name = "id"
-path = "src/id.rs"
+path = "./id.rs"
 
 [[bin]]
 name = "logname"
-path = "src/logname.rs"
+path = "./logname.rs"
 
 [[bin]]
 name = "logger"
-path = "src/logger.rs"
+path = "./logger.rs"
 
 [[bin]]
 name = "mesg"
-path = "src/mesg.rs"
+path = "./mesg.rs"
 
 [[bin]]
 name = "pwd"
-path = "src/pwd.rs"
+path = "./pwd.rs"
 
 [[bin]]
 name = "tty"
-path = "src/tty.rs"
+path = "./tty.rs"
+
+[[bin]]
+name = "write"
+path = "./write.rs"
 

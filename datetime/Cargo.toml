@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-datetime"
-version = "0.1.6"
+version = "0.2.0"
 edition = "2021"
 authors = ["Jeff Garzik"]
 license = "MIT"
@@ -8,20 +8,20 @@ repository = "https://github.com/rustcoreutils/posixutils-rs.git"
 
 [dependencies]
 plib = { path = "../plib" }
-clap = { version = "4", features = ["derive"] }
-gettext-rs = { version = "0.7", features = ["gettext-system"] }
-chrono = "0.4"
-libc = "0.2"
+clap.workspace = true
+gettext-rs.workspace = true
+chrono.workspace = true
+libc.workspace = true
 
 [[bin]]
 name = "cal"
-path = "src/cal.rs"
+path = "./cal.rs"
 
 [[bin]]
 name = "date"
-path = "src/date.rs"
+path = "./date.rs"
 
 [[bin]]
 name = "sleep"
-path = "src/sleep.rs"
+path = "./sleep.rs"
 

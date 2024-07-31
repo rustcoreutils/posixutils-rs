@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-xform"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2021"
 authors = ["Jeff Garzik"]
 license = "MIT"
@@ -8,24 +8,27 @@ repository = "https://github.com/rustcoreutils/posixutils-rs.git"
 
 [dependencies]
 plib = { path = "../plib" }
-clap = { version = "4", features = ["derive"] }
-gettext-rs = { version = "0.7", features = ["gettext-system"] }
-uuencode = "0.1"
+clap.workspace = true
+libc.workspace = true
+gettext-rs.workspace = true
 base64 = "0.21"
 
 [[bin]]
 name = "cksum"
-path = "src/cksum.rs"
+path = "./cksum.rs"
 
 [[bin]]
 name = "uncompress"
-path = "src/uncompress.rs"
+path = "./uncompress.rs"
+
+[[bin]]
+name = "compress"
+path = "./compress.rs"
 
 [[bin]]
 name = "uudecode"
-path = "src/uudecode.rs"
+path = "./uudecode.rs"
 
 [[bin]]
 name = "uuencode"
-path = "src/uuencode.rs"
-
+path = "./uuencode.rs"

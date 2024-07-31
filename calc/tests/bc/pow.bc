@@ -1,0 +1,44 @@
+scale = 2
+a = 2.000 ^ 10
+scale(a)
+a
+
+scale = 4
+a = 2.000 ^ 10
+scale(a)
+a
+
+scale = 4
+a = 2.000 ^ 1
+scale(a)
+a
+
+scale = 0
+a = 2 ^ -1
+scale(a)
+a
+
+a = 2.00 ^ -1
+scale(a)
+a
+
+scale = 2
+a = 2.00 ^ -1
+scale(a)
+a
+
+scale = 10
+2 ^ -1
+2 ^ -2
+89.290 ^ -1
+
+scale = 0
+2 ^ 1
+2 ^ 2
+3.489 ^ 4
+10 ^ 10
+0 ^ 0
+0 ^ 38
+1 ^ 1
+1 ^ 30
+quit

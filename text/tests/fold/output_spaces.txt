@@ -1,0 +1,1 @@
+Another example of a file with different line lengths and characters.

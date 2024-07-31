@@ -1,0 +1,14 @@
+#include <stdio.h>
+
+int main() {
+    printf("Hello, world!\n");
+    return 0;
+}
+
+void func1() {
+    printf("This is function 1\n");
+}
+
+void func2() {
+    printf("This is function 2\n");
+}

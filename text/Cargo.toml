@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-text"
-version = "0.1.6"
+version = "0.2.0"
 edition = "2021"
 authors = ["Jeff Garzik"]
 license = "MIT"
@@ -8,49 +8,92 @@ repository = "https://github.com/rustcoreutils/posixutils-rs.git"
 
 [dependencies]
 plib = { path = "../plib" }
-clap = { version = "4", features = ["derive"] }
-gettext-rs = { version = "0.7", features = ["gettext-system"] }
+clap.workspace = true
+gettext-rs.workspace = true
 topological-sort = "0.2"
+regex.workspace = true
+chrono.workspace = true
+libc.workspace = true
+notify-debouncer-full = "0.3"
+ctor = "0.2"
+atty.workspace = true
 diff = "0.1"
-regex = "1.10"
+dirs = "5.0"
+deunicode = "1.6"
 
 [[bin]]
 name = "asa"
-path = "src/asa.rs"
+path = "./asa.rs"
 
 [[bin]]
 name = "comm"
-path = "src/comm.rs"
+path = "./comm.rs"
+
+[[bin]]
+name = "unexpand"
+path = "./unexpand.rs"
+
+[[bin]]
+name = "csplit"
+path = "./csplit.rs"
 
 [[bin]]
 name = "diff"
-path = "src/diff.rs"
+path = "./diff.rs"
+
+[[bin]]
+name = "cut"
+path = "./cut.rs"
+
+[[bin]]
+name = "uniq"
+path = "./uniq.rs"
+
+[[bin]]
+name = "sort"
+path = "./sort.rs"
 
 [[bin]]
 name = "expand"
-path = "src/expand.rs"
+path = "./expand.rs"
+
+[[bin]]
+name = "tr"
+path = "./tr.rs"
 
 [[bin]]
 name = "fold"
-path = "src/fold.rs"
+path = "./fold.rs"
+
+[[bin]]
+name = "grep"
+path = "./grep.rs"
 
 [[bin]]
 name = "head"
-path = "src/head.rs"
+path = "./head.rs"
+
+[[bin]]
+name = "tail"
+path = "./tail.rs"
 
 [[bin]]
 name = "nl"
-path = "src/nl.rs"
+path = "./nl.rs"
 
 [[bin]]
 name = "paste"
-path = "src/paste.rs"
+path = "./paste.rs"
+
+[[bin]]
+name = "pr"
+path = "./pr.rs"
 
 [[bin]]
 name = "tsort"
-path = "src/tsort.rs"
+path = "./tsort.rs"
 
 [[bin]]
 name = "wc"
-path = "src/wc.rs"
+path = "./wc.rs"
 

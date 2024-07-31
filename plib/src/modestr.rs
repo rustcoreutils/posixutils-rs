@@ -207,7 +207,7 @@ pub fn parse(mode: &str) -> Result<ChmodMode, String> {
 
                 ParseState::NextClause => {
                     if c != ',' {
-                        return Err(format!("unexpected character: {}", c));
+                        return Err("invalid mode string".to_string());
                     }
                     done_with_char = true;
                     state = ParseState::Wholist;

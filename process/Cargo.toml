@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-process"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2021"
 authors = ["Jeff Garzik"]
 license = "MIT"
@@ -8,29 +8,34 @@ repository = "https://github.com/rustcoreutils/posixutils-rs.git"
 
 [dependencies]
 plib = { path = "../plib" }
-clap = { version = "4", features = ["derive"] }
-gettext-rs = { version = "0.7", features = ["gettext-system"] }
-libc = "0.2"
+clap.workspace = true
+gettext-rs.workspace = true
+libc.workspace = true
+atty.workspace = true
 errno = "0.3"
-regex = "1.10"
+dirs = "5.0"
 
 [[bin]]
 name = "env"
-path = "src/env.rs"
+path = "./env.rs"
 
 [[bin]]
 name = "kill"
-path = "src/kill.rs"
+path = "./kill.rs"
 
 [[bin]]
 name = "nice"
-path = "src/nice.rs"
+path = "./nice.rs"
+
+[[bin]]
+name = "nohup"
+path = "./nohup.rs"
 
 [[bin]]
 name = "renice"
-path = "src/renice.rs"
+path = "./renice.rs"
 
 [[bin]]
 name = "xargs"
-path = "src/xargs.rs"
+path = "./xargs.rs"
 

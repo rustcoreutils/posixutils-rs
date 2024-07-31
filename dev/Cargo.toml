@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-dev"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2021"
 authors = ["Jeff Garzik"]
 license = "MIT"
@@ -8,11 +8,25 @@ repository = "https://github.com/rustcoreutils/posixutils-rs.git"
 
 [dependencies]
 plib = { path = "../plib" }
-clap = { version = "4", features = ["derive"] }
-gettext-rs = { version = "0.7", features = ["gettext-system"] }
-object = "0.33"
+clap.workspace = true
+gettext-rs.workspace = true
+object =  { version = "0.35", features = ["read", "build", "elf"]}
+chrono.workspace = true
+ar = "0.9"
 
 [[bin]]
 name = "nm"
-path = "src/nm.rs"
+path = "./nm.rs"
 
+[[bin]]
+name = "ar"
+path = "./ar.rs"
+required-features = ["object/read_core", "object/archive"]
+
+[[bin]]
+name = "strip"
+path = "./strip.rs"
+
+[[bin]]
+name = "strings"
+path = "./strings.rs"

@@ -26,7 +26,6 @@ jobs:
     runs-on: macos-latest
     env:
       GETTEXT_SYSTEM: 1
-      GETTEXT_DIR: /usr/local
     steps:
       - uses: actions/checkout@v4
       - uses: sfackler/actions/rustup@master
@@ -43,8 +42,6 @@ jobs:
         with:
           path: ~/.cargo/registry/cache
           key: registry-${{ runner.os }}-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock') }}
-      - run: brew update
-      - run: brew install gettext
       - name: Fetch
         run: cargo fetch
       - name: Build

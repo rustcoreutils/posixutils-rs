@@ -33,9 +33,7 @@ jobs:
       - run: echo "version=$(rustc --version)" >> $GITHUB_OUTPUT
         id: rust-version
       - name: Install homebrew deps
-        run: |
-	  brew update
-	  brew install gettext
+        run: brew update && brew install gettext
       - uses: actions/cache@v4
         with:
           path: ~/.cargo/registry/index

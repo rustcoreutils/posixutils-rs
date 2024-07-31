@@ -1,0 +1,3 @@
+stdout=1 a'b\n2 ab'
+stderr=
+status=0

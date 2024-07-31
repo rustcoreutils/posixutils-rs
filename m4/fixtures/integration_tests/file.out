@@ -1,0 +1,3 @@
+stdout=fixtures/integration_tests/file.m4\nfixtures/integration_tests/include/file.m4
+stderr=
+status=0

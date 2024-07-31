@@ -1,0 +1,3 @@
+stdout=hello world hello\n\nhello world hello\n\nhello world hello\n\nhello world hello\n
+stderr=m4trace: -2- x\nm4trace: -1- y\nm4trace: -1- x\nm4trace: -1- traceoff\nm4trace: -2- x\nm4trace: -1- y\nm4trace: -1- x\n
+status=0

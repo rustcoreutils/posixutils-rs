@@ -1,0 +1,4 @@
+stdout=
+stderr=m4:fixtures/integration_tests/quoted_nested_eof_in_string.m4:1: ERROR: end of file in string\n
+status=1
+expect_error=true

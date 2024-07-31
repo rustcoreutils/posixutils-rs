@@ -1,0 +1,6 @@
+1 translit(abcde,ad,AD)
+2 translit(,ad,AD)
+3 translit(,ad)
+4 translit(abcde,ad)
+5 translit(abcde,ad,ADE)
+6 translit(abcde,abd,AB)

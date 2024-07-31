@@ -1,0 +1,4 @@
+stdout=
+stderr=m4:fixtures/integration_tests/define_unquoted_number_arg.m4:1: ERROR: end of file in argument list\n
+status=1
+expect_error=true

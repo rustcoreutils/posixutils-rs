@@ -1,0 +1,3 @@
+stdout=# Undefined\n1 not defined\n# Defined\n2 is defined\n# Nested undefine in third arg\n3 not defined\n4 is defined
+stderr=
+status=0

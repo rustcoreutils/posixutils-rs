@@ -1,0 +1,3 @@
+stdout=1 2 y\n3 \n4 define(a,b)a\n
+stderr=
+status=0

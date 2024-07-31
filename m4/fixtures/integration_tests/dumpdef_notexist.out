@@ -1,0 +1,4 @@
+stdout=
+stderr=m4:fixtures/integration_tests/dumpdef_notexist.m4:1: undefined macro `x'\n
+status=0
+expect_error=true

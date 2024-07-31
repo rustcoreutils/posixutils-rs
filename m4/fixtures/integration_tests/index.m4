@@ -1,0 +1,8 @@
+index(hello, ll)
+index(`hello', `ll')
+index(hello, l)
+index(hello, h)
+index(hello, o)
+index(hello, x)
+define(`x', `ll')
+index(hello, x)

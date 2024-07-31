@@ -43,8 +43,8 @@ jobs:
         with:
           path: ~/.cargo/registry/cache
           key: registry-${{ runner.os }}-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock') }}
-      - name: Install homebrew deps
-        run: brew update && brew install gettext
+      - run: brew update
+      - run: brew install gettext
       - name: Fetch
         run: cargo fetch
       - name: Build

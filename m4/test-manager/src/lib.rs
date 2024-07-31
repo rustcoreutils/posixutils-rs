@@ -18,7 +18,7 @@ pub struct TestSnapshot {
     pub stdout_regex: Option<String>,
     /// Skip updating this test (unless the test name is manually specified during the update). This
     /// is used for tests like `mkstemp` which generate random values during each run.
-    pub skip_update: bool
+    pub skip_update: bool,
 }
 
 fn escape_newlines(input: &str) -> String {
@@ -52,7 +52,7 @@ impl TestSnapshot {
             writeln!(out).unwrap();
             write!(out, "stdout_regex=").unwrap();
             out.write_all(escape_newlines(stdout_regex).as_bytes())
-            .unwrap();
+                .unwrap();
         }
         if self.skip_update {
             writeln!(out).unwrap();

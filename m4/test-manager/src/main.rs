@@ -111,13 +111,16 @@ fn update_snapshots(args: &Args, update: &UpdateSnapshots) {
             };
 
             println!("UPDATING snapshot for {test_name}");
-            let output = match input_file.path().extension().expect("Input file should have extension").as_bytes() {
-                b"m4" => {
-                    std::process::Command::new(&update.reference_command)
-                        .arg(input_file.path())
-                        .output()
-                        .unwrap()
-                },
+            let output = match input_file
+                .path()
+                .extension()
+                .expect("Input file should have extension")
+                .as_bytes()
+            {
+                b"m4" => std::process::Command::new(&update.reference_command)
+                    .arg(input_file.path())
+                    .output()
+                    .unwrap(),
                 b"args" => {
                     let args = std::fs::read_to_string(input_file.path()).unwrap();
                     std::process::Command::new("sh")
@@ -128,7 +131,6 @@ fn update_snapshots(args: &Args, update: &UpdateSnapshots) {
                 }
                 _ => panic!("Unsupported input extension {input_file:?}"),
             };
-            
 
             if update.debug_output {
                 println!("stdout:");

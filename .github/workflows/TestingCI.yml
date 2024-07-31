@@ -43,7 +43,7 @@ jobs:
       - name: Fetch
         run: cargo fetch
       - name: Build
-        run: GETTEXT_SYSTEM=1 GETTEXT_DIR=/usr/local cargo build --release --verbose
+        run: GETTEXT_SYSTEM=1 cargo build --release --verbose
       - name: Run tests
-        run: GETTEXT_SYSTEM=1 GETTEXT_DIR=/usr/local cargo test --release --verbose
+        run: GETTEXT_SYSTEM=1 cargo test --release --verbose
 

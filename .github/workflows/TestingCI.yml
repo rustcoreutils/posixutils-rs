@@ -32,8 +32,6 @@ jobs:
       - uses: sfackler/actions/rustup@master
       - run: echo "version=$(rustc --version)" >> $GITHUB_OUTPUT
         id: rust-version
-      - name: Install homebrew deps
-        run: brew update && brew install gettext
       - uses: actions/cache@v4
         with:
           path: ~/.cargo/registry/index
@@ -45,6 +43,8 @@ jobs:
         with:
           path: ~/.cargo/registry/cache
           key: registry-${{ runner.os }}-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+      - name: Install homebrew deps
+        run: brew update && brew install gettext
       - name: Fetch
         run: cargo fetch
       - name: Build

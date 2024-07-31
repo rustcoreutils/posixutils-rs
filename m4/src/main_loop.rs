@@ -6,14 +6,8 @@ use crate::macros::MacroImplementation;
 use crate::state::{StackFrame, State};
 use crate::EOF;
 
-/// [`Symbol`] writing output to `writer`, and returns a [`ParseConfig`] which has been modified
-/// during the process of evaluation (for example a new macro was defined, or changequote).
-///
-/// Arguments:
-/// - `unwrap_quotes` - Whether to unwrap quotes during evaluation.
-/// - `all_inputs` - Whether to process all the inputs in `state.input` (`true`), or just the top of
-///   the stack (`false`).
-pub(crate) fn process_streaming(
+/// The main loop, the most important function in this program.
+pub(crate) fn main_loop(
     mut state: State,
     stderr: &mut dyn Write,
 ) -> crate::error::Result<State> {

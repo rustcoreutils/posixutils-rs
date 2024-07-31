@@ -6,7 +6,7 @@ use state::State;
 use std::{cell::RefCell, ffi::OsStr, io::Write, path::PathBuf, rc::Rc};
 
 pub mod error;
-mod evaluate;
+mod main_loop;
 mod input;
 mod lexer;
 mod macros;
@@ -189,7 +189,7 @@ pub fn run_impl<STDOUT: Write + 'static, STDERR: Write>(
         }
     }
 
-    evaluate::process_streaming(state, &mut stderr)?;
+    main_loop::main_loop(state, &mut stderr)?;
 
     Ok(())
 }

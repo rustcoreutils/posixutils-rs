@@ -9,6 +9,7 @@ repository = "https://github.com/rustcoreutils/posixutils-rs.git"
 [dependencies]
 plib = { path = "../plib" }
 atty.workspace = true
+clap.workspace = true
 libc.workspace = true
 gettext-rs.workspace = true
 
@@ -24,3 +25,6 @@ path = "./false.rs"
 name = "test"
 path = "./test.rs"
 
+[[bin]]
+name = "realpath"
+path = "./realpath.rs"

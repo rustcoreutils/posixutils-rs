@@ -8,5 +8,6 @@
 //
 
 mod r#false;
+mod realpath;
 mod test;
 mod r#true;

@@ -25,3 +25,7 @@ path = "./date.rs"
 name = "sleep"
 path = "./sleep.rs"
 
+[[bin]]
+name = "time"
+path = "src/time.rs"
+

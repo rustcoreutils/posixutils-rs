@@ -40,92 +40,83 @@ fn strtod(s: &str) -> f64 {
     .unwrap_or(0.0)
 }
 
-// fn sprintf(argc: u16) {
-//     fn sprintf(&mut self, argc: u16) -> Result<String, String> {
-//         let arg_start = self.stack.len() - argc as usize;
-//         self.stack[arg_start..].reverse();
-//         let format = self.pop_scalar()?.to_string();
-//         let mut result = String::with_capacity(format.len());
-//         let mut remaining_args = argc - 1;
-//         let mut iter = format.chars();
-//         let mut next = iter.next();
-//         while let Some(c) = next {
-//             match c {
-//                 '%' => {
-//                     let (specifier, args) = parse_conversion_specifier_args(&mut iter)?;
-//                     if specifier == '%' {
-//                         result.push('%');
-//                         continue;
-//                     }
-//
-//                     if remaining_args == 0 {
-//                         return Err("not enough arguments for format string".to_string());
-//                     }
-//                     remaining_args -= 1;
-//                     match specifier {
-//                         'd' | 'i' => {
-//                             let value = f64_to_i64_or_err(self.pop_scalar()?.as_f64_or_err()?)?;
-//                             fmt_write_signed(&mut result, value, &args);
-//                         }
-//                         'u' | 'o' | 'x' | 'X' => {
-//                             let value = f64_to_i64_or_err(self.pop_scalar()?.as_f64_or_err()?)?;
-//                             if value.is_negative() {
-//                                 return Err(
-//                                     "negative value for unsigned format specifier".to_string()
-//                                 );
-//                             }
-//                             let format = match specifier {
-//                                 'u' => IntegerFormat::Decimal,
-//                                 'o' => IntegerFormat::Octal,
-//                                 'x' => IntegerFormat::HexLower,
-//                                 'X' => IntegerFormat::HexUpper,
-//                                 _ => unreachable!(),
-//                             };
-//                             fmt_write_unsigned(&mut result, value as u64, format, &args);
-//                         }
-//                         'a' | 'A' => {
-//                             let value = self.pop_scalar()?.as_f64_or_err()?;
-//                             fmt_write_hex_float(&mut result, value, specifier == 'a', &args);
-//                         }
-//                         'f' | 'F' => {
-//                             let value = self.pop_scalar()?.as_f64_or_err()?;
-//                             fmt_write_decimal_float(&mut result, value, specifier == 'f', &args);
-//                         }
-//                         'e' | 'E' => {
-//                             let value = self.pop_scalar()?.as_f64_or_err()?;
-//                             fmt_write_scientific_float(&mut result, value, specifier == 'e', &args);
-//                         }
-//                         'g' | 'G' => {
-//                             let value = self.pop_scalar()?.as_f64_or_err()?;
-//                             fmt_write_float_general(&mut result, value, specifier == 'g', &args);
-//                         }
-//                         'c' => {
-//                             let value =
-//                                 f64_to_i64_or_err(self.pop_scalar()?.as_f64_or_err()?)? as u8;
-//                             result.push(value as char);
-//                         }
-//                         's' => {
-//                             let value = self.pop_scalar()?.to_string();
-//                             fmt_write_string(&mut result, &value, &args);
-//                         }
-//                         _ => return Err(format!("unsupported format specifier '{}'", specifier)),
-//                     }
-//                     next = iter.next();
-//                 }
-//                 '\\' => {
-//                     let (escaped_char, next_char) = parse_escape_sequence(&mut iter)?;
-//                     result.push(escaped_char);
-//                     next = next_char;
-//                 }
-//                 other => {
-//                     result.push(other);
-//                     next = iter.next();
-//                 }
-//             }
-//         }
-//         Ok(result)
-//     }
-// }
+fn sprintf(argc: u16, stack: &mut Stack, record: &CString) -> Result<String, String> {
+    let mut values = Vec::with_capacity(argc as usize);
+    for _ in 0..(argc - 1) {
+        values.push(stack.pop_scalar_value(record)?)
+    }
+
+    let format_string = stack.pop_scalar_value(record)?.scalar_to_string();
+    let mut result = String::with_capacity(format_string.len());
+    let mut iter = format_string.chars();
+    let mut next = iter.next();
+    while let Some(c) = next {
+        match c {
+            '%' => {
+                let (specifier, args) = parse_conversion_specifier_args(&mut iter)?;
+                if specifier == '%' {
+                    result.push('%');
+                    continue;
+                }
+
+                if values.is_empty() {
+                    return Err("not enough arguments for format string".to_string());
+                }
+                match specifier {
+                    'd' | 'i' => {
+                        let value = values.pop().unwrap().scalar_as_f64() as i64;
+                        fmt_write_signed(&mut result, value, &args);
+                    }
+                    'u' | 'o' | 'x' | 'X' => {
+                        let value = values.pop().unwrap().scalar_as_f64() as i64;
+                        if value.is_negative() {
+                            return Err("negative value for unsigned format specifier".to_string());
+                        }
+                        let format = match specifier {
+                            'u' => IntegerFormat::Decimal,
+                            'o' => IntegerFormat::Octal,
+                            'x' => IntegerFormat::HexLower,
+                            'X' => IntegerFormat::HexUpper,
+                            _ => unreachable!(),
+                        };
+                        fmt_write_unsigned(&mut result, value as u64, format, &args);
+                    }
+                    'a' | 'A' => {
+                        let value = values.pop().unwrap().scalar_as_f64();
+                        fmt_write_hex_float(&mut result, value, specifier == 'a', &args);
+                    }
+                    'f' | 'F' => {
+                        let value = values.pop().unwrap().scalar_as_f64();
+                        fmt_write_decimal_float(&mut result, value, specifier == 'f', &args);
+                    }
+                    'e' | 'E' => {
+                        let value = values.pop().unwrap().scalar_as_f64();
+                        fmt_write_scientific_float(&mut result, value, specifier == 'e', &args);
+                    }
+                    'g' | 'G' => {
+                        let value = values.pop().unwrap().scalar_as_f64();
+                        fmt_write_float_general(&mut result, value, specifier == 'g', &args);
+                    }
+                    'c' => {
+                        let value = values.pop().unwrap().scalar_as_f64() as i64 as u8;
+                        result.push(value as char);
+                    }
+                    's' => {
+                        let value = values.pop().unwrap().scalar_to_string();
+                        fmt_write_string(&mut result, &value, &args);
+                    }
+                    _ => return Err(format!("unsupported format specifier '{}'", specifier)),
+                }
+                next = iter.next();
+            }
+            other => {
+                result.push(other);
+                next = iter.next();
+            }
+        }
+    }
+    Ok(result)
+}
 
 fn call_builtin(
     function: BuiltinFunction,
@@ -238,7 +229,8 @@ fn call_builtin(
             stack.push_value(n as f64)?;
         }
         BuiltinFunction::Sprintf => {
-            todo!();
+            let result = sprintf(argc, stack, record)?;
+            stack.push_value(result)?;
         }
         BuiltinFunction::Sub => {
             todo!()
@@ -2081,12 +2073,6 @@ mod tests {
     fn test_builtin_sprintf_char() {
         assert_eq!(test_sprintf("%c", vec![Constant::Number(55.0)]), "7");
         assert_eq!(test_sprintf("%c", vec![Constant::Number(548.0)]), "$");
-    }
-
-    #[test]
-    fn test_builtin_sprintf_escape_sequences() {
-        assert_eq!(test_sprintf("\\n hello world", vec![]), "\n hello world");
-        assert_eq!(test_sprintf("\\056", vec![]), ".");
     }
 
     #[test]

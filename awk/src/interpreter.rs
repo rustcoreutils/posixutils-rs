@@ -130,39 +130,39 @@ fn strtod(s: &str) -> f64 {
 fn call_builtin(
     function: BuiltinFunction,
     argc: u16,
-    current_frame: &mut Stack,
+    stack: &mut Stack,
     record: &CString,
     globals: &mut [AwkValue],
 ) -> Result<(), String> {
     match function {
         BuiltinFunction::Atan2 => {
-            let y = current_frame.pop_scalar_value(record)?.scalar_as_f64();
-            let x = current_frame.pop_scalar_value(record)?.scalar_as_f64();
-            current_frame.push_value(y.atan2(x))?;
+            let y = stack.pop_scalar_value(record)?.scalar_as_f64();
+            let x = stack.pop_scalar_value(record)?.scalar_as_f64();
+            stack.push_value(y.atan2(x))?;
         }
         BuiltinFunction::Cos => {
-            let value = current_frame.pop_scalar_value(record)?.scalar_as_f64();
-            current_frame.push_value(value.cos())?;
+            let value = stack.pop_scalar_value(record)?.scalar_as_f64();
+            stack.push_value(value.cos())?;
         }
         BuiltinFunction::Sin => {
-            let value = current_frame.pop_scalar_value(record)?.scalar_as_f64();
-            current_frame.push_value(value.sin())?;
+            let value = stack.pop_scalar_value(record)?.scalar_as_f64();
+            stack.push_value(value.sin())?;
         }
         BuiltinFunction::Exp => {
-            let value = current_frame.pop_scalar_value(record)?.scalar_as_f64();
-            current_frame.push_value(value.exp())?;
+            let value = stack.pop_scalar_value(record)?.scalar_as_f64();
+            stack.push_value(value.exp())?;
         }
         BuiltinFunction::Log => {
-            let value = current_frame.pop_scalar_value(record)?.scalar_as_f64();
-            current_frame.push_value(value.ln())?;
+            let value = stack.pop_scalar_value(record)?.scalar_as_f64();
+            stack.push_value(value.ln())?;
         }
         BuiltinFunction::Sqrt => {
-            let value = current_frame.pop_scalar_value(record)?.scalar_as_f64();
-            current_frame.push_value(value.sqrt())?;
+            let value = stack.pop_scalar_value(record)?.scalar_as_f64();
+            stack.push_value(value.sqrt())?;
         }
         BuiltinFunction::Int => {
-            let value = current_frame.pop_scalar_value(record)?.scalar_as_f64();
-            current_frame.push_value(value.trunc())?;
+            let value = stack.pop_scalar_value(record)?.scalar_as_f64();
+            stack.push_value(value.trunc())?;
         }
         BuiltinFunction::Rand => {
             todo!()
@@ -174,22 +174,22 @@ fn call_builtin(
             todo!()
         }
         BuiltinFunction::Index => {
-            let t = current_frame.pop_scalar_value(record)?.scalar_to_string();
-            let s = current_frame.pop_scalar_value(record)?.scalar_to_string();
+            let t = stack.pop_scalar_value(record)?.scalar_to_string();
+            let s = stack.pop_scalar_value(record)?.scalar_to_string();
             let index = s.find(&t).map(|i| i as f64 + 1.0).unwrap_or(0.0);
-            current_frame.push_value(index)?;
+            stack.push_value(index)?;
         }
         BuiltinFunction::Length => {
             if argc == 0 {
-                current_frame.push_value(record.count_bytes() as f64)?;
+                stack.push_value(record.count_bytes() as f64)?;
             } else {
-                let value = current_frame.pop_scalar_value(record)?.scalar_to_string();
-                current_frame.push_value(value.len() as f64)?;
+                let value = stack.pop_scalar_value(record)?.scalar_to_string();
+                stack.push_value(value.len() as f64)?;
             }
         }
         BuiltinFunction::Match => {
-            let ere = current_frame.pop_value().to_ere()?;
-            let string = current_frame.pop_scalar_value(record)?.scalar_to_string();
+            let ere = stack.pop_value().to_ere()?;
+            let string = stack.pop_scalar_value(record)?.scalar_to_string();
             // TODO: should look into this unwrap
             let mut locations = ere.match_locations(CString::new(string).unwrap());
             let start;
@@ -203,20 +203,20 @@ fn call_builtin(
             }
             globals[SpecialVar::Rstart as usize] = (start as f64).into();
             globals[SpecialVar::Rlength as usize] = (len as f64).into();
-            current_frame.push_value(start as f64)?;
+            stack.push_value(start as f64)?;
         }
         BuiltinFunction::Split => {
             let separator_ere = if argc == 2 {
                 globals[SpecialVar::Fs as usize].clone().to_ere()?
             } else {
                 assert_eq!(argc, 3);
-                current_frame.pop_value().to_ere()?
+                stack.pop_value().to_ere()?
             };
             // FIXME: check above that array_ref is a StackValue::ValueRef and that it
             // is an array. If this is true, `array_ref` cannot point to `s` since it is
             // a string
-            let array_ref = current_frame.pop().unwrap();
-            let s = current_frame.pop_scalar_value(record)?.scalar_to_string();
+            let array_ref = stack.pop().unwrap();
+            let s = stack.pop_scalar_value(record)?.scalar_to_string();
             // this is safe only if the value in `array_ref` is not a reference to
             // s, which we just popped
             let array = unsafe { (*array_ref.unwrap_ptr()).as_array()? };
@@ -235,7 +235,7 @@ fn call_builtin(
             }
             array.set(array.len().to_string(), s[split_start..].to_string());
             let n = array.len();
-            current_frame.push_value(n as f64)?;
+            stack.push_value(n as f64)?;
         }
         BuiltinFunction::Sprintf => {
             todo!();
@@ -247,20 +247,20 @@ fn call_builtin(
             let n = if argc == 2 {
                 usize::MAX
             } else {
-                current_frame.pop_scalar_value(record)?.scalar_as_f64() as usize
+                stack.pop_scalar_value(record)?.scalar_as_f64() as usize
             };
-            let m = current_frame.pop_scalar_value(record)?.scalar_as_f64() as usize;
-            let s = current_frame.pop_scalar_value(record)?.scalar_to_string();
+            let m = stack.pop_scalar_value(record)?.scalar_as_f64() as usize;
+            let s = stack.pop_scalar_value(record)?.scalar_to_string();
             let substr = s.chars().skip(m).take(n).collect::<String>();
-            current_frame.push_value(substr)?;
+            stack.push_value(substr)?;
         }
         BuiltinFunction::ToLower => {
-            let value = current_frame.pop_scalar_value(record)?.scalar_to_string();
-            current_frame.push_value(value.to_lowercase())?;
+            let value = stack.pop_scalar_value(record)?.scalar_to_string();
+            stack.push_value(value.to_lowercase())?;
         }
         BuiltinFunction::ToUpper => {
-            let value = current_frame.pop_scalar_value(record)?.scalar_to_string();
-            current_frame.push_value(value.to_uppercase())?;
+            let value = stack.pop_scalar_value(record)?.scalar_to_string();
+            stack.push_value(value.to_uppercase())?;
         }
         BuiltinFunction::Close => {
             todo!()
@@ -276,7 +276,7 @@ fn call_builtin(
             let record_separator = globals[SpecialVar::Ors as usize].clone().scalar_to_string();
             let mut output = String::new();
             for i in 0..argc {
-                let value = current_frame.pop_scalar_value(record)?.scalar_to_string();
+                let value = stack.pop_scalar_value(record)?.scalar_to_string();
                 output.push_str(&value);
                 if i < argc - 1 {
                     output.push_str(&field_separator);
@@ -753,10 +753,10 @@ struct Interpreter {
 }
 
 macro_rules! numeric_op {
-    ($frame:expr, $record:expr, $op:tt) => {
-        let rhs = $frame.pop_scalar_value($record)?.scalar_as_f64();
-        let lhs = $frame.pop_scalar_value($record)?.scalar_as_f64();
-        $frame.push_value(lhs $op rhs)?;
+    ($stack:expr, $record:expr, $op:tt) => {
+        let rhs = $stack.pop_scalar_value($record)?.scalar_as_f64();
+        let lhs = $stack.pop_scalar_value($record)?.scalar_as_f64();
+        $stack.push_value(lhs $op rhs)?;
     };
 }
 

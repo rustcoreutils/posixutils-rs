@@ -7,7 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::format::parse_escape_sequence;
 use crate::program::{
     AwkRule, BuiltinFunction, Constant, Function, OpCode, Pattern, Program, SpecialVar, VarId,
 };
@@ -19,6 +18,7 @@ use pest::{
 };
 use std::ffi::CString;
 use std::rc::Rc;
+use std::str::Chars;
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
@@ -189,6 +189,52 @@ fn first_child(pair: Pair<Rule>) -> Pair<Rule> {
 
 fn distance(start: usize, end: usize) -> i32 {
     (end as i32) - (start as i32)
+}
+
+fn is_octal_digit(c: char) -> bool {
+    ('0'..='7').contains(&c)
+}
+
+/// parses an escape sequence
+/// # Arguments
+/// - `iter`: a character iterator placed after the '\' character in an escape sequence.
+/// # Returns
+/// a pair containing the escaped character and the next character in the iterator
+/// # Errors
+/// returns an error if the escape sequence is invalid
+fn parse_escape_sequence(iter: &mut Chars) -> Result<(char, Option<char>), String> {
+    let mut char_after_escape_sequence = None;
+    let next_char = iter.next().ok_or("invalid escape sequence".to_string())?;
+    let escaped_char = match next_char {
+        '"' => '"',
+        '/' => '/',
+        'a' => '\x07',
+        'b' => '\x08',
+        'f' => '\x0C',
+        'n' => '\n',
+        'r' => '\r',
+        't' => '\t',
+        'v' => '\x0B',
+        '\\' => '\\',
+        n if is_octal_digit(n) => {
+            let mut char_code = n.to_digit(8).unwrap();
+            for _ in 0..2 {
+                if let Some(c) = iter.next() {
+                    if is_octal_digit(c) {
+                        char_code = char_code * 8 + c.to_digit(8).unwrap();
+                    } else {
+                        char_after_escape_sequence = Some(c);
+                        break;
+                    }
+                }
+            }
+            // FIXME: I don't think this is correct. We should also consider multi-byte characters
+            char::from_u32(char_code).ok_or("invalid character")?
+        }
+        other => return Err(format!("invalid escape sequence: \\{}", other)),
+    };
+    let char_after_escape_sequence = char_after_escape_sequence.or_else(|| iter.next());
+    Ok((escaped_char, char_after_escape_sequence))
 }
 
 fn escape_string(s: &str) -> Result<String, String> {

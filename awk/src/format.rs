@@ -77,10 +77,6 @@ fn write_inf_or_nan(target: &mut String, value: f64, lowercase_version: bool, si
     }
 }
 
-fn is_octal_digit(c: char) -> bool {
-    ('0'..='7').contains(&c)
-}
-
 /// swaps the sign at `target[write_starting_index]` with the last space
 /// padding character before the number
 /// # Panics
@@ -212,48 +208,6 @@ fn remove_trailing_zeros(
     if let Some('.') = target.chars().last() {
         target.pop();
     }
-}
-
-/// parses an escape sequence
-/// # Arguments
-/// - `iter`: a character iterator placed after the '\' character in an escape sequence.
-/// # Returns
-/// a pair containing the escaped character and the next character in the iterator
-/// # Errors
-/// returns an error if the escape sequence is invalid
-pub fn parse_escape_sequence(iter: &mut Chars) -> Result<(char, Option<char>), String> {
-    let mut char_after_escape_sequence = None;
-    let next_char = iter.next().ok_or("invalid escape sequence".to_string())?;
-    let escaped_char = match next_char {
-        '"' => '"',
-        '/' => '/',
-        'a' => '\x07',
-        'b' => '\x08',
-        'f' => '\x0C',
-        'n' => '\n',
-        'r' => '\r',
-        't' => '\t',
-        'v' => '\x0B',
-        '\\' => '\\',
-        n if is_octal_digit(n) => {
-            let mut char_code = n.to_digit(8).unwrap();
-            for _ in 0..2 {
-                if let Some(c) = iter.next() {
-                    if is_octal_digit(c) {
-                        char_code = char_code * 8 + c.to_digit(8).unwrap();
-                    } else {
-                        char_after_escape_sequence = Some(c);
-                        break;
-                    }
-                }
-            }
-            // FIXME: I don't think this is correct. We should also consider multi-byte characters
-            char::from_u32(char_code).ok_or("invalid character")?
-        }
-        other => return Err(format!("invalid escape sequence: \\{}", other)),
-    };
-    let char_after_escape_sequence = char_after_escape_sequence.or_else(|| iter.next());
-    Ok((escaped_char, char_after_escape_sequence))
 }
 
 #[derive(Default, Clone)]
@@ -863,21 +817,6 @@ mod tests {
         assert_eq!(args.zero_padded, true);
         assert_eq!(args.width, 123);
         assert_eq!(args.precision, Some(456));
-    }
-
-    #[test]
-    fn test_parse_escape_sequences() {
-        assert_eq!(parse_escape_sequence(&mut "\"".chars()), Ok(('"', None)));
-        assert_eq!(parse_escape_sequence(&mut "a".chars()), Ok(('\x07', None)));
-        assert_eq!(parse_escape_sequence(&mut "b".chars()), Ok(('\x08', None)));
-        assert_eq!(parse_escape_sequence(&mut "f".chars()), Ok(('\x0C', None)));
-        assert_eq!(parse_escape_sequence(&mut "n".chars()), Ok(('\n', None)));
-        assert_eq!(parse_escape_sequence(&mut "r".chars()), Ok(('\r', None)));
-        assert_eq!(parse_escape_sequence(&mut "t".chars()), Ok(('\t', None)));
-        assert_eq!(parse_escape_sequence(&mut "v".chars()), Ok(('\x0B', None)));
-        assert_eq!(parse_escape_sequence(&mut "0".chars()), Ok(('\0', None)));
-        assert_eq!(parse_escape_sequence(&mut "56".chars()), Ok(('.', None)));
-        assert_eq!(parse_escape_sequence(&mut "100".chars()), Ok(('@', None)));
     }
 
     #[test]

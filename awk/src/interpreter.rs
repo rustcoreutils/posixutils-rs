@@ -10,7 +10,7 @@
 use crate::format::{
     fmt_write_decimal_float, fmt_write_float_general, fmt_write_hex_float,
     fmt_write_scientific_float, fmt_write_signed, fmt_write_string, fmt_write_unsigned,
-    parse_conversion_specifier_args, parse_escape_sequence, FormatArgs, IntegerFormat,
+    parse_conversion_specifier_args, FormatArgs, IntegerFormat,
 };
 use crate::program::{BuiltinFunction, Constant, Function, OpCode, Pattern, Program, SpecialVar};
 use crate::regex::Regex;

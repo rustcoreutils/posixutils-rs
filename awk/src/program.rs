@@ -31,8 +31,8 @@ pub enum OpCode {
     Match,
     Concat,
 
-    // check if the array with reference on top of the stack contains the value
-    // preceding it. Pushed the result on the stack
+    // checks if the key on top of the stack is inside the array
+    // preceding it
     In,
 
     // unary operations
@@ -49,23 +49,21 @@ pub enum OpCode {
     // pop the value from the stack
     Pop,
 
-    // pushes on the stack a reference to the array element
-    // with the given id. The index of the element is on top
-    // of the stack.
-    ArrayRef(u32),
     // pushes on the stack the value variable
-    VarRef(u32),
+    GlobalRef(u32),
     // pushes on the stack a reference to a field. The field number is on top of the stack
     FieldRef,
     // assign the value on top of the stack to the reference
     // preceding it. Leaves the assigned value on top of the stack
     Assign,
 
-    LocalVarRef(u32),
-    LocalArrayRef(u32),
+    // uses the key on top of the stack to index the array preceding it. Pushes a reference
+    // to the indexed element (adding it to the array if its not present)
+    IndexArray,
 
-    // delete an element from the array with reference on top of the stack
-    // using the index preceding it
+    LocalRef(u32),
+
+    // deletes the key on top of the stack from the array preceding it
     Delete,
 
     // jump forwards or backwards by the given offset.

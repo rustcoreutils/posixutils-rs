@@ -339,22 +339,16 @@ impl Compiler {
         index
     }
 
-    fn get_var(
-        &self,
-        name: &str,
-        locals: &LocalMap,
-        local_ref: fn(VarId) -> OpCode,
-        global_ref: fn(VarId) -> OpCode,
-    ) -> Result<OpCode, String> {
+    fn get_var(&self, name: &str, locals: &LocalMap) -> Result<OpCode, String> {
         // FIXME: confusing naming of var vs array
         if let Some(local_id) = locals.get(name) {
-            Ok(local_ref(*local_id))
+            Ok(OpCode::LocalRef(*local_id))
         } else {
             let entry = self.names.borrow().get(name).copied();
             if let Some(var) = entry {
                 match var {
-                    GlobalName::Variable(id) => Ok(global_ref(id)),
-                    GlobalName::SpecialVar(id) => Ok(global_ref(id)),
+                    GlobalName::Variable(id) => Ok(OpCode::GlobalRef(id)),
+                    GlobalName::SpecialVar(id) => Ok(OpCode::GlobalRef(id)),
                     GlobalName::Function { .. } | GlobalName::BuiltinFunction => {
                         Err(format!("'{}' function used in variable context", name))
                     }
@@ -364,7 +358,7 @@ impl Compiler {
                 self.names
                     .borrow_mut()
                     .insert(name.to_string(), GlobalName::Variable(id));
-                Ok(global_ref(id))
+                Ok(OpCode::GlobalRef(id))
             }
         }
     }
@@ -575,17 +569,9 @@ impl Compiler {
                 return Ok(Expr::new(ExprKind::Number, instructions));
             }
             Rule::in_op => {
-                match &rhs.instructions[..] {
-                    [OpCode::VarRef(id)] => instructions.push(OpCode::ArrayRef(*id)),
-                    [OpCode::LocalVarRef(id)] => instructions.push(OpCode::LocalArrayRef(*id)),
-                    _ => {
-                        return Err(pest_error_from_span(
-                            op.as_span(),
-                            "right-hand side of 'in' operator should be an array identifier"
-                                .to_string(),
-                        ));
-                    }
-                }
+                let mut lhs_instructions = instructions;
+                let mut instructions = rhs.instructions;
+                instructions.append(&mut lhs_instructions);
                 instructions.push(OpCode::In);
                 return Ok(Expr::new(ExprKind::Number, instructions));
             }
@@ -676,25 +662,21 @@ impl Compiler {
         match lvalue.as_rule() {
             Rule::name => {
                 let get_instruction = self
-                    .get_var(lvalue.as_str(), locals, OpCode::LocalVarRef, OpCode::VarRef)
+                    .get_var(lvalue.as_str(), locals)
                     .map_err(|msg| pest_error_from_span(lvalue.as_span(), msg))?;
                 instructions.push(get_instruction);
             }
             Rule::array_element => {
                 let mut inner = lvalue.into_inner();
                 let name = inner.next().unwrap();
+                let get_instruction = self
+                    .get_var(name.as_str(), locals)
+                    .map_err(|msg| pest_error_from_span(name.as_span(), msg))?;
+                instructions.push(get_instruction);
                 // FIXME: only supports expression lists of one element
                 let index = inner.next().unwrap();
                 self.compile_expr(index, instructions, locals)?;
-                let get_instruction = self
-                    .get_var(
-                        name.as_str(),
-                        locals,
-                        OpCode::LocalArrayRef,
-                        OpCode::ArrayRef,
-                    )
-                    .map_err(|msg| pest_error_from_span(name.as_span(), msg))?;
-                instructions.push(get_instruction);
+                instructions.push(OpCode::IndexArray)
             }
             Rule::field_var => {
                 self.compile_expr(first_child(lvalue), instructions, locals)?;
@@ -774,17 +756,12 @@ impl Compiler {
             Rule::delete_element => {
                 let mut inner = stmt.into_inner();
                 let name = inner.next().unwrap();
-                let index = inner.next().unwrap();
-                self.compile_expr(index, instructions, locals)?;
                 let get_instruction = self
-                    .get_var(
-                        name.as_str(),
-                        locals,
-                        OpCode::LocalArrayRef,
-                        OpCode::ArrayRef,
-                    )
+                    .get_var(name.as_str(), locals)
                     .map_err(|msg| pest_error_from_span(name.as_span(), msg))?;
                 instructions.push(get_instruction);
+                let index = inner.next().unwrap();
+                self.compile_expr(index, instructions, locals)?;
                 instructions.push(OpCode::Delete);
             }
             Rule::expr => {
@@ -1314,33 +1291,34 @@ mod test {
         let (instructions, _) = compile_expr("++a");
         assert_eq!(
             instructions,
-            vec![OpCode::VarRef(FIRST_GLOBAL_VAR), OpCode::PreInc]
+            vec![OpCode::GlobalRef(FIRST_GLOBAL_VAR), OpCode::PreInc]
         );
 
         let (instructions, _) = compile_expr("--a");
         assert_eq!(
             instructions,
-            vec![OpCode::VarRef(FIRST_GLOBAL_VAR), OpCode::PreDec]
+            vec![OpCode::GlobalRef(FIRST_GLOBAL_VAR), OpCode::PreDec]
         );
 
         let (instructions, _) = compile_expr("a++");
         assert_eq!(
             instructions,
-            vec![OpCode::VarRef(FIRST_GLOBAL_VAR), OpCode::PostInc]
+            vec![OpCode::GlobalRef(FIRST_GLOBAL_VAR), OpCode::PostInc]
         );
 
         let (instructions, _) = compile_expr("a--");
         assert_eq!(
             instructions,
-            vec![OpCode::VarRef(FIRST_GLOBAL_VAR), OpCode::PostDec]
+            vec![OpCode::GlobalRef(FIRST_GLOBAL_VAR), OpCode::PostDec]
         );
 
         let (instructions, _) = compile_expr("++a[0]");
         assert_eq!(
             instructions,
             vec![
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(0),
-                OpCode::ArrayRef(FIRST_GLOBAL_VAR),
+                OpCode::IndexArray,
                 OpCode::PreInc
             ]
         );
@@ -1690,8 +1668,8 @@ mod test {
         assert_eq!(
             instructions,
             vec![
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(0),
-                OpCode::ArrayRef(FIRST_GLOBAL_VAR),
                 OpCode::In
             ]
         );
@@ -1849,13 +1827,13 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::VarRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(0),
                 OpCode::Eq,
                 OpCode::JumpIfFalse(3),
                 OpCode::PushConstant(1),
                 OpCode::Jump(8),
-                OpCode::VarRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(2),
                 OpCode::Eq,
                 OpCode::JumpIfFalse(3),
@@ -1882,7 +1860,7 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::VarRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(0),
                 OpCode::Assign,
             ]
@@ -1893,8 +1871,8 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::VarRef(FIRST_GLOBAL_VAR),
-                OpCode::VarRef(FIRST_GLOBAL_VAR + 1),
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR + 1),
                 OpCode::PushConstant(0),
                 OpCode::Assign,
                 OpCode::Assign,
@@ -1909,7 +1887,7 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::VarRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
                 OpCode::Dup,
                 OpCode::PushConstant(0),
                 OpCode::Add,
@@ -1922,7 +1900,7 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::VarRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
                 OpCode::Dup,
                 OpCode::PushConstant(0),
                 OpCode::Sub,
@@ -1935,7 +1913,7 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::VarRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
                 OpCode::Dup,
                 OpCode::PushConstant(0),
                 OpCode::Mul,
@@ -1948,7 +1926,7 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::VarRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
                 OpCode::Dup,
                 OpCode::PushConstant(0),
                 OpCode::Div,
@@ -1961,7 +1939,7 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::VarRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
                 OpCode::Dup,
                 OpCode::PushConstant(0),
                 OpCode::Mod,
@@ -1974,7 +1952,7 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::VarRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
                 OpCode::Dup,
                 OpCode::PushConstant(0),
                 OpCode::Pow,
@@ -1987,9 +1965,9 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::VarRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
                 OpCode::Dup,
-                OpCode::VarRef(FIRST_GLOBAL_VAR + 1),
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR + 1),
                 OpCode::Dup,
                 OpCode::PushConstant(0),
                 OpCode::Add,
@@ -2007,8 +1985,9 @@ mod test {
         assert_eq!(
             instructions,
             vec![
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(0),
-                OpCode::ArrayRef(FIRST_GLOBAL_VAR),
+                OpCode::IndexArray,
                 OpCode::PushConstant(1),
                 OpCode::Assign,
             ]
@@ -2121,17 +2100,17 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::VarRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(0),
                 OpCode::Assign,
                 OpCode::Pop,
-                OpCode::VarRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(1),
                 OpCode::Lt,
                 OpCode::JumpIfFalse(7),
                 OpCode::PushConstant(2),
                 OpCode::Pop,
-                OpCode::VarRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
                 OpCode::PostInc,
                 OpCode::Pop,
                 OpCode::Jump(-9),
@@ -2183,8 +2162,8 @@ mod test {
         assert_eq!(
             instructions,
             vec![
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(0),
-                OpCode::ArrayRef(FIRST_GLOBAL_VAR),
                 OpCode::Delete,
             ]
         );
@@ -2299,7 +2278,7 @@ mod test {
         assert_eq!(
             program.functions[0].instructions,
             vec![
-                OpCode::VarRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(0),
                 OpCode::Add,
                 OpCode::Pop,
@@ -2323,10 +2302,11 @@ mod test {
         assert_eq!(
             program.functions[0].instructions,
             vec![
+                OpCode::LocalRef(0),
                 OpCode::PushConstant(0),
-                OpCode::LocalArrayRef(0),
-                OpCode::LocalVarRef(1),
-                OpCode::LocalVarRef(2),
+                OpCode::IndexArray,
+                OpCode::LocalRef(1),
+                OpCode::LocalRef(2),
                 OpCode::Add,
                 OpCode::Assign,
                 OpCode::Pop,
@@ -2364,8 +2344,8 @@ mod test {
         assert_eq!(
             program.functions[0].instructions,
             vec![
-                OpCode::LocalVarRef(0),
-                OpCode::LocalVarRef(1),
+                OpCode::LocalRef(0),
+                OpCode::LocalRef(1),
                 OpCode::Add,
                 OpCode::Pop,
                 OpCode::PushUninitializedScalar,
@@ -2396,8 +2376,8 @@ mod test {
         assert_eq!(
             program.functions[0].instructions,
             vec![
-                OpCode::LocalVarRef(0),
-                OpCode::LocalVarRef(1),
+                OpCode::LocalRef(0),
+                OpCode::LocalRef(1),
                 OpCode::Add,
                 OpCode::Pop,
                 OpCode::PushUninitializedScalar,

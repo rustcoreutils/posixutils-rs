@@ -89,7 +89,7 @@ impl Regex {
         let mut raw = unsafe { std::mem::zeroed::<libc::regex_t>() };
         let compilation_status =
             unsafe { libc::regcomp(ptr::from_mut(&mut raw), regex.as_ptr(), libc::REG_EXTENDED) };
-        regex_compilation_result(compilation_status, &raw)?;
+        regex_compilation_result(0, &raw)?;
         Ok(Self {
             raw_regex: raw,
             regex_string: regex,
@@ -104,7 +104,7 @@ impl Regex {
         }
     }
 
-    pub fn matches(&self, string: CString) -> bool {
+    pub fn matches(&self, string: &CString) -> bool {
         let exec_status = unsafe {
             libc::regexec(
                 ptr::from_ref(&self.raw_regex),
@@ -162,7 +162,7 @@ mod tests {
     #[test]
     fn test_regex_matches() {
         let ere = regex_from_str("ab*c");
-        assert!(ere.matches(CString::new("abbbbc").unwrap()));
+        assert!(ere.matches(&CString::new("abbbbc").unwrap()));
     }
 
     #[test]

@@ -47,3 +47,7 @@ path = "./file.rs"
 [[bin]]
 name = "find"
 path = "./find.rs"
+
+[[bin]]
+name = "join"
+path = "./join.rs"

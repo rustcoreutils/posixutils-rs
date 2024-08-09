@@ -80,7 +80,14 @@ fn e_test() {
     let project_root = env!("CARGO_MANIFEST_DIR");
     let file1 = format!("{}/tests/join/file5.txt", project_root);
     let file2 = format!("{}/tests/join/file6.txt", project_root);
-    let args = ["-o", "1.2,2.1,2.2", "-e", "Wandalen", file1.as_str(), file2.as_str()];
+    let args = [
+        "-o",
+        "1.2,2.1,2.2",
+        "-e",
+        "Wandalen",
+        file1.as_str(),
+        file2.as_str(),
+    ];
 
     let expected_output = "Alice 1 HR\nBob 2 Finance\nCharlie 3 IT\nKos 4 Wandalen\n";
 
@@ -118,7 +125,8 @@ fn three_fields_test() {
     let file2 = format!("{}/tests/join/file4.txt", project_root);
     let args = [file1.as_str(), file2.as_str()];
 
-    let expected_output = "1 Bob HR Director HR\n2 Charlie Finance Analyst Finance\n3 Alice Engineering Manager IT\n";
+    let expected_output =
+        "1 Bob HR Director HR\n2 Charlie Finance Analyst Finance\n3 Alice Engineering Manager IT\n";
 
     run_test_join(&args, &expected_output, "", 0)
 }

@@ -14,6 +14,7 @@ mod expand;
 mod fold;
 mod grep;
 mod head;
+mod join;
 mod nl;
 mod paste;
 mod pr;

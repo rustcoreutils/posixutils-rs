@@ -209,11 +209,11 @@ fn call_builtin(
             stack.push_value(start as f64)?;
         }
         BuiltinFunction::Split => {
-            let separator_ere = if argc == 2 {
-                globals[SpecialVar::Fs as usize].clone().to_ere()?
+            let separator = if argc == 2 {
+                globals[SpecialVar::Fs as usize].clone()
             } else {
                 assert_eq!(argc, 3);
-                stack.pop_value().to_ere()?
+                stack.pop_value()
             };
             // FIXME: check above that array_ref is a StackValue::ValueRef and that it
             // is an array. If this is true, `array_ref` cannot point to `s` since it is
@@ -225,18 +225,52 @@ fn call_builtin(
             let array = unsafe { (*array_ref.unwrap_ptr()).as_array()? };
             array.clear();
 
-            let mut split_start = 0;
-            for (i, separator_range) in separator_ere
-                .match_locations(CString::new(s.clone()).unwrap())
-                .enumerate()
-            {
-                array.set(
-                    i.to_string(),
-                    s[split_start..separator_range.start].to_string(),
-                );
-                split_start = separator_range.end;
+            if argc == 3 {
+                let separator_ere = separator.to_ere()?;
+                let mut split_start = 0;
+                for (i, separator_range) in separator_ere
+                    .match_locations(CString::new(s.clone()).unwrap())
+                    .enumerate()
+                {
+                    array.set(
+                        (i + 1).to_string(),
+                        s[split_start..separator_range.start].to_string(),
+                    );
+                    split_start = separator_range.end;
+                }
+                array.set(array.len().to_string(), s[split_start..].to_string());
+            } else {
+                let fs = separator.scalar_to_string(convfmt)?;
+                if fs == " " {
+                    *array = s
+                        .trim_start()
+                        .split_ascii_whitespace()
+                        .enumerate()
+                        .map(|(i, s)| ((i + 1).to_string(), s))
+                        .collect()
+                } else if fs.len() == 1 {
+                    *array = s
+                        .split(&fs)
+                        .enumerate()
+                        .map(|(i, s)| ((i + 1).to_string(), s))
+                        .collect();
+                } else {
+                    // FIXME: copied from above
+                    let separator_ere = Regex::new(CString::new(fs).unwrap())?;
+                    let mut split_start = 0;
+                    for (i, separator_range) in separator_ere
+                        .match_locations(CString::new(s.clone()).unwrap())
+                        .enumerate()
+                    {
+                        array.set(
+                            (i + 1).to_string(),
+                            s[split_start..separator_range.start].to_string(),
+                        );
+                        split_start = separator_range.end;
+                    }
+                    array.set(array.len().to_string(), s[split_start..].to_string());
+                }
             }
-            array.set(array.len().to_string(), s[split_start..].to_string());
             let n = array.len();
             stack.push_value(n as f64)?;
         }
@@ -1139,6 +1173,8 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
                         .split_ascii_whitespace()
                         .map(|s| s.to_string()),
                 );
+            } else if fs.len() == 1 {
+                fields_buffer.extend(record.split(&fs).map(|s| s.to_string()));
             } else {
                 if fs != fs_ere.str() {
                     fs_ere = Regex::new(CString::new(fs).unwrap()).unwrap()
@@ -2194,7 +2230,7 @@ mod tests {
         let global = test_global(instructions, constants);
         assert_eq!(
             global,
-            Array::from_iter([("0", "a"), ("1", " b"), ("2", " c")]).into()
+            Array::from_iter([("1", "a"), ("2", " b"), ("3", " c")]).into()
         );
     }
 }

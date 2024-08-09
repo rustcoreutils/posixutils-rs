@@ -24,3 +24,6 @@ path = "./dirname.rs"
 name = "pathchk"
 path = "./pathchk.rs"
 
+[[bin]]
+name = "realpath"
+path = "./realpath.rs"

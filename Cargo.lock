@@ -977,6 +977,7 @@ name = "posixutils-misc"
 version = "0.2.0"
 dependencies = [
  "atty",
+ "clap",
  "gettext-rs",
  "libc",
  "plib",

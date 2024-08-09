@@ -24,7 +24,3 @@ path = "./false.rs"
 [[bin]]
 name = "test"
 path = "./test.rs"
-
-[[bin]]
-name = "realpath"
-path = "./realpath.rs"

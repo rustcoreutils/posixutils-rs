@@ -95,6 +95,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] strings
  - [x] strip (Development)
  - [x] tail
+ - [x] time
  - [x] tr
  - [x] true
  - [x] uncompress (compress cat.)
@@ -217,7 +218,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] sed
  - [ ] sh
  - [ ] talk
- - [ ] time
  - [ ] timeout
 
 ## Testing

@@ -68,7 +68,7 @@ fn find_type_test() {
 fn find_mtime_test() {
     let project_root = env!("CARGO_MANIFEST_DIR");
     let test_dir = format!("{}/tests/find/other", project_root);
-    let args = [&test_dir, "-mtime", "7"];
+    let args = [&test_dir, "-mtime", "7000"];
 
     run_test_find(&args, "", "", 0)
 }

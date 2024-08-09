@@ -145,6 +145,8 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] kill
  - [x] logger
  - [x] printf
+ - [x] ps
+ - [x] realpath
  - [x] stty
  - [x] tabs
  - [x] test
@@ -212,8 +214,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] newgrp
  - [ ] patch
  - [ ] pax
- - [ ] ps
- - [ ] realpath
  - [ ] sed
  - [ ] sh
  - [ ] talk

@@ -16,3 +16,9 @@
 	filename: OS error message
 ```
 
+## Other items
+
+The `find` test `find_mtime_test` is hardcoded to use a specific
+date offset.  This was increased to 7000 days to temporarily avoid
+test failure.  The test should be improved.
+

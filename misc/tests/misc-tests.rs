@@ -8,5 +8,5 @@
 //
 
 mod r#false;
-mod test;
 mod r#true;
+mod test;

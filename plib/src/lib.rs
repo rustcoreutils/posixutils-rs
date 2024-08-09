@@ -15,6 +15,7 @@ pub mod modestr;
 pub mod sccsfile;
 pub mod testing;
 pub mod utmpx;
+pub mod walkdir;
 
 pub const PROJECT_NAME: &'static str = "posixutils-rs";
 

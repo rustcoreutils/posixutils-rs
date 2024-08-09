@@ -336,6 +336,10 @@ impl Default for Compiler {
                 GlobalName::SpecialVar(SpecialVar::Fnr as u32),
             ),
             (
+                "FS".to_string(),
+                GlobalName::SpecialVar(SpecialVar::Fs as u32),
+            ),
+            (
                 "NF".to_string(),
                 GlobalName::SpecialVar(SpecialVar::Nf as u32),
             ),
@@ -354,6 +358,10 @@ impl Default for Compiler {
             (
                 "ORS".to_string(),
                 GlobalName::SpecialVar(SpecialVar::Ors as u32),
+            ),
+            (
+                "RLENGTH".to_string(),
+                GlobalName::SpecialVar(SpecialVar::Rlength as u32),
             ),
             (
                 "RS".to_string(),
@@ -2822,6 +2830,69 @@ mod test {
                     function: BuiltinFunction::System,
                     argc: 1,
                 },
+                OpCode::Pop,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_compile_special_variables() {
+        let program = compile_correct_program(
+            r#"
+            BEGIN {
+                ARGC
+                ARGV
+                CONVFMT
+                ENVIRON
+                FILENAME
+                FNR
+                FS
+                NF
+                NR
+                OFMT
+                OFS
+                ORS
+                RLENGTH
+                RS
+                RSTART
+                SUBSEP
+            }
+        "#,
+        );
+        assert_eq!(
+            program.begin_instructions,
+            vec![
+                OpCode::GlobalRef(SpecialVar::Argc as u32),
+                OpCode::Pop,
+                OpCode::GlobalRef(SpecialVar::Argv as u32),
+                OpCode::Pop,
+                OpCode::GlobalRef(SpecialVar::Convfmt as u32),
+                OpCode::Pop,
+                OpCode::GlobalRef(SpecialVar::Environ as u32),
+                OpCode::Pop,
+                OpCode::GlobalRef(SpecialVar::Filename as u32),
+                OpCode::Pop,
+                OpCode::GlobalRef(SpecialVar::Fnr as u32),
+                OpCode::Pop,
+                OpCode::GlobalRef(SpecialVar::Fs as u32),
+                OpCode::Pop,
+                OpCode::GlobalRef(SpecialVar::Nf as u32),
+                OpCode::Pop,
+                OpCode::GlobalRef(SpecialVar::Nr as u32),
+                OpCode::Pop,
+                OpCode::GlobalRef(SpecialVar::Ofmt as u32),
+                OpCode::Pop,
+                OpCode::GlobalRef(SpecialVar::Ofs as u32),
+                OpCode::Pop,
+                OpCode::GlobalRef(SpecialVar::Ors as u32),
+                OpCode::Pop,
+                OpCode::GlobalRef(SpecialVar::Rlength as u32),
+                OpCode::Pop,
+                OpCode::GlobalRef(SpecialVar::Rs as u32),
+                OpCode::Pop,
+                OpCode::GlobalRef(SpecialVar::Rstart as u32),
+                OpCode::Pop,
+                OpCode::GlobalRef(SpecialVar::Subsep as u32),
                 OpCode::Pop,
             ]
         );

@@ -77,6 +77,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] fold
  - [x] grep
  - [x] head
+ - [x] join
  - [x] link
  - [x] ls
  - [x] mkdir
@@ -204,7 +205,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
 ### Misc. category
  - [ ] awk
  - [ ] fuser
- - [ ] join
  - [ ] lp
  - [ ] m4
  - [ ] mailx

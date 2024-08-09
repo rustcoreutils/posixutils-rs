@@ -40,13 +40,13 @@ fn strtod(s: &str) -> f64 {
     .unwrap_or(0.0)
 }
 
-fn sprintf(argc: u16, stack: &mut Stack, record: &CString) -> Result<String, String> {
+fn sprintf(argc: u16, stack: &mut Stack) -> Result<String, String> {
     let mut values = Vec::with_capacity(argc as usize);
     for _ in 0..(argc - 1) {
-        values.push(stack.pop_scalar_value(record)?)
+        values.push(stack.pop_scalar_value()?)
     }
 
-    let format_string = stack.pop_scalar_value(record)?.scalar_to_string();
+    let format_string = stack.pop_scalar_value()?.scalar_to_string();
     let mut result = String::with_capacity(format_string.len());
     let mut iter = format_string.chars();
     let mut next = iter.next();
@@ -127,32 +127,32 @@ fn call_builtin(
 ) -> Result<(), String> {
     match function {
         BuiltinFunction::Atan2 => {
-            let y = stack.pop_scalar_value(record)?.scalar_as_f64();
-            let x = stack.pop_scalar_value(record)?.scalar_as_f64();
+            let y = stack.pop_scalar_value()?.scalar_as_f64();
+            let x = stack.pop_scalar_value()?.scalar_as_f64();
             stack.push_value(y.atan2(x))?;
         }
         BuiltinFunction::Cos => {
-            let value = stack.pop_scalar_value(record)?.scalar_as_f64();
+            let value = stack.pop_scalar_value()?.scalar_as_f64();
             stack.push_value(value.cos())?;
         }
         BuiltinFunction::Sin => {
-            let value = stack.pop_scalar_value(record)?.scalar_as_f64();
+            let value = stack.pop_scalar_value()?.scalar_as_f64();
             stack.push_value(value.sin())?;
         }
         BuiltinFunction::Exp => {
-            let value = stack.pop_scalar_value(record)?.scalar_as_f64();
+            let value = stack.pop_scalar_value()?.scalar_as_f64();
             stack.push_value(value.exp())?;
         }
         BuiltinFunction::Log => {
-            let value = stack.pop_scalar_value(record)?.scalar_as_f64();
+            let value = stack.pop_scalar_value()?.scalar_as_f64();
             stack.push_value(value.ln())?;
         }
         BuiltinFunction::Sqrt => {
-            let value = stack.pop_scalar_value(record)?.scalar_as_f64();
+            let value = stack.pop_scalar_value()?.scalar_as_f64();
             stack.push_value(value.sqrt())?;
         }
         BuiltinFunction::Int => {
-            let value = stack.pop_scalar_value(record)?.scalar_as_f64();
+            let value = stack.pop_scalar_value()?.scalar_as_f64();
             stack.push_value(value.trunc())?;
         }
         BuiltinFunction::Rand => {
@@ -165,8 +165,8 @@ fn call_builtin(
             todo!()
         }
         BuiltinFunction::Index => {
-            let t = stack.pop_scalar_value(record)?.scalar_to_string();
-            let s = stack.pop_scalar_value(record)?.scalar_to_string();
+            let t = stack.pop_scalar_value()?.scalar_to_string();
+            let s = stack.pop_scalar_value()?.scalar_to_string();
             let index = s.find(&t).map(|i| i as f64 + 1.0).unwrap_or(0.0);
             stack.push_value(index)?;
         }
@@ -174,13 +174,13 @@ fn call_builtin(
             if argc == 0 {
                 stack.push_value(record.count_bytes() as f64)?;
             } else {
-                let value = stack.pop_scalar_value(record)?.scalar_to_string();
+                let value = stack.pop_scalar_value()?.scalar_to_string();
                 stack.push_value(value.len() as f64)?;
             }
         }
         BuiltinFunction::Match => {
             let ere = stack.pop_value().to_ere()?;
-            let string = stack.pop_scalar_value(record)?.scalar_to_string();
+            let string = stack.pop_scalar_value()?.scalar_to_string();
             // TODO: should look into this unwrap
             let mut locations = ere.match_locations(CString::new(string).unwrap());
             let start;
@@ -207,7 +207,7 @@ fn call_builtin(
             // is an array. If this is true, `array_ref` cannot point to `s` since it is
             // a string
             let array_ref = stack.pop().unwrap();
-            let s = stack.pop_scalar_value(record)?.scalar_to_string();
+            let s = stack.pop_scalar_value()?.scalar_to_string();
             // this is safe only if the value in `array_ref` is not a reference to
             // s, which we just popped
             let array = unsafe { (*array_ref.unwrap_ptr()).as_array()? };
@@ -229,7 +229,7 @@ fn call_builtin(
             stack.push_value(n as f64)?;
         }
         BuiltinFunction::Sprintf => {
-            let result = sprintf(argc, stack, record)?;
+            let result = sprintf(argc, stack)?;
             stack.push_value(result)?;
         }
         BuiltinFunction::Sub => {
@@ -239,19 +239,19 @@ fn call_builtin(
             let n = if argc == 2 {
                 usize::MAX
             } else {
-                stack.pop_scalar_value(record)?.scalar_as_f64() as usize
+                stack.pop_scalar_value()?.scalar_as_f64() as usize
             };
-            let m = stack.pop_scalar_value(record)?.scalar_as_f64() as usize;
-            let s = stack.pop_scalar_value(record)?.scalar_to_string();
+            let m = stack.pop_scalar_value()?.scalar_as_f64() as usize;
+            let s = stack.pop_scalar_value()?.scalar_to_string();
             let substr = s.chars().skip(m).take(n).collect::<String>();
             stack.push_value(substr)?;
         }
         BuiltinFunction::ToLower => {
-            let value = stack.pop_scalar_value(record)?.scalar_to_string();
+            let value = stack.pop_scalar_value()?.scalar_to_string();
             stack.push_value(value.to_lowercase())?;
         }
         BuiltinFunction::ToUpper => {
-            let value = stack.pop_scalar_value(record)?.scalar_to_string();
+            let value = stack.pop_scalar_value()?.scalar_to_string();
             stack.push_value(value.to_uppercase())?;
         }
         BuiltinFunction::Close => {
@@ -268,7 +268,7 @@ fn call_builtin(
             let record_separator = globals[SpecialVar::Ors as usize].clone().scalar_to_string();
             let mut output = String::new();
             for i in 0..argc {
-                let value = stack.pop_scalar_value(record)?.scalar_to_string();
+                let value = stack.pop_scalar_value()?.scalar_to_string();
                 output.push_str(&value);
                 if i < argc - 1 {
                     output.push_str(&field_separator);
@@ -367,7 +367,10 @@ enum AwkValueVariant {
     Number(f64),
     String(String),
     Array(Array),
-    Regex(Rc<Regex>),
+    Regex {
+        ere: Rc<Regex>,
+        matches_record: bool,
+    },
     Uninitialized,
     UninitializedScalar,
 }
@@ -392,9 +395,8 @@ impl AwkValue {
             AwkValueVariant::Number(x) => *x,
             AwkValueVariant::String(s) => strtod(s),
             AwkValueVariant::UninitializedScalar => 0.0,
-            AwkValueVariant::Array(_)
-            | AwkValueVariant::Regex(_)
-            | AwkValueVariant::Uninitialized => {
+            AwkValueVariant::Regex { matches_record, .. } => bool_to_f64(*matches_record),
+            AwkValueVariant::Array(_) | AwkValueVariant::Uninitialized => {
                 panic!("not a scalar")
             }
         }
@@ -404,10 +406,9 @@ impl AwkValue {
         match &self.value {
             AwkValueVariant::Number(x) => *x != 0.0,
             AwkValueVariant::String(s) => !s.is_empty(),
+            AwkValueVariant::Regex { matches_record, .. } => *matches_record,
             AwkValueVariant::UninitializedScalar => false,
-            AwkValueVariant::Array(_)
-            | AwkValueVariant::Regex(_)
-            | AwkValueVariant::Uninitialized => {
+            AwkValueVariant::Array(_) | AwkValueVariant::Uninitialized => {
                 panic!("not a scalar")
             }
         }
@@ -419,19 +420,16 @@ impl AwkValue {
             AwkValueVariant::String(s) => s,
             AwkValueVariant::UninitializedScalar => String::new(),
             AwkValueVariant::Array(_)
-            | AwkValueVariant::Regex(_)
+            | AwkValueVariant::Regex { .. }
             | AwkValueVariant::Uninitialized => {
                 panic!("not a scalar")
             }
         }
     }
 
-    fn ensure_value_is_scalar(&mut self, record: &CString) -> Result<(), String> {
+    fn ensure_value_is_scalar(&mut self) -> Result<(), String> {
         match &self.value {
             AwkValueVariant::Uninitialized => self.value = AwkValueVariant::UninitializedScalar,
-            AwkValueVariant::Regex(re) => {
-                self.value = AwkValueVariant::Number(bool_to_f64(re.matches(record)));
-            }
             AwkValueVariant::Array(_) => return Err("array used in scalar context".into()),
             _ => {
                 //already a scalar
@@ -457,7 +455,7 @@ impl AwkValue {
 
     fn to_ere(self) -> Result<Rc<Regex>, String> {
         match self.value {
-            AwkValueVariant::Regex(ere) => Ok(ere),
+            AwkValueVariant::Regex { ere, .. } => Ok(ere),
             _ => Err("expected extended regular expression".to_string()),
         }
     }
@@ -489,6 +487,17 @@ impl AwkValue {
             ref_type: AwkRefType::None,
         }
     }
+
+    fn from_ere(ere: Rc<Regex>, record: &CString) -> Self {
+        let matches_record = ere.matches(record);
+        Self {
+            value: AwkValueVariant::Regex {
+                ere,
+                matches_record,
+            },
+            ref_type: AwkRefType::None,
+        }
+    }
 }
 
 impl From<f64> for AwkValue {
@@ -516,30 +525,11 @@ impl From<&str> for AwkValue {
     }
 }
 
-impl From<Rc<Regex>> for AwkValue {
-    fn from(value: Rc<Regex>) -> Self {
-        Self {
-            value: AwkValueVariant::Regex(value),
-            ref_type: AwkRefType::None,
-        }
-    }
-}
-
 impl From<Array> for AwkValue {
     fn from(value: Array) -> Self {
         Self {
             value: AwkValueVariant::Array(value),
             ref_type: AwkRefType::None,
-        }
-    }
-}
-
-impl From<Constant> for AwkValue {
-    fn from(value: Constant) -> Self {
-        match value {
-            Constant::Number(x) => x.into(),
-            Constant::String(s) => s.into(),
-            Constant::Regex(re) => re.into(),
         }
     }
 }
@@ -578,8 +568,8 @@ impl StackValue {
 
     /// # Safety
     /// if the `StackValue` is a `ValueRef` then the pointer has to point to a valid `AwkValue`
-    unsafe fn ensure_value_is_scalar(&mut self, record: &CString) -> Result<(), String> {
-        self.value_ref().ensure_value_is_scalar(record)
+    unsafe fn ensure_value_is_scalar(&mut self) -> Result<(), String> {
+        self.value_ref().ensure_value_is_scalar()
     }
 }
 
@@ -643,11 +633,11 @@ impl<'i, 's> Stack<'i, 's> {
         }
     }
 
-    fn pop_scalar_value(&mut self, record: &CString) -> Result<AwkValue, String> {
+    fn pop_scalar_value(&mut self) -> Result<AwkValue, String> {
         let mut value = self.pop().unwrap();
         // safe by type invariance
         unsafe {
-            value.ensure_value_is_scalar(record)?;
+            value.ensure_value_is_scalar()?;
             Ok(value.to_owned())
         }
     }
@@ -745,17 +735,17 @@ struct Interpreter {
 }
 
 macro_rules! numeric_op {
-    ($stack:expr, $record:expr, $op:tt) => {
-        let rhs = $stack.pop_scalar_value($record)?.scalar_as_f64();
-        let lhs = $stack.pop_scalar_value($record)?.scalar_as_f64();
+    ($stack:expr, $op:tt) => {
+        let rhs = $stack.pop_scalar_value()?.scalar_as_f64();
+        let lhs = $stack.pop_scalar_value()?.scalar_as_f64();
         $stack.push_value(lhs $op rhs)?;
     };
 }
 
 macro_rules! compare_op {
-    ($stack:expr, $record:expr, $op:tt) => {
-        let rhs = $stack.pop_scalar_value($record)?;
-        let lhs = $stack.pop_scalar_value($record)?;
+    ($stack:expr, $op:tt) => {
+        let rhs = $stack.pop_scalar_value()?;
+        let lhs = $stack.pop_scalar_value()?;
         match (&lhs.value, &rhs.value) {
             (AwkValueVariant::Number(lhs), AwkValueVariant::Number(rhs)) => {
                 $stack.push_value(bool_to_f64(lhs $op rhs))?;
@@ -801,94 +791,94 @@ impl Interpreter {
             let mut ip_increment: isize = 1;
             match instruction {
                 OpCode::Add => {
-                    numeric_op!(stack, &record, +);
+                    numeric_op!(stack, +);
                 }
                 OpCode::Sub => {
-                    numeric_op!(stack, &record, -);
+                    numeric_op!(stack,  -);
                 }
                 OpCode::Mul => {
-                    numeric_op!(stack, &record, *);
+                    numeric_op!(stack,  *);
                 }
                 OpCode::Div => {
-                    numeric_op!(stack, &record, /);
+                    numeric_op!(stack,  /);
                 }
                 OpCode::Mod => {
-                    numeric_op!(stack, &record, %);
+                    numeric_op!(stack,  %);
                 }
                 OpCode::Pow => {
-                    let rhs = stack.pop_scalar_value(&record)?.scalar_as_f64();
-                    let lhs = stack.pop_scalar_value(&record)?.scalar_as_f64();
+                    let rhs = stack.pop_scalar_value()?.scalar_as_f64();
+                    let lhs = stack.pop_scalar_value()?.scalar_as_f64();
                     stack.push_value(lhs.powf(rhs))?;
                 }
                 OpCode::Le => {
-                    compare_op!(stack, &record, <=);
+                    compare_op!(stack,  <=);
                 }
                 OpCode::Lt => {
-                    compare_op!(stack, &record, <);
+                    compare_op!(stack,  <);
                 }
                 OpCode::Ge => {
-                    compare_op!(stack, &record, >=);
+                    compare_op!(stack,  >=);
                 }
                 OpCode::Gt => {
-                    compare_op!(stack, &record, >);
+                    compare_op!(stack,  >);
                 }
                 OpCode::Eq => {
-                    compare_op!(stack, &record, ==);
+                    compare_op!(stack,  ==);
                 }
                 OpCode::Ne => {
-                    compare_op!(stack, &record, !=);
+                    compare_op!(stack,  !=);
                 }
                 OpCode::Match => {
                     let ere = stack.pop_value().to_ere()?;
-                    let string = stack.pop_scalar_value(&record)?.scalar_to_string();
+                    let string = stack.pop_scalar_value()?.scalar_to_string();
                     // FIXME: remove unwrap
                     let result = ere.matches(&CString::new(string).unwrap());
                     stack.push_value(bool_to_f64(result))?;
                 }
                 OpCode::Concat => {
-                    let rhs = stack.pop_scalar_value(&record)?.scalar_to_string();
-                    let mut lhs = stack.pop_scalar_value(&record)?.scalar_to_string();
+                    let rhs = stack.pop_scalar_value()?.scalar_to_string();
+                    let mut lhs = stack.pop_scalar_value()?.scalar_to_string();
                     lhs.push_str(&rhs);
                     stack.push_value(lhs)?;
                 }
                 OpCode::In => {
-                    let key = stack.pop_scalar_value(&record)?.scalar_to_string();
+                    let key = stack.pop_scalar_value()?.scalar_to_string();
                     let array = stack.pop_ref().as_array()?;
                     let result = array.contains(&key);
                     stack.push_value(bool_to_f64(result))?;
                 }
                 OpCode::Negate => {
-                    let value = stack.pop_scalar_value(&record)?.scalar_as_f64();
+                    let value = stack.pop_scalar_value()?.scalar_as_f64();
                     stack.push_value(-value)?;
                 }
                 OpCode::Not => {
-                    let value = stack.pop_scalar_value(&record)?.scalar_as_bool();
+                    let value = stack.pop_scalar_value()?.scalar_as_bool();
                     stack.push_value(bool_to_f64(!value))?;
                 }
                 OpCode::PostInc => {
                     let lvalue = stack.pop_ref();
-                    lvalue.ensure_value_is_scalar(&record)?;
+                    lvalue.ensure_value_is_scalar()?;
                     let expr_result = lvalue.scalar_as_f64();
                     *lvalue = (expr_result + 1.0).into();
                     stack.push_value(expr_result)?;
                 }
                 OpCode::PostDec => {
                     let lvalue = stack.pop_ref();
-                    lvalue.ensure_value_is_scalar(&record)?;
+                    lvalue.ensure_value_is_scalar()?;
                     let expr_result = lvalue.scalar_as_f64();
                     *lvalue = (expr_result - 1.0).into();
                     stack.push_value(expr_result)?;
                 }
                 OpCode::PreInc => {
                     let lvalue = stack.pop_ref();
-                    lvalue.ensure_value_is_scalar(&record)?;
+                    lvalue.ensure_value_is_scalar()?;
                     let expr_result = lvalue.scalar_as_f64() + 1.0;
                     *lvalue = expr_result.into();
                     stack.push_value(expr_result)?;
                 }
                 OpCode::PreDec => {
                     let lvalue = stack.pop_ref();
-                    lvalue.ensure_value_is_scalar(&record)?;
+                    lvalue.ensure_value_is_scalar()?;
                     let expr_result = lvalue.scalar_as_f64() - 1.0;
                     *lvalue = expr_result.into();
                     stack.push_value(expr_result)?;
@@ -899,7 +889,7 @@ impl Interpreter {
                 },
                 OpCode::LocalRef(index) => stack.push_ref_to_stack_element(index as usize)?,
                 OpCode::FieldRef => {
-                    let index = stack.pop_scalar_value(&record)?.scalar_as_f64();
+                    let index = stack.pop_scalar_value()?.scalar_as_f64();
                     if index < 0.0 || index > 1024.0 {
                         return Err("invalid field index".to_string());
                     }
@@ -908,32 +898,32 @@ impl Interpreter {
                     unsafe { stack.push_ref(&mut self.fields[index])? };
                 }
                 OpCode::Assign => {
-                    let value = stack.pop_scalar_value(&record)?;
+                    let value = stack.pop_scalar_value()?;
                     let lvalue = stack.pop_ref();
                     // FIXME: we don't need to convert values here, just check
-                    lvalue.ensure_value_is_scalar(&record)?;
+                    lvalue.ensure_value_is_scalar()?;
                     *lvalue = value.clone();
                     stack.push_value(value)?;
                 }
                 OpCode::IndexArray => {
-                    let key = stack.pop_scalar_value(&record)?.scalar_to_string();
+                    let key = stack.pop_scalar_value()?.scalar_to_string();
                     let array = stack.pop_ref().as_array()?;
                     let element_ref = array.get_or_insert_uninitialized(key) as *mut AwkValue;
                     unsafe { stack.push_ref(element_ref)? };
                 }
                 OpCode::Delete => {
-                    let key = stack.pop_scalar_value(&record)?.scalar_to_string();
+                    let key = stack.pop_scalar_value()?.scalar_to_string();
                     let array = stack.pop_ref().as_array()?;
                     array.delete(&key);
                 }
                 OpCode::JumpIfFalse(offset) => {
-                    let condition = stack.pop_scalar_value(&record)?.scalar_as_bool();
+                    let condition = stack.pop_scalar_value()?.scalar_as_bool();
                     if !condition {
                         ip_increment = offset as isize;
                     }
                 }
                 OpCode::JumpIfTrue(offset) => {
-                    let condition = stack.pop_scalar_value(&record)?.scalar_as_bool();
+                    let condition = stack.pop_scalar_value()?.scalar_as_bool();
                     if condition {
                         ip_increment = offset as isize;
                     }
@@ -949,9 +939,11 @@ impl Interpreter {
                 OpCode::CallBuiltin { function, argc } => {
                     call_builtin(function, argc, &mut stack, &record, &mut self.globals)?
                 }
-                OpCode::PushConstant(index) => {
-                    stack.push_value(self.constants[index as usize].clone())?;
-                }
+                OpCode::PushConstant(index) => match self.constants[index as usize].clone() {
+                    Constant::Number(num) => stack.push_value(num)?,
+                    Constant::String(s) => stack.push_value(s)?,
+                    Constant::Regex(ere) => stack.push_value(AwkValue::from_ere(ere, &record))?,
+                },
                 OpCode::PushOne => {
                     stack.push_value(1.0)?;
                 }
@@ -965,7 +957,7 @@ impl Interpreter {
                     stack.pop();
                 }
                 OpCode::Return => {
-                    let return_value = stack.pop_scalar_value(&record)?;
+                    let return_value = stack.pop_scalar_value()?;
                     stack.restore_caller();
                     stack.push_value(return_value)?;
                 }
@@ -990,8 +982,7 @@ impl Interpreter {
         globals[SpecialVar::Environ as usize] = env.into();
         globals[SpecialVar::Filename as usize] = AwkValue::from("-".to_string());
         globals[SpecialVar::Fnr as usize] = AwkValue::from(0.0);
-        globals[SpecialVar::Fs as usize] =
-            AwkValue::from(Rc::new(Regex::new(CString::new(" ").unwrap()).unwrap()));
+        globals[SpecialVar::Fs as usize] = AwkValue::from(" ");
         globals[SpecialVar::Nf as usize] = AwkValue::from(0.0);
         globals[SpecialVar::Nr as usize] = AwkValue::from(0.0);
         globals[SpecialVar::Ofmt as usize] = AwkValue::from("%.6g".to_string());

@@ -1072,6 +1072,7 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
     let mut current_arg_index = 1;
     let mut nr = 1;
     let mut fields_buffer = Vec::new();
+    let mut fs_ere = Regex::new(CString::default()).unwrap();
     loop {
         let argc = interpreter.globals[SpecialVar::Argc as usize].scalar_as_f64() as usize;
 
@@ -1128,20 +1129,32 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
 
             let fs = interpreter.globals[SpecialVar::Fs as usize]
                 .to_owned()
-                .to_ere()
+                .scalar_to_string(&interpreter.convfmt)
                 .unwrap();
 
-            let mut current_field_start = 0;
+            if fs == " " {
+                fields_buffer.extend(
+                    record
+                        .trim_start()
+                        .split_ascii_whitespace()
+                        .map(|s| s.to_string()),
+                );
+            } else {
+                if fs != fs_ere.str() {
+                    fs_ere = Regex::new(CString::new(fs).unwrap()).unwrap()
+                }
 
-            // TODO: fix unwrap
-            for sep_range in fs.match_locations(CString::new(record.clone()).unwrap()) {
-                fields_buffer.push(record[current_field_start..sep_range.start].to_string());
-                current_field_start = sep_range.end;
-            }
-            if current_field_start != 0 {
-                fields_buffer.push(record[current_field_start..].to_string())
-            }
+                let mut current_field_start = 0;
 
+                // TODO: fix unwrap
+                for sep_range in fs_ere.match_locations(CString::new(record.clone()).unwrap()) {
+                    fields_buffer.push(record[current_field_start..sep_range.start].to_string());
+                    current_field_start = sep_range.end;
+                }
+                if current_field_start != 0 {
+                    fields_buffer.push(record[current_field_start..].to_string());
+                }
+            }
             fields_buffer[0] = record;
 
             interpreter.globals[SpecialVar::Fnr as usize] = AwkValue::from(fnr as f64);

@@ -27,5 +27,4 @@ path = "./sleep.rs"
 
 [[bin]]
 name = "time"
-path = "src/time.rs"
-
+path = "./time.rs"

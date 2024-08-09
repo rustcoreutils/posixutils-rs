@@ -818,9 +818,7 @@ impl Interpreter {
             .unwrap_or_default();
         let mut last_field_value_referenced = 0;
         for (i, field) in fields.iter_mut().enumerate() {
-            let mut str = String::new();
-            std::mem::swap(&mut str, field);
-            let mut value = AwkValue::from(str);
+            let mut value = AwkValue::from(swap_with_default(field));
             value.ref_type = AwkRefType::Field;
             self.fields[i] = value;
         }

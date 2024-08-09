@@ -2234,4 +2234,23 @@ mod tests {
             Array::from_iter([("1", "a"), ("2", " b"), ("3", " c")]).into()
         );
     }
+
+    #[test]
+    fn test_builtin_split_with_default_fs() {
+        let instructions = vec![
+            OpCode::PushConstant(0),
+            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::CallBuiltin {
+                function: BuiltinFunction::Split,
+                argc: 2,
+            },
+        ];
+        let constants = vec![Constant::String("a b c".to_string())];
+
+        let global = test_global(instructions, constants);
+        assert_eq!(
+            global,
+            Array::from_iter([("1", "a"), ("2", "b"), ("3", "c")]).into()
+        );
+    }
 }

@@ -734,9 +734,13 @@ pub fn fmt_write_float_general(
             pad_target(target, args.width.saturating_sub(number_length), b' ');
         }
     } else {
+        let contains_significant_integer_digits = value.trunc() != 0.0;
         // in decimal notation, the number of significant digits is the precision plus the number of
-        // digits in the integer part of the number
-        let precision = significant_digits.saturating_sub(exponent.max(0) as usize + 1);
+        // digits in the integer part of the number. If the integer part is 0, the leading zero is
+        // not considered a significant digit
+        let precision = significant_digits.saturating_sub(
+            exponent.max(0) as usize + contains_significant_integer_digits as usize,
+        );
 
         let value = value.abs();
         let write_starting_index = target.len();
@@ -2673,5 +2677,20 @@ mod tests {
             },
         );
         assert_eq!(target, "1.");
+    }
+
+    #[test]
+    fn test_write_float_general_as_decimal_without_integer_digits() {
+        let mut target = String::new();
+        fmt_write_float_general(
+            &mut target,
+            0.7853981633974,
+            true,
+            &FormatArgs {
+                precision: Some(6),
+                ..Default::default()
+            },
+        );
+        assert_eq!(target, "0.785398");
     }
 }

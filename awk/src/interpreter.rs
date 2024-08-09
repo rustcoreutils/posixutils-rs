@@ -40,16 +40,25 @@ fn strtod(s: &str) -> f64 {
     .unwrap_or(0.0)
 }
 
-fn sprintf(argc: u16, stack: &mut Stack) -> Result<String, String> {
-    let mut values = Vec::with_capacity(argc as usize);
-    for _ in 0..(argc - 1) {
-        values.push(stack.pop_scalar_value()?)
-    }
+fn is_integer(num: f64) -> bool {
+    num.is_finite() && num.fract() == 0.0
+}
 
-    let format_string = stack.pop_scalar_value()?.scalar_to_string();
+fn swap_with_default<T: Default>(value: &mut T) -> T {
+    let mut result = T::default();
+    std::mem::swap(&mut result, value);
+    result
+}
+
+fn sprintf(
+    format_string: &str,
+    values: &mut [AwkValue],
+    float_format: &str,
+) -> Result<String, String> {
     let mut result = String::with_capacity(format_string.len());
     let mut iter = format_string.chars();
     let mut next = iter.next();
+    let mut current_arg = values.len();
     while let Some(c) = next {
         match c {
             '%' => {
@@ -59,16 +68,18 @@ fn sprintf(argc: u16, stack: &mut Stack) -> Result<String, String> {
                     continue;
                 }
 
-                if values.is_empty() {
+                if current_arg == 0 {
                     return Err("not enough arguments for format string".to_string());
                 }
+                current_arg -= 1;
+                let value = swap_with_default(&mut values[current_arg]);
                 match specifier {
                     'd' | 'i' => {
-                        let value = values.pop().unwrap().scalar_as_f64() as i64;
+                        let value = value.scalar_as_f64() as i64;
                         fmt_write_signed(&mut result, value, &args);
                     }
                     'u' | 'o' | 'x' | 'X' => {
-                        let value = values.pop().unwrap().scalar_as_f64() as i64;
+                        let value = value.scalar_as_f64() as i64;
                         if value.is_negative() {
                             return Err("negative value for unsigned format specifier".to_string());
                         }
@@ -82,27 +93,27 @@ fn sprintf(argc: u16, stack: &mut Stack) -> Result<String, String> {
                         fmt_write_unsigned(&mut result, value as u64, format, &args);
                     }
                     'a' | 'A' => {
-                        let value = values.pop().unwrap().scalar_as_f64();
+                        let value = value.scalar_as_f64();
                         fmt_write_hex_float(&mut result, value, specifier == 'a', &args);
                     }
                     'f' | 'F' => {
-                        let value = values.pop().unwrap().scalar_as_f64();
+                        let value = value.scalar_as_f64();
                         fmt_write_decimal_float(&mut result, value, specifier == 'f', &args);
                     }
                     'e' | 'E' => {
-                        let value = values.pop().unwrap().scalar_as_f64();
+                        let value = value.scalar_as_f64();
                         fmt_write_scientific_float(&mut result, value, specifier == 'e', &args);
                     }
                     'g' | 'G' => {
-                        let value = values.pop().unwrap().scalar_as_f64();
+                        let value = value.scalar_as_f64();
                         fmt_write_float_general(&mut result, value, specifier == 'g', &args);
                     }
                     'c' => {
-                        let value = values.pop().unwrap().scalar_as_f64() as i64 as u8;
+                        let value = value.scalar_as_f64() as i64 as u8;
                         result.push(value as char);
                     }
                     's' => {
-                        let value = values.pop().unwrap().scalar_to_string();
+                        let value = value.scalar_to_string(float_format)?;
                         fmt_write_string(&mut result, &value, &args);
                     }
                     _ => return Err(format!("unsupported format specifier '{}'", specifier)),
@@ -124,6 +135,7 @@ fn call_builtin(
     stack: &mut Stack,
     record: &CString,
     globals: &mut [AwkValue],
+    convfmt: &str,
 ) -> Result<(), String> {
     match function {
         BuiltinFunction::Atan2 => {
@@ -165,8 +177,8 @@ fn call_builtin(
             todo!()
         }
         BuiltinFunction::Index => {
-            let t = stack.pop_scalar_value()?.scalar_to_string();
-            let s = stack.pop_scalar_value()?.scalar_to_string();
+            let t = stack.pop_scalar_value()?.scalar_to_string(convfmt)?;
+            let s = stack.pop_scalar_value()?.scalar_to_string(convfmt)?;
             let index = s.find(&t).map(|i| i as f64 + 1.0).unwrap_or(0.0);
             stack.push_value(index)?;
         }
@@ -174,13 +186,13 @@ fn call_builtin(
             if argc == 0 {
                 stack.push_value(record.count_bytes() as f64)?;
             } else {
-                let value = stack.pop_scalar_value()?.scalar_to_string();
+                let value = stack.pop_scalar_value()?.scalar_to_string(convfmt)?;
                 stack.push_value(value.len() as f64)?;
             }
         }
         BuiltinFunction::Match => {
             let ere = stack.pop_value().to_ere()?;
-            let string = stack.pop_scalar_value()?.scalar_to_string();
+            let string = stack.pop_scalar_value()?.scalar_to_string(convfmt)?;
             // TODO: should look into this unwrap
             let mut locations = ere.match_locations(CString::new(string).unwrap());
             let start;
@@ -207,7 +219,7 @@ fn call_builtin(
             // is an array. If this is true, `array_ref` cannot point to `s` since it is
             // a string
             let array_ref = stack.pop().unwrap();
-            let s = stack.pop_scalar_value()?.scalar_to_string();
+            let s = stack.pop_scalar_value()?.scalar_to_string(convfmt)?;
             // this is safe only if the value in `array_ref` is not a reference to
             // s, which we just popped
             let array = unsafe { (*array_ref.unwrap_ptr()).as_array()? };
@@ -229,7 +241,12 @@ fn call_builtin(
             stack.push_value(n as f64)?;
         }
         BuiltinFunction::Sprintf => {
-            let result = sprintf(argc, stack)?;
+            let mut values = Vec::new();
+            for _ in 0..argc - 1 {
+                values.push(stack.pop_scalar_value()?);
+            }
+            let format_string = stack.pop_scalar_value()?.scalar_to_string(convfmt)?;
+            let result = sprintf(&format_string, &mut values, convfmt)?;
             stack.push_value(result)?;
         }
         BuiltinFunction::Sub => {
@@ -242,16 +259,16 @@ fn call_builtin(
                 stack.pop_scalar_value()?.scalar_as_f64() as usize
             };
             let m = stack.pop_scalar_value()?.scalar_as_f64() as usize;
-            let s = stack.pop_scalar_value()?.scalar_to_string();
+            let s = stack.pop_scalar_value()?.scalar_to_string(convfmt)?;
             let substr = s.chars().skip(m).take(n).collect::<String>();
             stack.push_value(substr)?;
         }
         BuiltinFunction::ToLower => {
-            let value = stack.pop_scalar_value()?.scalar_to_string();
+            let value = stack.pop_scalar_value()?.scalar_to_string(convfmt)?;
             stack.push_value(value.to_lowercase())?;
         }
         BuiltinFunction::ToUpper => {
-            let value = stack.pop_scalar_value()?.scalar_to_string();
+            let value = stack.pop_scalar_value()?.scalar_to_string(convfmt)?;
             stack.push_value(value.to_uppercase())?;
         }
         BuiltinFunction::Close => {
@@ -264,11 +281,18 @@ fn call_builtin(
             todo!()
         }
         BuiltinFunction::Print => {
-            let field_separator = globals[SpecialVar::Ofs as usize].clone().scalar_to_string();
-            let record_separator = globals[SpecialVar::Ors as usize].clone().scalar_to_string();
+            let field_separator = globals[SpecialVar::Ofs as usize]
+                .to_owned()
+                .scalar_to_string(convfmt)?;
+            let record_separator = globals[SpecialVar::Ors as usize]
+                .to_owned()
+                .scalar_to_string(convfmt)?;
+            let ofmt = globals[SpecialVar::Ofmt as usize]
+                .to_owned()
+                .scalar_to_string(convfmt)?;
             let mut output = String::new();
             for i in 0..argc {
-                let value = stack.pop_scalar_value()?.scalar_to_string();
+                let value = stack.pop_scalar_value()?.scalar_to_string(&ofmt)?;
                 output.push_str(&value);
                 if i < argc - 1 {
                     output.push_str(&field_separator);
@@ -414,11 +438,17 @@ impl AwkValue {
         }
     }
 
-    fn scalar_to_string(self) -> String {
+    fn scalar_to_string(self, num_fmt: &str) -> Result<String, String> {
         match self.value {
-            AwkValueVariant::Number(_) => todo!(),
-            AwkValueVariant::String(s) => s,
-            AwkValueVariant::UninitializedScalar => String::new(),
+            AwkValueVariant::Number(num) => {
+                if is_integer(num) {
+                    Ok((num as i64).to_string())
+                } else {
+                    sprintf(num_fmt, &mut [num.into()], num_fmt)
+                }
+            }
+            AwkValueVariant::String(s) => Ok(s),
+            AwkValueVariant::UninitializedScalar => Ok(String::new()),
             AwkValueVariant::Array(_)
             | AwkValueVariant::Regex { .. }
             | AwkValueVariant::Uninitialized => {
@@ -497,6 +527,12 @@ impl AwkValue {
             },
             ref_type: AwkRefType::None,
         }
+    }
+}
+
+impl Default for AwkValue {
+    fn default() -> Self {
+        Self::uninitialized()
     }
 }
 
@@ -732,6 +768,7 @@ struct Interpreter {
     globals: Vec<AwkValue>,
     constants: Vec<Constant>,
     fields: Vec<AwkValue>,
+    convfmt: String,
 }
 
 macro_rules! numeric_op {
@@ -743,7 +780,7 @@ macro_rules! numeric_op {
 }
 
 macro_rules! compare_op {
-    ($stack:expr, $op:tt) => {
+    ($stack:expr, $convfmt:expr, $op:tt) => {
         let rhs = $stack.pop_scalar_value()?;
         let lhs = $stack.pop_scalar_value()?;
         match (&lhs.value, &rhs.value) {
@@ -760,7 +797,7 @@ macro_rules! compare_op {
                 $stack.push_value(bool_to_f64(0.0 $op *rhs))?;
             }
             (_, _) => {
-                $stack.push_value(bool_to_f64(lhs.scalar_to_string() $op rhs.scalar_to_string()));
+                $stack.push_value(bool_to_f64(lhs.scalar_to_string($convfmt)? $op rhs.scalar_to_string($convfmt)?));
             }
         }
     };
@@ -811,38 +848,38 @@ impl Interpreter {
                     stack.push_value(lhs.powf(rhs))?;
                 }
                 OpCode::Le => {
-                    compare_op!(stack,  <=);
+                    compare_op!(stack, &self.convfmt, <=);
                 }
                 OpCode::Lt => {
-                    compare_op!(stack,  <);
+                    compare_op!(stack, &self.convfmt, <);
                 }
                 OpCode::Ge => {
-                    compare_op!(stack,  >=);
+                    compare_op!(stack, &self.convfmt, >=);
                 }
                 OpCode::Gt => {
-                    compare_op!(stack,  >);
+                    compare_op!(stack, &self.convfmt, >);
                 }
                 OpCode::Eq => {
-                    compare_op!(stack,  ==);
+                    compare_op!(stack, &self.convfmt, ==);
                 }
                 OpCode::Ne => {
-                    compare_op!(stack,  !=);
+                    compare_op!(stack, &self.convfmt, !=);
                 }
                 OpCode::Match => {
                     let ere = stack.pop_value().to_ere()?;
-                    let string = stack.pop_scalar_value()?.scalar_to_string();
+                    let string = stack.pop_scalar_value()?.scalar_to_string(&self.convfmt)?;
                     // FIXME: remove unwrap
                     let result = ere.matches(&CString::new(string).unwrap());
                     stack.push_value(bool_to_f64(result))?;
                 }
                 OpCode::Concat => {
-                    let rhs = stack.pop_scalar_value()?.scalar_to_string();
-                    let mut lhs = stack.pop_scalar_value()?.scalar_to_string();
+                    let rhs = stack.pop_scalar_value()?.scalar_to_string(&self.convfmt)?;
+                    let mut lhs = stack.pop_scalar_value()?.scalar_to_string(&self.convfmt)?;
                     lhs.push_str(&rhs);
                     stack.push_value(lhs)?;
                 }
                 OpCode::In => {
-                    let key = stack.pop_scalar_value()?.scalar_to_string();
+                    let key = stack.pop_scalar_value()?.scalar_to_string(&self.convfmt)?;
                     let array = stack.pop_ref().as_array()?;
                     let result = array.contains(&key);
                     stack.push_value(bool_to_f64(result))?;
@@ -906,13 +943,13 @@ impl Interpreter {
                     stack.push_value(value)?;
                 }
                 OpCode::IndexArray => {
-                    let key = stack.pop_scalar_value()?.scalar_to_string();
+                    let key = stack.pop_scalar_value()?.scalar_to_string(&self.convfmt)?;
                     let array = stack.pop_ref().as_array()?;
                     let element_ref = array.get_or_insert_uninitialized(key) as *mut AwkValue;
                     unsafe { stack.push_ref(element_ref)? };
                 }
                 OpCode::Delete => {
-                    let key = stack.pop_scalar_value()?.scalar_to_string();
+                    let key = stack.pop_scalar_value()?.scalar_to_string(&self.convfmt)?;
                     let array = stack.pop_ref().as_array()?;
                     array.delete(&key);
                 }
@@ -936,9 +973,14 @@ impl Interpreter {
                     stack.call_function(&function.instructions, argc as usize);
                     ip_increment = 0;
                 }
-                OpCode::CallBuiltin { function, argc } => {
-                    call_builtin(function, argc, &mut stack, &record, &mut self.globals)?
-                }
+                OpCode::CallBuiltin { function, argc } => call_builtin(
+                    function,
+                    argc,
+                    &mut stack,
+                    &record,
+                    &mut self.globals,
+                    &self.convfmt,
+                )?,
                 OpCode::PushConstant(index) => match self.constants[index as usize].clone() {
                     Constant::Number(num) => stack.push_value(num)?,
                     Constant::String(s) => stack.push_value(s)?,
@@ -964,6 +1006,9 @@ impl Interpreter {
                 OpCode::Invalid => panic!("invalid opcode"),
                 other => todo!("{:?}", other),
             }
+            self.convfmt = self.globals[SpecialVar::Convfmt as usize]
+                .to_owned()
+                .scalar_to_string(&self.convfmt)?;
             stack.ip += ip_increment;
         }
         Ok(stack
@@ -997,6 +1042,7 @@ impl Interpreter {
             globals,
             constants,
             fields: vec![AwkValue::uninitialized_scalar(); 64],
+            convfmt: "%.6g".to_string(),
         }
     }
 }
@@ -1040,7 +1086,7 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
             .unwrap()
             .get_or_insert_uninitialized(current_arg_index.to_string())
             .to_owned()
-            .scalar_to_string();
+            .scalar_to_string(&interpreter.convfmt)?;
 
         if arg.is_empty() {
             current_arg_index += 1;
@@ -1066,7 +1112,8 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
 
             let rs = interpreter.globals[SpecialVar::Rs as usize]
                 .to_owned()
-                .scalar_to_string()
+                .scalar_to_string(&interpreter.convfmt)
+                .unwrap()
                 .as_bytes()[0];
 
             let record = file_contents[next_record_start..]

@@ -12,4 +12,3 @@ mod dd;
 mod file;
 mod find;
 mod od;
-mod join;

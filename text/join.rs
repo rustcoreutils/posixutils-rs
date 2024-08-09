@@ -59,9 +59,7 @@ struct Args {
 }
 
 fn parse_fields(line: &str, sep: char) -> Vec<String> {
-    line.split(sep)
-        .map(|s| s.to_string())
-        .collect()
+    line.split(sep).map(|s| s.to_string()).collect()
 }
 
 fn process_files2(
@@ -73,7 +71,7 @@ fn process_files2(
     a: u8,
     e: Option<String>,
     o: Option<Vec<String>>,
-    v: u8
+    v: u8,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // code to support stdin
     let stdin = io::stdin();
@@ -111,11 +109,10 @@ fn process_files2(
                         let f_num: Vec<&str> = num.split('.').collect();
                         if f_num[0] == "1" {
                             if fields1.len() <= f_num[1].parse::<usize>()? - 1 {
-                                if let Some(e) = &e { 
+                                if let Some(e) = &e {
                                     res.push(e.to_string());
                                 }
-                            }
-                            else {
+                            } else {
                                 res.push(fields1[f_num[1].parse::<usize>()? - 1].clone());
                             }
                         } else if f_num[0] == "2" {
@@ -123,8 +120,7 @@ fn process_files2(
                                 if let Some(e) = &e {
                                     res.push(e.to_string());
                                 }
-                            }
-                            else {
+                            } else {
                                 res.push(fields2[f_num[1].parse::<usize>()? - 1].clone());
                             }
                         }
@@ -180,7 +176,7 @@ fn join(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         args.additional,
         args.empty,
         args.order,
-        args.unpairable
+        args.unpairable,
     )?;
 
     Ok(())

@@ -1056,6 +1056,7 @@ dependencies = [
  "plib",
  "regex",
  "topological-sort",
+ "walkdir",
 ]
 
 [[package]]

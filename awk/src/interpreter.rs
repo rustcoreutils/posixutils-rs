@@ -238,7 +238,7 @@ fn call_builtin(
                     );
                     split_start = separator_range.end;
                 }
-                array.set(array.len().to_string(), s[split_start..].to_string());
+                array.set((array.len() + 1).to_string(), s[split_start..].to_string());
             } else {
                 let fs = separator.scalar_to_string(convfmt)?;
                 if fs == " " {
@@ -1080,6 +1080,7 @@ impl Interpreter {
 }
 
 pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
+    //println!("{:?}", program);
     let args = iter::once(("0".to_string(), AwkValue::from("awk")))
         .chain(
             args.into_iter()

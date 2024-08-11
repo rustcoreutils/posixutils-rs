@@ -20,6 +20,7 @@ atty.workspace = true
 diff = "0.1"
 dirs = "5.0"
 deunicode = "1.6"
+walkdir = "2"
 
 [[bin]]
 name = "asa"
@@ -44,6 +45,10 @@ path = "./diff.rs"
 [[bin]]
 name = "cut"
 path = "./cut.rs"
+
+[[bin]]
+name = "join"
+path = "./join.rs"
 
 [[bin]]
 name = "uniq"

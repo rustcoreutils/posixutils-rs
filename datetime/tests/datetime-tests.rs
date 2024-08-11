@@ -7,20 +7,4 @@
 // SPDX-License-Identifier: MIT
 //
 
-mod comm;
-mod csplit;
-mod cut;
-mod expand;
-mod fold;
-mod grep;
-mod head;
-mod join;
-mod nl;
-mod paste;
-mod pr;
-mod sort;
-mod tail;
-mod tr;
-mod unexpand;
-mod uniq;
-mod wc;
+mod time;

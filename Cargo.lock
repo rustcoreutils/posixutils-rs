@@ -105,12 +105,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b048fb63fd8b5923fc5aa7b340d8e156aec7ec02f0c78fa8a6ddc2613f6f71de"
 
 [[package]]
-name = "block"
-version = "0.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d8c1fef690941d3e7788d328517591fecc684c084084702d6ff1641e993699a"
-
-[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -456,23 +450,7 @@ dependencies = [
 
 [[package]]
 name = "gettext-rs"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e49ea8a8fad198aaa1f9655a2524b64b70eb06b2f3ff37da407566c93054f364"
-dependencies = [
- "gettext-sys",
- "locale_config",
-]
-
-[[package]]
-name = "gettext-sys"
-version = "0.21.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c63ce2e00f56a206778276704bbe38564c8695249fdc8f354b4ef71c57c3839d"
-dependencies = [
- "cc",
- "temp-dir",
-]
+version = "0.1.0"
 
 [[package]]
 name = "hashbrown"
@@ -632,19 +610,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78b3ae25bc7c8c38cec158d1f2757ee79e9b3740fbc7ccf0e59e4b08d793fa89"
 
 [[package]]
-name = "locale_config"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08d2c35b16f4483f6c26f0e4e9550717a2f6575bcd6f12a53ff0c490a94a6934"
-dependencies = [
- "lazy_static",
- "objc",
- "objc-foundation",
- "regex",
- "winapi",
-]
-
-[[package]]
 name = "lock_api"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -659,15 +624,6 @@ name = "log"
 version = "0.4.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a7a70ba024b9dc04c27ea2f0c0548feb474ec5c54bba33a7f72f873a39d07b24"
-
-[[package]]
-name = "malloc_buf"
-version = "0.0.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62bb907fe88d54d8d9ce32a3cceab4218ed2f6b7d35617cafe9adf84e43919cb"
-dependencies = [
- "libc",
-]
 
 [[package]]
 name = "match_cfg"
@@ -804,35 +760,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c7398b9c8b70908f6371f47ed36737907c87c52af34c268fed0bf0ceb92ead9"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "objc"
-version = "0.2.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "915b1b472bc21c53464d6c8461c9d3af805ba1ef837e1cac254428f4a77177b1"
-dependencies = [
- "malloc_buf",
-]
-
-[[package]]
-name = "objc-foundation"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1add1b659e36c9607c7aab864a76c7a4c2760cd0cd2e120f3fb8b952c7e22bf9"
-dependencies = [
- "block",
- "objc",
- "objc_id",
-]
-
-[[package]]
-name = "objc_id"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c92d4ddb4bd7b50d730c215ff871754d0da6b2178849f8a2a2ab69712d0c073b"
-dependencies = [
- "objc",
 ]
 
 [[package]]
@@ -1050,6 +977,7 @@ name = "posixutils-misc"
 version = "0.2.0"
 dependencies = [
  "atty",
+ "clap",
  "gettext-rs",
  "libc",
  "plib",
@@ -1128,6 +1056,7 @@ dependencies = [
  "plib",
  "regex",
  "topological-sort",
+ "walkdir",
 ]
 
 [[package]]
@@ -1395,12 +1324,6 @@ dependencies = [
  "log",
  "time",
 ]
-
-[[package]]
-name = "temp-dir"
-version = "0.1.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f227968ec00f0e5322f9b8173c7a0cbcff6181a0a5b28e9892491c286277231"
 
 [[package]]
 name = "tempfile"

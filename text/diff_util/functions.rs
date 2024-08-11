@@ -11,7 +11,7 @@ use super::constants::UTF8_NOT_ALLOWED_BYTES;
 use crate::diff_util::constants::COULD_NOT_UNWRAP_FILENAME;
 
 pub fn system_time_to_rfc2822(system_time: SystemTime) -> String {
-    Into::<DateTime<Local>>::into(system_time).to_rfc2822()
+    format!("{}", Into::<DateTime<Local>>::into(system_time).format("%Y-%m-%d %H:%M:%S.%f %z"))
 }
 
 pub fn calculate_hash<T: Hash>(obj: &T) -> u64 {

@@ -104,4 +104,4 @@ path = "./wc.rs"
 
 [[bin]]
 name = "patch"
-path = "src/patch.rs"
+path = "./patch.rs"

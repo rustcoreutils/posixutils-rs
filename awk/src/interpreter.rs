@@ -130,7 +130,27 @@ fn sprintf(
     Ok(result)
 }
 
-fn call_builtin(
+fn builtin_match(stack: &mut Stack, global_env: &mut GlobalEnv) -> Result<(f64, f64), String> {
+    let ere = stack.pop_value().to_ere()?;
+    let string = stack
+        .pop_scalar_value()?
+        .scalar_to_string(&global_env.convfmt)?;
+    // TODO: should look into this unwrap
+    let mut locations = ere.match_locations(CString::new(string).unwrap());
+    let start;
+    let len;
+    if let Some(first_match) = locations.next() {
+        start = first_match.start as i64 + 1;
+        len = first_match.end as i64 - start + 1;
+    } else {
+        start = 0;
+        len = -1;
+    }
+    stack.push_value(start as f64)?;
+    Ok((start as f64, len as f64))
+}
+
+fn call_simple_builtin(
     function: BuiltinFunction,
     argc: u16,
     stack: &mut Stack,
@@ -195,26 +215,6 @@ fn call_builtin(
                     .scalar_to_string(&global_env.convfmt)?;
                 stack.push_value(value.len() as f64)?;
             }
-        }
-        BuiltinFunction::Match => {
-            let ere = stack.pop_value().to_ere()?;
-            let string = stack
-                .pop_scalar_value()?
-                .scalar_to_string(&global_env.convfmt)?;
-            // TODO: should look into this unwrap
-            let mut locations = ere.match_locations(CString::new(string).unwrap());
-            let start;
-            let len;
-            if let Some(first_match) = locations.next() {
-                start = first_match.start as i64 + 1;
-                len = first_match.end as i64 - start + 1;
-            } else {
-                start = 0;
-                len = -1;
-            }
-            // globals[SpecialVar::Rstart as usize] = (start as f64).into();
-            // globals[SpecialVar::Rlength as usize] = (len as f64).into();
-            stack.push_value(start as f64)?;
         }
         BuiltinFunction::Split => {
             let separator = if argc == 2 {
@@ -306,7 +306,7 @@ fn call_builtin(
         BuiltinFunction::Printf => {
             todo!()
         }
-        BuiltinFunction::Count => unreachable!("invalid builtin function"),
+        _ => unreachable!("call_simple_builtin was passed an invalid builtin function kind"),
     }
     Ok(())
 }
@@ -1127,9 +1127,16 @@ impl Interpreter {
                     stack.call_function(&function.instructions, argc as usize);
                     ip_increment = 0;
                 }
-                OpCode::CallBuiltin { function, argc } => {
-                    call_builtin(function, argc, &mut stack, &record.record, global_env)?
-                }
+                OpCode::CallBuiltin { function, argc } => match function {
+                    BuiltinFunction::Match => {
+                        let (start, len) = builtin_match(&mut stack, global_env)?;
+                        self.globals[SpecialVar::Rstart as usize] = start.into();
+                        self.globals[SpecialVar::Rlength as usize] = len.into();
+                    }
+                    other => {
+                        call_simple_builtin(other, argc, &mut stack, &record.record, global_env)?
+                    }
+                },
                 OpCode::PushConstant(index) => match self.constants[index as usize].clone() {
                     Constant::Number(num) => stack.push_value(num)?,
                     Constant::String(s) => stack.push_value(s)?,

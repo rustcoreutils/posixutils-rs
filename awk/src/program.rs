@@ -157,6 +157,7 @@ impl fmt::Debug for Program {
 }
 
 #[repr(u32)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum SpecialVar {
     Argc,
     Argv,

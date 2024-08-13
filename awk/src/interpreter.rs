@@ -507,7 +507,7 @@ impl Record {
 impl Default for Record {
     fn default() -> Self {
         let fields = (0..1024)
-            .map(|i| AwkValue::uninitialized_scalar().to_ref(AwkRefType::Field(i)))
+            .map(|i| AwkValue::field_ref(AwkValue::uninitialized_scalar(), i))
             .collect();
         Self {
             record: CString::default(),
@@ -759,6 +759,10 @@ impl AwkValue {
             },
             ref_type: AwkRefType::None,
         }
+    }
+
+    fn field_ref<V: Into<AwkValue>>(value: V, field_index: u16) -> Self {
+        value.into().to_ref(AwkRefType::Field(field_index))
     }
 }
 
@@ -1248,8 +1252,7 @@ impl Interpreter {
                         .scalar_to_string(&global_env.convfmt)?;
                     split_record(&record_str, &global_env.fs, |i, s| {
                         let field_index = i + 1;
-                        record.fields[field_index] =
-                            AwkValue::from(s).to_ref(AwkRefType::Field(field_index as u16))
+                        record.fields[field_index] = AwkValue::field_ref(s, field_index as u16);
                     });
                     record.record =
                         CString::new(record_str).map_err(|_| "invalid string".to_string())?;

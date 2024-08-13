@@ -697,16 +697,20 @@ impl AwkValue {
         global_env: &mut GlobalEnv,
     ) -> Result<FieldsState, String> {
         let rhs = rhs.into();
+        self.value = rhs.value;
         match self.ref_type {
-            AwkRefType::SpecialGlobalVar(special_var) => global_env.set(special_var, &rhs)?,
+            AwkRefType::SpecialGlobalVar(special_var) => global_env.set(special_var, &self)?,
             AwkRefType::Field(index) => {
-                return Ok(FieldsState::NeedToRecomputeRecord {
-                    changed_field: index as usize,
-                });
+                return if index == 0 {
+                    Ok(FieldsState::NeedToRecomputeFields)
+                } else {
+                    Ok(FieldsState::NeedToRecomputeRecord {
+                        changed_field: index as usize,
+                    })
+                }
             }
             AwkRefType::None => {}
         }
-        self.value = rhs.value;
         Ok(FieldsState::Ok)
     }
 

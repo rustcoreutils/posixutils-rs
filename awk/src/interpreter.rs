@@ -1264,7 +1264,8 @@ impl Interpreter {
                         write!(new_record, "{}{}", field_str, &global_env.ofs)
                             .expect("error writing to string");
                     }
-                    record.fields[0] = new_record.clone().into();
+                    record.fields[0] =
+                        AwkValue::from(new_record.clone()).to_ref(AwkRefType::Field(0));
                     record.record = CString::new(new_record).map_err(|_| "invalid string")?;
                 }
             }

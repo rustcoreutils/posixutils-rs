@@ -7,10 +7,7 @@ use crate::state::{StackFrame, State};
 use crate::EOF;
 
 /// The main loop, the most important function in this program.
-pub(crate) fn main_loop(
-    mut state: State,
-    stderr: &mut dyn Write,
-) -> crate::error::Result<State> {
+pub(crate) fn main_loop(mut state: State, stderr: &mut dyn Write) -> crate::error::Result<State> {
     let mut token: Vec<u8> = Vec::new();
 
     // TODO(style): rename these to something sensible.

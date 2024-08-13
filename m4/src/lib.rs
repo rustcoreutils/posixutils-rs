@@ -6,10 +6,10 @@ use state::State;
 use std::{cell::RefCell, ffi::OsStr, io::Write, path::PathBuf, rc::Rc};
 
 pub mod error;
-mod main_loop;
 mod input;
 mod lexer;
 mod macros;
+mod main_loop;
 mod output;
 mod precedence;
 mod state;

@@ -77,6 +77,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] fold
  - [x] grep
  - [x] head
+ - [x] join
  - [x] link
  - [x] ls
  - [x] mkdir
@@ -94,6 +95,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] strings
  - [x] strip (Development)
  - [x] tail
+ - [x] time
  - [x] tr
  - [x] true
  - [x] uncompress (compress cat.)
@@ -145,6 +147,8 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] kill
  - [x] logger
  - [x] printf
+ - [x] ps
+ - [x] realpath
  - [x] stty
  - [x] tabs
  - [x] test
@@ -202,7 +206,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
 ### Misc. category
  - [ ] awk
  - [ ] fuser
- - [ ] join
  - [ ] lp
  - [ ] m4
  - [ ] mailx
@@ -212,12 +215,9 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] newgrp
  - [ ] patch
  - [ ] pax
- - [ ] ps
- - [ ] realpath
  - [ ] sed
  - [ ] sh
  - [ ] talk
- - [ ] time
  - [ ] timeout
 
 ## Testing

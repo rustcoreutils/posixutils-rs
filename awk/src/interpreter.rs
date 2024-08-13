@@ -486,10 +486,9 @@ impl Record {
         self.last_field = 0;
         split_record(&record, field_separator, |i, s| {
             let field_index = i + 1;
-            self.fields[field_index] =
-                AwkValue::from(s).to_ref(AwkRefType::Field(field_index as u16))
+            self.fields[field_index] = AwkValue::field_ref(s, i as u16);
         });
-        self.fields[0] = record.clone().into();
+        self.fields[0] = AwkValue::field_ref(record.clone(), 0);
         self.record = CString::new(record).map_err(|_| "invalid string".to_string())?;
         Ok(())
     }

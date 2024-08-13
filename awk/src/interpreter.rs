@@ -17,6 +17,7 @@ use crate::regex::Regex;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::ffi::CString;
+use std::fmt::Write;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::{iter, u16};
@@ -134,8 +135,7 @@ fn call_builtin(
     argc: u16,
     stack: &mut Stack,
     record: &CString,
-    globals: &mut [AwkValue],
-    convfmt: &str,
+    global_env: &mut GlobalEnv,
 ) -> Result<(), String> {
     match function {
         BuiltinFunction::Atan2 => {
@@ -177,8 +177,12 @@ fn call_builtin(
             todo!()
         }
         BuiltinFunction::Index => {
-            let t = stack.pop_scalar_value()?.scalar_to_string(convfmt)?;
-            let s = stack.pop_scalar_value()?.scalar_to_string(convfmt)?;
+            let t = stack
+                .pop_scalar_value()?
+                .scalar_to_string(&global_env.convfmt)?;
+            let s = stack
+                .pop_scalar_value()?
+                .scalar_to_string(&global_env.convfmt)?;
             let index = s.find(&t).map(|i| i as f64 + 1.0).unwrap_or(0.0);
             stack.push_value(index)?;
         }
@@ -186,13 +190,17 @@ fn call_builtin(
             if argc == 0 {
                 stack.push_value(record.count_bytes() as f64)?;
             } else {
-                let value = stack.pop_scalar_value()?.scalar_to_string(convfmt)?;
+                let value = stack
+                    .pop_scalar_value()?
+                    .scalar_to_string(&global_env.convfmt)?;
                 stack.push_value(value.len() as f64)?;
             }
         }
         BuiltinFunction::Match => {
             let ere = stack.pop_value().to_ere()?;
-            let string = stack.pop_scalar_value()?.scalar_to_string(convfmt)?;
+            let string = stack
+                .pop_scalar_value()?
+                .scalar_to_string(&global_env.convfmt)?;
             // TODO: should look into this unwrap
             let mut locations = ere.match_locations(CString::new(string).unwrap());
             let start;
@@ -204,73 +212,33 @@ fn call_builtin(
                 start = 0;
                 len = -1;
             }
-            globals[SpecialVar::Rstart as usize] = (start as f64).into();
-            globals[SpecialVar::Rlength as usize] = (len as f64).into();
+            // globals[SpecialVar::Rstart as usize] = (start as f64).into();
+            // globals[SpecialVar::Rlength as usize] = (len as f64).into();
             stack.push_value(start as f64)?;
         }
         BuiltinFunction::Split => {
             let separator = if argc == 2 {
-                globals[SpecialVar::Fs as usize].clone()
+                None
             } else {
-                assert_eq!(argc, 3);
-                stack.pop_value()
+                Some(FieldSeparator::Ere(stack.pop_value().to_ere()?))
             };
             // FIXME: check above that array_ref is a StackValue::ValueRef and that it
             // is an array. If this is true, `array_ref` cannot point to `s` since it is
             // a string
             let array_ref = stack.pop().unwrap();
-            let s = stack.pop_scalar_value()?.scalar_to_string(convfmt)?;
+            let s = stack
+                .pop_scalar_value()?
+                .scalar_to_string(&global_env.convfmt)?;
             // this is safe only if the value in `array_ref` is not a reference to
             // s, which we just popped
             let array = unsafe { (*array_ref.unwrap_ptr()).as_array()? };
             array.clear();
 
-            if argc == 3 {
-                let separator_ere = separator.to_ere()?;
-                let mut split_start = 0;
-                for (i, separator_range) in separator_ere
-                    .match_locations(CString::new(s.clone()).unwrap())
-                    .enumerate()
-                {
-                    array.set(
-                        (i + 1).to_string(),
-                        s[split_start..separator_range.start].to_string(),
-                    );
-                    split_start = separator_range.end;
-                }
-                array.set((array.len() + 1).to_string(), s[split_start..].to_string());
-            } else {
-                let fs = separator.scalar_to_string(convfmt)?;
-                if fs == " " {
-                    *array = s
-                        .trim_start()
-                        .split_ascii_whitespace()
-                        .enumerate()
-                        .map(|(i, s)| ((i + 1).to_string(), s))
-                        .collect()
-                } else if fs.len() == 1 {
-                    *array = s
-                        .split(&fs)
-                        .enumerate()
-                        .map(|(i, s)| ((i + 1).to_string(), s))
-                        .collect();
-                } else {
-                    // FIXME: copied from above
-                    let separator_ere = Regex::new(CString::new(fs).unwrap())?;
-                    let mut split_start = 0;
-                    for (i, separator_range) in separator_ere
-                        .match_locations(CString::new(s.clone()).unwrap())
-                        .enumerate()
-                    {
-                        array.set(
-                            (i + 1).to_string(),
-                            s[split_start..separator_range.start].to_string(),
-                        );
-                        split_start = separator_range.end;
-                    }
-                    array.set(array.len().to_string(), s[split_start..].to_string());
-                }
-            }
+            split_record(
+                &s,
+                &separator.iter().next().unwrap_or(&global_env.fs),
+                |i, s| array.set((i + 1).to_string(), s),
+            );
             let n = array.len();
             stack.push_value(n as f64)?;
         }
@@ -279,8 +247,10 @@ fn call_builtin(
             for _ in 0..argc - 1 {
                 values.push(stack.pop_scalar_value()?);
             }
-            let format_string = stack.pop_scalar_value()?.scalar_to_string(convfmt)?;
-            let result = sprintf(&format_string, &mut values, convfmt)?;
+            let format_string = stack
+                .pop_scalar_value()?
+                .scalar_to_string(&global_env.convfmt)?;
+            let result = sprintf(&format_string, &mut values, &global_env.convfmt)?;
             stack.push_value(result)?;
         }
         BuiltinFunction::Sub => {
@@ -293,16 +263,22 @@ fn call_builtin(
                 stack.pop_scalar_value()?.scalar_as_f64() as usize
             };
             let m = stack.pop_scalar_value()?.scalar_as_f64() as usize;
-            let s = stack.pop_scalar_value()?.scalar_to_string(convfmt)?;
+            let s = stack
+                .pop_scalar_value()?
+                .scalar_to_string(&global_env.convfmt)?;
             let substr = s.chars().skip(m).take(n).collect::<String>();
             stack.push_value(substr)?;
         }
         BuiltinFunction::ToLower => {
-            let value = stack.pop_scalar_value()?.scalar_to_string(convfmt)?;
+            let value = stack
+                .pop_scalar_value()?
+                .scalar_to_string(&global_env.convfmt)?;
             stack.push_value(value.to_lowercase())?;
         }
         BuiltinFunction::ToUpper => {
-            let value = stack.pop_scalar_value()?.scalar_to_string(convfmt)?;
+            let value = stack
+                .pop_scalar_value()?
+                .scalar_to_string(&global_env.convfmt)?;
             stack.push_value(value.to_uppercase())?;
         }
         BuiltinFunction::Close => {
@@ -315,24 +291,17 @@ fn call_builtin(
             todo!()
         }
         BuiltinFunction::Print => {
-            let field_separator = globals[SpecialVar::Ofs as usize]
-                .to_owned()
-                .scalar_to_string(convfmt)?;
-            let record_separator = globals[SpecialVar::Ors as usize]
-                .to_owned()
-                .scalar_to_string(convfmt)?;
-            let ofmt = globals[SpecialVar::Ofmt as usize]
-                .to_owned()
-                .scalar_to_string(convfmt)?;
             let mut output = String::new();
             for i in 0..argc {
-                let value = stack.pop_scalar_value()?.scalar_to_string(&ofmt)?;
+                let value = stack
+                    .pop_scalar_value()?
+                    .scalar_to_string(&global_env.ofmt)?;
                 output.push_str(&value);
                 if i < argc - 1 {
-                    output.push_str(&field_separator);
+                    output.push_str(&global_env.ofs);
                 }
             }
-            print!("{}{}", output, record_separator);
+            print!("{}{}", output, global_env.ors);
         }
         BuiltinFunction::Printf => {
             todo!()
@@ -340,6 +309,147 @@ fn call_builtin(
         BuiltinFunction::Count => unreachable!("invalid builtin function"),
     }
     Ok(())
+}
+
+enum FieldSeparator {
+    Default,
+    Char(u8),
+    Ere(Rc<Regex>),
+}
+
+fn split_record<S: FnMut(usize, &str)>(
+    record: &str,
+    field_separator: &FieldSeparator,
+    mut store_result: S,
+) {
+    match field_separator {
+        FieldSeparator::Default => record
+            .trim_start()
+            .split_ascii_whitespace()
+            .enumerate()
+            .for_each(|(i, s)| store_result(i, s)),
+        FieldSeparator::Char(c) => record
+            .split(*c as char)
+            .enumerate()
+            .for_each(|(i, s)| store_result(i, s)),
+        FieldSeparator::Ere(re) => {
+            let mut split_start = 0;
+            let mut index = 0;
+            let mut iter = re.match_locations(CString::new(record).unwrap());
+            while let Some(separator_range) = iter.next() {
+                store_result(index, &record[split_start..separator_range.start]);
+                split_start = separator_range.end;
+                index += 1;
+            }
+            store_result(index, &record[split_start..])
+        }
+    }
+}
+
+impl TryFrom<String> for FieldSeparator {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if value == " " {
+            Ok(FieldSeparator::Default)
+        } else if value.len() == 1 {
+            Ok(FieldSeparator::Char(*value.as_bytes().first().unwrap()))
+        } else {
+            let c_str = CString::new(value).map_err(|_| "invalid string".to_string())?;
+            let ere = Regex::new(c_str)?;
+            Ok(FieldSeparator::Ere(Rc::from(ere)))
+        }
+    }
+}
+
+struct GlobalEnv {
+    convfmt: String,
+    fs: FieldSeparator,
+    ofs: String,
+    ors: String,
+    ofmt: String,
+}
+
+impl GlobalEnv {
+    fn set(&mut self, var: SpecialVar, value: &AwkValue) -> Result<(), String> {
+        let string_val = value.to_owned().scalar_to_string(&self.convfmt)?;
+        match var {
+            SpecialVar::Convfmt => self.convfmt = string_val,
+            SpecialVar::Fs => self.convfmt = string_val.into(),
+            SpecialVar::Ofmt => self.ofmt = string_val,
+            SpecialVar::Ofs => self.ofs = string_val,
+            SpecialVar::Ors => self.ors = string_val,
+            _ => todo!(),
+        }
+
+        Ok(())
+    }
+}
+
+impl Default for GlobalEnv {
+    fn default() -> Self {
+        Self {
+            convfmt: String::from("%.6g"),
+            fs: FieldSeparator::Default,
+            ofs: String::from(" "),
+            ors: String::from("\n"),
+            ofmt: String::from("%.6g"),
+        }
+    }
+}
+
+enum FieldsState {
+    NeedToRecomputeFields,
+    NeedToRecomputeRecord { changed_field: usize },
+    Ok,
+}
+
+struct Record {
+    record: CString,
+    fields: Vec<AwkValue>,
+    last_field: usize,
+}
+
+impl Record {
+    fn from_string(record: String, field_separator: &FieldSeparator) -> Result<Self, String> {
+        let mut r = Self::default();
+        r.reset(record, field_separator).map(|_| r)
+    }
+
+    fn reset(&mut self, record: String, field_separator: &FieldSeparator) -> Result<(), String> {
+        self.last_field = 0;
+        split_record(&record, field_separator, |i, s| {
+            let field_index = i + 1;
+            self.fields[field_index] =
+                AwkValue::from(s).to_ref(AwkRefType::Field(field_index as u16))
+        });
+        self.fields[0] = record.clone().into();
+        self.record = CString::new(record).map_err(|_| "invalid string".to_string())?;
+        Ok(())
+    }
+
+    fn recompute_fields(
+        &mut self,
+        convfmt: &str,
+        field_separator: &FieldSeparator,
+    ) -> Result<(), String> {
+        let record = self.fields[0].to_owned().scalar_to_string(convfmt)?;
+        self.reset(record, field_separator)
+    }
+}
+
+impl Default for Record {
+    fn default() -> Self {
+        let fields = (0..1024)
+            .map(|i| AwkValue::uninitialized_scalar().to_ref(AwkRefType::Field(i)))
+            .collect();
+        Self {
+            record: CString::default(),
+            // TODO: fix magic number
+            fields,
+            last_field: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -436,9 +546,8 @@ enum AwkValueVariant {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum AwkRefType {
     None,
-    Field,
-    Global,
-    ArrayElement,
+    Field(u16),
+    SpecialGlobalVar(SpecialVar),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -515,6 +624,29 @@ impl AwkValue {
             }
             _ => Err("scalar used in array context".to_string()),
         }
+    }
+
+    fn assign<V: Into<Self>>(
+        &mut self,
+        rhs: V,
+        global_env: &mut GlobalEnv,
+    ) -> Result<FieldsState, String> {
+        let rhs = rhs.into();
+        match self.ref_type {
+            AwkRefType::SpecialGlobalVar(special_var) => global_env.set(special_var, &rhs)?,
+            AwkRefType::Field(index) => {
+                return Ok(FieldsState::NeedToRecomputeRecord {
+                    changed_field: index as usize,
+                });
+            }
+            AwkRefType::None => {}
+        }
+        self.value = rhs.value;
+        Ok(FieldsState::Ok)
+    }
+
+    fn to_ref(self, ref_type: AwkRefType) -> Self {
+        Self { ref_type, ..self }
     }
 
     fn to_ere(self) -> Result<Rc<Regex>, String> {
@@ -801,7 +933,6 @@ impl<'i, 's> Stack<'i, 's> {
 struct Interpreter {
     globals: Vec<AwkValue>,
     constants: Vec<Constant>,
-    fields: Vec<AwkValue>,
     convfmt: String,
 }
 
@@ -842,20 +973,12 @@ impl Interpreter {
         &mut self,
         main: &[OpCode],
         functions: &[Function],
-        fields: &mut [String],
+        record: &mut Record,
         stack: &mut [StackValue],
+        global_env: &mut GlobalEnv,
     ) -> Result<AwkValue, String> {
         let mut stack = Stack::new(main, stack);
-        let record = fields
-            .get(0)
-            .map(|s| CString::new(s.clone()).unwrap())
-            .unwrap_or_default();
-        let mut last_field_value_referenced = 0;
-        for (i, field) in fields.iter_mut().enumerate() {
-            let mut value = AwkValue::from(swap_with_default(field));
-            value.ref_type = AwkRefType::Field;
-            self.fields[i] = value;
-        }
+        let mut fields_state = FieldsState::Ok;
         while let Some(instruction) = stack.next_instruction() {
             let mut ip_increment: isize = 1;
             match instruction {
@@ -928,28 +1051,28 @@ impl Interpreter {
                     let lvalue = stack.pop_ref();
                     lvalue.ensure_value_is_scalar()?;
                     let expr_result = lvalue.scalar_as_f64();
-                    *lvalue = (expr_result + 1.0).into();
+                    fields_state = lvalue.assign(expr_result + 1.0, global_env)?;
                     stack.push_value(expr_result)?;
                 }
                 OpCode::PostDec => {
                     let lvalue = stack.pop_ref();
                     lvalue.ensure_value_is_scalar()?;
                     let expr_result = lvalue.scalar_as_f64();
-                    *lvalue = (expr_result - 1.0).into();
+                    fields_state = lvalue.assign(expr_result - 1.0, global_env)?;
                     stack.push_value(expr_result)?;
                 }
                 OpCode::PreInc => {
                     let lvalue = stack.pop_ref();
                     lvalue.ensure_value_is_scalar()?;
                     let expr_result = lvalue.scalar_as_f64() + 1.0;
-                    *lvalue = expr_result.into();
+                    fields_state = lvalue.assign(expr_result, global_env)?;
                     stack.push_value(expr_result)?;
                 }
                 OpCode::PreDec => {
                     let lvalue = stack.pop_ref();
                     lvalue.ensure_value_is_scalar()?;
                     let expr_result = lvalue.scalar_as_f64() - 1.0;
-                    *lvalue = expr_result.into();
+                    fields_state = lvalue.assign(expr_result, global_env)?;
                     stack.push_value(expr_result)?;
                 }
                 OpCode::GlobalRef(index) => unsafe {
@@ -963,15 +1086,14 @@ impl Interpreter {
                         return Err("invalid field index".to_string());
                     }
                     let index = index as usize;
-                    last_field_value_referenced = index;
-                    unsafe { stack.push_ref(&mut self.fields[index])? };
+                    unsafe { stack.push_ref(&mut record.fields[index])? };
                 }
                 OpCode::Assign => {
                     let value = stack.pop_scalar_value()?;
                     let lvalue = stack.pop_ref();
                     // FIXME: we don't need to convert values here, just check
                     lvalue.ensure_value_is_scalar()?;
-                    *lvalue = value.clone();
+                    fields_state = lvalue.assign(value.clone(), global_env)?;
                     stack.push_value(value)?;
                 }
                 OpCode::IndexArray => {
@@ -1005,18 +1127,15 @@ impl Interpreter {
                     stack.call_function(&function.instructions, argc as usize);
                     ip_increment = 0;
                 }
-                OpCode::CallBuiltin { function, argc } => call_builtin(
-                    function,
-                    argc,
-                    &mut stack,
-                    &record,
-                    &mut self.globals,
-                    &self.convfmt,
-                )?,
+                OpCode::CallBuiltin { function, argc } => {
+                    call_builtin(function, argc, &mut stack, &record.record, global_env)?
+                }
                 OpCode::PushConstant(index) => match self.constants[index as usize].clone() {
                     Constant::Number(num) => stack.push_value(num)?,
                     Constant::String(s) => stack.push_value(s)?,
-                    Constant::Regex(ere) => stack.push_value(AwkValue::from_ere(ere, &record))?,
+                    Constant::Regex(ere) => {
+                        stack.push_value(AwkValue::from_ere(ere, &record.record))?
+                    }
                 },
                 OpCode::PushOne => {
                     stack.push_value(1.0)?;
@@ -1038,9 +1157,37 @@ impl Interpreter {
                 OpCode::Invalid => panic!("invalid opcode"),
                 other => todo!("{:?}", other),
             }
-            self.convfmt = self.globals[SpecialVar::Convfmt as usize]
-                .to_owned()
-                .scalar_to_string(&self.convfmt)?;
+            match fields_state {
+                FieldsState::Ok => {
+                    // no need to recompute anything
+                }
+                FieldsState::NeedToRecomputeFields => {
+                    record.last_field = 0;
+                    let record_str = record.fields[0]
+                        .to_owned()
+                        .scalar_to_string(&global_env.convfmt)?;
+                    split_record(&record_str, &global_env.fs, |i, s| {
+                        let field_index = i + 1;
+                        record.fields[field_index] =
+                            AwkValue::from(s).to_ref(AwkRefType::Field(field_index as u16))
+                    });
+                    record.record =
+                        CString::new(record_str).map_err(|_| "invalid string".to_string())?;
+                }
+                FieldsState::NeedToRecomputeRecord { changed_field } => {
+                    record.last_field = record.last_field.max(changed_field);
+                    self.globals[SpecialVar::Nf as usize] =
+                        AwkValue::from(record.last_field as f64);
+                    let mut new_record = String::new();
+                    for field in record.fields.iter().take(record.last_field).skip(1) {
+                        let field_str = field.clone().scalar_to_string(&global_env.convfmt)?;
+                        write!(new_record, "{}{}", field_str, &global_env.ofs)
+                            .expect("error writing to string");
+                    }
+                    record.fields[0] = new_record.clone().into();
+                    record.record = CString::new(new_record).map_err(|_| "invalid string")?;
+                }
+            }
             stack.ip += ip_increment;
         }
         Ok(stack
@@ -1073,7 +1220,6 @@ impl Interpreter {
         Self {
             globals,
             constants,
-            fields: vec![AwkValue::uninitialized_scalar(); 64],
             convfmt: "%.6g".to_string(),
         }
     }
@@ -1090,6 +1236,7 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
         .collect();
 
     let mut stack = vec![StackValue::Value(AwkValue::uninitialized()); STACK_SIZE];
+    let mut current_record = Record::default();
     let mut interpreter = Interpreter::new(
         args,
         // TODO: use env args
@@ -1097,17 +1244,18 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
         program.constants,
         program.globals_count,
     );
+    let mut global_env = GlobalEnv::default();
+
     interpreter.run(
         &program.begin_instructions,
         &program.functions,
-        &mut [],
+        &mut current_record,
         &mut stack,
+        &mut global_env,
     )?;
 
     let mut current_arg_index = 1;
     let mut nr = 1;
-    let mut fields_buffer = Vec::new();
-    let mut fs_ere = Regex::new(CString::default()).unwrap();
     loop {
         let argc = interpreter.globals[SpecialVar::Argc as usize].scalar_as_f64() as usize;
 
@@ -1142,8 +1290,6 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
         let mut fnr = 1;
         let mut next_record_start = 0;
         while next_record_start < file_contents.len() {
-            fields_buffer.clear();
-
             let rs = interpreter.globals[SpecialVar::Rs as usize]
                 .to_owned()
                 .scalar_to_string(&interpreter.convfmt)
@@ -1159,40 +1305,7 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
             // skip the record separator
             next_record_start += record.len() + 1;
 
-            // will be replaced later with record
-            fields_buffer.push(String::new());
-
-            let fs = interpreter.globals[SpecialVar::Fs as usize]
-                .to_owned()
-                .scalar_to_string(&interpreter.convfmt)
-                .unwrap();
-
-            if fs == " " {
-                fields_buffer.extend(
-                    record
-                        .trim_start()
-                        .split_ascii_whitespace()
-                        .map(|s| s.to_string()),
-                );
-            } else if fs.len() == 1 {
-                fields_buffer.extend(record.split(&fs).map(|s| s.to_string()));
-            } else {
-                if fs != fs_ere.str() {
-                    fs_ere = Regex::new(CString::new(fs).unwrap()).unwrap()
-                }
-
-                let mut current_field_start = 0;
-
-                // TODO: fix unwrap
-                for sep_range in fs_ere.match_locations(CString::new(record.clone()).unwrap()) {
-                    fields_buffer.push(record[current_field_start..sep_range.start].to_string());
-                    current_field_start = sep_range.end;
-                }
-                if current_field_start != 0 {
-                    fields_buffer.push(record[current_field_start..].to_string());
-                }
-            }
-            fields_buffer[0] = record;
+            current_record.reset(record, &global_env.fs)?;
 
             interpreter.globals[SpecialVar::Fnr as usize] = AwkValue::from(fnr as f64);
             interpreter.globals[SpecialVar::Nr as usize] = AwkValue::from(nr as f64);
@@ -1204,8 +1317,9 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
                         .run(
                             &e,
                             &program.functions,
-                            &mut fields_buffer.clone(),
+                            &mut current_record,
                             &mut stack,
+                            &mut global_env,
                         )?
                         .scalar_as_bool(),
                     Pattern::Range { .. } => todo!(),
@@ -1214,8 +1328,9 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
                     interpreter.run(
                         &rule.instructions,
                         &program.functions,
-                        &mut fields_buffer,
+                        &mut current_record,
                         &mut stack,
+                        &mut global_env,
                     )?;
                 }
             }
@@ -1230,8 +1345,9 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
     interpreter.run(
         &program.end_instructions,
         &program.functions,
-        &mut [],
+        &mut current_record,
         &mut stack,
+        &mut global_env,
     )?;
     Ok(())
 }
@@ -1252,7 +1368,13 @@ mod tests {
         let mut interpreter =
             Interpreter::new(Array::default(), Array::default(), constants, global_count);
         interpreter
-            .run(&instructions, &[], &mut vec![], &mut stack)
+            .run(
+                &instructions,
+                &[],
+                &mut Record::default(),
+                &mut stack,
+                &mut GlobalEnv::default(),
+            )
             .expect("error running test")
     }
 
@@ -1260,13 +1382,23 @@ mod tests {
         instructions: Vec<OpCode>,
         constants: Vec<Constant>,
         global_count: usize,
-        mut record: Vec<String>,
+        record: String,
     ) -> AwkValue {
         let mut stack = vec![StackValue::Value(AwkValue::uninitialized()); 250];
         let mut interpreter =
             Interpreter::new(Array::default(), Array::default(), constants, global_count);
+        let mut current_record = Record::default();
+        current_record
+            .reset(record, &FieldSeparator::Default)
+            .expect("error splitting record");
         interpreter
-            .run(&instructions, &[], &mut record, &mut stack)
+            .run(
+                &instructions,
+                &[],
+                &mut current_record,
+                &mut stack,
+                &mut GlobalEnv::default(),
+            )
             .expect("error running test")
     }
 
@@ -1274,7 +1406,13 @@ mod tests {
         let mut stack = vec![StackValue::Value(AwkValue::uninitialized()); 250];
         let mut interpreter = Interpreter::new(Array::default(), Array::default(), constants, 1);
         interpreter
-            .run(&instructions, &[], &mut vec![], &mut stack)
+            .run(
+                &instructions,
+                &[],
+                &mut Record::default(),
+                &mut stack,
+                &mut GlobalEnv::default(),
+            )
             .expect("error running test");
         interpreter.globals[FIRST_GLOBAL_VAR as usize].clone()
     }
@@ -1289,7 +1427,13 @@ mod tests {
         let mut interpreter =
             Interpreter::new(Array::default(), Array::default(), constants, global_count);
         interpreter
-            .run(&main, &functions, &mut vec![], &mut stack)
+            .run(
+                &main,
+                &functions,
+                &mut Record::default(),
+                &mut stack,
+                &mut GlobalEnv::default(),
+            )
             .expect("error running test")
     }
 
@@ -1872,12 +2016,7 @@ mod tests {
         let instructions = vec![OpCode::PushConstant(0), OpCode::FieldRef];
         let constant = vec![Constant::Number(0.0)];
         assert_eq!(
-            interpret_expr_with_record(
-                instructions,
-                constant,
-                0,
-                vec!["hello".to_string(), "hello".to_string()]
-            ),
+            interpret_expr_with_record(instructions, constant, 0, "hello".to_string()),
             AwkValue::from("hello".to_string())
         );
     }
@@ -1898,13 +2037,14 @@ mod tests {
             .run(
                 &instructions,
                 &[],
-                &mut ["1".to_string(), "1".to_string()],
+                &mut Record::from_string("1".to_string(), &FieldSeparator::Default).unwrap(),
                 &mut stack,
+                &mut Default::default(),
             )
             .unwrap();
         assert_eq!(
             interpreter.globals[SpecialVar::Nf as usize],
-            AwkValue::from(10.0)
+            AwkValue::from(9.0)
         );
     }
 
@@ -1957,7 +2097,7 @@ mod tests {
             argc: 0,
         }];
         assert_eq!(
-            interpret_expr_with_record(instructions, vec![], 0, vec!["test record".to_string()]),
+            interpret_expr_with_record(instructions, vec![], 0, "test record".to_string()),
             AwkValue::from(11.0)
         );
     }
@@ -2198,7 +2338,13 @@ mod tests {
 
         let mut interpreter = Interpreter::new(Array::default(), Array::default(), constants, 0);
         let result = interpreter
-            .run(&instructions, &[], &mut vec![], &mut stack)
+            .run(
+                &instructions,
+                &[],
+                &mut Record::default(),
+                &mut stack,
+                &mut GlobalEnv::default(),
+            )
             .expect("error running test");
 
         assert_eq!(result, AwkValue::from(6.0));

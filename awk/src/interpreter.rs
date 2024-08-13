@@ -150,6 +150,78 @@ fn builtin_match(stack: &mut Stack, global_env: &mut GlobalEnv) -> Result<(f64, 
     Ok((start as f64, len as f64))
 }
 
+fn gsub(ere: &Regex, repl: &str, in_str: &str, only_replace_first: bool) -> (String, usize) {
+    let mut result = String::with_capacity(in_str.len());
+    let mut last_match_end = 0;
+
+    let mut repl_parts = Vec::new();
+    let mut current_repl_part = String::new();
+    let mut repl_iter = repl.chars();
+    while let Some(c) = repl_iter.next() {
+        if c == '\\' {
+            match repl_iter.next() {
+                Some('\\') => current_repl_part.push('\\'),
+                Some('&') => current_repl_part.push_str(&in_str[last_match_end..]),
+                Some(c) => {
+                    current_repl_part.push('\\');
+                    current_repl_part.push(c);
+                }
+                None => {
+                    current_repl_part.push('\\');
+                    break;
+                }
+            }
+        } else if c == '&' {
+            repl_parts.push(current_repl_part);
+            current_repl_part = String::new();
+        } else {
+            current_repl_part.push(c);
+        }
+    }
+    repl_parts.push(current_repl_part);
+
+    let mut num_replacements = 0;
+    for m in ere.match_locations(CString::new(in_str).unwrap()) {
+        result.push_str(&in_str[last_match_end..m.start]);
+        let replaced_string = &in_str[m.start..m.end];
+        result.push_str(&repl_parts[0]);
+        for part in repl_parts.iter().skip(1) {
+            result.push_str(part);
+            result.push_str(replaced_string);
+        }
+        last_match_end = m.end;
+        num_replacements += 1;
+        if only_replace_first {
+            break;
+        }
+    }
+    result.push_str(&in_str[last_match_end..]);
+    (result, num_replacements)
+}
+
+fn builtin_gsub(
+    stack: &mut Stack,
+    global_env: &mut GlobalEnv,
+    is_sub: bool,
+) -> Result<FieldsState, String> {
+    // FIXME: this is not safe. in_str could be a reference to either repl or ere
+    let in_str = stack.pop().unwrap().unwrap_ptr();
+    let repl = stack
+        .pop_scalar_value()?
+        .scalar_to_string(&global_env.convfmt)?;
+    let ere = stack.pop_value().to_ere()?;
+    let in_str = unsafe { &mut *in_str };
+    in_str.ensure_value_is_scalar()?;
+    let (result, count) = gsub(
+        &ere,
+        &repl,
+        &in_str.to_owned().scalar_to_string(&global_env.convfmt)?,
+        is_sub,
+    );
+    stack.push_value(count as f64)?;
+    in_str.assign(result, global_env)
+}
+
 fn call_simple_builtin(
     function: BuiltinFunction,
     argc: u16,
@@ -191,9 +263,6 @@ fn call_simple_builtin(
             todo!()
         }
         BuiltinFunction::Srand => {
-            todo!()
-        }
-        BuiltinFunction::Gsub => {
             todo!()
         }
         BuiltinFunction::Index => {
@@ -252,9 +321,6 @@ fn call_simple_builtin(
                 .scalar_to_string(&global_env.convfmt)?;
             let result = sprintf(&format_string, &mut values, &global_env.convfmt)?;
             stack.push_value(result)?;
-        }
-        BuiltinFunction::Sub => {
-            todo!()
         }
         BuiltinFunction::Substr => {
             let n = if argc == 2 {
@@ -1132,6 +1198,13 @@ impl Interpreter {
                         let (start, len) = builtin_match(&mut stack, global_env)?;
                         self.globals[SpecialVar::Rstart as usize] = start.into();
                         self.globals[SpecialVar::Rlength as usize] = len.into();
+                    }
+                    BuiltinFunction::Sub | BuiltinFunction::Gsub => {
+                        if argc == 2 {
+                            unsafe { stack.push_ref(&mut record.fields[0])? };
+                        }
+                        fields_state =
+                            builtin_gsub(&mut stack, global_env, function == BuiltinFunction::Sub)?;
                     }
                     other => {
                         call_simple_builtin(other, argc, &mut stack, &record.record, global_env)?
@@ -2405,5 +2478,53 @@ mod tests {
             global,
             Array::from_iter([("1", "a"), ("2", "b"), ("3", "c")]).into()
         );
+    }
+
+    #[test]
+    fn test_builtin_sub() {
+        let instructions = vec![
+            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::PushConstant(0),
+            OpCode::Assign,
+            OpCode::PushConstant(1),
+            OpCode::PushConstant(2),
+            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::CallBuiltin {
+                function: BuiltinFunction::Sub,
+                argc: 3,
+            },
+        ];
+        let constants = vec![
+            Constant::String("aaabbbabaabb".to_string()),
+            Constant::Regex(Rc::from(regex_from_str("ab+"))),
+            Constant::String("x".to_string()),
+        ];
+
+        let global = test_global(instructions, constants);
+        assert_eq!(global, "aaxabaabb".into());
+    }
+
+    #[test]
+    fn test_builtin_gsub() {
+        let instructions = vec![
+            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::PushConstant(0),
+            OpCode::Assign,
+            OpCode::PushConstant(1),
+            OpCode::PushConstant(2),
+            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::CallBuiltin {
+                function: BuiltinFunction::Gsub,
+                argc: 3,
+            },
+        ];
+        let constants = vec![
+            Constant::String("aaabbbabaabb".to_string()),
+            Constant::Regex(Rc::from(regex_from_str("ab+"))),
+            Constant::String("x".to_string()),
+        ];
+
+        let global = test_global(instructions, constants);
+        assert_eq!(global, "aaxxax".into());
     }
 }

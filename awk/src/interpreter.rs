@@ -1073,38 +1073,46 @@ impl Interpreter {
                     stack.push_value(lhs.powf(rhs))?;
                 }
                 OpCode::Le => {
-                    compare_op!(stack, &self.convfmt, <=);
+                    compare_op!(stack, &global_env.convfmt, <=);
                 }
                 OpCode::Lt => {
-                    compare_op!(stack, &self.convfmt, <);
+                    compare_op!(stack, &global_env.convfmt, <);
                 }
                 OpCode::Ge => {
-                    compare_op!(stack, &self.convfmt, >=);
+                    compare_op!(stack, &global_env.convfmt, >=);
                 }
                 OpCode::Gt => {
-                    compare_op!(stack, &self.convfmt, >);
+                    compare_op!(stack, &global_env.convfmt, >);
                 }
                 OpCode::Eq => {
-                    compare_op!(stack, &self.convfmt, ==);
+                    compare_op!(stack, &global_env.convfmt, ==);
                 }
                 OpCode::Ne => {
-                    compare_op!(stack, &self.convfmt, !=);
+                    compare_op!(stack, &global_env.convfmt, !=);
                 }
                 OpCode::Match => {
                     let ere = stack.pop_value().to_ere()?;
-                    let string = stack.pop_scalar_value()?.scalar_to_string(&self.convfmt)?;
+                    let string = stack
+                        .pop_scalar_value()?
+                        .scalar_to_string(&global_env.convfmt)?;
                     // FIXME: remove unwrap
                     let result = ere.matches(&CString::new(string).unwrap());
                     stack.push_value(bool_to_f64(result))?;
                 }
                 OpCode::Concat => {
-                    let rhs = stack.pop_scalar_value()?.scalar_to_string(&self.convfmt)?;
-                    let mut lhs = stack.pop_scalar_value()?.scalar_to_string(&self.convfmt)?;
+                    let rhs = stack
+                        .pop_scalar_value()?
+                        .scalar_to_string(&global_env.convfmt)?;
+                    let mut lhs = stack
+                        .pop_scalar_value()?
+                        .scalar_to_string(&global_env.convfmt)?;
                     lhs.push_str(&rhs);
                     stack.push_value(lhs)?;
                 }
                 OpCode::In => {
-                    let key = stack.pop_scalar_value()?.scalar_to_string(&self.convfmt)?;
+                    let key = stack
+                        .pop_scalar_value()?
+                        .scalar_to_string(&global_env.convfmt)?;
                     let array = stack.pop_ref().as_array()?;
                     let result = array.contains(&key);
                     stack.push_value(bool_to_f64(result))?;
@@ -1167,13 +1175,17 @@ impl Interpreter {
                     stack.push_value(value)?;
                 }
                 OpCode::IndexArray => {
-                    let key = stack.pop_scalar_value()?.scalar_to_string(&self.convfmt)?;
+                    let key = stack
+                        .pop_scalar_value()?
+                        .scalar_to_string(&global_env.convfmt)?;
                     let array = stack.pop_ref().as_array()?;
                     let element_ref = array.get_or_insert_uninitialized(key) as *mut AwkValue;
                     unsafe { stack.push_ref(element_ref)? };
                 }
                 OpCode::Delete => {
-                    let key = stack.pop_scalar_value()?.scalar_to_string(&self.convfmt)?;
+                    let key = stack
+                        .pop_scalar_value()?
+                        .scalar_to_string(&global_env.convfmt)?;
                     let array = stack.pop_ref().as_array()?;
                     array.delete(&key);
                 }
@@ -1307,22 +1319,38 @@ impl Interpreter {
             .map(|_| AwkValueRef::new(AwkValue::uninitialized()))
             .collect::<Vec<AwkValueRef>>();
 
-        *globals[SpecialVar::Argc as usize].get_mut() = AwkValue::from(args.len() as f64);
-        *globals[SpecialVar::Argv as usize].get_mut() = args.into();
-        *globals[SpecialVar::Convfmt as usize].get_mut() = AwkValue::from("%.6g".to_string());
-        *globals[SpecialVar::Environ as usize].get_mut() = env.into();
-        *globals[SpecialVar::Filename as usize].get_mut() = AwkValue::from("-".to_string());
-        *globals[SpecialVar::Fnr as usize].get_mut() = AwkValue::from(0.0);
-        *globals[SpecialVar::Fs as usize].get_mut() = AwkValue::from(" ");
-        *globals[SpecialVar::Nf as usize].get_mut() = AwkValue::from(0.0);
-        *globals[SpecialVar::Nr as usize].get_mut() = AwkValue::from(0.0);
-        *globals[SpecialVar::Ofmt as usize].get_mut() = AwkValue::from("%.6g".to_string());
-        *globals[SpecialVar::Ofs as usize].get_mut() = AwkValue::from(" ".to_string());
-        *globals[SpecialVar::Ors as usize].get_mut() = AwkValue::from("\n".to_string());
-        *globals[SpecialVar::Rlength as usize].get_mut() = AwkValue::from(0.0);
-        *globals[SpecialVar::Rs as usize].get_mut() = AwkValue::from("\n".to_string());
-        *globals[SpecialVar::Rstart as usize].get_mut() = AwkValue::from(0.0);
-        *globals[SpecialVar::Subsep as usize].get_mut() = AwkValue::from("\034".to_string());
+        *globals[SpecialVar::Argc as usize].get_mut() = AwkValue::from(args.len() as f64)
+            .to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Argc));
+        *globals[SpecialVar::Argv as usize].get_mut() =
+            AwkValue::from(args).to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Argv));
+        *globals[SpecialVar::Convfmt as usize].get_mut() = AwkValue::from("%.6g".to_string())
+            .to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Convfmt));
+        *globals[SpecialVar::Environ as usize].get_mut() =
+            AwkValue::from(env).to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Environ));
+        *globals[SpecialVar::Filename as usize].get_mut() = AwkValue::from("-".to_string())
+            .to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Filename));
+        *globals[SpecialVar::Fnr as usize].get_mut() =
+            AwkValue::from(0.0).to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Fnr));
+        *globals[SpecialVar::Fs as usize].get_mut() =
+            AwkValue::from(" ").to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Fs));
+        *globals[SpecialVar::Nf as usize].get_mut() =
+            AwkValue::from(0.0).to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Nf));
+        *globals[SpecialVar::Nr as usize].get_mut() =
+            AwkValue::from(0.0).to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Nr));
+        *globals[SpecialVar::Ofmt as usize].get_mut() = AwkValue::from("%.6g".to_string())
+            .to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Ofmt));
+        *globals[SpecialVar::Ofs as usize].get_mut() =
+            AwkValue::from(" ".to_string()).to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Ofs));
+        *globals[SpecialVar::Ors as usize].get_mut() =
+            AwkValue::from("\n".to_string()).to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Ors));
+        *globals[SpecialVar::Rlength as usize].get_mut() =
+            AwkValue::from(0.0).to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Rlength));
+        *globals[SpecialVar::Rs as usize].get_mut() =
+            AwkValue::from("\n".to_string()).to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Rs));
+        *globals[SpecialVar::Rstart as usize].get_mut() =
+            AwkValue::from(0.0).to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Rstart));
+        *globals[SpecialVar::Subsep as usize].get_mut() = AwkValue::from("\034".to_string())
+            .to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Subsep));
 
         Self {
             globals,
@@ -1333,7 +1361,7 @@ impl Interpreter {
 }
 
 pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
-    //println!("{:?}", program);
+    // println!("{:?}", program);
     let args = iter::once(("0".to_string(), AwkValue::from("awk")))
         .chain(
             args.into_iter()
@@ -1385,7 +1413,9 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
             continue;
         }
 
-        *interpreter.globals[SpecialVar::Filename as usize].get_mut() = arg.clone().into();
+        interpreter.globals[SpecialVar::Filename as usize]
+            .get_mut()
+            .value = AwkValue::from(arg.clone()).value;
 
         if arg == "-" {
             todo!("read from stdin")
@@ -1417,11 +1447,14 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
             next_record_start += record.len() + 1;
 
             current_record.reset(record, &global_env.fs)?;
-            *interpreter.globals[SpecialVar::Nf as usize].get_mut() =
-                AwkValue::from(current_record.last_field as f64);
+            interpreter.globals[SpecialVar::Nf as usize].get_mut().value =
+                AwkValue::from(current_record.last_field as f64).value;
 
-            *interpreter.globals[SpecialVar::Fnr as usize].get_mut() = AwkValue::from(fnr as f64);
-            *interpreter.globals[SpecialVar::Nr as usize].get_mut() = AwkValue::from(nr as f64);
+            interpreter.globals[SpecialVar::Fnr as usize]
+                .get_mut()
+                .value = AwkValue::from(fnr as f64).value;
+            interpreter.globals[SpecialVar::Nr as usize].get_mut().value =
+                AwkValue::from(nr as f64).value;
 
             for rule in &program.rules {
                 let should_execute = match &rule.pattern {

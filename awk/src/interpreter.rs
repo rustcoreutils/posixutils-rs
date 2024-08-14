@@ -1244,6 +1244,15 @@ impl Interpreter {
                 OpCode::PushUninitializedScalar => {
                     stack.push_value(AwkValue::uninitialized_scalar())?;
                 }
+                OpCode::Dup => {
+                    let val = stack.pop().unwrap();
+                    unsafe {
+                        stack
+                            .push(val.clone())
+                            .expect("failed to push a popped value");
+                        stack.push(val)?;
+                    }
+                }
                 OpCode::Pop => {
                     stack.pop();
                 }

@@ -444,7 +444,7 @@ impl GlobalEnv {
         let string_val = value.to_owned().scalar_to_string(&self.convfmt)?;
         match var {
             SpecialVar::Convfmt => self.convfmt = string_val,
-            SpecialVar::Fs => self.convfmt = string_val.into(),
+            SpecialVar::Fs => self.fs = string_val.try_into()?,
             SpecialVar::Ofmt => self.ofmt = string_val,
             SpecialVar::Ofs => self.ofs = string_val,
             SpecialVar::Ors => self.ors = string_val,

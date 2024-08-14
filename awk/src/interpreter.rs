@@ -489,6 +489,7 @@ impl Record {
         self.last_field = 0;
         split_record(&record, field_separator, |i, s| {
             let field_index = i + 1;
+            self.last_field += 1;
             *self.fields[field_index].get_mut() = AwkValue::field_ref(s, field_index as u16);
         });
         *self.fields[0].get_mut() = AwkValue::field_ref(record.clone(), 0);
@@ -1270,7 +1271,7 @@ impl Interpreter {
                             AwkValue::from(record.last_field as f64);
                     }
                     let mut new_record = String::new();
-                    for field in record.fields.iter().take(record.last_field).skip(1) {
+                    for field in record.fields.iter().skip(1).take(record.last_field - 1) {
                         let field_str = unsafe {
                             (*field.get())
                                 .clone()
@@ -1279,6 +1280,12 @@ impl Interpreter {
                         write!(new_record, "{}{}", field_str, &global_env.ofs)
                             .expect("error writing to string");
                     }
+                    let last_field_str = unsafe {
+                        (*record.fields[record.last_field].get())
+                            .clone()
+                            .scalar_to_string(&global_env.convfmt)?
+                    };
+                    write!(new_record, "{}", last_field_str).expect("error writing to string");
                     unsafe {
                         *record.fields[0].get() =
                             AwkValue::from(new_record.clone()).to_ref(AwkRefType::Field(0))
@@ -1286,6 +1293,7 @@ impl Interpreter {
                     record.record = CString::new(new_record).map_err(|_| "invalid string")?;
                 }
             }
+            fields_state = FieldsState::Ok;
             stack.ip += ip_increment;
         }
         Ok(stack
@@ -1409,6 +1417,8 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
             next_record_start += record.len() + 1;
 
             current_record.reset(record, &global_env.fs)?;
+            *interpreter.globals[SpecialVar::Nf as usize].get_mut() =
+                AwkValue::from(current_record.last_field as f64);
 
             *interpreter.globals[SpecialVar::Fnr as usize].get_mut() = AwkValue::from(fnr as f64);
             *interpreter.globals[SpecialVar::Nr as usize].get_mut() = AwkValue::from(nr as f64);

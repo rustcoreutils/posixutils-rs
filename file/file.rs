@@ -328,7 +328,6 @@ impl Type {
         };
 
         input.replace_range(0..mat.as_str().len(), "");
-
         Ok(size)
     }
 

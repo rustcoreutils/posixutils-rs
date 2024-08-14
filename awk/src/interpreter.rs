@@ -1469,24 +1469,24 @@ mod tests {
         instructions: Vec<OpCode>,
         constants: Vec<Constant>,
         global_count: usize,
-        record: String,
-    ) -> AwkValue {
+        record_str: String,
+    ) -> (AwkValue, Record) {
         let mut stack = vec![StackValue::Value(AwkValue::uninitialized()); 250];
         let mut interpreter =
             Interpreter::new(Array::default(), Array::default(), constants, global_count);
-        let mut current_record = Record::default();
-        current_record
-            .reset(record, &FieldSeparator::Default)
+        let mut record = Record::from_string(record_str, &FieldSeparator::Default)
             .expect("error splitting record");
-        interpreter
+
+        let value = interpreter
             .run(
                 &instructions,
                 &[],
-                &mut current_record,
+                &mut record,
                 &mut stack,
                 &mut GlobalEnv::default(),
             )
-            .expect("error running test")
+            .expect("error running test");
+        (value, record)
     }
 
     fn test_global(instructions: Vec<OpCode>, constants: Vec<Constant>) -> AwkValue {
@@ -2102,10 +2102,8 @@ mod tests {
     fn test_access_whole_record_field() {
         let instructions = vec![OpCode::PushConstant(0), OpCode::FieldRef];
         let constant = vec![Constant::Number(0.0)];
-        assert_eq!(
-            interpret_expr_with_record(instructions, constant, 0, "hello".to_string()),
-            AwkValue::from("hello".to_string())
-        );
+        let (value, _) = interpret_expr_with_record(instructions, constant, 0, "hello".to_string());
+        assert_eq!(value, AwkValue::from("hello".to_string()));
     }
 
     #[test]
@@ -2183,10 +2181,9 @@ mod tests {
             function: BuiltinFunction::Length,
             argc: 0,
         }];
-        assert_eq!(
-            interpret_expr_with_record(instructions, vec![], 0, "test record".to_string()),
-            AwkValue::from(11.0)
-        );
+        let (value, _) =
+            interpret_expr_with_record(instructions, vec![], 0, "test record".to_string());
+        assert_eq!(value, AwkValue::from(11.0));
     }
 
     #[test]
@@ -2512,6 +2509,28 @@ mod tests {
     }
 
     #[test]
+    fn test_builtin_sub_on_record() {
+        let instructions = vec![
+            OpCode::PushConstant(0),
+            OpCode::PushConstant(1),
+            OpCode::CallBuiltin {
+                function: BuiltinFunction::Sub,
+                argc: 2,
+            },
+        ];
+        let constants = vec![
+            Constant::Regex(Rc::from(regex_from_str("ab+"))),
+            Constant::String("x".to_string()),
+        ];
+        let (_, record) =
+            interpret_expr_with_record(instructions, constants, 0, "aaabbb ab aabb".to_string());
+        assert_eq!(record.fields[0], AwkValue::field_ref("aax ab aabb", 0));
+        assert_eq!(record.fields[1], AwkValue::field_ref("aax", 1));
+        assert_eq!(record.fields[2], AwkValue::field_ref("ab", 2));
+        assert_eq!(record.fields[3], AwkValue::field_ref("aabb", 3));
+    }
+
+    #[test]
     fn test_builtin_gsub() {
         let instructions = vec![
             OpCode::GlobalRef(FIRST_GLOBAL_VAR),
@@ -2533,5 +2552,27 @@ mod tests {
 
         let global = test_global(instructions, constants);
         assert_eq!(global, "aaxxax".into());
+    }
+
+    #[test]
+    fn test_builtin_gsub_on_record() {
+        let instructions = vec![
+            OpCode::PushConstant(0),
+            OpCode::PushConstant(1),
+            OpCode::CallBuiltin {
+                function: BuiltinFunction::Gsub,
+                argc: 2,
+            },
+        ];
+        let constants = vec![
+            Constant::Regex(Rc::from(regex_from_str("ab+"))),
+            Constant::String("x".to_string()),
+        ];
+        let (_, record) =
+            interpret_expr_with_record(instructions, constants, 0, "aaabbb ab aabb".to_string());
+        assert_eq!(record.fields[0], AwkValue::field_ref("aax x ax", 0));
+        assert_eq!(record.fields[1], AwkValue::field_ref("aax", 1));
+        assert_eq!(record.fields[2], AwkValue::field_ref("x", 2));
+        assert_eq!(record.fields[3], AwkValue::field_ref("ax", 3));
     }
 }

@@ -329,11 +329,13 @@ fn call_simple_builtin(
             } else {
                 stack.pop_scalar_value()?.scalar_as_f64() as usize
             };
-            let m = stack.pop_scalar_value()?.scalar_as_f64() as usize;
+            // the behaviour for values < 1 is not specified. Here we follow what other
+            // implementations do
+            let m = stack.pop_scalar_value()?.scalar_as_f64().max(1.0) as usize;
             let s = stack
                 .pop_scalar_value()?
                 .scalar_to_string(&global_env.convfmt)?;
-            let substr = s.chars().skip(m).take(n).collect::<String>();
+            let substr = s.chars().skip(m - 1).take(n).collect::<String>();
             stack.push_value(substr)?;
         }
         BuiltinFunction::ToLower => {
@@ -2215,7 +2217,7 @@ mod tests {
         ];
         let constant = vec![
             Constant::String("hello".to_string()),
-            Constant::Number(1.0),
+            Constant::Number(2.0),
             Constant::Number(2.0),
         ];
         assert_eq!(
@@ -2234,7 +2236,7 @@ mod tests {
         let constant = vec![Constant::String("hello".to_string()), Constant::Number(3.0)];
         assert_eq!(
             interpret_expr(instructions, constant, 0),
-            AwkValue::from("lo".to_string())
+            AwkValue::from("llo".to_string())
         );
     }
 

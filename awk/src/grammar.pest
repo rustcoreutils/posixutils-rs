@@ -323,7 +323,7 @@ lvalue = {
   | field_var
 }
 
-field_var = { "$" ~ expr }
+field_var = { "$" ~ primary }
 
 input_function = {
     simple_get

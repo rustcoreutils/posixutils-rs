@@ -739,7 +739,8 @@ impl Compiler {
                 instructions.push(OpCode::IndexArray)
             }
             Rule::field_var => {
-                self.compile_expr(first_child(lvalue), instructions, locals)?;
+                let primary = self.map_primary(first_child(lvalue), locals)?;
+                instructions.extend(primary.instructions);
                 instructions.push(OpCode::FieldRef);
             }
             _ => unreachable!("encountered {:?} while compiling lvalue", lvalue.as_rule()),
@@ -2068,6 +2069,24 @@ mod test {
                 OpCode::FieldRef,
                 OpCode::PushConstant(1),
                 OpCode::Assign,
+            ]
+        );
+        assert_eq!(
+            constants,
+            vec![Constant::Number(1.0), Constant::Number(1.0)]
+        );
+    }
+
+    #[test]
+    fn compile_filed_var_compairisons() {
+        let (instructions, constants) = compile_expr("$1 == 1");
+        assert_eq!(
+            instructions,
+            vec![
+                OpCode::PushConstant(0),
+                OpCode::FieldRef,
+                OpCode::PushConstant(1),
+                OpCode::Eq,
             ]
         );
         assert_eq!(

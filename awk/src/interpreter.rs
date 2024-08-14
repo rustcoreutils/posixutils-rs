@@ -1153,6 +1153,10 @@ impl Interpreter {
                     fields_state = lvalue.assign(expr_result, global_env)?;
                     stack.push_value(expr_result)?;
                 }
+                OpCode::AsNumber => {
+                    let val = stack.pop_scalar_value()?;
+                    stack.push_value(val.scalar_as_f64())?;
+                }
                 OpCode::GlobalRef(index) => unsafe {
                     // globals outlive the stack, so this is safe
                     stack.push_ref(self.globals[index as usize].get())?

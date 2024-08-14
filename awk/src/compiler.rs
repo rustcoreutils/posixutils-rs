@@ -262,6 +262,15 @@ fn post_increment(val: &Cell<u32>) -> u32 {
     result
 }
 
+fn parse_float(val: &str) -> f64 {
+    lexical::parse_partial_with_options::<f64, _, { lexical::format::C_LITERAL }>(
+        val,
+        &lexical::ParseFloatOptions::default(),
+    )
+    .unwrap()
+    .0
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum ExprKind {
     LValue,
@@ -456,10 +465,7 @@ impl Compiler {
                 ))
             }
             Rule::number => {
-                // the standard rust parse doesn't fully support the awk number format
-                // (C number format), so we use the parsing function provided by libc
-                let number_cstr = CString::new(primary.as_str()).unwrap();
-                let num = unsafe { libc::atof(number_cstr.as_ptr()) };
+                let num = parse_float(primary.as_str());
                 let index = self.push_constant(Constant::Number(num));
                 Ok(Expr::new(
                     ExprKind::Number,

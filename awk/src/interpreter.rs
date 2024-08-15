@@ -436,12 +436,66 @@ impl TryFrom<String> for FieldSeparator {
     }
 }
 
+enum RecordSeparator {
+    Char(char),
+    Null,
+}
+
+fn first_record(buffer: &str, separator: &RecordSeparator) -> (String, usize) {
+    match separator {
+        RecordSeparator::Char(sep) => {
+            let str = buffer
+                .chars()
+                .take_while(|c| *c != *sep)
+                .collect::<String>();
+            let chars_read = str.len() + 1;
+            (str, chars_read)
+        }
+        RecordSeparator::Null => {
+            let leading_whitespace_bytes = buffer
+                .chars()
+                .take_while(|c| c.is_whitespace())
+                .map(|c| c.len_utf8())
+                .sum();
+            let str = buffer[leading_whitespace_bytes..]
+                .chars()
+                .take_while(|c| *c != '\n')
+                .collect::<String>();
+            let trailing_whitespace_bytes: usize = buffer[leading_whitespace_bytes + str.len()..]
+                .chars()
+                .take_while(|c| c.is_whitespace())
+                .map(|c| c.len_utf8())
+                .sum();
+            let chars_read = leading_whitespace_bytes + str.len() + trailing_whitespace_bytes;
+            (str, chars_read)
+        }
+    }
+}
+
+impl TryFrom<String> for RecordSeparator {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let mut iter = value.chars();
+        let result = match iter.next() {
+            Some(c) => RecordSeparator::Char(c),
+            None => RecordSeparator::Null,
+        };
+        if iter.next().is_some() {
+            Err("the record separator cannot contain more than one characters".to_string())
+        } else {
+            Ok(result)
+        }
+    }
+}
+
 struct GlobalEnv {
     convfmt: String,
     fs: FieldSeparator,
     ofs: String,
     ors: String,
     ofmt: String,
+    rs: RecordSeparator,
 }
 
 impl GlobalEnv {
@@ -453,6 +507,7 @@ impl GlobalEnv {
             SpecialVar::Ofmt => self.ofmt = string_val,
             SpecialVar::Ofs => self.ofs = string_val,
             SpecialVar::Ors => self.ors = string_val,
+            SpecialVar::Rs => self.rs = string_val.try_into()?,
             _ => todo!(),
         }
 
@@ -468,6 +523,7 @@ impl Default for GlobalEnv {
             ofs: String::from(" "),
             ors: String::from("\n"),
             ofmt: String::from("%.6g"),
+            rs: RecordSeparator::Char('\n'),
         }
     }
 }
@@ -1451,21 +1507,10 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
         let mut fnr = 1;
         let mut next_record_start = 0;
         while next_record_start < file_contents.len() {
-            let rs = interpreter.globals[SpecialVar::Rs as usize]
-                .get_mut()
-                .to_owned()
-                .scalar_to_string(&interpreter.convfmt)
-                .unwrap()
-                .as_bytes()[0];
+            let (record, bytes_read) =
+                first_record(&file_contents[next_record_start..], &global_env.rs);
 
-            let record = file_contents[next_record_start..]
-                .chars()
-                // '\n' is always a record separator, regardless of the value of rs
-                .take_while(|c| *c != rs as char || *c != '\n')
-                .collect::<String>();
-
-            // skip the record separator
-            next_record_start += record.len() + 1;
+            next_record_start += bytes_read;
 
             current_record.reset(record, &global_env.fs)?;
             interpreter.globals[SpecialVar::Nf as usize].get_mut().value =

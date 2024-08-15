@@ -1242,6 +1242,9 @@ impl Interpreter {
                 OpCode::PushOne => {
                     stack.push_value(1.0)?;
                 }
+                OpCode::PushZero => {
+                    stack.push_value(0.0)?;
+                }
                 OpCode::PushUninitialized => {
                     stack.push_value(AwkValue::uninitialized())?;
                 }

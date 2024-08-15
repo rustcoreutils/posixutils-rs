@@ -617,14 +617,16 @@ impl Compiler {
 
         match op.as_rule() {
             Rule::and => {
-                instructions.push(OpCode::JumpIfFalse(rhs.instructions.len() as i32 + 1));
+                instructions.push(OpCode::JumpIfFalse(rhs.instructions.len() as i32 + 2));
                 instructions.extend(rhs.instructions);
+                instructions.push(OpCode::Jump(2));
+                instructions.push(OpCode::PushZero);
                 return Ok(Expr::new(ExprKind::Number, instructions));
             }
             Rule::or => {
                 instructions.push(OpCode::JumpIfTrue(rhs.instructions.len() as i32 + 2));
                 instructions.extend(rhs.instructions);
-                instructions.push(OpCode::Jump(1));
+                instructions.push(OpCode::Jump(2));
                 instructions.push(OpCode::PushOne);
                 return Ok(Expr::new(ExprKind::Number, instructions));
             }
@@ -1785,8 +1787,10 @@ mod test {
             instructions,
             vec![
                 OpCode::PushConstant(0),
-                OpCode::JumpIfFalse(2),
+                OpCode::JumpIfFalse(3),
                 OpCode::PushConstant(1),
+                OpCode::Jump(2),
+                OpCode::PushZero,
             ]
         );
         assert_eq!(
@@ -1801,10 +1805,12 @@ mod test {
                 OpCode::PushConstant(0),
                 OpCode::PushConstant(1),
                 OpCode::Lt,
-                OpCode::JumpIfFalse(4),
+                OpCode::JumpIfFalse(5),
                 OpCode::PushConstant(2),
                 OpCode::PushConstant(3),
                 OpCode::Ge,
+                OpCode::Jump(2),
+                OpCode::PushZero,
             ]
         );
         assert_eq!(
@@ -1827,7 +1833,7 @@ mod test {
                 OpCode::PushConstant(0),
                 OpCode::JumpIfTrue(3),
                 OpCode::PushConstant(1),
-                OpCode::Jump(1),
+                OpCode::Jump(2),
                 OpCode::PushOne,
             ]
         );
@@ -1847,7 +1853,7 @@ mod test {
                 OpCode::PushConstant(2),
                 OpCode::PushConstant(3),
                 OpCode::Ge,
-                OpCode::Jump(1),
+                OpCode::Jump(2),
                 OpCode::PushOne,
             ]
         );

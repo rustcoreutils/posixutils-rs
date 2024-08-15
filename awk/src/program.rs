@@ -85,6 +85,8 @@ pub enum OpCode {
     PushConstant(u32),
     // Push 1 on top of the stack
     PushOne,
+    // Push 0 on top of the stack
+    PushZero,
     // Push the uninitialized value on top of the stack
     PushUninitialized,
     // Push the uninitialized scalar value on top of the stack

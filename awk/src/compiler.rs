@@ -309,12 +309,19 @@ pub enum GlobalName {
 type NameMap = HashMap<String, GlobalName>;
 type LocalMap = HashMap<String, VarId>;
 
+#[derive(Default)]
+struct LoopStubs {
+    break_stubs: Vec<usize>,
+    continue_stubs: Vec<usize>,
+}
+
 struct Compiler {
     constants: RefCell<Vec<Constant>>,
     names: RefCell<NameMap>,
     last_global_var_id: Cell<u32>,
     last_global_function_id: Cell<u32>,
     in_function: bool,
+    loop_stack: Vec<LoopStubs>,
 }
 
 impl Default for Compiler {
@@ -390,6 +397,7 @@ impl Default for Compiler {
             names: RefCell::new(default_globals),
             last_global_var_id: Cell::new(SpecialVar::Count as u32),
             last_global_function_id: Cell::new(0),
+            loop_stack: Vec::new(),
             in_function: false,
         }
     }
@@ -955,6 +963,8 @@ impl Compiler {
     ) -> Result<(), PestError> {
         let mut inner = for_stmt.into_inner();
 
+        self.loop_stack.push(LoopStubs::default());
+
         let init = inner.next().unwrap();
         self.compile_simple_statement(init, instructions, locals)?;
 
@@ -967,10 +977,19 @@ impl Compiler {
         let update = inner.next().unwrap();
         let body = inner.next().unwrap();
         self.compile_stmt(body, instructions, locals)?;
+        let update_start = instructions.len();
         self.compile_simple_statement(update, instructions, locals)?;
         instructions.push(OpCode::Jump(distance(instructions.len(), condition_start)));
         instructions[for_jump_index] =
             OpCode::JumpIfFalse(distance(for_jump_index, instructions.len()));
+
+        let loop_stubs = self.loop_stack.pop().unwrap();
+        for stub in loop_stubs.break_stubs {
+            instructions[stub] = OpCode::Jump(distance(stub, instructions.len()));
+        }
+        for stub in loop_stubs.continue_stubs {
+            instructions[stub] = OpCode::Jump(distance(stub, update_start));
+        }
 
         Ok(())
     }
@@ -982,6 +1001,8 @@ impl Compiler {
         locals: &LocalMap,
     ) -> Result<(), PestError> {
         let mut inner = while_stmt.into_inner();
+
+        self.loop_stack.push(LoopStubs::default());
 
         let condition_start = instructions.len();
         let condition = inner.next().unwrap();
@@ -996,6 +1017,13 @@ impl Compiler {
         instructions[while_jump_index] =
             OpCode::JumpIfFalse(distance(while_jump_index, instructions.len()));
 
+        let loop_stubs = self.loop_stack.pop().unwrap();
+        for stub in loop_stubs.break_stubs {
+            instructions[stub] = OpCode::Jump(distance(stub, instructions.len()));
+        }
+        for stub in loop_stubs.continue_stubs {
+            instructions[stub] = OpCode::Jump(distance(stub, condition_start));
+        }
         Ok(())
     }
 
@@ -1065,8 +1093,30 @@ impl Compiler {
                 instructions.push(OpCode::Next);
                 Ok(())
             }
-            Rule::break_stmt => todo!(),
-            Rule::continue_stmt => todo!(),
+            Rule::break_stmt => {
+                if let Some(loop_stubs) = self.loop_stack.last_mut() {
+                    loop_stubs.break_stubs.push(instructions.len());
+                    instructions.push(OpCode::Invalid);
+                    Ok(())
+                } else {
+                    Err(pest_error_from_span(
+                        stmt.as_span(),
+                        "break statement outside of loop".to_string(),
+                    ))
+                }
+            }
+            Rule::continue_stmt => {
+                if let Some(loop_stubs) = self.loop_stack.last_mut() {
+                    loop_stubs.continue_stubs.push(instructions.len());
+                    instructions.push(OpCode::Invalid);
+                    Ok(())
+                } else {
+                    Err(pest_error_from_span(
+                        stmt.as_span(),
+                        "continue statement outside of loop".to_string(),
+                    ))
+                }
+            }
             Rule::exit_stmt => {
                 if let Some(expr) = stmt.into_inner().next() {
                     self.compile_expr(expr, instructions, locals)?;
@@ -2370,6 +2420,88 @@ mod test {
                 Constant::Number(0.0),
                 Constant::Number(10.0),
                 Constant::Number(1.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_compile_break_inside_while_loop() {
+        let (instructions, _) = compile_stmt("while (1) { 1; break; }");
+        assert_eq!(
+            instructions,
+            vec![
+                OpCode::PushConstant(0),
+                OpCode::JumpIfFalse(5),
+                OpCode::PushConstant(1),
+                OpCode::Pop,
+                OpCode::Jump(2),
+                OpCode::Jump(-5),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_compile_continue_in_while_loop() {
+        let (instructions, _) = compile_stmt("while (1) { 1; continue; }");
+        assert_eq!(
+            instructions,
+            vec![
+                OpCode::PushConstant(0),
+                OpCode::JumpIfFalse(5),
+                OpCode::PushConstant(1),
+                OpCode::Pop,
+                OpCode::Jump(-4),
+                OpCode::Jump(-5),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_compile_break_inside_for_loop() {
+        let (instructions, _) = compile_stmt("for (i = 0; i < 10; i++) { 1; break; }");
+        assert_eq!(
+            instructions,
+            vec![
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::PushConstant(0),
+                OpCode::Assign,
+                OpCode::Pop,
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::PushConstant(1),
+                OpCode::Lt,
+                OpCode::JumpIfFalse(8),
+                OpCode::PushConstant(2),
+                OpCode::Pop,
+                OpCode::Jump(5),
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::PostInc,
+                OpCode::Pop,
+                OpCode::Jump(-10),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_compile_continue_in_for_loop() {
+        let (instructions, _) = compile_stmt("for (i = 0; i < 10; i++) { 1; continue; }");
+        assert_eq!(
+            instructions,
+            vec![
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::PushConstant(0),
+                OpCode::Assign,
+                OpCode::Pop,
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::PushConstant(1),
+                OpCode::Lt,
+                OpCode::JumpIfFalse(8),
+                OpCode::PushConstant(2),
+                OpCode::Pop,
+                OpCode::Jump(1),
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::PostInc,
+                OpCode::Pop,
+                OpCode::Jump(-10),
             ]
         );
     }

@@ -735,9 +735,20 @@ impl Compiler {
                     .get_var(name.as_str(), locals)
                     .map_err(|msg| pest_error_from_span(name.as_span(), msg))?;
                 instructions.push(get_instruction);
-                // FIXME: only supports expression lists of one element
                 let index = inner.next().unwrap();
                 self.compile_expr(index, instructions, locals)?;
+                if let Some(index) = inner.next() {
+                    instructions.push(OpCode::GlobalRef(SpecialVar::Subsep as u32));
+                    instructions.push(OpCode::Concat);
+                    self.compile_expr(index, instructions, locals)?;
+                    while let Some(index) = inner.next() {
+                        instructions.push(OpCode::Concat);
+                        instructions.push(OpCode::GlobalRef(SpecialVar::Subsep as u32));
+                        instructions.push(OpCode::Concat);
+                        self.compile_expr(index, instructions, locals)?;
+                    }
+                    instructions.push(OpCode::Concat);
+                }
                 instructions.push(OpCode::IndexArray)
             }
             Rule::field_var => {
@@ -2074,6 +2085,53 @@ mod test {
         assert_eq!(
             constants,
             vec![Constant::Number(1.0), Constant::Number(1.0)]
+        );
+    }
+
+    #[test]
+    fn compile_multidimensional_array_index() {
+        let (instructions, constants) = compile_expr("a[1, 2]");
+        assert_eq!(
+            instructions,
+            vec![
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::PushConstant(0),
+                OpCode::GlobalRef(SpecialVar::Subsep as u32),
+                OpCode::Concat,
+                OpCode::PushConstant(1),
+                OpCode::Concat,
+                OpCode::IndexArray,
+            ]
+        );
+        assert_eq!(
+            constants,
+            vec![Constant::Number(1.0), Constant::Number(2.0)]
+        );
+
+        let (instructions, constants) = compile_expr("a[1, 2, \"test\"]");
+        assert_eq!(
+            instructions,
+            vec![
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::PushConstant(0),
+                OpCode::GlobalRef(SpecialVar::Subsep as u32),
+                OpCode::Concat,
+                OpCode::PushConstant(1),
+                OpCode::Concat,
+                OpCode::GlobalRef(SpecialVar::Subsep as u32),
+                OpCode::Concat,
+                OpCode::PushConstant(2),
+                OpCode::Concat,
+                OpCode::IndexArray,
+            ]
+        );
+        assert_eq!(
+            constants,
+            vec![
+                Constant::Number(1.0),
+                Constant::Number(2.0),
+                Constant::String("test".to_string())
+            ]
         );
     }
 

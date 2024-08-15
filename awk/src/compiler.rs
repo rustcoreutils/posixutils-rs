@@ -1094,7 +1094,19 @@ impl Compiler {
                 })
             }
             Rule::normal_pattern => {
-                todo!("needs to be implemented after printing and fields are implemented");
+                let pattern = self.compile_normal_pattern(rule)?;
+                let instructions = vec![
+                    OpCode::PushZero,
+                    OpCode::FieldRef,
+                    OpCode::CallBuiltin {
+                        function: BuiltinFunction::Print,
+                        argc: 1,
+                    },
+                ];
+                Ok(AwkRule {
+                    pattern,
+                    instructions,
+                })
             }
             _ => unreachable!("encountered {:?} while compiling rule", rule.as_rule()),
         }
@@ -2597,6 +2609,28 @@ mod test {
         assert_eq!(
             program.rules[0].instructions,
             vec![OpCode::PushConstant(0), OpCode::Pop,]
+        );
+        assert_eq!(program.constants, vec![Constant::Number(1.0)]);
+    }
+
+    #[test]
+    fn compile_rule_without_action() {
+        let program = compile_correct_program("1");
+        assert_eq!(program.rules.len(), 1);
+        assert_eq!(
+            program.rules[0].pattern,
+            Pattern::Expr(vec![OpCode::PushConstant(0)])
+        );
+        assert_eq!(
+            program.rules[0].instructions,
+            vec![
+                OpCode::PushZero,
+                OpCode::FieldRef,
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Print,
+                    argc: 1
+                }
+            ]
         );
         assert_eq!(program.constants, vec![Constant::Number(1.0)]);
     }

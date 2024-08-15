@@ -440,7 +440,8 @@ fn test_cp_preserve_slink_time() {
     let dangle = &format!("{test_dir}/dangle");
     let d2 = &format!("{test_dir}/d2");
 
-    fs::create_dir(test_dir).unwrap();
+    fs::create_dir(test_dir)
+        .unwrap_or_else(|error| panic!("Error creating directory {test_dir:?}: {error:?}"));
 
     unix::fs::symlink(no_such, dangle).unwrap();
 

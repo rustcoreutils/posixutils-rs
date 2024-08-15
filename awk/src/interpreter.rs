@@ -365,7 +365,7 @@ fn call_simple_builtin(
                 values.push(
                     stack
                         .pop_scalar_value()?
-                        .scalar_to_string(&global_env.convfmt)?,
+                        .scalar_to_string(&global_env.ofmt)?,
                 );
             }
             let mut output = String::new();

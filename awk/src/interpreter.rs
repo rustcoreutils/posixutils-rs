@@ -360,16 +360,21 @@ fn call_simple_builtin(
             todo!()
         }
         BuiltinFunction::Print => {
-            let mut output = String::new();
-            for i in 0..argc {
-                let value = stack
-                    .pop_scalar_value()?
-                    .scalar_to_string(&global_env.ofmt)?;
-                output.push_str(&value);
-                if i < argc - 1 {
-                    output.push_str(&global_env.ofs);
-                }
+            let mut values = Vec::new();
+            for _ in 0..argc {
+                values.push(
+                    stack
+                        .pop_scalar_value()?
+                        .scalar_to_string(&global_env.convfmt)?,
+                );
             }
+            let mut output = String::new();
+            values.iter().skip(1).rev().fold(&mut output, |acc, elem| {
+                write!(acc, "{}{}", elem, &global_env.ofs).expect("error writing to string");
+                acc
+            });
+            // there has to be at least an element
+            output.push_str(values.first().expect("called print without arguments"));
             print!("{}{}", output, global_env.ors);
         }
         BuiltinFunction::Printf => {

@@ -1069,6 +1069,24 @@ impl<'i, 's> Stack<'i, 's> {
     }
 }
 
+enum ExecutionResult {
+    Expression(AwkValue),
+    Exit(i32),
+}
+
+impl ExecutionResult {
+    fn expr_to_bool(self) -> bool {
+        self.unwrap_expr().scalar_as_bool()
+    }
+
+    fn unwrap_expr(self) -> AwkValue {
+        match self {
+            ExecutionResult::Expression(value) => value,
+            _ => panic!("execution result is not an expression"),
+        }
+    }
+}
+
 struct Interpreter {
     globals: Vec<AwkValueRef>,
     constants: Vec<Constant>,
@@ -1115,7 +1133,7 @@ impl Interpreter {
         record: &mut Record,
         stack: &mut [StackValue],
         global_env: &mut GlobalEnv,
-    ) -> Result<AwkValue, String> {
+    ) -> Result<ExecutionResult, String> {
         let mut stack = Stack::new(main, stack);
         let mut fields_state = FieldsState::Ok;
         while let Some(instruction) = stack.next_instruction() {
@@ -1332,6 +1350,10 @@ impl Interpreter {
                 OpCode::Pop => {
                     stack.pop();
                 }
+                OpCode::Exit => {
+                    let exit_code = stack.pop_scalar_value()?.scalar_as_f64();
+                    return Ok(ExecutionResult::Exit(exit_code as i32));
+                }
                 OpCode::Return => {
                     let return_value = stack.pop_scalar_value()?;
                     stack.restore_caller();
@@ -1393,10 +1415,12 @@ impl Interpreter {
             fields_state = FieldsState::Ok;
             stack.ip += ip_increment;
         }
-        Ok(stack
-            .pop()
-            .map(|sv| unsafe { sv.to_owned() })
-            .unwrap_or(AwkValue::uninitialized()))
+        Ok(ExecutionResult::Expression(
+            stack
+                .pop()
+                .map(|sv| unsafe { sv.to_owned() })
+                .unwrap_or(AwkValue::uninitialized()),
+        ))
     }
 
     fn new(args: Array, env: Array, constants: Vec<Constant>, program_globals: usize) -> Self {
@@ -1445,7 +1469,7 @@ impl Interpreter {
     }
 }
 
-pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
+pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
     // println!("{:?}", program);
     let args = iter::once(("0".to_string(), AwkValue::from("awk")))
         .chain(
@@ -1466,8 +1490,10 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
     );
     let mut global_env = GlobalEnv::default();
     let mut range_pattern_started = vec![false; program.rules.len()];
+    let should_exit = false;
+    let mut return_value = 0;
 
-    interpreter.run(
+    let begin_result = interpreter.run(
         &program.begin_instructions,
         &program.functions,
         &mut current_record,
@@ -1475,9 +1501,13 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
         &mut global_env,
     )?;
 
+    if let ExecutionResult::Exit(val) = begin_result {
+        return_value = val;
+    }
+
     let mut current_arg_index = 1;
     let mut nr = 1;
-    loop {
+    'rules: while !should_exit {
         let argc = interpreter.globals[SpecialVar::Argc as usize]
             .get_mut()
             .scalar_as_f64() as usize;
@@ -1542,7 +1572,7 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
                             &mut stack,
                             &mut global_env,
                         )?
-                        .scalar_as_bool(),
+                        .expr_to_bool(),
                     Pattern::Range { start, end } => {
                         if range_pattern_started[i] {
                             let should_end = !interpreter
@@ -1553,7 +1583,7 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
                                     &mut stack,
                                     &mut global_env,
                                 )?
-                                .scalar_as_bool();
+                                .expr_to_bool();
                             range_pattern_started[i] = should_end;
                             // range is inclusive
                             true
@@ -1566,20 +1596,24 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
                                     &mut stack,
                                     &mut global_env,
                                 )?
-                                .scalar_as_bool();
+                                .expr_to_bool();
                             range_pattern_started[i] = should_start;
                             should_start
                         }
                     }
                 };
                 if should_execute {
-                    interpreter.run(
+                    let rule_result = interpreter.run(
                         &rule.instructions,
                         &program.functions,
                         &mut current_record,
                         &mut stack,
                         &mut global_env,
                     )?;
+                    if let ExecutionResult::Exit(val) = rule_result {
+                        return_value = val;
+                        break 'rules;
+                    }
                 }
             }
 
@@ -1590,14 +1624,17 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
         current_arg_index += 1;
     }
 
-    interpreter.run(
+    let end_result = interpreter.run(
         &program.end_instructions,
         &program.functions,
         &mut current_record,
         &mut stack,
         &mut global_env,
     )?;
-    Ok(())
+    if let ExecutionResult::Exit(val) = end_result {
+        return_value = val;
+    }
+    Ok(return_value)
 }
 
 #[cfg(test)]
@@ -1624,6 +1661,7 @@ mod tests {
                 &mut GlobalEnv::default(),
             )
             .expect("error running test")
+            .unwrap_expr()
     }
 
     fn interpret_expr_with_record(
@@ -1646,7 +1684,8 @@ mod tests {
                 &mut stack,
                 &mut GlobalEnv::default(),
             )
-            .expect("error running test");
+            .expect("error running test")
+            .unwrap_expr();
         (value, record)
     }
 
@@ -1685,6 +1724,7 @@ mod tests {
                 &mut GlobalEnv::default(),
             )
             .expect("error running test")
+            .unwrap_expr()
     }
 
     fn test_sprintf(format: &str, args: Vec<Constant>) -> String {
@@ -2592,7 +2632,8 @@ mod tests {
                 &mut stack,
                 &mut GlobalEnv::default(),
             )
-            .expect("error running test");
+            .expect("error running test")
+            .unwrap_expr();
 
         assert_eq!(result, AwkValue::from(6.0));
         assert_eq!(

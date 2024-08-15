@@ -75,7 +75,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let program = exit_if_error(compile_soruces(&args));
 
-    exit_if_error(interpret(program, args.arguments));
+    let result = exit_if_error(interpret(program, args.arguments));
+    std::process::exit(result);
 
     Ok(())
 }

@@ -1070,6 +1070,8 @@ impl Compiler {
             Rule::exit_stmt => {
                 if let Some(expr) = stmt.into_inner().next() {
                     self.compile_expr(expr, instructions, locals)?;
+                } else {
+                    instructions.push(OpCode::PushZero);
                 }
                 instructions.push(OpCode::Exit);
                 Ok(())
@@ -2381,7 +2383,7 @@ mod test {
     #[test]
     fn test_compile_exit() {
         let (instructions, _) = compile_stmt("exit;");
-        assert_eq!(instructions, vec![OpCode::Exit]);
+        assert_eq!(instructions, vec![OpCode::PushZero, OpCode::Exit]);
 
         let (instructions, constant) = compile_stmt("exit 1;");
         assert_eq!(instructions, vec![OpCode::PushConstant(0), OpCode::Exit]);

@@ -1,0 +1,3 @@
+stdout= world\n world\n1 hello\n2 hi\n\n4 come\n3 welcome\n\n
+stderr=
+status=0

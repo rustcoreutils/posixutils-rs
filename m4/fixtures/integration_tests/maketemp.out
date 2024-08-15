@@ -1,0 +1,5 @@
+stdout=/tmp/m4-Q3FNVz
+stderr=
+status=0
+stdout_regex=^/tmp/m4-.{6}$
+skip_update=true

@@ -1,0 +1,3 @@
+stdout=1 b,c\n2 b\n3 \n4 shift\n5 bye b,c\n6 b,c\n
+stderr=
+status=0

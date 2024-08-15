@@ -1,0 +1,3 @@
+stdout=1 hello\n2 world\n3 incr(1)\n4 wow
+stderr=
+status=0

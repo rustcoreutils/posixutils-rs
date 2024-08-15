@@ -89,5 +89,5 @@ fn parse_error_test() {
 
 #[test]
 fn command_error_test() {
-    run_test_time(&["-s", "ls", "-l"], "", "unexpected argument found", 0);
+    run_test_time(&["-s", "ls", "-l"], "", "unexpected argument '-s' found", 0);
 }

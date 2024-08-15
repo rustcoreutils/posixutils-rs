@@ -7,7 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::{io::Write, process::{Command, Output, Stdio}};
+use std::{
+    io::Write,
+    process::{Command, Output, Stdio},
+};
 
 use plib::TestPlan;
 

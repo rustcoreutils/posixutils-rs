@@ -152,7 +152,7 @@ lazy_static::lazy_static! {
         PrattParser::new()
         .op(Op::infix(Rule::or, Assoc::Left))
         .op(Op::infix(Rule::and, Assoc::Left))
-        .op(Op::infix(Rule::in_op, Assoc::Left))
+            .op(Op::infix(Rule::in_op, Assoc::Left))
         .op(Op::infix(Rule::match_op, Assoc::Left)
             | Op::infix(Rule::not_match, Assoc::Left))
         .op(Op::infix(Rule::comp_op, Assoc::Left))
@@ -554,7 +554,10 @@ impl Compiler {
                 }
                 Ok(Expr::new(ExprKind::Number, instructions))
             }
-            _ => unreachable!(),
+            _ => unreachable!(
+                "encountered {:?} while compiling primary",
+                primary.as_rule()
+            ),
         }
     }
 
@@ -706,7 +709,11 @@ impl Compiler {
         }
     }
 
-    fn compile_binary_expr(&self, expr: Pairs<Rule>, locals: &LocalMap) -> Result<Expr, PestError> {
+    fn compile_simple_binary_expr(
+        &self,
+        expr: Pairs<Rule>,
+        locals: &LocalMap,
+    ) -> Result<Expr, PestError> {
         PRATT_PARSER
             .map_primary(|primary| self.map_primary(primary, locals))
             .map_prefix(|op, rhs| self.map_prefix(op, rhs?))
@@ -735,20 +742,7 @@ impl Compiler {
                     .get_var(name.as_str(), locals)
                     .map_err(|msg| pest_error_from_span(name.as_span(), msg))?;
                 instructions.push(get_instruction);
-                let index = inner.next().unwrap();
-                self.compile_expr(index, instructions, locals)?;
-                if let Some(index) = inner.next() {
-                    instructions.push(OpCode::GlobalRef(SpecialVar::Subsep as u32));
-                    instructions.push(OpCode::Concat);
-                    self.compile_expr(index, instructions, locals)?;
-                    while let Some(index) = inner.next() {
-                        instructions.push(OpCode::Concat);
-                        instructions.push(OpCode::GlobalRef(SpecialVar::Subsep as u32));
-                        instructions.push(OpCode::Concat);
-                        self.compile_expr(index, instructions, locals)?;
-                    }
-                    instructions.push(OpCode::Concat);
-                }
+                self.compile_array_index(inner, instructions, locals)?;
                 instructions.push(OpCode::IndexArray)
             }
             Rule::field_var => {
@@ -757,6 +751,59 @@ impl Compiler {
                 instructions.push(OpCode::FieldRef);
             }
             _ => unreachable!("encountered {:?} while compiling lvalue", lvalue.as_rule()),
+        }
+        Ok(())
+    }
+
+    fn compile_array_index(
+        &self,
+        mut index: Pairs<Rule>,
+        instructions: &mut Vec<OpCode>,
+        locals: &LocalMap,
+    ) -> Result<(), PestError> {
+        let first_index = index.next().unwrap();
+        self.compile_expr(first_index, instructions, locals)?;
+        if let Some(second_index) = index.next() {
+            instructions.push(OpCode::GlobalRef(SpecialVar::Subsep as u32));
+            instructions.push(OpCode::Concat);
+            self.compile_expr(second_index, instructions, locals)?;
+            while let Some(other_index) = index.next() {
+                instructions.push(OpCode::Concat);
+                instructions.push(OpCode::GlobalRef(SpecialVar::Subsep as u32));
+                instructions.push(OpCode::Concat);
+                self.compile_expr(other_index, instructions, locals)?;
+            }
+            instructions.push(OpCode::Concat);
+        }
+        Ok(())
+    }
+
+    fn compile_binary_expr(
+        &self,
+        expr: Pair<Rule>,
+        instructions: &mut Vec<OpCode>,
+        locals: &LocalMap,
+    ) -> Result<(), PestError> {
+        let expr = first_child(expr);
+        match expr.as_rule() {
+            Rule::simple_binary_expr | Rule::simple_binary_print_expr => {
+                let expr = self.compile_simple_binary_expr(expr.into_inner(), locals)?;
+                instructions.extend(expr.instructions);
+            }
+            Rule::multidimensional_in => {
+                let mut inner = expr.into_inner();
+                let index = inner.next().unwrap();
+                let name = inner.next().unwrap();
+                let get_instruction = self
+                    .get_var(name.as_str(), locals)
+                    .map_err(|msg| pest_error_from_span(name.as_span(), msg))?;
+                instructions.push(get_instruction);
+                self.compile_array_index(index.into_inner(), instructions, locals)?;
+                instructions.push(OpCode::In);
+            }
+            other => {
+                unreachable!("encountered {:?} while compiling binary expression", other)
+            }
         }
         Ok(())
     }
@@ -793,9 +840,7 @@ impl Compiler {
             }
             Rule::ternary_expr | Rule::ternary_print_expr => {
                 let mut inner = expr.into_inner();
-                let condition =
-                    self.compile_binary_expr(inner.next().unwrap().into_inner(), locals)?;
-                instructions.extend(condition.instructions);
+                self.compile_binary_expr(inner.next().unwrap(), instructions, locals)?;
                 let mut true_expr_instructions = Vec::new();
                 self.compile_expr(inner.next().unwrap(), &mut true_expr_instructions, locals)?;
                 instructions.push(OpCode::JumpIfFalse(true_expr_instructions.len() as i32 + 2));
@@ -807,8 +852,7 @@ impl Compiler {
                 instructions.extend(false_expr_instructions);
             }
             Rule::binary_expr | Rule::binary_print_expr => {
-                let expr = self.compile_binary_expr(expr.into_inner(), locals)?;
-                instructions.extend(expr.instructions);
+                self.compile_binary_expr(expr, instructions, locals)?;
             }
             Rule::input_function => todo!(),
             _ => unreachable!(
@@ -1760,6 +1804,53 @@ mod test {
             ]
         );
         assert_eq!(constants, vec![Constant::String("a".to_string())]);
+    }
+
+    #[test]
+    fn test_compile_multidimensional_in_operator() {
+        let (instructions, constants) = compile_expr(r#"(1, 2) in map"#);
+        assert_eq!(
+            instructions,
+            vec![
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::PushConstant(0),
+                OpCode::GlobalRef(SpecialVar::Subsep as u32),
+                OpCode::Concat,
+                OpCode::PushConstant(1),
+                OpCode::Concat,
+                OpCode::In
+            ]
+        );
+        assert_eq!(
+            constants,
+            vec![Constant::Number(1.0), Constant::Number(2.0)]
+        );
+
+        let (instructions, constants) = compile_expr(r#"(1, "str", 3) in map"#);
+        assert_eq!(
+            instructions,
+            vec![
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::PushConstant(0),
+                OpCode::GlobalRef(SpecialVar::Subsep as u32),
+                OpCode::Concat,
+                OpCode::PushConstant(1),
+                OpCode::Concat,
+                OpCode::GlobalRef(SpecialVar::Subsep as u32),
+                OpCode::Concat,
+                OpCode::PushConstant(2),
+                OpCode::Concat,
+                OpCode::In
+            ]
+        );
+        assert_eq!(
+            constants,
+            vec![
+                Constant::Number(1.0),
+                Constant::String("str".to_string()),
+                Constant::Number(3.0)
+            ]
+        );
     }
 
     #[test]

@@ -49,27 +49,27 @@ builtin_func = _{
   | system
 }
 
-atan2   = { "atan2" }
-cos     = { "cos" }
-sin     = { "sin" }
-exp     = { "exp" }
-log     = { "log" }
-sqrt    = { "sqrt" }
-int     = { "int" }
-rand    = { "rand" }
-srand   = { "srand" }
-gsub    = { "gsub" }
-index   = { "index" }
-length  = { "length" }
-match_fn   = { "match" }
-split   = { "split" }
-sprintf = { "sprintf" }
-sub     = { "sub" }
-substr  = { "substr" }
-tolower = { "tolower" }
-toupper = { "toupper" }
-close   = { "close" }
-system  = { "system" }
+atan2    = { "atan2" }
+cos      = { "cos" }
+sin      = { "sin" }
+exp      = { "exp" }
+log      = { "log" }
+sqrt     = { "sqrt" }
+int      = { "int" }
+rand     = { "rand" }
+srand    = { "srand" }
+gsub     = { "gsub" }
+index    = { "index" }
+length   = { "length" }
+match_fn = { "match" }
+split    = { "split" }
+sprintf  = { "sprintf" }
+sub      = { "sub" }
+substr   = { "substr" }
+tolower  = { "tolower" }
+toupper  = { "toupper" }
+close    = { "close" }
+system   = { "system" }
 
 keyword = {
     "if"
@@ -122,7 +122,7 @@ function_definition = { "function" ~ name ~ "(" ~ param_list? ~ ")" ~ opt_newlin
 param_list = { name ~ ("," ~ name)* }
 
 normal_pattern = { range_pattern | expr }
-range_pattern = { expr ~ "," ~ opt_newline ~ expr }
+range_pattern  = { expr ~ "," ~ opt_newline ~ expr }
 
 action = {
     "{" ~ opt_newline ~ "}"
@@ -192,9 +192,9 @@ print_stmt = {
 }
 
 simple_print       = { "print" ~ print_expr_list? }
-print_call         = { "print" ~ "(" ~ multiple_expr_list ~ ")" }
+print_call         = { "print" ~ "(" ~ multiple_expr_list ~ ")" ~ !in_op}
 simple_printf      = { "printf" ~ print_expr_list? }
-printf_call        = { "printf" ~ "(" ~ multiple_expr_list ~ ")" }
+printf_call        = { "printf" ~ "(" ~ multiple_expr_list ~ ")" ~ !in_op}
 output_redirection = {
     ">" ~ expr
   | ">>" ~ expr
@@ -220,7 +220,7 @@ function_call         = { func_name ~ "(" ~ expr_list? ~ ")" }
 builtin_function_call = { builtin_func ~ ("(" ~ expr_list? ~ ")")? }
 
 prefix_op = _{
-  pre_inc
+    pre_inc
   | pre_dec
   | not
   | unary_plus
@@ -286,7 +286,14 @@ eq = { "==" }
 gt = { ">" }
 ge = { ">=" }
 
-binary_expr = { prefix_op? ~ primary ~ postfix_op? ~ (infix_op ~ prefix_op? ~ primary ~ postfix_op?)* }
+binary_expr = {
+    multidimensional_in
+  | simple_binary_expr
+}
+
+multidimensional_in    = { "(" ~ multidimensional_index ~ ")" ~ "in" ~ name }
+simple_binary_expr     = { prefix_op? ~ primary ~ postfix_op? ~ (infix_op ~ prefix_op? ~ primary ~ postfix_op?)* }
+multidimensional_index = { multiple_expr_list }
 
 ternary_expr = { binary_expr ~ "?" ~ expr ~ ":" ~ expr }
 
@@ -333,7 +340,7 @@ input_function = {
 
 simple_get = { "getline" ~ lvalue? }
 
-print_infix_op = _{
+print_infix_op           = _{
     pow
   | mul
   | div
@@ -347,8 +354,14 @@ print_infix_op = _{
   | or
   | concat
 }
+simple_binary_print_expr =  {
+    prefix_op? ~ primary ~ postfix_op? ~ (print_infix_op ~ prefix_op? ~ primary ~ postfix_op?)*
+}
+binary_print_expr        =  {
+    multidimensional_in
+  | simple_binary_expr
+}
 
-binary_print_expr  = { prefix_op? ~ primary ~ postfix_op? ~ (print_infix_op ~ prefix_op? ~ primary ~ postfix_op?)* }
 print_assignment   = { lvalue ~ assignment_op ~ print_expr }
 ternary_print_expr = { binary_print_expr ~ "?" ~ print_expr ~ ":" ~ print_expr }
 

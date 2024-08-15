@@ -1434,7 +1434,7 @@ impl Interpreter {
             AwkValue::from("\n".to_string()).to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Rs));
         *globals[SpecialVar::Rstart as usize].get_mut() =
             AwkValue::from(0.0).to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Rstart));
-        *globals[SpecialVar::Subsep as usize].get_mut() = AwkValue::from("\034".to_string())
+        *globals[SpecialVar::Subsep as usize].get_mut() = AwkValue::from(" ".to_string())
             .to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Subsep));
 
         Self {

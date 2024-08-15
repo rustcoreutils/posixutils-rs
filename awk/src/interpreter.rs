@@ -1465,6 +1465,7 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
         program.globals_count,
     );
     let mut global_env = GlobalEnv::default();
+    let mut range_pattern_started = vec![false; program.rules.len()];
 
     interpreter.run(
         &program.begin_instructions,
@@ -1530,7 +1531,7 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
             interpreter.globals[SpecialVar::Nr as usize].get_mut().value =
                 AwkValue::from(nr as f64).value;
 
-            for rule in &program.rules {
+            for (i, rule) in program.rules.iter().enumerate() {
                 let should_execute = match &rule.pattern {
                     Pattern::All => true,
                     Pattern::Expr(e) => interpreter
@@ -1542,7 +1543,34 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<(), String> {
                             &mut global_env,
                         )?
                         .scalar_as_bool(),
-                    Pattern::Range { .. } => todo!(),
+                    Pattern::Range { start, end } => {
+                        if range_pattern_started[i] {
+                            let should_end = !interpreter
+                                .run(
+                                    &end,
+                                    &program.functions,
+                                    &mut current_record,
+                                    &mut stack,
+                                    &mut global_env,
+                                )?
+                                .scalar_as_bool();
+                            range_pattern_started[i] = should_end;
+                            // range is inclusive
+                            true
+                        } else {
+                            let should_start = interpreter
+                                .run(
+                                    &start,
+                                    &program.functions,
+                                    &mut current_record,
+                                    &mut stack,
+                                    &mut global_env,
+                                )?
+                                .scalar_as_bool();
+                            range_pattern_started[i] = should_start;
+                            should_start
+                        }
+                    }
                 };
                 if should_execute {
                     interpreter.run(

@@ -508,7 +508,9 @@ impl GlobalEnv {
             SpecialVar::Ofs => self.ofs = string_val,
             SpecialVar::Ors => self.ors = string_val,
             SpecialVar::Rs => self.rs = string_val.try_into()?,
-            _ => todo!(),
+            _ => {
+                // not needed
+            }
         }
 
         Ok(())

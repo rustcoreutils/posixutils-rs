@@ -547,6 +547,7 @@ impl Record {
     }
 
     fn reset(&mut self, record: String, field_separator: &FieldSeparator) -> Result<(), String> {
+        let previous_last_field = self.last_field;
         self.last_field = 0;
         split_record(&record, field_separator, |i, s| {
             let field_index = i + 1;
@@ -555,6 +556,11 @@ impl Record {
         });
         *self.fields[0].get_mut() = AwkValue::field_ref(record.clone(), 0);
         self.record = CString::new(record).map_err(|_| "invalid string".to_string())?;
+        if self.last_field < previous_last_field {
+            for field in &mut self.fields[self.last_field..=previous_last_field] {
+                field.get_mut().value = AwkValueVariant::UninitializedScalar;
+            }
+        }
         Ok(())
     }
 }

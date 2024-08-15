@@ -288,7 +288,7 @@ fn test_awk_delete() {
 
 #[test]
 fn test_awk_next() {
-    test_awk!(next);
+    test_awk!(next, "tests/awk/test_data.txt");
 }
 
 #[test]

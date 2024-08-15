@@ -1071,6 +1071,7 @@ impl<'i, 's> Stack<'i, 's> {
 
 enum ExecutionResult {
     Expression(AwkValue),
+    Next,
     Exit(i32),
 }
 
@@ -1350,6 +1351,7 @@ impl Interpreter {
                 OpCode::Pop => {
                     stack.pop();
                 }
+                OpCode::Next => return Ok(ExecutionResult::Next),
                 OpCode::Exit => {
                     let exit_code = stack.pop_scalar_value()?.scalar_as_f64();
                     return Ok(ExecutionResult::Exit(exit_code as i32));
@@ -1507,7 +1509,7 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
 
     let mut current_arg_index = 1;
     let mut nr = 1;
-    'rules: while !should_exit {
+    'file_loop: while !should_exit {
         let argc = interpreter.globals[SpecialVar::Argc as usize]
             .get_mut()
             .scalar_as_f64() as usize;
@@ -1610,9 +1612,13 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
                         &mut stack,
                         &mut global_env,
                     )?;
-                    if let ExecutionResult::Exit(val) = rule_result {
-                        return_value = val;
-                        break 'rules;
+                    match rule_result {
+                        ExecutionResult::Next => break,
+                        ExecutionResult::Exit(val) => {
+                            return_value = val;
+                            break 'file_loop;
+                        }
+                        ExecutionResult::Expression(_) => {}
                     }
                 }
             }

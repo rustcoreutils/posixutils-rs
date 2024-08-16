@@ -80,6 +80,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] join
  - [x] link
  - [x] ls
+ - [x] m4
  - [x] mkdir
  - [x] mv
  - [x] nl
@@ -207,7 +208,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] awk
  - [ ] fuser
  - [ ] lp
- - [ ] m4
  - [ ] mailx
  - [ ] make
  - [ ] man

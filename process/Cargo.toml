@@ -15,6 +15,13 @@ atty.workspace = true
 errno = "0.3"
 dirs = "5.0"
 
+[dev-dependencies]
+tokio = { version = "1.39", features = ["net", "macros", "rt"]}
+
+[[bin]]
+name = "fuser"
+path = "./fuser.rs"
+
 [[bin]]
 name = "env"
 path = "./env.rs"

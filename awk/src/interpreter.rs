@@ -1091,7 +1091,6 @@ impl ExecutionResult {
 struct Interpreter {
     globals: Vec<AwkValueRef>,
     constants: Vec<Constant>,
-    convfmt: String,
 }
 
 macro_rules! numeric_op {
@@ -1463,11 +1462,7 @@ impl Interpreter {
         *globals[SpecialVar::Subsep as usize].get_mut() = AwkValue::from(" ".to_string())
             .to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Subsep));
 
-        Self {
-            globals,
-            constants,
-            convfmt: "%.6g".to_string(),
-        }
+        Self { globals, constants }
     }
 }
 
@@ -1524,7 +1519,7 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
             .unwrap()
             .get_or_insert_uninitialized(current_arg_index.to_string())
             .to_owned()
-            .scalar_to_string(&interpreter.convfmt)?;
+            .scalar_to_string(&global_env.convfmt)?;
 
         if arg.is_empty() {
             current_arg_index += 1;

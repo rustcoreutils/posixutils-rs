@@ -1645,66 +1645,109 @@ mod tests {
 
     const FIRST_GLOBAL_VAR: u32 = SpecialVar::Count as u32;
 
-    fn interpret_expr(
+    struct TestResult {
+        globals: Vec<AwkValue>,
+        execution_result: ExecutionResult,
+        record: Record,
+    }
+
+    struct Test {
         instructions: Vec<OpCode>,
         constants: Vec<Constant>,
-        global_count: usize,
-    ) -> AwkValue {
-        let mut stack = vec![StackValue::Value(AwkValue::uninitialized()); 250];
-        let mut interpreter =
-            Interpreter::new(Array::default(), Array::default(), constants, global_count);
-        interpreter
-            .run(
-                &instructions,
-                &[],
-                &mut Record::default(),
-                &mut stack,
-                &mut GlobalEnv::default(),
-            )
-            .expect("error running test")
+        functions: Vec<Function>,
+        record: Record,
+        globals_count: usize,
+    }
+
+    impl Test {
+        fn new(instructions: Vec<OpCode>, constants: Vec<Constant>) -> Self {
+            let globals_count = instructions
+                .iter()
+                .filter_map(|op| {
+                    if let OpCode::GlobalRef(i) = op {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                })
+                .max()
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(FIRST_GLOBAL_VAR - 1) as usize;
+            Self {
+                instructions: instructions.to_vec(),
+                constants: constants.to_vec(),
+                functions: Default::default(),
+                record: Default::default(),
+                globals_count,
+            }
+        }
+
+        fn add_function(mut self, f: Function) -> Self {
+            self.functions.push(f);
+            self
+        }
+
+        fn add_record(mut self, record_string: &str) -> Self {
+            self.record
+                .reset(record_string.to_string(), &FieldSeparator::Default)
+                .expect("could not split record");
+            self
+        }
+
+        fn run_correct(mut self) -> TestResult {
+            let mut stack = vec![StackValue::Value(AwkValue::uninitialized()); 250];
+            let mut interpreter = Interpreter::new(
+                Array::default(),
+                Array::default(),
+                self.constants,
+                self.globals_count,
+            );
+
+            let execution_result = interpreter
+                .run(
+                    &self.instructions,
+                    &self.functions,
+                    &mut self.record,
+                    &mut stack,
+                    &mut GlobalEnv::default(),
+                )
+                .expect("execution generated an error");
+
+            let globals = interpreter
+                .globals
+                .into_iter()
+                .map(|v| v.into_inner())
+                .collect();
+
+            TestResult {
+                execution_result,
+                globals,
+                record: self.record,
+            }
+        }
+    }
+
+    fn interpret_expr(instructions: Vec<OpCode>, constants: Vec<Constant>) -> AwkValue {
+        Test::new(instructions, constants)
+            .run_correct()
+            .execution_result
             .unwrap_expr()
     }
 
     fn interpret_expr_with_record(
         instructions: Vec<OpCode>,
         constants: Vec<Constant>,
-        global_count: usize,
-        record_str: String,
+        record_str: &str,
     ) -> (AwkValue, Record) {
-        let mut stack = vec![StackValue::Value(AwkValue::uninitialized()); 250];
-        let mut interpreter =
-            Interpreter::new(Array::default(), Array::default(), constants, global_count);
-        let mut record = Record::from_string(record_str, &FieldSeparator::Default)
-            .expect("error splitting record");
-
-        let value = interpreter
-            .run(
-                &instructions,
-                &[],
-                &mut record,
-                &mut stack,
-                &mut GlobalEnv::default(),
-            )
-            .expect("error running test")
-            .unwrap_expr();
-        (value, record)
+        let result = Test::new(instructions, constants)
+            .add_record(record_str)
+            .run_correct();
+        (result.execution_result.unwrap_expr(), result.record)
     }
 
     fn test_global(instructions: Vec<OpCode>, constants: Vec<Constant>) -> AwkValue {
-        let mut stack = vec![StackValue::Value(AwkValue::uninitialized()); 250];
-        let mut interpreter = Interpreter::new(Array::default(), Array::default(), constants, 1);
-        interpreter
-            .run(
-                &instructions,
-                &[],
-                &mut Record::default(),
-                &mut stack,
-                &mut GlobalEnv::default(),
-            )
-            .expect("error running test");
-        interpreter.globals[FIRST_GLOBAL_VAR as usize]
-            .get_mut()
-            .clone()
+        Test::new(instructions, constants).run_correct().globals[FIRST_GLOBAL_VAR as usize].clone()
     }
 
     fn interpret_with_functions(
@@ -1740,7 +1783,7 @@ mod tests {
             function: BuiltinFunction::Sprintf,
             argc: argc as u16,
         });
-        let result = interpret_expr(instructions, constants, 0);
+        let result = interpret_expr(instructions, constants);
         if let AwkValueVariant::String(s) = result.value {
             s
         } else {
@@ -1753,13 +1796,13 @@ mod tests {
         let instructions = vec![OpCode::PushConstant(0)];
         let constant = vec![Constant::Number(1.0)];
         assert_eq!(
-            interpret_expr(instructions.clone(), constant, 0),
+            interpret_expr(instructions.clone(), constant),
             AwkValue::from(1.0)
         );
 
         let constant = vec![Constant::String("hello".to_string())];
         assert_eq!(
-            interpret_expr(instructions, constant, 0),
+            interpret_expr(instructions, constant),
             AwkValue::from("hello".to_string())
         );
     }
@@ -1772,10 +1815,7 @@ mod tests {
             OpCode::Add,
         ];
         let constant = vec![Constant::Number(1.0), Constant::Number(1.0)];
-        assert_eq!(
-            interpret_expr(instructions, constant, 0),
-            AwkValue::from(2.0)
-        );
+        assert_eq!(interpret_expr(instructions, constant), AwkValue::from(2.0));
     }
 
     #[test]
@@ -1786,10 +1826,7 @@ mod tests {
             OpCode::Sub,
         ];
         let constant = vec![Constant::Number(145.0), Constant::Number(123.0)];
-        assert_eq!(
-            interpret_expr(instructions, constant, 0),
-            AwkValue::from(22.0)
-        );
+        assert_eq!(interpret_expr(instructions, constant), AwkValue::from(22.0));
     }
 
     #[test]
@@ -1802,7 +1839,7 @@ mod tests {
         let constant = vec![Constant::Number(12.0), Constant::Number(12.0)];
 
         assert_eq!(
-            interpret_expr(instructions, constant, 0),
+            interpret_expr(instructions, constant),
             AwkValue::from(144.0)
         );
     }
@@ -1816,10 +1853,7 @@ mod tests {
         ];
         let constant = vec![Constant::Number(144.0), Constant::Number(12.0)];
 
-        assert_eq!(
-            interpret_expr(instructions, constant, 0),
-            AwkValue::from(12.0)
-        );
+        assert_eq!(interpret_expr(instructions, constant), AwkValue::from(12.0));
     }
 
     #[test]
@@ -1831,10 +1865,7 @@ mod tests {
         ];
         let constant = vec![Constant::Number(144.0), Constant::Number(12.0)];
 
-        assert_eq!(
-            interpret_expr(instructions, constant, 0),
-            AwkValue::from(0.0)
-        );
+        assert_eq!(interpret_expr(instructions, constant), AwkValue::from(0.0));
     }
 
     #[test]
@@ -1846,10 +1877,7 @@ mod tests {
         ];
         let constant = vec![Constant::Number(2.0), Constant::Number(3.0)];
 
-        assert_eq!(
-            interpret_expr(instructions, constant, 0),
-            AwkValue::from(8.0)
-        );
+        assert_eq!(interpret_expr(instructions, constant), AwkValue::from(8.0));
     }
 
     #[test]
@@ -1865,7 +1893,7 @@ mod tests {
         ];
 
         assert_eq!(
-            interpret_expr(instructions, constant, 0),
+            interpret_expr(instructions, constant),
             AwkValue::from("helloworld".to_string())
         );
     }
@@ -1874,37 +1902,25 @@ mod tests {
     fn test_compare_same_operand_type() {
         let instructions = vec![OpCode::PushConstant(0), OpCode::PushConstant(1), OpCode::Le];
         let constant = vec![Constant::Number(2.0), Constant::Number(3.0)];
-        assert_eq!(
-            interpret_expr(instructions, constant, 0),
-            AwkValue::from(1.0)
-        );
+        assert_eq!(interpret_expr(instructions, constant), AwkValue::from(1.0));
 
         let constant = vec![
             Constant::String("abcd".to_string()),
             Constant::String("efgh".to_string()),
         ];
         let instructions = vec![OpCode::PushConstant(0), OpCode::PushConstant(1), OpCode::Ge];
-        assert_eq!(
-            interpret_expr(instructions, constant, 0),
-            AwkValue::from(0.0)
-        );
+        assert_eq!(interpret_expr(instructions, constant), AwkValue::from(0.0));
     }
 
     #[test]
     fn test_compare_number_string() {
         let instructions = vec![OpCode::PushConstant(0), OpCode::PushConstant(1), OpCode::Le];
         let constant = vec![Constant::Number(2.0), Constant::String("2.".to_string())];
-        assert_eq!(
-            interpret_expr(instructions, constant, 0),
-            AwkValue::from(1.0)
-        );
+        assert_eq!(interpret_expr(instructions, constant), AwkValue::from(1.0));
 
         let constant = vec![Constant::String("abcd".to_string()), Constant::Number(3.0)];
         let instructions = vec![OpCode::PushConstant(0), OpCode::PushConstant(1), OpCode::Ge];
-        assert_eq!(
-            interpret_expr(instructions, constant, 0),
-            AwkValue::from(1.0)
-        );
+        assert_eq!(interpret_expr(instructions, constant), AwkValue::from(1.0));
     }
 
     #[test]
@@ -1915,10 +1931,7 @@ mod tests {
             OpCode::Ge,
         ];
         let constant = vec![Constant::Number(2.0)];
-        assert_eq!(
-            interpret_expr(instructions, constant, 1),
-            AwkValue::from(1.0)
-        );
+        assert_eq!(interpret_expr(instructions, constant), AwkValue::from(1.0));
     }
 
     #[test]
@@ -1929,10 +1942,7 @@ mod tests {
             OpCode::In,
         ];
         let constant = vec![Constant::String("key".to_string())];
-        assert_eq!(
-            interpret_expr(instructions, constant, 1),
-            AwkValue::from(0.0)
-        );
+        assert_eq!(interpret_expr(instructions, constant), AwkValue::from(0.0));
 
         let instructions = vec![
             OpCode::GlobalRef(FIRST_GLOBAL_VAR),
@@ -1945,10 +1955,7 @@ mod tests {
             OpCode::In,
         ];
         let constant = vec![Constant::String("key".to_string())];
-        assert_eq!(
-            interpret_expr(instructions, constant, 1),
-            AwkValue::from(1.0)
-        );
+        assert_eq!(interpret_expr(instructions, constant), AwkValue::from(1.0));
     }
 
     #[test]
@@ -1960,10 +1967,7 @@ mod tests {
             OpCode::In,
         ];
         let constant = vec![Constant::String("key".to_string())];
-        assert_eq!(
-            interpret_expr(instructions, constant, 1),
-            AwkValue::from(0.0)
-        );
+        assert_eq!(interpret_expr(instructions, constant), AwkValue::from(0.0));
 
         let instructions = vec![
             OpCode::GlobalRef(FIRST_GLOBAL_VAR),
@@ -1978,10 +1982,7 @@ mod tests {
             OpCode::In,
         ];
         let constant = vec![Constant::String("key".to_string())];
-        assert_eq!(
-            interpret_expr(instructions, constant, 1),
-            AwkValue::from(1.0)
-        );
+        assert_eq!(interpret_expr(instructions, constant), AwkValue::from(1.0));
     }
 
     #[test]
@@ -1989,7 +1990,7 @@ mod tests {
         let instructions = vec![OpCode::PushConstant(0), OpCode::Negate];
         let constant = vec![Constant::Number(456.0)];
         assert_eq!(
-            interpret_expr(instructions, constant, 0),
+            interpret_expr(instructions, constant),
             AwkValue::from(-456.0)
         );
     }
@@ -1998,10 +1999,7 @@ mod tests {
     fn test_not() {
         let instructions = vec![OpCode::PushConstant(0), OpCode::Not];
         let constant = vec![Constant::Number(0.0)];
-        assert_eq!(
-            interpret_expr(instructions, constant, 0),
-            AwkValue::from(1.0)
-        );
+        assert_eq!(interpret_expr(instructions, constant), AwkValue::from(1.0));
     }
 
     #[test]
@@ -2113,7 +2111,7 @@ mod tests {
             Constant::String("test string".to_string()),
         ];
         assert_eq!(
-            interpret_expr(instructions, constant, 0),
+            interpret_expr(instructions, constant),
             AwkValue::from("test string".to_string())
         );
     }
@@ -2143,10 +2141,7 @@ mod tests {
             OpCode::PushConstant(1),
         ];
         let constant = vec![Constant::Number(1.0), Constant::Number(2.0)];
-        assert_eq!(
-            interpret_expr(instructions, constant, 0),
-            AwkValue::from(2.0)
-        );
+        assert_eq!(interpret_expr(instructions, constant), AwkValue::from(2.0));
     }
 
     #[test]
@@ -2162,10 +2157,7 @@ mod tests {
             Constant::Number(1.0),
             Constant::Number(2.0),
         ];
-        assert_eq!(
-            interpret_expr(instructions, constant, 0),
-            AwkValue::from(2.0)
-        );
+        assert_eq!(interpret_expr(instructions, constant), AwkValue::from(2.0));
     }
 
     #[test]
@@ -2181,10 +2173,7 @@ mod tests {
             Constant::Number(2.0),
             Constant::Number(3.0),
         ];
-        assert_eq!(
-            interpret_expr(instructions, constant, 0),
-            AwkValue::from(3.0)
-        );
+        assert_eq!(interpret_expr(instructions, constant), AwkValue::from(3.0));
     }
 
     #[test]
@@ -2306,8 +2295,12 @@ mod tests {
     fn test_access_whole_record_field() {
         let instructions = vec![OpCode::PushConstant(0), OpCode::FieldRef];
         let constant = vec![Constant::Number(0.0)];
-        let (value, _) = interpret_expr_with_record(instructions, constant, 0, "hello".to_string());
-        assert_eq!(value, AwkValue::from("hello".to_string()));
+        let value = Test::new(instructions, constant)
+            .add_record("hello")
+            .run_correct()
+            .execution_result
+            .unwrap_expr();
+        assert_eq!(value, AwkValue::from("hello"));
     }
 
     #[test]
@@ -2319,22 +2312,12 @@ mod tests {
             OpCode::Assign,
         ];
         let constants = vec![Constant::Number(9.0)];
-        let mut stack = vec![StackValue::Value(AwkValue::uninitialized()); 250];
 
-        let mut interpreter = Interpreter::new(Array::default(), Array::default(), constants, 0);
-        interpreter
-            .run(
-                &instructions,
-                &[],
-                &mut Record::from_string("1".to_string(), &FieldSeparator::Default).unwrap(),
-                &mut stack,
-                &mut Default::default(),
-            )
-            .unwrap();
-        assert_eq!(
-            *interpreter.globals[SpecialVar::Nf as usize].get_mut(),
-            AwkValue::from(9.0)
-        );
+        let result = Test::new(instructions, constants)
+            .add_record("1")
+            .run_correct();
+
+        assert_eq!(result.globals[SpecialVar::Nf as usize], AwkValue::from(9.0));
     }
 
     #[test]
@@ -2352,7 +2335,7 @@ mod tests {
             Constant::String("l".to_string()),
         ];
         assert_eq!(
-            interpret_expr(instructions.clone(), constant, 0),
+            interpret_expr(instructions.clone(), constant),
             AwkValue::from(3.0)
         );
 
@@ -2360,10 +2343,7 @@ mod tests {
             Constant::String("hello".to_string()),
             Constant::String("z".to_string()),
         ];
-        assert_eq!(
-            interpret_expr(instructions, constant, 0),
-            AwkValue::from(0.0)
-        );
+        assert_eq!(interpret_expr(instructions, constant), AwkValue::from(0.0));
     }
 
     #[test]
@@ -2377,7 +2357,7 @@ mod tests {
         ];
         let constant = vec![Constant::String("hello".to_string())];
         assert_eq!(
-            interpret_expr(instructions, constant, 0),
+            interpret_expr(instructions, constant.clone()),
             AwkValue::from(5.0)
         );
 
@@ -2385,8 +2365,11 @@ mod tests {
             function: BuiltinFunction::Length,
             argc: 0,
         }];
-        let (value, _) =
-            interpret_expr_with_record(instructions, vec![], 0, "test record".to_string());
+        let value = Test::new(instructions, constant)
+            .add_record("test record")
+            .run_correct()
+            .execution_result
+            .unwrap_expr();
         assert_eq!(value, AwkValue::from(11.0));
     }
 
@@ -2407,7 +2390,7 @@ mod tests {
             Constant::Number(2.0),
         ];
         assert_eq!(
-            interpret_expr(instructions, constant, 0),
+            interpret_expr(instructions, constant),
             AwkValue::from("el".to_string())
         );
 
@@ -2421,7 +2404,7 @@ mod tests {
         ];
         let constant = vec![Constant::String("hello".to_string()), Constant::Number(3.0)];
         assert_eq!(
-            interpret_expr(instructions, constant, 0),
+            interpret_expr(instructions, constant),
             AwkValue::from("llo".to_string())
         );
     }
@@ -2602,15 +2585,11 @@ mod tests {
                 Regex::new(CString::new("e").unwrap()).expect("failed to compile regex"),
             )),
         ];
-        assert_eq!(
-            interpret_expr(instructions, constant, 0),
-            AwkValue::from(1.0)
-        );
+        assert_eq!(interpret_expr(instructions, constant), AwkValue::from(1.0));
     }
 
     #[test]
     fn test_builtin_match() {
-        let mut stack = vec![StackValue::Value(AwkValue::uninitialized()); 250];
         let instructions = vec![
             OpCode::PushConstant(0),
             OpCode::PushConstant(1),
@@ -2623,26 +2602,15 @@ mod tests {
             Constant::String("this is a test".to_string()),
             Constant::Regex(Rc::new(regex_from_str("is* a"))),
         ];
+        let result = Test::new(instructions, constants).run_correct();
 
-        let mut interpreter = Interpreter::new(Array::default(), Array::default(), constants, 0);
-        let result = interpreter
-            .run(
-                &instructions,
-                &[],
-                &mut Record::default(),
-                &mut stack,
-                &mut GlobalEnv::default(),
-            )
-            .expect("error running test")
-            .unwrap_expr();
-
-        assert_eq!(result, AwkValue::from(6.0));
+        assert_eq!(result.execution_result.unwrap_expr(), AwkValue::from(6.0));
         assert_eq!(
-            *interpreter.globals[SpecialVar::Rstart as usize].get_mut(),
+            result.globals[SpecialVar::Rstart as usize],
             AwkValue::from(6.0)
         );
         assert_eq!(
-            *interpreter.globals[SpecialVar::Rlength as usize].get_mut(),
+            result.globals[SpecialVar::Rlength as usize],
             AwkValue::from(4.0)
         );
     }
@@ -2727,8 +2695,10 @@ mod tests {
             Constant::Regex(Rc::from(regex_from_str("ab+"))),
             Constant::String("x".to_string()),
         ];
-        let (_, mut record) =
-            interpret_expr_with_record(instructions, constants, 0, "aaabbb ab aabb".to_string());
+        let mut record = Test::new(instructions, constants)
+            .add_record("aaabbb ab aabb")
+            .run_correct()
+            .record;
         assert_eq!(
             *record.fields[0].get_mut(),
             AwkValue::field_ref("aax ab aabb", 0)
@@ -2776,8 +2746,10 @@ mod tests {
             Constant::Regex(Rc::from(regex_from_str("ab+"))),
             Constant::String("x".to_string()),
         ];
-        let (_, mut record) =
-            interpret_expr_with_record(instructions, constants, 0, "aaabbb ab aabb".to_string());
+        let mut record = Test::new(instructions, constants)
+            .add_record("aaabbb ab aabb")
+            .run_correct()
+            .record;
         assert_eq!(
             *record.fields[0].get_mut(),
             AwkValue::field_ref("aax x ax", 0)

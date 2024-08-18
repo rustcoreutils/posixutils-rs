@@ -107,6 +107,30 @@ pub enum Constant {
     Regex(Rc<Regex>),
 }
 
+impl From<String> for Constant {
+    fn from(value: String) -> Self {
+        Self::String(value)
+    }
+}
+
+impl From<&str> for Constant {
+    fn from(value: &str) -> Self {
+        value.to_string().into()
+    }
+}
+
+impl From<f64> for Constant {
+    fn from(value: f64) -> Self {
+        Self::Number(value)
+    }
+}
+
+impl From<Rc<Regex>> for Constant {
+    fn from(value: Rc<Regex>) -> Self {
+        Self::Regex(value)
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Pattern {
     Expr(Vec<OpCode>),

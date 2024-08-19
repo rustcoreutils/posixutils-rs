@@ -27,6 +27,16 @@ fn test_awk_empty_program() {
 }
 
 #[test]
+fn test_awk_print() {
+    test_awk!(print);
+}
+
+#[test]
+fn test_awk_printf() {
+    test_awk!(printf);
+}
+
+#[test]
 fn test_awk_hello_world() {
     test_awk!(hello_world)
 }

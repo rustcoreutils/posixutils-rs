@@ -1,0 +1,21 @@
+Hello, World!
+Integer: 42
+Floating-point: 3.141590
+Hello, Alice!
+Name: Alice, Age: 30, Height: 5.9
+Left-justified: left      |
+Right-justified:      right|
+Zero-padded: 00007
+Hexadecimal: ff
+Octal: 377
+Scientific notation: 1.234568e+04
+Percentage: %
+Newline: \n, Tab: \t
+Large integer: 1234567890123456768
+Negative integer: -42
+Negative floating-point: -3.141590
+Precision: 3.14
+Width and precision:       3.14
+Special characters: Hello, 	World!
+
+Empty string: ''

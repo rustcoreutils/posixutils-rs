@@ -188,13 +188,13 @@ delete_element = {
 }
 
 print_stmt = {
-    (print_call | simple_print | printf_call | simple_printf) ~ output_redirection?
+    (printf_call | simple_printf | print_call | simple_print) ~ output_redirection?
 }
 
 simple_print       = { "print" ~ print_expr_list? }
-print_call         = { "print" ~ "(" ~ multiple_expr_list ~ ")" ~ !in_op}
-simple_printf      = { "printf" ~ print_expr_list? }
-printf_call        = { "printf" ~ "(" ~ multiple_expr_list ~ ")" ~ !in_op}
+print_call         = { "print" ~ "(" ~ multiple_expr_list ~ ")" ~ !in_op }
+simple_printf      = { "printf" ~ print_expr_list }
+printf_call        = { "printf" ~ "(" ~ multiple_expr_list ~ ")" ~ !in_op }
 output_redirection = {
     ">" ~ expr
   | ">>" ~ expr

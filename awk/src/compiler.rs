@@ -898,7 +898,12 @@ impl Compiler {
                 let mut inner = stmt.into_inner();
                 let print = inner.next().unwrap();
                 match print.as_rule() {
-                    Rule::simple_print | Rule::print_call => {
+                    Rule::simple_print
+                    | Rule::print_call
+                    | Rule::simple_printf
+                    | Rule::printf_call => {
+                        let is_printf =
+                            matches!(print.as_rule(), Rule::printf_call | Rule::simple_printf);
                         let expressions = print.into_inner();
                         let argc = expressions.len() as u16;
                         if expressions.len() == 0 {
@@ -907,10 +912,17 @@ impl Compiler {
                             for expr in expressions {
                                 self.compile_expr(expr, instructions, locals)?;
                             }
-                            instructions.push(OpCode::CallBuiltin {
-                                function: BuiltinFunction::Print,
-                                argc,
-                            });
+                            if is_printf {
+                                instructions.push(OpCode::CallBuiltin {
+                                    function: BuiltinFunction::Printf,
+                                    argc,
+                                });
+                            } else {
+                                instructions.push(OpCode::CallBuiltin {
+                                    function: BuiltinFunction::Print,
+                                    argc,
+                                });
+                            }
                         }
                     }
                     _ => unreachable!(),
@@ -2664,6 +2676,92 @@ mod test {
             constants,
             vec![
                 Constant::String("hello".to_string()),
+                Constant::Number(1.0),
+                Constant::Number(2.0),
+                Constant::String("and".to_string()),
+                Constant::Number(3.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_compile_simple_printf() {
+        let (instructions, constant) = compile_stmt("printf \"test\";");
+        assert_eq!(
+            instructions,
+            vec![
+                OpCode::PushConstant(0),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Printf,
+                    argc: 1
+                },
+            ]
+        );
+        assert_eq!(constant, vec![Constant::String("test".to_string()),]);
+
+        let (instructions, constant) =
+            compile_stmt(r#"printf "%d, %d, %s, %.6f", 1, 2, "and", 3;"#);
+        assert_eq!(
+            instructions,
+            vec![
+                OpCode::PushConstant(0),
+                OpCode::PushConstant(1),
+                OpCode::PushConstant(2),
+                OpCode::PushConstant(3),
+                OpCode::PushConstant(4),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Printf,
+                    argc: 5
+                },
+            ]
+        );
+        assert_eq!(
+            constant,
+            vec![
+                Constant::String("%d, %d, %s, %.6f".to_string()),
+                Constant::Number(1.0),
+                Constant::Number(2.0),
+                Constant::String("and".to_string()),
+                Constant::Number(3.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_compile_printf_call() {
+        let (instructions, constant) = compile_stmt("printf (\"hello\");");
+        assert_eq!(
+            instructions,
+            vec![
+                OpCode::PushConstant(0),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Printf,
+                    argc: 1
+                },
+            ]
+        );
+        assert_eq!(constant, vec![Constant::String("hello".to_string())]);
+
+        let (instructions, constants) =
+            compile_stmt(r#"printf ("%g, %x, %s, %.6f", 1, 2, "and", 3);"#);
+        assert_eq!(
+            instructions,
+            vec![
+                OpCode::PushConstant(0),
+                OpCode::PushConstant(1),
+                OpCode::PushConstant(2),
+                OpCode::PushConstant(3),
+                OpCode::PushConstant(4),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Printf,
+                    argc: 5
+                },
+            ]
+        );
+        assert_eq!(
+            constants,
+            vec![
+                Constant::String("%g, %x, %s, %.6f".to_string()),
                 Constant::Number(1.0),
                 Constant::Number(2.0),
                 Constant::String("and".to_string()),

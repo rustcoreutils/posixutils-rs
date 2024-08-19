@@ -99,6 +99,7 @@ fn sprintf(
                 let (specifier, args) = parse_conversion_specifier_args(&mut iter)?;
                 if specifier == '%' {
                     result.push('%');
+                    next = iter.next();
                     continue;
                 }
 
@@ -2428,6 +2429,11 @@ mod tests {
             interpret_expr(instructions, constant),
             AwkValue::from("llo".to_string())
         );
+    }
+
+    #[test]
+    fn test_builtin_sprintf_with_escaped_percent_sign() {
+        assert_eq!(test_sprintf("%%", vec![]), "%");
     }
 
     #[test]

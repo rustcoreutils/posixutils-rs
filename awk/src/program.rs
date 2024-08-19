@@ -242,6 +242,12 @@ pub enum BuiltinFunction {
     System,
     Print,
     Printf,
+    RedirectedPrintTruncate,
+    RedirectedPrintAppend,
+    RedirectedPrintPipe,
+    RedirectedPrintfTruncate,
+    RedirectedPrintfAppend,
+    RedirectedPrintfPipe,
 
     /// the total number of builtin functions
     Count,

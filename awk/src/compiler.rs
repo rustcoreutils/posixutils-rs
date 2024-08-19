@@ -897,6 +897,8 @@ impl Compiler {
             Rule::print_stmt => {
                 let mut inner = stmt.into_inner();
                 let print = inner.next().unwrap();
+                let mut print_function;
+                let mut argc;
                 match print.as_rule() {
                     Rule::simple_print
                     | Rule::print_call
@@ -905,7 +907,7 @@ impl Compiler {
                         let is_printf =
                             matches!(print.as_rule(), Rule::printf_call | Rule::simple_printf);
                         let expressions = print.into_inner();
-                        let argc = expressions.len() as u16;
+                        argc = expressions.len() as u16;
                         if expressions.len() == 0 {
                             todo!()
                         } else {
@@ -913,20 +915,47 @@ impl Compiler {
                                 self.compile_expr(expr, instructions, locals)?;
                             }
                             if is_printf {
-                                instructions.push(OpCode::CallBuiltin {
-                                    function: BuiltinFunction::Printf,
-                                    argc,
-                                });
+                                print_function = BuiltinFunction::Printf;
                             } else {
-                                instructions.push(OpCode::CallBuiltin {
-                                    function: BuiltinFunction::Print,
-                                    argc,
-                                });
+                                print_function = BuiltinFunction::Print;
                             }
                         }
                     }
                     _ => unreachable!(),
                 }
+                if let Some(output_redirection) = inner.next() {
+                    match output_redirection.as_rule() {
+                        Rule::truncate => {
+                            if print_function == BuiltinFunction::Print {
+                                print_function = BuiltinFunction::RedirectedPrintTruncate
+                            } else {
+                                print_function = BuiltinFunction::RedirectedPrintfTruncate
+                            }
+                        }
+                        Rule::append => {
+                            if print_function == BuiltinFunction::Print {
+                                print_function = BuiltinFunction::RedirectedPrintAppend
+                            } else {
+                                print_function = BuiltinFunction::RedirectedPrintfAppend
+                            }
+                        }
+                        Rule::pipe => {
+                            if print_function == BuiltinFunction::Print {
+                                print_function = BuiltinFunction::RedirectedPrintPipe
+                            } else {
+                                print_function = BuiltinFunction::RedirectedPrintfPipe
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                    let expr = first_child(output_redirection);
+                    self.compile_expr(expr, instructions, locals)?;
+                    argc += 1;
+                }
+                instructions.push(OpCode::CallBuiltin {
+                    function: print_function,
+                    argc,
+                });
             }
             _ => unreachable!(
                 "encountered {:?} while compiling simple statement",
@@ -2685,6 +2714,60 @@ mod test {
     }
 
     #[test]
+    fn test_compile_redirected_simple_print() {
+        let (instructions, constant) = compile_stmt("print 1 > \"file\";");
+        assert_eq!(
+            instructions,
+            vec![
+                OpCode::PushConstant(0),
+                OpCode::PushConstant(1),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::RedirectedPrintTruncate,
+                    argc: 2
+                },
+            ]
+        );
+        assert_eq!(
+            constant,
+            vec![Constant::Number(1.0), Constant::String("file".to_string()),]
+        );
+
+        let (instructions, constant) = compile_stmt("print 1 >> \"file\";");
+        assert_eq!(
+            instructions,
+            vec![
+                OpCode::PushConstant(0),
+                OpCode::PushConstant(1),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::RedirectedPrintAppend,
+                    argc: 2
+                },
+            ]
+        );
+        assert_eq!(
+            constant,
+            vec![Constant::Number(1.0), Constant::String("file".to_string()),]
+        );
+
+        let (instructions, constant) = compile_stmt(r#"print 1 | "bash";"#);
+        assert_eq!(
+            instructions,
+            vec![
+                OpCode::PushConstant(0),
+                OpCode::PushConstant(1),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::RedirectedPrintPipe,
+                    argc: 2
+                },
+            ]
+        );
+        assert_eq!(
+            constant,
+            vec![Constant::Number(1.0), Constant::String("bash".to_string()),]
+        );
+    }
+
+    #[test]
     fn test_compile_simple_printf() {
         let (instructions, constant) = compile_stmt("printf \"test\";");
         assert_eq!(
@@ -2766,6 +2849,69 @@ mod test {
                 Constant::Number(2.0),
                 Constant::String("and".to_string()),
                 Constant::Number(3.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_compile_redirected_simple_printf() {
+        let (instructions, constant) = compile_stmt("printf \"test\" > \"file\";");
+        assert_eq!(
+            instructions,
+            vec![
+                OpCode::PushConstant(0),
+                OpCode::PushConstant(1),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::RedirectedPrintfTruncate,
+                    argc: 2
+                },
+            ]
+        );
+        assert_eq!(
+            constant,
+            vec![
+                Constant::String("test".to_string()),
+                Constant::String("file".to_string()),
+            ]
+        );
+
+        let (instructions, constant) = compile_stmt("printf \"test\" >> \"file\";");
+        assert_eq!(
+            instructions,
+            vec![
+                OpCode::PushConstant(0),
+                OpCode::PushConstant(1),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::RedirectedPrintfAppend,
+                    argc: 2
+                },
+            ]
+        );
+        assert_eq!(
+            constant,
+            vec![
+                Constant::String("test".to_string()),
+                Constant::String("file".to_string()),
+            ]
+        );
+
+        let (instructions, constant) = compile_stmt(r#"printf "test" | "bash";"#);
+        assert_eq!(
+            instructions,
+            vec![
+                OpCode::PushConstant(0),
+                OpCode::PushConstant(1),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::RedirectedPrintfPipe,
+                    argc: 2
+                },
+            ]
+        );
+        assert_eq!(
+            constant,
+            vec![
+                Constant::String("test".to_string()),
+                Constant::String("bash".to_string()),
             ]
         );
     }

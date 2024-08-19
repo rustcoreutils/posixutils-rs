@@ -191,15 +191,19 @@ print_stmt = {
     (printf_call | simple_printf | print_call | simple_print) ~ output_redirection?
 }
 
-simple_print       = { "print" ~ print_expr_list? }
-print_call         = { "print" ~ "(" ~ multiple_expr_list ~ ")" ~ !in_op }
-simple_printf      = { "printf" ~ print_expr_list }
-printf_call        = { "printf" ~ "(" ~ multiple_expr_list ~ ")" ~ !in_op }
-output_redirection = {
-    ">" ~ expr
-  | ">>" ~ expr
-  | "|" ~ expr
+simple_print       =  { "print" ~ print_expr_list? }
+print_call         =  { "print" ~ "(" ~ multiple_expr_list ~ ")" ~ !in_op }
+simple_printf      =  { "printf" ~ print_expr_list }
+printf_call        =  { "printf" ~ "(" ~ multiple_expr_list ~ ")" ~ !in_op }
+output_redirection = _{
+    truncate
+  | append
+  | pipe
 }
+
+truncate = { ">" ~ expr }
+append   = { ">>" ~ expr }
+pipe     = { "|" ~ expr }
 
 print_expr_list    = _{ print_expr ~ ("," ~ opt_newline ~ print_expr)* }
 expr_list          = _{ multiple_expr_list | expr }
@@ -359,14 +363,14 @@ simple_binary_print_expr =  {
 }
 binary_print_expr        =  {
     multidimensional_in
-  | simple_binary_expr
+  | simple_binary_print_expr
 }
 
 print_assignment   = { lvalue ~ assignment_op ~ print_expr }
 ternary_print_expr = { binary_print_expr ~ "?" ~ print_expr ~ ":" ~ print_expr }
 
 print_expr = {
-    assignment
+    print_assignment
   | ternary_print_expr
   | binary_print_expr
 }

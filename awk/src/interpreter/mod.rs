@@ -46,6 +46,34 @@ fn strtod(s: &str) -> f64 {
     .unwrap_or(0.0)
 }
 
+fn gather_values(stack: &mut Stack, count: u16) -> Result<Vec<AwkValue>, String> {
+    let mut values = Vec::new();
+    for _ in 0..count {
+        values.push(stack.pop_scalar_value()?);
+    }
+    Ok(values)
+}
+
+fn print_to_string(stack: &mut Stack, argc: u16, global_env: &GlobalEnv) -> Result<String, String> {
+    let mut values = Vec::new();
+    for _ in 0..argc {
+        values.push(
+            stack
+                .pop_scalar_value()?
+                .scalar_to_string(&global_env.ofmt)?,
+        );
+    }
+    let mut output = String::new();
+    values.iter().skip(1).rev().fold(&mut output, |acc, elem| {
+        write!(acc, "{}{}", elem, &global_env.ofs).expect("error writing to string");
+        acc
+    });
+    // there has to be at least an element
+    output.push_str(values.first().expect("called print without arguments"));
+    output.push_str(&global_env.ors);
+    Ok(output)
+}
+
 fn is_integer(num: f64) -> bool {
     num.is_finite() && num.fract() == 0.0
 }
@@ -319,10 +347,7 @@ fn call_simple_builtin(
             stack.push_value(n as f64)?;
         }
         BuiltinFunction::Sprintf => {
-            let mut values = Vec::new();
-            for _ in 0..argc - 1 {
-                values.push(stack.pop_scalar_value()?);
-            }
+            let mut values = gather_values(stack, argc - 1)?;
             let format_string = stack
                 .pop_scalar_value()?
                 .scalar_to_string(&global_env.convfmt)?;
@@ -366,22 +391,7 @@ fn call_simple_builtin(
             todo!()
         }
         BuiltinFunction::Print => {
-            let mut values = Vec::new();
-            for _ in 0..argc {
-                values.push(
-                    stack
-                        .pop_scalar_value()?
-                        .scalar_to_string(&global_env.ofmt)?,
-                );
-            }
-            let mut output = String::new();
-            values.iter().skip(1).rev().fold(&mut output, |acc, elem| {
-                write!(acc, "{}{}", elem, &global_env.ofs).expect("error writing to string");
-                acc
-            });
-            // there has to be at least an element
-            output.push_str(values.first().expect("called print without arguments"));
-            print!("{}{}", output, global_env.ors);
+            print!("{}", print_to_string(stack, argc, global_env)?);
         }
         BuiltinFunction::Printf => {
             todo!()

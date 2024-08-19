@@ -21,6 +21,7 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fmt::Write;
+use std::fs::File;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::{iter, u16};
@@ -1063,6 +1064,7 @@ impl ExecutionResult {
 struct Interpreter {
     globals: Vec<AwkValueRef>,
     constants: Vec<Constant>,
+    opened_files: HashMap<String, File>,
 }
 
 macro_rules! numeric_op {
@@ -1334,6 +1336,61 @@ impl Interpreter {
                         fields_state =
                             builtin_gsub(&mut stack, global_env, function == BuiltinFunction::Sub)?;
                     }
+                    // FIXME: refactor the following two cases
+                    BuiltinFunction::RedirectedPrintTruncate
+                    | BuiltinFunction::RedirectedPrintfTruncate => {
+                        let file_name = stack
+                            .pop_scalar_value()?
+                            .scalar_to_string(&global_env.convfmt)?;
+                        let file =
+                            self.opened_files
+                                .entry(file_name.clone())
+                                .or_insert_with(|| {
+                                    File::create(file_name).expect("failed to create file")
+                                });
+                        if function == BuiltinFunction::RedirectedPrintfTruncate {
+                            std::io::Write::write(
+                                file,
+                                print_to_string(&mut stack, argc - 1, global_env)?.as_bytes(),
+                            )
+                            .unwrap();
+                        } else {
+                            std::io::Write::write(
+                                file,
+                                builtin_sprintf(&mut stack, argc - 1, global_env)?.as_bytes(),
+                            )
+                            .unwrap();
+                        }
+                    }
+                    BuiltinFunction::RedirectedPrintAppend
+                    | BuiltinFunction::RedirectedPrintfAppend => {
+                        let file_name = stack
+                            .pop_scalar_value()?
+                            .scalar_to_string(&global_env.convfmt)?;
+                        let file =
+                            self.opened_files
+                                .entry(file_name.clone())
+                                .or_insert_with(|| {
+                                    File::options()
+                                        .create(true)
+                                        .append(true)
+                                        .open(file_name)
+                                        .expect("failed to open file")
+                                });
+                        if function == BuiltinFunction::RedirectedPrintfAppend {
+                            std::io::Write::write(
+                                file,
+                                print_to_string(&mut stack, argc - 1, global_env)?.as_bytes(),
+                            )
+                            .unwrap();
+                        } else {
+                            std::io::Write::write(
+                                file,
+                                builtin_sprintf(&mut stack, argc - 1, global_env)?.as_bytes(),
+                            )
+                            .unwrap();
+                        }
+                    }
                     other => {
                         call_simple_builtin(other, argc, &mut stack, &record.record, global_env)?
                     }
@@ -1481,7 +1538,11 @@ impl Interpreter {
         *globals[SpecialVar::Subsep as usize].get_mut() = AwkValue::from(" ".to_string())
             .to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Subsep));
 
-        Self { globals, constants }
+        Self {
+            globals,
+            constants,
+            opened_files: HashMap::new(),
+        }
     }
 }
 

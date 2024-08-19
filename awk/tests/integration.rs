@@ -361,3 +361,8 @@ fn test_awk_builtin_arithmetic_functions() {
 fn builtin_string_functions() {
     test_awk!(builtin_string_functions, "tests/awk/test_data.txt");
 }
+
+#[test]
+fn test_awk_delete_array_elements_in_for_each() {
+    test_awk!(delete_array_elements_in_for_each);
+}

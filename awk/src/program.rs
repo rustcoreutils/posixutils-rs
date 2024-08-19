@@ -43,6 +43,10 @@ pub enum OpCode {
     PreInc,
     PreDec,
 
+    CreateGlobalIterator(u32),
+    CreateLocalIterator(u32),
+    AdvanceIterOrJump(i32),
+
     AsNumber,
     // push the value on top of the stack
     Dup,

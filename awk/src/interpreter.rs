@@ -876,9 +876,17 @@ impl From<Array> for AwkValue {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+struct ArrayIterator {
+    array: *mut AwkValue,
+    iter_var: *mut AwkValue,
+    index: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 enum StackValue {
     Value(AwkValue),
     ValueRef(*mut AwkValue),
+    Iterator(ArrayIterator),
 }
 
 impl StackValue {
@@ -888,6 +896,7 @@ impl StackValue {
         match self {
             StackValue::Value(val) => val,
             StackValue::ValueRef(val_ref) => &mut **val_ref,
+            _ => unreachable!("invalid stack value"),
         }
     }
 
@@ -898,12 +907,20 @@ impl StackValue {
         }
     }
 
+    fn unwrap_array_iterator(self) -> ArrayIterator {
+        match self {
+            StackValue::Iterator(array_iterator) => array_iterator,
+            _ => unreachable!("expected iterator"),
+        }
+    }
+
     /// # Safety
     /// if the `StackValue` is a `ValueRef` then the pointer has to point to a valid `AwkValue`
     unsafe fn to_owned(self) -> AwkValue {
         match self {
             StackValue::Value(val) => val,
             StackValue::ValueRef(ref_val) => (*ref_val).to_owned(),
+            _ => unreachable!("invalid stack value"),
         }
     }
 
@@ -983,6 +1000,19 @@ impl<'i, 's> Stack<'i, 's> {
         }
     }
 
+    fn get_mut_value_ptr(&mut self, index: usize) -> Option<*mut AwkValue> {
+        if unsafe { self.sp.offset_from(self.bp) } >= index as isize {
+            let value = unsafe { &mut *self.bp.add(index) };
+            match value {
+                StackValue::Value(val) => Some(val),
+                StackValue::ValueRef(val_ref) => Some(*val_ref),
+                _ => unreachable!("invalid stack value"),
+            }
+        } else {
+            None
+        }
+    }
+
     fn pop_value(&mut self) -> AwkValue {
         // safe by type invariance
         unsafe {
@@ -1014,13 +1044,8 @@ impl<'i, 's> Stack<'i, 's> {
     /// # Panics
     /// panics if `value_index` is out of bounds
     fn push_ref_to_stack_element(&mut self, value_index: usize) -> Result<(), String> {
-        assert!(unsafe { self.sp.offset_from(self.bp) } >= value_index as isize);
-
-        let value = unsafe { &mut *self.bp.add(value_index) };
-        match value {
-            StackValue::Value(val) => unsafe { self.push_ref(val) },
-            StackValue::ValueRef(val_ref) => unsafe { self.push_ref(*val_ref) },
-        }
+        let value = self.get_mut_value_ptr(value_index).unwrap();
+        unsafe { self.push_ref(value) }
     }
 
     fn next_instruction(&mut self) -> Option<OpCode> {
@@ -1239,6 +1264,53 @@ impl Interpreter {
                     let expr_result = lvalue.scalar_as_f64() - 1.0;
                     fields_state = lvalue.assign(expr_result, global_env)?;
                     stack.push_value(expr_result)?;
+                }
+                OpCode::CreateGlobalIterator(index) => {
+                    let iter_var = stack.pop_ref();
+                    iter_var.ensure_value_is_scalar()?;
+                    let iter_var = iter_var as *mut AwkValue;
+                    let array = self.globals[index as usize].get();
+                    // both iter_var and array are valid until the stack value is popped.
+                    // The first from stack invariance, the second because its a global,
+                    // so it will outlive the stack.
+                    unsafe {
+                        stack.push(StackValue::Iterator(ArrayIterator {
+                            iter_var,
+                            array,
+                            index: 0,
+                        }))?
+                    };
+                }
+                OpCode::CreateLocalIterator(index) => {
+                    let iter_var = stack.pop_ref();
+                    iter_var.ensure_value_is_scalar()?;
+                    let iter_var = iter_var as *mut AwkValue;
+                    let array = stack
+                        .get_mut_value_ptr(index as usize)
+                        .expect("invalid local index");
+                    unsafe {
+                        stack.push(StackValue::Iterator(ArrayIterator {
+                            iter_var,
+                            array,
+                            index: 0,
+                        }))?
+                    };
+                }
+                OpCode::AdvanceIterOrJump(offset) => {
+                    let mut iter = stack.pop().unwrap().unwrap_array_iterator();
+                    let key_index = iter.index;
+                    let array = unsafe { &mut *iter.array }.as_array()?;
+                    if let Some(key) = array.keys.get(key_index).cloned() {
+                        unsafe {
+                            *iter.iter_var = key.to_string().into();
+                        }
+                        iter.index += 1;
+                        unsafe {
+                            stack.push(StackValue::Iterator(iter))?;
+                        }
+                    } else {
+                        ip_increment = offset as isize;
+                    }
                 }
                 OpCode::AsNumber => {
                     let val = stack.pop_scalar_value()?;
@@ -1640,6 +1712,8 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
 
 #[cfg(test)]
 mod tests {
+    use pest::pratt_parser::Op;
+
     use super::*;
     use crate::regex::regex_from_str;
 
@@ -2757,5 +2831,137 @@ mod tests {
         assert_eq!(*record.fields[1].get_mut(), AwkValue::field_ref("aax", 1));
         assert_eq!(*record.fields[2].get_mut(), AwkValue::field_ref("x", 2));
         assert_eq!(*record.fields[3].get_mut(), AwkValue::field_ref("ax", 3));
+    }
+
+    #[test]
+    fn test_iterate_through_empty_global_array() {
+        let instructions = vec![
+            OpCode::GlobalRef(FIRST_GLOBAL_VAR + 1),
+            OpCode::CreateGlobalIterator(FIRST_GLOBAL_VAR),
+            OpCode::AdvanceIterOrJump(2),
+            OpCode::Jump(-1),
+        ];
+        let result = Test::new(instructions, vec![]).run_correct();
+        assert_eq!(
+            result.globals[FIRST_GLOBAL_VAR as usize],
+            Array::default().into()
+        );
+        assert_eq!(
+            result.globals[FIRST_GLOBAL_VAR as usize + 1],
+            AwkValue::uninitialized_scalar()
+        );
+    }
+
+    #[test]
+    fn test_iterate_through_global_array() {
+        // ```
+        // a["key1"] = "value"
+        // a["key2"] = "value"
+        // a["key3"] = "value"
+        // for (a in array) {}
+        //```
+        let instructions = vec![
+            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::PushConstant(1),
+            OpCode::IndexArray,
+            OpCode::PushConstant(0),
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::PushConstant(2),
+            OpCode::IndexArray,
+            OpCode::PushConstant(0),
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::PushConstant(3),
+            OpCode::IndexArray,
+            OpCode::PushConstant(0),
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::GlobalRef(FIRST_GLOBAL_VAR + 1),
+            OpCode::CreateGlobalIterator(FIRST_GLOBAL_VAR),
+            OpCode::AdvanceIterOrJump(2),
+            OpCode::Jump(-1),
+        ];
+        let constants = vec![
+            Constant::String("value".to_string()),
+            Constant::String("key1".to_string()),
+            Constant::String("key2".to_string()),
+            Constant::String("key3".to_string()),
+        ];
+        let result = Test::new(instructions, constants).run_correct();
+        assert_eq!(
+            result.globals[FIRST_GLOBAL_VAR as usize],
+            Array::from_iter([("key1", "value"), ("key2", "value"), ("key3", "value")]).into()
+        );
+        assert_eq!(result.globals[FIRST_GLOBAL_VAR as usize + 1], "key3".into());
+    }
+
+    #[test]
+    fn test_iterate_through_empty_local_array() {
+        let instructions = vec![
+            OpCode::PushUninitialized,
+            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::CreateLocalIterator(0),
+            OpCode::AdvanceIterOrJump(2),
+            OpCode::Jump(-1),
+        ];
+        let result = Test::new(instructions, vec![]).run_correct();
+        assert_eq!(
+            result.execution_result.unwrap_expr(),
+            Array::default().into()
+        );
+        assert_eq!(
+            result.globals[FIRST_GLOBAL_VAR as usize],
+            AwkValue::uninitialized_scalar()
+        );
+    }
+
+    #[test]
+    fn test_iterate_through_local_array() {
+        // ```
+        // a["key1"] = "value"
+        // a["key2"] = "value"
+        // a["key3"] = "value"
+        // for (a in array) {}
+        //```
+        let instructions = vec![
+            OpCode::PushUninitialized,
+            OpCode::LocalRef(0),
+            OpCode::PushConstant(1),
+            OpCode::IndexArray,
+            OpCode::PushConstant(0),
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::LocalRef(0),
+            OpCode::PushConstant(2),
+            OpCode::IndexArray,
+            OpCode::PushConstant(0),
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::LocalRef(0),
+            OpCode::PushConstant(3),
+            OpCode::IndexArray,
+            OpCode::PushConstant(0),
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::CreateLocalIterator(0),
+            OpCode::AdvanceIterOrJump(2),
+            OpCode::Jump(-1),
+        ];
+        let constants = vec![
+            Constant::String("value".to_string()),
+            Constant::String("key1".to_string()),
+            Constant::String("key2".to_string()),
+            Constant::String("key3".to_string()),
+        ];
+        let result = Test::new(instructions, constants).run_correct();
+        assert_eq!(
+            result.execution_result.unwrap_expr(),
+            Array::from_iter([("key1", "value"), ("key2", "value"), ("key3", "value")]).into()
+        );
+        assert_eq!(result.globals[FIRST_GLOBAL_VAR as usize], "key3".into());
     }
 }

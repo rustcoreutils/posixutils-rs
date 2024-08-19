@@ -952,7 +952,44 @@ impl Compiler {
         instructions: &mut Vec<OpCode>,
         locals: &LocalMap,
     ) -> Result<(), PestError> {
-        todo!();
+        let mut inner = for_each_stmt.into_inner();
+
+        let iter_var = inner.next().unwrap();
+        let iter_var_get_stmt = self
+            .get_var(iter_var.as_str(), locals)
+            .map_err(|msg| pest_error_from_span(iter_var.as_span(), msg))?;
+        instructions.push(iter_var_get_stmt);
+
+        let array_var = inner.next().unwrap();
+        let array_var_get_stmt = self
+            .get_var(array_var.as_str(), locals)
+            .map_err(|msg| pest_error_from_span(array_var.as_span(), msg))?;
+
+        match array_var_get_stmt {
+            OpCode::GlobalRef(global_index) => {
+                instructions.push(OpCode::CreateGlobalIterator(global_index))
+            }
+            OpCode::LocalRef(local_index) => {
+                instructions.push(OpCode::CreateLocalIterator(local_index))
+            }
+            _ => unreachable!(),
+        }
+
+        let iter_deref_location = instructions.len();
+        instructions.push(OpCode::Invalid);
+
+        let body = inner.next().unwrap();
+        self.compile_stmt(body, instructions, locals)?;
+
+        instructions.push(OpCode::Jump(distance(
+            instructions.len(),
+            iter_deref_location,
+        )));
+
+        instructions[iter_deref_location] =
+            OpCode::AdvanceIterOrJump(distance(iter_deref_location, instructions.len()));
+
+        Ok(())
     }
 
     fn compile_for(
@@ -1318,6 +1355,8 @@ pub fn compile_program(text: &str) -> Result<Program, PestError> {
 
 #[cfg(test)]
 mod test {
+    use pest::pratt_parser::Op;
+
     use super::*;
     use crate::regex::regex_from_str;
 
@@ -3244,5 +3283,22 @@ mod test {
                 OpCode::Pop,
             ]
         );
+    }
+
+    #[test]
+    fn test_compile_for_each_stmt() {
+        let (program, constants) = compile_stmt("for (a in array) {1;}");
+        assert_eq!(
+            program,
+            vec![
+                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::CreateGlobalIterator(FIRST_GLOBAL_VAR + 1),
+                OpCode::AdvanceIterOrJump(4),
+                OpCode::PushConstant(0),
+                OpCode::Pop,
+                OpCode::Jump(-3)
+            ]
+        );
+        assert_eq!(constants, vec![Constant::Number(1.0)]);
     }
 }

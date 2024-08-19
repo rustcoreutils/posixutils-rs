@@ -163,6 +163,18 @@ fn sprintf(
     Ok(result)
 }
 
+fn builtin_sprintf(
+    stack: &mut Stack,
+    argc: u16,
+    global_env: &mut GlobalEnv,
+) -> Result<String, String> {
+    let mut values = gather_values(stack, argc - 1)?;
+    let format_string = stack
+        .pop_scalar_value()?
+        .scalar_to_string(&global_env.convfmt)?;
+    sprintf(&format_string, &mut values, &global_env.convfmt)
+}
+
 fn builtin_match(stack: &mut Stack, global_env: &mut GlobalEnv) -> Result<(f64, f64), String> {
     let ere = stack.pop_value().to_ere()?;
     let string = stack
@@ -347,12 +359,8 @@ fn call_simple_builtin(
             stack.push_value(n as f64)?;
         }
         BuiltinFunction::Sprintf => {
-            let mut values = gather_values(stack, argc - 1)?;
-            let format_string = stack
-                .pop_scalar_value()?
-                .scalar_to_string(&global_env.convfmt)?;
-            let result = sprintf(&format_string, &mut values, &global_env.convfmt)?;
-            stack.push_value(result)?;
+            let str = builtin_sprintf(stack, argc, global_env)?;
+            stack.push_value(str)?;
         }
         BuiltinFunction::Substr => {
             let n = if argc == 2 {
@@ -394,7 +402,7 @@ fn call_simple_builtin(
             print!("{}", print_to_string(stack, argc, global_env)?);
         }
         BuiltinFunction::Printf => {
-            todo!()
+            print!("{}", builtin_sprintf(stack, argc, global_env)?);
         }
         _ => unreachable!("call_simple_builtin was passed an invalid builtin function kind"),
     }

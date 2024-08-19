@@ -7,6 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
+use array::{Array, KeyIterator};
+
 use crate::format::{
     fmt_write_decimal_float, fmt_write_float_general, fmt_write_hex_float,
     fmt_write_scientific_float, fmt_write_signed, fmt_write_string, fmt_write_unsigned,
@@ -22,6 +24,8 @@ use std::fmt::Write;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::{iter, u16};
+
+mod array;
 
 const STACK_SIZE: usize = 2048;
 
@@ -307,7 +311,9 @@ fn call_simple_builtin(
             split_record(
                 &s,
                 &separator.iter().next().unwrap_or(&global_env.fs),
-                |i, s| array.set((i + 1).to_string(), s),
+                |i, s| {
+                    array.set((i + 1).to_string(), s);
+                },
             );
             let n = array.len();
             stack.push_value(n as f64)?;
@@ -582,84 +588,6 @@ impl Default for Record {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct ArrayElement {
-    value: AwkValue,
-    key_index: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Default)]
-struct Array {
-    values: HashMap<Rc<str>, ArrayElement>,
-    keys: Vec<Rc<str>>,
-}
-
-impl Array {
-    fn delete(&mut self, key: &str) {
-        if let Some(array_element) = self.values.remove(key) {
-            self.keys.swap_remove(array_element.key_index);
-            if self.keys.len() > 0 {
-                let swapped_key = self.keys[array_element.key_index].as_ref();
-                self.values.get_mut(swapped_key).unwrap().key_index = array_element.key_index;
-            }
-        }
-    }
-
-    fn get_or_insert_uninitialized(&mut self, key: String) -> &mut AwkValue {
-        let key = Rc::<str>::from(key);
-        &mut self
-            .values
-            .entry(key.clone())
-            .or_insert_with(|| {
-                let key_index = self.keys.len();
-                self.keys.push(key);
-                ArrayElement {
-                    value: AwkValue::uninitialized_scalar(),
-                    key_index,
-                }
-            })
-            .value
-    }
-
-    fn set<V: Into<AwkValue>>(&mut self, key: String, value: V) {
-        let key = Rc::<str>::from(key);
-        let value = value.into();
-        match self.values.entry(key.clone()) {
-            Entry::Occupied(e) => e.into_mut().value = value,
-            Entry::Vacant(e) => {
-                let key_index = self.keys.len();
-                self.keys.push(key.clone());
-                e.insert(ArrayElement { value, key_index });
-            }
-        }
-    }
-
-    fn contains(&self, key: &str) -> bool {
-        self.values.contains_key(key)
-    }
-
-    fn clear(&mut self) {
-        self.keys.clear();
-        self.values.clear();
-    }
-
-    fn len(&self) -> usize {
-        assert_eq!(self.values.len(), self.keys.len());
-
-        self.values.len()
-    }
-}
-
-impl<S: Into<String>, A: Into<AwkValue>> FromIterator<(S, A)> for Array {
-    fn from_iter<T: IntoIterator<Item = (S, A)>>(iter: T) -> Self {
-        let mut result = Self::default();
-        for (key, val) in iter {
-            result.set(key.into(), val);
-        }
-        result
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
 enum AwkValueVariant {
     Number(f64),
     String(String),
@@ -879,7 +807,7 @@ impl From<Array> for AwkValue {
 struct ArrayIterator {
     array: *mut AwkValue,
     iter_var: *mut AwkValue,
-    index: usize,
+    key_iter: KeyIterator,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1270,6 +1198,7 @@ impl Interpreter {
                     iter_var.ensure_value_is_scalar()?;
                     let iter_var = iter_var as *mut AwkValue;
                     let array = self.globals[index as usize].get();
+                    let key_iter = unsafe { &mut *array }.as_array()?.key_iter();
                     // both iter_var and array are valid until the stack value is popped.
                     // The first from stack invariance, the second because its a global,
                     // so it will outlive the stack.
@@ -1277,7 +1206,7 @@ impl Interpreter {
                         stack.push(StackValue::Iterator(ArrayIterator {
                             iter_var,
                             array,
-                            index: 0,
+                            key_iter,
                         }))?
                     };
                 }
@@ -1288,23 +1217,22 @@ impl Interpreter {
                     let array = stack
                         .get_mut_value_ptr(index as usize)
                         .expect("invalid local index");
+                    let key_iter = unsafe { &mut *array }.as_array()?.key_iter();
                     unsafe {
                         stack.push(StackValue::Iterator(ArrayIterator {
                             iter_var,
                             array,
-                            index: 0,
+                            key_iter,
                         }))?
                     };
                 }
                 OpCode::AdvanceIterOrJump(offset) => {
                     let mut iter = stack.pop().unwrap().unwrap_array_iterator();
-                    let key_index = iter.index;
                     let array = unsafe { &mut *iter.array }.as_array()?;
-                    if let Some(key) = array.keys.get(key_index).cloned() {
+                    if let Some(key) = array.key_iter_next(&mut iter.key_iter) {
                         unsafe {
                             *iter.iter_var = key.to_string().into();
                         }
-                        iter.index += 1;
                         unsafe {
                             stack.push(StackValue::Iterator(iter))?;
                         }
@@ -1342,7 +1270,7 @@ impl Interpreter {
                         .pop_scalar_value()?
                         .scalar_to_string(&global_env.convfmt)?;
                     let array = stack.pop_ref().as_array()?;
-                    let element_ref = array.get_or_insert_uninitialized(key) as *mut AwkValue;
+                    let element_ref = array.get_or_insert_uninitialized(key)? as *mut AwkValue;
                     unsafe { stack.push_ref(element_ref)? };
                 }
                 OpCode::Delete => {
@@ -1590,6 +1518,7 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
             .as_array()
             .unwrap()
             .get_or_insert_uninitialized(current_arg_index.to_string())
+            .unwrap()
             .to_owned()
             .scalar_to_string(&global_env.convfmt)?;
 

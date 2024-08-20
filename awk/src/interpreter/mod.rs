@@ -1573,7 +1573,6 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
     );
     let mut global_env = GlobalEnv::default();
     let mut range_pattern_started = vec![false; program.rules.len()];
-    let should_exit = false;
     let mut return_value = 0;
 
     let begin_result = interpreter.run(
@@ -1590,7 +1589,7 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
 
     let mut current_arg_index = 1;
     let mut nr = 1;
-    'file_loop: while !should_exit {
+    'file_loop: loop {
         let argc = interpreter.globals[SpecialVar::Argc as usize]
             .get_mut()
             .scalar_as_f64() as usize;

@@ -1391,6 +1391,12 @@ impl Interpreter {
                             .unwrap();
                         }
                     }
+                    BuiltinFunction::Close => {
+                        let file_name = stack
+                            .pop_scalar_value()?
+                            .scalar_to_string(&global_env.convfmt)?;
+                        self.opened_files.remove(&file_name);
+                    }
                     other => {
                         call_simple_builtin(other, argc, &mut stack, &record.record, global_env)?
                     }

@@ -1348,7 +1348,7 @@ impl Interpreter {
                                 .or_insert_with(|| {
                                     File::create(file_name).expect("failed to create file")
                                 });
-                        if function == BuiltinFunction::RedirectedPrintfTruncate {
+                        if function == BuiltinFunction::RedirectedPrintTruncate {
                             std::io::Write::write(
                                 file,
                                 print_to_string(&mut stack, argc - 1, global_env)?.as_bytes(),
@@ -1377,7 +1377,7 @@ impl Interpreter {
                                         .open(file_name)
                                         .expect("failed to open file")
                                 });
-                        if function == BuiltinFunction::RedirectedPrintfAppend {
+                        if function == BuiltinFunction::RedirectedPrintAppend {
                             std::io::Write::write(
                                 file,
                                 print_to_string(&mut stack, argc - 1, global_env)?.as_bytes(),

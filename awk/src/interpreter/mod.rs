@@ -669,10 +669,11 @@ impl AwkValue {
                 }
             }
             AwkValueVariant::String(s) => Ok(s),
+            AwkValueVariant::Regex { matches_record, .. } => {
+                Ok(if matches_record { "1" } else { "0" }.to_string())
+            }
             AwkValueVariant::UninitializedScalar => Ok(String::new()),
-            AwkValueVariant::Array(_)
-            | AwkValueVariant::Regex { .. }
-            | AwkValueVariant::Uninitialized => {
+            AwkValueVariant::Array(_) | AwkValueVariant::Uninitialized => {
                 panic!("not a scalar")
             }
         }
@@ -1725,7 +1726,6 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
 
 #[cfg(test)]
 mod tests {
-    
 
     use super::*;
     use crate::regex::regex_from_str;
@@ -2981,5 +2981,17 @@ mod tests {
             Array::from_iter([("key1", "value"), ("key2", "value"), ("key3", "value")]).into()
         );
         assert_eq!(result.globals[FIRST_GLOBAL_VAR as usize], "key3".into());
+    }
+
+    #[test]
+    fn test_ere_outside_match_matches_record() {
+        let instructions = vec![OpCode::PushConstant(0)];
+        let constants = vec![Constant::Regex(Rc::new(regex_from_str("test")))];
+        let result = Test::new(instructions, constants)
+            .add_record("this is a test")
+            .run_correct();
+        let value = result.execution_result.unwrap_expr();
+        assert_eq!(value.scalar_as_f64(), 1.0);
+        assert_eq!(value.scalar_to_string("").unwrap(), "1".to_string());
     }
 }

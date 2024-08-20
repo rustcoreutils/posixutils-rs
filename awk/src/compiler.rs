@@ -909,7 +909,12 @@ impl Compiler {
                         let expressions = print.into_inner();
                         argc = expressions.len() as u16;
                         if expressions.len() == 0 {
-                            todo!()
+                            // if it has no arguments it cannot be printf
+                            assert!(!is_printf);
+                            print_function = BuiltinFunction::Print;
+                            instructions.push(OpCode::PushZero);
+                            instructions.push(OpCode::FieldRef);
+                            argc = 1;
                         } else {
                             for expr in expressions {
                                 self.compile_expr(expr, instructions, locals)?;
@@ -3199,6 +3204,22 @@ mod test {
             ]
         );
         assert_eq!(program.constants, vec![Constant::Number(1.0)]);
+    }
+
+    #[test]
+    fn test_compile_print_with_no_args() {
+        let (instructions, _) = compile_stmt("print;");
+        assert_eq!(
+            instructions,
+            vec![
+                OpCode::PushZero,
+                OpCode::FieldRef,
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::Print,
+                    argc: 1
+                }
+            ]
+        );
     }
 
     #[test]

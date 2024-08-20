@@ -50,3 +50,29 @@ fn gencat_empty_message_file() {
         Vec::new(),
     );
 }
+
+#[test]
+fn gencat_sets_and_messagess() {
+    let cargo_manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let msg_file = cargo_manifest_dir.join("tests/gencat/sets_and_messages.msg");
+
+    #[cfg(not(target_os = "macos"))]
+    let expected_cat_file =
+        cargo_manifest_dir.join("tests/gencat/sets_and_messages_gnu_catfile.cat");
+
+    #[cfg(target_os = "macos")]
+    let expected_cat_file =
+        cargo_manifest_dir.join("tests/gencat/sets_and_messages_osx_catfile.cat");
+
+    let mut expected_output: Vec<u8> = Vec::new();
+    File::open(&expected_cat_file)
+        .unwrap()
+        .read_to_end(&mut expected_output)
+        .unwrap();
+
+    gencat_test(
+        &["-", msg_file.to_str().unwrap()],
+        expected_output,
+        Vec::new(),
+    );
+}

@@ -1,4 +1,3 @@
-use bytemuck::NoUninit;
 use byteorder::{BigEndian, ByteOrder, LittleEndian, NativeEndian, WriteBytesExt};
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
@@ -8,7 +7,7 @@ use std::{
     collections::BTreeMap,
     fmt::Display,
     fs::File,
-    io::{self, Cursor, Read, Seek, SeekFrom, Write},
+    io::{self, Cursor, Read, Seek, Write},
     num::ParseIntError,
     path::PathBuf,
     rc::Rc,
@@ -18,11 +17,15 @@ const NL_SETMAX: u32 = 255; //max set number(the limits.h defines it and is ment
 const NL_SETD: u32 = 1; // the default set number for the messages that are not in any set
 const GLIBC_MAGIC: u32 = 0x960408de;
 
-const OSX_MAGIC: &[u8; 8] = b"*nazgul*";
-const OSX_MAJOR_VER: i32 = 1;
-const OSX_MINOR_VER: i32 = 0;
-const OSX_BYTE_ORDER: i32 = 0x01; // denotes BIG ENDIAN for now
-const OSX_NOT_INVALID_FLAG: i32 = 0;
+#[cfg(target_os = "macos")]
+pub mod osx {
+    pub const OSX_MAGIC: &[u8; 8] = b"*nazgul*";
+    pub const OSX_MAJOR_VER: i32 = 1;
+    pub const OSX_MINOR_VER: i32 = 0;
+    pub const OSX_BYTE_ORDER: i32 = 0x01; // denotes BIG ENDIAN for now
+    pub const OSX_NOT_INVALID_FLAG: i32 = 0;
+    pub const FIRST_SET_OFFSET: i64 = 32;
+}
 
 /// gencat - generate a formatted message catalog
 #[derive(Parser, Debug)]
@@ -78,6 +81,7 @@ pub struct Set {
 }
 
 impl Set {
+    #[cfg(target_os = "macos")]
     fn get_msgs_count(&self) -> i32 {
         let mut count = 0;
         let mut current = self.first_msg.clone();
@@ -180,7 +184,8 @@ pub struct MessageCatalog {
 }
 
 /// Magic Header structure for the catalog file
-#[derive(NoUninit, Clone, Copy)]
+#[cfg(target_os = "macos")]
+#[derive(bytemuck::NoUninit, Clone, Copy)]
 #[repr(C)]
 struct CatFileMagicHeader {
     /// Magic cookie "*nazgul*"
@@ -261,6 +266,7 @@ impl MessageCatalog {
             },
         };
 
+        #[cfg(not(target_os = "macos"))]
         if build_default {
             catalog.add_set(NL_SETD, String::from("Default Set"));
         }
@@ -603,9 +609,9 @@ impl MessageCatalog {
         Ok(catalog)
     }
 
-    /// Write to the cat file **GNU compatible(anything not macos for now)**
-    //#[cfg(not(target_os = "macos"))]
-    pub fn write_catfile_another<T: Write + Seek>(
+    /// Write to the cat file **for GNU only**
+    #[cfg(not(target_os = "macos"))]
+    pub fn write_catfile<T: Write + Seek>(
         &self,
         file: &mut T,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -638,19 +644,19 @@ impl MessageCatalog {
     }
 
     /// Write to the cat file **for OSX only**
-    //#[cfg(target_os = "macos")]
+    #[cfg(target_os = "macos")]
     pub fn write_catfile<T: Write + Seek>(
         &self,
         file: &mut T,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let header = CatFileMagicHeader {
-            magic: *OSX_MAGIC,
-            major_ver: OSX_MAJOR_VER.to_be(),
-            minor_ver: OSX_MINOR_VER.to_be(),
-            flags: OSX_BYTE_ORDER.to_be(),
+            magic: *osx::OSX_MAGIC,
+            major_ver: osx::OSX_MAJOR_VER.to_be(),
+            minor_ver: osx::OSX_MINOR_VER.to_be(),
+            flags: osx::OSX_BYTE_ORDER.to_be(),
             num_sets: self.cat.total_sets().to_be(),
-            // for now we have set it to 0, but we will change this later on as we lay the first set details
-            first_set: 0,
+            // for now we have set it to 32, but we will change this later on as we lay the first set details
+            first_set: osx::FIRST_SET_OFFSET.to_be(),
         };
 
         file.write_all(bytemuck::bytes_of(&header))?;
@@ -667,9 +673,9 @@ impl MessageCatalog {
             let set_pos = file.stream_position()?;
 
             if set.set_id == 1 {
-                file.seek(SeekFrom::Start(first_set_pos))?;
+                file.seek(io::SeekFrom::Start(first_set_pos))?;
                 file.write_u64::<BigEndian>(set_pos)?;
-                file.seek(SeekFrom::Start(set_pos))?;
+                file.seek(io::SeekFrom::Start(set_pos))?;
             }
 
             file.write_u32::<BigEndian>(set.set_id)?;
@@ -688,7 +694,7 @@ impl MessageCatalog {
 
             let num_msgs = set.get_msgs_count();
             file.write_i32::<BigEndian>(num_msgs)?;
-            file.write_i32::<BigEndian>(OSX_NOT_INVALID_FLAG)?;
+            file.write_i32::<BigEndian>(osx::OSX_NOT_INVALID_FLAG)?;
 
             // We'll write the string data now
             let data_offset = file.stream_position()?;
@@ -714,7 +720,7 @@ impl MessageCatalog {
 
                 file.write_i32::<BigEndian>(msg.msg_id as i32)?;
                 file.write_i64::<BigEndian>(msg.offset)?;
-                file.write_i32::<BigEndian>(OSX_NOT_INVALID_FLAG)?;
+                file.write_i32::<BigEndian>(osx::OSX_NOT_INVALID_FLAG)?;
 
                 current_msg = msg.next.clone();
             }
@@ -722,15 +728,15 @@ impl MessageCatalog {
             let current_pos = file.stream_position()?;
 
             // go back and write first msg offset
-            file.seek(SeekFrom::Start(first_msg_offset_pos))?;
+            file.seek(io::SeekFrom::Start(first_msg_offset_pos))?;
             file.write_i64::<BigEndian>(first_msg_offset as i64)?;
 
             // go back and write data offset
-            file.seek(SeekFrom::Start(data_offset_pos))?;
+            file.seek(io::SeekFrom::Start(data_offset_pos))?;
             file.write_i64::<BigEndian>(data_offset as i64)?;
 
             // go back and write data length
-            file.seek(SeekFrom::Start(data_length_pos))?;
+            file.seek(io::SeekFrom::Start(data_length_pos))?;
             file.write_i32::<BigEndian>(data_length)?;
 
             let last_set = cat.last_set.as_ref().unwrap();
@@ -739,11 +745,11 @@ impl MessageCatalog {
             // if not last then we need to write the next set offset
             if set.set_id != last_set.set_id {
                 // go back and write next set offset
-                file.seek(SeekFrom::Start(next_set_offset))?;
+                file.seek(io::SeekFrom::Start(next_set_offset))?;
                 file.write_i64::<BigEndian>(current_pos as i64)?;
             }
 
-            file.seek(SeekFrom::Start(current_pos))?;
+            file.seek(io::SeekFrom::Start(current_pos))?;
 
             current_set = set.next.clone();
         }

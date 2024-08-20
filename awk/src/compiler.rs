@@ -23,7 +23,6 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     hash::Hash,
-    str::FromStr,
 };
 
 struct BuiltinFunctionInfo {
@@ -1401,7 +1400,7 @@ pub fn compile_program(text: &str) -> Result<Program, PestError> {
 
 #[cfg(test)]
 mod test {
-    use pest::pratt_parser::Op;
+    
 
     use super::*;
     use crate::regex::regex_from_str;
@@ -1417,7 +1416,7 @@ mod test {
     }
 
     fn compile_stmt(stmt: &str) -> (Vec<OpCode>, Vec<Constant>) {
-        let mut program = compile_program(format!("BEGIN {{ {} }}", stmt).as_str())
+        let program = compile_program(format!("BEGIN {{ {} }}", stmt).as_str())
             .expect("error compiling statement");
         (program.begin_instructions, program.constants)
     }

@@ -7,7 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::ops::Index;
 use std::{fmt::Write, str::Chars};
 
 const BASE_8_DIGITS: [char; 8] = ['0', '1', '2', '3', '4', '5', '6', '7'];

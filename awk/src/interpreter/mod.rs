@@ -12,12 +12,11 @@ use array::{Array, KeyIterator};
 use crate::format::{
     fmt_write_decimal_float, fmt_write_float_general, fmt_write_hex_float,
     fmt_write_scientific_float, fmt_write_signed, fmt_write_string, fmt_write_unsigned,
-    parse_conversion_specifier_args, FormatArgs, IntegerFormat,
+    parse_conversion_specifier_args, IntegerFormat,
 };
 use crate::program::{BuiltinFunction, Constant, Function, OpCode, Pattern, Program, SpecialVar};
 use crate::regex::Regex;
 use std::cell::UnsafeCell;
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fmt::Write;
@@ -1726,7 +1725,7 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
 
 #[cfg(test)]
 mod tests {
-    use pest::pratt_parser::Op;
+    
 
     use super::*;
     use crate::regex::regex_from_str;

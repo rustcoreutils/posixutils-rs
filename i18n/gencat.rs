@@ -150,36 +150,27 @@ impl Cat {
         let mut current = self.first_set.clone();
         let mut prev: Option<Rc<RefCell<Set>>> = None;
 
-        println!("Deleting set {}", current.is_some());
-
         while let Some(ref set) = current {
             let next = set.borrow().next.clone();
-            println!("Set ID: {}", set.borrow().set_id);
             if set.borrow().set_id == set_id {
-                // We found the set to delete
                 if let Some(prev) = prev.as_ref() {
-                    // If there's a previous set, link it to the next set
                     prev.borrow_mut().next = next.clone();
                 } else {
-                    // If there's no previous set, this was the first set
                     self.first_set = next.clone();
                 }
 
-                // If this was the last set, update last_set
                 if set.borrow().set_id == self.last_set.as_ref().unwrap().borrow().set_id {
                     self.last_set = prev;
                 }
 
                 return;
             } else {
-                // This isn't the set we're looking for, move to the next
                 prev = Some(set.clone());
                 current = next;
             }
         }
 
-        // If we get here, the set wasn't found
-        println!("Set {} not found for deletion", set_id);
+        // if we don't find the set to delete, we'll simply ignore
     }
 }
 
@@ -575,8 +566,6 @@ impl MessageCatalog {
             ptr += 4;
         }
 
-        println!("Plane Size: {:?}", le_array);
-
         // note: probably compare be_array and le_array as they should be the same
 
         let string_pool = &buf[ptr..];
@@ -604,7 +593,6 @@ impl MessageCatalog {
             }
         }
 
-        println!("Set Msg: {:?}", set_msg);
         for (set_id, messages) in set_msg.iter() {
             let set = catalog.add_set(*set_id, String::new());
             for (msg_id, msg) in messages.iter() {

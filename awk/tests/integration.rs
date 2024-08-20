@@ -312,6 +312,8 @@ fn test_awk_output_redirection() {
     let mut correct_stderr = true;
     let mut correct_exit_code = true;
 
+    let previous_append_file_contents = include_str!("awk/output_redirection_append.txt");
+
     run_test_with_checker(
         TestPlan {
             cmd: String::from("awk"),
@@ -345,7 +347,7 @@ fn test_awk_output_redirection() {
     .expect("failed to write to file");
     std::fs::write(
         "tests/awk/output_redirection_append.txt",
-        correct_append_output,
+        previous_append_file_contents,
     )
     .expect("failed to write to file");
 

@@ -773,7 +773,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match MessageCatalog::parse(&args.msgfile, catfile_catalog) {
         Ok(catalog) => {
             let mut buffer = Cursor::new(Vec::new());
-            catalog.write_catfile_another(&mut buffer)?;
+            catalog.write_catfile(&mut buffer)?;
 
             if catfile_path_str == "-" {
                 io::stdout().write_all(&buffer.get_ref())?;

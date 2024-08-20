@@ -378,3 +378,66 @@ fn builtin_string_functions() {
 fn test_awk_delete_array_elements_in_for_each() {
     test_awk!(delete_array_elements_in_for_each);
 }
+
+#[test]
+fn test_awk_call_function_no_args() {
+    test_awk!(call_function_no_args);
+}
+
+#[test]
+fn test_awk_scalar_arguments_are_passed_by_copy() {
+    test_awk!(scalar_arguments_are_passed_by_copy);
+}
+
+#[test]
+fn test_awk_array_arguments_are_passed_by_reference() {
+    test_awk!(array_arguments_are_passed_by_reference);
+}
+
+#[test]
+fn test_awk_call_function_with_less_arguments() {
+    test_awk!(call_function_with_less_arguments);
+}
+
+#[test]
+fn test_awk_recursive_function() {
+    test_awk!(recursive_function);
+}
+
+#[test]
+fn test_awk_mutually_recursive_functions() {
+    test_awk!(mutually_recursive_functions);
+}
+
+#[test]
+fn test_awk_empty_print_prints_the_whole_record() {
+    test_awk!(
+        empty_print_prints_the_whole_record,
+        "tests/awk/test_data.txt"
+    );
+}
+
+#[test]
+fn test_awk_ere_pattern() {
+    test_awk!(ere_pattern, "tests/awk/test_data.txt");
+}
+
+#[test]
+fn test_awk_ere_outside_match_matches_record() {
+    test_awk!(ere_outside_match_matches_record, "tests/awk/test_data.txt");
+}
+
+#[test]
+fn test_awk_simple_getline() {
+    test_awk!(simple_getline, "tests/awk/test_data.txt");
+}
+
+#[test]
+fn test_awk_getline_into_var() {
+    test_awk!(getline_into_var, "tests/awk/test_data.txt");
+}
+
+#[test]
+fn test_awk_getline_from_file() {
+    test_awk!(getline_from_file, "tests/awk/test_data.txt");
+}

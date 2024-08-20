@@ -1337,18 +1337,40 @@ impl Compiler {
             instructions.push(OpCode::Return);
         }
 
-        let id = post_increment(&self.last_global_function_id);
-        self.names.get_mut().insert(
-            name.to_string(),
-            GlobalName::Function {
-                id,
-                parameter_count: parameters_count as u32,
-            },
-        );
         Ok(Function {
             parameters_count,
             instructions,
         })
+    }
+
+    fn declare_program_functions(&mut self, program: Pairs<Rule>) -> Result<(), PestError> {
+        for item in program {
+            if item.as_rule() == Rule::function_definition {
+                let mut inner = item.into_inner();
+                let name = inner.next().unwrap();
+                let maybe_parameter_list = inner.next().unwrap();
+                let parameter_count = if maybe_parameter_list.as_rule() == Rule::param_list {
+                    maybe_parameter_list.into_inner().count() as u32
+                } else {
+                    0
+                };
+                let function_id = post_increment(&self.last_global_function_id);
+                let previous_value = self.names.borrow_mut().insert(
+                    name.as_str().to_string(),
+                    GlobalName::Function {
+                        id: function_id,
+                        parameter_count,
+                    },
+                );
+                if previous_value.is_some() {
+                    return Err(pest_error_from_span(
+                        name.as_span(),
+                        format!("function '{}' is defined multiple times", name),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1360,8 +1382,11 @@ pub fn compile_program(text: &str) -> Result<Program, PestError> {
 
     let mut compiler = Compiler::default();
     let program = AwkParser::parse(Rule::program, text)?.next().unwrap();
+    let program_iter = program.into_inner();
 
-    for item in program.into_inner() {
+    compiler.declare_program_functions(program_iter.clone())?;
+
+    for item in program_iter {
         match item.as_rule() {
             Rule::begin_action => {
                 compiler.compile_action(
@@ -1400,7 +1425,6 @@ pub fn compile_program(text: &str) -> Result<Program, PestError> {
 
 #[cfg(test)]
 mod test {
-    
 
     use super::*;
     use crate::regex::regex_from_str;
@@ -3564,5 +3588,93 @@ mod test {
             ]
         );
         assert_eq!(constants, vec![Constant::Number(1.0)]);
+    }
+
+    #[test]
+    fn test_compile_recursive_function() {
+        let program = compile_correct_program(
+            r#"
+            function fib(n) {
+                if (n <= 1) {
+                    return n;
+                }
+                return fib(n - 1) + fib(n - 2);
+            }
+        "#,
+        );
+        assert_eq!(
+            program.functions[0].instructions,
+            vec![
+                OpCode::LocalRef(0),
+                OpCode::PushConstant(0),
+                OpCode::Le,
+                OpCode::JumpIfFalse(3),
+                OpCode::LocalRef(0),
+                OpCode::Return,
+                OpCode::LocalRef(0),
+                OpCode::PushConstant(1),
+                OpCode::Sub,
+                OpCode::Call { id: 0, argc: 1 },
+                OpCode::LocalRef(0),
+                OpCode::PushConstant(2),
+                OpCode::Sub,
+                OpCode::Call { id: 0, argc: 1 },
+                OpCode::Add,
+                OpCode::Return,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_compile_mutually_recursive_functions() {
+        let program = compile_correct_program(
+            r#"
+            function is_even(n) {
+                if (n == 0) {
+                    return 1;
+                }
+                return is_odd(n - 1);
+            }
+
+            function is_odd(n) {
+                if (n == 0) {
+                    return 0;
+                }
+                return is_even(n - 1);
+            }
+        "#,
+        );
+        assert_eq!(
+            program.functions[0].instructions,
+            vec![
+                OpCode::LocalRef(0),
+                OpCode::PushConstant(0),
+                OpCode::Eq,
+                OpCode::JumpIfFalse(3),
+                OpCode::PushConstant(1),
+                OpCode::Return,
+                OpCode::LocalRef(0),
+                OpCode::PushConstant(2),
+                OpCode::Sub,
+                OpCode::Call { id: 1, argc: 1 },
+                OpCode::Return,
+            ]
+        );
+        assert_eq!(
+            program.functions[1].instructions,
+            vec![
+                OpCode::LocalRef(0),
+                OpCode::PushConstant(3),
+                OpCode::Eq,
+                OpCode::JumpIfFalse(3),
+                OpCode::PushConstant(4),
+                OpCode::Return,
+                OpCode::LocalRef(0),
+                OpCode::PushConstant(5),
+                OpCode::Sub,
+                OpCode::Call { id: 0, argc: 1 },
+                OpCode::Return,
+            ]
+        );
     }
 }

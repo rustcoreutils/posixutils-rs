@@ -1003,6 +1003,21 @@ impl<'i, 's> Stack<'i, 's> {
     fn call_function(&mut self, instructions: &'i [OpCode], argc: usize) {
         unsafe { assert!(self.sp.offset_from(self.bp) >= argc as isize) };
         let new_bp = unsafe { self.sp.sub(argc) };
+
+        // converts scalar references passed as arguments to values
+        // (only arrays are passed by reference)
+        for i in 0..argc {
+            let value = unsafe { &mut *new_bp.add(i) };
+            if let StackValue::ValueRef(ptr) = value {
+                let inner = unsafe { &mut **ptr };
+                match inner.value {
+                    AwkValueVariant::Array(_) => {}
+                    _ => {
+                        *value = StackValue::Value(inner.to_owned());
+                    }
+                }
+            }
+        }
         let caller_frame = CallFrame {
             bp: self.bp,
             sp: new_bp,
@@ -2993,5 +3008,107 @@ mod tests {
         let value = result.execution_result.unwrap_expr();
         assert_eq!(value.scalar_as_f64(), 1.0);
         assert_eq!(value.scalar_to_string("").unwrap(), "1".to_string());
+    }
+
+    #[test]
+    fn test_scalars_are_passed_by_value() {
+        // ```
+        // a = "test value"
+        // b = "test value"
+        // f(a, b)
+        // ```
+        let instructions = vec![
+            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::PushConstant(0),
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::GlobalRef(FIRST_GLOBAL_VAR + 1),
+            OpCode::PushConstant(0),
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::GlobalRef(FIRST_GLOBAL_VAR + 1),
+            OpCode::Call { id: 0, argc: 2 },
+        ];
+        // ```
+        // function f(a, b) {
+        //  a = 1;
+        //  b = 1;
+        // }
+        // ```
+        let function = Function {
+            parameters_count: 2,
+            instructions: vec![
+                OpCode::LocalRef(0),
+                OpCode::PushOne,
+                OpCode::Assign,
+                OpCode::Pop,
+                OpCode::LocalRef(1),
+                OpCode::PushOne,
+                OpCode::Assign,
+                OpCode::Pop,
+                OpCode::PushUninitializedScalar,
+                OpCode::Return,
+            ],
+        };
+        let constants = vec!["test value".into()];
+        let result = Test::new(instructions, constants)
+            .add_function(function)
+            .run_correct();
+        assert_eq!(
+            result.globals[FIRST_GLOBAL_VAR as usize],
+            "test value".into()
+        );
+        assert_eq!(
+            result.globals[FIRST_GLOBAL_VAR as usize + 1],
+            "test value".into()
+        );
+    }
+
+    #[test]
+    fn test_arrays_are_passed_by_reference() {
+        // ```
+        // a["key"] = "value"
+        // f(a)
+        // ```
+        let instructions = vec![
+            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::PushConstant(0),
+            OpCode::IndexArray,
+            OpCode::PushConstant(1),
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::Call { id: 0, argc: 1 },
+        ];
+        // ```
+        // function f(a) {
+        //  a["key"] = "new value"
+        // }
+        // ```
+        let function = Function {
+            parameters_count: 1,
+            instructions: vec![
+                OpCode::LocalRef(0),
+                OpCode::PushConstant(0),
+                OpCode::IndexArray,
+                OpCode::PushConstant(2),
+                OpCode::Assign,
+                OpCode::PushUninitializedScalar,
+                OpCode::Return,
+            ],
+        };
+        let constants = vec![
+            Constant::String("key".to_string()),
+            Constant::String("value".to_string()),
+            Constant::String("new value".to_string()),
+        ];
+        let result = Test::new(instructions, constants)
+            .add_function(function)
+            .run_correct();
+        assert_eq!(
+            result.globals[FIRST_GLOBAL_VAR as usize],
+            Array::from_iter([("key", "new value")]).into()
+        );
     }
 }

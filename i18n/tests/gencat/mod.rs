@@ -37,7 +37,6 @@ fn gencat_empty_message_file() {
     let expected_cat_file =
         cargo_manifest_dir.join("tests/gencat/empty_message_file_osx_catfile.cat");
 
-    //    let encoded_file = cargo_manifest_dir.join("tests/uucode/sample_historical_encoded.txt");
     let mut expected_output: Vec<u8> = Vec::new();
     File::open(&expected_cat_file)
         .unwrap()

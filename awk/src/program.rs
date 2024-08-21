@@ -53,19 +53,23 @@ pub enum OpCode {
     // pop the value from the stack
     Pop,
 
-    // pushes on the stack the value variable
-    GlobalRef(u32),
-    // pushes on the stack a reference to a field. The field number is on top of the stack
+    // pushes on the stack a scalar value or an array reference
+    GetGlobal(u32),
+    GetLocal(u32),
+    GetField,
+    // uses the key on top of the stack to index the array preceding it. Pushes the value
+    // of the indexed element (adding it to the array if its not present)
+    IndexArrayGetValue,
+
+    GlobalScalarRef(u32),
+    LocalScalarRef(u32),
     FieldRef,
+    // similar to IndexArrayGetValue, but pushes a reference to the indexed element
+    IndexArrayGetRef,
+
     // assign the value on top of the stack to the reference
     // preceding it. Leaves the assigned value on top of the stack
     Assign,
-
-    // uses the key on top of the stack to index the array preceding it. Pushes a reference
-    // to the indexed element (adding it to the array if its not present)
-    IndexArray,
-
-    LocalRef(u32),
 
     // deletes the key on top of the stack from the array preceding it
     Delete,

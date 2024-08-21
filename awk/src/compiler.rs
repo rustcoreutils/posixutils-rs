@@ -270,6 +270,19 @@ fn parse_float(val: &str) -> f64 {
     .0
 }
 
+fn lvalue_to_scalar_ref(instructions: &mut [OpCode]) {
+    let last_ref = instructions
+        .last_mut()
+        .expect("lvalue expression has no instructions");
+    match *last_ref {
+        OpCode::GetGlobal(ref id) => *last_ref = OpCode::GlobalScalarRef(*id),
+        OpCode::GetLocal(ref id) => *last_ref = OpCode::LocalScalarRef(*id),
+        OpCode::GetField => *last_ref = OpCode::FieldRef,
+        OpCode::IndexArrayGetValue => *last_ref = OpCode::IndexArrayGetRef,
+        _ => unreachable!(),
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum ExprKind {
     LValue,
@@ -410,15 +423,14 @@ impl Compiler {
     }
 
     fn get_var(&self, name: &str, locals: &LocalMap) -> Result<OpCode, String> {
-        // FIXME: confusing naming of var vs array
         if let Some(local_id) = locals.get(name) {
-            Ok(OpCode::LocalRef(*local_id))
+            Ok(OpCode::GetLocal(*local_id))
         } else {
             let entry = self.names.borrow().get(name).copied();
             if let Some(var) = entry {
                 match var {
-                    GlobalName::Variable(id) => Ok(OpCode::GlobalRef(id)),
-                    GlobalName::SpecialVar(id) => Ok(OpCode::GlobalRef(id)),
+                    GlobalName::Variable(id) => Ok(OpCode::GetGlobal(id)),
+                    GlobalName::SpecialVar(id) => Ok(OpCode::GetGlobal(id)),
                     GlobalName::Function { .. } | GlobalName::BuiltinFunction => {
                         Err(format!("'{}' function used in variable context", name))
                     }
@@ -428,7 +440,7 @@ impl Compiler {
                 self.names
                     .borrow_mut()
                     .insert(name.to_string(), GlobalName::Variable(id));
-                Ok(OpCode::GlobalRef(id))
+                Ok(OpCode::GetGlobal(id))
             }
         }
     }
@@ -591,6 +603,7 @@ impl Compiler {
                         "operand should be an lvalue".to_string(),
                     ));
                 }
+                lvalue_to_scalar_ref(&mut instructions);
                 if op.as_rule() == Rule::pre_inc {
                     instructions.push(OpCode::PreInc);
                 } else {
@@ -612,6 +625,7 @@ impl Compiler {
                 "operand should be an lvalue".to_string(),
             ));
         }
+        lvalue_to_scalar_ref(&mut instructions);
         if op.as_rule() == Rule::post_inc {
             instructions.push(OpCode::PostInc);
         } else {
@@ -643,6 +657,7 @@ impl Compiler {
             Rule::in_op => {
                 let mut lhs_instructions = instructions;
                 let mut instructions = rhs.instructions;
+                lvalue_to_scalar_ref(&mut instructions);
                 instructions.append(&mut lhs_instructions);
                 instructions.push(OpCode::In);
                 return Ok(Expr::new(ExprKind::Number, instructions));
@@ -750,12 +765,12 @@ impl Compiler {
                     .map_err(|msg| pest_error_from_span(name.as_span(), msg))?;
                 instructions.push(get_instruction);
                 self.compile_array_index(inner, instructions, locals)?;
-                instructions.push(OpCode::IndexArray)
+                instructions.push(OpCode::IndexArrayGetValue)
             }
             Rule::field_var => {
                 let primary = self.map_primary(first_child(lvalue), locals)?;
                 instructions.extend(primary.instructions);
-                instructions.push(OpCode::FieldRef);
+                instructions.push(OpCode::GetField);
             }
             _ => unreachable!("encountered {:?} while compiling lvalue", lvalue.as_rule()),
         }
@@ -771,12 +786,12 @@ impl Compiler {
         let first_index = index.next().unwrap();
         self.compile_expr(first_index, instructions, locals)?;
         if let Some(second_index) = index.next() {
-            instructions.push(OpCode::GlobalRef(SpecialVar::Subsep as u32));
+            instructions.push(OpCode::GetGlobal(SpecialVar::Subsep as u32));
             instructions.push(OpCode::Concat);
             self.compile_expr(second_index, instructions, locals)?;
             while let Some(other_index) = index.next() {
                 instructions.push(OpCode::Concat);
-                instructions.push(OpCode::GlobalRef(SpecialVar::Subsep as u32));
+                instructions.push(OpCode::GetGlobal(SpecialVar::Subsep as u32));
                 instructions.push(OpCode::Concat);
                 self.compile_expr(other_index, instructions, locals)?;
             }
@@ -826,6 +841,7 @@ impl Compiler {
             Rule::assignment => {
                 let mut inner = expr.into_inner();
                 self.compile_lvalue(first_child(inner.next().unwrap()), instructions, locals)?;
+                lvalue_to_scalar_ref(instructions);
                 let assignment_op = first_child(inner.next().unwrap());
                 if assignment_op.as_rule() != Rule::assign {
                     instructions.push(OpCode::Dup);
@@ -912,7 +928,7 @@ impl Compiler {
                             assert!(!is_printf);
                             print_function = BuiltinFunction::Print;
                             instructions.push(OpCode::PushZero);
-                            instructions.push(OpCode::FieldRef);
+                            instructions.push(OpCode::GetField);
                             argc = 1;
                         } else {
                             for expr in expressions {
@@ -1004,6 +1020,7 @@ impl Compiler {
             .get_var(iter_var.as_str(), locals)
             .map_err(|msg| pest_error_from_span(iter_var.as_span(), msg))?;
         instructions.push(iter_var_get_stmt);
+        lvalue_to_scalar_ref(instructions);
 
         let array_var = inner.next().unwrap();
         let array_var_get_stmt = self
@@ -1011,10 +1028,10 @@ impl Compiler {
             .map_err(|msg| pest_error_from_span(array_var.as_span(), msg))?;
 
         match array_var_get_stmt {
-            OpCode::GlobalRef(global_index) => {
+            OpCode::GetGlobal(global_index) => {
                 instructions.push(OpCode::CreateGlobalIterator(global_index))
             }
-            OpCode::LocalRef(local_index) => {
+            OpCode::GetLocal(local_index) => {
                 instructions.push(OpCode::CreateLocalIterator(local_index))
             }
             _ => unreachable!(),
@@ -1286,7 +1303,7 @@ impl Compiler {
                 let pattern = self.compile_normal_pattern(rule)?;
                 let instructions = vec![
                     OpCode::PushZero,
-                    OpCode::FieldRef,
+                    OpCode::GetField,
                     OpCode::CallBuiltin {
                         function: BuiltinFunction::Print,
                         argc: 1,
@@ -1581,34 +1598,34 @@ mod test {
         let (instructions, _) = compile_expr("++a");
         assert_eq!(
             instructions,
-            vec![OpCode::GlobalRef(FIRST_GLOBAL_VAR), OpCode::PreInc]
+            vec![OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR), OpCode::PreInc]
         );
 
         let (instructions, _) = compile_expr("--a");
         assert_eq!(
             instructions,
-            vec![OpCode::GlobalRef(FIRST_GLOBAL_VAR), OpCode::PreDec]
+            vec![OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR), OpCode::PreDec]
         );
 
         let (instructions, _) = compile_expr("a++");
         assert_eq!(
             instructions,
-            vec![OpCode::GlobalRef(FIRST_GLOBAL_VAR), OpCode::PostInc]
+            vec![OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR), OpCode::PostInc]
         );
 
         let (instructions, _) = compile_expr("a--");
         assert_eq!(
             instructions,
-            vec![OpCode::GlobalRef(FIRST_GLOBAL_VAR), OpCode::PostDec]
+            vec![OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR), OpCode::PostDec]
         );
 
         let (instructions, _) = compile_expr("++a[0]");
         assert_eq!(
             instructions,
             vec![
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::GetGlobal(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(0),
-                OpCode::IndexArray,
+                OpCode::IndexArrayGetRef,
                 OpCode::PreInc
             ]
         );
@@ -1958,7 +1975,7 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(0),
                 OpCode::In
             ]
@@ -1972,9 +1989,9 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::GetGlobal(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(0),
-                OpCode::GlobalRef(SpecialVar::Subsep as u32),
+                OpCode::GetGlobal(SpecialVar::Subsep as u32),
                 OpCode::Concat,
                 OpCode::PushConstant(1),
                 OpCode::Concat,
@@ -1990,13 +2007,13 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::GetGlobal(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(0),
-                OpCode::GlobalRef(SpecialVar::Subsep as u32),
+                OpCode::GetGlobal(SpecialVar::Subsep as u32),
                 OpCode::Concat,
                 OpCode::PushConstant(1),
                 OpCode::Concat,
-                OpCode::GlobalRef(SpecialVar::Subsep as u32),
+                OpCode::GetGlobal(SpecialVar::Subsep as u32),
                 OpCode::Concat,
                 OpCode::PushConstant(2),
                 OpCode::Concat,
@@ -2168,13 +2185,13 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::GetGlobal(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(0),
                 OpCode::Eq,
                 OpCode::JumpIfFalse(3),
                 OpCode::PushConstant(1),
                 OpCode::Jump(8),
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::GetGlobal(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(2),
                 OpCode::Eq,
                 OpCode::JumpIfFalse(3),
@@ -2201,7 +2218,7 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(0),
                 OpCode::Assign,
             ]
@@ -2212,8 +2229,8 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR + 1),
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR + 1),
                 OpCode::PushConstant(0),
                 OpCode::Assign,
                 OpCode::Assign,
@@ -2228,7 +2245,7 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
                 OpCode::Dup,
                 OpCode::PushConstant(0),
                 OpCode::Add,
@@ -2241,7 +2258,7 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
                 OpCode::Dup,
                 OpCode::PushConstant(0),
                 OpCode::Sub,
@@ -2254,7 +2271,7 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
                 OpCode::Dup,
                 OpCode::PushConstant(0),
                 OpCode::Mul,
@@ -2267,7 +2284,7 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
                 OpCode::Dup,
                 OpCode::PushConstant(0),
                 OpCode::Div,
@@ -2280,7 +2297,7 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
                 OpCode::Dup,
                 OpCode::PushConstant(0),
                 OpCode::Mod,
@@ -2293,7 +2310,7 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
                 OpCode::Dup,
                 OpCode::PushConstant(0),
                 OpCode::Pow,
@@ -2306,9 +2323,9 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
                 OpCode::Dup,
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR + 1),
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR + 1),
                 OpCode::Dup,
                 OpCode::PushConstant(0),
                 OpCode::Add,
@@ -2326,9 +2343,9 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::GetGlobal(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(0),
-                OpCode::IndexArray,
+                OpCode::IndexArrayGetRef,
                 OpCode::PushConstant(1),
                 OpCode::Assign,
             ]
@@ -2345,13 +2362,13 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::GetGlobal(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(0),
-                OpCode::GlobalRef(SpecialVar::Subsep as u32),
+                OpCode::GetGlobal(SpecialVar::Subsep as u32),
                 OpCode::Concat,
                 OpCode::PushConstant(1),
                 OpCode::Concat,
-                OpCode::IndexArray,
+                OpCode::IndexArrayGetValue,
             ]
         );
         assert_eq!(
@@ -2363,17 +2380,17 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::GetGlobal(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(0),
-                OpCode::GlobalRef(SpecialVar::Subsep as u32),
+                OpCode::GetGlobal(SpecialVar::Subsep as u32),
                 OpCode::Concat,
                 OpCode::PushConstant(1),
                 OpCode::Concat,
-                OpCode::GlobalRef(SpecialVar::Subsep as u32),
+                OpCode::GetGlobal(SpecialVar::Subsep as u32),
                 OpCode::Concat,
                 OpCode::PushConstant(2),
                 OpCode::Concat,
-                OpCode::IndexArray,
+                OpCode::IndexArrayGetValue,
             ]
         );
         assert_eq!(
@@ -2387,7 +2404,7 @@ mod test {
     }
 
     #[test]
-    fn compile_filed_var_assignment() {
+    fn compile_field_var_assignment() {
         let (instructions, constants) = compile_expr("$1 = 1");
         assert_eq!(
             instructions,
@@ -2405,13 +2422,13 @@ mod test {
     }
 
     #[test]
-    fn compile_filed_var_compairisons() {
+    fn compile_field_var_compairisons() {
         let (instructions, constants) = compile_expr("$1 == 1");
         assert_eq!(
             instructions,
             vec![
                 OpCode::PushConstant(0),
-                OpCode::FieldRef,
+                OpCode::GetField,
                 OpCode::PushConstant(1),
                 OpCode::Eq,
             ]
@@ -2506,17 +2523,17 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(0),
                 OpCode::Assign,
                 OpCode::Pop,
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::GetGlobal(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(1),
                 OpCode::Lt,
                 OpCode::JumpIfFalse(7),
                 OpCode::PushConstant(2),
                 OpCode::Pop,
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
                 OpCode::PostInc,
                 OpCode::Pop,
                 OpCode::Jump(-9),
@@ -2570,18 +2587,18 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(0),
                 OpCode::Assign,
                 OpCode::Pop,
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::GetGlobal(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(1),
                 OpCode::Lt,
                 OpCode::JumpIfFalse(8),
                 OpCode::PushConstant(2),
                 OpCode::Pop,
                 OpCode::Jump(5),
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
                 OpCode::PostInc,
                 OpCode::Pop,
                 OpCode::Jump(-10),
@@ -2595,18 +2612,18 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(0),
                 OpCode::Assign,
                 OpCode::Pop,
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::GetGlobal(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(1),
                 OpCode::Lt,
                 OpCode::JumpIfFalse(8),
                 OpCode::PushConstant(2),
                 OpCode::Pop,
                 OpCode::Jump(1),
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
                 OpCode::PostInc,
                 OpCode::Pop,
                 OpCode::Jump(-10),
@@ -2650,7 +2667,7 @@ mod test {
         assert_eq!(
             instructions,
             vec![
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::GetGlobal(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(0),
                 OpCode::Delete,
             ]
@@ -2969,7 +2986,7 @@ mod test {
         assert_eq!(
             program.functions[0].instructions,
             vec![
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::GetGlobal(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(0),
                 OpCode::Add,
                 OpCode::Pop,
@@ -2993,11 +3010,11 @@ mod test {
         assert_eq!(
             program.functions[0].instructions,
             vec![
-                OpCode::LocalRef(0),
+                OpCode::GetLocal(0),
                 OpCode::PushConstant(0),
-                OpCode::IndexArray,
-                OpCode::LocalRef(1),
-                OpCode::LocalRef(2),
+                OpCode::IndexArrayGetRef,
+                OpCode::GetLocal(1),
+                OpCode::GetLocal(2),
                 OpCode::Add,
                 OpCode::Assign,
                 OpCode::Pop,
@@ -3035,8 +3052,8 @@ mod test {
         assert_eq!(
             program.functions[0].instructions,
             vec![
-                OpCode::LocalRef(0),
-                OpCode::LocalRef(1),
+                OpCode::GetLocal(0),
+                OpCode::GetLocal(1),
                 OpCode::Add,
                 OpCode::Pop,
                 OpCode::PushUninitializedScalar,
@@ -3067,8 +3084,8 @@ mod test {
         assert_eq!(
             program.functions[0].instructions,
             vec![
-                OpCode::LocalRef(0),
-                OpCode::LocalRef(1),
+                OpCode::GetLocal(0),
+                OpCode::GetLocal(1),
                 OpCode::Add,
                 OpCode::Pop,
                 OpCode::PushUninitializedScalar,
@@ -3219,7 +3236,7 @@ mod test {
             program.rules[0].instructions,
             vec![
                 OpCode::PushZero,
-                OpCode::FieldRef,
+                OpCode::GetField,
                 OpCode::CallBuiltin {
                     function: BuiltinFunction::Print,
                     argc: 1
@@ -3236,7 +3253,7 @@ mod test {
             instructions,
             vec![
                 OpCode::PushZero,
-                OpCode::FieldRef,
+                OpCode::GetField,
                 OpCode::CallBuiltin {
                     function: BuiltinFunction::Print,
                     argc: 1
@@ -3537,37 +3554,37 @@ mod test {
         assert_eq!(
             program.begin_instructions,
             vec![
-                OpCode::GlobalRef(SpecialVar::Argc as u32),
+                OpCode::GetGlobal(SpecialVar::Argc as u32),
                 OpCode::Pop,
-                OpCode::GlobalRef(SpecialVar::Argv as u32),
+                OpCode::GetGlobal(SpecialVar::Argv as u32),
                 OpCode::Pop,
-                OpCode::GlobalRef(SpecialVar::Convfmt as u32),
+                OpCode::GetGlobal(SpecialVar::Convfmt as u32),
                 OpCode::Pop,
-                OpCode::GlobalRef(SpecialVar::Environ as u32),
+                OpCode::GetGlobal(SpecialVar::Environ as u32),
                 OpCode::Pop,
-                OpCode::GlobalRef(SpecialVar::Filename as u32),
+                OpCode::GetGlobal(SpecialVar::Filename as u32),
                 OpCode::Pop,
-                OpCode::GlobalRef(SpecialVar::Fnr as u32),
+                OpCode::GetGlobal(SpecialVar::Fnr as u32),
                 OpCode::Pop,
-                OpCode::GlobalRef(SpecialVar::Fs as u32),
+                OpCode::GetGlobal(SpecialVar::Fs as u32),
                 OpCode::Pop,
-                OpCode::GlobalRef(SpecialVar::Nf as u32),
+                OpCode::GetGlobal(SpecialVar::Nf as u32),
                 OpCode::Pop,
-                OpCode::GlobalRef(SpecialVar::Nr as u32),
+                OpCode::GetGlobal(SpecialVar::Nr as u32),
                 OpCode::Pop,
-                OpCode::GlobalRef(SpecialVar::Ofmt as u32),
+                OpCode::GetGlobal(SpecialVar::Ofmt as u32),
                 OpCode::Pop,
-                OpCode::GlobalRef(SpecialVar::Ofs as u32),
+                OpCode::GetGlobal(SpecialVar::Ofs as u32),
                 OpCode::Pop,
-                OpCode::GlobalRef(SpecialVar::Ors as u32),
+                OpCode::GetGlobal(SpecialVar::Ors as u32),
                 OpCode::Pop,
-                OpCode::GlobalRef(SpecialVar::Rlength as u32),
+                OpCode::GetGlobal(SpecialVar::Rlength as u32),
                 OpCode::Pop,
-                OpCode::GlobalRef(SpecialVar::Rs as u32),
+                OpCode::GetGlobal(SpecialVar::Rs as u32),
                 OpCode::Pop,
-                OpCode::GlobalRef(SpecialVar::Rstart as u32),
+                OpCode::GetGlobal(SpecialVar::Rstart as u32),
                 OpCode::Pop,
-                OpCode::GlobalRef(SpecialVar::Subsep as u32),
+                OpCode::GetGlobal(SpecialVar::Subsep as u32),
                 OpCode::Pop,
             ]
         );
@@ -3579,7 +3596,7 @@ mod test {
         assert_eq!(
             program,
             vec![
-                OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
                 OpCode::CreateGlobalIterator(FIRST_GLOBAL_VAR + 1),
                 OpCode::AdvanceIterOrJump(4),
                 OpCode::PushConstant(0),
@@ -3605,17 +3622,17 @@ mod test {
         assert_eq!(
             program.functions[0].instructions,
             vec![
-                OpCode::LocalRef(0),
+                OpCode::GetLocal(0),
                 OpCode::PushConstant(0),
                 OpCode::Le,
                 OpCode::JumpIfFalse(3),
-                OpCode::LocalRef(0),
+                OpCode::GetLocal(0),
                 OpCode::Return,
-                OpCode::LocalRef(0),
+                OpCode::GetLocal(0),
                 OpCode::PushConstant(1),
                 OpCode::Sub,
                 OpCode::Call { id: 0, argc: 1 },
-                OpCode::LocalRef(0),
+                OpCode::GetLocal(0),
                 OpCode::PushConstant(2),
                 OpCode::Sub,
                 OpCode::Call { id: 0, argc: 1 },
@@ -3647,13 +3664,13 @@ mod test {
         assert_eq!(
             program.functions[0].instructions,
             vec![
-                OpCode::LocalRef(0),
+                OpCode::GetLocal(0),
                 OpCode::PushConstant(0),
                 OpCode::Eq,
                 OpCode::JumpIfFalse(3),
                 OpCode::PushConstant(1),
                 OpCode::Return,
-                OpCode::LocalRef(0),
+                OpCode::GetLocal(0),
                 OpCode::PushConstant(2),
                 OpCode::Sub,
                 OpCode::Call { id: 1, argc: 1 },
@@ -3663,13 +3680,13 @@ mod test {
         assert_eq!(
             program.functions[1].instructions,
             vec![
-                OpCode::LocalRef(0),
+                OpCode::GetLocal(0),
                 OpCode::PushConstant(3),
                 OpCode::Eq,
                 OpCode::JumpIfFalse(3),
                 OpCode::PushConstant(4),
                 OpCode::Return,
-                OpCode::LocalRef(0),
+                OpCode::GetLocal(0),
                 OpCode::PushConstant(5),
                 OpCode::Sub,
                 OpCode::Call { id: 0, argc: 1 },

@@ -834,6 +834,7 @@ struct ArrayIterator {
 enum StackValue {
     Value(AwkValue),
     ValueRef(*mut AwkValue),
+    UninitializedRef(*mut AwkValue),
     Iterator(ArrayIterator),
 }
 
@@ -844,6 +845,7 @@ impl StackValue {
         match self {
             StackValue::Value(val) => val,
             StackValue::ValueRef(val_ref) => &mut **val_ref,
+            StackValue::UninitializedRef(val_ref) => &mut **val_ref,
             _ => unreachable!("invalid stack value"),
         }
     }
@@ -851,6 +853,7 @@ impl StackValue {
     fn unwrap_ptr(self) -> *mut AwkValue {
         match self {
             StackValue::ValueRef(ptr) => ptr,
+            StackValue::UninitializedRef(ptr) => ptr,
             _ => unreachable!("expected lvalue"),
         }
     }
@@ -868,6 +871,7 @@ impl StackValue {
         match self {
             StackValue::Value(val) => val,
             StackValue::ValueRef(ref_val) => (*ref_val).to_owned(),
+            StackValue::UninitializedRef(_) => AwkValue::uninitialized_scalar(),
             _ => unreachable!("invalid stack value"),
         }
     }
@@ -876,6 +880,15 @@ impl StackValue {
     /// if the `StackValue` is a `ValueRef` then the pointer has to point to a valid `AwkValue`
     unsafe fn ensure_value_is_scalar(&mut self) -> Result<(), String> {
         self.value_ref().ensure_value_is_scalar()
+    }
+
+    unsafe fn from_var(value: *mut AwkValue) -> Self {
+        let value_ref = &*value;
+        match value_ref.value {
+            AwkValueVariant::Array(_) => StackValue::ValueRef(value),
+            AwkValueVariant::Uninitialized => StackValue::UninitializedRef(value),
+            _ => StackValue::Value(value_ref.to_owned()),
+        }
     }
 }
 
@@ -954,6 +967,7 @@ impl<'i, 's> Stack<'i, 's> {
             match value {
                 StackValue::Value(val) => Some(val),
                 StackValue::ValueRef(val_ref) => Some(*val_ref),
+                StackValue::UninitializedRef(val_ref) => Some(*val_ref),
                 _ => unreachable!("invalid stack value"),
             }
         } else {
@@ -1003,21 +1017,6 @@ impl<'i, 's> Stack<'i, 's> {
     fn call_function(&mut self, instructions: &'i [OpCode], argc: usize) {
         unsafe { assert!(self.sp.offset_from(self.bp) >= argc as isize) };
         let new_bp = unsafe { self.sp.sub(argc) };
-
-        // converts scalar references passed as arguments to values
-        // (only arrays are passed by reference)
-        for i in 0..argc {
-            let value = unsafe { &mut *new_bp.add(i) };
-            if let StackValue::ValueRef(ptr) = value {
-                let inner = unsafe { &mut **ptr };
-                match inner.value {
-                    AwkValueVariant::Array(_) => {}
-                    _ => {
-                        *value = StackValue::Value(inner.to_owned());
-                    }
-                }
-            }
-        }
         let caller_frame = CallFrame {
             bp: self.bp,
             sp: new_bp,
@@ -1280,11 +1279,37 @@ impl Interpreter {
                     let val = stack.pop_scalar_value()?;
                     stack.push_value(val.scalar_as_f64())?;
                 }
-                OpCode::GlobalRef(index) => unsafe {
+                OpCode::GetGlobal(index) => unsafe {
+                    stack.push(StackValue::from_var(self.globals[index as usize].get()))?
+                },
+                OpCode::GetLocal(index) => {
+                    let value = stack.get_mut_value_ptr(index as usize).unwrap();
+                    unsafe { stack.push(StackValue::from_var(value))? };
+                }
+                OpCode::GetField => {
+                    let index = stack.pop_scalar_value()?.scalar_as_f64();
+                    if index < 0.0 || index > 1024.0 {
+                        return Err("invalid field index".to_string());
+                    }
+                    let index = index as usize;
+                    unsafe { stack.push_value((*record.fields[index].get()).to_owned())? };
+                }
+                OpCode::IndexArrayGetValue => {
+                    let key = stack
+                        .pop_scalar_value()?
+                        .scalar_to_string(&global_env.convfmt)?;
+                    let array = stack.pop_ref().as_array()?;
+                    let element = array.get_or_insert_uninitialized(key)?.to_owned();
+                    stack.push_value(element)?
+                }
+                OpCode::GlobalScalarRef(index) => unsafe {
                     // globals outlive the stack, so this is safe
                     stack.push_ref(self.globals[index as usize].get())?
                 },
-                OpCode::LocalRef(index) => stack.push_ref_to_stack_element(index as usize)?,
+                OpCode::LocalScalarRef(index) => {
+                    let value = stack.get_mut_value_ptr(index as usize).unwrap();
+                    unsafe { stack.push_ref(value)? };
+                }
                 OpCode::FieldRef => {
                     let index = stack.pop_scalar_value()?.scalar_as_f64();
                     if index < 0.0 || index > 1024.0 {
@@ -1293,6 +1318,14 @@ impl Interpreter {
                     let index = index as usize;
                     unsafe { stack.push_ref(record.fields[index].get())? };
                 }
+                OpCode::IndexArrayGetRef => {
+                    let key = stack
+                        .pop_scalar_value()?
+                        .scalar_to_string(&global_env.convfmt)?;
+                    let array = stack.pop_ref().as_array()?;
+                    let element_ref = array.get_or_insert_uninitialized(key)? as *mut AwkValue;
+                    unsafe { stack.push_ref(element_ref)? };
+                }
                 OpCode::Assign => {
                     let value = stack.pop_scalar_value()?;
                     let lvalue = stack.pop_ref();
@@ -1300,14 +1333,6 @@ impl Interpreter {
                     lvalue.ensure_value_is_scalar()?;
                     fields_state = lvalue.assign(value.clone(), global_env)?;
                     stack.push_value(value)?;
-                }
-                OpCode::IndexArray => {
-                    let key = stack
-                        .pop_scalar_value()?
-                        .scalar_to_string(&global_env.convfmt)?;
-                    let array = stack.pop_ref().as_array()?;
-                    let element_ref = array.get_or_insert_uninitialized(key)? as *mut AwkValue;
-                    unsafe { stack.push_ref(element_ref)? };
                 }
                 OpCode::Delete => {
                     let key = stack
@@ -1765,12 +1790,9 @@ mod tests {
         fn new(instructions: Vec<OpCode>, constants: Vec<Constant>) -> Self {
             let globals_count = instructions
                 .iter()
-                .filter_map(|op| {
-                    if let OpCode::GlobalRef(i) = op {
-                        Some(i)
-                    } else {
-                        None
-                    }
+                .filter_map(|op| match op {
+                    OpCode::GlobalScalarRef(i) | OpCode::GetGlobal(i) => Some(i),
+                    _ => None,
                 })
                 .max()
                 .copied()
@@ -2029,7 +2051,7 @@ mod tests {
     fn test_compare_number_uninitialized() {
         let instructions = vec![
             OpCode::PushConstant(0),
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
             OpCode::Ge,
         ];
         let constant = vec![Constant::Number(2.0)];
@@ -2039,7 +2061,7 @@ mod tests {
     #[test]
     fn test_interpret_in_for_global_array() {
         let instructions = vec![
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(0),
             OpCode::In,
         ];
@@ -2047,12 +2069,12 @@ mod tests {
         assert_eq!(interpret_expr(instructions, constant), AwkValue::from(0.0));
 
         let instructions = vec![
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(0),
-            OpCode::IndexArray,
+            OpCode::IndexArrayGetRef,
             OpCode::PushOne,
             OpCode::Assign,
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(0),
             OpCode::In,
         ];
@@ -2063,8 +2085,8 @@ mod tests {
     #[test]
     fn test_interpret_in_for_local_array_ref() {
         let instructions = vec![
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
-            OpCode::LocalRef(0),
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
+            OpCode::GetLocal(0),
             OpCode::PushConstant(0),
             OpCode::In,
         ];
@@ -2072,14 +2094,14 @@ mod tests {
         assert_eq!(interpret_expr(instructions, constant), AwkValue::from(0.0));
 
         let instructions = vec![
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(0),
-            OpCode::IndexArray,
+            OpCode::IndexArrayGetRef,
             OpCode::PushOne,
             OpCode::Assign,
             OpCode::Pop,
-            OpCode::LocalRef(0),
+            OpCode::GetLocal(0),
             OpCode::PushConstant(0),
             OpCode::In,
         ];
@@ -2106,32 +2128,32 @@ mod tests {
 
     #[test]
     fn test_postinc() {
-        let instructions = vec![OpCode::GlobalRef(FIRST_GLOBAL_VAR), OpCode::PostInc];
+        let instructions = vec![OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR), OpCode::PostInc];
         assert_eq!(test_global(instructions, vec![]), AwkValue::from(1.0));
     }
 
     #[test]
     fn test_postdec() {
-        let instructions = vec![OpCode::GlobalRef(FIRST_GLOBAL_VAR), OpCode::PostDec];
+        let instructions = vec![OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR), OpCode::PostDec];
         assert_eq!(test_global(instructions, vec![]), AwkValue::from(-1.0));
     }
 
     #[test]
     fn test_preinc() {
-        let instructions = vec![OpCode::GlobalRef(FIRST_GLOBAL_VAR), OpCode::PreInc];
+        let instructions = vec![OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR), OpCode::PreInc];
         assert_eq!(test_global(instructions, vec![]), AwkValue::from(1.0));
     }
 
     #[test]
     fn test_predec() {
-        let instructions = vec![OpCode::GlobalRef(FIRST_GLOBAL_VAR), OpCode::PreDec];
+        let instructions = vec![OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR), OpCode::PreDec];
         assert_eq!(test_global(instructions, vec![]), AwkValue::from(-1.0));
     }
 
     #[test]
     fn test_assign_to_global_var() {
         let instructions = vec![
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(0),
             OpCode::Assign,
         ];
@@ -2142,9 +2164,9 @@ mod tests {
     #[test]
     fn test_assign_to_array_element() {
         let instructions = vec![
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(0),
-            OpCode::IndexArray,
+            OpCode::IndexArrayGetRef,
             OpCode::PushConstant(1),
             OpCode::Assign,
         ];
@@ -2158,12 +2180,12 @@ mod tests {
     #[test]
     fn test_delete_global_array_element_after_insertion() {
         let instructions = vec![
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(0),
-            OpCode::IndexArray,
+            OpCode::IndexArrayGetRef,
             OpCode::PushConstant(1),
             OpCode::Assign,
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(0),
             OpCode::Delete,
         ];
@@ -2174,14 +2196,14 @@ mod tests {
     #[test]
     fn test_delete_global_array_element_after_insertion_through_local_ref() {
         let instructions = vec![
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(0),
-            OpCode::IndexArray,
+            OpCode::IndexArrayGetRef,
             OpCode::PushConstant(1),
             OpCode::Assign,
             OpCode::Pop,
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
-            OpCode::LocalRef(0),
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
+            OpCode::GetLocal(0),
             OpCode::PushConstant(0),
             OpCode::Delete,
         ];
@@ -2192,7 +2214,7 @@ mod tests {
     #[test]
     fn test_delete_from_empty_global_array() {
         let instructions = vec![
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(0),
             OpCode::Delete,
         ];
@@ -2204,7 +2226,7 @@ mod tests {
     fn test_assign_to_local_var() {
         let instructions = vec![
             OpCode::PushConstant(0),
-            OpCode::LocalRef(0),
+            OpCode::LocalScalarRef(0),
             OpCode::PushConstant(1),
             OpCode::Assign,
         ];
@@ -2221,10 +2243,10 @@ mod tests {
     #[test]
     fn test_assign_to_array_through_local_ref() {
         let instructions = vec![
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
-            OpCode::LocalRef(0),
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
+            OpCode::GetLocal(0),
             OpCode::PushConstant(0),
-            OpCode::IndexArray,
+            OpCode::IndexArrayGetRef,
             OpCode::PushConstant(1),
             OpCode::Assign,
         ];
@@ -2297,7 +2319,7 @@ mod tests {
         let main = vec![OpCode::PushUninitialized, OpCode::Call { id: 0, argc: 1 }];
         let functions = vec![Function {
             parameters_count: 1,
-            instructions: vec![OpCode::LocalRef(0), OpCode::Return],
+            instructions: vec![OpCode::LocalScalarRef(0), OpCode::Return],
         }];
         assert_eq!(
             interpret_with_functions(main, vec![], 1, functions),
@@ -2311,9 +2333,9 @@ mod tests {
         let functions = vec![Function {
             parameters_count: 1,
             instructions: vec![
-                OpCode::LocalRef(0),
+                OpCode::GetLocal(0),
                 OpCode::PushConstant(0),
-                OpCode::IndexArray,
+                OpCode::IndexArrayGetValue,
                 OpCode::Return,
             ],
         }];
@@ -2329,7 +2351,7 @@ mod tests {
         let main = vec![OpCode::PushConstant(0), OpCode::Call { id: 0, argc: 1 }];
         let functions = vec![Function {
             parameters_count: 1,
-            instructions: vec![OpCode::LocalRef(0), OpCode::PushOne, OpCode::Add],
+            instructions: vec![OpCode::GetLocal(0), OpCode::PushOne, OpCode::Add],
         }];
         let constant = vec![Constant::Number(0.0)];
         assert_eq!(
@@ -2341,15 +2363,15 @@ mod tests {
     #[test]
     fn test_call_function_with_array_argument() {
         let main = vec![
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
             OpCode::Call { id: 0, argc: 1 },
         ];
         let functions = vec![Function {
             parameters_count: 1,
             instructions: vec![
-                OpCode::LocalRef(0),
+                OpCode::GetLocal(0),
                 OpCode::PushConstant(0),
-                OpCode::IndexArray,
+                OpCode::IndexArrayGetRef,
                 OpCode::PushOne,
                 OpCode::Assign,
             ],
@@ -2374,11 +2396,11 @@ mod tests {
         let functions = vec![Function {
             parameters_count: 5,
             instructions: vec![
-                OpCode::LocalRef(0),
-                OpCode::LocalRef(1),
-                OpCode::LocalRef(2),
-                OpCode::LocalRef(3),
-                OpCode::LocalRef(4),
+                OpCode::GetLocal(0),
+                OpCode::GetLocal(1),
+                OpCode::GetLocal(2),
+                OpCode::GetLocal(3),
+                OpCode::GetLocal(4),
                 OpCode::Add,
                 OpCode::Add,
                 OpCode::Add,
@@ -2726,7 +2748,7 @@ mod tests {
     fn test_builtin_split_with_split_ere() {
         let instructions = vec![
             OpCode::PushConstant(0),
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(1),
             OpCode::CallBuiltin {
                 function: BuiltinFunction::Split,
@@ -2749,7 +2771,7 @@ mod tests {
     fn test_builtin_split_with_default_fs() {
         let instructions = vec![
             OpCode::PushConstant(0),
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
             OpCode::CallBuiltin {
                 function: BuiltinFunction::Split,
                 argc: 2,
@@ -2767,12 +2789,12 @@ mod tests {
     #[test]
     fn test_builtin_sub() {
         let instructions = vec![
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(0),
             OpCode::Assign,
             OpCode::PushConstant(1),
             OpCode::PushConstant(2),
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
             OpCode::CallBuiltin {
                 function: BuiltinFunction::Sub,
                 argc: 3,
@@ -2818,12 +2840,12 @@ mod tests {
     #[test]
     fn test_builtin_gsub() {
         let instructions = vec![
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(0),
             OpCode::Assign,
             OpCode::PushConstant(1),
             OpCode::PushConstant(2),
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
             OpCode::CallBuiltin {
                 function: BuiltinFunction::Gsub,
                 argc: 3,
@@ -2869,7 +2891,7 @@ mod tests {
     #[test]
     fn test_iterate_through_empty_global_array() {
         let instructions = vec![
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR + 1),
+            OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR + 1),
             OpCode::CreateGlobalIterator(FIRST_GLOBAL_VAR),
             OpCode::AdvanceIterOrJump(2),
             OpCode::Jump(-1),
@@ -2894,25 +2916,25 @@ mod tests {
         // for (a in array) {}
         //```
         let instructions = vec![
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(1),
-            OpCode::IndexArray,
+            OpCode::IndexArrayGetRef,
             OpCode::PushConstant(0),
             OpCode::Assign,
             OpCode::Pop,
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(2),
-            OpCode::IndexArray,
+            OpCode::IndexArrayGetRef,
             OpCode::PushConstant(0),
             OpCode::Assign,
             OpCode::Pop,
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(3),
-            OpCode::IndexArray,
+            OpCode::IndexArrayGetRef,
             OpCode::PushConstant(0),
             OpCode::Assign,
             OpCode::Pop,
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR + 1),
+            OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR + 1),
             OpCode::CreateGlobalIterator(FIRST_GLOBAL_VAR),
             OpCode::AdvanceIterOrJump(2),
             OpCode::Jump(-1),
@@ -2935,7 +2957,7 @@ mod tests {
     fn test_iterate_through_empty_local_array() {
         let instructions = vec![
             OpCode::PushUninitialized,
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
             OpCode::CreateLocalIterator(0),
             OpCode::AdvanceIterOrJump(2),
             OpCode::Jump(-1),
@@ -2961,25 +2983,25 @@ mod tests {
         //```
         let instructions = vec![
             OpCode::PushUninitialized,
-            OpCode::LocalRef(0),
+            OpCode::LocalScalarRef(0),
             OpCode::PushConstant(1),
-            OpCode::IndexArray,
+            OpCode::IndexArrayGetRef,
             OpCode::PushConstant(0),
             OpCode::Assign,
             OpCode::Pop,
-            OpCode::LocalRef(0),
+            OpCode::LocalScalarRef(0),
             OpCode::PushConstant(2),
-            OpCode::IndexArray,
+            OpCode::IndexArrayGetRef,
             OpCode::PushConstant(0),
             OpCode::Assign,
             OpCode::Pop,
-            OpCode::LocalRef(0),
+            OpCode::LocalScalarRef(0),
             OpCode::PushConstant(3),
-            OpCode::IndexArray,
+            OpCode::IndexArrayGetRef,
             OpCode::PushConstant(0),
             OpCode::Assign,
             OpCode::Pop,
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
             OpCode::CreateLocalIterator(0),
             OpCode::AdvanceIterOrJump(2),
             OpCode::Jump(-1),
@@ -3018,16 +3040,16 @@ mod tests {
         // f(a, b)
         // ```
         let instructions = vec![
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(0),
             OpCode::Assign,
             OpCode::Pop,
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR + 1),
+            OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR + 1),
             OpCode::PushConstant(0),
             OpCode::Assign,
             OpCode::Pop,
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR + 1),
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR + 1),
             OpCode::Call { id: 0, argc: 2 },
         ];
         // ```
@@ -3039,11 +3061,11 @@ mod tests {
         let function = Function {
             parameters_count: 2,
             instructions: vec![
-                OpCode::LocalRef(0),
+                OpCode::LocalScalarRef(0),
                 OpCode::PushOne,
                 OpCode::Assign,
                 OpCode::Pop,
-                OpCode::LocalRef(1),
+                OpCode::LocalScalarRef(1),
                 OpCode::PushOne,
                 OpCode::Assign,
                 OpCode::Pop,
@@ -3072,13 +3094,13 @@ mod tests {
         // f(a)
         // ```
         let instructions = vec![
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(0),
-            OpCode::IndexArray,
+            OpCode::IndexArrayGetRef,
             OpCode::PushConstant(1),
             OpCode::Assign,
             OpCode::Pop,
-            OpCode::GlobalRef(FIRST_GLOBAL_VAR),
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
             OpCode::Call { id: 0, argc: 1 },
         ];
         // ```
@@ -3089,9 +3111,9 @@ mod tests {
         let function = Function {
             parameters_count: 1,
             instructions: vec![
-                OpCode::LocalRef(0),
+                OpCode::GetLocal(0),
                 OpCode::PushConstant(0),
-                OpCode::IndexArray,
+                OpCode::IndexArrayGetRef,
                 OpCode::PushConstant(2),
                 OpCode::Assign,
                 OpCode::PushUninitializedScalar,

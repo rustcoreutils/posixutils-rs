@@ -743,24 +743,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a7a70ba024b9dc04c27ea2f0c0548feb474ec5c54bba33a7f72f873a39d07b24"
 
 [[package]]
-name = "m4"
-version = "0.1.0"
-dependencies = [
- "clap",
- "env_logger",
- "errno",
- "libc",
- "log",
- "m4-test-manager",
- "nom",
- "once_cell",
- "regex-lite",
- "similar-asserts",
- "test-log",
- "thiserror",
-]
-
-[[package]]
 name = "m4-test-manager"
 version = "0.1.0"
 dependencies = [
@@ -1127,6 +1109,24 @@ dependencies = [
  "gettext-rs",
  "libc",
  "plib",
+]
+
+[[package]]
+name = "posixutils-m4"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "env_logger",
+ "errno",
+ "libc",
+ "log",
+ "m4-test-manager",
+ "nom",
+ "once_cell",
+ "regex-lite",
+ "similar-asserts",
+ "test-log",
+ "thiserror",
 ]
 
 [[package]]

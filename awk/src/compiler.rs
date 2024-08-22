@@ -537,7 +537,7 @@ impl Compiler {
             }
             Rule::lvalue => {
                 let mut instructions = Vec::new();
-                self.compile_lvalue(first_child(primary), &mut instructions, locals)?;
+                self.compile_lvalue(primary, &mut instructions, locals)?;
                 Ok(Expr::new(ExprKind::LValue, instructions))
             }
             Rule::function_call => {
@@ -797,6 +797,7 @@ impl Compiler {
         instructions: &mut Vec<OpCode>,
         locals: &LocalMap,
     ) -> Result<(), PestError> {
+        let lvalue = first_child(lvalue);
         match lvalue.as_rule() {
             Rule::name => {
                 let get_instruction = self
@@ -887,7 +888,7 @@ impl Compiler {
         match expr.as_rule() {
             Rule::assignment => {
                 let mut inner = expr.into_inner();
-                self.compile_lvalue(first_child(inner.next().unwrap()), instructions, locals)?;
+                self.compile_lvalue(inner.next().unwrap(), instructions, locals)?;
                 lvalue_to_scalar_ref(instructions);
                 let assignment_op = first_child(inner.next().unwrap());
                 if assignment_op.as_rule() != Rule::assign {

@@ -21,7 +21,8 @@ members = [
 	"text",
 	"tree",
 	"users",
-	"xform"
+	"xform",
+	"i18n"
 ]
 
 [workspace.dependencies]

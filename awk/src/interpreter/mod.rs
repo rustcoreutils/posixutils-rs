@@ -1468,7 +1468,7 @@ impl Interpreter {
                         let field_index = i + 1;
                         record.last_field += 1;
                         unsafe {
-                            *record.fields[field_index].get_mut() =
+                            *record.fields[field_index].get() =
                                 AwkValue::field_ref(s, field_index as u16)
                         };
                     });

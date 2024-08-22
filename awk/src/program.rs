@@ -229,12 +229,23 @@ pub enum BuiltinFunction {
     Srand,
 
     // string functions
+    /// The order of the arguments is the following:
+    /// 1. The string to be searched
+    /// 2. The regular expression to search for
+    /// 3. The replacement string
+    ///
+    /// This ordering differs from the one specified in the source
+    /// code, but it was chosen for simplicity of implementation
     Gsub,
     Index,
     Length,
     Match,
+    /// The array is the first argument to the function.
+    /// This is different from the order specified in the source code
+    /// but it was chosen for simplicity of implementation
     Split,
     Sprintf,
+    /// See Gsub for the order of the arguments
     Sub,
     Substr,
     ToLower,

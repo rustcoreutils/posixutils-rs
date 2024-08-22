@@ -250,13 +250,11 @@ fn builtin_gsub(
     global_env: &mut GlobalEnv,
     is_sub: bool,
 ) -> Result<FieldsState, String> {
-    // FIXME: this is not safe. in_str could be a reference to either repl or ere
-    let in_str = stack.pop().unwrap().unwrap_ptr();
     let repl = stack
         .pop_scalar_value()?
         .scalar_to_string(&global_env.convfmt)?;
     let ere = stack.pop_value().to_ere()?;
-    let in_str = unsafe { &mut *in_str };
+    let in_str = stack.pop_ref();
     in_str.ensure_value_is_scalar()?;
     let (result, count) = gsub(
         &ere,
@@ -264,17 +262,17 @@ fn builtin_gsub(
         &in_str.to_owned().scalar_to_string(&global_env.convfmt)?,
         is_sub,
     );
+    let result = in_str.assign(result, global_env);
     stack.push_value(count as f64)?;
-    in_str.assign(result, global_env)
+    result
 }
 
 fn call_simple_builtin(
     function: BuiltinFunction,
     argc: u16,
     stack: &mut Stack,
-    record: &CString,
     global_env: &mut GlobalEnv,
-) -> Result<(), String> {
+) -> Result<FieldsState, String> {
     match function {
         BuiltinFunction::Atan2 => {
             let y = stack.pop_scalar_value()?.scalar_as_f64();
@@ -322,14 +320,10 @@ fn call_simple_builtin(
             stack.push_value(index)?;
         }
         BuiltinFunction::Length => {
-            if argc == 0 {
-                stack.push_value(record.count_bytes() as f64)?;
-            } else {
-                let value = stack
-                    .pop_scalar_value()?
-                    .scalar_to_string(&global_env.convfmt)?;
-                stack.push_value(value.len() as f64)?;
-            }
+            let value = stack
+                .pop_scalar_value()?
+                .scalar_to_string(&global_env.convfmt)?;
+            stack.push_value(value.len() as f64)?;
         }
         BuiltinFunction::Split => {
             let separator = if argc == 2 {
@@ -337,17 +331,10 @@ fn call_simple_builtin(
             } else {
                 Some(FieldSeparator::Ere(stack.pop_value().to_ere()?))
             };
-            // FIXME: check above that array_ref is a StackValue::ValueRef and that it
-            // is an array. If this is true, `array_ref` cannot point to `s` since it is
-            // a string
-            let array_ref = stack.pop().unwrap();
             let s = stack
                 .pop_scalar_value()?
                 .scalar_to_string(&global_env.convfmt)?;
-            // this is safe only if the value in `array_ref` is not a reference to
-            // s, which we just popped
-            let array = unsafe { (*array_ref.unwrap_ptr()).as_array()? };
-            array.clear();
+            let array = stack.pop_ref().as_array()?;
 
             split_record(
                 &s,
@@ -407,7 +394,7 @@ fn call_simple_builtin(
         }
         _ => unreachable!("call_simple_builtin was passed an invalid builtin function kind"),
     }
-    Ok(())
+    Ok(FieldsState::Ok)
 }
 
 enum FieldSeparator {
@@ -1370,9 +1357,6 @@ impl Interpreter {
                         }
                     }
                     BuiltinFunction::Sub | BuiltinFunction::Gsub => {
-                        if argc == 2 {
-                            unsafe { stack.push_ref(record.fields[0].get())? };
-                        }
                         fields_state =
                             builtin_gsub(&mut stack, global_env, function == BuiltinFunction::Sub)?;
                     }
@@ -1438,7 +1422,7 @@ impl Interpreter {
                         self.opened_files.remove(&file_name);
                     }
                     other => {
-                        call_simple_builtin(other, argc, &mut stack, &record.record, global_env)?
+                        fields_state = call_simple_builtin(other, argc, &mut stack, global_env)?
                     }
                 },
                 OpCode::PushConstant(index) => match self.constants[index as usize].clone() {
@@ -2485,10 +2469,14 @@ mod tests {
             AwkValue::from(5.0)
         );
 
-        let instructions = vec![OpCode::CallBuiltin {
-            function: BuiltinFunction::Length,
-            argc: 0,
-        }];
+        let instructions = vec![
+            OpCode::PushZero,
+            OpCode::GetField,
+            OpCode::CallBuiltin {
+                function: BuiltinFunction::Length,
+                argc: 1,
+            },
+        ];
         let value = Test::new(instructions, constant)
             .add_record("test record")
             .run_correct()
@@ -2747,8 +2735,8 @@ mod tests {
     #[test]
     fn test_builtin_split_with_split_ere() {
         let instructions = vec![
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(0),
-            OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(1),
             OpCode::CallBuiltin {
                 function: BuiltinFunction::Split,
@@ -2770,8 +2758,8 @@ mod tests {
     #[test]
     fn test_builtin_split_with_default_fs() {
         let instructions = vec![
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(0),
-            OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
             OpCode::CallBuiltin {
                 function: BuiltinFunction::Split,
                 argc: 2,
@@ -2792,9 +2780,9 @@ mod tests {
             OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(0),
             OpCode::Assign,
+            OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(1),
             OpCode::PushConstant(2),
-            OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
             OpCode::CallBuiltin {
                 function: BuiltinFunction::Sub,
                 argc: 3,
@@ -2813,6 +2801,8 @@ mod tests {
     #[test]
     fn test_builtin_sub_on_record() {
         let instructions = vec![
+            OpCode::PushZero,
+            OpCode::FieldRef,
             OpCode::PushConstant(0),
             OpCode::PushConstant(1),
             OpCode::CallBuiltin {
@@ -2843,9 +2833,9 @@ mod tests {
             OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(0),
             OpCode::Assign,
+            OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(1),
             OpCode::PushConstant(2),
-            OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
             OpCode::CallBuiltin {
                 function: BuiltinFunction::Gsub,
                 argc: 3,
@@ -2864,6 +2854,8 @@ mod tests {
     #[test]
     fn test_builtin_gsub_on_record() {
         let instructions = vec![
+            OpCode::PushZero,
+            OpCode::FieldRef,
             OpCode::PushConstant(0),
             OpCode::PushConstant(1),
             OpCode::CallBuiltin {

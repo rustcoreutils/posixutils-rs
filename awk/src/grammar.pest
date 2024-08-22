@@ -89,6 +89,7 @@ keyword = {
   | "begin"
   | "end"
   | "function"
+  | "getline"
 }
 
 program = { SOI ~ opt_newline ~ (item ~ terminator)* ~ item? ~ EOI }

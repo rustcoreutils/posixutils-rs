@@ -1466,6 +1466,7 @@ impl Interpreter {
                     };
                     split_record(&record_str, &global_env.fs, |i, s| {
                         let field_index = i + 1;
+                        record.last_field += 1;
                         unsafe {
                             *record.fields[field_index].get_mut() =
                                 AwkValue::field_ref(s, field_index as u16)
@@ -1473,6 +1474,8 @@ impl Interpreter {
                     });
                     record.record =
                         CString::new(record_str).map_err(|_| "invalid string".to_string())?;
+                    let nf = unsafe { &mut *self.globals[SpecialVar::Nf as usize].get() };
+                    nf.assign(record.last_field as f64, global_env)?;
                 }
                 FieldsState::NeedToRecomputeRecord { changed_field } => {
                     record.last_field = record.last_field.max(changed_field);
@@ -3159,6 +3162,56 @@ mod tests {
         assert_eq!(
             result.globals[FIRST_GLOBAL_VAR as usize],
             Array::from_iter([("key", "new value")]).into()
+        );
+    }
+
+    #[test]
+    fn test_changing_a_field_recomputes_the_record() {
+        let instructions = vec![
+            OpCode::PushOne,
+            OpCode::FieldRef,
+            OpCode::PushConstant(0),
+            OpCode::Assign,
+        ];
+        let constants = vec![Constant::String("test".to_string())];
+
+        let mut record = Test::new(instructions, constants)
+            .add_record("a b")
+            .run_correct()
+            .record;
+        assert_eq!(
+            *record.fields[0].get_mut(),
+            AwkValue::field_ref("test b", 0)
+        );
+        assert_eq!(*record.fields[1].get_mut(), AwkValue::field_ref("test", 1));
+        assert_eq!(*record.fields[2].get_mut(), AwkValue::field_ref("b", 2));
+    }
+
+    #[test]
+    fn test_changing_the_record_recomputes_fields() {
+        let instructions = vec![
+            OpCode::PushZero,
+            OpCode::FieldRef,
+            OpCode::PushConstant(0),
+            OpCode::Assign,
+        ];
+        let constants = vec![Constant::String("test".to_string())];
+
+        let mut result = Test::new(instructions, constants)
+            .add_record("a b")
+            .run_correct();
+        assert_eq!(result.record.last_field, 1);
+        assert_eq!(
+            *result.record.fields[0].get_mut(),
+            AwkValue::field_ref("test", 0)
+        );
+        assert_eq!(
+            *result.record.fields[1].get_mut(),
+            AwkValue::field_ref("test", 1)
+        );
+        assert_eq!(
+            result.globals[SpecialVar::Nf as usize],
+            AwkValue::from(1.0).to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Nf))
         );
     }
 }

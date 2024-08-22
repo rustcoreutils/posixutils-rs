@@ -455,37 +455,6 @@ enum RecordSeparator {
     Null,
 }
 
-fn first_record(buffer: &str, separator: &RecordSeparator) -> (String, usize) {
-    match separator {
-        RecordSeparator::Char(sep) => {
-            let str = buffer
-                .chars()
-                .take_while(|c| *c != *sep)
-                .collect::<String>();
-            let chars_read = str.len() + 1;
-            (str, chars_read)
-        }
-        RecordSeparator::Null => {
-            let leading_whitespace_bytes = buffer
-                .chars()
-                .take_while(|c| c.is_whitespace())
-                .map(|c| c.len_utf8())
-                .sum();
-            let str = buffer[leading_whitespace_bytes..]
-                .chars()
-                .take_while(|c| *c != '\n')
-                .collect::<String>();
-            let trailing_whitespace_bytes: usize = buffer[leading_whitespace_bytes + str.len()..]
-                .chars()
-                .take_while(|c| c.is_whitespace())
-                .map(|c| c.len_utf8())
-                .sum();
-            let chars_read = leading_whitespace_bytes + str.len() + trailing_whitespace_bytes;
-            (str, chars_read)
-        }
-    }
-}
-
 impl TryFrom<String> for RecordSeparator {
     type Error = String;
 
@@ -1110,6 +1079,7 @@ impl Interpreter {
         record: &mut Record,
         stack: &mut [StackValue],
         global_env: &mut GlobalEnv,
+        current_file: &mut ReadFile,
     ) -> Result<ExecutionResult, String> {
         let mut stack = Stack::new(main, stack);
         let mut fields_state = FieldsState::Ok;
@@ -1574,6 +1544,60 @@ impl Interpreter {
     }
 }
 
+#[derive(Default)]
+struct ReadFile {
+    file_contents: String,
+    next_record_start: usize,
+}
+
+impl ReadFile {
+    fn read_next_record(&mut self, separator: &RecordSeparator) -> Option<String> {
+        if self.next_record_start >= self.file_contents.len() {
+            return None;
+        }
+        let buffer = &self.file_contents[self.next_record_start..];
+        match separator {
+            RecordSeparator::Char(sep) => {
+                let str = buffer
+                    .chars()
+                    .take_while(|c| *c != *sep)
+                    .collect::<String>();
+                self.next_record_start += str.len() + 1;
+                Some(str)
+            }
+            RecordSeparator::Null => {
+                let leading_whitespace_bytes = buffer
+                    .chars()
+                    .take_while(|c| c.is_whitespace())
+                    .map(|c| c.len_utf8())
+                    .sum();
+                let str = buffer[leading_whitespace_bytes..]
+                    .chars()
+                    .take_while(|c| *c != '\n')
+                    .collect::<String>();
+                let trailing_whitespace_bytes: usize = buffer
+                    [leading_whitespace_bytes + str.len()..]
+                    .chars()
+                    .take_while(|c| c.is_whitespace())
+                    .map(|c| c.len_utf8())
+                    .sum();
+                self.next_record_start +=
+                    leading_whitespace_bytes + str.len() + trailing_whitespace_bytes;
+                Some(str)
+            }
+        }
+    }
+
+    fn new(filename: String) -> Result<Self, String> {
+        let file_contents = std::fs::read_to_string(&filename)
+            .map_err(|_| format!("could not read file '{}'", filename))?;
+        Ok(Self {
+            file_contents,
+            next_record_start: 0,
+        })
+    }
+}
+
 pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
     // println!("{:?}", program);
     let args = iter::once(("0".to_string(), AwkValue::from("awk")))
@@ -1603,6 +1627,7 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
         &mut current_record,
         &mut stack,
         &mut global_env,
+        &mut ReadFile::default(),
     )?;
 
     if let ExecutionResult::Exit(val) = begin_result {
@@ -1644,18 +1669,9 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
 
         // TODO: check if the arg is an assignment
 
-        // TODO: should probably figure out something better
-        let file_contents =
-            std::fs::read_to_string(&arg).map_err(|_| format!("could not read file {}", &arg))?;
-
+        let mut file = ReadFile::new(arg)?;
         let mut fnr = 1;
-        let mut next_record_start = 0;
-        while next_record_start < file_contents.len() {
-            let (record, bytes_read) =
-                first_record(&file_contents[next_record_start..], &global_env.rs);
-
-            next_record_start += bytes_read;
-
+        while let Some(record) = file.read_next_record(&global_env.rs) {
             current_record.reset(record, &global_env.fs)?;
             interpreter.globals[SpecialVar::Nf as usize].get_mut().value =
                 AwkValue::from(current_record.last_field as f64).value;
@@ -1676,6 +1692,7 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
                             &mut current_record,
                             &mut stack,
                             &mut global_env,
+                            &mut file,
                         )?
                         .expr_to_bool(),
                     Pattern::Range { start, end } => {
@@ -1687,6 +1704,7 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
                                     &mut current_record,
                                     &mut stack,
                                     &mut global_env,
+                                    &mut file,
                                 )?
                                 .expr_to_bool();
                             range_pattern_started[i] = should_end;
@@ -1700,6 +1718,7 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
                                     &mut current_record,
                                     &mut stack,
                                     &mut global_env,
+                                    &mut file,
                                 )?
                                 .expr_to_bool();
                             range_pattern_started[i] = should_start;
@@ -1714,6 +1733,7 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
                         &mut current_record,
                         &mut stack,
                         &mut global_env,
+                        &mut file,
                     )?;
                     match rule_result {
                         ExecutionResult::Next => break,
@@ -1739,6 +1759,7 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
         &mut current_record,
         &mut stack,
         &mut global_env,
+        &mut ReadFile::default(),
     )?;
     if let ExecutionResult::Exit(val) = end_result {
         return_value = val;
@@ -1817,6 +1838,7 @@ mod tests {
                     &mut self.record,
                     &mut stack,
                     &mut GlobalEnv::default(),
+                    &mut ReadFile::default(),
                 )
                 .expect("execution generated an error");
 
@@ -1872,6 +1894,7 @@ mod tests {
                 &mut Record::default(),
                 &mut stack,
                 &mut GlobalEnv::default(),
+                &mut ReadFile::default(),
             )
             .expect("error running test")
             .unwrap_expr()

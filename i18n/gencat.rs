@@ -258,8 +258,16 @@ impl std::error::Error for ParseError {}
 
 /// For set if it's $set NUMBER #COMMENT
 impl MessageCatalog {
-    pub fn new(build_default: bool) -> Self {
-        let mut catalog = MessageCatalog {
+    pub fn new(
+        #[cfg_attr(target_os = "macos", allow(unused_variables))] build_default: bool,
+    ) -> Self {
+        #[cfg(target_os = "macos")]
+        let catalog;
+
+        #[cfg(not(target_os = "macos"))]
+        let mut catalog;
+
+        catalog = MessageCatalog {
             cat: Cat {
                 first_set: None,
                 last_set: None,
@@ -459,6 +467,7 @@ impl MessageCatalog {
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn compute_optimal_size(&self) -> (usize, usize) {
         let mut best_total = usize::MAX;
         let mut best_size = usize::MAX;
@@ -508,6 +517,7 @@ impl MessageCatalog {
         (best_size, best_depth)
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn fill_arrays(&self, array: &mut [u32], string_pool: &mut Vec<u8>, best_size: usize) {
         for set in self.cat.all_sets().iter().rev() {
             let set = set.borrow();

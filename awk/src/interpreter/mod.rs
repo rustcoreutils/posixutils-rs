@@ -383,9 +383,6 @@ fn call_simple_builtin(
         BuiltinFunction::Close => {
             todo!()
         }
-        BuiltinFunction::GetLine => {
-            todo!()
-        }
         BuiltinFunction::System => {
             todo!()
         }
@@ -479,18 +476,22 @@ struct GlobalEnv {
     ors: String,
     ofmt: String,
     rs: RecordSeparator,
+    nr: u32,
+    fnr: u32,
 }
 
 impl GlobalEnv {
     fn set(&mut self, var: SpecialVar, value: &AwkValue) -> Result<(), String> {
-        let string_val = value.to_owned().scalar_to_string(&self.convfmt)?;
+        let as_string = |value: &AwkValue| value.to_owned().scalar_to_string(&self.convfmt);
         match var {
-            SpecialVar::Convfmt => self.convfmt = string_val,
-            SpecialVar::Fs => self.fs = string_val.try_into()?,
-            SpecialVar::Ofmt => self.ofmt = string_val,
-            SpecialVar::Ofs => self.ofs = string_val,
-            SpecialVar::Ors => self.ors = string_val,
-            SpecialVar::Rs => self.rs = string_val.try_into()?,
+            SpecialVar::Convfmt => self.convfmt = as_string(value)?,
+            SpecialVar::Fs => self.fs = as_string(value)?.try_into()?,
+            SpecialVar::Ofmt => self.ofmt = as_string(value)?,
+            SpecialVar::Ofs => self.ofs = as_string(value)?,
+            SpecialVar::Ors => self.ors = as_string(value)?,
+            SpecialVar::Rs => self.rs = as_string(value)?.try_into()?,
+            SpecialVar::Nr => self.nr = value.scalar_as_f64() as u32,
+            SpecialVar::Fnr => self.fnr = value.scalar_as_f64() as u32,
             _ => {
                 // not needed
             }
@@ -509,6 +510,8 @@ impl Default for GlobalEnv {
             ors: String::from("\n"),
             ofmt: String::from("%.6g"),
             rs: RecordSeparator::Char('\n'),
+            nr: 1,
+            fnr: 1,
         }
     }
 }
@@ -1389,6 +1392,19 @@ impl Interpreter {
                             .scalar_to_string(&global_env.convfmt)?;
                         self.opened_files.remove(&file_name);
                     }
+                    BuiltinFunction::GetLine => {
+                        let var = stack.pop_ref();
+                        if let Some(next_record) = current_file.read_next_record(&global_env.rs) {
+                            fields_state = var.assign(next_record, global_env)?;
+                            let nr = unsafe { &mut *self.globals[SpecialVar::Nr as usize].get() };
+                            nr.assign(global_env.nr as f64 + 1.0, global_env)?;
+                            let fnr = unsafe { &mut *self.globals[SpecialVar::Fnr as usize].get() };
+                            fnr.assign(global_env.fnr as f64 + 1.0, global_env)?;
+                            stack.push_value(1.0)?;
+                        } else {
+                            stack.push_value(0.0)?;
+                        }
+                    }
                     other => {
                         fields_state = call_simple_builtin(other, argc, &mut stack, global_env)?
                     }
@@ -1635,7 +1651,6 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
     }
 
     let mut current_arg_index = 1;
-    let mut nr = 1;
     'file_loop: loop {
         let argc = interpreter.globals[SpecialVar::Argc as usize]
             .get_mut()
@@ -1670,7 +1685,7 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
         // TODO: check if the arg is an assignment
 
         let mut file = ReadFile::new(arg)?;
-        let mut fnr = 1;
+        global_env.fnr = 1;
         while let Some(record) = file.read_next_record(&global_env.rs) {
             current_record.reset(record, &global_env.fs)?;
             interpreter.globals[SpecialVar::Nf as usize].get_mut().value =
@@ -1678,9 +1693,9 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
 
             interpreter.globals[SpecialVar::Fnr as usize]
                 .get_mut()
-                .value = AwkValue::from(fnr as f64).value;
+                .value = AwkValue::from(global_env.fnr as f64).value;
             interpreter.globals[SpecialVar::Nr as usize].get_mut().value =
-                AwkValue::from(nr as f64).value;
+                AwkValue::from(global_env.nr as f64).value;
 
             for (i, rule) in program.rules.iter().enumerate() {
                 let should_execute = match &rule.pattern {
@@ -1746,8 +1761,8 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
                 }
             }
 
-            fnr += 1;
-            nr += 1;
+            global_env.fnr += 1;
+            global_env.nr += 1;
         }
 
         current_arg_index += 1;

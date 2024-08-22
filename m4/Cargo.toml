@@ -1,7 +1,15 @@
 [package]
-name = "m4"
+name = "posixutils-m4"
 version = "0.1.0"
 edition = "2021"
+description = "m4 - macro language processor"
+authors = ["Luke Frisken"]
+license = "MIT"
+repository = "https://github.com/rustcoreutils/posixutils-rs.git"
+
+[[bin]]
+name = "m4"
+path = "src/main.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

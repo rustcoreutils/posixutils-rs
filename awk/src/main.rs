@@ -17,7 +17,6 @@ use std::error::Error;
 use std::io::Read;
 
 mod compiler;
-mod format;
 mod interpreter;
 mod program;
 mod regex;

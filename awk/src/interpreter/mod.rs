@@ -9,7 +9,7 @@
 
 use array::{Array, KeyIterator};
 
-use crate::format::{
+use format::{
     fmt_write_decimal_float, fmt_write_float_general, fmt_write_hex_float,
     fmt_write_scientific_float, fmt_write_signed, fmt_write_string, fmt_write_unsigned,
     parse_conversion_specifier_args, IntegerFormat,
@@ -26,6 +26,7 @@ use std::rc::Rc;
 use std::{iter, u16};
 
 mod array;
+mod format;
 
 const STACK_SIZE: usize = 2048;
 

@@ -377,6 +377,9 @@ fn call_simple_builtin(
                 .scalar_to_string(&global_env.convfmt)?;
             stack.push_value(value.to_uppercase())?;
         }
+        BuiltinFunction::Gsub | BuiltinFunction::Sub => {
+            return builtin_gsub(stack, global_env, function == BuiltinFunction::Sub)
+        }
         BuiltinFunction::Close => {
             todo!()
         }
@@ -421,8 +424,7 @@ fn split_record<S: FnMut(usize, &str)>(
         FieldSeparator::Ere(re) => {
             let mut split_start = 0;
             let mut index = 0;
-            let mut iter = re.match_locations(CString::new(record).unwrap());
-            while let Some(separator_range) = iter.next() {
+            for separator_range in re.match_locations(CString::new(record).unwrap()) {
                 store_result(index, &record[split_start..separator_range.start]);
                 split_start = separator_range.end;
                 index += 1;
@@ -1355,10 +1357,6 @@ impl Interpreter {
                             *self.globals[SpecialVar::Rstart as usize].get() = start.into();
                             *self.globals[SpecialVar::Rlength as usize].get() = len.into();
                         }
-                    }
-                    BuiltinFunction::Sub | BuiltinFunction::Gsub => {
-                        fields_state =
-                            builtin_gsub(&mut stack, global_env, function == BuiltinFunction::Sub)?;
                     }
                     // FIXME: refactor the following two cases
                     BuiltinFunction::RedirectedPrintTruncate

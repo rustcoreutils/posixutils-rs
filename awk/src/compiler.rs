@@ -878,6 +878,72 @@ impl Compiler {
         Ok(())
     }
 
+    fn compile_input_function(
+        &self,
+        expr: Pair<Rule>,
+        instructions: &mut Vec<OpCode>,
+        locals: &LocalMap,
+    ) -> Result<(), PestError> {
+        let input_function = first_child(expr);
+        match input_function.as_rule() {
+            Rule::simple_getline => {
+                if let Some(lvalue) = input_function.into_inner().next() {
+                    self.compile_lvalue(lvalue, instructions, locals)?;
+                    lvalue_to_scalar_ref(instructions);
+                } else {
+                    instructions.extend([OpCode::PushZero, OpCode::FieldRef]);
+                }
+                instructions.push(OpCode::CallBuiltin {
+                    function: BuiltinFunction::GetLine,
+                    argc: 1,
+                });
+            }
+            Rule::getline_from_file => {
+                let mut inner = input_function.into_inner();
+                let lvalue = inner.next().unwrap();
+                let file = if lvalue.as_rule() == Rule::lvalue {
+                    self.compile_lvalue(lvalue, instructions, locals)?;
+                    lvalue_to_scalar_ref(instructions);
+                    inner.next().unwrap()
+                } else {
+                    instructions.extend([OpCode::PushZero, OpCode::FieldRef]);
+                    lvalue
+                };
+                self.compile_expr(file, instructions, locals)?;
+                instructions.push(OpCode::CallBuiltin {
+                    function: BuiltinFunction::GetLineFromFile,
+                    argc: 2,
+                });
+            }
+            Rule::getline_from_pipe => {
+                let mut inner = input_function.into_inner();
+                let unpiped_expr = inner.next().unwrap();
+                let mut lvalues = Vec::new();
+                for piped_getline in inner {
+                    lvalues.push(piped_getline.into_inner().next());
+                }
+                let getline_count = lvalues.len();
+                for lvalue in lvalues.into_iter().rev() {
+                    if let Some(lvalue) = lvalue {
+                        self.compile_lvalue(lvalue.clone(), instructions, locals)?;
+                        lvalue_to_scalar_ref(instructions);
+                    } else {
+                        instructions.extend([OpCode::PushZero, OpCode::FieldRef]);
+                    }
+                }
+                self.compile_expr(unpiped_expr, instructions, locals)?;
+                for _ in 0..getline_count {
+                    instructions.push(OpCode::CallBuiltin {
+                        function: BuiltinFunction::GetLineFromPipe,
+                        argc: 2,
+                    });
+                }
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
     fn compile_expr(
         &self,
         expr: Pair<Rule>,
@@ -925,7 +991,9 @@ impl Compiler {
             Rule::binary_expr | Rule::binary_print_expr => {
                 self.compile_binary_expr(expr, instructions, locals)?;
             }
-            Rule::input_function => todo!(),
+            Rule::input_function | Rule::unpiped_input_function => {
+                self.compile_input_function(expr, instructions, locals)?;
+            }
             _ => unreachable!(
                 "encountered {:?} while compiling expression",
                 expr.as_rule()
@@ -3747,6 +3815,134 @@ mod test {
                 OpCode::Sub,
                 OpCode::Call { id: 0, argc: 1 },
                 OpCode::Return,
+            ]
+        );
+    }
+
+    #[test]
+    fn test_compile_simple_getline() {
+        let (expr, _) = compile_expr("getline");
+        assert_eq!(
+            expr,
+            vec![
+                OpCode::PushZero,
+                OpCode::FieldRef,
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::GetLine,
+                    argc: 1
+                }
+            ]
+        );
+
+        let (expr, _) = compile_expr("getline var");
+        assert_eq!(
+            expr,
+            vec![
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::GetLine,
+                    argc: 1
+                }
+            ]
+        )
+    }
+
+    #[test]
+    fn test_compile_getline_from_file() {
+        let (expr, _) = compile_expr("getline < \"file\"");
+        assert_eq!(
+            expr,
+            vec![
+                OpCode::PushZero,
+                OpCode::FieldRef,
+                OpCode::PushConstant(0),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::GetLineFromFile,
+                    argc: 2
+                }
+            ]
+        );
+
+        let (expr, _) = compile_expr("getline var < \"file\"");
+        assert_eq!(
+            expr,
+            vec![
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
+                OpCode::PushConstant(0),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::GetLineFromFile,
+                    argc: 2
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn test_compile_piped_getline() {
+        let (expr, _) = compile_expr("\"command\" | getline");
+        assert_eq!(
+            expr,
+            vec![
+                OpCode::PushZero,
+                OpCode::FieldRef,
+                OpCode::PushConstant(0),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::GetLineFromPipe,
+                    argc: 2
+                }
+            ]
+        );
+
+        let (expr, _) = compile_expr("\"command\" | getline var");
+        assert_eq!(
+            expr,
+            vec![
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
+                OpCode::PushConstant(0),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::GetLineFromPipe,
+                    argc: 2
+                }
+            ]
+        );
+
+        let (expr, _) = compile_expr("getline var | getline var2");
+        assert_eq!(
+            expr,
+            vec![
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR + 1),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::GetLine,
+                    argc: 1
+                },
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::GetLineFromPipe,
+                    argc: 2
+                }
+            ]
+        );
+
+        let (expr, _) = compile_expr("\"test\" | getline var | getline var2 | getline var3");
+        assert_eq!(
+            expr,
+            vec![
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR + 1),
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR + 2),
+                OpCode::PushConstant(0),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::GetLineFromPipe,
+                    argc: 2
+                },
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::GetLineFromPipe,
+                    argc: 2
+                },
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::GetLineFromPipe,
+                    argc: 2
+                }
             ]
         );
     }

@@ -322,10 +322,10 @@ mod_assign = { "%=" }
 pow_assign = { "^=" }
 
 expr = {
-    assignment
+    input_function
+  | assignment
   | ternary_expr
   | binary_expr
-  | input_function
 }
 
 lvalue = {
@@ -337,12 +337,26 @@ lvalue = {
 field_var = { "$" ~ primary }
 
 input_function = {
-    simple_get
-  | simple_get ~ "<" ~ expr
-  | "|" ~ "getline" ~ lvalue?
+    getline_from_pipe
+  | getline_from_file
+  | simple_getline
 }
 
-simple_get = { "getline" ~ lvalue? }
+simple_getline    = { "getline" ~ lvalue? }
+getline_from_file = { "getline" ~ lvalue? ~ "<" ~ expr }
+getline_from_pipe = { unpiped_expr ~ (piped_getline)+ }
+piped_getline     = { "|" ~ "getline" ~ lvalue? }
+
+unpiped_expr           = {
+    unpiped_input_function
+  | assignment
+  | ternary_expr
+  | binary_expr
+}
+unpiped_input_function = {
+    getline_from_file
+  | simple_getline
+}
 
 print_infix_op           = _{
     pow

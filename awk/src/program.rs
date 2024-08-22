@@ -254,6 +254,8 @@ pub enum BuiltinFunction {
     // I/O functions
     Close,
     GetLine,
+    GetLineFromFile,
+    GetLineFromPipe,
     System,
     Print,
     Printf,

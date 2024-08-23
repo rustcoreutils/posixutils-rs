@@ -8,8 +8,9 @@
 //
 
 use std::{
+    collections::{hash_map::Entry, HashMap},
     fs::File,
-    io::{BufReader, Bytes, Read},
+    io::{BufReader, Bytes, Read, Write},
 };
 
 pub enum RecordSeparator {
@@ -187,6 +188,39 @@ impl RecordReader for EmptyRecordReader {
 
     fn last_byte_read(&self) -> Option<u8> {
         None
+    }
+}
+
+#[derive(Default)]
+pub struct WriteFiles {
+    files: HashMap<String, File>,
+}
+
+impl WriteFiles {
+    pub fn write(&mut self, filename: &str, contents: &str, append: bool) -> Result<(), String> {
+        match self.files.entry(filename.to_string()) {
+            Entry::Occupied(mut e) => {
+                e.get_mut()
+                    .write_all(contents.as_bytes())
+                    .map_err(|e| e.to_string())?;
+            }
+            Entry::Vacant(e) => {
+                let mut file = File::options()
+                    .write(true)
+                    .create(true)
+                    .append(append)
+                    .open(filename)
+                    .map_err(|e| e.to_string())?;
+                file.write_all(contents.as_bytes())
+                    .map_err(|e| e.to_string())?;
+                e.insert(file);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn close_file(&mut self, filename: &str) {
+        self.files.remove(filename);
     }
 }
 

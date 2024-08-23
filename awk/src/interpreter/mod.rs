@@ -8,7 +8,7 @@
 //
 
 use array::{Array, KeyIterator};
-use io::{EmptyRecordReader, FileStream, RecordReader, RecordSeparator};
+use io::{EmptyRecordReader, FileStream, RecordReader, RecordSeparator, WriteFiles};
 
 use crate::program::{BuiltinFunction, Constant, Function, OpCode, Pattern, Program, SpecialVar};
 use crate::regex::Regex;
@@ -18,6 +18,7 @@ use format::{
     parse_conversion_specifier_args, IntegerFormat,
 };
 use std::cell::UnsafeCell;
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fmt::Write;
@@ -1020,7 +1021,7 @@ impl ExecutionResult {
 struct Interpreter {
     globals: Vec<AwkValueRef>,
     constants: Vec<Constant>,
-    opened_files: HashMap<String, File>,
+    write_files: WriteFiles,
 }
 
 macro_rules! numeric_op {
@@ -1312,66 +1313,35 @@ impl Interpreter {
                             *self.globals[SpecialVar::Rlength as usize].get() = len.into();
                         }
                     }
-                    // FIXME: refactor the following two cases
-                    BuiltinFunction::RedirectedPrintTruncate
-                    | BuiltinFunction::RedirectedPrintfTruncate => {
-                        let file_name = stack
+                    BuiltinFunction::RedirectedPrintfTruncate
+                    | BuiltinFunction::RedirectedPrintfAppend
+                    | BuiltinFunction::RedirectedPrintTruncate
+                    | BuiltinFunction::RedirectedPrintAppend => {
+                        let filename = stack
                             .pop_scalar_value()?
                             .scalar_to_string(&global_env.convfmt)?;
-                        let file =
-                            self.opened_files
-                                .entry(file_name.clone())
-                                .or_insert_with(|| {
-                                    File::create(file_name).expect("failed to create file")
-                                });
-                        if function == BuiltinFunction::RedirectedPrintTruncate {
-                            std::io::Write::write(
-                                file,
-                                print_to_string(&mut stack, argc - 1, global_env)?.as_bytes(),
-                            )
-                            .unwrap();
+                        let is_printf = matches!(
+                            function,
+                            BuiltinFunction::RedirectedPrintfTruncate
+                                | BuiltinFunction::RedirectedPrintfAppend
+                        );
+                        let str = if is_printf {
+                            builtin_sprintf(&mut stack, argc - 1, global_env)?
                         } else {
-                            std::io::Write::write(
-                                file,
-                                builtin_sprintf(&mut stack, argc - 1, global_env)?.as_bytes(),
-                            )
-                            .unwrap();
-                        }
-                    }
-                    BuiltinFunction::RedirectedPrintAppend
-                    | BuiltinFunction::RedirectedPrintfAppend => {
-                        let file_name = stack
-                            .pop_scalar_value()?
-                            .scalar_to_string(&global_env.convfmt)?;
-                        let file =
-                            self.opened_files
-                                .entry(file_name.clone())
-                                .or_insert_with(|| {
-                                    File::options()
-                                        .create(true)
-                                        .append(true)
-                                        .open(file_name)
-                                        .expect("failed to open file")
-                                });
-                        if function == BuiltinFunction::RedirectedPrintAppend {
-                            std::io::Write::write(
-                                file,
-                                print_to_string(&mut stack, argc - 1, global_env)?.as_bytes(),
-                            )
-                            .unwrap();
-                        } else {
-                            std::io::Write::write(
-                                file,
-                                builtin_sprintf(&mut stack, argc - 1, global_env)?.as_bytes(),
-                            )
-                            .unwrap();
-                        }
+                            print_to_string(&mut stack, argc - 1, global_env)?
+                        };
+                        let is_append = matches!(
+                            function,
+                            BuiltinFunction::RedirectedPrintfAppend
+                                | BuiltinFunction::RedirectedPrintAppend
+                        );
+                        self.write_files.write(&filename, &str, is_append)?;
                     }
                     BuiltinFunction::Close => {
-                        let file_name = stack
+                        let filename = stack
                             .pop_scalar_value()?
                             .scalar_to_string(&global_env.convfmt)?;
-                        self.opened_files.remove(&file_name);
+                        self.write_files.close_file(&filename);
                     }
                     BuiltinFunction::GetLine => {
                         let var = stack.pop_ref();
@@ -1539,7 +1509,7 @@ impl Interpreter {
         Self {
             globals,
             constants,
-            opened_files: HashMap::new(),
+            write_files: WriteFiles::default(),
         }
     }
 }

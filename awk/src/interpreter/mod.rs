@@ -8,14 +8,15 @@
 //
 
 use array::{Array, KeyIterator};
+use io::{EmptyRecordReader, FileStream, RecordReader, RecordSeparator};
 
+use crate::program::{BuiltinFunction, Constant, Function, OpCode, Pattern, Program, SpecialVar};
+use crate::regex::Regex;
 use format::{
     fmt_write_decimal_float, fmt_write_float_general, fmt_write_hex_float,
     fmt_write_scientific_float, fmt_write_signed, fmt_write_string, fmt_write_unsigned,
     parse_conversion_specifier_args, IntegerFormat,
 };
-use crate::program::{BuiltinFunction, Constant, Function, OpCode, Pattern, Program, SpecialVar};
-use crate::regex::Regex;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -27,6 +28,7 @@ use std::{iter, u16};
 
 mod array;
 mod format;
+mod io;
 
 const STACK_SIZE: usize = 2048;
 
@@ -448,28 +450,6 @@ impl TryFrom<String> for FieldSeparator {
     }
 }
 
-enum RecordSeparator {
-    Char(char),
-    Null,
-}
-
-impl TryFrom<String> for RecordSeparator {
-    type Error = String;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        let mut iter = value.chars();
-        let result = match iter.next() {
-            Some(c) => RecordSeparator::Char(c),
-            None => RecordSeparator::Null,
-        };
-        if iter.next().is_some() {
-            Err("the record separator cannot contain more than one characters".to_string())
-        } else {
-            Ok(result)
-        }
-    }
-}
-
 struct GlobalEnv {
     convfmt: String,
     fs: FieldSeparator,
@@ -510,7 +490,7 @@ impl Default for GlobalEnv {
             ofs: String::from(" "),
             ors: String::from("\n"),
             ofmt: String::from("%.6g"),
-            rs: RecordSeparator::Char('\n'),
+            rs: RecordSeparator::Char(b'\n'),
             nr: 1,
             fnr: 1,
         }
@@ -1083,7 +1063,7 @@ impl Interpreter {
         record: &mut Record,
         stack: &mut [StackValue],
         global_env: &mut GlobalEnv,
-        current_file: &mut ReadFile,
+        current_file: &mut dyn RecordReader,
     ) -> Result<ExecutionResult, String> {
         let mut stack = Stack::new(main, stack);
         let mut fields_state = FieldsState::Ok;
@@ -1395,7 +1375,7 @@ impl Interpreter {
                     }
                     BuiltinFunction::GetLine => {
                         let var = stack.pop_ref();
-                        if let Some(next_record) = current_file.read_next_record(&global_env.rs) {
+                        if let Some(next_record) = current_file.read_next_record(&global_env.rs)? {
                             fields_state = var.assign(next_record, global_env)?;
                             let nr = unsafe { &mut *self.globals[SpecialVar::Nr as usize].get() };
                             nr.assign(global_env.nr as f64 + 1.0, global_env)?;
@@ -1564,60 +1544,6 @@ impl Interpreter {
     }
 }
 
-#[derive(Default)]
-struct ReadFile {
-    file_contents: String,
-    next_record_start: usize,
-}
-
-impl ReadFile {
-    fn read_next_record(&mut self, separator: &RecordSeparator) -> Option<String> {
-        if self.next_record_start >= self.file_contents.len() {
-            return None;
-        }
-        let buffer = &self.file_contents[self.next_record_start..];
-        match separator {
-            RecordSeparator::Char(sep) => {
-                let str = buffer
-                    .chars()
-                    .take_while(|c| *c != *sep)
-                    .collect::<String>();
-                self.next_record_start += str.len() + 1;
-                Some(str)
-            }
-            RecordSeparator::Null => {
-                let leading_whitespace_bytes = buffer
-                    .chars()
-                    .take_while(|c| c.is_whitespace())
-                    .map(|c| c.len_utf8())
-                    .sum();
-                let str = buffer[leading_whitespace_bytes..]
-                    .chars()
-                    .take_while(|c| *c != '\n')
-                    .collect::<String>();
-                let trailing_whitespace_bytes: usize = buffer
-                    [leading_whitespace_bytes + str.len()..]
-                    .chars()
-                    .take_while(|c| c.is_whitespace())
-                    .map(|c| c.len_utf8())
-                    .sum();
-                self.next_record_start +=
-                    leading_whitespace_bytes + str.len() + trailing_whitespace_bytes;
-                Some(str)
-            }
-        }
-    }
-
-    fn new(filename: String) -> Result<Self, String> {
-        let file_contents = std::fs::read_to_string(&filename)
-            .map_err(|_| format!("could not read file '{}'", filename))?;
-        Ok(Self {
-            file_contents,
-            next_record_start: 0,
-        })
-    }
-}
-
 pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
     // println!("{:?}", program);
     let args = iter::once(("0".to_string(), AwkValue::from("awk")))
@@ -1647,7 +1573,7 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
         &mut current_record,
         &mut stack,
         &mut global_env,
-        &mut ReadFile::default(),
+        &mut EmptyRecordReader::default(),
     )?;
 
     if let ExecutionResult::Exit(val) = begin_result {
@@ -1688,9 +1614,9 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
 
         // TODO: check if the arg is an assignment
 
-        let mut file = ReadFile::new(arg)?;
+        let mut file = FileStream::open(&arg)?;
         global_env.fnr = 1;
-        while let Some(record) = file.read_next_record(&global_env.rs) {
+        while let Some(record) = file.read_next_record(&global_env.rs)? {
             current_record.reset(record, &global_env.fs)?;
             interpreter.globals[SpecialVar::Nf as usize].get_mut().value =
                 AwkValue::from(current_record.last_field as f64).value;
@@ -1778,7 +1704,7 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
         &mut current_record,
         &mut stack,
         &mut global_env,
-        &mut ReadFile::default(),
+        &mut EmptyRecordReader::default(),
     )?;
     if let ExecutionResult::Exit(val) = end_result {
         return_value = val;
@@ -1857,7 +1783,7 @@ mod tests {
                     &mut self.record,
                     &mut stack,
                     &mut GlobalEnv::default(),
-                    &mut ReadFile::default(),
+                    &mut EmptyRecordReader::default(),
                 )
                 .expect("execution generated an error");
 
@@ -1913,7 +1839,7 @@ mod tests {
                 &mut Record::default(),
                 &mut stack,
                 &mut GlobalEnv::default(),
-                &mut ReadFile::default(),
+                &mut EmptyRecordReader::default(),
             )
             .expect("error running test")
             .unwrap_expr()

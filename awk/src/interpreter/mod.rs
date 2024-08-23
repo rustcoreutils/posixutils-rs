@@ -8,7 +8,7 @@
 //
 
 use array::{Array, KeyIterator};
-use io::{EmptyRecordReader, FileStream, RecordReader, RecordSeparator, WriteFiles};
+use io::{EmptyRecordReader, FileStream, ReadFiles, RecordReader, RecordSeparator, WriteFiles};
 
 use crate::program::{BuiltinFunction, Constant, Function, OpCode, Pattern, Program, SpecialVar};
 use crate::regex::Regex;
@@ -1022,6 +1022,7 @@ struct Interpreter {
     globals: Vec<AwkValueRef>,
     constants: Vec<Constant>,
     write_files: WriteFiles,
+    read_files: ReadFiles,
 }
 
 macro_rules! numeric_op {
@@ -1342,6 +1343,7 @@ impl Interpreter {
                             .pop_scalar_value()?
                             .scalar_to_string(&global_env.convfmt)?;
                         self.write_files.close_file(&filename);
+                        self.read_files.close_file(&filename);
                     }
                     BuiltinFunction::GetLine => {
                         let var = stack.pop_ref();
@@ -1351,6 +1353,20 @@ impl Interpreter {
                             nr.assign(global_env.nr as f64 + 1.0, global_env)?;
                             let fnr = unsafe { &mut *self.globals[SpecialVar::Fnr as usize].get() };
                             fnr.assign(global_env.fnr as f64 + 1.0, global_env)?;
+                            stack.push_value(1.0)?;
+                        } else {
+                            stack.push_value(0.0)?;
+                        }
+                    }
+                    BuiltinFunction::GetLineFromFile => {
+                        let filename = stack
+                            .pop_scalar_value()?
+                            .scalar_to_string(&global_env.convfmt)?;
+                        let var = stack.pop_ref();
+                        if let Some(next_record) =
+                            self.read_files.read_next_record(filename, &global_env.rs)?
+                        {
+                            fields_state = var.assign(next_record, global_env)?;
                             stack.push_value(1.0)?;
                         } else {
                             stack.push_value(0.0)?;
@@ -1510,6 +1526,7 @@ impl Interpreter {
             globals,
             constants,
             write_files: WriteFiles::default(),
+            read_files: ReadFiles::default(),
         }
     }
 }

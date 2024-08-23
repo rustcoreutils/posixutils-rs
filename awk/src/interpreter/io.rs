@@ -224,6 +224,33 @@ impl WriteFiles {
     }
 }
 
+#[derive(Default)]
+pub struct ReadFiles {
+    files: HashMap<String, FileStream>,
+}
+
+impl ReadFiles {
+    pub fn read_next_record(
+        &mut self,
+        filename: String,
+        separator: &RecordSeparator,
+    ) -> Result<Option<String>, String> {
+        match self.files.entry(filename.clone()) {
+            Entry::Occupied(mut e) => e.get_mut().read_next_record(separator),
+            Entry::Vacant(e) => {
+                let mut file = FileStream::open(&filename)?;
+                let result = file.read_next_record(separator);
+                e.insert(file);
+                result
+            }
+        }
+    }
+
+    pub fn close_file(&mut self, filename: &str) {
+        self.files.remove(filename);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

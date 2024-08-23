@@ -22,8 +22,8 @@ sign            =  { "+" | "-" }
 float_suffix    =  { "f" | "l" | "F" | "L" }
 
 letter    =  { ('a'..'z') | ('A'..'Z') }
-name      = @{ !(keyword | builtin_func) ~ (letter | "_") ~ (letter | "_" | digit)* }
-func_name = @{ !(keyword | builtin_func) ~ name ~ &"(" }
+name      = @{ ((keyword | builtin_func) ~ (letter | "_" | digit)+) | (!(keyword | builtin_func) ~ (letter | "_") ~ (letter | "_" | digit)*) }
+func_name = @{ name ~ &"(" }
 
 builtin_func = _{
     atan2
@@ -180,8 +180,8 @@ exit_stmt   = { "exit" ~ expr? }
 
 simple_statement = {
     delete_element
-  | expr
   | print_stmt
+  | expr
 }
 
 delete_element = {
@@ -215,8 +215,8 @@ primary = _{
   | ere
   | number
   | string
-  | function_call
   | builtin_function_call
+  | function_call
   | lvalue
 }
 

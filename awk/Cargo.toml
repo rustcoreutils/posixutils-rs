@@ -12,6 +12,7 @@ pest = "2.7.10"
 pest_derive = "2.7.10"
 lazy_static = "1.4.0"
 lexical = { version = "6.1", features = ["format"] }
+rand = {version = "0.8.5", no-default-features = false, features = ["small_rng"] }
 
 [[bin]]
 name = "awk"

@@ -9,6 +9,8 @@
 
 use array::{Array, KeyIterator};
 use io::{EmptyRecordReader, FileStream, ReadFiles, RecordReader, RecordSeparator, WriteFiles};
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 
 use crate::program::{BuiltinFunction, Constant, Function, OpCode, Pattern, Program, SpecialVar};
 use crate::regex::Regex;
@@ -306,12 +308,6 @@ fn call_simple_builtin(
         BuiltinFunction::Int => {
             let value = stack.pop_scalar_value()?.scalar_as_f64();
             stack.push_value(value.trunc())?;
-        }
-        BuiltinFunction::Rand => {
-            todo!()
-        }
-        BuiltinFunction::Srand => {
-            todo!()
         }
         BuiltinFunction::Index => {
             let t = stack
@@ -1023,6 +1019,8 @@ struct Interpreter {
     constants: Vec<Constant>,
     write_files: WriteFiles,
     read_files: ReadFiles,
+    rand_seed: u64,
+    rng: SmallRng,
 }
 
 macro_rules! numeric_op {
@@ -1372,6 +1370,15 @@ impl Interpreter {
                             stack.push_value(0.0)?;
                         }
                     }
+                    BuiltinFunction::Rand => {
+                        let rand = self.rng.gen_range(0.0..1.0);
+                        stack.push_value(rand)?;
+                    }
+                    BuiltinFunction::Srand => {
+                        let seed = stack.pop_scalar_value()?.scalar_as_f64();
+                        self.rand_seed = seed as u64;
+                        self.rng = SmallRng::seed_from_u64(self.rand_seed);
+                    }
                     other => {
                         fields_state = call_simple_builtin(other, argc, &mut stack, global_env)?
                     }
@@ -1527,6 +1534,8 @@ impl Interpreter {
             constants,
             write_files: WriteFiles::default(),
             read_files: ReadFiles::default(),
+            rand_seed: 0,
+            rng: SmallRng::seed_from_u64(0),
         }
     }
 }

@@ -305,6 +305,92 @@ impl Drop for WritePipes {
     }
 }
 
+pub struct PipeRecordReader {
+    pipe: *mut libc::FILE,
+    last_byte_read: Option<u8>,
+    is_done: bool,
+}
+
+impl PipeRecordReader {
+    pub fn open(command: &str) -> Result<Self, String> {
+        let command = CString::new(command).map_err(|e| e.to_string())?;
+        let file = unsafe {
+            let file = libc::popen(command.as_ptr(), "r\0".as_ptr() as *const i8);
+            if file.is_null() {
+                return Err("failed to open pipe".to_string());
+            }
+            file
+        };
+        Ok(Self {
+            pipe: file,
+            last_byte_read: None,
+            is_done: false,
+        })
+    }
+}
+
+impl Iterator for PipeRecordReader {
+    type Item = ReadResult;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let result = unsafe { libc::fgetc(self.pipe) };
+        if result == libc::EOF {
+            self.is_done = true;
+            None
+        } else {
+            self.last_byte_read = Some(result as u8);
+            Some(Ok(result as u8))
+        }
+    }
+}
+
+impl RecordReader for PipeRecordReader {
+    fn is_done(&self) -> bool {
+        self.is_done
+    }
+
+    fn last_byte_read(&self) -> Option<u8> {
+        self.last_byte_read
+    }
+}
+
+impl Drop for PipeRecordReader {
+    fn drop(&mut self) {
+        unsafe {
+            if libc::pclose(self.pipe) == -1 {
+                panic!("failed to close pipe");
+            };
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct ReadPipes {
+    pipes: HashMap<String, PipeRecordReader>,
+}
+
+impl ReadPipes {
+    pub fn read_next_record(
+        &mut self,
+        command: String,
+        separator: &RecordSeparator,
+    ) -> Result<Option<String>, String> {
+        match self.pipes.entry(command.clone()) {
+            Entry::Occupied(mut e) => e.get_mut().read_next_record(separator),
+            Entry::Vacant(e) => {
+                let mut reader = PipeRecordReader::open(&command)?;
+                let result = reader.read_next_record(separator);
+                e.insert(reader);
+                result
+            }
+        }
+    }
+
+    pub fn close_pipe(&mut self, command: &str) {
+        self.pipes.remove(command);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -9,7 +9,8 @@
 
 use array::{Array, KeyIterator};
 use io::{
-    EmptyRecordReader, FileStream, ReadFiles, RecordReader, RecordSeparator, WriteFiles, WritePipes,
+    EmptyRecordReader, FileStream, ReadFiles, ReadPipes, RecordReader, RecordSeparator, WriteFiles,
+    WritePipes,
 };
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -1023,6 +1024,7 @@ struct Interpreter {
     write_files: WriteFiles,
     read_files: ReadFiles,
     write_pipes: WritePipes,
+    read_pipes: ReadPipes,
     rand_seed: u64,
     rng: SmallRng,
 }
@@ -1359,6 +1361,7 @@ impl Interpreter {
                         self.write_files.close_file(&filename);
                         self.read_files.close_file(&filename);
                         self.write_pipes.close_pipe(&filename);
+                        self.read_pipes.close_pipe(&filename);
                     }
                     BuiltinFunction::GetLine => {
                         let var = stack.pop_ref();
@@ -1380,6 +1383,20 @@ impl Interpreter {
                         let var = stack.pop_ref();
                         if let Some(next_record) =
                             self.read_files.read_next_record(filename, &global_env.rs)?
+                        {
+                            fields_state = var.assign(next_record, global_env)?;
+                            stack.push_value(1.0)?;
+                        } else {
+                            stack.push_value(0.0)?;
+                        }
+                    }
+                    BuiltinFunction::GetLineFromPipe => {
+                        let command = stack
+                            .pop_scalar_value()?
+                            .scalar_to_string(&global_env.convfmt)?;
+                        let var = stack.pop_ref();
+                        if let Some(next_record) =
+                            self.read_pipes.read_next_record(command, &global_env.rs)?
                         {
                             fields_state = var.assign(next_record, global_env)?;
                             stack.push_value(1.0)?;
@@ -1559,6 +1576,7 @@ impl Interpreter {
             write_files: WriteFiles::default(),
             read_files: ReadFiles::default(),
             write_pipes: WritePipes::default(),
+            read_pipes: ReadPipes::default(),
             rand_seed: 0,
             rng: SmallRng::seed_from_u64(0),
         }

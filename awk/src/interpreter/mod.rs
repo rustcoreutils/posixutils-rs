@@ -27,6 +27,7 @@ use std::fmt::Write;
 use std::fs::File;
 use std::marker::PhantomData;
 use std::rc::Rc;
+use std::time::SystemTime;
 use std::{iter, u16};
 
 mod array;
@@ -1375,8 +1376,15 @@ impl Interpreter {
                         stack.push_value(rand)?;
                     }
                     BuiltinFunction::Srand => {
-                        let seed = stack.pop_scalar_value()?.scalar_as_f64();
-                        self.rand_seed = seed as u64;
+                        let seed = if argc == 1 {
+                            stack.pop_scalar_value()?.scalar_as_f64() as u64
+                        } else {
+                            SystemTime::now()
+                                .duration_since(SystemTime::UNIX_EPOCH)
+                                .expect("time went backwards")
+                                .as_secs()
+                        };
+                        self.rand_seed = seed;
                         self.rng = SmallRng::seed_from_u64(self.rand_seed);
                     }
                     other => {

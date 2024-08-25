@@ -89,7 +89,7 @@ impl Regex {
         let mut raw = unsafe { std::mem::zeroed::<libc::regex_t>() };
         let compilation_status =
             unsafe { libc::regcomp(ptr::from_mut(&mut raw), regex.as_ptr(), libc::REG_EXTENDED) };
-        regex_compilation_result(0, &raw)?;
+        regex_compilation_result(compilation_status, &raw)?;
         Ok(Self {
             raw_regex: raw,
             regex_string: regex,

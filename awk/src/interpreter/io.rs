@@ -284,7 +284,7 @@ impl WritePipes {
         Ok(())
     }
 
-    pub fn close_file(&mut self, filename: &str) {
+    pub fn close_pipe(&mut self, filename: &str) {
         if let Some(file) = self.pipes.remove(filename) {
             unsafe {
                 libc::pclose(file);

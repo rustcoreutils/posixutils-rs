@@ -1358,6 +1358,7 @@ impl Interpreter {
                             .scalar_to_string(&global_env.convfmt)?;
                         self.write_files.close_file(&filename);
                         self.read_files.close_file(&filename);
+                        self.write_pipes.close_pipe(&filename);
                     }
                     BuiltinFunction::GetLine => {
                         let var = stack.pop_ref();

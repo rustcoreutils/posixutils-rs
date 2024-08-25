@@ -8,7 +8,9 @@
 //
 
 use array::{Array, KeyIterator};
-use io::{EmptyRecordReader, FileStream, ReadFiles, RecordReader, RecordSeparator, WriteFiles};
+use io::{
+    EmptyRecordReader, FileStream, ReadFiles, RecordReader, RecordSeparator, WriteFiles, WritePipes,
+};
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 
@@ -1020,6 +1022,7 @@ struct Interpreter {
     constants: Vec<Constant>,
     write_files: WriteFiles,
     read_files: ReadFiles,
+    write_pipes: WritePipes,
     rand_seed: u64,
     rng: SmallRng,
 }
@@ -1337,6 +1340,18 @@ impl Interpreter {
                         );
                         self.write_files.write(&filename, &str, is_append)?;
                     }
+                    BuiltinFunction::RedirectedPrintPipe
+                    | BuiltinFunction::RedirectedPrintfPipe => {
+                        let command = stack
+                            .pop_scalar_value()?
+                            .scalar_to_string(&global_env.convfmt)?;
+                        let str = if function == BuiltinFunction::RedirectedPrintPipe {
+                            print_to_string(&mut stack, argc - 1, global_env)?
+                        } else {
+                            builtin_sprintf(&mut stack, argc - 1, global_env)?
+                        };
+                        self.write_pipes.write(command, str)?;
+                    }
                     BuiltinFunction::Close => {
                         let filename = stack
                             .pop_scalar_value()?
@@ -1542,6 +1557,7 @@ impl Interpreter {
             constants,
             write_files: WriteFiles::default(),
             read_files: ReadFiles::default(),
+            write_pipes: WritePipes::default(),
             rand_seed: 0,
             rng: SmallRng::seed_from_u64(0),
         }

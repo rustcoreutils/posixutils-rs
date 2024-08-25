@@ -7,10 +7,13 @@
 // SPDX-License-Identifier: MIT
 //
 
+use core::panic;
 use std::{
     collections::{hash_map::Entry, HashMap},
+    ffi::CString,
     fs::File,
     io::{BufReader, Bytes, Read, Write},
+    process::Child,
 };
 
 pub enum RecordSeparator {
@@ -248,6 +251,57 @@ impl ReadFiles {
 
     pub fn close_file(&mut self, filename: &str) {
         self.files.remove(filename);
+    }
+}
+
+#[derive(Default)]
+pub struct WritePipes {
+    pipes: HashMap<String, *mut libc::FILE>,
+}
+
+impl WritePipes {
+    pub fn write(&mut self, command: String, contents: String) -> Result<(), String> {
+        let contents = CString::new(contents).map_err(|e| e.to_string())?;
+        let file = match self.pipes.entry(command.clone()) {
+            Entry::Occupied(mut e) => *e.get(),
+            Entry::Vacant(e) => {
+                let command = CString::new(command).map_err(|_| "invalid string".to_string())?;
+                let file = unsafe {
+                    let file = libc::popen(command.as_ptr(), "w\0".as_ptr() as *const i8);
+                    if file.is_null() {
+                        return Err("failed to open pipe".to_string());
+                    }
+                    file
+                };
+                e.insert(file);
+                file
+            }
+        };
+        let result = unsafe { libc::fputs(contents.as_ptr() as *const i8, file) };
+        if result == libc::EOF {
+            return Err("failed to write to file".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn close_file(&mut self, filename: &str) {
+        if let Some(file) = self.pipes.remove(filename) {
+            unsafe {
+                libc::pclose(file);
+            }
+        }
+    }
+}
+
+impl Drop for WritePipes {
+    fn drop(&mut self) {
+        for (_, file) in self.pipes.drain() {
+            unsafe {
+                if libc::pclose(file) == -1 {
+                    panic!("failed to close pipe");
+                };
+            }
+        }
     }
 }
 

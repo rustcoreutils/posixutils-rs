@@ -9,8 +9,8 @@
 
 use array::{Array, KeyIterator};
 use io::{
-    EmptyRecordReader, FileStream, ReadFiles, ReadPipes, RecordReader, RecordSeparator, WriteFiles,
-    WritePipes,
+    EmptyRecordReader, FileStream, ReadFiles, ReadPipes, RecordReader, RecordSeparator,
+    StdinRecordReader, WriteFiles, WritePipes,
 };
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -1647,15 +1647,15 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
             .get_mut()
             .value = AwkValue::from(arg.clone()).value;
 
-        if arg == "-" {
-            todo!("read from stdin")
-        }
+        let reader: &mut dyn RecordReader = if arg == "-" {
+            &mut StdinRecordReader::default()
+        } else {
+            &mut FileStream::open(&arg)?
+        };
 
         // TODO: check if the arg is an assignment
-
-        let mut file = FileStream::open(&arg)?;
         global_env.fnr = 1;
-        while let Some(record) = file.read_next_record(&global_env.rs)? {
+        while let Some(record) = reader.read_next_record(&global_env.rs)? {
             current_record.reset(record, &global_env.fs)?;
             interpreter.globals[SpecialVar::Nf as usize].get_mut().value =
                 AwkValue::from(current_record.last_field as f64).value;
@@ -1676,7 +1676,7 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
                             &mut current_record,
                             &mut stack,
                             &mut global_env,
-                            &mut file,
+                            reader,
                         )?
                         .expr_to_bool(),
                     Pattern::Range { start, end } => {
@@ -1688,7 +1688,7 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
                                     &mut current_record,
                                     &mut stack,
                                     &mut global_env,
-                                    &mut file,
+                                    reader,
                                 )?
                                 .expr_to_bool();
                             range_pattern_started[i] = should_end;
@@ -1702,7 +1702,7 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
                                     &mut current_record,
                                     &mut stack,
                                     &mut global_env,
-                                    &mut file,
+                                    reader,
                                 )?
                                 .expr_to_bool();
                             range_pattern_started[i] = should_start;
@@ -1717,7 +1717,7 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
                         &mut current_record,
                         &mut stack,
                         &mut global_env,
-                        &mut file,
+                        reader,
                     )?;
                     match rule_result {
                         ExecutionResult::Next => break,

@@ -391,6 +391,41 @@ impl ReadPipes {
     }
 }
 
+#[derive(Default)]
+pub struct StdinRecordReader {
+    last_byte_read: Option<u8>,
+    is_done: bool,
+}
+
+impl Iterator for StdinRecordReader {
+    type Item = ReadResult;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let next = std::io::stdin().lock().bytes().next();
+        match next {
+            Some(Ok(byte)) => {
+                self.last_byte_read = Some(byte);
+                Some(Ok(byte))
+            }
+            Some(Err(e)) => Some(Err(e.to_string())),
+            None => {
+                self.is_done = true;
+                None
+            }
+        }
+    }
+}
+
+impl RecordReader for StdinRecordReader {
+    fn is_done(&self) -> bool {
+        self.is_done
+    }
+
+    fn last_byte_read(&self) -> Option<u8> {
+        self.last_byte_read
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

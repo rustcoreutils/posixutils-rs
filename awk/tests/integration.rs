@@ -441,3 +441,19 @@ fn test_awk_getline_into_var() {
 fn test_awk_getline_from_file() {
     test_awk!(getline_from_file, "tests/awk/test_data.txt");
 }
+
+#[test]
+fn test_awk_read_records_from_stdin() {
+    run_test(TestPlan {
+        cmd: String::from("awk"),
+        args: vec![
+            "-f".to_string(),
+            "tests/awk/read_records_from_stdin.awk".to_string(),
+            "-".to_string(),
+        ],
+        stdin_data: String::from(include_str!("awk/test_data.txt")),
+        expected_out: String::from(include_str!("awk/read_records_from_stdin.out")),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}

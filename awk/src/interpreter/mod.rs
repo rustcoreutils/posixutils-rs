@@ -384,11 +384,15 @@ fn call_simple_builtin(
         BuiltinFunction::Gsub | BuiltinFunction::Sub => {
             return builtin_gsub(stack, global_env, function == BuiltinFunction::Sub)
         }
-        BuiltinFunction::Close => {
-            todo!()
-        }
         BuiltinFunction::System => {
-            todo!()
+            let command = stack
+                .pop_scalar_value()?
+                .scalar_to_string(&global_env.convfmt)?;
+            let command = CString::new(command).map_err(|_| "invalid string".to_string())?;
+            let status = unsafe { libc::system(command.as_ptr()) };
+            if status == -1 {
+                return Err("system call failed".to_string());
+            }
         }
         BuiltinFunction::Print => {
             print!("{}", print_to_string(stack, argc, global_env)?);

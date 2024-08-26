@@ -14,17 +14,20 @@ use std::{
     fs::File,
     io::{BufReader, Bytes, Read, Write},
     process::Child,
+    rc::Rc,
 };
+
+use super::string::AwkString;
 
 pub enum RecordSeparator {
     Char(u8),
     Null,
 }
 
-impl TryFrom<String> for RecordSeparator {
+impl TryFrom<AwkString> for RecordSeparator {
     type Error = String;
 
-    fn try_from(value: String) -> Result<Self, Self::Error> {
+    fn try_from(value: AwkString) -> Result<Self, Self::Error> {
         let mut iter = value.bytes();
         let result = match iter.next() {
             Some(c) => RecordSeparator::Char(c),
@@ -229,15 +232,16 @@ impl WriteFiles {
 
 #[derive(Default)]
 pub struct ReadFiles {
-    files: HashMap<String, FileStream>,
+    files: HashMap<Rc<str>, FileStream>,
 }
 
 impl ReadFiles {
     pub fn read_next_record(
         &mut self,
-        filename: String,
+        filename: AwkString,
         separator: &RecordSeparator,
     ) -> Result<Option<String>, String> {
+        let filename = filename.into_shared();
         match self.files.entry(filename.clone()) {
             Entry::Occupied(mut e) => e.get_mut().read_next_record(separator),
             Entry::Vacant(e) => {
@@ -256,16 +260,16 @@ impl ReadFiles {
 
 #[derive(Default)]
 pub struct WritePipes {
-    pipes: HashMap<String, *mut libc::FILE>,
+    pipes: HashMap<Rc<str>, *mut libc::FILE>,
 }
 
 impl WritePipes {
-    pub fn write(&mut self, command: String, contents: String) -> Result<(), String> {
-        let contents = CString::new(contents).map_err(|e| e.to_string())?;
-        let file = match self.pipes.entry(command.clone()) {
+    pub fn write(&mut self, command: AwkString, contents: AwkString) -> Result<(), String> {
+        let key = command.clone().into_shared();
+        let file = match self.pipes.entry(key) {
             Entry::Occupied(mut e) => *e.get(),
             Entry::Vacant(e) => {
-                let command = CString::new(command).map_err(|_| "invalid string".to_string())?;
+                let command: CString = command.try_into()?;
                 let file = unsafe {
                     let file = libc::popen(command.as_ptr(), "w\0".as_ptr() as *const i8);
                     if file.is_null() {
@@ -277,6 +281,7 @@ impl WritePipes {
                 file
             }
         };
+        let contents: CString = contents.try_into()?;
         let result = unsafe { libc::fputs(contents.as_ptr() as *const i8, file) };
         if result == libc::EOF {
             return Err("failed to write to file".to_string());
@@ -366,15 +371,16 @@ impl Drop for PipeRecordReader {
 
 #[derive(Default)]
 pub struct ReadPipes {
-    pipes: HashMap<String, PipeRecordReader>,
+    pipes: HashMap<Rc<str>, PipeRecordReader>,
 }
 
 impl ReadPipes {
     pub fn read_next_record(
         &mut self,
-        command: String,
+        command: AwkString,
         separator: &RecordSeparator,
     ) -> Result<Option<String>, String> {
+        let command = command.into_shared();
         match self.pipes.entry(command.clone()) {
             Entry::Occupied(mut e) => e.get_mut().read_next_record(separator),
             Entry::Vacant(e) => {

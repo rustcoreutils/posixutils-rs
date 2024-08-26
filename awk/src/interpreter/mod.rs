@@ -14,6 +14,7 @@ use io::{
 };
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
+use string::AwkString;
 
 use crate::program::{BuiltinFunction, Constant, Function, OpCode, Pattern, Program, SpecialVar};
 use crate::regex::Regex;
@@ -36,6 +37,7 @@ use std::{iter, u16};
 mod array;
 mod format;
 mod io;
+mod string;
 
 const STACK_SIZE: usize = 2048;
 
@@ -64,7 +66,11 @@ fn gather_values(stack: &mut Stack, count: u16) -> Result<Vec<AwkValue>, String>
     Ok(values)
 }
 
-fn print_to_string(stack: &mut Stack, argc: u16, global_env: &GlobalEnv) -> Result<String, String> {
+fn print_to_string(
+    stack: &mut Stack,
+    argc: u16,
+    global_env: &GlobalEnv,
+) -> Result<AwkString, String> {
     let mut values = Vec::new();
     for _ in 0..argc {
         values.push(
@@ -81,7 +87,7 @@ fn print_to_string(stack: &mut Stack, argc: u16, global_env: &GlobalEnv) -> Resu
     // there has to be at least an element
     output.push_str(values.first().expect("called print without arguments"));
     output.push_str(&global_env.ors);
-    Ok(output)
+    Ok(output.into())
 }
 
 fn is_integer(num: f64) -> bool {
@@ -98,7 +104,7 @@ fn sprintf(
     format_string: &str,
     values: &mut [AwkValue],
     float_format: &str,
-) -> Result<String, String> {
+) -> Result<AwkString, String> {
     let mut result = String::with_capacity(format_string.len());
     let mut iter = format_string.chars();
     let mut next = iter.next();
@@ -158,7 +164,7 @@ fn sprintf(
                         result.push(value as char);
                     }
                     's' => {
-                        let value = value.scalar_to_string(float_format)?;
+                        let value = value.scalar_to_string(&float_format)?;
                         fmt_write_string(&mut result, &value, &args);
                     }
                     _ => return Err(format!("unsupported format specifier '{}'", specifier)),
@@ -171,14 +177,14 @@ fn sprintf(
             }
         }
     }
-    Ok(result)
+    Ok(result.into())
 }
 
 fn builtin_sprintf(
     stack: &mut Stack,
     argc: u16,
     global_env: &mut GlobalEnv,
-) -> Result<String, String> {
+) -> Result<AwkString, String> {
     let mut values = gather_values(stack, argc - 1)?;
     let format_string = stack
         .pop_scalar_value()?
@@ -192,7 +198,7 @@ fn builtin_match(stack: &mut Stack, global_env: &mut GlobalEnv) -> Result<(f64, 
         .pop_scalar_value()?
         .scalar_to_string(&global_env.convfmt)?;
     // TODO: should look into this unwrap
-    let mut locations = ere.match_locations(CString::new(string).unwrap());
+    let mut locations = ere.match_locations(string.try_into()?);
     let start;
     let len;
     if let Some(first_match) = locations.next() {
@@ -206,7 +212,7 @@ fn builtin_match(stack: &mut Stack, global_env: &mut GlobalEnv) -> Result<(f64, 
     Ok((start as f64, len as f64))
 }
 
-fn gsub(ere: &Regex, repl: &str, in_str: &str, only_replace_first: bool) -> (String, usize) {
+fn gsub(ere: &Regex, repl: &str, in_str: &str, only_replace_first: bool) -> (AwkString, usize) {
     let mut result = String::with_capacity(in_str.len());
     let mut last_match_end = 0;
 
@@ -252,7 +258,7 @@ fn gsub(ere: &Regex, repl: &str, in_str: &str, only_replace_first: bool) -> (Str
         }
     }
     result.push_str(&in_str[last_match_end..]);
-    (result, num_replacements)
+    (result.into(), num_replacements)
 }
 
 fn builtin_gsub(
@@ -269,7 +275,7 @@ fn builtin_gsub(
     let (result, count) = gsub(
         &ere,
         &repl,
-        &in_str.to_owned().scalar_to_string(&global_env.convfmt)?,
+        &in_str.share().scalar_to_string(&global_env.convfmt)?,
         is_sub,
     );
     let result = in_str.assign(result, global_env);
@@ -320,7 +326,11 @@ fn call_simple_builtin(
             let s = stack
                 .pop_scalar_value()?
                 .scalar_to_string(&global_env.convfmt)?;
-            let index = s.find(&t).map(|i| i as f64 + 1.0).unwrap_or(0.0);
+            let index = s
+                .as_str()
+                .find(t.as_str())
+                .map(|i| i as f64 + 1.0)
+                .unwrap_or(0.0);
             stack.push_value(index)?;
         }
         BuiltinFunction::Length => {
@@ -385,10 +395,10 @@ fn call_simple_builtin(
             return builtin_gsub(stack, global_env, function == BuiltinFunction::Sub)
         }
         BuiltinFunction::System => {
-            let command = stack
+            let command: CString = stack
                 .pop_scalar_value()?
-                .scalar_to_string(&global_env.convfmt)?;
-            let command = CString::new(command).map_err(|_| "invalid string".to_string())?;
+                .scalar_to_string(&global_env.convfmt)?
+                .try_into()?;
             let status = unsafe { libc::system(command.as_ptr()) };
             if status == -1 {
                 return Err("system call failed".to_string());
@@ -439,36 +449,35 @@ fn split_record<S: FnMut(usize, &str)>(
     }
 }
 
-impl TryFrom<String> for FieldSeparator {
+impl TryFrom<AwkString> for FieldSeparator {
     type Error = String;
 
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        if value == " " {
+    fn try_from(value: AwkString) -> Result<Self, Self::Error> {
+        if value.as_str() == " " {
             Ok(FieldSeparator::Default)
         } else if value.len() == 1 {
             Ok(FieldSeparator::Char(*value.as_bytes().first().unwrap()))
         } else {
-            let c_str = CString::new(value).map_err(|_| "invalid string".to_string())?;
-            let ere = Regex::new(c_str)?;
+            let ere = Regex::new(value.try_into()?)?;
             Ok(FieldSeparator::Ere(Rc::from(ere)))
         }
     }
 }
 
 struct GlobalEnv {
-    convfmt: String,
+    convfmt: AwkString,
     fs: FieldSeparator,
-    ofs: String,
-    ors: String,
-    ofmt: String,
+    ofs: AwkString,
+    ors: AwkString,
+    ofmt: AwkString,
     rs: RecordSeparator,
     nr: u32,
     fnr: u32,
 }
 
 impl GlobalEnv {
-    fn set(&mut self, var: SpecialVar, value: &AwkValue) -> Result<(), String> {
-        let as_string = |value: &AwkValue| value.to_owned().scalar_to_string(&self.convfmt);
+    fn set(&mut self, var: SpecialVar, value: &mut AwkValue) -> Result<(), String> {
+        let as_string = |value: &mut AwkValue| value.share().scalar_to_string(&self.convfmt);
         match var {
             SpecialVar::Convfmt => self.convfmt = as_string(value)?,
             SpecialVar::Fs => self.fs = as_string(value)?.try_into()?,
@@ -490,11 +499,11 @@ impl GlobalEnv {
 impl Default for GlobalEnv {
     fn default() -> Self {
         Self {
-            convfmt: String::from("%.6g"),
+            convfmt: AwkString::from("%.6g"),
             fs: FieldSeparator::Default,
-            ofs: String::from(" "),
-            ors: String::from("\n"),
-            ofmt: String::from("%.6g"),
+            ofs: AwkString::from(" "),
+            ors: AwkString::from("\n"),
+            ofmt: AwkString::from("%.6g"),
             rs: RecordSeparator::Char(b'\n'),
             nr: 1,
             fnr: 1,
@@ -556,7 +565,7 @@ impl Default for Record {
 #[derive(Debug, Clone, PartialEq)]
 enum AwkValueVariant {
     Number(f64),
-    String(String),
+    String(AwkString),
     Array(Array),
     Regex {
         ere: Rc<Regex>,
@@ -564,6 +573,15 @@ enum AwkValueVariant {
     },
     Uninitialized,
     UninitializedScalar,
+}
+
+impl AwkValueVariant {
+    fn share(&mut self) -> Self {
+        match self {
+            AwkValueVariant::String(value) => AwkValueVariant::String(value.share()),
+            other => other.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -585,7 +603,7 @@ impl AwkValue {
     fn scalar_as_f64(&self) -> f64 {
         match &self.value {
             AwkValueVariant::Number(x) => *x,
-            AwkValueVariant::String(s) => strtod(s),
+            AwkValueVariant::String(s) => strtod(s.as_str()),
             AwkValueVariant::UninitializedScalar => 0.0,
             AwkValueVariant::Regex { matches_record, .. } => bool_to_f64(*matches_record),
             AwkValueVariant::Array(_) | AwkValueVariant::Uninitialized => {
@@ -606,20 +624,20 @@ impl AwkValue {
         }
     }
 
-    fn scalar_to_string(self, num_fmt: &str) -> Result<String, String> {
+    fn scalar_to_string(self, num_fmt: &str) -> Result<AwkString, String> {
         match self.value {
             AwkValueVariant::Number(num) => {
                 if is_integer(num) {
-                    Ok((num as i64).to_string())
+                    Ok((num as i64).to_string().into())
                 } else {
-                    sprintf(num_fmt, &mut [num.into()], num_fmt)
+                    sprintf(num_fmt, &mut [num.into()], num_fmt).map(|s| s.into())
                 }
             }
             AwkValueVariant::String(s) => Ok(s),
             AwkValueVariant::Regex { matches_record, .. } => {
-                Ok(if matches_record { "1" } else { "0" }.to_string())
+                Ok(if matches_record { "1" } else { "0" }.into())
             }
-            AwkValueVariant::UninitializedScalar => Ok(String::new()),
+            AwkValueVariant::UninitializedScalar => Ok(AwkString::default()),
             AwkValueVariant::Array(_) | AwkValueVariant::Uninitialized => {
                 panic!("not a scalar")
             }
@@ -660,7 +678,7 @@ impl AwkValue {
         let rhs = rhs.into();
         self.value = rhs.value;
         match self.ref_type {
-            AwkRefType::SpecialGlobalVar(special_var) => global_env.set(special_var, &self)?,
+            AwkRefType::SpecialGlobalVar(special_var) => global_env.set(special_var, self)?,
             AwkRefType::Field(index) => {
                 return if index == 0 {
                     Ok(FieldsState::NeedToRecomputeFields)
@@ -686,9 +704,9 @@ impl AwkValue {
         }
     }
 
-    fn to_owned(&self) -> Self {
+    fn share(&mut self) -> Self {
         Self {
-            value: self.value.clone(),
+            value: self.value.share(),
             ref_type: AwkRefType::None,
         }
     }
@@ -703,13 +721,6 @@ impl AwkValue {
     fn uninitialized_scalar() -> Self {
         Self {
             value: AwkValueVariant::UninitializedScalar,
-            ref_type: AwkRefType::None,
-        }
-    }
-
-    fn numeric_string(s: String) -> Self {
-        Self {
-            value: AwkValueVariant::String(s),
             ref_type: AwkRefType::None,
         }
     }
@@ -745,8 +756,8 @@ impl From<f64> for AwkValue {
     }
 }
 
-impl From<String> for AwkValue {
-    fn from(value: String) -> Self {
+impl From<AwkString> for AwkValue {
+    fn from(value: AwkString) -> Self {
         let value = value.into();
         Self {
             value: AwkValueVariant::String(value),
@@ -755,9 +766,15 @@ impl From<String> for AwkValue {
     }
 }
 
+impl From<String> for AwkValue {
+    fn from(value: String) -> Self {
+        AwkString::from(value).into()
+    }
+}
+
 impl From<&str> for AwkValue {
     fn from(value: &str) -> Self {
-        value.to_string().into()
+        AwkString::from(value).into()
     }
 }
 
@@ -814,10 +831,10 @@ impl StackValue {
 
     /// # Safety
     /// if the `StackValue` is a `ValueRef` then the pointer has to point to a valid `AwkValue`
-    unsafe fn to_owned(self) -> AwkValue {
+    unsafe fn into_owned(self) -> AwkValue {
         match self {
             StackValue::Value(val) => val,
-            StackValue::ValueRef(ref_val) => (*ref_val).to_owned(),
+            StackValue::ValueRef(ref_val) => (*ref_val).share(),
             StackValue::UninitializedRef(_) => AwkValue::uninitialized_scalar(),
             _ => unreachable!("invalid stack value"),
         }
@@ -830,11 +847,11 @@ impl StackValue {
     }
 
     unsafe fn from_var(value: *mut AwkValue) -> Self {
-        let value_ref = &*value;
+        let value_ref = &mut *value;
         match value_ref.value {
             AwkValueVariant::Array(_) => StackValue::ValueRef(value),
             AwkValueVariant::Uninitialized => StackValue::UninitializedRef(value),
-            _ => StackValue::Value(value_ref.to_owned()),
+            _ => StackValue::Value(value_ref.share()),
         }
     }
 }
@@ -904,7 +921,7 @@ impl<'i, 's> Stack<'i, 's> {
         // safe by type invariance
         unsafe {
             value.ensure_value_is_scalar()?;
-            Ok(value.to_owned())
+            Ok(value.into_owned())
         }
     }
 
@@ -926,7 +943,7 @@ impl<'i, 's> Stack<'i, 's> {
         // safe by type invariance
         unsafe {
             let value = self.pop().unwrap();
-            value.to_owned()
+            value.into_owned()
         }
     }
 
@@ -1050,7 +1067,7 @@ macro_rules! compare_op {
                 $stack.push_value(bool_to_f64(lhs $op rhs))?;
             }
             (AwkValueVariant::String(lhs), AwkValueVariant::String(rhs)) => {
-                $stack.push_value(bool_to_f64(lhs $op rhs))?;
+                $stack.push_value(bool_to_f64(lhs.as_str() $op rhs.as_str()))?;
             }
             (AwkValueVariant::Number(lhs), AwkValueVariant::UninitializedScalar) => {
                 $stack.push_value(bool_to_f64(*lhs $op 0.0))?;
@@ -1059,7 +1076,7 @@ macro_rules! compare_op {
                 $stack.push_value(bool_to_f64(0.0 $op *rhs))?;
             }
             (_, _) => {
-                $stack.push_value(bool_to_f64(lhs.scalar_to_string($convfmt)? $op rhs.scalar_to_string($convfmt)?));
+                $stack.push_value(bool_to_f64(lhs.scalar_to_string($convfmt)?.as_str() $op rhs.scalar_to_string($convfmt)?.as_str()));
             }
         }
     };
@@ -1124,7 +1141,7 @@ impl Interpreter {
                         .pop_scalar_value()?
                         .scalar_to_string(&global_env.convfmt)?;
                     // FIXME: remove unwrap
-                    let result = ere.matches(&CString::new(string).unwrap());
+                    let result = ere.matches(&string.try_into()?);
                     stack.push_value(bool_to_f64(result))?;
                 }
                 OpCode::Concat => {
@@ -1134,7 +1151,7 @@ impl Interpreter {
                     let mut lhs = stack
                         .pop_scalar_value()?
                         .scalar_to_string(&global_env.convfmt)?;
-                    lhs.push_str(&rhs);
+                    lhs.concat(&rhs);
                     stack.push_value(lhs)?;
                 }
                 OpCode::In => {
@@ -1245,14 +1262,14 @@ impl Interpreter {
                         return Err("invalid field index".to_string());
                     }
                     let index = index as usize;
-                    unsafe { stack.push_value((*record.fields[index].get()).to_owned())? };
+                    unsafe { stack.push_value((*record.fields[index].get()).share())? };
                 }
                 OpCode::IndexArrayGetValue => {
                     let key = stack
                         .pop_scalar_value()?
                         .scalar_to_string(&global_env.convfmt)?;
                     let array = stack.pop_ref().as_array()?;
-                    let element = array.get_or_insert_uninitialized(key)?.to_owned();
+                    let element = array.get_or_insert_uninitialized(key.into())?.share();
                     stack.push_value(element)?
                 }
                 OpCode::GlobalScalarRef(index) => unsafe {
@@ -1276,7 +1293,8 @@ impl Interpreter {
                         .pop_scalar_value()?
                         .scalar_to_string(&global_env.convfmt)?;
                     let array = stack.pop_ref().as_array()?;
-                    let element_ref = array.get_or_insert_uninitialized(key)? as *mut AwkValue;
+                    let element_ref =
+                        array.get_or_insert_uninitialized(key.into())? as *mut AwkValue;
                     unsafe { stack.push_ref(element_ref)? };
                 }
                 OpCode::Assign => {
@@ -1430,7 +1448,7 @@ impl Interpreter {
                 },
                 OpCode::PushConstant(index) => match self.constants[index as usize].clone() {
                     Constant::Number(num) => stack.push_value(num)?,
-                    Constant::String(s) => stack.push_value(s)?,
+                    Constant::String(s) => stack.push_value(AwkString::from(s))?,
                     Constant::Regex(ere) => {
                         stack.push_value(AwkValue::from_ere(ere, &record.record))?
                     }
@@ -1491,8 +1509,7 @@ impl Interpreter {
                                 AwkValue::field_ref(s, field_index as u16)
                         };
                     });
-                    record.record =
-                        CString::new(record_str).map_err(|_| "invalid string".to_string())?;
+                    record.record = record_str.try_into()?;
                     let nf = unsafe { &mut *self.globals[SpecialVar::Nf as usize].get() };
                     nf.assign(record.last_field as f64, global_env)?;
                 }
@@ -1522,7 +1539,7 @@ impl Interpreter {
                         *record.fields[0].get() =
                             AwkValue::from(new_record.clone()).to_ref(AwkRefType::Field(0))
                     };
-                    record.record = CString::new(new_record).map_err(|_| "invalid string")?;
+                    record.record = AwkString::from(new_record).try_into()?;
                 }
             }
             fields_state = FieldsState::Ok;
@@ -1531,7 +1548,7 @@ impl Interpreter {
         Ok(ExecutionResult::Expression(
             stack
                 .pop()
-                .map(|sv| unsafe { sv.to_owned() })
+                .map(|sv| unsafe { sv.into_owned() })
                 .unwrap_or(AwkValue::uninitialized()),
         ))
     }
@@ -1637,9 +1654,9 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
             .get_mut()
             .as_array()
             .unwrap()
-            .get_or_insert_uninitialized(current_arg_index.to_string())
+            .get_or_insert_uninitialized(current_arg_index.to_string().into())
             .unwrap()
-            .to_owned()
+            .share()
             .scalar_to_string(&global_env.convfmt)?;
 
         if arg.is_empty() {
@@ -1651,7 +1668,7 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
             .get_mut()
             .value = AwkValue::from(arg.clone()).value;
 
-        let reader: &mut dyn RecordReader = if arg == "-" {
+        let reader: &mut dyn RecordReader = if arg.as_str() == "-" {
             &mut StdinRecordReader::default()
         } else {
             &mut FileStream::open(&arg)?
@@ -1890,7 +1907,7 @@ mod tests {
 
     fn test_sprintf(format: &str, args: Vec<Constant>) -> String {
         let mut instructions = vec![OpCode::PushConstant(0)];
-        let mut constants = vec![Constant::String(format.to_string())];
+        let mut constants = vec![Constant::from(format)];
         let argc = args.len() + 1;
         for (i, c) in args.into_iter().enumerate() {
             instructions.push(OpCode::PushConstant(i as u32 + 1));
@@ -1902,7 +1919,7 @@ mod tests {
         });
         let result = interpret_expr(instructions, constants);
         if let AwkValueVariant::String(s) = result.value {
-            s
+            s.to_string()
         } else {
             panic!("expected string, got {:?}", result);
         }
@@ -1917,7 +1934,7 @@ mod tests {
             AwkValue::from(1.0)
         );
 
-        let constant = vec![Constant::String("hello".to_string())];
+        let constant = vec![Constant::from("hello")];
         assert_eq!(
             interpret_expr(instructions, constant),
             AwkValue::from("hello".to_string())
@@ -2004,10 +2021,7 @@ mod tests {
             OpCode::PushConstant(1),
             OpCode::Concat,
         ];
-        let constant = vec![
-            Constant::String("hello".to_string()),
-            Constant::String("world".to_string()),
-        ];
+        let constant = vec![Constant::from("hello"), Constant::from("world")];
 
         assert_eq!(
             interpret_expr(instructions, constant),
@@ -2021,10 +2035,7 @@ mod tests {
         let constant = vec![Constant::Number(2.0), Constant::Number(3.0)];
         assert_eq!(interpret_expr(instructions, constant), AwkValue::from(1.0));
 
-        let constant = vec![
-            Constant::String("abcd".to_string()),
-            Constant::String("efgh".to_string()),
-        ];
+        let constant = vec![Constant::from("abcd"), Constant::from("efgh")];
         let instructions = vec![OpCode::PushConstant(0), OpCode::PushConstant(1), OpCode::Ge];
         assert_eq!(interpret_expr(instructions, constant), AwkValue::from(0.0));
     }
@@ -2032,10 +2043,10 @@ mod tests {
     #[test]
     fn test_compare_number_string() {
         let instructions = vec![OpCode::PushConstant(0), OpCode::PushConstant(1), OpCode::Le];
-        let constant = vec![Constant::Number(2.0), Constant::String("2.".to_string())];
+        let constant = vec![Constant::Number(2.0), Constant::from("2.")];
         assert_eq!(interpret_expr(instructions, constant), AwkValue::from(1.0));
 
-        let constant = vec![Constant::String("abcd".to_string()), Constant::Number(3.0)];
+        let constant = vec![Constant::from("abcd"), Constant::Number(3.0)];
         let instructions = vec![OpCode::PushConstant(0), OpCode::PushConstant(1), OpCode::Ge];
         assert_eq!(interpret_expr(instructions, constant), AwkValue::from(1.0));
     }
@@ -2058,7 +2069,7 @@ mod tests {
             OpCode::PushConstant(0),
             OpCode::In,
         ];
-        let constant = vec![Constant::String("key".to_string())];
+        let constant = vec![Constant::from("key")];
         assert_eq!(interpret_expr(instructions, constant), AwkValue::from(0.0));
 
         let instructions = vec![
@@ -2071,7 +2082,7 @@ mod tests {
             OpCode::PushConstant(0),
             OpCode::In,
         ];
-        let constant = vec![Constant::String("key".to_string())];
+        let constant = vec![Constant::from("key")];
         assert_eq!(interpret_expr(instructions, constant), AwkValue::from(1.0));
     }
 
@@ -2083,7 +2094,7 @@ mod tests {
             OpCode::PushConstant(0),
             OpCode::In,
         ];
-        let constant = vec![Constant::String("key".to_string())];
+        let constant = vec![Constant::from("key")];
         assert_eq!(interpret_expr(instructions, constant), AwkValue::from(0.0));
 
         let instructions = vec![
@@ -2098,7 +2109,7 @@ mod tests {
             OpCode::PushConstant(0),
             OpCode::In,
         ];
-        let constant = vec![Constant::String("key".to_string())];
+        let constant = vec![Constant::from("key")];
         assert_eq!(interpret_expr(instructions, constant), AwkValue::from(1.0));
     }
 
@@ -2163,7 +2174,7 @@ mod tests {
             OpCode::PushConstant(1),
             OpCode::Assign,
         ];
-        let constant = vec![Constant::String("key".to_string()), Constant::Number(123.0)];
+        let constant = vec![Constant::from("key"), Constant::Number(123.0)];
         assert_eq!(
             test_global(instructions, constant),
             Array::from_iter([("key", 123.0)]).into()
@@ -2182,7 +2193,7 @@ mod tests {
             OpCode::PushConstant(0),
             OpCode::Delete,
         ];
-        let constant = vec![Constant::String("key".to_string()), Constant::Number(123.0)];
+        let constant = vec![Constant::from("key"), Constant::Number(123.0)];
         assert_eq!(test_global(instructions, constant), Array::default().into());
     }
 
@@ -2200,7 +2211,7 @@ mod tests {
             OpCode::PushConstant(0),
             OpCode::Delete,
         ];
-        let constant = vec![Constant::String("key".to_string()), Constant::Number(123.0)];
+        let constant = vec![Constant::from("key"), Constant::Number(123.0)];
         assert_eq!(test_global(instructions, constant), Array::default().into());
     }
 
@@ -2211,7 +2222,7 @@ mod tests {
             OpCode::PushConstant(0),
             OpCode::Delete,
         ];
-        let constant = vec![Constant::String("key".to_string())];
+        let constant = vec![Constant::from("key")];
         assert_eq!(test_global(instructions, constant), Array::default().into());
     }
 
@@ -2223,10 +2234,7 @@ mod tests {
             OpCode::PushConstant(1),
             OpCode::Assign,
         ];
-        let constant = vec![
-            Constant::Number(0.0),
-            Constant::String("test string".to_string()),
-        ];
+        let constant = vec![Constant::Number(0.0), Constant::from("test string")];
         assert_eq!(
             interpret_expr(instructions, constant),
             AwkValue::from("test string".to_string())
@@ -2243,7 +2251,7 @@ mod tests {
             OpCode::PushConstant(1),
             OpCode::Assign,
         ];
-        let constant = vec![Constant::String("key".to_string()), Constant::Number(123.0)];
+        let constant = vec![Constant::from("key"), Constant::Number(123.0)];
         assert_eq!(
             test_global(instructions, constant),
             Array::from_iter([("key", 123.0)]).into()
@@ -2270,7 +2278,7 @@ mod tests {
             OpCode::PushConstant(2),
         ];
         let constant = vec![
-            Constant::String("".to_string()),
+            Constant::from(""),
             Constant::Number(1.0),
             Constant::Number(2.0),
         ];
@@ -2300,7 +2308,7 @@ mod tests {
             parameters_count: 0,
             instructions: vec![OpCode::PushConstant(0), OpCode::Return],
         }];
-        let constant = vec![Constant::String("test".to_string())];
+        let constant = vec![Constant::from("test")];
         assert_eq!(
             interpret_with_functions(main, constant, 0, functions),
             AwkValue::from("test".to_string())
@@ -2332,7 +2340,7 @@ mod tests {
                 OpCode::Return,
             ],
         }];
-        let constant = vec![Constant::String("key".to_string())];
+        let constant = vec![Constant::from("key")];
         assert_eq!(
             interpret_with_functions(main, constant, 1, functions),
             AwkValue::uninitialized_scalar()
@@ -2369,7 +2377,7 @@ mod tests {
                 OpCode::Assign,
             ],
         }];
-        let constants = vec![Constant::String("key".to_string())];
+        let constants = vec![Constant::from("key")];
         assert_eq!(
             interpret_with_functions(main, constants, 1, functions),
             AwkValue::from(1.0)
@@ -2447,19 +2455,13 @@ mod tests {
                 argc: 2,
             },
         ];
-        let constant = vec![
-            Constant::String("hello".to_string()),
-            Constant::String("l".to_string()),
-        ];
+        let constant = vec![Constant::from("hello"), Constant::from("l")];
         assert_eq!(
             interpret_expr(instructions.clone(), constant),
             AwkValue::from(3.0)
         );
 
-        let constant = vec![
-            Constant::String("hello".to_string()),
-            Constant::String("z".to_string()),
-        ];
+        let constant = vec![Constant::from("hello"), Constant::from("z")];
         assert_eq!(interpret_expr(instructions, constant), AwkValue::from(0.0));
     }
 
@@ -2472,7 +2474,7 @@ mod tests {
                 argc: 1,
             },
         ];
-        let constant = vec![Constant::String("hello".to_string())];
+        let constant = vec![Constant::from("hello")];
         assert_eq!(
             interpret_expr(instructions, constant.clone()),
             AwkValue::from(5.0)
@@ -2506,7 +2508,7 @@ mod tests {
             },
         ];
         let constant = vec![
-            Constant::String("hello".to_string()),
+            Constant::from("hello"),
             Constant::Number(2.0),
             Constant::Number(2.0),
         ];
@@ -2523,7 +2525,7 @@ mod tests {
                 argc: 2,
             },
         ];
-        let constant = vec![Constant::String("hello".to_string()), Constant::Number(3.0)];
+        let constant = vec![Constant::from("hello"), Constant::Number(3.0)];
         assert_eq!(
             interpret_expr(instructions, constant),
             AwkValue::from("llo".to_string())
@@ -2539,46 +2541,40 @@ mod tests {
     fn test_builtin_sprintf_with_string_args() {
         assert_eq!(test_sprintf("hello", vec![]), "hello");
         assert_eq!(
-            test_sprintf("hello %s", vec![Constant::String("world".to_string())]),
+            test_sprintf("hello %s", vec![Constant::from("world")]),
             "hello world"
         );
         assert_eq!(
             test_sprintf(
                 "%s:%s:%s",
                 vec![
-                    Constant::String("a".to_string()),
-                    Constant::String("b".to_string()),
-                    Constant::String("c".to_string())
+                    Constant::from("a"),
+                    Constant::from("b"),
+                    Constant::from("c")
                 ]
             ),
             "a:b:c"
         );
         assert_eq!(
-            test_sprintf("%10s", vec![Constant::String("test".to_string())]),
+            test_sprintf("%10s", vec![Constant::from("test")]),
             "      test"
         );
         assert_eq!(
-            test_sprintf("%-10s", vec![Constant::String("test".to_string())]),
+            test_sprintf("%-10s", vec![Constant::from("test")]),
             "test      "
         );
+        assert_eq!(test_sprintf("%.2s", vec![Constant::from("test")]), "te");
+        assert_eq!(test_sprintf("%.20s", vec![Constant::from("test")]), "test");
         assert_eq!(
-            test_sprintf("%.2s", vec![Constant::String("test".to_string())]),
-            "te"
-        );
-        assert_eq!(
-            test_sprintf("%.20s", vec![Constant::String("test".to_string())]),
-            "test"
-        );
-        assert_eq!(
-            test_sprintf("%10.2s", vec![Constant::String("test".to_string())]),
+            test_sprintf("%10.2s", vec![Constant::from("test")]),
             "        te"
         );
         assert_eq!(
-            test_sprintf("%-10.2s", vec![Constant::String("test".to_string())]),
+            test_sprintf("%-10.2s", vec![Constant::from("test")]),
             "te        "
         );
         assert_eq!(
-            test_sprintf("%10.20s", vec![Constant::String("test".to_string())]),
+            test_sprintf("%10.20s", vec![Constant::from("test")]),
             "      test"
         );
     }
@@ -2706,7 +2702,7 @@ mod tests {
             OpCode::Match,
         ];
         let constant = vec![
-            Constant::String("hello".to_string()),
+            Constant::from("hello"),
             Constant::Regex(Rc::new(
                 Regex::new(CString::new("e").unwrap()).expect("failed to compile regex"),
             )),
@@ -2725,7 +2721,7 @@ mod tests {
             },
         ];
         let constants = vec![
-            Constant::String("this is a test".to_string()),
+            Constant::from("this is a test"),
             Constant::Regex(Rc::new(regex_from_str("is* a"))),
         ];
         let result = Test::new(instructions, constants).run_correct();
@@ -2753,7 +2749,7 @@ mod tests {
             },
         ];
         let constants = vec![
-            Constant::String("a, b, c".to_string()),
+            Constant::from("a, b, c"),
             Constant::Regex(Rc::new(regex_from_str(","))),
         ];
 
@@ -2774,7 +2770,7 @@ mod tests {
                 argc: 2,
             },
         ];
-        let constants = vec![Constant::String("a b c".to_string())];
+        let constants = vec![Constant::from("a b c")];
 
         let global = test_global(instructions, constants);
         assert_eq!(
@@ -2798,9 +2794,9 @@ mod tests {
             },
         ];
         let constants = vec![
-            Constant::String("aaabbbabaabb".to_string()),
+            Constant::from("aaabbbabaabb"),
             Constant::Regex(Rc::from(regex_from_str("ab+"))),
-            Constant::String("x".to_string()),
+            Constant::from("x"),
         ];
 
         let global = test_global(instructions, constants);
@@ -2821,7 +2817,7 @@ mod tests {
         ];
         let constants = vec![
             Constant::Regex(Rc::from(regex_from_str("ab+"))),
-            Constant::String("x".to_string()),
+            Constant::from("x"),
         ];
         let mut record = Test::new(instructions, constants)
             .add_record("aaabbb ab aabb")
@@ -2851,9 +2847,9 @@ mod tests {
             },
         ];
         let constants = vec![
-            Constant::String("aaabbbabaabb".to_string()),
+            Constant::from("aaabbbabaabb"),
             Constant::Regex(Rc::from(regex_from_str("ab+"))),
-            Constant::String("x".to_string()),
+            Constant::from("x"),
         ];
 
         let global = test_global(instructions, constants);
@@ -2874,7 +2870,7 @@ mod tests {
         ];
         let constants = vec![
             Constant::Regex(Rc::from(regex_from_str("ab+"))),
-            Constant::String("x".to_string()),
+            Constant::from("x"),
         ];
         let mut record = Test::new(instructions, constants)
             .add_record("aaabbb ab aabb")
@@ -2941,10 +2937,10 @@ mod tests {
             OpCode::Jump(-1),
         ];
         let constants = vec![
-            Constant::String("value".to_string()),
-            Constant::String("key1".to_string()),
-            Constant::String("key2".to_string()),
-            Constant::String("key3".to_string()),
+            Constant::from("value"),
+            Constant::from("key1"),
+            Constant::from("key2"),
+            Constant::from("key3"),
         ];
         let result = Test::new(instructions, constants).run_correct();
         assert_eq!(
@@ -3008,10 +3004,10 @@ mod tests {
             OpCode::Jump(-1),
         ];
         let constants = vec![
-            Constant::String("value".to_string()),
-            Constant::String("key1".to_string()),
-            Constant::String("key2".to_string()),
-            Constant::String("key3".to_string()),
+            Constant::from("value"),
+            Constant::from("key1"),
+            Constant::from("key2"),
+            Constant::from("key3"),
         ];
         let result = Test::new(instructions, constants).run_correct();
         assert_eq!(
@@ -3030,7 +3026,7 @@ mod tests {
             .run_correct();
         let value = result.execution_result.unwrap_expr();
         assert_eq!(value.scalar_as_f64(), 1.0);
-        assert_eq!(value.scalar_to_string("").unwrap(), "1".to_string());
+        assert_eq!(value.scalar_to_string("").unwrap(), "1".to_string().into());
     }
 
     #[test]
@@ -3122,9 +3118,9 @@ mod tests {
             ],
         };
         let constants = vec![
-            Constant::String("key".to_string()),
-            Constant::String("value".to_string()),
-            Constant::String("new value".to_string()),
+            Constant::from("key"),
+            Constant::from("value"),
+            Constant::from("new value"),
         ];
         let result = Test::new(instructions, constants)
             .add_function(function)
@@ -3143,7 +3139,7 @@ mod tests {
             OpCode::PushConstant(0),
             OpCode::Assign,
         ];
-        let constants = vec![Constant::String("test".to_string())];
+        let constants = vec![Constant::from("test")];
 
         let mut record = Test::new(instructions, constants)
             .add_record("a b")
@@ -3165,7 +3161,7 @@ mod tests {
             OpCode::PushConstant(0),
             OpCode::Assign,
         ];
-        let constants = vec![Constant::String("test".to_string())];
+        let constants = vec![Constant::from("test")];
 
         let mut result = Test::new(instructions, constants)
             .add_record("a b")

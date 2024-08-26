@@ -111,19 +111,13 @@ pub enum OpCode {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Constant {
     Number(f64),
-    String(String),
+    String(Rc<str>),
     Regex(Rc<Regex>),
-}
-
-impl From<String> for Constant {
-    fn from(value: String) -> Self {
-        Self::String(value)
-    }
 }
 
 impl From<&str> for Constant {
     fn from(value: &str) -> Self {
-        value.to_string().into()
+        Constant::String(Rc::from(value))
     }
 }
 

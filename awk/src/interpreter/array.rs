@@ -71,8 +71,7 @@ impl Array {
         None
     }
 
-    pub fn get_or_insert_uninitialized(&mut self, key: String) -> Result<&mut AwkValue, String> {
-        let key = Rc::<str>::from(key);
+    pub fn get_or_insert_uninitialized(&mut self, key: Rc<str>) -> Result<&mut AwkValue, String> {
         match self.values.entry(key.clone()) {
             Entry::Occupied(e) => Ok(&mut e.into_mut().value),
             Entry::Vacant(e) => {
@@ -187,7 +186,7 @@ mod tests {
         array.delete("a");
         assert_eq!(array.len(), 0);
         assert_eq!(
-            array.get_or_insert_uninitialized("a".to_string()).cloned(),
+            array.get_or_insert_uninitialized("a".into()).cloned(),
             Ok(AwkValue::uninitialized_scalar())
         );
     }
@@ -198,7 +197,7 @@ mod tests {
         array.set("a".to_string(), 1.0).unwrap();
         assert_eq!(array.len(), 1);
         assert_eq!(
-            array.get_or_insert_uninitialized("a".to_string()).cloned(),
+            array.get_or_insert_uninitialized("a".into()).cloned(),
             Ok(AwkValue::from(1.0))
         );
     }
@@ -210,7 +209,7 @@ mod tests {
         array.set("a".to_string(), 2.0).unwrap();
         assert_eq!(array.len(), 1);
         assert_eq!(
-            array.get_or_insert_uninitialized("a".to_string()).cloned(),
+            array.get_or_insert_uninitialized("a".into()).cloned(),
             Ok(AwkValue::from(2.0))
         );
     }
@@ -247,7 +246,7 @@ mod tests {
         assert!(array.set("e".to_string(), 2.0).is_ok());
         assert_eq!(array.len(), 2);
         assert_eq!(
-            array.get_or_insert_uninitialized("e".to_string()).cloned(),
+            array.get_or_insert_uninitialized("e".into()).cloned(),
             Ok(AwkValue::from(2.0))
         );
     }

@@ -236,7 +236,7 @@ fn parse_escape_sequence(iter: &mut Chars) -> Result<(char, Option<char>), Strin
     Ok((escaped_char, char_after_escape_sequence))
 }
 
-fn escape_string(s: &str) -> Result<String, String> {
+fn escape_string(s: &str) -> Result<Rc<str>, String> {
     let mut result = String::new();
     let s = s.trim_matches('"');
     let mut chars = s.chars();
@@ -252,7 +252,7 @@ fn escape_string(s: &str) -> Result<String, String> {
             other => result.push(other),
         }
     }
-    Ok(result)
+    Ok(result.into())
 }
 
 fn post_increment(val: &Cell<u32>) -> u32 {
@@ -1658,43 +1658,31 @@ mod test {
     #[test]
     fn test_compile_string() {
         let (_, constants) = compile_expr(r#""hello""#);
-        assert_eq!(constants, vec![Constant::String("hello".to_string())]);
+        assert_eq!(constants, vec!["hello".into()]);
 
         let (_, constants) = compile_expr(r#""hello\nworld""#);
-        assert_eq!(
-            constants,
-            vec![Constant::String("hello\nworld".to_string())]
-        );
+        assert_eq!(constants, vec![Constant::from("hello\nworld")]);
 
         let (_, constants) = compile_expr(r#""hello\tworld""#);
-        assert_eq!(
-            constants,
-            vec![Constant::String("hello\tworld".to_string())]
-        );
+        assert_eq!(constants, vec!["hello\tworld".into()]);
 
         let (_, constants) = compile_expr(r#""hello\\world""#);
-        assert_eq!(
-            constants,
-            vec![Constant::String("hello\\world".to_string())]
-        );
+        assert_eq!(constants, vec![Constant::from("hello\\world")]);
 
         let (_, constants) = compile_expr(r#""hello\"world""#);
         assert_eq!(
             constants,
-            vec![Constant::String(r#"hello"world"#.to_string())]
+            vec![Constant::from(r#"hello"world"#)]
         );
 
         let (_, constants) = compile_expr(r#""hello\0world""#);
-        assert_eq!(
-            constants,
-            vec![Constant::String("hello\x00world".to_string())]
-        );
+        assert_eq!(constants, vec![Constant::from("hello\x00world")]);
 
         let (_, constants) = compile_expr(r#""hello\41world""#);
-        assert_eq!(constants, vec![Constant::String("hello!world".to_string())]);
+        assert_eq!(constants, vec![Constant::from("hello!world")]);
 
         let (_, constants) = compile_expr(r#""hello\141world""#);
-        assert_eq!(constants, vec![Constant::String("helloaworld".to_string())]);
+        assert_eq!(constants, vec![Constant::from("helloaworld")]);
     }
 
     #[test]
@@ -1967,10 +1955,7 @@ mod test {
         );
         assert_eq!(
             constants,
-            vec![
-                Constant::String("hello".to_string()),
-                Constant::String("world".to_string()),
-            ]
+            vec![Constant::from("hello"), Constant::from("world"),]
         );
 
         let (instructions, constants) = compile_expr(r#""hello" 1 "world""#);
@@ -1987,9 +1972,9 @@ mod test {
         assert_eq!(
             constants,
             vec![
-                Constant::String("hello".to_string()),
+                Constant::from("hello"),
                 Constant::Number(1.0),
-                Constant::String("world".to_string()),
+                Constant::from("world"),
             ]
         );
 
@@ -2004,7 +1989,7 @@ mod test {
         );
         assert_eq!(
             constants,
-            vec![Constant::String("hello".to_string()), Constant::Number(1.0)]
+            vec![Constant::from("hello"), Constant::Number(1.0)]
         );
 
         let (instructions, constants) = compile_expr(r#"1"hello""#);
@@ -2018,7 +2003,7 @@ mod test {
         );
         assert_eq!(
             constants,
-            vec![Constant::Number(1.0), Constant::String("hello".to_string())]
+            vec![Constant::Number(1.0), Constant::from("hello")]
         );
     }
 
@@ -2029,10 +2014,7 @@ mod test {
             instructions,
             vec![OpCode::PushConstant(0), OpCode::PushConstant(1), OpCode::Lt]
         );
-        assert_eq!(
-            constants,
-            vec![Constant::Number(1.0), Constant::String("x".to_string())]
-        );
+        assert_eq!(constants, vec![Constant::Number(1.0), Constant::from("x")]);
 
         let (instructions, constants) = compile_expr("1 > 2");
         assert_eq!(
@@ -2061,7 +2043,7 @@ mod test {
         );
         assert_eq!(
             constants,
-            vec![Constant::String("str".to_string()), Constant::Number(2.0)]
+            vec![Constant::from("str"), Constant::Number(2.0)]
         );
 
         let (instructions, constants) = compile_expr("1 == 2");
@@ -2096,7 +2078,7 @@ mod test {
                 OpCode::In
             ]
         );
-        assert_eq!(constants, vec![Constant::String("a".to_string())]);
+        assert_eq!(constants, vec![Constant::from("a")]);
     }
 
     #[test]
@@ -2140,7 +2122,7 @@ mod test {
             constants,
             vec![
                 Constant::Number(1.0),
-                Constant::String("str".to_string()),
+                Constant::from("str"),
                 Constant::Number(3.0)
             ]
         );
@@ -2160,7 +2142,7 @@ mod test {
         assert_eq!(
             constants,
             vec![
-                Constant::String("hello".to_string()),
+                Constant::from("hello"),
                 Constant::Regex(Rc::new(regex_from_str("hello")))
             ]
         )
@@ -2181,7 +2163,7 @@ mod test {
         assert_eq!(
             constants,
             vec![
-                Constant::String("test".to_string()),
+                Constant::from("test"),
                 Constant::Regex(Rc::new(regex_from_str("te?s+t*")))
             ]
         )
@@ -2225,8 +2207,8 @@ mod test {
             vec![
                 Constant::Number(1.0),
                 Constant::Number(2.0),
-                Constant::String("x".to_string()),
-                Constant::String("y".to_string()),
+                Constant::from("x"),
+                Constant::from("y"),
             ]
         );
     }
@@ -2269,8 +2251,8 @@ mod test {
             vec![
                 Constant::Number(1.0),
                 Constant::Number(2.0),
-                Constant::String("x".to_string()),
-                Constant::String("y".to_string()),
+                Constant::from("x"),
+                Constant::from("y"),
             ]
         );
     }
@@ -2320,10 +2302,10 @@ mod test {
             constants,
             vec![
                 Constant::Number(1.0),
-                Constant::String("one".to_string()),
+                Constant::from("one"),
                 Constant::Number(2.0),
-                Constant::String("two".to_string()),
-                Constant::String("many".to_string()),
+                Constant::from("two"),
+                Constant::from("many"),
             ]
         );
     }
@@ -2514,7 +2496,7 @@ mod test {
             vec![
                 Constant::Number(1.0),
                 Constant::Number(2.0),
-                Constant::String("test".to_string())
+                Constant::from("test")
             ]
         );
     }
@@ -2823,10 +2805,10 @@ mod test {
         assert_eq!(
             constant,
             vec![
-                Constant::String("number".to_string()),
+                Constant::from("number"),
                 Constant::Number(1.0),
                 Constant::Number(2.0),
-                Constant::String("and".to_string()),
+                Constant::from("and"),
                 Constant::Number(3.0),
             ]
         );
@@ -2845,7 +2827,7 @@ mod test {
                 },
             ]
         );
-        assert_eq!(constant, vec![Constant::String("hello".to_string())]);
+        assert_eq!(constant, vec![Constant::from("hello")]);
 
         let (instructions, constants) = compile_stmt(r#"print ("hello", 1, 2, "and", 3);"#);
         assert_eq!(
@@ -2865,10 +2847,10 @@ mod test {
         assert_eq!(
             constants,
             vec![
-                Constant::String("hello".to_string()),
+                Constant::from("hello"),
                 Constant::Number(1.0),
                 Constant::Number(2.0),
-                Constant::String("and".to_string()),
+                Constant::from("and"),
                 Constant::Number(3.0),
             ]
         );
@@ -2890,7 +2872,7 @@ mod test {
         );
         assert_eq!(
             constant,
-            vec![Constant::Number(1.0), Constant::String("file".to_string()),]
+            vec![Constant::Number(1.0), Constant::from("file"),]
         );
 
         let (instructions, constant) = compile_stmt("print 1 >> \"file\";");
@@ -2907,7 +2889,7 @@ mod test {
         );
         assert_eq!(
             constant,
-            vec![Constant::Number(1.0), Constant::String("file".to_string()),]
+            vec![Constant::Number(1.0), Constant::from("file"),]
         );
 
         let (instructions, constant) = compile_stmt(r#"print 1 | "bash";"#);
@@ -2924,7 +2906,7 @@ mod test {
         );
         assert_eq!(
             constant,
-            vec![Constant::Number(1.0), Constant::String("bash".to_string()),]
+            vec![Constant::Number(1.0), Constant::from("bash"),]
         );
     }
 
@@ -2941,7 +2923,7 @@ mod test {
                 },
             ]
         );
-        assert_eq!(constant, vec![Constant::String("test".to_string()),]);
+        assert_eq!(constant, vec![Constant::from("test"),]);
 
         let (instructions, constant) =
             compile_stmt(r#"printf "%d, %d, %s, %.6f", 1, 2, "and", 3;"#);
@@ -2962,10 +2944,10 @@ mod test {
         assert_eq!(
             constant,
             vec![
-                Constant::String("%d, %d, %s, %.6f".to_string()),
+                Constant::from("%d, %d, %s, %.6f"),
                 Constant::Number(1.0),
                 Constant::Number(2.0),
-                Constant::String("and".to_string()),
+                Constant::from("and"),
                 Constant::Number(3.0),
             ]
         );
@@ -2984,7 +2966,7 @@ mod test {
                 },
             ]
         );
-        assert_eq!(constant, vec![Constant::String("hello".to_string())]);
+        assert_eq!(constant, vec![Constant::from("hello")]);
 
         let (instructions, constants) =
             compile_stmt(r#"printf ("%g, %x, %s, %.6f", 1, 2, "and", 3);"#);
@@ -3005,10 +2987,10 @@ mod test {
         assert_eq!(
             constants,
             vec![
-                Constant::String("%g, %x, %s, %.6f".to_string()),
+                Constant::from("%g, %x, %s, %.6f"),
                 Constant::Number(1.0),
                 Constant::Number(2.0),
-                Constant::String("and".to_string()),
+                Constant::from("and"),
                 Constant::Number(3.0),
             ]
         );
@@ -3030,10 +3012,7 @@ mod test {
         );
         assert_eq!(
             constant,
-            vec![
-                Constant::String("test".to_string()),
-                Constant::String("file".to_string()),
-            ]
+            vec![Constant::from("test"), Constant::from("file"),]
         );
 
         let (instructions, constant) = compile_stmt("printf \"test\" >> \"file\";");
@@ -3050,10 +3029,7 @@ mod test {
         );
         assert_eq!(
             constant,
-            vec![
-                Constant::String("test".to_string()),
-                Constant::String("file".to_string()),
-            ]
+            vec![Constant::from("test"), Constant::from("file"),]
         );
 
         let (instructions, constant) = compile_stmt(r#"printf "test" | "bash";"#);
@@ -3070,10 +3046,7 @@ mod test {
         );
         assert_eq!(
             constant,
-            vec![
-                Constant::String("test".to_string()),
-                Constant::String("bash".to_string()),
-            ]
+            vec![Constant::from("test"), Constant::from("bash"),]
         );
     }
 

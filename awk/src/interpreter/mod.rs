@@ -50,7 +50,7 @@ fn bool_to_f64(p: bool) -> f64 {
 }
 
 fn strtod(s: &str) -> f64 {
-    lexical::parse_partial_with_options::<f64, _, { lexical::format::C_LITERAL }>(
+    lexical::parse_partial_with_options::<f64, _, { lexical::format::C_STRING }>(
         s,
         &lexical::ParseFloatOptions::default(),
     )

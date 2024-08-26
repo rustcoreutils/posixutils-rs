@@ -1479,7 +1479,7 @@ impl Interpreter {
                 FieldsState::NeedToRecomputeFields => {
                     record.last_field = 0;
                     let record_str = unsafe {
-                        (*record.fields[0].get_mut())
+                        (*record.fields[0].get())
                             .to_owned()
                             .scalar_to_string(&global_env.convfmt)?
                     };

@@ -524,11 +524,6 @@ struct Record {
 }
 
 impl Record {
-    fn from_string(record: String, field_separator: &FieldSeparator) -> Result<Self, String> {
-        let mut r = Self::default();
-        r.reset(record, field_separator).map(|_| r)
-    }
-
     fn reset(&mut self, record: String, field_separator: &FieldSeparator) -> Result<(), String> {
         let previous_last_field = self.last_field;
         self.last_field = 0;

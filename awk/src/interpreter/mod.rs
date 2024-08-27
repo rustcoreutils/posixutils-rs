@@ -23,7 +23,8 @@ use format::{
     fmt_write_scientific_float, fmt_write_signed, fmt_write_string, fmt_write_unsigned,
     parse_conversion_specifier_args, IntegerFormat,
 };
-use std::cell::UnsafeCell;
+use std::borrow::BorrowMut;
+use std::cell::{RefCell, UnsafeCell};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -518,28 +519,81 @@ enum FieldsState {
 }
 
 struct Record {
-    record: CString,
+    record: RefCell<CString>,
     fields: Vec<AwkValueRef>,
-    last_field: usize,
+    last_field: RefCell<usize>,
 }
 
 impl Record {
     fn reset(&mut self, record: String, field_separator: &FieldSeparator) -> Result<(), String> {
-        let previous_last_field = self.last_field;
-        self.last_field = 0;
+        let previous_last_field = *self.last_field.get_mut();
+        let mut last_field = 0;
         split_record(&record, field_separator, |i, s| {
             let field_index = i + 1;
-            self.last_field += 1;
+            last_field += 1;
             *self.fields[field_index].get_mut() = AwkValue::field_ref(s, field_index as u16);
         });
-        *self.fields[0].get_mut() = AwkValue::field_ref(record.clone(), 0);
-        self.record = CString::new(record).map_err(|_| "invalid string".to_string())?;
-        if self.last_field < previous_last_field {
-            for field in &mut self.fields[self.last_field..=previous_last_field] {
+        if last_field < previous_last_field {
+            for field in &mut self.fields[last_field..=previous_last_field] {
                 field.get_mut().value = AwkValueVariant::UninitializedScalar;
             }
         }
+        *self.fields[0].get_mut() = AwkValue::field_ref(record.clone(), 0);
+        *self.record.get_mut() = CString::new(record).map_err(|_| "invalid string".to_string())?;
+        *self.last_field.get_mut() = last_field;
         Ok(())
+    }
+
+    /// # Safety
+    /// The caller has to ensure that there are no active references to the fields
+    unsafe fn recompute_record(
+        &self,
+        global_env: &GlobalEnv,
+        changed_field: usize,
+    ) -> Result<(), String> {
+        let last_field = self.last_field.borrow().max(changed_field);
+        let mut new_record = String::new();
+        for field in self.fields.iter().skip(1).take(last_field - 1) {
+            let field_str = (*field.get())
+                .clone()
+                .scalar_to_string(&global_env.convfmt)?;
+            write!(new_record, "{}{}", field_str, &global_env.ofs)
+                .expect("error writing to string");
+        }
+        let last_field_str = (*self.fields[last_field].get())
+            .clone()
+            .scalar_to_string(&global_env.convfmt)?;
+        write!(new_record, "{}", last_field_str).expect("error writing to string");
+        let mut record_str = AwkString::from(new_record);
+        *self.fields[0].get() =
+            AwkValue::field_ref(AwkString::numeric_string(record_str.share()), 0);
+        *self.record.borrow_mut() = record_str.try_into()?;
+        *self.last_field.borrow_mut() = last_field;
+        Ok(())
+    }
+
+    /// # Safety
+    /// The caller has to ensure that there are no active references to the fields
+    unsafe fn recompute_fields(&self, global_env: &GlobalEnv) -> Result<(), String> {
+        let mut last_field = 0;
+        let mut record_str = (*self.fields[0].get())
+            .to_owned()
+            .scalar_to_string(&global_env.convfmt)?;
+        split_record(&record_str, &global_env.fs, |i, s| {
+            let field_index = i + 1;
+            last_field += 1;
+            *self.fields[field_index].get() =
+                AwkValue::field_ref(AwkString::numeric_string(s), field_index as u16);
+        });
+        *self.fields[0].get() =
+            AwkValue::field_ref(AwkString::numeric_string(record_str.share()), 0);
+        *self.record.borrow_mut() = record_str.try_into()?;
+        *self.last_field.borrow_mut() = last_field;
+        Ok(())
+    }
+
+    fn get_last_field(&self) -> usize {
+        *self.last_field.borrow()
     }
 }
 
@@ -549,10 +603,10 @@ impl Default for Record {
             .map(|i| AwkValueRef::new(AwkValue::field_ref(AwkValue::uninitialized_scalar(), i)))
             .collect();
         Self {
-            record: CString::default(),
+            record: CString::default().into(),
             // TODO: fix magic number
             fields,
-            last_field: 0,
+            last_field: 0.into(),
         }
     }
 }
@@ -1445,7 +1499,7 @@ impl Interpreter {
                     Constant::Number(num) => stack.push_value(num)?,
                     Constant::String(s) => stack.push_value(AwkString::from(s))?,
                     Constant::Regex(ere) => {
-                        stack.push_value(AwkValue::from_ere(ere, &record.record))?
+                        stack.push_value(AwkValue::from_ere(ere, &record.record.borrow()))?
                     }
                 },
                 OpCode::PushOne => {
@@ -1490,51 +1544,16 @@ impl Interpreter {
                     // no need to recompute anything
                 }
                 FieldsState::NeedToRecomputeFields => {
-                    record.last_field = 0;
-                    let record_str = unsafe {
-                        (*record.fields[0].get())
-                            .to_owned()
-                            .scalar_to_string(&global_env.convfmt)?
-                    };
-                    split_record(&record_str, &global_env.fs, |i, s| {
-                        let field_index = i + 1;
-                        record.last_field += 1;
-                        unsafe {
-                            *record.fields[field_index].get() =
-                                AwkValue::field_ref(s, field_index as u16)
-                        };
-                    });
-                    record.record = record_str.try_into()?;
+                    unsafe { record.recompute_fields(global_env)? };
                     let nf = unsafe { &mut *self.globals[SpecialVar::Nf as usize].get() };
-                    nf.assign(record.last_field as f64, global_env)?;
+                    nf.assign(record.get_last_field() as f64, global_env)?;
                 }
                 FieldsState::NeedToRecomputeRecord { changed_field } => {
-                    record.last_field = record.last_field.max(changed_field);
+                    unsafe { record.recompute_record(global_env, changed_field)? };
                     unsafe {
                         *self.globals[SpecialVar::Nf as usize].get() =
-                            AwkValue::from(record.last_field as f64);
+                            AwkValue::from(record.get_last_field() as f64);
                     }
-                    let mut new_record = String::new();
-                    for field in record.fields.iter().skip(1).take(record.last_field - 1) {
-                        let field_str = unsafe {
-                            (*field.get())
-                                .clone()
-                                .scalar_to_string(&global_env.convfmt)?
-                        };
-                        write!(new_record, "{}{}", field_str, &global_env.ofs)
-                            .expect("error writing to string");
-                    }
-                    let last_field_str = unsafe {
-                        (*record.fields[record.last_field].get())
-                            .clone()
-                            .scalar_to_string(&global_env.convfmt)?
-                    };
-                    write!(new_record, "{}", last_field_str).expect("error writing to string");
-                    unsafe {
-                        *record.fields[0].get() =
-                            AwkValue::from(new_record.clone()).to_ref(AwkRefType::Field(0))
-                    };
-                    record.record = AwkString::from(new_record).try_into()?;
                 }
             }
             fields_state = FieldsState::Ok;
@@ -1674,7 +1693,7 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
         while let Some(record) = reader.read_next_record(&global_env.rs)? {
             current_record.reset(record, &global_env.fs)?;
             interpreter.globals[SpecialVar::Nf as usize].get_mut().value =
-                AwkValue::from(current_record.last_field as f64).value;
+                AwkValue::from(current_record.get_last_field() as f64).value;
 
             interpreter.globals[SpecialVar::Fnr as usize]
                 .get_mut()
@@ -3169,7 +3188,7 @@ mod tests {
         let mut result = Test::new(instructions, constants)
             .add_record("a b")
             .run_correct();
-        assert_eq!(result.record.last_field, 1);
+        assert_eq!(*result.record.last_field.get_mut(), 1);
         assert_eq!(
             *result.record.fields[0].get_mut(),
             AwkValue::field_ref("test", 0)

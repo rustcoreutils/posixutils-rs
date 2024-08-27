@@ -236,9 +236,8 @@ fn parse_escape_sequence(iter: &mut Chars) -> Result<(char, Option<char>), Strin
     Ok((escaped_char, char_after_escape_sequence))
 }
 
-fn escape_string(s: &str) -> Result<Rc<str>, String> {
+pub fn escape_string_contents(s: &str) -> Result<Rc<str>, String> {
     let mut result = String::new();
-    let s = s.trim_matches('"');
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
         match c {
@@ -519,7 +518,7 @@ impl Compiler {
             }
             Rule::string => {
                 let index = self.push_constant(Constant::String(
-                    escape_string(primary.as_str())
+                    escape_string_contents(primary.as_str().trim_matches('"'))
                         .map_err(|e| pest_error_from_span(primary.as_span(), e))?,
                 ));
                 Ok(Expr::new(
@@ -1538,6 +1537,16 @@ pub fn compile_program(text: &str) -> Result<Program, PestError> {
         }
     }
 
+    let globals = compiler
+        .names
+        .into_inner()
+        .into_iter()
+        .filter_map(|(k, v)| match v {
+            GlobalName::Variable(id) => Some((k, id)),
+            _ => None,
+        })
+        .collect();
+
     Ok(Program {
         constants: compiler.constants.into_inner(),
         begin_instructions,
@@ -1545,6 +1554,7 @@ pub fn compile_program(text: &str) -> Result<Program, PestError> {
         end_instructions,
         functions,
         globals_count: compiler.last_global_var_id.get() as usize,
+        globals,
     })
 }
 

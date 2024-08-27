@@ -9,7 +9,7 @@
 
 use crate::regex::Regex;
 use core::fmt;
-use std::rc::Rc;
+use std::{collections::HashMap, rc::Rc};
 
 pub type VarId = u32;
 
@@ -158,7 +158,7 @@ pub struct Function {
 pub struct Program {
     pub constants: Vec<Constant>,
     pub globals_count: usize,
-
+    pub globals: HashMap<String, u32>,
     pub begin_instructions: Vec<OpCode>,
     pub rules: Vec<AwkRule>,
     pub end_instructions: Vec<OpCode>,

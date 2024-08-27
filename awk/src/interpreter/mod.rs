@@ -16,6 +16,7 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use string::AwkString;
 
+use crate::compiler::escape_string_contents;
 use crate::program::{BuiltinFunction, Constant, Function, OpCode, Pattern, Program, SpecialVar};
 use crate::regex::Regex;
 use format::{
@@ -24,6 +25,7 @@ use format::{
     parse_conversion_specifier_args, IntegerFormat,
 };
 use std::cell::{RefCell, UnsafeCell};
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::fmt::Write;
 use std::iter;
@@ -1612,7 +1614,47 @@ impl Interpreter {
     }
 }
 
-pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
+fn is_valid_variable(s: &str) -> bool {
+    s.chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn parse_assignment(s: &str) -> Option<(&str, &str)> {
+    let (lhs, rhs) = s.split_once('=')?;
+    if is_valid_variable(lhs) {
+        Some((lhs, rhs))
+    } else {
+        None
+    }
+}
+
+fn set_globals_with_assignment_arguments(
+    interpreter: &mut Interpreter,
+    globals: &HashMap<String, u32>,
+    global_env: &mut GlobalEnv,
+    assignments: Vec<String>,
+) -> Result<(), String> {
+    assignments
+        .iter()
+        .filter_map(|s| parse_assignment(&s))
+        .filter_map(|(var, value)| globals.get(var).copied().map(|index| (index, value)))
+        .try_for_each(|(global_index, value)| {
+            let value = escape_string_contents(value)?;
+            interpreter.globals[global_index as usize]
+                .get_mut()
+                .assign(AwkString::from(value), global_env)
+                .expect("failed to assign value");
+            Ok(())
+        })
+}
+
+pub fn interpret(
+    program: Program,
+    args: Vec<String>,
+    assignments: Vec<String>,
+) -> Result<i32, String> {
     // println!("{:?}", program);
     let args = iter::once(("0".to_string(), AwkValue::from("awk")))
         .chain(
@@ -1634,6 +1676,13 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
     let mut global_env = GlobalEnv::default();
     let mut range_pattern_started = vec![false; program.rules.len()];
     let mut return_value = 0;
+
+    set_globals_with_assignment_arguments(
+        &mut interpreter,
+        &program.globals,
+        &mut global_env,
+        assignments,
+    )?;
 
     let begin_result = interpreter.run(
         &program.begin_instructions,
@@ -1668,6 +1717,19 @@ pub fn interpret(program: Program, args: Vec<String>) -> Result<i32, String> {
             .scalar_to_string(&global_env.convfmt)?;
 
         if arg.is_empty() {
+            current_arg_index += 1;
+            continue;
+        }
+
+        if let Some((var, value)) = parse_assignment(&arg) {
+            if let Some(&global_index) = program.globals.get(var) {
+                interpreter.globals[global_index as usize]
+                    .get_mut()
+                    .assign(
+                        AwkString::from(escape_string_contents(value)?),
+                        &mut global_env,
+                    )?;
+            }
             current_arg_index += 1;
             continue;
         }

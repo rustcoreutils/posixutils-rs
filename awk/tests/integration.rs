@@ -457,3 +457,29 @@ fn test_awk_read_records_from_stdin() {
         expected_exit_code: 0,
     });
 }
+
+#[test]
+fn test_awk_cli_variable_assignment() {
+    run_test(TestPlan {
+        cmd: String::from("awk"),
+        args: vec![
+            "-f".to_string(),
+            "tests/awk/cli_variable_assignment.awk".to_string(),
+            "-v".to_string(),
+            "variable=value1".to_string(),
+            "-v".to_string(),
+            "_variable=val\\nue2".to_string(),
+            "-v".to_string(),
+            "v2ar4_iable=\"value3\"".to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::from(include_str!("awk/cli_variable_assignment.out")),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn test_awk_variable_assignment_arguments() {
+    test_awk!(variable_assignment_arguments, "test_data.txt");
+}

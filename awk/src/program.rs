@@ -149,13 +149,6 @@ pub struct AwkRule {
     pub instructions: Vec<OpCode>,
 }
 
-#[derive(Clone, Copy)]
-pub enum NameType {
-    Var,
-    Array,
-    Function,
-}
-
 #[derive(Debug, PartialEq)]
 pub struct Function {
     pub parameters_count: usize,

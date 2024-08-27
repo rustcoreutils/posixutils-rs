@@ -76,6 +76,4 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let result = exit_if_error(interpret(program, args.arguments));
     std::process::exit(result);
-
-    Ok(())
 }

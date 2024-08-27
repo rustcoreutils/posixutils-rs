@@ -1016,15 +1016,6 @@ impl<'i, 's> Stack<'i, 's> {
         self.push(StackValue::ValueRef(value_ptr))
     }
 
-    /// Pushes a reference to a value on the stack. If at the given index there is already
-    /// a `StackValue::ValueRef`, it just clones it and pushes it on the stack
-    /// # Panics
-    /// panics if `value_index` is out of bounds
-    fn push_ref_to_stack_element(&mut self, value_index: usize) -> Result<(), String> {
-        let value = self.get_mut_value_ptr(value_index).unwrap();
-        unsafe { self.push_ref(value) }
-    }
-
     fn next_instruction(&mut self) -> Option<OpCode> {
         self.instructions.get(self.ip as usize).copied()
     }
@@ -1127,7 +1118,7 @@ macro_rules! compare_op {
                 $stack.push_value(bool_to_f64(0.0 $op *rhs))?;
             }
             (_, _) => {
-                $stack.push_value(bool_to_f64(lhs.scalar_to_string($convfmt)?.as_str() $op rhs.scalar_to_string($convfmt)?.as_str()));
+                $stack.push_value(bool_to_f64(lhs.scalar_to_string($convfmt)?.as_str() $op rhs.scalar_to_string($convfmt)?.as_str()))?;
             }
         }
     };
@@ -1539,7 +1530,6 @@ impl Interpreter {
                     stack.push_value(return_value)?;
                 }
                 OpCode::Invalid => panic!("invalid opcode"),
-                other => todo!("{:?}", other),
             }
             match fields_state {
                 FieldsState::Ok => {

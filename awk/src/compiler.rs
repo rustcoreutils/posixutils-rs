@@ -337,19 +337,11 @@ impl Expr {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum GlobalNameKind {
-    Function,
-    SpecialVar,
-    Var,
-}
-
 #[derive(Clone, Copy)]
 pub enum GlobalName {
     Variable(VarId),
     SpecialVar(VarId),
     Function { id: u32, parameter_count: u32 },
-    BuiltinFunction,
 }
 
 type NameMap = HashMap<String, GlobalName>;
@@ -465,7 +457,7 @@ impl Compiler {
                 match var {
                     GlobalName::Variable(id) => Ok(OpCode::GetGlobal(id)),
                     GlobalName::SpecialVar(id) => Ok(OpCode::GetGlobal(id)),
-                    GlobalName::Function { .. } | GlobalName::BuiltinFunction => {
+                    GlobalName::Function { .. } => {
                         Err(format!("'{}' function used in variable context", name))
                     }
                 }
@@ -1436,7 +1428,7 @@ impl Compiler {
 
     fn compile_function_definition(&mut self, function: Pair<Rule>) -> Result<Function, PestError> {
         let mut inner = function.into_inner();
-        let name = inner.next().unwrap().as_str();
+        let _name = inner.next().unwrap().as_str();
         let mut param_map = HashMap::new();
         let mut parameters_count = 0;
         let maybe_param_list = inner.next().unwrap();

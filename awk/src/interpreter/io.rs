@@ -13,7 +13,6 @@ use std::{
     ffi::CString,
     fs::File,
     io::{BufReader, Bytes, Read, Write},
-    process::Child,
     rc::Rc,
 };
 
@@ -267,7 +266,7 @@ impl WritePipes {
     pub fn write(&mut self, command: AwkString, contents: AwkString) -> Result<(), String> {
         let key = command.clone().into_shared();
         let file = match self.pipes.entry(key) {
-            Entry::Occupied(mut e) => *e.get(),
+            Entry::Occupied(e) => *e.get(),
             Entry::Vacant(e) => {
                 let command: CString = command.try_into()?;
                 let file = unsafe {

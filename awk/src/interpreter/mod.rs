@@ -538,8 +538,9 @@ impl Record {
                 field.get_mut().value = AwkValueVariant::UninitializedScalar;
             }
         }
-        *self.fields[0].get_mut() = AwkValue::field_ref(record.clone(), 0);
-        *self.record.get_mut() = CString::new(record).map_err(|_| "invalid string".to_string())?;
+        let mut record = AwkString::from(record);
+        *self.fields[0].get_mut() = AwkValue::field_ref(record.share(), 0);
+        *self.record.get_mut() = record.try_into()?;
         *self.last_field.get_mut() = last_field;
         Ok(())
     }
@@ -565,8 +566,7 @@ impl Record {
             .scalar_to_string(&global_env.convfmt)?;
         write!(new_record, "{}", last_field_str).expect("error writing to string");
         let mut record_str = AwkString::from(new_record);
-        *self.fields[0].get() =
-            AwkValue::field_ref(AwkString::numeric_string(record_str.share()), 0);
+        *self.fields[0].get() = AwkValue::field_ref(record_str.share(), 0);
         *self.record.borrow_mut() = record_str.try_into()?;
         *self.last_field.borrow_mut() = last_field;
         Ok(())
@@ -582,11 +582,9 @@ impl Record {
         split_record(&record_str, &global_env.fs, |i, s| {
             let field_index = i + 1;
             last_field += 1;
-            *self.fields[field_index].get() =
-                AwkValue::field_ref(AwkString::numeric_string(s), field_index as u16);
+            *self.fields[field_index].get() = AwkValue::field_ref(s, field_index as u16);
         });
-        *self.fields[0].get() =
-            AwkValue::field_ref(AwkString::numeric_string(record_str.share()), 0);
+        *self.fields[0].get() = AwkValue::field_ref(record_str.share(), 0);
         *self.record.borrow_mut() = record_str.try_into()?;
         *self.last_field.borrow_mut() = last_field;
         Ok(())
@@ -600,7 +598,9 @@ impl Record {
 impl Default for Record {
     fn default() -> Self {
         let fields = (0..1024)
-            .map(|i| AwkValueRef::new(AwkValue::field_ref(AwkValue::uninitialized_scalar(), i)))
+            .map(|i| {
+                AwkValueRef::new(AwkValue::uninitialized_scalar().to_ref(AwkRefType::Field(i)))
+            })
             .collect();
         Self {
             record: CString::default().into(),
@@ -729,13 +729,16 @@ impl AwkValue {
         match self.ref_type {
             AwkRefType::SpecialGlobalVar(special_var) => global_env.set(special_var, self)?,
             AwkRefType::Field(index) => {
+                if let AwkValueVariant::String(s) = &mut self.value {
+                    s.is_numeric = true;
+                }
                 return if index == 0 {
                     Ok(FieldsState::NeedToRecomputeFields)
                 } else {
                     Ok(FieldsState::NeedToRecomputeRecord {
                         changed_field: index as usize,
                     })
-                }
+                };
             }
             AwkRefType::None => {}
         }
@@ -785,8 +788,10 @@ impl AwkValue {
         }
     }
 
-    fn field_ref<V: Into<AwkValue>>(value: V, field_index: u16) -> Self {
-        value.into().to_ref(AwkRefType::Field(field_index))
+    fn field_ref<S: Into<AwkString>>(value: S, field_index: u16) -> Self {
+        let mut value = value.into();
+        value.is_numeric = true;
+        AwkValue::from(value).to_ref(AwkRefType::Field(field_index))
     }
 }
 
@@ -2439,7 +2444,7 @@ mod tests {
             .run_correct()
             .execution_result
             .unwrap_expr();
-        assert_eq!(value, AwkValue::from("hello"));
+        assert_eq!(value, AwkString::numeric_string("hello").into());
     }
 
     #[test]

@@ -19,7 +19,7 @@ enum AwkStringVariant {
 #[derive(Debug, Clone)]
 pub struct AwkString {
     value: AwkStringVariant,
-    is_numeric: bool,
+    pub is_numeric: bool,
 }
 
 impl AwkString {
@@ -66,10 +66,6 @@ impl AwkString {
 
     pub fn is_empty(&self) -> bool {
         self.as_str().is_empty()
-    }
-
-    pub fn is_numeric(&self) -> bool {
-        self.is_numeric
     }
 
     pub fn numeric_string<V: Into<AwkString>>(val: V) -> AwkString {

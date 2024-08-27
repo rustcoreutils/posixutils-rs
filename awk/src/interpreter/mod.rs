@@ -351,10 +351,8 @@ fn call_simple_builtin(
             split_record(
                 &s,
                 &separator.iter().next().unwrap_or(&global_env.fs),
-                |i, s| {
-                    array.set((i + 1).to_string(), s);
-                },
-            );
+                |i, s| array.set((i + 1).to_string(), s).map(|_| ()),
+            )?;
             let n = array.len();
             stack.push_value(n as f64)?;
         }
@@ -419,26 +417,26 @@ enum FieldSeparator {
     Ere(Rc<Regex>),
 }
 
-fn split_record<S: FnMut(usize, &str)>(
+fn split_record<S: FnMut(usize, &str) -> Result<(), String>>(
     record: &str,
     field_separator: &FieldSeparator,
     mut store_result: S,
-) {
+) -> Result<(), String> {
     match field_separator {
         FieldSeparator::Default => record
             .trim_start()
             .split_ascii_whitespace()
             .enumerate()
-            .for_each(|(i, s)| store_result(i, s)),
+            .try_for_each(|(i, s)| store_result(i, s)),
         FieldSeparator::Char(c) => record
             .split(*c as char)
             .enumerate()
-            .for_each(|(i, s)| store_result(i, s)),
+            .try_for_each(|(i, s)| store_result(i, s)),
         FieldSeparator::Ere(re) => {
             let mut split_start = 0;
             let mut index = 0;
             for separator_range in re.match_locations(CString::new(record).unwrap()) {
-                store_result(index, &record[split_start..separator_range.start]);
+                store_result(index, &record[split_start..separator_range.start])?;
                 split_start = separator_range.end;
                 index += 1;
             }
@@ -529,7 +527,9 @@ impl Record {
             let field_index = i + 1;
             last_field += 1;
             *self.fields[field_index].get_mut() = AwkValue::field_ref(s, field_index as u16);
-        });
+            Ok(())
+        })
+        .expect("error splitting record");
         if last_field < previous_last_field {
             for field in &mut self.fields[last_field..=previous_last_field] {
                 field.get_mut().value = AwkValueVariant::UninitializedScalar;
@@ -580,7 +580,9 @@ impl Record {
             let field_index = i + 1;
             last_field += 1;
             *self.fields[field_index].get() = AwkValue::field_ref(s, field_index as u16);
-        });
+            Ok(())
+        })
+        .expect("error splitting record");
         *self.fields[0].get() = AwkValue::field_ref(record_str.share(), 0);
         *self.record.borrow_mut() = record_str.try_into()?;
         *self.last_field.borrow_mut() = last_field;

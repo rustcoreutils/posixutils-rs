@@ -346,6 +346,7 @@ fn call_simple_builtin(
                 .pop_scalar_value()?
                 .scalar_to_string(&global_env.convfmt)?;
             let array = stack.pop_ref().as_array()?;
+            array.clear();
 
             split_record(
                 &s,

@@ -2690,6 +2690,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_match_op() {
         let instructions = vec![
             OpCode::PushConstant(0),
@@ -2706,6 +2707,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_builtin_match() {
         let instructions = vec![
             OpCode::PushConstant(0),
@@ -2733,6 +2735,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_builtin_split_with_split_ere() {
         let instructions = vec![
             OpCode::GetGlobal(FIRST_GLOBAL_VAR),
@@ -2775,6 +2778,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_builtin_sub() {
         let instructions = vec![
             OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
@@ -2799,6 +2803,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_builtin_sub_on_record() {
         let instructions = vec![
             OpCode::PushZero,
@@ -2828,6 +2833,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_builtin_gsub() {
         let instructions = vec![
             OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
@@ -2852,6 +2858,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_builtin_gsub_on_record() {
         let instructions = vec![
             OpCode::PushZero,
@@ -3013,6 +3020,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_ere_outside_match_matches_record() {
         let instructions = vec![OpCode::PushConstant(0)];
         let constants = vec![Constant::Regex(Rc::new(regex_from_str("test")))];

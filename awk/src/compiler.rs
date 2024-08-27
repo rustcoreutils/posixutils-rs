@@ -1670,10 +1670,7 @@ mod test {
         assert_eq!(constants, vec![Constant::from("hello\\world")]);
 
         let (_, constants) = compile_expr(r#""hello\"world""#);
-        assert_eq!(
-            constants,
-            vec![Constant::from(r#"hello"world"#)]
-        );
+        assert_eq!(constants, vec![Constant::from(r#"hello"world"#)]);
 
         let (_, constants) = compile_expr(r#""hello\0world""#);
         assert_eq!(constants, vec![Constant::from("hello\x00world")]);
@@ -2129,6 +2126,7 @@ mod test {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_compile_match() {
         let (instructions, constants) = compile_expr(r#" "hello" ~ /hello/ "#);
         assert_eq!(
@@ -2149,6 +2147,7 @@ mod test {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_compile_not_match() {
         let (instructions, constants) = compile_expr(r#" "test" !~ /te?s+t*/"#);
         assert_eq!(

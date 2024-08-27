@@ -155,17 +155,20 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_create_regex() {
         regex_from_str("test");
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_regex_matches() {
         let ere = regex_from_str("ab*c");
         assert!(ere.matches(&CString::new("abbbbc").unwrap()));
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_regex_match_locations() {
         let ere = regex_from_str("match");
         let mut iter = ere.match_locations(CString::new("match 12345 match2 matchmatch").unwrap());

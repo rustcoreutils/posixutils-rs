@@ -87,7 +87,7 @@ fn write_inf_or_nan(target: &mut String, value: f64, lowercase_version: bool, si
 fn swap_sign_in_front_of_number(target: &mut String, sign: &str, write_starting_index: usize) {
     // sign is ASCII or empty string
     assert!(sign.len() <= 1);
-    if sign.len() > 0 {
+    if !sign.is_empty() {
         // sign is the first character in the string
         assert_eq!(
             target[write_starting_index..write_starting_index + 1],
@@ -97,7 +97,7 @@ fn swap_sign_in_front_of_number(target: &mut String, sign: &str, write_starting_
         let sign_index = write_starting_index;
         // we know that at least one digit is written, so we can safely unwrap
         let first_digit_in_substring = target[write_starting_index..]
-            .find(|c: char| c.is_digit(10))
+            .find(|c: char| c.is_ascii_digit())
             .unwrap();
         let final_sign_index = write_starting_index + first_digit_in_substring - 1;
 
@@ -233,7 +233,7 @@ pub fn parse_conversion_specifier_args(iter: &mut Chars) -> Result<(char, Format
         let mut number = 0;
         loop {
             match *next {
-                c if c.is_digit(10) => {
+                c if c.is_ascii_digit() => {
                     number = number * 10 + c.to_digit(10).unwrap() as usize;
                 }
                 _ => break,
@@ -813,11 +813,11 @@ mod tests {
         let mut iter = "-+ #0123.456d".chars();
         let (specifier, args) = parse_conversion_specifier_args(&mut iter).unwrap();
         assert_eq!(specifier, 'd');
-        assert_eq!(args.left_justified, true);
-        assert_eq!(args.signed, true);
-        assert_eq!(args.prefix_space, true);
-        assert_eq!(args.alternative_form, true);
-        assert_eq!(args.zero_padded, true);
+        assert!(args.left_justified);
+        assert!(args.signed);
+        assert!(args.prefix_space);
+        assert!(args.alternative_form);
+        assert!(args.zero_padded);
         assert_eq!(args.width, 123);
         assert_eq!(args.precision, Some(456));
     }

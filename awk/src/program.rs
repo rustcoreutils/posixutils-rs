@@ -167,12 +167,12 @@ pub struct Program {
 
 impl fmt::Debug for Program {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Program {{\n")?;
-        write!(f, "  Constants: {:?}\n", self.constants)?;
-        write!(f, "  Begin instructions: {:?}\n", self.begin_instructions)?;
-        write!(f, "  Rules: {:?}\n", self.rules)?;
-        write!(f, "  End instructions: {:?}\n", self.end_instructions)?;
-        write!(f, "  Functions: {:?}\n", self.functions)?;
+        writeln!(f, "Program {{")?;
+        writeln!(f, "  Constants: {:?}", self.constants)?;
+        writeln!(f, "  Begin instructions: {:?}", self.begin_instructions)?;
+        writeln!(f, "  Rules: {:?}", self.rules)?;
+        writeln!(f, "  End instructions: {:?}", self.end_instructions)?;
+        writeln!(f, "  Functions: {:?}", self.functions)?;
         write!(f, "}}")
     }
 }

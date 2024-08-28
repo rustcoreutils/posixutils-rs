@@ -174,7 +174,7 @@ fn sprintf(
                         result.push(value as char);
                     }
                     's' => {
-                        let value = value.scalar_to_string(&float_format)?;
+                        let value = value.scalar_to_string(float_format)?;
                         fmt_write_string(&mut result, &value, &args);
                     }
                     _ => return Err(format!("unsupported format specifier '{}'", specifier)),
@@ -363,7 +363,7 @@ fn call_simple_builtin(
 
             split_record(
                 s,
-                &separator.iter().next().unwrap_or(&global_env.fs),
+                separator.iter().next().unwrap_or(&global_env.fs),
                 |i, s| array.set((i + 1).to_string(), s).map(|_| ()),
             )?;
             let n = array.len();
@@ -703,7 +703,7 @@ impl AwkValue {
                 if is_integer(num) {
                     Ok((num as i64).to_string().into())
                 } else {
-                    sprintf(num_fmt, &mut [num.into()], num_fmt).map(|s| s.into())
+                    sprintf(num_fmt, &mut [num.into()], num_fmt)
                 }
             }
             AwkValueVariant::String(s) => Ok(s),
@@ -810,7 +810,7 @@ impl AwkValue {
     }
 
     fn field_ref<V: Into<AwkValue>>(value: V, field_index: u16) -> Self {
-        let mut value = value.into();
+        let value = value.into();
         value.to_ref(AwkRefType::Field(field_index))
     }
 }
@@ -832,7 +832,7 @@ impl From<f64> for AwkValue {
 
 impl From<AwkString> for AwkValue {
     fn from(value: AwkString) -> Self {
-        let value = value.into();
+        let value = value;
         Self {
             value: AwkValueVariant::String(value),
             ref_type: AwkRefType::None,
@@ -968,7 +968,7 @@ impl<'i, 's> Stack<'i, 's> {
         if self.sp != self.bp {
             let mut value = StackValue::Value(AwkValue::uninitialized());
             self.sp = unsafe { self.sp.sub(1) };
-            unsafe { std::mem::swap(&mut value, &mut *self.sp) };
+            unsafe { core::ptr::swap(&mut value, self.sp) };
             Some(value)
         } else {
             None
@@ -984,7 +984,7 @@ impl<'i, 's> Stack<'i, 's> {
         if self.sp == self.stack_end {
             Err("stack overflow".to_string())
         } else {
-            *self.sp = value.into();
+            *self.sp = value;
             self.sp = self.sp.add(1);
             Ok(())
         }
@@ -1080,7 +1080,7 @@ impl<'i, 's> Stack<'i, 's> {
             sp: bp,
             stack_end,
             call_frames: Vec::new(),
-            _stack_lifetime: PhantomData::default(),
+            _stack_lifetime: PhantomData,
         }
     }
 }
@@ -1329,7 +1329,7 @@ impl Interpreter {
                 }
                 OpCode::GetField => {
                     let index = stack.pop_scalar_value()?.scalar_as_f64();
-                    if index < 0.0 || index > 1024.0 {
+                    if !(0.0..=1024.0).contains(&index) {
                         return Err("invalid field index".to_string());
                     }
                     let index = index as usize;
@@ -1353,7 +1353,7 @@ impl Interpreter {
                 }
                 OpCode::FieldRef => {
                     let index = stack.pop_scalar_value()?.scalar_as_f64();
-                    if index < 0.0 || index > 1024.0 {
+                    if !(0.0..=1024.0).contains(&index) {
                         return Err("invalid field index".to_string());
                     }
                     let index = index as usize;
@@ -1666,7 +1666,7 @@ fn set_globals_with_assignment_arguments(
 ) -> Result<(), String> {
     assignments
         .iter()
-        .filter_map(|s| parse_assignment(&s))
+        .filter_map(|s| parse_assignment(s))
         .filter_map(|(var, value)| globals.get(var).copied().map(|index| (index, value)))
         .try_for_each(|(global_index, value)| {
             let value = escape_string_contents(value)?;
@@ -1790,7 +1790,7 @@ pub fn interpret(
                     Pattern::All => true,
                     Pattern::Expr(e) => interpreter
                         .run(
-                            &e,
+                            e,
                             &program.functions,
                             &mut current_record,
                             &mut stack,
@@ -1802,7 +1802,7 @@ pub fn interpret(
                         if range_pattern_started[i] {
                             let should_end = !interpreter
                                 .run(
-                                    &end,
+                                    end,
                                     &program.functions,
                                     &mut current_record,
                                     &mut stack,
@@ -1816,7 +1816,7 @@ pub fn interpret(
                         } else {
                             let should_start = interpreter
                                 .run(
-                                    &start,
+                                    start,
                                     &program.functions,
                                     &mut current_record,
                                     &mut stack,

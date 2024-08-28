@@ -138,9 +138,9 @@ impl From<&str> for AwkString {
     }
 }
 
-impl Into<Rc<str>> for AwkString {
-    fn into(self) -> Rc<str> {
-        self.into_shared()
+impl From<AwkString> for Rc<str> {
+    fn from(val: AwkString) -> Self {
+        val.into_shared()
     }
 }
 

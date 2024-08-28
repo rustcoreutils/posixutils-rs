@@ -828,7 +828,7 @@ impl Compiler {
             instructions.push(OpCode::GetGlobal(SpecialVar::Subsep as u32));
             instructions.push(OpCode::Concat);
             self.compile_expr(second_index, instructions, locals)?;
-            while let Some(other_index) = index.next() {
+            for other_index in index {
                 instructions.push(OpCode::Concat);
                 instructions.push(OpCode::GetGlobal(SpecialVar::Subsep as u32));
                 instructions.push(OpCode::Concat);

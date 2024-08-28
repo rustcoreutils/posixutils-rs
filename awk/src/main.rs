@@ -40,7 +40,7 @@ struct Args {
 }
 
 fn compile_soruces(args: &Args) -> Result<Program, String> {
-    if args.program_files.len() > 0 {
+    if !args.program_files.is_empty() {
         let mut combined_sources = String::new();
         for source_file in &args.program_files {
             let mut file = std::fs::File::open(source_file)
@@ -49,7 +49,7 @@ fn compile_soruces(args: &Args) -> Result<Program, String> {
                 .map_err(|_| format!("could not read file '{}'", source_file))?;
         }
         compile_program(&combined_sources).map_err(|err| format!("{}", err))
-    } else if args.arguments.len() > 0 {
+    } else if !args.arguments.is_empty() {
         compile_program(&args.arguments[0]).map_err(|err| format!("{}", err))
     } else {
         Err("missing program argument".to_string())

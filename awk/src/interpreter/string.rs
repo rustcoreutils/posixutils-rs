@@ -62,6 +62,7 @@ impl AwkString {
                 self.value = AwkStringVariant::Owned(new_value);
             }
         }
+        self.is_numeric = false;
     }
 
     pub fn is_empty(&self) -> bool {

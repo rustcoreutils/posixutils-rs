@@ -1966,17 +1966,6 @@ mod tests {
             .unwrap_expr()
     }
 
-    fn interpret_expr_with_record(
-        instructions: Vec<OpCode>,
-        constants: Vec<Constant>,
-        record_str: &str,
-    ) -> (AwkValue, Record) {
-        let result = Test::new(instructions, constants)
-            .add_record(record_str)
-            .run_correct();
-        (result.execution_result.unwrap_expr(), result.record)
-    }
-
     fn test_global(instructions: Vec<OpCode>, constants: Vec<Constant>) -> AwkValue {
         Test::new(instructions, constants).run_correct().globals[FIRST_GLOBAL_VAR as usize].clone()
     }

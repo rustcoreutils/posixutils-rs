@@ -2746,7 +2746,7 @@ mod test {
         let (instructions, _) = compile_stmt("exit;");
         assert_eq!(instructions, vec![OpCode::PushZero, OpCode::Exit]);
 
-        let (instructions, constant) = compile_stmt("exit 1;");
+        let (instructions, _) = compile_stmt("exit 1;");
         assert_eq!(instructions, vec![OpCode::PushConstant(0), OpCode::Exit]);
     }
 
@@ -2767,7 +2767,7 @@ mod test {
 
     #[test]
     fn test_compile_delete() {
-        let (instructions, constant) = compile_stmt("delete a[1];");
+        let (instructions, _) = compile_stmt("delete a[1];");
         assert_eq!(
             instructions,
             vec![

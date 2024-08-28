@@ -481,7 +481,7 @@ fn test_awk_cli_variable_assignment() {
 
 #[test]
 fn test_awk_variable_assignment_arguments() {
-    test_awk!(variable_assignment_arguments, "test_data.txt");
+    test_awk!(variable_assignment_arguments, "tests/awk/test_data.txt");
 }
 
 #[test]

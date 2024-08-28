@@ -16,7 +16,7 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use string::AwkString;
 
-use crate::compiler::escape_string_contents;
+use crate::compiler::{escape_string_contents, is_valid_number};
 use crate::program::{BuiltinFunction, Constant, Function, OpCode, Pattern, Program, SpecialVar};
 use crate::regex::Regex;
 use format::{
@@ -97,6 +97,17 @@ fn swap_with_default<T: Default>(value: &mut T) -> T {
     let mut result = T::default();
     std::mem::swap(&mut result, value);
     result
+}
+
+fn maybe_numeric_string<S: Into<AwkString>>(str: S) -> AwkString {
+    let mut str = str.into();
+    let numeric_string = is_valid_number(
+        str.as_str()
+            .trim()
+            .trim_start_matches(|c| c == '+' || c == '-'),
+    );
+    str.is_numeric = numeric_string;
+    str
 }
 
 fn sprintf(
@@ -351,7 +362,7 @@ fn call_simple_builtin(
             array.clear();
 
             split_record(
-                &s,
+                s,
                 &separator.iter().next().unwrap_or(&global_env.fs),
                 |i, s| array.set((i + 1).to_string(), s).map(|_| ()),
             )?;
@@ -419,30 +430,40 @@ enum FieldSeparator {
     Ere(Rc<Regex>),
 }
 
-fn split_record<S: FnMut(usize, &str) -> Result<(), String>>(
-    record: &str,
+/// Splits a record into fields and calls the provided closure for each field.
+/// If the record is a numeric string, fields will be numeric strings if appropriate.
+fn split_record<S: FnMut(usize, AwkString) -> Result<(), String>>(
+    mut record: AwkString,
     field_separator: &FieldSeparator,
     mut store_result: S,
 ) -> Result<(), String> {
+    let is_record_numeric = record.is_numeric;
+    let string = |s: &str| -> AwkString {
+        if is_record_numeric {
+            AwkString::numeric_string(s)
+        } else {
+            s.into()
+        }
+    };
     match field_separator {
         FieldSeparator::Default => record
             .trim_start()
             .split_ascii_whitespace()
             .enumerate()
-            .try_for_each(|(i, s)| store_result(i, s)),
+            .try_for_each(|(i, s)| store_result(i, string(s))),
         FieldSeparator::Char(c) => record
             .split(*c as char)
             .enumerate()
-            .try_for_each(|(i, s)| store_result(i, s)),
+            .try_for_each(|(i, s)| store_result(i, string(s))),
         FieldSeparator::Ere(re) => {
             let mut split_start = 0;
             let mut index = 0;
-            for separator_range in re.match_locations(CString::new(record).unwrap()) {
-                store_result(index, &record[split_start..separator_range.start])?;
+            for separator_range in re.match_locations(record.share().try_into()?) {
+                store_result(index, string(&record[split_start..separator_range.start]))?;
                 split_start = separator_range.end;
                 index += 1;
             }
-            store_result(index, &record[split_start..])
+            store_result(index, string(&record[split_start..]))
         }
     }
 }
@@ -525,7 +546,8 @@ impl Record {
     fn reset(&mut self, record: String, field_separator: &FieldSeparator) -> Result<(), String> {
         let previous_last_field = *self.last_field.get_mut();
         let mut last_field = 0;
-        split_record(&record, field_separator, |i, s| {
+        let mut record = maybe_numeric_string(record);
+        split_record(record.share(), field_separator, |i, s| {
             let field_index = i + 1;
             last_field += 1;
             *self.fields[field_index].get_mut() = AwkValue::field_ref(s, field_index as u16);
@@ -537,7 +559,6 @@ impl Record {
                 field.get_mut().value = AwkValueVariant::UninitializedScalar;
             }
         }
-        let mut record = AwkString::from(record);
         *self.fields[0].get_mut() = AwkValue::field_ref(record.share(), 0);
         *self.record.get_mut() = record.try_into()?;
         *self.last_field.get_mut() = last_field;
@@ -564,7 +585,9 @@ impl Record {
             .clone()
             .scalar_to_string(&global_env.convfmt)?;
         write!(new_record, "{}", last_field_str).expect("error writing to string");
-        let mut record_str = AwkString::from(new_record);
+        // TODO: don't know if this is correct. Should the recomputed record be
+        // numeric?
+        let mut record_str = maybe_numeric_string(new_record);
         *self.fields[0].get() = AwkValue::field_ref(record_str.share(), 0);
         *self.record.borrow_mut() = record_str.try_into()?;
         *self.last_field.borrow_mut() = last_field;
@@ -578,7 +601,7 @@ impl Record {
         let mut record_str = (*self.fields[0].get())
             .to_owned()
             .scalar_to_string(&global_env.convfmt)?;
-        split_record(&record_str, &global_env.fs, |i, s| {
+        split_record(record_str.share(), &global_env.fs, |i, s| {
             let field_index = i + 1;
             last_field += 1;
             *self.fields[field_index].get() = AwkValue::field_ref(s, field_index as u16);
@@ -730,9 +753,6 @@ impl AwkValue {
         match self.ref_type {
             AwkRefType::SpecialGlobalVar(special_var) => global_env.set(special_var, self)?,
             AwkRefType::Field(index) => {
-                if let AwkValueVariant::String(s) = &mut self.value {
-                    s.is_numeric = true;
-                }
                 return if index == 0 {
                     Ok(FieldsState::NeedToRecomputeFields)
                 } else {
@@ -789,10 +809,9 @@ impl AwkValue {
         }
     }
 
-    fn field_ref<S: Into<AwkString>>(value: S, field_index: u16) -> Self {
+    fn field_ref<V: Into<AwkValue>>(value: V, field_index: u16) -> Self {
         let mut value = value.into();
-        value.is_numeric = true;
-        AwkValue::from(value).to_ref(AwkRefType::Field(field_index))
+        value.to_ref(AwkRefType::Field(field_index))
     }
 }
 
@@ -1434,7 +1453,8 @@ impl Interpreter {
                     BuiltinFunction::GetLine => {
                         let var = stack.pop_ref();
                         if let Some(next_record) = current_file.read_next_record(&global_env.rs)? {
-                            fields_state = var.assign(next_record, global_env)?;
+                            fields_state =
+                                var.assign(maybe_numeric_string(next_record), global_env)?;
                             let nr = unsafe { &mut *self.globals[SpecialVar::Nr as usize].get() };
                             nr.assign(global_env.nr as f64 + 1.0, global_env)?;
                             let fnr = unsafe { &mut *self.globals[SpecialVar::Fnr as usize].get() };
@@ -1452,7 +1472,8 @@ impl Interpreter {
                         if let Some(next_record) =
                             self.read_files.read_next_record(filename, &global_env.rs)?
                         {
-                            fields_state = var.assign(next_record, global_env)?;
+                            fields_state =
+                                var.assign(maybe_numeric_string(next_record), global_env)?;
                             stack.push_value(1.0)?;
                         } else {
                             stack.push_value(0.0)?;
@@ -1466,7 +1487,8 @@ impl Interpreter {
                         if let Some(next_record) =
                             self.read_pipes.read_next_record(command, &global_env.rs)?
                         {
-                            fields_state = var.assign(next_record, global_env)?;
+                            fields_state =
+                                var.assign(maybe_numeric_string(next_record), global_env)?;
                             stack.push_value(1.0)?;
                         } else {
                             stack.push_value(0.0)?;
@@ -1644,7 +1666,7 @@ fn set_globals_with_assignment_arguments(
             let value = escape_string_contents(value)?;
             interpreter.globals[global_index as usize]
                 .get_mut()
-                .assign(AwkString::from(value), global_env)
+                .assign(maybe_numeric_string(value), global_env)
                 .expect("failed to assign value");
             Ok(())
         })
@@ -1660,7 +1682,7 @@ pub fn interpret(
         .chain(
             args.into_iter()
                 .enumerate()
-                .map(|(index, s)| ((index + 1).to_string(), s.into())),
+                .map(|(index, s)| ((index + 1).to_string(), maybe_numeric_string(s).into())),
         )
         .collect();
 
@@ -1726,7 +1748,7 @@ pub fn interpret(
                 interpreter.globals[global_index as usize]
                     .get_mut()
                     .assign(
-                        AwkString::from(escape_string_contents(value)?),
+                        maybe_numeric_string(escape_string_contents(value)?),
                         &mut global_env,
                     )?;
             }
@@ -1736,7 +1758,7 @@ pub fn interpret(
 
         interpreter.globals[SpecialVar::Filename as usize]
             .get_mut()
-            .value = AwkValue::from(arg.clone()).value;
+            .value = AwkValueVariant::String(maybe_numeric_string(arg.clone()));
 
         let reader: &mut dyn RecordReader = if arg.as_str() == "-" {
             &mut StdinRecordReader::default()
@@ -2495,7 +2517,7 @@ mod tests {
             .run_correct()
             .execution_result
             .unwrap_expr();
-        assert_eq!(value, AwkString::numeric_string("hello").into());
+        assert_eq!(value, "hello".into());
     }
 
     #[test]

@@ -116,12 +116,6 @@ impl Regex {
         };
         exec_status != libc::REG_NOMATCH
     }
-
-    pub fn str(&self) -> &str {
-        self.regex_string
-            .to_str()
-            .expect("regex string contains invalid utf8")
-    }
 }
 
 impl Drop for Regex {

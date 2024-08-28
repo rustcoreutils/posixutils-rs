@@ -1970,25 +1970,15 @@ mod tests {
         Test::new(instructions, constants).run_correct().globals[FIRST_GLOBAL_VAR as usize].clone()
     }
 
-    fn interpret_with_functions(
+    fn interpret_with_function(
         main: Vec<OpCode>,
         constants: Vec<Constant>,
-        global_count: usize,
-        functions: Vec<Function>,
+        function: Function,
     ) -> AwkValue {
-        let mut stack = vec![StackValue::Value(AwkValue::uninitialized()); 250];
-        let mut interpreter =
-            Interpreter::new(Array::default(), Array::default(), constants, global_count);
-        interpreter
-            .run(
-                &main,
-                &functions,
-                &mut Record::default(),
-                &mut stack,
-                &mut GlobalEnv::default(),
-                &mut EmptyRecordReader::default(),
-            )
-            .expect("error running test")
+        Test::new(main, constants)
+            .add_function(function)
+            .run_correct()
+            .execution_result
             .unwrap_expr()
     }
 
@@ -2391,13 +2381,13 @@ mod tests {
     #[test]
     fn test_call_function_without_args() {
         let main = vec![OpCode::Call { id: 0, argc: 0 }];
-        let functions = vec![Function {
+        let function = Function {
             parameters_count: 0,
             instructions: vec![OpCode::PushConstant(0), OpCode::Return],
-        }];
+        };
         let constant = vec![Constant::from("test")];
         assert_eq!(
-            interpret_with_functions(main, constant, 0, functions),
+            interpret_with_function(main, constant, function),
             AwkValue::from("test".to_string())
         );
     }
@@ -2405,12 +2395,12 @@ mod tests {
     #[test]
     fn test_call_with_uninitialized_scalar_argument() {
         let main = vec![OpCode::PushUninitialized, OpCode::Call { id: 0, argc: 1 }];
-        let functions = vec![Function {
+        let functions = Function {
             parameters_count: 1,
             instructions: vec![OpCode::LocalScalarRef(0), OpCode::Return],
-        }];
+        };
         assert_eq!(
-            interpret_with_functions(main, vec![], 1, functions),
+            interpret_with_function(main, vec![], functions),
             AwkValue::uninitialized_scalar()
         );
     }
@@ -2418,7 +2408,7 @@ mod tests {
     #[test]
     fn test_call_with_uninitialized_array_argument() {
         let main = vec![OpCode::PushUninitialized, OpCode::Call { id: 0, argc: 1 }];
-        let functions = vec![Function {
+        let function = Function {
             parameters_count: 1,
             instructions: vec![
                 OpCode::GetLocal(0),
@@ -2426,10 +2416,10 @@ mod tests {
                 OpCode::IndexArrayGetValue,
                 OpCode::Return,
             ],
-        }];
+        };
         let constant = vec![Constant::from("key")];
         assert_eq!(
-            interpret_with_functions(main, constant, 1, functions),
+            interpret_with_function(main, constant, function),
             AwkValue::uninitialized_scalar()
         );
     }
@@ -2437,13 +2427,13 @@ mod tests {
     #[test]
     fn test_call_function_with_scalar_argument() {
         let main = vec![OpCode::PushConstant(0), OpCode::Call { id: 0, argc: 1 }];
-        let functions = vec![Function {
+        let function = Function {
             parameters_count: 1,
             instructions: vec![OpCode::GetLocal(0), OpCode::PushOne, OpCode::Add],
-        }];
+        };
         let constant = vec![Constant::Number(0.0)];
         assert_eq!(
-            interpret_with_functions(main, constant, 0, functions),
+            interpret_with_function(main, constant, function),
             AwkValue::from(1.0)
         );
     }
@@ -2454,7 +2444,7 @@ mod tests {
             OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
             OpCode::Call { id: 0, argc: 1 },
         ];
-        let functions = vec![Function {
+        let function = Function {
             parameters_count: 1,
             instructions: vec![
                 OpCode::GetLocal(0),
@@ -2463,10 +2453,10 @@ mod tests {
                 OpCode::PushOne,
                 OpCode::Assign,
             ],
-        }];
+        };
         let constants = vec![Constant::from("key")];
         assert_eq!(
-            interpret_with_functions(main, constants, 1, functions),
+            interpret_with_function(main, constants, function),
             AwkValue::from(1.0)
         );
     }
@@ -2481,7 +2471,7 @@ mod tests {
             OpCode::PushConstant(0),
             OpCode::Call { id: 0, argc: 5 },
         ];
-        let functions = vec![Function {
+        let function = Function {
             parameters_count: 5,
             instructions: vec![
                 OpCode::GetLocal(0),
@@ -2495,10 +2485,10 @@ mod tests {
                 OpCode::Add,
                 OpCode::Return,
             ],
-        }];
+        };
         let constants = vec![Constant::Number(1.0)];
         assert_eq!(
-            interpret_with_functions(main, constants, 0, functions),
+            interpret_with_function(main, constants, function),
             AwkValue::from(5.0)
         );
     }

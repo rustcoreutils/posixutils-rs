@@ -3275,4 +3275,144 @@ mod tests {
             AwkValue::from(1.0).to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Nf))
         );
     }
+
+    #[test]
+    fn test_push_multiple_references_to_the_same_global_variable() {
+        let instructions = vec![
+            OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
+            OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
+            OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
+            OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
+            OpCode::PushConstant(0),
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::PushConstant(1),
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::PushConstant(2),
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::PushConstant(3),
+            OpCode::Assign,
+            OpCode::Pop,
+        ];
+        let constants = vec![
+            Constant::from("test1"),
+            Constant::from("test2"),
+            Constant::from("test3"),
+            Constant::from("test4"),
+        ];
+        let result = Test::new(instructions, constants).run_correct();
+        assert_eq!(result.globals[FIRST_GLOBAL_VAR as usize], "test4".into());
+    }
+
+    #[test]
+    fn test_push_multiple_references_to_the_same_stack_value() {
+        let instructions = vec![
+            OpCode::PushUninitialized,
+            OpCode::LocalScalarRef(0),
+            OpCode::LocalScalarRef(0),
+            OpCode::LocalScalarRef(0),
+            OpCode::LocalScalarRef(0),
+            OpCode::PushConstant(0),
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::PushConstant(1),
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::PushConstant(2),
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::PushConstant(3),
+            OpCode::Assign,
+            OpCode::Pop,
+        ];
+        let constants = vec![
+            Constant::from("test1"),
+            Constant::from("test2"),
+            Constant::from("test3"),
+            Constant::from("test4"),
+        ];
+        let result = Test::new(instructions, constants).run_correct();
+        assert_eq!(result.execution_result.unwrap_expr(), "test4".into());
+    }
+
+    #[test]
+    fn test_push_multiple_references_to_the_same_record_field() {
+        let instructions = vec![
+            OpCode::PushOne,
+            OpCode::FieldRef,
+            OpCode::PushOne,
+            OpCode::FieldRef,
+            OpCode::PushOne,
+            OpCode::FieldRef,
+            OpCode::PushOne,
+            OpCode::FieldRef,
+            OpCode::PushConstant(0),
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::PushConstant(1),
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::PushConstant(2),
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::PushConstant(3),
+            OpCode::Assign,
+            OpCode::Pop,
+        ];
+        let constants = vec![
+            Constant::from("test1"),
+            Constant::from("test2"),
+            Constant::from("test3"),
+            Constant::from("test4"),
+        ];
+        let mut result = Test::new(instructions, constants).run_correct();
+        assert_eq!(
+            *result.record.fields[1].get_mut(),
+            AwkValue::field_ref("test4", 1)
+        );
+    }
+
+    #[test]
+    fn test_push_multiple_references_to_the_same_array_element() {
+        let instructions = vec![
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
+            OpCode::PushConstant(0),
+            OpCode::IndexArrayGetRef,
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
+            OpCode::PushConstant(0),
+            OpCode::IndexArrayGetRef,
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
+            OpCode::PushConstant(0),
+            OpCode::IndexArrayGetRef,
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
+            OpCode::PushConstant(0),
+            OpCode::IndexArrayGetRef,
+            OpCode::PushConstant(1),
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::PushConstant(2),
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::PushConstant(3),
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::PushConstant(4),
+            OpCode::Assign,
+            OpCode::Pop,
+        ];
+        let constants = vec![
+            Constant::from("key"),
+            Constant::from("test1"),
+            Constant::from("test2"),
+            Constant::from("test3"),
+            Constant::from("test4"),
+        ];
+        let result = Test::new(instructions, constants).run_correct();
+        assert_eq!(
+            result.globals[FIRST_GLOBAL_VAR as usize],
+            Array::from_iter([("key", "test4")]).into()
+        );
+    }
 }

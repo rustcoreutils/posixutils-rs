@@ -832,7 +832,6 @@ impl From<f64> for AwkValue {
 
 impl From<AwkString> for AwkValue {
     fn from(value: AwkString) -> Self {
-        let value = value;
         Self {
             value: AwkValueVariant::String(value),
             ref_type: AwkRefType::None,
@@ -868,12 +867,12 @@ struct ArrayIterator {
     key_iter: KeyIterator,
 }
 
-#[derive(Debug, Clone, PartialEq)]
 enum StackValue {
-    Value(AwkValue),
+    Value(AwkValueRef),
     ValueRef(*mut AwkValue),
     UninitializedRef(*mut AwkValue),
     Iterator(ArrayIterator),
+    Invalid,
 }
 
 impl StackValue {
@@ -881,7 +880,7 @@ impl StackValue {
     /// if the `StackValue` is a `ValueRef` then the pointer has to point to a valid `AwkValue`
     unsafe fn value_ref(&mut self) -> &mut AwkValue {
         match self {
-            StackValue::Value(val) => val,
+            StackValue::Value(val) => val.get_mut(),
             StackValue::ValueRef(val_ref) => &mut **val_ref,
             StackValue::UninitializedRef(val_ref) => &mut **val_ref,
             _ => unreachable!("invalid stack value"),
@@ -907,7 +906,7 @@ impl StackValue {
     /// if the `StackValue` is a `ValueRef` then the pointer has to point to a valid `AwkValue`
     unsafe fn into_owned(self) -> AwkValue {
         match self {
-            StackValue::Value(val) => val,
+            StackValue::Value(val) => val.into_inner(),
             StackValue::ValueRef(ref_val) => (*ref_val).share(),
             StackValue::UninitializedRef(_) => AwkValue::uninitialized_scalar(),
             _ => unreachable!("invalid stack value"),
@@ -925,14 +924,26 @@ impl StackValue {
         match value_ref.value {
             AwkValueVariant::Array(_) => StackValue::ValueRef(value),
             AwkValueVariant::Uninitialized => StackValue::UninitializedRef(value),
-            _ => StackValue::Value(value_ref.share()),
+            _ => StackValue::Value(UnsafeCell::new(value_ref.share())),
+        }
+    }
+
+    fn duplicate(&mut self) -> Self {
+        match self {
+            StackValue::Value(val) => val.get_mut().clone().into(),
+            StackValue::ValueRef(val_ref) => StackValue::ValueRef(*val_ref),
+            StackValue::UninitializedRef(uninitialized_ref) => {
+                StackValue::UninitializedRef(*uninitialized_ref)
+            }
+            StackValue::Iterator(iterator) => StackValue::Iterator(iterator.clone()),
+            StackValue::Invalid => StackValue::Invalid,
         }
     }
 }
 
 impl From<AwkValue> for StackValue {
     fn from(value: AwkValue) -> Self {
-        StackValue::Value(value)
+        StackValue::Value(UnsafeCell::new(value))
     }
 }
 
@@ -966,7 +977,7 @@ impl<'i, 's> Stack<'i, 's> {
     /// The top stack value if there is one. `None` otherwise
     fn pop(&mut self) -> Option<StackValue> {
         if self.sp != self.bp {
-            let mut value = StackValue::Value(AwkValue::uninitialized());
+            let mut value = StackValue::Invalid;
             self.sp = unsafe { self.sp.sub(1) };
             unsafe { core::ptr::swap(&mut value, self.sp) };
             Some(value)
@@ -1001,9 +1012,9 @@ impl<'i, 's> Stack<'i, 's> {
 
     fn get_mut_value_ptr(&mut self, index: usize) -> Option<*mut AwkValue> {
         if unsafe { self.sp.offset_from(self.bp) } >= index as isize {
-            let value = unsafe { &mut *self.bp.add(index) };
+            let value = unsafe { &*self.bp.add(index) };
             match value {
-                StackValue::Value(val) => Some(val),
+                StackValue::Value(val) => Some(val.get()),
                 StackValue::ValueRef(val_ref) => Some(*val_ref),
                 StackValue::UninitializedRef(val_ref) => Some(*val_ref),
                 _ => unreachable!("invalid stack value"),
@@ -1028,7 +1039,7 @@ impl<'i, 's> Stack<'i, 's> {
 
     fn push_value<V: Into<AwkValue>>(&mut self, value: V) -> Result<(), String> {
         // a `StackValue::Value` is always valid, so this is safe
-        unsafe { self.push(StackValue::Value(value.into())) }
+        unsafe { self.push(StackValue::from(value.into())) }
     }
 
     /// pushes a reference on the stack
@@ -1540,10 +1551,10 @@ impl Interpreter {
                     stack.push_value(AwkValue::uninitialized_scalar())?;
                 }
                 OpCode::Dup => {
-                    let val = stack.pop().unwrap();
+                    let mut val = stack.pop().unwrap();
                     unsafe {
                         stack
-                            .push(val.clone())
+                            .push(val.duplicate())
                             .expect("failed to push a popped value");
                         stack.push(val)?;
                     }
@@ -1692,7 +1703,9 @@ pub fn interpret(
         )
         .collect();
 
-    let mut stack = vec![StackValue::Value(AwkValue::uninitialized()); STACK_SIZE];
+    let mut stack = iter::repeat_with(|| StackValue::Invalid)
+        .take(STACK_SIZE)
+        .collect::<Vec<StackValue>>();
     let mut current_record = Record::default();
     let mut interpreter = Interpreter::new(
         args,
@@ -1926,7 +1939,9 @@ mod tests {
         }
 
         fn run_correct(mut self) -> TestResult {
-            let mut stack = vec![StackValue::Value(AwkValue::uninitialized()); 250];
+            let mut stack = iter::repeat_with(|| StackValue::Invalid)
+                .take(250)
+                .collect::<Vec<StackValue>>();
             let mut interpreter = Interpreter::new(
                 Array::default(),
                 Array::default(),

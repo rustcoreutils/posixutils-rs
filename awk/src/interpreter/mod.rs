@@ -1140,6 +1140,12 @@ macro_rules! compare_op {
             (AwkValueVariant::UninitializedScalar, AwkValueVariant::Number(rhs)) => {
                 $stack.push_value(bool_to_f64(0.0 $op *rhs))?;
             }
+            (AwkValueVariant::String(s), AwkValueVariant::Number(x)) if s.is_numeric => {
+                $stack.push_value(bool_to_f64(lhs.scalar_as_f64() $op *x))?;
+            }
+            (AwkValueVariant::Number(x), AwkValueVariant::String(s)) if s.is_numeric => {
+                $stack.push_value(bool_to_f64(*x $op rhs.scalar_as_f64()))?;
+            }
             (_, _) => {
                 $stack.push_value(bool_to_f64(lhs.scalar_to_string($convfmt)?.as_str() $op rhs.scalar_to_string($convfmt)?.as_str()))?;
             }

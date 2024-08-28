@@ -483,3 +483,8 @@ fn test_awk_cli_variable_assignment() {
 fn test_awk_variable_assignment_arguments() {
     test_awk!(variable_assignment_arguments, "test_data.txt");
 }
+
+#[test]
+fn test_awk_correct_comparisons() {
+    test_awk!(correct_comparisons, "tests/awk/test_data.txt");
+}

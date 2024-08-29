@@ -118,7 +118,9 @@ fn swap_sign_in_front_of_number(target: &mut String, sign: &str, write_starting_
     }
 }
 
-fn fix_exponent(target: &mut String, lowercase_version: bool, should_add_dot_after_number: bool) {
+/// Removes the exponent part of the number at the end of `target` and writes it to `exponent_buffer`.
+/// The exponent character is removed from `target` but is not written to `exponent_buffer`.
+fn gather_exponent(target: &mut String) -> ([u8; 5], usize) {
     // there are at most 5 characters after the 'e'. One for the sign and four for the exponent
     // (4 = ceil(log10(2^11)), where 11 is the number of bits in the exponent of an f64)
     let mut exponent_buffer = [0u8; 5];
@@ -129,7 +131,16 @@ fn fix_exponent(target: &mut String, lowercase_version: bool, should_add_dot_aft
     }
     // pop the 'e' character
     target.pop();
+    (exponent_buffer, exponent_buffer_length)
+}
 
+fn write_exponent(
+    target: &mut String,
+    exponent_buffer: &[u8; 5],
+    mut exponent_buffer_length: usize,
+    lowercase_version: bool,
+    should_add_dot_after_number: bool,
+) {
     if should_add_dot_after_number {
         target.push(decimal_point());
     }
@@ -213,6 +224,33 @@ fn remove_trailing_zeros(
     }
     if target.chars().last().is_some_and(|c| c == decimal_point()) {
         target.pop();
+    }
+}
+
+fn base_scientific_float_format(
+    args: &FormatArgs,
+    target: &mut String,
+    sign: &str,
+    value: f64,
+    precision: usize,
+    width: usize,
+) {
+    // left justified
+    //   sign integer_part <decimal_point> fractional_part e exponent_sign exponent_value padding
+    // right justified zero padded
+    //   sign padding integer_part <decimal point> fractional_part e exponent_sign exponent_value
+    // right justified space padded
+    //  padding sign integer_part <decimal point> fractional_part e exponent_sign exponent_value
+
+    let write_starting_index = target.len();
+    target.push_str(sign);
+    if args.left_justified {
+        write!(target, "{:.1$e}", value, precision).expect("error writing to string");
+    } else if args.zero_padded {
+        write!(target, "{:01$.2$e}", value, width, precision).expect("error writing to string")
+    } else {
+        write!(target, "{:1$.2$e}", value, width, precision).expect("error writing to string");
+        swap_sign_in_front_of_number(target, sign, write_starting_index);
     }
 }
 
@@ -592,26 +630,16 @@ pub fn fmt_write_scientific_float(
         sign.len() + should_add_dot_after_number as usize + additional_exponent_length,
     );
 
-    // left justified
-    //   sign integer_part <decimal_point> fractional_part e exponent_sign exponent_value padding
-    // right justified zero padded
-    //   sign padding integer_part <decimal point> fractional_part e exponent_sign exponent_value
-    // right justified space padded
-    //  padding sign integer_part <decimal point> fractional_part e exponent_sign exponent_value
+    base_scientific_float_format(args, target, sign, value, precision, width);
 
-    if args.left_justified {
-        target.push_str(sign);
-        write!(target, "{:.1$e}", value, precision).expect("error writing to string");
-    } else if args.zero_padded {
-        target.push_str(sign);
-        write!(target, "{:01$.2$e}", value, width, precision).expect("error writing to string")
-    } else {
-        target.push_str(sign);
-        write!(target, "{:1$.2$e}", value, width, precision).expect("error writing to string");
-        swap_sign_in_front_of_number(target, sign, write_starting_index);
-    }
-
-    fix_exponent(target, lowercase_version, should_add_dot_after_number);
+    let (exponent_buffer, exponent_buffer_length) = gather_exponent(target);
+    write_exponent(
+        target,
+        &exponent_buffer,
+        exponent_buffer_length,
+        lowercase_version,
+        should_add_dot_after_number,
+    );
 
     if args.left_justified {
         let number_length = target.len() - write_starting_index;
@@ -625,8 +653,6 @@ pub fn fmt_write_float_general(
     lowercase_version: bool,
     args: &FormatArgs,
 ) {
-    // TODO: refactor copied duplicate code
-
     let sign = sign_str(value.is_sign_negative(), args);
     if write_inf_or_nan(target, value, lowercase_version, sign) {
         return;
@@ -661,37 +687,9 @@ pub fn fmt_write_float_general(
             sign.len() + should_add_dot_after_number as usize + additional_exponent_length,
         );
 
-        // left justified
-        //   sign integer_part <decimal_point> fractional_part e exponent_sign exponent_value padding
-        // right justified zero padded
-        //   sign padding integer_part <decimal point> fractional_part e exponent_sign exponent_value
-        // right justified space padded
-        //  padding sign integer_part <decimal point> fractional_part e exponent_sign exponent_value
+        base_scientific_float_format(args, target, sign, value, precision, width);
 
-        if args.left_justified {
-            target.push_str(sign);
-            write!(target, "{:.1$e}", value, precision).expect("error writing to string");
-        } else if args.zero_padded {
-            target.push_str(sign);
-            write!(target, "{:01$.2$e}", value, width, precision).expect("error writing to string")
-        } else {
-            target.push_str(sign);
-
-            write!(target, "{:1$.2$e}", value, width, precision).expect("error writing to string");
-
-            swap_sign_in_front_of_number(target, sign, write_starting_index);
-        }
-
-        // there are at most 5 characters after the 'e'. One for the sign and four for the exponent
-        // (4 = ceil(log10(2^11)), where 11 is the number of bits in the exponent of an f64)
-        let mut exponent_buffer = [0u8; 5];
-        let mut exponent_buffer_length = 0;
-        while matches!(target.as_bytes().last(), Some(c) if *c != b'e') {
-            exponent_buffer[exponent_buffer_length] = target.pop().unwrap() as u8;
-            exponent_buffer_length += 1;
-        }
-        // pop the 'e' character
-        target.pop();
+        let (exponent_buffer, exponent_buffer_length) = gather_exponent(target);
 
         if !args.alternative_form {
             remove_trailing_zeros(
@@ -704,33 +702,13 @@ pub fn fmt_write_float_general(
             );
         }
 
-        if should_add_dot_after_number {
-            target.push(decimal_point());
-        }
-
-        // push the exponent character
-        if lowercase_version {
-            target.push('e');
-        } else {
-            target.push('E');
-        }
-
-        // push the sign character
-        if exponent_buffer[exponent_buffer_length - 1] != b'-' {
-            target.push('+');
-        } else {
-            target.push('-');
-            exponent_buffer_length -= 1;
-        }
-
-        // the exponent value should have at least two digits
-        if exponent_buffer_length <= 1 {
-            target.push('0');
-        }
-        // copy the rest of the buffer
-        for c in exponent_buffer[0..exponent_buffer_length].iter().rev() {
-            target.push(*c as char);
-        }
+        write_exponent(
+            target,
+            &exponent_buffer,
+            exponent_buffer_length,
+            lowercase_version,
+            should_add_dot_after_number,
+        );
 
         if args.left_justified {
             let number_length = target.len() - write_starting_index;

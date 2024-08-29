@@ -478,18 +478,18 @@ impl Compiler {
         call_span: pest::Span,
         locals: &LocalMap,
     ) -> Result<u16, PestError> {
-        let mut argc: u16 = 0;
+        let mut argc: u32 = 0;
         for arg in args {
             self.compile_expr(arg, instructions, locals)?;
             argc += 1;
-            if argc > u16::MAX {
+            if argc > u16::MAX as u32 {
                 return Err(pest_error_from_span(
                     call_span,
                     "function call with too many arguments".to_string(),
                 ));
             }
         }
-        Ok(argc)
+        Ok(argc as u16)
     }
 
     fn map_primary(&self, primary: Pair<Rule>, locals: &LocalMap) -> Result<Expr, PestError> {

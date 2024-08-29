@@ -207,7 +207,6 @@ fn builtin_match(stack: &mut Stack, global_env: &mut GlobalEnv) -> Result<(f64, 
     let string = stack
         .pop_scalar_value()?
         .scalar_to_string(&global_env.convfmt)?;
-    // TODO: should look into this unwrap
     let mut locations = ere.match_locations(string.try_into()?);
     let start;
     let len;
@@ -543,6 +542,8 @@ struct Record {
 }
 
 impl Record {
+    const MAX_FIELDS: usize = 1024;
+
     fn reset(&mut self, record: String, field_separator: &FieldSeparator) -> Result<(), String> {
         let previous_last_field = *self.last_field.get_mut();
         let mut last_field = 0;
@@ -621,17 +622,26 @@ impl Record {
 
 impl Default for Record {
     fn default() -> Self {
-        let fields = (0..1024)
+        let fields = (0..Record::MAX_FIELDS)
             .map(|i| {
-                AwkValueRef::new(AwkValue::uninitialized_scalar().to_ref(AwkRefType::Field(i)))
+                AwkValueRef::new(
+                    AwkValue::uninitialized_scalar().to_ref(AwkRefType::Field(i as u16)),
+                )
             })
             .collect();
         Self {
             record: CString::default().into(),
-            // TODO: fix magic number
             fields,
             last_field: 0.into(),
         }
+    }
+}
+
+fn is_valid_record_index(index: usize) -> Result<(), String> {
+    if !(0..=Record::MAX_FIELDS).contains(&index) {
+        Err("invalid field index".to_string())
+    } else {
+        Ok(())
     }
 }
 
@@ -1361,11 +1371,8 @@ impl Interpreter {
                     unsafe { stack.push(StackValue::from_var(value))? };
                 }
                 OpCode::GetField => {
-                    let index = stack.pop_scalar_value()?.scalar_as_f64();
-                    if !(0.0..=1024.0).contains(&index) {
-                        return Err("invalid field index".to_string());
-                    }
-                    let index = index as usize;
+                    let index = stack.pop_scalar_value()?.scalar_as_f64() as usize;
+                    is_valid_record_index(index)?;
                     unsafe { stack.push_value((*record.fields[index].get()).share())? };
                 }
                 OpCode::IndexArrayGetValue => {
@@ -1385,11 +1392,8 @@ impl Interpreter {
                     unsafe { stack.push_ref(value)? };
                 }
                 OpCode::FieldRef => {
-                    let index = stack.pop_scalar_value()?.scalar_as_f64();
-                    if !(0.0..=1024.0).contains(&index) {
-                        return Err("invalid field index".to_string());
-                    }
-                    let index = index as usize;
+                    let index = stack.pop_scalar_value()?.scalar_as_f64() as usize;
+                    is_valid_record_index(index)?;
                     unsafe { stack.push_ref(record.fields[index].get())? };
                 }
                 OpCode::IndexArrayGetRef => {
@@ -1801,7 +1805,6 @@ pub fn interpret(
             &mut FileStream::open(&arg)?
         };
 
-        // TODO: check if the arg is an assignment
         global_env.fnr = 1;
         while let Some(record) = reader.read_next_record(&global_env.rs)? {
             current_record.reset(record, &global_env.fs)?;

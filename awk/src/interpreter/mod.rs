@@ -1245,7 +1245,6 @@ impl Interpreter {
                     let string = stack
                         .pop_scalar_value()?
                         .scalar_to_string(&global_env.convfmt)?;
-                    // FIXME: remove unwrap
                     let result = ere.matches(&string.try_into()?);
                     stack.push_value(bool_to_f64(result))?;
                 }

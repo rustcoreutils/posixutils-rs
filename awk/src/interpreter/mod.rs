@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use array::{Array, KeyIterator};
+use array::{Array, KeyIterator, ValueIndex};
 use io::{
     EmptyRecordReader, FileStream, ReadFiles, ReadPipes, RecordReader, RecordSeparator,
     StdinRecordReader, WriteFiles, WritePipes,
@@ -867,9 +867,16 @@ struct ArrayIterator {
     key_iter: KeyIterator,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct ArrayElementRef {
+    array: *mut AwkValue,
+    value_index: ValueIndex,
+}
+
 enum StackValue {
     Value(AwkValueRef),
     ValueRef(*mut AwkValue),
+    ArrayElementRef(ArrayElementRef),
     UninitializedRef(*mut AwkValue),
     Iterator(ArrayIterator),
     Invalid,
@@ -883,14 +890,27 @@ impl StackValue {
             StackValue::Value(val) => val.get_mut(),
             StackValue::ValueRef(val_ref) => &mut **val_ref,
             StackValue::UninitializedRef(val_ref) => &mut **val_ref,
+            StackValue::ArrayElementRef(array_element_ref) => (*array_element_ref.array)
+                .as_array()
+                .unwrap()
+                .index_to_value(array_element_ref.value_index)
+                .unwrap(),
             _ => unreachable!("invalid stack value"),
         }
     }
 
-    fn unwrap_ptr(self) -> *mut AwkValue {
+    /// # Safety
+    /// if the `StackValue` is a `ArrayElementRef` then the pointer has to point to a valid `AwkValue`.
+    /// In this case, the returned pointer can only be used as long as the array containing the element is not modified.
+    unsafe fn unwrap_ptr(self) -> *mut AwkValue {
         match self {
             StackValue::ValueRef(ptr) => ptr,
             StackValue::UninitializedRef(ptr) => ptr,
+            StackValue::ArrayElementRef(array_element_ref) => (*array_element_ref.array)
+                .as_array()
+                .unwrap()
+                .index_to_value(array_element_ref.value_index)
+                .unwrap(),
             _ => unreachable!("expected lvalue"),
         }
     }
@@ -934,6 +954,9 @@ impl StackValue {
             StackValue::ValueRef(val_ref) => StackValue::ValueRef(*val_ref),
             StackValue::UninitializedRef(uninitialized_ref) => {
                 StackValue::UninitializedRef(*uninitialized_ref)
+            }
+            StackValue::ArrayElementRef(array_element_ref) => {
+                StackValue::ArrayElementRef(array_element_ref.clone())
             }
             StackValue::Iterator(iterator) => StackValue::Iterator(iterator.clone()),
             StackValue::Invalid => StackValue::Invalid,
@@ -1351,7 +1374,7 @@ impl Interpreter {
                         .pop_scalar_value()?
                         .scalar_to_string(&global_env.convfmt)?;
                     let array = stack.pop_ref().as_array()?;
-                    let element = array.get_or_insert_uninitialized(key.into())?.share();
+                    let element = array.get_value(key.into())?.share();
                     stack.push_value(element)?
                 }
                 OpCode::GlobalScalarRef(index) => unsafe {
@@ -1374,10 +1397,16 @@ impl Interpreter {
                     let key = stack
                         .pop_scalar_value()?
                         .scalar_to_string(&global_env.convfmt)?;
-                    let array = stack.pop_ref().as_array()?;
-                    let element_ref =
-                        array.get_or_insert_uninitialized(key.into())? as *mut AwkValue;
-                    unsafe { stack.push_ref(element_ref)? };
+                    let array = unsafe { stack.pop().unwrap().unwrap_ptr() };
+                    let value_index = unsafe { &mut *array }
+                        .as_array()?
+                        .get_value_index(key.into())?;
+                    unsafe {
+                        stack.push(StackValue::ArrayElementRef(ArrayElementRef {
+                            array,
+                            value_index,
+                        }))?
+                    };
                 }
                 OpCode::Assign => {
                     let value = stack.pop_scalar_value()?;
@@ -1752,7 +1781,7 @@ pub fn interpret(
             .get_mut()
             .as_array()
             .unwrap()
-            .get_or_insert_uninitialized(current_arg_index.to_string().into())
+            .get_value(current_arg_index.to_string().into())
             .unwrap()
             .share()
             .scalar_to_string(&global_env.convfmt)?;

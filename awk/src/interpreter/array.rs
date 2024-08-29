@@ -15,41 +15,39 @@ use std::{
 use super::AwkValue;
 
 #[derive(Debug, Clone, PartialEq)]
-struct ArrayElement {
-    value: AwkValue,
-    key_index: usize,
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub struct KeyIterator {
     index: usize,
 }
 
 pub type Key = Rc<str>;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ValueIndex {
+    index: usize,
+}
+
+pub type KeyValuePair = (Key, AwkValue);
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Array {
-    values: HashMap<Key, ArrayElement>,
-    keys: Vec<Option<Key>>,
+    key_map: HashMap<Key, usize>,
+    pairs: Vec<Option<KeyValuePair>>,
     iterator_count: usize,
-    empty_key_slots: usize,
+    empty_slots: usize,
 }
 
 impl Array {
     pub fn delete(&mut self, key: &str) {
-        if let Some(array_element) = self.values.remove(key) {
+        if let Some(pair_index) = self.key_map.remove(key) {
             if self.iterator_count == 0 {
-                self.keys.swap_remove(array_element.key_index);
-                if !self.keys.is_empty() {
-                    let swapped_key = self.keys[array_element.key_index]
-                        .as_ref()
-                        .unwrap()
-                        .as_ref();
-                    self.values.get_mut(swapped_key).unwrap().key_index = array_element.key_index;
+                self.pairs.swap_remove(pair_index);
+                if !self.pairs.is_empty() {
+                    let (key, _) = self.pairs[pair_index].as_ref().unwrap();
+                    *self.key_map.get_mut(key).unwrap() = pair_index;
                 }
             } else {
-                self.keys[array_element.key_index] = None;
-                self.empty_key_slots += 1;
+                self.pairs[pair_index] = None;
+                self.empty_slots += 1;
             }
         }
     }
@@ -60,9 +58,9 @@ impl Array {
     }
 
     pub fn key_iter_next(&mut self, iter: &mut KeyIterator) -> Option<Key> {
-        for maybe_key in &self.keys[iter.index..] {
+        for maybe_key in &self.pairs[iter.index..] {
             iter.index += 1;
-            if let Some(key) = maybe_key {
+            if let Some((key, _)) = maybe_key {
                 return Some(key.clone());
             }
         }
@@ -71,14 +69,19 @@ impl Array {
         None
     }
 
-    pub fn get_or_insert_uninitialized(&mut self, key: Rc<str>) -> Result<&mut AwkValue, String> {
-        match self.values.entry(key.clone()) {
-            Entry::Occupied(e) => Ok(&mut e.into_mut().value),
+    pub fn get_value_index(&mut self, key: Key) -> Result<ValueIndex, String> {
+        match self.key_map.entry(key.clone()) {
+            Entry::Occupied(e) => Ok(ValueIndex { index: *e.get() }),
             Entry::Vacant(e) => {
                 if self.iterator_count == 0 {
-                    let key_index = insert_key(key, &mut self.keys, self.empty_key_slots == 0);
-                    let value = AwkValue::uninitialized_scalar();
-                    Ok(&mut e.insert(ArrayElement { value, key_index }).value)
+                    let pair_index = insert_pair(
+                        key,
+                        AwkValue::uninitialized_scalar(),
+                        &mut self.pairs,
+                        self.empty_slots == 0,
+                    );
+                    e.insert(pair_index);
+                    Ok(ValueIndex { index: pair_index })
                 } else {
                     Err("cannot insert into an array with an active iterator".to_string())
                 }
@@ -86,23 +89,30 @@ impl Array {
         }
     }
 
-    pub fn set<V: Into<AwkValue>>(
-        &mut self,
-        key: String,
-        value: V,
-    ) -> Result<&mut AwkValue, String> {
+    pub fn index_to_value(&mut self, index: ValueIndex) -> Option<&mut AwkValue> {
+        self.pairs[index.index].as_mut().map(|(_, val)| val)
+    }
+
+    pub fn get_value(&mut self, key: Key) -> Result<&mut AwkValue, String> {
+        let index = self.get_value_index(key)?;
+        Ok(self.index_to_value(index).unwrap())
+    }
+
+    pub fn set<V: Into<AwkValue>>(&mut self, key: String, value: V) -> Result<ValueIndex, String> {
         if self.iterator_count == 0 {
             let key = Rc::<str>::from(key);
             let value = value.into();
-            match self.values.entry(key.clone()) {
+            match self.key_map.entry(key.clone()) {
                 Entry::Occupied(e) => {
-                    let element_ref = e.into_mut();
-                    element_ref.value = value;
-                    Ok(&mut element_ref.value)
+                    let pair_index = *e.get();
+                    self.pairs[pair_index].as_mut().unwrap().1 = value;
+                    Ok(ValueIndex { index: pair_index })
                 }
                 Entry::Vacant(e) => {
-                    let key_index = insert_key(key, &mut self.keys, self.empty_key_slots == 0);
-                    Ok(&mut e.insert(ArrayElement { value, key_index }).value)
+                    let pair_index =
+                        insert_pair(key, value, &mut self.pairs, self.empty_slots == 0);
+                    e.insert(pair_index);
+                    Ok(ValueIndex { index: pair_index })
                 }
             }
         } else {
@@ -111,18 +121,17 @@ impl Array {
     }
 
     pub fn contains(&self, key: &str) -> bool {
-        self.values.contains_key(key)
+        self.key_map.contains_key(key)
     }
 
     pub fn clear(&mut self) {
-        self.keys.clear();
-        self.values.clear();
+        self.key_map.clear();
+        self.pairs.clear();
+        self.empty_slots = 0;
     }
 
     pub fn len(&self) -> usize {
-        assert_eq!(self.values.len(), self.keys.len());
-
-        self.values.len()
+        self.key_map.len()
     }
 }
 
@@ -138,19 +147,24 @@ impl<S: Into<String>, A: Into<AwkValue>> FromIterator<(S, A)> for Array {
     }
 }
 
-fn insert_key(key: Key, keys: &mut Vec<Option<Key>>, has_empty_slots: bool) -> usize {
+fn insert_pair(
+    key: Key,
+    value: AwkValue,
+    pairs: &mut Vec<Option<KeyValuePair>>,
+    has_empty_slots: bool,
+) -> usize {
     if has_empty_slots {
-        let index = keys.len();
-        keys.push(Some(key));
+        let index = pairs.len();
+        pairs.push(Some((key, value)));
         index
     } else {
-        let index = keys
+        let index = pairs
             .iter()
             .enumerate()
             .filter_map(|(i, v)| v.as_ref().map(|_| i))
             .next()
             .expect("map has no empty key slots");
-        keys[index] = Some(key);
+        pairs[index] = Some((key, value));
         index
     }
 }
@@ -186,7 +200,7 @@ mod tests {
         array.delete("a");
         assert_eq!(array.len(), 0);
         assert_eq!(
-            array.get_or_insert_uninitialized("a".into()).cloned(),
+            array.get_value("a".into()).cloned(),
             Ok(AwkValue::uninitialized_scalar())
         );
     }
@@ -197,7 +211,7 @@ mod tests {
         array.set("a".to_string(), 1.0).unwrap();
         assert_eq!(array.len(), 1);
         assert_eq!(
-            array.get_or_insert_uninitialized("a".into()).cloned(),
+            array.get_value("a".into()).cloned(),
             Ok(AwkValue::from(1.0))
         );
     }
@@ -209,7 +223,7 @@ mod tests {
         array.set("a".to_string(), 2.0).unwrap();
         assert_eq!(array.len(), 1);
         assert_eq!(
-            array.get_or_insert_uninitialized("a".into()).cloned(),
+            array.get_value("a".into()).cloned(),
             Ok(AwkValue::from(2.0))
         );
     }
@@ -246,7 +260,7 @@ mod tests {
         assert!(array.set("e".to_string(), 2.0).is_ok());
         assert_eq!(array.len(), 2);
         assert_eq!(
-            array.get_or_insert_uninitialized("e".into()).cloned(),
+            array.get_value("e".into()).cloned(),
             Ok(AwkValue::from(2.0))
         );
     }

@@ -29,6 +29,14 @@ fn integer_hex_prefix_str(integer_format: IntegerFormat, args: &FormatArgs) -> &
     ""
 }
 
+fn decimal_point() -> char {
+    if cfg!(miri) {
+        '.'
+    } else {
+        unsafe { (*(*libc::localeconv()).decimal_point) as u8 as char }
+    }
+}
+
 fn copy_buffer_to_target(buffer: &[u8], target: &mut String) {
     for c in buffer.iter() {
         target.push(*c as char);
@@ -122,9 +130,8 @@ fn fix_exponent(target: &mut String, lowercase_version: bool, should_add_dot_aft
     // pop the 'e' character
     target.pop();
 
-    // FIXME: replace decimal point with locale specific decimal point
     if should_add_dot_after_number {
-        target.push('.');
+        target.push(decimal_point());
     }
 
     // push the exponent character
@@ -204,7 +211,7 @@ fn remove_trailing_zeros(
             }
         }
     }
-    if let Some('.') = target.chars().last() {
+    if target.chars().last().is_some_and(|c| c == decimal_point()) {
         target.pop();
     }
 }
@@ -259,7 +266,7 @@ pub fn parse_conversion_specifier_args(iter: &mut Chars) -> Result<(char, Format
 
     result.width = parse_number(&mut next, iter)?;
 
-    result.precision = if next == '.' {
+    result.precision = if next == decimal_point() {
         next = iter_next(iter)?;
         Some(parse_number(&mut next, iter)?)
     } else {
@@ -460,12 +467,11 @@ pub fn fmt_write_hex_float(
 
     let copy_fraction = |target: &mut String| {
         if fraction_buffer_length != 0 {
-            // TODO: use locale specific decimal point
-            target.push('.');
+            target.push(decimal_point());
             copy_buffer_to_target(&fraction_buffer[..fraction_buffer_length], target);
             pad_target(target, extra_trailing_zeros, b'0');
         } else if args.alternative_form {
-            target.push('.');
+            target.push(decimal_point());
         }
     };
 
@@ -535,7 +541,7 @@ pub fn fmt_write_decimal_float(
         target.push_str(sign);
         write!(target, "{:.1$}", value, precision).expect("error writing to string");
         if should_add_dot_after_number {
-            target.push('.');
+            target.push(decimal_point());
         }
         let number_length = target.len() - write_starting_index;
         pad_target(target, args.width.saturating_sub(number_length), b' ');
@@ -549,10 +555,9 @@ pub fn fmt_write_decimal_float(
             swap_sign_in_front_of_number(target, sign, write_starting_index);
         }
         if should_add_dot_after_number {
-            target.push('.');
+            target.push(decimal_point());
         }
     }
-    // FIXME: replace decimal point with locale specific decimal point
 }
 
 pub fn fmt_write_scientific_float(
@@ -699,9 +704,8 @@ pub fn fmt_write_float_general(
             );
         }
 
-        // FIXME: replace decimal point with locale specific decimal point
         if should_add_dot_after_number {
-            target.push('.');
+            target.push(decimal_point());
         }
 
         // push the exponent character
@@ -780,14 +784,13 @@ pub fn fmt_write_float_general(
         }
 
         if should_add_dot_after_number {
-            target.push('.');
+            target.push(decimal_point());
         }
 
         if args.left_justified {
             let number_length = target.len() - write_starting_index;
             pad_target(target, args.width.saturating_sub(number_length), b' ');
         }
-        // FIXME: replace decimal point with locale specific decimal point
     }
 }
 

@@ -1723,17 +1723,15 @@ pub fn interpret(
         )
         .collect();
 
+    let env = std::env::vars()
+        .map(|(k, v)| (k, maybe_numeric_string(v)))
+        .collect();
+
     let mut stack = iter::repeat_with(|| StackValue::Invalid)
         .take(STACK_SIZE)
         .collect::<Vec<StackValue>>();
     let mut current_record = Record::default();
-    let mut interpreter = Interpreter::new(
-        args,
-        // TODO: use env args
-        Array::default(),
-        program.constants,
-        program.globals_count,
-    );
+    let mut interpreter = Interpreter::new(args, env, program.constants, program.globals_count);
     let mut global_env = GlobalEnv::default();
     let mut range_pattern_started = vec![false; program.rules.len()];
     let mut return_value = 0;

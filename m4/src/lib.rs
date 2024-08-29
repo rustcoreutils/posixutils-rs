@@ -51,6 +51,8 @@ impl ArgumentDefine {
     }
 }
 
+/// Define a symbol name to have some value [`DefineDirective::Define`] or NULL
+/// [`DefineDirective::Undefine`].
 #[derive(Debug, Clone)]
 pub enum DefineDirective {
     /// `name[=val]`
@@ -66,6 +68,7 @@ pub struct Args {
     /// Enable line synchronization output for the c99 preprocessor phase (that is, #line
     /// directives).
     pub line_synchronization: bool,
+    /// See [`DefineDirective`].
     pub define_directives: Vec<DefineDirective>,
     /// Whether to read input from a file.
     pub files: Vec<PathBuf>,
@@ -77,12 +80,14 @@ impl Args {
             .arg(
                 clap::Arg::new("line_synchronization")
                     .short('s')
+                    .help("Output line synchronization directives, suitable for cpp")
                     .action(clap::ArgAction::SetTrue),
             )
             .arg(
                 clap::Arg::new("define")
                     .short('D')
-                    .value_name("name[=val]")
+                    .value_name("name[=value]")
+                    .help("Define the symbol name to have some value (or NULL)")
                     .num_args(1)
                     .action(clap::ArgAction::Append),
             )

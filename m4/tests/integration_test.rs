@@ -2,8 +2,8 @@
 //! You can regenerate the tests (which are based on the fixtures in `fixtures/integration_tests/`)
 //! using the following command:
 //! `cargo run -p m4-test-manager update-snapshots`
-use m4::error::GetExitCode;
 use m4_test_manager::TestSnapshot;
+use posixutils_m4::error::GetExitCode;
 use similar_asserts::assert_eq;
 use std::fs::read_to_string;
 use std::os::unix::ffi::OsStrExt;
@@ -61,11 +61,11 @@ fn run_command(input: &Path) -> std::process::Output {
 
             let stdout = StdoutRef::default();
             let mut stderr: Vec<u8> = Vec::new();
-            let args = m4::Args {
+            let args = posixutils_m4::Args {
                 files: vec![input.into()],
-                ..m4::Args::default()
+                ..posixutils_m4::Args::default()
             };
-            let result = m4::run(stdout.clone(), &mut stderr, args);
+            let result = posixutils_m4::run(stdout.clone(), &mut stderr, args);
             let status = ExitStatus::from_raw(result.get_exit_code() as i32);
             (stdout.into_inner(), stderr, status)
         }

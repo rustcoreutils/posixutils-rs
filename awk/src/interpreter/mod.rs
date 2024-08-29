@@ -1510,29 +1510,17 @@ impl Interpreter {
                             stack.push_value(0.0)?;
                         }
                     }
-                    BuiltinFunction::GetLineFromFile => {
+                    BuiltinFunction::GetLineFromFile | BuiltinFunction::GetLineFromPipe => {
                         let filename = stack
                             .pop_scalar_value()?
                             .scalar_to_string(&global_env.convfmt)?;
                         let var = stack.pop_ref();
-                        if let Some(next_record) =
+                        let maybe_next_record = if function == BuiltinFunction::GetLineFromFile {
                             self.read_files.read_next_record(filename, &global_env.rs)?
-                        {
-                            fields_state =
-                                var.assign(maybe_numeric_string(next_record), global_env)?;
-                            stack.push_value(1.0)?;
                         } else {
-                            stack.push_value(0.0)?;
-                        }
-                    }
-                    BuiltinFunction::GetLineFromPipe => {
-                        let command = stack
-                            .pop_scalar_value()?
-                            .scalar_to_string(&global_env.convfmt)?;
-                        let var = stack.pop_ref();
-                        if let Some(next_record) =
-                            self.read_pipes.read_next_record(command, &global_env.rs)?
-                        {
+                            self.read_pipes.read_next_record(filename, &global_env.rs)?
+                        };
+                        if let Some(next_record) = maybe_next_record {
                             fields_state =
                                 var.assign(maybe_numeric_string(next_record), global_env)?;
                             stack.push_value(1.0)?;

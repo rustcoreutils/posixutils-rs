@@ -11,6 +11,7 @@ use crate::program::{
     AwkRule, BuiltinFunction, Constant, Function, OpCode, Pattern, Program, SpecialVar, VarId,
 };
 use crate::regex::Regex;
+use pest::error::InputLocation;
 use pest::{
     iterators::{Pair, Pairs},
     pratt_parser::PrattParser,
@@ -1467,7 +1468,7 @@ impl Compiler {
         })
     }
 
-    fn declare_program_functions(&mut self, program: Pairs<Rule>) -> Result<(), PestError> {
+    fn declare_program_functions(&mut self, errors: &mut Vec<PestError>, program: Pairs<Rule>) {
         for item in program {
             if item.as_rule() == Rule::function_definition {
                 let mut inner = item.into_inner();
@@ -1487,51 +1488,118 @@ impl Compiler {
                     },
                 );
                 if previous_value.is_some() {
-                    return Err(pest_error_from_span(
+                    errors.push(pest_error_from_span(
                         name.as_span(),
                         format!("function '{}' is defined multiple times", name),
                     ));
                 }
             }
         }
+    }
+}
+
+fn location_end(loc: &InputLocation) -> usize {
+    match loc {
+        InputLocation::Pos(p) => *p,
+        InputLocation::Span((_, end)) => *end,
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CompilerErrors {
+    errors: Vec<PestError>,
+}
+
+impl std::fmt::Display for CompilerErrors {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        for error in &self.errors {
+            writeln!(f, "{}", error)?;
+        }
         Ok(())
     }
 }
 
-pub fn compile_program(text: &str) -> Result<Program, PestError> {
+fn next_checkpoint(text: &str) -> Option<usize> {
+    text.find('}')
+        .map(|p| text.len().min(p + 1))
+        .into_iter()
+        .chain(text.find("BEGIN"))
+        .chain(text.find("END"))
+        .chain(text.find("function"))
+        .min()
+}
+
+fn gather_errors(first_error: PestError, source: &str) -> CompilerErrors {
+    let first_error_end = location_end(&first_error.location);
+
+    let mut errors = vec![first_error];
+    let mut parsing_start = first_error_end;
+
+    while let Some(checkpoint_offset) = next_checkpoint(&source[parsing_start..]) {
+        parsing_start += checkpoint_offset;
+        match AwkParser::parse(Rule::program, &source[parsing_start..]) {
+            Ok(_) => break,
+            Err(err) => errors.push(err),
+        }
+    }
+
+    CompilerErrors { errors }
+}
+
+fn append_if_err(errors: &mut Vec<PestError>, result: Result<(), PestError>) {
+    if let Err(err) = result {
+        errors.push(err);
+    }
+}
+
+pub fn compile_program(text: &str) -> Result<Program, CompilerErrors> {
     let mut begin_instructions = Vec::new();
     let mut rules = Vec::new();
     let mut end_instructions = Vec::new();
     let mut functions = Vec::new();
 
     let mut compiler = Compiler::default();
-    let program = AwkParser::parse(Rule::program, text)?.next().unwrap();
+    let program = match AwkParser::parse(Rule::program, text) {
+        Ok(mut program) => program.next().unwrap(),
+        Err(err) => {
+            return Err(gather_errors(err, text));
+        }
+    };
     let program_iter = program.into_inner();
+    let mut errors = Vec::new();
 
-    compiler.declare_program_functions(program_iter.clone())?;
+    compiler.declare_program_functions(&mut errors, program_iter.clone());
 
     for item in program_iter {
         match item.as_rule() {
             Rule::begin_action => {
-                compiler.compile_action(
-                    first_child(item),
-                    &mut begin_instructions,
-                    &HashMap::new(),
-                )?;
+                append_if_err(
+                    &mut errors,
+                    compiler.compile_action(
+                        first_child(item),
+                        &mut begin_instructions,
+                        &HashMap::new(),
+                    ),
+                );
             }
             Rule::end_action => {
-                compiler.compile_action(
-                    first_child(item),
-                    &mut end_instructions,
-                    &HashMap::new(),
-                )?;
+                append_if_err(
+                    &mut errors,
+                    compiler.compile_action(
+                        first_child(item),
+                        &mut end_instructions,
+                        &HashMap::new(),
+                    ),
+                );
             }
-            Rule::rule => {
-                rules.push(compiler.compile_rule(item)?);
-            }
-            Rule::function_definition => {
-                functions.push(compiler.compile_function_definition(item)?);
-            }
+            Rule::rule => match compiler.compile_rule(item) {
+                Ok(rule) => rules.push(rule),
+                Err(err) => errors.push(err),
+            },
+            Rule::function_definition => match compiler.compile_function_definition(item) {
+                Ok(function) => functions.push(function),
+                Err(err) => errors.push(err),
+            },
             Rule::EOI => {}
             _ => unreachable!("encontered {:?} while compiling program", item.as_rule()),
         }
@@ -1547,15 +1615,19 @@ pub fn compile_program(text: &str) -> Result<Program, PestError> {
         })
         .collect();
 
-    Ok(Program {
-        constants: compiler.constants.into_inner(),
-        begin_instructions,
-        rules,
-        end_instructions,
-        functions,
-        globals_count: compiler.last_global_var_id.get() as usize,
-        globals,
-    })
+    if errors.is_empty() {
+        Ok(Program {
+            constants: compiler.constants.into_inner(),
+            begin_instructions,
+            rules,
+            end_instructions,
+            functions,
+            globals_count: compiler.last_global_var_id.get() as usize,
+            globals,
+        })
+    } else {
+        Err(CompilerErrors { errors })
+    }
 }
 
 /// Returns true if the given string is a valid number token.

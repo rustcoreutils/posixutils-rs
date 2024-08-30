@@ -1709,7 +1709,12 @@ fn set_globals_with_assignment_arguments(
         })
 }
 
-pub fn interpret(program: Program, args: &[String], assignments: &[String]) -> Result<i32, String> {
+pub fn interpret(
+    program: Program,
+    args: &[String],
+    assignments: &[String],
+    separator: Option<String>,
+) -> Result<i32, String> {
     // println!("{:?}", program);
     let args = iter::once(("0".to_string(), AwkValue::from("awk")))
         .chain(args.into_iter().enumerate().map(|(index, s)| {
@@ -1739,6 +1744,12 @@ pub fn interpret(program: Program, args: &[String], assignments: &[String]) -> R
         &mut global_env,
         assignments,
     )?;
+
+    if let Some(separator) = separator {
+        interpreter.globals[SpecialVar::Fs as usize]
+            .get_mut()
+            .assign(AwkString::from(separator), &mut global_env)?;
+    }
 
     let begin_result = interpreter.run(
         &program.begin_instructions,

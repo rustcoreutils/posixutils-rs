@@ -64,10 +64,20 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .map_err(|_| format!("could not read file '{}'", source_file))?;
         }
         let program = exit_if_error(compile_program(&combined_sources));
-        exit_if_error(interpret(program, &args.arguments, &args.assignments))
+        exit_if_error(interpret(
+            program,
+            &args.arguments,
+            &args.assignments,
+            args.separator_string,
+        ))
     } else if !args.arguments.is_empty() {
         let program = exit_if_error(compile_program(&args.arguments[0]));
-        exit_if_error(interpret(program, &args.arguments[1..], &args.assignments))
+        exit_if_error(interpret(
+            program,
+            &args.arguments[1..],
+            &args.assignments,
+            args.separator_string,
+        ))
     } else {
         eprintln!("missing program argument");
         1

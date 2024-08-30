@@ -500,3 +500,21 @@ fn test_awk_execute_program_from_args() {
         expected_exit_code: 0,
     })
 }
+
+#[test]
+fn test_awk_use_cli_provided_separator() {
+    run_test(TestPlan {
+        cmd: String::from("awk"),
+        args: vec![
+            "-F".to_string(),
+            ",".to_string(),
+            "-f".to_string(),
+            "tests/awk/use_cli_provided_separator.awk".to_string(),
+            "tests/awk/test_data.csv".to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::from(include_str!("awk/use_cli_provided_separator.out")),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    })
+}

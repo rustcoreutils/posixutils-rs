@@ -1693,7 +1693,7 @@ fn set_globals_with_assignment_arguments(
     interpreter: &mut Interpreter,
     globals: &HashMap<String, u32>,
     global_env: &mut GlobalEnv,
-    assignments: Vec<String>,
+    assignments: &[String],
 ) -> Result<(), String> {
     assignments
         .iter()
@@ -1709,18 +1709,15 @@ fn set_globals_with_assignment_arguments(
         })
 }
 
-pub fn interpret(
-    program: Program,
-    args: Vec<String>,
-    assignments: Vec<String>,
-) -> Result<i32, String> {
+pub fn interpret(program: Program, args: &[String], assignments: &[String]) -> Result<i32, String> {
     // println!("{:?}", program);
     let args = iter::once(("0".to_string(), AwkValue::from("awk")))
-        .chain(
-            args.into_iter()
-                .enumerate()
-                .map(|(index, s)| ((index + 1).to_string(), maybe_numeric_string(s).into())),
-        )
+        .chain(args.into_iter().enumerate().map(|(index, s)| {
+            (
+                (index + 1).to_string(),
+                maybe_numeric_string(s.as_str()).into(),
+            )
+        }))
         .collect();
 
     let env = std::env::vars()

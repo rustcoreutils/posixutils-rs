@@ -488,3 +488,15 @@ fn test_awk_variable_assignment_arguments() {
 fn test_awk_correct_comparisons() {
     test_awk!(correct_comparisons, "tests/awk/test_data.txt");
 }
+
+#[test]
+fn test_awk_execute_program_from_args() {
+    run_test(TestPlan {
+        cmd: String::from("awk"),
+        args: vec!["BEGIN { print \"Hello, World!\" }".to_string()],
+        stdin_data: String::new(),
+        expected_out: String::from("Hello, World!\n"),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    })
+}

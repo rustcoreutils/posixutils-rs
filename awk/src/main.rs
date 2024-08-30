@@ -9,11 +9,11 @@
 
 use crate::compiler::compile_program;
 use crate::interpreter::interpret;
-use crate::program::Program;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, textdomain};
 use plib::PROJECT_NAME;
 use std::error::Error;
+use std::fmt::Display;
 use std::io::Read;
 
 mod compiler;
@@ -39,24 +39,7 @@ struct Args {
     arguments: Vec<String>,
 }
 
-fn compile_soruces(args: &Args) -> Result<Program, String> {
-    if !args.program_files.is_empty() {
-        let mut combined_sources = String::new();
-        for source_file in &args.program_files {
-            let mut file = std::fs::File::open(source_file)
-                .map_err(|_| format!("could not open file '{}'", source_file))?;
-            file.read_to_string(&mut combined_sources)
-                .map_err(|_| format!("could not read file '{}'", source_file))?;
-        }
-        compile_program(&combined_sources).map_err(|err| format!("{}", err))
-    } else if !args.arguments.is_empty() {
-        compile_program(&args.arguments[0]).map_err(|err| format!("{}", err))
-    } else {
-        Err("missing program argument".to_string())
-    }
-}
-
-fn exit_if_error<T>(r: Result<T, String>) -> T {
+fn exit_if_error<T, U: Display>(r: Result<T, U>) -> T {
     match r {
         Ok(v) => v,
         Err(err) => {
@@ -72,8 +55,22 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let args = Args::parse();
 
-    let program = exit_if_error(compile_soruces(&args));
-
-    let result = exit_if_error(interpret(program, args.arguments, args.assignments));
-    std::process::exit(result);
+    let return_status = if !args.program_files.is_empty() {
+        let mut combined_sources = String::new();
+        for source_file in &args.program_files {
+            let mut file = std::fs::File::open(source_file)
+                .map_err(|_| format!("could not open file '{}'", source_file))?;
+            file.read_to_string(&mut combined_sources)
+                .map_err(|_| format!("could not read file '{}'", source_file))?;
+        }
+        let program = exit_if_error(compile_program(&combined_sources));
+        exit_if_error(interpret(program, &args.arguments, &args.assignments))
+    } else if !args.arguments.is_empty() {
+        let program = exit_if_error(compile_program(&args.arguments[0]));
+        exit_if_error(interpret(program, &args.arguments[1..], &args.assignments))
+    } else {
+        eprintln!("missing program argument");
+        1
+    };
+    std::process::exit(return_status);
 }

@@ -1751,17 +1751,19 @@ pub fn interpret(
             .assign(AwkString::from(separator), &mut global_env)?;
     }
 
-    let begin_result = interpreter.run(
-        &program.begin_instructions,
-        &program.functions,
-        &mut current_record,
-        &mut stack,
-        &mut global_env,
-        &mut EmptyRecordReader::default(),
-    )?;
-
-    if let ExecutionResult::Exit(val) = begin_result {
-        return_value = val;
+    for action in program.begin_actions {
+        let begin_result = interpreter.run(
+            &action.instructions,
+            &program.functions,
+            &mut current_record,
+            &mut stack,
+            &mut global_env,
+            &mut EmptyRecordReader::default(),
+        )?;
+        if let ExecutionResult::Exit(val) = begin_result {
+            return_value = val;
+            break;
+        }
     }
 
     let mut current_arg_index = 1;
@@ -1869,7 +1871,7 @@ pub fn interpret(
                 };
                 if should_execute {
                     let rule_result = interpreter.run(
-                        &rule.instructions,
+                        &rule.action.instructions,
                         &program.functions,
                         &mut current_record,
                         &mut stack,
@@ -1894,17 +1896,21 @@ pub fn interpret(
         current_arg_index += 1;
     }
 
-    let end_result = interpreter.run(
-        &program.end_instructions,
-        &program.functions,
-        &mut current_record,
-        &mut stack,
-        &mut global_env,
-        &mut EmptyRecordReader::default(),
-    )?;
-    if let ExecutionResult::Exit(val) = end_result {
-        return_value = val;
+    for action in program.end_actions {
+        let end_result = interpreter.run(
+            &action.instructions,
+            &program.functions,
+            &mut current_record,
+            &mut stack,
+            &mut global_env,
+            &mut EmptyRecordReader::default(),
+        )?;
+        if let ExecutionResult::Exit(val) = end_result {
+            return_value = val;
+            break;
+        }
     }
+
     Ok(return_value)
 }
 
@@ -2424,6 +2430,7 @@ mod tests {
         let function = Function {
             parameters_count: 0,
             instructions: vec![OpCode::PushConstant(0), OpCode::Return],
+            ..Default::default()
         };
         let constant = vec![Constant::from("test")];
         assert_eq!(
@@ -2438,6 +2445,7 @@ mod tests {
         let functions = Function {
             parameters_count: 1,
             instructions: vec![OpCode::LocalScalarRef(0), OpCode::Return],
+            ..Default::default()
         };
         assert_eq!(
             interpret_with_function(main, vec![], functions),
@@ -2456,6 +2464,7 @@ mod tests {
                 OpCode::IndexArrayGetValue,
                 OpCode::Return,
             ],
+            ..Default::default()
         };
         let constant = vec![Constant::from("key")];
         assert_eq!(
@@ -2470,6 +2479,7 @@ mod tests {
         let function = Function {
             parameters_count: 1,
             instructions: vec![OpCode::GetLocal(0), OpCode::PushOne, OpCode::Add],
+            ..Default::default()
         };
         let constant = vec![Constant::Number(0.0)];
         assert_eq!(
@@ -2493,6 +2503,7 @@ mod tests {
                 OpCode::PushOne,
                 OpCode::Assign,
             ],
+            ..Default::default()
         };
         let constants = vec![Constant::from("key")];
         assert_eq!(
@@ -2525,6 +2536,7 @@ mod tests {
                 OpCode::Add,
                 OpCode::Return,
             ],
+            ..Default::default()
         };
         let constants = vec![Constant::Number(1.0)];
         assert_eq!(
@@ -3194,6 +3206,7 @@ mod tests {
                 OpCode::PushUninitializedScalar,
                 OpCode::Return,
             ],
+            ..Default::default()
         };
         let constants = vec!["test value".into()];
         let result = Test::new(instructions, constants)
@@ -3241,6 +3254,7 @@ mod tests {
                 OpCode::PushUninitializedScalar,
                 OpCode::Return,
             ],
+            ..Default::default()
         };
         let constants = vec![
             Constant::from("key"),

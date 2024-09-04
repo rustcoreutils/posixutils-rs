@@ -10,6 +10,7 @@
 use crate::compiler::compile_program;
 use crate::interpreter::interpret;
 use clap::Parser;
+use compiler::SourceFile;
 use gettextrs::{bind_textdomain_codeset, textdomain};
 use plib::PROJECT_NAME;
 use std::error::Error;
@@ -56,14 +57,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
 
     let return_status = if !args.program_files.is_empty() {
-        let mut combined_sources = String::new();
+        let mut sources = Vec::new();
         for source_file in &args.program_files {
             let mut file = std::fs::File::open(source_file)
                 .map_err(|_| format!("could not open file '{}'", source_file))?;
-            file.read_to_string(&mut combined_sources)
+            let mut contents = String::new();
+            file.read_to_string(&mut contents)
                 .map_err(|_| format!("could not read file '{}'", source_file))?;
+            sources.push(SourceFile {
+                contents,
+                filename: source_file.clone(),
+            });
         }
-        let program = exit_if_error(compile_program(&combined_sources));
+        let program = exit_if_error(compile_program(&sources));
         exit_if_error(interpret(
             program,
             &args.arguments,
@@ -71,7 +77,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             args.separator_string,
         ))
     } else if !args.arguments.is_empty() {
-        let program = exit_if_error(compile_program(&args.arguments[0]));
+        let program = exit_if_error(compile_program(&[SourceFile::stdin(
+            args.arguments[0].clone(),
+        )]));
         exit_if_error(interpret(
             program,
             &args.arguments[1..],

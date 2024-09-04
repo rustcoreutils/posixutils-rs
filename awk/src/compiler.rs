@@ -8,7 +8,8 @@
 //
 
 use crate::program::{
-    AwkRule, BuiltinFunction, Constant, Function, OpCode, Pattern, Program, SpecialVar, VarId,
+    Action, AwkRule, BuiltinFunction, Constant, DebugInfo, Function, OpCode, Pattern, Program,
+    SourceLocation, SpecialVar, VarId,
 };
 use crate::regex::Regex;
 use pest::error::InputLocation;
@@ -285,14 +286,27 @@ fn lvalue_to_scalar_ref(instructions: &mut [OpCode]) {
 
 fn normalize_builtin_function_arguments(
     function: BuiltinFunction,
-    mut args: Vec<Vec<OpCode>>,
-) -> (Vec<OpCode>, u16) {
-    let flatten = |args: Vec<Vec<OpCode>>| args.into_iter().flatten().collect::<Vec<_>>();
+    mut args: Vec<Instructions>,
+    line_col: (usize, usize),
+) -> (Instructions, u16) {
+    let flatten = |args: Vec<Instructions>| {
+        args.into_iter()
+            .fold(Instructions::default(), |mut acc, i| {
+                acc.extend(i);
+                acc
+            })
+    };
     let argc = args.len() as u16;
     match function {
         BuiltinFunction::Length => {
             if args.is_empty() {
-                (vec![OpCode::PushZero, OpCode::GetField], 1)
+                (
+                    Instructions::from_instructions_and_line_col(
+                        vec![OpCode::PushZero, OpCode::GetField],
+                        line_col,
+                    ),
+                    1,
+                )
             } else {
                 (args.into_iter().next().unwrap(), 1)
             }
@@ -304,12 +318,15 @@ fn normalize_builtin_function_arguments(
         }
         BuiltinFunction::Sub | BuiltinFunction::Gsub => {
             if argc == 2 {
-                let mut instructions = vec![OpCode::PushZero, OpCode::FieldRef];
-                instructions.extend(args.into_iter().flatten());
+                let mut instructions = Instructions::from_instructions_and_line_col(
+                    vec![OpCode::PushZero, OpCode::FieldRef],
+                    line_col,
+                );
+                instructions.extend(flatten(args));
                 (instructions, 3)
             } else {
                 args.rotate_right(1);
-                lvalue_to_scalar_ref(&mut args[0]);
+                lvalue_to_scalar_ref(&mut args[0].opcodes);
                 (flatten(args), 3)
             }
         }
@@ -328,11 +345,11 @@ enum ExprKind {
 
 struct Expr {
     kind: ExprKind,
-    instructions: Vec<OpCode>,
+    instructions: Instructions,
 }
 
 impl Expr {
-    fn new(kind: ExprKind, instructions: Vec<OpCode>) -> Self {
+    fn new(kind: ExprKind, instructions: Instructions) -> Self {
         Expr { kind, instructions }
     }
 }
@@ -346,6 +363,56 @@ pub enum GlobalName {
 
 type NameMap = HashMap<String, GlobalName>;
 type LocalMap = HashMap<String, VarId>;
+
+#[derive(Debug, Default)]
+struct Instructions {
+    opcodes: Vec<OpCode>,
+    source_locations: Vec<SourceLocation>,
+}
+
+impl Instructions {
+    fn from_instructions_and_line_col(instructions: Vec<OpCode>, line_col: (usize, usize)) -> Self {
+        let source_locations = vec![
+            SourceLocation {
+                line: line_col.0 as u32,
+                column: line_col.1 as u32,
+            };
+            instructions.len()
+        ];
+        Instructions {
+            opcodes: instructions,
+            source_locations,
+        }
+    }
+
+    fn push(&mut self, instruction: OpCode, line_col: (usize, usize)) {
+        self.opcodes.push(instruction);
+        self.source_locations.push(SourceLocation {
+            line: line_col.0 as u32,
+            column: line_col.1 as u32,
+        });
+    }
+
+    fn extend(&mut self, instructions: Instructions) {
+        self.opcodes.extend(instructions.opcodes);
+        self.source_locations.extend(instructions.source_locations);
+    }
+
+    fn into_action(self, file: Rc<str>) -> Action {
+        Action {
+            instructions: self.opcodes,
+            debug_info: DebugInfo {
+                source_locations: self.source_locations,
+                file,
+            },
+        }
+    }
+
+    fn len(&self) -> usize {
+        assert_eq!(self.opcodes.len(), self.source_locations.len());
+        self.opcodes.len()
+    }
+}
 
 #[derive(Default)]
 struct LoopStubs {
@@ -474,7 +541,7 @@ impl Compiler {
     fn compile_function_args(
         &self,
         args: Pairs<Rule>,
-        instructions: &mut Vec<OpCode>,
+        instructions: &mut Instructions,
         call_span: pest::Span,
         locals: &LocalMap,
     ) -> Result<u16, PestError> {
@@ -495,7 +562,7 @@ impl Compiler {
     fn map_primary(&self, primary: Pair<Rule>, locals: &LocalMap) -> Result<Expr, PestError> {
         match primary.as_rule() {
             Rule::expr => {
-                let mut instructions = Vec::new();
+                let mut instructions = Instructions::default();
                 self.compile_expr(primary, &mut instructions, locals)?;
                 Ok(Expr::new(ExprKind::Number, instructions))
             }
@@ -506,7 +573,10 @@ impl Compiler {
                 let index = self.push_constant(Constant::Regex(Rc::new(regex)));
                 Ok(Expr::new(
                     ExprKind::Regex,
-                    vec![OpCode::PushConstant(index)],
+                    Instructions::from_instructions_and_line_col(
+                        vec![OpCode::PushConstant(index)],
+                        primary.line_col(),
+                    ),
                 ))
             }
             Rule::number => {
@@ -514,7 +584,10 @@ impl Compiler {
                 let index = self.push_constant(Constant::Number(num));
                 Ok(Expr::new(
                     ExprKind::Number,
-                    vec![OpCode::PushConstant(index)],
+                    Instructions::from_instructions_and_line_col(
+                        vec![OpCode::PushConstant(index)],
+                        primary.line_col(),
+                    ),
                 ))
             }
             Rule::string => {
@@ -524,19 +597,23 @@ impl Compiler {
                 ));
                 Ok(Expr::new(
                     ExprKind::String,
-                    vec![OpCode::PushConstant(index)],
+                    Instructions::from_instructions_and_line_col(
+                        vec![OpCode::PushConstant(index)],
+                        primary.line_col(),
+                    ),
                 ))
             }
             Rule::lvalue => {
-                let mut instructions = Vec::new();
+                let mut instructions = Instructions::default();
                 self.compile_lvalue(primary, &mut instructions, locals)?;
                 Ok(Expr::new(ExprKind::LValue, instructions))
             }
             Rule::function_call => {
                 let span = primary.as_span();
+                let line_col = primary.line_col();
                 let mut inner = primary.into_inner();
                 let name = inner.next().unwrap().as_str();
-                let mut instructions = Vec::new();
+                let mut instructions = Instructions::default();
                 let argc = self.compile_function_args(inner, &mut instructions, span, locals)?;
                 match self.names.borrow().get(name) {
                     Some(GlobalName::Function {
@@ -551,13 +628,16 @@ impl Compiler {
                             ));
                         } else if argc < *parameter_count as u16 {
                             for _ in argc..*parameter_count as u16 {
-                                instructions.push(OpCode::PushUninitialized);
+                                instructions.push(OpCode::PushUninitialized, line_col);
                             }
                         }
-                        instructions.push(OpCode::Call {
-                            id: *id,
-                            argc: *parameter_count as u16,
-                        });
+                        instructions.push(
+                            OpCode::Call {
+                                id: *id,
+                                argc: *parameter_count as u16,
+                            },
+                            line_col,
+                        );
                     }
                     Some(_) => {
                         return Err(pest_error_from_span(
@@ -576,11 +656,12 @@ impl Compiler {
             }
             Rule::builtin_function_call => {
                 let span = primary.as_span();
+                let line_col = primary.line_col();
                 let mut inner = primary.into_inner();
                 let function = inner.next().unwrap();
                 let mut args = Vec::new();
                 for arg in inner {
-                    let mut arg_instructions = Vec::new();
+                    let mut arg_instructions = Instructions::default();
                     self.compile_expr(arg, &mut arg_instructions, locals)?;
                     args.push(arg_instructions);
                     if args.len() > u16::MAX as usize {
@@ -596,11 +677,14 @@ impl Compiler {
                     .expect("missing builtin");
                 if (fn_info.min_args..=fn_info.max_args).contains(&argc) {
                     let (mut instructions, argc) =
-                        normalize_builtin_function_arguments(fn_info.function, args);
-                    instructions.push(OpCode::CallBuiltin {
-                        function: fn_info.function,
-                        argc,
-                    });
+                        normalize_builtin_function_arguments(fn_info.function, args, line_col);
+                    instructions.push(
+                        OpCode::CallBuiltin {
+                            function: fn_info.function,
+                            argc,
+                        },
+                        line_col,
+                    );
                     Ok(Expr::new(ExprKind::Number, instructions))
                 } else {
                     Err(pest_error_from_span(
@@ -624,15 +708,15 @@ impl Compiler {
         let mut instructions = rhs.instructions;
         match op.as_rule() {
             Rule::negate => {
-                instructions.push(OpCode::Negate);
+                instructions.push(OpCode::Negate, op.line_col());
                 Ok(Expr::new(ExprKind::Number, instructions))
             }
             Rule::not => {
-                instructions.push(OpCode::Not);
+                instructions.push(OpCode::Not, op.line_col());
                 Ok(Expr::new(ExprKind::Number, instructions))
             }
             Rule::unary_plus => {
-                instructions.push(OpCode::AsNumber);
+                instructions.push(OpCode::AsNumber, op.line_col());
                 Ok(Expr::new(ExprKind::Number, instructions))
             }
             Rule::pre_inc | Rule::pre_dec => {
@@ -642,11 +726,11 @@ impl Compiler {
                         "operand should be an lvalue".to_string(),
                     ));
                 }
-                lvalue_to_scalar_ref(&mut instructions);
+                lvalue_to_scalar_ref(&mut instructions.opcodes);
                 if op.as_rule() == Rule::pre_inc {
-                    instructions.push(OpCode::PreInc);
+                    instructions.push(OpCode::PreInc, op.line_col());
                 } else {
-                    instructions.push(OpCode::PreDec);
+                    instructions.push(OpCode::PreDec, op.line_col());
                 }
                 Ok(Expr::new(ExprKind::Number, instructions))
             }
@@ -664,11 +748,11 @@ impl Compiler {
                 "operand should be an lvalue".to_string(),
             ));
         }
-        lvalue_to_scalar_ref(&mut instructions);
+        lvalue_to_scalar_ref(&mut instructions.opcodes);
         if op.as_rule() == Rule::post_inc {
-            instructions.push(OpCode::PostInc);
+            instructions.push(OpCode::PostInc, op.line_col());
         } else {
-            instructions.push(OpCode::PostDec);
+            instructions.push(OpCode::PostDec, op.line_col());
         }
         Ok(Expr::new(ExprKind::Number, instructions))
     }
@@ -680,25 +764,31 @@ impl Compiler {
 
         match op.as_rule() {
             Rule::and => {
-                instructions.push(OpCode::JumpIfFalse(rhs.instructions.len() as i32 + 2));
+                instructions.push(
+                    OpCode::JumpIfFalse(rhs.instructions.len() as i32 + 2),
+                    op.line_col(),
+                );
                 instructions.extend(rhs.instructions);
-                instructions.push(OpCode::Jump(2));
-                instructions.push(OpCode::PushZero);
+                instructions.push(OpCode::Jump(2), op.line_col());
+                instructions.push(OpCode::PushZero, op.line_col());
                 return Ok(Expr::new(ExprKind::Number, instructions));
             }
             Rule::or => {
-                instructions.push(OpCode::JumpIfTrue(rhs.instructions.len() as i32 + 2));
+                instructions.push(
+                    OpCode::JumpIfTrue(rhs.instructions.len() as i32 + 2),
+                    op.line_col(),
+                );
                 instructions.extend(rhs.instructions);
-                instructions.push(OpCode::Jump(2));
-                instructions.push(OpCode::PushOne);
+                instructions.push(OpCode::Jump(2), op.line_col());
+                instructions.push(OpCode::PushOne, op.line_col());
                 return Ok(Expr::new(ExprKind::Number, instructions));
             }
             Rule::in_op => {
-                let mut lhs_instructions = instructions;
+                let lhs_instructions = instructions;
                 let mut instructions = rhs.instructions;
-                lvalue_to_scalar_ref(&mut instructions);
-                instructions.append(&mut lhs_instructions);
-                instructions.push(OpCode::In);
+                lvalue_to_scalar_ref(&mut instructions.opcodes);
+                instructions.extend(lhs_instructions);
+                instructions.push(OpCode::In, op.line_col());
                 return Ok(Expr::new(ExprKind::Number, instructions));
             }
             _ => {}
@@ -707,31 +797,31 @@ impl Compiler {
         instructions.extend(rhs.instructions);
         match op.as_rule() {
             Rule::add => {
-                instructions.push(OpCode::Add);
+                instructions.push(OpCode::Add, op.line_col());
                 Ok(Expr::new(ExprKind::Number, instructions))
             }
             Rule::binary_sub => {
-                instructions.push(OpCode::Sub);
+                instructions.push(OpCode::Sub, op.line_col());
                 Ok(Expr::new(ExprKind::Number, instructions))
             }
             Rule::mul => {
-                instructions.push(OpCode::Mul);
+                instructions.push(OpCode::Mul, op.line_col());
                 Ok(Expr::new(ExprKind::Number, instructions))
             }
             Rule::div => {
-                instructions.push(OpCode::Div);
+                instructions.push(OpCode::Div, op.line_col());
                 Ok(Expr::new(ExprKind::Number, instructions))
             }
             Rule::modulus => {
-                instructions.push(OpCode::Mod);
+                instructions.push(OpCode::Mod, op.line_col());
                 Ok(Expr::new(ExprKind::Number, instructions))
             }
             Rule::pow => {
-                instructions.push(OpCode::Pow);
+                instructions.push(OpCode::Pow, op.line_col());
                 Ok(Expr::new(ExprKind::Number, instructions))
             }
             Rule::le => {
-                instructions.push(OpCode::Le);
+                instructions.push(OpCode::Le, op.line_col());
                 Ok(Expr::new(ExprKind::Number, instructions))
             }
             Rule::comp_op => {
@@ -742,28 +832,31 @@ impl Compiler {
                     ));
                 }
                 let op = first_child(op);
-                instructions.push(match op.as_rule() {
-                    Rule::lt => OpCode::Lt,
-                    Rule::gt => OpCode::Gt,
-                    Rule::le => OpCode::Le,
-                    Rule::ge => OpCode::Ge,
-                    Rule::eq => OpCode::Eq,
-                    Rule::ne => OpCode::Ne,
-                    _ => unreachable!(),
-                });
+                instructions.push(
+                    match op.as_rule() {
+                        Rule::lt => OpCode::Lt,
+                        Rule::gt => OpCode::Gt,
+                        Rule::le => OpCode::Le,
+                        Rule::ge => OpCode::Ge,
+                        Rule::eq => OpCode::Eq,
+                        Rule::ne => OpCode::Ne,
+                        _ => unreachable!(),
+                    },
+                    op.line_col(),
+                );
                 Ok(Expr::new(ExprKind::Comp, instructions))
             }
             Rule::match_op => {
-                instructions.push(OpCode::Match);
+                instructions.push(OpCode::Match, op.line_col());
                 Ok(Expr::new(ExprKind::Number, instructions))
             }
             Rule::not_match => {
-                instructions.push(OpCode::Match);
-                instructions.push(OpCode::Not);
+                instructions.push(OpCode::Match, op.line_col());
+                instructions.push(OpCode::Not, op.line_col());
                 Ok(Expr::new(ExprKind::Number, instructions))
             }
             Rule::concat => {
-                instructions.push(OpCode::Concat);
+                instructions.push(OpCode::Concat, op.line_col());
                 Ok(Expr::new(ExprKind::String, instructions))
             }
             _ => unreachable!(),
@@ -786,16 +879,17 @@ impl Compiler {
     fn compile_lvalue(
         &self,
         lvalue: Pair<Rule>,
-        instructions: &mut Vec<OpCode>,
+        instructions: &mut Instructions,
         locals: &LocalMap,
     ) -> Result<(), PestError> {
         let lvalue = first_child(lvalue);
+        let line_col = lvalue.line_col();
         match lvalue.as_rule() {
             Rule::name => {
                 let get_instruction = self
                     .get_var(lvalue.as_str(), locals)
                     .map_err(|msg| pest_error_from_span(lvalue.as_span(), msg))?;
-                instructions.push(get_instruction);
+                instructions.push(get_instruction, line_col);
             }
             Rule::array_element => {
                 let mut inner = lvalue.into_inner();
@@ -803,14 +897,14 @@ impl Compiler {
                 let get_instruction = self
                     .get_var(name.as_str(), locals)
                     .map_err(|msg| pest_error_from_span(name.as_span(), msg))?;
-                instructions.push(get_instruction);
+                instructions.push(get_instruction, line_col);
                 self.compile_array_index(inner, instructions, locals)?;
-                instructions.push(OpCode::IndexArrayGetValue)
+                instructions.push(OpCode::IndexArrayGetValue, line_col)
             }
             Rule::field_var => {
                 let primary = self.map_primary(first_child(lvalue), locals)?;
                 instructions.extend(primary.instructions);
-                instructions.push(OpCode::GetField);
+                instructions.push(OpCode::GetField, line_col);
             }
             _ => unreachable!("encountered {:?} while compiling lvalue", lvalue.as_rule()),
         }
@@ -820,22 +914,29 @@ impl Compiler {
     fn compile_array_index(
         &self,
         mut index: Pairs<Rule>,
-        instructions: &mut Vec<OpCode>,
+        instructions: &mut Instructions,
         locals: &LocalMap,
     ) -> Result<(), PestError> {
         let first_index = index.next().unwrap();
         self.compile_expr(first_index, instructions, locals)?;
         if let Some(second_index) = index.next() {
-            instructions.push(OpCode::GetGlobal(SpecialVar::Subsep as u32));
-            instructions.push(OpCode::Concat);
+            let second_index_line_col = second_index.line_col();
+            instructions.push(
+                OpCode::GetGlobal(SpecialVar::Subsep as u32),
+                second_index.line_col(),
+            );
+            instructions.push(OpCode::Concat, second_index.line_col());
             self.compile_expr(second_index, instructions, locals)?;
             for other_index in index {
-                instructions.push(OpCode::Concat);
-                instructions.push(OpCode::GetGlobal(SpecialVar::Subsep as u32));
-                instructions.push(OpCode::Concat);
+                instructions.push(OpCode::Concat, other_index.line_col());
+                instructions.push(
+                    OpCode::GetGlobal(SpecialVar::Subsep as u32),
+                    other_index.line_col(),
+                );
+                instructions.push(OpCode::Concat, other_index.line_col());
                 self.compile_expr(other_index, instructions, locals)?;
             }
-            instructions.push(OpCode::Concat);
+            instructions.push(OpCode::Concat, second_index_line_col);
         }
         Ok(())
     }
@@ -843,7 +944,7 @@ impl Compiler {
     fn compile_binary_expr(
         &self,
         expr: Pair<Rule>,
-        instructions: &mut Vec<OpCode>,
+        instructions: &mut Instructions,
         locals: &LocalMap,
     ) -> Result<(), PestError> {
         let expr = first_child(expr);
@@ -859,9 +960,9 @@ impl Compiler {
                 let get_instruction = self
                     .get_var(name.as_str(), locals)
                     .map_err(|msg| pest_error_from_span(name.as_span(), msg))?;
-                instructions.push(get_instruction);
+                instructions.push(get_instruction, name.line_col());
                 self.compile_array_index(index.into_inner(), instructions, locals)?;
-                instructions.push(OpCode::In);
+                instructions.push(OpCode::In, name.line_col());
             }
             other => {
                 unreachable!("encountered {:?} while compiling binary expression", other)
@@ -873,39 +974,52 @@ impl Compiler {
     fn compile_input_function(
         &self,
         expr: Pair<Rule>,
-        instructions: &mut Vec<OpCode>,
+        instructions: &mut Instructions,
         locals: &LocalMap,
     ) -> Result<(), PestError> {
         let input_function = first_child(expr);
+        let line_col = input_function.line_col();
         match input_function.as_rule() {
             Rule::simple_getline => {
                 if let Some(lvalue) = input_function.into_inner().next() {
                     self.compile_lvalue(lvalue, instructions, locals)?;
-                    lvalue_to_scalar_ref(instructions);
+                    lvalue_to_scalar_ref(&mut instructions.opcodes);
                 } else {
-                    instructions.extend([OpCode::PushZero, OpCode::FieldRef]);
+                    instructions.extend(Instructions::from_instructions_and_line_col(
+                        vec![OpCode::PushZero, OpCode::FieldRef],
+                        line_col,
+                    ));
                 }
-                instructions.push(OpCode::CallBuiltin {
-                    function: BuiltinFunction::GetLine,
-                    argc: 1,
-                });
+                instructions.push(
+                    OpCode::CallBuiltin {
+                        function: BuiltinFunction::GetLine,
+                        argc: 1,
+                    },
+                    line_col,
+                );
             }
             Rule::getline_from_file => {
                 let mut inner = input_function.into_inner();
                 let lvalue = inner.next().unwrap();
                 let file = if lvalue.as_rule() == Rule::lvalue {
                     self.compile_lvalue(lvalue, instructions, locals)?;
-                    lvalue_to_scalar_ref(instructions);
+                    lvalue_to_scalar_ref(&mut instructions.opcodes);
                     inner.next().unwrap()
                 } else {
-                    instructions.extend([OpCode::PushZero, OpCode::FieldRef]);
+                    instructions.extend(Instructions::from_instructions_and_line_col(
+                        vec![OpCode::PushZero, OpCode::FieldRef],
+                        line_col,
+                    ));
                     lvalue
                 };
                 self.compile_expr(file, instructions, locals)?;
-                instructions.push(OpCode::CallBuiltin {
-                    function: BuiltinFunction::GetLineFromFile,
-                    argc: 2,
-                });
+                instructions.push(
+                    OpCode::CallBuiltin {
+                        function: BuiltinFunction::GetLineFromFile,
+                        argc: 2,
+                    },
+                    line_col,
+                );
             }
             Rule::getline_from_pipe => {
                 let mut inner = input_function.into_inner();
@@ -918,17 +1032,23 @@ impl Compiler {
                 for lvalue in lvalues.into_iter().rev() {
                     if let Some(lvalue) = lvalue {
                         self.compile_lvalue(lvalue.clone(), instructions, locals)?;
-                        lvalue_to_scalar_ref(instructions);
+                        lvalue_to_scalar_ref(&mut instructions.opcodes);
                     } else {
-                        instructions.extend([OpCode::PushZero, OpCode::FieldRef]);
+                        instructions.extend(Instructions::from_instructions_and_line_col(
+                            vec![OpCode::PushZero, OpCode::FieldRef],
+                            line_col,
+                        ));
                     }
                 }
                 self.compile_expr(unpiped_expr, instructions, locals)?;
                 for _ in 0..getline_count {
-                    instructions.push(OpCode::CallBuiltin {
-                        function: BuiltinFunction::GetLineFromPipe,
-                        argc: 2,
-                    });
+                    instructions.push(
+                        OpCode::CallBuiltin {
+                            function: BuiltinFunction::GetLineFromPipe,
+                            argc: 2,
+                        },
+                        line_col,
+                    );
                 }
             }
             _ => unreachable!(),
@@ -939,7 +1059,7 @@ impl Compiler {
     fn compile_expr(
         &self,
         expr: Pair<Rule>,
-        instructions: &mut Vec<OpCode>,
+        instructions: &mut Instructions,
         locals: &LocalMap,
     ) -> Result<(), PestError> {
         let expr = first_child(expr);
@@ -947,37 +1067,55 @@ impl Compiler {
             Rule::assignment => {
                 let mut inner = expr.into_inner();
                 self.compile_lvalue(inner.next().unwrap(), instructions, locals)?;
-                lvalue_to_scalar_ref(instructions);
+                lvalue_to_scalar_ref(&mut instructions.opcodes);
                 let assignment_op = first_child(inner.next().unwrap());
                 if assignment_op.as_rule() != Rule::assign {
-                    instructions.push(OpCode::Dup);
+                    instructions.push(OpCode::Dup, assignment_op.line_col());
                     self.compile_expr(inner.next().unwrap(), instructions, locals)?;
                     match assignment_op.as_rule() {
-                        Rule::add_assign => instructions.push(OpCode::Add),
-                        Rule::sub_assign => instructions.push(OpCode::Sub),
-                        Rule::mul_assign => instructions.push(OpCode::Mul),
-                        Rule::div_assign => instructions.push(OpCode::Div),
-                        Rule::mod_assign => instructions.push(OpCode::Mod),
-                        Rule::pow_assign => instructions.push(OpCode::Pow),
+                        Rule::add_assign => {
+                            instructions.push(OpCode::Add, assignment_op.line_col())
+                        }
+                        Rule::sub_assign => {
+                            instructions.push(OpCode::Sub, assignment_op.line_col())
+                        }
+                        Rule::mul_assign => {
+                            instructions.push(OpCode::Mul, assignment_op.line_col())
+                        }
+                        Rule::div_assign => {
+                            instructions.push(OpCode::Div, assignment_op.line_col())
+                        }
+                        Rule::mod_assign => {
+                            instructions.push(OpCode::Mod, assignment_op.line_col())
+                        }
+                        Rule::pow_assign => {
+                            instructions.push(OpCode::Pow, assignment_op.line_col())
+                        }
                         _ => unreachable!(),
                     }
                 } else {
                     self.compile_expr(inner.next().unwrap(), instructions, locals)?;
                 }
 
-                instructions.push(OpCode::Assign);
+                instructions.push(OpCode::Assign, assignment_op.line_col());
             }
             Rule::ternary_expr | Rule::ternary_print_expr => {
+                let line_col = expr.line_col();
                 let mut inner = expr.into_inner();
                 self.compile_binary_expr(inner.next().unwrap(), instructions, locals)?;
-                let mut true_expr_instructions = Vec::new();
+                let mut true_expr_instructions = Instructions::default();
                 self.compile_expr(inner.next().unwrap(), &mut true_expr_instructions, locals)?;
-                instructions.push(OpCode::JumpIfFalse(true_expr_instructions.len() as i32 + 2));
-                instructions.extend(&true_expr_instructions);
-                true_expr_instructions.clear();
-                let mut false_expr_instructions = true_expr_instructions;
+                instructions.push(
+                    OpCode::JumpIfFalse(true_expr_instructions.len() as i32 + 2),
+                    line_col,
+                );
+                instructions.extend(true_expr_instructions);
+                let mut false_expr_instructions = Instructions::default();
                 self.compile_expr(inner.next().unwrap(), &mut false_expr_instructions, locals)?;
-                instructions.push(OpCode::Jump(false_expr_instructions.len() as i32 + 1));
+                instructions.push(
+                    OpCode::Jump(false_expr_instructions.len() as i32 + 1),
+                    line_col,
+                );
                 instructions.extend(false_expr_instructions);
             }
             Rule::binary_expr | Rule::binary_print_expr => {
@@ -997,10 +1135,11 @@ impl Compiler {
     fn compile_simple_statement(
         &mut self,
         simple_stmt: Pair<Rule>,
-        instructions: &mut Vec<OpCode>,
+        instructions: &mut Instructions,
         locals: &LocalMap,
     ) -> Result<(), PestError> {
         let stmt = first_child(simple_stmt);
+        let stmt_line_col = stmt.line_col();
         match stmt.as_rule() {
             Rule::delete_element => {
                 let mut inner = stmt.into_inner();
@@ -1008,14 +1147,14 @@ impl Compiler {
                 let get_instruction = self
                     .get_var(name.as_str(), locals)
                     .map_err(|msg| pest_error_from_span(name.as_span(), msg))?;
-                instructions.push(get_instruction);
+                instructions.push(get_instruction, stmt_line_col);
                 let index = inner.next().unwrap();
                 self.compile_expr(index, instructions, locals)?;
-                instructions.push(OpCode::Delete);
+                instructions.push(OpCode::Delete, stmt_line_col);
             }
             Rule::expr => {
                 self.compile_expr(stmt, instructions, locals)?;
-                instructions.push(OpCode::Pop);
+                instructions.push(OpCode::Pop, stmt_line_col);
             }
             Rule::print_stmt => {
                 let mut inner = stmt.into_inner();
@@ -1035,8 +1174,8 @@ impl Compiler {
                             // if it has no arguments it cannot be printf
                             assert!(!is_printf);
                             print_function = BuiltinFunction::Print;
-                            instructions.push(OpCode::PushZero);
-                            instructions.push(OpCode::GetField);
+                            instructions.push(OpCode::PushZero, stmt_line_col);
+                            instructions.push(OpCode::GetField, stmt_line_col);
                             argc = 1;
                         } else {
                             for expr in expressions {
@@ -1080,10 +1219,13 @@ impl Compiler {
                     self.compile_expr(expr, instructions, locals)?;
                     argc += 1;
                 }
-                instructions.push(OpCode::CallBuiltin {
-                    function: print_function,
-                    argc,
-                });
+                instructions.push(
+                    OpCode::CallBuiltin {
+                        function: print_function,
+                        argc,
+                    },
+                    stmt_line_col,
+                );
             }
             _ => unreachable!(
                 "encountered {:?} while compiling simple statement",
@@ -1096,7 +1238,7 @@ impl Compiler {
     fn compile_do_while(
         &mut self,
         do_while: Pair<Rule>,
-        instructions: &mut Vec<OpCode>,
+        instructions: &mut Instructions,
         locals: &LocalMap,
     ) -> Result<(), PestError> {
         let mut inner = do_while.into_inner();
@@ -1106,11 +1248,12 @@ impl Compiler {
         self.compile_stmt(body, instructions, locals)?;
 
         let condition = inner.next().unwrap();
+        let condition_line_col = condition.line_col();
         self.compile_expr(condition, instructions, locals)?;
-        instructions.push(OpCode::JumpIfTrue(distance(
-            instructions.len(),
-            start_index,
-        )));
+        instructions.push(
+            OpCode::JumpIfTrue(distance(instructions.len(), start_index)),
+            condition_line_col,
+        );
 
         Ok(())
     }
@@ -1118,7 +1261,7 @@ impl Compiler {
     fn compile_for_each(
         &mut self,
         for_each_stmt: Pair<Rule>,
-        instructions: &mut Vec<OpCode>,
+        instructions: &mut Instructions,
         locals: &LocalMap,
     ) -> Result<(), PestError> {
         let mut inner = for_each_stmt.into_inner();
@@ -1127,36 +1270,38 @@ impl Compiler {
         let iter_var_get_stmt = self
             .get_var(iter_var.as_str(), locals)
             .map_err(|msg| pest_error_from_span(iter_var.as_span(), msg))?;
-        instructions.push(iter_var_get_stmt);
-        lvalue_to_scalar_ref(instructions);
+        instructions.push(iter_var_get_stmt, iter_var.line_col());
+        lvalue_to_scalar_ref(&mut instructions.opcodes);
 
         let array_var = inner.next().unwrap();
+        let array_var_line_col = array_var.line_col();
         let array_var_get_stmt = self
             .get_var(array_var.as_str(), locals)
             .map_err(|msg| pest_error_from_span(array_var.as_span(), msg))?;
 
         match array_var_get_stmt {
-            OpCode::GetGlobal(global_index) => {
-                instructions.push(OpCode::CreateGlobalIterator(global_index))
-            }
+            OpCode::GetGlobal(global_index) => instructions.push(
+                OpCode::CreateGlobalIterator(global_index),
+                array_var_line_col,
+            ),
             OpCode::GetLocal(local_index) => {
-                instructions.push(OpCode::CreateLocalIterator(local_index))
+                instructions.push(OpCode::CreateLocalIterator(local_index), array_var_line_col)
             }
             _ => unreachable!(),
         }
 
         let iter_deref_location = instructions.len();
-        instructions.push(OpCode::Invalid);
+        instructions.push(OpCode::Invalid, array_var_line_col);
 
         let body = inner.next().unwrap();
         self.compile_stmt(body, instructions, locals)?;
 
-        instructions.push(OpCode::Jump(distance(
-            instructions.len(),
-            iter_deref_location,
-        )));
+        instructions.push(
+            OpCode::Jump(distance(instructions.len(), iter_deref_location)),
+            array_var_line_col,
+        );
 
-        instructions[iter_deref_location] =
+        instructions.opcodes[iter_deref_location] =
             OpCode::AdvanceIterOrJump(distance(iter_deref_location, instructions.len()));
 
         Ok(())
@@ -1165,7 +1310,7 @@ impl Compiler {
     fn compile_for(
         &mut self,
         for_stmt: Pair<Rule>,
-        instructions: &mut Vec<OpCode>,
+        instructions: &mut Instructions,
         locals: &LocalMap,
     ) -> Result<(), PestError> {
         let mut inner = for_stmt.into_inner();
@@ -1177,25 +1322,29 @@ impl Compiler {
 
         let condition_start = instructions.len();
         let condition = inner.next().unwrap();
+        let condition_line_col = condition.line_col();
         self.compile_expr(condition, instructions, locals)?;
         let for_jump_index = instructions.len();
-        instructions.push(OpCode::Invalid);
+        instructions.push(OpCode::Invalid, condition_line_col);
 
         let update = inner.next().unwrap();
         let body = inner.next().unwrap();
         self.compile_stmt(body, instructions, locals)?;
         let update_start = instructions.len();
         self.compile_simple_statement(update, instructions, locals)?;
-        instructions.push(OpCode::Jump(distance(instructions.len(), condition_start)));
-        instructions[for_jump_index] =
+        instructions.push(
+            OpCode::Jump(distance(instructions.len(), condition_start)),
+            condition_line_col,
+        );
+        instructions.opcodes[for_jump_index] =
             OpCode::JumpIfFalse(distance(for_jump_index, instructions.len()));
 
         let loop_stubs = self.loop_stack.pop().unwrap();
         for stub in loop_stubs.break_stubs {
-            instructions[stub] = OpCode::Jump(distance(stub, instructions.len()));
+            instructions.opcodes[stub] = OpCode::Jump(distance(stub, instructions.len()));
         }
         for stub in loop_stubs.continue_stubs {
-            instructions[stub] = OpCode::Jump(distance(stub, update_start));
+            instructions.opcodes[stub] = OpCode::Jump(distance(stub, update_start));
         }
 
         Ok(())
@@ -1204,7 +1353,7 @@ impl Compiler {
     fn compile_while(
         &mut self,
         while_stmt: Pair<Rule>,
-        instructions: &mut Vec<OpCode>,
+        instructions: &mut Instructions,
         locals: &LocalMap,
     ) -> Result<(), PestError> {
         let mut inner = while_stmt.into_inner();
@@ -1213,23 +1362,27 @@ impl Compiler {
 
         let condition_start = instructions.len();
         let condition = inner.next().unwrap();
+        let condition_line_col = condition.line_col();
         self.compile_expr(condition, instructions, locals)?;
         let while_jump_index = instructions.len();
-        instructions.push(OpCode::Invalid);
+        instructions.push(OpCode::Invalid, condition_line_col);
 
         let body = inner.next().unwrap();
         self.compile_stmt(body, instructions, locals)?;
-        instructions.push(OpCode::Jump(distance(instructions.len(), condition_start)));
+        instructions.push(
+            OpCode::Jump(distance(instructions.len(), condition_start)),
+            condition_line_col,
+        );
 
-        instructions[while_jump_index] =
+        instructions.opcodes[while_jump_index] =
             OpCode::JumpIfFalse(distance(while_jump_index, instructions.len()));
 
         let loop_stubs = self.loop_stack.pop().unwrap();
         for stub in loop_stubs.break_stubs {
-            instructions[stub] = OpCode::Jump(distance(stub, instructions.len()));
+            instructions.opcodes[stub] = OpCode::Jump(distance(stub, instructions.len()));
         }
         for stub in loop_stubs.continue_stubs {
-            instructions[stub] = OpCode::Jump(distance(stub, condition_start));
+            instructions.opcodes[stub] = OpCode::Jump(distance(stub, condition_start));
         }
         Ok(())
     }
@@ -1237,30 +1390,31 @@ impl Compiler {
     fn compile_if(
         &mut self,
         if_stmt: Pair<Rule>,
-        instructions: &mut Vec<OpCode>,
+        instructions: &mut Instructions,
         locals: &LocalMap,
     ) -> Result<(), PestError> {
         let mut inner = if_stmt.into_inner();
 
         let condition = inner.next().unwrap();
+        let condition_line_col = condition.line_col();
         self.compile_expr(condition, instructions, locals)?;
 
         let if_jump_index = instructions.len();
-        instructions.push(OpCode::Invalid);
+        instructions.push(OpCode::Invalid, condition_line_col);
 
         let body = inner.next().unwrap();
         self.compile_stmt(body, instructions, locals)?;
 
         if let Some(else_body) = inner.next() {
             let else_jump_index = instructions.len();
-            instructions.push(OpCode::Invalid);
-            instructions[if_jump_index] =
+            instructions.push(OpCode::Invalid, else_body.line_col());
+            instructions.opcodes[if_jump_index] =
                 OpCode::JumpIfFalse(distance(if_jump_index, instructions.len()));
             self.compile_stmt(else_body, instructions, locals)?;
-            instructions[else_jump_index] =
+            instructions.opcodes[else_jump_index] =
                 OpCode::Jump(distance(else_jump_index, instructions.len()));
         } else {
-            instructions[if_jump_index] =
+            instructions.opcodes[if_jump_index] =
                 OpCode::JumpIfFalse(distance(if_jump_index, instructions.len()));
         }
 
@@ -1270,7 +1424,7 @@ impl Compiler {
     fn compile_action(
         &mut self,
         action: Pair<Rule>,
-        instructions: &mut Vec<OpCode>,
+        instructions: &mut Instructions,
         locals: &LocalMap,
     ) -> Result<(), PestError> {
         for stmt in action.into_inner() {
@@ -1282,7 +1436,7 @@ impl Compiler {
     fn compile_stmt(
         &mut self,
         stmt: Pair<Rule>,
-        instructions: &mut Vec<OpCode>,
+        instructions: &mut Instructions,
         locals: &LocalMap,
     ) -> Result<(), PestError> {
         match stmt.as_rule() {
@@ -1297,13 +1451,13 @@ impl Compiler {
             Rule::ut_foreach => self.compile_for_each(stmt, instructions, locals),
             Rule::simple_statement => self.compile_simple_statement(stmt, instructions, locals),
             Rule::next => {
-                instructions.push(OpCode::Next);
+                instructions.push(OpCode::Next, stmt.line_col());
                 Ok(())
             }
             Rule::break_stmt => {
                 if let Some(loop_stubs) = self.loop_stack.last_mut() {
                     loop_stubs.break_stubs.push(instructions.len());
-                    instructions.push(OpCode::Invalid);
+                    instructions.push(OpCode::Invalid, stmt.line_col());
                     Ok(())
                 } else {
                     Err(pest_error_from_span(
@@ -1315,7 +1469,7 @@ impl Compiler {
             Rule::continue_stmt => {
                 if let Some(loop_stubs) = self.loop_stack.last_mut() {
                     loop_stubs.continue_stubs.push(instructions.len());
-                    instructions.push(OpCode::Invalid);
+                    instructions.push(OpCode::Invalid, stmt.line_col());
                     Ok(())
                 } else {
                     Err(pest_error_from_span(
@@ -1325,12 +1479,13 @@ impl Compiler {
                 }
             }
             Rule::exit_stmt => {
+                let stmt_line_col = stmt.line_col();
                 if let Some(expr) = stmt.into_inner().next() {
                     self.compile_expr(expr, instructions, locals)?;
                 } else {
-                    instructions.push(OpCode::PushZero);
+                    instructions.push(OpCode::PushZero, stmt_line_col);
                 }
-                instructions.push(OpCode::Exit);
+                instructions.push(OpCode::Exit, stmt_line_col);
                 Ok(())
             }
             Rule::return_stmt => {
@@ -1340,12 +1495,13 @@ impl Compiler {
                         "return statement outside of function".to_string(),
                     ));
                 }
+                let stmt_line_col = stmt.line_col();
                 if let Some(expr) = stmt.into_inner().next() {
                     self.compile_expr(expr, instructions, locals)?;
                 } else {
-                    instructions.push(OpCode::PushUninitializedScalar);
+                    instructions.push(OpCode::PushUninitializedScalar, stmt_line_col);
                 }
-                instructions.push(OpCode::Return);
+                instructions.push(OpCode::Return, stmt_line_col);
                 Ok(())
             }
             Rule::do_while => self.compile_do_while(stmt, instructions, locals),
@@ -1357,24 +1513,24 @@ impl Compiler {
         let pattern = first_child(pattern);
         match pattern.as_rule() {
             Rule::expr => {
-                let mut instructions = Vec::new();
+                let mut instructions = Instructions::default();
                 self.compile_expr(pattern, &mut instructions, &HashMap::new())?;
-                Ok(Pattern::Expr(instructions))
+                Ok(Pattern::Expr(instructions.opcodes))
             }
             Rule::range_pattern => {
                 let mut inner = pattern.into_inner();
 
                 let start = inner.next().unwrap();
-                let mut start_instructions = Vec::new();
+                let mut start_instructions = Instructions::default();
                 self.compile_expr(start, &mut start_instructions, &HashMap::new())?;
 
                 let end = inner.next().unwrap();
-                let mut end_instructions = Vec::new();
+                let mut end_instructions = Instructions::default();
                 self.compile_expr(end, &mut end_instructions, &HashMap::new())?;
 
                 Ok(Pattern::Range {
-                    start: start_instructions,
-                    end: end_instructions,
+                    start: start_instructions.opcodes,
+                    end: end_instructions.opcodes,
                 })
             }
             _ => unreachable!(
@@ -1384,51 +1540,59 @@ impl Compiler {
         }
     }
 
-    fn compile_rule(&mut self, rule: Pair<Rule>) -> Result<AwkRule, PestError> {
+    fn compile_rule(&mut self, rule: Pair<Rule>, file: Rc<str>) -> Result<AwkRule, PestError> {
         let rule = first_child(rule);
         match rule.as_rule() {
             Rule::action => {
-                let mut instructions = Vec::new();
+                let mut instructions = Instructions::default();
                 self.compile_action(rule, &mut instructions, &HashMap::new())?;
                 Ok(AwkRule {
                     pattern: Pattern::All,
-                    instructions,
+                    action: instructions.into_action(file),
                 })
             }
             Rule::pattern_and_action => {
                 let mut inner = rule.into_inner();
                 let pattern = self.compile_normal_pattern(inner.next().unwrap())?;
                 let action = inner.next().unwrap();
-                let mut instructions = Vec::new();
+                let mut instructions = Instructions::default();
                 let locals = HashMap::new();
                 self.compile_action(action, &mut instructions, &locals)?;
                 Ok(AwkRule {
                     pattern,
-                    instructions,
+                    action: instructions.into_action(file),
                 })
             }
             Rule::normal_pattern => {
+                let rule_line_col = rule.line_col();
                 let pattern = self.compile_normal_pattern(rule)?;
-                let instructions = vec![
-                    OpCode::PushZero,
-                    OpCode::GetField,
-                    OpCode::CallBuiltin {
-                        function: BuiltinFunction::Print,
-                        argc: 1,
-                    },
-                ];
+                let instructions = Instructions::from_instructions_and_line_col(
+                    vec![
+                        OpCode::PushZero,
+                        OpCode::GetField,
+                        OpCode::CallBuiltin {
+                            function: BuiltinFunction::Print,
+                            argc: 1,
+                        },
+                    ],
+                    rule_line_col,
+                );
                 Ok(AwkRule {
                     pattern,
-                    instructions,
+                    action: instructions.into_action(file),
                 })
             }
             _ => unreachable!("encountered {:?} while compiling rule", rule.as_rule()),
         }
     }
 
-    fn compile_function_definition(&mut self, function: Pair<Rule>) -> Result<Function, PestError> {
+    fn compile_function_definition(
+        &mut self,
+        function: Pair<Rule>,
+        file: Rc<str>,
+    ) -> Result<Function, PestError> {
         let mut inner = function.into_inner();
-        let _name = inner.next().unwrap().as_str();
+        let name = inner.next().unwrap();
         let mut param_map = HashMap::new();
         let mut parameters_count = 0;
         let maybe_param_list = inner.next().unwrap();
@@ -1451,20 +1615,26 @@ impl Compiler {
         } else {
             maybe_param_list
         };
-        let mut instructions = Vec::new();
+        let mut instructions = Instructions::default();
         self.in_function = true;
         self.compile_action(body, &mut instructions, &param_map)?;
         self.in_function = false;
 
         // ensure that functions always return
-        if !matches!(instructions.last(), Some(OpCode::Return)) {
-            instructions.push(OpCode::PushUninitializedScalar);
-            instructions.push(OpCode::Return);
+        if !matches!(instructions.opcodes.last(), Some(OpCode::Return)) {
+            let name_line_col = name.line_col();
+            instructions.push(OpCode::PushUninitializedScalar, name_line_col);
+            instructions.push(OpCode::Return, name_line_col);
         }
 
         Ok(Function {
+            name: name.as_str().into(),
             parameters_count,
-            instructions,
+            instructions: instructions.opcodes,
+            debug_info: DebugInfo {
+                file,
+                source_locations: instructions.source_locations,
+            },
         })
     }
 
@@ -1529,21 +1699,27 @@ fn next_checkpoint(text: &str) -> Option<usize> {
         .min()
 }
 
-fn gather_errors(first_error: PestError, source: &str) -> CompilerErrors {
+fn improve_error(error: PestError, file: &str) -> PestError {
+    if file != "" {
+        error.with_path(&file)
+    } else {
+        error
+    }
+}
+
+fn gather_errors(first_error: PestError, source: &str, errors: &mut Vec<PestError>, file: &str) {
     let first_error_end = location_end(&first_error.location);
 
-    let mut errors = vec![first_error];
+    errors.push(improve_error(first_error, file));
     let mut parsing_start = first_error_end;
 
     while let Some(checkpoint_offset) = next_checkpoint(&source[parsing_start..]) {
         parsing_start += checkpoint_offset;
         match AwkParser::parse(Rule::program, &source[parsing_start..]) {
             Ok(_) => break,
-            Err(err) => errors.push(err),
+            Err(err) => errors.push(improve_error(err, file)),
         }
     }
-
-    CompilerErrors { errors }
 }
 
 fn append_if_err(errors: &mut Vec<PestError>, result: Result<(), PestError>) {
@@ -1552,56 +1728,78 @@ fn append_if_err(errors: &mut Vec<PestError>, result: Result<(), PestError>) {
     }
 }
 
-pub fn compile_program(text: &str) -> Result<Program, CompilerErrors> {
-    let mut begin_instructions = Vec::new();
-    let mut rules = Vec::new();
-    let mut end_instructions = Vec::new();
-    let mut functions = Vec::new();
+pub struct SourceFile {
+    pub filename: String,
+    pub contents: String,
+}
+
+impl SourceFile {
+    pub fn stdin(contents: String) -> Self {
+        Self {
+            filename: "".to_string(),
+            contents,
+        }
+    }
+}
+
+pub fn compile_program(sources: &[SourceFile]) -> Result<Program, CompilerErrors> {
+    let mut parsed_sources = Vec::new();
+    let mut errors = Vec::new();
+    for source_file in sources {
+        let filename: Rc<str> = source_file.filename.clone().into();
+        match AwkParser::parse(Rule::program, &source_file.contents) {
+            Ok(mut program) => {
+                let program = program.next().unwrap();
+                parsed_sources.push((filename, program.into_inner()));
+            }
+            Err(err) => {
+                gather_errors(err, &source_file.contents, &mut errors, &filename);
+            }
+        };
+    }
 
     let mut compiler = Compiler::default();
-    let program = match AwkParser::parse(Rule::program, text) {
-        Ok(mut program) => program.next().unwrap(),
-        Err(err) => {
-            return Err(gather_errors(err, text));
-        }
-    };
-    let program_iter = program.into_inner();
-    let mut errors = Vec::new();
+    for (_, program_iter) in &parsed_sources {
+        compiler.declare_program_functions(&mut errors, program_iter.clone());
+    }
 
-    compiler.declare_program_functions(&mut errors, program_iter.clone());
-
-    for item in program_iter {
-        match item.as_rule() {
-            Rule::begin_action => {
-                append_if_err(
-                    &mut errors,
-                    compiler.compile_action(
-                        first_child(item),
-                        &mut begin_instructions,
-                        &HashMap::new(),
-                    ),
-                );
+    let mut begin_actions = Vec::new();
+    let mut rules = Vec::new();
+    let mut end_actions = Vec::new();
+    let mut functions = Vec::new();
+    for (filename, program_iter) in parsed_sources {
+        for item in program_iter {
+            match item.as_rule() {
+                Rule::begin_action | Rule::end_action => {
+                    let is_begin_action = item.as_rule() == Rule::begin_action;
+                    let mut instructions = Instructions::default();
+                    append_if_err(
+                        &mut errors,
+                        compiler.compile_action(
+                            first_child(item),
+                            &mut instructions,
+                            &HashMap::new(),
+                        ),
+                    );
+                    if is_begin_action {
+                        begin_actions.push(instructions.into_action(filename.clone()));
+                    } else {
+                        end_actions.push(instructions.into_action(filename.clone()));
+                    }
+                }
+                Rule::rule => match compiler.compile_rule(item, filename.clone()) {
+                    Ok(rule) => rules.push(rule),
+                    Err(err) => errors.push(err),
+                },
+                Rule::function_definition => {
+                    match compiler.compile_function_definition(item, filename.clone()) {
+                        Ok(function) => functions.push(function),
+                        Err(err) => errors.push(err),
+                    }
+                }
+                Rule::EOI => {}
+                _ => unreachable!("encontered {:?} while compiling program", item.as_rule()),
             }
-            Rule::end_action => {
-                append_if_err(
-                    &mut errors,
-                    compiler.compile_action(
-                        first_child(item),
-                        &mut end_instructions,
-                        &HashMap::new(),
-                    ),
-                );
-            }
-            Rule::rule => match compiler.compile_rule(item) {
-                Ok(rule) => rules.push(rule),
-                Err(err) => errors.push(err),
-            },
-            Rule::function_definition => match compiler.compile_function_definition(item) {
-                Ok(function) => functions.push(function),
-                Err(err) => errors.push(err),
-            },
-            Rule::EOI => {}
-            _ => unreachable!("encontered {:?} while compiling program", item.as_rule()),
         }
     }
 
@@ -1618,9 +1816,9 @@ pub fn compile_program(text: &str) -> Result<Program, CompilerErrors> {
     if errors.is_empty() {
         Ok(Program {
             constants: compiler.constants.into_inner(),
-            begin_instructions,
+            begin_actions,
             rules,
-            end_instructions,
+            end_actions,
             functions,
             globals_count: compiler.last_global_var_id.get() as usize,
             globals,
@@ -1644,34 +1842,41 @@ mod test {
     const FIRST_GLOBAL_VAR: u32 = SpecialVar::Count as u32;
 
     fn compile_expr(expr: &str) -> (Vec<OpCode>, Vec<Constant>) {
-        let mut program = compile_program(format!("BEGIN {{ {} }}", expr).as_str())
+        let mut program = compile_program(&[SourceFile::stdin(format!("BEGIN {{ {} }}", expr))])
             .expect("error compiling expression");
         // remove OpCode::Pop
-        program.begin_instructions.pop();
-        (program.begin_instructions, program.constants)
+        program.begin_actions[0].instructions.pop();
+        (
+            program.begin_actions[0].instructions.clone(),
+            program.constants,
+        )
     }
 
     fn compile_stmt(stmt: &str) -> (Vec<OpCode>, Vec<Constant>) {
-        let program = compile_program(format!("BEGIN {{ {} }}", stmt).as_str())
+        let program = compile_program(&[SourceFile::stdin(format!("BEGIN {{ {} }}", stmt))])
             .expect("error compiling statement");
-        (program.begin_instructions, program.constants)
+        (
+            program.begin_actions[0].instructions.clone(),
+            program.constants,
+        )
     }
 
     fn compile_correct_program(text: &str) -> Program {
-        compile_program(text).expect("error compiling program")
+        compile_program(&[SourceFile::stdin(text.to_string())]).expect("error compiling program")
     }
 
     fn does_not_compile(text: &str) {
-        compile_program(text).expect_err("expected error compiling program");
+        compile_program(&[SourceFile::stdin(text.to_string())])
+            .expect_err("expected error compiling program");
     }
 
     #[test]
     fn test_compile_empty_program() {
         let program = compile_correct_program("");
         assert!(program.constants.is_empty());
-        assert!(program.begin_instructions.is_empty());
+        assert!(program.begin_actions.is_empty());
         assert!(program.rules.is_empty());
-        assert!(program.end_instructions.is_empty());
+        assert!(program.end_actions.is_empty());
         assert!(program.functions.is_empty());
     }
 
@@ -1679,9 +1884,10 @@ mod test {
     fn test_compile_empty_begin() {
         let program = compile_correct_program("BEGIN {}");
         assert!(program.constants.is_empty());
-        assert!(program.begin_instructions.is_empty());
+        assert_eq!(program.begin_actions.len(), 1);
+        assert!(program.begin_actions[0].instructions.is_empty());
         assert!(program.rules.is_empty());
-        assert!(program.end_instructions.is_empty());
+        assert!(program.end_actions.is_empty());
         assert!(program.functions.is_empty());
     }
 
@@ -1689,9 +1895,10 @@ mod test {
     fn test_compile_empty_end() {
         let program = compile_correct_program("END {}");
         assert!(program.constants.is_empty());
-        assert!(program.begin_instructions.is_empty());
+        assert!(program.begin_actions.is_empty());
         assert!(program.rules.is_empty());
-        assert!(program.end_instructions.is_empty());
+        assert_eq!(program.end_actions.len(), 1);
+        assert!(program.end_actions[0].instructions.is_empty());
         assert!(program.functions.is_empty());
     }
 
@@ -3201,7 +3408,7 @@ mod test {
             "#,
         );
         assert_eq!(
-            program.begin_instructions,
+            program.begin_actions[0].instructions,
             vec![OpCode::Call { id: 0, argc: 0 }, OpCode::Pop]
         );
     }
@@ -3228,7 +3435,7 @@ mod test {
             ]
         );
         assert_eq!(
-            program.begin_instructions,
+            program.begin_actions[0].instructions,
             vec![
                 OpCode::PushConstant(0),
                 OpCode::PushConstant(1),
@@ -3260,7 +3467,7 @@ mod test {
             ]
         );
         assert_eq!(
-            program.begin_instructions,
+            program.begin_actions[0].instructions,
             vec![
                 OpCode::PushConstant(0),
                 OpCode::PushUninitialized,
@@ -3320,7 +3527,7 @@ mod test {
             Pattern::Expr(vec![OpCode::PushConstant(0)])
         );
         assert_eq!(
-            program.rules[0].instructions,
+            program.rules[0].action.instructions,
             vec![
                 OpCode::PushConstant(1),
                 OpCode::PushConstant(2),
@@ -3356,7 +3563,7 @@ mod test {
             }
         );
         assert_eq!(
-            program.rules[0].instructions,
+            program.rules[0].action.instructions,
             vec![
                 OpCode::PushConstant(2),
                 OpCode::PushConstant(3),
@@ -3385,7 +3592,7 @@ mod test {
         assert_eq!(program.rules.len(), 1);
         assert_eq!(program.rules[0].pattern, Pattern::All);
         assert_eq!(
-            program.rules[0].instructions,
+            program.rules[0].action.instructions,
             vec![OpCode::PushConstant(0), OpCode::Pop,]
         );
         assert_eq!(program.constants, vec![Constant::Number(1.0)]);
@@ -3400,7 +3607,7 @@ mod test {
             Pattern::Expr(vec![OpCode::PushConstant(0)])
         );
         assert_eq!(
-            program.rules[0].instructions,
+            program.rules[0].action.instructions,
             vec![
                 OpCode::PushZero,
                 OpCode::GetField,
@@ -3448,7 +3655,7 @@ mod test {
             "#,
         );
         assert_eq!(
-            program.begin_instructions,
+            program.begin_actions[0].instructions,
             vec![
                 OpCode::PushConstant(0),
                 OpCode::PushConstant(1),
@@ -3539,7 +3746,7 @@ mod test {
         "#,
         );
         assert_eq!(
-            program.begin_instructions,
+            program.begin_actions[0].instructions,
             vec![
                 OpCode::PushZero,
                 OpCode::FieldRef,
@@ -3684,7 +3891,7 @@ mod test {
         "#,
         );
         assert_eq!(
-            program.begin_instructions,
+            program.begin_actions[0].instructions,
             vec![
                 OpCode::PushConstant(0),
                 OpCode::CallBuiltin {
@@ -3727,7 +3934,7 @@ mod test {
         "#,
         );
         assert_eq!(
-            program.begin_instructions,
+            program.begin_actions[0].instructions,
             vec![
                 OpCode::GetGlobal(SpecialVar::Argc as u32),
                 OpCode::Pop,

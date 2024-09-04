@@ -133,6 +133,24 @@ impl From<Rc<Regex>> for Constant {
     }
 }
 
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub struct SourceLocation {
+    pub line: u32,
+    pub column: u32,
+}
+
+#[derive(Debug, PartialEq, Default)]
+pub struct DebugInfo {
+    pub file: Rc<str>,
+    pub source_locations: Vec<SourceLocation>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Action {
+    pub instructions: Vec<OpCode>,
+    pub debug_info: DebugInfo,
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Pattern {
     Expr(Vec<OpCode>),
@@ -146,22 +164,24 @@ pub enum Pattern {
 #[derive(Debug, PartialEq)]
 pub struct AwkRule {
     pub pattern: Pattern,
-    pub instructions: Vec<OpCode>,
+    pub action: Action,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Default)]
 pub struct Function {
+    pub name: Rc<str>,
     pub parameters_count: usize,
     pub instructions: Vec<OpCode>,
+    pub debug_info: DebugInfo,
 }
 
 pub struct Program {
     pub constants: Vec<Constant>,
     pub globals_count: usize,
     pub globals: HashMap<String, u32>,
-    pub begin_instructions: Vec<OpCode>,
+    pub begin_actions: Vec<Action>,
     pub rules: Vec<AwkRule>,
-    pub end_instructions: Vec<OpCode>,
+    pub end_actions: Vec<Action>,
     pub functions: Vec<Function>,
 }
 
@@ -169,9 +189,9 @@ impl fmt::Debug for Program {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         writeln!(f, "Program {{")?;
         writeln!(f, "  Constants: {:?}", self.constants)?;
-        writeln!(f, "  Begin instructions: {:?}", self.begin_instructions)?;
+        writeln!(f, "  Begin instructions: {:?}", self.begin_actions)?;
         writeln!(f, "  Rules: {:?}", self.rules)?;
-        writeln!(f, "  End instructions: {:?}", self.end_instructions)?;
+        writeln!(f, "  End instructions: {:?}", self.begin_actions)?;
         writeln!(f, "  Functions: {:?}", self.functions)?;
         write!(f, "}}")
     }

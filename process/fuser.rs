@@ -2,15 +2,22 @@ extern crate clap;
 extern crate libc;
 extern crate plib;
 
-use clap::Parser;
+#[cfg(target_os = "macos")]
+#[allow(warnings, missing_docs)]
+pub mod osx_libproc_bindings {
+    include!(concat!(env!("OUT_DIR"), "/osx_libproc_bindings.rs"));
+}
+
+use clap::{CommandFactory, Parser};
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use libc::fstat;
+#[cfg(target_os = "macos")]
+use libc::{c_char, c_int, c_void};
 use plib::PROJECT_NAME;
 use std::{
     collections::BTreeMap,
     env,
     ffi::{CStr, CString},
-    fmt,
     fs::{self, File},
     io::{self, BufRead, Error, ErrorKind, Write},
     net::{IpAddr, Ipv4Addr, UdpSocket},
@@ -20,10 +27,112 @@ use std::{
     thread,
     time::Duration,
 };
+#[cfg(target_os = "macos")]
+use std::{os::unix::ffi::OsStrExt, ptr};
 
 const PROC_PATH: &'static str = "/proc";
 const PROC_MOUNTS: &'static str = "/proc/mounts";
 const NAME_FIELD: usize = 20;
+
+// similar to list_pids_ret() below, there are two cases when 0 is returned, one when there are
+// no pids, and the other when there is an error
+// when `errno` is set to indicate an error in the input type, the return value is 0
+#[cfg(target_os = "macos")]
+fn check_listpid_ret(ret: c_int) -> io::Result<Vec<u32>> {
+    if ret < 0 || (ret == 0 && io::Error::last_os_error().raw_os_error().unwrap_or(0) != 0) {
+        return Err(io::Error::last_os_error());
+    }
+
+    // `ret` cannot be negative here - so no possible loss of sign
+    #[allow(clippy::cast_sign_loss)]
+    let capacity = ret as usize / std::mem::size_of::<u32>();
+    Ok(Vec::with_capacity(capacity))
+}
+
+// Common code for handling the special case of listpids return, where 0 is a valid return
+// but is also used in the error case - so we need to look at errno to distringish between a valid
+// 0 return and an error return
+// when `errno` is set to indicate an error in the input type, the return value is 0
+#[cfg(target_os = "macos")]
+fn list_pids_ret(ret: c_int, mut pids: Vec<u32>) -> io::Result<Vec<u32>> {
+    if ret < 0 || (ret == 0 && io::Error::last_os_error().raw_os_error().unwrap_or(0) != 0) {
+        Err(io::Error::last_os_error())
+    } else {
+        // `ret` cannot be negative here, so no possible loss of sign
+        #[allow(clippy::cast_sign_loss)]
+        let items_count = ret as usize / std::mem::size_of::<u32>();
+        unsafe {
+            pids.set_len(items_count);
+        }
+        Ok(pids)
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn listpids(proc_type: u32) -> io::Result<Vec<u32>> {
+    let buffer_size =
+        unsafe { osx_libproc_bindings::proc_listpids(proc_type, proc_type, ptr::null_mut(), 0) };
+
+    let mut pids = check_listpid_ret(buffer_size)?;
+    let buffer_ptr = pids.as_mut_ptr().cast::<libc::c_void>();
+
+    let ret = unsafe {
+        osx_libproc_bindings::proc_listpids(proc_type, proc_type, buffer_ptr, buffer_size)
+    };
+
+    list_pids_ret(ret, pids)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn listpidspath(
+    proc_type: u32,
+    path: &Path,
+    is_volume: bool,
+    exclude_event_only: bool,
+) -> io::Result<Vec<u32>> {
+    let path_bytes = path.as_os_str().as_bytes();
+    let c_path = CString::new(path_bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "CString::new failed"))?;
+    let mut pathflags: u32 = 0;
+    if is_volume {
+        pathflags |= osx_libproc_bindings::PROC_LISTPIDSPATH_PATH_IS_VOLUME;
+    }
+    if exclude_event_only {
+        pathflags |= osx_libproc_bindings::PROC_LISTPIDSPATH_EXCLUDE_EVTONLY;
+    }
+
+    let buffer_size = unsafe {
+        osx_libproc_bindings::proc_listpidspath(
+            proc_type,
+            proc_type,
+            c_path.as_ptr().cast::<c_char>(),
+            pathflags,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    let mut pids = check_listpid_ret(buffer_size)?;
+    let buffer_ptr = pids.as_mut_ptr().cast::<c_void>();
+
+    let ret = unsafe {
+        osx_libproc_bindings::proc_listpidspath(
+            proc_type,
+            proc_type,
+            c_path.as_ptr().cast::<c_char>(),
+            0,
+            buffer_ptr,
+            buffer_size,
+        )
+    };
+
+    list_pids_ret(ret, pids)
+}
+
+#[cfg(target_os = "macos")]
+type DeviceId = i32;
+
+#[cfg(target_os = "linux")]
+type DeviceId = u64;
 
 #[derive(Clone, Default, PartialEq)]
 enum ProcType {
@@ -130,17 +239,17 @@ impl Procs {
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone, Default)]
 struct UnixSocketList {
     name: String,
-    device_id: u64,
+    device_id: DeviceId,
     inode: u64,
     net_inode: u64,
     next: Option<Box<UnixSocketList>>,
 }
 
 impl UnixSocketList {
-    fn new(name: String, device_id: u64, inode: u64, net_inode: u64) -> Self {
+    fn new(name: String, device_id: DeviceId, inode: u64, net_inode: u64) -> Self {
         UnixSocketList {
             name,
             device_id,
@@ -150,7 +259,7 @@ impl UnixSocketList {
         }
     }
 
-    fn add_socket(&mut self, name: String, device_id: u64, inode: u64, net_inode: u64) {
+    fn add_socket(&mut self, name: String, device_id: DeviceId, inode: u64, net_inode: u64) {
         let new_node = Box::new(UnixSocketList {
             name,
             device_id,
@@ -187,13 +296,13 @@ impl<'a> Iterator for UnixSocketListIterator<'a> {
 #[derive(Default)]
 struct InodeList {
     name: Names,
-    device_id: u64,
+    device_id: DeviceId,
     inode: u64,
     next: Option<Box<InodeList>>,
 }
 
 impl InodeList {
-    fn new(name: Names, device_id: u64, inode: u64) -> Self {
+    fn new(name: Names, device_id: DeviceId, inode: u64) -> Self {
         InodeList {
             name,
             device_id,
@@ -285,12 +394,12 @@ impl Names {
 #[derive(Default)]
 struct DeviceList {
     name: Names,
-    device_id: u64,
+    device_id: DeviceId,
     next: Option<Box<DeviceList>>,
 }
 
 impl DeviceList {
-    fn new(name: Names, device_id: u64) -> Self {
+    fn new(name: Names, device_id: DeviceId) -> Self {
         DeviceList {
             name,
             device_id,
@@ -337,7 +446,6 @@ struct Args {
     /// A pathname on which the file or file system is to be reported.
     file: Vec<PathBuf>,
 }
-use clap::CommandFactory;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     setlocale(LocaleCategory::LcAll, "");
     textdomain(PROJECT_NAME)?;
@@ -368,51 +476,109 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         mut need_check_map,
     ) = init_defaults(file);
 
-    fill_unix_cache(&mut unix_socket_list)?;
+    #[cfg(target_os = "linux")]
+    get_matched_procs_linux(
+        &mut names,
+        &mut unix_socket_list,
+        &mut mount_list,
+        &mut inode_list,
+        &mut device_list,
+        &mut need_check_map,
+        mount,
+    )?;
+
+    #[cfg(target_os = "macos")]
+    get_matched_procs_macos(&mut names, mount)?;
+
+    for name in names.iter_mut() {
+        print_matches(name, user)?;
+    }
+
+    std::process::exit(0);
+}
+
+#[cfg(target_os = "linux")]
+fn get_matched_procs_linux(
+    names: &mut Vec<Names>,
+    unix_socket_list: &mut UnixSocketList,
+    mount_list: &mut MountList,
+    inode_list: &mut InodeList,
+    device_list: &mut DeviceList,
+    need_check_map: &mut bool,
+    mount: bool,
+) -> Result<(), io::Error> {
+    fill_unix_cache(unix_socket_list)?;
 
     let net_dev = find_net_dev()?;
 
     for name in names.iter_mut() {
         name.name_space = determine_namespace(&name.filename);
-
         match name.name_space {
             NameSpace::File => handle_file_namespace(
                 name,
                 mount,
-                &mut mount_list,
-                &mut inode_list,
-                &mut device_list,
-                &mut need_check_map,
+                mount_list,
+                inode_list,
+                device_list,
+                need_check_map,
             )?,
             NameSpace::Tcp => {
                 if !mount {
-                    handle_tcp_namespace(name, &mut inode_list, net_dev)?
+                    handle_tcp_namespace(name, inode_list, net_dev)?;
                 }
             }
             NameSpace::Udp => {
                 if !mount {
-                    handle_udp_namespace(name, &mut inode_list, net_dev)?
+                    handle_udp_namespace(name, inode_list, net_dev)?;
                 }
             }
         }
 
-        if (scan_procs(
-            need_check_map,
+        if scan_procs(
+            *need_check_map,
             name,
             &inode_list,
             &device_list,
             &unix_socket_list,
             net_dev,
-        ))
+        )
         .is_err()
         {
             std::process::exit(1);
         }
-
-        print_matches(name, user)?;
     }
 
-    std::process::exit(0)
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn get_matched_procs_macos(
+    names: &mut Vec<Names>,
+    mount: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for name in names.iter_mut() {
+        let st = timeout(&name.filename.to_string_lossy(), 5)?;
+        let uid = st.st_uid;
+
+        let pids = listpidspath(
+            osx_libproc_bindings::PROC_ALL_PIDS,
+            Path::new(&name.filename),
+            mount,
+            false,
+        )?;
+
+        for pid in pids {
+            add_process(
+                name,
+                pid.try_into().unwrap(),
+                uid,
+                Access::Cwd,
+                ProcType::Normal,
+                None,
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Initializes and returns default values.
@@ -544,7 +710,7 @@ fn handle_file_namespace(
 fn handle_tcp_namespace(
     names: &mut Names,
     inode_list: &mut InodeList,
-    net_dev: u64,
+    net_dev: DeviceId,
 ) -> Result<(), std::io::Error> {
     let tcp_connection_list = parse_inet(names)?;
     *inode_list = find_net_sockets(&tcp_connection_list, "tcp", net_dev)?;
@@ -570,7 +736,7 @@ fn handle_tcp_namespace(
 fn handle_udp_namespace(
     names: &mut Names,
     inode_list: &mut InodeList,
-    net_dev: u64,
+    net_dev: DeviceId,
 ) -> Result<(), std::io::Error> {
     let udp_connection_list = parse_inet(names)?;
     *inode_list = find_net_sockets(&udp_connection_list, "udp", net_dev)?;
@@ -676,7 +842,7 @@ fn scan_procs(
     inode_list: &InodeList,
     device_list: &DeviceList,
     unix_socket_list: &UnixSocketList,
-    net_dev: u64,
+    net_dev: DeviceId,
 ) -> Result<(), io::Error> {
     let my_pid = std::process::id() as i32;
     let dir_entries = fs::read_dir(PROC_PATH)?;
@@ -912,7 +1078,7 @@ fn check_dir(
     uid: u32,
     access: Access,
     unix_socket_list: &UnixSocketList,
-    net_dev: u64,
+    net_dev: DeviceId,
 ) -> Result<(), io::Error> {
     let dir_path = format!("/proc/{}/{}", pid, dirname);
     let dir_entries = fs::read_dir(&dir_path)?;
@@ -1005,11 +1171,11 @@ fn check_map(
                 };
 
                 let device = tmp_maj * 256 + tmp_min;
-                let device_u64 = device as u64;
+                let device_int = device as DeviceId;
 
                 if device_list
                     .iter()
-                    .any(|device| device.device_id == device_u64)
+                    .any(|device| device.device_id == device_int)
                 {
                     add_process(names, pid, uid, access.clone(), ProcType::Normal, None);
                 }
@@ -1176,7 +1342,7 @@ fn parse_inet(names: &mut Names) -> Result<IpConnections, io::Error> {
 /// # Returns
 ///
 /// Returns the device identifier (`u64`) of the network interface.
-fn find_net_dev() -> Result<u64, io::Error> {
+fn find_net_dev() -> Result<DeviceId, io::Error> {
     let socket = UdpSocket::bind("0.0.0.0:0")?;
     let fd = socket.as_raw_fd();
     let mut stat_buf = unsafe { std::mem::zeroed() };
@@ -1187,7 +1353,7 @@ fn find_net_dev() -> Result<u64, io::Error> {
         }
     }
 
-    Ok(stat_buf.st_dev as u64)
+    Ok(stat_buf.st_dev)
 }
 
 /// Finds network sockets based on the given protocol and updates the `InodeList`
@@ -1213,7 +1379,7 @@ fn find_net_dev() -> Result<u64, io::Error> {
 fn find_net_sockets(
     connections_list: &IpConnections,
     protocol: &str,
-    net_dev: u64,
+    net_dev: DeviceId,
 ) -> Result<InodeList, io::Error> {
     let pathname = format!("/proc/net/{}", protocol);
 

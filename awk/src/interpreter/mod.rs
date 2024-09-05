@@ -1498,7 +1498,7 @@ impl Interpreter {
                 OpCode::Jump(offset) => {
                     ip_increment = offset as isize;
                 }
-                OpCode::Call { id, argc } => {
+                OpCode::Call(id) => {
                     let function = &functions[id as usize];
                     stack.call_function(&function);
                     ip_increment = 0;
@@ -2485,7 +2485,7 @@ mod tests {
 
     #[test]
     fn test_call_function_without_args() {
-        let main = vec![OpCode::Call { id: 0, argc: 0 }];
+        let main = vec![OpCode::Call(0)];
         let function = Function {
             parameters_count: 0,
             instructions: vec![OpCode::PushConstant(0), OpCode::Return],
@@ -2500,7 +2500,7 @@ mod tests {
 
     #[test]
     fn test_call_with_uninitialized_scalar_argument() {
-        let main = vec![OpCode::PushUninitialized, OpCode::Call { id: 0, argc: 1 }];
+        let main = vec![OpCode::PushUninitialized, OpCode::Call(0)];
         let functions = Function {
             parameters_count: 1,
             instructions: vec![OpCode::LocalScalarRef(0), OpCode::Return],
@@ -2514,7 +2514,7 @@ mod tests {
 
     #[test]
     fn test_call_with_uninitialized_array_argument() {
-        let main = vec![OpCode::PushUninitialized, OpCode::Call { id: 0, argc: 1 }];
+        let main = vec![OpCode::PushUninitialized, OpCode::Call(0)];
         let function = Function {
             parameters_count: 1,
             instructions: vec![
@@ -2534,7 +2534,7 @@ mod tests {
 
     #[test]
     fn test_call_function_with_scalar_argument() {
-        let main = vec![OpCode::PushConstant(0), OpCode::Call { id: 0, argc: 1 }];
+        let main = vec![OpCode::PushConstant(0), OpCode::Call(0)];
         let function = Function {
             parameters_count: 1,
             instructions: vec![OpCode::GetLocal(0), OpCode::PushOne, OpCode::Add],
@@ -2549,10 +2549,7 @@ mod tests {
 
     #[test]
     fn test_call_function_with_array_argument() {
-        let main = vec![
-            OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
-            OpCode::Call { id: 0, argc: 1 },
-        ];
+        let main = vec![OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR), OpCode::Call(0)];
         let function = Function {
             parameters_count: 1,
             instructions: vec![
@@ -2579,7 +2576,7 @@ mod tests {
             OpCode::PushConstant(0),
             OpCode::PushConstant(0),
             OpCode::PushConstant(0),
-            OpCode::Call { id: 0, argc: 5 },
+            OpCode::Call(0),
         ];
         let function = Function {
             parameters_count: 5,
@@ -3243,7 +3240,7 @@ mod tests {
             OpCode::Pop,
             OpCode::GetGlobal(FIRST_GLOBAL_VAR),
             OpCode::GetGlobal(FIRST_GLOBAL_VAR + 1),
-            OpCode::Call { id: 0, argc: 2 },
+            OpCode::Call(0),
         ];
         // ```
         // function f(a, b) {
@@ -3295,7 +3292,7 @@ mod tests {
             OpCode::Assign,
             OpCode::Pop,
             OpCode::GetGlobal(FIRST_GLOBAL_VAR),
-            OpCode::Call { id: 0, argc: 1 },
+            OpCode::Call(0),
         ];
         // ```
         // function f(a) {

@@ -80,10 +80,7 @@ pub enum OpCode {
     JumpIfTrue(i32),
     Jump(i32),
 
-    Call {
-        id: u32,
-        argc: u16,
-    },
+    Call(u32),
     CallBuiltin {
         function: BuiltinFunction,
         argc: u16,

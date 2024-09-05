@@ -631,13 +631,7 @@ impl Compiler {
                                 instructions.push(OpCode::PushUninitialized, line_col);
                             }
                         }
-                        instructions.push(
-                            OpCode::Call {
-                                id: *id,
-                                argc: *parameter_count as u16,
-                            },
-                            line_col,
-                        );
+                        instructions.push(OpCode::Call(*id), line_col);
                     }
                     Some(_) => {
                         return Err(pest_error_from_span(
@@ -3413,7 +3407,7 @@ mod test {
         );
         assert_eq!(
             program.begin_actions[0].instructions,
-            vec![OpCode::Call { id: 0, argc: 0 }, OpCode::Pop]
+            vec![OpCode::Call(0), OpCode::Pop]
         );
     }
 
@@ -3443,7 +3437,7 @@ mod test {
             vec![
                 OpCode::PushConstant(0),
                 OpCode::PushConstant(1),
-                OpCode::Call { id: 0, argc: 2 },
+                OpCode::Call(0),
                 OpCode::Pop,
             ]
         );
@@ -3475,7 +3469,7 @@ mod test {
             vec![
                 OpCode::PushConstant(0),
                 OpCode::PushUninitialized,
-                OpCode::Call { id: 0, argc: 2 },
+                OpCode::Call(0),
                 OpCode::Pop,
             ]
         );
@@ -4014,11 +4008,11 @@ mod test {
                 OpCode::GetLocal(0),
                 OpCode::PushConstant(1),
                 OpCode::Sub,
-                OpCode::Call { id: 0, argc: 1 },
+                OpCode::Call(0),
                 OpCode::GetLocal(0),
                 OpCode::PushConstant(2),
                 OpCode::Sub,
-                OpCode::Call { id: 0, argc: 1 },
+                OpCode::Call(0),
                 OpCode::Add,
                 OpCode::Return,
             ]
@@ -4056,7 +4050,7 @@ mod test {
                 OpCode::GetLocal(0),
                 OpCode::PushConstant(2),
                 OpCode::Sub,
-                OpCode::Call { id: 1, argc: 1 },
+                OpCode::Call(1),
                 OpCode::Return,
             ]
         );
@@ -4072,7 +4066,7 @@ mod test {
                 OpCode::GetLocal(0),
                 OpCode::PushConstant(5),
                 OpCode::Sub,
-                OpCode::Call { id: 0, argc: 1 },
+                OpCode::Call(0),
                 OpCode::Return,
             ]
         );

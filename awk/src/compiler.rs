@@ -231,6 +231,9 @@ fn parse_escape_sequence(iter: &mut Chars) -> Result<(char, Option<char>), Strin
                     }
                 }
             }
+            if char_code == 0 {
+                return Err("invalid escape sequence: \\0".to_string());
+            }
             // FIXME: I don't think this is correct. We should also consider multi-byte characters
             char::from_u32(char_code).ok_or("invalid character")?
         }

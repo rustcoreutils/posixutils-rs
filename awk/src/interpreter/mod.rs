@@ -206,7 +206,7 @@ fn builtin_sprintf(
 }
 
 fn builtin_match(stack: &mut Stack, global_env: &mut GlobalEnv) -> Result<(f64, f64), String> {
-    let ere = stack.pop_value().to_ere()?;
+    let ere = stack.pop_value().into_ere()?;
     let string = stack
         .pop_scalar_value()?
         .scalar_to_string(&global_env.convfmt)?;
@@ -281,7 +281,7 @@ fn builtin_gsub(
     let repl = stack
         .pop_scalar_value()?
         .scalar_to_string(&global_env.convfmt)?;
-    let ere = stack.pop_value().to_ere()?;
+    let ere = stack.pop_value().into_ere()?;
     let in_str = stack.pop_ref();
     in_str.ensure_value_is_scalar()?;
     let (result, count) = gsub(
@@ -355,7 +355,7 @@ fn call_simple_builtin(
             let separator = if argc == 2 {
                 None
             } else {
-                Some(FieldSeparator::Ere(stack.pop_value().to_ere()?))
+                Some(FieldSeparator::Ere(stack.pop_value().into_ere()?))
             };
             let s = stack
                 .pop_scalar_value()?
@@ -628,7 +628,7 @@ impl Default for Record {
         let fields = (0..Record::MAX_FIELDS)
             .map(|i| {
                 AwkValueRef::new(
-                    AwkValue::uninitialized_scalar().to_ref(AwkRefType::Field(i as u16)),
+                    AwkValue::uninitialized_scalar().into_ref(AwkRefType::Field(i as u16)),
                 )
             })
             .collect();
@@ -779,11 +779,11 @@ impl AwkValue {
         Ok(FieldsState::Ok)
     }
 
-    fn to_ref(self, ref_type: AwkRefType) -> Self {
+    fn into_ref(self, ref_type: AwkRefType) -> Self {
         Self { ref_type, ..self }
     }
 
-    fn to_ere(self) -> Result<Rc<Regex>, String> {
+    fn into_ere(self) -> Result<Rc<Regex>, String> {
         match self.value {
             AwkValueVariant::Regex { ere, .. } => Ok(ere),
             _ => Err("expected extended regular expression".to_string()),
@@ -824,7 +824,7 @@ impl AwkValue {
 
     fn field_ref<V: Into<AwkValue>>(value: V, field_index: u16) -> Self {
         let value = value.into();
-        value.to_ref(AwkRefType::Field(field_index))
+        value.into_ref(AwkRefType::Field(field_index))
     }
 }
 
@@ -1001,9 +1001,9 @@ struct CallFrame<'i> {
 
 /// # Invariants
 /// - `sp` and `bp` are pointers into the same
-/// contiguously allocated chunk of memory
+///     contiguously allocated chunk of memory
 /// - `stack_end` is one past the last valid pointer
-/// of the allocated memory starting at `bp`
+///     of the allocated memory starting at `bp`
 /// - values in the range [`bp`, `sp`) can be accessed safely
 struct Stack<'i, 's> {
     current_function_name: Rc<str>,
@@ -1320,7 +1320,7 @@ impl Interpreter {
                     compare_op!(stack, &global_env.convfmt, !=);
                 }
                 OpCode::Match => {
-                    let ere = stack.pop_value().to_ere()?;
+                    let ere = stack.pop_value().into_ere()?;
                     let string = stack
                         .pop_scalar_value()?
                         .scalar_to_string(&global_env.convfmt)?;
@@ -1526,8 +1526,7 @@ impl Interpreter {
                     ip_increment = offset as isize;
                 }
                 OpCode::Call(id) => {
-                    let function = &functions[id as usize];
-                    stack.call_function(&function);
+                    stack.call_function(&functions[id as usize]);
                     ip_increment = 0;
                 }
                 OpCode::CallBuiltin { function, argc } => match function {
@@ -1718,37 +1717,37 @@ impl Interpreter {
             .collect::<Vec<AwkValueRef>>();
 
         *globals[SpecialVar::Argc as usize].get_mut() = AwkValue::from(args.len() as f64)
-            .to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Argc));
+            .into_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Argc));
         *globals[SpecialVar::Argv as usize].get_mut() =
-            AwkValue::from(args).to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Argv));
+            AwkValue::from(args).into_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Argv));
         *globals[SpecialVar::Convfmt as usize].get_mut() = AwkValue::from("%.6g".to_string())
-            .to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Convfmt));
+            .into_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Convfmt));
         *globals[SpecialVar::Environ as usize].get_mut() =
-            AwkValue::from(env).to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Environ));
+            AwkValue::from(env).into_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Environ));
         *globals[SpecialVar::Filename as usize].get_mut() = AwkValue::from("-".to_string())
-            .to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Filename));
+            .into_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Filename));
         *globals[SpecialVar::Fnr as usize].get_mut() =
-            AwkValue::from(0.0).to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Fnr));
+            AwkValue::from(0.0).into_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Fnr));
         *globals[SpecialVar::Fs as usize].get_mut() =
-            AwkValue::from(" ").to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Fs));
+            AwkValue::from(" ").into_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Fs));
         *globals[SpecialVar::Nf as usize].get_mut() =
-            AwkValue::from(0.0).to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Nf));
+            AwkValue::from(0.0).into_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Nf));
         *globals[SpecialVar::Nr as usize].get_mut() =
-            AwkValue::from(0.0).to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Nr));
+            AwkValue::from(0.0).into_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Nr));
         *globals[SpecialVar::Ofmt as usize].get_mut() = AwkValue::from("%.6g".to_string())
-            .to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Ofmt));
+            .into_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Ofmt));
         *globals[SpecialVar::Ofs as usize].get_mut() =
-            AwkValue::from(" ".to_string()).to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Ofs));
-        *globals[SpecialVar::Ors as usize].get_mut() =
-            AwkValue::from("\n".to_string()).to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Ors));
+            AwkValue::from(" ".to_string()).into_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Ofs));
+        *globals[SpecialVar::Ors as usize].get_mut() = AwkValue::from("\n".to_string())
+            .into_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Ors));
         *globals[SpecialVar::Rlength as usize].get_mut() =
-            AwkValue::from(0.0).to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Rlength));
+            AwkValue::from(0.0).into_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Rlength));
         *globals[SpecialVar::Rs as usize].get_mut() =
-            AwkValue::from("\n".to_string()).to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Rs));
+            AwkValue::from("\n".to_string()).into_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Rs));
         *globals[SpecialVar::Rstart as usize].get_mut() =
-            AwkValue::from(0.0).to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Rstart));
+            AwkValue::from(0.0).into_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Rstart));
         *globals[SpecialVar::Subsep as usize].get_mut() = AwkValue::from(" ".to_string())
-            .to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Subsep));
+            .into_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Subsep));
 
         Self {
             globals,
@@ -1807,7 +1806,7 @@ pub fn interpret(
 ) -> Result<i32, String> {
     // println!("{:?}", program);
     let args = iter::once(("0".to_string(), AwkValue::from("awk")))
-        .chain(args.into_iter().enumerate().map(|(index, s)| {
+        .chain(args.iter().enumerate().map(|(index, s)| {
             (
                 (index + 1).to_string(),
                 maybe_numeric_string(s.as_str()).into(),
@@ -2664,7 +2663,7 @@ mod tests {
 
         assert_eq!(
             result.globals[SpecialVar::Nf as usize],
-            AwkValue::from(9.0).to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Nf))
+            AwkValue::from(9.0).into_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Nf))
         );
     }
 
@@ -3410,7 +3409,7 @@ mod tests {
         );
         assert_eq!(
             result.globals[SpecialVar::Nf as usize],
-            AwkValue::from(1.0).to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Nf))
+            AwkValue::from(1.0).into_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Nf))
         );
     }
 

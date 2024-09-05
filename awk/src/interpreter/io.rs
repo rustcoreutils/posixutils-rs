@@ -281,7 +281,7 @@ impl WritePipes {
             }
         };
         let contents: CString = contents.try_into()?;
-        let result = unsafe { libc::fputs(contents.as_ptr() as *const i8, file) };
+        let result = unsafe { libc::fputs(contents.as_ptr(), file) };
         if result == libc::EOF {
             return Err("failed to write to file".to_string());
         }

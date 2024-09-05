@@ -7,6 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
+#![allow(clippy::result_large_err)]
+
 use crate::program::{
     Action, AwkRule, BuiltinFunction, Constant, DebugInfo, Function, OpCode, Pattern, Program,
     SourceLocation, SpecialVar, VarId,
@@ -620,6 +622,8 @@ impl Compiler {
                         id,
                         parameter_count,
                     }) => {
+                        // I think this is a better way to structure the code
+                        #[allow(clippy::comparison_chain)]
                         if argc > *parameter_count as u16 {
                             // TODO: other implementations simply issue a warning
                             return Err(pest_error_from_span(
@@ -1698,8 +1702,8 @@ fn next_checkpoint(text: &str) -> Option<usize> {
 }
 
 fn improve_error(error: PestError, file: &str) -> PestError {
-    if file != "" {
-        error.with_path(&file)
+    if !file.is_empty() {
+        error.with_path(file)
     } else {
         error
     }

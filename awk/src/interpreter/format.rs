@@ -91,7 +91,7 @@ fn write_inf_or_nan(target: &mut String, value: f64, lowercase_version: bool, si
 /// - `sign` is neither an empty string nor a single ASCII character
 /// - `sign` is not the first character in the string
 /// - the character before the first digit in the substring starting at `write_starting_index`
-/// is not an ASCII character
+///   is not an ASCII character
 fn swap_sign_in_front_of_number(target: &mut String, sign: &str, write_starting_index: usize) {
     // sign is ASCII or empty string
     assert!(sign.len() <= 1);
@@ -217,8 +217,8 @@ fn remove_trailing_zeros(
             // rotate is safe, see above
             bytes.rotate_right(trailing_zeros);
             // we just replace b'0' with b' '. No multibyte chars are involved
-            for i in 0..trailing_zeros {
-                bytes[i] = b' ';
+            for b in bytes {
+                *b = b' ';
             }
         }
     }

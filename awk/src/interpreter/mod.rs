@@ -224,7 +224,12 @@ fn builtin_match(stack: &mut Stack, global_env: &mut GlobalEnv) -> Result<(f64, 
     Ok((start as f64, len as f64))
 }
 
-fn gsub(ere: &Regex, repl: &str, in_str: &str, only_replace_first: bool) -> (AwkString, usize) {
+fn gsub(
+    ere: &Regex,
+    repl: &str,
+    in_str: &str,
+    only_replace_first: bool,
+) -> Result<(AwkString, usize), String> {
     let mut result = String::with_capacity(in_str.len());
     let mut last_match_end = 0;
 
@@ -255,7 +260,7 @@ fn gsub(ere: &Regex, repl: &str, in_str: &str, only_replace_first: bool) -> (Awk
     repl_parts.push(current_repl_part);
 
     let mut num_replacements = 0;
-    for m in ere.match_locations(CString::new(in_str).unwrap()) {
+    for m in ere.match_locations(AwkString::from(in_str).try_into()?) {
         result.push_str(&in_str[last_match_end..m.start]);
         let replaced_string = &in_str[m.start..m.end];
         result.push_str(&repl_parts[0]);
@@ -270,7 +275,7 @@ fn gsub(ere: &Regex, repl: &str, in_str: &str, only_replace_first: bool) -> (Awk
         }
     }
     result.push_str(&in_str[last_match_end..]);
-    (result.into(), num_replacements)
+    Ok((result.into(), num_replacements))
 }
 
 fn builtin_gsub(
@@ -289,7 +294,7 @@ fn builtin_gsub(
         &repl,
         &in_str.share().scalar_to_string(&global_env.convfmt)?,
         is_sub,
-    );
+    )?;
     let result = in_str.assign(result, global_env);
     stack.push_value(count as f64)?;
     result
@@ -906,9 +911,9 @@ impl StackValue {
             StackValue::UninitializedRef(val_ref) => &mut **val_ref,
             StackValue::ArrayElementRef(array_element_ref) => (*array_element_ref.array)
                 .as_array()
-                .unwrap()
+                .expect("expected array")
                 .index_to_value(array_element_ref.value_index)
-                .unwrap(),
+                .expect("invalid array value index"),
             _ => unreachable!("invalid stack value"),
         }
     }
@@ -924,9 +929,9 @@ impl StackValue {
                 // safe by type invariance
                 (*array_element_ref.array)
                     .as_array()
-                    .unwrap()
+                    .expect("invalid array")
                     .index_to_value(array_element_ref.value_index)
-                    .unwrap()
+                    .expect("invalid array value index")
             },
             _ => unreachable!("expected lvalue"),
         }
@@ -1051,7 +1056,7 @@ impl<'i, 's> Stack<'i, 's> {
     }
 
     fn pop_scalar_value(&mut self) -> Result<AwkValue, String> {
-        let mut value = self.pop().unwrap();
+        let mut value = self.pop().expect("empty stack");
         // safe by type invariance
         unsafe {
             value.ensure_value_is_scalar()?;
@@ -1076,14 +1081,14 @@ impl<'i, 's> Stack<'i, 's> {
     fn pop_value(&mut self) -> AwkValue {
         // safe by type invariance
         unsafe {
-            let value = self.pop().unwrap();
+            let value = self.pop().expect("empty stack");
             value.into_owned()
         }
     }
 
     fn pop_ref(&mut self) -> &mut AwkValue {
         // safe by type invariance
-        unsafe { &mut *self.pop().unwrap().unwrap_ptr() }
+        unsafe { &mut *self.pop().expect("empty stack").unwrap_ptr() }
     }
 
     fn push_value<V: Into<AwkValue>>(&mut self, value: V) -> Result<(), String> {
@@ -1420,7 +1425,7 @@ impl Interpreter {
                 OpCode::AdvanceIterOrJump(offset) => {
                     // if the top of the stack is not an iterator
                     // the code is malformed
-                    let mut iter = stack.pop().unwrap().unwrap_array_iterator();
+                    let mut iter = stack.pop().expect("empty stack").unwrap_array_iterator();
                     // The pointer value is valid by stack invariance
                     let array = unsafe { &mut *iter.array }.as_array()?;
                     if let Some(key) = array.key_iter_next(&mut iter.key_iter) {
@@ -1443,7 +1448,9 @@ impl Interpreter {
                     stack.push(StackValue::from_var(self.globals[index as usize].get()))?
                 },
                 OpCode::GetLocal(index) => {
-                    let value = stack.get_mut_value_ptr(index as usize).unwrap();
+                    let value = stack
+                        .get_mut_value_ptr(index as usize)
+                        .expect("invalid local index");
                     // this value is valid until the stack value at `index` is popped
                     // so this preserves the stack invariance
                     unsafe { stack.push(StackValue::from_var(value))? };
@@ -1467,7 +1474,9 @@ impl Interpreter {
                     stack.push_ref(self.globals[index as usize].get())?
                 },
                 OpCode::LocalScalarRef(index) => {
-                    let value = stack.get_mut_value_ptr(index as usize).unwrap();
+                    let value = stack
+                        .get_mut_value_ptr(index as usize)
+                        .expect("invalid local index");
                     // this value is valid until the stack value at `index` is popped
                     // so this preserves the stack invariance
                     unsafe { stack.push_ref(value)? };
@@ -1482,7 +1491,7 @@ impl Interpreter {
                     let key = stack
                         .pop_scalar_value()?
                         .scalar_to_string(&global_env.convfmt)?;
-                    let array = unsafe { stack.pop().unwrap().unwrap_ptr() };
+                    let array = unsafe { stack.pop().expect("empty stack").unwrap_ptr() };
                     // safe by type invariance
                     let value_index = unsafe { &mut *array }
                         .as_array()?
@@ -1876,8 +1885,9 @@ pub fn interpret(
             interpreter.globals[SpecialVar::Argv as usize]
                 .get_mut()
                 .as_array()
-                .unwrap()
+                .expect("ARGV is not an array")
                 .get_value(current_arg_index.to_string().into())
+                // there cannot be active iterators at this point, so this is safe
                 .unwrap()
                 .share()
                 .scalar_to_string(&global_env.convfmt)?

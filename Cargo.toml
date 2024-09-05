@@ -8,6 +8,7 @@ members = [
 	"display",
 	"file",
 	"fs",
+	"make",
 	"m4",
 	"m4/test-manager",
 	"gettext-rs",

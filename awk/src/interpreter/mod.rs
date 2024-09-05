@@ -1855,24 +1855,33 @@ pub fn interpret(
         }
     }
 
+    if program.rules.is_empty() && program.end_actions.is_empty() {
+        return Ok(return_value);
+    }
+
     let mut current_arg_index = 1;
+    let mut input_read = false;
     'file_loop: loop {
         let argc = interpreter.globals[SpecialVar::Argc as usize]
             .get_mut()
             .scalar_as_f64() as usize;
 
-        if current_arg_index >= argc {
-            break;
-        }
-
-        let arg = interpreter.globals[SpecialVar::Argv as usize]
-            .get_mut()
-            .as_array()
-            .unwrap()
-            .get_value(current_arg_index.to_string().into())
-            .unwrap()
-            .share()
-            .scalar_to_string(&global_env.convfmt)?;
+        let arg = if current_arg_index >= argc {
+            if input_read {
+                break;
+            } else {
+                "-".into()
+            }
+        } else {
+            interpreter.globals[SpecialVar::Argv as usize]
+                .get_mut()
+                .as_array()
+                .unwrap()
+                .get_value(current_arg_index.to_string().into())
+                .unwrap()
+                .share()
+                .scalar_to_string(&global_env.convfmt)?
+        };
 
         if arg.is_empty() {
             current_arg_index += 1;
@@ -1901,6 +1910,9 @@ pub fn interpret(
         } else {
             &mut FileStream::open(&arg)?
         };
+
+        // at this point we know that some input will be read
+        input_read = true;
 
         global_env.fnr = 1;
         while let Some(record) = reader.read_next_record(&global_env.rs)? {

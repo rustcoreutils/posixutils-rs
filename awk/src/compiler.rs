@@ -625,7 +625,8 @@ impl Compiler {
                         // I think this is a better way to structure the code
                         #[allow(clippy::comparison_chain)]
                         if argc > *parameter_count as u16 {
-                            // TODO: other implementations simply issue a warning
+                            // other implementations issue a warning here
+                            // but I think it's better to error out
                             return Err(pest_error_from_span(
                                 span,
                                 format!("function '{}' called with too many arguments", name),

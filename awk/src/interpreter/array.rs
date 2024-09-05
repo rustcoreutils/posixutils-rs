@@ -37,6 +37,8 @@ pub struct Array {
 }
 
 impl Array {
+    /// Remove the element with the given key.
+    /// This is possible even if there is an active iterator.
     pub fn delete(&mut self, key: &str) {
         if let Some(pair_index) = self.key_map.remove(key) {
             if self.iterator_count == 0 {
@@ -69,6 +71,9 @@ impl Array {
         None
     }
 
+    /// Get the `ValueIndex` of the key in the array. If the key does not exist, it will be inserted.
+    /// # Errors
+    /// If the array has an active iterator, an error will be returned.
     pub fn get_value_index(&mut self, key: Key) -> Result<ValueIndex, String> {
         match self.key_map.entry(key.clone()) {
             Entry::Occupied(e) => Ok(ValueIndex { index: *e.get() }),
@@ -98,6 +103,9 @@ impl Array {
         Ok(self.index_to_value(index).unwrap())
     }
 
+    /// Set the array element at the given key to the given value
+    /// # Errors
+    /// If the array has an active iterator, an error will be returned.
     pub fn set<V: Into<AwkValue>>(&mut self, key: String, value: V) -> Result<ValueIndex, String> {
         if self.iterator_count == 0 {
             let key = Rc::<str>::from(key);

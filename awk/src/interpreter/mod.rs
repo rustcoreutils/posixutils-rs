@@ -17,7 +17,10 @@ use rand::{Rng, SeedableRng};
 use string::AwkString;
 
 use crate::compiler::{escape_string_contents, is_valid_number};
-use crate::program::{BuiltinFunction, Constant, Function, OpCode, Pattern, Program, SpecialVar};
+use crate::program::{
+    Action, BuiltinFunction, Constant, Function, OpCode, Pattern, Program, SourceLocation,
+    SpecialVar,
+};
 use crate::regex::Regex;
 use format::{
     fmt_write_decimal_float, fmt_write_float_general, fmt_write_hex_float,
@@ -981,6 +984,9 @@ impl From<AwkValue> for StackValue {
 }
 
 struct CallFrame<'i> {
+    function_name: Rc<str>,
+    function_file: Rc<str>,
+    source_locations: &'i [SourceLocation],
     bp: *mut StackValue,
     sp: *mut StackValue,
     ip: isize,
@@ -994,8 +1000,11 @@ struct CallFrame<'i> {
 /// of the allocated memory starting at `bp`
 /// - values in the range [`bp`, `sp`) can be accessed safely
 struct Stack<'i, 's> {
+    current_function_name: Rc<str>,
+    current_function_file: Rc<str>,
     ip: isize,
     instructions: &'i [OpCode],
+    source_locations: &'i [SourceLocation],
     sp: *mut StackValue,
     bp: *mut StackValue,
     stack_end: *mut StackValue,
@@ -1087,19 +1096,25 @@ impl<'i, 's> Stack<'i, 's> {
         self.instructions.get(self.ip as usize).copied()
     }
 
-    fn call_function(&mut self, instructions: &'i [OpCode], argc: usize) {
-        unsafe { assert!(self.sp.offset_from(self.bp) >= argc as isize) };
-        let new_bp = unsafe { self.sp.sub(argc) };
+    fn call_function(&mut self, function: &'i Function) {
+        unsafe { assert!(self.sp.offset_from(self.bp) >= function.parameters_count as isize) };
+        let new_bp = unsafe { self.sp.sub(function.parameters_count) };
         let caller_frame = CallFrame {
             bp: self.bp,
             sp: new_bp,
             ip: self.ip,
             instructions: self.instructions,
+            source_locations: self.source_locations,
+            function_file: self.current_function_file.clone(),
+            function_name: self.current_function_name.clone(),
         };
+        self.current_function_file = function.debug_info.file.clone();
+        self.current_function_name = function.name.clone();
         self.call_frames.push(caller_frame);
         self.bp = new_bp;
         self.ip = 0;
-        self.instructions = instructions;
+        self.instructions = &function.instructions;
+        self.source_locations = &function.debug_info.source_locations;
     }
 
     fn restore_caller(&mut self) {
@@ -1113,12 +1128,15 @@ impl<'i, 's> Stack<'i, 's> {
         self.ip = caller_frame.ip;
     }
 
-    fn new(main: &'i [OpCode], stack: &'s mut [StackValue]) -> Self {
+    fn new(main: &'i Action, stack: &'s mut [StackValue]) -> Self {
         let stack_len = stack.len();
         let bp = stack.as_mut_ptr();
         let stack_end = unsafe { bp.add(stack_len) };
         Self {
-            instructions: main,
+            current_function_file: main.debug_info.file.clone(),
+            current_function_name: "<start>".into(),
+            instructions: &main.instructions,
+            source_locations: &main.debug_info.source_locations,
             ip: 0,
             bp,
             sp: bp,
@@ -1197,17 +1215,56 @@ macro_rules! compare_op {
     };
 }
 
+fn stack_trace(error: String, stack: Stack) -> String {
+    let mut result = format!("runtime error: {}\ncall trace:\n", error);
+    let error_location = stack.source_locations[stack.ip as usize];
+    writeln!(
+        result,
+        "=> {} at {}:{}:{}",
+        stack.current_function_name,
+        stack.current_function_file,
+        error_location.line,
+        error_location.column
+    )
+    .expect("error writing to string");
+    for frame in stack.call_frames.iter().rev() {
+        let source_location = frame.source_locations[frame.ip as usize];
+        writeln!(
+            result,
+            "=> {} at {}:{}:{}",
+            frame.function_name, frame.function_file, source_location.line, source_location.column
+        )
+        .expect("error writing to string");
+    }
+
+    result
+}
+
 impl Interpreter {
     fn run(
         &mut self,
-        main: &[OpCode],
+        action: &Action,
         functions: &[Function],
         record: &mut Record,
         stack: &mut [StackValue],
         global_env: &mut GlobalEnv,
         current_file: &mut dyn RecordReader,
     ) -> Result<ExecutionResult, String> {
-        let mut stack = Stack::new(main, stack);
+        let mut stack = Stack::new(action, stack);
+        match self.run_internal(functions, record, &mut stack, global_env, current_file) {
+            Err(err) => Err(stack_trace(err, stack)),
+            Ok(result) => Ok(result),
+        }
+    }
+
+    fn run_internal<'a>(
+        &mut self,
+        functions: &'a [Function],
+        record: &mut Record,
+        stack: &mut Stack<'a, 'a>,
+        global_env: &mut GlobalEnv,
+        current_file: &mut dyn RecordReader,
+    ) -> Result<ExecutionResult, String> {
         let mut fields_state = FieldsState::Ok;
         while let Some(instruction) = stack.next_instruction() {
             let mut ip_increment: isize = 1;
@@ -1443,12 +1500,12 @@ impl Interpreter {
                 }
                 OpCode::Call { id, argc } => {
                     let function = &functions[id as usize];
-                    stack.call_function(&function.instructions, argc as usize);
+                    stack.call_function(&function);
                     ip_increment = 0;
                 }
                 OpCode::CallBuiltin { function, argc } => match function {
                     BuiltinFunction::Match => {
-                        let (start, len) = builtin_match(&mut stack, global_env)?;
+                        let (start, len) = builtin_match(stack, global_env)?;
                         unsafe {
                             *self.globals[SpecialVar::Rstart as usize].get() = start.into();
                             *self.globals[SpecialVar::Rlength as usize].get() = len.into();
@@ -1467,9 +1524,9 @@ impl Interpreter {
                                 | BuiltinFunction::RedirectedPrintfAppend
                         );
                         let str = if is_printf {
-                            builtin_sprintf(&mut stack, argc - 1, global_env)?
+                            builtin_sprintf(stack, argc - 1, global_env)?
                         } else {
-                            print_to_string(&mut stack, argc - 1, global_env)?
+                            print_to_string(stack, argc - 1, global_env)?
                         };
                         let is_append = matches!(
                             function,
@@ -1484,9 +1541,9 @@ impl Interpreter {
                             .pop_scalar_value()?
                             .scalar_to_string(&global_env.convfmt)?;
                         let str = if function == BuiltinFunction::RedirectedPrintPipe {
-                            print_to_string(&mut stack, argc - 1, global_env)?
+                            print_to_string(stack, argc - 1, global_env)?
                         } else {
-                            builtin_sprintf(&mut stack, argc - 1, global_env)?
+                            builtin_sprintf(stack, argc - 1, global_env)?
                         };
                         self.write_pipes.write(command, str)?;
                     }
@@ -1547,9 +1604,7 @@ impl Interpreter {
                         self.rand_seed = seed;
                         self.rng = SmallRng::seed_from_u64(self.rand_seed);
                     }
-                    other => {
-                        fields_state = call_simple_builtin(other, argc, &mut stack, global_env)?
-                    }
+                    other => fields_state = call_simple_builtin(other, argc, stack, global_env)?,
                 },
                 OpCode::PushConstant(index) => match self.constants[index as usize].clone() {
                     Constant::Number(num) => stack.push_value(num)?,
@@ -1753,7 +1808,7 @@ pub fn interpret(
 
     for action in program.begin_actions {
         let begin_result = interpreter.run(
-            &action.instructions,
+            &action,
             &program.functions,
             &mut current_record,
             &mut stack,
@@ -1828,9 +1883,9 @@ pub fn interpret(
             for (i, rule) in program.rules.iter().enumerate() {
                 let should_execute = match &rule.pattern {
                     Pattern::All => true,
-                    Pattern::Expr(e) => interpreter
+                    Pattern::Expr(expr) => interpreter
                         .run(
-                            &e.instructions,
+                            expr,
                             &program.functions,
                             &mut current_record,
                             &mut stack,
@@ -1842,7 +1897,7 @@ pub fn interpret(
                         if range_pattern_started[i] {
                             let should_end = !interpreter
                                 .run(
-                                    &end.instructions,
+                                    end,
                                     &program.functions,
                                     &mut current_record,
                                     &mut stack,
@@ -1856,7 +1911,7 @@ pub fn interpret(
                         } else {
                             let should_start = interpreter
                                 .run(
-                                    &start.instructions,
+                                    start,
                                     &program.functions,
                                     &mut current_record,
                                     &mut stack,
@@ -1871,7 +1926,7 @@ pub fn interpret(
                 };
                 if should_execute {
                     let rule_result = interpreter.run(
-                        &rule.action.instructions,
+                        &rule.action,
                         &program.functions,
                         &mut current_record,
                         &mut stack,
@@ -1898,7 +1953,7 @@ pub fn interpret(
 
     for action in program.end_actions {
         let end_result = interpreter.run(
-            &action.instructions,
+            &action,
             &program.functions,
             &mut current_record,
             &mut stack,
@@ -1979,10 +2034,14 @@ mod tests {
                 self.constants,
                 self.globals_count,
             );
+            let action = Action {
+                debug_info: Default::default(),
+                instructions: self.instructions,
+            };
 
             let execution_result = interpreter
                 .run(
-                    &self.instructions,
+                    &action,
                     &self.functions,
                     &mut self.record,
                     &mut stack,

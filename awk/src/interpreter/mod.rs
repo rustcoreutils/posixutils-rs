@@ -589,8 +589,9 @@ impl Record {
             .clone()
             .scalar_to_string(&global_env.convfmt)?;
         write!(new_record, "{}", last_field_str).expect("error writing to string");
-        // TODO: don't know if this is correct. Should the recomputed record be
-        // numeric?
+        // the spec doesn't specify if a recomputed record should be a numeric string.
+        // Most other implementations don't really handle this case. Here we just
+        // mark it as a numeric string if appropriate
         let mut record_str = maybe_numeric_string(new_record);
         *self.fields[0].get() = AwkValue::field_ref(record_str.share(), 0);
         *self.record.borrow_mut() = record_str.try_into()?;

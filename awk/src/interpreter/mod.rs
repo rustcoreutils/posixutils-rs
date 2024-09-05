@@ -1830,7 +1830,7 @@ pub fn interpret(
                     Pattern::All => true,
                     Pattern::Expr(e) => interpreter
                         .run(
-                            e,
+                            &e.instructions,
                             &program.functions,
                             &mut current_record,
                             &mut stack,
@@ -1842,7 +1842,7 @@ pub fn interpret(
                         if range_pattern_started[i] {
                             let should_end = !interpreter
                                 .run(
-                                    end,
+                                    &end.instructions,
                                     &program.functions,
                                     &mut current_record,
                                     &mut stack,
@@ -1856,7 +1856,7 @@ pub fn interpret(
                         } else {
                             let should_start = interpreter
                                 .run(
-                                    start,
+                                    &start.instructions,
                                     &program.functions,
                                     &mut current_record,
                                     &mut stack,

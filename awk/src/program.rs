@@ -153,11 +153,8 @@ pub struct Action {
 
 #[derive(Debug, PartialEq)]
 pub enum Pattern {
-    Expr(Vec<OpCode>),
-    Range {
-        start: Vec<OpCode>,
-        end: Vec<OpCode>,
-    },
+    Expr(Action),
+    Range { start: Action, end: Action },
     All,
 }
 
@@ -198,20 +195,20 @@ impl fmt::Debug for Program {
 
         for rule in &self.rules {
             match &rule.pattern {
-                Pattern::Expr(expr) => {
+                Pattern::Expr(action) => {
                     writeln!(f, "  /")?;
-                    for instruction in expr {
+                    for instruction in &action.instructions {
                         writeln!(f, "    {:?}", instruction)?;
                     }
                     writeln!(f, "  / {{")?;
                 }
                 Pattern::Range { start, end } => {
                     writeln!(f, "  /")?;
-                    for instruction in start {
+                    for instruction in &start.instructions {
                         writeln!(f, "    {:?}", instruction)?;
                     }
                     writeln!(f, "  /, /")?;
-                    for instruction in end {
+                    for instruction in &end.instructions {
                         writeln!(f, "    {:?}", instruction)?;
                     }
                     writeln!(f, "  / {{")?;

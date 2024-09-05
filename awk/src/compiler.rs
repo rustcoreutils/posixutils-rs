@@ -1509,13 +1509,17 @@ impl Compiler {
         }
     }
 
-    fn compile_normal_pattern(&mut self, pattern: Pair<Rule>) -> Result<Pattern, PestError> {
+    fn compile_normal_pattern(
+        &mut self,
+        pattern: Pair<Rule>,
+        file: Rc<str>,
+    ) -> Result<Pattern, PestError> {
         let pattern = first_child(pattern);
         match pattern.as_rule() {
             Rule::expr => {
                 let mut instructions = Instructions::default();
                 self.compile_expr(pattern, &mut instructions, &HashMap::new())?;
-                Ok(Pattern::Expr(instructions.opcodes))
+                Ok(Pattern::Expr(instructions.into_action(file)))
             }
             Rule::range_pattern => {
                 let mut inner = pattern.into_inner();
@@ -1529,8 +1533,8 @@ impl Compiler {
                 self.compile_expr(end, &mut end_instructions, &HashMap::new())?;
 
                 Ok(Pattern::Range {
-                    start: start_instructions.opcodes,
-                    end: end_instructions.opcodes,
+                    start: start_instructions.into_action(file.clone()),
+                    end: end_instructions.into_action(file),
                 })
             }
             _ => unreachable!(
@@ -1553,7 +1557,7 @@ impl Compiler {
             }
             Rule::pattern_and_action => {
                 let mut inner = rule.into_inner();
-                let pattern = self.compile_normal_pattern(inner.next().unwrap())?;
+                let pattern = self.compile_normal_pattern(inner.next().unwrap(), file.clone())?;
                 let action = inner.next().unwrap();
                 let mut instructions = Instructions::default();
                 let locals = HashMap::new();
@@ -1565,7 +1569,7 @@ impl Compiler {
             }
             Rule::normal_pattern => {
                 let rule_line_col = rule.line_col();
-                let pattern = self.compile_normal_pattern(rule)?;
+                let pattern = self.compile_normal_pattern(rule, file.clone())?;
                 let instructions = Instructions::from_instructions_and_line_col(
                     vec![
                         OpCode::PushZero,
@@ -3522,10 +3526,10 @@ mod test {
             "#,
         );
         assert_eq!(program.rules.len(), 1);
-        assert_eq!(
-            program.rules[0].pattern,
-            Pattern::Expr(vec![OpCode::PushConstant(0)])
-        );
+        assert!(matches!(
+            &program.rules[0].pattern,
+            Pattern::Expr(Action { instructions, .. }) if *instructions == [OpCode::PushConstant(0)]
+        ));
         assert_eq!(
             program.rules[0].action.instructions,
             vec![
@@ -3555,13 +3559,10 @@ mod test {
             "#,
         );
         assert_eq!(program.rules.len(), 1);
-        assert_eq!(
-            program.rules[0].pattern,
-            Pattern::Range {
-                start: vec![OpCode::PushConstant(0)],
-                end: vec![OpCode::PushConstant(1)]
-            }
-        );
+        assert!(matches!(
+            &program.rules[0].pattern,
+            Pattern::Range { start, end } if start.instructions == [OpCode::PushConstant(0)] && end.instructions == [OpCode::PushConstant(1)]
+        ));
         assert_eq!(
             program.rules[0].action.instructions,
             vec![
@@ -3602,10 +3603,10 @@ mod test {
     fn compile_rule_without_action() {
         let program = compile_correct_program("1");
         assert_eq!(program.rules.len(), 1);
-        assert_eq!(
-            program.rules[0].pattern,
-            Pattern::Expr(vec![OpCode::PushConstant(0)])
-        );
+        assert!(matches!(
+            &program.rules[0].pattern,
+            Pattern::Expr(Action { instructions, .. }) if *instructions == [OpCode::PushConstant(0)]
+        ));
         assert_eq!(
             program.rules[0].action.instructions,
             vec![

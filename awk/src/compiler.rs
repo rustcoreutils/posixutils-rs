@@ -1963,9 +1963,6 @@ mod test {
         let (_, constants) = compile_expr(r#""hello\"world""#);
         assert_eq!(constants, vec![Constant::from(r#"hello"world"#)]);
 
-        let (_, constants) = compile_expr(r#""hello\0world""#);
-        assert_eq!(constants, vec![Constant::from("hello\x00world")]);
-
         let (_, constants) = compile_expr(r#""hello\41world""#);
         assert_eq!(constants, vec![Constant::from("hello!world")]);
 

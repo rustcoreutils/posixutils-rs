@@ -187,13 +187,53 @@ pub struct Program {
 
 impl fmt::Debug for Program {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "Program {{")?;
-        writeln!(f, "  Constants: {:?}", self.constants)?;
-        writeln!(f, "  Begin instructions: {:?}", self.begin_actions)?;
-        writeln!(f, "  Rules: {:?}", self.rules)?;
-        writeln!(f, "  End instructions: {:?}", self.begin_actions)?;
-        writeln!(f, "  Functions: {:?}", self.functions)?;
-        write!(f, "}}")
+        writeln!(f, "Program:")?;
+        for action in &self.begin_actions {
+            writeln!(f, "  BEGIN {{")?;
+            for instruction in &action.instructions {
+                writeln!(f, "    {:?}", instruction)?;
+            }
+            writeln!(f, "  }}")?;
+        }
+
+        for rule in &self.rules {
+            match &rule.pattern {
+                Pattern::Expr(expr) => {
+                    writeln!(f, "  /")?;
+                    for instruction in expr {
+                        writeln!(f, "    {:?}", instruction)?;
+                    }
+                    writeln!(f, "  / {{")?;
+                }
+                Pattern::Range { start, end } => {
+                    writeln!(f, "  /")?;
+                    for instruction in start {
+                        writeln!(f, "    {:?}", instruction)?;
+                    }
+                    writeln!(f, "  /, /")?;
+                    for instruction in end {
+                        writeln!(f, "    {:?}", instruction)?;
+                    }
+                    writeln!(f, "  / {{")?;
+                }
+                Pattern::All => {
+                    writeln!(f, "  {{")?;
+                }
+            }
+            for instruction in &rule.action.instructions {
+                writeln!(f, "    {:?}", instruction)?;
+            }
+            writeln!(f, "  }}")?;
+        }
+
+        for action in &self.end_actions {
+            writeln!(f, "  END {{")?;
+            for instruction in &action.instructions {
+                writeln!(f, "    {:?}", instruction)?;
+            }
+            writeln!(f, "  }}")?;
+        }
+        Ok(())
     }
 }
 

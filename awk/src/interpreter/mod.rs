@@ -2662,7 +2662,10 @@ mod tests {
             .add_record("1")
             .run_correct();
 
-        assert_eq!(result.globals[SpecialVar::Nf as usize], AwkValue::from(9.0));
+        assert_eq!(
+            result.globals[SpecialVar::Nf as usize],
+            AwkValue::from(9.0).to_ref(AwkRefType::SpecialGlobalVar(SpecialVar::Nf))
+        );
     }
 
     #[test]

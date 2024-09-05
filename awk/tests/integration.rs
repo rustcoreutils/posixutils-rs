@@ -518,3 +518,18 @@ fn test_awk_use_cli_provided_separator() {
         expected_exit_code: 0,
     })
 }
+
+#[test]
+fn test_awk_no_file_arguments_reads_from_stdin() {
+    run_test(TestPlan {
+        cmd: String::from("awk"),
+        args: vec![
+            "-f".to_string(),
+            "tests/awk/no_file_arguments_reads_from_stdin.awk".to_string(),
+        ],
+        stdin_data: include_str!("awk/test_data.txt").to_string(),
+        expected_out: include_str!("awk/no_file_arguments_reads_from_stdin.out").to_string(),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    })
+}

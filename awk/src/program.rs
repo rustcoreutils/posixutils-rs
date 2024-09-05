@@ -230,6 +230,18 @@ impl fmt::Debug for Program {
             }
             writeln!(f, "  }}")?;
         }
+        writeln!(f, "Functions:")?;
+        for function in &self.functions {
+            writeln!(f, "  {}({}) {{", function.name, function.parameters_count)?;
+            for instruction in &function.instructions {
+                writeln!(f, "    {:?}", instruction)?;
+            }
+            writeln!(f, "  }}")?;
+        }
+        writeln!(f, "Constants:")?;
+        for (i, constant) in self.constants.iter().enumerate() {
+            writeln!(f, "  {}: {:?}", i, constant)?;
+        }
         Ok(())
     }
 }

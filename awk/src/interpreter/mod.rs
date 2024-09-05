@@ -1498,7 +1498,6 @@ impl Interpreter {
                 OpCode::Assign => {
                     let value = stack.pop_scalar_value()?;
                     let lvalue = stack.pop_ref();
-                    // FIXME: we don't need to convert values here, just check
                     lvalue.ensure_value_is_scalar()?;
                     fields_state = lvalue.assign(value.clone(), global_env)?;
                     stack.push_value(value)?;

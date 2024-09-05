@@ -217,7 +217,7 @@ fn remove_trailing_zeros(
             // rotate is safe, see above
             bytes.rotate_right(trailing_zeros);
             // we just replace b'0' with b' '. No multibyte chars are involved
-            for b in bytes {
+            for b in bytes[..trailing_zeros].iter_mut() {
                 *b = b' ';
             }
         }

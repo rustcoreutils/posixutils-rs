@@ -292,7 +292,7 @@ fn builtin_gsub(
     let (result, count) = gsub(
         &ere,
         &repl,
-        &in_str.share().scalar_to_string(&global_env.convfmt)?,
+        &in_str.clone().scalar_to_string(&global_env.convfmt)?,
         is_sub,
     )?;
     let result = in_str.assign(result, global_env);
@@ -440,7 +440,7 @@ enum FieldSeparator {
 /// Splits a record into fields and calls the provided closure for each field.
 /// If the record is a numeric string, fields will be numeric strings if appropriate.
 fn split_record<S: FnMut(usize, AwkString) -> Result<(), String>>(
-    mut record: AwkString,
+    record: AwkString,
     field_separator: &FieldSeparator,
     mut store_result: S,
 ) -> Result<(), String> {
@@ -465,7 +465,7 @@ fn split_record<S: FnMut(usize, AwkString) -> Result<(), String>>(
         FieldSeparator::Ere(re) => {
             let mut split_start = 0;
             let mut index = 0;
-            for separator_range in re.match_locations(record.share().try_into()?) {
+            for separator_range in re.match_locations(record.clone().try_into()?) {
                 store_result(index, string(&record[split_start..separator_range.start]))?;
                 split_start = separator_range.end;
                 index += 1;
@@ -503,7 +503,7 @@ struct GlobalEnv {
 
 impl GlobalEnv {
     fn set(&mut self, var: SpecialVar, value: &mut AwkValue) -> Result<(), String> {
-        let as_string = |value: &mut AwkValue| value.share().scalar_to_string(&self.convfmt);
+        let as_string = |value: &mut AwkValue| value.clone().scalar_to_string(&self.convfmt);
         match var {
             SpecialVar::Convfmt => self.convfmt = as_string(value)?,
             SpecialVar::Fs => self.fs = as_string(value)?.try_into()?,
@@ -555,8 +555,8 @@ impl Record {
     fn reset(&mut self, record: String, field_separator: &FieldSeparator) -> Result<(), String> {
         let previous_last_field = *self.last_field.get_mut();
         let mut last_field = 0;
-        let mut record = maybe_numeric_string(record);
-        split_record(record.share(), field_separator, |i, s| {
+        let record = maybe_numeric_string(record);
+        split_record(record.clone(), field_separator, |i, s| {
             let field_index = i + 1;
             last_field += 1;
             *self.fields[field_index].get_mut() = AwkValue::field_ref(s, field_index as u16);
@@ -568,7 +568,7 @@ impl Record {
                 field.get_mut().value = AwkValueVariant::UninitializedScalar;
             }
         }
-        *self.fields[0].get_mut() = AwkValue::field_ref(record.share(), 0);
+        *self.fields[0].get_mut() = AwkValue::field_ref(record.clone(), 0);
         *self.record.get_mut() = record.try_into()?;
         *self.last_field.get_mut() = last_field;
         Ok(())
@@ -597,8 +597,8 @@ impl Record {
         // the spec doesn't specify if a recomputed record should be a numeric string.
         // Most other implementations don't really handle this case. Here we just
         // mark it as a numeric string if appropriate
-        let mut record_str = maybe_numeric_string(new_record);
-        *self.fields[0].get() = AwkValue::field_ref(record_str.share(), 0);
+        let record_str = maybe_numeric_string(new_record);
+        *self.fields[0].get() = AwkValue::field_ref(record_str.clone(), 0);
         *self.record.borrow_mut() = record_str.try_into()?;
         *self.last_field.borrow_mut() = last_field;
         Ok(())
@@ -608,17 +608,17 @@ impl Record {
     /// The caller has to ensure that there are no active references to the fields
     unsafe fn recompute_fields(&self, global_env: &GlobalEnv) -> Result<(), String> {
         let mut last_field = 0;
-        let mut record_str = (*self.fields[0].get())
+        let record_str = (*self.fields[0].get())
             .to_owned()
             .scalar_to_string(&global_env.convfmt)?;
-        split_record(record_str.share(), &global_env.fs, |i, s| {
+        split_record(record_str.clone(), &global_env.fs, |i, s| {
             let field_index = i + 1;
             last_field += 1;
             *self.fields[field_index].get() = AwkValue::field_ref(s, field_index as u16);
             Ok(())
         })
         .expect("error splitting record");
-        *self.fields[0].get() = AwkValue::field_ref(record_str.share(), 0);
+        *self.fields[0].get() = AwkValue::field_ref(record_str.clone(), 0);
         *self.record.borrow_mut() = record_str.try_into()?;
         *self.last_field.borrow_mut() = last_field;
         Ok(())
@@ -665,15 +665,6 @@ enum AwkValueVariant {
     },
     Uninitialized,
     UninitializedScalar,
-}
-
-impl AwkValueVariant {
-    fn share(&mut self) -> Self {
-        match self {
-            AwkValueVariant::String(value) => AwkValueVariant::String(value.share()),
-            other => other.clone(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -793,13 +784,6 @@ impl AwkValue {
         match self.value {
             AwkValueVariant::Regex { ere, .. } => Ok(ere),
             _ => Err("expected extended regular expression".to_string()),
-        }
-    }
-
-    fn share(&mut self) -> Self {
-        Self {
-            value: self.value.share(),
-            ref_type: AwkRefType::None,
         }
     }
 
@@ -949,7 +933,7 @@ impl StackValue {
     unsafe fn into_owned(self) -> AwkValue {
         match self {
             StackValue::Value(val) => val.into_inner(),
-            StackValue::ValueRef(ref_val) => (*ref_val).share(),
+            StackValue::ValueRef(ref_val) => (*ref_val).clone().into_ref(AwkRefType::None),
             StackValue::UninitializedRef(_) => AwkValue::uninitialized_scalar(),
             _ => unreachable!("invalid stack value"),
         }
@@ -969,7 +953,7 @@ impl StackValue {
         match value_ref.value {
             AwkValueVariant::Array(_) => StackValue::ValueRef(value),
             AwkValueVariant::Uninitialized => StackValue::UninitializedRef(value),
-            _ => StackValue::Value(UnsafeCell::new(value_ref.share())),
+            _ => StackValue::Value(UnsafeCell::new(value_ref.clone())),
         }
     }
 
@@ -1459,14 +1443,14 @@ impl Interpreter {
                     let index = stack.pop_scalar_value()?.scalar_as_f64() as usize;
                     is_valid_record_index(index)?;
                     // fields are never arrays, so this is always safe
-                    unsafe { stack.push_value((*record.fields[index].get()).share())? };
+                    unsafe { stack.push_value((*record.fields[index].get()).clone())? };
                 }
                 OpCode::IndexArrayGetValue => {
                     let key = stack
                         .pop_scalar_value()?
                         .scalar_to_string(&global_env.convfmt)?;
                     let array = stack.pop_ref().as_array()?;
-                    let element = array.get_value(key.into())?.share();
+                    let element = array.get_value(key.into())?.clone();
                     stack.push_value(element)?
                 }
                 OpCode::GlobalScalarRef(index) => unsafe {
@@ -1888,7 +1872,7 @@ pub fn interpret(
                 .get_value(current_arg_index.to_string().into())
                 // there cannot be active iterators at this point, so this is safe
                 .unwrap()
-                .share()
+                .clone()
                 .scalar_to_string(&global_env.convfmt)?
         };
 

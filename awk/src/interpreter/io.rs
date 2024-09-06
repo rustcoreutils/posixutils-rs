@@ -240,7 +240,7 @@ impl ReadFiles {
         filename: AwkString,
         separator: &RecordSeparator,
     ) -> Result<Option<String>, String> {
-        let filename = filename.into_shared();
+        let filename = Rc::<str>::from(filename);
         match self.files.entry(filename.clone()) {
             Entry::Occupied(mut e) => e.get_mut().read_next_record(separator),
             Entry::Vacant(e) => {
@@ -264,7 +264,7 @@ pub struct WritePipes {
 
 impl WritePipes {
     pub fn write(&mut self, command: AwkString, contents: AwkString) -> Result<(), String> {
-        let key = command.clone().into_shared();
+        let key = Rc::from(command.clone());
         let file = match self.pipes.entry(key) {
             Entry::Occupied(e) => *e.get(),
             Entry::Vacant(e) => {
@@ -379,7 +379,7 @@ impl ReadPipes {
         command: AwkString,
         separator: &RecordSeparator,
     ) -> Result<Option<String>, String> {
-        let command = command.into_shared();
+        let command = Rc::<str>::from(command);
         match self.pipes.entry(command.clone()) {
             Entry::Occupied(mut e) => e.get_mut().read_next_record(separator),
             Entry::Vacant(e) => {

@@ -23,29 +23,6 @@ pub struct AwkString {
 }
 
 impl AwkString {
-    pub fn share(&mut self) -> Self {
-        match &self.value {
-            AwkStringVariant::Owned(ref value) => {
-                let value = AwkStringVariant::Shared(Rc::from(value.as_str()));
-                Self {
-                    value,
-                    is_numeric: self.is_numeric,
-                }
-            }
-            AwkStringVariant::Shared(value) => Self {
-                value: AwkStringVariant::Shared(value.clone()),
-                is_numeric: self.is_numeric,
-            },
-        }
-    }
-
-    pub fn into_shared(self) -> Rc<str> {
-        match self.value {
-            AwkStringVariant::Owned(value) => Rc::from(value),
-            AwkStringVariant::Shared(value) => value,
-        }
-    }
-
     pub fn as_str(&self) -> &str {
         match &self.value {
             AwkStringVariant::Owned(value) => value,
@@ -140,7 +117,10 @@ impl From<&str> for AwkString {
 
 impl From<AwkString> for Rc<str> {
     fn from(val: AwkString) -> Self {
-        val.into_shared()
+        match val.value {
+            AwkStringVariant::Owned(value) => value.into(),
+            AwkStringVariant::Shared(value) => value,
+        }
     }
 }
 

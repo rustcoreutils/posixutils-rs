@@ -1813,7 +1813,6 @@ pub fn interpret(
     assignments: &[String],
     separator: Option<String>,
 ) -> Result<i32, String> {
-    // println!("{:?}", program);
     let args = iter::once(("0".to_string(), AwkValue::from("awk")))
         .chain(args.iter().enumerate().map(|(index, s)| {
             (

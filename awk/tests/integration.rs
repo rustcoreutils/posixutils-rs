@@ -533,3 +533,20 @@ fn test_awk_no_file_arguments_reads_from_stdin() {
         expected_exit_code: 0,
     })
 }
+
+#[test]
+fn test_awk_multifile_program() {
+    run_test(TestPlan {
+        cmd: String::from("awk"),
+        args: vec![
+            "-f".to_string(),
+            "tests/awk/multifile_program1.awk".to_string(),
+            "-f".to_string(),
+            "tests/awk/multifile_program2.awk".to_string(),
+        ],
+        stdin_data: String::new(),
+        expected_out: String::from(include_str!("awk/multifile_program.out")),
+        expected_err: String::from(""),
+        expected_exit_code: 0,
+    })
+}

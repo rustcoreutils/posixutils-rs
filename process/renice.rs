@@ -82,11 +82,24 @@ fn parse_id(which: u32, input: &str) -> Result<u32, &'static str> {
 fn xgetpriority(which: u32, id: u32) -> io::Result<i32> {
     set_errno(errno::Errno(0));
 
-    #[cfg(not(target_os = "macos"))]
-    let res = unsafe { libc::getpriority(which, id) };
+    // Prevent accidental shadowing by using a block
+    let which_cast = {
+        #[cfg(all(not(target_os = "macos"), not(target_env = "musl")))]
+        {
+            which
+        }
 
-    #[cfg(target_os = "macos")]
-    let res = unsafe { libc::getpriority(which as i32, id) };
+        #[cfg(all(not(target_os = "macos"), target_env = "musl"))]
+        {
+            which as i32
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            which as i32
+        }
+    };
+    let res = unsafe { libc::getpriority(which_cast, id) };
 
     let errno_res = errno().0;
     if errno_res == 0 {
@@ -99,11 +112,25 @@ fn xgetpriority(which: u32, id: u32) -> io::Result<i32> {
 }
 
 fn xsetpriority(which: u32, id: u32, prio: i32) -> io::Result<()> {
-    #[cfg(not(target_os = "macos"))]
-    let res = unsafe { libc::setpriority(which, id, prio) };
+    // Prevent accidental shadowing by using a block
+    let which_cast = {
+        #[cfg(all(not(target_os = "macos"), not(target_env = "musl")))]
+        {
+            which
+        }
 
-    #[cfg(target_os = "macos")]
-    let res = unsafe { libc::setpriority(which as i32, id, prio) };
+        #[cfg(all(not(target_os = "macos"), target_env = "musl"))]
+        {
+            which as i32
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            which as i32
+        }
+    };
+
+    let res = unsafe { libc::setpriority(which_cast, id, prio) };
 
     if res < 0 {
         let e = io::Error::last_os_error();

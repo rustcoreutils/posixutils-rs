@@ -582,11 +582,20 @@ fn get_terminal_width() -> usize {
     // Fallback to manually querying via `ioctl`.
     unsafe {
         let mut winsize: MaybeUninit<libc::winsize> = MaybeUninit::zeroed();
-        let ret = libc::ioctl(
-            libc::STDOUT_FILENO,
-            winsize_request_code(),
-            winsize.as_mut_ptr(),
-        );
+        let request_cast = {
+            let request = winsize_request_code();
+
+            #[cfg(target_env = "musl")]
+            {
+                request as i32
+            }
+
+            #[cfg(not(target_env = "musl"))]
+            {
+                request
+            }
+        };
+        let ret = libc::ioctl(libc::STDOUT_FILENO, request_cast, winsize.as_mut_ptr());
 
         // We're only interested in stdout here unlike `term_size::dimensions`
         // so we won't query further if the first `ioctl` call fails.

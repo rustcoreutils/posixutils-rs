@@ -8,7 +8,8 @@
 //
 
 extern crate libc;
-use libc::{endutxent, getutxent, setutxent};
+// TODO: Remove "libc_aliases" when https://github.com/rust-lang/libc/issues/3190 is resolved
+use crate::libc_aliases::{endutxent, getutxent, setutxent};
 use std::ffi::CStr;
 
 #[derive(Debug)]
@@ -23,6 +24,8 @@ pub struct Utmpx {
 }
 
 pub fn ut_type_str(typ: libc::c_short) -> &'static str {
+    // TODO: Remove "libc_aliases" when https://github.com/rust-lang/libc/issues/3190 is resolved
+    use crate::libc_aliases as libc;
     match typ {
         libc::BOOT_TIME => "BOOT_TIME",
         libc::DEAD_PROCESS => "DEAD_PROCESS",

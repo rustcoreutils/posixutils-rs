@@ -129,23 +129,31 @@ fn print_entry(args: &Args, entry: &plib::utmpx::Utmpx) {
     }
 
     let mut selected = false;
-    if (args.boot && entry.typ == libc::BOOT_TIME)
-        || (args.userproc && entry.typ == libc::USER_PROCESS)
-        || (args.dead && entry.typ == libc::DEAD_PROCESS)
-        || (args.login && entry.typ == libc::LOGIN_PROCESS)
-        || (args.runlevel && entry.typ == libc::RUN_LVL)
-        || (args.process && entry.typ == libc::INIT_PROCESS)
     {
-        selected = true;
+        // TODO: Remove "libc_aliases" when https://github.com/rust-lang/libc/issues/3190 is resolved
+        use plib::libc_aliases as libc;
+        if (args.boot && entry.typ == libc::BOOT_TIME)
+            || (args.userproc && entry.typ == libc::USER_PROCESS)
+            || (args.dead && entry.typ == libc::DEAD_PROCESS)
+            || (args.login && entry.typ == libc::LOGIN_PROCESS)
+            || (args.runlevel && entry.typ == libc::RUN_LVL)
+            || (args.process && entry.typ == libc::INIT_PROCESS)
+        {
+            selected = true;
+        }
     }
 
     if !selected {
         return;
     }
 
-    let line = match entry.typ {
-        libc::BOOT_TIME => "system boot",
-        _ => entry.line.as_str(),
+    let line = {
+        // TODO: Remove "libc_aliases" when https://github.com/rust-lang/libc/issues/3190 is resolved
+        use plib::libc_aliases as libc;
+        match entry.typ {
+            libc::BOOT_TIME => "system boot",
+            _ => entry.line.as_str(),
+        }
     };
 
     if args.short_format {

@@ -126,6 +126,7 @@ fn sem_key_lookup(semkey: i32) -> io::Result<i32> {
 }
 
 // Define the union semun as per your requirements
+#[cfg(not(target_env = "musl"))]
 #[repr(C)]
 union semun {
     val: c_int,               // for SETVAL
@@ -134,6 +135,7 @@ union semun {
                               // Depending on your platform, you might need to add other fields as well
 }
 
+#[cfg(not(target_env = "musl"))]
 fn sem_rm(semid: i32) -> io::Result<i32> {
     let arg = semun { val: 0 };
 
@@ -146,6 +148,7 @@ fn sem_rm(semid: i32) -> io::Result<i32> {
     }
 }
 
+#[cfg(not(target_env = "musl"))]
 fn remove_ipcs(args: &Args) -> io::Result<()> {
     // remove semaphores
     if let Some(semkey) = args.semkey {
@@ -178,6 +181,12 @@ fn remove_ipcs(args: &Args) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(target_env = "musl")]
+fn remove_ipcs(_args: &Args) -> io::Result<()> {
+    // TODO
+    unimplemented!();
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

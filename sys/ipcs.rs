@@ -90,7 +90,18 @@ fn display_message_queues(_args: &Args) {
                 break;
             }
 
-            let key = msg_ds.msg_perm.__key; // Ensure the correct field name for your system
+            let key = {
+                #[cfg(not(target_env = "musl"))]
+                {
+                    msg_ds.msg_perm.__key // Ensure the correct field name for your system
+                }
+
+                // TODO: What placeholder value should go here?
+                #[cfg(target_env = "musl")]
+                {
+                    0_i32
+                }
+            };
             let mode = msg_ds.msg_perm.mode;
             let uid = msg_ds.msg_perm.uid;
             let gid = msg_ds.msg_perm.gid;
@@ -154,10 +165,24 @@ fn display_shared_memory(_args: &Args) {
             continue;
         }
 
-        #[cfg(target_os = "macos")]
-        let key = shmbuf.shm_perm._key; // Check for the correct field name on your system
-        #[cfg(not(target_os = "macos"))]
-        let key = shmbuf.shm_perm.__key; // Check for the correct field name on your system
+        // Prevent accidental shadowing by using a block
+        let key = {
+            #[cfg(target_os = "macos")]
+            {
+                shmbuf.shm_perm._key // Check for the correct field name on your system
+            }
+
+            #[cfg(all(not(target_os = "macos"), not(target_env = "musl")))]
+            {
+                shmbuf.shm_perm.__key // Check for the correct field name on your system
+            }
+
+            // TODO: What placeholder value should go here?
+            #[cfg(all(not(target_os = "macos"), target_env = "musl"))]
+            {
+                0_i32
+            }
+        };
         let mode = shmbuf.shm_perm.mode;
         let uid = shmbuf.shm_perm.uid;
         let gid = shmbuf.shm_perm.gid;
@@ -187,6 +212,7 @@ fn display_shared_memory(_args: &Args) {
     }
 }
 
+#[cfg(not(target_env = "musl"))]
 fn display_semaphores(_args: &Args) {
     use libc::{semctl, semid_ds, IPC_STAT};
     use std::ffi::CStr;
@@ -236,6 +262,12 @@ fn display_semaphores(_args: &Args) {
 
         semid += 1;
     }
+}
+
+#[cfg(target_env = "musl")]
+fn display_semaphores(_args: &Args) {
+    // TODO
+    unimplemented!();
 }
 
 fn get_current_date() -> String {

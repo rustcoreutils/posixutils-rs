@@ -1,0 +1,3 @@
+stdout=1 hello(friend)\n2 hi friend\n3 goodbye friend\n4 hi friend\n5 hello(friend)\n6 wow friend\n7 hi friend\n8 hello(friend)\n
+stderr=
+status=0

@@ -131,7 +131,7 @@ fn realpath_empty_path() {
     realpath_test(
         &[""],
         "",
-        "error: one of the values isn't valid for an argument\n",
+        "error: a value is required for '[PATH]...' but none was supplied\n\nFor more information, try '--help'.\n",
         2,
     );
 }

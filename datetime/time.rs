@@ -7,9 +7,9 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::io::{self, Write};
 use std::process::{Command, Stdio};
 use std::time::Instant;
-use std::io::{self, Write};
 
 use clap::Parser;
 
@@ -56,11 +56,9 @@ fn time(args: Args) -> Result<(), TimeError> {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
-        .map_err(|e| {
-            match e.kind() {
-                io::ErrorKind::NotFound => TimeError::CommandNotFound(args.utility),
-                _ => TimeError::ExecCommand(args.utility),
-            }
+        .map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => TimeError::CommandNotFound(args.utility),
+            _ => TimeError::ExecCommand(args.utility),
         })?;
 
     let _ = child.wait().map_err(|_| TimeError::ExecTime)?;
@@ -78,7 +76,8 @@ fn time(args: Args) -> Result<(), TimeError> {
             elapsed.as_secs_f64(),
             user_time,
             system_time
-        ).map_err(|_| TimeError::ExecTime)?;
+        )
+        .map_err(|_| TimeError::ExecTime)?;
     } else {
         writeln!(
             io::stderr(),
@@ -86,7 +85,8 @@ fn time(args: Args) -> Result<(), TimeError> {
             elapsed.as_secs_f64(),
             user_time,
             system_time
-        ).map_err(|_| TimeError::ExecTime)?;
+        )
+        .map_err(|_| TimeError::ExecTime)?;
     }
 
     Ok(())
@@ -112,8 +112,7 @@ impl Status {
     }
 }
 
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {   
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     setlocale(LocaleCategory::LcAll, "");
@@ -125,7 +124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             TimeError::CommandNotFound(err) => {
                 eprintln!("Command not found: {}", err);
                 Status::UtilNotFound.exit()
-            },
+            }
             TimeError::ExecCommand(err) => {
                 eprintln!("Error while executing command: {}", err);
                 Status::UtilError.exit()
@@ -133,7 +132,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             TimeError::ExecTime => {
                 eprintln!("Error while executing time utility");
                 Status::TimeError.exit()
-            },
+            }
         }
     }
 

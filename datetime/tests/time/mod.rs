@@ -7,7 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::{io::Write, process::{Command, Output, Stdio}};
+use std::{
+    io::Write,
+    process::{Command, Output, Stdio},
+};
 
 use plib::TestPlan;
 
@@ -86,5 +89,5 @@ fn parse_error_test() {
 
 #[test]
 fn command_error_test() {
-    run_test_time(&["-s", "ls", "-l"], "", "unexpected argument found", 0);
+    run_test_time(&["-s", "ls", "-l"], "", "unexpected argument '-s' found", 0);
 }

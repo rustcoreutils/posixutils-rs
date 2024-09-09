@@ -90,8 +90,8 @@ fn handle_sysconf(
 
 #[cfg(target_os = "linux")]
 fn handle_confstr(
-    var: &str,
-    confstr_mappings: &HashMap<&'static str, libc::c_int>,
+    _var: &str,
+    _confstr_mappings: &HashMap<&'static str, libc::c_int>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     Err(Box::new(std::io::Error::new(
         std::io::ErrorKind::Other,

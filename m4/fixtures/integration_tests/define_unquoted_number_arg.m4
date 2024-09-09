@@ -1,0 +1,1 @@
+define(`hi', $# hello)hi

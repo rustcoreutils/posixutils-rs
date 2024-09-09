@@ -16,7 +16,7 @@ normal Rust programs."
 
 ## WANTED:  Volunteers!
 
-Contributions are welcome.  Developers and non-developers alike, please read [CONTRIBUTING](CONTRIBUTING.md) for details.
+Contributions are welcome.  Developers and non-developers alike, please read [CONTRIBUTING](CONTRIBUTING.md) for details, and [WANTED](WANTED.md) for recommended coding tasks for newcomers.
 
 Core specification: https://pubs.opengroup.org/onlinepubs/9699919799/
 
@@ -75,11 +75,13 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] file
  - [x] find
  - [x] fold
+ - [x] gencat (i18n)
  - [x] grep
  - [x] head
  - [x] join
  - [x] link
  - [x] ls
+ - [x] m4
  - [x] mkdir
  - [x] mv
  - [x] nl
@@ -184,7 +186,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] val (SCCS)
 
  ### i18n category
- - [ ] gencat (i18n)
  - [ ] gettext (i18n)
  - [ ] iconv (i18n)
  - [ ] locale (i18n)
@@ -207,7 +208,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] awk
  - [ ] fuser
  - [ ] lp
- - [ ] m4
  - [ ] mailx
  - [ ] make
  - [ ] man

@@ -1,0 +1,4 @@
+stdout=\n
+stderr=m4:fixtures/integration_tests/define_parse_brackets.m4:2: ERROR: end of file in argument list\n
+status=1
+expect_error=true

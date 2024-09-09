@@ -1,0 +1,3 @@
+stdout=from include.m4\nm1 goodbye m1 hi\n\n
+stderr=
+status=0

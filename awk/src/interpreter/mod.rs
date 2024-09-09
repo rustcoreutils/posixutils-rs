@@ -499,6 +499,7 @@ struct GlobalEnv {
     rs: RecordSeparator,
     nr: u32,
     fnr: u32,
+    nf: usize,
 }
 
 impl GlobalEnv {
@@ -513,6 +514,7 @@ impl GlobalEnv {
             SpecialVar::Rs => self.rs = as_string(value)?.try_into()?,
             SpecialVar::Nr => self.nr = value.scalar_as_f64() as u32,
             SpecialVar::Fnr => self.fnr = value.scalar_as_f64() as u32,
+            SpecialVar::Nf => self.nf = value.scalar_as_f64() as usize,
             _ => {
                 // not needed
             }
@@ -533,13 +535,15 @@ impl Default for GlobalEnv {
             rs: RecordSeparator::Char(b'\n'),
             nr: 1,
             fnr: 1,
+            nf: 0,
         }
     }
 }
 
 enum FieldsState {
-    NeedToRecomputeFields,
-    NeedToRecomputeRecord { changed_field: usize },
+    RecordChanged,
+    FieldChanged { changed_field: usize },
+    NfChanged,
     Ok,
 }
 
@@ -564,7 +568,7 @@ impl Record {
         })
         .expect("error splitting record");
         if last_field < previous_last_field {
-            for field in &mut self.fields[last_field..=previous_last_field] {
+            for field in &mut self.fields[last_field + 1..=previous_last_field] {
                 field.get_mut().value = AwkValueVariant::UninitializedScalar;
             }
         }
@@ -579,9 +583,24 @@ impl Record {
     unsafe fn recompute_record(
         &self,
         global_env: &GlobalEnv,
-        changed_field: usize,
+        last_field: usize,
+        truncate_fields: bool,
     ) -> Result<(), String> {
-        let last_field = self.last_field.borrow().max(changed_field);
+        let last_field = if truncate_fields {
+            if last_field < *self.last_field.borrow() {
+                for field in self
+                    .fields
+                    .iter()
+                    .skip(last_field + 1)
+                    .take(*self.last_field.borrow() - last_field)
+                {
+                    (*field.get()).value = AwkValueVariant::UninitializedScalar;
+                }
+            }
+            last_field
+        } else {
+            self.last_field.borrow().max(last_field)
+        };
         let mut new_record = String::new();
         for field in self.fields.iter().skip(1).take(last_field - 1) {
             let field_str = (*field.get())
@@ -761,12 +780,17 @@ impl AwkValue {
         let rhs = rhs.into();
         self.value = rhs.value;
         match self.ref_type {
-            AwkRefType::SpecialGlobalVar(special_var) => global_env.set(special_var, self)?,
+            AwkRefType::SpecialGlobalVar(special_var) => {
+                global_env.set(special_var, self)?;
+                if special_var == SpecialVar::Nf {
+                    return Ok(FieldsState::NfChanged);
+                }
+            }
             AwkRefType::Field(index) => {
                 return if index == 0 {
-                    Ok(FieldsState::NeedToRecomputeFields)
+                    Ok(FieldsState::RecordChanged)
                 } else {
-                    Ok(FieldsState::NeedToRecomputeRecord {
+                    Ok(FieldsState::FieldChanged {
                         changed_field: index as usize,
                     })
                 };
@@ -1679,18 +1703,21 @@ impl Interpreter {
                 FieldsState::Ok => {
                     // no need to recompute anything
                 }
-                FieldsState::NeedToRecomputeFields => {
+                FieldsState::RecordChanged => {
                     // there are no active field references at this point, so this is safe
                     unsafe { record.recompute_fields(global_env)? };
                     let nf = unsafe { &mut *self.globals[SpecialVar::Nf as usize].get() };
                     nf.assign(record.get_last_field() as f64, global_env)?;
                 }
-                FieldsState::NeedToRecomputeRecord { changed_field } => {
+                FieldsState::FieldChanged { changed_field } => {
                     // there are no active field references at this point, so this is safe
-                    unsafe { record.recompute_record(global_env, changed_field)? };
+                    unsafe { record.recompute_record(global_env, changed_field, false)? };
                     let nf = unsafe { &mut *self.globals[SpecialVar::Nf as usize].get() };
                     nf.assign(record.get_last_field() as f64, global_env)?;
                 }
+                FieldsState::NfChanged => unsafe {
+                    record.recompute_record(global_env, global_env.nf, true)?;
+                },
             }
             fields_state = FieldsState::Ok;
             stack.ip += ip_increment;
@@ -1912,6 +1939,7 @@ pub fn interpret(
             current_record.reset(record, &global_env.fs)?;
             interpreter.globals[SpecialVar::Nf as usize].get_mut().value =
                 AwkValue::from(current_record.get_last_field() as f64).value;
+            global_env.nf = current_record.get_last_field();
 
             interpreter.globals[SpecialVar::Fnr as usize]
                 .get_mut()
@@ -3555,6 +3583,46 @@ mod tests {
         assert_eq!(
             result.globals[FIRST_GLOBAL_VAR as usize],
             Array::from_iter([("key", "test4")]).into()
+        );
+    }
+
+    #[test]
+    fn test_modifying_nf_recomputes_record() {
+        let instructions = vec![
+            OpCode::GlobalScalarRef(SpecialVar::Nf as u32),
+            OpCode::PushOne,
+            OpCode::Assign,
+        ];
+        let mut result = Test::new(instructions, vec![])
+            .add_record("1 2 3 4")
+            .run_correct();
+        assert_eq!(*result.record.last_field.get_mut(), 1);
+        assert_eq!(
+            *result.record.fields[0].get_mut(),
+            AwkValue::field_ref(maybe_numeric_string("1"), 0)
+        );
+        assert_eq!(
+            *result.record.fields[1].get_mut(),
+            AwkValue::field_ref(maybe_numeric_string("1"), 1)
+        );
+        assert_eq!(
+            *result.record.fields[2].get_mut(),
+            AwkValue::field_ref(AwkValue::uninitialized_scalar(), 2)
+        );
+
+        let instructions = vec![
+            OpCode::GlobalScalarRef(SpecialVar::Nf as u32),
+            OpCode::PushConstant(0),
+            OpCode::Assign,
+        ];
+        let constants = vec![Constant::from(10.0)];
+        let mut result = Test::new(instructions, constants)
+            .add_record("1 2 3 4")
+            .run_correct();
+        assert_eq!(*result.record.last_field.get_mut(), 10);
+        assert_eq!(
+            *result.record.fields[0].get_mut(),
+            AwkValue::field_ref(maybe_numeric_string("1 2 3 4      "), 0)
         );
     }
 }

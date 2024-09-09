@@ -550,3 +550,11 @@ fn test_awk_multifile_program() {
         expected_exit_code: 0,
     })
 }
+
+#[test]
+fn test_awk_modifying_nf_recomputes_the_record() {
+    test_awk!(
+        modifying_nf_recomputes_the_record,
+        "tests/awk/test_data.txt"
+    );
+}

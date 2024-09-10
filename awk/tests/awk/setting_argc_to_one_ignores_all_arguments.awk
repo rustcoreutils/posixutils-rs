@@ -1,0 +1,3 @@
+BEGIN {
+    ARGC = 1
+}

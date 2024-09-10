@@ -1,0 +1,3 @@
+previous content
+appended first line
+appended second line

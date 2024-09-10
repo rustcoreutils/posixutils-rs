@@ -58,6 +58,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
 ## Stage 3 - Test coverage
 
  - [x] ar (Development)
+ - [x] awk
  - [x] basename
  - [x] bc
  - [x] cksum
@@ -205,7 +206,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] vi (Editors)
 
 ### Misc. category
- - [ ] awk
  - [ ] fuser
  - [ ] lp
  - [ ] mailx

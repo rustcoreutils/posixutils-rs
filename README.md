@@ -168,12 +168,12 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] crontab (cron cat.)
 
 ### Development category
- - [ ] c17 (Development)
+ - [ ] c17 (Development) -- Volunteer starting point at https://github.com/rustcoreutils/posixutils-rs/tree/c99
  - [ ] cflow (Development)
  - [ ] ctags (Development)
  - [ ] cxref (Development)
- - [ ] lex (Development)
- - [ ] yacc (Development)
+ - [ ] lex (Development) -- Volunteer starting point at https://github.com/rustcoreutils/posixutils-rs/tree/lex
+ - [ ] yacc (Development) -- Volunteer starting point at https://github.com/rustcoreutils/posixutils-rs/tree/yacc
 
 ### SCCS category
  - [ ] admin (SCCS)
@@ -188,7 +188,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
  ### i18n category
  - [ ] gettext (i18n)
- - [ ] iconv (i18n)
+ - [ ] iconv (i18n) (status: in progress)
  - [ ] locale (i18n)
  - [ ] localedef (i18n)
  - [ ] msgfmt (i18n)
@@ -202,23 +202,23 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
 ### Editors category
  - [ ] ed (Editors)
- - [ ] ex (Editors)
+ - [ ] ex (Editors) -- Volunteer starting point at https://github.com/rustcoreutils/posixutils-rs/tree/ed
  - [ ] vi (Editors)
 
 ### Misc. category
- - [ ] fuser
+ - [ ] fuser (status: in progress)
  - [ ] lp
  - [ ] mailx
- - [ ] make
- - [ ] man
+ - [ ] make (status: in progress)
+ - [ ] man (status: in progress)
  - [ ] more
  - [ ] newgrp
- - [ ] patch
+ - [ ] patch (status: in progress)
  - [ ] pax
  - [ ] sed
- - [ ] sh
- - [ ] talk
- - [ ] timeout
+ - [ ] sh -- Volunteer starting point at https://github.com/rustcoreutils/posixutils-rs/tree/shell
+ - [ ] talk (status: in progress)
+ - [ ] timeout (status: in progress)
 
 ## Testing
 

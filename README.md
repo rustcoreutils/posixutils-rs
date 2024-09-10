@@ -14,11 +14,11 @@ Implementation goals include clean, safe Rust code and maximal use of
 small Rust community crates.  This project's utilities should "look like
 normal Rust programs."
 
+Core POSIX specification: https://pubs.opengroup.org/onlinepubs/9699919799/   (Old, free edition.  POSIX.2024 was just released.)
+
 ## WANTED:  Volunteers!
 
 Contributions are welcome.  Developers and non-developers alike, please read [CONTRIBUTING](CONTRIBUTING.md) for details, and [WANTED](WANTED.md) for recommended coding tasks for newcomers.
-
-Core specification: https://pubs.opengroup.org/onlinepubs/9699919799/
 
 ### Non-goals
 

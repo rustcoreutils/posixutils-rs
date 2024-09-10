@@ -90,7 +90,7 @@ pub fn unified_match(line: &str) -> PatchUnitKind {
     let cache = unified_regex_cache();
 
     for kind in ORDERED_KINDS {
-        if cache[&kind].is_match(line) {
+        if cache[kind].is_match(line) {
             return PatchUnitKind::Unified(*kind);
         }
     }
@@ -98,5 +98,5 @@ pub fn unified_match(line: &str) -> PatchUnitKind {
     // TODO: NewLine,
     // TODO: NoNewLine
 
-    return PatchUnitKind::Unkonw;
+    PatchUnitKind::Unkonw
 }

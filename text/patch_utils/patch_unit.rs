@@ -21,6 +21,7 @@ use super::{
         unified::UnifiedRegexKind,
     },
     hunks::Hunks,
+    patch_error::PatchResult,
     patch_format::PatchFormat,
     patch_options::PatchOptions,
 };
@@ -82,7 +83,7 @@ impl<'a> PatchUnit<'a> {
             "Format should be Normal when converting PatchUnit to Hunks!"
         );
 
-        let mut hunks = Hunks::new(PatchFormat::Normal, &self.options);
+        let mut hunks = Hunks::new(PatchFormat::Normal, self.options);
 
         for pair in self.lines().iter().zip(self.kinds()) {
             match pair.1 {
@@ -119,15 +120,15 @@ impl<'a> PatchUnit<'a> {
             "Format should be Unified when converting PatchUnit to Hunks!"
         );
 
-        let mut hunks = Hunks::new(PatchFormat::Unified, &self.options);
+        let mut hunks = Hunks::new(PatchFormat::Unified, self.options);
 
         for pair in self.lines().iter().zip(self.kinds()) {
             match pair.1 {
                 PatchUnitKind::Unified(unified_regex_kind) => match unified_regex_kind {
                     UnifiedRegexKind::RangeHeader => {
                         let splitted_range_line = pair.0.split(' ').collect::<Vec<&str>>();
-                        let range1 = Range::try_from_unified(&splitted_range_line[1]).expect("UnifiedRange verified by regex is expected to be parsed, with no errors");
-                        let range2 = Range::try_from_unified(&splitted_range_line[2]).expect("UnifiedRange verified by regex is expected to be parsed, with no errors");
+                        let range1 = Range::try_from_unified(splitted_range_line[1]).expect("UnifiedRange verified by regex is expected to be parsed, with no errors");
+                        let range2 = Range::try_from_unified(splitted_range_line[2]).expect("UnifiedRange verified by regex is expected to be parsed, with no errors");
 
                         hunks.add_hunk(Hunk::new_unified_hunk(UnifiedHunkData::new(
                             range1,
@@ -171,7 +172,7 @@ impl<'a> PatchUnit<'a> {
             "Format should be Context when converting PatchUnit to Hunks!"
         );
 
-        let mut hunks = Hunks::new(PatchFormat::Context, &self.options);
+        let mut hunks = Hunks::new(PatchFormat::Context, self.options);
 
         let mut is_change = false;
 
@@ -179,7 +180,7 @@ impl<'a> PatchUnit<'a> {
             match pair.1 {
                 PatchUnitKind::Context(regex_kind) => match regex_kind {
                     ContextRegexKind::FirstLine => hunks.set_f1_header(pair.0),
-                    ContextRegexKind::SecondLine => hunks.set_f1_header(pair.0),
+                    ContextRegexKind::SecondLine => hunks.set_f2_header(pair.0),
                     ContextRegexKind::HunkSeparator => {
                         hunks.add_hunk(Hunk::new_context_hunk(ContextHunkData::new(
                             None,
@@ -254,7 +255,7 @@ impl<'a> PatchUnit<'a> {
             "Format should be ED when converting PatchUnit to Hunks!"
         );
 
-        let mut hunks = Hunks::new(PatchFormat::EditScript, &self.options);
+        let mut hunks = Hunks::new(PatchFormat::EditScript, self.options);
         let mut last_hunk_kind = EditScriptHunkKind::Insert;
 
         for pair in self.lines().iter().zip(self.kinds()) {
@@ -329,6 +330,16 @@ impl<'a> PatchUnit<'a> {
         hunks
     }
 
+    pub fn verify_patch(&self) -> PatchResult<()> {
+        match self.format() {
+            PatchFormat::None => panic!("Trying to convert PatchUnit of format None into Hunks!"),
+            PatchFormat::Normal => self.verify_normal_patch(),
+            PatchFormat::Unified => self.verify_unified_patch(),
+            PatchFormat::Context => self.verify_context_patch(),
+            PatchFormat::EditScript => self.verify_ed_patch(),
+        }
+    }
+
     pub fn into_hunks(&self) -> Hunks<'a> {
         match self.format() {
             PatchFormat::None => panic!("Trying to convert PatchUnit of format None into Hunks!"),
@@ -337,5 +348,21 @@ impl<'a> PatchUnit<'a> {
             PatchFormat::Context => self.into_hunks_from_context_patch_unit(),
             PatchFormat::EditScript => self.into_hunks_from_ed_patch_unit(),
         }
+    }
+
+    fn verify_normal_patch(&self) -> PatchResult<()> {
+        todo!()
+    }
+
+    fn verify_unified_patch(&self) -> Result<(), super::patch_error::PatchError> {
+        todo!()
+    }
+
+    fn verify_context_patch(&self) -> Result<(), super::patch_error::PatchError> {
+        todo!()
+    }
+
+    fn verify_ed_patch(&self) -> Result<(), super::patch_error::PatchError> {
+        todo!()
     }
 }

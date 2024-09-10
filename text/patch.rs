@@ -22,10 +22,7 @@ use std::{
 
 use clap::Parser;
 use patch_utils::{
-    constants::{
-        context::initialize_context_regex_cache, ed::initialize_ed_regex_cache,
-        normal::initialize_normal_regex_cache, unified::initialize_unified_regex_cache,
-    },
+    constants::init,
     functions::{file_exists, if_else, print_error},
     hunks::Apply,
     patch_file::PatchFile,
@@ -96,13 +93,13 @@ pub struct FormatGroup {
     unified: bool,
 }
 
-impl Into<PatchOptions> for Args {
-    fn into(self) -> PatchOptions {
+impl From<Args> for PatchOptions {
+    fn from(value: Args) -> Self {
         let patch_format_options = [
-            (self.format.ed, PatchFormat::EditScript),
-            (self.format.normal, PatchFormat::Normal),
-            (self.format.context, PatchFormat::Context),
-            (self.format.unified, PatchFormat::Unified),
+            (value.format.ed, PatchFormat::EditScript),
+            (value.format.normal, PatchFormat::Normal),
+            (value.format.context, PatchFormat::Context),
+            (value.format.unified, PatchFormat::Unified),
             (true, PatchFormat::None), // to ensure next unwrap works
         ];
 
@@ -114,14 +111,14 @@ impl Into<PatchOptions> for Args {
             .unwrap();
 
         PatchOptions {
-            backup: self.backup,
-            reversed: self.reverse,
-            file_path: self.file,
-            output_patch: self.output_file,
-            strip: self.num,
+            backup: value.backup,
+            reverse: value.reverse,
+            file: value.file,
+            output_file: value.output_file,
+            strip: value.num,
             patch_format,
-            patch_path: self.patchfile,
-            reject_file: self.reject_file,
+            patch_file: value.patchfile,
+            reject_file: value.reject_file,
         }
     }
 }
@@ -175,11 +172,8 @@ fn main() {
     patch_operation().expect("Failed!");
 }
 
-fn patch_operation<'a>() -> io::Result<()> {
-    initialize_normal_regex_cache();
-    initialize_ed_regex_cache();
-    initialize_context_regex_cache();
-    initialize_unified_regex_cache();
+fn patch_operation() -> io::Result<()> {
+    init();
 
     let args = Args::parse();
 
@@ -190,51 +184,27 @@ fn patch_operation<'a>() -> io::Result<()> {
 
     let patch_options: PatchOptions = args.into();
     let patch_file =
-        PatchFile::load_file(PathBuf::from(&patch_options.patch_path), FileKind::Patch)?;
+        PatchFile::load_file(PathBuf::from(&patch_options.patch_file), FileKind::Patch)?;
 
     let patch = PatchUnits::try_build(&patch_options, &patch_file)?;
 
-    match patch {
-        Some(patch_units) => {
-            let mut hunks_collection = patch_units.into_hunks()?;
+    if let Some(patch_units) = patch {
+        let into_hunks = patch_units.into_hunks();
 
-            for hunks in hunks_collection.iter_mut() {
-                let result = hunks.apply();
-                result.expect("Failed to apply hunk!");
+        match into_hunks {
+            Ok(mut into_hunks) => {
+                for hunks in into_hunks.hunks.iter_mut() {
+                    let result = hunks.apply();
+                    result.expect("Failed to apply hunk!");
+                }
+
+                for _failures in into_hunks.failures.iter_mut() {
+                    // reject failures.0
+                }
             }
+            Err(_) => todo!(),
         }
-        None => {}
     }
 
-    return Ok(());
-    // let file = PatchFile::load_file(
-    //     patch_options.file_path.clone(),
-    //     if_else(
-    //         patch_options.reverse(),
-    //         PatchFileKind::Modified,
-    //         PatchFileKind::Original,
-    //     ),
-    // )?;
-
-    // if patch_options.backup() {
-    //     let backup_file_path = file_path.with_file_name(format!(
-    //         "{}.orig",
-    //         file_path.file_name().unwrap().to_str().unwrap()
-    //     ));
-
-    //     file.copy_to(backup_file_path)?;
-    // }
-
-    // let patch = Patch::try_new(&patch_file, &file, patch_options);
-
-    // if let Ok(mut patch) = patch {
-    //     let result = patch.apply();
-    //     if let Err(error) = result {
-    //         eprintln!("patch: {}", error);
-    //     }
-    // } else if let Err(error) = patch {
-    //     eprintln!("patch: {}", error);
-    // }
-
-    // Ok(())
+    Ok(())
 }

@@ -1,6 +1,16 @@
-use std::{fs::File, io::BufWriter, io::Write};
+use std::{
+    fs::{self, File},
+    io::{BufWriter, Write},
+    path::PathBuf,
+};
 
 use chrono::{DateTime, Utc};
+use regex::Regex;
+
+use crate::patch_utils::{
+    constants::UNIFIED_CONTEXT_HEADER_REGEX,
+    functions::{context_unified_date_convert, if_else},
+};
 
 use super::{
     constants::context::ORIGINAL_SKIP,
@@ -27,8 +37,10 @@ pub struct Hunks<'a> {
     file: Option<PatchFile>,
     file1_header: Option<&'a str>,
     file1_date: Option<DateTime<Utc>>,
+    file1_path: Option<PathBuf>,
     file2_header: Option<&'a str>,
     file2_date: Option<DateTime<Utc>>,
+    file2_path: Option<PathBuf>,
     options: &'a PatchOptions,
 }
 
@@ -48,7 +60,9 @@ impl<'a> Hunks<'a> {
             file2_header: None,
             options,
             file1_date: None,
-            file2_date: None
+            file1_path: None,
+            file2_date: None,
+            file2_path: None,
         }
     }
 
@@ -94,14 +108,6 @@ impl<'a> Hunks<'a> {
 
     pub fn modify_hunks(&mut self, operator: fn(&mut Vec<Hunk>)) {
         operator(&mut self.data);
-    }
-
-    pub fn hunks(&self) -> &Vec<Hunk<'a>> {
-        &self.data
-    }
-
-    pub fn hunks_mut(&mut self) -> &mut Vec<Hunk<'a>> {
-        &mut self.data
     }
 
     fn apply_normal(&mut self) -> PatchResult<()> {
@@ -170,10 +176,10 @@ impl<'a> Hunks<'a> {
         }
 
         match no_new_line_count {
-            0 => writeln!(output , "")?,
+            0 => writeln!(output)?,
             1 => {
                 if matches!(file.kind(), FileKind::Original) && !file.ends_with_newline() {
-                    writeln!(output, "")?;
+                    writeln!(output)?;
                 }
             }
             _ => {}
@@ -269,7 +275,7 @@ impl<'a> Hunks<'a> {
             if f1_range.start() > old_file_line {
                 let start = old_file_line;
                 for j in start..f1_range.start() {
-                    writeln!(output , "{}", file.lines()[j - 1])?;
+                    writeln!(output, "{}", file.lines()[j - 1])?;
                     old_file_line += 1;
                     _new_file_line += 1;
                 }
@@ -282,7 +288,7 @@ impl<'a> Hunks<'a> {
                         old_file_line += 1;
                     }
                     PatchLine::UnifiedUnchanged(_) => {
-                        writeln!(output,  "{}", patch_line.original_line())?;
+                        writeln!(output, "{}", patch_line.original_line())?;
                         _new_file_line += 1;
                         old_file_line += 1;
                     }
@@ -353,10 +359,10 @@ impl<'a> Hunks<'a> {
         }
 
         match no_new_line_count {
-            0 => writeln!(output, "")?,
+            0 => writeln!(output)?,
             1 => {
                 if matches!(file.kind(), FileKind::Original) && !file.ends_with_newline() {
-                    writeln!(output, "")?;
+                    writeln!(output)?;
                 }
             }
             _ => {}
@@ -387,15 +393,11 @@ impl<'a> Hunks<'a> {
                 .context_hunk_data()
                 .f1_range()
                 .expect("ContextRange is expected not to be None here!");
-            let range2 = hunk
-                .context_hunk_data()
-                .f2_range()
-                .expect("ContextRange is expected not to be None here!");
 
             if range1.start() > original_file_line {
                 let start = original_file_line;
                 for _ in start..range1.start() {
-                    writeln!(output , "{}", file.lines()[original_file_line - 1])?;
+                    writeln!(output, "{}", file.lines()[original_file_line - 1])?;
                     original_file_line += 1;
                 }
             }
@@ -412,7 +414,7 @@ impl<'a> Hunks<'a> {
             for patch_line in patch_lines {
                 match patch_line {
                     PatchLine::ContextInserted(_, is_change) => {
-                        writeln!(output,  "{}", patch_line.original_line())?;
+                        writeln!(output, "{}", patch_line.original_line())?;
 
                         if *is_change {
                             original_file_line += 1;
@@ -431,7 +433,7 @@ impl<'a> Hunks<'a> {
                         original_file_line += 1;
                     }
                     PatchLine::ContextUnchanged(_) => {
-                        writeln!(output,  "{}", patch_line.original_line())?;
+                        writeln!(output, "{}", patch_line.original_line())?;
                         original_file_line += 1;
                     }
                     PatchLine::ContextHunkRange(_) => {}
@@ -445,10 +447,10 @@ impl<'a> Hunks<'a> {
         }
 
         match no_newline_count {
-            0 => writeln!(output, "")?,
+            0 => writeln!(output)?,
             1 => {
                 if matches!(file.kind(), FileKind::Original) && !file.ends_with_newline() {
-                    writeln!(output, "")?;
+                    writeln!(output)?;
                 }
             }
             _ => {}
@@ -477,10 +479,6 @@ impl<'a> Hunks<'a> {
             let f2_range = hunk
                 .context_hunk_data()
                 .f2_range()
-                .expect("ContextRange is expected not to be None here!");
-            let f1_range = hunk
-                .context_hunk_data()
-                .f1_range()
                 .expect("ContextRange is expected not to be None here!");
 
             if f2_range.start() > new_file_line {
@@ -526,10 +524,10 @@ impl<'a> Hunks<'a> {
         }
 
         match no_newline_count {
-            0 => writeln!(output, "")?,
+            0 => writeln!(output)?,
             1 => {
                 if matches!(file.kind(), FileKind::Modified) && !file.ends_with_newline() {
-                    writeln!(output, "")?;
+                    writeln!(output)?;
                 }
             }
             _ => {}
@@ -622,42 +620,145 @@ impl<'a> Hunks<'a> {
         Ok(())
     }
 
-    fn prepare_normal_to_apply(&mut self) -> PatchResult<()> {
-        let output_file = if let Some(output_file) = &self.options.output_patch {
-            output_file
-        } else if let Some(output_file) = &self.options.file_path {
-            output_file   
-        } else {
-            return Err(PatchError::Error("Could not specify output file!"))
+    fn prepare_context_unified(&mut self) -> PatchResult<()> {
+        // returns Option<(path , date)>
+        fn extract(regex: &Regex, text: &str) -> Option<(String, String)> {
+            match regex.captures(text) {
+                Some(matched) => {
+                    let path = &matched["path"];
+                    let date = &matched["date"];
+                    Some((path.to_owned(), date.to_owned()))
+                }
+                _ => None,
+            }
+        }
+
+        let mut f1_ok = false;
+        let mut f2_ok = false;
+
+        let path_regex = Regex::new(UNIFIED_CONTEXT_HEADER_REGEX)?;
+
+        // f1 arrangement
+        if let Some((path, date)) = extract(
+            &path_regex,
+            self.file1_header
+                .expect("Context/Unified file1 header is expected to exist"),
+        ) {
+            self.file1_path = Some(PathBuf::from(path));
+            self.file1_date = context_unified_date_convert(&date);
+
+            f1_ok = true;
+        }
+
+        // f2 arrangement
+        if let Some((path, date)) = extract(
+            &path_regex,
+            self.file2_header
+                .expect("Context/Unified file2 header is expected to exist"),
+        ) {
+            self.file2_path = Some(PathBuf::from(path));
+            self.file2_date = context_unified_date_convert(&date);
+
+            f2_ok = true;
+        }
+
+        let file_path = match (self.options.reverse, f1_ok, f2_ok) {
+            (true, _, true) => self.file2_path.clone().unwrap(),
+            (false, true, _) => self.file1_path.clone().unwrap(),
+            _ => {
+                return Err(PatchError::Error(
+                    "Could not recognize destination/output file.",
+                ))
+            }
         };
-        // determin output file
 
-        // determin reject file
-        // // it is reject_file or output + .rej
-        // let output_file = if let Some(output_file) = self.options.output_patch {
-        //     output_file
-        // } else if let Some() {
+        self.handle_backup(&file_path)?;
 
-        // }
+        self.file = Some(PatchFile::load_file(
+            file_path,
+            if_else(self.options.reverse, FileKind::Modified, FileKind::Original),
+        )?);
 
-        // if self.options.backup {
+        let output_file_path = if self.options.reverse && f2_ok {
+            self.file2_path.clone().unwrap()
+        } else if f1_ok {
+            self.file1_path.clone().unwrap()
+        } else {
+            return Err(PatchError::Error(
+                "Could not recognize destination/output file.",
+            ));
+        };
 
-        // }
+        let output_file: File = File::create(output_file_path)?;
+        self.output = Some(BufWriter::new(output_file));
 
-        todo!()
+        if self.options.reverse {
+            if f2_ok {
+                Ok(())
+            } else {
+                Err(PatchError::Error(
+                    "File2 should be prepared, when it is reversed.",
+                ))
+            }
+        } else {
+            if f1_ok {
+                Ok(())
+            } else {
+                Err(PatchError::Error("File1 should be prepared."))
+            }
+        }
+    }
+
+    fn prepare_normal_ed(&mut self) -> PatchResult<()> {
+        let output_file = match &self.options.file {
+            Some(path) => {
+                self.file = Some(PatchFile::load_file(
+                    path.clone(),
+                    if_else(self.options.reverse, FileKind::Modified, FileKind::Original),
+                )?);
+
+                path
+            },
+            None => match &self.options.output_file {
+                Some(path) => path,
+                None => {
+                    return Err(PatchError::Error(
+                        "Could not recognize destination/output file.",
+                    ))
+                }
+            }
+        };
+
+        let output_file: File = File::create(output_file)?;
+        self.output = Some(BufWriter::new(output_file));
+
+        Ok(())
     }
 
     fn prepare_to_apply(&mut self) -> PatchResult<()> {
-        // let (output , time) = if matches!(self.kind , PatchFormat::Unified) || matches!(self.kind , PatchFormat::Context) {
+        if matches!(self.kind, PatchFormat::Unified) || matches!(self.kind, PatchFormat::Context) {
+            self.prepare_context_unified()?;
+        } else {
+            self.prepare_normal_ed()?;
+        }
 
-        // }
+        Ok(())
+    }
 
-        match self.kind {
-            PatchFormat::None => panic!("Preparing Hunks with unknown kind, is not possible!"),
-            PatchFormat::Normal => self.prepare_normal_to_apply(),
-            PatchFormat::Unified => todo!(),
-            PatchFormat::Context => todo!(),
-            PatchFormat::EditScript => todo!(),
+    fn handle_backup(&self, path: &PathBuf) -> PatchResult<()> {
+        if !self.options.backup {
+            return Ok(());
+        }
+
+        if !path.is_file() {
+            Err(PatchError::Error("Path to backup is not a file"))
+        } else {
+            let file_name = path
+                .file_name()
+                .expect("Failed to unwrap file name to backup.");
+            let file_name = format!("{}.orig", file_name.to_str().unwrap());
+            fs::copy(path, file_name)?;
+            Ok(())
         }
     }
 }
@@ -666,7 +767,7 @@ impl Apply for Hunks<'_> {
     fn apply(&mut self) -> PatchResult<()> {
         self.prepare_to_apply()?;
 
-        match (self.kind, self.options.reversed) {
+        match (self.kind, self.options.reverse) {
             (PatchFormat::None, _) => panic!("PatchFormat should be valid!"),
             (PatchFormat::Normal, false) => self.apply_normal(),
             (PatchFormat::Normal, true) => self.apply_normal_reverse(),

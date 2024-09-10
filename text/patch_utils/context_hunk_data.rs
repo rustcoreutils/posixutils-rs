@@ -1,6 +1,6 @@
 use crate::patch_utils::constants::context::ORIGINAL_SKIP;
 
-use super::{functions::verify_patch_line, patch_line::PatchLine, range::Range};
+use super::{functions::lines_equal, patch_line::PatchLine, range::Range};
 
 #[derive(Debug)]
 pub struct ContextHunkData<'a> {
@@ -125,12 +125,12 @@ impl<'a> ContextHunkData<'a> {
                 PatchLine::ContextHunkSeparator(_) => {}
                 PatchLine::ContextInserted(_, is_change) => {
                     if reversed {
-                        verify_patch_line(
+                        lines_equal(
                             line.original_line(),
                             &file.lines()[current_modified_line - 1],
                         )?;
                     } else if *is_change {
-                        verify_patch_line(
+                        lines_equal(
                             line.original_line(),
                             &file.lines()[current_original_line - 1],
                         )?;
@@ -144,7 +144,7 @@ impl<'a> ContextHunkData<'a> {
                 }
                 PatchLine::ContextDeleted(_, is_change) => {
                     if !reversed {
-                        verify_patch_line(
+                        lines_equal(
                             line.original_line(),
                             &file.lines()[current_original_line - 1],
                         )?;
@@ -158,12 +158,12 @@ impl<'a> ContextHunkData<'a> {
                 }
                 PatchLine::ContextUnchanged(_) => {
                     if reversed {
-                        verify_patch_line(
+                        lines_equal(
                             line.original_line(),
                             &file.lines()[current_modified_line - 1],
                         )?;
                     } else {
-                        verify_patch_line(
+                        lines_equal(
                             line.original_line(),
                             &file.lines()[current_original_line - 1],
                         )?;

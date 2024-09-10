@@ -86,12 +86,12 @@ impl Range {
         match numeric_strings.len() {
             1 => {
                 let number = numeric_strings[0].parse::<usize>()?;
-                return Ok(Range::new(number, number, PatchFormat::EditScript));
+                Ok(Range::new(number, number, PatchFormat::EditScript))
             }
             2 => {
                 let number1 = numeric_strings[0].parse::<usize>()?;
                 let number2 = numeric_strings[1].parse::<usize>()?;
-                return Ok(Range::new(number1, number2, PatchFormat::EditScript));
+                Ok(Range::new(number1, number2, PatchFormat::EditScript))
             }
             _ => Err(PatchError::Error(
                 "Invalid ED range numeric string list length!",

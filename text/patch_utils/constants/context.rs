@@ -35,7 +35,7 @@ pub fn context_match(line: &str) -> PatchUnitKind {
     let cache = context_regex_cache();
 
     for kind in ORDERED_KINDS {
-        if cache[&kind].is_match(line) {
+        if cache[kind].is_match(line) {
             return PatchUnitKind::Context(*kind);
         }
     }
@@ -43,7 +43,7 @@ pub fn context_match(line: &str) -> PatchUnitKind {
     // TODO: NewLine,
     // TODO: NoNewLine
 
-    return PatchUnitKind::Unkonw;
+    PatchUnitKind::Unkonw
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

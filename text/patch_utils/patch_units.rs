@@ -9,8 +9,13 @@ use crate::patch_utils::{
 };
 
 use super::{
-    functions::is_normal_head, hunks::Hunks, patch_file::PatchFile,
-    patch_format::PatchFormat, patch_options::PatchOptions, patch_unit::PatchUnit,
+    functions::is_normal_head,
+    hunks::Hunks,
+    patch_error::{PatchError, PatchResult},
+    patch_file::PatchFile,
+    patch_format::PatchFormat,
+    patch_options::PatchOptions,
+    patch_unit::PatchUnit,
 };
 
 #[derive(Debug)]
@@ -41,7 +46,7 @@ impl<'a> PatchUnits<'a> {
     }
 
     pub fn options(&self) -> &PatchOptions {
-        &self.options
+        self.options
     }
 
     pub fn try_build(
@@ -72,11 +77,11 @@ impl<'a> PatchUnits<'a> {
 
             let ed_normal_allowed = patch_file.lines().len() == lines.len();
             let result = match options.patch_format {
-                PatchFormat::EditScript => Self::get_ed_patch_units(lines, &options),
-                PatchFormat::Normal => Self::get_normal_patch_unit(lines, &options),
-                PatchFormat::Unified => Self::get_unified_patch_unit(lines, &options),
-                PatchFormat::Context => Self::get_context_patch_unit(lines, &options),
-                PatchFormat::None => Self::guess_get_patch_unit(lines, ed_normal_allowed, &options),
+                PatchFormat::EditScript => Self::get_ed_patch_units(lines, options),
+                PatchFormat::Normal => Self::get_normal_patch_unit(lines, options),
+                PatchFormat::Unified => Self::get_unified_patch_unit(lines, options),
+                PatchFormat::Context => Self::get_context_patch_unit(lines, options),
+                PatchFormat::None => Self::guess_get_patch_unit(lines, ed_normal_allowed, options),
             };
 
             match result {
@@ -377,13 +382,28 @@ impl<'a> PatchUnits<'a> {
         ))
     }
 
-    pub fn into_hunks(&self) -> io::Result<Vec<Hunks<'a>>> {
-        let mut hunks_collection: Vec<Hunks<'a>> = vec![];
+    pub fn into_hunks(&'a self) -> PatchResult<IntoHunks<'a>> {
+        let mut into_hunks: IntoHunks<'a> = IntoHunks {
+            hunks: vec![],
+            total_count: 0,
+            failures: vec![],
+            fail_count: 0
+        };
 
         for unit in &self.patches {
-            hunks_collection.push(unit.into_hunks());
+            match unit.verify_patch() {
+                Ok(_) => into_hunks.hunks.push(unit.into_hunks()),
+                Err(error) => into_hunks.failures.push((unit, error)),
+            }
         }
 
-        Ok(hunks_collection)
+        Ok(into_hunks)
     }
+}
+
+pub struct IntoHunks<'a> {
+    pub hunks: Vec<Hunks<'a>>,
+    pub total_count: usize,
+    pub failures: Vec<(&'a PatchUnit<'a>, PatchError)>,
+    pub fail_count: usize,
 }

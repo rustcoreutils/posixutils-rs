@@ -33,7 +33,7 @@ pub fn ed_match(line: &str) -> PatchUnitKind {
     let cache = ed_regex_cache();
 
     for kind in ORDERED_KINDS {
-        if cache[&kind].is_match(line) {
+        if cache[kind].is_match(line) {
             return PatchUnitKind::Ed(*kind);
         }
     }
@@ -41,7 +41,7 @@ pub fn ed_match(line: &str) -> PatchUnitKind {
     // TODO: NewLine,
     // TODO: NoNewLine
 
-    return PatchUnitKind::Unkonw;
+    PatchUnitKind::Unkonw
 }
 
 pub fn initialize_ed_regex_cache() {

@@ -1,4 +1,7 @@
-use super::{edit_script_range_data::EditScriptHunkKind, patch_line::PatchLine, range::Range};
+use super::{
+    edit_script_range_data::EditScriptHunkKind, functions::if_else, patch_line::PatchLine,
+    range::Range,
+};
 
 #[derive(Debug, Clone)]
 pub struct EditScriptHunkData<'a> {
@@ -33,10 +36,6 @@ impl<'a> EditScriptHunkData<'a> {
     }
 
     pub(crate) fn verify_file(&self, file: &super::patch_file::PatchFile) -> Result<(), ()> {
-        if file.lines().len() >= self.range.end() {
-            Ok(())
-        } else {
-            Err(())
-        }
+        if_else(file.lines().len() >= self.range.end(), Ok(()), Err(()))
     }
 }

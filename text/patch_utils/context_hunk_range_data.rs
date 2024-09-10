@@ -17,7 +17,7 @@ impl<'a> ContextHunkRangeData<'a> {
     }
 
     pub fn line(&self) -> &str {
-        &self.line
+        self.line
     }
 
     pub fn is_original(&self) -> bool {

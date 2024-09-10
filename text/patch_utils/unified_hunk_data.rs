@@ -2,9 +2,7 @@ use core::panic;
 
 use crate::patch_utils::patch_format::PatchFormat;
 
-use super::{
-    functions::verify_patch_line, patch_file::PatchFile, patch_line::PatchLine, range::Range,
-};
+use super::{functions::lines_equal, patch_file::PatchFile, patch_line::PatchLine, range::Range};
 
 #[derive(Debug)]
 pub struct UnifiedHunkData<'a> {
@@ -76,15 +74,9 @@ impl<'a> UnifiedHunkData<'a> {
                 PatchLine::UnifiedHunkHeader(_) => {}
                 PatchLine::UnifiedUnchanged(_) => {
                     if reversed {
-                        verify_patch_line(
-                            &file.lines()[modified_file_line - 1],
-                            line.original_line(),
-                        )?;
+                        lines_equal(&file.lines()[modified_file_line - 1], line.original_line())?;
                     } else {
-                        verify_patch_line(
-                            &file.lines()[original_file_line - 1],
-                            line.original_line(),
-                        )?;
+                        lines_equal(&file.lines()[original_file_line - 1], line.original_line())?;
                     }
 
                     original_file_line += 1;
@@ -92,20 +84,14 @@ impl<'a> UnifiedHunkData<'a> {
                 }
                 PatchLine::UnifiedInserted(_) => {
                     if reversed {
-                        verify_patch_line(
-                            &file.lines()[modified_file_line - 1],
-                            line.original_line(),
-                        )?;
+                        lines_equal(&file.lines()[modified_file_line - 1], line.original_line())?;
                     }
 
                     modified_file_line += 1;
                 }
                 PatchLine::UnifiedDeleted(_) => {
                     if !reversed {
-                        verify_patch_line(
-                            &file.lines()[original_file_line - 1],
-                            line.original_line(),
-                        )?;
+                        lines_equal(&file.lines()[original_file_line - 1], line.original_line())?;
                     }
 
                     original_file_line += 1;

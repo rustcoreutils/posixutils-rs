@@ -176,9 +176,9 @@ impl<'a> PatchLine<'a> {
             return Ok(PatchLine::NormalLineDelete(patch_line_data));
         }
 
-        return Err(PatchLineError::NormalPatch(
+        Err(PatchLineError::NormalPatch(
             NormalPatchError::InvalidPatchLine(line.to_owned()),
-        ));
+        ))
     }
 
     pub fn is_unified_hunk_header(&self) -> bool {
@@ -247,8 +247,10 @@ impl Display for PatchLineError {
             PatchLineError::InvalidEditScriptRange => "InvalidEditScriptRange",
             PatchLineError::InvalidEditScriptPatch => "InvalidEditScriptPatch",
             PatchLineError::NormalPatch(normal_patch_error) => match normal_patch_error {
-                NormalPatchError::InvalidPatchLine(line) => "Could not classify normal patch line!",
-                NormalPatchError::InvalidPatchRange(line) => "This line supposed to be normal patch range: "
+                NormalPatchError::InvalidPatchLine(line) => "Could not classify normal patch line.",
+                NormalPatchError::InvalidPatchRange(line) => {
+                    "The line supposed to be normal patch range."
+                }
             },
             PatchLineError::CouldNotOpenPatchDestinationFile => "CouldNotOpenPatchDestinationFile",
             PatchLineError::IOError(_error_kind) => "IOError",

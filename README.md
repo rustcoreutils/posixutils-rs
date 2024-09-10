@@ -1,8 +1,8 @@
 
 # posixutils-rs
 
-This is a suite of Rust-native core command line utilties (cp, mv, c99,
-m4, make, ...) using SuSv3 as the base POSIX specification.
+This is a suite of Rust-native core command line utilties (cp, mv,
+awk, make, vi, ...) using POSIX.2024 as the baseline specification.
 
 ## Goals
 

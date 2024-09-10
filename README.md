@@ -91,6 +91,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] paste
  - [x] pr
  - [x] readlink
+ - [x] realpath
  - [x] rm
  - [x] rmdir
  - [x] sort
@@ -151,7 +152,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] logger
  - [x] printf
  - [x] ps
- - [x] realpath
  - [x] stty
  - [x] tabs
  - [x] test

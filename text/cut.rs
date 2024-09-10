@@ -292,12 +292,14 @@ fn cut_files(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // open files, or stdin
 
+    let filenames = args.filenames;
+    let filenames_len = filenames.len();
     let readers: Vec<Box<dyn Read>> =
-        if args.filenames.len() == 1 && args.filenames[0] == PathBuf::from("-") {
+        if filenames_len == 0 || (filenames_len == 1 && filenames[0] == PathBuf::from("-")) {
             vec![Box::new(io::stdin().lock())]
         } else {
-            let mut bufs: Vec<Box<dyn Read>> = vec![];
-            for file in &args.filenames {
+            let mut bufs: Vec<Box<dyn Read>> = Vec::with_capacity(filenames_len);
+            for file in &filenames {
                 bufs.push(Box::new(std::fs::File::open(file)?))
             }
             bufs

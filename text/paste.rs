@@ -156,7 +156,7 @@ fn paste_files_serial(mut info: PasteInfo, mut dinfo: DelimInfo) -> io::Result<(
 
             // if EOF, output line terminator and end inner loop
             if n_read == 0 {
-                println!("");
+                println!();
                 break;
 
             // output line segment

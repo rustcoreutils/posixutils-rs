@@ -11,7 +11,7 @@ mod ls_util;
 
 use clap::{CommandFactory, FromArgMatches, Parser};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
+use plib::{platform::PIoctlOp, PROJECT_NAME};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs;
@@ -582,20 +582,11 @@ fn get_terminal_width() -> usize {
     // Fallback to manually querying via `ioctl`.
     unsafe {
         let mut winsize: MaybeUninit<libc::winsize> = MaybeUninit::zeroed();
-        let request_cast = {
-            let request = winsize_request_code();
-
-            #[cfg(target_env = "musl")]
-            {
-                request as i32
-            }
-
-            #[cfg(not(target_env = "musl"))]
-            {
-                request
-            }
-        };
-        let ret = libc::ioctl(libc::STDOUT_FILENO, request_cast, winsize.as_mut_ptr());
+        let ret = libc::ioctl(
+            libc::STDOUT_FILENO,
+            winsize_request_code() as PIoctlOp,
+            winsize.as_mut_ptr(),
+        );
 
         // We're only interested in stdout here unlike `term_size::dimensions`
         // so we won't query further if the first `ioctl` call fails.
@@ -907,7 +898,7 @@ fn display_entries(entries: &mut [Entry], config: &Config, dir_path: Option<&str
                         }
                     }
                 }
-                println!("");
+                println!();
             }
         }
         OutputFormat::MultiColumnAcross => {
@@ -933,7 +924,7 @@ fn display_entries(entries: &mut [Entry], config: &Config, dir_path: Option<&str
             {
                 if col_idx == last_col_idx {
                     entry.print_multi_column(padding);
-                    println!("");
+                    println!();
                 } else {
                     entry.print_multi_column(padding);
                     print!("{:COLUMN_SPACING$}", "");
@@ -943,7 +934,7 @@ fn display_entries(entries: &mut [Entry], config: &Config, dir_path: Option<&str
             // If the last entry does not end up on the bottom right of
             // the grid
             if entries.len() % num_columns != 0 {
-                println!("");
+                println!();
             }
         }
         OutputFormat::StreamOutputFormat => {
@@ -1015,7 +1006,7 @@ fn display_entries(entries: &mut [Entry], config: &Config, dir_path: Option<&str
 
             for entry in entries.iter() {
                 entry.print_multi_column(padding);
-                println!("");
+                println!();
             }
         }
     }

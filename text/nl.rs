@@ -299,7 +299,7 @@ fn nl_main(args: &Args) -> io::Result<()> {
                     line_number = args.starting_line_number;
                     line_number_overflowed = false;
                 }
-                println!("");
+                println!();
             }
         } else {
             break;

@@ -13,7 +13,7 @@ extern crate plib;
 use chrono::Local;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
+use plib::{platform, PROJECT_NAME};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, Write};
@@ -44,14 +44,10 @@ fn select_terminal(user_name: &str) -> String {
     let entries = plib::utmpx::load();
 
     // Filter the entries to find terminals for the specified user
-    let user_entries: Vec<_> = {
-        // TODO: Remove "libc_aliases" when https://github.com/rust-lang/libc/issues/3190 is resolved
-        use plib::libc_aliases as libc;
-        entries
-            .into_iter()
-            .filter(|entry| entry.user == user_name && entry.typ == libc::USER_PROCESS)
-            .collect()
-    };
+    let user_entries: Vec<_> = entries
+        .into_iter()
+        .filter(|entry| entry.user == user_name && entry.typ == platform::USER_PROCESS)
+        .collect();
 
     if user_entries.is_empty() {
         eprintln!("{}: {}", gettext("No terminals found for user"), user_name);

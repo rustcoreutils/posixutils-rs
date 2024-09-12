@@ -149,8 +149,8 @@ fn parse_expression(tokens: &mut Vec<&str>) -> Vec<Expr> {
             "-size" => {
                 tokens.pop();
                 if let Some(size) = tokens.pop() {
-                    let (size, in_bytes) = if size.ends_with('c') {
-                        (size[..size.len() - 1].parse::<u64>().unwrap_or(0), true)
+                    let (size, in_bytes) = if let Some(st) = size.strip_suffix('c') {
+                        (st.parse::<u64>().unwrap_or(0), true)
                     } else {
                         (size.parse::<u64>().unwrap_or(0), false)
                     };
@@ -250,15 +250,15 @@ fn evaluate_expression(
         match expression {
             Expr::Not(inner) => {
                 let i: Vec<Expr> = vec![f_path.clone(), *inner.clone()];
-                not_res = evaluate_expression(&i.as_slice(), files.clone(), root_dev)?;
+                not_res = evaluate_expression(i.as_slice(), files.clone(), root_dev)?;
             }
             Expr::Or(inner) => {
                 let i: Vec<Expr> = vec![f_path.clone(), *inner.clone()];
-                or_res = evaluate_expression(&i.as_slice(), files.clone(), root_dev)?;
+                or_res = evaluate_expression(i.as_slice(), files.clone(), root_dev)?;
             }
             Expr::And(inner) => {
                 let i: Vec<Expr> = vec![f_path.clone(), *inner.clone()];
-                and_res = evaluate_expression(&i.as_slice(), files.clone(), root_dev)?;
+                and_res = evaluate_expression(i.as_slice(), files.clone(), root_dev)?;
             }
             _ => {}
         }
@@ -307,7 +307,7 @@ fn evaluate_expression(
                         FileType::Fifo => file_type.is_fifo(),
                         FileType::File => file_type.is_file(),
                         FileType::Socket => file_type.is_socket(),
-                        FileType::Unknown => return Err(format!("Unknown argument to -type")),
+                        FileType::Unknown => return Err("Unknown argument to -type".to_owned()),
                     };
                     if !r {
                         c_files.remove(file.path());
@@ -316,7 +316,7 @@ fn evaluate_expression(
                 Expr::NoUser => {
                     if let Ok(metadata) = file.metadata() {
                         let uid = metadata.uid();
-                        if !users::get_user_by_uid(uid).is_none() {
+                        if users::get_user_by_uid(uid).is_some() {
                             c_files.remove(file.path());
                         }
                     }
@@ -324,7 +324,7 @@ fn evaluate_expression(
                 Expr::NoGroup => {
                     if let Ok(metadata) = file.metadata() {
                         let gid = metadata.gid();
-                        if !users::get_group_by_gid(gid).is_none() {
+                        if users::get_group_by_gid(gid).is_some() {
                             c_files.remove(file.path());
                         }
                     }

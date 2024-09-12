@@ -1139,6 +1139,7 @@ checksum = "bda66fc9667c18cb2758a2ac84d1167245054bcf85d5d1aaa6923f45801bdd02"
 name = "plib"
 version = "0.2.0"
 dependencies = [
+ "cfg-if",
  "libc",
 ]
 

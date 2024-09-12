@@ -422,7 +422,7 @@ enum ProcessFileResult {
 }
 
 fn process_file<F, H>(
-    path_stack: &Vec<Rc<[libc::c_char]>>,
+    path_stack: &[Rc<[libc::c_char]>],
     dir_fd: &FileDescriptor,
     entry_filename: Rc<[libc::c_char]>,
     follow_symlinks: bool,
@@ -439,7 +439,7 @@ where
         Ok(md) => md,
         Err(e) => {
             err_reporter(
-                Entry::new(dir_fd, &path_stack, &entry_filename, None),
+                Entry::new(dir_fd, path_stack, &entry_filename, None),
                 Error::new(e, ErrorKind::Stat),
             );
             return ProcessFileResult::NotProcessed;
@@ -583,7 +583,7 @@ where
                 Err(e) => {
                     if let Some(path_stack) = &path_stack {
                         err_reporter(
-                            Entry::new(&starting_dir, &path_stack, &filename, None),
+                            Entry::new(&starting_dir, path_stack, &filename, None),
                             Error::new(e, ErrorKind::Open),
                         );
                     }

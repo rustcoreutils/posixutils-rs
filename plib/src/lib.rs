@@ -10,10 +10,9 @@
 pub mod curuser;
 pub mod group;
 pub mod io;
-// TODO: Remove "libc_aliases" when https://github.com/rust-lang/libc/issues/3190 is resolved
-pub mod libc_aliases;
 pub mod lzw;
 pub mod modestr;
+pub mod platform;
 pub mod sccsfile;
 pub mod testing;
 pub mod utmpx;

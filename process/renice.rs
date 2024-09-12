@@ -15,6 +15,7 @@ use clap::Parser;
 use errno::{errno, set_errno};
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use libc::{getpwnam, passwd};
+use plib::platform::PPriorityWhichT;
 use plib::PROJECT_NAME;
 use std::ffi::CString;
 use std::io;
@@ -82,24 +83,7 @@ fn parse_id(which: u32, input: &str) -> Result<u32, &'static str> {
 fn xgetpriority(which: u32, id: u32) -> io::Result<i32> {
     set_errno(errno::Errno(0));
 
-    // Prevent accidental shadowing by using a block
-    let which_cast = {
-        #[cfg(all(not(target_os = "macos"), not(target_env = "musl")))]
-        {
-            which
-        }
-
-        #[cfg(all(not(target_os = "macos"), target_env = "musl"))]
-        {
-            which as i32
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            which as i32
-        }
-    };
-    let res = unsafe { libc::getpriority(which_cast, id) };
+    let res = unsafe { libc::getpriority(which as PPriorityWhichT, id) };
 
     let errno_res = errno().0;
     if errno_res == 0 {
@@ -112,25 +96,7 @@ fn xgetpriority(which: u32, id: u32) -> io::Result<i32> {
 }
 
 fn xsetpriority(which: u32, id: u32, prio: i32) -> io::Result<()> {
-    // Prevent accidental shadowing by using a block
-    let which_cast = {
-        #[cfg(all(not(target_os = "macos"), not(target_env = "musl")))]
-        {
-            which
-        }
-
-        #[cfg(all(not(target_os = "macos"), target_env = "musl"))]
-        {
-            which as i32
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            which as i32
-        }
-    };
-
-    let res = unsafe { libc::setpriority(which_cast, id, prio) };
+    let res = unsafe { libc::setpriority(which as PPriorityWhichT, id, prio) };
 
     if res < 0 {
         let e = io::Error::last_os_error();

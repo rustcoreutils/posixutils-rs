@@ -68,7 +68,7 @@ fn update_snapshots(args: &Args, update: &UpdateSnapshots) {
                 return false;
             }
 
-            if let Some(name) = update.test_case_name.as_ref().map(|s| s.as_str()) {
+            if let Some(name) = update.test_case_name.as_deref() {
                 if name != entry.path().file_stem().unwrap().to_str().unwrap() {
                     return false;
                 }

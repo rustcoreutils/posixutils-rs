@@ -1,6 +1,10 @@
 BEGIN {
     print index("hello", "l");
-    print length("hello");
+  	print length("hello");
+   	a[0] = 0;
+  	a[1] = 1;
+  	a[2] = 2;
+  	print length(a);
     print match("hello", /l+/);
     print RSTART;
     print RLENGTH;

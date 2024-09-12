@@ -351,10 +351,16 @@ fn call_simple_builtin(
             stack.push_value(index)?;
         }
         BuiltinFunction::Length => {
-            let value = stack
-                .pop_scalar_value()?
-                .scalar_to_string(&global_env.convfmt)?;
-            stack.push_value(value.len() as f64)?;
+            let value = stack.pop_value();
+            match &value.value {
+                AwkValueVariant::Array(array) => {
+                    stack.push_value(array.len() as f64)?;
+                }
+                _ => {
+                    let value_str = value.scalar_to_string(&global_env.convfmt)?;
+                    stack.push_value(value_str.len() as f64)?;
+                }
+            }
         }
         BuiltinFunction::Split => {
             let separator = if argc == 2 {
@@ -2750,6 +2756,38 @@ mod tests {
             .execution_result
             .unwrap_expr();
         assert_eq!(value, AwkValue::from(11.0));
+
+        let instructions = vec![
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
+            OpCode::PushConstant(0),
+            OpCode::IndexArrayGetRef,
+            OpCode::PushZero,
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
+            OpCode::PushConstant(1),
+            OpCode::IndexArrayGetRef,
+            OpCode::PushZero,
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
+            OpCode::PushConstant(2),
+            OpCode::IndexArrayGetRef,
+            OpCode::PushZero,
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
+            OpCode::CallBuiltin {
+                function: BuiltinFunction::Length,
+                argc: 1,
+            },
+        ];
+        let constants = vec![
+            Constant::from("key1"),
+            Constant::from("key2"),
+            Constant::from("key3"),
+        ];
+        assert_eq!(interpret_expr(instructions, constants), AwkValue::from(3.0));
     }
 
     #[test]

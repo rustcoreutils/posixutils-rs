@@ -139,6 +139,11 @@ lazy_static::lazy_static! {
             min_args: 1,
             max_args: 1,
         }),
+        (Rule::fflush, BuiltinFunctionInfo {
+            function: BuiltinFunction::FFlush,
+            min_args: 0,
+            max_args: 1,
+        }),
         (Rule::system, BuiltinFunctionInfo {
             function: BuiltinFunction::System,
             min_args: 1,
@@ -1142,16 +1147,19 @@ impl Compiler {
         let stmt = first_child(simple_stmt);
         let stmt_line_col = stmt.line_col();
         match stmt.as_rule() {
-            Rule::delete_element => {
+            Rule::array_delete => {
                 let mut inner = stmt.into_inner();
                 let name = inner.next().unwrap();
                 let get_instruction = self
                     .get_var(name.as_str(), locals)
                     .map_err(|msg| pest_error_from_span(name.as_span(), msg))?;
                 instructions.push(get_instruction, stmt_line_col);
-                let index = inner.next().unwrap();
-                self.compile_expr(index, instructions, locals)?;
-                instructions.push(OpCode::Delete, stmt_line_col);
+                if let Some(index) = inner.next() {
+                    self.compile_expr(index, instructions, locals)?;
+                    instructions.push(OpCode::DeleteElement, stmt_line_col);
+                } else {
+                    instructions.push(OpCode::ClearArray, stmt_line_col);
+                }
             }
             Rule::expr => {
                 self.compile_expr(stmt, instructions, locals)?;
@@ -1451,6 +1459,10 @@ impl Compiler {
             Rule::ut_for => self.compile_for(stmt, instructions, locals),
             Rule::ut_foreach => self.compile_for_each(stmt, instructions, locals),
             Rule::simple_statement => self.compile_simple_statement(stmt, instructions, locals),
+            Rule::nextfile => {
+                instructions.push(OpCode::NextFile, stmt.line_col());
+                Ok(())
+            }
             Rule::next => {
                 instructions.push(OpCode::Next, stmt.line_col());
                 Ok(())
@@ -3023,6 +3035,12 @@ mod test {
     }
 
     #[test]
+    fn test_compile_nextfile() {
+        let (instructions, _) = compile_stmt("nextfile;");
+        assert_eq!(instructions, vec![OpCode::NextFile]);
+    }
+
+    #[test]
     fn test_compile_exit() {
         let (instructions, _) = compile_stmt("exit;");
         assert_eq!(instructions, vec![OpCode::PushZero, OpCode::Exit]);
@@ -3047,15 +3065,24 @@ mod test {
     }
 
     #[test]
-    fn test_compile_delete() {
+    fn test_compile_delete_element() {
         let (instructions, _) = compile_stmt("delete a[1];");
         assert_eq!(
             instructions,
             vec![
                 OpCode::GetGlobal(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(0),
-                OpCode::Delete,
+                OpCode::DeleteElement,
             ]
+        );
+    }
+
+    #[test]
+    fn test_compile_clear_array() {
+        let (instructions, _) = compile_stmt("delete a");
+        assert_eq!(
+            instructions,
+            vec![OpCode::GetGlobal(FIRST_GLOBAL_VAR), OpCode::ClearArray]
         );
     }
 
@@ -3885,6 +3912,8 @@ mod test {
             r#"
             BEGIN {
                 close("file");
+                fflush("file");
+                fflush();
                 system("ls");
             }
         "#,
@@ -3899,6 +3928,17 @@ mod test {
                 },
                 OpCode::Pop,
                 OpCode::PushConstant(1),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::FFlush,
+                    argc: 1
+                },
+                OpCode::Pop,
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::FFlush,
+                    argc: 0
+                },
+                OpCode::Pop,
+                OpCode::PushConstant(2),
                 OpCode::CallBuiltin {
                     function: BuiltinFunction::System,
                     argc: 1,

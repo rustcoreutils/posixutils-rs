@@ -351,10 +351,16 @@ fn call_simple_builtin(
             stack.push_value(index)?;
         }
         BuiltinFunction::Length => {
-            let value = stack
-                .pop_scalar_value()?
-                .scalar_to_string(&global_env.convfmt)?;
-            stack.push_value(value.len() as f64)?;
+            let value = stack.pop_value();
+            match &value.value {
+                AwkValueVariant::Array(array) => {
+                    stack.push_value(array.len() as f64)?;
+                }
+                _ => {
+                    let value_str = value.scalar_to_string(&global_env.convfmt)?;
+                    stack.push_value(value_str.len() as f64)?;
+                }
+            }
         }
         BuiltinFunction::Split => {
             let separator = if argc == 2 {
@@ -1171,6 +1177,7 @@ impl<'i, 's> Stack<'i, 's> {
 enum ExecutionResult {
     Expression(AwkValue),
     Next,
+    NextFile,
     Exit(i32),
 }
 
@@ -1215,7 +1222,11 @@ macro_rules! compare_op {
                 $stack.push_value(bool_to_f64(lhs $op rhs))?;
             }
             (AwkValueVariant::String(lhs), AwkValueVariant::String(rhs)) => {
-                $stack.push_value(bool_to_f64(lhs.as_str() $op rhs.as_str()))?;
+              	if lhs.is_numeric && rhs.is_numeric {
+									$stack.push_value(bool_to_f64(strtod(lhs) $op strtod(rhs)))?;
+              	} else {
+                	$stack.push_value(bool_to_f64(lhs.as_str() $op rhs.as_str()))?;
+              	}
             }
             (AwkValueVariant::Number(lhs), AwkValueVariant::UninitializedScalar) => {
                 $stack.push_value(bool_to_f64(*lhs $op 0.0))?;
@@ -1520,12 +1531,16 @@ impl Interpreter {
                     fields_state = lvalue.assign(value.clone(), global_env)?;
                     stack.push_value(value)?;
                 }
-                OpCode::Delete => {
+                OpCode::DeleteElement => {
                     let key = stack
                         .pop_scalar_value()?
                         .scalar_to_string(&global_env.convfmt)?;
                     let array = stack.pop_ref().as_array()?;
                     array.delete(&key);
+                }
+                OpCode::ClearArray => {
+                    let array = stack.pop_ref().as_array()?;
+                    array.clear();
                 }
                 OpCode::JumpIfFalse(offset) => {
                     let condition = stack.pop_scalar_value()?.scalar_as_bool();
@@ -1600,6 +1615,22 @@ impl Interpreter {
                         self.read_files.close_file(&filename);
                         self.write_pipes.close_pipe(&filename);
                         self.read_pipes.close_pipe(&filename);
+                    }
+                    BuiltinFunction::FFlush => {
+                        let expr_str = if argc == 1 {
+                            stack
+                                .pop_scalar_value()?
+                                .scalar_to_string(&global_env.convfmt)?
+                        } else {
+                            AwkString::default()
+                        };
+                        let result = if expr_str.is_empty() {
+                            self.write_files.flush_file(&expr_str)
+                                && self.write_pipes.flush_file(&expr_str)
+                        } else {
+                            self.write_files.flush_all() && self.write_pipes.flush_all()
+                        };
+                        stack.push_value(bool_to_f64(result))?;
                     }
                     BuiltinFunction::GetLine => {
                         let var = stack.pop_ref();
@@ -1689,6 +1720,7 @@ impl Interpreter {
                     stack.pop();
                 }
                 OpCode::Next => return Ok(ExecutionResult::Next),
+                OpCode::NextFile => return Ok(ExecutionResult::NextFile),
                 OpCode::Exit => {
                     let exit_code = stack.pop_scalar_value()?.scalar_as_f64();
                     return Ok(ExecutionResult::Exit(exit_code as i32));
@@ -1936,7 +1968,7 @@ pub fn interpret(
         input_read = true;
 
         global_env.fnr = 1;
-        while let Some(record) = reader.read_next_record(&global_env.rs)? {
+        'record_loop: while let Some(record) = reader.read_next_record(&global_env.rs)? {
             current_record.reset(record, &global_env.fs)?;
             interpreter.globals[SpecialVar::Nf as usize].get_mut().value =
                 AwkValue::from(current_record.get_last_field() as f64).value;
@@ -2003,6 +2035,7 @@ pub fn interpret(
                     )?;
                     match rule_result {
                         ExecutionResult::Next => break,
+                        ExecutionResult::NextFile => break 'record_loop,
                         ExecutionResult::Exit(val) => {
                             return_value = val;
                             break 'file_loop;
@@ -2441,7 +2474,7 @@ mod tests {
             OpCode::Assign,
             OpCode::GetGlobal(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(0),
-            OpCode::Delete,
+            OpCode::DeleteElement,
         ];
         let constant = vec![Constant::from("key"), Constant::Number(123.0)];
         assert_eq!(test_global(instructions, constant), Array::default().into());
@@ -2459,7 +2492,7 @@ mod tests {
             OpCode::GetGlobal(FIRST_GLOBAL_VAR),
             OpCode::GetLocal(0),
             OpCode::PushConstant(0),
-            OpCode::Delete,
+            OpCode::DeleteElement,
         ];
         let constant = vec![Constant::from("key"), Constant::Number(123.0)];
         assert_eq!(test_global(instructions, constant), Array::default().into());
@@ -2470,10 +2503,46 @@ mod tests {
         let instructions = vec![
             OpCode::GetGlobal(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(0),
-            OpCode::Delete,
+            OpCode::DeleteElement,
         ];
         let constant = vec![Constant::from("key")];
         assert_eq!(test_global(instructions, constant), Array::default().into());
+    }
+
+    #[test]
+    fn test_clear_array() {
+        let instructions = vec![
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
+            OpCode::PushConstant(0),
+            OpCode::IndexArrayGetRef,
+            OpCode::PushZero,
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
+            OpCode::PushConstant(1),
+            OpCode::IndexArrayGetRef,
+            OpCode::PushZero,
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
+            OpCode::PushConstant(2),
+            OpCode::IndexArrayGetRef,
+            OpCode::PushZero,
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
+            OpCode::ClearArray,
+        ];
+        let constants = vec![
+            Constant::from("key1"),
+            Constant::from("key2"),
+            Constant::from("key3"),
+        ];
+        let result = Test::new(instructions, constants).run_correct();
+        assert_eq!(
+            result.globals[FIRST_GLOBAL_VAR as usize],
+            Array::default().into()
+        );
     }
 
     #[test]
@@ -2750,6 +2819,38 @@ mod tests {
             .execution_result
             .unwrap_expr();
         assert_eq!(value, AwkValue::from(11.0));
+
+        let instructions = vec![
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
+            OpCode::PushConstant(0),
+            OpCode::IndexArrayGetRef,
+            OpCode::PushZero,
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
+            OpCode::PushConstant(1),
+            OpCode::IndexArrayGetRef,
+            OpCode::PushZero,
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
+            OpCode::PushConstant(2),
+            OpCode::IndexArrayGetRef,
+            OpCode::PushZero,
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
+            OpCode::CallBuiltin {
+                function: BuiltinFunction::Length,
+                argc: 1,
+            },
+        ];
+        let constants = vec![
+            Constant::from("key1"),
+            Constant::from("key2"),
+            Constant::from("key3"),
+        ];
+        assert_eq!(interpret_expr(instructions, constants), AwkValue::from(3.0));
     }
 
     #[test]

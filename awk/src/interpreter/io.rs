@@ -224,6 +224,22 @@ impl WriteFiles {
         Ok(())
     }
 
+    pub fn flush_file(&mut self, filename: &str) -> bool {
+        if let Some(file) = self.files.get_mut(filename) {
+            file.flush().is_ok()
+        } else {
+            false
+        }
+    }
+
+    pub fn flush_all(&mut self) -> bool {
+        let mut success = true;
+        for file in self.files.values_mut() {
+            success = success && file.flush().is_ok();
+        }
+        success
+    }
+
     pub fn close_file(&mut self, filename: &str) {
         self.files.remove(filename);
     }
@@ -286,6 +302,22 @@ impl WritePipes {
             return Err("failed to write to file".to_string());
         }
         Ok(())
+    }
+
+    pub fn flush_file(&mut self, filename: &str) -> bool {
+        if let Some(file) = self.pipes.get(filename) {
+            unsafe { libc::fflush(*file) == 0 }
+        } else {
+            false
+        }
+    }
+
+    pub fn flush_all(&mut self) -> bool {
+        let mut success = true;
+        for file in self.pipes.values() {
+            success = success && unsafe { libc::fflush(*file) == 0 };
+        }
+        success
     }
 
     pub fn close_pipe(&mut self, filename: &str) {

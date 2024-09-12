@@ -302,6 +302,15 @@ fn test_awk_next() {
 }
 
 #[test]
+fn test_awk_nextfile() {
+    test_awk!(
+        nextfile,
+        "tests/awk/test_data.txt",
+        "tests/awk/test_data2.txt"
+    );
+}
+
+#[test]
 fn test_awk_exit() {
     test_awk!(exit, "tests/awk/test_data.txt");
 }

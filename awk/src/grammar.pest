@@ -46,6 +46,7 @@ builtin_func = _{
   | tolower
   | toupper
   | close
+	| fflush
   | system
 }
 
@@ -69,6 +70,7 @@ substr   = { "substr" }
 tolower  = { "tolower" }
 toupper  = { "toupper" }
 close    = { "close" }
+fflush   = { "fflush" }
 system   = { "system" }
 
 keyword = {

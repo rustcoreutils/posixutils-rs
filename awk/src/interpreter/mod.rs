@@ -1612,6 +1612,22 @@ impl Interpreter {
                         self.write_pipes.close_pipe(&filename);
                         self.read_pipes.close_pipe(&filename);
                     }
+                    BuiltinFunction::FFlush => {
+                        let expr_str = if argc == 1 {
+                            stack
+                                .pop_scalar_value()?
+                                .scalar_to_string(&global_env.convfmt)?
+                        } else {
+                            AwkString::default()
+                        };
+                        let result = if expr_str.is_empty() {
+                            self.write_files.flush_file(&expr_str)
+                                && self.write_pipes.flush_file(&expr_str)
+                        } else {
+                            self.write_files.flush_all() && self.write_pipes.flush_all()
+                        };
+                        stack.push_value(bool_to_f64(result))?;
+                    }
                     BuiltinFunction::GetLine => {
                         let var = stack.pop_ref();
                         if let Some(next_record) = current_file.read_next_record(&global_env.rs)? {

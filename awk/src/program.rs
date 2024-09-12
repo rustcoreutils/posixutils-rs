@@ -309,6 +309,7 @@ pub enum BuiltinFunction {
 
     // I/O functions
     Close,
+    FFlush,
     GetLine,
     GetLineFromFile,
     GetLineFromPipe,

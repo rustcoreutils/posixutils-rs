@@ -139,6 +139,11 @@ lazy_static::lazy_static! {
             min_args: 1,
             max_args: 1,
         }),
+        (Rule::fflush, BuiltinFunctionInfo {
+            function: BuiltinFunction::FFlush,
+            min_args: 0,
+            max_args: 1,
+        }),
         (Rule::system, BuiltinFunctionInfo {
             function: BuiltinFunction::System,
             min_args: 1,
@@ -3907,6 +3912,8 @@ mod test {
             r#"
             BEGIN {
                 close("file");
+                fflush("file");
+                fflush();
                 system("ls");
             }
         "#,
@@ -3921,6 +3928,17 @@ mod test {
                 },
                 OpCode::Pop,
                 OpCode::PushConstant(1),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::FFlush,
+                    argc: 1
+                },
+                OpCode::Pop,
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::FFlush,
+                    argc: 0
+                },
+                OpCode::Pop,
+                OpCode::PushConstant(2),
                 OpCode::CallBuiltin {
                     function: BuiltinFunction::System,
                     argc: 1,

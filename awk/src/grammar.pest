@@ -179,13 +179,13 @@ return_stmt = { "return" ~ expr? }
 exit_stmt   = { "exit" ~ expr? }
 
 simple_statement = {
-    delete_element
+    array_delete
   | print_stmt
   | expr
 }
 
-delete_element = {
-    "delete" ~ name ~ "[" ~ expr ~ "]"
+array_delete = {
+    "delete" ~ name ~ ("[" ~ expr ~ "]")?
 }
 
 print_stmt = {

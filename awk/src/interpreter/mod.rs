@@ -1526,12 +1526,16 @@ impl Interpreter {
                     fields_state = lvalue.assign(value.clone(), global_env)?;
                     stack.push_value(value)?;
                 }
-                OpCode::Delete => {
+                OpCode::DeleteElement => {
                     let key = stack
                         .pop_scalar_value()?
                         .scalar_to_string(&global_env.convfmt)?;
                     let array = stack.pop_ref().as_array()?;
                     array.delete(&key);
+                }
+                OpCode::ClearArray => {
+                    let array = stack.pop_ref().as_array()?;
+                    array.clear();
                 }
                 OpCode::JumpIfFalse(offset) => {
                     let condition = stack.pop_scalar_value()?.scalar_as_bool();
@@ -2447,7 +2451,7 @@ mod tests {
             OpCode::Assign,
             OpCode::GetGlobal(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(0),
-            OpCode::Delete,
+            OpCode::DeleteElement,
         ];
         let constant = vec![Constant::from("key"), Constant::Number(123.0)];
         assert_eq!(test_global(instructions, constant), Array::default().into());
@@ -2465,7 +2469,7 @@ mod tests {
             OpCode::GetGlobal(FIRST_GLOBAL_VAR),
             OpCode::GetLocal(0),
             OpCode::PushConstant(0),
-            OpCode::Delete,
+            OpCode::DeleteElement,
         ];
         let constant = vec![Constant::from("key"), Constant::Number(123.0)];
         assert_eq!(test_global(instructions, constant), Array::default().into());
@@ -2476,10 +2480,46 @@ mod tests {
         let instructions = vec![
             OpCode::GetGlobal(FIRST_GLOBAL_VAR),
             OpCode::PushConstant(0),
-            OpCode::Delete,
+            OpCode::DeleteElement,
         ];
         let constant = vec![Constant::from("key")];
         assert_eq!(test_global(instructions, constant), Array::default().into());
+    }
+
+    #[test]
+    fn test_clear_array() {
+        let instructions = vec![
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
+            OpCode::PushConstant(0),
+            OpCode::IndexArrayGetRef,
+            OpCode::PushZero,
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
+            OpCode::PushConstant(1),
+            OpCode::IndexArrayGetRef,
+            OpCode::PushZero,
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
+            OpCode::PushConstant(2),
+            OpCode::IndexArrayGetRef,
+            OpCode::PushZero,
+            OpCode::Assign,
+            OpCode::Pop,
+            OpCode::GetGlobal(FIRST_GLOBAL_VAR),
+            OpCode::ClearArray,
+        ];
+        let constants = vec![
+            Constant::from("key1"),
+            Constant::from("key2"),
+            Constant::from("key3"),
+        ];
+        let result = Test::new(instructions, constants).run_correct();
+        assert_eq!(
+            result.globals[FIRST_GLOBAL_VAR as usize],
+            Array::default().into()
+        );
     }
 
     #[test]

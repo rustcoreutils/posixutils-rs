@@ -72,7 +72,9 @@ pub enum OpCode {
     Assign,
 
     // deletes the key on top of the stack from the array preceding it
-    Delete,
+    DeleteElement,
+    // clears the array on top of the stack
+    ClearArray,
 
     // jump forwards or backwards by the given offset.
     // Offset 0 is the jump instruction

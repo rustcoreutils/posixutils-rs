@@ -1142,16 +1142,19 @@ impl Compiler {
         let stmt = first_child(simple_stmt);
         let stmt_line_col = stmt.line_col();
         match stmt.as_rule() {
-            Rule::delete_element => {
+            Rule::array_delete => {
                 let mut inner = stmt.into_inner();
                 let name = inner.next().unwrap();
                 let get_instruction = self
                     .get_var(name.as_str(), locals)
                     .map_err(|msg| pest_error_from_span(name.as_span(), msg))?;
                 instructions.push(get_instruction, stmt_line_col);
-                let index = inner.next().unwrap();
-                self.compile_expr(index, instructions, locals)?;
-                instructions.push(OpCode::Delete, stmt_line_col);
+                if let Some(index) = inner.next() {
+                    self.compile_expr(index, instructions, locals)?;
+                    instructions.push(OpCode::DeleteElement, stmt_line_col);
+                } else {
+                    instructions.push(OpCode::ClearArray, stmt_line_col);
+                }
             }
             Rule::expr => {
                 self.compile_expr(stmt, instructions, locals)?;
@@ -3047,15 +3050,24 @@ mod test {
     }
 
     #[test]
-    fn test_compile_delete() {
+    fn test_compile_delete_element() {
         let (instructions, _) = compile_stmt("delete a[1];");
         assert_eq!(
             instructions,
             vec![
                 OpCode::GetGlobal(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(0),
-                OpCode::Delete,
+                OpCode::DeleteElement,
             ]
+        );
+    }
+
+    #[test]
+    fn test_compile_clear_array() {
+        let (instructions, _) = compile_stmt("delete a");
+        assert_eq!(
+            instructions,
+            vec![OpCode::GetGlobal(FIRST_GLOBAL_VAR), OpCode::ClearArray]
         );
     }
 

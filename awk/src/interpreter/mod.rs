@@ -1177,6 +1177,7 @@ impl<'i, 's> Stack<'i, 's> {
 enum ExecutionResult {
     Expression(AwkValue),
     Next,
+    NextFile,
     Exit(i32),
 }
 
@@ -1699,6 +1700,7 @@ impl Interpreter {
                     stack.pop();
                 }
                 OpCode::Next => return Ok(ExecutionResult::Next),
+                OpCode::NextFile => return Ok(ExecutionResult::NextFile),
                 OpCode::Exit => {
                     let exit_code = stack.pop_scalar_value()?.scalar_as_f64();
                     return Ok(ExecutionResult::Exit(exit_code as i32));
@@ -1946,7 +1948,7 @@ pub fn interpret(
         input_read = true;
 
         global_env.fnr = 1;
-        while let Some(record) = reader.read_next_record(&global_env.rs)? {
+        'record_loop: while let Some(record) = reader.read_next_record(&global_env.rs)? {
             current_record.reset(record, &global_env.fs)?;
             interpreter.globals[SpecialVar::Nf as usize].get_mut().value =
                 AwkValue::from(current_record.get_last_field() as f64).value;
@@ -2013,6 +2015,7 @@ pub fn interpret(
                     )?;
                     match rule_result {
                         ExecutionResult::Next => break,
+                        ExecutionResult::NextFile => break 'record_loop,
                         ExecutionResult::Exit(val) => {
                             return_value = val;
                             break 'file_loop;

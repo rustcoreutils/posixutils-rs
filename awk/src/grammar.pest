@@ -161,17 +161,19 @@ ut_for     = { "for" ~ "(" ~ simple_statement? ~ ";" ~ expr? ~ ";" ~ simple_stat
 ut_foreach = { "for" ~ "(" ~ name ~ in_op ~ name ~ ")" ~ opt_newline ~ unterminated_statement }
 
 terminatable_statement = _{
-    simple_statement
+	  nextfile
   | next
   | break_stmt
   | continue_stmt
   | exit_stmt
   | return_stmt
   | do_while
+  | simple_statement
 }
 
 do_while      = { "do" ~ opt_newline ~ terminated_statement ~ "while" ~ "(" ~ expr ~ ")" }
 next          = { "next" }
+nextfile      = { "nextfile" }
 break_stmt    = { "break" }
 continue_stmt = { "continue" }
 

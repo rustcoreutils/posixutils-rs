@@ -100,6 +100,7 @@ pub enum OpCode {
     PushUninitializedScalar,
 
     Next,
+    NextFile,
     Exit,
     Return,
 

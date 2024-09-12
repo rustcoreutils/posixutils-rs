@@ -1454,6 +1454,10 @@ impl Compiler {
             Rule::ut_for => self.compile_for(stmt, instructions, locals),
             Rule::ut_foreach => self.compile_for_each(stmt, instructions, locals),
             Rule::simple_statement => self.compile_simple_statement(stmt, instructions, locals),
+            Rule::nextfile => {
+                instructions.push(OpCode::NextFile, stmt.line_col());
+                Ok(())
+            }
             Rule::next => {
                 instructions.push(OpCode::Next, stmt.line_col());
                 Ok(())
@@ -3023,6 +3027,12 @@ mod test {
     fn test_compile_next() {
         let (instructions, _) = compile_stmt("next;");
         assert_eq!(instructions, vec![OpCode::Next]);
+    }
+
+    #[test]
+    fn test_compile_nextfile() {
+        let (instructions, _) = compile_stmt("nextfile;");
+        assert_eq!(instructions, vec![OpCode::NextFile]);
     }
 
     #[test]

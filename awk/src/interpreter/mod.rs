@@ -1648,6 +1648,7 @@ impl Interpreter {
                                 .expect("time went backwards")
                                 .as_secs()
                         };
+                        stack.push_value(self.rand_seed as f64)?;
                         self.rand_seed = seed;
                         self.rng = SmallRng::seed_from_u64(self.rand_seed);
                     }
@@ -3624,5 +3625,33 @@ mod tests {
             *result.record.fields[0].get_mut(),
             AwkValue::field_ref(maybe_numeric_string("1 2 3 4      "), 0)
         );
+    }
+
+    #[test]
+    fn test_srand_returns_the_previous_seed_value() {
+        let constants = vec![Constant::from(42.0)];
+        let instructions = vec![
+            OpCode::PushConstant(0),
+            OpCode::CallBuiltin {
+                function: BuiltinFunction::Srand,
+                argc: 1,
+            },
+        ];
+        let result = Test::new(instructions, constants.clone()).run_correct();
+        assert_eq!(result.execution_result.unwrap_expr(), AwkValue::from(0.0));
+
+        let instructions = vec![
+            OpCode::PushConstant(0),
+            OpCode::CallBuiltin {
+                function: BuiltinFunction::Srand,
+                argc: 1,
+            },
+            OpCode::CallBuiltin {
+                function: BuiltinFunction::Srand,
+                argc: 0,
+            },
+        ];
+        let result = Test::new(instructions, constants).run_correct();
+        assert_eq!(result.execution_result.unwrap_expr(), AwkValue::from(42.0));
     }
 }

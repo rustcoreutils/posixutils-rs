@@ -30,3 +30,6 @@ path = "./strip.rs"
 [[bin]]
 name = "strings"
 path = "./strings.rs"
+
+[lints]
+workspace = true

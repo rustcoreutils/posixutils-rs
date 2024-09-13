@@ -36,15 +36,15 @@ impl LineBreakIterator {
 
         self.buf.clear();
         let num_bytes_read = self.reader.read_until(b'\n', &mut self.buf)?;
-        if self.buf.ends_with(&[b'\n']) {
+        if self.buf.ends_with(b"\n") {
             self.buf.pop();
 
-            if self.buf.ends_with(&[b'\r']) {
+            if self.buf.ends_with(b"\r") {
                 self.buf.pop();
             }
         }
 
-        if self.buf.len() == 0 && num_bytes_read > 0 {
+        if self.buf.is_empty() && num_bytes_read > 0 {
             self.lines.push_back(Line {
                 line: String::new(),
                 ends_on_form_feed: false,

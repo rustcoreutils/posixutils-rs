@@ -752,7 +752,7 @@ fn get_file_names_in_directory_order(directory: &str) -> io::Result<Vec<OsString
                     dirent_ref.d_name.as_ptr() as *const u8,
                     dirent_ref.d_name.len(),
                 );
-                let cstr = CStr::from_bytes_until_nul(bytes).map_err(|e| io::Error::other(e))?;
+                let cstr = CStr::from_bytes_until_nul(bytes).map_err(io::Error::other)?;
 
                 // Using an `OsString` because `to_string_lossy()` could
                 // possibly cause a name collision:
@@ -772,9 +772,7 @@ fn get_file_names_in_directory_order(directory: &str) -> io::Result<Vec<OsString
             return Err(io::Error::last_os_error());
         }
 
-        if let Err(e) = loop_result {
-            return Err(e);
-        }
+        loop_result?;
 
         Ok(filenames)
     }
@@ -787,7 +785,7 @@ fn display_entries(entries: &mut [Entry], config: &Config, dir_path: Option<&str
                 // Only considering the no-error case since the sorting
                 // order will get messed up anyway if even one entry in the
                 // `libc::readdir` call fails.
-                if let Ok(mut file_names) = get_file_names_in_directory_order(&dir_path) {
+                if let Ok(mut file_names) = get_file_names_in_directory_order(dir_path) {
                     if config.reverse_sorting {
                         file_names.reverse();
                     }
@@ -898,7 +896,7 @@ fn display_entries(entries: &mut [Entry], config: &Config, dir_path: Option<&str
                         }
                     }
                 }
-                println!("");
+                println!();
             }
         }
         OutputFormat::MultiColumnAcross => {
@@ -924,7 +922,7 @@ fn display_entries(entries: &mut [Entry], config: &Config, dir_path: Option<&str
             {
                 if col_idx == last_col_idx {
                     entry.print_multi_column(padding);
-                    println!("");
+                    println!();
                 } else {
                     entry.print_multi_column(padding);
                     print!("{:COLUMN_SPACING$}", "");
@@ -934,7 +932,7 @@ fn display_entries(entries: &mut [Entry], config: &Config, dir_path: Option<&str
             // If the last entry does not end up on the bottom right of
             // the grid
             if entries.len() % num_columns != 0 {
-                println!("");
+                println!();
             }
         }
         OutputFormat::StreamOutputFormat => {
@@ -1006,7 +1004,7 @@ fn display_entries(entries: &mut [Entry], config: &Config, dir_path: Option<&str
 
             for entry in entries.iter() {
                 entry.print_multi_column(padding);
-                println!("");
+                println!();
             }
         }
     }

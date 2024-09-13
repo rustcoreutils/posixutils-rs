@@ -26,3 +26,5 @@ path = "./tabs.rs"
 name = "tput"
 path = "./tput.rs"
 
+[lints]
+workspace = true

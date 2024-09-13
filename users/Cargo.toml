@@ -43,3 +43,5 @@ path = "./tty.rs"
 name = "write"
 path = "./write.rs"
 
+[lints]
+workspace = true

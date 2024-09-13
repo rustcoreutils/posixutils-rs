@@ -16,3 +16,6 @@ byteorder = "1.5.0"
 [[bin]]
 name = "gencat"
 path = "./gencat.rs"
+
+[lints]
+workspace = true

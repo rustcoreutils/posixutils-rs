@@ -17,3 +17,6 @@ rand = {version = "0.8", default-features = false, features = ["small_rng"] }
 [[bin]]
 name = "awk"
 path = "src/main.rs"
+
+[lints]
+workspace = true

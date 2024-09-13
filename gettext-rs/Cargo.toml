@@ -5,3 +5,6 @@ edition = "2021"
 
 [lib]
 name = "gettextrs"
+
+[lints]
+workspace = true

@@ -34,7 +34,7 @@ impl Hunk {
         let (ln1, ln2) = change.get_lns();
 
         Self {
-            kind: change.clone(),
+            kind: change,
             changes: vec![change; 1],
             ln1_start: ln1,
             ln1_end: ln1,
@@ -148,7 +148,7 @@ impl Hunk {
 
                 println!("{}c{}", self.f1_range(), self.f2_range());
 
-                let mut replaced_lines = vec![""; 0];
+                let mut replaced_lines = Vec::<&str>::new();
 
                 for change in &self.changes {
                     let (new, old) = (
@@ -326,7 +326,7 @@ pub struct Hunks {
 impl Hunks {
     pub fn new() -> Self {
         Self {
-            hunks: vec![Hunk::new(); 0],
+            hunks: Vec::<Hunk>::new(),
         }
     }
 

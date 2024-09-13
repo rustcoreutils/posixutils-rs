@@ -27,3 +27,6 @@ path = "./pathchk.rs"
 [[bin]]
 name = "realpath"
 path = "./realpath.rs"
+
+[lints]
+workspace = true

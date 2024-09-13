@@ -88,3 +88,5 @@ path = "./touch.rs"
 name = "unlink"
 path = "./unlink.rs"
 
+[lints]
+workspace = true

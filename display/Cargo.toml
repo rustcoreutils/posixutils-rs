@@ -19,3 +19,5 @@ path = "./echo.rs"
 name = "printf"
 path = "./printf.rs"
 
+[lints]
+workspace = true

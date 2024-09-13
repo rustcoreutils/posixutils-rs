@@ -13,22 +13,19 @@ use std::path::PathBuf;
 
 pub fn input_stream(pathname: &PathBuf, dashed_stdin: bool) -> io::Result<Box<dyn Read>> {
     // open file, or stdin
-    let file: Box<dyn Read>;
     let path_str = pathname.as_os_str();
-    if dashed_stdin && path_str == "-" {
-        file = Box::new(io::stdin().lock());
-    } else if !dashed_stdin && path_str == "" {
-        file = Box::new(io::stdin().lock());
+    let file: Box<dyn Read> = if (dashed_stdin && path_str == "-") || (!dashed_stdin && path_str.is_empty()) {
+        Box::new(io::stdin().lock())
     } else {
-        file = Box::new(fs::File::open(pathname)?);
-    }
+        Box::new(fs::File::open(pathname)?)
+    };
 
     Ok(file)
 }
 
 pub fn input_stream_opt(pathname: &Option<PathBuf>) -> io::Result<Box<dyn Read>> {
     match pathname {
-        Some(path) => input_stream(&path, false),
+        Some(path) => input_stream(path, false),
         None => input_stream(&PathBuf::new(), false),
     }
 }

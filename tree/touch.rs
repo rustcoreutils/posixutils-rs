@@ -87,7 +87,7 @@ fn parse_tm_posix(time: &str) -> Result<DateTime<Utc>, Box<dyn std::error::Error
 
         // format: YYMMDDhhmm[.SS]
         10 => {
-            let mut yearling = *&time[0..2].parse::<u32>()?;
+            let mut yearling = time[0..2].parse::<u32>()?;
             if yearling <= 68 {
                 yearling += 2000;
             } else {

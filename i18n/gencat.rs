@@ -411,7 +411,7 @@ impl MessageCatalog {
                     msg
                 };
 
-                catalog.add_msg(&current_set.as_ref().unwrap(), msg_id, msg);
+                catalog.add_msg(current_set.as_ref().unwrap(), msg_id, msg);
             }
         }
 
@@ -792,10 +792,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             catalog.write_catfile(&mut buffer)?;
 
             if catfile_path_str == "-" {
-                io::stdout().write_all(&buffer.get_ref())?;
+                io::stdout().write_all(buffer.get_ref())?;
             } else {
                 let mut file = File::create(&args.catfile)?;
-                file.write_all(&buffer.get_ref())?;
+                file.write_all(buffer.get_ref())?;
             }
         }
         Err(err) => {

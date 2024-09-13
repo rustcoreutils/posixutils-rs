@@ -3,7 +3,7 @@ use std::{
     fs::File,
     hash::{DefaultHasher, Hash, Hasher},
     io::{self, Read},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::SystemTime,
 };
 
@@ -35,7 +35,7 @@ pub fn vec_min(nums: &[usize]) -> usize {
         }
     }
 
-    return result;
+    result
 }
 
 pub fn is_binary(file_path: &PathBuf) -> io::Result<bool> {
@@ -53,11 +53,11 @@ pub fn is_binary(file_path: &PathBuf) -> io::Result<bool> {
     Ok(false)
 }
 
-pub fn check_existance(path_buf: &PathBuf) -> io::Result<bool> {
-    if path_buf.exists() == false {
+pub fn check_existance(path: &Path) -> io::Result<bool> {
+    if path.exists() == false {
         println!(
             "diff: {}: No such file or directory",
-            path_buf.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME)
+            path.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME)
         );
 
         return Ok(false);

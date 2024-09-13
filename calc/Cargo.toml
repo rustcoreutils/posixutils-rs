@@ -21,3 +21,6 @@ path = "./expr.rs"
 [[bin]]
 name = "bc"
 path = "./bc.rs"
+
+[lints]
+workspace = true

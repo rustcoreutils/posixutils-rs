@@ -106,7 +106,7 @@ fn move_file(
     source: &Path,
     target: &Path,
     inode_map: &mut HashMap<(u64, u64), (ftw::FileDescriptor, CString)>,
-    mut created_files: Option<&mut HashSet<PathBuf>>,
+    created_files: Option<&mut HashSet<PathBuf>>,
 ) -> io::Result<bool> {
     let source_filename = CString::new(source.as_os_str().as_bytes()).unwrap();
     let target_filename = CString::new(target.as_os_str().as_bytes()).unwrap();
@@ -292,7 +292,7 @@ fn move_file(
             .map_err(err_inter_device)?;
     }
 
-    let created_files = match created_files.as_deref_mut() {
+    let created_files = match created_files {
         Some(set) => set,
         None => &mut HashSet::new(),
     };

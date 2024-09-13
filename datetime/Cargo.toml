@@ -28,3 +28,6 @@ path = "./sleep.rs"
 [[bin]]
 name = "time"
 path = "./time.rs"
+
+[lints]
+workspace = true

@@ -244,7 +244,7 @@ fn show_info(args: &Args, info: &MountList) {
 
     for mount in &info.mounts {
         if mount.masked {
-            show_mount(args, block_size, &mount);
+            show_mount(args, block_size, mount);
         }
     }
 }

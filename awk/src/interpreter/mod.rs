@@ -107,7 +107,7 @@ fn maybe_numeric_string<S: Into<AwkString>>(str: S) -> AwkString {
     let numeric_string = is_valid_number(
         str.as_str()
             .trim()
-            .trim_start_matches(|c| c == '+' || c == '-'),
+            .trim_start_matches(['+', '-']),
     );
     str.is_numeric = numeric_string;
     str

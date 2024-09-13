@@ -422,7 +422,7 @@ enum ProcessFileResult {
 }
 
 fn process_file<F, H>(
-    path_stack: &Vec<Rc<[libc::c_char]>>,
+    path_stack: &[Rc<[libc::c_char]>],
     dir_fd: &FileDescriptor,
     entry_filename: Rc<[libc::c_char]>,
     follow_symlinks: bool,
@@ -439,7 +439,7 @@ where
         Ok(md) => md,
         Err(e) => {
             err_reporter(
-                Entry::new(dir_fd, &path_stack, &entry_filename, None),
+                Entry::new(dir_fd, path_stack, &entry_filename, None),
                 Error::new(e, ErrorKind::Stat),
             );
             return ProcessFileResult::NotProcessed;
@@ -490,23 +490,23 @@ where
                 // Is the directory searchable?
                 if entry_metadata.is_executable() {
                     if conserve_fds {
-                        return ProcessFileResult::ProcessedDirectory(NodeOrMetadata::Metadata(
+                        ProcessFileResult::ProcessedDirectory(NodeOrMetadata::Metadata(
                             entry_metadata,
-                        ));
+                        ))
                     } else {
                         match OwnedDir::open_at(dir_fd, entry_filename.as_ptr()) {
                             Ok(new_dir) => {
-                                return ProcessFileResult::ProcessedDirectory(
+                                ProcessFileResult::ProcessedDirectory(
                                     NodeOrMetadata::TreeNode(TreeNode {
                                         dir: HybridDir::Owned(new_dir),
                                         filename: entry_filename,
                                         metadata: entry_metadata,
-                                    }),
-                                );
+                                    })
+                                )
                             }
                             Err(error) => {
                                 err_reporter(entry, error);
-                                return ProcessFileResult::NotProcessed;
+                                ProcessFileResult::NotProcessed
                             }
                         }
                     }
@@ -515,18 +515,18 @@ where
                     // lowercase for "permission" in the error message so don't use that here.
                     let e = io::Error::from_raw_os_error(libc::EACCES);
                     err_reporter(entry, Error::new(e, ErrorKind::DirNotSearchable));
-                    return ProcessFileResult::NotProcessed;
+                    ProcessFileResult::NotProcessed
                 }
             } else {
-                return ProcessFileResult::ProcessedFile;
+                ProcessFileResult::ProcessedFile
             }
         }
         Ok(false) => {
             // `false` means skip the directory
-            return ProcessFileResult::Skipped;
+            ProcessFileResult::Skipped
         }
         Err(_) => {
-            return ProcessFileResult::NotProcessed;
+            ProcessFileResult::NotProcessed
         }
     }
 }
@@ -583,7 +583,7 @@ where
                 Err(e) => {
                     if let Some(path_stack) = &path_stack {
                         err_reporter(
-                            Entry::new(&starting_dir, &path_stack, &filename, None),
+                            Entry::new(&starting_dir, path_stack, &filename, None),
                             Error::new(e, ErrorKind::Open),
                         );
                     }
@@ -607,12 +607,12 @@ where
 ///
 /// # Arguments
 /// * `path` - Pathname of the directory. Passing a file to this argument will cause the function to
-/// return `false` but will otherwise allow processing the file inside `file_handler` like a normal
-/// entry.
+///   return `false` but will otherwise allow processing the file inside `file_handler` like a normal
+///   entry.
 ///
 /// * `file_handler` - Called for each entry in the tree. If the current entry is a directory, its
-/// contents will be skipped if `file_handler` returns `false`. The return value of `file_handler`
-/// is ignored when the entry is a file.
+///   contents will be skipped if `file_handler` returns `false`. The return value of `file_handler`
+///   is ignored when the entry is a file.
 ///
 /// * `postprocess_dir` - Called when `traverse_directory` is exiting a directory.
 ///
@@ -881,7 +881,7 @@ fn read_link_at(
 
     let num_bytes = ret as usize;
     buf.shrink_to(num_bytes);
-    return Ok(Rc::from(buf.into_boxed_slice()));
+    Ok(Rc::from(buf.into_boxed_slice()))
 }
 
 // Build the full path of an entry

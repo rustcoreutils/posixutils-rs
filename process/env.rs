@@ -59,7 +59,7 @@ fn merge_env(new_env: &Vec<String>, clear: bool) -> HashMap<String, String> {
 
     if !clear {
         for (key, value) in env::vars() {
-            map.insert(String::from(key), String::from(value));
+            map.insert(key, value);
         }
     }
 

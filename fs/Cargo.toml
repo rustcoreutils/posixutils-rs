@@ -16,3 +16,5 @@ libc.workspace = true
 name = "df"
 path = "./df.rs"
 
+[lints]
+workspace = true

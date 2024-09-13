@@ -139,16 +139,11 @@ fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
     };
 
     if path1_is_file && path2_is_file {
-        return FileDiff::file_diff(path1, path2, &format_options, None);
+        FileDiff::file_diff(path1, path2, &format_options, None)
     } else if !path1_is_file && !path2_is_file {
-        return DirDiff::dir_diff(
-            PathBuf::from(path1),
-            PathBuf::from(path2),
-            &format_options,
-            args.recurse,
-        );
+        DirDiff::dir_diff(path1, path2, &format_options, args.recurse)
     } else {
-        return FileDiff::file_dir_diff(path1, path2, &format_options);
+        FileDiff::file_dir_diff(path1, path2, &format_options)
     }
 }
 
@@ -164,5 +159,5 @@ fn main() -> Result<DiffExitStatus, Box<dyn std::error::Error>> {
         eprintln!("diff: {}", error);
     }
 
-    return Ok(DiffExitStatus::NotDifferent);
+    Ok(DiffExitStatus::NotDifferent)
 }

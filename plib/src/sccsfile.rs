@@ -167,8 +167,8 @@ fn parse_deltas(lines: &[&str]) -> Result<Vec<SccsDelta>, &'static str> {
                 comments: String::new(),
             });
         } else if in_delta_section {
-            if line.starts_with("c ") {
-                current_comments.push_str(&line[2..]);
+            if let Some(st) = line.strip_prefix("c ") {
+                current_comments.push_str(st);
                 current_comments.push('\n');
             } else if line.starts_with("e") {
                 if let Some(last_delta) = deltas.last_mut() {

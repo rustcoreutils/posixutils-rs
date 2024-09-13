@@ -33,3 +33,5 @@ test-log = { version = "0.2", default-features=false, features=["log"]}
 [build-dependencies]
 m4-test-manager = { path = "./test-manager" }
 
+[lints]
+workspace = true

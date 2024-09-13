@@ -151,7 +151,7 @@ fn parse_cmd_line(args: &Args) -> Result<Vec<u16>, &'static str> {
         for stop in tabstops_str.split(',') {
             tabstops.push(
                 stop.parse()
-                    .expect(gettext("Invalid tabstop value.").as_str()),
+                    .unwrap_or_else(|_| { panic!("{}", gettext("Invalid tabstop value.")) }),
             );
         }
     }

@@ -33,7 +33,7 @@ struct Args {
     /// - n - No line numbering.
     ///
     /// - pREGEX - Number only lines that contain the basic regular expression
-    /// specified in *REGEX*.
+    ///   specified in *REGEX*.
     #[arg(short = 'b', long, default_value_t = LineNumberingStyle::NonEmpty)]
     body_numbering: LineNumberingStyle,
 
@@ -112,9 +112,9 @@ impl FromStr for LineNumberingStyle {
             s => {
                 if let Some(re) = s.strip_prefix('p') {
                     if let Ok(regexp) = Regex::new(re) {
-                        return Ok(LineNumberingStyle::Regex(regexp));
+                        Ok(LineNumberingStyle::Regex(regexp))
                     } else {
-                        return Err(format!("invalid regular expression: {re}"));
+                        Err(format!("invalid regular expression: {re}"))
                     }
                 } else {
                     Err(format!("invalid variant: {s}"))
@@ -299,7 +299,7 @@ fn nl_main(args: &Args) -> io::Result<()> {
                     line_number = args.starting_line_number;
                     line_number_overflowed = false;
                 }
-                println!("");
+                println!();
             }
         } else {
             break;

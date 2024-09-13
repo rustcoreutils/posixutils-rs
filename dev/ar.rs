@@ -236,7 +236,7 @@ impl ArchiveMember {
         writer.write_all(&object::archive::TERMINATOR)?;
         writer.write_all(&self.data)?;
         if self.data.len() % 2 != 0 {
-            writer.write_all(&[b'\n'])?;
+            writer.write_all(b"\n")?;
         }
 
         Ok(())

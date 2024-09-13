@@ -39,3 +39,5 @@ path = "./renice.rs"
 name = "xargs"
 path = "./xargs.rs"
 
+[lints]
+workspace = true

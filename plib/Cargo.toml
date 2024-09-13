@@ -11,3 +11,6 @@ libc.workspace = true
 
 [lib]
 doctest = false
+
+[lints]
+workspace = true

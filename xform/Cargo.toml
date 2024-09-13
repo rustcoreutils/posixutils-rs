@@ -32,3 +32,6 @@ path = "./uudecode.rs"
 [[bin]]
 name = "uuencode"
 path = "./uuencode.rs"
+
+[lints]
+workspace = true

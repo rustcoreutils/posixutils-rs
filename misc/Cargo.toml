@@ -24,3 +24,6 @@ path = "./false.rs"
 [[bin]]
 name = "test"
 path = "./test.rs"
+
+[lints]
+workspace = true

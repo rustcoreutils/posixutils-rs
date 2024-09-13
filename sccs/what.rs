@@ -40,7 +40,7 @@ fn process_file<R: BufRead>(reader: R, single: bool) -> io::Result<()> {
             }
             let rest = &line[start + pos + 4..];
             if let Some(end) =
-                rest.find(|c| c == '"' || c == '>' || c == '\n' || c == '\\' || c == '\0')
+                rest.find(['"', '>', '\n', '\\', '\0'])
             {
                 println!("@(#){}", &rest[..end]);
             } else {
@@ -62,7 +62,7 @@ fn main() -> io::Result<()> {
 
     for file in &args.files {
         let path = Path::new(file);
-        if let Ok(file) = File::open(&path) {
+        if let Ok(file) = File::open(path) {
             let reader = BufReader::new(file);
             process_file(reader, args.single)?;
         } else {

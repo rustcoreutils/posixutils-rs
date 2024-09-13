@@ -15,3 +15,5 @@ gettext-rs.workspace = true
 name = "what"
 path = "./what.rs"
 
+[lints]
+workspace = true

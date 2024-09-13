@@ -47,3 +47,6 @@ path = "./file.rs"
 [[bin]]
 name = "find"
 path = "./find.rs"
+
+[lints]
+workspace = true

@@ -38,3 +38,6 @@ path = "./uname.rs"
 name = "who"
 path = "./who.rs"
 
+
+[lints]
+workspace = true

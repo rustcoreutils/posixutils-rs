@@ -1,8 +1,8 @@
 
 # posixutils-rs
 
-This is a suite of Rust-native core command line utilties (cp, mv, c99,
-m4, make, ...) using SuSv3 as the base POSIX specification.
+This is a suite of Rust-native core command line utilties (cp, mv,
+awk, make, vi, ...) using POSIX.2024 as the baseline specification.
 
 ## Goals
 
@@ -14,11 +14,11 @@ Implementation goals include clean, safe Rust code and maximal use of
 small Rust community crates.  This project's utilities should "look like
 normal Rust programs."
 
+Core POSIX specification: https://pubs.opengroup.org/onlinepubs/9699919799/   (Old, free edition.  POSIX.2024 was just released.)
+
 ## WANTED:  Volunteers!
 
 Contributions are welcome.  Developers and non-developers alike, please read [CONTRIBUTING](CONTRIBUTING.md) for details, and [WANTED](WANTED.md) for recommended coding tasks for newcomers.
-
-Core specification: https://pubs.opengroup.org/onlinepubs/9699919799/
 
 ### Non-goals
 
@@ -58,6 +58,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
 ## Stage 3 - Test coverage
 
  - [x] ar (Development)
+ - [x] awk
  - [x] basename
  - [x] bc
  - [x] cksum
@@ -90,6 +91,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] paste
  - [x] pr
  - [x] readlink
+ - [x] realpath
  - [x] rm
  - [x] rmdir
  - [x] sort
@@ -150,7 +152,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] logger
  - [x] printf
  - [x] ps
- - [x] realpath
  - [x] stty
  - [x] tabs
  - [x] test
@@ -167,12 +168,12 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] crontab (cron cat.)
 
 ### Development category
- - [ ] c17 (Development)
+ - [ ] c17 (Development) -- Volunteer starting point at https://github.com/rustcoreutils/posixutils-rs/tree/c99
  - [ ] cflow (Development)
  - [ ] ctags (Development)
  - [ ] cxref (Development)
- - [ ] lex (Development)
- - [ ] yacc (Development)
+ - [ ] lex (Development) -- Volunteer starting point at https://github.com/rustcoreutils/posixutils-rs/tree/lex
+ - [ ] yacc (Development) -- Volunteer starting point at https://github.com/rustcoreutils/posixutils-rs/tree/yacc
 
 ### SCCS category
  - [ ] admin (SCCS)
@@ -187,7 +188,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
  ### i18n category
  - [ ] gettext (i18n)
- - [ ] iconv (i18n)
+ - [ ] iconv (i18n) (status: in progress)
  - [ ] locale (i18n)
  - [ ] localedef (i18n)
  - [ ] msgfmt (i18n)
@@ -201,24 +202,23 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
 ### Editors category
  - [ ] ed (Editors)
- - [ ] ex (Editors)
+ - [ ] ex (Editors) -- Volunteer starting point at https://github.com/rustcoreutils/posixutils-rs/tree/ed
  - [ ] vi (Editors)
 
 ### Misc. category
- - [ ] awk
- - [ ] fuser
+ - [ ] fuser (status: in progress)
  - [ ] lp
  - [ ] mailx
- - [ ] make
- - [ ] man
+ - [ ] make (status: in progress)
+ - [ ] man (status: in progress)
  - [ ] more
  - [ ] newgrp
- - [ ] patch
+ - [ ] patch (status: in progress)
  - [ ] pax
  - [ ] sed
- - [ ] sh
- - [ ] talk
- - [ ] timeout
+ - [ ] sh -- Volunteer starting point at https://github.com/rustcoreutils/posixutils-rs/tree/shell
+ - [ ] talk (status: in progress)
+ - [ ] timeout (status: in progress)
 
 ## Testing
 

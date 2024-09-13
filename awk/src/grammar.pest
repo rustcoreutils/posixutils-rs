@@ -1,0 +1,391 @@
+// 
+// Copyright (c) 2024 Hemi Labs, Inc.
+// 
+// This file is part of the posixutils-rs project covered under
+// the MIT License.  For the full license text, please see the LICENSE
+// file in the root directory of this project.
+// SPDX-License-Identifier: MIT
+// 
+
+WHITESPACE = _{ " " | "\t" | "\r" }
+COMMENT    = _{ "#" ~ (!"\n" ~ ANY)* ~ &"\n" }
+
+string          =  { "\"" ~ (("\\\"") | (!("\"" | "\n") ~ ANY))* ~ "\"" }
+ere             =  { "/" ~ (("\\" ~ "/") | (!("/" | "\n") ~ ANY))* ~ "/" }
+number          = @{ decimal_float | integer }
+digit           =  { ('0'..'9') }
+integer         = @{ digit+ }
+decimal_float   =  { (fractional_part ~ exponent? ~ float_suffix?) | (integer ~ exponent ~ float_suffix?) }
+fractional_part =  { (integer? ~ "." ~ integer) | integer ~ "." }
+exponent        =  { ("e" | "E") ~ sign? ~ integer }
+sign            =  { "+" | "-" }
+float_suffix    =  { "f" | "l" | "F" | "L" }
+
+letter    =  { ('a'..'z') | ('A'..'Z') }
+name      = @{ ((keyword | builtin_func) ~ (letter | "_" | digit)+) | (!(keyword | builtin_func) ~ (letter | "_") ~ (letter | "_" | digit)*) }
+func_name = @{ name ~ &"(" }
+
+builtin_func = _{
+    atan2
+  | cos
+  | sin
+  | exp
+  | log
+  | sqrt
+  | int
+  | rand
+  | srand
+  | gsub
+  | index
+  | length
+  | match_fn
+  | split
+  | sprintf
+  | substr
+  | sub
+  | tolower
+  | toupper
+  | close
+  | system
+}
+
+atan2    = { "atan2" }
+cos      = { "cos" }
+sin      = { "sin" }
+exp      = { "exp" }
+log      = { "log" }
+sqrt     = { "sqrt" }
+int      = { "int" }
+rand     = { "rand" }
+srand    = { "srand" }
+gsub     = { "gsub" }
+index    = { "index" }
+length   = { "length" }
+match_fn = { "match" }
+split    = { "split" }
+sprintf  = { "sprintf" }
+sub      = { "sub" }
+substr   = { "substr" }
+tolower  = { "tolower" }
+toupper  = { "toupper" }
+close    = { "close" }
+system   = { "system" }
+
+keyword = {
+    "if"
+  | "else"
+  | "while"
+  | "for"
+  | "foreach"
+  | "next"
+  | "break"
+  | "continue"
+  | "do"
+  | "return"
+  | "exit"
+  | "print"
+  | "printf"
+  | "in"
+  | "begin"
+  | "end"
+  | "function"
+  | "getline"
+}
+
+program = { SOI ~ opt_newline ~ (item ~ terminator)* ~ item? ~ EOI }
+
+terminator = _{ ";"? ~ "\n"* }
+
+opt_newline = _{ "\n"* }
+
+item = _{
+    begin_action
+  | end_action
+  | rule
+  | function_definition
+}
+
+begin_action = { "BEGIN" ~ action }
+end_action   = { "END" ~ action }
+
+rule = {
+    action
+  | pattern_and_action
+  | normal_pattern
+}
+
+pattern_and_action = {
+    normal_pattern ~ action
+}
+
+function_definition = { "function" ~ name ~ "(" ~ param_list? ~ ")" ~ opt_newline ~ action }
+
+param_list = { name ~ ("," ~ name)* }
+
+normal_pattern = { range_pattern | expr }
+range_pattern  = { expr ~ "," ~ opt_newline ~ expr }
+
+action = {
+    "{" ~ opt_newline ~ "}"
+  | "{" ~ opt_newline ~ terminated_statement* ~ unterminated_statement? ~ "}"
+}
+
+terminated_statement = _{
+    action ~ opt_newline
+  | t_if
+  | t_while
+  | t_for
+  | t_foreach
+  | empty_stmt
+  | terminatable_statement ~ "\n" ~ opt_newline
+  | terminatable_statement ~ ";" ~ opt_newline
+}
+
+t_if       =  { "if" ~ "(" ~ expr ~ ")" ~ opt_newline ~ terminated_statement ~ ("else" ~ opt_newline ~ terminated_statement)? }
+t_while    =  { "while" ~ "(" ~ expr ~ ")" ~ opt_newline ~ terminated_statement }
+t_for      =  { "for" ~ "(" ~ simple_statement? ~ ";" ~ expr? ~ ";" ~ simple_statement? ~ ")" ~ opt_newline ~ terminated_statement }
+t_foreach  =  { "for" ~ "(" ~ name ~ "in" ~ name ~ ")" ~ opt_newline ~ terminated_statement }
+empty_stmt = _{ ";" ~ opt_newline }
+
+unterminated_statement = _{
+    terminatable_statement
+  | ut_if
+  | ut_while
+  | ut_for
+  | ut_foreach
+}
+
+ut_if      = { "if" ~ "(" ~ expr ~ ")" ~ opt_newline ~ (unterminated_statement | terminated_statement ~ "else" ~ opt_newline ~ unterminated_statement) }
+ut_while   = { "while" ~ "(" ~ expr ~ ")" ~ opt_newline ~ unterminated_statement }
+ut_for     = { "for" ~ "(" ~ simple_statement? ~ ";" ~ expr? ~ ";" ~ simple_statement? ~ ")" ~ opt_newline ~ unterminated_statement }
+ut_foreach = { "for" ~ "(" ~ name ~ in_op ~ name ~ ")" ~ opt_newline ~ unterminated_statement }
+
+terminatable_statement = _{
+    simple_statement
+  | next
+  | break_stmt
+  | continue_stmt
+  | exit_stmt
+  | return_stmt
+  | do_while
+}
+
+do_while      = { "do" ~ opt_newline ~ terminated_statement ~ "while" ~ "(" ~ expr ~ ")" }
+next          = { "next" }
+break_stmt    = { "break" }
+continue_stmt = { "continue" }
+
+return_stmt = { "return" ~ expr? }
+exit_stmt   = { "exit" ~ expr? }
+
+simple_statement = {
+    delete_element
+  | print_stmt
+  | expr
+}
+
+delete_element = {
+    "delete" ~ name ~ "[" ~ expr ~ "]"
+}
+
+print_stmt = {
+    (printf_call | simple_printf | print_call | simple_print) ~ output_redirection?
+}
+
+simple_print       =  { "print" ~ print_expr_list? }
+print_call         =  { "print" ~ "(" ~ multiple_expr_list ~ ")" ~ !in_op }
+simple_printf      =  { "printf" ~ print_expr_list }
+printf_call        =  { "printf" ~ "(" ~ multiple_expr_list ~ ")" ~ !in_op }
+output_redirection = _{
+    truncate
+  | append
+  | pipe
+}
+
+truncate = { ">" ~ expr }
+append   = { ">>" ~ expr }
+pipe     = { "|" ~ expr }
+
+print_expr_list    = _{ print_expr ~ ("," ~ opt_newline ~ print_expr)* }
+expr_list          = _{ multiple_expr_list | expr }
+multiple_expr_list = _{ expr ~ ("," ~ opt_newline ~ expr)+ }
+
+primary = _{
+    "(" ~ expr ~ ")"
+  | ere
+  | number
+  | string
+  | builtin_function_call
+  | function_call
+  | lvalue
+}
+
+array_element         = { name ~ "[" ~ expr_list ~ "]" }
+function_call         = { func_name ~ "(" ~ expr_list? ~ ")" }
+builtin_function_call = { builtin_func ~ ("(" ~ expr_list? ~ ")")? }
+
+prefix_op = _{
+    pre_inc
+  | pre_dec
+  | not
+  | unary_plus
+  | negate
+}
+
+pre_inc    = { "++" }
+pre_dec    = { "--" }
+not        = { "!" }
+unary_plus = { "+" }
+negate     = { "-" }
+
+postfix_op = _{
+    post_inc
+  | post_dec
+}
+
+post_inc = { "++" }
+post_dec = { "--" }
+
+infix_op = _{
+    pow
+  | mul
+  | div
+  | modulus
+  | add
+  | binary_sub
+  | comp_op
+  | match_op
+  | not_match
+  | in_op
+  | and
+  | or
+  | concat
+}
+
+pow        = { "^" }
+mul        = { "*" }
+div        = { "/" }
+modulus    = { "%" }
+add        = { "+" }
+binary_sub = { "-" }
+match_op   = { "~" }
+not_match  = { "!~" }
+and        = { "&&" }
+or         = { "||" }
+concat     = { "" }
+in_op      = { "in" }
+
+comp_op = {
+    le
+  | lt
+  | ge
+  | gt
+  | ne
+  | eq
+}
+
+lt = { "<" }
+le = { "<=" }
+ne = { "!=" }
+eq = { "==" }
+gt = { ">" }
+ge = { ">=" }
+
+binary_expr = {
+    multidimensional_in
+  | simple_binary_expr
+}
+
+multidimensional_in    = { "(" ~ multidimensional_index ~ ")" ~ "in" ~ name }
+simple_binary_expr     = { prefix_op? ~ primary ~ postfix_op? ~ (infix_op ~ prefix_op? ~ primary ~ postfix_op?)* }
+multidimensional_index = { multiple_expr_list }
+
+ternary_expr = { binary_expr ~ "?" ~ expr ~ ":" ~ expr }
+
+assignment = { lvalue ~ assignment_op ~ expr }
+
+assignment_op = {
+    assign
+  | add_assign
+  | sub_assign
+  | mul_assign
+  | div_assign
+  | mod_assign
+  | pow_assign
+}
+
+assign     = { "=" }
+add_assign = { "+=" }
+sub_assign = { "-=" }
+mul_assign = { "*=" }
+div_assign = { "/=" }
+mod_assign = { "%=" }
+pow_assign = { "^=" }
+
+expr = {
+    input_function
+  | assignment
+  | ternary_expr
+  | binary_expr
+}
+
+lvalue = {
+    array_element
+  | name
+  | field_var
+}
+
+field_var = { "$" ~ primary }
+
+input_function = {
+    getline_from_pipe
+  | getline_from_file
+  | simple_getline
+}
+
+simple_getline    = { "getline" ~ lvalue? }
+getline_from_file = { "getline" ~ lvalue? ~ "<" ~ expr }
+getline_from_pipe = { unpiped_expr ~ (piped_getline)+ }
+piped_getline     = { "|" ~ "getline" ~ lvalue? }
+
+unpiped_expr           = {
+    unpiped_input_function
+  | assignment
+  | ternary_expr
+  | binary_expr
+}
+unpiped_input_function = {
+    getline_from_file
+  | simple_getline
+}
+
+print_infix_op           = _{
+    pow
+  | mul
+  | div
+  | modulus
+  | add
+  | binary_sub
+  | match_op
+  | not_match
+  | in_op
+  | and
+  | or
+  | concat
+}
+simple_binary_print_expr =  {
+    prefix_op? ~ primary ~ postfix_op? ~ (print_infix_op ~ prefix_op? ~ primary ~ postfix_op?)*
+}
+binary_print_expr        =  {
+    multidimensional_in
+  | simple_binary_print_expr
+}
+
+print_assignment   = { lvalue ~ assignment_op ~ print_expr }
+ternary_print_expr = { binary_print_expr ~ "?" ~ print_expr ~ ":" ~ print_expr }
+
+print_expr = {
+    print_assignment
+  | ternary_print_expr
+  | binary_print_expr
+}

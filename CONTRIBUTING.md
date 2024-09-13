@@ -49,7 +49,7 @@ There are several ways to contribute to posixutils-rs:
 * Support the most widely used GNU/BSD extensions
 * If a system has an OS-specific feature that _must_ be
   exposed through a given utility, do so.
-* Race-free userland.  `walker` crate should be able to help.
+* Race-free userland.  See `ftw` internal crate.
 * Push small crates out:  Create tiny, light-dep crates from common functionality (such as Lex or Yacc file parsing), and publish via cargo.  Remove from main posixutils tree and set of crates.
 
 ### Testing and Bug Reporting: Info to provide in GH issue

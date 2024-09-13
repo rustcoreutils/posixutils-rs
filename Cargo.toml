@@ -2,12 +2,14 @@
 resolver = "2"
 
 members = [
+	"awk",
 	"calc",
 	"datetime",
 	"dev",
 	"display",
 	"file",
 	"fs",
+	"ftw",
 	"m4",
 	"m4/test-manager",
 	"gettext-rs",
@@ -32,3 +34,4 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 libc = "0.2"
 regex = "1.10"
 gettext-rs = { path = "./gettext-rs" }
+errno = "0.3"

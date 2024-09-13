@@ -132,7 +132,7 @@ fn read_mount_info() -> io::Result<MountList> {
         for mount in mounts {
             let devname = to_cstr(&mount.f_mntfromname);
             let dirname = to_cstr(&mount.f_mntonname);
-            info.push(&mount, devname, dirname);
+            info.push(mount, devname, dirname);
         }
     }
 

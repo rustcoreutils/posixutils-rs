@@ -48,5 +48,3 @@ path = "./renice.rs"
 [[bin]]
 name = "xargs"
 path = "./xargs.rs"
-
-

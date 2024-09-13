@@ -2,12 +2,14 @@ use libc::uid_t;
 use plib::{run_test_with_checker, TestPlan};
 use std::{
     ffi::CStr,
-    fs::{self, File},
-    io::{self, Read},
+    fs, io,
     path::{Path, PathBuf},
     process::{Command, Output},
     str,
 };
+
+#[cfg(target_os = "linux")]
+use std::{fs::File, io::Read};
 use tokio::net::{TcpListener, UdpSocket, UnixListener};
 
 fn fuser_test(
@@ -80,8 +82,8 @@ fn get_process_user(pid: u32) -> io::Result<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn get_process_user(pid: u32) -> io::Result<String> {
-    let uid = unsafe{ libc::getuid() };
+fn get_process_user(_pid: u32) -> io::Result<String> {
+    let uid = unsafe { libc::getuid() };
     get_username_by_uid(uid)
 }
 
@@ -178,6 +180,7 @@ fn test_fuser_with_many_files() {
 }
 
 /// Starts a TCP server on port 8080.
+#[cfg(target_os = "linux")]
 async fn start_tcp_server() -> TcpListener {
     TcpListener::bind(("127.0.0.1", 8080))
         .await
@@ -204,6 +207,7 @@ async fn test_fuser_tcp() {
 }
 
 /// Starts a UDP server on port 8081.
+#[cfg(target_os = "linux")]
 async fn start_udp_server() -> UdpSocket {
     UdpSocket::bind(("127.0.0.1", 8081))
         .await
@@ -229,6 +233,7 @@ async fn test_fuser_udp() {
     });
 }
 /// Starts a Unix socket server at the specified path.
+#[cfg(target_os = "linux")]
 async fn start_unix_socket(socket_path: &str) -> UnixListener {
     if fs::metadata(socket_path).is_ok() {
         println!("A socket is already present. Deleting...");

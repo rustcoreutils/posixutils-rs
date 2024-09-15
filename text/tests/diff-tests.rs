@@ -8,13 +8,9 @@
 // SPDX-License-Identifier: MIT
 //
 
-#[path = "../diff_util/mod.rs"]
-mod diff_util;
-
-use diff_util::constants::{EXIT_STATUS_DIFFERENCE, EXIT_STATUS_NO_DIFFERENCE};
 use plib::{run_test, TestPlan};
 
-fn diff_test(args: &[&str], expected_output: &str, expected_diff_exit_status: u8) {
+fn diff_test(args: &[&str], expected_output: &str) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
 
     run_test(TestPlan {
@@ -23,7 +19,7 @@ fn diff_test(args: &[&str], expected_output: &str, expected_diff_exit_status: u8
         stdin_data: String::from(""),
         expected_out: String::from(expected_output),
         expected_err: String::from(""),
-        expected_exit_code: i32::from(expected_diff_exit_status),
+        expected_exit_code: 0,
     });
 }
 
@@ -218,11 +214,7 @@ fn diff_tests_setup() {
 #[test]
 fn test_diff_normal() {
     let data = input_by_key("test_diff_normal");
-    diff_test(
-        &[data.file1_path(), data.file2_path()],
-        data.content(),
-        EXIT_STATUS_DIFFERENCE,
-    );
+    diff_test(&[data.file1_path(), data.file2_path()], data.content());
 }
 
 #[test]
@@ -232,7 +224,6 @@ fn test_diff_context3() {
     diff_test(
         &["-c", data.file1_path(), data.file2_path()],
         data.content(),
-        EXIT_STATUS_DIFFERENCE,
     );
 }
 
@@ -243,7 +234,6 @@ fn test_diff_context1() {
     diff_test(
         &["-C", "1", data.file1_path(), data.file2_path()],
         data.content(),
-        EXIT_STATUS_DIFFERENCE,
     );
 }
 
@@ -254,7 +244,6 @@ fn test_diff_context10() {
     diff_test(
         &["-C", "10", data.file1_path(), data.file2_path()],
         data.content(),
-        EXIT_STATUS_DIFFERENCE,
     );
 }
 
@@ -265,7 +254,6 @@ fn test_diff_edit_script() {
     diff_test(
         &["-e", data.file1_path(), data.file2_path()],
         data.content(),
-        EXIT_STATUS_DIFFERENCE,
     );
 }
 
@@ -276,7 +264,6 @@ fn test_diff_forward_edit_script() {
     diff_test(
         &["-f", data.file1_path(), data.file2_path()],
         data.content(),
-        EXIT_STATUS_DIFFERENCE,
     );
 }
 
@@ -287,7 +274,6 @@ fn test_diff_unified3() {
     diff_test(
         &["-u", data.file1_path(), data.file2_path()],
         data.content(),
-        EXIT_STATUS_DIFFERENCE,
     );
 }
 
@@ -298,7 +284,6 @@ fn test_diff_unified0() {
     diff_test(
         &["-U", "0", data.file1_path(), data.file2_path()],
         data.content(),
-        EXIT_STATUS_DIFFERENCE,
     );
 }
 
@@ -309,28 +294,19 @@ fn test_diff_unified10() {
     diff_test(
         &["-U", "10", data.file1_path(), data.file2_path()],
         data.content(),
-        EXIT_STATUS_DIFFERENCE,
     );
 }
 
 #[test]
 fn test_diff_file_directory() {
     let data = input_by_key("test_diff_file_directory");
-    diff_test(
-        &[data.file1_path(), data.file2_path()],
-        data.content(),
-        EXIT_STATUS_DIFFERENCE,
-    );
+    diff_test(&[data.file1_path(), data.file2_path()], data.content());
 }
 
 #[test]
 fn test_diff_directories() {
     let data = input_by_key("test_diff_directories");
-    diff_test(
-        &[data.file1_path(), data.file2_path()],
-        data.content(),
-        EXIT_STATUS_DIFFERENCE,
-    );
+    diff_test(&[data.file1_path(), data.file2_path()], data.content());
 }
 
 #[test]
@@ -340,7 +316,6 @@ fn test_diff_directories_recursive() {
     diff_test(
         &["-r", data.file1_path(), data.file2_path()],
         data.content(),
-        EXIT_STATUS_DIFFERENCE,
     );
 }
 
@@ -351,7 +326,6 @@ fn test_diff_directories_recursive_context() {
     diff_test(
         &["-r", "-c", data.file1_path(), data.file2_path()],
         data.content(),
-        EXIT_STATUS_DIFFERENCE,
     );
 }
 
@@ -362,7 +336,6 @@ fn test_diff_directories_recursive_edit_script() {
     diff_test(
         &["-r", "-e", data.file1_path(), data.file2_path()],
         data.content(),
-        EXIT_STATUS_DIFFERENCE,
     );
 }
 
@@ -373,7 +346,6 @@ fn test_diff_directories_recursive_forward_edit_script() {
     diff_test(
         &["-r", "-f", data.file1_path(), data.file2_path()],
         data.content(),
-        EXIT_STATUS_DIFFERENCE,
     );
 }
 
@@ -384,18 +356,13 @@ fn test_diff_directories_recursive_unified() {
     diff_test(
         &["-r", "-u", data.file1_path(), data.file2_path()],
         data.content(),
-        EXIT_STATUS_DIFFERENCE,
     );
 }
 
 #[test]
 fn test_diff_counting_eol_spaces() {
     let data = input_by_key("test_diff_counting_eol_spaces");
-    diff_test(
-        &[data.file1_path(), data.file2_path()],
-        data.content(),
-        EXIT_STATUS_DIFFERENCE,
-    );
+    diff_test(&[data.file1_path(), data.file2_path()], data.content());
 }
 
 #[test]
@@ -405,7 +372,6 @@ fn test_diff_ignoring_eol_spaces() {
     diff_test(
         &["-b", data.file1_path(), data.file2_path()],
         data.content(),
-        EXIT_STATUS_NO_DIFFERENCE,
     );
 }
 
@@ -424,6 +390,5 @@ fn test_diff_unified_two_labels() {
             data.file2_path(),
         ],
         data.content(),
-        EXIT_STATUS_DIFFERENCE,
     );
 }

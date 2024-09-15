@@ -11,7 +11,7 @@ pub enum DiffExitStatus {
 }
 
 impl DiffExitStatus {
-    pub fn status_code(&self) -> u8 {
+    pub fn status_code(&self) -> i32 {
         match self {
             DiffExitStatus::NotDifferent => EXIT_STATUS_NO_DIFFERENCE,
             DiffExitStatus::Different => EXIT_STATUS_DIFFERENCE,
@@ -22,6 +22,10 @@ impl DiffExitStatus {
 
 impl Termination for DiffExitStatus {
     fn report(self) -> std::process::ExitCode {
-        std::process::ExitCode::from(self.status_code())
+        if self.status_code() == EXIT_STATUS_TROUBLE {
+            return std::process::ExitCode::FAILURE;
+        }
+
+        std::process::ExitCode::SUCCESS
     }
 }

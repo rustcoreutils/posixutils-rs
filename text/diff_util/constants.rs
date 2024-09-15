@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
-pub const EXIT_STATUS_NO_DIFFERENCE: u8 = 0_u8;
-pub const EXIT_STATUS_DIFFERENCE: u8 = 1_u8;
-pub const EXIT_STATUS_TROUBLE: u8 = 2_u8;
+pub const EXIT_STATUS_NO_DIFFERENCE: u8 = 0;
+pub const EXIT_STATUS_DIFFERENCE: u8 = 1;
+pub const EXIT_STATUS_TROUBLE: u8 = 2;
 pub const NO_NEW_LINE_AT_END_OF_FILE: &'static str = "\\ No newline at end of file";
 pub const COULD_NOT_UNWRAP_FILENAME: &'static str = "Could not unwrap filename!";
 pub const UTF8_NOT_ALLOWED_BYTES: [u8; 26] = [

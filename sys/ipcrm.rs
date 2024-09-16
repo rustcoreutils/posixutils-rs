@@ -7,10 +7,11 @@
 // SPDX-License-Identifier: MIT
 //
 
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 #[cfg(not(target_os = "macos"))]
 use libc::{msgctl, msgget, msqid_ds};
+
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use libc::{semctl, semget, shmctl, shmget, shmid_ds};
 use plib::PROJECT_NAME;
 use std::ffi::{c_int, c_ushort};
@@ -122,6 +123,7 @@ fn sem_key_lookup(semkey: i32) -> io::Result<i32> {
 }
 
 // Define the union semun as per your requirements
+#[cfg(not(target_env = "musl"))]
 #[repr(C)]
 union semun {
     val: c_int,               // for SETVAL
@@ -130,6 +132,7 @@ union semun {
                               // Depending on your platform, you might need to add other fields as well
 }
 
+#[cfg(not(target_env = "musl"))]
 fn sem_rm(semid: i32) -> io::Result<i32> {
     let arg = semun { val: 0 };
 
@@ -142,38 +145,53 @@ fn sem_rm(semid: i32) -> io::Result<i32> {
     }
 }
 
-fn remove_ipcs(args: &Args) -> io::Result<()> {
-    // remove semaphores
-    if let Some(semkey) = args.semkey {
-        let semid = sem_key_lookup(semkey)?;
-        sem_rm(semid)?;
-    }
-    if let Some(semid) = args.semid {
-        sem_rm(semid)?;
-    }
-
-    // remove shared memory segments
-    if let Some(shmkey) = args.shmkey {
-        let shmid = shm_key_lookup(shmkey)?;
-        shm_rm(shmid)?;
-    }
-    if let Some(shmid) = args.shmid {
-        shm_rm(shmid)?;
-    }
-
-    // remove message queues
-    #[cfg(not(target_os = "macos"))]
+fn remove_ipcs(
+    #[cfg_attr(target_env = "musl", allow(unused_variables))] args: &Args,
+) -> io::Result<()> {
     {
-        if let Some(msgkey) = args.msgkey {
-            let msgid = msg_key_lookup(msgkey)?;
-            msg_rm(msgid)?;
+        #[cfg(not(target_env = "musl"))]
+        {
+            // remove semaphores
+            if let Some(semkey) = args.semkey {
+                let semid = sem_key_lookup(semkey)?;
+                sem_rm(semid)?;
+            }
+            if let Some(semid) = args.semid {
+                sem_rm(semid)?;
+            }
+
+            // remove shared memory segments
+            if let Some(shmkey) = args.shmkey {
+                let shmid = shm_key_lookup(shmkey)?;
+                shm_rm(shmid)?;
+            }
+            if let Some(shmid) = args.shmid {
+                shm_rm(shmid)?;
+            }
+
+            // remove message queues
+            #[cfg(not(target_os = "macos"))]
+            {
+                if let Some(msgkey) = args.msgkey {
+                    let msgid = msg_key_lookup(msgkey)?;
+                    msg_rm(msgid)?;
+                }
+                if let Some(msgid) = args.msgid {
+                    msg_rm(msgid)?;
+                }
+            }
+
+            Ok(())
         }
-        if let Some(msgid) = args.msgid {
-            msg_rm(msgid)?;
+
+        #[cfg(target_env = "musl")]
+        {
+            // TODO
+            println!("Not supported on platform");
+
+            Ok(())
         }
     }
-
-    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

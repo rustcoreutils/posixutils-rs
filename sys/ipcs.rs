@@ -86,7 +86,7 @@ fn display_message_queues(_args: &Args) {
                 break;
             }
 
-            let key = msg_ds.msg_perm.__key; // Ensure the correct field name for your system
+            let key = plib::sys::get_key_from_msqid_ds(&msg_ds);
             let mode = msg_ds.msg_perm.mode;
             let uid = msg_ds.msg_perm.uid;
             let gid = msg_ds.msg_perm.gid;
@@ -150,10 +150,7 @@ fn display_shared_memory(_args: &Args) {
             continue;
         }
 
-        #[cfg(target_os = "macos")]
-        let key = shmbuf.shm_perm._key; // Check for the correct field name on your system
-        #[cfg(not(target_os = "macos"))]
-        let key = shmbuf.shm_perm.__key; // Check for the correct field name on your system
+        let key = plib::sys::get_key_from_ipc_perm(&shmbuf.shm_perm);
         let mode = shmbuf.shm_perm.mode;
         let uid = shmbuf.shm_perm.uid;
         let gid = shmbuf.shm_perm.gid;
@@ -184,53 +181,64 @@ fn display_shared_memory(_args: &Args) {
 }
 
 fn display_semaphores(_args: &Args) {
-    use libc::{semctl, semid_ds, IPC_STAT};
-    use std::ffi::CStr;
+    {
+        #[cfg(not(target_env = "musl"))]
+        {
+            use libc::{semctl, semid_ds, IPC_STAT};
+            use std::ffi::CStr;
 
-    let mut semid: i32 = 0;
-    let mut sem_ds: semid_ds = unsafe { std::mem::zeroed() };
+            let mut semid: i32 = 0;
+            let mut sem_ds: semid_ds = unsafe { std::mem::zeroed() };
 
-    println!("Semaphores:");
-    println!("T     ID     KEY        MODE       OWNER    GROUP    NSEMS");
+            println!("Semaphores:");
+            println!("T     ID     KEY        MODE       OWNER    GROUP    NSEMS");
 
-    loop {
-        if unsafe { semctl(semid, 0, IPC_STAT, &mut sem_ds) } == -1 {
-            break;
+            loop {
+                if unsafe { semctl(semid, 0, IPC_STAT, &mut sem_ds) } == -1 {
+                    break;
+                }
+
+                #[cfg(not(target_os = "macos"))]
+                let key = sem_ds.sem_perm.__key; // Check for the correct field name on your system
+                #[cfg(target_os = "macos")]
+                let key = sem_ds.sem_perm._key; // Check for the correct field name on your system
+
+                let mode = sem_ds.sem_perm.mode;
+                let uid = sem_ds.sem_perm.uid;
+                let gid = sem_ds.sem_perm.gid;
+
+                let owner = unsafe {
+                    CStr::from_ptr(libc::getpwuid(uid).as_ref().unwrap().pw_name)
+                        .to_str()
+                        .unwrap()
+                };
+                let group = unsafe {
+                    CStr::from_ptr(libc::getgrgid(gid).as_ref().unwrap().gr_name)
+                        .to_str()
+                        .unwrap()
+                };
+
+                let mode_str = format!(
+                    "{}{}{}",
+                    if mode & 0o400 != 0 { "r" } else { "-" },
+                    if mode & 0o200 != 0 { "w" } else { "-" },
+                    if mode & 0o100 != 0 { "a" } else { "-" }
+                );
+
+                println!(
+                    "s     {:<5}  0x{:08x}  {:<10}  {:<8}  {:<8}  {:<5}",
+                    semid, key, mode_str, owner, group, sem_ds.sem_nsems
+                );
+
+                semid += 1;
+            }
         }
 
-        #[cfg(not(target_os = "macos"))]
-        let key = sem_ds.sem_perm.__key; // Check for the correct field name on your system
-        #[cfg(target_os = "macos")]
-        let key = sem_ds.sem_perm._key; // Check for the correct field name on your system
-
-        let mode = sem_ds.sem_perm.mode;
-        let uid = sem_ds.sem_perm.uid;
-        let gid = sem_ds.sem_perm.gid;
-
-        let owner = unsafe {
-            CStr::from_ptr(libc::getpwuid(uid).as_ref().unwrap().pw_name)
-                .to_str()
-                .unwrap()
-        };
-        let group = unsafe {
-            CStr::from_ptr(libc::getgrgid(gid).as_ref().unwrap().gr_name)
-                .to_str()
-                .unwrap()
-        };
-
-        let mode_str = format!(
-            "{}{}{}",
-            if mode & 0o400 != 0 { "r" } else { "-" },
-            if mode & 0o200 != 0 { "w" } else { "-" },
-            if mode & 0o100 != 0 { "a" } else { "-" }
-        );
-
-        println!(
-            "s     {:<5}  0x{:08x}  {:<10}  {:<8}  {:<8}  {:<5}",
-            semid, key, mode_str, owner, group, sem_ds.sem_nsems
-        );
-
-        semid += 1;
+        #[cfg(target_env = "musl")]
+        {
+            // TODO
+            println!("Not supported on platform");
+        }
     }
 }
 

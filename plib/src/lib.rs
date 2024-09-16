@@ -12,7 +12,11 @@ pub mod group;
 pub mod io;
 pub mod lzw;
 pub mod modestr;
+pub mod platform;
+pub mod priority;
 pub mod sccsfile;
+pub mod sys;
+pub mod terminal;
 pub mod testing;
 pub mod utmpx;
 

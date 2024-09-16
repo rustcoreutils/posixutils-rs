@@ -11,12 +11,12 @@ mod ls_util;
 
 use clap::{CommandFactory, FromArgMatches, Parser};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use plib::terminal::get_terminal_width;
 use plib::PROJECT_NAME;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs;
 use std::io;
-use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -548,56 +548,6 @@ impl Config {
 
         (config, file)
     }
-}
-
-fn get_terminal_width() -> usize {
-    // Constants taken from:
-    // https://docs.rs/term_size/0.3.2/src/term_size/platform/unix.rs.html#5-19
-    const fn winsize_request_code() -> std::ffi::c_ulong {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        return 0x5413;
-
-        #[cfg(any(
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "netbsd",
-            target_os = "openbsd"
-        ))]
-        return 0x40087468;
-
-        #[cfg(target_os = "solaris")]
-        0x5468
-    }
-
-    // COLUMNS is usually automatically set and it even changes when the
-    // terminal window is resized.
-    if let Ok(s) = std::env::var("COLUMNS") {
-        if let Ok(num_columns) = s.parse() {
-            return num_columns;
-        }
-    }
-
-    // Fallback to manually querying via `ioctl`.
-    unsafe {
-        let mut winsize: MaybeUninit<libc::winsize> = MaybeUninit::zeroed();
-        let ret = libc::ioctl(
-            libc::STDOUT_FILENO,
-            winsize_request_code(),
-            winsize.as_mut_ptr(),
-        );
-
-        // We're only interested in stdout here unlike `term_size::dimensions`
-        // so we won't query further if the first `ioctl` call fails.
-        if ret == 0 {
-            let winsize = winsize.assume_init();
-            return winsize.ws_col as usize;
-        }
-    }
-
-    // Historical default terminal width is 80
-    80
 }
 
 /// Calculate how many columns will fit in `terminal_width` given

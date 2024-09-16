@@ -8,12 +8,11 @@
 //
 
 use clap::Parser;
-use errno::{errno, set_errno};
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use libc::{getpwnam, passwd};
+use plib::priority::{getpriority, setpriority};
 use plib::PROJECT_NAME;
 use std::ffi::CString;
-use std::io;
 
 const PRIO_MIN: i32 = -20;
 const PRIO_MAX: i32 = 20;
@@ -75,41 +74,6 @@ fn parse_id(which: u32, input: &str) -> Result<u32, &'static str> {
     }
 }
 
-fn xgetpriority(which: u32, id: u32) -> io::Result<i32> {
-    set_errno(errno::Errno(0));
-
-    #[cfg(not(target_os = "macos"))]
-    let res = unsafe { libc::getpriority(which, id) };
-
-    #[cfg(target_os = "macos")]
-    let res = unsafe { libc::getpriority(which as i32, id) };
-
-    let errno_res = errno().0;
-    if errno_res == 0 {
-        Ok(res)
-    } else {
-        let e = io::Error::from_raw_os_error(errno_res);
-        eprintln!("getpriority: {}", e);
-        Err(e)
-    }
-}
-
-fn xsetpriority(which: u32, id: u32, prio: i32) -> io::Result<()> {
-    #[cfg(not(target_os = "macos"))]
-    let res = unsafe { libc::setpriority(which, id, prio) };
-
-    #[cfg(target_os = "macos")]
-    let res = unsafe { libc::setpriority(which as i32, id, prio) };
-
-    if res < 0 {
-        let e = io::Error::last_os_error();
-        eprintln!("setpriority: {}", e);
-        Err(e)
-    } else {
-        Ok(())
-    }
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // parse command line arguments
     let args = Args::parse();
@@ -133,13 +97,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let id = parse_id(which, &args.id)?;
 
     // get current priority
-    let prio = xgetpriority(which, id)?;
+    let prio = getpriority(which, id)?;
 
     // adjust priority based on user input
     let newprio = (prio + args.niceval).clamp(PRIO_MIN, PRIO_MAX);
 
     // attempt to set new priority
-    xsetpriority(which, id, newprio)?;
+    setpriority(which, id, newprio)?;
 
     Ok(())
 }

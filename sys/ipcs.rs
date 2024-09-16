@@ -86,7 +86,7 @@ fn display_message_queues(_args: &Args) {
                 break;
             }
 
-            let key = plib::sys::get_key_from_msqid_ds(&msg_ds);
+            let key = plib::ipc::get_key_from_msqid_ds(&msg_ds);
             let mode = msg_ds.msg_perm.mode;
             let uid = msg_ds.msg_perm.uid;
             let gid = msg_ds.msg_perm.gid;
@@ -150,7 +150,7 @@ fn display_shared_memory(_args: &Args) {
             continue;
         }
 
-        let key = plib::sys::get_key_from_ipc_perm(&shmbuf.shm_perm);
+        let key = plib::ipc::get_key_from_ipc_perm(&shmbuf.shm_perm);
         let mode = shmbuf.shm_perm.mode;
         let uid = shmbuf.shm_perm.uid;
         let gid = shmbuf.shm_perm.gid;

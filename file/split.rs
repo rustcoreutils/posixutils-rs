@@ -70,7 +70,7 @@ impl OutputState {
         assert!(self.suffix_len > 1);
 
         if self.suffix.is_empty() {
-            self.suffix = String::from("a".repeat(self.suffix_len as usize));
+            self.suffix = "a".repeat(self.suffix_len as usize);
             return Ok(());
         }
 
@@ -137,7 +137,11 @@ impl OutputState {
     fn write(&mut self, buf: &[u8]) -> io::Result<()> {
         match &mut self.outf {
             None => {
-                assert!(false);
+                // TODO
+                #[allow(clippy::assertions_on_constants)]
+                {
+                    assert!(false);
+                }
                 Ok(())
             }
             Some(ref mut f) => f.write_all(buf),

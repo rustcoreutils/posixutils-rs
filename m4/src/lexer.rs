@@ -1,11 +1,11 @@
-//! REQUIEREMENTS:
+//! REQUIREMENTS:
 //!
 //! * Because m4 supports streaming input and output, it seems like we should probably support
-//! streaming lexing/parsing so that we don't run out of RAM.
+//!   streaming lexing/parsing so that we don't run out of RAM.
 //! * For good performance it seems like the lexer should probably take into account the current state of the macro
-//! definitions, otherwise potentially any input word not matching builtin macros could be a macro and we will need to re-analyze it in a second phase. Also I think there is the possibility to undefine builtin macros? in which case this is absolutely necessary. This seems relevant for nom https://github.com/rust-bakery/nom/issues/1419
-//!  So it seems like a good optimization that once we know a word is not a current macro name, to
-//!  forget trying to parse the rest of it as a macro.
+//!   definitions, otherwise potentially any input word not matching builtin macros could be a macro and we will need to re-analyze it in a second phase. Also I think there is the possibility to undefine builtin macros? in which case this is absolutely necessary. This seems relevant for nom https://github.com/rust-bakery/nom/issues/1419
+//!   So it seems like a good optimization that once we know a word is not a current macro name, to
+//!   forget trying to parse the rest of it as a macro.
 //! * Perhaps this might be useful https://github.com/fflorent/nom_locate/blob/master/README.md
 //!
 //! Taking a look at this BSD licensed code

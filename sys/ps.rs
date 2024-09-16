@@ -31,10 +31,13 @@ fn main() {
     if args.all {
         match platform::list_processes() {
             Ok(processes) => {
-                println!(
-                    "{:<5} {:<5} {:<5} {:<5} {}",
-                    "PID", "PPID", "UID", "GID", "COMMAND"
-                );
+                #[allow(clippy::print_literal)]
+                {
+                    println!(
+                        "{:<5} {:<5} {:<5} {:<5} {}",
+                        "PID", "PPID", "UID", "GID", "COMMAND"
+                    );
+                }
                 for proc in processes {
                     println!(
                         "{:<5} {:<5} {:<5} {:<5} {}",

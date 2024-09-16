@@ -149,10 +149,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match &args.timestr {
         None => show_time(args.utc, DEF_TIMESTR),
         Some(timestr) => {
-            if timestr.starts_with("+") {
-                show_time(args.utc, &timestr[1..]);
+            if let Some(st) = timestr.strip_prefix("+") {
+                show_time(args.utc, st);
             } else {
-                set_time(args.utc, &timestr)?;
+                set_time(args.utc, timestr)?;
             }
         }
     }

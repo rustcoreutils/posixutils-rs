@@ -241,7 +241,11 @@ fn get_current_date() -> String {
 }
 
 fn display_ipc_status(args: &Args) {
-    println!("IPC status from {} as of {}", "source", get_current_date());
+    // TODO: Add "source"
+    #[allow(clippy::print_literal)]
+    {
+        println!("IPC status from {} as of {}", "source", get_current_date());
+    }
 
     if args.message_queues {
         display_message_queues(args);

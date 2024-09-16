@@ -110,11 +110,8 @@ enum ParseState {
 }
 
 pub fn parse(mode: &str) -> Result<ChmodMode, String> {
-    match u32::from_str_radix(mode, 8) {
-        Ok(m) => {
-            return Ok(ChmodMode::Absolute(m));
-        }
-        Err(_) => {}
+    if let Ok(m) = u32::from_str_radix(mode, 8) {
+        return Ok(ChmodMode::Absolute(m));
     }
 
     let mut state = ParseState::Wholist;

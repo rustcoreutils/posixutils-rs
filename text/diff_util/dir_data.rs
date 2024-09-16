@@ -39,6 +39,6 @@ impl DirData {
     }
 
     pub fn path_str(&self) -> &str {
-        &self.path.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME)
+        self.path.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME)
     }
 }

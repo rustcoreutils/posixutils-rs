@@ -261,25 +261,34 @@ impl MessageCatalog {
     pub fn new(
         #[cfg_attr(target_os = "macos", allow(unused_variables))] build_default: bool,
     ) -> Self {
-        #[cfg(target_os = "macos")]
-        let catalog;
-
-        #[cfg(not(target_os = "macos"))]
-        let mut catalog;
-
-        catalog = MessageCatalog {
+        let message_catalog = MessageCatalog {
             cat: Cat {
                 first_set: None,
                 last_set: None,
             },
         };
 
-        #[cfg(not(target_os = "macos"))]
-        if build_default {
-            catalog.add_set(NL_SETD, String::from("Default Set"));
-        }
+        let message_catalog_to_use: MessageCatalog = {
+            #[cfg(target_os = "macos")]
+            {
+                message_catalog
+            }
 
-        catalog
+            #[cfg(not(target_os = "macos"))]
+            {
+                if build_default {
+                    let mut message_catalog_mut = message_catalog;
+
+                    message_catalog_mut.add_set(NL_SETD, String::from("Default Set"));
+
+                    message_catalog_mut
+                } else {
+                    message_catalog
+                }
+            }
+        };
+
+        message_catalog_to_use
     }
 
     /// Parse the message file and override the catalog file(if it already exists)
@@ -411,7 +420,7 @@ impl MessageCatalog {
                     msg
                 };
 
-                catalog.add_msg(&current_set.as_ref().unwrap(), msg_id, msg);
+                catalog.add_msg(current_set.as_ref().unwrap(), msg_id, msg);
             }
         }
 
@@ -792,10 +801,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             catalog.write_catfile(&mut buffer)?;
 
             if catfile_path_str == "-" {
-                io::stdout().write_all(&buffer.get_ref())?;
+                io::stdout().write_all(buffer.get_ref())?;
             } else {
                 let mut file = File::create(&args.catfile)?;
-                file.write_all(&buffer.get_ref())?;
+                file.write_all(buffer.get_ref())?;
             }
         }
         Err(err) => {

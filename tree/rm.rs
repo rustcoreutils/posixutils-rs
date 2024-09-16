@@ -251,7 +251,7 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
     }
 
     // Also forbidden to `rm` the root directory
-    if let Ok(abspath) = fs::canonicalize(&filepath) {
+    if let Ok(abspath) = fs::canonicalize(filepath) {
         if abspath.as_os_str() == "/" {
             // If the arg is verbatim "/"
             let err_str = if filepath.as_os_str() == "/" {
@@ -272,7 +272,7 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
             let md = entry.metadata().unwrap();
 
             if md.file_type() == ftw::FileType::Directory {
-                match process_directory(cfg, &entry, &md) {
+                match process_directory(cfg, &entry, md) {
                     Ok(dir_action) => match dir_action {
                         DirAction::Entered => Ok(true),
                         DirAction::Removed | DirAction::Skipped => Ok(false),
@@ -283,7 +283,7 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
                     }
                 }
             } else {
-                if should_remove_file(cfg, &md, || entry.path().clean_trailing_slashes()) {
+                if should_remove_file(cfg, md, || entry.path().clean_trailing_slashes()) {
                     // Remove the file
                     let ret =
                         unsafe { libc::unlinkat(entry.dir_fd(), entry.file_name().as_ptr(), 0) };
@@ -408,7 +408,7 @@ fn rm_file(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
 }
 
 fn rm_path(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
-    let metadata = match fs::symlink_metadata(&filepath) {
+    let metadata = match fs::symlink_metadata(filepath) {
         Ok(md) => md,
         Err(e) => {
             // Not an error with -f in the case of operands that do not exist

@@ -81,7 +81,7 @@ impl FileData {
             }
         }
 
-        return COULD_NOT_UNWRAP_FILENAME;
+        COULD_NOT_UNWRAP_FILENAME
     }
 
     pub fn set_change(&mut self, change: Change, index: usize) {
@@ -102,7 +102,7 @@ impl FileData {
             }
         }
 
-        return false;
+        false
     }
 
     pub fn change(&self, index: usize) -> &Change {
@@ -110,6 +110,6 @@ impl FileData {
     }
 
     pub fn path(&self) -> &str {
-        self.path.to_str().unwrap_or(&COULD_NOT_UNWRAP_FILENAME)
+        self.path.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME)
     }
 }

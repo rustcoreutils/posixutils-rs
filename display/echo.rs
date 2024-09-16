@@ -55,7 +55,7 @@ fn translate_str(skip_nl: bool, s: &str) -> String {
                     output.push('\x11');
                 }
                 '\\' => {
-                    output.push_str("\\");
+                    output.push('\\');
                 }
                 _ => {}
             }
@@ -65,7 +65,7 @@ fn translate_str(skip_nl: bool, s: &str) -> String {
     }
 
     if nl && !skip_nl {
-        output.push_str("\n");
+        output.push('\n');
     }
 
     output

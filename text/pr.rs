@@ -20,10 +20,10 @@ use std::process::ExitCode;
 
 use self::pr_util::{line_transform, Args, PageIterator, Parameters};
 
-const FORM_FEED: char = 12 as char;
+const FORM_FEED: char = 12_u8 as char;
 const TAB: char = '\t';
-const BACKSPACE: char = 8 as char;
-const ALERT: char = 7 as char;
+const BACKSPACE: char = 8_u8 as char;
+const ALERT: char = 7_u8 as char;
 const CARRIAGE_RETURN: char = '\r';
 
 const DATE_TIME_FORMAT: &str = "%b %d %H:%M %Y";
@@ -110,7 +110,7 @@ fn print_footer(form_feed_as_page_separator: bool) {
     if form_feed_as_page_separator {
         print!("{FORM_FEED}");
     } else {
-        println!("");
+        println!();
     }
 }
 
@@ -254,7 +254,7 @@ fn pr_serial(path: &PathBuf, params: &Parameters) -> io::Result<()> {
             if !params.omit_header {
                 print_header(
                     &dt,
-                    &*path.to_string_lossy(),
+                    &path.to_string_lossy(),
                     page_number,
                     params.header.as_deref(),
                     params.page_width,
@@ -343,7 +343,7 @@ fn pr_serial(path: &PathBuf, params: &Parameters) -> io::Result<()> {
             if !params.omit_header {
                 print_header(
                     &dt,
-                    &*path.to_string_lossy(),
+                    &path.to_string_lossy(),
                     page_number,
                     params.header.as_deref(),
                     params.page_width,

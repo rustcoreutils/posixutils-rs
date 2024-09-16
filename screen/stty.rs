@@ -10,10 +10,6 @@
 // - stty get-short display
 //
 
-extern crate clap;
-extern crate libc;
-extern crate plib;
-
 mod osdata;
 
 use clap::Parser;

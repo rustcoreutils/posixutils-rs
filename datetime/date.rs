@@ -11,9 +11,6 @@
 // - double-check that Rust stftime() is POSIX compliant
 //
 
-extern crate clap;
-extern crate plib;
-
 use chrono::{DateTime, Datelike, Local, LocalResult, TimeZone, Utc};
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};

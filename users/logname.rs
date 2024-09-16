@@ -7,8 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-extern crate plib;
-
 fn main() {
     let username = plib::curuser::login_name();
 

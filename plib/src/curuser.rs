@@ -7,7 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-extern crate libc;
 use std::ffi::CStr;
 
 pub fn login_name() -> String {

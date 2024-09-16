@@ -7,8 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-extern crate clap;
-extern crate plib;
 use std::cmp::Ordering;
 
 use std::io::{ErrorKind, Read};

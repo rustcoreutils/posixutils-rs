@@ -8,11 +8,6 @@
 //
 //
 
-extern crate atty;
-extern crate clap;
-extern crate libc;
-extern crate plib;
-
 mod common;
 
 use self::common::{copy_file, error_string};

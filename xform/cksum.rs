@@ -15,9 +15,6 @@
 //   a Rust crate + our finalize() function.
 //
 
-extern crate clap;
-extern crate plib;
-
 mod crc32;
 
 use clap::Parser;

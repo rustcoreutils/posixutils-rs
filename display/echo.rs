@@ -13,8 +13,6 @@
 //	Write an 8-bit value that is the 0, 1, 2 or 3-digit octal number _num_.
 //
 
-extern crate plib;
-
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use std::io::{self, Write};

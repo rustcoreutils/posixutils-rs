@@ -11,9 +11,6 @@
 // - Research if 100 is a POSIX-compliant limit for MAX_STOPS
 //
 
-extern crate clap;
-extern crate plib;
-
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;

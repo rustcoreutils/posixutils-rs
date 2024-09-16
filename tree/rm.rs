@@ -7,10 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-extern crate atty;
-extern crate clap;
-extern crate plib;
-
 mod common;
 
 use self::common::error_string;

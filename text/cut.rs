@@ -380,7 +380,7 @@ fn read_range(line: &str) -> Result<Vec<(i32, i32)>, String> {
             let end = if range.len() == 1 {
                 start
             } else if nums[1].is_empty() {
-                std::i32::MAX - 1
+                i32::MAX - 1
             } else {
                 match nums[1].parse::<i32>() {
                     Err(err) => return Err(err.to_string()),

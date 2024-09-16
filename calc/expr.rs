@@ -185,19 +185,21 @@ fn cmpop(lhs: &Token, rhs: &Token, op: CmpOp) -> Result<Token, &'static str> {
     let lhs_int = token_to_int(lhs);
     let rhs_int = token_to_int(rhs);
 
-    // if both are integers, perform int comparison
-    if lhs_int.is_some() && rhs_int.is_some() {
-        Ok(cmpint(lhs_int.unwrap(), rhs_int.unwrap(), op))
-
-    // otherwise, convert int to string, and perform string compare
-    } else if let Some(val) = lhs_int {
-        let tmp = Token::Str(val.to_string());
-        cmpstr(&tmp, rhs, op)
-    } else if let Some(val) = rhs_int {
-        let tmp = Token::Str(val.to_string());
-        cmpstr(lhs, &tmp, op)
-    } else {
-        cmpstr(lhs, rhs, op)
+    match (lhs_int, rhs_int) {
+        (Some(lhs), Some(rhs)) => {
+            // if both are integers, perform int comparison
+            Ok(cmpint(lhs, rhs, op))
+        }
+        // otherwise, convert int to string, and perform string compare
+        (Some(lh), _) => {
+            let tmp = Token::Str(lh.to_string());
+            cmpstr(&tmp, rhs, op)
+        }
+        (_, Some(rh)) => {
+            let tmp = Token::Str(rh.to_string());
+            cmpstr(lhs, &tmp, op)
+        }
+        _ => cmpstr(lhs, rhs, op),
     }
 }
 

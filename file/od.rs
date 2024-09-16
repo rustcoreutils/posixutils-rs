@@ -177,14 +177,15 @@ fn parse_skip(offset: &str) -> Result<u64, Box<dyn std::error::Error>> {
     let (number, multiplier) = if offset.starts_with("0x") || offset.starts_with("0X") {
         // For hexadecimal, 'b' should be part of the number if it is the last character
         (offset, 1)
-    } else if offset.ends_with('b') {
-        (&offset[..offset.len() - 1], 512)
-    } else if offset.ends_with('k') {
-        (&offset[..offset.len() - 1], 1024)
-    } else if offset.ends_with('m') {
-        (&offset[..offset.len() - 1], 1048576)
     } else {
-        (offset, 1)
+        let mut chars = offset.chars();
+
+        match chars.next_back() {
+            Some('b') => (chars.as_str(), 512),
+            Some('k') => (chars.as_str(), 1024),
+            Some('m') => (chars.as_str(), 1048576),
+            _ => (offset, 1),
+        }
     };
 
     let base_value = parse_count::<u64>(number)?;

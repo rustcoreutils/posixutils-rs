@@ -421,7 +421,7 @@ impl Entry {
         match self_sorting_key.0.cmp(&other_sorting_key.0) {
             Ordering::Equal => {
                 match self_sorting_key.1.cmp(&other_sorting_key.1) {
-                    Ordering::Equal => self_sorting_key.2.cmp(&other_sorting_key.2),
+                    Ordering::Equal => self_sorting_key.2.cmp(other_sorting_key.2),
                     r => r.reverse(), // Default is from largest file size to smallest
                 }
             }

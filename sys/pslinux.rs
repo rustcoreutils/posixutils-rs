@@ -1,7 +1,7 @@
 use std::fs;
 use std::fs::read_to_string;
 use std::io::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub struct ProcessInfo {
     pub pid: i32,
@@ -27,7 +27,7 @@ pub fn list_processes() -> Result<Vec<ProcessInfo>, Error> {
     Ok(processes)
 }
 
-fn get_process_info(pid: i32, proc_path: &PathBuf) -> Option<ProcessInfo> {
+fn get_process_info(pid: i32, proc_path: &Path) -> Option<ProcessInfo> {
     let status_path = proc_path.join("status");
     let cmdline_path = proc_path.join("cmdline");
     let stat_path = proc_path.join("stat");

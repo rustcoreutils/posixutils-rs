@@ -724,7 +724,7 @@ fn copy_special_file(
     };
     if ret == 0 {
         created_files.insert(target.to_path_buf());
-        return Ok(());
+        Ok(())
     } else {
         let e = io::Error::last_os_error();
         let err_str = gettext!(
@@ -732,7 +732,7 @@ fn copy_special_file(
             target.display(),
             error_string(&e)
         );
-        return Err(io::Error::other(err_str));
+        Err(io::Error::other(err_str))
     }
 }
 

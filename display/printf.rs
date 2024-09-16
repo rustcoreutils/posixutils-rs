@@ -126,7 +126,7 @@ fn tokenize_format_str(format: &str) -> Vec<Token> {
                 }
 
                 ParseState::Width => {
-                    if c.is_digit(10) {
+                    if c.is_ascii_digit() {
                         width.push(c);
                         done_with_char = true;
                     } else {
@@ -148,7 +148,7 @@ fn tokenize_format_str(format: &str) -> Vec<Token> {
                 }
 
                 ParseState::PrecisionValue => {
-                    if c.is_digit(10) {
+                    if c.is_ascii_digit() {
                         precision.push(c);
                         done_with_char = true;
                     } else {

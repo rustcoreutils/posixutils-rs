@@ -331,18 +331,22 @@ fn csplit_file(args: &Args, ctx: SplitOps, new_files: &mut Vec<String>) -> io::R
                         }
                     }
 
-                    if split_options.len() == 1 {
-                        split_options.remove(0);
-                    } else if split_options.len() > 1 {
-                        if let Operand::Repeat(repeat) = &mut split_options[1] {
-                            *repeat -= 1;
-                            if *repeat == 0 {
-                                split_options.remove(0);
-                                split_options.remove(0);
-                            }
-                        } else {
+                    match split_options.len() {
+                        1 => {
                             split_options.remove(0);
                         }
+                        us if us > 1 => {
+                            if let Operand::Repeat(repeat) = &mut split_options[1] {
+                                *repeat -= 1;
+                                if *repeat == 0 {
+                                    split_options.remove(0);
+                                    split_options.remove(0);
+                                }
+                            } else {
+                                split_options.remove(0);
+                            }
+                        }
+                        _ => {}
                     }
                 } else {
                     if line.is_empty() {

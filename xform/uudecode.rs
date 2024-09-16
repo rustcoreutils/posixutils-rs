@@ -93,7 +93,7 @@ fn decode_historical_line(line: &str) -> Vec<u8> {
 
 fn decode_base64_line(line: &str) -> io::Result<Vec<u8>> {
     BASE64_STANDARD
-        .decode(&line)
+        .decode(line)
         .map_err(|_| Error::from(io::ErrorKind::InvalidInput))
 }
 
@@ -139,7 +139,7 @@ fn decode_file(args: &Args) -> io::Result<()> {
         }
 
         DecodingType::Base64 => {
-            while let Some(line) = lines.next() {
+            for line in lines {
                 if line == "====" || line == "====\n" {
                     break;
                 }
@@ -154,10 +154,10 @@ fn decode_file(args: &Args) -> io::Result<()> {
         io::stdout().write_all(&out)?;
     } else {
         if out_path.exists() {
-            remove_file(&out_path)?;
+            remove_file(out_path)?;
         }
 
-        let mut o_file = File::create(&out_path)?;
+        let mut o_file = File::create(out_path)?;
         let mut o_file_perm = o_file.metadata()?.permissions();
         let o_file_perm_mode = o_file_perm.mode();
         let new_o_file_perm_mode = ((o_file_perm_mode >> 9) << 9) | header.lower_perm_bits;

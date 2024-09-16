@@ -18,7 +18,7 @@ pub fn textdomain<T: Into<Vec<u8>>>(domainname: T) -> Result<Vec<u8>, std::io::E
 }
 
 pub fn gettext<T: Into<String>>(msgid: T) -> String {
-    return msgid.into();
+    msgid.into()
 }
 
 #[macro_export]

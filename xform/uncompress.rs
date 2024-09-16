@@ -11,9 +11,6 @@
 // - support options -f, -v
 //
 
-extern crate clap;
-extern crate plib;
-
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::lzw::UnixLZWReader;

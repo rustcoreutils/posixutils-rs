@@ -11,9 +11,6 @@
 // - Arg help should indicate "[[month] year]" as the default
 //
 
-extern crate clap;
-extern crate plib;
-
 use chrono::Datelike;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};

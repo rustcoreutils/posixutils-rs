@@ -7,8 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-extern crate clap;
-
 use chrono::DateTime;
 use clap::{Parser, Subcommand};
 use object::{Object, ObjectSymbol, SymbolKind};

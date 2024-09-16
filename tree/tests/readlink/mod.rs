@@ -7,8 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-extern crate tempfile;
-
 use plib::{run_test, TestPlan};
 use std::fs::File;
 use std::io::Write;

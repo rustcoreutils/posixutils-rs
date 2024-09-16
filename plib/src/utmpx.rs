@@ -7,7 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-extern crate libc;
 use libc::{endutxent, getutxent, setutxent};
 use std::ffi::CStr;
 

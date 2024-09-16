@@ -7,9 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-extern crate clap;
-extern crate plib;
-
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;

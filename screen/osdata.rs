@@ -7,8 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-extern crate libc;
-
 use std::collections::HashMap;
 
 #[cfg(target_os = "macos")]

@@ -7,8 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-extern crate clap;
-extern crate plib;
 use std::io::{self, BufRead, Error, ErrorKind, Read};
 
 use clap::Parser;

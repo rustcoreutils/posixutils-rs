@@ -14,10 +14,6 @@
 
 mod diff_util;
 
-extern crate clap;
-extern crate diff;
-extern crate plib;
-
 use std::{fs, io, path::PathBuf};
 
 use clap::Parser;

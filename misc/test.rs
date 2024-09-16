@@ -11,9 +11,6 @@
 // - fix and test unary ops
 //
 
-extern crate libc;
-extern crate plib;
-
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use std::os::unix::fs::FileTypeExt;

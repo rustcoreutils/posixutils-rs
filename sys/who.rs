@@ -11,10 +11,6 @@
 // - implement -T, -u options
 //
 
-extern crate chrono;
-extern crate clap;
-extern crate plib;
-
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;

@@ -1,3 +1,12 @@
+//
+// Copyright (c) 2024 Hemi Labs, Inc.
+//
+// This file is part of the posixutils-rs project covered under
+// the MIT License.  For the full license text, please see the LICENSE
+// file in the root directory of this project.
+// SPDX-License-Identifier: MIT
+//
+
 use std::fs;
 use std::fs::read_to_string;
 use std::io::Error;
@@ -9,6 +18,8 @@ pub struct ProcessInfo {
     pub uid: u32,
     pub gid: u32,
     pub path: String,
+    pub tty: Option<String>, // Add TTY field for -a option
+    pub sid: i32,            // Add session ID (SID) for -d option
 }
 
 pub fn list_processes() -> Result<Vec<ProcessInfo>, Error> {
@@ -36,15 +47,19 @@ fn get_process_info(pid: i32, proc_path: &Path) -> Option<ProcessInfo> {
     let status = read_to_string(status_path).ok()?;
     let cmdline = read_to_string(cmdline_path).unwrap_or_default();
     let exe = fs::read_link(exe_path).unwrap_or_else(|_| PathBuf::from("[Permission denied]"));
-    let mut comm = String::new();
+    let comm = String::new();
 
-    if let Ok(stat) = read_to_string(stat_path) {
-        if let Some(start) = stat.find('(') {
-            if let Some(end) = stat.find(')') {
-                comm = stat[start + 1..end].to_string();
-            }
-        }
-    }
+    // Read from /proc/<pid>/stat to get the session ID and TTY number
+    let stat = read_to_string(stat_path).ok()?;
+    let stat_fields: Vec<&str> = stat.split_whitespace().collect();
+    let sid = stat_fields[5].parse().unwrap_or(0); // Session ID (SID)
+    let tty_nr = stat_fields[6].parse::<i32>().unwrap_or(0);
+
+    let tty = if tty_nr > 0 {
+        Some(format!("tty{}", tty_nr)) // Simplified TTY representation
+    } else {
+        None
+    };
 
     let mut ppid = 0;
     let mut uid = 0;
@@ -80,5 +95,7 @@ fn get_process_info(pid: i32, proc_path: &Path) -> Option<ProcessInfo> {
         uid,
         gid,
         path,
+        tty,
+        sid, // Return the session ID (SID)
     })
 }

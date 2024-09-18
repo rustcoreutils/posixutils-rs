@@ -332,24 +332,87 @@ fn parse_symbols(input: &str) -> Result<Vec<Operand>, String> {
     let mut chars = input.chars().peekable();
 
     while let Some(&ch) = chars.peek() {
-        if ch == '[' {
-            chars.next(); // Skip '['
-            let Some(&'=') = chars.peek() else {
-                let symbol = chars
-                    .next()
-                    .ok_or("Error: Missing symbol after '['".to_string())?;
-                operands.push(parse_repeated_char(&mut chars, symbol)?);
-                continue;
-            };
+        match ch {
+            '[' => {
+                // Skip '['
+                chars.next();
+                let Some('=') = chars.peek() else {
+                    let symbol = chars
+                        .next()
+                        .ok_or("Error: Missing symbol after '['".to_string())?;
+                    operands.push(parse_repeated_char(&mut chars, symbol)?);
+                    continue;
+                };
 
-            operands.extend(parse_equiv(&mut chars)?);
-        } else {
-            // Add a regular character with a repetition of 1
-            operands.push(Operand::Char(Char {
-                char: ch,
-                repeated: 1,
-            }));
-            chars.next();
+                operands.extend(parse_equiv(&mut chars)?);
+            }
+            // A single backslash character (0x5C)
+            // https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/V1_chap05.html#tagtcjh_2
+            // https://www.unicode.org/Public/UCD/latest/ucd/NameAliases.txt
+            '\\' => {
+                // Skip '\'
+                chars.next();
+
+                let char_after_initial_backslash = chars.next();
+
+                let char_for_operand = match char_after_initial_backslash {
+                    // <alert>
+                    // Code point 0007
+                    Some('a') => '\u{0007}',
+                    // <backspace>
+                    // Code point 0008
+                    Some('b') => '\u{0008}',
+                    // <tab>
+                    // Code point 0009
+                    Some('t') => '\u{0009}',
+                    // <newline>
+                    // Code point 000A
+                    Some('n') => '\u{000A}',
+                    // <vertical-tab>
+                    // Code point 000B
+                    Some('v') => '\u{000B}',
+                    // <form-feed>
+                    // Code point 000C
+                    Some('f') => '\u{000C}',
+                    // <carriage-return>
+                    // Code point 000D
+                    Some('r') => '\u{000D}',
+                    // <backslash>
+                    // Code point 005C
+                    Some('\\') => {
+                        // An escaped backslash
+                        '\u{005C}'
+                    }
+                    Some(cha) => {
+                        // If a backslash is not at the end of the string, and is not followed by one of the valid
+                        // escape characters (including another backslash), the backslash is basically just ignored:
+                        // the following character is the character added to the set.
+                        cha
+                    }
+                    None => {
+                        eprintln!(
+                            "tr: warning: an unescaped backslash at end of string is not portable"
+                        );
+
+                        // If an unescaped backslash is the last character of the string, treat it as though it were
+                        // escaped (backslash is added to the set)
+                        '\u{005C}'
+                    }
+                };
+
+                operands.push(Operand::Char(Char {
+                    char: char_for_operand,
+                    repeated: 1,
+                }));
+            }
+            _ => {
+                // Add a regular character with a repetition of 1
+                operands.push(Operand::Char(Char {
+                    char: ch,
+                    repeated: 1,
+                }));
+                chars.next();
+            }
         }
     }
 

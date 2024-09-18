@@ -1,6 +1,17 @@
-use libc::{c_int, c_void, pid_t, proc_listallpids, proc_pidinfo, proc_pidpath};
+//
+// Copyright (c) 2024 Hemi Labs, Inc.
+//
+// This file is part of the posixutils-rs project covered under
+// the MIT License.  For the full license text, please see the LICENSE
+// file in the root directory of this project.
+// SPDX-License-Identifier: MIT
+//
+
+use libc::{c_int, c_void, getsid, pid_t, proc_listallpids, proc_pidinfo, proc_pidpath};
 use std::ffi::CStr;
+use std::fs;
 use std::io::Error;
+use std::os::unix::fs::MetadataExt;
 
 const PROC_PIDPATHINFO_MAXSIZE: usize = 4096;
 
@@ -10,6 +21,8 @@ pub struct ProcessInfo {
     pub uid: u32,
     pub gid: u32,
     pub path: String,
+    pub tty: Option<String>, // Add TTY field for -a option
+    pub sid: pid_t,          // Session ID (SID) for -d option
 }
 
 pub fn list_processes() -> Result<Vec<ProcessInfo>, Error> {
@@ -75,11 +88,37 @@ fn get_process_info(pid: pid_t) -> Option<ProcessInfo> {
         String::new()
     };
 
+    // Retrieve the terminal device ID (TTY)
+    let tty_dev = proc_info.e_tdev;
+
+    // Map the terminal device ID to the TTY name
+    let tty = get_tty_name(tty_dev);
+
     Some(ProcessInfo {
         pid: proc_info.pbi_pid as pid_t,
         ppid: proc_info.pbi_ppid as pid_t,
         uid: proc_info.pbi_uid,
         gid: proc_info.pbi_gid,
         path,
+        tty,                         // Add the terminal (TTY) name
+        sid: unsafe { getsid(pid) }, // Add session ID (SID)
     })
+}
+
+// Function to map a device ID to a TTY name
+fn get_tty_name(tty_dev: u32) -> Option<String> {
+    let dev_dir = "/dev/";
+    if let Ok(entries) = fs::read_dir(dev_dir) {
+        for entry in entries {
+            if let Ok(entry) = entry {
+                let path = entry.path();
+                if let Ok(metadata) = fs::metadata(&path) {
+                    if metadata.rdev() == tty_dev as u64 {
+                        return Some(path.file_name()?.to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+    }
+    None
 }

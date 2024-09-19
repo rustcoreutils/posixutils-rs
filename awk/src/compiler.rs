@@ -600,15 +600,16 @@ impl Compiler {
                 ))
             }
             Rule::string => {
-                let index = self.push_constant(Constant::String(
-                    escape_string_contents(primary.as_str().trim_matches('"'))
-                        .map_err(|e| pest_error_from_span(primary.as_span(), e))?,
-                ));
+                let span = primary.as_span();
+                let string_line_col = primary.line_col();
+                let str = escape_string_contents(first_child(primary).as_str())
+                    .map_err(|e| pest_error_from_span(span, e))?;
+                let index = self.push_constant(Constant::String(str));
                 Ok(Expr::new(
                     ExprKind::String,
                     Instructions::from_instructions_and_line_col(
                         vec![OpCode::PushConstant(index)],
-                        primary.line_col(),
+                        string_line_col,
                     ),
                 ))
             }
@@ -1960,8 +1961,50 @@ mod test {
 
     #[test]
     fn test_compile_string() {
+        let (_, constants) = compile_expr(r#""""#);
+        assert_eq!(constants, vec!["".into()]);
+
         let (_, constants) = compile_expr(r#""hello""#);
         assert_eq!(constants, vec!["hello".into()]);
+
+        let (_, constants) = compile_expr(r#""\"""#);
+        assert_eq!(constants, vec![Constant::from("\"")]);
+
+        let (_, constants) = compile_expr(r#""\/""#);
+        assert_eq!(constants, vec![Constant::from("/")]);
+
+        let (_, constants) = compile_expr(r#""\a""#);
+        assert_eq!(constants, vec![Constant::from("\x07")]);
+
+        let (_, constants) = compile_expr(r#""\b""#);
+        assert_eq!(constants, vec![Constant::from("\x08")]);
+
+        let (_, constants) = compile_expr(r#""\f""#);
+        assert_eq!(constants, vec![Constant::from("\x0C")]);
+
+        let (_, constants) = compile_expr(r#""\n""#);
+        assert_eq!(constants, vec![Constant::from("\n")]);
+
+        let (_, constants) = compile_expr(r#""\r""#);
+        assert_eq!(constants, vec![Constant::from("\r")]);
+
+        let (_, constants) = compile_expr(r#""\t""#);
+        assert_eq!(constants, vec![Constant::from("\t")]);
+
+        let (_, constants) = compile_expr(r#""\v""#);
+        assert_eq!(constants, vec![Constant::from("\x0B")]);
+
+        let (_, constants) = compile_expr(r#""\\""#);
+        assert_eq!(constants, vec![Constant::from("\\")]);
+
+        let (_, constants) = compile_expr(r#""\7""#);
+        assert_eq!(constants, vec![Constant::from("\x07")]);
+
+        let (_, constants) = compile_expr(r#""\41""#);
+        assert_eq!(constants, vec![Constant::from("!")]);
+
+        let (_, constants) = compile_expr(r#""\142""#);
+        assert_eq!(constants, vec![Constant::from("b")]);
 
         let (_, constants) = compile_expr(r#""hello\nworld""#);
         assert_eq!(constants, vec![Constant::from("hello\nworld")]);
@@ -1980,6 +2023,12 @@ mod test {
 
         let (_, constants) = compile_expr(r#""hello\141world""#);
         assert_eq!(constants, vec![Constant::from("helloaworld")]);
+
+        let (_, constants) = compile_expr(r#""\\""#);
+        assert_eq!(constants, vec![Constant::from("\\")]);
+
+        let (_, constants) = compile_expr(r#""\"""#);
+        assert_eq!(constants, vec![Constant::from("\"")]);
     }
 
     #[test]

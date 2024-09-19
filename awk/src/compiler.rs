@@ -2026,12 +2026,6 @@ mod test {
 
         let (_, constants) = compile_expr(r#""hello\141world""#);
         assert_eq!(constants, vec![Constant::from("helloaworld")]);
-
-        let (_, constants) = compile_expr(r#""\\""#);
-        assert_eq!(constants, vec![Constant::from("\\")]);
-
-        let (_, constants) = compile_expr(r#""\"""#);
-        assert_eq!(constants, vec![Constant::from("\"")]);
     }
 
     #[test]

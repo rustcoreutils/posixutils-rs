@@ -1656,7 +1656,12 @@ impl Compiler {
         })
     }
 
-    fn declare_program_functions(&mut self, errors: &mut Vec<PestError>, program: Pairs<Rule>) {
+    fn declare_program_functions(
+        &mut self,
+        program: Pairs<Rule>,
+        filename: &str,
+        errors: &mut Vec<PestError>,
+    ) {
         for item in program {
             if item.as_rule() == Rule::function_definition {
                 let mut inner = item.into_inner();
@@ -1676,10 +1681,14 @@ impl Compiler {
                     },
                 );
                 if previous_value.is_some() {
-                    errors.push(pest_error_from_span(
-                        name.as_span(),
-                        format!("function '{}' is defined multiple times", name),
-                    ));
+                    let error = improve_error(
+                        pest_error_from_span(
+                            name.as_span(),
+                            format!("function '{}' is defined multiple times", name),
+                        ),
+                        filename,
+                    );
+                    errors.push(error);
                 }
             }
         }
@@ -1740,12 +1749,6 @@ fn gather_errors(first_error: PestError, source: &str, errors: &mut Vec<PestErro
     }
 }
 
-fn append_if_err(errors: &mut Vec<PestError>, result: Result<(), PestError>) {
-    if let Err(err) = result {
-        errors.push(err);
-    }
-}
-
 pub struct SourceFile {
     pub filename: String,
     pub contents: String,
@@ -1777,8 +1780,8 @@ pub fn compile_program(sources: &[SourceFile]) -> Result<Program, CompilerErrors
     }
 
     let mut compiler = Compiler::default();
-    for (_, program_iter) in &parsed_sources {
-        compiler.declare_program_functions(&mut errors, program_iter.clone());
+    for (filename, program_iter) in &parsed_sources {
+        compiler.declare_program_functions(program_iter.clone(), filename, &mut errors);
     }
 
     let mut begin_actions = Vec::new();
@@ -1791,14 +1794,14 @@ pub fn compile_program(sources: &[SourceFile]) -> Result<Program, CompilerErrors
                 Rule::begin_action | Rule::end_action => {
                     let is_begin_action = item.as_rule() == Rule::begin_action;
                     let mut instructions = Instructions::default();
-                    append_if_err(
-                        &mut errors,
-                        compiler.compile_action(
-                            first_child(item),
-                            &mut instructions,
-                            &HashMap::new(),
-                        ),
+                    let result = compiler.compile_action(
+                        first_child(item),
+                        &mut instructions,
+                        &HashMap::new(),
                     );
+                    if let Err(err) = result {
+                        errors.push(improve_error(err, &filename));
+                    }
                     if is_begin_action {
                         begin_actions.push(instructions.into_action(filename.clone()));
                     } else {
@@ -1807,12 +1810,12 @@ pub fn compile_program(sources: &[SourceFile]) -> Result<Program, CompilerErrors
                 }
                 Rule::rule => match compiler.compile_rule(item, filename.clone()) {
                     Ok(rule) => rules.push(rule),
-                    Err(err) => errors.push(err),
+                    Err(err) => errors.push(improve_error(err, &filename)),
                 },
                 Rule::function_definition => {
                     match compiler.compile_function_definition(item, filename.clone()) {
                         Ok(function) => functions.push(function),
-                        Err(err) => errors.push(err),
+                        Err(err) => errors.push(improve_error(err, &filename)),
                     }
                 }
                 Rule::EOI => {}

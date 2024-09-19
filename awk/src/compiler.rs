@@ -601,8 +601,15 @@ impl Compiler {
             }
             Rule::string => {
                 let index = self.push_constant(Constant::String(
-                    escape_string_contents(primary.as_str().trim_matches('"'))
-                        .map_err(|e| pest_error_from_span(primary.as_span(), e))?,
+                    escape_string_contents(
+                        primary
+                            .as_str()
+                            .strip_prefix('"')
+                            .expect("dquot at start")
+                            .strip_suffix('"')
+                            .expect("dquot at end"),
+                    )
+                    .map_err(|e| pest_error_from_span(primary.as_span(), e))?,
                 ));
                 Ok(Expr::new(
                     ExprKind::String,

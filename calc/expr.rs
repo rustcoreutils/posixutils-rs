@@ -191,12 +191,12 @@ fn cmpop(lhs: &Token, rhs: &Token, op: CmpOp) -> Result<Token, &'static str> {
             Ok(cmpint(lhs, rhs, op))
         }
         // otherwise, convert int to string, and perform string compare
-        (Some(lh), _) => {
-            let tmp = Token::Str(lh.to_string());
+        (Some(lhs), _) => {
+            let tmp = Token::Str(lhs.to_string());
             cmpstr(&tmp, rhs, op)
         }
-        (_, Some(rh)) => {
-            let tmp = Token::Str(rh.to_string());
+        (_, Some(rhs)) => {
+            let tmp = Token::Str(rhs.to_string());
             cmpstr(lhs, &tmp, op)
         }
         _ => cmpstr(lhs, rhs, op),

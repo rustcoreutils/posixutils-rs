@@ -48,50 +48,69 @@ struct PasteInfo {
     pub inputs: Vec<PasteFile>,
 }
 
-struct DelimInfo {
-    cur_delim: usize,
-    delims_len: usize,
-    delims: Box<[char]>,
+// TODO
+// Use an iterator instead of an index
+enum DelimInfo {
+    NoDelimiters,
+    SingleDelimiter(char),
+    MultipleDelimiters {
+        cur_delim: usize,
+        delims: Box<[char]>,
+        number_of_delims: usize,
+    },
 }
 
 impl DelimInfo {
     fn new(delims: Box<[char]>) -> DelimInfo {
-        let delims_len = delims.len();
+        let mut iter = delims.iter();
 
-        DelimInfo {
-            cur_delim: 0,
+        let Some(first_delimiter) = iter.next() else {
+            // Otherwise there are no delimiters
+            return Self::NoDelimiters;
+        };
+
+        let Some(_) = iter.next() else {
+            // There is only one delimiter
+            return Self::SingleDelimiter(first_delimiter.to_owned());
+        };
+
+        // Otherwise there are more than one delimiters
+        let number_of_delims = delims.len();
+
+        Self::MultipleDelimiters {
             delims,
-            delims_len,
+            cur_delim: 0,
+            number_of_delims,
         }
     }
 
     fn delim(&mut self) -> Option<char> {
-        let delims_len = self.delims_len;
+        match self {
+            DelimInfo::NoDelimiters => None,
+            DelimInfo::SingleDelimiter(ch) => Some(ch.to_owned()),
+            DelimInfo::MultipleDelimiters {
+                cur_delim,
+                delims,
+                number_of_delims,
+            } => {
+                let cur_delim_to_owned = cur_delim.to_owned();
 
-        if delims_len == 0 {
-            None
-        } else {
-            let cur_delim = self.cur_delim;
+                // Advance function
+                {
+                    let cur_delim_to_owned_plus_one = cur_delim_to_owned + 1;
 
-            // Non-empty, so unwrap
-            let ch = self.delims.get(cur_delim).unwrap().to_owned();
-
-            // Advance function
-            {
-                if delims_len > 1 {
-                    let cur_delim_plus_one = cur_delim + 1;
-
-                    let new_cur_delim = if cur_delim_plus_one >= delims_len {
+                    let new_cur_delim = if cur_delim_to_owned_plus_one >= *number_of_delims {
                         0
                     } else {
-                        cur_delim_plus_one
+                        cur_delim_to_owned_plus_one
                     };
 
-                    self.cur_delim = new_cur_delim;
+                    *cur_delim = new_cur_delim;
                 }
-            }
 
-            Some(ch)
+                // Unwrap because indexing here should never fail
+                Some(delims.get(cur_delim_to_owned).unwrap().to_owned())
+            }
         }
     }
 }
@@ -134,7 +153,7 @@ fn open_inputs(args: &Args) -> Result<PasteInfo, Box<dyn Error>> {
         // https://pubs.opengroup.org/onlinepubs/9799919799/utilities/paste.html
         match filename.as_str() {
             "-" => vec.push(PasteFile {
-                filename: format!("Pipe: standard input (opened as '{filename}'"),
+                filename: format!("Pipe: standard input (opened as '{filename}')"),
                 eof: false,
                 last: false,
                 rdr: Box::new(io::stdin().lock()),

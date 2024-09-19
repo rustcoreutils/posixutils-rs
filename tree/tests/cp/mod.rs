@@ -342,7 +342,7 @@ fn test_cp_fail_perm() {
         1,
     );
 
-    for f in [test_dir, d, d_a] {
+    for f in [test_dir, d, d_a, dd] {
         fs::set_permissions(f, fs::Permissions::from_mode(0o777)).unwrap();
     }
     fs::remove_dir_all(test_dir).unwrap();
@@ -936,6 +936,37 @@ fn test_cp_special_bits() {
         fs::metadata(c).unwrap().mode(),
         fs::metadata(c2).unwrap().mode()
     );
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// Replicates failure to copy D/D on `test_cp_fail_perm` due to not OR'ing with S_IRWXU:
+// https://github.com/rustcoreutils/posixutils-rs/issues/199
+#[test]
+fn test_cp_issue199() {
+    let test_dir = &format!("{}/test_cp_issue199", env!("CARGO_TARGET_TMPDIR"));
+    let d = &format!("{test_dir}/D");
+    let dd = &format!("{test_dir}/DD");
+    let d_d = &format!("{test_dir}/D/D");
+
+    let setgid = libc::S_ISGID as u32;
+    let setuid = libc::S_ISUID as u32;
+
+    fs::create_dir(test_dir).unwrap();
+
+    let mode = fs::symlink_metadata(test_dir).unwrap().mode();
+    fs::set_permissions(test_dir, fs::Permissions::from_mode(mode & !setgid)).unwrap();
+
+    fs::create_dir(d).unwrap();
+    fs::create_dir(d_d).unwrap();
+
+    let nonperm_bits = fs::symlink_metadata(d).unwrap().mode() & !(setgid | setuid) & !0o777;
+    fs::set_permissions(d, fs::Permissions::from_mode(0o500 | nonperm_bits)).unwrap();
+
+    cp_test(&["-pR", d, dd], "", "", 0);
+
+    fs::set_permissions(d, fs::Permissions::from_mode(0o777)).unwrap();
+    fs::set_permissions(dd, fs::Permissions::from_mode(0o777)).unwrap();
 
     fs::remove_dir_all(test_dir).unwrap();
 }

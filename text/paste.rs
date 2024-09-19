@@ -8,14 +8,17 @@
 //
 // TODO:
 // - stdin ("-")
+// -- Probably fixed
 // - fix:  empty-string delimiters \0
+// -- Probably fixed
 // - improve:  don't open all files at once in --serial mode
 //
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
-use std::fs::{self, File};
+use std::error::Error;
+use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 
 /// paste - merge corresponding or subsequent lines of files
@@ -36,54 +39,66 @@ struct Args {
 
 struct PasteFile {
     filename: String,
-    rdr: BufReader<File>,
+    rdr: Box<dyn BufRead>,
     eof: bool,
     last: bool,
 }
 
 struct PasteInfo {
-    inputs: Vec<PasteFile>,
-}
-
-impl PasteInfo {
-    fn new() -> PasteInfo {
-        PasteInfo { inputs: Vec::new() }
-    }
+    pub inputs: Vec<PasteFile>,
 }
 
 struct DelimInfo {
     cur_delim: usize,
-    delims: String,
+    delims_len: usize,
+    delims: Box<[char]>,
 }
 
 impl DelimInfo {
-    fn new() -> DelimInfo {
+    fn new(delims: Box<[char]>) -> DelimInfo {
+        let delims_len = delims.len();
+
         DelimInfo {
             cur_delim: 0,
-            delims: String::from("\t"),
+            delims,
+            delims_len,
         }
     }
 
-    fn delim(&mut self) -> char {
-        let ch = self.delims.chars().nth(self.cur_delim).unwrap();
+    fn delim(&mut self) -> Option<char> {
+        let delims_len = self.delims_len;
 
-        self.advance();
+        if delims_len == 0 {
+            None
+        } else {
+            let cur_delim = self.cur_delim;
 
-        ch
-    }
+            // Non-empty, so unwrap
+            let ch = self.delims.get(cur_delim).unwrap().to_owned();
 
-    fn advance(&mut self) {
-        if self.delims.len() > 1 {
-            self.cur_delim = self.cur_delim + 1;
-            if self.cur_delim >= self.delims.len() {
-                self.cur_delim = 0;
+            // Advance function
+            {
+                if delims_len > 1 {
+                    let cur_delim_plus_one = cur_delim + 1;
+
+                    let new_cur_delim = if cur_delim_plus_one >= delims_len {
+                        0
+                    } else {
+                        cur_delim_plus_one
+                    };
+
+                    self.cur_delim = new_cur_delim;
+                }
             }
+
+            Some(ch)
         }
     }
 }
 
-fn xlat_delim_str(s: &str) -> String {
-    let mut output = String::with_capacity(s.len() + 10);
+fn xlat_delim_str(s: &str) -> Box<[char]> {
+    // Plus 10?
+    let mut output = Vec::<char>::with_capacity(s.len() + 10);
 
     let mut in_escape = false;
     for ch in s.chars() {
@@ -104,38 +119,68 @@ fn xlat_delim_str(s: &str) -> String {
         }
     }
 
-    output
+    output.into_boxed_slice()
 }
 
-fn open_inputs(args: &Args, info: &mut PasteInfo) -> io::Result<()> {
-    // open each input
-    for filename in &args.files {
-        let f_res = fs::File::open(filename);
+fn open_inputs(args: &Args) -> Result<PasteInfo, Box<dyn Error>> {
+    let files = &args.files;
 
-        match f_res {
-            Err(e) => {
-                eprintln!("{}: {}", filename, e);
-                return Err(e);
+    let mut vec = Vec::with_capacity(files.len());
+
+    // open each input
+    for filename in files {
+        // POSIX says only to read from stdin if "-" is passed as a file. Most implementations
+        // automatically read from stdin if no files are passed to `paste`.
+        // https://pubs.opengroup.org/onlinepubs/9799919799/utilities/paste.html
+        match filename.as_str() {
+            "-" => vec.push(PasteFile {
+                filename: format!("Pipe: standard input (opened as '{filename}'"),
+                eof: false,
+                last: false,
+                rdr: Box::new(io::stdin().lock()),
+            }),
+            "" => {
+                eprintln!("paste: FILE is an empty string, skipping");
             }
-            Ok(f) => {
-                info.inputs.push(PasteFile {
-                    filename: filename.to_string(),
-                    rdr: BufReader::new(f),
-                    eof: false,
-                    last: false,
-                });
+            _ => {
+                let f_res = fs::File::open(filename);
+
+                match f_res {
+                    Err(er) => {
+                        eprintln!("{filename}: {er}");
+
+                        return Err(er.into());
+                    }
+                    Ok(f) => {
+                        vec.push(PasteFile {
+                            filename: format!("File: {filename}"),
+                            rdr: Box::new(BufReader::new(f)),
+                            eof: false,
+                            last: false,
+                        });
+                    }
+                }
             }
         }
     }
 
-    // mark final input
-    let idx = info.inputs.len() - 1;
-    info.inputs[idx].last = true;
+    if vec.is_empty() {
+        eprintln!(
+            "paste: No valid [FILES] were specified. Use '-' if you are trying to read from stdin."
+        );
 
-    Ok(())
+        return Err(Box::<_>::from("Execution failed"));
+    }
+
+    // mark final input
+    if let Some(pa) = vec.last_mut() {
+        pa.last = true;
+    }
+
+    Ok(PasteInfo { inputs: vec })
 }
 
-fn paste_files_serial(mut info: PasteInfo, mut dinfo: DelimInfo) -> io::Result<()> {
+fn paste_files_serial(mut info: PasteInfo, mut delim_info: DelimInfo) -> io::Result<()> {
     // loop serially for each input file
     for input in &mut info.inputs {
         let mut first_line = true;
@@ -144,12 +189,15 @@ fn paste_files_serial(mut info: PasteInfo, mut dinfo: DelimInfo) -> io::Result<(
         loop {
             // read line
             let mut buffer = String::new();
-            let n_read_res = input.rdr.read_line(&mut buffer);
-            if let Err(e) = n_read_res {
-                eprintln!("{}: {}", input.filename, e);
-                return Err(e);
-            }
-            let n_read = n_read_res.unwrap();
+
+            let n_read = match input.rdr.read_line(&mut buffer) {
+                Ok(us) => us,
+                Err(er) => {
+                    eprintln!("{}: {}", input.filename, er);
+
+                    return Err(er);
+                }
+            };
 
             // if EOF, output line terminator and end inner loop
             if n_read == 0 {
@@ -158,12 +206,23 @@ fn paste_files_serial(mut info: PasteInfo, mut dinfo: DelimInfo) -> io::Result<(
 
             // output line segment
             } else {
-                let slice = &buffer[0..buffer.len() - 1];
+                let mut chars = buffer.chars();
+
+                // TODO
+                // Check that the removed character is a newline?
+                let _: Option<char> = chars.next_back();
+
+                let slice = chars.as_str();
 
                 if first_line {
-                    print!("{}", slice);
+                    print!("{slice}");
                 } else {
-                    print!("{}{}", dinfo.delim(), slice);
+                    let delimiter = match delim_info.delim() {
+                        Some(ch) => ch.to_string(),
+                        None => String::new(),
+                    };
+
+                    print!("{delimiter}{slice}");
                 }
             }
 
@@ -188,12 +247,15 @@ fn paste_files(mut info: PasteInfo, mut dinfo: DelimInfo) -> io::Result<()> {
             if !input.eof {
                 // read input line
                 let mut buffer = String::new();
-                let n_read_res = input.rdr.read_line(&mut buffer);
-                if let Err(e) = n_read_res {
-                    eprintln!("{}: {}", input.filename, e);
-                    return Err(e);
-                }
-                let n_read = n_read_res.unwrap();
+
+                let n_read = match input.rdr.read_line(&mut buffer) {
+                    Ok(us) => us,
+                    Err(er) => {
+                        eprintln!("{}: {}", input.filename, er);
+
+                        return Err(er);
+                    }
+                };
 
                 // if at EOF, note and continue
                 if n_read == 0 {
@@ -202,17 +264,26 @@ fn paste_files(mut info: PasteInfo, mut dinfo: DelimInfo) -> io::Result<()> {
                 // otherwise add to output line, sans trailing NL
                 } else {
                     have_data = true;
-                    output.push_str(&buffer[0..buffer.len() - 1]);
+
+                    let mut chars = buffer.chars();
+
+                    // TODO
+                    // Check that the removed character is a newline
+                    let _: Option<char> = chars.next_back();
+
+                    output.push_str(chars.as_str());
                 }
             }
 
             // final record, output line end
             if input.last {
                 output.push('\n');
-
-            // next delimiter
             } else {
-                output.push(dinfo.delim());
+                // next delimiter
+                #[allow(clippy::collapsible_else_if)]
+                if let Some(ch) = dinfo.delim() {
+                    output.push(ch);
+                }
             }
         }
 
@@ -224,7 +295,7 @@ fn paste_files(mut info: PasteInfo, mut dinfo: DelimInfo) -> io::Result<()> {
         match io::stdout().write_all(output.as_bytes()) {
             Ok(()) => {}
             Err(e) => {
-                eprintln!("stdout: {}", e);
+                eprintln!("stdout: {e}");
                 return Err(e);
             }
         }
@@ -241,21 +312,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
-    let mut state = PasteInfo::new();
-    let mut delim_state = DelimInfo::new();
-    match &args.delims {
-        None => {}
-        Some(dlm) => {
-            delim_state.delims = xlat_delim_str(dlm);
-        }
-    }
+    let paste_info = open_inputs(&args)?;
 
-    open_inputs(&args, &mut state)?;
+    let delim_state = match args.delims {
+        None => {
+            // Default when no delimiter argument is provided
+            DelimInfo::new(Box::new(['\t']))
+        }
+        Some(st) => {
+            // Delimiters parsed from "-d"/"--delims" argument
+            //
+            // Support for empty delimiter list:
+            //
+            // bsdutils: no, supports "-d" but requires the delimiter list to be non-empty
+            // Busybox: does not support "-d" at all
+            // GNU Core Utilities: yes
+            // toybox: yes
+            // uutils's coreutils: no, supports "-d", but panics on an empty delimiter list
+            //
+            // POSIX seems to almost forbid this:
+            // "These elements specify one or more delimiters to use, instead of the default <tab>, to replace the <newline> of the input lines."
+            // https://pubs.opengroup.org/onlinepubs/9799919799/utilities/paste.html
+            DelimInfo::new(xlat_delim_str(&st))
+        }
+    };
 
     if args.serial {
-        paste_files_serial(state, delim_state)?;
+        paste_files_serial(paste_info, delim_state)?;
     } else {
-        paste_files(state, delim_state)?;
+        paste_files(paste_info, delim_state)?;
     }
 
     Ok(())

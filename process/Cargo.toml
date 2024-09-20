@@ -14,6 +14,10 @@ libc.workspace = true
 atty.workspace = true
 errno = "0.3"
 dirs = "5.0"
+nix = { version = "0.29", features = ["resource", "process", "signal", "time"] }
+
+[dev-dependencies]
+sysinfo = "0.31"
 
 [[bin]]
 name = "env"
@@ -36,6 +40,9 @@ name = "renice"
 path = "./renice.rs"
 
 [[bin]]
+name = "timeout"
+path = "./timeout.rs"
+
+[[bin]]
 name = "xargs"
 path = "./xargs.rs"
-

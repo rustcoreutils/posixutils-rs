@@ -10,10 +10,6 @@
 // - bug: only one group is returned, in group list (MacOS-only?)
 //
 
-extern crate clap;
-extern crate libc;
-extern crate plib;
-
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;

@@ -11,9 +11,6 @@
 // - Research if 100 is a POSIX-compliant limit for MAX_STOPS
 //
 
-extern crate clap;
-extern crate plib;
-
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
@@ -151,7 +148,7 @@ fn parse_cmd_line(args: &Args) -> Result<Vec<u16>, &'static str> {
         for stop in tabstops_str.split(',') {
             tabstops.push(
                 stop.parse()
-                    .expect(gettext("Invalid tabstop value.").as_str()),
+                    .unwrap_or_else(|_| panic!("{}", gettext("Invalid tabstop value."))),
             );
         }
     }

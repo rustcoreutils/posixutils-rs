@@ -10,10 +10,6 @@
 // - stty get-short display
 //
 
-extern crate clap;
-extern crate libc;
-extern crate plib;
-
 mod osdata;
 
 use clap::Parser;
@@ -53,9 +49,9 @@ fn speed_to_str(revspeed: &HashMap<speed_t, &'static str>, speed: speed_t) -> St
 }
 
 fn ti_baud_str(revspeed: &HashMap<speed_t, &'static str>, ti: &Termios) -> String {
-    let ispeed = cfgetispeed(&ti);
+    let ispeed = cfgetispeed(ti);
     let ispeed_str = speed_to_str(revspeed, ispeed);
-    let ospeed = cfgetospeed(&ti);
+    let ospeed = cfgetospeed(ti);
     let ospeed_str = speed_to_str(revspeed, ospeed);
 
     if ispeed == ospeed {
@@ -72,7 +68,7 @@ fn stty_show_short(ti: Termios) -> io::Result<()> {
 
 fn build_flagstr(name: &str, flag: tcflag_t, pflg: u32, vset: tcflag_t, mask: tcflag_t) -> String {
     if (flag & mask) == vset {
-        format!("{}", name)
+        name.to_string()
     } else if (pflg & PNEG) != 0 {
         format!("-{}", name)
     } else {
@@ -123,7 +119,7 @@ fn flagmap_push(
     };
 }
 
-fn show_flags(name: &str, flags: &Vec<String>) {
+fn show_flags(name: &str, flags: &[String]) {
     println!("{}: {}", name, flags.join(" "));
 }
 
@@ -173,7 +169,7 @@ fn stty_show_long(ti: Termios) -> io::Result<()> {
     }
 
     for (name, param) in &tty_params {
-        flagmap_push(&ti, &mut flagmap, name, &param);
+        flagmap_push(&ti, &mut flagmap, name, param);
     }
 
     for flagname in &flagnames {
@@ -187,15 +183,15 @@ fn stty_show_long(ti: Termios) -> io::Result<()> {
 
 // display compact, parse-able form stty values
 fn stty_show_compact(ti: Termios) -> io::Result<()> {
-    let mut tiv = Vec::new();
-
     // encode settings as pairs of (String,u64)
-    tiv.push((String::from("ifl"), ti.c_iflag as u64));
-    tiv.push((String::from("ofl"), ti.c_oflag as u64));
-    tiv.push((String::from("cfl"), ti.c_cflag as u64));
-    tiv.push((String::from("lfl"), ti.c_lflag as u64));
-    tiv.push((String::from("isp"), cfgetispeed(&ti) as u64));
-    tiv.push((String::from("osp"), cfgetospeed(&ti) as u64));
+    let mut tiv = vec![
+        (String::from("ifl"), ti.c_iflag as u64),
+        (String::from("ofl"), ti.c_oflag as u64),
+        (String::from("cfl"), ti.c_cflag as u64),
+        (String::from("lfl"), ti.c_lflag as u64),
+        (String::from("isp"), cfgetispeed(&ti) as u64),
+        (String::from("osp"), cfgetospeed(&ti) as u64),
+    ];
 
     // encode control chars as pairs of (String,u64)
     for (i, cc) in ti.c_cc.iter().enumerate() {
@@ -350,9 +346,9 @@ fn set_ti_speed(
     let speed = speed_res.unwrap();
 
     if is_input {
-        let _ = cfsetispeed(ti, *speed)?;
+        cfsetispeed(ti, *speed)?;
     } else {
-        let _ = cfsetospeed(ti, *speed)?;
+        cfsetospeed(ti, *speed)?;
     }
 
     Ok(())
@@ -370,7 +366,7 @@ fn merge_map(ti: &mut Termios, pairmap: &HashMap<String, u64>) -> Result<bool, &
     // push control chars into termio struct
     let cclen = ti.c_cc.len();
     for idx in 0..cclen {
-        dirty = set_ti_cchar(ti, &pairmap, dirty, idx)?;
+        dirty = set_ti_cchar(ti, pairmap, dirty, idx)?;
     }
 
     Ok(dirty)
@@ -442,11 +438,11 @@ fn stty_set_long(mut ti: Termios, args: &Args) -> io::Result<()> {
         // if operand begins with "-", it is a negation
         let mut negate = false;
         let operand = {
-            if operand_raw.starts_with("-") {
+            if let Some(st) = operand_raw.strip_prefix("-") {
                 negate = true;
-                &operand_raw[1..]
+                st
             } else {
-                &operand_raw[..]
+                operand_raw.as_str()
             }
         };
 

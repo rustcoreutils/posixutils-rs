@@ -1116,12 +1116,12 @@ fn test_duplicate_input_files_quiet() {
 }
 
 #[test]
-fn test_muptiple_pattern_files_multiple_input_files() {
+fn test_multiple_pattern_files_multiple_input_files() {
     grep_test(&["-f", BRE_FILE_1, "-f", BRE_FILE_2, INPUT_FILE_1, INPUT_FILE_2, INPUT_FILE_3], LINES_INPUT, "tests/grep/f_1:line_{1}\ntests/grep/f_1:p_line_{2}_s\ntests/grep/f_1:  line_{3}  \ntests/grep/f_1:line_{70}\ntests/grep/f_2:#include <stdio.h>\ntests/grep/f_2:void func1() {\ntests/grep/f_2:void func2() {\n", "", 0);
 }
 
 #[test]
-fn test_muptiple_pattern_files_multiple_input_files_count() {
+fn test_multiple_pattern_files_multiple_input_files_count() {
     grep_test(
         &[
             "-c",
@@ -1141,7 +1141,7 @@ fn test_muptiple_pattern_files_multiple_input_files_count() {
 }
 
 #[test]
-fn test_muptiple_pattern_files_multiple_input_files_files_with_matches() {
+fn test_multiple_pattern_files_multiple_input_files_files_with_matches() {
     grep_test(
         &[
             "-l",
@@ -1161,7 +1161,7 @@ fn test_muptiple_pattern_files_multiple_input_files_files_with_matches() {
 }
 
 #[test]
-fn test_muptiple_pattern_files_multiple_input_files_quiet() {
+fn test_multiple_pattern_files_multiple_input_files_quiet() {
     grep_test(
         &[
             "-q",
@@ -1181,7 +1181,7 @@ fn test_muptiple_pattern_files_multiple_input_files_quiet() {
 }
 
 #[test]
-fn test_muptiple_pattern_files_multiple_input_files_line_number() {
+fn test_multiple_pattern_files_multiple_input_files_line_number() {
     grep_test(&["-n", "-f", BRE_FILE_1, "-f", BRE_FILE_2, INPUT_FILE_1, INPUT_FILE_2, INPUT_FILE_3], LINES_INPUT, "tests/grep/f_1:1:line_{1}\ntests/grep/f_1:2:p_line_{2}_s\ntests/grep/f_1:3:  line_{3}  \ntests/grep/f_1:7:line_{70}\ntests/grep/f_2:1:#include <stdio.h>\ntests/grep/f_2:8:void func1() {\ntests/grep/f_2:12:void func2() {\n", "", 0);
 }
 

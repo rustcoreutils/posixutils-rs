@@ -7,9 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-extern crate clap;
-extern crate plib;
-
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
@@ -102,7 +99,7 @@ fn build_display_str(args: &Args, count: &CountInfo, filename: &OsStr) -> String
     if multi_file {
         output.push(' ');
 
-        if filename == "" {
+        if filename.is_empty() {
             output.push_str("(stdin)");
         } else {
             output.push_str(filename.to_string_lossy().as_ref());
@@ -206,7 +203,7 @@ fn wc_file(
         wc_file_bytes(count, pathname)?;
     }
 
-    let output = build_display_str(&args, count, pathname.as_os_str());
+    let output = build_display_str(args, count, pathname.as_os_str());
 
     println!("{}", output);
 
@@ -260,7 +257,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if args.files.len() > 1 {
-        let output = build_display_str(&args, &totals, &OsStr::new("total"));
+        let output = build_display_str(&args, &totals, OsStr::new("total"));
         println!("{}", output);
     }
 

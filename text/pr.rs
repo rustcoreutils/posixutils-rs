@@ -110,7 +110,7 @@ fn print_footer(form_feed_as_page_separator: bool) {
     if form_feed_as_page_separator {
         print!("{FORM_FEED}");
     } else {
-        println!("");
+        println!();
     }
 }
 
@@ -254,7 +254,7 @@ fn pr_serial(path: &PathBuf, params: &Parameters) -> io::Result<()> {
             if !params.omit_header {
                 print_header(
                     &dt,
-                    &*path.to_string_lossy(),
+                    &path.to_string_lossy(),
                     page_number,
                     params.header.as_deref(),
                     params.page_width,
@@ -343,7 +343,7 @@ fn pr_serial(path: &PathBuf, params: &Parameters) -> io::Result<()> {
             if !params.omit_header {
                 print_header(
                     &dt,
-                    &*path.to_string_lossy(),
+                    &path.to_string_lossy(),
                     page_number,
                     params.header.as_deref(),
                     params.page_width,

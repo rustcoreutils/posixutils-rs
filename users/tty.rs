@@ -7,9 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-extern crate atty;
-extern crate plib;
-
 fn main() {
     let is_tty = atty::is(atty::Stream::Stdin);
     if !is_tty {

@@ -7,9 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-extern crate clap;
-extern crate plib;
-
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
@@ -94,10 +91,10 @@ fn expand_file(tablist: &TabList, pathname: &PathBuf) -> io::Result<()> {
                 if column > 1 {
                     column = column - 1;
                 }
-            } else if byte == '\r' as u8 || byte == '\n' as u8 {
+            } else if byte == b'\r' || byte == b'\n' {
                 writer.write_all(&[byte])?;
                 column = 1;
-            } else if byte != '\t' as u8 {
+            } else if byte != b'\t' {
                 writer.write_all(&[byte])?;
                 column = column + 1;
             } else {
@@ -142,7 +139,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let tablist = {
         if let Some(ref tablist) = args.tablist {
-            match parse_tablist(&tablist) {
+            match parse_tablist(tablist) {
                 Ok(tl) => tl,
                 Err(e) => {
                     eprintln!("{}", e);

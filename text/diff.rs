@@ -14,10 +14,6 @@
 
 mod diff_util;
 
-extern crate clap;
-extern crate diff;
-extern crate plib;
-
 use std::{fs, io, path::PathBuf};
 
 use clap::Parser;
@@ -152,17 +148,18 @@ fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
     }
 }
 
-fn main() -> Result<DiffExitStatus, Box<dyn std::error::Error>> {
+fn main() -> DiffExitStatus {
     // parse command line arguments
     let args = Args::parse();
 
     let result = check_difference(args);
 
-    if let Ok(diff_exit_status) = &result {
-        return Ok(*diff_exit_status);
-    } else if let Err(error) = &result {
-        eprintln!("diff: {}", error);
-    }
+    match result {
+        Ok(diff_exit_status) => diff_exit_status,
+        Err(error) => {
+            eprintln!("diff: {}", error);
 
-    return Ok(DiffExitStatus::NotDifferent);
+            DiffExitStatus::Trouble
+        }
+    }
 }

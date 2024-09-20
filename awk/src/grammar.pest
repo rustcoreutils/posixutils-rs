@@ -10,7 +10,13 @@
 WHITESPACE = _{ " " | "\t" | "\r" }
 COMMENT    = _{ "#" ~ (!"\n" ~ ANY)* ~ &"\n" }
 
-string          =  { "\"" ~ (("\\\"") | (!("\"" | "\n") ~ ANY))* ~ "\"" }
+string          = ${ "\"" ~ string_contents ~ "\"" }
+string_contents = @{ string_char* }
+string_char     =  {
+    !("\"" | "\\") ~ ANY
+  | "\\" ~ ("\"" | "/" | "a" | "b" | "f" | "n" | "r" | "t" | "v" | "\\")
+  | "\\" ~ ASCII_DIGIT{1, 3}
+}
 ere             =  { "/" ~ (("\\" ~ "/") | (!("/" | "\n") ~ ANY))* ~ "/" }
 number          = @{ decimal_float | integer }
 digit           =  { ('0'..'9') }
@@ -46,7 +52,7 @@ builtin_func = _{
   | tolower
   | toupper
   | close
-	| fflush
+  | fflush
   | system
 }
 
@@ -163,7 +169,7 @@ ut_for     = { "for" ~ "(" ~ simple_statement? ~ ";" ~ expr? ~ ";" ~ simple_stat
 ut_foreach = { "for" ~ "(" ~ name ~ in_op ~ name ~ ")" ~ opt_newline ~ unterminated_statement }
 
 terminatable_statement = _{
-	  nextfile
+    nextfile
   | next
   | break_stmt
   | continue_stmt

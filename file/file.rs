@@ -156,7 +156,7 @@ impl Value {
         let re = Regex::new(r"\\([0-7]{1,3})").map_err(|_| RawMagicLineParseError::InvalidRegex)?;
 
         let result = re
-            .replace_all(&input, |capture: &regex::Captures| {
+            .replace_all(input, |capture: &regex::Captures| {
                 let mat = capture.get(1).unwrap().as_str();
 
                 let v = u32::from_str_radix(mat, 8).unwrap();
@@ -169,7 +169,7 @@ impl Value {
 
     fn parse_number(input: &mut String) -> Option<(ComparisonOperator, u64)> {
         let regex = Regex::new(r"^[=<>&^x]").unwrap();
-        let comparision_op = match regex.find(&input) {
+        let comparision_op = match regex.find(input) {
             Some(mat) => {
                 let comp = mat.as_str().chars().next().unwrap();
                 input.replace_range(..1, ""); // Remove the matched operator
@@ -192,6 +192,8 @@ impl Value {
 }
 
 /// Parses Hexadecimal, Octal and Unsigned Decimal
+// TODO
+#[allow(clippy::needless_match)]
 fn parse_number(input: &mut String) -> Option<u64> {
     if let Some(hex_num) = parse_hexadecimal(input) {
         Some(hex_num)
@@ -510,6 +512,7 @@ fn parse_magic_file_and_test(
                 }
             }
         } else {
+            // TODO: Empty branch
         }
     }
 

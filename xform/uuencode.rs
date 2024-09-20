@@ -7,9 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-extern crate clap;
-extern crate plib;
-
 use base64::prelude::*;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
@@ -65,7 +62,7 @@ fn get_permission_values(perm: Permissions) -> String {
 }
 
 fn encode_base64_line(line: &[u8]) -> Vec<u8> {
-    let mut out = BASE64_STANDARD.encode(&line).as_bytes().to_vec();
+    let mut out = BASE64_STANDARD.encode(line).as_bytes().to_vec();
     out.push(b'\n');
     out
 }

@@ -7,10 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-extern crate clap;
-extern crate libc;
-extern crate plib;
-
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
@@ -132,7 +128,7 @@ fn read_mount_info() -> io::Result<MountList> {
         for mount in mounts {
             let devname = to_cstr(&mount.f_mntfromname);
             let dirname = to_cstr(&mount.f_mntonname);
-            info.push(&mount, devname, dirname);
+            info.push(mount, devname, dirname);
         }
     }
 
@@ -244,7 +240,7 @@ fn show_info(args: &Args, info: &MountList) {
 
     for mount in &info.mounts {
         if mount.masked {
-            show_mount(args, block_size, &mount);
+            show_mount(args, block_size, mount);
         }
     }
 }

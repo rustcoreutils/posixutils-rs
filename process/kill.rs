@@ -7,10 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-extern crate clap;
-extern crate libc;
-extern crate plib;
-
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 
@@ -133,11 +129,10 @@ fn parse_cmdline() -> Result<Config, &'static str> {
                 mode = ConfigMode::List;
             } else if arg == "--" {
                 in_args = false;
-            } else if arg.starts_with("-") {
-                let argstr = &arg[1..];
-                let sig_no = match argstr.parse::<u32>() {
+            } else if let Some(st) = arg.strip_prefix("-") {
+                let sig_no = match st.parse::<u32>() {
                     Ok(signo) => signo,
-                    Err(_) => lookup_signum(argstr)?,
+                    Err(_) => lookup_signum(st)?,
                 };
                 mode = ConfigMode::Signal(sig_no);
             } else {

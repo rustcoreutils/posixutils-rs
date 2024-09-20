@@ -175,13 +175,25 @@ where
             }
 
             unsafe {
+                // Creates the target directory with the same file permission bits as the source,
+                // modified by the umask of the process. Copying the permission bits without the
+                // umask is postponed to the `postprocess_dir` closure on the call to
+                // `traverse_directory` inside `copy_file`.
                 let ret = libc::mkdirat(
                     target_dirfd,
                     target_filename,
-                    source_md.mode() as libc::mode_t,
+                    // OR'ed with S_IRWXU according to the spec
+                    source_md.mode() as libc::mode_t | libc::S_IRWXU,
                 );
+
                 if ret != 0 {
-                    return Err(io::Error::last_os_error());
+                    let e = io::Error::last_os_error();
+                    let err_str = gettext!(
+                        "cannot create directory '{}': {}",
+                        target.display(),
+                        error_string(&e)
+                    );
+                    return Err(io::Error::other(err_str));
                 }
             }
         }
@@ -515,14 +527,25 @@ where
                             // not allow atomically creating a directory then opening it:
                             //
                             // https://stackoverflow.com/questions/45818628/whats-the-expected-behavior-of-openname-o-creato-directory-mode/48693137#48693137
-                            let new_target_dirfd = ftw::FileDescriptor::open_at(
+                            let new_target_dirfd = match ftw::FileDescriptor::open_at(
                                 target_dirfd,
                                 target_filename_cstr.as_ptr(),
                                 libc::O_RDONLY,
-                            )
-                            .map_err(|_| ())?;
-                            target_dirfd_stack_borrowed.push(new_target_dirfd);
+                            ) {
+                                Ok(fd) => fd,
+                                Err(e) => {
+                                    let err_str = gettext!(
+                                        "cannot open directory '{}': {}",
+                                        target.display(),
+                                        error_string(&e)
+                                    );
+                                    *last_error.borrow_mut() = Some(io::Error::other(err_str));
+                                    *terminate_borrowed = true;
+                                    return Ok(false);
+                                }
+                            };
 
+                            target_dirfd_stack_borrowed.push(new_target_dirfd);
                             target_dir_path_borrowed.push(target_filename);
 
                             true
@@ -724,7 +747,7 @@ fn copy_special_file(
     };
     if ret == 0 {
         created_files.insert(target.to_path_buf());
-        return Ok(());
+        Ok(())
     } else {
         let e = io::Error::last_os_error();
         let err_str = gettext!(
@@ -732,7 +755,7 @@ fn copy_special_file(
             target.display(),
             error_string(&e)
         );
-        return Err(io::Error::other(err_str));
+        Err(io::Error::other(err_str))
     }
 }
 

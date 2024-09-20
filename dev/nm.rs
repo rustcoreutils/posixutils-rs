@@ -11,9 +11,6 @@
 // - sort output
 //
 
-extern crate clap;
-extern crate plib;
-
 use object::{
     Object, ObjectSection, ObjectSymbol, SectionIndex, SectionKind, Symbol, SymbolKind,
     SymbolSection,

@@ -11,8 +11,6 @@
 // - fix bug:  zero padding does not work for negative numbers
 //
 
-extern crate plib;
-
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use std::io::{self, Write};
@@ -128,7 +126,7 @@ fn tokenize_format_str(format: &str) -> Vec<Token> {
                 }
 
                 ParseState::Width => {
-                    if c.is_digit(10) {
+                    if c.is_ascii_digit() {
                         width.push(c);
                         done_with_char = true;
                     } else {
@@ -150,7 +148,7 @@ fn tokenize_format_str(format: &str) -> Vec<Token> {
                 }
 
                 ParseState::PrecisionValue => {
-                    if c.is_digit(10) {
+                    if c.is_ascii_digit() {
                         precision.push(c);
                         done_with_char = true;
                     } else {

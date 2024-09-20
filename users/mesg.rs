@@ -11,10 +11,6 @@
 // - set process exit code according to spec
 //
 
-extern crate clap;
-extern crate libc;
-extern crate plib;
-
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;

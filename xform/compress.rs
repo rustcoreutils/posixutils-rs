@@ -89,10 +89,10 @@ fn compress_file(args: &Args, pathname: &PathBuf) -> io::Result<i32> {
                 }
 
                 let mut new_file = pathname.clone();
-                new_file.set_file_name(format!("{fname}"));
+                new_file.set_file_name(&fname);
                 let mut f = File::create(&new_file)?;
 
-                fs::remove_file(&pathname)?;
+                fs::remove_file(pathname)?;
                 f.write_all(&out_buf)?;
 
                 if args.verbose {

@@ -11,10 +11,6 @@
 // - implement -T, -u options
 //
 
-extern crate chrono;
-extern crate clap;
-extern crate plib;
-
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
@@ -112,8 +108,8 @@ fn print_fmt_term(entry: &plib::utmpx::Utmpx, line: &str) {
 
 fn current_terminal() -> String {
     let s = plib::curuser::tty();
-    if s.starts_with("/dev/") {
-        s[5..].to_string()
+    if let Some(st) = s.strip_prefix("/dev/") {
+        st.to_owned()
     } else {
         s
     }
@@ -167,7 +163,7 @@ fn show_utmpx_entries(args: &Args) {
 
     let entries = plib::utmpx::load();
     for entry in &entries {
-        print_entry(&args, entry);
+        print_entry(args, entry);
     }
 }
 
@@ -192,7 +188,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // parse command line arguments; if "who am i", use special args
     let mut args = {
         if am_i {
-            Args::parse_from(&["who", "-m"])
+            Args::parse_from(["who", "-m"])
         } else {
             Args::parse()
         }

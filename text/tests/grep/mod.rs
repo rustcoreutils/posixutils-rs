@@ -8,7 +8,14 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use std::{
+    fs::File,
+    io::Write,
+    path::PathBuf,
+    process::{Command, Output, Stdio},
+};
+
+use plib::testing::TestPlan;
 
 const LINES_INPUT: &str =
     "line_{1}\np_line_{2}_s\n  line_{3}  \nLINE_{4}\np_LINE_{5}_s\nl_{6}\nline_{70}\n";
@@ -30,6 +37,54 @@ const INVALID_ERE: &str = r#"{1,3}"#;
 const BRE_FILE_1: &str = "tests/grep/bre/p_1";
 const BRE_FILE_2: &str = "tests/grep/bre/p_2";
 const EMPTY_PATTERN_FILE: &str = "tests/grep/empty_pattern";
+
+fn run_test_base(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> Output {
+    let relpath = if cfg!(debug_assertions) {
+        format!("target/debug/{}", cmd)
+    } else {
+        format!("target/release/{}", cmd)
+    };
+    let test_bin_path = std::env::current_dir()
+        .unwrap()
+        .parent()
+        .unwrap() // Move up to the workspace root from the current package directory
+        .join(relpath); // Adjust the path to the binary
+
+    // Fill STDIN to temporary file
+    let mut temp_stdin = tempfile::NamedTempFile::new().expect("failed to create temp file");
+    temp_stdin
+        .write_all(stdin_data)
+        .expect("failed to write to temp stdin file");
+
+    let temp_stdin_path: PathBuf = temp_stdin.path().to_path_buf();
+
+    let output = Command::new(test_bin_path)
+        .args(args)
+        .stdin(File::open(temp_stdin_path).expect("failed to open temp stdin file")) // Pass filled temporary file as STDIN before utility will be spawned
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn process")
+        .wait_with_output()
+        .expect("failed to wait for process");
+
+    output
+}
+
+pub fn run_test(plan: TestPlan) {
+    let output = run_test_base(&plan.cmd, &plan.args, plan.stdin_data.as_bytes());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout, plan.expected_out);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr, plan.expected_err);
+
+    assert_eq!(output.status.code(), Some(plan.expected_exit_code));
+    if plan.expected_exit_code == 0 {
+        assert!(output.status.success());
+    }
+}
 
 fn grep_test(
     args: &[&str],

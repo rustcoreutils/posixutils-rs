@@ -226,9 +226,7 @@ fn open_inputs(files: Vec<String>) -> Result<PasteInfo, Box<dyn Error>> {
 
                         let file = match open_result {
                             Err(er) => {
-                                eprintln!("{key}: {er}");
-
-                                return Err(Box::new(er));
+                                return Err(Box::from(format!("{key}: {er}")));
                             }
                             Ok(fi) => fi,
                         };
@@ -271,15 +269,19 @@ fn paste_files_serial(
     mut delim_info: DelimInfo,
 ) -> Result<(), Box<dyn Error>> {
     // loop serially for each input file
-    for input in &mut paste_info.inputs {
+
+    // Re-use buffers to avoid repeated allocations
+    let mut buffer = String::new();
+
+    for paste_file in &mut paste_info.inputs {
         let mut first_line = true;
 
         // for each input line
         loop {
-            // read line
-            let mut buffer = String::new();
+            // Equivalent to allocating a new String here
+            buffer.clear();
 
-            let rc = &input.rdr;
+            let rc = &paste_file.rdr;
 
             // TODO
             // unwrap
@@ -289,9 +291,9 @@ fn paste_files_serial(
             let read_line_result = match buf_read_box.read_line(&mut buffer) {
                 Ok(us) => us,
                 Err(er) => {
-                    eprintln!("{}: {}", input.filename, er);
+                    let filename = &paste_file.filename;
 
-                    return Err(Box::new(er));
+                    return Err(Box::from(format!("{filename}: {er}")));
                 }
             };
 
@@ -341,7 +343,7 @@ fn paste_files_serial(
     Ok(())
 }
 
-fn paste_files(mut paste_info: PasteInfo, mut delim_info: DelimInfo) -> io::Result<()> {
+fn paste_files(mut paste_info: PasteInfo, mut delim_info: DelimInfo) -> Result<(), Box<dyn Error>> {
     // for each input line, across N files
 
     // Re-use buffers to avoid repeated allocations
@@ -371,9 +373,9 @@ fn paste_files(mut paste_info: PasteInfo, mut delim_info: DelimInfo) -> io::Resu
                 let read_line_result = match buf_read_box.read_line(&mut buffer) {
                     Ok(us) => us,
                     Err(er) => {
-                        eprintln!("{}: {}", paste_file.filename, er);
+                        let filename = &paste_file.filename;
 
-                        return Err(er);
+                        return Err(Box::from(format!("{filename}: {er}")));
                     }
                 };
 

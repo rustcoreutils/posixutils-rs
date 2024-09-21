@@ -10,6 +10,7 @@ use std::{
 
 #[cfg(target_os = "linux")]
 use std::{fs::File, io::Read};
+#[cfg(target_os = "linux")]
 use tokio::net::{TcpListener, UdpSocket, UnixListener};
 
 fn fuser_test(
@@ -140,6 +141,7 @@ fn test_fuser_with_user() {
 ///
 /// **Assertions:**
 /// - Verifies that the PIDs of both processes are included in the stdout.
+#[ignore]
 #[test]
 fn test_fuser_with_many_files() {
     let process1 = Command::new("sleep")

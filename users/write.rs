@@ -10,7 +10,7 @@
 use chrono::Local;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
+use plib::{platform, PROJECT_NAME};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, Write};
@@ -43,7 +43,7 @@ fn select_terminal(user_name: &str) -> String {
     // Filter the entries to find terminals for the specified user
     let user_entries: Vec<_> = entries
         .into_iter()
-        .filter(|entry| entry.user == user_name && entry.typ == libc::USER_PROCESS)
+        .filter(|entry| entry.user == user_name && entry.typ == platform::USER_PROCESS)
         .collect();
 
     if user_entries.is_empty() {

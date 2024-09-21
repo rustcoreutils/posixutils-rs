@@ -7,7 +7,9 @@ license = "MIT"
 repository = "https://github.com/rustcoreutils/posixutils-rs.git"
 
 [dependencies]
+cfg-if = "1.0"
 libc.workspace = true
+errno.workspace = true
 
 [lib]
 doctest = false

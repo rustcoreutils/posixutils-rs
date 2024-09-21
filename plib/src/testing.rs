@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2024 Jeff Garzik
+// Copyright (c) 2024 Hemi Labs, Inc.
 //
 // This file is part of the posixutils-rs project covered under
 // the MIT License.  For the full license text, please see the LICENSE
@@ -9,6 +9,8 @@
 
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::Duration;
 
 pub struct TestPlan {
     pub cmd: String,
@@ -47,13 +49,31 @@ fn run_test_base(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> Output {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("failed to spawn head");
+        .expect("failed to spawn grep");
 
-    let stdin = child.stdin.as_mut().expect("failed to get stdin");
-    stdin
-        .write_all(stdin_data)
-        .expect("failed to write to stdin");
+    // Separate the mutable borrow of stdin from the child process
+    if let Some(mut stdin) = child.stdin.take() {
+        let chunk_size = 1024; // Example chunk size, adjust as needed
+        for chunk in stdin_data.chunks(chunk_size) {
+            // Write each chunk
+            if let Err(e) = stdin.write_all(chunk) {
+                eprintln!("Error writing to stdin: {}", e);
+                break;
+            }
+            // Flush after writing each chunk
+            if let Err(e) = stdin.flush() {
+                eprintln!("Error flushing stdin: {}", e);
+                break;
+            }
 
+            // Optional: Sleep briefly to avoid CPU spinning
+            thread::sleep(Duration::from_millis(10));
+        }
+        // Explicitly drop stdin to close the pipe
+        drop(stdin);
+    }
+
+    // Ensure we wait for the process to complete after writing to stdin
     let output = child.wait_with_output().expect("failed to wait for child");
     output
 }

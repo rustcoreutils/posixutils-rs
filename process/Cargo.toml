@@ -14,6 +14,16 @@ libc.workspace = true
 atty.workspace = true
 dirs = "5.0"
 
+[dev-dependencies]
+tokio = { version = "1.39", features = ["net", "macros", "rt"]}
+
+[build-dependencies]
+bindgen = { version = "0.70.0", features = ["runtime"] }
+
+[[bin]]
+name = "fuser"
+path = "./fuser.rs"
+
 [[bin]]
 name = "env"
 path = "./env.rs"
@@ -37,4 +47,3 @@ path = "./renice.rs"
 [[bin]]
 name = "xargs"
 path = "./xargs.rs"
-

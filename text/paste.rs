@@ -60,7 +60,6 @@ impl PasteFile {
 }
 
 struct PasteInfo {
-    #[allow(clippy::type_complexity)]
     pub inputs: Vec<PasteFile>,
 }
 

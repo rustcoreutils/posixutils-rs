@@ -49,11 +49,11 @@ fn run_test_base(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> Output {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("failed to spawn grep");
+        .expect(format!("failed to spawn command {}", cmd).as_str());
 
     // Separate the mutable borrow of stdin from the child process
     if let Some(mut stdin) = child.stdin.take() {
-        let chunk_size = 1024; // Example chunk size, adjust as needed
+        let chunk_size = 1024; // Arbitrary chunk size, adjust if needed
         for chunk in stdin_data.chunks(chunk_size) {
             // Write each chunk
             if let Err(e) = stdin.write_all(chunk) {
@@ -66,7 +66,7 @@ fn run_test_base(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> Output {
                 break;
             }
 
-            // Optional: Sleep briefly to avoid CPU spinning
+            // Sleep briefly to avoid CPU spinning
             thread::sleep(Duration::from_millis(10));
         }
         // Explicitly drop stdin to close the pipe

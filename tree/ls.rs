@@ -11,7 +11,7 @@ mod ls_util;
 
 use clap::{CommandFactory, FromArgMatches, Parser};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
+use plib::{platform::P_WINSIZE_REQUEST_CODE, PROJECT_NAME};
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs;
@@ -551,26 +551,6 @@ impl Config {
 }
 
 fn get_terminal_width() -> usize {
-    // Constants taken from:
-    // https://docs.rs/term_size/0.3.2/src/term_size/platform/unix.rs.html#5-19
-    const fn winsize_request_code() -> std::ffi::c_ulong {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        return 0x5413;
-
-        #[cfg(any(
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "netbsd",
-            target_os = "openbsd"
-        ))]
-        return 0x40087468;
-
-        #[cfg(target_os = "solaris")]
-        0x5468
-    }
-
     // COLUMNS is usually automatically set and it even changes when the
     // terminal window is resized.
     if let Ok(s) = std::env::var("COLUMNS") {
@@ -584,7 +564,7 @@ fn get_terminal_width() -> usize {
         let mut winsize: MaybeUninit<libc::winsize> = MaybeUninit::zeroed();
         let ret = libc::ioctl(
             libc::STDOUT_FILENO,
-            winsize_request_code(),
+            P_WINSIZE_REQUEST_CODE,
             winsize.as_mut_ptr(),
         );
 

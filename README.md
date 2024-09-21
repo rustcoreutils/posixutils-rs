@@ -76,6 +76,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] file
  - [x] find
  - [x] fold
+ - [x] fuser
  - [x] gencat (i18n)
  - [x] grep
  - [x] head
@@ -206,7 +207,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] vi (Editors)
 
 ### Misc. category
- - [ ] fuser (status: in progress)
  - [ ] lp
  - [ ] mailx
  - [ ] make (status: in progress)

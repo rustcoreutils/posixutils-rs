@@ -14,7 +14,6 @@ gettext-rs.workspace = true
 libc.workspace = true
 regex.workspace = true
 chrono.workspace = true
-atty.workspace = true
 errno.workspace = true
 
 [dev-dependencies]
@@ -87,4 +86,3 @@ path = "./touch.rs"
 [[bin]]
 name = "unlink"
 path = "./unlink.rs"
-

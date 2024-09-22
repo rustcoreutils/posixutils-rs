@@ -1272,7 +1272,7 @@ fn test_mv_hardlink_case() {
 #[test]
 #[cfg_attr(not(all(target_os = "linux", feature = "posixutils_test_all")), ignore)]
 fn test_mv_i_link_no() {
-    // Tricks `atty::is(atty::Stream::Stdin)` to allow showing the overwrite
+    // Tricks `io::stdin().is_terminal()` to allow showing the overwrite
     // prompt without -i
     fn mv_test_fake_tty(
         args: &[&str],

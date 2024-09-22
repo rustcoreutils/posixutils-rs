@@ -16,7 +16,6 @@ chrono.workspace = true
 libc.workspace = true
 notify-debouncer-full = "0.3"
 ctor = "0.2"
-atty.workspace = true
 diff = "0.1"
 dirs = "5.0"
 deunicode = "1.6"
@@ -101,4 +100,3 @@ path = "./tsort.rs"
 [[bin]]
 name = "wc"
 path = "./wc.rs"
-

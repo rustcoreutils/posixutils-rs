@@ -270,4 +270,12 @@ These platforms are not as well tested, but most components of posixutils build 
   * Not working:
     * posixutils-sys
 
+Since posixutils is modular, components not in the above list can be installed like this:
+
+```Shell
+# For example, in an x86_64 "alpine:3.20" container (x86_64-unknown-linux-musl):
+apk add cargo
+cargo install --git https://github.com/rustcoreutils/posixutils-rs --locked -- posixutils-text
+```
+
 See https://doc.rust-lang.org/rustc/platform-support.html for an explanation of these platform names.

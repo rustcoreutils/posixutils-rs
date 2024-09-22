@@ -54,8 +54,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.job.target }}
-      - run: cargo build ${{ matrix.job.excludes }} --release --verbose --workspace
-      - run: cargo test ${{ matrix.job.excludes }} --release --verbose --workspace
+      - run: cargo check ${{ matrix.job.excludes }} --release --target ${{ matrix.job.target }} --verbose --workspace
     strategy:
       matrix:
         job:

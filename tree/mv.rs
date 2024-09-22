@@ -18,9 +18,10 @@ use plib::PROJECT_NAME;
 use std::{
     collections::{HashMap, HashSet},
     ffi::CString,
+    fs,
+    io::{self, IsTerminal},
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::{Path, PathBuf},
-    {fs, io},
 };
 
 /// mv - move files
@@ -54,7 +55,7 @@ impl MvConfig {
         MvConfig {
             force: args.force,
             interactive: args.interactive,
-            is_terminal: atty::is(atty::Stream::Stdin),
+            is_terminal: io::stdin().is_terminal(),
         }
     }
 }

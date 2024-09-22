@@ -16,7 +16,8 @@ use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleC
 use plib::PROJECT_NAME;
 use std::{
     ffi::CString,
-    fs, io,
+    fs,
+    io::{self, IsTerminal},
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::{Path, PathBuf},
 };
@@ -440,7 +441,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
-    let is_tty = atty::is(atty::Stream::Stdin);
+    let is_tty = io::stdin().is_terminal();
     let cfg = RmConfig { args, is_tty };
 
     let mut exit_code = 0;

@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-m4"
-version = "0.1.0"
+version = "0.2.1"
 edition = "2021"
 description = "m4 - macro language processor"
 authors = ["Luke Frisken"]

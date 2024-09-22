@@ -623,7 +623,7 @@ dependencies = [
 
 [[package]]
 name = "ftw"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "errno",
  "libc",
@@ -653,7 +653,7 @@ dependencies = [
 
 [[package]]
 name = "gettext-rs"
-version = "0.1.0"
+version = "0.2.1"
 
 [[package]]
 name = "gimli"
@@ -1265,7 +1265,7 @@ checksum = "bda66fc9667c18cb2758a2ac84d1167245054bcf85d5d1aaa6923f45801bdd02"
 
 [[package]]
 name = "plib"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "cfg-if",
  "errno",
@@ -1274,7 +1274,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-awk"
-version = "0.1.7"
+version = "0.2.1"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -1289,7 +1289,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-calc"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bigdecimal",
  "clap",
@@ -1304,7 +1304,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-datetime"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "clap",
@@ -1315,7 +1315,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-dev"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ar",
  "chrono",
@@ -1327,7 +1327,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-display"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -1336,7 +1336,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-file"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "atty",
  "clap",
@@ -1350,7 +1350,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-fs"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -1360,7 +1360,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-i18n"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytemuck",
  "byteorder",
@@ -1371,7 +1371,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-m4"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "clap",
  "env_logger",
@@ -1389,7 +1389,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-misc"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "atty",
  "clap",
@@ -1400,7 +1400,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-pathnames"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -1410,7 +1410,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-process"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "atty",
  "bindgen",
@@ -1424,7 +1424,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-sccs"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -1433,7 +1433,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-screen"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -1445,7 +1445,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-sys"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "clap",
@@ -1457,7 +1457,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-text"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "atty",
  "chrono",
@@ -1477,7 +1477,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-tree"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "atty",
  "chrono",
@@ -1493,7 +1493,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-users"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "atty",
  "chrono",
@@ -1506,7 +1506,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-xform"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64",
  "clap",

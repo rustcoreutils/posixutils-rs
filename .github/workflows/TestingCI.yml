@@ -47,3 +47,28 @@ jobs:
       - name: Run tests
         run: cargo test --release --verbose
 
+  secondary-platforms:
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo fetch
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.job.target }}
+      - run: cargo build ${{ matrix.job.excludes }} --release --verbose --workspace
+      - run: cargo test ${{ matrix.job.excludes }} --release --verbose --workspace
+    strategy:
+      matrix:
+        job:
+          - {
+              target: aarch64-unknown-linux-gnu,
+              excludes: "--exclude posixutils-awk --exclude posixutils-m4 --exclude posixutils-tree",
+            }
+          - {
+              target: aarch64-unknown-linux-musl,
+              excludes: "--exclude posixutils-awk --exclude posixutils-m4 --exclude posixutils-sys --exclude posixutils-tree",
+            }
+          - {
+              target: x86_64-unknown-linux-musl,
+              excludes: "--exclude posixutils-sys",
+            }
+    runs-on: ubuntu-latest

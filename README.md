@@ -202,8 +202,8 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] uux (UUCP)
 
 ### Editors category
- - [ ] ed (Editors)
- - [ ] ex (Editors) -- Volunteer starting point at https://github.com/rustcoreutils/posixutils-rs/tree/ed
+ - [ ] ed (Editors) -- Volunteer starting point at https://github.com/rustcoreutils/posixutils-rs/tree/ed
+ - [ ] ex (Editors)
  - [ ] vi (Editors)
 
 ### Misc. category
@@ -219,6 +219,14 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] sh -- Volunteer starting point at https://github.com/rustcoreutils/posixutils-rs/tree/shell
  - [ ] talk (status: in progress)
  - [ ] timeout (status: in progress)
+
+## Installation
+
+These are "core" utilities of any operating system.  Production packaging in the future will be done on a per-distro basis in a distro-specific way.
+
+As such, Dockerfiles, rpm and deb packaging is welcome, but currently considered a secondary priority to finishing, bugfixing and tuning the utilities.  Packaging contributions are weclome...  if done right.
+
+The standard `cargo install` should work, for those interested in testing.  Care should be taken with PATH to point to the correct `cp` or `mv`, when mixing with standard system utilities on an already-shipped operating system.
 
 ## Testing
 

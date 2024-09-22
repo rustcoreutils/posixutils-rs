@@ -240,3 +240,34 @@ sudo -E cargo test --release --features posixutils_test_all,requires_root <test_
 ```
 
 Integration tests may generate test data under `CARGO_TARGET_TMPDIR` (usually resolves to `target/tmp`) and `/dev/shm` (Linux only).
+
+
+## Supported platforms
+
+### Fully supported
+
+The project is fully built and tested on these platforms on every pull request:
+
+* `aarch64-apple-darwin`
+* `x86_64-unknown-linux-gnu`
+
+### Partially supported
+
+These platforms are not as well tested, but most components of posixutils build on these platforms:
+
+* `aarch64-unknown-linux-gnu`
+  * Not working:
+    * posixutils-awk
+    * posixutils-m4
+    * posixutils-tree
+* `aarch64-unknown-linux-musl`
+  * Not working:
+    * posixutils-awk
+    * posixutils-m4
+    * posixutils-sys
+    * posixutils-tree
+* `x86_64-unknown-linux-musl`
+  * Not working:
+    * posixutils-sys
+
+See https://doc.rust-lang.org/rustc/platform-support.html for an explanation of these platform names.

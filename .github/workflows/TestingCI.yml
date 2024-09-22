@@ -54,19 +54,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.job.target }}
-      - run: cargo check ${{ matrix.job.excludes }} --release --target ${{ matrix.job.target }} --verbose --workspace
+      - run: cargo ${{ matrix.job.command }} ${{ matrix.job.excludes }} --release --target ${{ matrix.job.target }} --verbose --workspace
     strategy:
       matrix:
         job:
           - {
+              command: check,
               target: aarch64-unknown-linux-gnu,
               excludes: "--exclude posixutils-awk --exclude posixutils-m4 --exclude posixutils-tree",
             }
           - {
+              command: check,
               target: aarch64-unknown-linux-musl,
               excludes: "--exclude posixutils-awk --exclude posixutils-m4 --exclude posixutils-sys --exclude posixutils-tree",
             }
           - {
+              command: build,
               target: x86_64-unknown-linux-musl,
               excludes: "--exclude posixutils-sys",
             }

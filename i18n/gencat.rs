@@ -486,7 +486,7 @@ impl MessageCatalog {
         let mut act_size = 1 + self.cat.total_messages() / 5;
 
         while act_size <= best_total {
-            let mut deep = vec![0; act_size as usize];
+            let mut deep = vec![0; act_size];
             let mut act_depth = 1;
 
             for set in self.cat.all_sets() {
@@ -501,7 +501,7 @@ impl MessageCatalog {
                     if deep[idx] > act_depth {
                         act_depth = deep[idx];
 
-                        if act_depth * act_size > best_total as usize {
+                        if act_depth * act_size > best_total {
                             break;
                         }
                     }
@@ -540,7 +540,7 @@ impl MessageCatalog {
                     idx += best_size * 3;
                 }
 
-                array[idx] = (set.set_id + 1) as u32;
+                array[idx] = set.set_id + 1;
                 array[idx + 1] = msg.msg_id as u32;
                 array[idx + 2] = string_pool.len() as u32;
 
@@ -580,14 +580,14 @@ impl MessageCatalog {
         // little-endian array
         let array_size = (plane_size * plane_depth * 3) as usize;
         let mut le_array = vec![0u32; array_size];
-        for i in 0..array_size {
-            le_array[i] = LittleEndian::read_u32(&buf[ptr..(ptr + 4)]);
+        for elem in le_array.iter_mut().take(array_size) {
+            *elem = LittleEndian::read_u32(&buf[ptr..(ptr + 4)]);
             ptr += 4;
         }
 
         let mut be_array = vec![0u32; array_size];
-        for i in 0..array_size {
-            be_array[i] = BigEndian::read_u32(&buf[ptr..(ptr + 4)]);
+        for elem in be_array.iter_mut().take(array_size) {
+            *elem = BigEndian::read_u32(&buf[ptr..(ptr + 4)]);
             ptr += 4;
         }
 
@@ -611,10 +611,7 @@ impl MessageCatalog {
                     + string_offset;
 
                 let msg = String::from_utf8_lossy(&string_pool[string_offset..msg_end]).to_string();
-                set_msg
-                    .entry(set_id)
-                    .or_insert_with(BTreeMap::new)
-                    .insert(msg_id, msg);
+                set_msg.entry(set_id).or_default().insert(msg_id, msg);
             }
         }
 

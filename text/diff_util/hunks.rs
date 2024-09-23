@@ -34,7 +34,7 @@ impl Hunk {
         let (ln1, ln2) = change.get_lns();
 
         Self {
-            kind: change.clone(),
+            kind: change,
             changes: vec![change; 1],
             ln1_start: ln1,
             ln1_end: ln1,
@@ -107,7 +107,7 @@ impl Hunk {
     }
 
     pub fn change_sequence_acceptable(&self, change: &Change) -> bool {
-        let sequence_is_allowed = if let Some(_) = self.changes.last() {
+        let sequence_is_allowed = if self.changes.last().is_some() {
             change.get_ln1().abs_diff(self.ln1_start) == 1
                 || change.get_ln1().abs_diff(self.ln1_end) == 1
                 || change.get_ln2().abs_diff(self.ln2_start) == 1
@@ -139,7 +139,7 @@ impl Hunk {
                     println!("< {}", file1.line(change.get_ln1() - 1));
                 }
 
-                if is_last && file1.ends_with_newline() == false {
+                if is_last && !file1.ends_with_newline() {
                     println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
                 }
             }
@@ -159,7 +159,7 @@ impl Hunk {
                     println!("< {}", old);
                 }
 
-                if is_last && file1.ends_with_newline() == false {
+                if is_last && !file1.ends_with_newline() {
                     println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
                 }
 
@@ -169,7 +169,7 @@ impl Hunk {
                     println!("> {}", new);
                 }
 
-                if is_last && file2.ends_with_newline() == false {
+                if is_last && !file2.ends_with_newline() {
                     println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
                 }
             }
@@ -254,7 +254,7 @@ impl Hunk {
             }
         }
 
-        if is_last && file1.ends_with_newline() == false {
+        if is_last && !file1.ends_with_newline() {
             println!(
                 "diff: {}:{}\n",
                 file1.name(),
@@ -262,7 +262,7 @@ impl Hunk {
             );
         }
 
-        if is_last && file2.ends_with_newline() == false {
+        if is_last && !file2.ends_with_newline() {
             println!(
                 "diff: {}:{}\n",
                 file2.name(),
@@ -300,7 +300,7 @@ impl Hunk {
             }
         }
 
-        if is_last && file1.ends_with_newline() == false {
+        if is_last && !file1.ends_with_newline() {
             println!(
                 "diff: {}:{}\n",
                 file1.name(),
@@ -308,7 +308,7 @@ impl Hunk {
             );
         }
 
-        if is_last && file2.ends_with_newline() == false {
+        if is_last && !file2.ends_with_newline() {
             println!(
                 "diff: {}:{}\n",
                 file2.name(),
@@ -326,7 +326,7 @@ pub struct Hunks {
 impl Hunks {
     pub fn new() -> Self {
         Self {
-            hunks: vec![Hunk::new(); 0],
+            hunks: vec![] as Vec<Hunk>,
         }
     }
 

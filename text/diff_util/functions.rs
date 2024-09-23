@@ -3,7 +3,7 @@ use std::{
     fs::File,
     hash::{DefaultHasher, Hash, Hasher},
     io::{self, Read},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::SystemTime,
 };
 
@@ -35,7 +35,7 @@ pub fn vec_min(nums: &[usize]) -> usize {
         }
     }
 
-    return result;
+    result
 }
 
 pub fn is_binary(file_path: &PathBuf) -> io::Result<bool> {
@@ -43,8 +43,8 @@ pub fn is_binary(file_path: &PathBuf) -> io::Result<bool> {
     let mut buffer = [0; 1024];
 
     if let Ok(count) = file.read(&mut buffer) {
-        for i in 0..count {
-            if UTF8_NOT_ALLOWED_BYTES.contains(&buffer[i]) {
+        for buf in buffer.iter().take(count) {
+            if UTF8_NOT_ALLOWED_BYTES.contains(buf) {
                 return Ok(true);
             }
         }
@@ -53,8 +53,8 @@ pub fn is_binary(file_path: &PathBuf) -> io::Result<bool> {
     Ok(false)
 }
 
-pub fn check_existance(path_buf: &PathBuf) -> io::Result<bool> {
-    if path_buf.exists() == false {
+pub fn check_existance(path_buf: &Path) -> io::Result<bool> {
+    if !path_buf.exists() {
         println!(
             "diff: {}: No such file or directory",
             path_buf.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME)

@@ -104,7 +104,7 @@ fn process_files2(
                     for num in order {
                         let f_num: Vec<&str> = num.split('.').collect();
                         if f_num[0] == "1" {
-                            if fields1.len() <= f_num[1].parse::<usize>()? - 1 {
+                            if fields1.len() < f_num[1].parse::<usize>()? {
                                 if let Some(e) = &e {
                                     res.push(e.to_string());
                                 }
@@ -112,7 +112,7 @@ fn process_files2(
                                 res.push(fields1[f_num[1].parse::<usize>()? - 1].clone());
                             }
                         } else if f_num[0] == "2" {
-                            if fields2.len() <= f_num[1].parse::<usize>()? - 1 {
+                            if fields2.len() < f_num[1].parse::<usize>()? {
                                 if let Some(e) = &e {
                                     res.push(e.to_string());
                                 }
@@ -124,10 +124,8 @@ fn process_files2(
                     if v == 0 {
                         println!("{}", res.join(" "));
                     }
-                } else {
-                    if v == 0 {
-                        println!("{} {}", fields1.join(" "), fields2[1..].join(" "));
-                    }
+                } else if v == 0 {
+                    println!("{} {}", fields1.join(" "), fields2[1..].join(" "));
                 }
             }
         }

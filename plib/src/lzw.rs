@@ -204,23 +204,23 @@ impl UnixLZWReader {
         let mut bits = self.n_bits;
         let mut bp: usize = 0;
 
-        bp = bp + (r_off >> 3) as usize;
-        r_off = r_off & 7;
+        bp += (r_off >> 3) as usize;
+        r_off &= 7;
 
         let mut gcode: i32 = (self.gbuf[bp] as i32) >> r_off;
-        bp = bp + 1;
-        bits = bits - (8 - r_off) as u32;
+        bp += 1;
+        bits -= (8 - r_off) as u32;
         r_off = 8 - r_off;
 
         if bits >= 8 {
-            gcode = gcode | ((self.gbuf[bp] as i32) << r_off);
-            bp = bp + 1;
-            r_off = r_off + 8;
-            bits = bits - 8;
+            gcode |= (self.gbuf[bp] as i32) << r_off;
+            bp += 1;
+            r_off += 8;
+            bits -= 8;
         }
 
-        gcode = gcode | (((self.gbuf[bp] as i32) & RMASK[bits as usize]) << r_off);
-        self.roffset = self.roffset + self.n_bits as i32;
+        gcode |= ((self.gbuf[bp] as i32) & RMASK[bits as usize]) << r_off;
+        self.roffset += self.n_bits as i32;
 
         gcode
     }
@@ -435,7 +435,7 @@ impl UnixLZWWriter {
             None => BITS,
         };
 
-        let maxmaxcode = (1 << maxbits) as i32;
+        let maxmaxcode = 1 << maxbits;
 
         Self {
             state: WriterState::Start,
@@ -503,8 +503,8 @@ impl UnixLZWWriter {
             bp += (r_off >> 3) as usize;
             r_off &= 7;
 
-            self.buf[bp] = ((self.buf[bp] as i32 & RMASK[r_off as usize] as i32) as u8)
-                | ((ocode << r_off) & LMASK[r_off as usize] as i32) as u8;
+            self.buf[bp] = ((self.buf[bp] as i32 & RMASK[r_off as usize]) as u8)
+                | ((ocode << r_off) & LMASK[r_off as usize]) as u8;
             bp += 1;
             bits -= 8 - r_off;
             ocode >>= 8 - r_off;
@@ -607,10 +607,10 @@ impl UnixLZWWriter {
             let mut i = (c << self.write_params.hshift) ^ self.write_params.ent;
 
             let mut skip_flag = false;
-            if self.htab[i as usize] as i32 == self.write_params.fcode {
+            if self.htab[i as usize] == self.write_params.fcode {
                 self.write_params.ent = self.codetab[i as usize] as i32;
                 continue;
-            } else if self.htab[i as usize] as i32 >= 0 {
+            } else if self.htab[i as usize] >= 0 {
                 let mut disp = self.write_params.hsize_reg - i;
                 if i == 0 {
                     disp = 1;
@@ -620,7 +620,7 @@ impl UnixLZWWriter {
                     if i < 0 {
                         i += self.write_params.hsize_reg;
                     }
-                    if self.htab[i as usize] as i32 == self.write_params.fcode {
+                    if self.htab[i as usize] == self.write_params.fcode {
                         self.write_params.ent = self.codetab[i as usize] as i32;
                         skip_flag = true;
                         break;
@@ -641,7 +641,7 @@ impl UnixLZWWriter {
             if self.free_ent < self.maxmaxcode {
                 self.codetab[i as usize] = self.free_ent as u16;
                 self.free_ent += 1;
-                self.htab[i as usize] = self.write_params.fcode as i32;
+                self.htab[i as usize] = self.write_params.fcode;
             } else if self.in_count >= self.checkpoint && self.block_compress {
                 self.clear_block()?;
             }

@@ -197,10 +197,8 @@ impl Value {
 fn parse_number(input: &mut String) -> Option<u64> {
     if let Some(hex_num) = parse_hexadecimal(input) {
         Some(hex_num)
-    } else if let Some(dec_oct_num) = parse_decimal_octal(input) {
-        Some(dec_oct_num)
     } else {
-        None
+        parse_decimal_octal(input)
     }
 }
 
@@ -268,7 +266,7 @@ impl Type {
         };
 
         // the input string should be empty after all the steps being followed
-        if input.len() != 0 {
+        if !input.is_empty() {
             return Err(RawMagicLineParseError::InvalidTypeFormat);
         }
 
@@ -442,7 +440,7 @@ impl RawMagicFileLine {
     fn string_test(&self, tf_reader: &mut BufReader<File>) -> bool {
         if let Value::String(val) = &self.value {
             let mut buf = vec![0u8; val.len()];
-            if let Err(_) = tf_reader.read_exact(&mut buf) {
+            if tf_reader.read_exact(&mut buf).is_err() {
                 return false;
             }
 
@@ -455,7 +453,7 @@ impl RawMagicFileLine {
 
     fn number_test(&self, size: u64, mask: Option<u64>, tf_reader: &mut BufReader<File>) -> bool {
         let mut buf = vec![0; size as usize];
-        if let Err(_) = tf_reader.read_exact(&mut buf) {
+        if tf_reader.read_exact(&mut buf).is_err() {
             return false;
         }
 
@@ -466,7 +464,7 @@ impl RawMagicFileLine {
         let mut tf_val = u64::from_be_bytes(array_buf);
 
         if let Some(mask) = mask {
-            tf_val = mask & tf_val;
+            tf_val &= mask;
         }
 
         match &self.value {
@@ -620,17 +618,15 @@ fn analyze_file(mut path: String, args: &Args) {
             } else if file_type.is_file() {
                 if args.no_further_file_classification {
                     println!("{path}: regular file");
+                } else if met.len() == 0 {
+                    println!("{path}: empty");
                 } else {
-                    if met.len() == 0 {
-                        println!("{path}: empty");
-                    } else {
-                        match get_type_from_magic_file_dbs(&PathBuf::from(&path), &magic_files) {
-                            Some(f_type) => {
-                                println!("{path}: {f_type}");
-                            }
-                            None => {
-                                println!("{path}: data");
-                            }
+                    match get_type_from_magic_file_dbs(&PathBuf::from(&path), &magic_files) {
+                        Some(f_type) => {
+                            println!("{path}: {f_type}");
+                        }
+                        None => {
+                            println!("{path}: data");
                         }
                     }
                 }

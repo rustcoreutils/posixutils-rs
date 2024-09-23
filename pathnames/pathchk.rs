@@ -40,13 +40,10 @@ fn check_path_basic(pathname: &str) -> Result<(), &'static str> {
     }
 
     for component in Path::new(pathname).components() {
-        match component {
-            Component::Normal(filename) => {
-                if filename.to_string_lossy().starts_with("-") {
-                    return Err("filename begins with -");
-                }
+        if let Component::Normal(filename) = component {
+            if filename.to_string_lossy().starts_with("-") {
+                return Err("filename begins with -");
             }
-            _ => {}
         }
     }
 
@@ -64,16 +61,13 @@ fn check_path_limits(
     }
 
     for component in Path::new(pathname).components() {
-        match component {
-            Component::Normal(filename) => {
-                if filename.len() > max_name {
-                    return Err("filename too long");
-                }
-                if check_ascii && !filename.is_ascii() {
-                    return Err("filename contains non-portable characters");
-                }
+        if let Component::Normal(filename) = component {
+            if filename.len() > max_name {
+                return Err("filename too long");
             }
-            _ => {}
+            if check_ascii && !filename.is_ascii() {
+                return Err("filename contains non-portable characters");
+            }
         }
     }
 

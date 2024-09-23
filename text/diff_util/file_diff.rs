@@ -49,7 +49,7 @@ impl<'a> FileDiff<'a> {
             file1,
             file2,
             hunks: Hunks::new(),
-            format_options: format_options,
+            format_options,
             are_different: false,
         }
     }
@@ -61,7 +61,7 @@ impl<'a> FileDiff<'a> {
         show_if_different: Option<String>,
     ) -> io::Result<DiffExitStatus> {
         if is_binary(&path1)? || is_binary(&path2)? {
-            return Self::binary_file_diff(&path1, &path2);
+            Self::binary_file_diff(&path1, &path2)
         } else {
             let mut file1 = FileData::get_file(path1)?;
             let mut file2 = FileData::get_file(path2)?;
@@ -76,7 +76,7 @@ impl<'a> FileDiff<'a> {
                 }
             }
 
-            return diff.print();
+            diff.print()
         }
     }
 
@@ -89,24 +89,24 @@ impl<'a> FileDiff<'a> {
 
         if path1_file_type.is_file() {
             let path1_file = path1.clone();
-            let path1_file = path1_file.file_name().expect(&COULD_NOT_UNWRAP_FILENAME);
+            let path1_file = path1_file.file_name().expect(COULD_NOT_UNWRAP_FILENAME);
             let path2 = path2.join(path1_file);
 
             if !check_existance(&path2)? {
                 return Ok(DiffExitStatus::Trouble);
             }
 
-            return FileDiff::file_diff(path1, path2, format_options, None);
+            FileDiff::file_diff(path1, path2, format_options, None)
         } else {
             let path2_file = path2.clone();
-            let path2_file = path2_file.file_name().expect(&COULD_NOT_UNWRAP_FILENAME);
+            let path2_file = path2_file.file_name().expect(COULD_NOT_UNWRAP_FILENAME);
             let path1 = path1.join(path2_file);
 
             if !check_existance(&path1)? {
                 return Ok(DiffExitStatus::Trouble);
             }
 
-            return FileDiff::file_diff(path1, path2, format_options, None);
+            FileDiff::file_diff(path1, path2, format_options, None)
         }
     }
 
@@ -152,13 +152,13 @@ impl<'a> FileDiff<'a> {
             for hunk_index in 0..hunks_count {
                 let hunk = self.hunks.hunk_at_mut(hunk_index);
                 match self.format_options.output_format {
-                    OutputFormat::Debug => hunk.print_debug(&self.file1, &self.file2),
+                    OutputFormat::Debug => hunk.print_debug(self.file1, self.file2),
                     OutputFormat::Default => {
-                        hunk.print_default(&self.file1, &self.file2, hunk_index == hunks_count - 1)
+                        hunk.print_default(self.file1, self.file2, hunk_index == hunks_count - 1)
                     }
                     OutputFormat::EditScript => hunk.print_edit_script(
-                        &self.file1,
-                        &self.file2,
+                        self.file1,
+                        self.file2,
                         hunk_index == hunks_count - 1,
                     ),
                     OutputFormat::Context(_) => {
@@ -166,8 +166,8 @@ impl<'a> FileDiff<'a> {
                         return Ok(DiffExitStatus::Trouble);
                     }
                     OutputFormat::ForwardEditScript => hunk.print_forward_edit_script(
-                        &self.file1,
-                        &self.file2,
+                        self.file1,
+                        self.file2,
                         hunk_index == hunks_count - 1,
                     ),
                     OutputFormat::Unified(_) => {
@@ -179,9 +179,9 @@ impl<'a> FileDiff<'a> {
         }
 
         if self.are_different() {
-            return Ok(DiffExitStatus::Different);
+            Ok(DiffExitStatus::Different)
         } else {
-            return Ok(DiffExitStatus::NotDifferent);
+            Ok(DiffExitStatus::NotDifferent)
         }
     }
 
@@ -200,8 +200,8 @@ impl<'a> FileDiff<'a> {
         let mut file1_considered_lines = vec![0; 0];
         let mut file2_considered_lines = vec![0; 0];
 
-        for i in 0..=n {
-            distances[i][0] = i;
+        for (i, vec) in distances.iter_mut().enumerate().take(n + 1) {
+            vec[i] = i;
         }
 
         for j in 0..=m {
@@ -210,7 +210,7 @@ impl<'a> FileDiff<'a> {
 
         for i in 1..=n {
             for j in 1..=m {
-                let cost = if self.compare_lines(&self.file1.line(i - 1), &self.file2.line(j - 1)) {
+                let cost = if self.compare_lines(self.file1.line(i - 1), self.file2.line(j - 1)) {
                     if !file1_considered_lines.contains(&i) && !file2_considered_lines.contains(&j)
                     {
                         file1_considered_lines.push(i);
@@ -243,7 +243,7 @@ impl<'a> FileDiff<'a> {
 
                 i -= 1
             } else {
-                if !self.compare_lines(&self.file1.line(i - 1), &self.file2.line(j - 1)) {
+                if !self.compare_lines(self.file1.line(i - 1), self.file2.line(j - 1)) {
                     self.add_change(Change::Substitute(ChangeData::new(i, j)));
                 }
 
@@ -288,7 +288,7 @@ impl<'a> FileDiff<'a> {
             .hunks
             .hunks()
             .iter()
-            .filter(|hunk| !Change::is_none(&hunk.kind()) && !Change::is_unchanged(&hunk.kind()))
+            .filter(|hunk| !Change::is_none(hunk.kind()) && !Change::is_unchanged(hunk.kind()))
             .map(|hunk| {
                 (
                     hunk.ln1_start() as i64,
@@ -303,13 +303,13 @@ impl<'a> FileDiff<'a> {
 
         let mut context_ranges = vec![(usize::MIN, usize::MIN, usize::MIN, usize::MIN); 0];
 
-        let f1_max = if self.file1.ends_with_newline() && f1_lines - 1 >= 1 {
+        let f1_max = if self.file1.ends_with_newline() && f1_lines > 1 {
             f1_lines - 1
         } else {
             f1_lines
         };
 
-        let f2_max = if self.file2.ends_with_newline() && f2_lines - 1 >= 1 {
+        let f2_max = if self.file2.ends_with_newline() && f2_lines > 1 {
             f2_lines - 1
         } else {
             f2_lines
@@ -321,7 +321,7 @@ impl<'a> FileDiff<'a> {
             let ln2s = i64::clamp(cr.2 - context as i64, 1, f2_max as i64);
             let ln2e = i64::clamp(cr.3 + context as i64, 1, f2_max as i64);
 
-            if context_ranges.len() > 0 {
+            if !context_ranges.is_empty() {
                 // Overlap check
                 if let Some((_, ln1_end, _, ln2_end)) = context_ranges.last_mut() {
                     if *ln1_end >= ln1s as usize || *ln2_end >= ln2s as usize {
@@ -335,7 +335,7 @@ impl<'a> FileDiff<'a> {
             context_ranges.push((ln1s as usize, ln1e as usize, ln2s as usize, ln2e as usize));
         }
 
-        return context_ranges;
+        context_ranges
     }
 
     fn order_hunks_by_output_format(&mut self) {
@@ -376,7 +376,7 @@ impl<'a> FileDiff<'a> {
             let cr = change_ranges[cr_index];
 
             println!("***************");
-            println!("*** {} ***", format!("{},{}", cr.0, cr.1));
+            println!("*** {},{} ***", cr.0, cr.1);
             if self.file1.expected_changed_in_range(
                 cr.0 - 1,
                 cr.1 - 1,
@@ -391,13 +391,11 @@ impl<'a> FileDiff<'a> {
                 }
             }
 
-            if cr_index == change_ranges.len() - 1 {
-                if self.file1.ends_with_newline() == false {
-                    println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
-                }
+            if cr_index == change_ranges.len() - 1 && !self.file1.ends_with_newline() {
+                println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
             }
 
-            println!("--- {} ---", format!("{},{}", cr.2, cr.3));
+            println!("--- {},{} ---", cr.2, cr.3);
 
             if self.file2.expected_changed_in_range(
                 cr.2 - 1,
@@ -413,10 +411,8 @@ impl<'a> FileDiff<'a> {
                 }
             }
 
-            if cr_index == change_ranges.len() - 1 {
-                if self.file2.ends_with_newline() == false {
-                    println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
-                }
+            if cr_index == change_ranges.len() - 1 && !self.file2.ends_with_newline() {
+                println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
             }
         }
     }
@@ -439,14 +435,14 @@ impl<'a> FileDiff<'a> {
 
             for f1_line in cr.0..=cr.1 {
                 let change = self.file1.change(f1_line - 1);
-                changes.insert(calculate_hash(change), change.clone());
+                changes.insert(calculate_hash(change), *change);
             }
 
             for f2_line in cr.2..=cr.3 {
                 let change = self.file2.change(f2_line - 1);
                 let hash = calculate_hash(change);
-                if changes.contains_key(&hash) == false {
-                    changes.insert(calculate_hash(change), change.clone());
+                if !changes.contains_key(&hash) {
+                    changes.insert(calculate_hash(change), *change);
                 }
             }
 
@@ -507,7 +503,7 @@ impl<'a> FileDiff<'a> {
                     increase_by_one_if(change.is_substitute(), &mut printed_substitute);
 
                     let printables = match change {
-                        Change::None => vec![String::new(); 0],
+                        Change::None => vec![] as Vec<String>,
                         Change::Unchanged(data) => {
                             vec![format!(" {}", self.file1.line(data.ln1() - 1))]
                         }
@@ -536,7 +532,7 @@ impl<'a> FileDiff<'a> {
                         && printed_unchanged == unchanged_count
                         && printed_delete == delete_count
                         && printed_substitute == substitute_count
-                        && self.file1.ends_with_newline() == false
+                        && !self.file1.ends_with_newline()
                     {
                         println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
                         f1_no_eof_printable = false;
@@ -551,7 +547,7 @@ impl<'a> FileDiff<'a> {
                         && cr_index == context_ranges.len() - 1
                         && insert_count == printed_insert
                         && printed_substitute == substitute_count
-                        && self.file2.ends_with_newline() == false
+                        && !self.file2.ends_with_newline()
                     {
                         println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
                         f2_no_eof_printable = false;
@@ -563,13 +559,13 @@ impl<'a> FileDiff<'a> {
 
     pub fn get_header(file: &FileData, label: &Option<String>) -> String {
         if let Some(label) = label {
-            return format!("{}", label);
+            label.to_string()
         } else {
-            return format!(
+            format!(
                 "{}\t{}",
                 file.path(),
                 system_time_to_rfc2822(file.modified())
-            );
+            )
         }
     }
 }

@@ -388,7 +388,7 @@ fn evaluate_expression(
                 Expr::Newer(f) => {
                     if let Ok(metadata) = fs::metadata(f) {
                         if let Ok(file_metadata) = file.metadata() {
-                            if !(file_metadata.modified().unwrap() > metadata.modified().unwrap()) {
+                            if file_metadata.modified().unwrap() <= metadata.modified().unwrap() {
                                 c_files.remove(file.path());
                             }
                         }

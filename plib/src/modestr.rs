@@ -55,6 +55,12 @@ impl ChmodAction {
     }
 }
 
+impl Default for ChmodAction {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug)]
 pub struct ChmodClause {
     // wholist
@@ -80,6 +86,12 @@ impl ChmodClause {
     }
 }
 
+impl Default for ChmodClause {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug)]
 pub struct ChmodSymbolic {
     pub clauses: Vec<ChmodClause>,
@@ -90,6 +102,12 @@ impl ChmodSymbolic {
         ChmodSymbolic {
             clauses: Vec::new(),
         }
+    }
+}
+
+impl Default for ChmodSymbolic {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -227,9 +245,9 @@ pub fn parse(mode: &str) -> Result<ChmodMode, String> {
 // apply symbolic mutations to the given file at path
 pub fn mutate(cur_mode: u32, symbolic: &ChmodSymbolic) -> u32 {
     let mut new_mode = cur_mode;
-    let mut user = cur_mode & S_IRWXU as u32;
-    let mut group = cur_mode & S_IRWXG as u32;
-    let mut others = cur_mode & S_IRWXO as u32;
+    let mut user = cur_mode & S_IRWXU;
+    let mut group = cur_mode & S_IRWXG;
+    let mut others = cur_mode & S_IRWXO;
 
     // apply each clause
     for clause in &symbolic.clauses {
@@ -239,123 +257,123 @@ pub fn mutate(cur_mode: u32, symbolic: &ChmodSymbolic) -> u32 {
                 // add bits to the mode
                 ChmodActionOp::Add => {
                     if action.copy_user {
-                        user |= cur_mode & S_IRWXU as u32;
+                        user |= cur_mode & S_IRWXU;
                     }
                     if action.copy_group {
-                        group |= cur_mode & S_IRWXG as u32;
+                        group |= cur_mode & S_IRWXG;
                     }
                     if action.copy_others {
-                        others |= cur_mode & S_IRWXO as u32;
+                        others |= cur_mode & S_IRWXO;
                     }
                     if action.read {
-                        user |= S_IRUSR as u32;
-                        group |= S_IRGRP as u32;
-                        others |= S_IROTH as u32;
+                        user |= S_IRUSR;
+                        group |= S_IRGRP;
+                        others |= S_IROTH;
                     }
                     if action.write {
-                        user |= S_IWUSR as u32;
-                        group |= S_IWGRP as u32;
-                        others |= S_IWOTH as u32;
+                        user |= S_IWUSR;
+                        group |= S_IWGRP;
+                        others |= S_IWOTH;
                     }
                     if action.execute {
-                        user |= S_IXUSR as u32;
-                        group |= S_IXGRP as u32;
-                        others |= S_IXOTH as u32;
+                        user |= S_IXUSR;
+                        group |= S_IXGRP;
+                        others |= S_IXOTH;
                     }
                     if action.execute_dir {
-                        user |= S_IXUSR as u32;
-                        group |= S_IXGRP as u32;
-                        others |= S_IXOTH as u32;
+                        user |= S_IXUSR;
+                        group |= S_IXGRP;
+                        others |= S_IXOTH;
                     }
                     if action.setuid {
-                        user |= S_ISUID as u32;
+                        user |= S_ISUID;
                     }
                     if action.sticky {
-                        others |= S_ISVTX as u32;
+                        others |= S_ISVTX;
                     }
                 }
 
                 // remove bits from the mode
                 ChmodActionOp::Remove => {
                     if action.copy_user {
-                        user &= !(cur_mode & S_IRWXU as u32);
+                        user &= !(cur_mode & S_IRWXU);
                     }
                     if action.copy_group {
-                        group &= !(cur_mode & S_IRWXG as u32);
+                        group &= !(cur_mode & S_IRWXG);
                     }
                     if action.copy_others {
-                        others &= !(cur_mode & S_IRWXO as u32);
+                        others &= !(cur_mode & S_IRWXO);
                     }
                     if action.read {
-                        user &= !S_IRUSR as u32;
-                        group &= !S_IRGRP as u32;
-                        others &= !S_IROTH as u32;
+                        user &= !S_IRUSR;
+                        group &= !S_IRGRP;
+                        others &= !S_IROTH;
                     }
                     if action.write {
-                        user &= !S_IWUSR as u32;
-                        group &= !S_IWGRP as u32;
-                        others &= !S_IWOTH as u32;
+                        user &= !S_IWUSR;
+                        group &= !S_IWGRP;
+                        others &= !S_IWOTH;
                     }
                     if action.execute {
-                        user &= !S_IXUSR as u32;
-                        group &= !S_IXGRP as u32;
-                        others &= !S_IXOTH as u32;
+                        user &= !S_IXUSR;
+                        group &= !S_IXGRP;
+                        others &= !S_IXOTH;
                     }
                     if action.execute_dir {
-                        user &= !S_IXUSR as u32;
-                        group &= !S_IXGRP as u32;
-                        others &= !S_IXOTH as u32;
+                        user &= !S_IXUSR;
+                        group &= !S_IXGRP;
+                        others &= !S_IXOTH;
                     }
                     if action.setuid {
-                        user &= !S_ISUID as u32;
+                        user &= !S_ISUID;
                     }
                     if action.sticky {
-                        others &= !S_ISVTX as u32;
+                        others &= !S_ISVTX;
                     }
                 }
 
                 // set the mode bits
                 ChmodActionOp::Set => {
                     if action.copy_user {
-                        user = cur_mode & S_IRWXU as u32;
+                        user = cur_mode & S_IRWXU;
                     } else {
                         user = 0;
                     }
                     if action.copy_group {
-                        group = cur_mode & S_IRWXG as u32;
+                        group = cur_mode & S_IRWXG;
                     } else {
                         group = 0;
                     }
                     if action.copy_others {
-                        others = cur_mode & S_IRWXO as u32;
+                        others = cur_mode & S_IRWXO;
                     } else {
                         others = 0;
                     }
                     if action.read {
-                        user |= S_IRUSR as u32;
-                        group |= S_IRGRP as u32;
-                        others |= S_IROTH as u32;
+                        user |= S_IRUSR;
+                        group |= S_IRGRP;
+                        others |= S_IROTH;
                     }
                     if action.write {
-                        user |= S_IWUSR as u32;
-                        group |= S_IWGRP as u32;
-                        others |= S_IWOTH as u32;
+                        user |= S_IWUSR;
+                        group |= S_IWGRP;
+                        others |= S_IWOTH;
                     }
                     if action.execute {
-                        user |= S_IXUSR as u32;
-                        group |= S_IXGRP as u32;
-                        others |= S_IXOTH as u32;
+                        user |= S_IXUSR;
+                        group |= S_IXGRP;
+                        others |= S_IXOTH;
                     }
                     if action.execute_dir {
-                        user |= S_IXUSR as u32;
-                        group |= S_IXGRP as u32;
-                        others |= S_IXOTH as u32;
+                        user |= S_IXUSR;
+                        group |= S_IXGRP;
+                        others |= S_IXOTH;
                     }
                     if action.setuid {
-                        user |= S_ISUID as u32;
+                        user |= S_ISUID;
                     }
                     if action.sticky {
-                        others |= S_ISVTX as u32;
+                        others |= S_ISVTX;
                     }
                 }
             }
@@ -363,13 +381,13 @@ pub fn mutate(cur_mode: u32, symbolic: &ChmodSymbolic) -> u32 {
 
         // apply the clause
         if clause.user {
-            new_mode = (new_mode & !S_IRWXU as u32) | user;
+            new_mode = (new_mode & !S_IRWXU) | user;
         }
         if clause.group {
-            new_mode = (new_mode & !S_IRWXG as u32) | group;
+            new_mode = (new_mode & !S_IRWXG) | group;
         }
         if clause.others {
-            new_mode = (new_mode & !S_IRWXO as u32) | others;
+            new_mode = (new_mode & !S_IRWXO) | others;
         }
     }
 

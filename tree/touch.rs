@@ -55,12 +55,9 @@ fn parse_tm_posix(time: &str) -> Result<DateTime<Utc>, Box<dyn std::error::Error
 
     // split into YYYYMMDDhhmm and [.SS] components
     let mut tmp_time = String::new();
-    match time.split_once('.') {
-        Some((t, secs)) => {
-            tmp_time = t.to_string();
-            seconds = secs.to_string();
-        }
-        None => {}
+    if let Some((t, secs)) = time.split_once('.') {
+        tmp_time = t.to_string();
+        seconds = secs.to_string();
     }
     if !tmp_time.is_empty() {
         time = tmp_time;

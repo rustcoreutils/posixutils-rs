@@ -54,9 +54,9 @@ impl CountInfo {
     }
 
     fn accum(&mut self, count: &CountInfo) {
-        self.words = self.words + count.words;
-        self.chars = self.chars + count.chars;
-        self.nl = self.nl + count.nl;
+        self.words += count.words;
+        self.chars += count.chars;
+        self.nl += count.nl;
     }
 }
 
@@ -64,9 +64,9 @@ fn build_display_str(args: &Args, count: &CountInfo, filename: &OsStr) -> String
     let mut output = String::with_capacity(filename.len() + (3 * 10));
 
     let multi_file = args.files.len() > 1;
-    let only_lines = (args.words == false) && (args.bytes == false) && (args.chars == false);
-    let only_words = (args.lines == false) && (args.bytes == false) && (args.chars == false);
-    let only_bytechars = (args.lines == false) && (args.words == false);
+    let only_lines = (!args.words) && (!args.bytes) && (!args.chars);
+    let only_words = (!args.lines) && (!args.bytes) && (!args.chars);
+    let only_bytechars = (!args.lines) && (!args.words);
 
     if args.lines {
         let numstr = match only_lines {
@@ -76,7 +76,7 @@ fn build_display_str(args: &Args, count: &CountInfo, filename: &OsStr) -> String
         output.push_str(&numstr);
     }
     if args.words {
-        if output.len() > 0 {
+        if !output.is_empty() {
             output.push(' ');
         }
         let numstr = match only_words {
@@ -86,7 +86,7 @@ fn build_display_str(args: &Args, count: &CountInfo, filename: &OsStr) -> String
         output.push_str(&numstr);
     }
     if args.bytes || args.chars {
-        if output.len() > 0 {
+        if !output.is_empty() {
             output.push(' ');
         }
         let numstr = match only_bytechars {
@@ -121,7 +121,7 @@ fn wc_file_bytes(count: &mut CountInfo, pathname: &PathBuf) -> io::Result<()> {
             break;
         }
 
-        count.chars = count.chars + n_read;
+        count.chars += n_read;
 
         let bufslice = &buffer[0..n_read];
 
@@ -129,26 +129,24 @@ fn wc_file_bytes(count: &mut CountInfo, pathname: &PathBuf) -> io::Result<()> {
             let ch = *ch_u8 as char;
 
             if ch == '\n' {
-                count.nl = count.nl + 1;
+                count.nl += 1;
                 if in_word {
                     in_word = false;
-                    count.words = count.words + 1;
+                    count.words += 1;
                 }
             } else if ch.is_whitespace() {
                 if in_word {
                     in_word = false;
-                    count.words = count.words + 1;
+                    count.words += 1;
                 }
-            } else {
-                if !in_word {
-                    in_word = true;
-                }
+            } else if !in_word {
+                in_word = true;
             }
         }
     }
 
     if in_word {
-        count.words = count.words + 1;
+        count.words += 1;
     }
 
     Ok(())
@@ -164,8 +162,8 @@ fn wc_file_chars(args: &Args, count: &mut CountInfo, pathname: &PathBuf) -> io::
             break;
         }
 
-        count.nl = count.nl + 1;
-        count.chars = count.chars + n_read;
+        count.nl += 1;
+        count.chars += n_read;
 
         if args.words {
             let mut in_word = false;
@@ -174,16 +172,14 @@ fn wc_file_chars(args: &Args, count: &mut CountInfo, pathname: &PathBuf) -> io::
                 if ch.is_whitespace() {
                     if in_word {
                         in_word = false;
-                        count.words = count.words + 1;
+                        count.words += 1;
                     }
-                } else {
-                    if !in_word {
-                        in_word = true;
-                    }
+                } else if !in_word {
+                    in_word = true;
                 }
             }
             if in_word {
-                count.words = count.words + 1;
+                count.words += 1;
             }
         }
     }

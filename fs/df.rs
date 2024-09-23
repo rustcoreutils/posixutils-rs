@@ -14,7 +14,7 @@ use std::ffi::{CStr, CString};
 use std::io;
 
 #[cfg(target_os = "linux")]
-const _PATH_MOUNTED: &'static str = "/etc/mtab";
+const _PATH_MOUNTED: &str = "/etc/mtab";
 
 /// df - report free storage space
 #[derive(Parser, Debug)]

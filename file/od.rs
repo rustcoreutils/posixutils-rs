@@ -259,12 +259,12 @@ fn parse_offset(offset: &str) -> Result<u64, Box<dyn std::error::Error>> {
     let mut multiplier = 1;
 
     // Handle special suffixes
-    let offset = if offset.ends_with('b') {
+    let offset = if let Some(stripped) = offset.strip_suffix('b') {
         multiplier = 512;
-        &offset[..offset.len() - 1]
-    } else if offset.ends_with('.') {
+        stripped
+    } else if let Some(stripped) = offset.strip_suffix('.') {
         base = 10;
-        &offset[..offset.len() - 1]
+        stripped
     } else {
         offset
     };

@@ -80,7 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     args.remove(0);
 
     let skip_nl = {
-        if args.len() > 0 && (args[0] == "-n") {
+        if !args.is_empty() && (args[0] == "-n") {
             args.remove(0);
             true
         } else {

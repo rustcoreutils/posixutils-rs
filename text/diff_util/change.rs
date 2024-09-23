@@ -84,13 +84,13 @@ impl Change {
 
 impl PartialEq for Change {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::None, Self::None) => true,
-            (Self::Unchanged(_), Self::Unchanged(_)) => true,
-            (Self::Insert(_), Self::Insert(_)) => true,
-            (Self::Delete(_), Self::Delete(_)) => true,
-            (Self::Substitute(_), Self::Substitute(_)) => true,
-            _ => false,
-        }
+        matches!(
+            (self, other),
+            (Self::None, Self::None)
+                | (Self::Unchanged(_), Self::Unchanged(_))
+                | (Self::Insert(_), Self::Insert(_))
+                | (Self::Delete(_), Self::Delete(_))
+                | (Self::Substitute(_), Self::Substitute(_))
+        )
     }
 }

@@ -463,11 +463,9 @@ fn pr_merged(paths: &[PathBuf], params: &Parameters) -> io::Result<()> {
         }
 
         let mut required_rows = 0;
-        for page in pages.iter() {
-            if let Some(p) = page {
-                if p.num_nonpadding_lines > required_rows {
-                    required_rows = p.num_nonpadding_lines;
-                }
+        for p in pages.iter().flatten() {
+            if p.num_nonpadding_lines > required_rows {
+                required_rows = p.num_nonpadding_lines;
             }
         }
 

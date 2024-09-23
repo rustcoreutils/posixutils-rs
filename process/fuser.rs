@@ -199,9 +199,8 @@ mod linux {
         type Item = &'a IpConnections;
 
         fn next(&mut self) -> Option<Self::Item> {
-            self.current.map(|node| {
+            self.current.inspect(|node| {
                 self.current = node.next.as_deref();
-                node
             })
         }
     }
@@ -241,9 +240,8 @@ mod linux {
         type Item = &'a UnixSocketList;
 
         fn next(&mut self) -> Option<Self::Item> {
-            self.current.map(|node| {
+            self.current.inspect(|node| {
                 self.current = node.next.as_deref();
-                node
             })
         }
     }
@@ -279,9 +277,8 @@ mod linux {
         type Item = &'a InodeList;
 
         fn next(&mut self) -> Option<Self::Item> {
-            self.current.map(|node| {
+            self.current.inspect(|node| {
                 self.current = node.next.as_deref();
-                node
             })
         }
     }
@@ -321,9 +318,8 @@ mod linux {
         type Item = &'a DeviceList;
 
         fn next(&mut self) -> Option<Self::Item> {
-            self.current.map(|node| {
+            self.current.inspect(|node| {
                 self.current = node.next.as_deref();
-                node
             })
         }
     }
@@ -1053,7 +1049,7 @@ mod linux {
                     None
                 }
             })
-            .unwrap_or_else(NameSpace::default)
+            .unwrap_or_default()
     }
 
     /// Processes file namespaces by expanding paths and updating lists based on the mount flag.

@@ -223,12 +223,10 @@ fn update_range_field(mut field1: RangeField, mut field2: RangeField) -> (RangeF
 /// the second RangeField object based on their field numbers and first characters.
 ///
 fn compare_range_fields(field1: &RangeField, field2: &RangeField) -> bool {
-    if field1.field_number < field2.field_number {
-        true
-    } else if field1.field_number == field2.field_number {
-        field1.first_character <= field2.first_character
-    } else {
-        false
+    match field1.field_number.cmp(&field2.field_number) {
+        Ordering::Less => true,
+        Ordering::Equal => field1.first_character <= field2.first_character,
+        Ordering::Greater => false,
     }
 }
 
@@ -951,15 +949,15 @@ fn merge_empty_lines(vec: Vec<&str>) -> Vec<String> {
     let mut empty_count = 0;
     let mut result = vec![];
 
-    for i in 0..vec.len() {
-        if vec[i].is_empty() {
+    for str in &vec {
+        if str.is_empty() {
             empty_count += 1;
         } else if empty_count > 0 {
             let spaces = " ".repeat(empty_count);
-            result.push(format!("{}{}", spaces, vec[i]));
+            result.push(format!("{}{}", spaces, str));
             empty_count = 0;
         } else {
-            result.push(vec[i].to_string());
+            result.push(str.to_string());
         }
     }
 

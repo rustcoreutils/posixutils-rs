@@ -126,10 +126,7 @@ impl Entry {
                         Some('|')
                     } else {
                         let mode = metadata.mode();
-                        if mode
-                            & (libc::S_IXUSR as u32 | libc::S_IXGRP as u32 | libc::S_IXOTH as u32)
-                            != 0
-                        {
+                        if mode & (libc::S_IXUSR | libc::S_IXGRP | libc::S_IXOTH) != 0 {
                             Some('*')
                         } else {
                             None
@@ -509,6 +506,7 @@ impl Entry {
 }
 
 // Used for padding in long format
+#[derive(Default)]
 pub struct LongFormatPadding {
     pub blocks_str_width: usize,
     pub inode_str_width: usize,
@@ -519,22 +517,6 @@ pub struct LongFormatPadding {
     pub device_id_major_width: usize,
     pub device_id_minor_width: usize,
     pub time_width: usize,
-}
-
-impl Default for LongFormatPadding {
-    fn default() -> Self {
-        Self {
-            blocks_str_width: 0,
-            inode_str_width: 0,
-            num_links_width: 0,
-            owner_name_width: 0,
-            group_name_width: 0,
-            file_size_width: 0,
-            device_id_major_width: 0,
-            device_id_minor_width: 0,
-            time_width: 0,
-        }
-    }
 }
 
 impl LongFormatPadding {
@@ -570,22 +552,12 @@ impl LongFormatPadding {
 }
 
 // Used for padding in multi-column format
+#[derive(Default)]
 pub struct MultiColumnPadding {
     pub total_width: usize,
     pub inode_str_width: usize,
     pub blocks_str_width: usize,
     pub file_name_width: usize,
-}
-
-impl Default for MultiColumnPadding {
-    fn default() -> Self {
-        Self {
-            total_width: 0,
-            inode_str_width: 0,
-            blocks_str_width: 0,
-            file_name_width: 0,
-        }
-    }
 }
 
 impl MultiColumnPadding {
@@ -664,19 +636,19 @@ fn get_file_mode_string(metadata: &fs::Metadata) -> String {
     let mode = metadata.mode();
 
     // Owner permissions
-    file_mode.push(if mode & (libc::S_IRUSR as u32) != 0 {
+    file_mode.push(if mode & (libc::S_IRUSR) != 0 {
         'r'
     } else {
         '-'
     });
-    file_mode.push(if mode & (libc::S_IWUSR as u32) != 0 {
+    file_mode.push(if mode & (libc::S_IWUSR) != 0 {
         'w'
     } else {
         '-'
     });
     file_mode.push({
-        let executable = mode & (libc::S_IXUSR as u32) != 0;
-        let set_user_id = mode & (libc::S_ISUID as u32) != 0;
+        let executable = mode & (libc::S_IXUSR) != 0;
+        let set_user_id = mode & (libc::S_ISUID) != 0;
         match (executable, set_user_id) {
             (true, true) => 's',
             (true, false) => 'x',
@@ -686,49 +658,47 @@ fn get_file_mode_string(metadata: &fs::Metadata) -> String {
     });
 
     // Group permissions
-    file_mode.push(if mode & (libc::S_IRGRP as u32) != 0 {
+    file_mode.push(if mode & (libc::S_IRGRP) != 0 {
         'r'
     } else {
         '-'
     });
-    file_mode.push(if mode & (libc::S_IWGRP as u32) != 0 {
+    file_mode.push(if mode & (libc::S_IWGRP) != 0 {
         'w'
     } else {
         '-'
     });
-    file_mode.push(if mode & (libc::S_IXGRP as u32) != 0 {
+    file_mode.push(if mode & (libc::S_IXGRP) != 0 {
         'x'
     } else {
         '-'
     });
 
     // Other permissions
-    file_mode.push(if mode & (libc::S_IROTH as u32) != 0 {
+    file_mode.push(if mode & (libc::S_IROTH) != 0 {
         'r'
     } else {
         '-'
     });
-    file_mode.push(if mode & (libc::S_IWOTH as u32) != 0 {
+    file_mode.push(if mode & (libc::S_IWOTH) != 0 {
         'w'
     } else {
         '-'
     });
     file_mode.push({
         if file_type.is_dir() {
-            let searchable = mode & (libc::S_IXOTH as u32) != 0;
-            let restricted_deletion = mode & (libc::S_ISVTX as u32) != 0;
+            let searchable = mode & (libc::S_IXOTH) != 0;
+            let restricted_deletion = mode & (libc::S_ISVTX) != 0;
             match (searchable, restricted_deletion) {
                 (true, true) => 't',
                 (true, false) => 'x',
                 (false, true) => 'T',
                 (false, false) => '-',
             }
+        } else if mode & (libc::S_IXOTH) != 0 {
+            'x'
         } else {
-            if mode & (libc::S_IXOTH as u32) != 0 {
-                'x'
-            } else {
-                '-'
-            }
+            '-'
         }
     });
 
@@ -783,7 +753,7 @@ fn get_file_info(metadata: &fs::Metadata) -> FileInfo {
             )
         };
 
-        FileInfo::DeviceInfo((major as u32, minor as u32))
+        FileInfo::DeviceInfo((major, minor))
     } else {
         FileInfo::Size(metadata.size())
     }

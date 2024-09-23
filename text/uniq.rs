@@ -180,11 +180,10 @@ fn output_result<W: Write>(
 ) -> Result<(), io::Error> {
     if args.count {
         writeln!(output, "{} {}", count, line)?;
-    } else if args.repeated && count > 1 {
-        writeln!(output, "{}", line)?;
-    } else if args.unique && count == 1 {
-        writeln!(output, "{}", line)?;
-    } else if !args.repeated && !args.unique {
+    } else if args.repeated && count > 1
+        || args.unique && count == 1
+        || !args.repeated && !args.unique
+    {
         writeln!(output, "{}", line)?;
     }
     Ok(())

@@ -81,8 +81,8 @@ fn main() {
     };
 
     println!(
-        "{:<5} {:<5} {:<5} {:<5} {}",
-        "PID", "PPID", "UID", "GID", "COMMAND"
+        "{:<5} {:<5} {:<5} {:<5} COMMAND",
+        "PID", "PPID", "UID", "GID",
     );
     for proc in filtered_processes {
         println!(

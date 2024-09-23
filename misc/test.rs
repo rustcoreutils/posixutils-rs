@@ -82,10 +82,10 @@ fn parse_unary_op(s: &str) -> Option<UnaryOp> {
 }
 
 fn want_metadata(op: &UnaryOp) -> bool {
-    match op {
-        UnaryOp::Terminal | UnaryOp::StrNonZero | UnaryOp::StrZero => false,
-        _ => true,
-    }
+    !matches!(
+        op,
+        UnaryOp::Terminal | UnaryOp::StrNonZero | UnaryOp::StrZero
+    )
 }
 
 fn eval_str(s: &str) -> bool {
@@ -183,10 +183,7 @@ fn parse_binary_op(s: &str) -> Option<BinOp> {
 }
 
 fn parse_int(s: &str) -> i64 {
-    match s.parse::<i64>() {
-        Ok(i) => i,
-        Err(_) => 0,
-    }
+    s.parse::<i64>().unwrap_or_default()
 }
 
 fn eval_binary_int(op: &BinOp, s1: &str, s2: &str) -> bool {

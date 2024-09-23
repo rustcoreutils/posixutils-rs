@@ -67,11 +67,7 @@ fn token_display(t: &Token) -> String {
 
 // is token an lval?
 fn token_is_lval(t: &Token) -> bool {
-    match t {
-        Token::Integer(_) => true,
-        Token::Str(_) => true,
-        _ => false,
-    }
+    matches!(t, Token::Integer(_) | Token::Str(_))
 }
 
 // is token zero?
@@ -228,14 +224,12 @@ fn logop(lhs: &Token, rhs: &Token, is_and: bool) -> Token {
         } else {
             Token::Integer(0)
         }
+    } else if !lhs_zero {
+        lhs.clone()
+    } else if !rhs_zero {
+        rhs.clone()
     } else {
-        if !lhs_zero {
-            lhs.clone()
-        } else if !rhs_zero {
-            rhs.clone()
-        } else {
-            Token::Integer(0)
-        }
+        Token::Integer(0)
     }
 }
 

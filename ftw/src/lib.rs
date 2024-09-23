@@ -79,7 +79,7 @@ impl Clone for FileDescriptor {
 
 impl FileDescriptor {
     /// Create a `FileDescriptor` with arguments similar to `libc::openat`.
-    pub fn open_at(
+    pub unsafe fn open_at(
         dir_file_descriptor: &FileDescriptor,
         filename: *const libc::c_char,
         flags: i32,
@@ -122,7 +122,7 @@ impl Metadata {
     ///
     /// `dirfd` could be the special value `libc::AT_FDCWD` to query the metadata of a file at the
     /// process' current working directory.
-    pub fn new(
+    pub unsafe fn new(
         dirfd: libc::c_int,
         filename: *const libc::c_char,
         follow_symlinks: bool,
@@ -349,11 +349,13 @@ impl<'a> Entry<'a> {
 
     /// Check if this `Entry` is an empty directory.
     pub fn is_empty_dir(&self) -> io::Result<bool> {
-        let file_descriptor = FileDescriptor::open_at(
-            self.dir_file_descriptor,
-            self.file_name().as_ptr(),
-            libc::O_RDONLY,
-        )?;
+        let file_descriptor = unsafe {
+            FileDescriptor::open_at(
+                self.dir_file_descriptor,
+                self.file_name().as_ptr(),
+                libc::O_RDONLY,
+            )?
+        };
         match OwnedDir::new(file_descriptor) {
             Ok(dir) => {
                 let mut num_entries = 0;
@@ -415,7 +417,7 @@ enum NodeOrMetadata {
 }
 
 enum ProcessFileResult {
-    ProcessedDirectory(NodeOrMetadata),
+    ProcessedDirectory(Box<NodeOrMetadata>),
     ProcessedFile,
     NotProcessed,
     Skipped,
@@ -435,16 +437,17 @@ where
     H: FnMut(Entry<'_>, Error),
 {
     // Get the metadata for the file without following symlinks.
-    let entry_symlink_metadata = match Metadata::new(dir_fd.fd, entry_filename.as_ptr(), false) {
-        Ok(md) => md,
-        Err(e) => {
-            err_reporter(
-                Entry::new(dir_fd, path_stack, &entry_filename, None),
-                Error::new(e, ErrorKind::Stat),
-            );
-            return ProcessFileResult::NotProcessed;
-        }
-    };
+    let entry_symlink_metadata =
+        match unsafe { Metadata::new(dir_fd.fd, entry_filename.as_ptr(), false) } {
+            Ok(md) => md,
+            Err(e) => {
+                err_reporter(
+                    Entry::new(dir_fd, path_stack, &entry_filename, None),
+                    Error::new(e, ErrorKind::Stat),
+                );
+                return ProcessFileResult::NotProcessed;
+            }
+        };
     let is_symlink = entry_symlink_metadata.file_type() == FileType::SymbolicLink;
 
     // If `follow_symlinks` is enabled, read the location of the symlink and use the metadata of the
@@ -461,7 +464,7 @@ where
             }
         };
 
-        match Metadata::new(dir_fd.fd, entry_filename.as_ptr(), true) {
+        match unsafe { Metadata::new(dir_fd.fd, entry_filename.as_ptr(), true) } {
             Ok(md) => (Some(read_link), md),
             Err(e) => {
                 if e.kind() == io::ErrorKind::NotFound {
@@ -490,18 +493,18 @@ where
                 // Is the directory searchable?
                 if entry_metadata.is_executable() {
                     if conserve_fds {
-                        ProcessFileResult::ProcessedDirectory(NodeOrMetadata::Metadata(
+                        ProcessFileResult::ProcessedDirectory(Box::new(NodeOrMetadata::Metadata(
                             entry_metadata,
-                        ))
+                        )))
                     } else {
                         match OwnedDir::open_at(dir_fd, entry_filename.as_ptr()) {
-                            Ok(new_dir) => ProcessFileResult::ProcessedDirectory(
+                            Ok(new_dir) => ProcessFileResult::ProcessedDirectory(Box::new(
                                 NodeOrMetadata::TreeNode(TreeNode {
                                     dir: HybridDir::Owned(new_dir),
                                     filename: entry_filename,
                                     metadata: entry_metadata,
                                 }),
-                            ),
+                            )),
                             Err(error) => {
                                 err_reporter(entry, error);
                                 ProcessFileResult::NotProcessed
@@ -573,19 +576,20 @@ where
         let filename_cstr = CString::new(component.as_os_str().as_bytes()).unwrap();
         let filename = cstring_to_rc(&filename_cstr);
 
-        starting_dir =
-            match FileDescriptor::open_at(&starting_dir, filename.as_ptr(), libc::O_RDONLY) {
-                Ok(fd) => fd,
-                Err(e) => {
-                    if let Some(path_stack) = &path_stack {
-                        err_reporter(
-                            Entry::new(&starting_dir, path_stack, &filename, None),
-                            Error::new(e, ErrorKind::Open),
-                        );
-                    }
-                    return None;
+        starting_dir = match unsafe {
+            FileDescriptor::open_at(&starting_dir, filename.as_ptr(), libc::O_RDONLY)
+        } {
+            Ok(fd) => fd,
+            Err(e) => {
+                if let Some(path_stack) = &path_stack {
+                    err_reporter(
+                        Entry::new(&starting_dir, path_stack, &filename, None),
+                        Error::new(e, ErrorKind::Open),
+                    );
                 }
-            };
+                return None;
+            }
+        };
 
         if let Some(path_stack) = &mut path_stack {
             path_stack.push(filename);
@@ -665,7 +669,7 @@ where
             &mut err_reporter,
             false,
         ) {
-            ProcessFileResult::ProcessedDirectory(node) => match node {
+            ProcessFileResult::ProcessedDirectory(node) => match *node {
                 NodeOrMetadata::TreeNode(node) => stack.push(node),
                 NodeOrMetadata::Metadata(_) => unreachable!(),
             },
@@ -699,11 +703,8 @@ where
     let fd_threshold: usize = fd_rlim_cur as usize - 7;
 
     // Depth first traversal main loop
-    'outer: loop {
-        let current = match stack.last() {
-            Some(last) => last,
-            None => break, // Done, stack is empty
-        };
+    'outer: while let Some(last) = stack.last() {
+        let current = last;
 
         let dir = &current.dir;
         let dir_fd = match dir {
@@ -778,7 +779,7 @@ where
                         // `dir_iter` has a dependency on `stack` so run it's `Drop` method first
                         std::mem::drop(dir_iter);
 
-                        match node {
+                        match *node {
                             NodeOrMetadata::TreeNode(node) => stack.push(node),
                             NodeOrMetadata::Metadata(metadata) => match dir {
                                 HybridDir::Owned(current_dir) => {
@@ -831,12 +832,14 @@ where
             },
             None => &starting_dir,
         };
-        if let Err(_) = postprocess_dir(Entry::new(
+        if postprocess_dir(Entry::new(
             prev_dir,
             &path_stack,
             &current.filename,
             Some(&current.metadata),
-        )) {
+        ))
+        .is_err()
+        {
             success = false;
             // Don't `continue` here, falldown below
         }

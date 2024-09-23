@@ -93,15 +93,12 @@ fn comm_file(
     let mut want2 = true;
 
     loop {
-        if want1 && buf1.is_empty() {
-            if rdr1.read_line(&mut buf1)? == 0 {
-                want1 = false;
-            }
+        if want1 && buf1.is_empty() && rdr1.read_line(&mut buf1)? == 0 {
+            want1 = false;
         }
-        if want2 && buf2.is_empty() {
-            if rdr2.read_line(&mut buf2)? == 0 {
-                want2 = false;
-            }
+
+        if want2 && buf2.is_empty() && rdr2.read_line(&mut buf2)? == 0 {
+            want2 = false;
         }
 
         if buf1.is_empty() && buf2.is_empty() {

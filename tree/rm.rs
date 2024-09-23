@@ -148,15 +148,13 @@ where
                     } else {
                         gettext!("remove regular file '{}'?", filename_fn())
                     }
+                } else if is_empty {
+                    gettext!(
+                        "remove write-protected regular empty file '{}'?",
+                        filename_fn()
+                    )
                 } else {
-                    if is_empty {
-                        gettext!(
-                            "remove write-protected regular empty file '{}'?",
-                            filename_fn()
-                        )
-                    } else {
-                        gettext!("remove write-protected regular file '{}'?", filename_fn())
-                    }
+                    gettext!("remove write-protected regular file '{}'?", filename_fn())
                 }
             }
             ftw::FileType::Directory => unreachable!(), // Handled in the caller
@@ -218,12 +216,10 @@ fn process_directory(
         }
 
     // Else, manually traverse the directory to remove the contents one-by-one
+    } else if descend_into_directory(cfg, entry, metadata) {
+        Ok(DirAction::Entered)
     } else {
-        if descend_into_directory(cfg, entry, metadata) {
-            Ok(DirAction::Entered)
-        } else {
-            Ok(DirAction::Skipped)
-        }
+        Ok(DirAction::Skipped)
     }
 }
 
@@ -392,7 +388,7 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
 /// signature is only to match `rm_directory`.
 fn rm_file(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
     let filename_cstr = CString::new(filepath.as_os_str().as_bytes())?;
-    let metadata = ftw::Metadata::new(libc::AT_FDCWD, filename_cstr.as_ptr(), false)?;
+    let metadata = unsafe { ftw::Metadata::new(libc::AT_FDCWD, filename_cstr.as_ptr(), false)? };
 
     if should_remove_file(cfg, &metadata, || display_cleaned(filepath)) {
         fs::remove_file(filepath).map_err(|e| {

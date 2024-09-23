@@ -171,7 +171,7 @@ fn show_utmpx_summary() {
     let mut count = 0;
     let entries = plib::utmpx::load();
     for entry in &entries {
-        if entry.user.len() > 0 {
+        if !entry.user.is_empty() {
             println!("{}", entry.user);
             count += 1;
         }

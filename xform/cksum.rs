@@ -44,7 +44,7 @@ fn cksum_file(filename: &PathBuf) -> io::Result<()> {
             break;
         }
 
-        n_bytes = n_bytes + n_read as u64;
+        n_bytes += n_read as u64;
         crc = crc32::update(crc, &buffer[0..n_read]);
     }
 

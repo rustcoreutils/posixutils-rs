@@ -417,20 +417,18 @@ impl Config {
                 MULTI_COLUMN | STREAM_OUTPUT_FORMAT | MUTI_COLUMN_ACROSS => {
                     long_format_state.push(false);
                 }
-                ONE_ENTRY_PER_LINE => loop {
-                    // Remove any `false` that was added by -C, -m or -x until
-                    // a `true` is reached or the vec is empty
-                    match long_format_state.last().copied() {
-                        Some(enabled) => {
-                            if enabled {
-                                break;
-                            } else {
-                                long_format_state.pop();
-                            }
+                ONE_ENTRY_PER_LINE => {
+                    while let Some(enabled) = long_format_state.last().copied() {
+                        // Remove any `false` that was added by -C, -m or -x until
+                        // a `true` is reached or the vec is empty
+
+                        if enabled {
+                            break;
+                        } else {
+                            long_format_state.pop();
                         }
-                        None => break,
                     }
-                },
+                }
                 _ => unreachable!(),
             }
         }
@@ -517,9 +515,8 @@ impl Config {
             args.reverse_sorting = false;
 
             // -A is also ignored
-            match file_inclusion {
-                FileInclusion::Default => file_inclusion = FileInclusion::All,
-                _ => (),
+            if let FileInclusion::Default = file_inclusion {
+                file_inclusion = FileInclusion::All
             }
         }
 

@@ -107,7 +107,7 @@ fn set_mesg(fd: i32, st: libc::stat, setting: &str) -> io::Result<()> {
             return Ok(());
         }
 
-        mode = mode & !(libc::S_IWGRP | libc::S_IWOTH);
+        mode &= !(libc::S_IWGRP | libc::S_IWOTH);
     }
 
     let chres = unsafe { libc::fchmod(fd, mode) };

@@ -131,20 +131,15 @@ fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
         ignore_trailing_white_spaces: args.ignore_eol_space,
         label1: args.label,
         label2: args.label2,
-        output_format: output_format,
+        output_format,
     };
 
     if path1_is_file && path2_is_file {
-        return FileDiff::file_diff(path1, path2, &format_options, None);
+        FileDiff::file_diff(path1, path2, &format_options, None)
     } else if !path1_is_file && !path2_is_file {
-        return DirDiff::dir_diff(
-            PathBuf::from(path1),
-            PathBuf::from(path2),
-            &format_options,
-            args.recurse,
-        );
+        DirDiff::dir_diff(path1, path2, &format_options, args.recurse)
     } else {
-        return FileDiff::file_dir_diff(path1, path2, &format_options);
+        FileDiff::file_dir_diff(path1, path2, &format_options)
     }
 }
 

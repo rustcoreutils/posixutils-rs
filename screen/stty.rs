@@ -23,7 +23,7 @@ use termios::{
     Termios, TCSANOW,
 };
 
-const HDR_SAVE: &'static str = "pfmt1";
+const HDR_SAVE: &str = "pfmt1";
 
 /// stty - set the options for a terminal
 #[derive(Parser, Debug)]
@@ -131,23 +131,20 @@ fn show_cchars(tty_params: &HashMap<&'static str, ParamType>, ti: &Termios) {
     // minor inefficiency: 2nd iteration through param list
 
     for (name, param) in tty_params {
-        match param {
-            ParamType::Cchar(_pflg, chidx) => {
-                let ch = ti.c_cc[*chidx] as char;
-                let ch_rev = cchar_rev.get(&ch);
-                let ch_str = {
-                    if ch == '\0' {
-                        String::from("<undef>")
-                    } else if let Some(ch_xlat) = ch_rev {
-                        format!("^{}", ch_xlat)
-                    } else {
-                        format!("{}", ti.c_cc[*chidx] as u8)
-                    }
-                };
+        if let ParamType::Cchar(_pflg, chidx) = param {
+            let ch = ti.c_cc[*chidx] as char;
+            let ch_rev = cchar_rev.get(&ch);
+            let ch_str = {
+                if ch == '\0' {
+                    String::from("<undef>")
+                } else if let Some(ch_xlat) = ch_rev {
+                    format!("^{}", ch_xlat)
+                } else {
+                    format!("{}", ti.c_cc[*chidx])
+                }
+            };
 
-                v.push(format!("{} = {}", name, ch_str));
-            }
-            _ => {}
+            v.push(format!("{} = {}", name, ch_str));
         }
     }
 
@@ -296,7 +293,7 @@ fn set_ti_flag(
 
     // set flag bits (unless negation)
     if !negate {
-        newflags = newflags | val_set;
+        newflags |= val_set;
     }
 
     // commit flag bits to termio struct, if changed
@@ -450,7 +447,7 @@ fn stty_set_long(mut ti: Termios, args: &Args) -> io::Result<()> {
         if operand.parse::<u64>().is_ok() {
             set_ti_speed(&mut ti, &speedmap, true, operand)?;
             set_ti_speed(&mut ti, &speedmap, false, operand)?;
-            idx = idx + 1;
+            idx += 1;
             continue;
         }
 
@@ -478,7 +475,7 @@ fn stty_set_long(mut ti: Termios, args: &Args) -> io::Result<()> {
 
         let mut op_arg = String::new();
         if (flags & PARG) != 0 {
-            idx = idx + 1;
+            idx += 1;
 
             if idx == args.operands.len() {
                 let errstr = format!("Missing operand for {}", operand);
@@ -519,7 +516,7 @@ fn stty_set_long(mut ti: Termios, args: &Args) -> io::Result<()> {
             }
         }
 
-        idx = idx + 1;
+        idx += 1;
     }
 
     // finally, commit new termio settings (if any)

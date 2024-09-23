@@ -104,11 +104,7 @@ fn swap_with_default<T: Default>(value: &mut T) -> T {
 
 fn maybe_numeric_string<S: Into<AwkString>>(str: S) -> AwkString {
     let mut str = str.into();
-    let numeric_string = is_valid_number(
-        str.as_str()
-            .trim()
-            .trim_start_matches(|c| c == '+' || c == '-'),
-    );
+    let numeric_string = is_valid_number(str.as_str().trim().trim_start_matches(['+', '-']));
     str.is_numeric = numeric_string;
     str
 }

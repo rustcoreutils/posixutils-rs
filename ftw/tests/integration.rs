@@ -124,7 +124,9 @@ fn test_ftw_deep() {
             panic!("{}", io::Error::last_os_error());
         }
 
-        fd = ftw::FileDescriptor::open_at(&fd, filename.as_ptr(), libc::O_RDONLY).unwrap();
+        fd = unsafe {
+            ftw::FileDescriptor::open_at(&fd, filename.as_ptr(), libc::O_RDONLY).unwrap()
+        };
     }
 
     let mut count = 0;
@@ -295,7 +297,9 @@ fn test_ftw_long_filename() {
             panic!("{}", io::Error::last_os_error());
         }
 
-        fd = ftw::FileDescriptor::open_at(&fd, filename.as_ptr(), libc::O_RDONLY).unwrap();
+        fd = unsafe {
+            ftw::FileDescriptor::open_at(&fd, filename.as_ptr(), libc::O_RDONLY).unwrap()
+        };
 
         // If at the last index, add dummy directories
         if i == DIR_HIERARCHY_DEPTH - 1 {

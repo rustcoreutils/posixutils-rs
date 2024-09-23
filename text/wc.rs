@@ -42,7 +42,6 @@ struct CountInfo {
     words: usize,
     chars: usize,
     nl: usize,
-    was_space: bool,
 }
 
 impl CountInfo {
@@ -51,7 +50,6 @@ impl CountInfo {
             words: 0,
             chars: 0,
             nl: 0,
-            was_space: true,
         }
     }
 
@@ -128,7 +126,7 @@ fn wc_file_bytes(count: &mut CountInfo, pathname: &PathBuf, table: &[bool; 256])
     let mut file = plib::io::input_stream(pathname, false)?;
 
     let mut buffer = [0; plib::BUFSZ];
-    let mut was_space = count.was_space;
+    let mut was_space = true;
 
     loop {
         let n_read = file.read(&mut buffer[..])?;
@@ -147,7 +145,6 @@ fn wc_file_bytes(count: &mut CountInfo, pathname: &PathBuf, table: &[bool; 256])
             was_space = is_space;
         }
     }
-    count.was_space = was_space;
 
     Ok(())
 }

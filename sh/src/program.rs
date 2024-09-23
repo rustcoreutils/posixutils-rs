@@ -98,11 +98,11 @@ pub enum LogicalOp {
 
 pub struct Conjunction {
     pub elements: Vec<(Pipeline, LogicalOp)>,
+    pub is_async: bool,
 }
 
-pub enum CompleteCommand {
-    AsyncList(Vec<Conjunction>),
-    Conjunction(Conjunction),
+pub struct CompleteCommand {
+    pub commands: Vec<Conjunction>,
 }
 
 pub struct Program {

@@ -16,11 +16,11 @@ use nix::{
         signal::{
             raise, sigaction, signal, sigprocmask, SaFlags, SigAction, SigHandler, SigSet,
             SigmaskHow,
-            Signal::{self, SIGKILL, SIGTERM, SIGTTIN, SIGTTOU},
+            Signal::{self, SIGKILL, SIGTERM},
         },
         wait::{waitpid, WaitPidFlag, WaitStatus},
     },
-    unistd::{alarm, execvp, fork, setpgid, ForkResult, Pid},
+    unistd::{execvp, fork, ForkResult},
 };
 use plib::PROJECT_NAME;
 use std::{
@@ -143,7 +143,7 @@ fn parse_signal(s: &str) -> Result<Signal, String> {
 /// * `duration` - [Duration] value of
 fn set_timeout(duration: Duration) {
     if !duration.is_zero() {
-        alarm::set(duration.as_secs() as libc::c_uint);
+        unsafe { libc::alarm(duration.as_secs() as libc::c_uint) };
     }
 }
 
@@ -339,14 +339,14 @@ fn timeout(args: Args) -> i32 {
 
     // Ensures, this process is process leader so all subprocesses can be killed.s
     if !foreground {
-        let _ = setpgid(Pid::from_raw(0), Pid::from_raw(0));
+        unsafe { libc::setpgid(0, 0) };
     }
 
     // Setup handlers before to catch signals before fork()
     set_handler(signal_name);
     unsafe {
-        let _ = signal(SIGTTIN, SigHandler::SigIgn);
-        let _ = signal(SIGTTOU, SigHandler::SigIgn);
+        libc::signal(libc::SIGTTIN, libc::SIG_IGN);
+        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
     }
     set_chld();
 
@@ -362,8 +362,8 @@ fn timeout(args: Args) -> i32 {
             let _ = sigprocmask(SigmaskHow::SIG_SETMASK, Some(&sig_set), None);
 
             unsafe {
-                let _ = signal(SIGTTIN, SigHandler::SigDfl);
-                let _ = signal(SIGTTOU, SigHandler::SigDfl);
+                libc::signal(libc::SIGTTIN, libc::SIG_DFL);
+                libc::signal(libc::SIGTTOU, libc::SIG_DFL);
             }
 
             let utility_path = if Path::new(&utility).is_file() {

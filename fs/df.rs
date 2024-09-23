@@ -161,7 +161,8 @@ fn read_mount_info() -> io::Result<MountList> {
             let mut mount: libc::statfs = std::mem::zeroed();
             let rc = libc::statfs(dirname.as_ptr(), &mut mount);
             if rc < 0 {
-                return Err(io::Error::last_os_error());
+                eprintln!("{}: {}", dirname.to_str().unwrap(), io::Error::last_os_error());
+                continue;
             }
 
             info.push(&mount, devname, dirname);

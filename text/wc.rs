@@ -62,19 +62,18 @@ impl CountInfo {
     }
 }
 
-fn is_space(c: usize) -> bool {
-    ( c > 8 && c < 14) || (c == 32)
-}
-
-fn create_table() -> [bool; 256] {
+const fn create_table() -> [bool; 256] {
     let mut table = [false; 256];
-
-    for i in 0..256 {
-        table[i] = is_space(i)
-    }
+    table[9] = true;
+    table[10] = true;
+    table[11] = true;
+    table[12] = true;
+    table[13] = true;
+    table[32] = true;
     table
 }
 
+const BYTE_TABLE: [bool; 256] = create_table();
 
 fn build_display_str(args: &Args, count: &CountInfo, filename: &OsStr) -> String {
     let mut output = String::with_capacity(filename.len() + (3 * 10));
@@ -231,14 +230,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
     let mut exit_code = 0;
-    let table = create_table();
     let mut totals = CountInfo::new();
 
     // input via stdin
     if args.files.is_empty() {
         let mut count = CountInfo::new();
 
-        if let Err(e) = wc_file(&args, chars_mode, &PathBuf::new(), &mut count, &table) {
+        if let Err(e) = wc_file(&args, chars_mode, &PathBuf::new(), &mut count, &BYTE_TABLE) {
             exit_code = 1;
             eprintln!("stdin: {}", e);
         }
@@ -248,7 +246,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for filename in &args.files {
             let mut count = CountInfo::new();
 
-            if let Err(e) = wc_file(&args, chars_mode, filename, &mut count, &table) {
+            if let Err(e) = wc_file(&args, chars_mode, filename, &mut count, &BYTE_TABLE) {
                 exit_code = 1;
                 eprintln!("{}: {}", filename.display(), e);
             }

@@ -14,8 +14,7 @@ use nix::{
     sys::{
         resource::{setrlimit, Resource},
         signal::{
-            raise, sigaction, signal, sigprocmask, SaFlags, SigAction, SigHandler, SigSet,
-            SigmaskHow,
+            raise, signal, sigprocmask, SigHandler, SigSet, SigmaskHow,
             Signal::{self, SIGKILL, SIGTERM},
         },
         wait::{waitpid, WaitPidFlag, WaitStatus},
@@ -202,27 +201,43 @@ extern "C" fn handler(mut signal: i32) {
 /// # Arguments
 ///
 /// `signal` - signal of type [Signal] that needs to be unblocked.
-fn unblock_signal(signal: Signal) {
-    let mut sig_set = SigSet::empty();
-    sig_set.add(signal);
-    if sigprocmask(SigmaskHow::SIG_UNBLOCK, Some(&sig_set), None).is_err() {
-        eprintln!("timeout: failed to set unblock signals mask");
-        std::process::exit(125)
+fn unblock_signal(signal: i32) {
+    unsafe {
+        let mut sig_set = std::mem::MaybeUninit::uninit();
+        let _ = libc::sigemptyset(sig_set.as_mut_ptr());
+        let mut sig_set = sig_set.assume_init();
+
+        libc::sigaddset(&mut sig_set, signal);
+        if libc::sigprocmask(
+            libc::SIG_UNBLOCK,
+            &sig_set,
+            std::ptr::null_mut::<libc::sigset_t>(),
+        ) != 0
+        {
+            eprintln!("timeout: failed to set unblock signals mask");
+            std::process::exit(125)
+        }
     }
 }
 
 /// Installs handler for [Signal::SIGCHLD] signal to receive child's exit status code from parent (timeout).
 fn set_chld() {
-    let handler = SigHandler::Handler(chld_handler);
-    let flags = SaFlags::SA_RESTART;
-    let mask = SigSet::empty();
-    let sa = SigAction::new(handler, flags, mask);
-
     unsafe {
-        let _ = sigaction(Signal::SIGCHLD, &sa);
-    };
+        let mut sig_action = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+        let p_sa = sig_action.as_mut_ptr();
+        (*p_sa).sa_sigaction = chld_handler as *const extern "C" fn(libc::c_int) as usize;
+        (*p_sa).sa_flags = libc::SA_RESTART;
+        libc::sigemptyset(&mut (*p_sa).sa_mask);
+        let sig_action = sig_action.assume_init();
 
-    unblock_signal(Signal::SIGCHLD);
+        libc::sigaction(
+            libc::SIGCHLD,
+            &sig_action,
+            std::ptr::null_mut::<libc::sigaction>(),
+        );
+    }
+
+    unblock_signal(libc::SIGCHLD);
 }
 
 /// Installs handler ([handler]) for incoming [Signal] and other signals.
@@ -230,19 +245,41 @@ fn set_chld() {
 /// # Arguments
 ///
 /// `signal` - signal of type [Signal] that needs to be handled.
-fn set_handler(signal: Signal) {
-    let handler = SigHandler::Handler(handler);
-    let flags = SaFlags::SA_RESTART;
-    let mask = SigSet::empty();
-    let sa = SigAction::new(handler, flags, mask);
-
+fn set_handler(signal: i32) {
     unsafe {
-        let _ = sigaction(Signal::SIGALRM, &sa);
-        let _ = sigaction(Signal::SIGINT, &sa);
-        let _ = sigaction(Signal::SIGQUIT, &sa);
-        let _ = sigaction(Signal::SIGHUP, &sa);
-        let _ = sigaction(Signal::SIGTERM, &sa);
-        let _ = sigaction(signal, &sa);
+        let mut sig_action = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+        let p_sa = sig_action.as_mut_ptr();
+        (*p_sa).sa_sigaction = handler as *const extern "C" fn(libc::c_int) as usize;
+        (*p_sa).sa_flags = libc::SA_RESTART;
+        libc::sigemptyset(&mut (*p_sa).sa_mask);
+        let sig_action = sig_action.assume_init();
+
+        libc::sigaction(
+            libc::SIGALRM,
+            &sig_action,
+            std::ptr::null_mut::<libc::sigaction>(),
+        );
+        libc::sigaction(
+            libc::SIGINT,
+            &sig_action,
+            std::ptr::null_mut::<libc::sigaction>(),
+        );
+        libc::sigaction(
+            libc::SIGQUIT,
+            &sig_action,
+            std::ptr::null_mut::<libc::sigaction>(),
+        );
+        libc::sigaction(
+            libc::SIGHUP,
+            &sig_action,
+            std::ptr::null_mut::<libc::sigaction>(),
+        );
+        libc::sigaction(
+            libc::SIGTERM,
+            &sig_action,
+            std::ptr::null_mut::<libc::sigaction>(),
+        );
+        libc::sigaction(signal, &sig_action, std::ptr::null_mut::<libc::sigaction>());
     }
 }
 
@@ -343,7 +380,7 @@ fn timeout(args: Args) -> i32 {
     }
 
     // Setup handlers before to catch signals before fork()
-    set_handler(signal_name);
+    set_handler(signal_name as i32);
     unsafe {
         libc::signal(libc::SIGTTIN, libc::SIG_IGN);
         libc::signal(libc::SIGTTOU, libc::SIG_IGN);
@@ -351,7 +388,7 @@ fn timeout(args: Args) -> i32 {
     set_chld();
 
     // To be able to handle SIGALRM (will be send after timeout)
-    unblock_signal(Signal::SIGALRM);
+    unblock_signal(libc::SIGALRM);
 
     let mut sig_set = SigSet::empty();
     block_handler_and_chld(signal_name, &mut sig_set);
@@ -431,7 +468,7 @@ fn timeout(args: Args) -> i32 {
                 WaitStatus::Signaled(_, rec_signal, _) => {
                     if !TIMED_OUT.load(Ordering::SeqCst) && disable_core_dumps() {
                         let _ = unsafe { signal(rec_signal, SigHandler::SigDfl) };
-                        unblock_signal(rec_signal);
+                        unblock_signal(rec_signal as i32);
                         let _ = raise(rec_signal);
                     }
                     if TIMED_OUT.load(Ordering::SeqCst) && rec_signal == SIGKILL {

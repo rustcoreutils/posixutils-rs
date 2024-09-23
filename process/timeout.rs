@@ -434,7 +434,7 @@ fn search_in_path(utility: &str) -> Option<String> {
 ///
 /// `args` - [Args] structure of timeout options and operands.
 ///
-/// # Return
+/// # Returns
 ///
 /// [i32] - exit status code of timeout utility.
 fn timeout(args: Args) -> i32 {

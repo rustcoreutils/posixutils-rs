@@ -9,10 +9,25 @@
 
 use std::ffi::{CStr, CString};
 
-#[inline(always)]
-pub unsafe fn to_cstring(s: *mut libc::c_char) -> CString {
-    debug_assert!(!s.is_null());
-    let s = CStr::from_ptr(s);
-    let s = CString::from(s);
-    s
+pub trait ToCString {
+    unsafe fn to_cstring(&self) -> CString;
+}
+
+impl ToCString for *mut libc::c_char {
+    #[inline(always)]
+    unsafe fn to_cstring(&self) -> CString {
+        debug_assert!(!self.is_null());
+        let s = CStr::from_ptr(*self);
+        let s = CString::from(s);
+        s
+    }
+}
+
+impl ToCString for &[libc::c_char] {
+    #[inline(always)]
+    unsafe fn to_cstring(&self) -> CString {
+        let s = CStr::from_ptr(self.as_ptr());
+        let s = CString::from(s);
+        s
+    }
 }

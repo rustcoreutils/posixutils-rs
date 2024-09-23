@@ -10,7 +10,7 @@
 use libc::{endmntent, getmntent, mntent, setmntent, FILE};
 use std::ffi::{CStr, CString};
 use std::io;
-use crate::common::to_cstring;
+use crate::common::ToCString;
 
 /// The mtab (contraction of mounted file systems table) file
 /// is a system information file, commonly found on Unix-like systems.
@@ -81,10 +81,10 @@ impl MountEntity {
     unsafe fn new(me: *const mntent) -> Self {
         debug_assert!(!me.is_null());
         Self {
-            mnt_fsname: to_cstring((*me).mnt_fsname),
-            mnt_dir: to_cstring((*me).mnt_dir),
-            mnt_type: to_cstring((*me).mnt_type),
-            mnt_opts: to_cstring((*me).mnt_opts),
+            mnt_fsname: (*me).mnt_fsname.to_cstring(),
+            mnt_dir: (*me).mnt_dir.to_cstring(),
+            mnt_type: (*me).mnt_type.to_cstring(),
+            mnt_opts: (*me).mnt_opts.to_cstring(),
             mnt_freq: (*me).mnt_freq,
             mnt_passno: (*me).mnt_passno,
         }

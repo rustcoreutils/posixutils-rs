@@ -16,6 +16,7 @@ use std::io;
 #[cfg(not(target_os = "macos"))]
 use crate::mntent::MountTable;
 
+mod common;
 #[cfg(not(target_os = "macos"))]
 mod mntent;
 
@@ -37,14 +38,6 @@ struct Args {
 
     /// A pathname of a file within the hierarchy of the desired file system.
     files: Vec<String>,
-}
-
-#[cfg(target_os = "macos")]
-fn to_cstr(array: &[libc::c_char]) -> &CStr {
-    unsafe {
-        // Assuming the array is null-terminated, as it should be for C strings.
-        CStr::from_ptr(array.as_ptr())
-    }
 }
 
 fn stat(filename: &CString) -> io::Result<libc::stat> {
@@ -116,6 +109,7 @@ impl MountList {
 
 #[cfg(target_os = "macos")]
 fn read_mount_info() -> io::Result<MountList> {
+    use crate::common::to_cstring;
     let mut info = MountList::new();
 
     unsafe {
@@ -127,9 +121,9 @@ fn read_mount_info() -> io::Result<MountList> {
 
         let mounts: &[libc::statfs] = std::slice::from_raw_parts(mounts as _, n_mnt as _);
         for mount in mounts {
-            let devname = to_cstr(&mount.f_mntfromname);
-            let dirname = to_cstr(&mount.f_mntonname);
-            info.push(mount, devname, dirname);
+            let devname = to_cstring(&mount.f_mntfromname);
+            let dirname = to_cstring(&mount.f_mntonname);
+            info.push(mount, &devname, &dirname);
         }
     }
 

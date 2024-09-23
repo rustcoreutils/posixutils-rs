@@ -11,10 +11,7 @@ use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use nix::{
     errno::Errno,
-    sys::{
-        resource::{setrlimit, Resource},
-        wait::{waitpid, WaitPidFlag, WaitStatus},
-    },
+    sys::wait::{waitpid, WaitPidFlag, WaitStatus},
     unistd::{execvp, fork, ForkResult},
 };
 use plib::PROJECT_NAME;
@@ -388,13 +385,14 @@ fn block_handler_and_chld(signal: i32, old_set: &mut libc::sigset_t) {
 /// `true` is successfull, `false` otherwise.
 fn disable_core_dumps() -> bool {
     #[cfg(target_os = "linux")]
-    if nix::sys::prctl::set_dumpable(false).is_ok() {
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) } == 0 {
         return true;
     }
-    if setrlimit(Resource::RLIMIT_CORE, 0, 0).is_ok() {
-        return true;
-    }
-    false
+    let rlim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    (unsafe { libc::setrlimit(libc::RLIMIT_CORE, &rlim) } == 0)
 }
 
 /// Searches for the executable utility in the directories specified by the `PATH` environment variable.

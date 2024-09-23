@@ -224,9 +224,9 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
 These are "core" utilities of any operating system.  Production packaging in the future will be done on a per-distro basis in a distro-specific way.
 
-As such, Dockerfiles, rpm and deb packaging is welcome, but currently considered a secondary priority to finishing, bugfixing and tuning the utilities.  Packaging contributions are weclome...  if done right.
+As such, Dockerfiles, rpm and deb packaging are welcome, but currently considered a secondary priority to finishing, bugfixing and tuning the utilities.  Packaging contributions are welcome...  if done right.
 
-The standard `cargo install` should work, for those interested in testing.  Care should be taken with PATH to point to the correct `cp` or `mv`, when mixing with standard system utilities on an already-shipped operating system.
+The standard `cargo install` should work, for those interested in testing.  Care should be taken with PATH to point to the correct `cp` or `awk`, when mixing with standard system utilities on an already-shipped operating system.
 
 ## Testing
 

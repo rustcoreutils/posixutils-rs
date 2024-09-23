@@ -13,7 +13,6 @@ use nix::{
     errno::Errno,
     sys::{
         resource::{setrlimit, Resource},
-        signal::Signal::{self, SIGKILL, SIGTERM},
         wait::{waitpid, WaitPidFlag, WaitStatus},
     },
     unistd::{execvp, fork, ForkResult},
@@ -24,7 +23,6 @@ use std::{
     ffi::CString,
     os::unix::fs::PermissionsExt,
     path::Path,
-    str::FromStr,
     sync::{
         atomic::{AtomicBool, AtomicI32, Ordering},
         Mutex,
@@ -32,8 +30,79 @@ use std::{
     time::Duration,
 };
 
+#[cfg(target_os = "macos")]
+const SIGLIST: [(&str, i32); 31] = [
+    ("HUP", 1),
+    ("INT", 2),
+    ("QUIT", 3),
+    ("ILL", 4),
+    ("TRAP", 5),
+    ("ABRT", 6),
+    ("EMT", 7),
+    ("FPE", 8),
+    ("KILL", 9),
+    ("BUS", 10),
+    ("SEGV", 11),
+    ("SYS", 12),
+    ("PIPE", 13),
+    ("ALRM", 14),
+    ("TERM", 15),
+    ("URG", 16),
+    ("STOP", 17),
+    ("TSTP", 18),
+    ("CONT", 19),
+    ("CHLD", 20),
+    ("TTIN", 21),
+    ("TTOU", 22),
+    ("IO", 23),
+    ("XCPU", 24),
+    ("XFSZ", 25),
+    ("VTALRM", 26),
+    ("PROF", 27),
+    ("WINCH", 28),
+    ("INFO", 29),
+    ("USR1", 30),
+    ("USR2", 31),
+];
+
+#[cfg(target_os = "linux")]
+const SIGLIST: [(&str, i32); 32] = [
+    ("HUP", 1),
+    ("INT", 2),
+    ("QUIT", 3),
+    ("ILL", 4),
+    ("TRAP", 5),
+    ("ABRT", 6),
+    ("IOT", 6),
+    ("BUS", 7),
+    ("FPE", 8),
+    ("KILL", 9),
+    ("USR1", 10),
+    ("SEGV", 11),
+    ("USR2", 12),
+    ("PIPE", 13),
+    ("ALRM", 14),
+    ("TERM", 15),
+    ("STKFLT", 16),
+    ("CHLD", 17),
+    ("CONT", 18),
+    ("STOP", 19),
+    ("TSTP", 20),
+    ("TTIN", 21),
+    ("TTOU", 22),
+    ("URG", 23),
+    ("XCPU", 24),
+    ("XFSZ", 25),
+    ("VTALRM", 26),
+    ("PROF", 27),
+    ("WINCH", 28),
+    ("IO", 29),
+    ("PWR", 30),
+    ("SYS", 31),
+];
+
 static FOREGROUND: AtomicBool = AtomicBool::new(false);
-static FIRST_SIGNAL: AtomicI32 = AtomicI32::new(SIGTERM as i32);
+static FIRST_SIGNAL: AtomicI32 = AtomicI32::new(libc::SIGTERM);
 static KILL_AFTER: Mutex<Option<Duration>> = Mutex::new(None);
 static MONITORED_PID: AtomicI32 = AtomicI32::new(0);
 static TIMED_OUT: AtomicBool = AtomicBool::new(false);
@@ -59,7 +128,7 @@ struct Args {
     /// Specify the signal to send when the time limit is reached, using one of the symbolic names defined in the <signal.h> header.
     /// Values of signal shall be recognized in a case-independent fashion, without the SIG prefix. By default, SIGTERM shall be sent.
     #[arg(short = 's', long, default_value = "TERM", value_parser = parse_signal)]
-    signal_name: Signal,
+    signal_name: i32,
 
     /// The maximum amount of time to allow the utility to run, specified as a decimal number with an optional decimal fraction and an optional suffix.
     #[arg(name = "DURATION", value_parser = parse_duration)]
@@ -121,15 +190,16 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 /// # Returns
 ///
 /// Returns the parsed [Signal] value.
-fn parse_signal(s: &str) -> Result<Signal, String> {
-    let s = s.to_uppercase();
-    let signal_name = if s.starts_with("SIG") {
-        s.to_string()
-    } else {
-        format!("SIG{s}")
-    };
+fn parse_signal(signal_name: &str) -> Result<i32, String> {
+    let normalized = signal_name.trim().to_uppercase();
+    let normalized = normalized.strip_prefix("SIG").unwrap_or(&normalized);
 
-    Signal::from_str(&signal_name).map_err(|_| format!("invalid signal name '{s}'"))
+    for (name, num) in SIGLIST.iter() {
+        if name == &normalized {
+            return Ok(*num);
+        }
+    }
+    Err(format!("invalid signal name '{signal_name}'"))
 }
 
 /// Starts the timeout after which [Signal::SIGALRM] will be send.
@@ -374,7 +444,7 @@ fn timeout(args: Args) -> i32 {
     } = args;
 
     FOREGROUND.store(foreground, Ordering::SeqCst);
-    FIRST_SIGNAL.store(signal_name as i32, Ordering::SeqCst);
+    FIRST_SIGNAL.store(signal_name, Ordering::SeqCst);
     *KILL_AFTER.lock().unwrap() = kill_after;
 
     // Ensures, this process is process leader so all subprocesses can be killed.s
@@ -383,7 +453,7 @@ fn timeout(args: Args) -> i32 {
     }
 
     // Setup handlers before to catch signals before fork()
-    set_handler(signal_name as i32);
+    set_handler(signal_name);
     unsafe {
         libc::signal(libc::SIGTTIN, libc::SIG_IGN);
         libc::signal(libc::SIGTTOU, libc::SIG_IGN);
@@ -394,7 +464,7 @@ fn timeout(args: Args) -> i32 {
     unblock_signal(libc::SIGALRM);
 
     let mut original_set = get_empty_sig_set();
-    block_handler_and_chld(signal_name as i32, &mut original_set);
+    block_handler_and_chld(signal_name, &mut original_set);
 
     match unsafe { fork() } {
         Ok(ForkResult::Child) => {
@@ -480,7 +550,7 @@ fn timeout(args: Args) -> i32 {
                         unblock_signal(rec_signal as i32);
                         unsafe { libc::raise(rec_signal as i32) };
                     }
-                    if TIMED_OUT.load(Ordering::SeqCst) && rec_signal == SIGKILL {
+                    if TIMED_OUT.load(Ordering::SeqCst) && rec_signal as i32 == libc::SIGKILL {
                         preserve_status = true;
                     }
                     128 + rec_signal as i32

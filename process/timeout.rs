@@ -9,16 +9,15 @@
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use nix::{
-    sys::wait::{waitpid, WaitPidFlag, WaitStatus},
-    unistd::Pid,
-};
 use plib::PROJECT_NAME;
 use std::{
     error::Error,
-    os::unix::{fs::PermissionsExt, process::CommandExt},
+    os::unix::{
+        fs::PermissionsExt,
+        process::{CommandExt, ExitStatusExt},
+    },
     path::Path,
-    process::Command,
+    process::{Command, ExitStatus},
     sync::{
         atomic::{AtomicBool, AtomicI32, Ordering},
         Mutex,
@@ -511,51 +510,59 @@ fn timeout(args: Args) -> i32 {
 
     set_timeout(duration);
 
-    let mut wait_status: WaitStatus;
+    let mut wait_status;
+    let mut status = 0;
+    let options = libc::WNOHANG | libc::WCONTINUED | libc::WUNTRACED;
+
     loop {
-        match waitpid(
-            Pid::from_raw(MONITORED_PID.load(Ordering::SeqCst) as i32),
-            Some(WaitPidFlag::WNOHANG | WaitPidFlag::WCONTINUED | WaitPidFlag::WUNTRACED),
-        ) {
-            Ok(ws) => wait_status = ws,
-            Err(_) => {
-                eprintln!("timeout: failed to wait for child");
-                return 125;
-            }
-        }
-        match wait_status {
-            WaitStatus::StillAlive | WaitStatus::Continued(_) => {
-                unsafe { libc::sigsuspend(&original_set) };
-            }
-            WaitStatus::Stopped(_, _s) => {
-                send_signal(MONITORED_PID.load(Ordering::SeqCst) as i32, libc::SIGCONT);
-                TIMED_OUT.store(true, Ordering::SeqCst);
-            }
-            _ => {
-                break;
-            }
+        wait_status = unsafe {
+            libc::waitpid(
+                MONITORED_PID.load(Ordering::SeqCst),
+                &mut status,
+                options,
+            )
+        };
+
+        let es = ExitStatus::from_raw(status);
+        if wait_status == 0 || es.continued() {
+            unsafe { libc::sigsuspend(&original_set) };
+        } else if es.stopped_signal().is_some() {
+            send_signal(MONITORED_PID.load(Ordering::SeqCst), libc::SIGCONT);
+        } else {
+            break;
         }
     }
-    let status = match wait_status {
-        WaitStatus::Exited(_, status) => status,
-        WaitStatus::Signaled(_, rec_signal, _) => {
-            if !TIMED_OUT.load(Ordering::SeqCst) && disable_core_dumps() {
-                unsafe { libc::signal(rec_signal as i32, libc::SIG_DFL) };
-                unblock_signal(rec_signal as i32);
-                unsafe { libc::raise(rec_signal as i32) };
+
+    if wait_status < 0 {
+        eprintln!("timeout: failed to wait for child");
+        125
+    } else {
+        if libc::WIFEXITED(status) {
+            status = libc::WEXITSTATUS(status)
+        } else if libc::WIFSIGNALED(status) {
+            let signal = libc::WTERMSIG(status);
+            if libc::WCOREDUMP(status) {
+                eprintln!("timeout: monitored command dumped core");
+                return 125;
             }
-            if TIMED_OUT.load(Ordering::SeqCst) && rec_signal as i32 == libc::SIGKILL {
+            if !TIMED_OUT.load(Ordering::SeqCst) && disable_core_dumps() {
+                unsafe { libc::signal(signal, libc::SIG_DFL) };
+                unblock_signal(signal);
+                unsafe { libc::raise(signal) };
+            }
+            if TIMED_OUT.load(Ordering::SeqCst) && signal as i32 == libc::SIGKILL {
                 preserve_status = true;
             }
-            128 + rec_signal as i32
+            status = 128 + signal
+        } else {
+            eprintln!("timeout: unknown status from commnad: {status}")
         }
-        _ => 125,
-    };
 
-    if TIMED_OUT.load(Ordering::SeqCst) && !preserve_status {
-        124
-    } else {
-        status
+        if TIMED_OUT.load(Ordering::SeqCst) && !preserve_status {
+            124
+        } else {
+            status
+        }
     }
 }
 

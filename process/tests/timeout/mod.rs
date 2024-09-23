@@ -12,7 +12,6 @@ use std::{
     process::{Command, Output, Stdio},
 };
 
-use nix::unistd::{getpgid, Pid};
 use sysinfo::System;
 
 pub struct TestPlan {
@@ -25,7 +24,7 @@ pub struct TestPlan {
     pub has_subprocesses: bool,
 }
 
-fn run_test_base(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> (Output, Pid) {
+fn run_test_base(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> (Output, i32) {
     let relpath = if cfg!(debug_assertions) {
         format!("target/debug/{}", cmd)
     } else {
@@ -46,7 +45,7 @@ fn run_test_base(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> (Output, P
         .spawn()
         .expect("failed to spawn head");
 
-    let pgid = getpgid(Some(Pid::from_raw(child.id() as i32))).unwrap();
+    let pgid = unsafe { libc::getpgid(child.id() as i32) };
 
     let stdin = child.stdin.as_mut().expect("failed to get stdin");
     stdin
@@ -75,7 +74,7 @@ pub fn run_test(plan: TestPlan) {
     system.refresh_all();
     for (_, process) in system.processes() {
         if let Some(gid) = process.group_id() {
-            if *gid == pgid.as_raw() as u32 {
+            if *gid == pgid as u32 {
                 assert!(plan.has_subprocesses)
             }
         }

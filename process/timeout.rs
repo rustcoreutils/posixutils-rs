@@ -10,16 +10,15 @@
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use nix::{
-    errno::Errno,
     sys::wait::{waitpid, WaitPidFlag, WaitStatus},
-    unistd::{execvp, fork, ForkResult},
+    unistd::Pid,
 };
 use plib::PROJECT_NAME;
 use std::{
     error::Error,
-    ffi::CString,
-    os::unix::fs::PermissionsExt,
+    os::unix::{fs::PermissionsExt, process::CommandExt},
     path::Path,
+    process::Command,
     sync::{
         atomic::{AtomicBool, AtomicI32, Ordering},
         Mutex,
@@ -438,7 +437,7 @@ fn timeout(args: Args) -> i32 {
         signal_name,
         duration,
         utility,
-        mut arguments,
+        arguments,
     } = args;
 
     FOREGROUND.store(foreground, Ordering::SeqCst);
@@ -464,105 +463,99 @@ fn timeout(args: Args) -> i32 {
     let mut original_set = get_empty_sig_set();
     block_handler_and_chld(signal_name, &mut original_set);
 
-    match unsafe { fork() } {
-        Ok(ForkResult::Child) => {
-            // Restore original mask for child.= process.
-            unsafe {
+    // Validate utility
+    let utility_path = if Path::new(&utility).is_file() {
+        utility.clone()
+    } else {
+        match search_in_path(&utility) {
+            Some(path) => path,
+            None => {
+                eprintln!("timeout: utility '{utility}' not found");
+                return 127;
+            }
+        }
+    };
+
+    let spawn_result = unsafe {
+        Command::new(&utility_path)
+            .args(arguments)
+            .pre_exec(move || {
                 libc::sigprocmask(
                     libc::SIG_SETMASK,
                     &original_set,
                     std::ptr::null_mut::<libc::sigset_t>(),
-                )
-            };
+                );
 
-            unsafe {
                 libc::signal(libc::SIGTTIN, libc::SIG_DFL);
                 libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+                Ok(())
+            })
+            .spawn()
+    };
+    let child = match spawn_result {
+        Ok(child) => child,
+        Err(err) => match err.kind() {
+            std::io::ErrorKind::NotFound => {
+                eprintln!("timeout: utility '{utility}' not found");
+                return 127;
             }
-
-            let utility_path = if Path::new(&utility).is_file() {
-                utility.clone()
-            } else {
-                match search_in_path(&utility) {
-                    Some(path) => path,
-                    None => {
-                        eprintln!("timeout: utility '{utility}' not found");
-                        return 127;
-                    }
-                }
-            };
-
-            let utility_c = CString::new(utility_path.clone()).unwrap();
-            let mut arguments_c: Vec<CString> = arguments
-                .drain(..)
-                .map(|arg| CString::new(arg).unwrap())
-                .collect();
-            arguments_c.insert(0, utility_c.clone());
-            match execvp(&utility_c, &arguments_c) {
-                Ok(_) => 0,
-                Err(Errno::ENOENT) => {
-                    eprintln!("timeout: utility '{utility}' not found");
-                    127
-                }
-                Err(_) => {
-                    eprintln!("timeout: unable to run the utility '{utility}'");
-                    126
-                }
+            std::io::ErrorKind::PermissionDenied => {
+                eprintln!("timeout: unable to run the utility '{utility}'");
+                return 126;
             }
-        }
-        Ok(ForkResult::Parent { child }) => {
-            MONITORED_PID.store(child.as_raw(), Ordering::SeqCst);
+            _ => return 125,
+        },
+    };
 
-            set_timeout(duration);
+    MONITORED_PID.store(child.id() as i32, Ordering::SeqCst);
 
-            let mut wait_status: WaitStatus;
-            loop {
-                match waitpid(
-                    child,
-                    Some(WaitPidFlag::WNOHANG | WaitPidFlag::WCONTINUED | WaitPidFlag::WUNTRACED),
-                ) {
-                    Ok(ws) => wait_status = ws,
-                    Err(_) => {
-                        eprintln!("timeout: failed to wait for child");
-                        return 125;
-                    }
-                }
-                match wait_status {
-                    WaitStatus::StillAlive | WaitStatus::Continued(_) => {
-                        unsafe { libc::sigsuspend(&original_set) };
-                    }
-                    WaitStatus::Stopped(_, _s) => {
-                        send_signal(MONITORED_PID.load(Ordering::SeqCst), libc::SIGCONT);
-                        TIMED_OUT.store(true, Ordering::SeqCst);
-                    }
-                    _ => {
-                        break;
-                    }
-                }
-            }
-            let status = match wait_status {
-                WaitStatus::Exited(_, status) => status,
-                WaitStatus::Signaled(_, rec_signal, _) => {
-                    if !TIMED_OUT.load(Ordering::SeqCst) && disable_core_dumps() {
-                        unsafe { libc::signal(rec_signal as i32, libc::SIG_DFL) };
-                        unblock_signal(rec_signal as i32);
-                        unsafe { libc::raise(rec_signal as i32) };
-                    }
-                    if TIMED_OUT.load(Ordering::SeqCst) && rec_signal as i32 == libc::SIGKILL {
-                        preserve_status = true;
-                    }
-                    128 + rec_signal as i32
-                }
-                _ => 125,
-            };
+    set_timeout(duration);
 
-            if TIMED_OUT.load(Ordering::SeqCst) && !preserve_status {
-                124
-            } else {
-                status
+    let mut wait_status: WaitStatus;
+    loop {
+        match waitpid(
+            Pid::from_raw(MONITORED_PID.load(Ordering::SeqCst) as i32),
+            Some(WaitPidFlag::WNOHANG | WaitPidFlag::WCONTINUED | WaitPidFlag::WUNTRACED),
+        ) {
+            Ok(ws) => wait_status = ws,
+            Err(_) => {
+                eprintln!("timeout: failed to wait for child");
+                return 125;
             }
         }
-        Err(_) => 125,
+        match wait_status {
+            WaitStatus::StillAlive | WaitStatus::Continued(_) => {
+                unsafe { libc::sigsuspend(&original_set) };
+            }
+            WaitStatus::Stopped(_, _s) => {
+                send_signal(MONITORED_PID.load(Ordering::SeqCst) as i32, libc::SIGCONT);
+                TIMED_OUT.store(true, Ordering::SeqCst);
+            }
+            _ => {
+                break;
+            }
+        }
+    }
+    let status = match wait_status {
+        WaitStatus::Exited(_, status) => status,
+        WaitStatus::Signaled(_, rec_signal, _) => {
+            if !TIMED_OUT.load(Ordering::SeqCst) && disable_core_dumps() {
+                unsafe { libc::signal(rec_signal as i32, libc::SIG_DFL) };
+                unblock_signal(rec_signal as i32);
+                unsafe { libc::raise(rec_signal as i32) };
+            }
+            if TIMED_OUT.load(Ordering::SeqCst) && rec_signal as i32 == libc::SIGKILL {
+                preserve_status = true;
+            }
+            128 + rec_signal as i32
+        }
+        _ => 125,
+    };
+
+    if TIMED_OUT.load(Ordering::SeqCst) && !preserve_status {
+        124
+    } else {
+        status
     }
 }
 

@@ -42,6 +42,7 @@ struct CountInfo {
     words: usize,
     chars: usize,
     nl: usize,
+    was_space: bool,
 }
 
 impl CountInfo {
@@ -50,6 +51,7 @@ impl CountInfo {
             words: 0,
             chars: 0,
             nl: 0,
+            was_space: true,
         }
     }
 
@@ -59,6 +61,20 @@ impl CountInfo {
         self.nl = self.nl + count.nl;
     }
 }
+
+fn is_space(c: usize) -> bool {
+    ( c > 8 && c < 14) || (c == 32)
+}
+
+fn create_table() -> [bool; 256] {
+    let mut table = [false; 256];
+
+    for i in 0..256 {
+        table[i] = is_space(i)
+    }
+    table
+}
+
 
 fn build_display_str(args: &Args, count: &CountInfo, filename: &OsStr) -> String {
     let mut output = String::with_capacity(filename.len() + (3 * 10));
@@ -109,11 +125,11 @@ fn build_display_str(args: &Args, count: &CountInfo, filename: &OsStr) -> String
     output
 }
 
-fn wc_file_bytes(count: &mut CountInfo, pathname: &PathBuf) -> io::Result<()> {
+fn wc_file_bytes(count: &mut CountInfo, pathname: &PathBuf, table: &[bool; 256]) -> io::Result<()> {
     let mut file = plib::io::input_stream(pathname, false)?;
 
     let mut buffer = [0; plib::BUFSZ];
-    let mut in_word = false;
+    let mut was_space = count.was_space;
 
     loop {
         let n_read = file.read(&mut buffer[..])?;
@@ -126,30 +142,13 @@ fn wc_file_bytes(count: &mut CountInfo, pathname: &PathBuf) -> io::Result<()> {
         let bufslice = &buffer[0..n_read];
 
         for ch_u8 in bufslice {
-            let ch = *ch_u8 as char;
-
-            if ch == '\n' {
-                count.nl = count.nl + 1;
-                if in_word {
-                    in_word = false;
-                    count.words = count.words + 1;
-                }
-            } else if ch.is_whitespace() {
-                if in_word {
-                    in_word = false;
-                    count.words = count.words + 1;
-                }
-            } else {
-                if !in_word {
-                    in_word = true;
-                }
-            }
+            let is_space = table[*ch_u8 as usize];
+            count.nl += (ch_u8 == &10) as usize;
+            count.words += (!is_space && was_space) as usize;
+            was_space = is_space;
         }
     }
-
-    if in_word {
-        count.words = count.words + 1;
-    }
+    count.was_space = was_space;
 
     Ok(())
 }
@@ -196,11 +195,12 @@ fn wc_file(
     chars_mode: bool,
     pathname: &PathBuf,
     count: &mut CountInfo,
+    table: &[bool; 256],
 ) -> io::Result<()> {
     if chars_mode {
         wc_file_chars(args, count, pathname)?;
     } else {
-        wc_file_bytes(count, pathname)?;
+        wc_file_bytes(count, pathname, table)?;
     }
 
     let output = build_display_str(args, count, pathname.as_os_str());
@@ -231,13 +231,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
     let mut exit_code = 0;
+    let table = create_table();
     let mut totals = CountInfo::new();
 
     // input via stdin
     if args.files.is_empty() {
         let mut count = CountInfo::new();
 
-        if let Err(e) = wc_file(&args, chars_mode, &PathBuf::new(), &mut count) {
+        if let Err(e) = wc_file(&args, chars_mode, &PathBuf::new(), &mut count, &table) {
             exit_code = 1;
             eprintln!("stdin: {}", e);
         }
@@ -247,7 +248,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for filename in &args.files {
             let mut count = CountInfo::new();
 
-            if let Err(e) = wc_file(&args, chars_mode, filename, &mut count) {
+            if let Err(e) = wc_file(&args, chars_mode, filename, &mut count, &table) {
                 exit_code = 1;
                 eprintln!("{}: {}", filename.display(), e);
             }

@@ -1,0 +1,16 @@
+[package]
+name = "posixutils-sh"
+version = "0.1.7"
+edition = "2021"
+
+[dependencies]
+plib = { path = "../plib" }
+gettext-rs.workspace = true
+clap.workspace = true
+libc.workspace = true
+pest = "2.7"
+pest_derive = "2.7"
+
+[[bin]]
+name = "awk"
+path = "src/main.rs"

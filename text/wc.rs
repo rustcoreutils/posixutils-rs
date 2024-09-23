@@ -122,7 +122,7 @@ fn build_display_str(args: &Args, count: &CountInfo, filename: &OsStr) -> String
     output
 }
 
-fn wc_file_bytes(count: &mut CountInfo, pathname: &PathBuf, table: &[bool; 256], chars_mode: bool) -> io::Result<()> {
+fn wc_file_bytes(count: &mut CountInfo, pathname: &PathBuf, chars_mode: bool) -> io::Result<()> {
     let mut file = plib::io::input_stream(pathname, false)?;
 
     let mut buffer = [0; plib::BUFSZ];
@@ -146,7 +146,7 @@ fn wc_file_bytes(count: &mut CountInfo, pathname: &PathBuf, table: &[bool; 256],
 
 
         for ch_u8 in bufslice {
-            let is_space = table[*ch_u8 as usize];
+            let is_space = BYTE_TABLE[*ch_u8 as usize];
             count.nl += (ch_u8 == &10) as usize;
             count.words += (!is_space && was_space) as usize;
             was_space = is_space;
@@ -161,9 +161,8 @@ fn wc_file(
     chars_mode: bool,
     pathname: &PathBuf,
     count: &mut CountInfo,
-    table: &[bool; 256],
 ) -> io::Result<()> {
-    wc_file_bytes(count, pathname, table, chars_mode)?;
+    wc_file_bytes(count, pathname, chars_mode)?;
 
     let output = build_display_str(args, count, pathname.as_os_str());
 
@@ -199,7 +198,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.files.is_empty() {
         let mut count = CountInfo::new();
 
-        if let Err(e) = wc_file(&args, chars_mode, &PathBuf::new(), &mut count, &BYTE_TABLE) {
+        if let Err(e) = wc_file(&args, chars_mode, &PathBuf::new(), &mut count) {
             exit_code = 1;
             eprintln!("stdin: {}", e);
         }
@@ -209,7 +208,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for filename in &args.files {
             let mut count = CountInfo::new();
 
-            if let Err(e) = wc_file(&args, chars_mode, filename, &mut count, &BYTE_TABLE) {
+            if let Err(e) = wc_file(&args, chars_mode, filename, &mut count) {
                 exit_code = 1;
                 eprintln!("{}: {}", filename.display(), e);
             }

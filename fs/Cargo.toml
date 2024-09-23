@@ -14,5 +14,5 @@ libc.workspace = true
 
 [[bin]]
 name = "df"
-path = "src/df.rs"
+path = "./df.rs"
 

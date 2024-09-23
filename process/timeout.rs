@@ -13,10 +13,7 @@ use nix::{
     errno::Errno,
     sys::{
         resource::{setrlimit, Resource},
-        signal::{
-            raise, signal, sigprocmask, SigHandler, SigSet, SigmaskHow,
-            Signal::{self, SIGKILL, SIGTERM},
-        },
+        signal::Signal::{self, SIGKILL, SIGTERM},
         wait::{waitpid, WaitPidFlag, WaitStatus},
     },
     unistd::{execvp, fork, ForkResult},
@@ -196,6 +193,12 @@ extern "C" fn handler(mut signal: i32) {
     }
 }
 
+fn get_empty_sig_set() -> libc::sigset_t {
+    let mut sig_set = std::mem::MaybeUninit::uninit();
+    let _ = unsafe { libc::sigemptyset(sig_set.as_mut_ptr()) };
+    unsafe { sig_set.assume_init() }
+}
+
 /// Unblocks incoming signal by adding it to empty signals mask.
 ///
 /// # Arguments
@@ -203,9 +206,7 @@ extern "C" fn handler(mut signal: i32) {
 /// `signal` - signal of type [Signal] that needs to be unblocked.
 fn unblock_signal(signal: i32) {
     unsafe {
-        let mut sig_set = std::mem::MaybeUninit::uninit();
-        let _ = libc::sigemptyset(sig_set.as_mut_ptr());
-        let mut sig_set = sig_set.assume_init();
+        let mut sig_set = get_empty_sig_set();
 
         libc::sigaddset(&mut sig_set, signal);
         if libc::sigprocmask(
@@ -290,21 +291,23 @@ fn set_handler(signal: i32) {
 /// `signal` - signal of type [Signal] that needs to be handled.
 ///
 /// `old_set` - mutable reference to set of gidnals of type [SigSet] into which will be placed previous mask.
-fn block_handler_and_chld(signal: Signal, old_set: &mut SigSet) {
-    let mut block_set = SigSet::empty();
+fn block_handler_and_chld(signal: i32, old_set: &mut libc::sigset_t) {
+    unsafe {
+        let mut block_set = get_empty_sig_set();
 
-    block_set.add(Signal::SIGALRM);
-    block_set.add(Signal::SIGINT);
-    block_set.add(Signal::SIGQUIT);
-    block_set.add(Signal::SIGHUP);
-    block_set.add(Signal::SIGTERM);
-    block_set.add(signal);
+        libc::sigaddset(&mut block_set, libc::SIGALRM);
+        libc::sigaddset(&mut block_set, libc::SIGINT);
+        libc::sigaddset(&mut block_set, libc::SIGQUIT);
+        libc::sigaddset(&mut block_set, libc::SIGHUP);
+        libc::sigaddset(&mut block_set, libc::SIGTERM);
+        libc::sigaddset(&mut block_set, signal);
 
-    block_set.add(Signal::SIGCHLD);
+        libc::sigaddset(&mut block_set, libc::SIGCHLD);
 
-    if sigprocmask(SigmaskHow::SIG_BLOCK, Some(&block_set), Some(old_set)).is_err() {
-        eprintln!("timeout: failed to set block signals mask");
-        std::process::exit(125)
+        if libc::sigprocmask(libc::SIG_BLOCK, &block_set, old_set) != 0 {
+            eprintln!("timeout: failed to set block signals mask");
+            std::process::exit(125)
+        }
     }
 }
 
@@ -390,13 +393,19 @@ fn timeout(args: Args) -> i32 {
     // To be able to handle SIGALRM (will be send after timeout)
     unblock_signal(libc::SIGALRM);
 
-    let mut sig_set = SigSet::empty();
-    block_handler_and_chld(signal_name, &mut sig_set);
+    let mut original_set = get_empty_sig_set();
+    block_handler_and_chld(signal_name as i32, &mut original_set);
 
     match unsafe { fork() } {
         Ok(ForkResult::Child) => {
             // Restore original mask for child.= process.
-            let _ = sigprocmask(SigmaskHow::SIG_SETMASK, Some(&sig_set), None);
+            unsafe {
+                libc::sigprocmask(
+                    libc::SIG_SETMASK,
+                    &original_set,
+                    std::ptr::null_mut::<libc::sigset_t>(),
+                )
+            };
 
             unsafe {
                 libc::signal(libc::SIGTTIN, libc::SIG_DFL);
@@ -452,7 +461,7 @@ fn timeout(args: Args) -> i32 {
                 }
                 match wait_status {
                     WaitStatus::StillAlive | WaitStatus::Continued(_) => {
-                        let _ = sig_set.suspend();
+                        unsafe { libc::sigsuspend(&original_set) };
                     }
                     WaitStatus::Stopped(_, _s) => {
                         send_signal(MONITORED_PID.load(Ordering::SeqCst), libc::SIGCONT);
@@ -467,9 +476,9 @@ fn timeout(args: Args) -> i32 {
                 WaitStatus::Exited(_, status) => status,
                 WaitStatus::Signaled(_, rec_signal, _) => {
                     if !TIMED_OUT.load(Ordering::SeqCst) && disable_core_dumps() {
-                        let _ = unsafe { signal(rec_signal, SigHandler::SigDfl) };
+                        unsafe { libc::signal(rec_signal as i32, libc::SIG_DFL) };
                         unblock_signal(rec_signal as i32);
-                        let _ = raise(rec_signal);
+                        unsafe { libc::raise(rec_signal as i32) };
                     }
                     if TIMED_OUT.load(Ordering::SeqCst) && rec_signal == SIGKILL {
                         preserve_status = true;

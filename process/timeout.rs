@@ -144,13 +144,13 @@ struct Args {
 ///
 /// * `s` - [str] that represents duration.
 ///
-/// # Errors
-///
-/// Returns an error if passed invalid input.
-///
 /// # Returns
 ///
 /// Returns the parsed [Duration] value.
+///
+/// # Errors
+///
+/// Returns a [String] error if passed invalid duration string.
 fn parse_duration(s: &str) -> Result<Duration, String> {
     let (value, suffix) = s.split_at(
         s.find(|c: char| !c.is_ascii_digit() && c != '.')
@@ -178,15 +178,15 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 ///
 /// * `s` - [str] that represents the signal name.
 ///
-/// # Errors
-///
-/// Returns an error if passed invalid input.
-///
 /// # Returns
 ///
 /// Returns the parsed [Signal] value.
-fn parse_signal(signal_name: &str) -> Result<i32, String> {
-    let normalized = signal_name.trim().to_uppercase();
+///
+/// # Errors
+///
+/// Returns an [String] error if passed invalid signal name.
+fn parse_signal(s: &str) -> Result<i32, String> {
+    let normalized = s.trim().to_uppercase();
     let normalized = normalized.strip_prefix("SIG").unwrap_or(&normalized);
 
     for (name, num) in SIGLIST.iter() {
@@ -194,14 +194,14 @@ fn parse_signal(signal_name: &str) -> Result<i32, String> {
             return Ok(*num);
         }
     }
-    Err(format!("invalid signal name '{signal_name}'"))
+    Err(format!("invalid signal name '{s}'"))
 }
 
-/// Starts the timeout after which [Signal::SIGALRM] will be send.
+/// Starts the timeout after which [libc::SIGALRM] will be send.
 ///
 /// # Arguments
 ///
-/// * `duration` - [Duration] value of
+/// * `duration` - [Duration] value of time until alarm.
 fn set_timeout(duration: Duration) {
     if !duration.is_zero() {
         unsafe { libc::alarm(duration.as_secs() as libc::c_uint) };
@@ -209,6 +209,11 @@ fn set_timeout(duration: Duration) {
 }
 
 /// Sends a signal to the process or process group.
+///
+/// # Arguments:
+///
+/// * `pid` - [i32] value of PID.
+/// * `signal` - [i32] value of signal tat must be sent.
 fn send_signal(pid: i32, signal: i32) {
     if pid == 0 {
         unsafe { libc::signal(signal, libc::SIG_IGN) };
@@ -218,7 +223,7 @@ fn send_signal(pid: i32, signal: i32) {
     }
 }
 
-/// Signal [Signal::SIGCHLD] handler.
+/// Signal [libc::SIGCHLD] handler.
 extern "C" fn chld_handler(_signal: i32) {}
 
 /// Timeout signal handler.
@@ -228,7 +233,7 @@ extern "C" fn chld_handler(_signal: i32) {}
 /// * `signal` - integer value of incoming signal.
 extern "C" fn handler(mut signal: i32) {
     // When timeout receives [libc::SIGALRM], this will be considered as timeout reached and
-    // timeout will send prepared signal
+    // timeout will send prepared signal.
     if signal == libc::SIGALRM {
         TIMED_OUT.store(true, Ordering::SeqCst);
         signal = FIRST_SIGNAL.load(Ordering::SeqCst);
@@ -258,6 +263,11 @@ extern "C" fn handler(mut signal: i32) {
     }
 }
 
+/// Returns empty set of signals.
+///
+/// # Returns:
+///
+/// Returns [libc::sigset_t] empty set of signal.
 fn get_empty_sig_set() -> libc::sigset_t {
     let mut sig_set = std::mem::MaybeUninit::uninit();
     let _ = unsafe { libc::sigemptyset(sig_set.as_mut_ptr()) };
@@ -268,7 +278,7 @@ fn get_empty_sig_set() -> libc::sigset_t {
 ///
 /// # Arguments
 ///
-/// `signal` - signal of type [Signal] that needs to be unblocked.
+/// `signal` - [i32] value of signal that needs to be unblocked.
 fn unblock_signal(signal: i32) {
     unsafe {
         let mut sig_set = get_empty_sig_set();
@@ -286,7 +296,7 @@ fn unblock_signal(signal: i32) {
     }
 }
 
-/// Installs handler for [Signal::SIGCHLD] signal to receive child's exit status code from parent (timeout).
+/// Installs handler for [libc::SIGCHLD] signal to receive child's exit status code from parent (timeout).
 fn set_chld() {
     unsafe {
         let mut sig_action = std::mem::MaybeUninit::<libc::sigaction>::uninit();
@@ -306,11 +316,11 @@ fn set_chld() {
     unblock_signal(libc::SIGCHLD);
 }
 
-/// Installs handler ([handler]) for incoming [Signal] and other signals.
+/// Installs handler ([handler]) for incoming signal and other signals.
 ///
 /// # Arguments
 ///
-/// `signal` - signal of type [Signal] that needs to be handled.
+/// `signal` - [i32] value of signal that needs to be handled.
 fn set_handler(signal: i32) {
     unsafe {
         let mut sig_action = std::mem::MaybeUninit::<libc::sigaction>::uninit();
@@ -353,9 +363,8 @@ fn set_handler(signal: i32) {
 ///
 /// # Arguments
 ///
-/// `signal` - signal of type [Signal] that needs to be handled.
-///
-/// `old_set` - mutable reference to set of gidnals of type [SigSet] into which will be placed previous mask.
+/// `signal` - [i32] value of signal that needs to be handled.
+/// `old_set` - [libc::sigset_t] mutable reference to set of signals into which will be placed previous mask.
 fn block_handler_and_chld(signal: i32, old_set: &mut libc::sigset_t) {
     unsafe {
         let mut block_set = get_empty_sig_set();
@@ -423,7 +432,7 @@ fn search_in_path(utility: &str) -> Option<String> {
 ///
 /// # Arguments
 ///
-/// `args` - structure of timeout options and operands.
+/// `args` - [Args] structure of timeout options and operands.
 ///
 /// # Return
 ///
@@ -438,6 +447,18 @@ fn timeout(args: Args) -> i32 {
         utility,
         arguments,
     } = args;
+
+    let utility_path = if Path::new(&utility).is_file() {
+        utility.clone()
+    } else {
+        match search_in_path(&utility) {
+            Some(path) => path,
+            None => {
+                eprintln!("timeout: utility '{utility}' not found");
+                return 127;
+            }
+        }
+    };
 
     FOREGROUND.store(foreground, Ordering::SeqCst);
     FIRST_SIGNAL.store(signal_name, Ordering::SeqCst);
@@ -461,19 +482,6 @@ fn timeout(args: Args) -> i32 {
 
     let mut original_set = get_empty_sig_set();
     block_handler_and_chld(signal_name, &mut original_set);
-
-    // Validate utility
-    let utility_path = if Path::new(&utility).is_file() {
-        utility.clone()
-    } else {
-        match search_in_path(&utility) {
-            Some(path) => path,
-            None => {
-                eprintln!("timeout: utility '{utility}' not found");
-                return 127;
-            }
-        }
-    };
 
     let spawn_result = unsafe {
         Command::new(&utility_path)
@@ -515,13 +523,8 @@ fn timeout(args: Args) -> i32 {
     let options = libc::WNOHANG | libc::WCONTINUED | libc::WUNTRACED;
 
     loop {
-        wait_status = unsafe {
-            libc::waitpid(
-                MONITORED_PID.load(Ordering::SeqCst),
-                &mut status,
-                options,
-            )
-        };
+        wait_status =
+            unsafe { libc::waitpid(MONITORED_PID.load(Ordering::SeqCst), &mut status, options) };
 
         let es = ExitStatus::from_raw(status);
         if wait_status == 0 || es.continued() {
@@ -566,6 +569,11 @@ fn timeout(args: Args) -> i32 {
     }
 }
 
+/// Exit code:
+///     124 - Process timed out.
+///     125 - An error other than the two described below occurred.
+///     126 - The utility specified by utility was found but could not be executed.
+///     127 - The utility specified by utility could not be found.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments
     let args = Args::try_parse().unwrap_or_else(|err| match err.kind() {

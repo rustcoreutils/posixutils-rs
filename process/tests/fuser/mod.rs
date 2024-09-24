@@ -39,6 +39,7 @@ fn fuser_test(
 ///
 /// **Assertions:**
 /// - Verifies that the PID of the process is included in the output of `fuser`.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn test_fuser_basic() {
     let process = Command::new("sleep")

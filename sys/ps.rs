@@ -14,6 +14,7 @@ mod psmacos;
 mod pslinux;
 
 use clap::Parser;
+use std::collections::HashMap;
 
 #[cfg(target_os = "macos")]
 mod platform {
@@ -44,6 +45,57 @@ struct Args {
     /// Exclude session leaders
     #[arg(short = 'd', long)]
     exclude_session_leaders: bool,
+
+    /// Full output format (-f)
+    #[arg(short = 'f', long)]
+    full_format: bool,
+
+    /// Long output format (-l)
+    #[arg(short = 'l', long)]
+    long_format: bool,
+
+    /// Custom output format (-o)
+    #[arg(short = 'o', long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    output_format: Option<String>,
+}
+
+// Parse the -o format option into a list of fields
+fn parse_output_format<'a>(
+    format: &'a str,
+    posix_fields: &'a HashMap<&'a str, (&'a str, &'a str)>,
+) -> Vec<&'a str> {
+    format
+        .split(|c| c == ' ' || c == ',')
+        .map(|s| {
+            let field = s.split('=').next().unwrap_or("").trim();
+            if posix_fields.contains_key(field) {
+                field
+            } else {
+                panic!("Invalid field specified in -o option: {}", field);
+            }
+        })
+        .collect()
+}
+
+// Lookup table for POSIX-compliant output fields
+fn posix_field_map() -> HashMap<&'static str, (&'static str, &'static str)> {
+    HashMap::from([
+        ("ruser", ("uid", "RUSER")),
+        ("user", ("uid", "USER")),
+        ("rgroup", ("gid", "RGROUP")),
+        ("group", ("gid", "GROUP")),
+        ("pid", ("pid", "PID")),
+        ("ppid", ("ppid", "PPID")),
+        ("pgid", ("pgid", "PGID")),
+        ("pcpu", ("pcpu", "%CPU")),
+        ("vsz", ("vsz", "VSZ")),
+        ("nice", ("nice", "NI")),
+        ("etime", ("etime", "ELAPSED")),
+        ("time", ("time", "TIME")),
+        ("tty", ("tty", "TTY")),
+        ("comm", ("comm", "COMMAND")),
+        ("args", ("args", "COMMAND")),
+    ])
 }
 
 fn main() {
@@ -80,14 +132,42 @@ fn main() {
         processes
     };
 
-    println!(
-        "{:<5} {:<5} {:<5} {:<5} {}",
-        "PID", "PPID", "UID", "GID", "COMMAND"
-    );
+    // Define a lookup table for POSIX-compliant fields
+    let posix_fields = posix_field_map();
+
+    // Build output based on -o, -f, -l, or default
+    let output_fields = if let Some(ref format) = args.output_format {
+        parse_output_format(format, &posix_fields)
+    } else if args.full_format {
+        vec!["uid", "pid", "ppid", "C", "time", "comm"]
+    } else if args.long_format {
+        vec!["nice", "vsz", "WCHAN", "tty", "comm"]
+    } else {
+        vec!["pid", "ppid", "tty", "time", "comm"] // Default format
+    };
+
+    // Print the header
+    for field in &output_fields {
+        let header = posix_fields.get(*field).unwrap_or(&(&field, &field)).1;
+        print!("{:<10} ", header);
+    }
+    println!();
+
+    // Print each process
     for proc in filtered_processes {
-        println!(
-            "{:<5} {:<5} {:<5} {:<5} {}",
-            proc.pid, proc.ppid, proc.uid, proc.gid, proc.path
-        );
+        for field in &output_fields {
+            match *field {
+                "pid" => print!("{:<10} ", proc.pid),
+                "ppid" => print!("{:<10} ", proc.ppid),
+                "group" => print!("{:<10} ", proc.gid),
+                "tty" => print!("{:<10} ", proc.tty.as_deref().unwrap_or("-")),
+                // "time" => print!("{:<10} ", proc.time),
+                "comm" => print!("{:<10} ", proc.path),
+                "user" => print!("{:<10} ", proc.uid), // Example for user field, would need to resolve UID -> username
+                // Add cases for more fields as needed...
+                _ => print!("{:<10} ", "-"),
+            }
+        }
+        println!();
     }
 }

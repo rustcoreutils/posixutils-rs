@@ -531,6 +531,7 @@ fn timeout(args: Args) -> i32 {
             unsafe { libc::sigsuspend(&original_set) };
         } else if es.stopped_signal().is_some() {
             send_signal(MONITORED_PID.load(Ordering::SeqCst), libc::SIGCONT);
+            TIMED_OUT.store(true, Ordering::SeqCst);
         } else {
             break;
         }
@@ -540,8 +541,8 @@ fn timeout(args: Args) -> i32 {
         eprintln!("timeout: failed to wait for child");
         125
     } else {
-        if libc::WIFEXITED(status) {
-            status = libc::WEXITSTATUS(status)
+        status = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
         } else if libc::WIFSIGNALED(status) {
             let signal = libc::WTERMSIG(status);
             if libc::WCOREDUMP(status) {
@@ -556,10 +557,11 @@ fn timeout(args: Args) -> i32 {
             if TIMED_OUT.load(Ordering::SeqCst) && signal as i32 == libc::SIGKILL {
                 preserve_status = true;
             }
-            status = 128 + signal
+            128 + signal
         } else {
-            eprintln!("timeout: unknown status from commnad: {status}")
-        }
+            eprintln!("timeout: unknown status from commnad: {status}");
+            return 125;
+        };
 
         if TIMED_OUT.load(Ordering::SeqCst) && !preserve_status {
             124

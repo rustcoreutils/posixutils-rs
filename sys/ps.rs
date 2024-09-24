@@ -26,9 +26,9 @@ mod platform {
     pub use crate::pslinux::*;
 }
 
+/// ps - report process status
 #[derive(Parser)]
-#[command(name = "ps")]
-#[command(about = "Report process status", version = "1.0")]
+#[command(author, version, about, long_about)]
 struct Args {
     /// List all processes
     #[arg(short = 'A', long)]
@@ -39,30 +39,30 @@ struct Args {
     all2: bool,
 
     /// List all processes associated with terminals
-    #[arg(short = 'a', long)]
+    #[arg(short = 'a')]
     terminal_processes: bool,
 
     /// Exclude session leaders
-    #[arg(short = 'd', long)]
+    #[arg(short = 'd')]
     exclude_session_leaders: bool,
 
     /// Full output format (-f)
-    #[arg(short = 'f', long)]
+    #[arg(short = 'f', long = "full")]
     full_format: bool,
 
     /// Long output format (-l)
-    #[arg(short = 'l', long)]
+    #[arg(short = 'l', long = "long")]
     long_format: bool,
 
     /// Custom output format (-o)
-    #[arg(short = 'o', long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    #[arg(short = 'o', value_parser = clap::builder::NonEmptyStringValueParser::new())]
     output_format: Option<String>,
 }
 
 // Parse the -o format option into a list of fields
 fn parse_output_format<'a>(
     format: &'a str,
-    posix_fields: &'a HashMap<&'a str, (&'a str, &'a str)>,
+    posix_fields: &'a HashMap<&'a str, &'a str>,
 ) -> Vec<&'a str> {
     format
         .split(|c| c == ' ' || c == ',')
@@ -78,23 +78,23 @@ fn parse_output_format<'a>(
 }
 
 // Lookup table for POSIX-compliant output fields
-fn posix_field_map() -> HashMap<&'static str, (&'static str, &'static str)> {
+fn posix_field_map() -> HashMap<&'static str, &'static str> {
     HashMap::from([
-        ("ruser", ("uid", "RUSER")),
-        ("user", ("uid", "USER")),
-        ("rgroup", ("gid", "RGROUP")),
-        ("group", ("gid", "GROUP")),
-        ("pid", ("pid", "PID")),
-        ("ppid", ("ppid", "PPID")),
-        ("pgid", ("pgid", "PGID")),
-        ("pcpu", ("pcpu", "%CPU")),
-        ("vsz", ("vsz", "VSZ")),
-        ("nice", ("nice", "NI")),
-        ("etime", ("etime", "ELAPSED")),
-        ("time", ("time", "TIME")),
-        ("tty", ("tty", "TTY")),
-        ("comm", ("comm", "COMMAND")),
-        ("args", ("args", "COMMAND")),
+        ("ruser", "RUSER"),
+        ("user", "USER"),
+        ("rgroup", "RGROUP"),
+        ("group", "GROUP"),
+        ("pid", "PID"),
+        ("ppid", "PPID"),
+        ("pgid", "PGID"),
+        ("pcpu", "%CPU"),
+        ("vsz", "VSZ"),
+        ("nice", "NI"),
+        ("etime", "ELAPSED"),
+        ("time", "TIME"),
+        ("tty", "TTY"),
+        ("comm", "COMMAND"),
+        ("args", "COMMAND"),
     ])
 }
 
@@ -148,7 +148,7 @@ fn main() {
 
     // Print the header
     for field in &output_fields {
-        let header = posix_fields.get(*field).unwrap_or(&(&field, &field)).1;
+        let header = posix_fields.get(*field).unwrap_or(&field);
         print!("{:<10} ", header);
     }
     println!();

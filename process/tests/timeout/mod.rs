@@ -10,6 +10,8 @@
 use std::{
     io::Write,
     process::{Command, Output, Stdio},
+    thread,
+    time::Duration,
 };
 
 use sysinfo::System;
@@ -43,15 +45,33 @@ fn run_test_base(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> (Output, i
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("failed to spawn head");
+        .expect(format!("failed to spawn command {}", cmd).as_str());
 
     let pgid = unsafe { libc::getpgid(child.id() as i32) };
 
-    let stdin = child.stdin.as_mut().expect("failed to get stdin");
-    stdin
-        .write_all(stdin_data)
-        .expect("failed to write to stdin");
+    // Separate the mutable borrow of stdin from the child process
+    if let Some(mut stdin) = child.stdin.take() {
+        let chunk_size = 1024; // Arbitrary chunk size, adjust if needed
+        for chunk in stdin_data.chunks(chunk_size) {
+            // Write each chunk
+            if let Err(e) = stdin.write_all(chunk) {
+                eprintln!("Error writing to stdin: {}", e);
+                break;
+            }
+            // Flush after writing each chunk
+            if let Err(e) = stdin.flush() {
+                eprintln!("Error flushing stdin: {}", e);
+                break;
+            }
 
+            // Sleep briefly to avoid CPU spinning
+            thread::sleep(Duration::from_millis(10));
+        }
+        // Explicitly drop stdin to close the pipe
+        drop(stdin);
+    }
+
+    // Ensure we wait for the process to complete after writing to stdin
     let output = child.wait_with_output().expect("failed to wait for child");
     (output, pgid)
 }
@@ -113,6 +133,7 @@ fn timeout_test_extended(
 const TRUE: &'static str = "true";
 const SLEEP: &'static str = "sleep";
 const NON_EXECUTABLE: &'static str = "tests/timeout/non_executable.sh";
+const WITH_ARGUMENT: &'static str = "tests/timeout/with_argument.sh";
 const SPAWN_CHILD: &'static str = "tests/timeout/spawn_child.sh";
 
 #[test]
@@ -235,13 +256,7 @@ fn test_utility_not_found() {
 
 #[test]
 fn test_utility_error() {
-    let message: String = if cfg!(target_os = "macos") {
-        String::from("usage: sleep seconds\n")
-    } else {
-        String::from("/usr/bin/sleep: invalid time interval ‘invalid_value’\nTry '/usr/bin/sleep --help' for more information.\n")
-    };
-
-    timeout_test(&["1", SLEEP, "invalid_value"], &message, 1);
+    timeout_test(&["1", WITH_ARGUMENT], "error: enter some argument\n", 1);
 }
 
 #[test]

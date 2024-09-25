@@ -11,7 +11,7 @@ use crate::compiler::compile_program;
 use crate::interpreter::interpret;
 use clap::Parser;
 use compiler::SourceFile;
-use gettextrs::{bind_textdomain_codeset, textdomain};
+use gettextrs::{bind_textdomain_codeset, gettext, textdomain};
 use plib::PROJECT_NAME;
 use std::error::Error;
 use std::fmt::Display;
@@ -22,19 +22,23 @@ mod interpreter;
 mod program;
 mod regex;
 
-/// awk - pattern scanning and processing language
 #[derive(Parser)]
 struct Args {
-    /// Define the input field separator
-    #[arg(short = 'F')]
+    #[arg(short = 'F', help = gettext("Define the input field separator"))]
     separator_string: Option<String>,
 
-    /// Specify the program files
-    #[arg(short = 'f', action = clap::ArgAction::Append)]
+    #[arg(
+        short = 'f',
+        action = clap::ArgAction::Append,
+        help = gettext("Specify the program files")
+    )]
     program_files: Vec<String>,
 
-    /// Globals assignments, executed before the start of the program
-    #[arg(short = 'v', action = clap::ArgAction::Append)]
+    #[arg(
+        short = 'v',
+        action = clap::ArgAction::Append,
+        help = gettext("Globals assignments, executed before the start of the program")
+    )]
     assignments: Vec<String>,
 
     arguments: Vec<String>,

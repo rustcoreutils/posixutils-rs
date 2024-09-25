@@ -8,7 +8,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 #[cfg(not(target_os = "macos"))]
 use libc::{msgctl, msgget, msqid_ds};
 use libc::{semctl, semget, shmctl, shmget, shmid_ds};
@@ -17,34 +17,54 @@ use std::ffi::{c_int, c_ushort};
 use std::io::{self, Error, ErrorKind};
 use std::ptr;
 
-/// ipcrm - remove an XSI message queue, semaphore set, or shared memory segment identifier
 #[derive(Parser)]
-#[command(version, about)]
+#[command(
+    version,
+    about = gettext("ipcrm - remove an XSI message queue, semaphore set, or shared memory segment identifier")
+)]
 struct Args {
-    /// Remove the shared memory identifier semid from the system.
-    #[arg(short = 's', long)]
+    #[arg(
+        short = 's',
+        long,
+        help = gettext("Remove the shared memory identifier semid from the system")
+    )]
     semid: Option<i32>,
 
-    /// Remove the shared memory identifier, created with key semkey, from the system.
-    #[arg(short = 'S', long)]
+    #[arg(
+        short = 'S',
+        long,
+        help = gettext("Remove the shared memory identifier, created with key semkey, from the system")
+    )]
     semkey: Option<i32>,
 
-    /// Remove the shared memory identifier shmid from the system.
-    #[arg(short = 'm', long)]
+    #[arg(
+        short = 'm',
+        long,
+        help = gettext("Remove the shared memory identifier shmid from the system")
+    )]
     shmid: Option<i32>,
 
-    /// Remove the shared memory identifier, created with key shmkey, from the system.
-    #[arg(short = 'M', long)]
+    #[arg(
+        short = 'M',
+        long,
+        help = gettext("Remove the shared memory identifier, created with key shmkey, from the system")
+    )]
     shmkey: Option<i32>,
 
-    /// Remove the message queue identifier msgid from the system.
     #[cfg(not(target_os = "macos"))]
-    #[arg(short = 'q', long)]
+    #[arg(
+        short = 'q',
+        long,
+        help = gettext("Remove the message queue identifier msgid from the system")
+    )]
     msgid: Option<i32>,
 
-    /// Remove the message queue identifier, created with key msgkey, from the system.
     #[cfg(not(target_os = "macos"))]
-    #[arg(short = 'Q', long)]
+    #[arg(
+        short = 'Q',
+        long,
+        help = gettext("Remove the message queue identifier, created with key msgkey, from the system")
+    )]
     msgkey: Option<i32>,
 }
 

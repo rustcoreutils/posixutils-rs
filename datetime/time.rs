@@ -13,21 +13,30 @@ use std::time::Instant;
 
 use clap::Parser;
 
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 
 #[derive(Parser)]
-#[command(version, about)]
+#[command(
+    version,
+    about = gettext("time - time a simple command or give resource usage")
+)]
 struct Args {
-    /// Write timing output to standard error in POSIX format
-    #[arg(short, long)]
+    #[arg(
+        short,
+        long,
+        help = gettext("Write timing output to standard error in POSIX format")
+    )]
     posix: bool,
 
-    /// The utility to be invoked
+    #[arg(help = gettext("The utility to be invoked"))]
     utility: String,
 
-    /// Arguments for the utility
-    #[arg(name = "ARGUMENT", trailing_var_arg = true)]
+    #[arg(
+        name = "ARGUMENT",
+        trailing_var_arg = true,
+        help = gettext("Arguments for the utility")
+    )]
     arguments: Vec<String>,
 }
 

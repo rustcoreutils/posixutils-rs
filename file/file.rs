@@ -9,7 +9,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use regex::Regex;
 use std::{
@@ -21,31 +21,49 @@ use std::{
     path::PathBuf,
 };
 
-/// file - determine file type
 #[derive(Parser)]
-#[command(version, about, disable_help_flag = true)]
+#[command(
+    version,
+    disable_help_flag = true,
+    about = gettext("file - determine file type")
+)]
 struct Args {
     #[arg(long, action = clap::ArgAction::HelpLong)]
     help: Option<bool>,
 
-    /// Apply default position-sensitive system tests and context-sensitive system tests to the file.
-    #[arg(short = 'd', long)]
+    #[arg(
+        short = 'd',
+        long,
+        help = gettext(
+            "Apply default position-sensitive system tests and context-sensitive system tests to the file"
+        )
+    )]
     default_tests: bool,
 
-    /// Identify symbolic link with non existent file as symbolic link
-    #[arg(short = 'h', long)]
+    #[arg(
+        short = 'h',
+        long,
+        help = gettext("Identify symbolic link with non existent file as symbolic link")
+    )]
     identify_as_symbolic_link: bool,
 
-    /// Don't perform further classification on regular file
-    #[arg(short = 'i', long)]
+    #[arg(
+        short = 'i',
+        long,
+        help = gettext("Don't perform further classification on regular file")
+    )]
     no_further_file_classification: bool,
 
-    /// File containing position-sensitive tests
-    #[arg(short = 'm')]
+    #[arg(
+        short = 'm',
+        help = gettext("File containing position-sensitive tests")
+    )]
     test_file1: Option<PathBuf>,
 
-    /// File containing additional position-sensitive tests
-    #[arg(short = 'M')]
+    #[arg(
+        short = 'M',
+        help = gettext("File containing additional position-sensitive tests")
+    )]
     test_file2: Option<PathBuf>,
 
     files: Vec<String>,

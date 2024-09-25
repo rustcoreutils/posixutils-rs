@@ -15,7 +15,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use std::io::{self, Read};
 use std::process::{Command, Stdio};
@@ -23,50 +23,72 @@ use std::process::{Command, Stdio};
 const ARG_MAX: i32 = 131072; // arbitrary.  todo: discover actual value
 const MAX_ARGS_BYTES: usize = ARG_MAX as usize - 2048;
 
-/// xargs - construct argument lists and invoke utility
 #[derive(Parser)]
-#[command(version, about)]
+#[command(
+    version,
+    about = gettext("xargs - construct argument lists and invoke utility")
+)]
 struct Args {
-    /// The utility shall be executed for each non-empty number lines of arguments from standard input.
-    #[arg(short = 'L', long)]
+    #[arg(
+        short = 'L',
+        long,
+        help = gettext(
+            "The utility shall be executed for each non-empty number lines of arguments from standard input"
+        )
+    )]
     lines: Option<usize>,
 
-    /// Invoke utility using as many standard input arguments as possible, up to number
-    #[arg(short = 'n', long)]
+    #[arg(
+        short = 'n',
+        long,
+        help = gettext(
+            "Invoke utility using as many standard input arguments as possible, up to number"
+        )
+    )]
     maxnum: Option<usize>,
 
-    /// Invoke utility using as many standard input arguments as possible yielding a command line length less than size
-    #[arg(short = 's', long)]
+    #[arg(
+        short = 's',
+        long,
+        help = gettext(
+            "Invoke utility using as many standard input arguments as possible yielding a command line length less than size"
+        )
+    )]
     maxsize: Option<usize>,
 
-    /// Use eofstr as the logical end-of-file string.
-    #[arg(short = 'E', long, default_value = "")]
+    #[arg(
+        short = 'E',
+        long,
+        default_value = "",
+        help = gettext("Use eofstr as the logical end-of-file string")
+    )]
     eofstr: String,
 
-    /// Insert mode.
-    #[arg(short = 'I', long)]
+    #[arg(short = 'I', long, help = gettext("Insert mode"))]
     replstr: Option<String>,
 
-    /// prompt mode
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Prompt mode"))]
     prompt: bool,
 
-    /// trace mode
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Trace mode"))]
     trace: bool,
 
-    /// null-based processing
-    #[arg(short = '0', long = "null")]
+    #[arg(short = '0', long = "null", help = gettext("Null-based processing"))]
     null_mode: bool,
 
-    /// Terminate if a constructed command line will not fit in the implied or specified size
-    #[arg(short = 'x', long)]
+    #[arg(
+        short = 'x',
+        long,
+        help = gettext(
+            "Terminate if a constructed command line will not fit in the implied or specified size"
+        )
+    )]
     exit: bool,
 
-    /// utility to invoke
+    #[arg(help = gettext("Utility to invoke"))]
     util: String,
 
-    /// utility arguments
+    #[arg(help = gettext("Utility arguments"))]
     util_args: Vec<String>,
 }
 

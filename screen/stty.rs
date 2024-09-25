@@ -13,7 +13,7 @@
 mod osdata;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use osdata::{ParamType, PARG, PNEG};
 use plib::PROJECT_NAME;
 use std::collections::HashMap;
@@ -25,19 +25,30 @@ use termios::{
 
 const HDR_SAVE: &'static str = "pfmt1";
 
-/// stty - set the options for a terminal
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("stty - set the options for a terminal"))]
 struct Args {
-    /// Write to standard output all the current settings, in human-readable form.
-    #[arg(short, long, group = "mode")]
+    #[arg(
+        short,
+        long,
+        group = "mode",
+        help = gettext(
+            "Write to standard output all the current settings, in human-readable form"
+        )
+    )]
     all: bool,
 
-    /// Write to standard output all the current settings, in stty-readable form.
-    #[arg(short = 'g', long, group = "mode")]
+    #[arg(
+        short = 'g',
+        long,
+        group = "mode",
+        help = gettext(
+            "Write to standard output all the current settings, in stty-readable form"
+        )
+    )]
     save: bool,
 
-    /// List of terminal configuration commands
+    #[arg(help = gettext("List of terminal configuration commands"))]
     operands: Vec<String>,
 }
 

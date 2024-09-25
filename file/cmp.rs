@@ -8,28 +8,46 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use std::io::{self, ErrorKind, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-/// cmp - compare two files
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("cmp - compare two files"))]
 struct Args {
-    /// Write the byte number (decimal) and the differing bytes (octal) for each difference.
-    #[arg(short = 'l', long, group = "verbosity")]
+    #[arg(
+        short = 'l',
+        long,
+        group = "verbosity",
+        help = gettext(
+            "Write the byte number (decimal) and the differing bytes (octal) for each difference"
+        )
+    )]
     verbose: bool,
 
-    /// Write nothing for differing files; return exit status only.
-    #[arg(short, long, alias = "quiet", group = "verbosity")]
+    #[arg(
+        short,
+        long,
+        alias = "quiet",
+        group = "verbosity",
+        help = gettext("Write nothing for differing files; return exit status only")
+    )]
     silent: bool,
 
-    /// A pathname of the first file to be compared. If file1 is '-', the standard input shall be used.
+    #[arg(
+        help = gettext(
+            "A pathname of the first file to be compared. If file1 is '-', the standard input shall be used"
+        )
+    )]
     file1: PathBuf,
 
-    /// A pathname of the second file to be compared. If file2 is '-', the standard input shall be used.
+    #[arg(
+        help = gettext(
+            "A pathname of the second file to be compared. If file2 is '-', the standard input shall be used"
+        )
+    )]
     file2: PathBuf,
 }
 

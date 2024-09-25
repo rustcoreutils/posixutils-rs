@@ -20,16 +20,19 @@ use std::collections::HashMap;
 use std::ffi::CString;
 
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("getconf - get configuration values"))]
 struct Args {
-    /// Variable to get the value of
+    #[arg(help = gettext("Variable to get the value of"))]
     var: String,
 
-    /// Pathname for path configuration variables
+    #[arg(help = gettext("Pathname for path configuration variables"))]
     pathname: Option<String>,
 
-    /// Specification for the variable (optional)
-    #[arg(short = 'v', long)]
+    #[arg(
+        short = 'v',
+        long,
+        help = gettext("Specification for the variable (optional)")
+    )]
     specification: Option<String>,
 }
 

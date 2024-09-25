@@ -8,7 +8,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use std::ffi::CString;
 use std::path::{Component, Path};
@@ -16,21 +16,31 @@ use std::path::{Component, Path};
 const _POSIX_PATH_MAX: usize = 255;
 const _POSIX_NAME_MAX: usize = 14;
 
-/// pathchk - check pathnames
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("pathchk - check pathnames"))]
 struct Args {
-    /// Instead of performing checks based on the underlying file system,
-    /// perform portable, POSIX-compliant checks.
-    #[arg(short, long, group = "mode")]
+    #[arg(
+        short,
+        long,
+        group = "mode",
+        help = gettext(
+            "Instead of performing checks based on the underlying file system, \
+             perform portable, POSIX-compliant checks"
+        )
+    )]
     portable: bool,
 
-    /// Instead of performing checks based on the underlying file system,
-    /// Check each component in pathname for basic validity
-    #[arg(short = 'P', group = "mode")]
+    #[arg(
+        short = 'P',
+        group = "mode",
+        help = gettext(
+            "Instead of performing checks based on the underlying file system, \
+             check each component in pathname for basic validity"
+        )
+    )]
     basic: bool,
 
-    /// The pathnames to be checked
+    #[arg(help = gettext("The pathnames to be checked"))]
     pathnames: Vec<String>,
 }
 

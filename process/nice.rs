@@ -8,24 +8,36 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
-/// nice - invoke a utility with an altered nice value
 #[derive(Parser)]
-#[command(version, about)]
+#[command(
+    version,
+    about = gettext("nice - invoke a utility with an altered nice value")
+)]
 struct Args {
-    /// A positive or negative decimal integer which shall have the same effect on the execution of the utility as if the utility had called the nice() function with the numeric value of the increment option-argument.
-    #[arg(short, long, default_value_t=10, value_parser = clap::value_parser!(i32).range(-30..30))]
+    #[arg(
+        short,
+        long,
+        default_value_t = 10,
+        value_parser = clap::value_parser!(i32).range(-30..30),
+        help = gettext(
+            "A positive or negative decimal integer which shall have \
+             the same effect on the execution of the utility as if the \
+             utility had called the nice() function with the numeric \
+             value of the increment option-argument"
+        )
+    )]
     niceval: i32,
 
-    /// utility to invoke
+    #[arg(help = gettext("Utility to invoke"))]
     util: String,
 
-    /// utility arguments
+    #[arg(help = gettext("Utility arguments"))]
     util_args: Vec<String>,
 }
 

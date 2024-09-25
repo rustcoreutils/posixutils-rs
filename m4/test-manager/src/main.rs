@@ -12,13 +12,13 @@ struct Args {
     fixtures_directory: PathBuf,
 }
 
-#[derive(Debug, clap::Subcommand)]
+#[derive(clap::Subcommand)]
 enum Commands {
     UpdateSnapshots(UpdateSnapshots),
 }
 
 /// Update the integration test snapshots.
-#[derive(Debug, clap::Args)]
+#[derive(clap::Args)]
 struct UpdateSnapshots {
     /// Optionally specify a secific test case name that you want to update, where name is
     /// {name}.m4 of the test case file.

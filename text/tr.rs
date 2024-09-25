@@ -60,7 +60,7 @@ impl Args {
 }
 
 // The Char struct represents a character along with its repetition count.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct Char {
     // The character.
     char: char,
@@ -69,14 +69,14 @@ struct Char {
 }
 
 // The Equiv struct represents a character equivalent.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct Equiv {
     // The character equivalent.
     char: char,
 }
 
 // The Operand enum can be either a Char or an Equiv
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum Operand {
     Char(Char),
     Equiv(Equiv),
@@ -420,7 +420,7 @@ fn parse_symbols(input: &str) -> Result<Vec<Operand>, String> {
 }
 
 /// Represents the case sensitivity of character classes.
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 enum CaseSensitive {
     UpperCase,
     LowerCase,

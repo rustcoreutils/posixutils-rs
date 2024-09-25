@@ -15,7 +15,7 @@ use plib::PROJECT_NAME;
 use std::path::PathBuf;
 
 /// Cut - cut out selected fields of each line of a file
-#[derive(Parser, Debug, Clone)]
+#[derive(Parser, Clone)]
 #[command(version, about)]
 struct Args {
     /// Cut based on a list of bytes
@@ -79,7 +79,7 @@ fn validate_args(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 enum ParseVariat {
     Bytes(Vec<(i32, i32)>),
     Characters(Vec<(i32, i32)>),

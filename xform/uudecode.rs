@@ -34,14 +34,12 @@ struct Args {
     file: Option<PathBuf>,
 }
 
-#[derive(Debug)]
 enum DecodingType {
     Historical,
 
     Base64,
 }
 
-#[derive(Debug)]
 struct Header {
     dec_type: DecodingType,
 

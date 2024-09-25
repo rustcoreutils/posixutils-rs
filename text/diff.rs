@@ -28,7 +28,7 @@ use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 
 /// diff - compare two files
-#[derive(Parser, Debug, Clone)]
+#[derive(Parser, Clone)]
 #[command(version, about)]
 struct Args {
     /// Cause EOL whitespace to be treated as blanks

@@ -71,14 +71,12 @@ const CONV_ASCII_EBCDIC: [u8; 256] = [
     0xdd, 0xde, 0xdf, 0xea, 0xeb, 0xec, 0xed, 0xee, 0xef, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff,
 ];
 
-#[derive(Debug)]
 enum AsciiConv {
     Ascii,
     EBCDIC,
     IBM,
 }
 
-#[derive(Debug)]
 enum Conversion {
     Ascii(AsciiConv),
     Lcase,
@@ -89,7 +87,6 @@ enum Conversion {
     Sync,
 }
 
-#[derive(Debug)]
 struct Config {
     ifile: String,
     ofile: String,

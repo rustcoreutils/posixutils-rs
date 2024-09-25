@@ -23,8 +23,8 @@ macro_rules! reduce {
 }
 
 /// uudecode - decode a binary file
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// A pathname of a file that shall be used instead of any pathname contained in the input data.
     #[arg(short, long)]
@@ -34,14 +34,12 @@ struct Args {
     file: Option<PathBuf>,
 }
 
-#[derive(Debug)]
 enum DecodingType {
     Historical,
 
     Base64,
 }
 
-#[derive(Debug)]
 struct Header {
     dec_type: DecodingType,
 

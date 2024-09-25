@@ -4,8 +4,8 @@ use plib::PROJECT_NAME;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Convert all sequences of two or more spaces to tabs
     #[arg(short = 'a')]

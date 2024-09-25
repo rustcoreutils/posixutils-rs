@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 /// what — identify SCCS files
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// Display at most one identification string per file
     #[arg(short = 's', long)]

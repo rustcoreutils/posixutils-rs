@@ -19,8 +19,8 @@ use std::slice::Chunks;
 use std::str::FromStr;
 
 /// Hex, octal, ASCII, and other types of dumps
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Address base (d for decimal, o for octal, x for hexadecimal, n for none)
     #[arg(short = 'A')]
@@ -69,7 +69,7 @@ struct Args {
     /// Input files
     files: Vec<PathBuf>,
 
-    #[clap(skip)]
+    #[arg(skip)]
     /// Offset in the file where dumping is to commence, must start with "+"]
     offset: Option<String>,
 }

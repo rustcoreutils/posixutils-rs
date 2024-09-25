@@ -13,12 +13,12 @@
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
+use plib::{platform, PROJECT_NAME};
 use std::path::PathBuf;
 
 /// who - display who is on the system
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Process all utmpx entries
     #[arg(short, long)]
@@ -125,12 +125,12 @@ fn print_entry(args: &Args, entry: &plib::utmpx::Utmpx) {
     }
 
     let mut selected = false;
-    if (args.boot && entry.typ == libc::BOOT_TIME)
-        || (args.userproc && entry.typ == libc::USER_PROCESS)
-        || (args.dead && entry.typ == libc::DEAD_PROCESS)
-        || (args.login && entry.typ == libc::LOGIN_PROCESS)
-        || (args.runlevel && entry.typ == libc::RUN_LVL)
-        || (args.process && entry.typ == libc::INIT_PROCESS)
+    if (args.boot && entry.typ == platform::BOOT_TIME)
+        || (args.userproc && entry.typ == platform::USER_PROCESS)
+        || (args.dead && entry.typ == platform::DEAD_PROCESS)
+        || (args.login && entry.typ == platform::LOGIN_PROCESS)
+        || (args.runlevel && entry.typ == platform::RUN_LVL)
+        || (args.process && entry.typ == platform::INIT_PROCESS)
     {
         selected = true;
     }
@@ -140,7 +140,7 @@ fn print_entry(args: &Args, entry: &plib::utmpx::Utmpx) {
     }
 
     let line = match entry.typ {
-        libc::BOOT_TIME => "system boot",
+        platform::BOOT_TIME => "system boot",
         _ => entry.line.as_str(),
     };
 

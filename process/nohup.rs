@@ -13,7 +13,7 @@ use libc::{dup, dup2, SIGHUP, SIG_IGN};
 use plib::PROJECT_NAME;
 use std::env;
 use std::fs::{File, OpenOptions};
-use std::io;
+use std::io::{self, IsTerminal};
 use std::os::unix::io::AsRawFd;
 use std::process::{self, Command};
 
@@ -45,11 +45,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Redirecting stdout and stderr to the nohup.out file if they are connected to a terminal
-    if atty::is(atty::Stream::Stdout) || atty::is(atty::Stream::Stderr) {
+    if io::stdout().is_terminal() || io::stderr().is_terminal() {
         let nohup_out_file =
             get_nohup_out_file().expect("Failed to open nohup.out in current or home directory");
 
-        if atty::is(atty::Stream::Stdout) {
+        if io::stdout().is_terminal() {
             let fd = nohup_out_file.0.as_raw_fd();
 
             if unsafe { dup2(fd, libc::STDOUT_FILENO) } == -1 {
@@ -71,7 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        if atty::is(atty::Stream::Stderr) {
+        if io::stderr().is_terminal() {
             let fd = nohup_out_file.0.as_raw_fd();
 
             if unsafe { dup2(fd, libc::STDERR_FILENO) } == -1 {

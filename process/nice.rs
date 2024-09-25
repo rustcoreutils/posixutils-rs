@@ -15,8 +15,8 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
 /// nice - invoke a utility with an altered nice value
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// A positive or negative decimal integer which shall have the same effect on the execution of the utility as if the utility had called the nice() function with the numeric value of the increment option-argument.
     #[arg(short, long, default_value_t=10, value_parser = clap::value_parser!(i32).range(-30..30))]

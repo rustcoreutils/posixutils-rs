@@ -18,8 +18,8 @@ use std::process::ExitCode;
 use std::str::FromStr;
 
 /// nl - line numbering filter
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about, disable_help_flag = true)]
+#[derive(Parser)]
+#[command(version, about, disable_help_flag = true)]
 struct Args {
     #[arg(long, action = clap::ArgAction::HelpLong)]
     help: Option<bool>,
@@ -93,7 +93,7 @@ struct Args {
     file: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum LineNumberingStyle {
     All,
     NonEmpty,
@@ -137,7 +137,7 @@ impl std::fmt::Display for LineNumberingStyle {
     }
 }
 
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Clone, ValueEnum)]
 enum NumberFormat {
     Ln,
     Rn,

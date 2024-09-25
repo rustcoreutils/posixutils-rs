@@ -7,7 +7,6 @@ use std::{
 
 use super::{change::Change, constants::COULD_NOT_UNWRAP_FILENAME};
 
-#[derive(Debug)]
 pub struct FileData {
     path: PathBuf,
     lines: Vec<String>,

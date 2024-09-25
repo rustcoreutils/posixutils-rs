@@ -23,7 +23,7 @@ mod program;
 mod regex;
 
 /// awk - pattern scanning and processing language
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 struct Args {
     /// Define the input field separator
     #[arg(short = 'F')]

@@ -9,20 +9,19 @@ env:
 
 jobs:
   linux-ubuntu:
-
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v4
-    - name: Fetch
-      run: cargo fetch
-    - name: Build
-      run: cargo build --release --verbose
-    - name: Run tests
-      run: cargo test --release --verbose
+      - uses: actions/checkout@v4
+      - name: Fetch
+        run: cargo fetch
+      - name: Build
+        run: cargo build --release --verbose
+      - name: Run tests
+        run: cargo test --release --verbose
+      - name: Run fmt check
+        run: cargo fmt --all -- --check
 
   macos-homebrew:
-
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -46,4 +45,3 @@ jobs:
         run: cargo build --release --verbose
       - name: Run tests
         run: cargo test --release --verbose
-

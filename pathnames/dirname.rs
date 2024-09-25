@@ -14,8 +14,8 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 /// dirname - return the directory portion of a pathname
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     pathname: OsString,
 }

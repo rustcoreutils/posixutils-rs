@@ -16,8 +16,8 @@ use std::io::{self, BufRead, Error, ErrorKind, Read, Write};
 use std::path::PathBuf;
 
 /// split - split a file into pieces
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Use suffix_length letters to form the suffix portion of the filenames of the split file.
     #[arg(short='a', long, default_value_t=2, value_parser = clap::value_parser!(u32).range(1..))]

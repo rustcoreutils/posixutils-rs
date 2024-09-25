@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-m4"
-version = "0.1.0"
+version = "0.2.1"
 edition = "2021"
 description = "m4 - macro language processor"
 authors = ["Luke Frisken"]
@@ -16,7 +16,7 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 env_logger = "0.11"
-errno = "0.3"
+errno.workspace = true
 libc.workspace = true
 log = "0.4"
 nom = "7.1"

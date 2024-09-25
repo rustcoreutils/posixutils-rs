@@ -13,8 +13,8 @@ use plib::PROJECT_NAME;
 use std::{fs, io};
 
 /// link - call link function
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Link source
     file1: String,

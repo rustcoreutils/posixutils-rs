@@ -17,8 +17,8 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
 /// env - set the environment for command invocation
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Invoke utility with exactly the environment specified by the arguments; the inherited environment shall be ignored completely.
     #[arg(short, long)]

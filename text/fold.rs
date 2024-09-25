@@ -16,8 +16,8 @@ use std::path::PathBuf;
 const TABSTOP: usize = 8;
 
 /// fold - filter for folding lines
-#[derive(Parser, Debug, Clone)]
-#[command(author, version, about, long_about)]
+#[derive(Parser, Clone)]
+#[command(version, about)]
 struct Args {
     /// Count width in bytes rather than column positions.
     #[arg(short, long)]

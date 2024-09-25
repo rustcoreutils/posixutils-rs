@@ -19,8 +19,8 @@ use plib::PROJECT_NAME;
 use std::collections::HashMap;
 use std::ffi::CString;
 
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Variable to get the value of
     var: String,

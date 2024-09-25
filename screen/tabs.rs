@@ -21,8 +21,8 @@ use terminfo::{capability as cap, Database};
 const MAX_STOPS: usize = 100;
 
 /// tabs - set terminal tabs
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Indicate the type of terminal.
     #[arg(short = 'T', long)]

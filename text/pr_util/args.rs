@@ -17,8 +17,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 /// pr - print files
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about, disable_help_flag = true)]
+#[derive(Parser)]
+#[command(version, about, disable_help_flag = true)]
 pub struct Args {
     /// Begin output at page number FIRST_PAGE of the formatted input. Stop
     /// printing at LAST_PAGE if present.
@@ -259,7 +259,7 @@ fn parse_separator(s: &str) -> Result<char, String> {
 
 macro_rules! impl_char_and_number {
     ($t:tt, $option:expr, $default_chr:expr, $default_num:expr) => {
-        #[derive(Debug, Clone)]
+        #[derive(Clone)]
         pub struct $t {
             chr: char,
             num: usize,

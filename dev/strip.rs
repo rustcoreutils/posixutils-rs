@@ -23,7 +23,7 @@ use plib::PROJECT_NAME;
 
 /// strip - remove unnecessary information from strippable files
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     input_files: Vec<OsString>,
 }

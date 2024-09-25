@@ -23,6 +23,7 @@ mod program;
 mod regex;
 
 #[derive(Parser)]
+#[command(version, about = gettext("awk - pattern scanning and processing language"))]
 struct Args {
     #[arg(short = 'F', help = gettext("Define the input field separator"))]
     separator_string: Option<String>,

@@ -69,7 +69,7 @@ struct Args {
     /// Input files
     files: Vec<PathBuf>,
 
-    #[clap(skip)]
+    #[arg(skip)]
     /// Offset in the file where dumping is to commence, must start with "+"]
     offset: Option<String>,
 }

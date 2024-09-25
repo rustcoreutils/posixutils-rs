@@ -12,6 +12,26 @@ use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleC
 use plib::PROJECT_NAME;
 use std::path::{Component, Path, PathBuf};
 
+/// realpath -- return resolved canonical path
+#[derive(Parser)]
+#[command(version, about)]
+struct Args {
+    /// Error if the path cannot be resolved
+    #[arg(short = 'e', overrides_with = "_canonicalize_missing")]
+    canonicalize_existing: bool,
+
+    /// Do not error if the path cannot be resolved (default)
+    #[arg(short = 'E', overrides_with = "canonicalize_existing")]
+    _canonicalize_missing: bool,
+
+    /// Don't print errors when paths cannot be resolved
+    #[arg(short, long)]
+    quiet: bool,
+
+    #[arg(value_name = "PATH", default_value = ".")]
+    paths: Vec<PathBuf>,
+}
+
 /// Returns a normalized path.
 /// If `must_exist`, returns an error if the path cannot be resolved
 fn normalize<P: AsRef<Path>>(path: P) -> std::io::Result<PathBuf> {
@@ -40,26 +60,6 @@ fn normalize<P: AsRef<Path>>(path: P) -> std::io::Result<PathBuf> {
         }
     }
     Ok(out)
-}
-
-/// realpath -- return resolved canonical path
-#[derive(Parser)]
-#[clap(version)]
-struct Args {
-    /// Error if the path cannot be resolved
-    #[clap(short = 'e', long, overrides_with = "_canonicalize_missing")]
-    canonicalize_existing: bool,
-
-    /// Do not error if the path cannot be resolved (default)
-    #[clap(short = 'E', overrides_with = "canonicalize_existing")]
-    _canonicalize_missing: bool,
-
-    /// Don't print errors when paths cannot be resolved
-    #[clap(short, long)]
-    quiet: bool,
-
-    #[clap(value_name = "PATH", default_value = ".")]
-    paths: Vec<PathBuf>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

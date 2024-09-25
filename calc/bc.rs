@@ -23,7 +23,7 @@ mod bc_util;
 
 /// bc - arbitrary-precision arithmetic language
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     #[arg(short = 'l')]
     define_math_functions: bool,

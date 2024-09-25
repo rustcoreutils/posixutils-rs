@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 /// Cut - cut out selected fields of each line of a file
 #[derive(Parser, Debug, Clone)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// Cut based on a list of bytes
     #[arg(short = 'b', long)]

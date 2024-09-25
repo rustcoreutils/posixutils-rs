@@ -19,7 +19,7 @@ const PRIO_MAX: i32 = 20;
 
 /// renice - set nice values of running processes
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// A positive or negative decimal integer which shall have the same effect on the execution of the utility as if the utility had called the nice() function with the numeric value of the increment option-argument.
     #[arg(short, long, required=true, value_parser = clap::value_parser!(i32).range(-20..20))]

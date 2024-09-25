@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 /// The uniq utility - filters out duplicate lines in a file
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(version, about)]
 struct Args {
     /// Count the number of repeated lines
     #[arg(short = 'c')]

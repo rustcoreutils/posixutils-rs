@@ -25,7 +25,7 @@ const MAX_ARGS_BYTES: usize = ARG_MAX as usize - 2048;
 
 /// xargs - construct argument lists and invoke utility
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// The utility shall be executed for each non-empty number lines of arguments from standard input.
     #[arg(short = 'L', long)]

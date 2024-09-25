@@ -18,7 +18,7 @@ const _POSIX_NAME_MAX: usize = 14;
 
 /// pathchk - check pathnames
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// Instead of performing checks based on the underlying file system,
     /// perform portable, POSIX-compliant checks.

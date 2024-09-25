@@ -18,7 +18,7 @@ use std::str::FromStr;
 
 /// pr - print files
 #[derive(Parser)]
-#[command(author, version, about, long_about, disable_help_flag = true)]
+#[command(version, about, disable_help_flag = true)]
 pub struct Args {
     /// Begin output at page number FIRST_PAGE of the formatted input. Stop
     /// printing at LAST_PAGE if present.

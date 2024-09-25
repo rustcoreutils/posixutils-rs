@@ -16,7 +16,7 @@ use std::process::ExitCode;
 
 /// cmp - compare two files
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// Write the byte number (decimal) and the differing bytes (octal) for each difference.
     #[arg(short = 'l', long, group = "verbosity")]

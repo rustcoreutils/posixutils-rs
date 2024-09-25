@@ -25,7 +25,7 @@ use std::path::PathBuf;
 
 /// cksum - write file checksums and sizes
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// Files to read as input.  Use "-" or no-args for stdin.
     files: Vec<PathBuf>,

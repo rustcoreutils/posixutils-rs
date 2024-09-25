@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 /// uncompress - expand compressed data
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// Write to standard output; no files are changed.
     #[arg(short = 'c', long)]

@@ -14,7 +14,7 @@ use std::path::Path;
 
 /// basename - return non-directory portion of a pathname
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     pathname: String,
 

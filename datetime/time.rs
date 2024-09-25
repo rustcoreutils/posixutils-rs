@@ -17,7 +17,7 @@ use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(version, about)]
 struct Args {
     /// Write timing output to standard error in POSIX format
     #[arg(short, long)]

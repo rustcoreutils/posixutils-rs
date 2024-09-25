@@ -14,7 +14,7 @@ use plib::PROJECT_NAME;
 
 /// touch - change file access and modification times
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// Change the access time of file.
     #[arg(short, long)]

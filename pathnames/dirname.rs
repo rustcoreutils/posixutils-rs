@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 /// dirname - return the directory portion of a pathname
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     pathname: OsString,
 }

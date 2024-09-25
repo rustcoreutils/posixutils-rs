@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// Variable to get the value of
     var: String,

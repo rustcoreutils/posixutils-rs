@@ -20,7 +20,7 @@ const NODUP: u32 = 1 << 2;
 
 /// comm - select or reject lines common to two files
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// Suppress the output column of lines unique to file1.
     #[arg(short = '1', long)]

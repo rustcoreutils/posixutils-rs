@@ -41,7 +41,7 @@ struct OutputOptions {
 
 /// strings - find printable strings in files
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     #[command(flatten)]
     output_options: OutputOptions,

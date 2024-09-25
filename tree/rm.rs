@@ -24,7 +24,7 @@ use std::{
 
 /// rm - remove directory entries
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// Do not prompt for confirmation.
     #[arg(short, long, overrides_with_all = ["force", "interactive"])]

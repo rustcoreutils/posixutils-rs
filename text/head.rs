@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 /// head - copy the first part of files
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// The first <N> lines of each input file shall be copied to standard output.
     #[arg(short, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..))]

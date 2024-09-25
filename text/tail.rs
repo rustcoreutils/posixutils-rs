@@ -43,7 +43,7 @@ impl FromStr for SignedIsize {
 
 /// tail - copy the last part of a file
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(version, about)]
 struct Args {
     /// The number of lines to print from the end of the file
     #[arg(short = 'n')]

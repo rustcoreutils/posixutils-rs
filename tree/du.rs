@@ -19,7 +19,7 @@ use std::{fs, io};
 
 /// du - estimate file space usage
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// Write counts for all files, not just directories
     #[arg(short, long)]

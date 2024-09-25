@@ -19,7 +19,7 @@ use terminfo::{capability as cap, Database};
 
 /// tput - change terminal characteristics
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// Indicate the type of terminal.
     #[arg(short = 'T', long)]

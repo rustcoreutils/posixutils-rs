@@ -22,7 +22,7 @@ use plib::PROJECT_NAME;
 
 /// Sort, merge, or sequence check text files
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// Check that the single input file is ordered as specified
     #[arg(short = 'c')]

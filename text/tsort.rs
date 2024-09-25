@@ -16,7 +16,7 @@ use topological_sort::TopologicalSort;
 
 /// tsort - topological sort
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// File to read as input.
     file: Option<PathBuf>,

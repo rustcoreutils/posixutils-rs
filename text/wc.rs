@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 /// wc - word, line, and byte or character count
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// Count number of bytes in each file
     #[arg(short = 'c', long)]

@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 /// who - display who is on the system
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// Process all utmpx entries
     #[arg(short, long)]

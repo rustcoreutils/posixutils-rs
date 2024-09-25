@@ -23,7 +23,7 @@ use std::{
 
 /// file - determine file type
 #[derive(Parser)]
-#[command(author, version, about, long_about, disable_help_flag = true)]
+#[command(version, about, disable_help_flag = true)]
 struct Args {
     #[arg(long, action = clap::ArgAction::HelpLong)]
     help: Option<bool>,

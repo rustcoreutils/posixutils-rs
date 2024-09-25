@@ -24,7 +24,7 @@ macro_rules! reduce {
 
 /// uudecode - decode a binary file
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// A pathname of a file that shall be used instead of any pathname contained in the input data.
     #[arg(short, long)]

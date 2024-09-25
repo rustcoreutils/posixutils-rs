@@ -14,7 +14,7 @@ use plib::PROJECT_NAME;
 
 /// ipcs - report XSI interprocess communication facilities status
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// Write information about active message queues.
     #[arg(short = 'q', long = "queues")]

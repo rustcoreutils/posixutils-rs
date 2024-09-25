@@ -21,7 +21,7 @@ const RW: u32 = 0o666;
 
 /// uuencode - encode a binary file
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// Encode to base64 (MIME) standard, rather than UUE format.
     #[arg(short = 'm', long)]

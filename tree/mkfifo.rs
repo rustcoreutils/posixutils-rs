@@ -15,7 +15,7 @@ use std::io;
 
 /// mkfifo - make FIFO special files
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// Set the file permission bits of the newly-created FIFO to the specified mode value.
     #[arg(short, long)]

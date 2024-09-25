@@ -28,7 +28,7 @@ mod platform {
 
 /// ps - report process status
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// List all processes
     #[arg(short = 'A', long)]

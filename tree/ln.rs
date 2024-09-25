@@ -15,7 +15,7 @@ use std::{fs, io};
 
 /// ln - link files
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// Force existing destination pathnames to be removed to allow the link.
     #[arg(short, long)]

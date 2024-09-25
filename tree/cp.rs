@@ -19,7 +19,7 @@ use std::{fs, io};
 
 /// cp - copy files
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// Do not prompt for confirmation if the destination path exists
     #[arg(short, long)]

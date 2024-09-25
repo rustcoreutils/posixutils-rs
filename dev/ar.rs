@@ -157,7 +157,7 @@ enum Commands {
 
 /// ar - create and maintain library archives
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     #[command(subcommand)]
     command: Commands,

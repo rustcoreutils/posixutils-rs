@@ -14,7 +14,7 @@ use std::{fs, io};
 
 /// unlink - call the unlink function
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// An existing pathname to be unlinked (removed).
     pathname: String,

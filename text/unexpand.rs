@@ -5,7 +5,7 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(version, about)]
 struct Args {
     /// Convert all sequences of two or more spaces to tabs
     #[arg(short = 'a')]

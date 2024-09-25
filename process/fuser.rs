@@ -1309,7 +1309,7 @@ mod macos {
 
 /// fuser - list process IDs of all processes that have one or more files open
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// The file is treated as a mount point and the utility shall report on any files open in the file system.
     #[arg(short = 'c')]

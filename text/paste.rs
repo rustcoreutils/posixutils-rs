@@ -27,7 +27,7 @@ use std::rc::Rc;
 
 /// paste - merge corresponding or subsequent lines of files
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// Concatenate all of the lines from each input file into one line of output per file, in command line order.
     #[arg(short, long)]

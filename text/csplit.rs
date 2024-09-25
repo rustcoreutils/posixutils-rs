@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 /// csplit - split files based on context
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// Name the created files prefix 00, prefix 01, ..., prefixn.
     #[arg(short = 'f', long, default_value = "xx")]

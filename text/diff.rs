@@ -29,7 +29,7 @@ use plib::PROJECT_NAME;
 
 /// diff - compare two files
 #[derive(Parser, Debug, Clone)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// Cause EOL whitespace to be treated as blanks
     #[arg(short = 'b', long = "ignore-space-change")]

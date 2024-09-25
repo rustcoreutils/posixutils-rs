@@ -19,7 +19,7 @@ use std::{fs, io};
 
 /// chgrp - change file group ownership
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// Change symbolic links, rather than the files they point to
     #[arg(short = 'h', long)]

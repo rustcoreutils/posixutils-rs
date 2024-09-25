@@ -19,7 +19,7 @@ const NAME_MAX: usize = 255;
 
 /// compress - compress data
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// Specify the maximum number of bits to use in a code. 9 <= bits <= 14
     #[arg(short = 'b')]

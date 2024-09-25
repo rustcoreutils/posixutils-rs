@@ -16,7 +16,7 @@ use std::io::{self, Read, Write};
 
 /// tee - duplicate standard input
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// Append the output to the files.
     #[arg(short, long)]

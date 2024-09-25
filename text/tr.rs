@@ -8,7 +8,7 @@ use std::io::{self, Read};
 
 /// tr - translate or delete characters
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(version, about)]
 struct Args {
     /// Delete characters in STRING1 from the input
     #[arg(short = 'd')]

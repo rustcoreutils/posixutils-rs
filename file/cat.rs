@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 /// cat - concatenate and print files
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// Disable output buffering (a no-op, for POSIX compat.)
     #[arg(short, long, default_value_t = true)]

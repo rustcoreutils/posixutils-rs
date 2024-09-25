@@ -13,7 +13,7 @@ use plib::PROJECT_NAME;
 
 /// uname - return system name
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// Behave as though all of the options -mnrsv were specified.
     #[arg(short, long)]

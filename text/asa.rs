@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 /// asa - interpret carriage-control characters
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// Files to read as input.
     files: Vec<PathBuf>,

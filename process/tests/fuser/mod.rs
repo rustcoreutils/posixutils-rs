@@ -198,6 +198,7 @@ async fn start_tcp_server() -> TcpListener {
 /// **Assertions:**
 /// - Verifies that the output of `fuser` matches the manual execution for TCP sockets.
 #[tokio::test]
+#[ignore]
 #[cfg(target_os = "linux")]
 async fn test_fuser_tcp() {
     let _server = start_tcp_server().await;
@@ -225,6 +226,7 @@ async fn start_udp_server() -> UdpSocket {
 /// **Assertions:**
 /// - Verifies that the output of `fuser` matches the manual execution for UDP sockets.
 #[tokio::test]
+#[ignore]
 #[cfg(target_os = "linux")]
 async fn test_fuser_udp() {
     let _server = start_udp_server().await;

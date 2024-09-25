@@ -259,7 +259,7 @@ fn parse_separator(s: &str) -> Result<char, String> {
 
 macro_rules! impl_char_and_number {
     ($t:tt, $option:expr, $default_chr:expr, $default_num:expr) => {
-        #[derive(Debug, Clone)]
+        #[derive(Clone)]
         pub struct $t {
             chr: char,
             num: usize,

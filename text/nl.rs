@@ -93,7 +93,7 @@ struct Args {
     file: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum LineNumberingStyle {
     All,
     NonEmpty,
@@ -137,7 +137,7 @@ impl std::fmt::Display for LineNumberingStyle {
     }
 }
 
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Clone, ValueEnum)]
 enum NumberFormat {
     Ln,
     Rn,

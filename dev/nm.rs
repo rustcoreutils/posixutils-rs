@@ -22,7 +22,7 @@ use plib::PROJECT_NAME;
 use std::collections::HashMap;
 use std::fs;
 
-#[derive(Debug, ValueEnum, Clone)]
+#[derive(ValueEnum, Clone)]
 enum OutputType {
     D,
     O,

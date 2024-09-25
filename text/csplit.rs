@@ -45,14 +45,12 @@ struct Args {
     operands: Vec<String>,
 }
 
-#[derive(Debug)]
 enum Operand {
     Rx(Regex, isize, bool),
     LineNum(usize),
     Repeat(usize),
 }
 
-#[derive(Debug)]
 struct SplitOps {
     ops: Vec<Operand>,
 }

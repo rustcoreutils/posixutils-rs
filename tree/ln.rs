@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::{fs, io};
 
 /// ln - link files
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// Force existing destination pathnames to be removed to allow the link.

@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, Read};
 
 /// tr - translate or delete characters
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Delete characters in STRING1 from the input

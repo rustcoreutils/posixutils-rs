@@ -14,7 +14,7 @@ use std::io::{self, BufWriter, Read, Write};
 use std::path::PathBuf;
 
 /// expand - convert tabs to spaces
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// Tab stops, either a single positive decimal integer or a list of tabstops separated by commas.

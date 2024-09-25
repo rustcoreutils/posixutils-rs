@@ -21,7 +21,7 @@ use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 
 /// Sort, merge, or sequence check text files
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// Check that the single input file is ordered as specified

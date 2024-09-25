@@ -14,7 +14,7 @@ use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
 /// head - copy the first part of files
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// The first <N> lines of each input file shall be copied to standard output.

@@ -20,7 +20,7 @@ const PERMISSION_MASK: u32 = 0o7;
 const RW: u32 = 0o666;
 
 /// uuencode - encode a binary file
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// Encode to base64 (MIME) standard, rather than UUE format.

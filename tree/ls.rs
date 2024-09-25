@@ -24,7 +24,7 @@ use std::process::ExitCode;
 use self::ls_util::{ls_from_utf8_lossy, Entry, LongFormatPadding, MultiColumnPadding};
 
 /// ls - list directory contents
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// Write out all directory entries, including those whose names begin with

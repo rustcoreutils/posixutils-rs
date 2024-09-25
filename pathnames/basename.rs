@@ -13,7 +13,7 @@ use plib::PROJECT_NAME;
 use std::path::Path;
 
 /// basename - return non-directory portion of a pathname
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
     pathname: String,

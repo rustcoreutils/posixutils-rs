@@ -19,7 +19,7 @@ use std::path::{Component, Path};
 const PWD_ENV: &'static str = "PWD";
 
 /// pwd - return working directory name
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// Count number of bytes in each file

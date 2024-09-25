@@ -23,7 +23,7 @@ use std::{
 };
 
 /// rm - remove directory entries
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// Do not prompt for confirmation.

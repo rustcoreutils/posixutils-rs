@@ -17,7 +17,7 @@ use std::io;
 const _PATH_MOUNTED: &'static str = "/etc/mtab";
 
 /// df - report free storage space
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// Use 1024-byte units, instead of the default 512-byte units, when writing space figures.

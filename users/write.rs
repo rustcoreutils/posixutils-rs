@@ -25,7 +25,7 @@ const ERASE_CHAR: char = '\u{08}';
 const KILL_CHAR: char = '\u{15}';
 
 /// write - write to another user
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// Login name of the person to whom the message shall be written.

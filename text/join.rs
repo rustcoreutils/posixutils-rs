@@ -16,7 +16,7 @@ use std::io::{self, BufRead, BufReader};
 use std::path::PathBuf;
 
 /// join - relational database operator
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Additional lines to include when there are no matches

@@ -22,7 +22,7 @@ use std::{
 };
 
 /// file - determine file type
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about, disable_help_flag = true)]
 struct Args {
     #[clap(long, action = clap::ArgAction::HelpLong)]

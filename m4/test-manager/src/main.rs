@@ -3,7 +3,7 @@ use std::{io::Write, os::unix::ffi::OsStrExt, path::PathBuf, process::Stdio};
 use clap::Parser;
 use m4_test_manager::TestSnapshot;
 
-#[derive(Debug, clap::Parser)]
+#[derive(Parser)]
 #[command(version, about)]
 struct Args {
     #[command(subcommand)]

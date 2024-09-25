@@ -28,7 +28,7 @@ pub mod osx {
 }
 
 /// gencat - generate a formatted message catalog
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// A pathname of the formatted message catalog.

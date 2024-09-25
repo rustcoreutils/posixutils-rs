@@ -24,7 +24,7 @@ use std::io::{self, Read};
 use std::path::PathBuf;
 
 /// cksum - write file checksums and sizes
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// Files to read as input.  Use "-" or no-args for stdin.

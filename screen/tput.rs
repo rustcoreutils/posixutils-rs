@@ -18,7 +18,7 @@ use std::io;
 use terminfo::{capability as cap, Database};
 
 /// tput - change terminal characteristics
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// Indicate the type of terminal.

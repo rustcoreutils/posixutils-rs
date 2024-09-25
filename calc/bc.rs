@@ -22,7 +22,7 @@ use rustyline::{error::ReadlineError, DefaultEditor, Result};
 mod bc_util;
 
 /// bc - arbitrary-precision arithmetic language
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
     #[arg(short = 'l')]

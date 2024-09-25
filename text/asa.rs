@@ -18,7 +18,7 @@ use std::io::{self, BufRead};
 use std::path::PathBuf;
 
 /// asa - interpret carriage-control characters
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// Files to read as input.

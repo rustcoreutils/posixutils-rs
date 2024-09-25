@@ -17,7 +17,7 @@ use plib::{platform, PROJECT_NAME};
 use std::path::PathBuf;
 
 /// who - display who is on the system
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// Process all utmpx entries

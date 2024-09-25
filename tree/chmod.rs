@@ -16,7 +16,7 @@ use std::path::Path;
 use std::{fs, io};
 
 /// chmod - change the file modes
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// Recursively change file mode bits.

@@ -19,7 +19,7 @@ use std::path::Path;
 use std::{fs, io};
 
 /// chown - change the file ownership
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// Change symbolic links, rather than the files they point to

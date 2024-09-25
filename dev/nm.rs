@@ -30,7 +30,7 @@ enum OutputType {
 }
 
 /// nm - write the name list of an object file
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// Write the full pathname or library name of an object on each line.

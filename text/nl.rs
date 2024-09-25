@@ -18,7 +18,7 @@ use std::process::ExitCode;
 use std::str::FromStr;
 
 /// nl - line numbering filter
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about, disable_help_flag = true)]
 struct Args {
     #[arg(long, action = clap::ArgAction::HelpLong)]

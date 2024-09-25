@@ -43,7 +43,7 @@ fn normalize<P: AsRef<Path>>(path: P) -> std::io::Result<PathBuf> {
 }
 
 /// realpath -- return resolved canonical path
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[clap(version)]
 struct Args {
     /// Error if the path cannot be resolved

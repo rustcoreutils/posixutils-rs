@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 const NAME_MAX: usize = 255;
 
 /// compress - compress data
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// Specify the maximum number of bits to use in a code. 9 <= bits <= 14

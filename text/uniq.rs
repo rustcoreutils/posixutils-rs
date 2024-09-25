@@ -6,7 +6,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
 
 /// The uniq utility - filters out duplicate lines in a file
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Count the number of repeated lines

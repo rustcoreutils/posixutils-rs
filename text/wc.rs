@@ -15,7 +15,7 @@ use std::io::{self, Read};
 use std::path::PathBuf;
 
 /// wc - word, line, and byte or character count
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// Count number of bytes in each file
@@ -143,7 +143,6 @@ fn wc_file_bytes(count: &mut CountInfo, pathname: &PathBuf, chars_mode: bool) ->
             // number of UTF-8 unicode codepoints in this slice of bytes
             count.chars += bufslice.iter().filter(|&ch| (ch >> 6) != 0b10).count();
         }
-
 
         for ch_u8 in bufslice {
             let is_space = BYTE_TABLE[*ch_u8 as usize];

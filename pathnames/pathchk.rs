@@ -17,7 +17,7 @@ const _POSIX_PATH_MAX: usize = 255;
 const _POSIX_NAME_MAX: usize = 14;
 
 /// pathchk - check pathnames
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// Instead of performing checks based on the underlying file system,

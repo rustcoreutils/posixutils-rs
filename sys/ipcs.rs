@@ -13,7 +13,7 @@ use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleC
 use plib::PROJECT_NAME;
 
 /// ipcs - report XSI interprocess communication facilities status
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// Write information about active message queues.

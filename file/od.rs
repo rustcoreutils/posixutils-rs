@@ -19,7 +19,7 @@ use std::slice::Chunks;
 use std::str::FromStr;
 
 /// Hex, octal, ASCII, and other types of dumps
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// Address base (d for decimal, o for octal, x for hexadecimal, n for none)

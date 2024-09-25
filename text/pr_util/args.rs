@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 /// pr - print files
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about, disable_help_flag = true)]
 pub struct Args {
     /// Begin output at page number FIRST_PAGE of the formatted input. Stop

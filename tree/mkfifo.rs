@@ -14,7 +14,7 @@ use plib::{modestr, PROJECT_NAME};
 use std::io;
 
 /// mkfifo - make FIFO special files
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// Set the file permission bits of the newly-created FIFO to the specified mode value.

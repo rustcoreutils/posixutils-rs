@@ -25,7 +25,7 @@ use std::{
 };
 
 /// mv - move files
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// Do not prompt for confirmation if the destination path exists

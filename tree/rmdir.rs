@@ -15,7 +15,7 @@ use std::io::{self, Error, ErrorKind};
 use std::path::Path;
 
 /// rmdir - remove directories
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// Remove all directories in a pathname

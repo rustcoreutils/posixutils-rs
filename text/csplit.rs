@@ -19,7 +19,7 @@ use std::io::{self, BufRead, Error, ErrorKind, Read, Write};
 use std::path::PathBuf;
 
 /// csplit - split files based on context
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// Name the created files prefix 00, prefix 01, ..., prefixn.

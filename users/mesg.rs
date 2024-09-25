@@ -18,7 +18,7 @@ use std::io::{self, Error, ErrorKind, IsTerminal};
 use std::mem;
 
 /// mesg - permit or deny messages
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(author, version, about, long_about)]
 struct Args {
     /// "y" or "n":  Grant (y) or deny (n) permission to other users to send messages to the terminal device.

@@ -18,8 +18,8 @@ use std::io::{self, Error, ErrorKind};
 use std::ptr;
 
 /// ipcrm - remove an XSI message queue, semaphore set, or shared memory segment identifier
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Remove the shared memory identifier semid from the system.
     #[arg(short = 's', long)]

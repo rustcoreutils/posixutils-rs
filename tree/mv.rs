@@ -18,14 +18,15 @@ use plib::PROJECT_NAME;
 use std::{
     collections::{HashMap, HashSet},
     ffi::CString,
+    fs,
+    io::{self, IsTerminal},
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::{Path, PathBuf},
-    {fs, io},
 };
 
 /// mv - move files
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Do not prompt for confirmation if the destination path exists
     #[arg(short, long, overrides_with_all = ["force", "interactive"])]
@@ -54,7 +55,7 @@ impl MvConfig {
         MvConfig {
             force: args.force,
             interactive: args.interactive,
-            is_terminal: atty::is(atty::Stream::Stdin),
+            is_terminal: io::stdin().is_terminal(),
         }
     }
 }

@@ -26,8 +26,8 @@ use termios::{
 const HDR_SAVE: &'static str = "pfmt1";
 
 /// stty - set the options for a terminal
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Write to standard output all the current settings, in human-readable form.
     #[arg(short, long, group = "mode")]

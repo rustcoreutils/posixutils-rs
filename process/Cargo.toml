@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-process"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["Jeff Garzik"]
 license = "MIT"
@@ -11,12 +11,18 @@ plib = { path = "../plib" }
 clap.workspace = true
 gettext-rs.workspace = true
 libc.workspace = true
-atty.workspace = true
-errno = "0.3"
 dirs = "5.0"
 
 [dev-dependencies]
 sysinfo = "0.31"
+tokio = { version = "1.39", features = ["net", "macros", "rt"]}
+
+[build-dependencies]
+bindgen = { version = "0.70.0", features = ["runtime"] }
+
+[[bin]]
+name = "fuser"
+path = "./fuser.rs"
 
 [[bin]]
 name = "env"

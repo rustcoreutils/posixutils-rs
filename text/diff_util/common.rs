@@ -1,4 +1,3 @@
-#[derive(Debug)]
 pub struct FormatOptions {
     pub ignore_trailing_white_spaces: bool,
     pub output_format: OutputFormat,
@@ -6,7 +5,6 @@ pub struct FormatOptions {
     pub label2: Option<String>,
 }
 
-#[derive(Debug)]
 #[allow(dead_code)]
 pub enum OutputFormat {
     Debug,

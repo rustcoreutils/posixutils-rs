@@ -15,8 +15,8 @@ use std::path::PathBuf;
 use topological_sort::TopologicalSort;
 
 /// tsort - topological sort
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// File to read as input.
     file: Option<PathBuf>,

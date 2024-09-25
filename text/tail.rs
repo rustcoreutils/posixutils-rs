@@ -14,7 +14,7 @@ use std::time::Duration;
 ///
 /// The `SignedIsize` struct is a simple wrapper around the `isize` type, designed to parse
 /// a string into an `isize` value that defaults to negative if no explicit sign is provided.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct SignedIsize(isize);
 
 impl FromStr for SignedIsize {
@@ -42,8 +42,8 @@ impl FromStr for SignedIsize {
 }
 
 /// tail - copy the last part of a file
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// The number of lines to print from the end of the file
     #[arg(short = 'n')]

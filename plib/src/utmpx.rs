@@ -7,10 +7,9 @@
 // SPDX-License-Identifier: MIT
 //
 
-use libc::{endutxent, getutxent, setutxent};
+use crate::platform::{self, endutxent, getutxent, setutxent};
 use std::ffi::CStr;
 
-#[derive(Debug)]
 pub struct Utmpx {
     pub user: String,
     pub id: String,
@@ -23,15 +22,15 @@ pub struct Utmpx {
 
 pub fn ut_type_str(typ: libc::c_short) -> &'static str {
     match typ {
-        libc::BOOT_TIME => "BOOT_TIME",
-        libc::DEAD_PROCESS => "DEAD_PROCESS",
-        libc::EMPTY => "EMPTY",
-        libc::INIT_PROCESS => "INIT_PROCESS",
-        libc::LOGIN_PROCESS => "LOGIN_PROCESS",
-        libc::NEW_TIME => "NEW_TIME",
-        libc::OLD_TIME => "OLD_TIME",
-        libc::RUN_LVL => "RUN_LVL",
-        libc::USER_PROCESS => "USER_PROCESS",
+        platform::BOOT_TIME => "BOOT_TIME",
+        platform::DEAD_PROCESS => "DEAD_PROCESS",
+        platform::EMPTY => "EMPTY",
+        platform::INIT_PROCESS => "INIT_PROCESS",
+        platform::LOGIN_PROCESS => "LOGIN_PROCESS",
+        platform::NEW_TIME => "NEW_TIME",
+        platform::OLD_TIME => "OLD_TIME",
+        platform::RUN_LVL => "RUN_LVL",
+        platform::USER_PROCESS => "USER_PROCESS",
 
         _ => "(unknown)",
     }

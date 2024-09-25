@@ -18,8 +18,8 @@ use std::path::Path;
 use std::{fs, io};
 
 /// du - estimate file space usage
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Write counts for all files, not just directories
     #[arg(short, long)]

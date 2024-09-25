@@ -17,8 +17,8 @@ use std::collections::HashMap;
 use std::io::Error;
 
 /// id - return user identity
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Output all different group IDs (effective, real, and supplementary) only, using a numeric format
     #[arg(short = 'G', long, group = "output")]

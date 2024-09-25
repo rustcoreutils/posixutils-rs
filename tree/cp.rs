@@ -18,8 +18,8 @@ use std::path::PathBuf;
 use std::{fs, io};
 
 /// cp - copy files
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Do not prompt for confirmation if the destination path exists
     #[arg(short, long)]

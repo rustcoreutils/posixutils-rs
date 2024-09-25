@@ -13,8 +13,8 @@ use plib::PROJECT_NAME;
 use std::{thread, time};
 
 /// sleep - suspend execution for an interval
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Number of seconds to sleep
     #[arg(value_parser = clap::value_parser!(u64).range(1..))]

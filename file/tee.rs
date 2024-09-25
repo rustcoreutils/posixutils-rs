@@ -15,8 +15,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 
 /// tee - duplicate standard input
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Append the output to the files.
     #[arg(short, long)]

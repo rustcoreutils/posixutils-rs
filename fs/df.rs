@@ -17,8 +17,8 @@ use std::io;
 const _PATH_MOUNTED: &'static str = "/etc/mtab";
 
 /// df - report free storage space
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Use 1024-byte units, instead of the default 512-byte units, when writing space figures.
     #[arg(short, long)]
@@ -161,7 +161,12 @@ fn read_mount_info() -> io::Result<MountList> {
             let mut mount: libc::statfs = std::mem::zeroed();
             let rc = libc::statfs(dirname.as_ptr(), &mut mount);
             if rc < 0 {
-                return Err(io::Error::last_os_error());
+                eprintln!(
+                    "{}: {}",
+                    dirname.to_str().unwrap(),
+                    io::Error::last_os_error()
+                );
+                continue;
             }
 
             info.push(&mount, devname, dirname);

@@ -28,7 +28,6 @@ members = [
 ]
 
 [workspace.dependencies]
-atty = "0.2"
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "cargo"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 libc = "0.2"

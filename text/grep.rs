@@ -21,7 +21,7 @@ use std::{
 
 /// grep - search a file for a pattern.
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// Match using extended regular expressions.
     #[arg(short = 'E', long)]

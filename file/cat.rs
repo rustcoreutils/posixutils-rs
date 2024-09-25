@@ -19,8 +19,8 @@ use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
 /// cat - concatenate and print files
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Disable output buffering (a no-op, for POSIX compat.)
     #[arg(short, long, default_value_t = true)]

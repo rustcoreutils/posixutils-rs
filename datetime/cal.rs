@@ -16,16 +16,23 @@ use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 
-/// cal - print a calendar
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about = gettext("cal - print a calendar"))]
 struct Args {
-    /// Specify the month to be displayed, represented as a decimal integer from 1 (January) to 12 (December).
-    #[arg(value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(
+        value_parser = clap::value_parser!(u32).range(1..),
+        help = gettext(
+            "Specify the month to be displayed, represented as a decimal integer from 1 (January) to 12 (December)"
+        )
+    )]
     month: Option<u32>,
 
-    /// Specify the year for which the calendar is displayed, represented as a decimal integer from 1 to 9999.
-    #[arg(value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(
+        value_parser = clap::value_parser!(u32).range(1..),
+        help = gettext(
+            "Specify the year for which the calendar is displayed, represented as a decimal integer from 1 to 9999"
+        )
+    )]
     year: Option<u32>,
 }
 

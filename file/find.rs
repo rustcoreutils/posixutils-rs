@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::{env, fs};
 use walkdir::{DirEntry, WalkDir};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum Expr {
     And(Box<Expr>),
     Or(Box<Expr>),
@@ -38,7 +38,7 @@ enum Expr {
     Newer(PathBuf),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum FileType {
     BlockDevice,
     CharDevice,

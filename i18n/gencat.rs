@@ -28,8 +28,8 @@ pub mod osx {
 }
 
 /// gencat - generate a formatted message catalog
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// A pathname of the formatted message catalog.
     catfile: PathBuf,

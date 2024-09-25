@@ -19,8 +19,8 @@ use plib::PROJECT_NAME;
 const DEF_TIMESTR: &str = "%a %b %e %H:%M:%S %Z %Y";
 
 /// date - write the date and time
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Perform operations as if the TZ env var was set to the string "UTC0"
     #[arg(short, long)]

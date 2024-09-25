@@ -11,12 +11,12 @@ use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use std::ffi::OsStr;
-use std::io::{self, BufRead, Read};
+use std::io::{self, Read};
 use std::path::PathBuf;
 
 /// wc - word, line, and byte or character count
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Count number of bytes in each file
     #[arg(short = 'c', long)]
@@ -59,6 +59,19 @@ impl CountInfo {
         self.nl = self.nl + count.nl;
     }
 }
+
+const fn create_table() -> [bool; 256] {
+    let mut table = [false; 256];
+    table[9] = true;
+    table[10] = true;
+    table[11] = true;
+    table[12] = true;
+    table[13] = true;
+    table[32] = true;
+    table
+}
+
+const BYTE_TABLE: [bool; 256] = create_table();
 
 fn build_display_str(args: &Args, count: &CountInfo, filename: &OsStr) -> String {
     let mut output = String::with_capacity(filename.len() + (3 * 10));
@@ -109,11 +122,11 @@ fn build_display_str(args: &Args, count: &CountInfo, filename: &OsStr) -> String
     output
 }
 
-fn wc_file_bytes(count: &mut CountInfo, pathname: &PathBuf) -> io::Result<()> {
+fn wc_file_bytes(count: &mut CountInfo, pathname: &PathBuf, chars_mode: bool) -> io::Result<()> {
     let mut file = plib::io::input_stream(pathname, false)?;
 
     let mut buffer = [0; plib::BUFSZ];
-    let mut in_word = false;
+    let mut was_space = true;
 
     loop {
         let n_read = file.read(&mut buffer[..])?;
@@ -121,70 +134,21 @@ fn wc_file_bytes(count: &mut CountInfo, pathname: &PathBuf) -> io::Result<()> {
             break;
         }
 
-        count.chars = count.chars + n_read;
-
         let bufslice = &buffer[0..n_read];
 
+        if !chars_mode {
+            // number of bytes read
+            count.chars = count.chars + n_read;
+        } else {
+            // number of UTF-8 unicode codepoints in this slice of bytes
+            count.chars += bufslice.iter().filter(|&ch| (ch >> 6) != 0b10).count();
+        }
+
         for ch_u8 in bufslice {
-            let ch = *ch_u8 as char;
-
-            if ch == '\n' {
-                count.nl = count.nl + 1;
-                if in_word {
-                    in_word = false;
-                    count.words = count.words + 1;
-                }
-            } else if ch.is_whitespace() {
-                if in_word {
-                    in_word = false;
-                    count.words = count.words + 1;
-                }
-            } else {
-                if !in_word {
-                    in_word = true;
-                }
-            }
-        }
-    }
-
-    if in_word {
-        count.words = count.words + 1;
-    }
-
-    Ok(())
-}
-
-fn wc_file_chars(args: &Args, count: &mut CountInfo, pathname: &PathBuf) -> io::Result<()> {
-    let mut reader = plib::io::input_reader(pathname, false)?;
-
-    loop {
-        let mut buffer = String::new();
-        let n_read = reader.read_line(&mut buffer)?;
-        if n_read == 0 {
-            break;
-        }
-
-        count.nl = count.nl + 1;
-        count.chars = count.chars + n_read;
-
-        if args.words {
-            let mut in_word = false;
-
-            for ch in buffer.chars() {
-                if ch.is_whitespace() {
-                    if in_word {
-                        in_word = false;
-                        count.words = count.words + 1;
-                    }
-                } else {
-                    if !in_word {
-                        in_word = true;
-                    }
-                }
-            }
-            if in_word {
-                count.words = count.words + 1;
-            }
+            let is_space = BYTE_TABLE[*ch_u8 as usize];
+            count.nl += (ch_u8 == &10) as usize;
+            count.words += (!is_space && was_space) as usize;
+            was_space = is_space;
         }
     }
 
@@ -197,11 +161,7 @@ fn wc_file(
     pathname: &PathBuf,
     count: &mut CountInfo,
 ) -> io::Result<()> {
-    if chars_mode {
-        wc_file_chars(args, count, pathname)?;
-    } else {
-        wc_file_bytes(count, pathname)?;
-    }
+    wc_file_bytes(count, pathname, chars_mode)?;
 
     let output = build_display_str(args, count, pathname.as_os_str());
 

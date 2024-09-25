@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-tree"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["Jeff Garzik"]
 license = "MIT"
@@ -14,7 +14,6 @@ gettext-rs.workspace = true
 libc.workspace = true
 regex.workspace = true
 chrono.workspace = true
-atty.workspace = true
 errno.workspace = true
 
 [dev-dependencies]
@@ -87,4 +86,3 @@ path = "./touch.rs"
 [[bin]]
 name = "unlink"
 path = "./unlink.rs"
-

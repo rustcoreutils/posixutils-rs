@@ -13,22 +13,29 @@
 
 use chrono::{DateTime, Datelike, Local, LocalResult, TimeZone, Utc};
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 
 const DEF_TIMESTR: &str = "%a %b %e %H:%M:%S %Z %Y";
 
-/// date - write the date and time
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("date - write the date and time"))]
 struct Args {
-    /// Perform operations as if the TZ env var was set to the string "UTC0"
-    #[arg(short, long)]
+    #[arg(
+        short,
+        long,
+        help = gettext(
+            "Perform operations as if the TZ env var was set to the string \"UTC0\""
+        )
+    )]
     utc: bool,
 
-    /// If prefixed with '+', Display the current time in the given FORMAT,
-    /// as in strftime(3).  Otherwise, set the current time to the given
-    /// string.
+    #[arg(
+        help = gettext(
+            "If prefixed with '+', Display the current time in the given FORMAT, \
+             as in strftime(3). Otherwise, set the current time to the given string"
+        )
+    )]
     timestr: Option<String>,
 }
 

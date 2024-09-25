@@ -8,16 +8,17 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use std::{thread, time};
 
-/// sleep - suspend execution for an interval
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("sleep - suspend execution for an interval"))]
 struct Args {
-    /// Number of seconds to sleep
-    #[arg(value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(
+        value_parser = clap::value_parser!(u64).range(1..),
+        help = gettext("Number of seconds to sleep")
+    )]
     seconds: u64,
 }
 

@@ -8,7 +8,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use libc::{getpwnam, passwd};
 use plib::priority::{getpriority, setpriority};
 use plib::PROJECT_NAME;
@@ -17,27 +17,53 @@ use std::ffi::CString;
 const PRIO_MIN: i32 = -20;
 const PRIO_MAX: i32 = 20;
 
-/// renice - set nice values of running processes
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("renice - set nice values of running processes"))]
 struct Args {
-    /// A positive or negative decimal integer which shall have the same effect on the execution of the utility as if the utility had called the nice() function with the numeric value of the increment option-argument.
-    #[arg(short, long, required=true, value_parser = clap::value_parser!(i32).range(-20..20))]
+    #[arg(
+        short,
+        long,
+        required = true,
+        value_parser = clap::value_parser!(i32).range(-20..20),
+        help = gettext(
+            "A positive or negative decimal integer which shall have the same effect \
+             on the execution of the utility as if the utility had called the nice() \
+             function with the numeric value of the increment option-argument"
+        )
+    )]
     niceval: i32,
 
-    /// Interpret the following operands as unsigned decimal integer process group IDs.
-    #[arg(short = 'g', long, group = "mode")]
+    #[arg(
+        short = 'g',
+        long,
+        group = "mode",
+        help = gettext(
+            "Interpret the following operands as unsigned decimal integer process group IDs"
+        )
+    )]
     pgrp: bool,
 
-    /// Interpret the following operands as unsigned decimal integer process IDs. The -p option is the default if no options are specified.
-    #[arg(short, long, group = "mode", default_value_t = true)]
+    #[arg(
+        short,
+        long,
+        group = "mode",
+        default_value_t = true,
+        help = gettext(
+            "Interpret the following operands as unsigned decimal integer process IDs. \
+             The -p option is the default if no options are specified"
+        )
+    )]
     pid: bool,
 
-    /// Interpret the following operands as users.
-    #[arg(short, long, group = "mode")]
+    #[arg(
+        short,
+        long,
+        group = "mode",
+        help = gettext("Interpret the following operands as users")
+    )]
     user: bool,
 
-    /// process id to adjust priority
+    #[arg(help = gettext("Process id to adjust priority"))]
     id: String,
 }
 

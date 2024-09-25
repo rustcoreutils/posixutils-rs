@@ -9,7 +9,7 @@
 //
 use crate::io::ErrorKind;
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use std::fs::File;
 use std::io::{self, BufReader, Error, Read, Seek, SeekFrom};
@@ -18,55 +18,66 @@ use std::path::PathBuf;
 use std::slice::Chunks;
 use std::str::FromStr;
 
-/// Hex, octal, ASCII, and other types of dumps
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("od - dump files in octal and other formats"))]
 struct Args {
-    /// Address base (d for decimal, o for octal, x for hexadecimal, n for none)
-    #[arg(short = 'A')]
+    #[arg(
+        short = 'A',
+        help = gettext(
+            "Address base (d for decimal, o for octal, x for hexadecimal, n for none)"
+        )
+    )]
     address_base: Option<char>,
 
-    /// Skip bytes from the beginning of the input
-    #[arg(short = 'j')]
+    #[arg(short = 'j', help = gettext("Skip bytes from the beginning of the input"))]
     skip: Option<String>,
 
-    /// Read only the specified number of bytes
-    #[arg(short = 'N')]
+    #[arg(short = 'N', help = gettext("Read only the specified number of bytes"))]
     count: Option<String>,
 
-    /// Select the output format
-    #[arg(short = 't')]
+    #[arg(short = 't', help = gettext("Select the output format"))]
     type_strings: Vec<String>,
 
-    /// Interpret bytes in octal
-    #[arg(short = 'b')]
+    #[arg(
+        short = 'b',
+        help = gettext("Interpret bytes in octal")
+    )]
     octal_bytes: bool,
 
-    /// Interpret words (two-byte units) in unsigned decimal
-    #[arg(short = 'd')]
+    #[arg(
+        short = 'd',
+        help = gettext("Interpret words (two-byte units) in unsigned decimal")
+    )]
     unsigned_decimal_words: bool,
 
-    /// Interpret words (two-byte units) in octal
-    #[arg(short = 'o')]
+    #[arg(
+        short = 'o',
+        help = gettext("Interpret words (two-byte units) in octal")
+    )]
     octal_words: bool,
 
-    /// Interpret bytes as characters
-    #[arg(short = 'c')]
+    #[arg(
+        short = 'c',
+        help = gettext("Interpret bytes as characters")
+    )]
     bytes_char: bool,
 
-    /// Interpret words (two-byte units) in signed decimal
-    #[arg(short = 's')]
+    #[arg(
+        short = 's',
+        help = gettext("Interpret words (two-byte units) in signed decimal")
+    )]
     signed_decimal_words: bool,
 
-    /// Interpret words (two-byte units) in hexadecimal
-    #[arg(short = 'x')]
+    #[arg(
+        short = 'x',
+        help = gettext("Interpret words (two-byte units) in hexadecimal")
+    )]
     hex_words: bool,
 
-    /// Verbose output
-    #[arg(short = 'v')]
+    #[arg(short = 'v', help = gettext("Verbose output"))]
     verbose: bool,
 
-    /// Input files
+    #[arg(help = gettext("Input files"))]
     files: Vec<PathBuf>,
 
     #[arg(skip)]

@@ -22,7 +22,6 @@ use std::{
     path::PathBuf,
 };
 
-#[derive(Debug)]
 pub struct FileDiff<'a> {
     file1: &'a mut FileData,
     file2: &'a mut FileData,

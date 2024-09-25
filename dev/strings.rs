@@ -14,7 +14,7 @@ use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use object::{Object, ObjectSection};
 use plib::PROJECT_NAME;
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, ValueEnum)]
 enum OffsetFormat {
     #[value(name = "d", help = "decimal")]
     Decimal,
@@ -24,7 +24,7 @@ enum OffsetFormat {
     Hex,
 }
 
-#[derive(clap::Args, Clone, Copy, Debug)]
+#[derive(clap::Args, Clone, Copy)]
 struct OutputOptions {
     /// Scan the input files in their entirety
     #[arg(short = 'a')]

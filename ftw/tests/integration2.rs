@@ -50,7 +50,13 @@ fn test_ftw_fd_raii() {
         }
     }
 
-    ftw::traverse_directory(test_dir, |_| Ok(true), |_| Ok(()), |_, _| {}, false, false);
+    ftw::traverse_directory(
+        test_dir,
+        |_| Ok(true),
+        |_| Ok(()),
+        |_, _| {},
+        ftw::TraverseDirectoryOpts::default(),
+    );
 
     let final_fd_count = count_open_fds();
     assert_eq!(starting_fd_count, final_fd_count);
@@ -85,7 +91,7 @@ fn test_ftw_too_many_open_files() {
                 panic!("{}", io::Error::last_os_error());
             }
 
-            fd = ftw::FileDescriptor::open_at(&fd, filename.as_ptr(), libc::O_RDONLY).unwrap();
+            fd = ftw::FileDescriptor::open_at(&fd, filename, libc::O_RDONLY).unwrap();
         }
     }
 
@@ -104,8 +110,7 @@ fn test_ftw_too_many_open_files() {
             assert!(e.kind() == ftw::ErrorKind::Open);
             assert_eq!(e.inner().raw_os_error(), Some(libc::EMFILE));
         },
-        false,
-        false,
+        ftw::TraverseDirectoryOpts::default(),
     );
 
     assert_eq!(dir_count, DIR_HIERARCHY_DEPTH);
@@ -120,7 +125,7 @@ fn test_ftw_too_many_open_files() {
         // Open the penultimate directory
         for i in 0..DIR_HIERARCHY_DEPTH - 1 {
             let filename = if i == 0 { &test_dir_name } else { &dir_name };
-            fd = ftw::FileDescriptor::open_at(&fd, filename.as_ptr(), libc::O_RDONLY).unwrap();
+            fd = ftw::FileDescriptor::open_at(&fd, filename, libc::O_RDONLY).unwrap();
         }
 
         // Remove the directories starting from the deepest
@@ -137,7 +142,7 @@ fn test_ftw_too_many_open_files() {
             }
 
             // Go up a level in the tree
-            fd = ftw::FileDescriptor::open_at(&fd, c"..".as_ptr(), libc::O_RDONLY).unwrap();
+            fd = ftw::FileDescriptor::open_at(&fd, c"..", libc::O_RDONLY).unwrap();
         }
 
         assert!(!Path::new(test_dir).exists());

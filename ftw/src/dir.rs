@@ -80,14 +80,17 @@ impl OwnedDir {
         dir_file_descriptor: &FileDescriptor,
         filename: *const libc::c_char,
     ) -> Result<Self, Error> {
-        let file_descriptor =
-            FileDescriptor::open_at(dir_file_descriptor, filename, libc::O_RDONLY)
-                .map_err(|e| Error::new(e, ErrorKind::Open))?;
+        let file_descriptor = FileDescriptor::open_at(
+            dir_file_descriptor,
+            unsafe { CStr::from_ptr(filename) },
+            libc::O_RDONLY,
+        )
+        .map_err(|e| Error::new(e, ErrorKind::Open))?;
         let dir = OwnedDir::new(file_descriptor).map_err(|e| Error::new(e, ErrorKind::OpenDir))?;
         Ok(dir)
     }
 
-    pub fn iter<'a>(&'a self) -> OwnedDirIterator<'a> {
+    pub fn iter(&self) -> OwnedDirIterator {
         OwnedDirIterator {
             dirp: self.dirp,
             phantom: PhantomData,
@@ -150,7 +153,7 @@ impl DeferredDir {
         }
     }
 
-    pub fn iter<'a>(&'a self) -> DeferredDirIterator<'a> {
+    pub fn iter(&self) -> DeferredDirIterator {
         let file_descriptor = self.open_file_descriptor();
         let dir = OwnedDir::new(file_descriptor).unwrap();
         let dirp = dir.dirp;
@@ -177,7 +180,7 @@ impl DeferredDir {
 
         let filename_cstr = CString::new(components.as_path().as_os_str().as_bytes()).unwrap();
 
-        FileDescriptor::open_at(&starting_dir, filename_cstr.as_ptr(), libc::O_RDONLY).unwrap()
+        FileDescriptor::open_at(&starting_dir, &filename_cstr, libc::O_RDONLY).unwrap()
     }
 
     pub fn parent(&self) -> &Rc<(FileDescriptor, PathBuf)> {

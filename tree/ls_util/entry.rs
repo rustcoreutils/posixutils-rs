@@ -9,18 +9,20 @@
 
 use super::ls_from_utf8_lossy;
 use crate::{
-    ClassifyFiles, Config, DereferenceSymbolicLink, FileTimeOption, LongFormatOptions,
-    OutputFormat, DATE_TIME_FORMAT_OLD_OR_FUTURE, DATE_TIME_FORMAT_RECENT,
+    ClassifyFiles, Config, FileTimeOption, LongFormatOptions, OutputFormat,
+    DATE_TIME_FORMAT_OLD_OR_FUTURE, DATE_TIME_FORMAT_RECENT,
 };
 use chrono::{DateTime, Local};
-use std::cmp::Ordering;
-use std::ffi::{CStr, OsStr, OsString};
-use std::fs;
-use std::io;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
-use std::path::Path;
-use std::time::{Duration, SystemTime};
+use std::{
+    cmp::Ordering,
+    ffi::{CStr, OsStr, OsString},
+    io,
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{FileTypeExt, MetadataExt},
+    },
+    time::{Duration, SystemTime},
+};
 
 enum FileInfo {
     Size(u64),
@@ -51,41 +53,11 @@ pub struct Entry {
 
 impl Entry {
     pub fn new(
-        path: &Path,
+        target_path: Option<String>,
         file_name_raw: OsString,
-        file_metadata: &fs::Metadata,
+        metadata: &ftw::Metadata,
         config: &Config,
-        is_commandline_arg: bool,
     ) -> io::Result<Self> {
-        let dereference_symlink = match config.dereference_symbolic_link {
-            DereferenceSymbolicLink::CommandLine => is_commandline_arg,
-            DereferenceSymbolicLink::All => true,
-            DereferenceSymbolicLink::None => false,
-        };
-
-        // Rust doesn't seem to understand that this is being used in the
-        // `metadata` if/else below.
-        #[allow(unused_assignments)]
-        let mut dereferenced_metadata = None;
-
-        // If -H or -L are enabled, the metadata to be reported is from the file
-        // that the symbolic link points to.
-        let metadata = if file_metadata.is_symlink() && dereference_symlink {
-            dereferenced_metadata = Some(fs::metadata(path)?);
-            dereferenced_metadata.as_ref().unwrap() // `unwrap` here will never fail
-        } else {
-            file_metadata
-        };
-
-        let mut target_path = None;
-        if metadata.is_symlink() && !dereference_symlink {
-            if let OutputFormat::LongFormat(_) = &config.output_format {
-                let target = fs::read_link(path)?;
-                let os_str = target.as_os_str();
-                target_path = Some(ls_from_utf8_lossy(os_str.as_bytes()));
-            }
-        }
-
         let file_info = get_file_info(metadata);
 
         // This `SystemTime` *is* affected by -c or -u
@@ -147,18 +119,6 @@ impl Entry {
             ClassifyFiles::None => None,
         };
 
-        // let file_name_raw = if is_dot {
-        //     // Because `OsStr::file_name` would return the name of the directory
-        //     // instead of "."
-        //     OsString::from(".")
-        // } else {
-        //     // Returns `None` if `path` ends in ".."
-        //     let file_name = path.file_name();
-
-        //     file_name
-        //         .map(|s| s.to_os_string())
-        //         .unwrap_or(OsString::from(".."))
-        // };
         let file_name_display = {
             let tmp = ls_from_utf8_lossy(file_name_raw.as_bytes());
 
@@ -222,10 +182,6 @@ impl Entry {
     /// Return the number of 512-byte blocks allocated to this file.
     pub fn blocks(&self) -> u64 {
         self.blocks
-    }
-
-    pub fn file_name_os_str(&self) -> &OsStr {
-        &self.file_name_raw
     }
 
     pub fn file_name_str(&self) -> &str {
@@ -607,7 +563,7 @@ struct LongFormatData {
 
 impl LongFormatData {
     pub fn new(
-        metadata: &fs::Metadata,
+        metadata: &ftw::Metadata,
         long_format_options: &LongFormatOptions,
     ) -> io::Result<Self> {
         let file_mode = get_file_mode_string(metadata);
@@ -641,24 +597,19 @@ impl LongFormatData {
     }
 }
 
-fn get_file_mode_string(metadata: &fs::Metadata) -> String {
+fn get_file_mode_string(metadata: &ftw::Metadata) -> String {
     let mut file_mode = String::with_capacity(10);
 
     let file_type = metadata.file_type();
 
     // Entry type
-    file_mode.push(if file_type.is_dir() {
-        'd'
-    } else if file_type.is_block_device() {
-        'b'
-    } else if file_type.is_char_device() {
-        'c'
-    } else if file_type.is_symlink() {
-        'l'
-    } else if file_type.is_fifo() {
-        'p'
-    } else {
-        '-'
+    file_mode.push(match file_type {
+        ftw::FileType::SymbolicLink => 'l',
+        ftw::FileType::BlockDevice => 'b',
+        ftw::FileType::Directory => 'd',
+        ftw::FileType::CharacterDevice => 'c',
+        ftw::FileType::Fifo => 'p',
+        _ => '-',
     });
 
     let mode = metadata.mode();
@@ -735,7 +686,7 @@ fn get_file_mode_string(metadata: &fs::Metadata) -> String {
     file_mode
 }
 
-fn get_owner_name(metadata: &fs::Metadata, numeric: bool) -> io::Result<String> {
+fn get_owner_name(metadata: &ftw::Metadata, numeric: bool) -> io::Result<String> {
     let uid = metadata.uid();
     if numeric {
         Ok(uid.to_string())
@@ -752,7 +703,7 @@ fn get_owner_name(metadata: &fs::Metadata, numeric: bool) -> io::Result<String> 
     }
 }
 
-fn get_group_name(metadata: &fs::Metadata, numeric: bool) -> io::Result<String> {
+fn get_group_name(metadata: &ftw::Metadata, numeric: bool) -> io::Result<String> {
     let gid = metadata.gid();
     if numeric {
         Ok(gid.to_string())
@@ -769,46 +720,50 @@ fn get_group_name(metadata: &fs::Metadata, numeric: bool) -> io::Result<String> 
     }
 }
 
-fn get_file_info(metadata: &fs::Metadata) -> FileInfo {
-    let file_type = metadata.file_type();
-    if file_type.is_char_device() || file_type.is_block_device() {
-        let device_id = metadata.rdev();
+fn get_file_info(metadata: &ftw::Metadata) -> FileInfo {
+    match metadata.file_type() {
+        ftw::FileType::CharacterDevice | ftw::FileType::BlockDevice => {
+            let device_id = metadata.rdev();
 
-        // major ID - class of the device
-        // minor ID - specific instance of a device
-        let (major, minor) = unsafe {
-            (
-                libc::major(device_id as libc::dev_t),
-                libc::minor(device_id as libc::dev_t),
-            )
-        };
+            // major ID - class of the device
+            // minor ID - specific instance of a device
+            let (major, minor) = unsafe {
+                (
+                    libc::major(device_id as libc::dev_t),
+                    libc::minor(device_id as libc::dev_t),
+                )
+            };
 
-        FileInfo::DeviceInfo((major as u32, minor as u32))
-    } else {
-        FileInfo::Size(metadata.size())
+            FileInfo::DeviceInfo((major as u32, minor as u32))
+        }
+        _ => FileInfo::Size(metadata.size()),
     }
 }
 
 fn get_system_time(
-    metadata: &fs::Metadata,
+    metadata: &ftw::Metadata,
     file_time_option: &FileTimeOption,
 ) -> io::Result<SystemTime> {
-    let time = match file_time_option {
-        FileTimeOption::LastModificationTime => metadata.modified()?,
-        FileTimeOption::LastAcessTime => metadata.accessed()?,
+    let seconds_since_epoch = match file_time_option {
+        FileTimeOption::LastModificationTime => {
+            u64::try_from(metadata.mtime()).map_err(|_| io::Error::other("negative mtime"))?
+        }
+        FileTimeOption::LastAcessTime => {
+            u64::try_from(metadata.atime()).map_err(|_| io::Error::other("negative atime"))?
+        }
         FileTimeOption::LastStatusChangeTime => {
-            let seconds_since_epoch =
-                u64::try_from(metadata.ctime()).map_err(|_| io::Error::other("negative ctime"))?;
-            SystemTime::UNIX_EPOCH
-                .checked_add(Duration::from_secs(seconds_since_epoch))
-                .ok_or(io::Error::other("`SystemTime` overflow"))?
+            u64::try_from(metadata.ctime()).map_err(|_| io::Error::other("negative ctime"))?
         }
     };
+
+    let time = SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_secs(seconds_since_epoch))
+        .ok_or(io::Error::other("`SystemTime` overflow"))?;
     Ok(time)
 }
 
 fn get_time_and_time_string(
-    metadata: &fs::Metadata,
+    metadata: &ftw::Metadata,
     file_time_option: &FileTimeOption,
 ) -> io::Result<(SystemTime, String)> {
     let time = get_system_time(metadata, file_time_option)?;

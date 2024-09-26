@@ -104,6 +104,13 @@ mod tests {
     }
 
     #[test]
+    fn test_open_not_found() {
+        let mtab = MountTable::open(c"/tmp/not_found", c"r");
+        let mtab = mtab.err().unwrap();
+        assert_eq!(mtab.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
     fn test_iterable() {
         let mtab = MountTable::open(c"tests/mtab.txt", c"r").unwrap();
         let vec = Vec::from_iter(mtab);

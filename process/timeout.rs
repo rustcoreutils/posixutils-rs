@@ -8,7 +8,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use std::{
     error::Error,
@@ -102,39 +102,28 @@ static KILL_AFTER: Mutex<Option<Duration>> = Mutex::new(None);
 static MONITORED_PID: AtomicI32 = AtomicI32::new(0);
 static TIMED_OUT: AtomicBool = AtomicBool::new(false);
 
-/// timeout — execute a utility with a time limit
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("timeout — execute a utility with a time limit"))]
 struct Args {
-    /// Only time out the utility itself, not its descendants.
-    #[arg(short = 'f', long)]
+    #[arg(short = 'f', long, help=gettext("Only time out the utility itself, not its descendants."))]
     foreground: bool,
 
-    /// Always preserve (mimic) the wait status of the executed utility, even if the time limit was reached.
-    #[arg(short = 'p', long)]
+    #[arg(short = 'p', long, help=gettext("Preserve the exit status of the utility."))]
     preserve_status: bool,
 
-    /// Send a SIGKILL signal if the child process created to execute the utility has not terminated after the time period
-    /// specified by time has elapsed since the first signal was sent. The value of time shall be interpreted as specified for
-    /// the duration operand.
-    #[arg(short = 'k', long, value_parser = parse_duration)]
+    #[arg(short = 'k', long, value_parser = parse_duration, help=gettext("Send a SIGKILL signal if the child process has not terminated after the time period."))]
     kill_after: Option<Duration>,
 
-    /// Specify the signal to send when the time limit is reached, using one of the symbolic names defined in the <signal.h> header.
-    /// Values of signal shall be recognized in a case-independent fashion, without the SIG prefix. By default, SIGTERM shall be sent.
-    #[arg(short = 's', long, default_value = "TERM", value_parser = parse_signal)]
+    #[arg(short = 's', long, default_value = "TERM", value_parser = parse_signal, help=gettext("Specify the signal to send when the time limit is reached."))]
     signal_name: i32,
 
-    /// The maximum amount of time to allow the utility to run, specified as a decimal number with an optional decimal fraction and an optional suffix.
-    #[arg(name = "DURATION", value_parser = parse_duration)]
+    #[arg(name = "DURATION", value_parser = parse_duration, help=gettext("The maximum amount of time to allow the utility to run, specified as a decimal number with an optional decimal fraction and an optional suffix."))]
     duration: Duration,
 
-    /// The name of a utility that is to be executed.
-    #[arg(name = "UTILITY")]
+    #[arg(name = "UTILITY", help=gettext("The utility to execute."))]
     utility: String,
 
-    /// Any string to be supplied as an argument when executing the utility named by the utility operand.
-    #[arg(name = "ARGUMENT", trailing_var_arg = true)]
+    #[arg(name = "ARGUMENT", trailing_var_arg = true, help=gettext("Arguments to pass to the utility."))]
     arguments: Vec<String>,
 }
 

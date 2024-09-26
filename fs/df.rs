@@ -7,6 +7,9 @@
 // SPDX-License-Identifier: MIT
 //
 
+#[cfg(target_os = "linux")]
+mod mntent;
+
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;

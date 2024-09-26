@@ -14,6 +14,7 @@ libc.workspace = true
 dirs = "5.0"
 
 [dev-dependencies]
+sysinfo = "0.31"
 tokio = { version = "1.39", features = ["net", "macros", "rt"]}
 
 [build-dependencies]
@@ -42,6 +43,10 @@ path = "./nohup.rs"
 [[bin]]
 name = "renice"
 path = "./renice.rs"
+
+[[bin]]
+name = "timeout"
+path = "./timeout.rs"
 
 [[bin]]
 name = "xargs"

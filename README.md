@@ -101,6 +101,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] strip (Development)
  - [x] tail
  - [x] time
+ - [x] timeout
  - [x] tr
  - [x] true
  - [x] uncompress (compress cat.)
@@ -218,7 +219,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] sed
  - [ ] sh -- Volunteer starting point at https://github.com/rustcoreutils/posixutils-rs/tree/shell
  - [ ] talk (status: in progress)
- - [ ] timeout (status: in progress)
 
 ## Installation
 

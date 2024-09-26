@@ -13,6 +13,8 @@ gettext-rs.workspace = true
 libc.workspace = true
 chrono.workspace = true
 syslog = "6.1"
+thiserror = "1.0.63"
+binrw = "0.14.0"
 
 [[bin]]
 name = "id"
@@ -41,3 +43,7 @@ path = "./tty.rs"
 [[bin]]
 name = "write"
 path = "./write.rs"
+
+[[bin]]
+name = "talk"
+path = "./talk.rs"

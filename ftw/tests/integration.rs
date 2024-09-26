@@ -41,11 +41,29 @@ fn test_ftw_simple() {
         },
         |_| Ok(()),
         |_, e| panic!("{}", e.inner()),
-        false,
-        false,
+        ftw::TraverseDirectoryOpts::default(),
     );
 
     expected_filenames.sort();
+    filenames.sort();
+    assert_eq!(expected_filenames.as_slice(), filenames.as_slice());
+
+    // Test listing files like in ls
+    filenames.clear();
+    ftw::traverse_directory(
+        test_dir,
+        |entry| {
+            let s = format!("{}", entry.path());
+            filenames.push(s);
+            Ok(true)
+        },
+        |_| Ok(()),
+        |_, e| panic!("{}", e.inner()),
+        ftw::TraverseDirectoryOpts {
+            list_contents_first: true,
+            ..Default::default()
+        },
+    );
     filenames.sort();
     assert_eq!(expected_filenames.as_slice(), filenames.as_slice());
 
@@ -96,8 +114,10 @@ fn test_ftw_symlinks() {
         },
         |_| Ok(()),
         |_, e| panic!("{}", e.inner()),
-        false,
-        true,
+        ftw::TraverseDirectoryOpts {
+            follow_symlinks: true,
+            ..Default::default()
+        },
     );
 
     expected_filenames.sort();
@@ -124,7 +144,7 @@ fn test_ftw_deep() {
             panic!("{}", io::Error::last_os_error());
         }
 
-        fd = ftw::FileDescriptor::open_at(&fd, filename.as_ptr(), libc::O_RDONLY).unwrap();
+        fd = ftw::FileDescriptor::open_at(&fd, filename, libc::O_RDONLY).unwrap();
     }
 
     let mut count = 0;
@@ -137,8 +157,7 @@ fn test_ftw_deep() {
         },
         |_| Ok(()),
         |_, e| panic!("{}", e.inner()),
-        false,
-        false,
+        ftw::TraverseDirectoryOpts::default(),
     );
 
     assert_eq!(count, DIR_HIERARCHY_DEPTH);
@@ -183,8 +202,10 @@ fn test_ftw_deep_symlinks() {
         },
         |_| Ok(()),
         |_, e| panic!("{}", e.inner()),
-        false,
-        true,
+        ftw::TraverseDirectoryOpts {
+            follow_symlinks: true,
+            ..Default::default()
+        },
     );
 
     assert_eq!(count, DIR_HIERARCHY_DEPTH);
@@ -248,8 +269,11 @@ fn test_ftw_path_prefix_modification() {
 
             panic!("{}", e.inner());
         },
-        true,
-        true,
+        ftw::TraverseDirectoryOpts {
+            follow_symlinks_on_args: true,
+            follow_symlinks: true,
+            ..Default::default()
+        },
     );
 
     // Once a/b is reached, traverse_directory should not go down the wrong directory even if a/b is
@@ -267,8 +291,11 @@ fn test_ftw_path_prefix_modification() {
         },
         |_| Ok(()),
         |_, e| panic!("{}", e.inner()),
-        true,
-        true,
+        ftw::TraverseDirectoryOpts {
+            follow_symlinks_on_args: true,
+            follow_symlinks: true,
+            ..Default::default()
+        },
     );
 
     // Rerunning the directory traversal should now follow the "wrong" directory.
@@ -295,7 +322,7 @@ fn test_ftw_long_filename() {
             panic!("{}", io::Error::last_os_error());
         }
 
-        fd = ftw::FileDescriptor::open_at(&fd, filename.as_ptr(), libc::O_RDONLY).unwrap();
+        fd = ftw::FileDescriptor::open_at(&fd, filename, libc::O_RDONLY).unwrap();
 
         // If at the last index, add dummy directories
         if i == DIR_HIERARCHY_DEPTH - 1 {
@@ -325,8 +352,7 @@ fn test_ftw_long_filename() {
         },
         |_| Ok(()),
         |_, e| panic!("{:?}", e.kind()),
-        false,
-        false,
+        ftw::TraverseDirectoryOpts::default(),
     );
 
     for char in dummy_dirs.chars() {

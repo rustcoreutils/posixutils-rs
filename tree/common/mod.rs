@@ -104,10 +104,18 @@ where
         return Ok(CopyResult::CopiedFile);
     }
 
-    let source_deref_md = ftw::Metadata::new(source.dir_fd(), source.file_name().as_ptr(), true);
+    let source_deref_md = unsafe { ftw::Metadata::new(source.dir_fd(), source.file_name(), true) };
 
-    let target_symlink_md = ftw::Metadata::new(target_dirfd, target_filename, false);
-    let target_deref_md = ftw::Metadata::new(target_dirfd, target_filename, true);
+    let target_symlink_md = ftw::Metadata::new(
+        target_dirfd,
+        unsafe { CStr::from_ptr(target_filename) },
+        false,
+    );
+    let target_deref_md = ftw::Metadata::new(
+        target_dirfd,
+        unsafe { CStr::from_ptr(target_filename) },
+        true,
+    );
     let target_is_dangling_symlink = target_symlink_md.is_ok() && target_deref_md.is_err();
 
     let target_symlink_md = match target_symlink_md {
@@ -527,11 +535,13 @@ where
                             // not allow atomically creating a directory then opening it:
                             //
                             // https://stackoverflow.com/questions/45818628/whats-the-expected-behavior-of-openname-o-creato-directory-mode/48693137#48693137
-                            let new_target_dirfd = match ftw::FileDescriptor::open_at(
-                                target_dirfd,
-                                target_filename_cstr.as_ptr(),
-                                libc::O_RDONLY,
-                            ) {
+                            let new_target_dirfd = match unsafe {
+                                ftw::FileDescriptor::open_at(
+                                    target_dirfd,
+                                    &target_filename_cstr,
+                                    libc::O_RDONLY,
+                                )
+                            } {
                                 Ok(fd) => fd,
                                 Err(e) => {
                                     let err_str = gettext!(
@@ -619,8 +629,11 @@ where
             *last_error.borrow_mut() = Some(error.inner());
             *terminate.borrow_mut() = true;
         },
-        cfg.follow_cli,
-        cfg.dereference,
+        ftw::TraverseDirectoryOpts {
+            follow_symlinks_on_args: cfg.follow_cli,
+            follow_symlinks: cfg.dereference,
+            ..Default::default()
+        },
     );
 
     match last_error.into_inner() {
@@ -770,7 +783,7 @@ fn copy_characteristics(
     // `io::copy`).
     // Should fix sporadic errors on `test_cp_preserve_slink_time` where `dangle` has a later
     // access time than `d2`.
-    let source_md = ftw::Metadata::new(source.dir_fd(), source.file_name().as_ptr(), false)?;
+    let source_md = unsafe { ftw::Metadata::new(source.dir_fd(), source.file_name(), false) }?;
 
     // [last_access_time, last_modified_time]
     let times = [
@@ -826,7 +839,8 @@ fn copy_characteristics(
 
             // Symbolic link permissions are ignored on Linux
             #[cfg(target_os = "linux")]
-            if let Ok(md) = ftw::Metadata::new(target_dirfd, target_filename, false) {
+            if let Ok(md) = ftw::Metadata::new(target_dirfd, CStr::from_ptr(target_filename), false)
+            {
                 if md.file_type() == ftw::FileType::SymbolicLink {
                     if let Some(errno) = fchmodat_error.raw_os_error() {
                         if errno == libc::EOPNOTSUPP {

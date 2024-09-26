@@ -81,11 +81,11 @@ impl FileDescriptor {
     /// Create a `FileDescriptor` with arguments similar to `libc::openat`.
     pub fn open_at(
         dir_file_descriptor: &FileDescriptor,
-        filename: *const libc::c_char,
+        file_name: &CStr,
         flags: i32,
     ) -> io::Result<Self> {
         unsafe {
-            let fd = libc::openat(dir_file_descriptor.fd, filename, flags);
+            let fd = libc::openat(dir_file_descriptor.fd, file_name.as_ptr(), flags);
             if fd == -1 {
                 Err(io::Error::last_os_error())
             } else {
@@ -124,7 +124,7 @@ impl Metadata {
     /// process' current working directory.
     pub fn new(
         dirfd: libc::c_int,
-        filename: *const libc::c_char,
+        file_name: &CStr,
         follow_symlinks: bool,
     ) -> io::Result<Metadata> {
         let mut statbuf = MaybeUninit::uninit();
@@ -133,7 +133,7 @@ impl Metadata {
         } else {
             libc::AT_SYMLINK_NOFOLLOW
         };
-        let ret = unsafe { libc::fstatat(dirfd, filename, statbuf.as_mut_ptr(), flags) };
+        let ret = unsafe { libc::fstatat(dirfd, file_name.as_ptr(), statbuf.as_mut_ptr(), flags) };
         if ret != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -193,6 +193,21 @@ impl Metadata {
         } else {
             self.0.st_mode & libc::S_IXOTH != 0
         }
+    }
+
+    /// Returns `true` if this metadata is for a directory.
+    pub fn is_dir(&self) -> bool {
+        self.file_type().is_dir()
+    }
+
+    /// Returns `true` if this metadata is for a regular file.
+    pub fn is_file(&self) -> bool {
+        self.file_type().is_file()
+    }
+
+    /// Returns `true` if this metadata is for a symbolic link.
+    pub fn is_symlink(&self) -> bool {
+        self.file_type().is_symlink()
     }
 }
 
@@ -274,11 +289,47 @@ pub enum FileType {
     Fifo,
 }
 
+impl FileType {
+    /// Tests whether this file type represents a directory.
+    pub fn is_dir(&self) -> bool {
+        *self == FileType::Directory
+    }
+
+    /// Tests whether this file type represents a symbolic link.
+    pub fn is_symlink(&self) -> bool {
+        *self == FileType::SymbolicLink
+    }
+
+    /// Tests whether this file type represents a regular file.
+    pub fn is_file(&self) -> bool {
+        *self == FileType::RegularFile
+    }
+}
+
+impl unix::fs::FileTypeExt for FileType {
+    fn is_block_device(&self) -> bool {
+        *self == FileType::BlockDevice
+    }
+
+    fn is_char_device(&self) -> bool {
+        *self == FileType::CharacterDevice
+    }
+
+    fn is_fifo(&self) -> bool {
+        *self == FileType::Fifo
+    }
+
+    fn is_socket(&self) -> bool {
+        *self == FileType::Socket
+    }
+}
+
 #[derive(Debug)]
 struct TreeNode {
     dir: HybridDir,
     filename: Rc<[libc::c_char]>,
     metadata: Metadata,
+    path_depth: usize,
 }
 
 /// An entry in the directory tree.
@@ -286,8 +337,8 @@ struct TreeNode {
 pub struct Entry<'a> {
     dir_file_descriptor: &'a FileDescriptor,
     path_stack: &'a [Rc<[libc::c_char]>],
-    filename: &'a Rc<[libc::c_char]>,
-    metadata: Option<&'a Metadata>,
+    filename: Rc<[libc::c_char]>,
+    metadata: Option<Metadata>,
     is_symlink: Option<bool>,
     read_link: Option<Rc<[libc::c_char]>>,
 }
@@ -296,8 +347,8 @@ impl<'a> Entry<'a> {
     fn new(
         dir_file_descriptor: &'a FileDescriptor,
         path_stack: &'a [Rc<[libc::c_char]>],
-        filename: &'a Rc<[libc::c_char]>,
-        metadata: Option<&'a Metadata>,
+        filename: Rc<[libc::c_char]>,
+        metadata: Option<Metadata>,
     ) -> Self {
         Self {
             dir_file_descriptor,
@@ -325,7 +376,7 @@ impl<'a> Entry<'a> {
     ///
     /// This is either the metadata of the file itself or the metadata of the file it points to.
     pub fn metadata(&self) -> Option<&Metadata> {
-        self.metadata
+        self.metadata.as_ref()
     }
 
     /// Check if this entry is a symlink.
@@ -344,16 +395,13 @@ impl<'a> Entry<'a> {
     ///
     /// This is either relative to the current working directory or an absolute path.
     pub fn path(&self) -> DisplayablePath {
-        DisplayablePath(build_path(self.path_stack, self.filename))
+        DisplayablePath(build_path(self.path_stack, &self.filename))
     }
 
     /// Check if this `Entry` is an empty directory.
     pub fn is_empty_dir(&self) -> io::Result<bool> {
-        let file_descriptor = FileDescriptor::open_at(
-            self.dir_file_descriptor,
-            self.file_name().as_ptr(),
-            libc::O_RDONLY,
-        )?;
+        let file_descriptor =
+            FileDescriptor::open_at(self.dir_file_descriptor, self.file_name(), libc::O_RDONLY)?;
         match OwnedDir::new(file_descriptor) {
             Ok(dir) => {
                 let mut num_entries = 0;
@@ -379,9 +427,18 @@ impl<'a> Entry<'a> {
             Err(e) => Err(e),
         }
     }
+
+    /// Returns whether this entry is a `..` or a `..`.
+    pub fn is_dot_or_double_dot(&self) -> bool {
+        const DOT: u8 = b'.';
+
+        let slice = self.file_name().to_bytes_with_nul();
+        slice.get(..2) == Some(&[DOT, 0]) || slice.get(..3) == Some(&[DOT, DOT, 0])
+    }
 }
 
 /// Wrapper around a `PathBuf` that prevents directly using the path for `std::fs` functions.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DisplayablePath(PathBuf);
 
 impl fmt::Display for DisplayablePath {
@@ -399,6 +456,11 @@ impl DisplayablePath {
         }
         s
     }
+
+    /// Get the internal representation of `self`.
+    pub fn as_inner(&self) -> &Path {
+        &self.0
+    }
 }
 
 impl Deref for DisplayablePath {
@@ -409,37 +471,38 @@ impl Deref for DisplayablePath {
     }
 }
 
-enum NodeOrMetadata {
-    TreeNode(TreeNode),
-    Metadata(Metadata),
-}
-
-enum ProcessFileResult {
-    ProcessedDirectory(NodeOrMetadata),
+// Ignore clippy warnings, this is only used in `process_file` below
+#[allow(clippy::large_enum_variant)]
+enum ProcessFileResult<'a> {
+    ProcessedDirectory(Entry<'a>),
     ProcessedFile,
     NotProcessed,
     Skipped,
 }
 
-fn process_file<F, H>(
-    path_stack: &[Rc<[libc::c_char]>],
-    dir_fd: &FileDescriptor,
+fn process_file<'a, F, H>(
+    path_stack: &'a [Rc<[libc::c_char]>],
+    dir_fd: &'a FileDescriptor,
     entry_filename: Rc<[libc::c_char]>,
     follow_symlinks: bool,
+    is_dot_or_double_dot: bool,
     file_handler: &mut F,
     err_reporter: &mut H,
-    conserve_fds: bool,
-) -> ProcessFileResult
+) -> ProcessFileResult<'a>
 where
     F: FnMut(Entry<'_>) -> Result<bool, ()>,
     H: FnMut(Entry<'_>, Error),
 {
     // Get the metadata for the file without following symlinks.
-    let entry_symlink_metadata = match Metadata::new(dir_fd.fd, entry_filename.as_ptr(), false) {
+    let entry_symlink_metadata = match Metadata::new(
+        dir_fd.fd,
+        unsafe { CStr::from_ptr(entry_filename.as_ptr()) },
+        false,
+    ) {
         Ok(md) => md,
         Err(e) => {
             err_reporter(
-                Entry::new(dir_fd, path_stack, &entry_filename, None),
+                Entry::new(dir_fd, path_stack, entry_filename, None),
                 Error::new(e, ErrorKind::Stat),
             );
             return ProcessFileResult::NotProcessed;
@@ -454,14 +517,18 @@ where
             Ok(p) => p,
             Err(e) => {
                 err_reporter(
-                    Entry::new(dir_fd, path_stack, &entry_filename, None),
+                    Entry::new(dir_fd, path_stack, entry_filename, None),
                     Error::new(e, ErrorKind::ReadLink),
                 );
                 return ProcessFileResult::NotProcessed;
             }
         };
 
-        match Metadata::new(dir_fd.fd, entry_filename.as_ptr(), true) {
+        match Metadata::new(
+            dir_fd.fd,
+            unsafe { CStr::from_ptr(entry_filename.as_ptr()) },
+            true,
+        ) {
             Ok(md) => (Some(read_link), md),
             Err(e) => {
                 if e.kind() == io::ErrorKind::NotFound {
@@ -469,7 +536,7 @@ where
                     (Some(read_link), entry_symlink_metadata)
                 } else {
                     err_reporter(
-                        Entry::new(dir_fd, path_stack, &entry_filename, None),
+                        Entry::new(dir_fd, path_stack, entry_filename, None),
                         Error::new(e, ErrorKind::Stat),
                     );
                     return ProcessFileResult::NotProcessed;
@@ -480,34 +547,24 @@ where
         (None, entry_symlink_metadata)
     };
 
-    let mut entry = Entry::new(dir_fd, path_stack, &entry_filename, Some(&entry_metadata));
+    let mut entry = Entry::new(dir_fd, path_stack, entry_filename, Some(entry_metadata));
     entry.is_symlink = Some(is_symlink);
     entry.read_link = entry_readlink;
 
-    match file_handler(entry.clone()) {
+    let file_handler_result = file_handler(entry.clone());
+
+    // Always skip . and .. to avoid infinite loops
+    if is_dot_or_double_dot {
+        return ProcessFileResult::Skipped;
+    }
+
+    match file_handler_result {
         Ok(true) => {
-            if entry_metadata.file_type() == FileType::Directory {
+            let entry_metadata = entry.metadata.as_ref().unwrap();
+            if entry_metadata.is_dir() {
                 // Is the directory searchable?
                 if entry_metadata.is_executable() {
-                    if conserve_fds {
-                        ProcessFileResult::ProcessedDirectory(NodeOrMetadata::Metadata(
-                            entry_metadata,
-                        ))
-                    } else {
-                        match OwnedDir::open_at(dir_fd, entry_filename.as_ptr()) {
-                            Ok(new_dir) => ProcessFileResult::ProcessedDirectory(
-                                NodeOrMetadata::TreeNode(TreeNode {
-                                    dir: HybridDir::Owned(new_dir),
-                                    filename: entry_filename,
-                                    metadata: entry_metadata,
-                                }),
-                            ),
-                            Err(error) => {
-                                err_reporter(entry, error);
-                                ProcessFileResult::NotProcessed
-                            }
-                        }
-                    }
+                    ProcessFileResult::ProcessedDirectory(entry)
                 } else {
                     // "Permission denied" error. `io::ErrorKind::PermissionDenied` uses
                     // lowercase for "permission" in the error message so don't use that here.
@@ -573,19 +630,22 @@ where
         let filename_cstr = CString::new(component.as_os_str().as_bytes()).unwrap();
         let filename = cstring_to_rc(&filename_cstr);
 
-        starting_dir =
-            match FileDescriptor::open_at(&starting_dir, filename.as_ptr(), libc::O_RDONLY) {
-                Ok(fd) => fd,
-                Err(e) => {
-                    if let Some(path_stack) = &path_stack {
-                        err_reporter(
-                            Entry::new(&starting_dir, path_stack, &filename, None),
-                            Error::new(e, ErrorKind::Open),
-                        );
-                    }
-                    return None;
+        starting_dir = match FileDescriptor::open_at(
+            &starting_dir,
+            unsafe { CStr::from_ptr(filename.as_ptr()) },
+            libc::O_RDONLY,
+        ) {
+            Ok(fd) => fd,
+            Err(e) => {
+                if let Some(path_stack) = &path_stack {
+                    err_reporter(
+                        Entry::new(&starting_dir, path_stack, filename, None),
+                        Error::new(e, ErrorKind::Open),
+                    );
                 }
-            };
+                return None;
+            }
+        };
 
         if let Some(path_stack) = &mut path_stack {
             path_stack.push(filename);
@@ -593,6 +653,19 @@ where
     }
 
     Some((starting_dir, path_components))
+}
+
+/// Options for `traverse_directory`. These are disabled by default.
+#[derive(Debug, Clone, Default)] // Defaults to all `false`
+pub struct TraverseDirectoryOpts {
+    /// Whether to dereference `path` if it's a symlink.
+    pub follow_symlinks_on_args: bool,
+    /// Dereference symlinks encountered (also including `path`).
+    pub follow_symlinks: bool,
+    /// Do not ignore `.` and `..`
+    pub include_dot_and_double_dot: bool,
+    /// List the contents of the current directory before descending into a subdirectory.
+    pub list_contents_first: bool,
 }
 
 /// Walk through a directory tree.
@@ -603,20 +676,18 @@ where
 ///
 /// # Arguments
 /// * `path` - Pathname of the directory. Passing a file to this argument will cause the function to
-/// return `false` but will otherwise allow processing the file inside `file_handler` like a normal
-/// entry.
+///     return `false` but will otherwise allow processing the file inside `file_handler` like a
+///     normal entry.
 ///
 /// * `file_handler` - Called for each entry in the tree. If the current entry is a directory, its
-/// contents will be skipped if `file_handler` returns `false`. The return value of `file_handler`
-/// is ignored when the entry is a file.
+///     contents will be skipped if `file_handler` returns `false`. The return value of
+///     `file_handler` is ignored when the entry is a file.
 ///
 /// * `postprocess_dir` - Called when `traverse_directory` is exiting a directory.
 ///
 /// * `err_reporter` - Callback for reporting the errors encountered during the directory traversal.
 ///
-/// * `follow_symlinks_on_args` - Whether to dereference `path` if it's a symlink.
-///
-/// * `follow_symlinks` - Dereference symlinks encountered (also including `path`).
+/// * `opts` - Additional options for this function.
 ///
 /// # Return
 ///
@@ -627,8 +698,7 @@ pub fn traverse_directory<P, F, G, H>(
     mut file_handler: F,
     mut postprocess_dir: G,
     mut err_reporter: H,
-    follow_symlinks_on_args: bool,
-    follow_symlinks: bool,
+    opts: TraverseDirectoryOpts,
 ) -> bool
 where
     P: AsRef<Path>,
@@ -636,10 +706,20 @@ where
     G: FnMut(Entry<'_>) -> Result<(), ()>,
     H: FnMut(Entry<'_>, Error),
 {
+    let TraverseDirectoryOpts {
+        follow_symlinks_on_args,
+        follow_symlinks,
+        include_dot_and_double_dot,
+        list_contents_first,
+    } = opts;
+
     // Stack of the directories to process
     let mut stack: Vec<TreeNode> = Vec::new();
     // Stack of the filename (relative to CWD). Updated in sync with `stack` above
     let mut path_stack: Vec<Rc<[libc::c_char]>> = Vec::new();
+
+    // Used in `ls`
+    let mut subdirs: Vec<TreeNode> = Vec::new();
 
     let (starting_dir, path_components) = match open_long_filename(
         FileDescriptor::cwd(),
@@ -659,16 +739,29 @@ where
         match process_file(
             &path_stack,
             &starting_dir,
-            dir_filename,
+            dir_filename.clone(),
             follow_symlinks_on_args || follow_symlinks,
+            false,
             &mut file_handler,
             &mut err_reporter,
-            false,
         ) {
-            ProcessFileResult::ProcessedDirectory(node) => match node {
-                NodeOrMetadata::TreeNode(node) => stack.push(node),
-                NodeOrMetadata::Metadata(_) => unreachable!(),
-            },
+            ProcessFileResult::ProcessedDirectory(entry) => {
+                match OwnedDir::open_at(&starting_dir, dir_filename.as_ptr()) {
+                    Ok(new_dir) => {
+                        let node = TreeNode {
+                            dir: HybridDir::Owned(new_dir),
+                            filename: dir_filename,
+                            metadata: entry.metadata.unwrap(),
+                            path_depth: path_stack.len(),
+                        };
+                        stack.push(node);
+                    }
+                    Err(error) => {
+                        err_reporter(entry, error);
+                        return false;
+                    }
+                }
+            }
             ProcessFileResult::ProcessedFile => {
                 // `path` was not a directory
                 return false;
@@ -699,21 +792,22 @@ where
     let fd_threshold: usize = fd_rlim_cur as usize - 7;
 
     // Depth first traversal main loop
-    'outer: loop {
-        let current = match stack.last() {
-            Some(last) => last,
-            None => break, // Done, stack is empty
-        };
-
+    'outer: while let Some(current) = stack.last() {
         let dir = &current.dir;
         let dir_fd = match dir {
             HybridDir::Owned(dir) => dir.file_descriptor(),
             HybridDir::Deferred(dir) => &dir.open_file_descriptor(),
         };
 
+        // Resize `path_stack` to the appropriate depth.
+        debug_assert!(path_stack.len() >= current.path_depth);
+        path_stack.truncate(current.path_depth);
+
         // Push the directory's filename. The contents' filename will be concatenated to the
         // directory's filename.
         path_stack.push(current.filename.clone());
+
+        let path_depth = path_stack.len();
 
         {
             let mut dir_iter = dir.iter();
@@ -739,8 +833,8 @@ where
                                 // Need to report the filename of the directory itself so exclude
                                 // the last one
                                 &path_stack[..(path_stack.len() - 2)],
-                                &current.filename,
-                                Some(&current.metadata),
+                                current.filename.clone(),
+                                Some(current.metadata.clone()),
                             ),
                             Error::new(e, ErrorKind::ReadDir),
                         );
@@ -750,15 +844,20 @@ where
                     }
                 };
 
+                let is_dot_or_double_dot = entry.is_dot_or_double_dot();
+
                 // Skip . and ..
-                if entry.is_dot_or_double_dot() {
+                if is_dot_or_double_dot && !include_dot_and_double_dot {
                     continue;
                 }
 
                 let entry_filename = cstring_to_rc(entry.name_cstr());
 
                 let conserve_fds = match dir {
-                    HybridDir::Owned(_) => stack.len() >= fd_threshold,
+                    HybridDir::Owned(_) => {
+                        let used_fds = stack.len() + subdirs.len();
+                        used_fds >= fd_threshold
+                    }
                     HybridDir::Deferred(_) => {
                         // If parent is conserving file descriptors, so should its subdirectories
                         true
@@ -770,17 +869,13 @@ where
                     dir_fd,
                     entry_filename.clone(),
                     follow_symlinks,
+                    is_dot_or_double_dot,
                     &mut file_handler,
                     &mut err_reporter,
-                    conserve_fds,
                 ) {
-                    ProcessFileResult::ProcessedDirectory(node) => {
-                        // `dir_iter` has a dependency on `stack` so run it's `Drop` method first
-                        std::mem::drop(dir_iter);
-
-                        match node {
-                            NodeOrMetadata::TreeNode(node) => stack.push(node),
-                            NodeOrMetadata::Metadata(metadata) => match dir {
+                    ProcessFileResult::ProcessedDirectory(entry) => {
+                        let node = if conserve_fds {
+                            match dir {
                                 HybridDir::Owned(current_dir) => {
                                     let path = build_path(&path_stack, &entry_filename);
                                     let slow_dir = DeferredDir::new(
@@ -790,27 +885,51 @@ where
                                         )),
                                         path,
                                     );
-                                    stack.push(TreeNode {
+                                    TreeNode {
                                         dir: HybridDir::Deferred(slow_dir),
                                         filename: entry_filename,
-                                        metadata,
-                                    });
+                                        metadata: entry.metadata.unwrap(),
+                                        path_depth,
+                                    }
                                 }
                                 HybridDir::Deferred(current_dir) => {
                                     let slow_dir = DeferredDir::new(
                                         current_dir.parent().clone(),
                                         build_path(&path_stack, &entry_filename),
                                     );
-                                    stack.push(TreeNode {
+                                    TreeNode {
                                         dir: HybridDir::Deferred(slow_dir),
                                         filename: entry_filename,
-                                        metadata,
-                                    });
+                                        metadata: entry.metadata.unwrap(),
+                                        path_depth,
+                                    }
                                 }
-                            },
-                        }
+                            }
+                        } else {
+                            match OwnedDir::open_at(dir_fd, entry_filename.as_ptr()) {
+                                Ok(new_dir) => TreeNode {
+                                    dir: HybridDir::Owned(new_dir),
+                                    filename: entry_filename,
+                                    metadata: entry.metadata.unwrap(),
+                                    path_depth,
+                                },
+                                Err(error) => {
+                                    err_reporter(entry, error);
+                                    success = false;
+                                    continue;
+                                }
+                            }
+                        };
 
-                        continue 'outer;
+                        if list_contents_first {
+                            subdirs.push(node);
+                        } else {
+                            // `dir_iter` has a dependency on `stack` so run it's `Drop` method first
+                            std::mem::drop(dir_iter);
+
+                            stack.push(node);
+                            continue 'outer;
+                        }
                     }
                     ProcessFileResult::NotProcessed => {
                         success = false;
@@ -818,6 +937,21 @@ where
                     ProcessFileResult::ProcessedFile | ProcessFileResult::Skipped => (),
                 }
             }
+        }
+
+        if list_contents_first && !subdirs.is_empty() {
+            // Lexicographically sort for ls
+            subdirs.sort_by(|a, b| {
+                let filename_a = unsafe { CStr::from_ptr(a.filename.as_ptr()) };
+                let filename_b = unsafe { CStr::from_ptr(b.filename.as_ptr()) };
+                filename_a.cmp(filename_b)
+            });
+
+            // Add in reverse order because `stack` is a LIFO
+            while let Some(node) = subdirs.pop() {
+                stack.push(node);
+            }
+            continue 'outer;
         }
 
         // Undoes the `path_stack.push` above
@@ -831,18 +965,19 @@ where
             },
             None => &starting_dir,
         };
-        if let Err(_) = postprocess_dir(Entry::new(
+        if postprocess_dir(Entry::new(
             prev_dir,
             &path_stack,
-            &current.filename,
-            Some(&current.metadata),
-        )) {
+            current.filename.clone(),
+            Some(current.metadata.clone()),
+        ))
+        .is_err()
+        {
             success = false;
             // Don't `continue` here, falldown below
         }
 
-        // Go up a level in the tree
-        path_stack.pop();
+        // Process the next node
         stack.pop().unwrap();
     }
 

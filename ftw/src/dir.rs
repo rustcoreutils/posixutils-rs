@@ -87,7 +87,7 @@ impl OwnedDir {
         Ok(dir)
     }
 
-    pub fn iter<'a>(&'a self) -> OwnedDirIterator<'a> {
+    pub fn iter(&self) -> OwnedDirIterator<'_> {
         OwnedDirIterator {
             dirp: self.dirp,
             phantom: PhantomData,
@@ -150,7 +150,7 @@ impl DeferredDir {
         }
     }
 
-    pub fn iter<'a>(&'a self) -> DeferredDirIterator<'a> {
+    pub fn iter(&self) -> DeferredDirIterator<'_> {
         let file_descriptor = self.open_file_descriptor();
         let dir = OwnedDir::new(file_descriptor).unwrap();
         let dirp = dir.dirp;

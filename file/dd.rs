@@ -148,7 +148,7 @@ fn convert_swab(data: &mut [u8]) {
 fn convert_lcase(data: &mut [u8]) {
     for byte in data.iter_mut() {
         if *byte >= b'A' && *byte <= b'Z' {
-            *byte = *byte + 32;
+            *byte += 32;
         }
     }
 }
@@ -156,7 +156,7 @@ fn convert_lcase(data: &mut [u8]) {
 fn convert_ucase(data: &mut [u8]) {
     for byte in data.iter_mut() {
         if *byte >= b'a' && *byte <= b'z' {
-            *byte = *byte - 32;
+            *byte -= 32;
         }
     }
 }

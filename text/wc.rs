@@ -132,7 +132,7 @@ fn wc_file_bytes(count: &mut CountInfo, pathname: &PathBuf, chars_mode: bool) ->
 
         if !chars_mode {
             // number of bytes read
-            count.chars = count.chars + n_read;
+            count.chars += n_read;
         } else {
             // number of UTF-8 unicode codepoints in this slice of bytes
             count.chars += bufslice.iter().filter(|&ch| (ch >> 6) != 0b10).count();

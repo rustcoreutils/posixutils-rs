@@ -87,6 +87,7 @@ fn parse_setting(setting: &str) -> Result<bool, &'static str> {
     }
 }
 
+#[allow(clippy::assign_op_pattern)]
 fn set_mesg(fd: i32, st: libc::stat, setting: &str) -> io::Result<()> {
     let res = parse_setting(setting);
     if let Err(e) = res {

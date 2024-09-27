@@ -484,7 +484,7 @@ impl RawMagicFileLine {
         let mut tf_val = u64::from_be_bytes(array_buf);
 
         if let Some(mask) = mask {
-            tf_val = mask & tf_val;
+            tf_val &= mask;
         }
 
         match &self.value {

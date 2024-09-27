@@ -1,10 +1,10 @@
 [package]
 name = "posixutils-tree"
 version = "0.2.1"
-edition = "2021"
 authors = ["Jeff Garzik"]
-license = "MIT"
-repository = "https://github.com/rustcoreutils/posixutils-rs.git"
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
 
 [dependencies]
 plib = { path = "../plib" }
@@ -22,6 +22,9 @@ tempfile = "3.10"
 [features]
 posixutils_test_all = []
 requires_root = []
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "chgrp"

@@ -1,10 +1,10 @@
 [package]
 name = "posixutils-dev"
 version = "0.2.1"
-edition = "2021"
 authors = ["Jeff Garzik"]
-license = "MIT"
-repository = "https://github.com/rustcoreutils/posixutils-rs.git"
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
 
 [dependencies]
 plib = { path = "../plib" }
@@ -13,6 +13,9 @@ gettext-rs.workspace = true
 object =  { version = "0.35", features = ["read", "build", "elf"]}
 chrono.workspace = true
 ar = "0.9"
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "nm"

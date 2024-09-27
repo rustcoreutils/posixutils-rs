@@ -1,7 +1,10 @@
 [package]
 name = "m4-test-manager"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
 
 [dependencies]
 clap.workspace = true
+
+[lints]
+workspace = true

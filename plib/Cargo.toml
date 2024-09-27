@@ -1,15 +1,18 @@
 [package]
 name = "plib"
 version = "0.2.1"
-edition = "2021"
 authors = ["Jeff Garzik"]
-license = "MIT"
-repository = "https://github.com/rustcoreutils/posixutils-rs.git"
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
 
 [dependencies]
 cfg-if = "1.0"
 libc.workspace = true
 errno.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 doctest = false

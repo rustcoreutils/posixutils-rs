@@ -1,10 +1,10 @@
 [package]
 name = "posixutils-i18n"
 version = "0.2.1"
-edition = "2021"
 authors = ["Jeff Garzik"]
-license = "MIT"
-repository = "https://github.com/rustcoreutils/posixutils-rs.git"
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
 
 [dependencies]
 plib = { path = "../plib" }
@@ -12,6 +12,9 @@ clap.workspace = true
 gettext-rs.workspace = true
 bytemuck = { version = "1.17.0", features = ["derive"] }
 byteorder = "1.5.0"
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "gencat"

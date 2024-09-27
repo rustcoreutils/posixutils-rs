@@ -7,7 +7,7 @@
 //
 
 use clap::{error::ErrorKind, Parser};
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use thiserror::Error;
 
@@ -34,6 +34,16 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+#[derive(Parser)]
+#[command(version, about=gettext("talk - talk to another user"))]
+struct Args {
+    #[arg(help = gettext("Address to connect or listen to"))]
+    address: String,
+
+    #[arg(help = gettext("Terminal name to use (optional)"))]
+    ttyname: Option<String>,
+}
 
 /// A static variable to hold the state of delete invitations on SIGINT signal.
 static DELETE_INVITATIONS: LazyLock<
@@ -360,17 +370,6 @@ impl CtlRes {
         let mut cursor = Cursor::new(bytes);
         cursor.read_be()
     }
-}
-
-/// talk - talk to another user
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
-struct Args {
-    /// Address to connect or listen to
-    address: String,
-
-    /// Terminal name to use (optional)
-    ttyname: Option<String>,
 }
 
 fn talk(args: Args) -> Result<(), TalkError> {

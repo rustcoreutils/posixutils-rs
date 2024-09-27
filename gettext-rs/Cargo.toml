@@ -1,7 +1,10 @@
 [package]
 name = "gettext-rs"
 version = "0.2.1"
-edition = "2021"
+edition.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 name = "gettextrs"

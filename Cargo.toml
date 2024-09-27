@@ -27,6 +27,11 @@ members = [
 	"i18n"
 ]
 
+[workspace.package]
+repository = "https://github.com/rustcoreutils/posixutils-rs"
+license = "MIT"
+edition = "2021"
+
 [workspace.dependencies]
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "cargo"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -34,3 +39,6 @@ libc = "0.2"
 regex = "1.10"
 gettext-rs = { path = "./gettext-rs" }
 errno = "0.3"
+
+[workspace.lints]
+

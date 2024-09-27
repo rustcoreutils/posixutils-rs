@@ -1,10 +1,10 @@
 [package]
 name = "ftw"
 version = "0.2.1"
-edition = "2021"
 authors = ["Jeff Garzik"]
-license = "MIT"
-repository = "https://github.com/rustcoreutils/posixutils-rs.git"
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
 
 [dependencies]
 libc.workspace = true
@@ -12,6 +12,9 @@ errno.workspace = true
 
 [dev-dependencies]
 rand = "0.8.5"
+
+[lints]
+workspace = true
 
 [lib]
 doctest = false

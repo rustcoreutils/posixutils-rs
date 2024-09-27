@@ -1,10 +1,10 @@
 [package]
 name = "posixutils-screen"
 version = "0.2.1"
-edition = "2021"
 authors = ["Jeff Garzik"]
-license = "MIT"
-repository = "https://github.com/rustcoreutils/posixutils-rs.git"
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
 
 [dependencies]
 plib = { path = "../plib" }
@@ -13,6 +13,9 @@ gettext-rs.workspace = true
 terminfo = "0.8"
 termios = "0.3"
 libc.workspace = true
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "stty"

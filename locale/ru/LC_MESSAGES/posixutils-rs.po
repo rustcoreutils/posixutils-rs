@@ -1,0 +1,944 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) YEAR THE PACKAGE'S COPYRIGHT HOLDER
+# This file is distributed under the same license as the PACKAGE package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, YEAR.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: PACKAGE VERSION\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2024-09-27 11:29+0000\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: LANGUAGE <LL@li.org>\n"
+"Language: \n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+#: tree/ls.rs:828
+msgid "total"
+msgstr ""
+
+#: tree/ls.rs:1058
+msgid "not listing already-listed directory"
+msgstr ""
+
+#: tree/ls.rs:1082
+msgid "cannot access"
+msgstr ""
+
+#: tree/ln.rs:59
+msgid "Must supply a source and target for linking"
+msgstr ""
+
+#: tree/rmdir.rs:38
+msgid "Non-unicode directory name rejected"
+msgstr ""
+
+#: tree/common/mod.rs:120
+msgid "cannot access '{}': {}"
+msgstr ""
+
+#. 2.b. Issue a diagnostic, target and source are both untouched.
+#. This matches coreutils mv behavior.
+#: tree/common/mod.rs:137 tree/mv.rs:171
+msgid "'{}' and '{}' are the same file"
+msgstr ""
+
+#: tree/common/mod.rs:149
+msgid "-r not specified; omitting directory '{}'"
+msgstr ""
+
+#: tree/common/mod.rs:159 tree/mv.rs:193
+msgid "cannot overwrite non-directory '{}' with directory '{}'"
+msgstr ""
+
+#: tree/common/mod.rs:170
+msgid "cannot copy a directory, '{}', into itself, '{}'"
+msgstr ""
+
+#: tree/common/mod.rs:192
+msgid "cannot create directory '{}': {}"
+msgstr ""
+
+#: tree/common/mod.rs:212 tree/common/mod.rs:369 tree/common/mod.rs:397
+msgid "cannot open '{}' for reading: {}"
+msgstr ""
+
+#: tree/common/mod.rs:242 tree/common/mod.rs:754
+msgid "cannot create regular file '{}': {}"
+msgstr ""
+
+#: tree/common/mod.rs:260 tree/mv.rs:221
+msgid "will not overwrite just-created '{}' with '{}'"
+msgstr ""
+
+#: tree/common/mod.rs:300
+msgid "replace '{}', overriding mode {} ({})?"
+msgstr ""
+
+#: tree/common/mod.rs:310
+msgid "unwritable '{}' (mode {}, {}); try anyway?"
+msgstr ""
+
+#: tree/common/mod.rs:321 tree/mv.rs:148
+msgid "overwrite '{}'?"
+msgstr ""
+
+#: tree/common/mod.rs:538
+msgid "cannot open directory '{}': {}"
+msgstr ""
+
+#: tree/common/mod.rs:666 tree/mv.rs:346
+msgid "invalid filename: {}"
+msgstr ""
+
+#: tree/common/mod.rs:797
+msgid "failed to preserve times for '{}': {}"
+msgstr ""
+
+#: tree/common/mod.rs:840
+msgid "failed to preserve permissions for '{}': {}"
+msgstr ""
+
+#: tree/rm.rs:81
+msgid "descend into directory '{}'?"
+msgstr ""
+
+#: tree/rm.rs:86
+msgid "descend into write-protected directory '{}'?"
+msgstr ""
+
+#: tree/rm.rs:102
+msgid "remove directory '{}'?"
+msgstr ""
+
+#: tree/rm.rs:107
+msgid "remove write-protected directory '{}'?"
+msgstr ""
+
+#: tree/rm.rs:129
+msgid "remove socket '{}'?"
+msgstr ""
+
+#: tree/rm.rs:132
+msgid "remove symbolic link '{}'?"
+msgstr ""
+
+#: tree/rm.rs:135
+msgid "remove block special file '{}'?"
+msgstr ""
+
+#: tree/rm.rs:138
+msgid "remove character special file '{}'?"
+msgstr ""
+
+#: tree/rm.rs:141
+msgid "remove fifo '{}'?"
+msgstr ""
+
+#: tree/rm.rs:147
+msgid "remove regular empty file '{}'?"
+msgstr ""
+
+#: tree/rm.rs:149
+msgid "remove regular file '{}'?"
+msgstr ""
+
+#: tree/rm.rs:154
+msgid "remove write-protected regular empty file '{}'?"
+msgstr ""
+
+#: tree/rm.rs:158
+msgid "remove write-protected regular file '{}'?"
+msgstr ""
+
+#: tree/rm.rs:200 tree/rm.rs:297 tree/rm.rs:374 tree/rm.rs:400 tree/rm.rs:420
+msgid "cannot remove '{}': {}"
+msgstr ""
+
+#: tree/rm.rs:207 tree/rm.rs:328
+msgid "cannot remove directory '{}': {}"
+msgstr ""
+
+#: tree/rm.rs:238
+msgid "cannot remove '{}': Is a directory"
+msgstr ""
+
+#: tree/rm.rs:248
+msgid "refusing to remove '.' or '..' directory: skipping '{}'"
+msgstr ""
+
+#: tree/rm.rs:259
+msgid "it is dangerous to operate recursively on '/'"
+msgstr ""
+
+#: tree/rm.rs:262
+msgid "it is dangerous to operate recursively on '{}' (same as '/')"
+msgstr ""
+
+#: tree/rm.rs:345
+msgid "cannot access directory '{}': {}"
+msgstr ""
+
+#: tree/rm.rs:355
+msgid "error accessing directory entry: {}"
+msgstr ""
+
+#: tree/rm.rs:364 tree/cp.rs:132
+msgid "cannot stat '{}': {}"
+msgstr ""
+
+#: tree/cp.rs:115
+msgid "Must supply a source and target for copy"
+msgstr ""
+
+#: tree/mv.rs:201
+msgid "cannot overwrite directory '{}' with non-directory '{}'"
+msgstr ""
+
+#: tree/mv.rs:242
+msgid "cannot move '{}' to a subdirectory of itself, '{}'"
+msgstr ""
+
+#: tree/mv.rs:250
+msgid "cannot move '{}' to '{}': {}"
+msgstr ""
+
+#: tree/mv.rs:265
+msgid "'{}' to '{}'"
+msgstr ""
+
+#: tree/mv.rs:271
+msgid "inter-device move failed: {}"
+msgstr ""
+
+#: tree/mv.rs:284
+msgid "unable to remove target: {}"
+msgstr ""
+
+#: tree/mv.rs:363
+msgid "cannot remove '{}'"
+msgstr ""
+
+#: tree/mv.rs:385
+msgid "Must supply a source and target for move"
+msgstr ""
+
+#: dev/strip.rs:25
+msgid "strip - remove unnecessary information from strippable files"
+msgstr ""
+
+#: misc/test.rs:153 misc/test.rs:274
+msgid "unknown operator"
+msgstr ""
+
+#: misc/test.rs:299
+msgid "missing closing bracket"
+msgstr ""
+
+#: misc/test.rs:347 misc/test.rs:352
+msgid "invalid number of arguments"
+msgstr ""
+
+#: xform/compress.rs:81
+msgid "Do you want to overwrite {} (y)es or (n)o?"
+msgstr ""
+
+#: screen/tput.rs:21
+msgid "tput - change terminal characteristics"
+msgstr ""
+
+#: screen/tput.rs:23 screen/tabs.rs:27
+msgid "Indicate the type of terminal"
+msgstr ""
+
+#: screen/tput.rs:26
+msgid "Terminal operand to execute"
+msgstr ""
+
+#: screen/tput.rs:92
+msgid "Unknown terminal command"
+msgstr ""
+
+#: screen/tabs.rs:25
+msgid "tabs - set terminal tabs"
+msgstr ""
+
+#: screen/tabs.rs:33
+msgid "Specify repetitive tab stops separated by (1) columns"
+msgstr ""
+
+#: screen/tabs.rs:153
+msgid "Invalid tabstop value."
+msgstr ""
+
+#: screen/tabs.rs:181
+msgid "Terminal does not support hardware tabs."
+msgstr ""
+
+#: screen/tabs.rs:189
+msgid "Failed to clear tabs"
+msgstr ""
+
+#: screen/tabs.rs:204
+msgid "Failed to set tab"
+msgstr ""
+
+#: screen/stty.rs:29
+msgid "stty - set the options for a terminal"
+msgstr ""
+
+#: screen/stty.rs:36
+msgid ""
+"Write to standard output all the current settings, in human-readable form"
+msgstr ""
+
+#: screen/stty.rs:46
+msgid ""
+"Write to standard output all the current settings, in stty-readable form"
+msgstr ""
+
+#: screen/stty.rs:51
+msgid "List of terminal configuration commands"
+msgstr ""
+
+#: datetime/sleep.rs:16
+msgid "sleep - suspend execution for an interval"
+msgstr ""
+
+#: datetime/sleep.rs:20
+msgid "Number of seconds to sleep"
+msgstr ""
+
+#: datetime/cal.rs:20
+msgid "cal - print a calendar"
+msgstr ""
+
+#: datetime/cal.rs:25
+msgid ""
+"Specify the month to be displayed, represented as a decimal integer from 1 "
+"(January) to 12 (December)"
+msgstr ""
+
+#: datetime/cal.rs:33
+msgid ""
+"Specify the year for which the calendar is displayed, represented as a "
+"decimal integer from 1 to 9999"
+msgstr ""
+
+#: datetime/cal.rs:41
+msgid "January"
+msgstr ""
+
+#: datetime/cal.rs:42
+msgid "February"
+msgstr ""
+
+#: datetime/cal.rs:43
+msgid "March"
+msgstr ""
+
+#: datetime/cal.rs:44
+msgid "April"
+msgstr ""
+
+#: datetime/cal.rs:45
+msgid "May"
+msgstr ""
+
+#: datetime/cal.rs:46
+msgid "June"
+msgstr ""
+
+#: datetime/cal.rs:47
+msgid "July"
+msgstr ""
+
+#: datetime/cal.rs:48
+msgid "August"
+msgstr ""
+
+#: datetime/cal.rs:49
+msgid "September"
+msgstr ""
+
+#: datetime/cal.rs:50
+msgid "October"
+msgstr ""
+
+#: datetime/cal.rs:51
+msgid "November"
+msgstr ""
+
+#: datetime/cal.rs:52
+msgid "December"
+msgstr ""
+
+#: datetime/cal.rs:57
+msgid "Su Mo Tu We Th Fr Sa"
+msgstr ""
+
+#: datetime/cal.rs:119
+msgid "year must be between 1 and 9999"
+msgstr ""
+
+#: datetime/cal.rs:128
+msgid "month must be between 1 and 12"
+msgstr ""
+
+#: datetime/date.rs:22
+msgid "date - write the date and time"
+msgstr ""
+
+#: datetime/date.rs:28
+msgid "Perform operations as if the TZ env var was set to the string \"UTC0\""
+msgstr ""
+
+#: datetime/date.rs:35
+msgid ""
+"If prefixed with '+', Display the current time in the given FORMAT, as in "
+"strftime(3). Otherwise, set the current time to the given string"
+msgstr ""
+
+#: datetime/time.rs:22
+msgid "time - time a simple command or give resource usage"
+msgstr ""
+
+#: datetime/time.rs:28
+msgid "Write timing output to standard error in POSIX format"
+msgstr ""
+
+#: datetime/time.rs:32
+msgid "The utility to be invoked"
+msgstr ""
+
+#: datetime/time.rs:38
+msgid "Arguments for the utility"
+msgstr ""
+
+#: process/env.rs:20
+msgid "env - set the environment for command invocation"
+msgstr ""
+
+#: process/env.rs:26
+msgid ""
+"Invoke utility with exactly the environment specified by the arguments; the "
+"inherited environment shall be ignored completely"
+msgstr ""
+
+#: process/env.rs:31
+msgid "NAME=VALUE pairs, the utility to invoke, and its arguments"
+msgstr ""
+
+#: process/xargs.rs:29
+msgid "xargs - construct argument lists and invoke utility"
+msgstr ""
+
+#: process/xargs.rs:36
+msgid ""
+"The utility shall be executed for each non-empty number lines of arguments "
+"from standard input"
+msgstr ""
+
+#: process/xargs.rs:45
+msgid ""
+"Invoke utility using as many standard input arguments as possible, up to "
+"number"
+msgstr ""
+
+#: process/xargs.rs:54
+msgid ""
+"Invoke utility using as many standard input arguments as possible yielding a "
+"command line length less than size"
+msgstr ""
+
+#: process/xargs.rs:63
+msgid "Use eofstr as the logical end-of-file string"
+msgstr ""
+
+#: process/xargs.rs:67
+msgid "Insert mode"
+msgstr ""
+
+#: process/xargs.rs:70
+msgid "Prompt mode"
+msgstr ""
+
+#: process/xargs.rs:73
+msgid "Trace mode"
+msgstr ""
+
+#: process/xargs.rs:76
+msgid "Null-based processing"
+msgstr ""
+
+#: process/xargs.rs:83
+msgid ""
+"Terminate if a constructed command line will not fit in the implied or "
+"specified size"
+msgstr ""
+
+#: process/xargs.rs:88 process/nice.rs:37
+msgid "Utility to invoke"
+msgstr ""
+
+#: process/xargs.rs:91 process/nice.rs:40
+msgid "Utility arguments"
+msgstr ""
+
+#: process/nice.rs:20
+msgid "nice - invoke a utility with an altered nice value"
+msgstr ""
+
+#: process/nice.rs:29 process/renice.rs:29
+msgid ""
+"A positive or negative decimal integer which shall have the same effect on "
+"the execution of the utility as if the utility had called the nice() "
+"function with the numeric value of the increment option-argument"
+msgstr ""
+
+#: process/renice.rs:21
+msgid "renice - set nice values of running processes"
+msgstr ""
+
+#: process/renice.rs:41
+msgid ""
+"Interpret the following operands as unsigned decimal integer process group "
+"IDs"
+msgstr ""
+
+#: process/renice.rs:52
+msgid ""
+"Interpret the following operands as unsigned decimal integer process IDs. "
+"The -p option is the default if no options are specified"
+msgstr ""
+
+#: process/renice.rs:62
+msgid "Interpret the following operands as users"
+msgstr ""
+
+#: process/renice.rs:66
+msgid "Process id to adjust priority"
+msgstr ""
+
+#: process/timeout.rs:106
+msgid "timeout — execute a utility with a time limit"
+msgstr ""
+
+#: process/timeout.rs:108
+msgid "Only time out the utility itself, not its descendants."
+msgstr ""
+
+#: process/timeout.rs:111
+msgid "Preserve the exit status of the utility."
+msgstr ""
+
+#: process/timeout.rs:114
+msgid ""
+"Send a SIGKILL signal if the child process has not terminated after the time "
+"period."
+msgstr ""
+
+#: process/timeout.rs:117
+msgid "Specify the signal to send when the time limit is reached."
+msgstr ""
+
+#: process/timeout.rs:120
+msgid ""
+"The maximum amount of time to allow the utility to run, specified as a "
+"decimal number with an optional decimal fraction and an optional suffix."
+msgstr ""
+
+#: process/timeout.rs:123
+msgid "The utility to execute."
+msgstr ""
+
+#: process/timeout.rs:126
+msgid "Arguments to pass to the utility."
+msgstr ""
+
+#: fs/df.rs:20
+msgid "df - report free storage space"
+msgstr ""
+
+#: fs/df.rs:25
+msgid ""
+"Use 1024-byte units, instead of the default 512-byte units, when writing "
+"space figures"
+msgstr ""
+
+#: fs/df.rs:32
+msgid "Write information in a portable output format"
+msgstr ""
+
+#: fs/df.rs:39
+msgid "Include total allocated-space figures in the output"
+msgstr ""
+
+#: fs/df.rs:44
+msgid "A pathname of a file within the hierarchy of the desired file system"
+msgstr ""
+
+#: users/write.rs:50
+msgid "No terminals found for user"
+msgstr ""
+
+#: users/write.rs:64
+msgid "No valid terminals found for user"
+msgstr ""
+
+#: users/write.rs:100
+msgid "Error checking metadata for terminal"
+msgstr ""
+
+#: users/write.rs:236
+msgid "Permission denied"
+msgstr ""
+
+#: users/mesg.rs:65
+msgid "fstat failed"
+msgstr ""
+
+#: users/mesg.rs:115
+msgid "failed to change terminal mode"
+msgstr ""
+
+#: sys/ipcrm.rs:23
+msgid ""
+"ipcrm - remove an XSI message queue, semaphore set, or shared memory segment "
+"identifier"
+msgstr ""
+
+#: sys/ipcrm.rs:29
+msgid "Remove the shared memory identifier semid from the system"
+msgstr ""
+
+#: sys/ipcrm.rs:36
+msgid ""
+"Remove the shared memory identifier, created with key semkey, from the system"
+msgstr ""
+
+#: sys/ipcrm.rs:43
+msgid "Remove the shared memory identifier shmid from the system"
+msgstr ""
+
+#: sys/ipcrm.rs:50
+msgid ""
+"Remove the shared memory identifier, created with key shmkey, from the system"
+msgstr ""
+
+#: sys/ipcrm.rs:58
+msgid "Remove the message queue identifier msgid from the system"
+msgstr ""
+
+#: sys/ipcrm.rs:66
+msgid ""
+"Remove the message queue identifier, created with key msgkey, from the system"
+msgstr ""
+
+#: sys/ipcs.rs:123
+msgid "Message Queue facility not in system."
+msgstr ""
+
+#: sys/ipcs.rs:141
+msgid "Shared Memory facility not in system."
+msgstr ""
+
+#: sys/who.rs:158
+msgid "USER"
+msgstr ""
+
+#: sys/who.rs:159
+msgid "LINE"
+msgstr ""
+
+#: sys/who.rs:160
+msgid "TIME"
+msgstr ""
+
+#: sys/who.rs:217
+msgid "who: -f option not yet implemented"
+msgstr ""
+
+#: sys/getconf.rs:23
+msgid "getconf - get configuration values"
+msgstr ""
+
+#: sys/getconf.rs:25
+msgid "Variable to get the value of"
+msgstr ""
+
+#: sys/getconf.rs:28
+msgid "Pathname for path configuration variables"
+msgstr ""
+
+#: sys/getconf.rs:34
+msgid "Specification for the variable (optional)"
+msgstr ""
+
+#: sys/getconf.rs:64 sys/getconf.rs:79
+msgid "Error: Unknown system configuration variable"
+msgstr ""
+
+#: sys/getconf.rs:111 sys/getconf.rs:126 sys/getconf.rs:143
+msgid "Error: Unknown configuration string variable"
+msgstr ""
+
+#: sys/getconf.rs:165 sys/getconf.rs:181
+msgid "Error: Unknown path configuration variable"
+msgstr ""
+
+#: pathnames/pathchk.rs:20
+msgid "pathchk - check pathnames"
+msgstr ""
+
+#: pathnames/pathchk.rs:27
+msgid ""
+"Instead of performing checks based on the underlying file system, perform "
+"portable, POSIX-compliant checks"
+msgstr ""
+
+#: pathnames/pathchk.rs:37
+msgid ""
+"Instead of performing checks based on the underlying file system, check each "
+"component in pathname for basic validity"
+msgstr ""
+
+#: pathnames/pathchk.rs:43
+msgid "The pathnames to be checked"
+msgstr ""
+
+#: pathnames/dirname.rs:19
+msgid "dirname - return the directory portion of a pathname"
+msgstr ""
+
+#: pathnames/basename.rs:18
+msgid "basename - return non-directory portion of a pathname"
+msgstr ""
+
+#. "Page" seems to be the only thing that's translated.
+#.
+#. "The LC_MESSAGES locale category affects the spelling of page;"
+#.
+#. https://www.gnu.org/software/coreutils/manual/html_node/pr-invocation.html
+#: text/pr.rs:91
+msgid "Page"
+msgstr ""
+
+#: text/asa.rs:84
+msgid "malformed line"
+msgstr ""
+
+#: sccs/what.rs:18
+msgid "what - identify SCCS files"
+msgstr ""
+
+#: sccs/what.rs:23
+msgid "Display at most one identification string per file"
+msgstr ""
+
+#: sccs/what.rs:27 file/od.rs:80
+msgid "Input files"
+msgstr ""
+
+#: sccs/what.rs:66
+msgid "Cannot open file"
+msgstr ""
+
+#: awk/src/main.rs:26
+msgid "awk - pattern scanning and processing language"
+msgstr ""
+
+#: awk/src/main.rs:28
+msgid "Define the input field separator"
+msgstr ""
+
+#: awk/src/main.rs:34
+msgid "Specify the program files"
+msgstr ""
+
+#: awk/src/main.rs:41
+msgid "Globals assignments, executed before the start of the program"
+msgstr ""
+
+#: display/printf.rs:331
+msgid "printf: not enough arguments"
+msgstr ""
+
+#: file/tee.rs:18
+msgid "tee - duplicate standard input"
+msgstr ""
+
+#: file/tee.rs:20
+msgid "Append the output to the files"
+msgstr ""
+
+#: file/tee.rs:23
+msgid "Ignore the SIGINT signal"
+msgstr ""
+
+#: file/tee.rs:26
+msgid "One or more output files"
+msgstr ""
+
+#: file/split.rs:19
+msgid "split - split a file into pieces"
+msgstr ""
+
+#: file/split.rs:27 file/split.rs:38
+msgid ""
+"Use suffix_length letters to form the suffix portion of the filenames of the "
+"split file"
+msgstr ""
+
+#: file/split.rs:47
+msgid "Split a file into pieces n bytes in size"
+msgstr ""
+
+#: file/split.rs:51
+msgid "File to be split"
+msgstr ""
+
+#: file/split.rs:54
+msgid "Prefix of output files"
+msgstr ""
+
+#: file/cat.rs:22
+msgid "cat - concatenate and print files"
+msgstr ""
+
+#: file/cat.rs:28
+msgid "Disable output buffering (a no-op, for POSIX compat)"
+msgstr ""
+
+#: file/cat.rs:32
+msgid "Files to read as input. Use '-' or no-args for stdin"
+msgstr ""
+
+#: file/od.rs:22
+msgid "od - dump files in octal and other formats"
+msgstr ""
+
+#: file/od.rs:27
+msgid ""
+"Address base (d for decimal, o for octal, x for hexadecimal, n for none)"
+msgstr ""
+
+#: file/od.rs:32
+msgid "Skip bytes from the beginning of the input"
+msgstr ""
+
+#: file/od.rs:35
+msgid "Read only the specified number of bytes"
+msgstr ""
+
+#: file/od.rs:38
+msgid "Select the output format"
+msgstr ""
+
+#: file/od.rs:43
+msgid "Interpret bytes in octal"
+msgstr ""
+
+#: file/od.rs:49
+msgid "Interpret words (two-byte units) in unsigned decimal"
+msgstr ""
+
+#: file/od.rs:55
+msgid "Interpret words (two-byte units) in octal"
+msgstr ""
+
+#: file/od.rs:61
+msgid "Interpret bytes as characters"
+msgstr ""
+
+#: file/od.rs:67
+msgid "Interpret words (two-byte units) in signed decimal"
+msgstr ""
+
+#: file/od.rs:73
+msgid "Interpret words (two-byte units) in hexadecimal"
+msgstr ""
+
+#: file/od.rs:77
+msgid "Verbose output"
+msgstr ""
+
+#: file/file.rs:28
+msgid "file - determine file type"
+msgstr ""
+
+#: file/file.rs:38
+msgid ""
+"Apply default position-sensitive system tests and context-sensitive system "
+"tests to the file"
+msgstr ""
+
+#: file/file.rs:46
+msgid "Identify symbolic link with non existent file as symbolic link"
+msgstr ""
+
+#: file/file.rs:53
+msgid "Don't perform further classification on regular file"
+msgstr ""
+
+#: file/file.rs:59
+msgid "File containing position-sensitive tests"
+msgstr ""
+
+#: file/file.rs:65
+msgid "File containing additional position-sensitive tests"
+msgstr ""
+
+#: file/cmp.rs:18
+msgid "cmp - compare two files"
+msgstr ""
+
+#: file/cmp.rs:25
+msgid ""
+"Write the byte number (decimal) and the differing bytes (octal) for each "
+"difference"
+msgstr ""
+
+#: file/cmp.rs:35
+msgid "Write nothing for differing files; return exit status only"
+msgstr ""
+
+#: file/cmp.rs:41
+msgid ""
+"A pathname of the first file to be compared. If file1 is '-', the standard "
+"input shall be used"
+msgstr ""
+
+#: file/cmp.rs:48
+msgid ""
+"A pathname of the second file to be compared. If file2 is '-', the standard "
+"input shall be used"
+msgstr ""
+
+#: file/dd.rs:309
+msgid "invalid conv option"
+msgstr ""
+
+#: file/dd.rs:331
+msgid "invalid block size suffix"
+msgstr ""
+
+#: file/dd.rs:350 file/dd.rs:376
+msgid "invalid option"
+msgstr ""
+
+#: i18n/gencat.rs:31
+msgid "gencat - generate a formatted message catalog"
+msgstr ""
+
+#: i18n/gencat.rs:33
+msgid "A pathname of the formatted message catalog"
+msgstr ""
+
+#: i18n/gencat.rs:36
+msgid "A pathname of a message text source file"
+msgstr ""

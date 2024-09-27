@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 pub fn setlocale<T: Into<Vec<u8>>>(_category: LocaleCategory, locale: T) -> Option<Vec<u8>> {
     Some(locale.into())
 }
@@ -11,6 +13,14 @@ where
     U: Into<String>,
 {
     Ok(None)
+}
+
+pub fn bindtextdomain<T, U>(_domainname: T, dirname: U) -> Result<PathBuf, std::io::Error>
+where
+    T: Into<Vec<u8>>,
+    U: Into<PathBuf>,
+{
+    Ok(dirname.into())
 }
 
 pub fn textdomain<T: Into<Vec<u8>>>(domainname: T) -> Result<Vec<u8>, std::io::Error> {

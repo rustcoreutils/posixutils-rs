@@ -137,12 +137,7 @@ fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
     if path1_is_file && path2_is_file {
         FileDiff::file_diff(path1, path2, &format_options, None)
     } else if !path1_is_file && !path2_is_file {
-        DirDiff::dir_diff(
-            PathBuf::from(path1),
-            PathBuf::from(path2),
-            &format_options,
-            args.recurse,
-        )
+        DirDiff::dir_diff(path1, path2, &format_options, args.recurse)
     } else {
         FileDiff::file_dir_diff(path1, path2, &format_options)
     }

@@ -34,8 +34,8 @@ impl<'a> DirDiff<'a> {
         format_options: &FormatOptions,
         recursive: bool,
     ) -> io::Result<DiffExitStatus> {
-        let mut dir1: DirData = DirData::load(PathBuf::from(path1))?;
-        let mut dir2: DirData = DirData::load(PathBuf::from(path2))?;
+        let mut dir1: DirData = DirData::load(path1)?;
+        let mut dir2: DirData = DirData::load(path2)?;
 
         let mut dir_diff = DirDiff::new(&mut dir1, &mut dir2, &format_options, recursive);
         dir_diff.analyze()

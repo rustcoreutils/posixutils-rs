@@ -163,6 +163,7 @@ impl UnixLZWReader {
         }
     }
 
+    #[allow(clippy::assign_op_pattern)]
     fn getcode(&mut self) -> i32 {
         if self.clear || self.roffset >= self.size || self.free_ent > self.maxcode {
             // as free_ent represents the index of the next available entry that can be made

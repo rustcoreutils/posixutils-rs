@@ -6,10 +6,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-extern crate clap;
-extern crate gettextrs;
-extern crate plib;
-
 use clap::{error::ErrorKind, Parser};
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
@@ -430,35 +426,6 @@ fn talk(args: Args) -> Result<(), TalkError> {
     }
 
     Ok(())
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::try_parse().unwrap_or_else(|err| {
-        if err.kind() == ErrorKind::DisplayHelp || err.kind() == ErrorKind::DisplayVersion {
-            // Print help or version message
-            eprintln!("{}", err);
-        } else {
-            // Print custom error message
-            eprintln!("Error parsing arguments: {}", err);
-        }
-
-        // Exit with a non-zero status code
-        std::process::exit(1);
-    });
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
-
-    let mut exit_code = 0;
-
-    register_signals();
-
-    if let Err(err) = talk(args) {
-        exit_code = 1;
-        eprint!("{}", err);
-    }
-
-    process::exit(exit_code)
 }
 
 /// Checks if the standard input is a TTY (terminal).
@@ -1741,4 +1708,33 @@ fn get_terminal_size() -> (u16, u16) {
     }
 
     (size.ws_col, size.ws_row)
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::try_parse().unwrap_or_else(|err| {
+        if err.kind() == ErrorKind::DisplayHelp || err.kind() == ErrorKind::DisplayVersion {
+            // Print help or version message
+            eprintln!("{}", err);
+        } else {
+            // Print custom error message
+            eprintln!("Error parsing arguments: {}", err);
+        }
+
+        // Exit with a non-zero status code
+        std::process::exit(1);
+    });
+    setlocale(LocaleCategory::LcAll, "");
+    textdomain(PROJECT_NAME)?;
+    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+
+    let mut exit_code = 0;
+
+    register_signals();
+
+    if let Err(err) = talk(args) {
+        exit_code = 1;
+        eprint!("{}", err);
+    }
+
+    process::exit(exit_code)
 }

@@ -76,19 +76,13 @@ struct Mount {
     cached_statfs: libc::statfs,
 }
 
+#[derive(Default)]
 struct MountList {
     mounts: Vec<Mount>,
     has_masks: bool,
 }
 
 impl MountList {
-    fn new() -> MountList {
-        MountList {
-            mounts: Vec::new(),
-            has_masks: false,
-        }
-    }
-
     fn mask_all(&mut self) {
         for mount in &mut self.mounts {
             mount.masked = true;
@@ -147,7 +141,7 @@ fn read_mount_info() -> io::Result<MountList> {
 
 #[cfg(target_os = "linux")]
 fn read_mount_info() -> io::Result<MountList> {
-    let mut info = MountList::new();
+    let mut info = MountList::default();
 
     unsafe {
         let path_mnt = CString::new(_PATH_MOUNTED).unwrap();

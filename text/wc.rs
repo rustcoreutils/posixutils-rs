@@ -38,6 +38,7 @@ struct Args {
     files: Vec<PathBuf>,
 }
 
+#[derive(Default)]
 struct CountInfo {
     words: usize,
     chars: usize,
@@ -45,14 +46,6 @@ struct CountInfo {
 }
 
 impl CountInfo {
-    fn new() -> CountInfo {
-        CountInfo {
-            words: 0,
-            chars: 0,
-            nl: 0,
-        }
-    }
-
     fn accum(&mut self, count: &CountInfo) {
         self.words = self.words + count.words;
         self.chars = self.chars + count.chars;
@@ -191,11 +184,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
     let mut exit_code = 0;
-    let mut totals = CountInfo::new();
+    let mut totals = CountInfo::default();
 
     // input via stdin
     if args.files.is_empty() {
-        let mut count = CountInfo::new();
+        let mut count = CountInfo::default();
 
         if let Err(e) = wc_file(&args, chars_mode, &PathBuf::new(), &mut count) {
             exit_code = 1;
@@ -205,7 +198,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // input files
     } else {
         for filename in &args.files {
-            let mut count = CountInfo::new();
+            let mut count = CountInfo::default();
 
             if let Err(e) = wc_file(&args, chars_mode, filename, &mut count) {
                 exit_code = 1;

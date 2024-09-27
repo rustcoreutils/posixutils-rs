@@ -26,10 +26,6 @@ impl Default for Hunk {
 }
 
 impl Hunk {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn from(change: Change) -> Self {
         let (ln1, ln2) = change.get_lns();
 
@@ -318,17 +314,12 @@ impl Hunk {
     }
 }
 
+#[derive(Default)]
 pub struct Hunks {
     hunks: Vec<Hunk>,
 }
 
 impl Hunks {
-    pub fn new() -> Self {
-        Self {
-            hunks: vec![Hunk::new(); 0],
-        }
-    }
-
     pub fn add_change(&mut self, change: Change) {
         if let Some(last_hunk) = self.hunks.last_mut() {
             let last_change_kind = last_hunk.kind();

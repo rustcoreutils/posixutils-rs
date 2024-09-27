@@ -47,7 +47,7 @@ impl<'a> FileDiff<'a> {
         Self {
             file1,
             file2,
-            hunks: Hunks::new(),
+            hunks: Hunks::default(),
             format_options: format_options,
             are_different: false,
         }

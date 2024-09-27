@@ -7,12 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
-extern crate clap;
-extern crate libc;
-extern crate plib;
-
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use std::ffi::{CStr, CString};
 use std::io;
@@ -20,23 +16,33 @@ use std::io;
 #[cfg(target_os = "linux")]
 const _PATH_MOUNTED: &'static str = "/etc/mtab";
 
-/// df - report free storage space
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about = gettext("df - report free storage space"))]
 struct Args {
-    /// Use 1024-byte units, instead of the default 512-byte units, when writing space figures.
-    #[arg(short, long)]
+    #[arg(
+        short,
+        long,
+        help = gettext("Use 1024-byte units, instead of the default 512-byte units, when writing space figures")
+    )]
     kilo: bool,
 
-    /// Write information in a portable output format
-    #[arg(short = 'P', long)]
+    #[arg(
+        short = 'P',
+        long,
+        help = gettext("Write information in a portable output format")
+    )]
     portable: bool,
 
-    /// Include total allocated-space figures in the output.
-    #[arg(short, long)]
+    #[arg(
+        short,
+        long,
+        help = gettext("Include total allocated-space figures in the output")
+    )]
     total: bool,
 
-    /// A pathname of a file within the hierarchy of the desired file system.
+    #[arg(
+        help = gettext("A pathname of a file within the hierarchy of the desired file system")
+    )]
     files: Vec<String>,
 }
 
@@ -132,7 +138,7 @@ fn read_mount_info() -> io::Result<MountList> {
         for mount in mounts {
             let devname = to_cstr(&mount.f_mntfromname);
             let dirname = to_cstr(&mount.f_mntonname);
-            info.push(&mount, devname, dirname);
+            info.push(mount, devname, dirname);
         }
     }
 
@@ -165,7 +171,12 @@ fn read_mount_info() -> io::Result<MountList> {
             let mut mount: libc::statfs = std::mem::zeroed();
             let rc = libc::statfs(dirname.as_ptr(), &mut mount);
             if rc < 0 {
-                return Err(io::Error::last_os_error());
+                eprintln!(
+                    "{}: {}",
+                    dirname.to_str().unwrap(),
+                    io::Error::last_os_error()
+                );
+                continue;
             }
 
             info.push(&mount, devname, dirname);
@@ -244,7 +255,7 @@ fn show_info(args: &Args, info: &MountList) {
 
     for mount in &info.mounts {
         if mount.masked {
-            show_mount(args, block_size, &mount);
+            show_mount(args, block_size, mount);
         }
     }
 }

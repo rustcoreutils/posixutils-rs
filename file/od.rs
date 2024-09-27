@@ -9,7 +9,7 @@
 //
 use crate::io::ErrorKind;
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use std::fs::File;
 use std::io::{self, BufReader, Error, Read, Seek, SeekFrom};
@@ -18,58 +18,69 @@ use std::path::PathBuf;
 use std::slice::Chunks;
 use std::str::FromStr;
 
-/// Hex, octal, ASCII, and other types of dumps
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about = gettext("od - dump files in octal and other formats"))]
 struct Args {
-    /// Address base (d for decimal, o for octal, x for hexadecimal, n for none)
-    #[arg(short = 'A')]
+    #[arg(
+        short = 'A',
+        help = gettext(
+            "Address base (d for decimal, o for octal, x for hexadecimal, n for none)"
+        )
+    )]
     address_base: Option<char>,
 
-    /// Skip bytes from the beginning of the input
-    #[arg(short = 'j')]
+    #[arg(short = 'j', help = gettext("Skip bytes from the beginning of the input"))]
     skip: Option<String>,
 
-    /// Read only the specified number of bytes
-    #[arg(short = 'N')]
+    #[arg(short = 'N', help = gettext("Read only the specified number of bytes"))]
     count: Option<String>,
 
-    /// Select the output format
-    #[arg(short = 't')]
+    #[arg(short = 't', help = gettext("Select the output format"))]
     type_strings: Vec<String>,
 
-    /// Interpret bytes in octal
-    #[arg(short = 'b')]
+    #[arg(
+        short = 'b',
+        help = gettext("Interpret bytes in octal")
+    )]
     octal_bytes: bool,
 
-    /// Interpret words (two-byte units) in unsigned decimal
-    #[arg(short = 'd')]
+    #[arg(
+        short = 'd',
+        help = gettext("Interpret words (two-byte units) in unsigned decimal")
+    )]
     unsigned_decimal_words: bool,
 
-    /// Interpret words (two-byte units) in octal
-    #[arg(short = 'o')]
+    #[arg(
+        short = 'o',
+        help = gettext("Interpret words (two-byte units) in octal")
+    )]
     octal_words: bool,
 
-    /// Interpret bytes as characters
-    #[arg(short = 'c')]
+    #[arg(
+        short = 'c',
+        help = gettext("Interpret bytes as characters")
+    )]
     bytes_char: bool,
 
-    /// Interpret words (two-byte units) in signed decimal
-    #[arg(short = 's')]
+    #[arg(
+        short = 's',
+        help = gettext("Interpret words (two-byte units) in signed decimal")
+    )]
     signed_decimal_words: bool,
 
-    /// Interpret words (two-byte units) in hexadecimal
-    #[arg(short = 'x')]
+    #[arg(
+        short = 'x',
+        help = gettext("Interpret words (two-byte units) in hexadecimal")
+    )]
     hex_words: bool,
 
-    /// Verbose output
-    #[arg(short = 'v')]
+    #[arg(short = 'v', help = gettext("Verbose output"))]
     verbose: bool,
 
-    /// Input files
+    #[arg(help = gettext("Input files"))]
     files: Vec<PathBuf>,
 
-    #[clap(skip)]
+    #[arg(skip)]
     /// Offset in the file where dumping is to commence, must start with "+"]
     offset: Option<String>,
 }
@@ -177,14 +188,15 @@ fn parse_skip(offset: &str) -> Result<u64, Box<dyn std::error::Error>> {
     let (number, multiplier) = if offset.starts_with("0x") || offset.starts_with("0X") {
         // For hexadecimal, 'b' should be part of the number if it is the last character
         (offset, 1)
-    } else if offset.ends_with('b') {
-        (&offset[..offset.len() - 1], 512)
-    } else if offset.ends_with('k') {
-        (&offset[..offset.len() - 1], 1024)
-    } else if offset.ends_with('m') {
-        (&offset[..offset.len() - 1], 1048576)
     } else {
-        (offset, 1)
+        let mut chars = offset.chars();
+
+        match chars.next_back() {
+            Some('b') => (chars.as_str(), 512),
+            Some('k') => (chars.as_str(), 1024),
+            Some('m') => (chars.as_str(), 1048576),
+            _ => (offset, 1),
+        }
     };
 
     let base_value = parse_count::<u64>(number)?;
@@ -311,8 +323,13 @@ fn parse_offset(offset: &str) -> Result<u64, Box<dyn std::error::Error>> {
 /// 12. Continues until all data is read or the count limit is reached.
 /// 13. Prints the final address in the specified base format.
 ///
-fn print_data<R: Read>(reader: &mut R, config: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    let mut offset = 0; // Initialize offset for printing addresses.
+fn print_data<R: Read>(
+    reader: &mut R,
+    config: &Args,
+    bytes_that_will_be_skipped: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // The bytes have been skipped now. The offset will be > 0 if skipping was performed.
+    let mut offset = bytes_that_will_be_skipped; // Initialize offset for printing addresses.
 
     let mut buffer = [0; 16]; // Buffer to read data in chunks of 16 bytes.
     let mut previous_offset_string = String::new();
@@ -351,25 +368,27 @@ fn print_data<R: Read>(reader: &mut R, config: &Args) -> Result<(), Box<dyn std:
             }
         }
 
+        let local_buf_len = local_buf.len();
+
         // Print the address in the specified base format.
         let offset_string = if let Some(base) = config.address_base {
             match base {
-                'd' => format!("{:07} ", offset),  // Decimal format
-                'o' => format!("{:07o} ", offset), // Octal format
-                'x' => format!("{:07x} ", offset), // Hexadecimal format
-                'n' => String::new(),              // No address printed
-                _ => format!("{:07o} ", offset),   // Default to Octal if invalid base
+                'd' => format!("{:07}", offset),  // Decimal format
+                'o' => format!("{:07o}", offset), // Octal format
+                'x' => format!("{:06x}", offset), // Hexadecimal format (only six characters)
+                'n' => String::new(),             // No address printed
+                _ => format!("{:07o}", offset),   // Default to octal if invalid base
             }
         } else {
-            format!("{:07o} ", offset) // Default to octal if no base is specified.
+            format!("{:07o}", offset) // Default to octal if no base is specified.
         };
 
         // Process and print the buffer based on configuration.
         if config.bytes_char {
             // Print bytes as characters.
 
-            let res = process_formatter(&BCFormatter, local_buf);
-            proccess_res_string(
+            let res = process_formatter(&BCFormatter, local_buf, local_buf_len);
+            process_res_string(
                 &offset_string,
                 &mut previous_offset_string,
                 &mut previous_asterisk,
@@ -379,8 +398,8 @@ fn print_data<R: Read>(reader: &mut R, config: &Args) -> Result<(), Box<dyn std:
         } else if config.type_strings.is_empty() {
             // Process the buffer in chunks of 2 bytes.
             let chunks = local_buf.chunks(2);
-            let res = process_chunks_formatter(&OFormatter, chunks);
-            proccess_res_string(
+            let res = process_chunks_formatter(&OFormatter, chunks, 2, local_buf_len);
+            process_res_string(
                 &offset_string,
                 &mut previous_offset_string,
                 &mut previous_asterisk,
@@ -402,8 +421,8 @@ fn print_data<R: Read>(reader: &mut R, config: &Args) -> Result<(), Box<dyn std:
                 let chunks = local_buf.chunks(num_bytes);
                 match type_char {
                     'a' => {
-                        let res = process_formatter(&AFormatter, local_buf);
-                        proccess_res_string(
+                        let res = process_formatter(&AFormatter, local_buf, local_buf_len);
+                        process_res_string(
                             &offset_string,
                             &mut previous_offset_string,
                             &mut previous_asterisk,
@@ -412,8 +431,8 @@ fn print_data<R: Read>(reader: &mut R, config: &Args) -> Result<(), Box<dyn std:
                         );
                     }
                     'c' => {
-                        let res = process_formatter(&CFormatter, local_buf);
-                        proccess_res_string(
+                        let res = process_formatter(&CFormatter, local_buf, local_buf_len);
+                        process_res_string(
                             &offset_string,
                             &mut previous_offset_string,
                             &mut previous_asterisk,
@@ -423,14 +442,15 @@ fn print_data<R: Read>(reader: &mut R, config: &Args) -> Result<(), Box<dyn std:
                     }
                     'u' => {
                         // Check if the number of bytes is valid for unsigned integers.
-                        if !(num_bytes == 1 || num_bytes == 2 || num_bytes == 4 || num_bytes == 8) {
+                        if !matches!(num_bytes, 1 | 2 | 4 | 8) {
                             return Err(Box::new(Error::new(
                                 ErrorKind::Other,
                                 format!("invalid type string `u{}`", num_bytes),
                             )));
                         }
-                        let res = process_chunks_formatter(&UFormatter, chunks);
-                        proccess_res_string(
+                        let res =
+                            process_chunks_formatter(&UFormatter, chunks, num_bytes, local_buf_len);
+                        process_res_string(
                             &offset_string,
                             &mut previous_offset_string,
                             &mut previous_asterisk,
@@ -440,14 +460,15 @@ fn print_data<R: Read>(reader: &mut R, config: &Args) -> Result<(), Box<dyn std:
                     }
                     'd' => {
                         // Check if the number of bytes is valid for signed integers.
-                        if !(num_bytes == 1 || num_bytes == 2 || num_bytes == 4 || num_bytes == 8) {
+                        if !matches!(num_bytes, 1 | 2 | 4 | 8) {
                             return Err(Box::new(Error::new(
                                 ErrorKind::Other,
                                 format!("invalid type string `d{}`", num_bytes),
                             )));
                         }
-                        let res = process_chunks_formatter(&DFormatter, chunks);
-                        proccess_res_string(
+                        let res =
+                            process_chunks_formatter(&DFormatter, chunks, num_bytes, local_buf_len);
+                        process_res_string(
                             &offset_string,
                             &mut previous_offset_string,
                             &mut previous_asterisk,
@@ -457,14 +478,15 @@ fn print_data<R: Read>(reader: &mut R, config: &Args) -> Result<(), Box<dyn std:
                     }
                     'x' => {
                         // Check if the number of bytes is valid for hexadecimal format.
-                        if !(num_bytes == 1 || num_bytes == 2 || num_bytes == 4 || num_bytes == 8) {
+                        if !matches!(num_bytes, 1 | 2 | 4 | 8) {
                             return Err(Box::new(Error::new(
                                 ErrorKind::Other,
                                 format!("invalid type string `x{}`", num_bytes),
                             )));
                         }
-                        let res = process_chunks_formatter(&XFormatter, chunks);
-                        proccess_res_string(
+                        let res =
+                            process_chunks_formatter(&XFormatter, chunks, num_bytes, local_buf_len);
+                        process_res_string(
                             &offset_string,
                             &mut previous_offset_string,
                             &mut previous_asterisk,
@@ -474,14 +496,15 @@ fn print_data<R: Read>(reader: &mut R, config: &Args) -> Result<(), Box<dyn std:
                     }
                     'o' => {
                         // Check if the number of bytes is valid for octal format.
-                        if !(num_bytes == 1 || num_bytes == 2 || num_bytes == 4 || num_bytes == 8) {
+                        if !matches!(num_bytes, 1 | 2 | 4 | 8) {
                             return Err(Box::new(Error::new(
                                 ErrorKind::Other,
                                 format!("invalid type string `o{}`", num_bytes),
                             )));
                         }
-                        let res = process_chunks_formatter(&OFormatter, chunks);
-                        proccess_res_string(
+                        let res =
+                            process_chunks_formatter(&OFormatter, chunks, num_bytes, local_buf_len);
+                        process_res_string(
                             &offset_string,
                             &mut previous_offset_string,
                             &mut previous_asterisk,
@@ -491,14 +514,15 @@ fn print_data<R: Read>(reader: &mut R, config: &Args) -> Result<(), Box<dyn std:
                     }
                     'f' => {
                         // Check if the number of bytes is valid for floats.
-                        if !(num_bytes == 4 || num_bytes == 8) {
+                        if !(matches!(num_bytes, 4 | 8)) {
                             return Err(Box::new(Error::new(
                                 ErrorKind::Other,
                                 format!("invalid type string `f{}`", num_bytes),
                             )));
                         }
-                        let res = process_chunks_formatter(&FFormatter, chunks);
-                        proccess_res_string(
+                        let res =
+                            process_chunks_formatter(&FFormatter, chunks, num_bytes, local_buf_len);
+                        process_res_string(
                             &offset_string,
                             &mut previous_offset_string,
                             &mut previous_asterisk,
@@ -508,8 +532,8 @@ fn print_data<R: Read>(reader: &mut R, config: &Args) -> Result<(), Box<dyn std:
                     }
                     _ => {
                         // Default formatter for unknown types.
-                        let res = process_formatter(&DefaultFormatter, local_buf);
-                        proccess_res_string(
+                        let res = process_formatter(&DefaultFormatter, local_buf, local_buf_len);
+                        process_res_string(
                             &offset_string,
                             &mut previous_offset_string,
                             &mut previous_asterisk,
@@ -527,20 +551,20 @@ fn print_data<R: Read>(reader: &mut R, config: &Args) -> Result<(), Box<dyn std:
     // Print the final address in the specified base format.
     if let Some(base) = config.address_base {
         match base {
-            'd' => print!("{:07} ", offset),  // Decimal format
-            'o' => print!("{:07o} ", offset), // Octal format
-            'x' => print!("{:07x} ", offset), // Hexadecimal format
-            'n' => (),                        // No address printed
-            _ => print!("{:07o} ", offset),   // Default to Octal if invalid base
+            'd' => println!("{:07}", offset),  // Decimal format
+            'o' => println!("{:07o}", offset), // Octal format
+            'x' => println!("{:06x}", offset), // Hexadecimal format (only six characters)
+            'n' => (),                         // No address printed
+            _ => println!("{:07o}", offset),   // Default to octal if invalid base
         }
     } else {
-        print!("{:07o} ", offset); // Default to octal if no base is specified.
+        println!("{:07o}", offset); // Default to octal if no base is specified.
     }
 
     Ok(())
 }
 
-fn proccess_res_string(
+fn process_res_string(
     offset_string: &str,
     previous_offset_string: &mut String,
     previous_asterisk: &mut bool,
@@ -562,17 +586,39 @@ fn proccess_res_string(
 }
 
 trait FormatterChunks {
-    fn format_value_from_chunk(&self, chunk: &[u8]) -> String;
+    fn format_value_from_chunk(&self, chunk: &[u8], num_bytes: usize) -> String;
 }
 
 struct UFormatter;
-struct DFormatter;
-struct XFormatter;
-struct OFormatter;
-struct FFormatter;
 
 impl FormatterChunks for UFormatter {
-    fn format_value_from_chunk(&self, chunk: &[u8]) -> String {
+    fn format_value_from_chunk(&self, chunk: &[u8], num_bytes: usize) -> String {
+        let pad_to = match num_bytes {
+            1 => {
+                // u8::MAX is 255 (3 digits)
+                3_usize
+            }
+            2 => {
+                // u16::MAX is 65535 (5 digits)
+                5_usize
+            }
+            4 => {
+                // u32::MAX is 4294967295 (10 digits)
+                10_usize
+            }
+            8 => {
+                // u64::MAX is 18446744073709551615 (20 digits)
+                20_usize
+            }
+            _ => {
+                // TODO
+                // Should be unreachable
+                debug_assert!(false);
+
+                0
+            }
+        };
+
         let value = match chunk.len() {
             1 => u8::from_be_bytes(chunk.try_into().unwrap()) as u64,
             2 => {
@@ -616,12 +662,41 @@ impl FormatterChunks for UFormatter {
             }
             _ => 0,
         };
-        format!("{} ", value)
+
+        format!(" {value: >width$}", width = pad_to)
     }
 }
 
+struct DFormatter;
+
 impl FormatterChunks for DFormatter {
-    fn format_value_from_chunk(&self, chunk: &[u8]) -> String {
+    fn format_value_from_chunk(&self, chunk: &[u8], num_bytes: usize) -> String {
+        let pad_to = match num_bytes {
+            1 => {
+                // i8::MIN is -128 (4 digits)
+                4_usize
+            }
+            2 => {
+                // i16::MIN is -32768 (6 digits)
+                6_usize
+            }
+            4 => {
+                // i32::MIN is -2147483648 (11 digits)
+                11_usize
+            }
+            8 => {
+                // i64::MIN is -9223372036854775808 (20 digits)
+                20_usize
+            }
+            _ => {
+                // TODO
+                // Should be unreachable
+                debug_assert!(false);
+
+                0
+            }
+        };
+
         let value = match chunk.len() {
             1 => i8::from_be_bytes(chunk.try_into().unwrap()) as i64,
             2 => {
@@ -665,12 +740,15 @@ impl FormatterChunks for DFormatter {
             }
             _ => 0,
         };
-        format!("{} ", value)
+
+        format!(" {value: >width$}", width = pad_to)
     }
 }
+
+struct XFormatter;
 
 impl FormatterChunks for XFormatter {
-    fn format_value_from_chunk(&self, chunk: &[u8]) -> String {
+    fn format_value_from_chunk(&self, chunk: &[u8], num_bytes: usize) -> String {
         let value = match chunk.len() {
             1 => u8::from_be_bytes(chunk.try_into().unwrap()) as u64,
             2 => {
@@ -714,12 +792,16 @@ impl FormatterChunks for XFormatter {
             }
             _ => 0,
         };
-        format!("{:04x} ", value)
+
+        // It takes exactly two hexadecimal digits to represent a byte (2^8 = 256 and 16^2 = 256)
+        format!(" {value:0width$x}", width = num_bytes * 2)
     }
 }
+
+struct OFormatter;
 
 impl FormatterChunks for OFormatter {
-    fn format_value_from_chunk(&self, chunk: &[u8]) -> String {
+    fn format_value_from_chunk(&self, chunk: &[u8], num_bytes: usize) -> String {
         let value = match chunk.len() {
             1 => u8::from_be_bytes(chunk.try_into().unwrap()) as u64,
             2 => {
@@ -763,12 +845,16 @@ impl FormatterChunks for OFormatter {
             }
             _ => 0,
         };
-        format!("{:03o} ", value)
+
+        // It takes three octal digits to represent a byte (2^8 = 256 and 8^3 = 512)
+        format!(" {value:0width$o}", width = num_bytes * 3)
     }
 }
 
+struct FFormatter;
+
 impl FormatterChunks for FFormatter {
-    fn format_value_from_chunk(&self, chunk: &[u8]) -> String {
+    fn format_value_from_chunk(&self, chunk: &[u8], _num_bytes: usize) -> String {
         let value = match chunk.len() {
             4 => {
                 let mut arr: [u8; 4] = chunk.try_into().unwrap();
@@ -800,15 +886,24 @@ impl FormatterChunks for FFormatter {
             }
             _ => 0.0,
         };
-        format!("{:e} ", value)
+        format!(" {value:e}")
     }
 }
 
-fn process_chunks_formatter(formatter: &dyn FormatterChunks, chunks: Chunks<u8>) -> String {
-    let mut result = String::new();
+fn process_chunks_formatter(
+    formatter: &dyn FormatterChunks,
+    chunks: Chunks<u8>,
+    num_bytes: usize,
+    local_buf_len: usize,
+) -> String {
+    let buffer_size = local_buf_len * 8;
+
+    let mut result = String::with_capacity(buffer_size);
+
     for chunk in chunks {
-        result.push_str(&formatter.format_value_from_chunk(chunk));
+        result.push_str(&formatter.format_value_from_chunk(chunk, num_bytes));
     }
+
     result
 }
 
@@ -824,11 +919,11 @@ struct DefaultFormatter;
 impl Formatter for AFormatter {
     fn format_value(&self, byte: u8) -> String {
         if let Some(name) = get_named_char(byte) {
-            format!("{} ", name)
+            format!(" {name: >3}")
         } else if byte.is_ascii_graphic() || byte.is_ascii_whitespace() {
-            format!("{} ", byte as char)
+            format!("   {}", byte as char)
         } else {
-            format!("{:03o} ", byte)
+            format!(" {byte:03o}")
         }
     }
 }
@@ -836,18 +931,18 @@ impl Formatter for AFormatter {
 impl Formatter for CFormatter {
     fn format_value(&self, byte: u8) -> String {
         match byte {
-            b'\\' => "\\ ".to_string(),
-            b'\x07' => "\\a ".to_string(),
-            b'\x08' => "\\b ".to_string(),
-            b'\x0C' => "\\f ".to_string(),
-            b'\x0A' => "\\n ".to_string(),
-            b'\x0D' => "\\r ".to_string(),
-            b'\x09' => "\\t ".to_string(),
-            b'\x0B' => "\\v ".to_string(),
+            b'\\' => "  \\".to_string(),
+            b'\x07' => "  \\a".to_string(),
+            b'\x08' => "  \\b".to_string(),
+            b'\x0C' => "  \\f".to_string(),
+            b'\x0A' => "  \\n".to_string(),
+            b'\x0D' => "  \\r".to_string(),
+            b'\x09' => "  \\t".to_string(),
+            b'\x0B' => "  \\v".to_string(),
             _ if byte.is_ascii_graphic() || byte.is_ascii_whitespace() => {
-                format!("{} ", byte as char)
+                format!("   {}", byte as char)
             }
-            _ => format!("{:03o} ", byte),
+            _ => format!(" {:03o}", byte),
         }
     }
 }
@@ -855,31 +950,35 @@ impl Formatter for CFormatter {
 impl Formatter for BCFormatter {
     fn format_value(&self, byte: u8) -> String {
         match byte {
-            b'\0' => "NUL ".to_string(),
-            b'\x08' => "BS ".to_string(),
-            b'\x0C' => "FF ".to_string(),
-            b'\x0A' => "NL ".to_string(),
-            b'\x0D' => "CR ".to_string(),
-            b'\x09' => "HT ".to_string(),
+            b'\0' => " NUL".to_string(),
+            b'\x08' => "  BS".to_string(),
+            b'\x0C' => "  FF".to_string(),
+            b'\x0A' => "  NL".to_string(),
+            b'\x0D' => "  CR".to_string(),
+            b'\x09' => "  HT".to_string(),
             _ if byte.is_ascii_graphic() || byte.is_ascii_whitespace() => {
-                format!("{} ", byte as char)
+                format!("   {}", byte as char)
             }
-            _ => format!("{:03o} ", byte),
+            _ => format!(" {:03o}", byte),
         }
     }
 }
 
 impl Formatter for DefaultFormatter {
     fn format_value(&self, byte: u8) -> String {
-        format!("{:03o} ", byte)
+        format!(" {:03o}", byte)
     }
 }
 
-fn process_formatter(formatter: &dyn Formatter, local_buf: &[u8]) -> String {
-    let mut result = String::new();
+fn process_formatter(formatter: &dyn Formatter, local_buf: &[u8], local_buf_len: usize) -> String {
+    let buffer_size = local_buf_len * 8;
+
+    let mut result = String::with_capacity(buffer_size);
+
     for byte in local_buf {
         result.push_str(&formatter.format_value(*byte));
     }
+
     result
 }
 
@@ -971,6 +1070,8 @@ fn od(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         bytes_to_skip = parse_offset(offset)?; // Parse the offset option.
     }
 
+    let bytes_that_will_be_skipped = usize::try_from(bytes_to_skip)?;
+
     let mut reader: Box<dyn Read> = if (args.files.len() == 1
         && args.files[0] == PathBuf::from("-"))
         || args.files.is_empty()
@@ -1030,7 +1131,7 @@ fn od(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Print the data using the reader.
-    print_data(&mut reader, args)?;
+    print_data(&mut reader, args, bytes_that_will_be_skipped)?;
 
     Ok(())
 }

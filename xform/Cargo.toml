@@ -1,10 +1,10 @@
 [package]
 name = "posixutils-xform"
-version = "0.2.0"
-edition = "2021"
+version = "0.2.1"
 authors = ["Jeff Garzik"]
-license = "MIT"
-repository = "https://github.com/rustcoreutils/posixutils-rs.git"
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
 
 [dependencies]
 plib = { path = "../plib" }
@@ -12,6 +12,9 @@ clap.workspace = true
 libc.workspace = true
 gettext-rs.workspace = true
 base64 = "0.21"
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "cksum"

@@ -1,20 +1,22 @@
 [package]
 name = "posixutils-file"
-version = "0.2.0"
-edition = "2021"
+version = "0.2.1"
 authors = ["Jeff Garzik"]
-license = "MIT"
-repository = "https://github.com/rustcoreutils/posixutils-rs.git"
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
 
 [dependencies]
 plib = { path = "../plib" }
 clap.workspace = true
 gettext-rs.workspace = true
 libc.workspace = true
-atty.workspace = true
 regex.workspace = true
 walkdir = "2"
 users = "0.11"
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "cat"

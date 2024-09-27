@@ -10,7 +10,13 @@
 WHITESPACE = _{ " " | "\t" | "\r" }
 COMMENT    = _{ "#" ~ (!"\n" ~ ANY)* ~ &"\n" }
 
-string          =  { "\"" ~ (("\\\"") | (!("\"" | "\n") ~ ANY))* ~ "\"" }
+string          = ${ "\"" ~ string_contents ~ "\"" }
+string_contents = @{ string_char* }
+string_char     =  {
+    !("\"" | "\\") ~ ANY
+  | "\\" ~ ("\"" | "/" | "a" | "b" | "f" | "n" | "r" | "t" | "v" | "\\")
+  | "\\" ~ ASCII_DIGIT{1, 3}
+}
 ere             =  { "/" ~ (("\\" ~ "/") | (!("/" | "\n") ~ ANY))* ~ "/" }
 number          = @{ decimal_float | integer }
 digit           =  { ('0'..'9') }
@@ -46,6 +52,7 @@ builtin_func = _{
   | tolower
   | toupper
   | close
+  | fflush
   | system
 }
 
@@ -69,6 +76,7 @@ substr   = { "substr" }
 tolower  = { "tolower" }
 toupper  = { "toupper" }
 close    = { "close" }
+fflush   = { "fflush" }
 system   = { "system" }
 
 keyword = {
@@ -161,17 +169,19 @@ ut_for     = { "for" ~ "(" ~ simple_statement? ~ ";" ~ expr? ~ ";" ~ simple_stat
 ut_foreach = { "for" ~ "(" ~ name ~ in_op ~ name ~ ")" ~ opt_newline ~ unterminated_statement }
 
 terminatable_statement = _{
-    simple_statement
+    nextfile
   | next
   | break_stmt
   | continue_stmt
   | exit_stmt
   | return_stmt
   | do_while
+  | simple_statement
 }
 
 do_while      = { "do" ~ opt_newline ~ terminated_statement ~ "while" ~ "(" ~ expr ~ ")" }
 next          = { "next" }
+nextfile      = { "nextfile" }
 break_stmt    = { "break" }
 continue_stmt = { "continue" }
 
@@ -179,13 +189,13 @@ return_stmt = { "return" ~ expr? }
 exit_stmt   = { "exit" ~ expr? }
 
 simple_statement = {
-    delete_element
+    array_delete
   | print_stmt
   | expr
 }
 
-delete_element = {
-    "delete" ~ name ~ "[" ~ expr ~ "]"
+array_delete = {
+    "delete" ~ name ~ ("[" ~ expr ~ "]")?
 }
 
 print_stmt = {

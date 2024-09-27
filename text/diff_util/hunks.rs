@@ -2,7 +2,7 @@ use crate::diff_util::constants::NO_NEW_LINE_AT_END_OF_FILE;
 
 use super::{change::Change, file_data::FileData};
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Hunk {
     kind: Change,
     changes: Vec<Change>,
@@ -318,7 +318,6 @@ impl Hunk {
     }
 }
 
-#[derive(Debug)]
 pub struct Hunks {
     hunks: Vec<Hunk>,
 }

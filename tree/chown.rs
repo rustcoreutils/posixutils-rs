@@ -10,10 +10,6 @@
 // - implement -h, -H, -L, -P
 //
 
-extern crate clap;
-extern crate libc;
-extern crate plib;
-
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
@@ -23,8 +19,8 @@ use std::path::Path;
 use std::{fs, io};
 
 /// chown - change the file ownership
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Change symbolic links, rather than the files they point to
     #[arg(short = 'h', long)]

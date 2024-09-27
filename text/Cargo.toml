@@ -1,10 +1,10 @@
 [package]
 name = "posixutils-text"
-version = "0.2.0"
-edition = "2021"
+version = "0.2.1"
 authors = ["Jeff Garzik"]
-license = "MIT"
-repository = "https://github.com/rustcoreutils/posixutils-rs.git"
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
 
 [dependencies]
 plib = { path = "../plib" }
@@ -16,11 +16,13 @@ chrono.workspace = true
 libc.workspace = true
 notify-debouncer-full = "0.3"
 ctor = "0.2"
-atty.workspace = true
 diff = "0.1"
 dirs = "5.0"
 deunicode = "1.6"
 walkdir = "2"
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "asa"

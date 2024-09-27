@@ -7,18 +7,14 @@
 // SPDX-License-Identifier: MIT
 //
 
-extern crate clap;
-extern crate gettextrs;
-extern crate plib;
-
 use chrono::Local;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 
 /// ipcs - report XSI interprocess communication facilities status
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Write information about active message queues.
     #[arg(short = 'q', long = "queues")]

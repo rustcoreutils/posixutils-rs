@@ -7,39 +7,51 @@
 // SPDX-License-Identifier: MIT
 //
 
-extern crate clap;
-extern crate plib;
-
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use std::cmp;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, Error, ErrorKind, Read, Write};
 use std::path::PathBuf;
 
-/// split - split a file into pieces
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about = gettext("split - split a file into pieces"))]
 struct Args {
-    /// Use suffix_length letters to form the suffix portion of the filenames of the split file.
-    #[arg(short='a', long, default_value_t=2, value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(
+        short = 'a',
+        long,
+        default_value_t = 2,
+        value_parser = clap::value_parser!(u32).range(1..),
+        help = gettext(
+            "Use suffix_length letters to form the suffix portion of the filenames of the split file"
+        )
+    )]
     suffix_len: u32,
 
-    /// Use suffix_length letters to form the suffix portion of the filenames of the split file.
-    #[arg(short, long, group = "mode", value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(
+        short,
+        long,
+        group = "mode",
+        value_parser = clap::value_parser!(u64).range(1..),
+        help = gettext(
+            "Use suffix_length letters to form the suffix portion of the filenames of the split file"
+        )
+    )]
     lines: Option<u64>,
 
-    /// Split a file into pieces n bytes in size.
-    #[arg(short, long, group = "mode")]
+    #[arg(
+        short,
+        long,
+        group = "mode",
+        help = gettext("Split a file into pieces n bytes in size")
+    )]
     bytes: Option<String>,
 
-    /// File to be split
-    #[arg(default_value = "")]
+    #[arg(default_value = "", help = gettext("File to be split"))]
     file: PathBuf,
 
-    /// Prefix of output files
-    #[arg(default_value = "x")]
+    #[arg(default_value = "x", help = gettext("Prefix of output files"))]
     prefix: String,
 }
 
@@ -73,7 +85,7 @@ impl OutputState {
         assert!(self.suffix_len > 1);
 
         if self.suffix.is_empty() {
-            self.suffix = String::from("a".repeat(self.suffix_len as usize));
+            self.suffix = "a".repeat(self.suffix_len as usize);
             return Ok(());
         }
 

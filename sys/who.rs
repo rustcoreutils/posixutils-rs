@@ -11,18 +11,14 @@
 // - implement -T, -u options
 //
 
-extern crate chrono;
-extern crate clap;
-extern crate plib;
-
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
+use plib::{platform, PROJECT_NAME};
 use std::path::PathBuf;
 
 /// who - display who is on the system
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Process all utmpx entries
     #[arg(short, long)]
@@ -112,8 +108,8 @@ fn print_fmt_term(entry: &plib::utmpx::Utmpx, line: &str) {
 
 fn current_terminal() -> String {
     let s = plib::curuser::tty();
-    if s.starts_with("/dev/") {
-        s[5..].to_string()
+    if let Some(st) = s.strip_prefix("/dev/") {
+        st.to_owned()
     } else {
         s
     }
@@ -129,12 +125,12 @@ fn print_entry(args: &Args, entry: &plib::utmpx::Utmpx) {
     }
 
     let mut selected = false;
-    if (args.boot && entry.typ == libc::BOOT_TIME)
-        || (args.userproc && entry.typ == libc::USER_PROCESS)
-        || (args.dead && entry.typ == libc::DEAD_PROCESS)
-        || (args.login && entry.typ == libc::LOGIN_PROCESS)
-        || (args.runlevel && entry.typ == libc::RUN_LVL)
-        || (args.process && entry.typ == libc::INIT_PROCESS)
+    if (args.boot && entry.typ == platform::BOOT_TIME)
+        || (args.userproc && entry.typ == platform::USER_PROCESS)
+        || (args.dead && entry.typ == platform::DEAD_PROCESS)
+        || (args.login && entry.typ == platform::LOGIN_PROCESS)
+        || (args.runlevel && entry.typ == platform::RUN_LVL)
+        || (args.process && entry.typ == platform::INIT_PROCESS)
     {
         selected = true;
     }
@@ -144,7 +140,7 @@ fn print_entry(args: &Args, entry: &plib::utmpx::Utmpx) {
     }
 
     let line = match entry.typ {
-        libc::BOOT_TIME => "system boot",
+        platform::BOOT_TIME => "system boot",
         _ => entry.line.as_str(),
     };
 
@@ -167,7 +163,7 @@ fn show_utmpx_entries(args: &Args) {
 
     let entries = plib::utmpx::load();
     for entry in &entries {
-        print_entry(&args, entry);
+        print_entry(args, entry);
     }
 }
 
@@ -192,7 +188,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // parse command line arguments; if "who am i", use special args
     let mut args = {
         if am_i {
-            Args::parse_from(&["who", "-m"])
+            Args::parse_from(["who", "-m"])
         } else {
             Args::parse()
         }

@@ -345,3 +345,12 @@ fn test_od_overlap4() {
 fn test_od_overlap5() {
     cut_test(&["-d", ":", "-b", "1-3,1-4", "-"], "abcde\n", "abcd\n");
 }
+
+#[test]
+fn test_stdin_no_hyphen() {
+    cut_test(
+        &["-c", "1-12,41-"],
+        "081ca869c86b0b885be83db4335de7522b930913 41 truefalse/src/false.rs\n",
+        "081ca869c86b 41 truefalse/src/false.rs\n",
+    );
+}

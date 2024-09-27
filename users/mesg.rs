@@ -11,45 +11,43 @@
 // - set process exit code according to spec
 //
 
-extern crate clap;
-extern crate libc;
-extern crate plib;
-
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
-use std::io::{self, Error, ErrorKind};
+use std::io::{self, Error, ErrorKind, IsTerminal};
 use std::mem;
 
 /// mesg - permit or deny messages
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// "y" or "n":  Grant (y) or deny (n) permission to other users to send messages to the terminal device.
     operand: Option<String>,
 }
 
-const STREAMS: [atty::Stream; 3] = [
-    atty::Stream::Stdin,
-    atty::Stream::Stdout,
-    atty::Stream::Stderr,
-];
-
-fn find_tty() -> Option<atty::Stream> {
-    for stream in STREAMS {
-        if atty::is(stream) {
-            return Some(stream);
-        }
-    }
-
-    None
+enum Stream {
+    Stdin,
+    Stdout,
+    Stderr,
 }
 
-fn tty_to_fd(tty: atty::Stream) -> i32 {
+fn find_tty() -> Option<Stream> {
+    if io::stdin().is_terminal() {
+        Some(Stream::Stdin)
+    } else if io::stdout().is_terminal() {
+        Some(Stream::Stdout)
+    } else if io::stderr().is_terminal() {
+        Some(Stream::Stderr)
+    } else {
+        None
+    }
+}
+
+fn tty_to_fd(tty: Stream) -> i32 {
     match tty {
-        atty::Stream::Stdin => libc::STDIN_FILENO,
-        atty::Stream::Stdout => libc::STDOUT_FILENO,
-        atty::Stream::Stderr => libc::STDERR_FILENO,
+        Stream::Stdin => libc::STDIN_FILENO,
+        Stream::Stdout => libc::STDOUT_FILENO,
+        Stream::Stderr => libc::STDERR_FILENO,
     }
 }
 

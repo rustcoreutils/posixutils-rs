@@ -7,8 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-extern crate clap;
-extern crate plib;
 use std::io::{self, BufRead, Error, ErrorKind, Read};
 
 use clap::Parser;
@@ -17,8 +15,8 @@ use plib::PROJECT_NAME;
 use std::path::PathBuf;
 
 /// Cut - cut out selected fields of each line of a file
-#[derive(Parser, Debug, Clone)]
-#[command(author, version, about, long_about)]
+#[derive(Parser, Clone)]
+#[command(version, about)]
 struct Args {
     /// Cut based on a list of bytes
     #[arg(short = 'b', long)]
@@ -81,7 +79,7 @@ fn validate_args(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 enum ParseVariat {
     Bytes(Vec<(i32, i32)>),
     Characters(Vec<(i32, i32)>),
@@ -292,12 +290,14 @@ fn cut_files(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     // open files, or stdin
 
+    let filenames = args.filenames;
+    let filenames_len = filenames.len();
     let readers: Vec<Box<dyn Read>> =
-        if args.filenames.len() == 1 && args.filenames[0] == PathBuf::from("-") {
+        if filenames_len == 0 || (filenames_len == 1 && filenames[0] == PathBuf::from("-")) {
             vec![Box::new(io::stdin().lock())]
         } else {
-            let mut bufs: Vec<Box<dyn Read>> = vec![];
-            for file in &args.filenames {
+            let mut bufs: Vec<Box<dyn Read>> = Vec::with_capacity(filenames_len);
+            for file in &filenames {
                 bufs.push(Box::new(std::fs::File::open(file)?))
             }
             bufs
@@ -380,7 +380,7 @@ fn read_range(line: &str) -> Result<Vec<(i32, i32)>, String> {
             let end = if range.len() == 1 {
                 start
             } else if nums[1].is_empty() {
-                std::i32::MAX - 1
+                i32::MAX - 1
             } else {
                 match nums[1].parse::<i32>() {
                     Err(err) => return Err(err.to_string()),

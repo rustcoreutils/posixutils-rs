@@ -11,9 +11,6 @@
 // - sort output
 //
 
-extern crate clap;
-extern crate plib;
-
 use object::{
     Object, ObjectSection, ObjectSymbol, SectionIndex, SectionKind, Symbol, SymbolKind,
     SymbolSection,
@@ -25,7 +22,7 @@ use plib::PROJECT_NAME;
 use std::collections::HashMap;
 use std::fs;
 
-#[derive(Debug, ValueEnum, Clone)]
+#[derive(ValueEnum, Clone)]
 enum OutputType {
     D,
     O,
@@ -33,8 +30,8 @@ enum OutputType {
 }
 
 /// nm - write the name list of an object file
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Write the full pathname or library name of an object on each line.
     #[arg(short = 'A', long = "print-file-name")]

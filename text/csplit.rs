@@ -10,9 +10,6 @@
 // - err on line num == 0
 //
 
-extern crate clap;
-extern crate plib;
-
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
@@ -22,8 +19,8 @@ use std::io::{self, BufRead, Error, ErrorKind, Read, Write};
 use std::path::PathBuf;
 
 /// csplit - split files based on context
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Name the created files prefix 00, prefix 01, ..., prefixn.
     #[arg(short = 'f', long, default_value = "xx")]
@@ -48,14 +45,12 @@ struct Args {
     operands: Vec<String>,
 }
 
-#[derive(Debug)]
 enum Operand {
     Rx(Regex, isize, bool),
     LineNum(usize),
     Repeat(usize),
 }
 
-#[derive(Debug)]
 struct SplitOps {
     ops: Vec<Operand>,
 }
@@ -334,18 +329,22 @@ fn csplit_file(args: &Args, ctx: SplitOps, new_files: &mut Vec<String>) -> io::R
                         }
                     }
 
-                    if split_options.len() == 1 {
-                        split_options.remove(0);
-                    } else if split_options.len() > 1 {
-                        if let Operand::Repeat(repeat) = &mut split_options[1] {
-                            *repeat -= 1;
-                            if *repeat == 0 {
-                                split_options.remove(0);
-                                split_options.remove(0);
-                            }
-                        } else {
+                    match split_options.len() {
+                        1 => {
                             split_options.remove(0);
                         }
+                        us if us > 1 => {
+                            if let Operand::Repeat(repeat) = &mut split_options[1] {
+                                *repeat -= 1;
+                                if *repeat == 0 {
+                                    split_options.remove(0);
+                                    split_options.remove(0);
+                                }
+                            } else {
+                                split_options.remove(0);
+                            }
+                        }
+                        _ => {}
                     }
                 } else {
                     if line.is_empty() {

@@ -7,8 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-extern crate clap;
-
 use chrono::DateTime;
 use clap::{Parser, Subcommand};
 use object::{Object, ObjectSymbol, SymbolKind};
@@ -18,7 +16,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
-#[derive(clap::Args, Debug)]
+#[derive(clap::Args)]
 #[group(required = false, multiple = false)]
 struct InsertArgs {
     /// Insert the files after the specified member
@@ -30,7 +28,7 @@ struct InsertArgs {
     insert_before: bool,
 }
 
-#[derive(clap::Args, Debug)]
+#[derive(clap::Args)]
 struct DeleteArgs {
     /// Give verbose output
     #[arg(short = 'v')]
@@ -40,7 +38,7 @@ struct DeleteArgs {
     files: Vec<OsString>,
 }
 
-#[derive(clap::Args, Debug)]
+#[derive(clap::Args)]
 struct MoveArgs {
     #[command(flatten)]
     insert_args: InsertArgs,
@@ -48,7 +46,7 @@ struct MoveArgs {
     files: Vec<OsString>,
 }
 
-#[derive(clap::Args, Debug)]
+#[derive(clap::Args)]
 struct PrintArgs {
     /// Give verbose output
     #[arg(short = 'v')]
@@ -62,7 +60,7 @@ struct PrintArgs {
     files: Vec<OsString>,
 }
 
-#[derive(clap::Args, Debug)]
+#[derive(clap::Args)]
 struct QuickAppendArgs {
     /// Suppress archive creation diagnostics
     #[arg(short = 'c')]
@@ -76,7 +74,7 @@ struct QuickAppendArgs {
     files: Vec<String>,
 }
 
-#[derive(clap::Args, Debug)]
+#[derive(clap::Args)]
 struct ReplaceArgs {
     /// Suppress archive creation diagnostics
     #[arg(short = 'c')]
@@ -96,7 +94,7 @@ struct ReplaceArgs {
     files: Vec<OsString>,
 }
 
-#[derive(clap::Args, Debug)]
+#[derive(clap::Args)]
 struct ListArgs {
     /// Give verbose output
     #[arg(short = 'v')]
@@ -110,7 +108,7 @@ struct ListArgs {
     files: Vec<OsString>,
 }
 
-#[derive(clap::Args, Debug)]
+#[derive(clap::Args)]
 struct ExtractArgs {
     /// Give verbose output
     #[arg(short = 'v')]
@@ -132,7 +130,7 @@ struct ExtractArgs {
     files: Vec<OsString>,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand)]
 enum Commands {
     /// Delete one or more files from the archive
     #[command(name = "-d")]
@@ -158,8 +156,8 @@ enum Commands {
 }
 
 /// ar - create and maintain library archives
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     #[command(subcommand)]
     command: Commands,
@@ -236,7 +234,7 @@ impl ArchiveMember {
         writer.write_all(&object::archive::TERMINATOR)?;
         writer.write_all(&self.data)?;
         if self.data.len() % 2 != 0 {
-            writer.write_all(&[b'\n'])?;
+            writer.write_all(b"\n")?;
         }
 
         Ok(())

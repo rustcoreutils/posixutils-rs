@@ -8,27 +8,25 @@
 //
 //
 
-extern crate atty;
-extern crate clap;
-extern crate libc;
-extern crate plib;
-
 mod common;
 
-use self::common::{copy_characteristics, error_string, is_file_writable};
+use self::common::{copy_file, error_string};
 use clap::Parser;
+use common::CopyConfig;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
-use std::collections::{HashMap, HashSet};
-use std::ffi::CString;
-use std::os::unix::fs::FileTypeExt;
-use std::os::{unix::ffi::OsStrExt, unix::fs::MetadataExt};
-use std::path::{Path, PathBuf};
-use std::{fs, io};
+use std::{
+    collections::{HashMap, HashSet},
+    ffi::CString,
+    fs,
+    io::{self, IsTerminal},
+    os::unix::{ffi::OsStrExt, fs::MetadataExt},
+    path::{Path, PathBuf},
+};
 
 /// mv - move files
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Do not prompt for confirmation if the destination path exists
     #[arg(short, long, overrides_with_all = ["force", "interactive"])]
@@ -46,117 +44,20 @@ struct Args {
     files: Vec<PathBuf>,
 }
 
-struct Config {
+struct MvConfig {
     force: bool,
     interactive: bool,
     is_terminal: bool,
 }
 
-impl Config {
+impl MvConfig {
     fn new(args: &Args) -> Self {
-        Config {
+        MvConfig {
             force: args.force,
             interactive: args.interactive,
-            is_terminal: atty::is(atty::Stream::Stdin),
+            is_terminal: io::stdin().is_terminal(),
         }
     }
-}
-
-fn copy_file_and_attributes(
-    source: &Path,
-    target: &Path,
-    source_md: &fs::Metadata,
-) -> io::Result<()> {
-    let file_type = source_md.file_type();
-
-    // These will cause `fs::copy` to hang
-    if file_type.is_block_device()
-        || file_type.is_char_device()
-        || file_type.is_fifo()
-        || file_type.is_socket()
-    {
-        unsafe {
-            let target_cstr = CString::new(target.as_os_str().as_bytes())?;
-
-            // The types of these two are not the same for all platforms. This
-            // should just be converting them back to their original type that
-            // `libc::stat` returned.
-            let mode = source_md.mode() as libc::mode_t;
-            let dev = source_md.rdev() as libc::dev_t;
-
-            let ret = libc::mknod(target_cstr.as_ptr(), mode, dev);
-            if ret == 0 {
-                return Ok(());
-            } else {
-                return Err(io::Error::last_os_error());
-            }
-        }
-    }
-
-    fs::copy(&source, &target)?;
-
-    // Error while copying file characteristics does not change the exit status
-    let _ = copy_characteristics(source_md, target);
-    Ok(())
-}
-
-fn copy_or_hard_link(
-    source: &Path,
-    target: &Path,
-    source_md: &fs::Metadata,
-    inode_map: &mut HashMap<(u64, u64), PathBuf>,
-) -> io::Result<()> {
-    // Same (device ID, inode) means a hard link.
-    // This pessimistically assumes that the file hierarchy of the source may
-    // contain more than one filesystem. The addition of the device ID is
-    // because inode is not unique across filesystems.
-    let identifier = (source_md.dev(), source_md.ino());
-
-    if let Some(prev) = inode_map.get(&identifier) {
-        // Preserve hard links like coreutils mv. Creating a copy is also
-        // allowed by the standard.
-        fs::hard_link(prev, &target)?;
-    } else {
-        // 6. copy source to target
-        copy_file_and_attributes(&source, &target, source_md)?;
-
-        // Don't include every file, just those with hard links
-        if source_md.nlink() > 1 {
-            inode_map.insert(identifier, target.to_path_buf());
-        }
-    }
-    Ok(())
-}
-
-fn copy_dir_all(
-    src: &Path,
-    dst: &Path,
-    inode_map: &mut HashMap<(u64, u64), PathBuf>,
-) -> io::Result<()> {
-    fs::create_dir_all(&dst)?;
-
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-
-        let source = entry.path();
-        let target = dst.join(entry.file_name());
-
-        if source.is_dir() {
-            copy_dir_all(&source, &target, inode_map)?;
-        } else {
-            let source_md = entry.metadata()?;
-
-            copy_or_hard_link(&source, &target, &source_md, inode_map).map_err(
-                |e: io::Error| -> io::Error {
-                    let from_to = gettext!("'{}' to '{}'", source.display(), target.display());
-                    let err_str = format!("{}: {}", from_to, error_string(&e));
-                    io::Error::other(err_str)
-                },
-            )?;
-        }
-    }
-
-    Ok(())
 }
 
 fn prompt_user(prompt: &str) -> bool {
@@ -166,17 +67,47 @@ fn prompt_user(prompt: &str) -> bool {
     response.to_lowercase().starts_with('y')
 }
 
+// Copy the file or directory hierarchy from `src` to `dst`.
+fn copy_hierarchy(
+    cfg: &MvConfig,
+    src: &Path,
+    dst: &Path,
+    inode_map: &mut HashMap<(u64, u64), (ftw::FileDescriptor, CString)>,
+    created_files: &mut HashSet<PathBuf>,
+) -> io::Result<()> {
+    let copy_cfg = CopyConfig {
+        force: cfg.force,
+        follow_cli: true,   // Follow symlink if passed as an argument
+        dereference: false, // Don't follow symlinks
+        interactive: cfg.interactive,
+        preserve: true,  // Always copy file attributes
+        recursive: true, // Recursively copy
+    };
+
+    copy_file(
+        &copy_cfg,
+        src,
+        dst,
+        created_files,
+        Some(inode_map),
+        prompt_user,
+    )
+}
+
 /// Handles moving the file.
 ///
 /// Returns `Ok(true)` if the source was deleted and `Ok(false)` if it's not.
 fn move_file(
-    cfg: &Config,
+    cfg: &MvConfig,
     source: &Path,
     target: &Path,
-    inode_map: &mut HashMap<(u64, u64), PathBuf>,
-    created_files: Option<&HashSet<PathBuf>>,
+    inode_map: &mut HashMap<(u64, u64), (ftw::FileDescriptor, CString)>,
+    created_files: Option<&mut HashSet<PathBuf>>,
 ) -> io::Result<bool> {
-    let target_md = match fs::metadata(target) {
+    let source_filename = CString::new(source.as_os_str().as_bytes()).unwrap();
+    let target_filename = CString::new(target.as_os_str().as_bytes()).unwrap();
+
+    let target_md = match ftw::Metadata::new(libc::AT_FDCWD, &target_filename, true) {
         Ok(md) => Some(md),
         Err(e) => {
             if e.kind() == io::ErrorKind::NotFound {
@@ -189,12 +120,12 @@ fn move_file(
     };
     let target_exists = target_md.is_some();
     let target_is_dir = match &target_md {
-        Some(md) => md.is_dir(),
+        Some(md) => md.file_type() == ftw::FileType::Directory,
         None => false,
     };
-    let target_is_writable = is_file_writable(target_md.as_ref());
+    let target_is_writable = target_md.map(|md| md.is_writable()).unwrap_or(false);
 
-    let source_md = match fs::metadata(source) {
+    let source_md = match ftw::Metadata::new(libc::AT_FDCWD, &source_filename, true) {
         Ok(md) => Some(md),
         Err(e) => {
             if e.kind() == io::ErrorKind::NotFound {
@@ -207,7 +138,7 @@ fn move_file(
     };
     let source_exists = source_md.is_some();
     let source_is_dir = match &source_md {
-        Some(md) => md.is_dir(),
+        Some(md) => md.file_type() == ftw::FileType::Directory,
         None => false,
     };
 
@@ -222,8 +153,8 @@ fn move_file(
 
     // 2. source and target are same dirent
     if let (Ok(smd), Ok(tmd), Some(deref_smd)) = (
-        fs::symlink_metadata(source),
-        fs::symlink_metadata(target),
+        ftw::Metadata::new(libc::AT_FDCWD, &source_filename, false),
+        ftw::Metadata::new(libc::AT_FDCWD, &target_filename, false),
         &source_md,
     ) {
         // `true` for hard links to the same file and when `source == target`
@@ -284,7 +215,7 @@ fn move_file(
         //
         // `created_files` is `None` when `move_file` is called directly from
         // `main`.
-        if let Some(created_files) = created_files {
+        if let Some(created_files) = created_files.as_ref() {
             if created_files.contains(target) {
                 let err_str = gettext!(
                     "will not overwrite just-created '{}' with '{}'",
@@ -342,7 +273,7 @@ fn move_file(
     };
 
     // 5. remove destination path
-    if target.exists() {
+    if target_exists {
         let remove_result = if target_is_dir {
             fs::remove_dir(target)
         } else {
@@ -357,21 +288,16 @@ fn move_file(
             .map_err(err_inter_device)?;
     }
 
-    if source_is_dir {
-        copy_dir_all(source, target, inode_map).map_err(err_inter_device)?;
-    } else {
-        // This is a `Some` otherwise `fs::rename` in (3) would have caught it.
-        let source_md = source_md.unwrap();
-
-        copy_or_hard_link(source, target, &source_md, inode_map)
-            .map_err(err_reason)
-            .map_err(err_inter_device)?;
-    }
+    let created_files = match created_files {
+        Some(set) => set,
+        None => &mut HashSet::new(),
+    };
+    copy_hierarchy(cfg, source, target, inode_map, created_files).map_err(err_inter_device)?;
 
     Ok(false)
 }
 
-fn move_files(cfg: &Config, sources: &[PathBuf], target: &Path) -> Option<()> {
+fn move_files(cfg: &MvConfig, sources: &[PathBuf], target: &Path) -> Option<()> {
     let mut result = Some(());
 
     let mut created_files = HashSet::new();
@@ -399,7 +325,7 @@ fn move_files(cfg: &Config, sources: &[PathBuf], target: &Path) -> Option<()> {
                     source,
                     &new_target,
                     &mut inode_map,
-                    Some(&created_files),
+                    Some(&mut created_files),
                 ) {
                     Ok(is_source_deleted) => {
                         created_files.insert(new_target);
@@ -480,7 +406,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let cfg = Config::new(&args);
+    let cfg = MvConfig::new(&args);
     if dir_exists {
         match move_files(&cfg, sources, target) {
             Some(_) => Ok(()),

@@ -11,9 +11,6 @@
 // - add tests
 //
 
-extern crate clap;
-extern crate plib;
-
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
@@ -21,8 +18,8 @@ use std::io::{self, BufRead};
 use std::path::PathBuf;
 
 /// asa - interpret carriage-control characters
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Files to read as input.
     files: Vec<PathBuf>,

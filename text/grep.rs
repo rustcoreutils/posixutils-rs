@@ -7,10 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-extern crate clap;
-extern crate libc;
-extern crate plib;
-
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, textdomain};
 use libc::{regcomp, regex_t, regexec, regfree, REG_EXTENDED, REG_ICASE, REG_NOMATCH};
@@ -25,7 +21,7 @@ use std::{
 
 /// grep - search a file for a pattern.
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// Match using extended regular expressions.
     #[arg(short = 'E', long)]
@@ -265,7 +261,7 @@ impl Patterns {
                 // Therefore, an empty pattern is replaced with ".*".
                 #[cfg(target_os = "macos")]
                 {
-                    pattern = if pattern == "" {
+                    pattern = if pattern.is_empty() {
                         String::from(".*")
                     } else {
                         pattern

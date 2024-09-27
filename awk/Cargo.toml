@@ -1,7 +1,9 @@
 [package]
 name = "posixutils-awk"
-version = "0.1.7"
-edition = "2021"
+version = "0.2.1"
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
 
 [dependencies]
 plib = { path = "../plib" }
@@ -12,7 +14,10 @@ pest = "2.7"
 pest_derive = "2.7"
 lazy_static = "1.4"
 lexical = { version = "6.1", features = ["format"] }
-rand = {version = "0.8", no-default-features = false, features = ["small_rng"] }
+rand = {version = "0.8", default-features = false, features = ["small_rng"] }
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "awk"

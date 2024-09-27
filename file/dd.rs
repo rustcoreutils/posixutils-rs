@@ -7,8 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-extern crate plib;
-
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use std::fs;
@@ -73,14 +71,12 @@ const CONV_ASCII_EBCDIC: [u8; 256] = [
     0xdd, 0xde, 0xdf, 0xea, 0xeb, 0xec, 0xed, 0xee, 0xef, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff,
 ];
 
-#[derive(Debug)]
 enum AsciiConv {
     Ascii,
     EBCDIC,
     IBM,
 }
 
-#[derive(Debug)]
 enum Conversion {
     Ascii(AsciiConv),
     Lcase,
@@ -91,7 +87,6 @@ enum Conversion {
     Sync,
 }
 
-#[derive(Debug)]
 struct Config {
     ifile: String,
     ofile: String,
@@ -227,18 +222,16 @@ fn apply_conversions(data: &mut Vec<u8>, config: &Config) {
 }
 
 fn copy_convert_file(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
-    let mut ifile: Box<dyn Read>;
-    if config.ifile == "" {
-        ifile = Box::new(io::stdin().lock());
+    let mut ifile: Box<dyn Read> = if config.ifile.is_empty() {
+        Box::new(io::stdin().lock())
     } else {
-        ifile = Box::new(fs::File::open(&config.ifile)?);
-    }
-    let mut ofile: Box<dyn Write>;
-    if config.ofile == "" {
-        ofile = Box::new(io::stdout().lock())
+        Box::new(fs::File::open(&config.ifile)?)
+    };
+    let mut ofile: Box<dyn Write> = if config.ofile.is_empty() {
+        Box::new(io::stdout().lock())
     } else {
-        ofile = Box::new(fs::File::create(&config.ofile)?)
-    }
+        Box::new(fs::File::create(&config.ofile)?)
+    };
 
     let mut ibuf = vec![0u8; config.ibs];
     let obuf = vec![0u8; config.obs];

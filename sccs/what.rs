@@ -7,9 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-extern crate clap;
-extern crate plib;
-
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
@@ -17,15 +14,17 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-/// what — identify SCCS files
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about = gettext("what - identify SCCS files"))]
 struct Args {
-    /// Display at most one identification string per file
-    #[arg(short = 's', long)]
+    #[arg(
+        short = 's',
+        long,
+        help = gettext("Display at most one identification string per file")
+    )]
     single: bool,
 
-    /// Input files
+    #[arg(help = gettext("Input files"))]
     files: Vec<PathBuf>,
 }
 
@@ -39,9 +38,7 @@ fn process_file<R: BufRead>(reader: R, single: bool) -> io::Result<()> {
                 return Ok(());
             }
             let rest = &line[start + pos + 4..];
-            if let Some(end) =
-                rest.find(|c| c == '"' || c == '>' || c == '\n' || c == '\\' || c == '\0')
-            {
+            if let Some(end) = rest.find(['"', '>', '\n', '\\', '\0']) {
                 println!("@(#){}", &rest[..end]);
             } else {
                 println!("@(#){}", rest);
@@ -62,7 +59,7 @@ fn main() -> io::Result<()> {
 
     for file in &args.files {
         let path = Path::new(file);
-        if let Ok(file) = File::open(&path) {
+        if let Ok(file) = File::open(path) {
             let reader = BufReader::new(file);
             process_file(reader, args.single)?;
         } else {

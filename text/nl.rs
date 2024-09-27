@@ -18,8 +18,8 @@ use std::process::ExitCode;
 use std::str::FromStr;
 
 /// nl - line numbering filter
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about, disable_help_flag = true)]
+#[derive(Parser)]
+#[command(version, about, disable_help_flag = true)]
 struct Args {
     #[arg(long, action = clap::ArgAction::HelpLong)]
     help: Option<bool>,
@@ -33,7 +33,7 @@ struct Args {
     /// - n - No line numbering.
     ///
     /// - pREGEX - Number only lines that contain the basic regular expression
-    /// specified in *REGEX*.
+    ///   specified in *REGEX*.
     #[arg(short = 'b', long, default_value_t = LineNumberingStyle::NonEmpty)]
     body_numbering: LineNumberingStyle,
 
@@ -93,7 +93,7 @@ struct Args {
     file: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum LineNumberingStyle {
     All,
     NonEmpty,
@@ -112,9 +112,9 @@ impl FromStr for LineNumberingStyle {
             s => {
                 if let Some(re) = s.strip_prefix('p') {
                     if let Ok(regexp) = Regex::new(re) {
-                        return Ok(LineNumberingStyle::Regex(regexp));
+                        Ok(LineNumberingStyle::Regex(regexp))
                     } else {
-                        return Err(format!("invalid regular expression: {re}"));
+                        Err(format!("invalid regular expression: {re}"))
                     }
                 } else {
                     Err(format!("invalid variant: {s}"))
@@ -137,7 +137,7 @@ impl std::fmt::Display for LineNumberingStyle {
     }
 }
 
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Clone, ValueEnum)]
 enum NumberFormat {
     Ln,
     Rn,
@@ -299,7 +299,7 @@ fn nl_main(args: &Args) -> io::Result<()> {
                     line_number = args.starting_line_number;
                     line_number_overflowed = false;
                 }
-                println!("");
+                println!();
             }
         } else {
             break;

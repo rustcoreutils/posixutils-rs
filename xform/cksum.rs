@@ -15,9 +15,6 @@
 //   a Rust crate + our finalize() function.
 //
 
-extern crate clap;
-extern crate plib;
-
 mod crc32;
 
 use clap::Parser;
@@ -27,8 +24,8 @@ use std::io::{self, Read};
 use std::path::PathBuf;
 
 /// cksum - write file checksums and sizes
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Files to read as input.  Use "-" or no-args for stdin.
     files: Vec<PathBuf>,

@@ -7,9 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-extern crate clap;
-extern crate plib;
-
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use modestr::{ChmodMode, ChmodSymbolic};
@@ -19,8 +16,8 @@ use std::path::Path;
 use std::{fs, io};
 
 /// chmod - change the file modes
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Recursively change file mode bits.
     #[arg(short = 'R', long)]

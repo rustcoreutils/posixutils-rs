@@ -10,10 +10,6 @@
 // - bug: only one group is returned, in group list (MacOS-only?)
 //
 
-extern crate clap;
-extern crate libc;
-extern crate plib;
-
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
@@ -21,8 +17,8 @@ use std::collections::HashMap;
 use std::io::Error;
 
 /// id - return user identity
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Output all different group IDs (effective, real, and supplementary) only, using a numeric format
     #[arg(short = 'G', long, group = "output")]

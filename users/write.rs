@@ -7,13 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
-extern crate clap;
-extern crate plib;
-
 use chrono::Local;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
+use plib::{platform, PROJECT_NAME};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, Write};
@@ -28,8 +25,8 @@ const ERASE_CHAR: char = '\u{08}';
 const KILL_CHAR: char = '\u{15}';
 
 /// write - write to another user
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Login name of the person to whom the message shall be written.
     username: String,
@@ -46,7 +43,7 @@ fn select_terminal(user_name: &str) -> String {
     // Filter the entries to find terminals for the specified user
     let user_entries: Vec<_> = entries
         .into_iter()
-        .filter(|entry| entry.user == user_name && entry.typ == libc::USER_PROCESS)
+        .filter(|entry| entry.user == user_name && entry.typ == platform::USER_PROCESS)
         .collect();
 
     if user_entries.is_empty() {

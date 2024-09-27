@@ -3,7 +3,7 @@ use std::{io::Write, os::unix::ffi::OsStrExt, path::PathBuf, process::Stdio};
 use clap::Parser;
 use m4_test_manager::TestSnapshot;
 
-#[derive(Debug, clap::Parser)]
+#[derive(Parser)]
 #[command(version, about)]
 struct Args {
     #[command(subcommand)]
@@ -12,13 +12,13 @@ struct Args {
     fixtures_directory: PathBuf,
 }
 
-#[derive(Debug, clap::Subcommand)]
+#[derive(clap::Subcommand)]
 enum Commands {
     UpdateSnapshots(UpdateSnapshots),
 }
 
 /// Update the integration test snapshots.
-#[derive(Debug, clap::Args)]
+#[derive(clap::Args)]
 struct UpdateSnapshots {
     /// Optionally specify a secific test case name that you want to update, where name is
     /// {name}.m4 of the test case file.
@@ -68,7 +68,7 @@ fn update_snapshots(args: &Args, update: &UpdateSnapshots) {
                 return false;
             }
 
-            if let Some(name) = update.test_case_name.as_ref().map(|s| s.as_str()) {
+            if let Some(name) = update.test_case_name.as_deref() {
                 if name != entry.path().file_stem().unwrap().to_str().unwrap() {
                     return false;
                 }

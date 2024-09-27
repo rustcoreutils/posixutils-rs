@@ -7,11 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
-extern crate atty;
-extern crate plib;
+use std::io::{self, IsTerminal};
 
 fn main() {
-    let is_tty = atty::is(atty::Stream::Stdin);
+    let is_tty = io::stdin().is_terminal();
     if !is_tty {
         println!("not a tty");
         std::process::exit(1);

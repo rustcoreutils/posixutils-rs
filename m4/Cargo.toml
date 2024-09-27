@@ -1,22 +1,16 @@
 [package]
 name = "posixutils-m4"
-version = "0.1.0"
-edition = "2021"
+version = "0.2.1"
 description = "m4 - macro language processor"
 authors = ["Luke Frisken"]
-license = "MIT"
-repository = "https://github.com/rustcoreutils/posixutils-rs.git"
-
-[[bin]]
-name = "m4"
-path = "src/main.rs"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
 
 [dependencies]
 clap.workspace = true
 env_logger = "0.11"
-errno = "0.3"
+errno.workspace = true
 libc.workspace = true
 log = "0.4"
 nom = "7.1"
@@ -33,3 +27,9 @@ test-log = { version = "0.2", default-features=false, features=["log"]}
 [build-dependencies]
 m4-test-manager = { path = "./test-manager" }
 
+[lints]
+workspace = true
+
+[[bin]]
+name = "m4"
+path = "src/main.rs"

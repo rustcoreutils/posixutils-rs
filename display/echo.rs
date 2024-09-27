@@ -13,8 +13,6 @@
 //	Write an 8-bit value that is the 0, 1, 2 or 3-digit octal number _num_.
 //
 
-extern crate plib;
-
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use std::io::{self, Write};
@@ -57,7 +55,7 @@ fn translate_str(skip_nl: bool, s: &str) -> String {
                     output.push('\x11');
                 }
                 '\\' => {
-                    output.push_str("\\");
+                    output.push('\\');
                 }
                 _ => {}
             }
@@ -67,7 +65,7 @@ fn translate_str(skip_nl: bool, s: &str) -> String {
     }
 
     if nl && !skip_nl {
-        output.push_str("\n");
+        output.push('\n');
     }
 
     output

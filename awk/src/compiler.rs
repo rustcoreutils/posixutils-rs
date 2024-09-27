@@ -139,6 +139,11 @@ lazy_static::lazy_static! {
             min_args: 1,
             max_args: 1,
         }),
+        (Rule::fflush, BuiltinFunctionInfo {
+            function: BuiltinFunction::FFlush,
+            min_args: 0,
+            max_args: 1,
+        }),
         (Rule::system, BuiltinFunctionInfo {
             function: BuiltinFunction::System,
             min_args: 1,
@@ -595,15 +600,16 @@ impl Compiler {
                 ))
             }
             Rule::string => {
-                let index = self.push_constant(Constant::String(
-                    escape_string_contents(primary.as_str().trim_matches('"'))
-                        .map_err(|e| pest_error_from_span(primary.as_span(), e))?,
-                ));
+                let span = primary.as_span();
+                let string_line_col = primary.line_col();
+                let str = escape_string_contents(first_child(primary).as_str())
+                    .map_err(|e| pest_error_from_span(span, e))?;
+                let index = self.push_constant(Constant::String(str));
                 Ok(Expr::new(
                     ExprKind::String,
                     Instructions::from_instructions_and_line_col(
                         vec![OpCode::PushConstant(index)],
-                        primary.line_col(),
+                        string_line_col,
                     ),
                 ))
             }
@@ -1142,16 +1148,19 @@ impl Compiler {
         let stmt = first_child(simple_stmt);
         let stmt_line_col = stmt.line_col();
         match stmt.as_rule() {
-            Rule::delete_element => {
+            Rule::array_delete => {
                 let mut inner = stmt.into_inner();
                 let name = inner.next().unwrap();
                 let get_instruction = self
                     .get_var(name.as_str(), locals)
                     .map_err(|msg| pest_error_from_span(name.as_span(), msg))?;
                 instructions.push(get_instruction, stmt_line_col);
-                let index = inner.next().unwrap();
-                self.compile_expr(index, instructions, locals)?;
-                instructions.push(OpCode::Delete, stmt_line_col);
+                if let Some(index) = inner.next() {
+                    self.compile_expr(index, instructions, locals)?;
+                    instructions.push(OpCode::DeleteElement, stmt_line_col);
+                } else {
+                    instructions.push(OpCode::ClearArray, stmt_line_col);
+                }
             }
             Rule::expr => {
                 self.compile_expr(stmt, instructions, locals)?;
@@ -1451,6 +1460,10 @@ impl Compiler {
             Rule::ut_for => self.compile_for(stmt, instructions, locals),
             Rule::ut_foreach => self.compile_for_each(stmt, instructions, locals),
             Rule::simple_statement => self.compile_simple_statement(stmt, instructions, locals),
+            Rule::nextfile => {
+                instructions.push(OpCode::NextFile, stmt.line_col());
+                Ok(())
+            }
             Rule::next => {
                 instructions.push(OpCode::Next, stmt.line_col());
                 Ok(())
@@ -1643,7 +1656,12 @@ impl Compiler {
         })
     }
 
-    fn declare_program_functions(&mut self, errors: &mut Vec<PestError>, program: Pairs<Rule>) {
+    fn declare_program_functions(
+        &mut self,
+        program: Pairs<Rule>,
+        filename: &str,
+        errors: &mut Vec<PestError>,
+    ) {
         for item in program {
             if item.as_rule() == Rule::function_definition {
                 let mut inner = item.into_inner();
@@ -1663,10 +1681,14 @@ impl Compiler {
                     },
                 );
                 if previous_value.is_some() {
-                    errors.push(pest_error_from_span(
-                        name.as_span(),
-                        format!("function '{}' is defined multiple times", name),
-                    ));
+                    let error = improve_error(
+                        pest_error_from_span(
+                            name.as_span(),
+                            format!("function '{}' is defined multiple times", name),
+                        ),
+                        filename,
+                    );
+                    errors.push(error);
                 }
             }
         }
@@ -1727,12 +1749,6 @@ fn gather_errors(first_error: PestError, source: &str, errors: &mut Vec<PestErro
     }
 }
 
-fn append_if_err(errors: &mut Vec<PestError>, result: Result<(), PestError>) {
-    if let Err(err) = result {
-        errors.push(err);
-    }
-}
-
 pub struct SourceFile {
     pub filename: String,
     pub contents: String,
@@ -1764,8 +1780,8 @@ pub fn compile_program(sources: &[SourceFile]) -> Result<Program, CompilerErrors
     }
 
     let mut compiler = Compiler::default();
-    for (_, program_iter) in &parsed_sources {
-        compiler.declare_program_functions(&mut errors, program_iter.clone());
+    for (filename, program_iter) in &parsed_sources {
+        compiler.declare_program_functions(program_iter.clone(), filename, &mut errors);
     }
 
     let mut begin_actions = Vec::new();
@@ -1778,14 +1794,14 @@ pub fn compile_program(sources: &[SourceFile]) -> Result<Program, CompilerErrors
                 Rule::begin_action | Rule::end_action => {
                     let is_begin_action = item.as_rule() == Rule::begin_action;
                     let mut instructions = Instructions::default();
-                    append_if_err(
-                        &mut errors,
-                        compiler.compile_action(
-                            first_child(item),
-                            &mut instructions,
-                            &HashMap::new(),
-                        ),
+                    let result = compiler.compile_action(
+                        first_child(item),
+                        &mut instructions,
+                        &HashMap::new(),
                     );
+                    if let Err(err) = result {
+                        errors.push(improve_error(err, &filename));
+                    }
                     if is_begin_action {
                         begin_actions.push(instructions.into_action(filename.clone()));
                     } else {
@@ -1794,12 +1810,12 @@ pub fn compile_program(sources: &[SourceFile]) -> Result<Program, CompilerErrors
                 }
                 Rule::rule => match compiler.compile_rule(item, filename.clone()) {
                     Ok(rule) => rules.push(rule),
-                    Err(err) => errors.push(err),
+                    Err(err) => errors.push(improve_error(err, &filename)),
                 },
                 Rule::function_definition => {
                     match compiler.compile_function_definition(item, filename.clone()) {
                         Ok(function) => functions.push(function),
-                        Err(err) => errors.push(err),
+                        Err(err) => errors.push(improve_error(err, &filename)),
                     }
                 }
                 Rule::EOI => {}
@@ -1948,8 +1964,50 @@ mod test {
 
     #[test]
     fn test_compile_string() {
+        let (_, constants) = compile_expr(r#""""#);
+        assert_eq!(constants, vec!["".into()]);
+
         let (_, constants) = compile_expr(r#""hello""#);
         assert_eq!(constants, vec!["hello".into()]);
+
+        let (_, constants) = compile_expr(r#""\"""#);
+        assert_eq!(constants, vec![Constant::from("\"")]);
+
+        let (_, constants) = compile_expr(r#""\/""#);
+        assert_eq!(constants, vec![Constant::from("/")]);
+
+        let (_, constants) = compile_expr(r#""\a""#);
+        assert_eq!(constants, vec![Constant::from("\x07")]);
+
+        let (_, constants) = compile_expr(r#""\b""#);
+        assert_eq!(constants, vec![Constant::from("\x08")]);
+
+        let (_, constants) = compile_expr(r#""\f""#);
+        assert_eq!(constants, vec![Constant::from("\x0C")]);
+
+        let (_, constants) = compile_expr(r#""\n""#);
+        assert_eq!(constants, vec![Constant::from("\n")]);
+
+        let (_, constants) = compile_expr(r#""\r""#);
+        assert_eq!(constants, vec![Constant::from("\r")]);
+
+        let (_, constants) = compile_expr(r#""\t""#);
+        assert_eq!(constants, vec![Constant::from("\t")]);
+
+        let (_, constants) = compile_expr(r#""\v""#);
+        assert_eq!(constants, vec![Constant::from("\x0B")]);
+
+        let (_, constants) = compile_expr(r#""\\""#);
+        assert_eq!(constants, vec![Constant::from("\\")]);
+
+        let (_, constants) = compile_expr(r#""\7""#);
+        assert_eq!(constants, vec![Constant::from("\x07")]);
+
+        let (_, constants) = compile_expr(r#""\41""#);
+        assert_eq!(constants, vec![Constant::from("!")]);
+
+        let (_, constants) = compile_expr(r#""\142""#);
+        assert_eq!(constants, vec![Constant::from("b")]);
 
         let (_, constants) = compile_expr(r#""hello\nworld""#);
         assert_eq!(constants, vec![Constant::from("hello\nworld")]);
@@ -3023,6 +3081,12 @@ mod test {
     }
 
     #[test]
+    fn test_compile_nextfile() {
+        let (instructions, _) = compile_stmt("nextfile;");
+        assert_eq!(instructions, vec![OpCode::NextFile]);
+    }
+
+    #[test]
     fn test_compile_exit() {
         let (instructions, _) = compile_stmt("exit;");
         assert_eq!(instructions, vec![OpCode::PushZero, OpCode::Exit]);
@@ -3047,15 +3111,24 @@ mod test {
     }
 
     #[test]
-    fn test_compile_delete() {
+    fn test_compile_delete_element() {
         let (instructions, _) = compile_stmt("delete a[1];");
         assert_eq!(
             instructions,
             vec![
                 OpCode::GetGlobal(FIRST_GLOBAL_VAR),
                 OpCode::PushConstant(0),
-                OpCode::Delete,
+                OpCode::DeleteElement,
             ]
+        );
+    }
+
+    #[test]
+    fn test_compile_clear_array() {
+        let (instructions, _) = compile_stmt("delete a");
+        assert_eq!(
+            instructions,
+            vec![OpCode::GetGlobal(FIRST_GLOBAL_VAR), OpCode::ClearArray]
         );
     }
 
@@ -3885,6 +3958,8 @@ mod test {
             r#"
             BEGIN {
                 close("file");
+                fflush("file");
+                fflush();
                 system("ls");
             }
         "#,
@@ -3899,6 +3974,17 @@ mod test {
                 },
                 OpCode::Pop,
                 OpCode::PushConstant(1),
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::FFlush,
+                    argc: 1
+                },
+                OpCode::Pop,
+                OpCode::CallBuiltin {
+                    function: BuiltinFunction::FFlush,
+                    argc: 0
+                },
+                OpCode::Pop,
+                OpCode::PushConstant(2),
                 OpCode::CallBuiltin {
                     function: BuiltinFunction::System,
                     argc: 1,

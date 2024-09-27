@@ -9,10 +9,8 @@
 // TODO:
 // - (efficiency): collect all output in a buffer, then write to stdout
 // - Research if 100 is a POSIX-compliant limit for MAX_STOPS
+// - gettext("Specify repetitive tab stops separated by ({}) columns")
 //
-
-extern crate clap;
-extern crate plib;
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
@@ -23,16 +21,17 @@ use terminfo::{capability as cap, Database};
 // arbitrarily chosen.  todo: search if POSIX-ly correct.
 const MAX_STOPS: usize = 100;
 
-/// tabs - set terminal tabs
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about = gettext("tabs - set terminal tabs"))]
 struct Args {
-    /// Indicate the type of terminal.
-    #[arg(short = 'T', long)]
+    #[arg(short = 'T', long, help = gettext("Indicate the type of terminal"))]
     term: Option<String>,
 
-    /// Specify repetitive tab stops separated by (1) columns
-    #[arg(short = '1', long)]
+    #[arg(
+        short = '1',
+        long,
+        help = gettext("Specify repetitive tab stops separated by (1) columns")
+    )]
     rep_1: bool,
 
     /// Specify repetitive tab stops separated by (2) columns
@@ -151,7 +150,7 @@ fn parse_cmd_line(args: &Args) -> Result<Vec<u16>, &'static str> {
         for stop in tabstops_str.split(',') {
             tabstops.push(
                 stop.parse()
-                    .expect(gettext("Invalid tabstop value.").as_str()),
+                    .unwrap_or_else(|_| panic!("{}", gettext("Invalid tabstop value."))),
             );
         }
     }

@@ -9,7 +9,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use regex::Regex;
 use std::{
@@ -21,31 +21,49 @@ use std::{
     path::PathBuf,
 };
 
-/// file - determine file type
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about, disable_help_flag = true)]
+#[derive(Parser)]
+#[command(
+    version,
+    disable_help_flag = true,
+    about = gettext("file - determine file type")
+)]
 struct Args {
-    #[clap(long, action = clap::ArgAction::HelpLong)]
+    #[arg(long, action = clap::ArgAction::HelpLong)]
     help: Option<bool>,
 
-    /// Apply default position-sensitive system tests and context-sensitive system tests to the file.
-    #[arg(short = 'd', long)]
+    #[arg(
+        short = 'd',
+        long,
+        help = gettext(
+            "Apply default position-sensitive system tests and context-sensitive system tests to the file"
+        )
+    )]
     default_tests: bool,
 
-    /// Identify symbolic link with non existent file as symbolic link
-    #[arg(short = 'h', long)]
+    #[arg(
+        short = 'h',
+        long,
+        help = gettext("Identify symbolic link with non existent file as symbolic link")
+    )]
     identify_as_symbolic_link: bool,
 
-    /// Don't perform further classification on regular file
-    #[arg(short = 'i', long)]
+    #[arg(
+        short = 'i',
+        long,
+        help = gettext("Don't perform further classification on regular file")
+    )]
     no_further_file_classification: bool,
 
-    /// File containing position-sensitive tests
-    #[arg(short = 'm')]
+    #[arg(
+        short = 'm',
+        help = gettext("File containing position-sensitive tests")
+    )]
     test_file1: Option<PathBuf>,
 
-    /// File containing additional position-sensitive tests
-    #[arg(short = 'M')]
+    #[arg(
+        short = 'M',
+        help = gettext("File containing additional position-sensitive tests")
+    )]
     test_file2: Option<PathBuf>,
 
     files: Vec<String>,
@@ -156,7 +174,7 @@ impl Value {
         let re = Regex::new(r"\\([0-7]{1,3})").map_err(|_| RawMagicLineParseError::InvalidRegex)?;
 
         let result = re
-            .replace_all(&input, |capture: &regex::Captures| {
+            .replace_all(input, |capture: &regex::Captures| {
                 let mat = capture.get(1).unwrap().as_str();
 
                 let v = u32::from_str_radix(mat, 8).unwrap();
@@ -169,7 +187,7 @@ impl Value {
 
     fn parse_number(input: &mut String) -> Option<(ComparisonOperator, u64)> {
         let regex = Regex::new(r"^[=<>&^x]").unwrap();
-        let comparision_op = match regex.find(&input) {
+        let comparision_op = match regex.find(input) {
             Some(mat) => {
                 let comp = mat.as_str().chars().next().unwrap();
                 input.replace_range(..1, ""); // Remove the matched operator
@@ -192,6 +210,8 @@ impl Value {
 }
 
 /// Parses Hexadecimal, Octal and Unsigned Decimal
+// TODO
+#[allow(clippy::needless_match)]
 fn parse_number(input: &mut String) -> Option<u64> {
     if let Some(hex_num) = parse_hexadecimal(input) {
         Some(hex_num)
@@ -510,6 +530,7 @@ fn parse_magic_file_and_test(
                 }
             }
         } else {
+            // TODO: Empty branch
         }
     }
 

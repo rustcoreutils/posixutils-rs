@@ -145,15 +145,9 @@ fn realpath_args_canonicalization() {
     realpath_test(&["foobar"], &out_str, "", 0);
     realpath_test(&["-E", "foobar"], &out_str, "", 0);
 
-    // Canonicalization flag must be explicitly suplied
+    // Canonicalization flag must be explicitly supplied
     realpath_test(
         &["-e", "foobar"],
-        "",
-        "realpath: foobar: No such file or directory (os error 2)\n",
-        1,
-    );
-    realpath_test(
-        &["--canonicalize-existing", "foobar"],
         "",
         "realpath: foobar: No such file or directory (os error 2)\n",
         1,

@@ -7,11 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
-extern crate clap;
-extern crate plib;
-
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use std::collections::HashMap;
 use std::env;
@@ -19,15 +16,19 @@ use std::io;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
-/// env - set the environment for command invocation
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about = gettext("env - set the environment for command invocation"))]
 struct Args {
-    /// Invoke utility with exactly the environment specified by the arguments; the inherited environment shall be ignored completely.
-    #[arg(short, long)]
+    #[arg(
+        short,
+        long,
+        help = gettext(
+            "Invoke utility with exactly the environment specified by the arguments; the inherited environment shall be ignored completely"
+        )
+    )]
     ignore_env: bool,
 
-    /// NAME=VALUE pairs, the utility to invoke, and its arguments.
+    #[arg(help = gettext("NAME=VALUE pairs, the utility to invoke, and its arguments"))]
     operands: Vec<String>,
 }
 
@@ -59,7 +60,7 @@ fn merge_env(new_env: &Vec<String>, clear: bool) -> HashMap<String, String> {
 
     if !clear {
         for (key, value) in env::vars() {
-            map.insert(String::from(key), String::from(value));
+            map.insert(key, value);
         }
     }
 

@@ -14,10 +14,6 @@
 
 mod diff_util;
 
-extern crate clap;
-extern crate diff;
-extern crate plib;
-
 use std::{fs, io, path::PathBuf};
 
 use clap::Parser;
@@ -32,8 +28,8 @@ use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 
 /// diff - compare two files
-#[derive(Parser, Debug, Clone)]
-#[command(author, version, about, long_about)]
+#[derive(Parser, Clone)]
+#[command(version, about)]
 struct Args {
     /// Cause EOL whitespace to be treated as blanks
     #[arg(short = 'b', long = "ignore-space-change")]
@@ -152,17 +148,18 @@ fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
     }
 }
 
-fn main() -> Result<DiffExitStatus, Box<dyn std::error::Error>> {
+fn main() -> DiffExitStatus {
     // parse command line arguments
     let args = Args::parse();
 
     let result = check_difference(args);
 
-    if let Ok(diff_exit_status) = &result {
-        return Ok(*diff_exit_status);
-    } else if let Err(error) = &result {
-        eprintln!("diff: {}", error);
-    }
+    match result {
+        Ok(diff_exit_status) => diff_exit_status,
+        Err(error) => {
+            eprintln!("diff: {}", error);
 
-    return Ok(DiffExitStatus::NotDifferent);
+            DiffExitStatus::Trouble
+        }
+    }
 }

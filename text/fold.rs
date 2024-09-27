@@ -7,9 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-extern crate clap;
-extern crate plib;
-
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
@@ -19,8 +16,8 @@ use std::path::PathBuf;
 const TABSTOP: usize = 8;
 
 /// fold - filter for folding lines
-#[derive(Parser, Debug, Clone)]
-#[command(author, version, about, long_about)]
+#[derive(Parser, Clone)]
+#[command(version, about)]
 struct Args {
     /// Count width in bytes rather than column positions.
     #[arg(short, long)]
@@ -90,15 +87,15 @@ impl OutputState {
     }
 }
 
-fn find_last_blank(v: &Vec<u8>) -> Option<usize> {
+fn find_last_blank(v: &[u8]) -> Option<usize> {
     for (pos, chv) in v.iter().rev().enumerate() {
         let ch = *chv as char;
         if ch.is_whitespace() {
-            return Some(pos as usize);
+            return Some(pos);
         }
     }
 
-    return None;
+    None
 }
 
 fn fold_file(args: &Args, pathname: &PathBuf) -> io::Result<()> {
@@ -142,7 +139,7 @@ fn fold_file(args: &Args, pathname: &PathBuf) -> io::Result<()> {
                         let rhs = &state.data[blankpos + 1..];
                         spill.extend_from_slice(rhs);
                         state.data.truncate(blankpos + 1);
-                        state.push('\n' as u8);
+                        state.push(b'\n');
                         state.write_line()?;
                         for dchv in &spill {
                             let dch = *dchv as char;
@@ -158,7 +155,7 @@ fn fold_file(args: &Args, pathname: &PathBuf) -> io::Result<()> {
                     break;
                 }
 
-                state.push('\n' as u8);
+                state.push(b'\n');
                 state.write_line()?;
             }
         }

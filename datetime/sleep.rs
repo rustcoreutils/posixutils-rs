@@ -9,6 +9,7 @@
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use libc::{signal, SIGALRM, SIG_IGN};
 use plib::PROJECT_NAME;
 use std::{thread, time};
 
@@ -29,6 +30,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     setlocale(LocaleCategory::LcAll, "");
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+
+    unsafe {
+        // Ignore the SIGALRM signal
+        signal(SIGALRM, SIG_IGN);
+    }
 
     thread::sleep(time::Duration::from_secs(args.seconds));
 

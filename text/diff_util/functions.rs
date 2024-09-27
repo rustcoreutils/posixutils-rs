@@ -35,7 +35,7 @@ pub fn vec_min(nums: &[usize]) -> usize {
         }
     }
 
-    return result;
+    result
 }
 
 pub fn is_binary(file_path: &PathBuf) -> io::Result<bool> {

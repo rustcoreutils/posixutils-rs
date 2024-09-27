@@ -80,7 +80,7 @@ impl FileData {
             }
         }
 
-        return COULD_NOT_UNWRAP_FILENAME;
+        COULD_NOT_UNWRAP_FILENAME
     }
 
     pub fn set_change(&mut self, change: Change, index: usize) {
@@ -101,7 +101,7 @@ impl FileData {
             }
         }
 
-        return false;
+        false
     }
 
     pub fn change(&self, index: usize) -> &Change {

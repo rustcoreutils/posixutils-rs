@@ -61,22 +61,22 @@ impl<'a> FileDiff<'a> {
     ) -> io::Result<DiffExitStatus> {
         if is_binary(&path1)? || is_binary(&path2)? {
             return Self::binary_file_diff(&path1, &path2);
-        } else {
-            let mut file1 = FileData::get_file(path1)?;
-            let mut file2 = FileData::get_file(path2)?;
-
-            let mut diff = FileDiff::new(&mut file1, &mut file2, format_options);
-
-            diff.needleman_wunsch_diff_lines();
-
-            if diff.are_different() {
-                if let Some(show_if_different) = show_if_different {
-                    println!("{}", show_if_different);
-                }
-            }
-
-            return diff.print();
         }
+
+        let mut file1 = FileData::get_file(path1)?;
+        let mut file2 = FileData::get_file(path2)?;
+
+        let mut diff = FileDiff::new(&mut file1, &mut file2, format_options);
+
+        diff.needleman_wunsch_diff_lines();
+
+        if diff.are_different() {
+            if let Some(show_if_different) = show_if_different {
+                println!("{}", show_if_different);
+            }
+        }
+
+        diff.print()
     }
 
     pub fn file_dir_diff(
@@ -95,7 +95,7 @@ impl<'a> FileDiff<'a> {
                 return Ok(DiffExitStatus::Trouble);
             }
 
-            return FileDiff::file_diff(path1, path2, format_options, None);
+            FileDiff::file_diff(path1, path2, format_options, None)
         } else {
             let path2_file = path2.clone();
             let path2_file = path2_file.file_name().expect(&COULD_NOT_UNWRAP_FILENAME);
@@ -105,7 +105,7 @@ impl<'a> FileDiff<'a> {
                 return Ok(DiffExitStatus::Trouble);
             }
 
-            return FileDiff::file_diff(path1, path2, format_options, None);
+            FileDiff::file_diff(path1, path2, format_options, None)
         }
     }
 
@@ -177,10 +177,9 @@ impl<'a> FileDiff<'a> {
             }
         }
 
-        if self.are_different() {
-            return Ok(DiffExitStatus::Different);
-        } else {
-            return Ok(DiffExitStatus::NotDifferent);
+        match self.are_different() {
+            true => Ok(DiffExitStatus::Different),
+            false => Ok(DiffExitStatus::NotDifferent),
         }
     }
 
@@ -334,7 +333,7 @@ impl<'a> FileDiff<'a> {
             context_ranges.push((ln1s as usize, ln1e as usize, ln2s as usize, ln2e as usize));
         }
 
-        return context_ranges;
+        context_ranges
     }
 
     fn order_hunks_by_output_format(&mut self) {
@@ -562,13 +561,13 @@ impl<'a> FileDiff<'a> {
 
     pub fn get_header(file: &FileData, label: &Option<String>) -> String {
         if let Some(label) = label {
-            return format!("{}", label);
+            format!("{}", label)
         } else {
-            return format!(
+            format!(
                 "{}\t{}",
                 file.path(),
                 system_time_to_rfc2822(file.modified())
-            );
+            )
         }
     }
 }

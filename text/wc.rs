@@ -12,6 +12,7 @@ use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use std::ffi::OsStr;
 use std::io::{self, Read};
+use std::ops::AddAssign;
 use std::path::PathBuf;
 
 /// wc - word, line, and byte or character count
@@ -45,11 +46,11 @@ struct CountInfo {
     nl: usize,
 }
 
-impl CountInfo {
-    fn accum(&mut self, count: &CountInfo) {
-        self.words = self.words + count.words;
-        self.chars = self.chars + count.chars;
-        self.nl = self.nl + count.nl;
+impl AddAssign for CountInfo {
+    fn add_assign(&mut self, rhs: Self) {
+        self.words += rhs.words;
+        self.chars += rhs.chars;
+        self.nl += rhs.nl;
     }
 }
 
@@ -205,7 +206,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("{}: {}", filename.display(), e);
             }
 
-            totals.accum(&count);
+            totals += count;
         }
     }
 

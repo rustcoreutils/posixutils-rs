@@ -134,6 +134,7 @@ fn show_flags(name: &str, flags: &[String]) {
     println!("{}: {}", name, flags.join(" "));
 }
 
+#[allow(clippy::single_match)]
 fn show_cchars(tty_params: &HashMap<&'static str, ParamType>, ti: &Termios) {
     let mut v = Vec::new();
     let cchar_xlat = osdata::load_cchar_xlat();

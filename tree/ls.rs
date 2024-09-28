@@ -518,9 +518,8 @@ impl Config {
             args.reverse_sorting = false;
 
             // -A is also ignored
-            match file_inclusion {
-                FileInclusion::Default => file_inclusion = FileInclusion::All,
-                _ => (),
+            if let FileInclusion::Default = file_inclusion {
+                file_inclusion = FileInclusion::All
             }
         }
 

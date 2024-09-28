@@ -307,7 +307,7 @@ fn set_ti_flag(
 
     // set flag bits (unless negation)
     if !negate {
-        newflags = newflags | val_set;
+        newflags |= val_set;
     }
 
     // commit flag bits to termio struct, if changed
@@ -461,7 +461,7 @@ fn stty_set_long(mut ti: Termios, args: &Args) -> io::Result<()> {
         if operand.parse::<u64>().is_ok() {
             set_ti_speed(&mut ti, &speedmap, true, operand)?;
             set_ti_speed(&mut ti, &speedmap, false, operand)?;
-            idx = idx + 1;
+            idx += 1;
             continue;
         }
 
@@ -489,7 +489,7 @@ fn stty_set_long(mut ti: Termios, args: &Args) -> io::Result<()> {
 
         let mut op_arg = String::new();
         if (flags & PARG) != 0 {
-            idx = idx + 1;
+            idx += 1;
 
             if idx == args.operands.len() {
                 let errstr = format!("Missing operand for {}", operand);
@@ -530,7 +530,7 @@ fn stty_set_long(mut ti: Termios, args: &Args) -> io::Result<()> {
             }
         }
 
-        idx = idx + 1;
+        idx += 1;
     }
 
     // finally, commit new termio settings (if any)

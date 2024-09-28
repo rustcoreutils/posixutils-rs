@@ -355,14 +355,10 @@ impl Parameters {
 
         let (first_page, last_page) = args.pages.unwrap_or((1, None));
 
-        let num_columns = {
-            if args.merge {
-                args.file.len()
-            } else if let Some(n) = args.columns {
-                n
-            } else {
-                1
-            }
+        let num_columns = if args.merge {
+            args.file.len()
+        } else {
+            args.columns.unwrap_or(1)
         };
 
         let form_feed = args.form_feed || args.form_feed_with_pause;

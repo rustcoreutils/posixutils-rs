@@ -10,7 +10,6 @@
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::lzw::UnixLZWWriter;
-use plib::PROJECT_NAME;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -118,8 +117,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = Args::parse();
 
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
 
     if args.files.is_empty() {
         args.files.push(PathBuf::new());

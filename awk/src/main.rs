@@ -12,7 +12,6 @@ use crate::interpreter::interpret;
 use clap::Parser;
 use compiler::SourceFile;
 use gettextrs::{bind_textdomain_codeset, gettext, textdomain};
-use plib::PROJECT_NAME;
 use std::error::Error;
 use std::fmt::Display;
 use std::io::Read;
@@ -56,8 +55,8 @@ fn exit_if_error<T, U: Display>(r: Result<T, U>) -> T {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
 
     let args = Args::parse();
 

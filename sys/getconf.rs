@@ -15,7 +15,6 @@
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use libc::{pathconf, sysconf};
-use plib::PROJECT_NAME;
 use std::collections::HashMap;
 use std::ffi::CString;
 
@@ -329,8 +328,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Set locale and text domain for localization
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
 
     if let Some(pathname) = args.pathname {
         let pathconf_mappings = load_pathconf_mapping();

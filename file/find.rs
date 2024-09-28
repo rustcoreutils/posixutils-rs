@@ -8,7 +8,6 @@
 //
 
 use gettextrs::{bind_textdomain_codeset, textdomain};
-use plib::PROJECT_NAME;
 use regex::Regex;
 use std::collections::HashSet;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -484,8 +483,8 @@ fn find(args: Vec<String>) -> Result<(), String> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
 
     let args: Vec<String> = env::args().collect();
 

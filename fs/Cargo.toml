@@ -7,10 +7,12 @@ license.workspace = true
 edition.workspace = true
 
 [dependencies]
-plib = { path = "../plib" }
 clap.workspace = true
 gettext-rs.workspace = true
 libc.workspace = true
+
+[dev-dependencies]
+plib = { path = "../plib" }
 
 [lints]
 workspace = true

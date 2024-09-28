@@ -19,7 +19,6 @@ use object::{
     build::elf::{Builder, Section, SectionData},
     elf,
 };
-use plib::PROJECT_NAME;
 
 #[derive(Parser)]
 #[command(version, about = gettext("strip - remove unnecessary information from strippable files"))]
@@ -145,8 +144,8 @@ fn strip_file(file: &OsStr) {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
 
     let args = Args::parse();
     for file in args.input_files {

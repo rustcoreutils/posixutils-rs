@@ -6,7 +6,6 @@ license.workspace = true
 edition.workspace = true
 
 [dependencies]
-plib = { path = "../plib" }
 gettext-rs.workspace = true
 clap.workspace = true
 libc.workspace = true
@@ -15,6 +14,9 @@ pest_derive = "2.7"
 lazy_static = "1.4"
 lexical = { version = "6.1", features = ["format"] }
 rand = {version = "0.8", default-features = false, features = ["small_rng"] }
+
+[dev-dependencies]
+plib = { path = "../plib" }
 
 [lints]
 workspace = true

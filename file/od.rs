@@ -10,7 +10,6 @@
 use crate::io::ErrorKind;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 use std::fs::File;
 use std::io::{self, BufReader, Error, Read, Seek, SeekFrom};
 use std::num::ParseIntError;
@@ -1138,8 +1137,8 @@ fn od(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
 
     let mut args = Args::parse();
     args.validate_args()?;

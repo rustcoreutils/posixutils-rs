@@ -15,7 +15,6 @@ mod osdata;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use osdata::{ParamType, PARG, PNEG};
-use plib::PROJECT_NAME;
 use std::collections::HashMap;
 use std::io::{self, Error, ErrorKind};
 use termios::{
@@ -556,8 +555,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
 
     // load termio settings
     let ti = Termios::from_fd(libc::STDIN_FILENO)?;

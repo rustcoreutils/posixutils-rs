@@ -10,7 +10,6 @@
 use chrono::Local;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 
 /// ipcs - report XSI interprocess communication facilities status
 #[derive(Parser)]
@@ -262,8 +261,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Set locale and text domain for localization
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
 
     // Validate arguments and determine what to display
     if args.all {

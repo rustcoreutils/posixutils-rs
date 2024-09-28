@@ -9,7 +9,6 @@
 
 use clap::{Parser, ValueEnum};
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 use regex::Regex;
 use std::fs;
 use std::io::{self, BufRead, Read};
@@ -325,8 +324,8 @@ fn main() -> ExitCode {
 
     // Initialize translation system
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME).unwrap();
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8").unwrap();
+    textdomain(env!("PROJECT_NAME")).unwrap();
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8").unwrap();
 
     match nl_main(&args) {
         Ok(_) => ExitCode::from(0),

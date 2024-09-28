@@ -9,7 +9,6 @@
 
 use clap::{CommandFactory, Parser};
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 use std::fs::{metadata, Metadata};
 use std::io::{self, Write};
 use std::sync::mpsc;
@@ -1357,8 +1356,8 @@ struct Args {
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
 
     let Args {
         mount, user, file, ..

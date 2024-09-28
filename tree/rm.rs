@@ -13,7 +13,6 @@ use self::common::error_string;
 use clap::Parser;
 use ftw::{self, traverse_directory};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 use std::{
     ffi::CString,
     fs,
@@ -437,8 +436,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
 
     let is_tty = io::stdin().is_terminal();
     let cfg = RmConfig { args, is_tty };

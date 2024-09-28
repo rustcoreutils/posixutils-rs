@@ -10,7 +10,6 @@
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 use regex::Regex;
 use std::{
     error::Error,
@@ -665,8 +664,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize translation system
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME).unwrap();
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8").unwrap();
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
 
     for file in &args.files {
         analyze_file(file.clone(), &args);

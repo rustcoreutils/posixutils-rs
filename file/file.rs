@@ -599,65 +599,78 @@ fn analyze_file(mut path: String, args: &Args) {
         magic_files.push(get_default_magic_file());
     }
 
-    match fs::symlink_metadata(&path) {
-        Ok(met) => {
-            let file_type = met.file_type();
-
-            if file_type.is_symlink() {
-                if args.identify_as_symbolic_link {
-                    println!("{path}: symbolic link");
-                } else {
-                    match read_link(&path) {
-                        Ok(file_p) => {
-                            // trace the file pointed by symbolic link
-                            if file_p.exists() {
-                                println!("{path}: symbolic link to {}", file_p.to_str().unwrap());
-                            } else {
-                                println!(
-                                    "{path}: broken symbolic link to {}",
-                                    file_p.to_str().unwrap()
-                                );
-                            }
-                        }
-                        Err(_) => {
-                            println!("{path}: symbolic link");
-                        }
-                    }
-                }
-            } else if file_type.is_char_device() {
-                println!("{path}: character special");
-            } else if file_type.is_dir() {
-                println!("{path}: directory");
-            } else if file_type.is_fifo() {
-                println!("{path}: fifo");
-            } else if file_type.is_socket() {
-                println!("{path}: socket");
-            }
-            if file_type.is_block_device() {
-                println!("{path}: block special");
-            } else if file_type.is_file() {
-                if args.no_further_file_classification {
-                    println!("{path}: regular file");
-                } else {
-                    if met.len() == 0 {
-                        println!("{path}: empty");
-                    } else {
-                        match get_type_from_magic_file_dbs(&PathBuf::from(&path), &magic_files) {
-                            Some(f_type) => {
-                                println!("{path}: {f_type}");
-                            }
-                            None => {
-                                println!("{path}: data");
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    let met = match fs::symlink_metadata(&path) {
+        Ok(met) => met,
         Err(_) => {
             println!("{path}: cannot open");
+            return;
+        }
+    };
+
+    let file_type = met.file_type();
+
+    if file_type.is_symlink() {
+        if args.identify_as_symbolic_link {
+            println!("{path}: symbolic link");
+            return;
+        }
+        match read_link(&path) {
+            Ok(file_p) => {
+                // trace the file pointed by symbolic link
+                if file_p.exists() {
+                    println!("{path}: symbolic link to {}", file_p.to_str().unwrap());
+                } else {
+                    println!(
+                        "{path}: broken symbolic link to {}",
+                        file_p.to_str().unwrap()
+                    );
+                }
+            }
+            Err(_) => {
+                println!("{path}: symbolic link");
+            }
+        }
+        return;
+    }
+    if file_type.is_char_device() {
+        println!("{path}: character special");
+        return;
+    }
+    if file_type.is_dir() {
+        println!("{path}: directory");
+        return;
+    }
+    if file_type.is_fifo() {
+        println!("{path}: fifo");
+        return;
+    }
+    if file_type.is_socket() {
+        println!("{path}: socket");
+        return;
+    }
+    if file_type.is_block_device() {
+        println!("{path}: block special");
+        return;
+    }
+    if file_type.is_file() {
+        if args.no_further_file_classification {
+            println!("{path}: regular file");
+            return;
+        }
+        if met.len() == 0 {
+            println!("{path}: empty");
+            return;
+        }
+        match get_type_from_magic_file_dbs(&PathBuf::from(&path), &magic_files) {
+            Some(f_type) => {
+                println!("{path}: {f_type}");
+            }
+            None => {
+                println!("{path}: data");
+            }
         }
     }
+    unreachable!();
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

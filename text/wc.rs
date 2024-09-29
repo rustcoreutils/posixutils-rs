@@ -89,7 +89,7 @@ fn build_display_str(args: &Args, count: &CountInfo, filename: &OsStr) -> String
         output.push_str(&numstr);
     }
     if args.words {
-        if output.len() > 0 {
+        if !output.is_empty() {
             output.push(' ');
         }
         let numstr = match only_words {
@@ -99,7 +99,7 @@ fn build_display_str(args: &Args, count: &CountInfo, filename: &OsStr) -> String
         output.push_str(&numstr);
     }
     if args.bytes || args.chars {
-        if output.len() > 0 {
+        if !output.is_empty() {
             output.push(' ');
         }
         let numstr = match only_bytechars {

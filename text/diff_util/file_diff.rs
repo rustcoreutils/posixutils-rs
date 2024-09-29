@@ -320,7 +320,7 @@ impl<'a> FileDiff<'a> {
             let ln2s = i64::clamp(cr.2 - context as i64, 1, f2_max as i64);
             let ln2e = i64::clamp(cr.3 + context as i64, 1, f2_max as i64);
 
-            if context_ranges.len() > 0 {
+            if !context_ranges.is_empty() {
                 // Overlap check
                 if let Some((_, ln1_end, _, ln2_end)) = context_ranges.last_mut() {
                     if *ln1_end >= ln1s as usize || *ln2_end >= ln2s as usize {

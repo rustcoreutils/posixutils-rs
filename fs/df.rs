@@ -7,14 +7,19 @@
 // SPDX-License-Identifier: MIT
 //
 
+#[cfg(target_os = "linux")]
+mod mntent;
+
+#[cfg(target_os = "linux")]
+use crate::mntent::MountTable;
+
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
-use std::ffi::{CStr, CString};
+#[cfg(target_os = "macos")]
+use std::ffi::CStr;
+use std::ffi::CString;
 use std::io;
-
-#[cfg(target_os = "linux")]
-const _PATH_MOUNTED: &'static str = "/etc/mtab";
 
 #[derive(Parser)]
 #[command(version, about = gettext("df - report free storage space"))]
@@ -54,9 +59,7 @@ fn to_cstr(array: &[libc::c_char]) -> &CStr {
     }
 }
 
-fn stat(filename_str: &str) -> io::Result<libc::stat> {
-    let filename = CString::new(filename_str).unwrap();
-
+fn stat(filename: &CString) -> io::Result<libc::stat> {
     unsafe {
         let mut st: libc::stat = std::mem::zeroed();
         let rc = libc::stat(filename.as_ptr(), &mut st);
@@ -102,11 +105,11 @@ impl MountList {
         }
     }
 
-    fn push(&mut self, fsstat: &libc::statfs, devname: &CStr, dirname: &CStr) {
+    fn push(&mut self, fsstat: &libc::statfs, devname: &CString, dirname: &CString) {
         let dev = {
-            if let Ok(st) = stat(devname.to_str().unwrap()) {
+            if let Ok(st) = stat(devname) {
                 st.st_rdev as i64
-            } else if let Ok(st) = stat(dirname.to_str().unwrap()) {
+            } else if let Ok(st) = stat(dirname) {
                 st.st_dev as i64
             } else {
                 -1
@@ -136,9 +139,9 @@ fn read_mount_info() -> io::Result<MountList> {
 
         let mounts: &[libc::statfs] = std::slice::from_raw_parts(mounts as _, n_mnt as _);
         for mount in mounts {
-            let devname = to_cstr(&mount.f_mntfromname);
-            let dirname = to_cstr(&mount.f_mntonname);
-            info.push(mount, devname, dirname);
+            let devname = to_cstr(&mount.f_mntfromname).into();
+            let dirname = to_cstr(&mount.f_mntonname).into();
+            info.push(mount, &devname, &dirname);
         }
     }
 
@@ -149,47 +152,30 @@ fn read_mount_info() -> io::Result<MountList> {
 fn read_mount_info() -> io::Result<MountList> {
     let mut info = MountList::new();
 
-    unsafe {
-        let path_mnt = CString::new(_PATH_MOUNTED).unwrap();
-        let mnt_mode = CString::new("r").unwrap();
-        let f = libc::setmntent(path_mnt.as_ptr(), mnt_mode.as_ptr());
-        if f.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-
-        loop {
-            let me = libc::getmntent(f);
-            if me.is_null() {
-                break;
-            }
-
-            let me_devname = (*me).mnt_fsname;
-            let me_dirname = (*me).mnt_dir;
-            let devname = CStr::from_ptr(me_devname);
-            let dirname = CStr::from_ptr(me_dirname);
-
-            let mut mount: libc::statfs = std::mem::zeroed();
-            let rc = libc::statfs(dirname.as_ptr(), &mut mount);
+    let mounts = MountTable::try_new()?;
+    for mount in mounts {
+        unsafe {
+            let mut buf: libc::statfs = std::mem::zeroed();
+            let rc = libc::statfs(mount.dir.as_ptr(), &mut buf);
             if rc < 0 {
                 eprintln!(
                     "{}: {}",
-                    dirname.to_str().unwrap(),
+                    mount.dir.to_str().unwrap(),
                     io::Error::last_os_error()
                 );
                 continue;
             }
 
-            info.push(&mount, devname, dirname);
+            info.push(&buf, &mount.fsname, &mount.dir);
         }
-
-        libc::endmntent(f);
     }
 
     Ok(info)
 }
 
 fn mask_fs_by_file(info: &mut MountList, filename: &str) -> io::Result<()> {
-    let stat_res = stat(filename);
+    let c_filename = CString::new(filename).expect("`filename` contains an internal 0 byte");
+    let stat_res = stat(&c_filename);
     if let Err(e) = stat_res {
         eprintln!("{}: {}", filename, e);
         return Err(e);

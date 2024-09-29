@@ -117,15 +117,15 @@ impl<'a> DirDiff<'a> {
                             show_if_different.push_str("-b ");
                         }
 
-                        if let Some(label1) = &self.format_options.label1 {
+                        if let Some(label1) = &self.format_options.label1() {
                             show_if_different.push_str(format!("--label {} ", label1).as_str())
                         }
 
-                        if let Some(label2) = &self.format_options.label2 {
+                        if let Some(label2) = &self.format_options.label2() {
                             show_if_different.push_str(format!("--label2 {} ", label2).as_str())
                         }
 
-                        if let Some(label1) = &self.format_options.label1 {
+                        if let Some(label1) = &self.format_options.label1() {
                             show_if_different.push_str(format!("{} ", label1).as_str())
                         } else {
                             show_if_different
@@ -133,7 +133,7 @@ impl<'a> DirDiff<'a> {
                             show_if_different.push(' ');
                         }
 
-                        if let Some(label2) = &self.format_options.label2 {
+                        if let Some(label2) = &self.format_options.label2() {
                             show_if_different.push_str(format!("{} ", label2).as_str())
                         } else {
                             show_if_different

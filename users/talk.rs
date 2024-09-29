@@ -745,6 +745,7 @@ fn handle_character<W: Write>(
     handle.flush().unwrap();
     Ok(())
 }
+
 /// Handles user input from stdin, sending it over a TCP stream.
 ///
 /// # Arguments
@@ -762,18 +763,24 @@ fn handle_stdin_input(
     top_line: Arc<Mutex<u16>>,
     output_buffer: &mut String,
 ) -> Result<(), io::Error> {
-    let mut buffer: [u8; 1] = [0; 1]; // Buffer for raw input
+    // Buffer for raw input
+    let mut buffer: [u8; 1] = [0; 1];
     let mut line_buffer = String::new();
     loop {
         // Read one byte from stdin
         let result =
             unsafe { libc::read(STDIN_FILENO, buffer.as_mut_ptr() as *mut libc::c_void, 1) };
-        if result < 0 {
-            eprintln!("Error reading from stdin: {}", io::Error::last_os_error());
-            break;
-        } else if result == 0 {
-            // EOF reached
-            break;
+
+        match result.cmp(&0) {
+            std::cmp::Ordering::Less => {
+                eprintln!("Error reading from stdin: {}", io::Error::last_os_error());
+                break;
+            }
+            std::cmp::Ordering::Equal => {
+                // EOF reached
+                break;
+            }
+            _ => {}
         }
 
         let input_char = char::from(buffer[0]);

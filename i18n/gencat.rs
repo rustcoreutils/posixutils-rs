@@ -610,10 +610,7 @@ impl MessageCatalog {
                     + string_offset;
 
                 let msg = String::from_utf8_lossy(&string_pool[string_offset..msg_end]).to_string();
-                set_msg
-                    .entry(set_id)
-                    .or_insert_with(BTreeMap::new)
-                    .insert(msg_id, msg);
+                set_msg.entry(set_id).or_default().insert(msg_id, msg);
             }
         }
 

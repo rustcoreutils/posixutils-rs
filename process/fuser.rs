@@ -1082,7 +1082,7 @@ mod linux {
                     None
                 }
             })
-            .unwrap_or_else(NameSpace::default)
+            .unwrap_or_default()
     }
 
     /// Processes file namespaces by expanding paths and updating lists based on the mount flag.

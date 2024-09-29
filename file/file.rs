@@ -286,7 +286,7 @@ impl Type {
         };
 
         // the input string should be empty after all the steps being followed
-        if input.len() != 0 {
+        if !input.is_empty() {
             return Err(RawMagicLineParseError::InvalidTypeFormat);
         }
 

@@ -1,3 +1,5 @@
+use std::hash::Hash;
+
 #[derive(Clone, Copy, Debug, Default, Hash)]
 pub struct ChangeData {
     ln1: usize, // line number in file1
@@ -18,7 +20,7 @@ impl ChangeData {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Hash)]
+#[derive(Clone, Copy, Debug, Default)]
 pub enum Change {
     #[default]
     None,
@@ -92,5 +94,12 @@ impl PartialEq for Change {
             (Self::Substitute(_), Self::Substitute(_)) => true,
             _ => false,
         }
+    }
+}
+
+// https://rust-lang.github.io/rust-clippy/master/index.html#/derived_hash_with_manual_eq
+impl Hash for Change {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        core::mem::discriminant(self).hash(state);
     }
 }

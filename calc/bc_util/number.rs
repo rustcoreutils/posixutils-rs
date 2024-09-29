@@ -100,22 +100,21 @@ impl Number {
     }
 
     /// Convert the number to a string in the given base.
-    pub fn to_string(mut self, base: u64) -> String {
-        if self.is_zero() {
+    pub fn to_string(&self, base: u64) -> String {
+        let mut number = self.0.clone();
+        if number.is_zero() {
             return "0".to_string();
         }
-
-        let scale = self.scale();
 
         let mut result = String::new();
         if self.0.is_negative() {
             result.push('-');
-            self.0 = -self.0;
+            number = -number;
         }
 
         let base_ilog10 = base.ilog10();
-        let integer_part = self.0.with_scale(0);
-        let mut fractional_part = self.0 - &integer_part;
+        let integer_part = number.with_scale(0);
+        let mut fractional_part = number - &integer_part;
 
         if integer_part.is_zero() {
             result.push('0');
@@ -145,6 +144,7 @@ impl Number {
 
         result.push('.');
         let mut temp = BigDecimal::one();
+        let scale = self.scale();
         // The standard doesn't specify how many fractional digits to print.
         // Here, we set the scale of the number to the value smallest value of
         // i such that: (base ^ i).digits() > scale.
@@ -556,5 +556,12 @@ mod tests {
 
         assert_eq!(n.scale(), 1);
         assert_eq!(n.to_string(10), "1.0");
+    }
+
+    #[test]
+    fn test_to_string() {
+        let n = Number::parse("4.5", 10).unwrap().negate();
+        assert_eq!(n.to_string(10), "-4.5");
+        assert_eq!(n.to_string(10), "-4.5");
     }
 }

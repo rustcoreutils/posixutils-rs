@@ -947,19 +947,26 @@ fn merge_files(paths: &mut Vec<Box<dyn Read>>, output_path: &Option<PathBuf>) ->
 ///
 /// A vector of strings (`Vec<String>`) where consecutive empty strings are merged with the nearest non-empty string.
 ///
+/// # Examples
+///
+/// ```
+/// let result = merge_empty_lines(vec!["line1", "line2", "", "", "", "lineN"]);
+/// assert_eq!(result, vec!["line1", "line2", "   lineN"]);
+/// ```
+///
 fn merge_empty_lines(vec: Vec<&str>) -> Vec<String> {
     let mut empty_count = 0;
     let mut result = vec![];
 
-    for i in 0..vec.len() {
-        if vec[i].is_empty() {
+    for i in vec {
+        if i.is_empty() {
             empty_count += 1;
         } else if empty_count > 0 {
             let spaces = " ".repeat(empty_count);
-            result.push(format!("{}{}", spaces, vec[i]));
+            result.push(format!("{}{}", spaces, i));
             empty_count = 0;
         } else {
-            result.push(vec[i].to_string());
+            result.push(i.to_string());
         }
     }
 
@@ -1030,4 +1037,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     std::process::exit(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_merge_empty_lines() {
+        let result = merge_empty_lines(vec!["line1", "line2", "", "", "", "lineN"]);
+        assert_eq!(result, vec!["line1", "line2", "   lineN"]);
+    }
 }

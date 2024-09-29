@@ -375,7 +375,7 @@ impl<'a> FileDiff<'a> {
             let cr = change_ranges[cr_index];
 
             println!("***************");
-            println!("*** {} ***", format!("{},{}", cr.0, cr.1));
+            println!("*** {},{} ***", cr.0, cr.1);
             if self.file1.expected_changed_in_range(
                 cr.0 - 1,
                 cr.1 - 1,
@@ -396,7 +396,7 @@ impl<'a> FileDiff<'a> {
                 }
             }
 
-            println!("--- {} ---", format!("{},{}", cr.2, cr.3));
+            println!("--- {},{} ---", cr.2, cr.3);
 
             if self.file2.expected_changed_in_range(
                 cr.2 - 1,

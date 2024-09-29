@@ -80,7 +80,7 @@ impl Entry {
         };
 
         let long_format_data =
-            if let OutputFormat::LongFormat(long_format_options) = &config.output_format {
+            if let OutputFormat::Long(long_format_options) = &config.output_format {
                 Some(LongFormatData::new(metadata, long_format_options)?)
             } else {
                 None

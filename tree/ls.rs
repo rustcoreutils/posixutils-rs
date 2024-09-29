@@ -296,9 +296,9 @@ struct LongFormatOptions {
 enum OutputFormat {
     MultiColumn,
     MultiColumnAcross,
-    StreamOutputFormat,
+    Stream,
     OneEntryPerLine,
-    LongFormat(LongFormatOptions),
+    Long(LongFormatOptions),
 }
 
 enum SortBy {
@@ -320,6 +320,7 @@ enum DereferenceSymbolicLink {
     None,
 }
 
+#[allow(clippy::enum_variant_names)]
 enum FileTimeOption {
     LastModificationTime,
     LastStatusChangeTime,
@@ -451,7 +452,7 @@ impl Config {
         ) {
             (false, false, false, false) => {
                 if long_format_enabled {
-                    OutputFormat::LongFormat(long_format_options)
+                    OutputFormat::Long(long_format_options)
                 } else {
                     // According to the specification:
                     //
@@ -464,7 +465,7 @@ impl Config {
                 }
             }
             (true, false, false, false) => OutputFormat::MultiColumn,
-            (false, true, false, false) => OutputFormat::StreamOutputFormat,
+            (false, true, false, false) => OutputFormat::Stream,
             (false, false, true, false) => OutputFormat::MultiColumnAcross,
             (false, false, false, true) => OutputFormat::OneEntryPerLine,
             _ => unreachable!(), // -C, -m, -x, and -1 are mutually exclusive
@@ -718,7 +719,7 @@ fn display_entries(entries: &mut [Entry], config: &Config, dir_path: Option<&str
     }
 
     let mut display_total_size = config.display_size;
-    if let OutputFormat::LongFormat(_) = &config.output_format {
+    if let OutputFormat::Long(_) = &config.output_format {
         display_total_size = true;
     }
 
@@ -743,7 +744,7 @@ fn display_entries(entries: &mut [Entry], config: &Config, dir_path: Option<&str
     }
 
     match &config.output_format {
-        OutputFormat::LongFormat(_) => {
+        OutputFormat::Long(_) => {
             let mut padding = LongFormatPadding::default();
 
             // Calculate required padding
@@ -829,7 +830,7 @@ fn display_entries(entries: &mut [Entry], config: &Config, dir_path: Option<&str
                 println!();
             }
         }
-        OutputFormat::StreamOutputFormat => {
+        OutputFormat::Stream => {
             let stream_outputs: Vec<_> = entries
                 .iter()
                 .map(|entry| entry.build_stream_mode_string())
@@ -962,7 +963,7 @@ fn ls(paths: Vec<PathBuf>, config: &Config) -> io::Result<u8> {
         let target_path = {
             let mut target_path = None;
             if metadata.is_symlink() && !dereference_symlink {
-                if let OutputFormat::LongFormat(_) = &config.output_format {
+                if let OutputFormat::Long(_) = &config.output_format {
                     let mut buf = vec![0u8; libc::PATH_MAX as usize];
 
                     let path_cstr = CString::new(path.as_os_str().as_bytes()).unwrap();
@@ -1174,7 +1175,7 @@ fn process_single_dir(
 
                     let mut target_path = None;
                     if metadata.is_symlink() && !dereference_symlink {
-                        if let OutputFormat::LongFormat(_) = &config.output_format {
+                        if let OutputFormat::Long(_) = &config.output_format {
                             target_path = Some(ls_from_utf8_lossy(
                                 dir_entry.read_link().unwrap().to_bytes(),
                             ));

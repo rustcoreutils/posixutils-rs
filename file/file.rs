@@ -70,6 +70,7 @@ struct Args {
 }
 
 /// Errors that can occur during parsing of a raw magic line.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug)]
 enum RawMagicLineParseError {
     /// Indicates that the offset format is invalid.

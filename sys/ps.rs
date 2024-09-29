@@ -148,7 +148,7 @@ fn main() {
 
     // Print the header
     for field in &output_fields {
-        let header = posix_fields.get(*field).unwrap_or(&field);
+        let header = posix_fields.get(*field).unwrap_or(field);
         print!("{:<10} ", header);
     }
     println!();

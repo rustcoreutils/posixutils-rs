@@ -88,7 +88,7 @@ impl<'a> FileDiff<'a> {
 
         if path1_file_type.is_file() {
             let path1_file = path1.clone();
-            let path1_file = path1_file.file_name().expect(&COULD_NOT_UNWRAP_FILENAME);
+            let path1_file = path1_file.file_name().expect(COULD_NOT_UNWRAP_FILENAME);
             let path2 = path2.join(path1_file);
 
             if !check_existance(&path2)? {
@@ -98,7 +98,7 @@ impl<'a> FileDiff<'a> {
             return FileDiff::file_diff(path1, path2, format_options, None);
         } else {
             let path2_file = path2.clone();
-            let path2_file = path2_file.file_name().expect(&COULD_NOT_UNWRAP_FILENAME);
+            let path2_file = path2_file.file_name().expect(COULD_NOT_UNWRAP_FILENAME);
             let path1 = path1.join(path2_file);
 
             if !check_existance(&path1)? {
@@ -151,13 +151,13 @@ impl<'a> FileDiff<'a> {
             for hunk_index in 0..hunks_count {
                 let hunk = self.hunks.hunk_at_mut(hunk_index);
                 match self.format_options.output_format {
-                    OutputFormat::Debug => hunk.print_debug(&self.file1, &self.file2),
+                    OutputFormat::Debug => hunk.print_debug(self.file1, self.file2),
                     OutputFormat::Default => {
-                        hunk.print_default(&self.file1, &self.file2, hunk_index == hunks_count - 1)
+                        hunk.print_default(self.file1, self.file2, hunk_index == hunks_count - 1)
                     }
                     OutputFormat::EditScript => hunk.print_edit_script(
-                        &self.file1,
-                        &self.file2,
+                        self.file1,
+                        self.file2,
                         hunk_index == hunks_count - 1,
                     ),
                     OutputFormat::Context(_) => {
@@ -165,8 +165,8 @@ impl<'a> FileDiff<'a> {
                         return Ok(DiffExitStatus::Trouble);
                     }
                     OutputFormat::ForwardEditScript => hunk.print_forward_edit_script(
-                        &self.file1,
-                        &self.file2,
+                        self.file1,
+                        self.file2,
                         hunk_index == hunks_count - 1,
                     ),
                     OutputFormat::Unified(_) => {
@@ -209,7 +209,7 @@ impl<'a> FileDiff<'a> {
 
         for i in 1..=n {
             for j in 1..=m {
-                let cost = if self.compare_lines(&self.file1.line(i - 1), &self.file2.line(j - 1)) {
+                let cost = if self.compare_lines(self.file1.line(i - 1), self.file2.line(j - 1)) {
                     if !file1_considered_lines.contains(&i) && !file2_considered_lines.contains(&j)
                     {
                         file1_considered_lines.push(i);
@@ -242,7 +242,7 @@ impl<'a> FileDiff<'a> {
 
                 i -= 1
             } else {
-                if !self.compare_lines(&self.file1.line(i - 1), &self.file2.line(j - 1)) {
+                if !self.compare_lines(self.file1.line(i - 1), self.file2.line(j - 1)) {
                     self.add_change(Change::Substitute(ChangeData::new(i, j)));
                 }
 
@@ -287,7 +287,7 @@ impl<'a> FileDiff<'a> {
             .hunks
             .hunks()
             .iter()
-            .filter(|hunk| !Change::is_none(&hunk.kind()) && !Change::is_unchanged(&hunk.kind()))
+            .filter(|hunk| !Change::is_none(hunk.kind()) && !Change::is_unchanged(hunk.kind()))
             .map(|hunk| {
                 (
                     hunk.ln1_start() as i64,

@@ -261,21 +261,21 @@ impl FromStrRadix for u64 {
 ///
 /// # Returns
 ///
-/// - `Result<u64, Box<dyn std::error::Error>>`: This function returns a `Result` which is:
+/// - `Result<u64, ParseIntError>>`: This function returns a `Result` which is:
 ///   - `Ok(u64)`: On success, the parsed and multiplied offset as a `u64`.
-///   - `Err(Box<dyn std::error::Error>)`: On failure, an error boxed as a `dyn std::error::Error`.
+///   - `Err(ParseIntError)`: On failure, an error.
 ///
-fn parse_offset(offset: &str) -> Result<u64, Box<dyn std::error::Error>> {
+fn parse_offset(offset: &str) -> Result<u64, ParseIntError> {
     let mut base = 8;
     let mut multiplier = 1;
 
     // Handle special suffixes
-    let offset = if offset.ends_with('b') {
+    let offset = if let Some(offset) = offset.strip_suffix('b') {
         multiplier = 512;
-        &offset[..offset.len() - 1]
-    } else if offset.ends_with('.') {
+        offset
+    } else if let Some(offset) = offset.strip_suffix('.') {
         base = 10;
-        &offset[..offset.len() - 1]
+        offset
     } else {
         offset
     };
@@ -1151,4 +1151,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     std::process::exit(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::IntErrorKind;
+
+    use super::*;
+
+    #[test]
+    fn test_parse_offset() {
+        assert_eq!(parse_offset("777b"), Ok(0o777 * 512));
+        assert_eq!(parse_offset("777."), Ok(777));
+        assert_eq!(parse_offset("777"), Ok(0o777));
+    }
+
+    #[test]
+    fn test_parse_offset_invalid() {
+        let result = parse_offset("7.7");
+        assert!(result.is_err());
+        let result = result.unwrap_err();
+        assert_eq!(result.kind(), &IntErrorKind::InvalidDigit);
+    }
 }

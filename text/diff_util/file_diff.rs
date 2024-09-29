@@ -91,7 +91,7 @@ impl<'a> FileDiff<'a> {
             let path1_file = path1_file.file_name().expect(&COULD_NOT_UNWRAP_FILENAME);
             let path2 = path2.join(path1_file);
 
-            if !check_existance(&path2)? {
+            if !check_existance(&path2) {
                 return Ok(DiffExitStatus::Trouble);
             }
 
@@ -101,7 +101,7 @@ impl<'a> FileDiff<'a> {
             let path2_file = path2_file.file_name().expect(&COULD_NOT_UNWRAP_FILENAME);
             let path1 = path1.join(path2_file);
 
-            if !check_existance(&path1)? {
+            if !check_existance(&path1) {
                 return Ok(DiffExitStatus::Trouble);
             }
 

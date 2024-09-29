@@ -113,8 +113,8 @@ fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
     let path1 = PathBuf::from(&args.file1);
     let path2 = PathBuf::from(&args.file2);
 
-    let path1_exists = check_existance(&path1)?;
-    let path2_exists = check_existance(&path2)?;
+    let path1_exists = check_existance(&path1);
+    let path2_exists = check_existance(&path2);
 
     if !path1_exists || !path2_exists {
         return Ok(DiffExitStatus::Trouble);

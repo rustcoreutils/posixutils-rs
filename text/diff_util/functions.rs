@@ -3,7 +3,7 @@ use std::{
     fs::File,
     hash::{DefaultHasher, Hash, Hasher},
     io::{self, Read},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::SystemTime,
 };
 
@@ -53,15 +53,15 @@ pub fn is_binary(file_path: &PathBuf) -> io::Result<bool> {
     Ok(false)
 }
 
-pub fn check_existance(path_buf: &PathBuf) -> io::Result<bool> {
-    if path_buf.exists() == false {
+pub fn check_existance(path_buf: &Path) -> bool {
+    let result = path_buf.exists();
+
+    if !result {
         println!(
             "diff: {}: No such file or directory",
             path_buf.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME)
         );
-
-        return Ok(false);
     }
 
-    Ok(true)
+    result
 }

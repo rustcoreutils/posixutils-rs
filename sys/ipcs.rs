@@ -241,7 +241,11 @@ fn get_current_date() -> String {
 }
 
 fn display_ipc_status(args: &Args) {
-    println!("{} {}", gettext("IPC status from source as of"), get_current_date());
+    println!(
+        "{} {}",
+        gettext("IPC status from source as of"),
+        get_current_date()
+    );
 
     if args.message_queues {
         display_message_queues(args);

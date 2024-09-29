@@ -379,12 +379,11 @@ fn talk(args: Args) -> Result<(), TalkError> {
 
     // Retrieve the local and remote machine names
     let (my_machine_name, his_machine_name) =
-        get_names(&mut msg, &args.address, &args.ttyname).map_err(|e| TalkError::IoError(e))?;
+        get_names(&mut msg, &args.address, &args.ttyname).map_err(TalkError::IoError)?;
 
     // Get the local and remote addresses, and the daemon port number
     let (my_machine_addr, his_machine_addr, daemon_port) =
-        get_addrs(&mut msg, &my_machine_name, &his_machine_name)
-            .map_err(|e| TalkError::IoError(e))?;
+        get_addrs(&mut msg, &my_machine_name, &his_machine_name).map_err(TalkError::IoError)?;
 
     let (width, height) = get_terminal_size();
 
@@ -392,7 +391,7 @@ fn talk(args: Args) -> Result<(), TalkError> {
 
     check_if_tty()?;
     // Open control socket
-    let (ctl_addr, socket) = open_ctl(my_machine_addr).map_err(|e| TalkError::IoError(e))?;
+    let (ctl_addr, socket) = open_ctl(my_machine_addr).map_err(TalkError::IoError)?;
 
     let ctl_addr_data = msg.create_ctl_addr(ctl_addr);
     msg.ctl_addr.sa_data = ctl_addr_data;

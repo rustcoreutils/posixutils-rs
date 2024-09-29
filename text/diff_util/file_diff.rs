@@ -561,14 +561,15 @@ impl<'a> FileDiff<'a> {
     }
 
     pub fn get_header(file: &FileData, label: &Option<String>) -> String {
-        if let Some(label) = label {
-            return format!("{}", label);
-        } else {
-            return format!(
-                "{}\t{}",
-                file.path(),
-                system_time_to_rfc2822(file.modified())
-            );
+        match label {
+            Some(label) => label.clone(),
+            None => {
+                format!(
+                    "{}\t{}",
+                    file.path(),
+                    system_time_to_rfc2822(file.modified())
+                )
+            }
         }
     }
 }

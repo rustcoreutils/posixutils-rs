@@ -302,13 +302,13 @@ impl<'a> FileDiff<'a> {
 
         let mut context_ranges = vec![(usize::MIN, usize::MIN, usize::MIN, usize::MIN); 0];
 
-        let f1_max = if self.file1.ends_with_newline() && f1_lines - 1 >= 1 {
+        let f1_max = if self.file1.ends_with_newline() && f1_lines > 1 {
             f1_lines - 1
         } else {
             f1_lines
         };
 
-        let f2_max = if self.file2.ends_with_newline() && f2_lines - 1 >= 1 {
+        let f2_max = if self.file2.ends_with_newline() && f2_lines > 1 {
             f2_lines - 1
         } else {
             f2_lines

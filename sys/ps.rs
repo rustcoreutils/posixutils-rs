@@ -65,7 +65,7 @@ fn parse_output_format<'a>(
     posix_fields: &'a HashMap<&'a str, &'a str>,
 ) -> Vec<&'a str> {
     format
-        .split(|c| c == ' ' || c == ',')
+        .split([' ', ','])
         .map(|s| {
             let field = s.split('=').next().unwrap_or("").trim();
             if posix_fields.contains_key(field) {

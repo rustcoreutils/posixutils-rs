@@ -438,7 +438,7 @@ mod linux {
                     Err(_) => continue,
                 };
 
-                let st = fs::metadata(&entry.path())?;
+                let st = fs::metadata(entry.path())?;
                 let uid = st.uid();
 
                 check_root_access(names, pid, uid, &root_stat, device_list, inode_list)?;

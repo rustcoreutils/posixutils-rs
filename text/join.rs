@@ -104,20 +104,22 @@ fn process_files2(
                     for num in order {
                         let f_num: Vec<&str> = num.split('.').collect();
                         if f_num[0] == "1" {
-                            if fields1.len() <= f_num[1].parse::<usize>()? - 1 {
+                            let num: usize = f_num[1].parse()?;
+                            if fields1.len() < num {
                                 if let Some(e) = &e {
                                     res.push(e.to_string());
                                 }
                             } else {
-                                res.push(fields1[f_num[1].parse::<usize>()? - 1].clone());
+                                res.push(fields1[num - 1].clone());
                             }
                         } else if f_num[0] == "2" {
-                            if fields2.len() <= f_num[1].parse::<usize>()? - 1 {
+                            let num: usize = f_num[1].parse()?;
+                            if fields2.len() < num {
                                 if let Some(e) = &e {
                                     res.push(e.to_string());
                                 }
                             } else {
-                                res.push(fields2[f_num[1].parse::<usize>()? - 1].clone());
+                                res.push(fields2[num - 1].clone());
                             }
                         }
                     }

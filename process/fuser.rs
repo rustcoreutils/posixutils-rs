@@ -607,6 +607,7 @@ mod linux {
 
         Ok(())
     }
+
     /// Checks a directory within a process's `/proc` entry for matching devices and inodes,
     /// and updates the `Names` object with relevant process information.
     ///
@@ -629,6 +630,7 @@ mod linux {
     /// # Returns
     ///
     /// Returns `Ok(())` on success.
+    #[allow(clippy::too_many_arguments)]
     fn check_dir(
         names: &mut Names,
         pid: i32,
@@ -695,6 +697,7 @@ mod linux {
 
         Ok(())
     }
+
     /// Checks the memory map of a process for matching devices and updates the `Names` object.
     ///
     /// # Arguments

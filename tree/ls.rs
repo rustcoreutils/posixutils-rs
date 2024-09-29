@@ -1185,7 +1185,7 @@ fn process_single_dir(
                     target_path
                 };
 
-                let entry = Entry::new(target_path, file_name_raw, &metadata, config)
+                let entry = Entry::new(target_path, file_name_raw, metadata, config)
                     .map_err(|e| io::Error::other(format!("'{path_str}': {e}")))?;
 
                 let mut include_entry = false;
@@ -1246,7 +1246,7 @@ fn process_single_dir(
                     }
                     print_contents(
                         config,
-                        &current_dir_ref,
+                        current_dir_ref,
                         &mut entries,
                         &mut errors,
                         &exit_code,
@@ -1271,7 +1271,7 @@ fn process_single_dir(
             if dir_parent != current_dir_ref.as_path() {
                 print_contents(
                     config,
-                    &current_dir_ref,
+                    current_dir_ref,
                     &mut entries,
                     &mut errors,
                     &exit_code,

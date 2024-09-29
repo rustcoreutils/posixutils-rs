@@ -37,7 +37,7 @@ impl<'a> DirDiff<'a> {
         let mut dir1: DirData = DirData::load(path1)?;
         let mut dir2: DirData = DirData::load(path2)?;
 
-        let mut dir_diff = DirDiff::new(&mut dir1, &mut dir2, &format_options, recursive);
+        let mut dir_diff = DirDiff::new(&mut dir1, &mut dir2, format_options, recursive);
         return dir_diff.analyze();
     }
 
@@ -177,13 +177,13 @@ impl<'a> DirDiff<'a> {
                     } else {
                         let (file, dir) = if in_dir1_is_file && !in_dir2_is_file {
                             (
-                                path1.to_str().unwrap_or(&COULD_NOT_UNWRAP_FILENAME),
-                                path2.to_str().unwrap_or(&COULD_NOT_UNWRAP_FILENAME),
+                                path1.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME),
+                                path2.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME),
                             )
                         } else {
                             (
-                                path2.to_str().unwrap_or(&COULD_NOT_UNWRAP_FILENAME),
-                                path1.to_str().unwrap_or(&COULD_NOT_UNWRAP_FILENAME),
+                                path2.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME),
+                                path1.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME),
                             )
                         };
 

@@ -51,28 +51,30 @@ struct Args {
 }
 
 /// Display modes
-pub enum HeaderMode {
+pub enum OutputMode {
     /// When both the -k and -P options are specified
     Posix,
     /// When the -P option is specified without the -k option
     PosixLegacy,
-    Inodes,
+    /// The format of the default output from df is unspecified,
+    /// but all space figures are reported in 512-byte units
+    Unspecified,
 }
 
-impl HeaderMode {
+impl OutputMode {
     pub fn new(kilo: bool, portable: bool) -> Self {
         match (kilo, portable) {
             (true, true) => Self::Posix,
             (false, true) => Self::PosixLegacy,
-            _ => Self::Inodes,
+            _ => Self::Unspecified,
         }
     }
 
     pub fn get_block_size(&self) -> u64 {
         match self {
-            HeaderMode::Posix => 1024,
-            HeaderMode::PosixLegacy => 512,
-            HeaderMode::Inodes => 0,
+            OutputMode::Posix => 1024,
+            OutputMode::PosixLegacy => 512,
+            OutputMode::Unspecified => 512,
         }
     }
 }
@@ -95,10 +97,22 @@ impl Field {
     pub fn print_header_align_right(&self) {
         print!("{: >width$} ", self.caption, width = self.width);
     }
+
+    pub fn print_string(&self, value: &String) {
+        print!("{: <width$} ", value, width = self.width);
+    }
+
+    pub fn print_u64(&self, value: u64) {
+        print!("{: >width$} ", value, width = self.width);
+    }
+
+    pub fn print_percentage(&self, value: u32) {
+        print!("{: >width$}% ", value, width = self.width - 1);
+    }
 }
 
-pub struct Header {
-    pub mode: HeaderMode,
+pub struct Fields {
+    pub mode: OutputMode,
     /// file system
     pub source: Field,
     /// FS size
@@ -109,56 +123,69 @@ pub struct Header {
     pub avail: Field,
     /// percent used
     pub pcent: Field,
-    /// inode total
-    pub itotal: Field,
-    /// inodes used
-    pub iused: Field,
-    /// inodes available
-    pub iavail: Field,
-    /// inodes used in percent
-    pub ipcent: Field,
     /// mount point
     pub target: Field,
     // /// specified file name
     // file: Field,
 }
 
-impl Header {
-    pub fn new(mode: HeaderMode) -> Self {
+impl Fields {
+    pub fn new(mode: OutputMode) -> Self {
         let size_caption = format!("{}-{}", mode.get_block_size(), gettext("blocks"));
         Self {
             mode,
             source: Field::new(gettext("Filesystem"), 14),
             size: Field::new(size_caption, 0),
-            used: Field::new(gettext("Used"), 5),
-            avail: Field::new(gettext("Available"), 5),
+            used: Field::new(gettext("Used"), 9),
+            avail: Field::new(gettext("Available"), 9),
             pcent: Field::new(gettext("Capacity"), 5),
-            itotal: Field::new(gettext("Inodes"), 5),
-            iused: Field::new(gettext("IUsed"), 5),
-            iavail: Field::new(gettext("IFree"), 5),
-            ipcent: Field::new(gettext("IUse%"), 5),
             target: Field::new(gettext("Mounted on"), 0),
         }
     }
 
     pub fn print_header(&self) {
         self.source.print_header();
-        match self.mode {
-            HeaderMode::Posix | HeaderMode::PosixLegacy => {
-                self.size.print_header_align_right();
-                self.used.print_header_align_right();
-                self.avail.print_header_align_right();
-                self.pcent.print_header_align_right();
-            }
-            HeaderMode::Inodes => {
-                self.itotal.print_header_align_right();
-                self.iused.print_header_align_right();
-                self.iavail.print_header_align_right();
-                self.ipcent.print_header_align_right();
-            }
-        }
+        self.size.print_header_align_right();
+        self.used.print_header_align_right();
+        self.avail.print_header_align_right();
+        self.pcent.print_header_align_right();
         self.target.print_header();
-        print!("\n");
+        println!();
+    }
+
+    fn print_row(&self, mount: &Mount) {
+        if !mount.masked {
+            return;
+        }
+
+        let sf = &mount.cached_statfs;
+
+        let block_size = self.mode.get_block_size();
+        let blksz = sf.f_bsize as u64;
+
+        let total = (sf.f_blocks * blksz) / block_size;
+        let avail = (sf.f_bavail * blksz) / block_size;
+        let free = (sf.f_bfree * blksz) / block_size;
+        let used = total - free;
+
+        // The percentage value shall be expressed as a positive integer,
+        // with any fractional result causing it to be rounded to the next highest integer.
+        let percentage_used = f64::from(used as u32) / f64::from((used + free) as u32);
+        let percentage_used = percentage_used * 100.0;
+        let percentage_used = percentage_used.ceil() as u32;
+
+        // The remaining output with -P shall consist of one line of information
+        // for each specified file system. These lines shall be formatted as follows:
+        // "%s %d %d %d %d%% %s\n", <file system name>, <total space>,
+        //     <space used>, <space free>, <percentage used>,
+        //     <file system root>
+        self.source.print_string(&mount.devname);
+        self.size.print_u64(total);
+        self.used.print_u64(used);
+        self.avail.print_u64(avail);
+        self.pcent.print_percentage(percentage_used);
+        self.target.print_string(&mount.dir);
+        println!();
     }
 }
 
@@ -303,52 +330,6 @@ fn mask_fs_by_file(info: &mut MountList, filename: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn show_mount(args: &Args, block_size: u64, mount: &Mount) {
-    let sf = &mount.cached_statfs;
-
-    let blksz = sf.f_bsize as u64;
-
-    let total = (sf.f_blocks * blksz) / block_size;
-    let avail = (sf.f_bavail * blksz) / block_size;
-    let free = (sf.f_bfree * blksz) / block_size;
-    let used = total - free;
-
-    if total == 0 {
-        return;
-    }
-
-    let pct = ((total - avail) * 100) / total;
-
-    if args.portable {
-        println!(
-            "{:>20} {:>9} {:>9} {:>9} {:>7} {}",
-            mount.devname, total, used, avail, pct, mount.dir
-        );
-    } else {
-        println!(
-            "{:>20} {:>9} {:>9} {:>9} {:>3} {}",
-            mount.devname, total, used, avail, pct, mount.dir
-        );
-    }
-}
-
-fn show_info(args: &Args, info: &MountList) {
-    let mode = HeaderMode::new(args.kilo, args.portable);
-    let header = Header::new(mode);
-    header.print_header();
-
-    let block_size: u64 = match args.kilo {
-        true => 1024,
-        false => 512,
-    };
-
-    for mount in &info.mounts {
-        if mount.masked {
-            show_mount(args, block_size, mount);
-        }
-    }
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // parse command line arguments
     let args = Args::parse();
@@ -368,7 +349,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     info.ensure_masked();
-    show_info(&args, &info);
+
+    let mode = OutputMode::new(args.kilo, args.portable);
+    let fields = Fields::new(mode);
+    fields.print_header();
+
+    for mount in &info.mounts {
+        fields.print_row(mount);
+    }
 
     Ok(())
 }

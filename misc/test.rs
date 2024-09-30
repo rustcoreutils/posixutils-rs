@@ -18,7 +18,8 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-// unary operators
+/// Unary operators
+#[allow(clippy::upper_case_acronyms)]
 #[derive(PartialEq)]
 enum UnaryOp {
     Block,
@@ -40,7 +41,7 @@ enum UnaryOp {
     StrZero,
 }
 
-// binary operators
+/// Binary operators
 enum BinOp {
     PathEquals,
     PathNewer,

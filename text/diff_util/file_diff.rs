@@ -1,10 +1,9 @@
 use super::{
-    change::ChangeData,
     common::{FormatOptions, OutputFormat},
     constants::COULD_NOT_UNWRAP_FILENAME,
     diff_exit_status::DiffExitStatus,
     file_data::FileData,
-    functions::{check_existance, is_binary, system_time_to_rfc2822, vec_min},
+    functions::{check_existance, is_binary, system_time_to_rfc2822},
     hunks::Hunks,
 };
 
@@ -49,7 +48,7 @@ impl<'a> FileDiff<'a> {
             file1,
             file2,
             hunks: Hunks::new(),
-            format_options: format_options,
+            format_options,
             are_different: false,
         }
     }
@@ -68,7 +67,22 @@ impl<'a> FileDiff<'a> {
 
             let mut diff = FileDiff::new(&mut file1, &mut file2, format_options);
 
-            diff.needleman_wunsch_diff_lines();
+            // histogram diff
+            let mut lcs_indices: Vec<i32> = vec![-1; diff.file1.lines().len()];
+            let num_lines1 = diff.file1.lines().len();
+            let num_lines2 = diff.file2.lines().len();
+            FileDiff::histogram_lcs(
+                &diff.file1,
+                &diff.file2,
+                0,
+                num_lines1,
+                0,
+                num_lines2,
+                &mut lcs_indices,
+            );
+
+            diff.hunks
+                .create_hunks_from_lcs(&lcs_indices, num_lines1, num_lines2);
 
             if diff.are_different() {
                 if let Some(show_if_different) = show_if_different {
@@ -185,99 +199,81 @@ impl<'a> FileDiff<'a> {
         }
     }
 
-    fn compare_lines(&self, l1: &str, l2: &str) -> bool {
-        if self.format_options.ignore_trailing_white_spaces {
-            l1.trim_end() == l2.trim_end()
-        } else {
-            l1 == l2
-        }
-    }
-
-    fn needleman_wunsch_diff_lines(&mut self) {
-        let n = self.file1.lines().len();
-        let m = self.file2.lines().len();
-        let mut distances = vec![vec![0; m + 1]; n + 1];
-        let mut file1_considered_lines = vec![0; 0];
-        let mut file2_considered_lines = vec![0; 0];
-
-        for i in 0..=n {
-            distances[i][0] = i;
-        }
-
-        for j in 0..=m {
-            distances[0][j] = j;
+    /// Longest common subsequence (LCS) algorithm by recursively building a histogram.
+    /// Indices in lcs_indices will be the line number in file1 while values will
+    /// be the corresponding line number in file2. If the value is -1, then the
+    /// line is not part of the LCS.
+    pub fn histogram_lcs(
+        file1: &FileData,
+        file2: &FileData,
+        mut x0: usize,
+        mut x1: usize,
+        mut y0: usize,
+        mut y1: usize,
+        lcs_indices: &mut Vec<i32>,
+    ) {
+        // collect common elements at the beginning
+        while (x0 < x1) && (y0 < y1) && (file1.line(x0) == file2.line(y0)) {
+            lcs_indices[x0] = y0 as i32;
+            x0 += 1;
+            y0 += 1;
         }
 
-        for i in 1..=n {
-            for j in 1..=m {
-                let cost = if self.compare_lines(&self.file1.line(i - 1), &self.file2.line(j - 1)) {
-                    if !file1_considered_lines.contains(&i) && !file2_considered_lines.contains(&j)
-                    {
-                        file1_considered_lines.push(i);
-                        file2_considered_lines.push(j);
-
-                        self.add_change(Change::Unchanged(ChangeData::new(i, j)));
-                    }
-                    0
-                } else {
-                    1
-                };
-
-                let inserted = distances[i - 1][j] + 1;
-                let deleted = distances[i][j - 1] + 1;
-                let substituted = distances[i - 1][j - 1] + cost;
-
-                distances[i][j] = vec_min(&[inserted, deleted, substituted]);
-            }
+        if (x0 == x1) || (y0 == y1) {
+            // we can return early
+            return;
         }
 
-        let (mut i, mut j) = (n, m);
+        // collect common elements at the end
+        while (x0 < x1) && (y0 < y1) && (file1.line(x1 - 1) == file2.line(y1 - 1)) {
+            lcs_indices[x1 - 1] = (y1 - 1) as i32;
+            x1 -= 1;
+            y1 -= 1;
+        }
 
-        while i > 0 || j > 0 {
-            if j > 0 && distances[i][j] == distances[i][j - 1] + 1 {
-                self.add_change(Change::Insert(ChangeData::new(i, j)));
-
-                j -= 1
-            } else if i > 0 && distances[i][j] == distances[i - 1][j] + 1 {
-                self.add_change(Change::Delete(ChangeData::new(i, j)));
-
-                i -= 1
+        // build histogram
+        let mut hist: HashMap<&str, Vec<i32>> = HashMap::new();
+        for i in x0..x1 {
+            if let Some(rec) = hist.get_mut(file1.line(i).as_str()) {
+                rec[0] += 1_i32;
+                rec[1] = i as i32;
             } else {
-                if !self.compare_lines(&self.file1.line(i - 1), &self.file2.line(j - 1)) {
-                    self.add_change(Change::Substitute(ChangeData::new(i, j)));
-                }
-
-                i -= 1;
-                j -= 1
+                hist.insert(file1.line(i).as_str(), vec![1, i as i32, 0, -1]);
             }
         }
-    }
-
-    fn add_change(&mut self, change: Change) {
-        if let Change::None = change {
-        } else {
-            if !self.are_different {
-                self.are_different = match &change {
-                    Change::None => false,
-                    Change::Unchanged(_) => false,
-                    Change::Insert(_) => true,
-                    Change::Delete(_) => true,
-                    Change::Substitute(_) => true,
-                }
-            }
-
-            let (l1, l2) = change.get_lns();
-
-            if l1 != 0 {
-                self.file1.set_change(change, l1 - 1);
-            }
-
-            if l2 != 0 {
-                self.file2.set_change(change, l2 - 1);
+        for i in y0..y1 {
+            if let Some(rec) = hist.get_mut(file2.line(i).as_str()) {
+                rec[2] += 1_i32;
+                rec[3] = i as i32;
+            } else {
+                hist.insert(file2.line(i).as_str(), vec![0, -1, 1, i as i32]);
             }
         }
 
-        self.hunks.add_change(change);
+        // find lowest-occurrence item that appears in both files
+        let key = hist
+            .iter()
+            .filter(|(_k, v)| (v[0] > 0) && (v[2] > 0))
+            .min_by(|a, b| {
+                let c = a.1[0] + a.1[2];
+                let d = b.1[0] + b.1[2];
+                c.cmp(&d)
+            })
+            .map(|(k, _v)| *k);
+
+        match key {
+            None => {
+                return;
+            }
+            Some(k) => {
+                let rec = hist.get(k).unwrap();
+                let x1_new = rec[1] as usize;
+                let y1_new = rec[3] as usize;
+                lcs_indices[x1_new] = y1_new as i32;
+                FileDiff::histogram_lcs(file1, file2, x0, x1_new, y0, y1_new, lcs_indices);
+                FileDiff::histogram_lcs(file1, file2, x1_new + 1, x1, y1_new + 1, y1, lcs_indices);
+            }
+        }
     }
 
     fn get_context_ranges(&self, context: usize) -> Vec<(usize, usize, usize, usize)> {

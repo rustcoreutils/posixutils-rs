@@ -5,14 +5,13 @@ use std::{
     time::SystemTime,
 };
 
-use super::{change::Change, constants::COULD_NOT_UNWRAP_FILENAME};
+use super::constants::COULD_NOT_UNWRAP_FILENAME;
 use plib::BUFSZ;
 
 #[derive(Debug)]
 pub struct FileData {
     path: PathBuf,
     lines: Vec<String>,
-    changes: Vec<Change>,
     modified: SystemTime,
     ends_with_newline: bool,
 }
@@ -49,27 +48,14 @@ impl FileData {
             lines.push(String::from(""));
         }
 
-        let changes = vec![Change::None; lines.len()];
-
         let result = Self {
             path,
             lines,
-            changes,
             modified,
             ends_with_newline,
         };
 
         Ok(result)
-    }
-
-    pub fn get_context_identifier(&self, change_index: usize) -> &str {
-        match self.changes[change_index] {
-            Change::None => " ",
-            Change::Unchanged(_) => " ",
-            Change::Insert(_) => "+",
-            Change::Delete(_) => "-",
-            Change::Substitute(_) => "!",
-        }
     }
 
     pub fn lines(&self) -> &Vec<String> {
@@ -92,31 +78,6 @@ impl FileData {
         }
 
         return COULD_NOT_UNWRAP_FILENAME;
-    }
-
-    pub fn set_change(&mut self, change: Change, index: usize) {
-        self.changes[index] = change;
-    }
-
-    pub fn expected_changed_in_range(
-        &self,
-        start: usize,
-        end: usize,
-        expected_changes: &Vec<fn(&Change) -> bool>,
-    ) -> bool {
-        for i in start..=end {
-            for expected_change in expected_changes {
-                if expected_change(&self.changes[i]) {
-                    return true;
-                }
-            }
-        }
-
-        return false;
-    }
-
-    pub fn change(&self, index: usize) -> &Change {
-        &self.changes[index]
     }
 
     pub fn path(&self) -> &str {

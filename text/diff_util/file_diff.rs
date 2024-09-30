@@ -8,9 +8,8 @@ use super::{
 };
 
 use crate::diff_util::{
-    change::Change,
+    change::{Change, ChangeContext},
     constants::NO_NEW_LINE_AT_END_OF_FILE,
-    functions::{calculate_hash, increase_by_one_if},
 };
 
 use std::{
@@ -276,7 +275,7 @@ impl<'a> FileDiff<'a> {
         }
     }
 
-    fn get_context_ranges(&self, context: usize) -> Vec<(usize, usize, usize, usize)> {
+    fn get_context_ranges(&self, context: usize) -> Vec<ChangeContext> {
         let f1_lines = self.file1.lines().len();
         let f2_lines = self.file2.lines().len();
 
@@ -287,17 +286,18 @@ impl<'a> FileDiff<'a> {
             .filter(|hunk| !Change::is_none(&hunk.kind()) && !Change::is_unchanged(&hunk.kind()))
             .map(|hunk| {
                 (
+                    hunk.kind().clone(),
                     hunk.ln1_start() as i64,
                     hunk.ln1_end() as i64,
                     hunk.ln2_start() as i64,
                     hunk.ln2_end() as i64,
                 )
             })
-            .collect::<Vec<(i64, i64, i64, i64)>>();
+            .collect::<Vec<(Change, i64, i64, i64, i64)>>();
 
         change_ranges.sort_by_key(|change| (change.1, change.3));
 
-        let mut context_ranges = vec![(usize::MIN, usize::MIN, usize::MIN, usize::MIN); 0];
+        let mut context_ranges: Vec<ChangeContext> = Vec::new();
 
         let f1_max = if self.file1.ends_with_newline() && f1_lines - 1 >= 1 {
             f1_lines - 1
@@ -312,26 +312,36 @@ impl<'a> FileDiff<'a> {
         };
 
         for cr in change_ranges {
-            let ln1s = i64::clamp(cr.0 - context as i64, 1, f1_max as i64);
-            let ln1e = i64::clamp(cr.1 + context as i64, 1, f1_max as i64);
-            let ln2s = i64::clamp(cr.2 - context as i64, 1, f2_max as i64);
-            let ln2e = i64::clamp(cr.3 + context as i64, 1, f2_max as i64);
+            let ln1s = i64::clamp(cr.1 - context as i64, 1, f1_max as i64);
+            let ln1e = i64::clamp(cr.2 + context as i64, 1, f1_max as i64);
+            let ln2s = i64::clamp(cr.3 - context as i64, 1, f2_max as i64);
+            let ln2e = i64::clamp(cr.4 + context as i64, 1, f2_max as i64);
 
             if context_ranges.len() > 0 {
                 // Overlap check
-                if let Some((_, ln1_end, _, ln2_end)) = context_ranges.last_mut() {
-                    if *ln1_end >= ln1s as usize || *ln2_end >= ln2s as usize {
-                        *ln1_end = ln1e as usize;
-                        *ln2_end = ln2e as usize;
+                if let Some(change_ctx) = context_ranges.last_mut() {
+                    if change_ctx.ln1_end >= ln1s as usize || change_ctx.ln2_end >= ln2s as usize {
+                        change_ctx.ln1_end = ln1e as usize;
+                        change_ctx.ln2_end = ln2e as usize;
                         continue;
                     }
                 }
             }
 
-            context_ranges.push((ln1s as usize, ln1e as usize, ln2s as usize, ln2e as usize));
+            context_ranges.push(ChangeContext {
+                change: cr.0,
+                ln1_start: ln1s as usize,
+                ln1_end: ln1e as usize,
+                hk1_start: cr.1 as usize,
+                hk1_end: cr.2 as usize,
+                ln2_start: ln2s as usize,
+                ln2_end: ln2e as usize,
+                hk2_start: cr.3 as usize,
+                hk2_end: cr.4 as usize,
+            });
         }
 
-        return context_ranges;
+        context_ranges
     }
 
     fn order_hunks_by_output_format(&mut self) {
@@ -369,23 +379,23 @@ impl<'a> FileDiff<'a> {
         let change_ranges = self.get_context_ranges(context);
 
         for cr_index in 0..change_ranges.len() {
-            let cr = change_ranges[cr_index];
+            let cr = &change_ranges[cr_index];
 
             println!("***************");
-            println!("*** {} ***", format!("{},{}", cr.0, cr.1));
-            if self.file1.expected_changed_in_range(
-                cr.0 - 1,
-                cr.1 - 1,
-                &vec![Change::is_delete, Change::is_substitute],
-            ) {
-                for i in cr.0..=cr.1 {
-                    println!(
-                        "{} {}",
-                        self.file1.get_context_identifier(i - 1),
-                        self.file1.line(i - 1)
-                    );
-                }
-            }
+            println!("*** {} ***", format!("{},{}", cr.ln1_start, cr.ln1_end));
+            // if self.file1.expected_changed_in_range(
+            //     cr.0 - 1,
+            //     cr.1 - 1,
+            //     &vec![Change::is_delete, Change::is_substitute],
+            // ) {
+            //     for i in cr.0..=cr.1 {
+            //         println!(
+            //             "{}",
+            //             // self.file1.get_context_identifier(i - 1),
+            //             self.file1.line(i - 1)
+            //         );
+            //     }
+            // }
 
             if cr_index == change_ranges.len() - 1 {
                 if self.file1.ends_with_newline() == false {
@@ -393,21 +403,21 @@ impl<'a> FileDiff<'a> {
                 }
             }
 
-            println!("--- {} ---", format!("{},{}", cr.2, cr.3));
+            println!("--- {} ---", format!("{},{}", cr.ln2_start, cr.ln2_end));
 
-            if self.file2.expected_changed_in_range(
-                cr.2 - 1,
-                cr.3 - 1,
-                &vec![Change::is_insert, Change::is_substitute],
-            ) {
-                for i in cr.2..=cr.3 {
-                    println!(
-                        "{} {}",
-                        self.file2.get_context_identifier(i - 1),
-                        self.file2.line(i - 1)
-                    );
-                }
-            }
+            // if self.file2.expected_changed_in_range(
+            //     cr.2 - 1,
+            //     cr.3 - 1,
+            //     &vec![Change::is_insert, Change::is_substitute],
+            // ) {
+            //     for i in cr.2..=cr.3 {
+            //         println!(
+            //             "{}",
+            //             // self.file2.get_context_identifier(i - 1),
+            //             self.file2.line(i - 1)
+            //         );
+            //     }
+            // }
 
             if cr_index == change_ranges.len() - 1 {
                 if self.file2.ends_with_newline() == false {
@@ -430,130 +440,55 @@ impl<'a> FileDiff<'a> {
         let context_ranges = self.get_context_ranges(unified);
 
         for cr_index in 0..context_ranges.len() {
-            let cr = context_ranges[cr_index];
-            let mut changes = HashMap::<u64, Change>::new();
+            let cr = &context_ranges[cr_index];
 
-            for f1_line in cr.0..=cr.1 {
-                let change = self.file1.change(f1_line - 1);
-                changes.insert(calculate_hash(change), change.clone());
-            }
+            let mut f1_range = String::new();
+            let mut f2_range = String::new();
 
-            for f2_line in cr.2..=cr.3 {
-                let change = self.file2.change(f2_line - 1);
-                let hash = calculate_hash(change);
-                if changes.contains_key(&hash) == false {
-                    changes.insert(calculate_hash(change), change.clone());
+            if cr.change.is_insert() {
+                f1_range = format!("{},{}", cr.ln1_start, 0);
+            } else {
+                let count = cr.ln1_end - cr.ln1_start + 1;
+                if count == 1 {
+                    f1_range = format!("{}", cr.ln1_start);
+                } else {
+                    f1_range = format!("{},{}", cr.ln1_start, count);
                 }
             }
 
-            if changes.values().any(|change| {
-                Change::is_delete(change)
-                    || Change::is_insert(change)
-                    || Change::is_substitute(change)
-            }) {
-                let mut values = changes.values().cloned().collect::<Vec<Change>>();
-                values.sort_by_key(|change| change.get_lns());
-
-                let f1_range = if values.iter().all(|change| change.is_insert()) {
-                    format!("{},{}", cr.0, 0)
+            if cr.change.is_delete() {
+                f2_range = format!("{},{}", cr.ln2_start, 0);
+            } else {
+                let count = cr.ln2_end - cr.ln2_start + 1;
+                if count == 1 {
+                    f2_range = format!("{}", cr.ln2_start);
                 } else {
-                    let start = cr.0;
-                    let count = cr.1 - cr.0 + 1;
-                    if count == 1 {
-                        format!("{}", start)
-                    } else {
-                        format!("{},{}", start, count)
-                    }
-                };
-
-                let f2_range = if values.iter().all(|change| change.is_delete()) {
-                    format!("{},{}", cr.2, 0)
-                } else {
-                    let start = cr.2;
-                    let count = cr.3 - cr.2 + 1;
-                    if count == 1 {
-                        format!("{}", start)
-                    } else {
-                        format!("{},{}", start, count)
-                    }
-                };
-
-                let unchanged_count = values.iter().filter(|change| change.is_unchanged()).count();
-                let insert_count = values.iter().filter(|change| change.is_insert()).count();
-                let delete_count = values.iter().filter(|change| change.is_delete()).count();
-                let substitute_count = values
-                    .iter()
-                    .filter(|change| change.is_substitute())
-                    .count();
-
-                let mut printed_unchanged = 0usize;
-                let mut printed_insert = 0usize;
-                let mut printed_delete = 0usize;
-                let mut printed_substitute = 0usize;
-
-                let mut f1_no_eof_printable = true;
-                let mut f2_no_eof_printable = true;
-
-                println!("@@ -{} +{} @@", f1_range, f2_range);
-
-                for change in values {
-                    increase_by_one_if(change.is_unchanged(), &mut printed_unchanged);
-                    increase_by_one_if(change.is_insert(), &mut printed_insert);
-                    increase_by_one_if(change.is_delete(), &mut printed_delete);
-                    increase_by_one_if(change.is_substitute(), &mut printed_substitute);
-
-                    let printables = match change {
-                        Change::None => vec![String::new(); 0],
-                        Change::Unchanged(data) => {
-                            vec![format!(" {}", self.file1.line(data.ln1() - 1))]
-                        }
-                        Change::Insert(data) => {
-                            vec![format!("+{}", self.file2.line(data.ln2() - 1))]
-                        }
-                        Change::Delete(data) => {
-                            vec![format!("-{}", self.file1.line(data.ln1() - 1))]
-                        }
-                        Change::Substitute(data) => {
-                            vec![
-                                format!("-{}", self.file1.line(data.ln1() - 1)),
-                                format!("+{}", self.file2.line(data.ln2() - 1)),
-                            ]
-                        }
-                    };
-
-                    if change.is_none() {
-                        continue;
-                    }
-
-                    println!("{}", printables[0]);
-
-                    if f1_no_eof_printable
-                        && cr_index == context_ranges.len() - 1
-                        && printed_unchanged == unchanged_count
-                        && printed_delete == delete_count
-                        && printed_substitute == substitute_count
-                        && self.file1.ends_with_newline() == false
-                    {
-                        println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
-                        f1_no_eof_printable = false;
-                    }
-
-                    if change.is_substitute() {
-                        println!("{}", printables[1]);
-                    }
-
-                    if f2_no_eof_printable
-                        && unified != 0
-                        && cr_index == context_ranges.len() - 1
-                        && insert_count == printed_insert
-                        && printed_substitute == substitute_count
-                        && self.file2.ends_with_newline() == false
-                    {
-                        println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
-                        f2_no_eof_printable = false;
-                    }
+                    f2_range = format!("{},{}", cr.ln2_start, count);
                 }
             }
+
+            println!("@@ -{} +{} @@", f1_range, f2_range);
+
+            for i in cr.ln1_start..cr.hk1_start {
+                println!(" {}", self.file1.line(i));
+            }
+            for i in cr.hk1_start..cr.hk1_end {
+                println!("-{}", self.file1.line(i));
+            }
+            for i in cr.hk2_start..cr.hk2_end {
+                println!("+{}", self.file2.line(i));
+            }
+            for i in cr.hk2_end..cr.ln2_end {
+                println!(" {}", self.file2.line(i));
+            }
+
+            println!("@@ -{} +{} @@", f1_range, f2_range);
+        }
+        if !self.file1.ends_with_newline() {
+            println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
+        }
+        if !self.file2.ends_with_newline() {
+            println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
         }
     }
 

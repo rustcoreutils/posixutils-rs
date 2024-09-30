@@ -28,6 +28,18 @@ pub enum Change {
     Substitute(ChangeData),
 }
 
+pub struct ChangeContext {
+    pub change: Change,
+    pub ln1_start: usize,
+    pub ln1_end: usize,
+    pub hk1_start: usize,
+    pub hk1_end: usize,
+    pub ln2_start: usize,
+    pub ln2_end: usize,
+    pub hk2_start: usize,
+    pub hk2_end: usize,
+}
+
 impl Change {
     pub fn is_none(&self) -> bool {
         *self == Change::None

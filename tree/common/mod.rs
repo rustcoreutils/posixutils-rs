@@ -19,6 +19,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub type InodeMap = HashMap<(u64, u64), (ftw::FileDescriptor, CString)>;
+
 /// Return the error message.
 ///
 /// This is for compatibility with coreutils mv. `format!("{e}")` will append
@@ -441,7 +443,7 @@ pub fn copy_file<F>(
     source_arg: &Path,
     target_arg: &Path,
     created_files: &mut HashSet<PathBuf>,
-    mut inode_map: Option<&mut HashMap<(u64, u64), (ftw::FileDescriptor, CString)>>,
+    mut inode_map: Option<&mut InodeMap>,
     prompt_fn: F,
 ) -> io::Result<()>
 where
@@ -646,7 +648,7 @@ pub fn copy_files<F>(
     cfg: &CopyConfig,
     sources: &[PathBuf],
     target: &Path,
-    mut inode_map: Option<&mut HashMap<(u64, u64), (ftw::FileDescriptor, CString)>>,
+    mut inode_map: Option<&mut InodeMap>,
     prompt_fn: F,
 ) -> Option<()>
 where

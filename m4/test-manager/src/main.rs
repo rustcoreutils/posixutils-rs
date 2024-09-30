@@ -155,6 +155,7 @@ fn update_snapshots(args: &Args, update: &UpdateSnapshots) {
             }
             let mut f = std::fs::OpenOptions::new()
                 .write(true)
+                .truncate(true)
                 .create(true)
                 .open(snapshot_file)
                 .unwrap();

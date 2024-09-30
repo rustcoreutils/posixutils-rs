@@ -45,10 +45,16 @@ struct Args {
     ttyname: Option<String>,
 }
 
+pub struct State {
+    pub msg_bytes1: Vec<u8>,
+    pub msg_bytes2: Vec<u8>,
+    pub socket: Arc<UdpSocket>,
+    pub talkd_addr: SocketAddr,
+}
+
 /// A static variable to hold the state of delete invitations on SIGINT signal.
-static DELETE_INVITATIONS: LazyLock<
-    Arc<Mutex<Option<(Vec<u8>, Vec<u8>, Arc<UdpSocket>, SocketAddr)>>>,
-> = LazyLock::new(|| Arc::new(Mutex::new(None)));
+static DELETE_INVITATIONS: LazyLock<Arc<Mutex<Option<State>>>> =
+    LazyLock::new(|| Arc::new(Mutex::new(None)));
 
 /// The size of the buffer for control message fields like l_name, r_name, and r_tty in CtlMsg.
 const BUFFER_SIZE: usize = 12;
@@ -954,7 +960,13 @@ fn handle_new_invitation(
 
     let clone_socket = Arc::clone(&socket);
 
-    *DELETE_INVITATIONS.lock().unwrap() = Some((msg_bytes1, msg_bytes2, clone_socket, talkd_addr));
+    *DELETE_INVITATIONS.lock().unwrap() = Some(State {
+        msg_bytes1,
+        msg_bytes2,
+        socket: clone_socket,
+        talkd_addr,
+    });
+
     // Start listening for incoming TCP connections.
     for stream in listener.incoming() {
         match stream {
@@ -1620,12 +1632,10 @@ pub fn handle_signals(signal_code: libc::c_int) {
     eprintln!("Connection closed, exiting...");
 
     // Lock the DELETE_INVITATIONS mutex and check for an existing invitation
-    if let Some((msg_bytes1, msg_bytes2, socket, talkd_addr)) =
-        DELETE_INVITATIONS.lock().unwrap().as_ref()
-    {
+    if let Some(state) = DELETE_INVITATIONS.lock().unwrap().as_ref() {
         // Handle the deletion of invitations
-        handle_delete_invitations(socket, msg_bytes1, talkd_addr);
-        handle_delete_invitations(socket, msg_bytes2, talkd_addr);
+        handle_delete_invitations(&state.socket, &state.msg_bytes1, &state.talkd_addr);
+        handle_delete_invitations(&state.socket, &state.msg_bytes2, &state.talkd_addr);
     }
 
     // Exit the process with a code indicating the signal received

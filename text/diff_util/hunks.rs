@@ -1,6 +1,6 @@
 use crate::diff_util::constants::NO_NEW_LINE_AT_END_OF_FILE;
 
-use super::{change::Change, file_data::FileData};
+use super::{change::{Change, ChangeData}, file_data::FileData};
 
 #[derive(Clone, Debug)]
 pub struct Hunk {
@@ -124,19 +124,17 @@ impl Hunk {
             Change::None => {}
             Change::Unchanged(_) => {}
             Change::Insert(_) => {
-                self.changes.sort_by_key(|change| change.get_ln2());
-
                 println!("{}a{}", self.ln1_start, self.f2_range());
-                for change in &self.changes {
-                    println!("> {}", file2.line(change.get_ln2() - 1));
+
+                for i in self.ln2_start..self.ln2_end {
+                    println!("> {}", file2.line(i));
                 }
             }
             Change::Delete(_) => {
-                self.changes.sort_by_key(|change| change.get_ln1());
-
                 println!("{}d{}", self.f1_range(), self.ln2_end);
-                for change in &self.changes {
-                    println!("< {}", file1.line(change.get_ln1() - 1));
+
+                for i in self.ln1_start..self.ln1_end {
+                    println!("< {}", file1.line(i));
                 }
 
                 if is_last && file1.ends_with_newline() == false {
@@ -144,32 +142,23 @@ impl Hunk {
                 }
             }
             Change::Substitute(_) => {
-                self.changes.sort_by_key(|change| change.get_ln2());
 
                 println!("{}c{}", self.f1_range(), self.f2_range());
 
-                let mut replaced_lines = vec![""; 0];
-
-                for change in &self.changes {
-                    let (new, old) = (
-                        file2.line(change.get_ln2() - 1),
-                        file1.line(change.get_ln1() - 1),
-                    );
-                    replaced_lines.push(new);
-                    println!("< {}", old);
+                for i in self.ln1_start..self.ln1_end {
+                    println!("< {}", file1.line(i));
                 }
 
-                if is_last && file1.ends_with_newline() == false {
+                if is_last && !file1.ends_with_newline() {
                     println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
                 }
 
                 println!("---");
-
-                for new in replaced_lines {
-                    println!("> {}", new);
+                for i in self.ln2_start..self.ln2_end {
+                    println!("> {}", file2.line(i));
                 }
 
-                if is_last && file2.ends_with_newline() == false {
+                if is_last && !file2.ends_with_newline() {
                     println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
                 }
             }
@@ -327,24 +316,6 @@ impl Hunks {
     pub fn new() -> Self {
         Self {
             hunks: vec![Hunk::new(); 0],
-        }
-    }
-
-    pub fn add_change(&mut self, change: Change) {
-        if let Some(last_hunk) = self.hunks.last_mut() {
-            let last_change_kind = last_hunk.kind();
-
-            if *last_change_kind == change {
-                if last_hunk.change_sequence_acceptable(&change) {
-                    last_hunk.add(change);
-                } else {
-                    self.hunks.push(Hunk::from(change))
-                }
-            } else {
-                self.hunks.push(Hunk::from(change));
-            }
-        } else {
-            self.hunks.push(Hunk::from(change));
         }
     }
 

@@ -135,9 +135,9 @@ impl Fields {
         Self {
             mode,
             source: Field::new(gettext("Filesystem"), 14),
-            size: Field::new(size_caption, 0),
-            used: Field::new(gettext("Used"), 9),
-            avail: Field::new(gettext("Available"), 9),
+            size: Field::new(size_caption, 10),
+            used: Field::new(gettext("Used"), 10),
+            avail: Field::new(gettext("Available"), 10),
             pcent: Field::new(gettext("Capacity"), 5),
             target: Field::new(gettext("Mounted on"), 0),
         }
@@ -153,38 +153,26 @@ impl Fields {
         println!();
     }
 
-    fn print_row(&self, mount: &Mount) {
-        if !mount.masked {
-            return;
-        }
-
-        let sf = &mount.cached_statfs;
-
-        let block_size = self.mode.get_block_size();
-        let blksz = sf.f_bsize as u64;
-
-        let total = (sf.f_blocks * blksz) / block_size;
-        let avail = (sf.f_bavail * blksz) / block_size;
-        let free = (sf.f_bfree * blksz) / block_size;
-        let used = total - free;
-
-        // The percentage value shall be expressed as a positive integer,
-        // with any fractional result causing it to be rounded to the next highest integer.
-        let percentage_used = f64::from(used as u32) / f64::from((used + free) as u32);
-        let percentage_used = percentage_used * 100.0;
-        let percentage_used = percentage_used.ceil() as u32;
-
+    fn print_row(
+        &self,
+        fsname: &String,
+        total: u64,
+        used: u64,
+        avail: u64,
+        percentage_used: u32,
+        target: &String,
+    ) {
         // The remaining output with -P shall consist of one line of information
         // for each specified file system. These lines shall be formatted as follows:
         // "%s %d %d %d %d%% %s\n", <file system name>, <total space>,
         //     <space used>, <space free>, <percentage used>,
         //     <file system root>
-        self.source.print_string(&mount.devname);
+        self.source.print_string(fsname);
         self.size.print_u64(total);
         self.used.print_u64(used);
         self.avail.print_u64(avail);
         self.pcent.print_percentage(percentage_used);
-        self.target.print_string(&mount.dir);
+        self.target.print_string(target);
         println!();
     }
 }
@@ -215,6 +203,39 @@ struct Mount {
     dev: i64,
     masked: bool,
     cached_statfs: libc::statfs,
+}
+
+impl Mount {
+    fn print(&self, fields: &Fields) {
+        if !self.masked {
+            return;
+        }
+
+        let sf = self.cached_statfs;
+
+        let block_size = fields.mode.get_block_size();
+        let blksz = sf.f_bsize as u64;
+
+        let total = (sf.f_blocks * blksz) / block_size;
+        let avail = (sf.f_bavail * blksz) / block_size;
+        let free = (sf.f_bfree * blksz) / block_size;
+        let used = total - free;
+
+        // The percentage value shall be expressed as a positive integer,
+        // with any fractional result causing it to be rounded to the next highest integer.
+        let percentage_used = f64::from(used as u32) / f64::from((used + free) as u32);
+        let percentage_used = percentage_used * 100.0;
+        let percentage_used = percentage_used.ceil() as u32;
+
+        fields.print_row(
+            &self.devname,
+            total,
+            used,
+            avail,
+            percentage_used,
+            &self.dir,
+        );
+    }
 }
 
 struct MountList {
@@ -355,7 +376,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fields.print_header();
 
     for mount in &info.mounts {
-        fields.print_row(mount);
+        mount.print(&fields);
     }
 
     Ok(())

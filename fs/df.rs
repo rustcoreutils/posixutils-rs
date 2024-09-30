@@ -18,8 +18,7 @@ use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleC
 use plib::PROJECT_NAME;
 #[cfg(target_os = "macos")]
 use std::ffi::CStr;
-use std::ffi::CString;
-use std::io;
+use std::{cmp, ffi::CString, io};
 
 #[derive(Parser)]
 #[command(version, about = gettext("df - report free storage space"))]
@@ -49,6 +48,118 @@ struct Args {
         help = gettext("A pathname of a file within the hierarchy of the desired file system")
     )]
     files: Vec<String>,
+}
+
+/// Display modes
+pub enum HeaderMode {
+    /// When both the -k and -P options are specified
+    Posix,
+    /// When the -P option is specified without the -k option
+    PosixLegacy,
+    Inodes,
+}
+
+impl HeaderMode {
+    pub fn new(kilo: bool, portable: bool) -> Self {
+        match (kilo, portable) {
+            (true, true) => Self::Posix,
+            (false, true) => Self::PosixLegacy,
+            _ => Self::Inodes,
+        }
+    }
+
+    pub fn get_block_size(&self) -> u64 {
+        match self {
+            HeaderMode::Posix => 1024,
+            HeaderMode::PosixLegacy => 512,
+            HeaderMode::Inodes => 0,
+        }
+    }
+}
+
+pub struct Field {
+    caption: String,
+    width: usize,
+}
+
+impl Field {
+    pub fn new(caption: String, min_width: usize) -> Self {
+        let width = cmp::max(caption.len(), min_width);
+        Self { caption, width }
+    }
+
+    pub fn print_header(&self) {
+        print!("{: <width$} ", self.caption, width = self.width);
+    }
+
+    pub fn print_header_align_right(&self) {
+        print!("{: >width$} ", self.caption, width = self.width);
+    }
+}
+
+pub struct Header {
+    pub mode: HeaderMode,
+    /// file system
+    pub source: Field,
+    /// FS size
+    pub size: Field,
+    /// FS size used
+    pub used: Field,
+    /// FS size available
+    pub avail: Field,
+    /// percent used
+    pub pcent: Field,
+    /// inode total
+    pub itotal: Field,
+    /// inodes used
+    pub iused: Field,
+    /// inodes available
+    pub iavail: Field,
+    /// inodes used in percent
+    pub ipcent: Field,
+    /// mount point
+    pub target: Field,
+    // /// specified file name
+    // file: Field,
+}
+
+impl Header {
+    pub fn new(mode: HeaderMode) -> Self {
+        let size_caption = format!("{}-{}", mode.get_block_size(), gettext("blocks"));
+        Self {
+            mode,
+            source: Field::new(gettext("Filesystem"), 14),
+            size: Field::new(size_caption, 0),
+            used: Field::new(gettext("Used"), 5),
+            avail: Field::new(gettext("Available"), 5),
+            pcent: Field::new(gettext("Capacity"), 5),
+            itotal: Field::new(gettext("Inodes"), 5),
+            iused: Field::new(gettext("IUsed"), 5),
+            iavail: Field::new(gettext("IFree"), 5),
+            ipcent: Field::new(gettext("IUse%"), 5),
+            target: Field::new(gettext("Mounted on"), 0),
+        }
+    }
+
+    pub fn print_header(&self) {
+        self.source.print_header();
+        match self.mode {
+            HeaderMode::Posix | HeaderMode::PosixLegacy => {
+                self.size.print_header_align_right();
+                self.used.print_header_align_right();
+                self.avail.print_header_align_right();
+                self.pcent.print_header_align_right();
+            }
+            HeaderMode::Inodes => {
+                self.itotal.print_header_align_right();
+                self.iused.print_header_align_right();
+                self.iavail.print_header_align_right();
+                self.ipcent.print_header_align_right();
+            }
+        }
+        self.target.print_header();
+        print!("\n");
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -222,22 +333,14 @@ fn show_mount(args: &Args, block_size: u64, mount: &Mount) {
 }
 
 fn show_info(args: &Args, info: &MountList) {
+    let mode = HeaderMode::new(args.kilo, args.portable);
+    let header = Header::new(mode);
+    header.print_header();
+
     let block_size: u64 = match args.kilo {
         true => 1024,
         false => 512,
     };
-
-    if args.portable {
-        println!(
-            "Filesystem         {:>4}-blocks      Used Available Capacity Mounted on",
-            block_size
-        );
-    } else {
-        println!(
-            "Filesystem         {:>4}-blocks      Used Available Use % Mounted on",
-            block_size
-        );
-    }
 
     for mount in &info.mounts {
         if mount.masked {

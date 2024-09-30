@@ -1,11 +1,12 @@
 use std::{
     fs::File,
-    io::{self, BufReader, Read},
+    io::{self, Read},
     path::PathBuf,
     time::SystemTime,
 };
 
 use super::{change::Change, constants::COULD_NOT_UNWRAP_FILENAME};
+use plib::BUFSZ;
 
 #[derive(Debug)]
 pub struct FileData {
@@ -22,18 +23,27 @@ impl FileData {
     }
 
     pub fn get_file(path: PathBuf) -> io::Result<Self> {
-        let file = File::open(path.clone())?;
+        let mut file = File::open(path.clone())?;
         let modified = file.metadata()?.modified()?;
-        let mut buf_reader = BufReader::new(file);
+        let mut buffer = [0_u8; BUFSZ];
+        // let mut read_length: usize = 0;
         let mut content = String::new();
-        buf_reader.read_to_string(&mut content)?;
 
+        loop {
+            let n = file.read(&mut buffer).expect("Couldn't read file");
+            if n == 0 {
+                break;
+            }
+            let string_slice =
+                std::str::from_utf8(&buffer[..n]).expect("Couldn't convert to string");
+            content.push_str(string_slice);
+        }
         let mut lines = content
-            .lines()
+            .split("\n")
             .map(|line| line.to_string())
             .collect::<Vec<String>>();
 
-        let ends_with_newline = content.ends_with("\n");
+        let ends_with_newline = content.ends_with('\n');
 
         if ends_with_newline {
             lines.push(String::from(""));

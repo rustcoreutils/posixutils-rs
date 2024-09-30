@@ -31,26 +31,22 @@ pub struct FileDiff<'a> {
 }
 
 impl<'a> FileDiff<'a> {
-    pub fn are_different(&self) -> bool {
-        self.are_different
-    }
-
     fn new(
         file1: &'a mut FileData,
         file2: &'a mut FileData,
         format_options: &'a FormatOptions,
     ) -> Self {
-        if format_options.label1.is_none() && format_options.label2.is_some() {
-            panic!("label1 can not be NONE when label2 is available");
-        }
-
         Self {
             file1,
             file2,
             hunks: Hunks::new(),
-            format_options: format_options,
+            format_options,
             are_different: false,
         }
+    }
+
+    pub fn are_different(&self) -> bool {
+        self.are_different
     }
 
     pub fn file_diff(
@@ -362,11 +358,11 @@ impl<'a> FileDiff<'a> {
     fn print_context(&mut self, context: usize) {
         println!(
             "*** {}",
-            Self::get_header(self.file1, &self.format_options.label1)
+            Self::get_header(self.file1, &self.format_options.label1())
         );
         println!(
             "--- {}",
-            Self::get_header(self.file2, &self.format_options.label2)
+            Self::get_header(self.file2, &self.format_options.label2())
         );
 
         let change_ranges = self.get_context_ranges(context);
@@ -423,11 +419,11 @@ impl<'a> FileDiff<'a> {
     fn print_unified(&mut self, unified: usize) {
         println!(
             "--- {}",
-            Self::get_header(self.file1, &self.format_options.label1)
+            Self::get_header(self.file1, &self.format_options.label1())
         );
         println!(
             "+++ {}",
-            Self::get_header(self.file2, &self.format_options.label2)
+            Self::get_header(self.file2, &self.format_options.label2())
         );
 
         let context_ranges = self.get_context_ranges(unified);

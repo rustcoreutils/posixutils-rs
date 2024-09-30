@@ -212,7 +212,8 @@ impl Value {
 
 /// Parses Hexadecimal, Octal and Unsigned Decimal
 // TODO
-#[allow(clippy::needless_match)]
+#[allow(clippy::manual_map)] // TODO remove this
+#[allow(clippy::needless_match)] // TODO remove this
 fn parse_number(input: &mut String) -> Option<u64> {
     if let Some(hex_num) = parse_hexadecimal(input) {
         Some(hex_num)

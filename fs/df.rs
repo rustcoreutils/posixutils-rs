@@ -18,8 +18,7 @@ use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleC
 use plib::PROJECT_NAME;
 #[cfg(target_os = "macos")]
 use std::ffi::CStr;
-use std::ffi::CString;
-use std::io;
+use std::{cmp, ffi::CString, io};
 
 #[derive(Parser)]
 #[command(version, about = gettext("df - report free storage space"))]
@@ -51,6 +50,133 @@ struct Args {
     files: Vec<String>,
 }
 
+/// Display modes
+pub enum OutputMode {
+    /// When both the -k and -P options are specified
+    Posix,
+    /// When the -P option is specified without the -k option
+    PosixLegacy,
+    /// The format of the default output from df is unspecified,
+    /// but all space figures are reported in 512-byte units
+    Unspecified,
+}
+
+impl OutputMode {
+    pub fn new(kilo: bool, portable: bool) -> Self {
+        match (kilo, portable) {
+            (true, true) => Self::Posix,
+            (false, true) => Self::PosixLegacy,
+            _ => Self::Unspecified,
+        }
+    }
+
+    pub fn get_block_size(&self) -> u64 {
+        match self {
+            OutputMode::Posix => 1024,
+            OutputMode::PosixLegacy => 512,
+            OutputMode::Unspecified => 512,
+        }
+    }
+}
+
+pub struct Field {
+    caption: String,
+    width: usize,
+}
+
+impl Field {
+    pub fn new(caption: String, min_width: usize) -> Self {
+        let width = cmp::max(caption.len(), min_width);
+        Self { caption, width }
+    }
+
+    pub fn print_header(&self) {
+        print!("{: <width$} ", self.caption, width = self.width);
+    }
+
+    pub fn print_header_align_right(&self) {
+        print!("{: >width$} ", self.caption, width = self.width);
+    }
+
+    pub fn print_string(&self, value: &String) {
+        print!("{: <width$} ", value, width = self.width);
+    }
+
+    pub fn print_u64(&self, value: u64) {
+        print!("{: >width$} ", value, width = self.width);
+    }
+
+    pub fn print_percentage(&self, value: u32) {
+        print!("{: >width$}% ", value, width = self.width - 1);
+    }
+}
+
+pub struct Fields {
+    pub mode: OutputMode,
+    /// file system
+    pub source: Field,
+    /// FS size
+    pub size: Field,
+    /// FS size used
+    pub used: Field,
+    /// FS size available
+    pub avail: Field,
+    /// percent used
+    pub pcent: Field,
+    /// mount point
+    pub target: Field,
+    // /// specified file name
+    // file: Field,
+}
+
+impl Fields {
+    pub fn new(mode: OutputMode) -> Self {
+        let size_caption = format!("{}-{}", mode.get_block_size(), gettext("blocks"));
+        Self {
+            mode,
+            source: Field::new(gettext("Filesystem"), 14),
+            size: Field::new(size_caption, 10),
+            used: Field::new(gettext("Used"), 10),
+            avail: Field::new(gettext("Available"), 10),
+            pcent: Field::new(gettext("Capacity"), 5),
+            target: Field::new(gettext("Mounted on"), 0),
+        }
+    }
+
+    pub fn print_header(&self) {
+        self.source.print_header();
+        self.size.print_header_align_right();
+        self.used.print_header_align_right();
+        self.avail.print_header_align_right();
+        self.pcent.print_header_align_right();
+        self.target.print_header();
+        println!();
+    }
+
+    fn print_row(
+        &self,
+        fsname: &String,
+        total: u64,
+        used: u64,
+        avail: u64,
+        percentage_used: u32,
+        target: &String,
+    ) {
+        // The remaining output with -P shall consist of one line of information
+        // for each specified file system. These lines shall be formatted as follows:
+        // "%s %d %d %d %d%% %s\n", <file system name>, <total space>,
+        //     <space used>, <space free>, <percentage used>,
+        //     <file system root>
+        self.source.print_string(fsname);
+        self.size.print_u64(total);
+        self.used.print_u64(used);
+        self.avail.print_u64(avail);
+        self.pcent.print_percentage(percentage_used);
+        self.target.print_string(target);
+        println!();
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn to_cstr(array: &[libc::c_char]) -> &CStr {
     unsafe {
@@ -77,6 +203,39 @@ struct Mount {
     dev: i64,
     masked: bool,
     cached_statfs: libc::statfs,
+}
+
+impl Mount {
+    fn print(&self, fields: &Fields) {
+        if !self.masked {
+            return;
+        }
+
+        let sf = self.cached_statfs;
+
+        let block_size = fields.mode.get_block_size();
+        let blksz = sf.f_bsize as u64;
+
+        let total = (sf.f_blocks * blksz) / block_size;
+        let avail = (sf.f_bavail * blksz) / block_size;
+        let free = (sf.f_bfree * blksz) / block_size;
+        let used = total - free;
+
+        // The percentage value shall be expressed as a positive integer,
+        // with any fractional result causing it to be rounded to the next highest integer.
+        let percentage_used = f64::from(used as u32) / f64::from((used + free) as u32);
+        let percentage_used = percentage_used * 100.0;
+        let percentage_used = percentage_used.ceil() as u32;
+
+        fields.print_row(
+            &self.devname,
+            total,
+            used,
+            avail,
+            percentage_used,
+            &self.dir,
+        );
+    }
 }
 
 struct MountList {
@@ -192,60 +351,6 @@ fn mask_fs_by_file(info: &mut MountList, filename: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn show_mount(args: &Args, block_size: u64, mount: &Mount) {
-    let sf = &mount.cached_statfs;
-
-    let blksz = sf.f_bsize as u64;
-
-    let total = (sf.f_blocks * blksz) / block_size;
-    let avail = (sf.f_bavail * blksz) / block_size;
-    let free = (sf.f_bfree * blksz) / block_size;
-    let used = total - free;
-
-    if total == 0 {
-        return;
-    }
-
-    let pct = ((total - avail) * 100) / total;
-
-    if args.portable {
-        println!(
-            "{:>20} {:>9} {:>9} {:>9} {:>7} {}",
-            mount.devname, total, used, avail, pct, mount.dir
-        );
-    } else {
-        println!(
-            "{:>20} {:>9} {:>9} {:>9} {:>3} {}",
-            mount.devname, total, used, avail, pct, mount.dir
-        );
-    }
-}
-
-fn show_info(args: &Args, info: &MountList) {
-    let block_size: u64 = match args.kilo {
-        true => 1024,
-        false => 512,
-    };
-
-    if args.portable {
-        println!(
-            "Filesystem         {:>4}-blocks      Used Available Capacity Mounted on",
-            block_size
-        );
-    } else {
-        println!(
-            "Filesystem         {:>4}-blocks      Used Available Use % Mounted on",
-            block_size
-        );
-    }
-
-    for mount in &info.mounts {
-        if mount.masked {
-            show_mount(args, block_size, mount);
-        }
-    }
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // parse command line arguments
     let args = Args::parse();
@@ -265,7 +370,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     info.ensure_masked();
-    show_info(&args, &info);
+
+    let mode = OutputMode::new(args.kilo, args.portable);
+    let fields = Fields::new(mode);
+    fields.print_header();
+
+    for mount in &info.mounts {
+        mount.print(&fields);
+    }
 
     Ok(())
 }

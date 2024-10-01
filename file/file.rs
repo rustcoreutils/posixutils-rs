@@ -669,6 +669,7 @@ fn analyze_file(mut path: String, args: &Args) {
                 println!("{path}: data");
             }
         }
+        return;
     }
     unreachable!();
 }

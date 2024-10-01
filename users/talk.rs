@@ -205,35 +205,38 @@ pub struct Osockaddr {
     pub sa_data: [u8; 14],
 }
 
-impl Osockaddr {
-    // Converts the packed address structure into a SocketAddrV4
-    pub fn to_socketaddr(&self) -> Option<SocketAddrV4> {
+impl From<&Osockaddr> for SocketAddrV4 {
+    fn from(value: &Osockaddr) -> Self {
         // Extract the port
-        let port = u16::from_be_bytes([self.sa_data[0], self.sa_data[1]]);
+        let port = u16::from_be_bytes([value.sa_data[0], value.sa_data[1]]);
 
         // Extract the IP address
         let ip = Ipv4Addr::new(
-            self.sa_data[2],
-            self.sa_data[3],
-            self.sa_data[4],
-            self.sa_data[5],
+            value.sa_data[2],
+            value.sa_data[3],
+            value.sa_data[4],
+            value.sa_data[5],
         );
 
-        Some(SocketAddrV4::new(ip, port))
+        Self::new(ip, port)
     }
+}
 
-    /// Creates a new `sa_data` array from the given IP address and port.
-    ///
-    /// # Arguments
-    ///
-    /// * `ip` - A string slice representing the IP address (e.g., "192.168.1.1").
-    /// * `port` - A u16 representing the port number.
-    ///
-    /// # Returns
-    ///
-    /// Returns an `Option<[u8; 14]>` containing the packed address if successful,
-    /// or `None` if the IP address format is invalid.
-    fn new(ip: &str, port: u16) -> [u8; 14] {
+impl From<&SocketAddr> for Osockaddr {
+    fn from(value: &SocketAddr) -> Self {
+        match value {
+            SocketAddr::V4(v) => Self::from(v),
+            SocketAddr::V6(_) => unimplemented!(),
+        }
+    }
+}
+
+impl From<&SocketAddrV4> for Osockaddr {
+    fn from(value: &SocketAddrV4) -> Self {
+        let ip = value.ip().to_string();
+        let port = value.port();
+        // TODO use as.bytes()
+
         let mut sa_data: [u8; 14] = [0; 14];
 
         let ip_segments: Result<Vec<u8>, _> = ip.split('.').map(|s| s.parse::<u8>()).collect();
@@ -249,7 +252,10 @@ impl Osockaddr {
             }
         }
 
-        sa_data
+        Self {
+            sa_family: 0, // TODO use enum
+            sa_data,
+        }
     }
 }
 
@@ -464,9 +470,7 @@ fn handle_existing_invitation(
     output_buffer: &mut String,
     res: &mut CtlRes,
 ) -> Result<(), TalkError> {
-    let tcp_addr = res.addr.to_socketaddr().ok_or_else(|| {
-        TalkError::AddressResolutionFailed("Failed to convert address to socket address.".into())
-    })?;
+    let tcp_addr = SocketAddrV4::from(&res.addr);
 
     // Establish a TCP connection to the `tcp_addr`. Map any IO errors to `TalkError::IoError`.
     let stream = TcpStream::connect(tcp_addr).map_err(TalkError::IoError)?;
@@ -916,6 +920,7 @@ fn send_byte(write_stream: &TcpStream, byte: u8) -> Result<(), io::Error> {
 /// # Returns
 ///
 /// A `Result` indicating success or a `TalkError`.
+#[allow(clippy::too_many_arguments)]
 fn handle_new_invitation(
     talkd_addr: SocketAddr,
     daemon_port: u16,
@@ -932,7 +937,7 @@ fn handle_new_invitation(
     logger.set_state("[Service connection established.]");
 
     // Create the socket address data and set it in the `msg`.
-    let tcp_data = Osockaddr::new(&socket_addr.ip().to_string(), socket_addr.port());
+    let tcp_data = Osockaddr::from(&socket_addr).sa_data;
 
     logger.set_state("[Waiting for your party to respond]");
 

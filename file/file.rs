@@ -549,27 +549,18 @@ fn get_type_from_magic_file_dbs(test_file: &PathBuf, magic_file_dbs: &[PathBuf])
     })
 }
 
-/// Get the default raw(text based) magic file
-fn get_default_magic_file() -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        PathBuf::from("/usr/share/file/magic/magic")
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        PathBuf::from("/etc/magic")
-    }
-}
+#[cfg(target_os = "macos")]
+/// Default raw (text based) magic file
+const DEFAULT_MAGIC_FILE: &str = "/usr/share/file/magic/magic";
+#[cfg(not(target_os = "macos"))]
+/// Default raw (text based) magic file
+const DEFAULT_MAGIC_FILE: &str = "/etc/magic";
 
-fn analyze_file(mut path: String, args: &Args) {
+fn get_magic_files(args: &Args) -> Vec<PathBuf> {
     // set priority according to the occurence of flags in the args lowest index will get highest priority
     let mut magic_files: Vec<PathBuf> = Vec::new();
 
-    if path == "-" {
-        path = String::new();
-        io::stdin().read_line(&mut path).unwrap();
-        path = path.trim().to_string();
-    }
+    let default_magic_file = PathBuf::from(DEFAULT_MAGIC_FILE);
 
     if let Some(test_file2) = &args.test_file2 {
         magic_files.push(test_file2.clone());
@@ -581,85 +572,109 @@ fn analyze_file(mut path: String, args: &Args) {
 
             if m_index > h_index {
                 magic_files.push(args.test_file1.as_ref().unwrap().clone());
-                magic_files.push(get_default_magic_file());
+                magic_files.push(default_magic_file);
             } else {
-                magic_files.push(get_default_magic_file());
+                magic_files.push(default_magic_file);
                 magic_files.push(args.test_file1.as_ref().unwrap().clone());
             }
         } else if args.test_file1.is_some() {
             magic_files.push(args.test_file1.as_ref().unwrap().clone());
         } else if args.default_tests {
-            magic_files.push(get_default_magic_file());
+            magic_files.push(default_magic_file);
         }
     } else if let Some(test_file1) = &args.test_file1 {
         magic_files.push(test_file1.clone());
 
         if args.test_file2.is_none() && !args.default_tests {
-            magic_files.push(get_default_magic_file());
+            magic_files.push(default_magic_file);
         }
     } else {
-        magic_files.push(get_default_magic_file());
+        magic_files.push(default_magic_file);
     }
 
-    match fs::symlink_metadata(&path) {
-        Ok(met) => {
-            let file_type = met.file_type();
+    magic_files
+}
 
-            if file_type.is_symlink() {
-                if args.identify_as_symbolic_link {
-                    println!("{path}: symbolic link");
-                } else {
-                    match read_link(&path) {
-                        Ok(file_p) => {
-                            // trace the file pointed by symbolic link
-                            if file_p.exists() {
-                                println!("{path}: symbolic link to {}", file_p.to_str().unwrap());
-                            } else {
-                                println!(
-                                    "{path}: broken symbolic link to {}",
-                                    file_p.to_str().unwrap()
-                                );
-                            }
-                        }
-                        Err(_) => {
-                            println!("{path}: symbolic link");
-                        }
-                    }
-                }
-            } else if file_type.is_char_device() {
-                println!("{path}: character special");
-            } else if file_type.is_dir() {
-                println!("{path}: directory");
-            } else if file_type.is_fifo() {
-                println!("{path}: fifo");
-            } else if file_type.is_socket() {
-                println!("{path}: socket");
-            }
-            if file_type.is_block_device() {
-                println!("{path}: block special");
-            } else if file_type.is_file() {
-                if args.no_further_file_classification {
-                    println!("{path}: regular file");
-                } else {
-                    if met.len() == 0 {
-                        println!("{path}: empty");
-                    } else {
-                        match get_type_from_magic_file_dbs(&PathBuf::from(&path), &magic_files) {
-                            Some(f_type) => {
-                                println!("{path}: {f_type}");
-                            }
-                            None => {
-                                println!("{path}: data");
-                            }
-                        }
-                    }
-                }
-            }
-        }
+fn analyze_file(mut path: String, args: &Args, magic_files: &Vec<PathBuf>) {
+    if path == "-" {
+        path = String::new();
+        io::stdin().read_line(&mut path).unwrap();
+        path = path.trim().to_string();
+    }
+
+    let met = match fs::symlink_metadata(&path) {
+        Ok(met) => met,
         Err(_) => {
             println!("{path}: cannot open");
+            return;
         }
+    };
+
+    let file_type = met.file_type();
+
+    if file_type.is_symlink() {
+        if args.identify_as_symbolic_link {
+            println!("{path}: symbolic link");
+            return;
+        }
+        match read_link(&path) {
+            Ok(file_p) => {
+                // trace the file pointed by symbolic link
+                if file_p.exists() {
+                    println!("{path}: symbolic link to {}", file_p.to_str().unwrap());
+                } else {
+                    println!(
+                        "{path}: broken symbolic link to {}",
+                        file_p.to_str().unwrap()
+                    );
+                }
+            }
+            Err(_) => {
+                println!("{path}: symbolic link");
+            }
+        }
+        return;
     }
+    if file_type.is_char_device() {
+        println!("{path}: character special");
+        return;
+    }
+    if file_type.is_dir() {
+        println!("{path}: directory");
+        return;
+    }
+    if file_type.is_fifo() {
+        println!("{path}: fifo");
+        return;
+    }
+    if file_type.is_socket() {
+        println!("{path}: socket");
+        return;
+    }
+    if file_type.is_block_device() {
+        println!("{path}: block special");
+        return;
+    }
+    if file_type.is_file() {
+        if args.no_further_file_classification {
+            println!("{path}: regular file");
+            return;
+        }
+        if met.len() == 0 {
+            println!("{path}: empty");
+            return;
+        }
+        match get_type_from_magic_file_dbs(&PathBuf::from(&path), &magic_files) {
+            Some(f_type) => {
+                println!("{path}: {f_type}");
+            }
+            None => {
+                println!("{path}: data");
+            }
+        }
+        return;
+    }
+    unreachable!();
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -670,8 +685,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     textdomain(PROJECT_NAME).unwrap();
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8").unwrap();
 
+    let magic_files = get_magic_files(&args);
+
     for file in &args.files {
-        analyze_file(file.clone(), &args);
+        analyze_file(file.clone(), &args, &magic_files);
     }
 
     Ok(())

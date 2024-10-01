@@ -39,6 +39,13 @@ fn file_is_a_directory() {
 }
 
 #[test]
+fn file_is_a_character_special() {
+    let file = "/dev/null";
+
+    file_test(&[file], &format!("{file}: character special\n"), "");
+}
+
+#[test]
 fn file_is_an_empty_file() {
     let file = "tests/file/empty_file.txt";
 
@@ -118,17 +125,6 @@ fn file_file_is_a_broken_sym_link() {
 
     // Delete the symlink after testing
     remove_file(broken_sym_link).unwrap()
-}
-
-#[test]
-fn file_is_a_character_special() {
-    let file = PathBuf::from("/dev/null");
-
-    file_test(
-        &[file.to_str().unwrap()],
-        &format!("{}: character special\n", file.to_str().unwrap()),
-        "",
-    );
 }
 
 #[test]

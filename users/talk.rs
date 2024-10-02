@@ -26,7 +26,8 @@ use std::{
     io::{self, Cursor, Error, IsTerminal, Write},
     mem::{size_of, zeroed},
     net::{
-        self, AddrParseError, Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket,
+        self, AddrParseError, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener,
+        TcpStream, UdpSocket,
     },
     os::fd::AsRawFd,
     process, ptr,
@@ -196,6 +197,7 @@ type SaFamily = u16;
 #[cfg(target_os = "linux")]
 type SaFamily = sa_family_t;
 
+#[derive(PartialEq)]
 #[binrw]
 /// Socket address structure representing a network address.
 pub struct Osockaddr {
@@ -203,6 +205,15 @@ pub struct Osockaddr {
     pub sa_family: SaFamily,
     /// Address data, including the port and IP address.
     pub sa_data: [u8; 14],
+}
+
+impl Default for Osockaddr {
+    fn default() -> Self {
+        Osockaddr {
+            sa_family: 0, // TODO use enum libc::AF_UNSPEC as u16
+            sa_data: [0; 14],
+        }
+    }
 }
 
 impl From<&Osockaddr> for SocketAddrV4 {
@@ -226,45 +237,29 @@ impl From<&SocketAddr> for Osockaddr {
     fn from(value: &SocketAddr) -> Self {
         match value {
             SocketAddr::V4(v) => Self::from(v),
-            SocketAddr::V6(_) => unimplemented!(),
+            SocketAddr::V6(v) => Self::from(v),
         }
     }
 }
 
 impl From<&SocketAddrV4> for Osockaddr {
     fn from(value: &SocketAddrV4) -> Self {
-        let ip = value.ip().to_string();
-        let port = value.port();
-        // TODO use as.bytes()
+        let port: [u8; 2] = value.port().to_be_bytes();
+        let octets: [u8; 4] = value.ip().octets();
 
-        let mut sa_data: [u8; 14] = [0; 14];
+        let mut result = Self::default();
 
-        let ip_segments: Result<Vec<u8>, _> = ip.split('.').map(|s| s.parse::<u8>()).collect();
+        result.sa_data[0..2].copy_from_slice(&port);
+        result.sa_data[2..6].copy_from_slice(&octets);
+        result.sa_data[12..14].copy_from_slice(&[0, 2]);
 
-        match ip_segments {
-            Ok(ip_bytes) if ip_bytes.len() == 4 => {
-                sa_data[0..2].copy_from_slice(&port.to_be_bytes());
-                sa_data[2..6].copy_from_slice(&ip_bytes);
-                sa_data[12..14].copy_from_slice(&[0, 2]);
-            }
-            _ => {
-                eprint!("Invalid IP address format: {}", ip);
-            }
-        }
-
-        Self {
-            sa_family: 0, // TODO use enum
-            sa_data,
-        }
+        result
     }
 }
 
-impl Default for Osockaddr {
-    fn default() -> Self {
-        Osockaddr {
-            sa_family: 0,
-            sa_data: [0; 14],
-        }
+impl From<&SocketAddrV6> for Osockaddr {
+    fn from(_value: &SocketAddrV6) -> Self {
+        unimplemented!()
     }
 }
 
@@ -1757,4 +1752,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     process::exit(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_osock_addr_from_socket_addr_v4() {
+        let socket = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 600);
+        let value = Osockaddr::from(&socket);
+        assert_eq!(value.sa_family, libc::AF_UNSPEC as u16);
+        assert_eq!(value.sa_data, [2, 88, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2]);
+    }
 }

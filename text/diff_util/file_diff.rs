@@ -2,7 +2,7 @@ use super::{
     common::{FormatOptions, OutputFormat},
     constants::COULD_NOT_UNWRAP_FILENAME,
     diff_exit_status::DiffExitStatus,
-    file_data::FileData,
+    file_data::{FileData, LineReader},
     functions::{check_existance, is_binary, system_time_to_rfc2822},
     hunks::Hunks,
 };
@@ -14,7 +14,7 @@ use crate::diff_util::{
 
 use std::{
     collections::HashMap,
-    fs::File,
+    fs::{File, read_to_string},
     io::{self, BufReader, Read},
     os::unix::fs::MetadataExt,
     path::PathBuf,
@@ -22,8 +22,8 @@ use std::{
 
 #[derive(Debug)]
 pub struct FileDiff<'a> {
-    file1: &'a mut FileData,
-    file2: &'a mut FileData,
+    file1: &'a mut FileData<'a>,
+    file2: &'a mut FileData<'a>,
     hunks: Hunks,
     format_options: &'a FormatOptions,
     are_different: bool,
@@ -35,8 +35,8 @@ impl<'a> FileDiff<'a> {
     }
 
     fn new(
-        file1: &'a mut FileData,
-        file2: &'a mut FileData,
+        file1: &'a mut FileData<'a>,
+        file2: &'a mut FileData<'a>,
         format_options: &'a FormatOptions,
     ) -> Self {
         if format_options.label1.is_none() && format_options.label2.is_some() {
@@ -61,8 +61,19 @@ impl<'a> FileDiff<'a> {
         if is_binary(&path1)? || is_binary(&path2)? {
             return Self::binary_file_diff(&path1, &path2);
         } else {
-            let mut file1 = FileData::get_file(path1)?;
-            let mut file2 = FileData::get_file(path2)?;
+            let content1 = read_to_string(&path1)?.into_bytes();
+            let mut lines1 = Vec::new();
+            for line in (LineReader{ content: &content1 }) {
+                lines1.push(line);
+            }
+
+            let content2 = read_to_string(&path2)?.into_bytes();
+            let mut lines2 = Vec::new();
+            for line in (LineReader{ content: &content2 }) {
+                lines2.push(line);
+            }
+            let mut file1 = FileData::get_file(path1, lines1)?;
+            let mut file2 = FileData::get_file(path2, lines2)?;
 
             let mut diff = FileDiff::new(&mut file1, &mut file2, format_options);
 
@@ -233,19 +244,19 @@ impl<'a> FileDiff<'a> {
         // build histogram
         let mut hist: HashMap<&str, Vec<i32>> = HashMap::new();
         for i in x0..x1 {
-            if let Some(rec) = hist.get_mut(file1.line(i).as_str()) {
+            if let Some(rec) = hist.get_mut(file1.line(i)) {
                 rec[0] += 1_i32;
                 rec[1] = i as i32;
             } else {
-                hist.insert(file1.line(i).as_str(), vec![1, i as i32, 0, -1]);
+                hist.insert(file1.line(i), vec![1, i as i32, 0, -1]);
             }
         }
         for i in y0..y1 {
-            if let Some(rec) = hist.get_mut(file2.line(i).as_str()) {
+            if let Some(rec) = hist.get_mut(file2.line(i)) {
                 rec[2] += 1_i32;
                 rec[3] = i as i32;
             } else {
-                hist.insert(file2.line(i).as_str(), vec![0, -1, 1, i as i32]);
+                hist.insert(file2.line(i), vec![0, -1, 1, i as i32]);
             }
         }
 

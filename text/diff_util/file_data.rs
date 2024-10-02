@@ -1,68 +1,45 @@
 use std::{
     fs::File,
-    io::{self, Read},
+    io,
+    mem::take,
     path::PathBuf,
+    str::from_utf8,
     time::SystemTime,
 };
 
 use super::constants::COULD_NOT_UNWRAP_FILENAME;
-use plib::BUFSZ;
 
 #[derive(Debug)]
-pub struct FileData {
+pub struct FileData<'a> {
     path: PathBuf,
-    lines: Vec<String>,
+    lines: Vec<&'a str>,
     modified: SystemTime,
     ends_with_newline: bool,
 }
 
-impl FileData {
+impl<'a> FileData<'a> {
     pub fn ends_with_newline(&self) -> bool {
         self.ends_with_newline
     }
 
-    pub fn get_file(path: PathBuf) -> io::Result<Self> {
-        let mut file = File::open(path.clone())?;
+    pub fn get_file(path: PathBuf, lines: Vec<&'a str>) -> io::Result<Self> {
+        let file = File::open(&path)?;
         let modified = file.metadata()?.modified()?;
-        let mut buffer = [0_u8; BUFSZ];
-        // let mut read_length: usize = 0;
-        let mut content = String::new();
 
-        loop {
-            let n = file.read(&mut buffer).expect("Couldn't read file");
-            if n == 0 {
-                break;
-            }
-            let string_slice =
-                std::str::from_utf8(&buffer[..n]).expect("Couldn't convert to string");
-            content.push_str(string_slice);
-        }
-        let mut lines = content
-            .split("\n")
-            .map(|line| line.to_string())
-            .collect::<Vec<String>>();
-
-        let ends_with_newline = content.ends_with('\n');
-
-        if ends_with_newline {
-            lines.push(String::from(""));
-        }
-
-        let result = Self {
+        Ok(Self {
             path,
             lines,
             modified,
-            ends_with_newline,
-        };
-
-        Ok(result)
+            // FIXME: properly detect if file ends with newline
+            ends_with_newline: false,
+        })
     }
 
-    pub fn lines(&self) -> &Vec<String> {
+    pub fn lines(&self) -> &Vec<&str> {
         &self.lines
     }
 
-    pub fn line(&self, index: usize) -> &String {
+    pub fn line(&self, index: usize) -> &str {
         &self.lines[index]
     }
 
@@ -82,5 +59,35 @@ impl FileData {
 
     pub fn path(&self) -> &str {
         self.path.to_str().unwrap_or(&COULD_NOT_UNWRAP_FILENAME)
+    }
+}
+
+pub struct LineReader<'a> {
+    pub content: &'a [u8],
+}
+
+impl<'a> Iterator for LineReader<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut carriage = false;
+        let mut iter = self.content.iter().enumerate();
+        let mut line_len = loop {
+            match iter.next() {
+                Some((i, b'\n')) => break i + 1,
+                None => {
+                    return (!self.content.is_empty()).then(|| {
+                        from_utf8(take(&mut self.content)).expect("Failed to convert to str")
+                    });
+                }
+                Some((_, &it)) => carriage = it == b'\r',
+            }
+        };
+        let (line, rest) = self.content.split_at(line_len);
+        if carriage {
+            line_len -= 1;
+        }
+        self.content = rest;
+        Some(from_utf8(&line[..line_len - 1]).expect("Failed to convert to str"))
     }
 }

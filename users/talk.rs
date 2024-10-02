@@ -834,7 +834,7 @@ fn process_input_char(
             eprint!("\x1B[{};H\x1B[K", *top_line + 1);
             *top_line += 1;
 
-            if *top_line >= split_row.checked_sub(1).unwrap_or(0) {
+            if *top_line >= split_row.saturating_sub(1) {
                 eprint!("\x1B[{};H", 2);
                 *top_line = 2;
             }
@@ -1331,12 +1331,8 @@ fn draw_terminal(split_row: u16, width: u16) -> io::Result<io::StdoutLock<'stati
     // Move the cursor to the split row and draw the split line.
     write!(handle, "\x1b[{};0H", split_row)?;
     // Draw the horizontal split line (─) across the width of the terminal.
-    writeln!(
-        handle,
-        "└{:─<width$}┘",
-        "",
-        width = (width as usize).checked_sub(2).unwrap_or(0)
-    )?;
+    let width = usize::from(width.saturating_sub(2));
+    writeln!(handle, "└{:─<width$}┘", "", width = width)?;
     // Move the cursor back to the top-left corner and then down by one line.
     write!(handle, "\x1b[1;H")?;
     write!(handle, "\x1B[1B")?;

@@ -42,10 +42,8 @@ fn dirname_valid(name: &OsStr) -> bool {
             if component != Component::RootDir {
                 return false;
             }
-        } else {
-            if component == Component::CurDir || component == Component::ParentDir {
-                return false;
-            }
+        } else if component == Component::CurDir || component == Component::ParentDir {
+            return false;
         }
     }
 

@@ -217,25 +217,25 @@ fn intop(lhs: &Token, rhs: &Token, op: IntOp) -> Result<Token, &'static str> {
     }
 }
 
-// logical and/or operation
+/// logical and/or operation
 fn logop(lhs: &Token, rhs: &Token, is_and: bool) -> Token {
     let lhs_zero = token_is_zero(lhs);
     let rhs_zero = token_is_zero(rhs);
 
     if is_and {
-        if !lhs_zero && !rhs_zero {
+        return if !lhs_zero && !rhs_zero {
             lhs.clone()
         } else {
             Token::Integer(0)
-        }
+        };
+    }
+
+    if !lhs_zero {
+        lhs.clone()
+    } else if !rhs_zero {
+        rhs.clone()
     } else {
-        if !lhs_zero {
-            lhs.clone()
-        } else if !rhs_zero {
-            rhs.clone()
-        } else {
-            Token::Integer(0)
-        }
+        Token::Integer(0)
     }
 }
 

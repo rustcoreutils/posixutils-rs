@@ -148,15 +148,13 @@ where
                     } else {
                         gettext!("remove regular file '{}'?", filename_fn())
                     }
+                } else if is_empty {
+                    gettext!(
+                        "remove write-protected regular empty file '{}'?",
+                        filename_fn()
+                    )
                 } else {
-                    if is_empty {
-                        gettext!(
-                            "remove write-protected regular empty file '{}'?",
-                            filename_fn()
-                        )
-                    } else {
-                        gettext!("remove write-protected regular file '{}'?", filename_fn())
-                    }
+                    gettext!("remove write-protected regular file '{}'?", filename_fn())
                 }
             }
             ftw::FileType::Directory => unreachable!(), // Handled in the caller
@@ -184,45 +182,48 @@ fn process_directory(
 ) -> io::Result<DirAction> {
     let dir_is_empty = entry.is_empty_dir();
 
-    // If directory is empty or the directory is inaccessible, try to remove it directly
-    if (dir_is_empty.is_ok() && dir_is_empty.as_ref().unwrap() == &true) || dir_is_empty.is_err() {
-        if should_remove_directory(cfg, entry, metadata) {
-            let ret = unsafe {
-                libc::unlinkat(
-                    entry.dir_fd(),
-                    entry.file_name().as_ptr(),
-                    libc::AT_REMOVEDIR,
-                )
-            };
-            if ret != 0 {
-                let err_str = if let Err(e1) = dir_is_empty {
-                    gettext!(
-                        "cannot remove '{}': {}",
-                        entry.path().clean_trailing_slashes(),
-                        error_string(&e1)
-                    )
-                } else {
-                    let e2 = io::Error::last_os_error();
-                    gettext!(
-                        "cannot remove directory '{}': {}",
-                        entry.path().clean_trailing_slashes(),
-                        error_string(&e2)
+    match dir_is_empty {
+        // If directory is empty or the directory is inaccessible, try to remove it directly
+        Ok(true) | Err(_) => {
+            if should_remove_directory(cfg, entry, metadata) {
+                let ret = unsafe {
+                    libc::unlinkat(
+                        entry.dir_fd(),
+                        entry.file_name().as_ptr(),
+                        libc::AT_REMOVEDIR,
                     )
                 };
-                Err(io::Error::other(err_str))
+                if ret != 0 {
+                    let err_str = if let Err(e1) = dir_is_empty {
+                        gettext!(
+                            "cannot remove '{}': {}",
+                            entry.path().clean_trailing_slashes(),
+                            error_string(&e1)
+                        )
+                    } else {
+                        let e2 = io::Error::last_os_error();
+                        gettext!(
+                            "cannot remove directory '{}': {}",
+                            entry.path().clean_trailing_slashes(),
+                            error_string(&e2)
+                        )
+                    };
+                    Err(io::Error::other(err_str))
+                } else {
+                    Ok(DirAction::Removed)
+                }
             } else {
-                Ok(DirAction::Removed)
+                Ok(DirAction::Skipped)
             }
-        } else {
-            Ok(DirAction::Skipped)
         }
 
-    // Else, manually traverse the directory to remove the contents one-by-one
-    } else {
-        if descend_into_directory(cfg, entry, metadata) {
-            Ok(DirAction::Entered)
-        } else {
-            Ok(DirAction::Skipped)
+        // Else, manually traverse the directory to remove the contents one-by-one
+        Ok(false) => {
+            if descend_into_directory(cfg, entry, metadata) {
+                Ok(DirAction::Entered)
+            } else {
+                Ok(DirAction::Skipped)
+            }
         }
     }
 }

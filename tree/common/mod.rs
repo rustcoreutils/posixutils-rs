@@ -326,12 +326,10 @@ where
                         return Ok(CopyResult::Skipped);
                     }
                 }
-            } else {
-                if cfg.interactive {
-                    let is_affirm = prompt_fn(&gettext!("overwrite '{}'?", target.display()));
-                    if !is_affirm {
-                        return Ok(CopyResult::Skipped);
-                    }
+            } else if cfg.interactive {
+                let is_affirm = prompt_fn(&gettext!("overwrite '{}'?", target.display()));
+                if !is_affirm {
+                    return Ok(CopyResult::Skipped);
                 }
             }
 

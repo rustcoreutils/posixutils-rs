@@ -402,30 +402,21 @@ impl<'a> Entry<'a> {
     pub fn is_empty_dir(&self) -> io::Result<bool> {
         let file_descriptor =
             FileDescriptor::open_at(self.dir_file_descriptor, self.file_name(), libc::O_RDONLY)?;
-        match OwnedDir::new(file_descriptor) {
-            Ok(dir) => {
-                let mut num_entries = 0;
 
-                // Manually count the number of entries.
-                for entry_or_err in dir.iter() {
-                    let entry = match entry_or_err {
-                        Ok(entry) => entry,
-                        Err(e) => {
-                            return Err(e);
-                        }
-                    };
+        let dir = OwnedDir::new(file_descriptor)?;
 
-                    if entry.is_dot_or_double_dot() {
-                        continue;
-                    }
+        let mut num_entries = 0;
 
-                    num_entries += 1;
-                }
-
-                Ok(num_entries == 0)
+        // Manually count the number of entries.
+        for entry_or_err in dir.iter() {
+            let entry = entry_or_err?;
+            if entry.is_dot_or_double_dot() {
+                continue;
             }
-            Err(e) => Err(e),
+            num_entries += 1;
         }
+
+        Ok(num_entries == 0)
     }
 
     /// Returns whether this entry is a `..` or a `..`.

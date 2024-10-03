@@ -34,6 +34,24 @@ pub enum ShellToken {
     DLessDash, // <<-
     LessGreat, // <>
 
+    // reserved words
+    Bang,   // !
+    LBrace, // {
+    RBrace, // }
+    Case,   // case
+    Do,     // do
+    Done,   // done
+    Elif,   // elif
+    Else,   // else
+    Esac,   // esac
+    Fi,     // fi
+    For,    // for
+    If,     // if
+    In,     // in
+    Then,   // then
+    Until,  // until
+    While,  // while
+
     // number followed by a redirection operator
     IoNumber(u32),
 
@@ -104,6 +122,11 @@ pub fn is_operator(c: char) -> bool {
     char_to_operator_token(c).is_some()
 }
 
+fn advance_and_return(lex: &mut Lexer, complete_token: ShellToken) -> ShellToken {
+    lex.advance_char();
+    complete_token
+}
+
 pub struct Lexer<'src> {
     source: &'src str,
     source_iter: CharIndices<'src>,
@@ -153,11 +176,6 @@ impl<'src> Lexer<'src> {
             // operator
             self.advance_char();
 
-            fn advance_and_return(lex: &mut Lexer, complete_token: ShellToken) -> ShellToken {
-                lex.advance_char();
-                complete_token
-            }
-
             let complete_token = match partial_token {
                 ShellToken::And => match self.lookahead {
                     '&' => advance_and_return(self, ShellToken::AndIf),
@@ -195,7 +213,43 @@ impl<'src> Lexer<'src> {
             return complete_token;
         }
 
-        ShellToken::WordStart
+        match self.lookahead {
+            '!' => advance_and_return(self, ShellToken::Bang),
+            '{' => advance_and_return(self, ShellToken::LBrace),
+            '}' => advance_and_return(self, ShellToken::RBrace),
+            other if other.is_alphabetic() => {
+                let start = self.current_char_index;
+                let previous_iter_value = self.source_iter.clone();
+                let previous_lookahead_value = self.lookahead;
+
+                while self.lookahead.is_alphabetic() {
+                    self.advance_char();
+                }
+                let word = &self.source[start..self.current_char_index];
+                match word {
+                    "case" => ShellToken::Case,
+                    "do" => ShellToken::Do,
+                    "done" => ShellToken::Done,
+                    "elif" => ShellToken::Elif,
+                    "else" => ShellToken::Else,
+                    "esac" => ShellToken::Esac,
+                    "fi" => ShellToken::Fi,
+                    "for" => ShellToken::For,
+                    "if" => ShellToken::If,
+                    "in" => ShellToken::In,
+                    "then" => ShellToken::Then,
+                    "until" => ShellToken::Until,
+                    "while" => ShellToken::While,
+                    _ => {
+                        self.current_char_index = start;
+                        self.source_iter = previous_iter_value;
+                        self.lookahead = previous_lookahead_value;
+                        ShellToken::WordStart
+                    }
+                }
+            }
+            _ => ShellToken::WordStart,
+        }
     }
 
     pub fn next_word_token(&mut self) -> WordToken {
@@ -309,6 +363,28 @@ mod tests {
         assert_eq!(lex.next_shell_token(), ShellToken::GreatAnd);
         assert_eq!(lex.next_shell_token(), ShellToken::DLessDash);
         assert_eq!(lex.next_shell_token(), ShellToken::LessGreat);
+        assert_eq!(lex.next_shell_token(), ShellToken::EOF);
+    }
+
+    #[test]
+    fn test_lex_reserved_words() {
+        let mut lex = Lexer::new("! { } case do done elif else esac fi for if in then until while");
+        assert_eq!(lex.next_shell_token(), ShellToken::Bang);
+        assert_eq!(lex.next_shell_token(), ShellToken::LBrace);
+        assert_eq!(lex.next_shell_token(), ShellToken::RBrace);
+        assert_eq!(lex.next_shell_token(), ShellToken::Case);
+        assert_eq!(lex.next_shell_token(), ShellToken::Do);
+        assert_eq!(lex.next_shell_token(), ShellToken::Done);
+        assert_eq!(lex.next_shell_token(), ShellToken::Elif);
+        assert_eq!(lex.next_shell_token(), ShellToken::Else);
+        assert_eq!(lex.next_shell_token(), ShellToken::Esac);
+        assert_eq!(lex.next_shell_token(), ShellToken::Fi);
+        assert_eq!(lex.next_shell_token(), ShellToken::For);
+        assert_eq!(lex.next_shell_token(), ShellToken::If);
+        assert_eq!(lex.next_shell_token(), ShellToken::In);
+        assert_eq!(lex.next_shell_token(), ShellToken::Then);
+        assert_eq!(lex.next_shell_token(), ShellToken::Until);
+        assert_eq!(lex.next_shell_token(), ShellToken::While);
         assert_eq!(lex.next_shell_token(), ShellToken::EOF);
     }
 

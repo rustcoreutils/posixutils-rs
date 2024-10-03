@@ -1,0 +1,143 @@
+// 
+// Copyright (c) 2024 Hemi Labs, Inc.
+// 
+// This file is part of the posixutils-rs project covered under
+// the MIT License.  For the full license text, please see the LICENSE
+// file in the root directory of this project.
+// SPDX-License-Identifier: MIT
+// 
+
+COMMENT    = _{ "#" ~ (!"\n" ~ ANY)* ~ &"\n" }
+WHITESPACE = _{ " " | "\t" }
+
+newline_list =  { "\n"+ }
+linebreak    = _{ "\n"* }
+
+letter = { ('a'..'z') | ('A'..'Z') }
+digit  = { '0'..'9' }
+name   = { (letter | "_") ~ (letter | "_" | digit)* }
+
+assignment_word = { "x" }
+io_number       = { "x" }
+
+program = { linebreak ~ (complete_command ~ (newline_list ~ complete_command)*)? ~ linebreak }
+
+complete_command = { list ~ separator_op? }
+
+list = { and_or ~ (separator_op ~ and_or)* }
+
+and_or = { pipeline ~ ((and_if | or_if) ~ linebreak ~ pipeline)* }
+and_if = { "&&" }
+or_if  = { "||" }
+
+pipeline = { pipe_sequence | negated_pipe_sequence }
+
+negated_pipe_sequence = { "!" ~ pipe_sequence }
+
+pipe_sequence = { command ~ ("|" ~ linebreak ~ command)* }
+
+command = {
+    simple_command
+  | compound_command
+  | redirected_compound_command
+  | function_definition
+}
+
+redirected_compound_command = { compound_command ~ redirect_list }
+
+compound_command = {
+    brace_group
+  | subshell
+  | for_clause
+  | case_clause
+  | if_clause
+  | while_clause
+  | until_clause
+}
+
+subshell      = { "(" ~ compound_list ~ ")" }
+compound_list = { linebreak ~ term ~ separator? }
+term          = { and_or ~ (separator ~ and_or)* }
+
+for_clause = { "for" ~ name ~ (linebreak ~ "in" ~ word*)? ~ sequential_sep? ~ do_group }
+
+case_clause = { "case" ~ word ~ linebreak ~ "in" ~ linebreak ~ (case_item) ~ "esac" }
+
+case_item = {
+    "("? ~ pattern ~ ")" ~ (compound_list | linebreak) ~ (";;" ~ linebreak)
+}
+
+pattern = { word ~ ("|" ~ word) }
+
+if_clause = { "if" ~ compound_list ~ "then" ~ compound_list ~ else_part? ~ "fi" }
+else_part = {
+    ("elif" ~ compound_list ~ "then" ~ compound_list)* ~ "else" ~ compound_list
+}
+
+while_clause = { "while" ~ compound_list ~ do_group }
+
+until_clause = { "until" ~ compound_list ~ do_group }
+
+function_definition = { name ~ "(" ~ ")" ~ linebreak ~ function_body }
+
+function_body = { compound_command ~ redirect_list? }
+
+brace_group = { "{" ~ compound_list ~ "}" }
+
+do_group = { "do" ~ compound_list ~ "done" }
+
+simple_command = { cmd_prefix? ~ word ~ cmd_suffix? }
+
+cmd_prefix = { (io_redirect | assignment_word)+ }
+cmd_suffix = { (io_redirect | word)+ }
+
+redirect_list = { io_redirect+ }
+io_redirect   = { io_number? ~ (io_file | io_here) }
+io_file       = {
+    "<" ~ word
+  | "<&" ~ word
+  | ">" ~ word
+  | ">&" ~ word
+  | ">>" ~ word
+  | "<>" ~ word
+  | ">|" ~ word
+}
+
+io_here = { "<<" ~ word | "<<-" ~ word }
+
+separator_op   = { "&" | ";" }
+separator      = { (separator_op ~ linebreak) | newline_list }
+sequential_sep = { (";" ~ linebreak) | newline_list }
+
+word = { (parameter_expansion | arithmetic_expansion | command_substitution | s_string | d_string | ANY)+ }
+
+parameter_expansion = {
+    "${" ~ name ~ (expansion_op ~ word)? ~ "}"
+  | "$" ~ name
+}
+
+expansion_op = {
+    ":-"
+  | "-"
+  | ":="
+  | "="
+  | ":?"
+  | "?"
+  | ":+"
+  | "+"
+  | "%"
+  | "%%"
+  | "#"
+  | "##"
+}
+
+command_substitution = {
+    "`" ~ complete_command ~ "`"
+  | "$(" ~ complete_command ~ ")"
+}
+
+arithmetic_expansion  = { "$((" ~ arithmetic_expression ~ "))" }
+arithmetic_expression = { "x" }
+
+s_string = { "'" ~ (!"'" ~ ANY*) ~ "'" }
+d_string = { "\"" ~ (parameter_expansion | arithmetic_expansion | command_substitution | (!"\"" ~ ANY))+ ~ "\"" }

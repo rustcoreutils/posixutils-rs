@@ -8,9 +8,7 @@ plib = { path = "../plib" }
 gettext-rs.workspace = true
 clap.workspace = true
 libc.workspace = true
-pest = "2.7"
-pest_derive = "2.7"
 
 [[bin]]
-name = "awk"
+name = "sh"
 path = "src/main.rs"

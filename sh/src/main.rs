@@ -7,6 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod lexer;
+mod parser;
 mod program;
 
 fn main() {}

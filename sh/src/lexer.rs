@@ -244,6 +244,16 @@ impl<'src> Lexer<'src> {
         }
     }
 
+    pub fn next_line(&mut self) -> &'src str {
+        let start = self.current_char_index;
+        while self.lookahead != '\n' && !self.reached_eof() {
+            self.advance_char();
+        }
+        self.advance_char();
+        let end = self.current_char_index;
+        &self.source[start..end]
+    }
+
     pub fn new(source: &'src str) -> Self {
         let mut source_iter = source.char_indices();
         let lookahead;

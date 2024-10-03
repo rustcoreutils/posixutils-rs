@@ -307,7 +307,21 @@ impl<'src> Parser<'src> {
         if self.shell_lookahead == ShellToken::DLess
             || self.shell_lookahead == ShellToken::DLessDash
         {
-            todo!("here document")
+            let remove_leading_tabs = self.shell_lookahead == ShellToken::DLessDash;
+            let mut contents = String::new();
+            let end = self.lexer.next_line();
+            loop {
+                let line = self.lexer.next_line();
+                if line == end {
+                    break;
+                }
+                if remove_leading_tabs {
+                    contents.push_str(line.trim_start_matches('\t'));
+                } else {
+                    contents.push_str(line);
+                }
+            }
+            return Some(RedirectionKind::HereDocument { contents });
         }
         let kind = match self.shell_lookahead {
             ShellToken::Greater => IORedirectionKind::RedirectOutput,
@@ -936,6 +950,32 @@ mod tests {
                     file: literal_word("build_result.txt")
                 }
             }]
+        )
+    }
+
+    #[test]
+    fn parse_here_document_redirection() {
+        assert_eq!(
+            parse_single_redirection("<<end\nthis\nis\n\ta\ntest\nend\n"),
+            Redirection {
+                file_descriptor: None,
+                kind: RedirectionKind::HereDocument {
+                    contents: "this\nis\n\ta\ntest\n".to_string()
+                }
+            }
+        )
+    }
+
+    #[test]
+    fn parse_here_document_redirection_remove_leading_tabs() {
+        assert_eq!(
+            parse_single_redirection("<<-end\nthis\nis\n\ta\n\t\t\t\ttest\nend\n"),
+            Redirection {
+                file_descriptor: None,
+                kind: RedirectionKind::HereDocument {
+                    contents: "this\nis\na\ntest\n".to_string()
+                }
+            }
         )
     }
 }

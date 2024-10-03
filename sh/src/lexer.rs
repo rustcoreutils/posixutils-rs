@@ -152,26 +152,32 @@ impl<'src> Lexer<'src> {
             // multi-character operators all start with a single character
             // operator
             self.advance_char();
+
+            fn advance_and_return(lex: &mut Lexer, complete_token: ShellToken) -> ShellToken {
+                lex.advance_char();
+                complete_token
+            }
+
             let complete_token = match partial_token {
                 ShellToken::And => match self.lookahead {
-                    '&' => ShellToken::AndIf,
+                    '&' => advance_and_return(self, ShellToken::AndIf),
                     _ => ShellToken::And,
                 },
                 ShellToken::Pipe => match self.lookahead {
-                    '|' => ShellToken::OrIf,
+                    '|' => advance_and_return(self, ShellToken::OrIf),
                     _ => ShellToken::Pipe,
                 },
                 ShellToken::SemiColon => match self.lookahead {
-                    ';' => ShellToken::DSemi,
+                    ';' => advance_and_return(self, ShellToken::DSemi),
                     _ => ShellToken::SemiColon,
                 },
                 ShellToken::Less => match self.lookahead {
-                    '&' => ShellToken::LessAnd,
-                    '>' => ShellToken::LessGreat,
+                    '&' => advance_and_return(self, ShellToken::LessAnd),
+                    '>' => advance_and_return(self, ShellToken::LessGreat),
                     '<' => {
                         self.advance_char();
                         if self.lookahead == '-' {
-                            ShellToken::DLessDash
+                            advance_and_return(self, ShellToken::DLessDash)
                         } else {
                             ShellToken::DLess
                         }
@@ -179,14 +185,13 @@ impl<'src> Lexer<'src> {
                     _ => ShellToken::Less,
                 },
                 ShellToken::Greater => match self.lookahead {
-                    '>' => ShellToken::DGreat,
-                    '&' => ShellToken::GreatAnd,
-                    '|' => ShellToken::Clobber,
+                    '>' => advance_and_return(self, ShellToken::DGreat),
+                    '&' => advance_and_return(self, ShellToken::GreatAnd),
+                    '|' => advance_and_return(self, ShellToken::Clobber),
                     _ => ShellToken::Greater,
                 },
                 other => other,
             };
-            self.advance_char();
             return complete_token;
         }
 
@@ -275,7 +280,7 @@ mod tests {
 
     #[test]
     fn lex_operators() {
-        let mut lex = Lexer::new("& ( ) ; \n | && || ;; < > >| << >> <& >& <<- <>");
+        let mut lex = Lexer::new("&();\n|&&||;;< > >| << >><&>&<<-<>");
         assert_eq!(lex.next_shell_token(), ShellToken::And);
         assert_eq!(lex.next_shell_token(), ShellToken::LParen);
         assert_eq!(lex.next_shell_token(), ShellToken::RParen);

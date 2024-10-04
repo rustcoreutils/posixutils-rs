@@ -62,18 +62,22 @@ impl<'a> FileDiff<'a> {
             return Self::binary_file_diff(&path1, &path2);
         } else {
             let content1 = read_to_string(&path1)?.into_bytes();
+            let linereader1 = LineReader::new(&content1);
+            let ends_with_newline1 = linereader1.ends_with_newline();
             let mut lines1 = Vec::new();
-            for line in (LineReader{ content: &content1 }) {
+            for line in linereader1 {
                 lines1.push(line);
             }
 
             let content2 = read_to_string(&path2)?.into_bytes();
+            let linereader2 = LineReader::new(&content2);
+            let ends_with_newline2 = linereader2.ends_with_newline();
             let mut lines2 = Vec::new();
-            for line in (LineReader{ content: &content2 }) {
+            for line in linereader2 {
                 lines2.push(line);
             }
-            let mut file1 = FileData::get_file(path1, lines1)?;
-            let mut file2 = FileData::get_file(path2, lines2)?;
+            let mut file1 = FileData::get_file(path1, lines1, ends_with_newline1)?;
+            let mut file2 = FileData::get_file(path2, lines2, ends_with_newline2)?;
 
             let mut diff = FileDiff::new(&mut file1, &mut file2, format_options);
 

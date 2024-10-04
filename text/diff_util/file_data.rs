@@ -22,7 +22,7 @@ impl<'a> FileData<'a> {
         self.ends_with_newline
     }
 
-    pub fn get_file(path: PathBuf, lines: Vec<&'a str>) -> io::Result<Self> {
+    pub fn get_file(path: PathBuf, lines: Vec<&'a str>, ends_with_newline: bool) -> io::Result<Self> {
         let file = File::open(&path)?;
         let modified = file.metadata()?.modified()?;
 
@@ -30,8 +30,7 @@ impl<'a> FileData<'a> {
             path,
             lines,
             modified,
-            // FIXME: properly detect if file ends with newline
-            ends_with_newline: false,
+            ends_with_newline,
         })
     }
 
@@ -63,7 +62,18 @@ impl<'a> FileData<'a> {
 }
 
 pub struct LineReader<'a> {
-    pub content: &'a [u8],
+    content: &'a [u8],
+    ends_with_newline: bool,
+}
+
+impl<'a> LineReader<'a> {
+    pub fn new(content: &'a [u8]) -> Self {
+        let ends_with_newline = content.last() == Some(&b'\n');
+        Self { content, ends_with_newline }
+    }
+    pub fn ends_with_newline(&self) -> bool {
+        self.ends_with_newline
+    }
 }
 
 impl<'a> Iterator for LineReader<'a> {
@@ -90,4 +100,5 @@ impl<'a> Iterator for LineReader<'a> {
         self.content = rest;
         Some(from_utf8(&line[..line_len - 1]).expect("Failed to convert to str"))
     }
+
 }

@@ -10,6 +10,8 @@ edition.workspace = true
 plib = { path = "../plib" }
 clap.workspace = true
 gettext-rs.workspace = true
+libc.workspace = true
+thiserror = "1.0"
 
 [lints]
 workspace = true
@@ -22,3 +24,6 @@ path = "./echo.rs"
 name = "printf"
 path = "./printf.rs"
 
+[[bin]]
+name = "man"
+path = "./man.rs"

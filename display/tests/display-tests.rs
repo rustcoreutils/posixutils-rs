@@ -8,4 +8,5 @@
 //
 
 mod echo;
+mod man;
 mod printf;

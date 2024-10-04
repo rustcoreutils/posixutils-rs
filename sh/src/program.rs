@@ -135,18 +135,35 @@ pub struct Redirection {
     pub kind: RedirectionKind,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 pub struct Assignment {
     pub name: Name,
     pub value: Word,
 }
 
-#[derive(Debug, PartialEq, Default)]
+impl std::fmt::Debug for Assignment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "{}={:?}", self.name, self.value)
+    }
+}
+
+#[derive(PartialEq, Default)]
 pub struct SimpleCommand {
     pub command: Option<Word>,
     pub assignments: Vec<Assignment>,
     pub redirections: Vec<Redirection>,
     pub arguments: Vec<Word>,
+}
+
+impl std::fmt::Debug for SimpleCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "SimpleCommand:")?;
+        writeln!(f, "  assignments: {:?}", self.assignments)?;
+        writeln!(f, "  command: {:?}", self.command)?;
+        writeln!(f, "  arguments: {:?}", self.arguments)?;
+        writeln!(f, "  redirections: {:?}", self.redirections)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -197,9 +214,19 @@ pub enum Command {
     },
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 pub struct Pipeline {
     pub commands: Vec<Command>,
+}
+
+impl std::fmt::Debug for Pipeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Pipeline:")?;
+        for command in &self.commands {
+            writeln!(f, "{}", indent(command))?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -209,18 +236,63 @@ pub enum LogicalOp {
     None,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 pub struct Conjunction {
     pub elements: Vec<(Pipeline, LogicalOp)>,
     pub is_async: bool,
 }
 
-#[derive(Debug, PartialEq)]
+impl std::fmt::Debug for Conjunction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "Conjunction{}:",
+            if self.is_async { " (async)" } else { "" }
+        )?;
+        for (pipeline, logical_op) in &self.elements {
+            writeln!(f, "{}", indent(pipeline))?;
+            if *logical_op != LogicalOp::None {
+                writeln!(f, "{:?}", logical_op)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(PartialEq)]
 pub struct CompleteCommand {
     pub commands: Vec<Conjunction>,
 }
 
-#[derive(Debug, PartialEq)]
+impl std::fmt::Debug for CompleteCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "CompleteCommand:")?;
+        for conjunction in &self.commands {
+            writeln!(f, "{}", indent(conjunction))?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(PartialEq)]
 pub struct Program {
     pub commands: CompleteCommandList,
+}
+
+impl std::fmt::Debug for Program {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Program:")?;
+        for command in &self.commands {
+            writeln!(f, "{:?}", command)?;
+        }
+        Ok(())
+    }
+}
+
+fn indent<D: std::fmt::Debug>(val: &D) -> String {
+    format!("{:?}", val)
+        .lines()
+        .map(|line| format!("    {}", line))
+        .collect::<Vec<String>>()
+        .join("\n")
 }

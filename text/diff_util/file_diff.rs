@@ -442,6 +442,19 @@ impl<'a> FileDiff<'a> {
         }
     }
 
+    fn print_line(&self, start: usize, end: usize, prefix: &str) -> usize {
+        let mut j = start;
+        for i in start..end {
+            if prefix == "+" {
+                println!("{prefix}{}", self.file2.line(i));
+            } else {
+                println!("{prefix}{}", self.file1.line(i));
+            }
+            j += 1;
+        }
+        j
+    }
+
     fn print_unified(&mut self, unified: usize) {
         println!(
             "--- {}",
@@ -452,53 +465,47 @@ impl<'a> FileDiff<'a> {
             Self::get_header(self.file2, &self.format_options.label2)
         );
 
-        let context_ranges = self.get_context_ranges(unified);
+        let mut curr_pos1 = 0;
 
-        for cr_index in 0..context_ranges.len() {
-            let cr = &context_ranges[cr_index];
-
-            let mut f1_range = String::new();
-            let mut f2_range = String::new();
-
-            if cr.change.is_insert() {
-                f1_range = format!("{},{}", cr.ln1_start, 0);
-            } else {
-                let count = cr.ln1_end - cr.ln1_start + 1;
-                if count == 1 {
-                    f1_range = format!("{}", cr.ln1_start);
-                } else {
-                    f1_range = format!("{},{}", cr.ln1_start, count);
-                }
+        for hunk in self.hunks.hunks() {
+            // print context before first hunk
+            if (curr_pos1 == 0) && (hunk.ln1_start() > unified) {
+                // this is guaranteed to be >= 0 due to the above conditions
+                curr_pos1 = hunk.ln1_start() - unified;
+                // FIXME: the numbers printed below are wrong
+                println!(
+                    "@@ -{},{} +{},{} @@",
+                    hunk.ln1_start() + 1,
+                    hunk.ln1_end() - hunk.ln1_start(),
+                    hunk.ln2_start() + 1,
+                    hunk.ln2_end() - hunk.ln2_start()
+                );
             }
 
-            if cr.change.is_delete() {
-                f2_range = format!("{},{}", cr.ln2_start, 0);
-            } else {
-                let count = cr.ln2_end - cr.ln2_start + 1;
-                if count == 1 {
-                    f2_range = format!("{}", cr.ln2_start);
-                } else {
-                    f2_range = format!("{},{}", cr.ln2_start, count);
-                }
+            // do we have enough context between hunks?
+            if (curr_pos1 != 0) && (hunk.ln1_start() - curr_pos1 > unified * 2) {
+                // print the context after the last hunk
+                _ = self.print_line(curr_pos1, curr_pos1 + unified, " ");
+                // print a new section start
+                // FIXME: the numbers printed below are wrong
+                println!(
+                    "@@ -{},{} +{},{} @@",
+                    hunk.ln1_start() + 1,
+                    hunk.ln1_end() - hunk.ln1_start(),
+                    hunk.ln2_start() + 1,
+                    hunk.ln2_end() - hunk.ln2_start()
+                );
+                curr_pos1 = hunk.ln1_start() - unified
             }
 
-            println!("@@ -{} +{} @@", f1_range, f2_range);
-
-            for i in cr.ln1_start..cr.hk1_start {
-                println!(" {}", self.file1.line(i));
-            }
-            for i in cr.hk1_start..cr.hk1_end {
-                println!("-{}", self.file1.line(i));
-            }
-            for i in cr.hk2_start..cr.hk2_end {
-                println!("+{}", self.file2.line(i));
-            }
-            for i in cr.hk2_end..cr.ln2_end {
-                println!(" {}", self.file2.line(i));
-            }
-
-            println!("@@ -{} +{} @@", f1_range, f2_range);
+            // print context before current hunk
+            _ = self.print_line(curr_pos1, hunk.ln1_start(), " ");
+            // print delete hunk
+            curr_pos1 = self.print_line(hunk.ln1_start(), hunk.ln1_end(), "-");
+            // print insert hunk
+            _ = self.print_line(hunk.ln2_start(), hunk.ln2_end(), "+");
         }
+
         if !self.file1.ends_with_newline() {
             println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
         }

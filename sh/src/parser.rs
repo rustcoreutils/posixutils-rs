@@ -69,8 +69,21 @@ impl<'src> Parser<'src> {
         todo!();
     }
 
-    fn match_shell_alterntives(&mut self, tokens: &[ShellToken]) -> Option<ShellToken> {
-        todo!();
+    fn matches_shell_alterntives(&mut self, tokens: &[ShellToken]) -> Option<ShellToken> {
+        for token in tokens {
+            if self.shell_lookahead == *token {
+                self.advance_shell();
+                return Some(*token);
+            }
+        }
+        None
+    }
+
+    fn match_shell_token(&mut self, token: ShellToken) {
+        if self.shell_lookahead != token {
+            todo!();
+        }
+        self.advance_shell();
     }
 
     fn skip_linebreak(&mut self) {
@@ -447,18 +460,18 @@ impl<'src> Parser<'src> {
         // and_or = pipeline (("&&" | "||") linebreak pipeline)*
         let mut last = self.parse_pipeline();
         let mut elements = Vec::new();
-        while let Some(op) = self.match_shell_alterntives(&[ShellToken::AndIf, ShellToken::OrIf]) {
+        while let Some(op) = self.matches_shell_alterntives(&[ShellToken::AndIf, ShellToken::OrIf])
+        {
             let op = match op {
                 ShellToken::AndIf => LogicalOp::And,
                 ShellToken::OrIf => LogicalOp::Or,
                 _ => unreachable!(),
             };
             self.skip_linebreak();
-            let mut temp = Pipeline {
-                commands: Vec::new(),
-            };
-            std::mem::swap(&mut temp, &mut last);
-            elements.push((temp, op));
+            let next = self.parse_pipeline();
+            let previous = last;
+            last = next;
+            elements.push((previous, op));
         }
         elements.push((last, LogicalOp::None));
         Conjunction {
@@ -490,7 +503,22 @@ impl<'src> Parser<'src> {
 
     fn parse_program(mut self) -> Program {
         // program = linebreak (complete_command (complete_command  newline_list)*)? linebreak
-        todo!()
+        // set initial lookahead
+        self.advance_shell();
+        self.skip_linebreak();
+        let mut commands = Vec::new();
+        while self.shell_lookahead != ShellToken::EOF {
+            if commands.len() > 0 {
+                self.match_shell_token(ShellToken::Newline);
+                self.skip_linebreak();
+            }
+            if self.shell_lookahead == ShellToken::EOF {
+                break;
+            }
+            commands.push(self.parse_complete_command());
+        }
+
+        Program { commands }
     }
 
     fn new(source: &'src str) -> Self {
@@ -500,6 +528,10 @@ impl<'src> Parser<'src> {
             word_lookahead: WordToken::EOF,
         }
     }
+}
+
+pub fn parse(text: &str) -> Program {
+    Parser::new(text).parse_program()
 }
 
 #[cfg(test)]
@@ -512,9 +544,42 @@ mod tests {
         }
     }
 
+    fn unwrap_complete_command(program: Program) -> CompleteCommand {
+        assert_eq!(program.commands.len(), 1);
+        program.commands.into_iter().next().unwrap()
+    }
+
+    fn unwrap_conjunction(program: Program) -> Conjunction {
+        let complete_command = unwrap_complete_command(program);
+        assert_eq!(complete_command.commands.len(), 1);
+        complete_command.commands.into_iter().next().unwrap()
+    }
+
+    fn unwrap_pipeline(program: Program) -> Pipeline {
+        let conjunction = unwrap_conjunction(program);
+        assert_eq!(conjunction.elements.len(), 1);
+        let (pipeline, _) = conjunction.elements.into_iter().next().unwrap();
+        pipeline
+    }
+
+    fn unwrap_command(program: Program) -> Command {
+        let pipeline = unwrap_pipeline(program);
+        assert_eq!(pipeline.commands.len(), 1);
+        pipeline.commands.into_iter().next().unwrap()
+    }
+
+    fn unwrap_simple_command(program: Program) -> SimpleCommand {
+        let command = unwrap_command(program);
+        if let Command::SimpleCommand(command) = command {
+            command
+        } else {
+            panic!("expected simple command")
+        }
+    }
+
     fn parse_word(word: &str) -> Word {
-        let mut parser = Parser::new(word);
-        parser.parse_word_until(WordToken::EOF, true).unwrap()
+        let command = unwrap_simple_command(parse(&format!("fake_cmd {}", word)));
+        command.arguments.into_iter().next().unwrap()
     }
 
     fn parse_parameter_expansion(word: &str) -> ParameterExpansion {
@@ -527,9 +592,7 @@ mod tests {
     }
 
     fn parse_simple_command(text: &str) -> SimpleCommand {
-        let mut parser = Parser::new(text);
-        parser.advance_shell();
-        parser.parse_simple_command()
+        unwrap_simple_command(parse(text))
     }
 
     fn parse_single_redirection(text: &str) -> Redirection {
@@ -539,6 +602,14 @@ mod tests {
         assert!(cmd.assignments.is_empty());
         assert_eq!(cmd.redirections.len(), 1);
         cmd.redirections.into_iter().next().unwrap()
+    }
+
+    fn parse_pipeline(text: &str) -> Pipeline {
+        unwrap_pipeline(parse(text))
+    }
+
+    fn parse_conjunction(text: &str) -> Conjunction {
+        unwrap_conjunction(parse(text))
     }
 
     #[test]
@@ -977,5 +1048,58 @@ mod tests {
                 }
             }
         )
+    }
+
+    #[test]
+    fn parse_simple_pipeline() {
+        let pipeline = parse_pipeline("echo hello | wc -l");
+        assert_eq!(pipeline.commands.len(), 2);
+        assert_eq!(
+            pipeline.commands[0],
+            Command::SimpleCommand(SimpleCommand {
+                command: Some(literal_word("echo")),
+                arguments: vec![literal_word("hello")],
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            pipeline.commands[1],
+            Command::SimpleCommand(SimpleCommand {
+                command: Some(literal_word("wc")),
+                arguments: vec![literal_word("-l")],
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_simple_conjunction() {
+        let conjunction = parse_conjunction("a && b");
+        assert_eq!(conjunction.elements.len(), 2);
+        assert!(!conjunction.is_async);
+        assert_eq!(
+            conjunction.elements[0],
+            (
+                Pipeline {
+                    commands: vec![Command::SimpleCommand(SimpleCommand {
+                        command: Some(literal_word("a")),
+                        ..Default::default()
+                    })]
+                },
+                LogicalOp::And
+            )
+        );
+        assert_eq!(
+            conjunction.elements[1],
+            (
+                Pipeline {
+                    commands: vec![Command::SimpleCommand(SimpleCommand {
+                        command: Some(literal_word("b")),
+                        ..Default::default()
+                    })]
+                },
+                LogicalOp::None
+            )
+        );
     }
 }

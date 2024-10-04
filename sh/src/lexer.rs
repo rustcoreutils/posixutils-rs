@@ -9,7 +9,7 @@
 
 use std::str::CharIndices;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ShellToken {
     // single character control operators
     And,       // &

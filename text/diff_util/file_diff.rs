@@ -174,7 +174,7 @@ impl<'a> FileDiff<'a> {
         if let OutputFormat::Context(context) = self.format_options.output_format {
             self.print_context(context);
         } else if let OutputFormat::Unified(unified) = self.format_options.output_format {
-            self.print_unified(unified);
+            let _ = self.print_unified(unified);
         } else {
             let hunks_count = self.hunks.hunks().len();
 
@@ -443,20 +443,20 @@ impl<'a> FileDiff<'a> {
         }
     }
 
-    fn print_line(&self, lines: &mut String, start: usize, end: usize, prefix: &str) -> usize {
+    fn print_line(&self, lines: &mut String, start: usize, end: usize, prefix: &str) -> Result<usize, std::fmt::Error> {
         let mut j = 0;
         for i in start..end {
             if prefix == "+" {
-                writeln!(lines, "{prefix}{}", self.file2.line(i));
+                writeln!(lines, "{prefix}{}", self.file2.line(i))?;
             } else {
-                writeln!(lines, "{prefix}{}", self.file1.line(i));
+                writeln!(lines, "{prefix}{}", self.file1.line(i))?;
             }
             j += 1;
         }
-        j
+        Ok(j)
     }
 
-    fn print_unified(&mut self, unified: usize) {
+    fn print_unified(&mut self, unified: usize) -> Result<(), std::fmt::Error> {
         println!(
             "--- {}",
             Self::get_header(self.file1, &self.format_options.label1)
@@ -476,7 +476,7 @@ impl<'a> FileDiff<'a> {
         // keep track of the length of the current hunk
         let mut hunk1_len = 0;
         let mut hunk2_len = 0;
-        let mut offset = 0;
+        let mut offset: usize;
         let mut lines = String::new();
 
         for hunk in self.hunks.hunks() {
@@ -494,8 +494,7 @@ impl<'a> FileDiff<'a> {
             // do we have enough context between hunks?
             if (curr_pos1 != 0) && (hunk.ln1_start() - curr_pos1 > unified * 2) {
                 // print the context after the previous hunk
-                offset = self.print_line(&mut lines, curr_pos1, curr_pos1 + unified, " ");
-                // println!("Offset after final context: {}", offset);
+                offset = self.print_line(&mut lines, curr_pos1, curr_pos1 + unified, " ")?;
                 hunk1_len += offset;
                 hunk2_len += offset;
                 // print a new section start
@@ -521,19 +520,16 @@ impl<'a> FileDiff<'a> {
             }
 
             // print context before current hunk
-            offset = self.print_line(&mut lines, curr_pos1, hunk.ln1_start(), " ");
-            // println!("Offset after initial context: {}", offset);
+            offset = self.print_line(&mut lines, curr_pos1, hunk.ln1_start(), " ")?;
             curr_pos1 += offset;
             hunk1_len += offset;
             hunk2_len += offset;
             // print delete hunk
-            offset = self.print_line(&mut lines, hunk.ln1_start(), hunk.ln1_end(), "-");
-            // println!("Offset after delete context: {}", offset);
+            offset = self.print_line(&mut lines, hunk.ln1_start(), hunk.ln1_end(), "-")?;
             curr_pos1 += offset;
             hunk1_len += offset;
             // print insert hunk
-            offset = self.print_line(&mut lines, hunk.ln2_start(), hunk.ln2_end(), "+");
-            // println!("Offset after insert context: {}", offset);
+            offset = self.print_line(&mut lines, hunk.ln2_start(), hunk.ln2_end(), "+")?;
             hunk2_len += offset;
         }
 
@@ -558,6 +554,7 @@ impl<'a> FileDiff<'a> {
         if !self.file2.ends_with_newline() {
             println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
         }
+        Ok(())
     }
 
     pub fn get_header(file: &FileData, label: &Option<String>) -> String {

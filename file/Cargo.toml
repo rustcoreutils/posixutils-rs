@@ -8,6 +8,7 @@ edition.workspace = true
 
 [dependencies]
 plib = { path = "../plib" }
+ftw = { path = "../ftw" }
 clap.workspace = true
 gettext-rs.workspace = true
 libc.workspace = true

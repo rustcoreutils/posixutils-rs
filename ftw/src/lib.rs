@@ -107,7 +107,7 @@ impl AsRawFd for FileDescriptor {
     }
 }
 
-/// Metadata of an entry. This is analogous to `std::fs::Metadata`.
+/// Metadata of an entry. This is analogous to [`std::fs::Metadata`].
 #[derive(Clone)]
 pub struct Metadata(libc::stat);
 
@@ -120,7 +120,7 @@ impl fmt::Debug for Metadata {
 impl Metadata {
     /// Create a new `Metadata`.
     ///
-    /// `dirfd` could be the special value `libc::AT_FDCWD` to query the metadata of a file at the
+    /// `dirfd` could be the special value [`libc::AT_FDCWD`] to query the metadata of a file at the
     /// process' current working directory.
     pub fn new(
         dirfd: libc::c_int,
@@ -142,16 +142,7 @@ impl Metadata {
 
     /// Query the file type.
     pub fn file_type(&self) -> FileType {
-        match self.0.st_mode & libc::S_IFMT {
-            libc::S_IFSOCK => FileType::Socket,
-            libc::S_IFLNK => FileType::SymbolicLink,
-            libc::S_IFREG => FileType::RegularFile,
-            libc::S_IFBLK => FileType::BlockDevice,
-            libc::S_IFDIR => FileType::Directory,
-            libc::S_IFCHR => FileType::CharacterDevice,
-            libc::S_IFIFO => FileType::Fifo,
-            _ => unreachable!(),
-        }
+        FileType::from(self.0.st_mode)
     }
 
     // These are "effective" IDs and not "real" to allow for things like sudo
@@ -277,7 +268,7 @@ impl unix::fs::MetadataExt for Metadata {
     }
 }
 
-/// File type of an entry. Returned by `Metadata::file_type`.
+/// File type of an entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
     Socket,
@@ -321,6 +312,31 @@ impl unix::fs::FileTypeExt for FileType {
 
     fn is_socket(&self) -> bool {
         *self == FileType::Socket
+    }
+}
+
+impl From<libc::mode_t> for FileType {
+    fn from(value: libc::mode_t) -> Self {
+        match value & libc::S_IFMT {
+            libc::S_IFSOCK => FileType::Socket,
+            libc::S_IFLNK => FileType::SymbolicLink,
+            libc::S_IFREG => FileType::RegularFile,
+            libc::S_IFBLK => FileType::BlockDevice,
+            libc::S_IFDIR => FileType::Directory,
+            libc::S_IFCHR => FileType::CharacterDevice,
+            libc::S_IFIFO => FileType::Fifo,
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl From<std::fs::FileType> for FileType {
+    fn from(value: std::fs::FileType) -> Self {
+        struct FileTypeCopy {
+            mode: libc::mode_t,
+        }
+        let ft = unsafe { std::mem::transmute::<std::fs::FileType, FileTypeCopy>(value) };
+        Self::from(ft.mode)
     }
 }
 

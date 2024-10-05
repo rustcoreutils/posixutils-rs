@@ -14,6 +14,7 @@ use crate::diff_util::{
 
 use std::{
     collections::HashMap,
+    fmt::Write,
     fs::{File, read_to_string},
     io::{self, BufReader, Read},
     os::unix::fs::MetadataExt,
@@ -442,13 +443,13 @@ impl<'a> FileDiff<'a> {
         }
     }
 
-    fn print_line(&self, start: usize, end: usize, prefix: &str) -> usize {
-        let mut j = start;
+    fn print_line(&self, lines: &mut String, start: usize, end: usize, prefix: &str) -> usize {
+        let mut j = 0;
         for i in start..end {
             if prefix == "+" {
-                println!("{prefix}{}", self.file2.line(i));
+                writeln!(lines, "{prefix}{}", self.file2.line(i));
             } else {
-                println!("{prefix}{}", self.file1.line(i));
+                writeln!(lines, "{prefix}{}", self.file1.line(i));
             }
             j += 1;
         }
@@ -465,45 +466,90 @@ impl<'a> FileDiff<'a> {
             Self::get_header(self.file2, &self.format_options.label2)
         );
 
+        // curr_pos to keep track of the current position in both files
         let mut curr_pos1 = 0;
+        let mut curr_pos2 = 0;
+        // `context_start` and `hunk_len` to get the values for the hunk header
+        // keep track of the lines where context start
+        let mut context_start1 = 0;
+        let mut context_start2 = 0;
+        // keep track of the length of the current hunk
+        let mut hunk1_len = 0;
+        let mut hunk2_len = 0;
+        let mut offset = 0;
+        let mut lines = String::new();
 
         for hunk in self.hunks.hunks() {
-            // print context before first hunk
-            if (curr_pos1 == 0) && (hunk.ln1_start() > unified) {
+            // move cursor to the start of context for first hunk
+            if curr_pos1 == 0 {
+                if hunk.ln1_start() > unified {
                 // this is guaranteed to be >= 0 due to the above conditions
                 curr_pos1 = hunk.ln1_start() - unified;
-                // FIXME: the numbers printed below are wrong
-                println!(
-                    "@@ -{},{} +{},{} @@",
-                    hunk.ln1_start() + 1,
-                    hunk.ln1_end() - hunk.ln1_start(),
-                    hunk.ln2_start() + 1,
-                    hunk.ln2_end() - hunk.ln2_start()
-                );
+                curr_pos2 = hunk.ln2_start() - unified;
+                }
+                context_start1 = curr_pos1 + 1;
+                context_start2 = curr_pos2 + 1;
             }
 
             // do we have enough context between hunks?
             if (curr_pos1 != 0) && (hunk.ln1_start() - curr_pos1 > unified * 2) {
-                // print the context after the last hunk
-                _ = self.print_line(curr_pos1, curr_pos1 + unified, " ");
+                // print the context after the previous hunk
+                offset = self.print_line(&mut lines, curr_pos1, curr_pos1 + unified, " ");
+                // println!("Offset after final context: {}", offset);
+                hunk1_len += offset;
+                hunk2_len += offset;
                 // print a new section start
-                // FIXME: the numbers printed below are wrong
+                curr_pos1 = hunk.ln1_start() - unified;
+                curr_pos2 = hunk.ln2_start() - unified;
                 println!(
                     "@@ -{},{} +{},{} @@",
-                    hunk.ln1_start() + 1,
-                    hunk.ln1_end() - hunk.ln1_start(),
-                    hunk.ln2_start() + 1,
-                    hunk.ln2_end() - hunk.ln2_start()
+                    context_start1,
+                    hunk1_len,
+                    context_start2,
+                    hunk2_len
                 );
-                curr_pos1 = hunk.ln1_start() - unified
+                if lines.ends_with('\n') {
+                    lines.pop();
+                }
+                println!("{}", lines);
+                lines.clear();
+                context_start1 = curr_pos1 + 1;
+                context_start2 = curr_pos2 + 1;
+                hunk1_len = 0;
+                hunk2_len = 0;
+
             }
 
             // print context before current hunk
-            _ = self.print_line(curr_pos1, hunk.ln1_start(), " ");
+            offset = self.print_line(&mut lines, curr_pos1, hunk.ln1_start(), " ");
+            // println!("Offset after initial context: {}", offset);
+            curr_pos1 += offset;
+            hunk1_len += offset;
+            hunk2_len += offset;
             // print delete hunk
-            curr_pos1 = self.print_line(hunk.ln1_start(), hunk.ln1_end(), "-");
+            offset = self.print_line(&mut lines, hunk.ln1_start(), hunk.ln1_end(), "-");
+            // println!("Offset after delete context: {}", offset);
+            curr_pos1 += offset;
+            hunk1_len += offset;
             // print insert hunk
-            _ = self.print_line(hunk.ln2_start(), hunk.ln2_end(), "+");
+            offset = self.print_line(&mut lines, hunk.ln2_start(), hunk.ln2_end(), "+");
+            // println!("Offset after insert context: {}", offset);
+            hunk2_len += offset;
+        }
+
+        // print final hunk
+        if !lines.is_empty() {
+            println!(
+                "@@ -{},{} +{},{} @@",
+                context_start1,
+                hunk1_len,
+                context_start2,
+                hunk2_len
+            );
+            if lines.ends_with('\n') {
+                lines.pop();
+            }
+            println!("{}", lines);
         }
 
         if !self.file1.ends_with_newline() {

@@ -30,19 +30,6 @@ impl Hunk {
         Self::default()
     }
 
-    pub fn from(change: Change) -> Self {
-        let (ln1, ln2) = change.get_lns();
-
-        Self {
-            kind: change.clone(),
-            changes: vec![change; 1],
-            ln1_start: ln1,
-            ln1_end: ln1,
-            ln2_start: ln2,
-            ln2_end: ln2,
-        }
-    }
-
     pub fn f1_range(&self) -> String {
         if self.ln1_start == self.ln1_end {
             format!("{}", self.ln1_start)
@@ -63,33 +50,6 @@ impl Hunk {
         &self.kind
     }
 
-    pub fn add(&mut self, change: Change) {
-        assert!(
-            self.change_sequence_acceptable(&change),
-            "Only change of following lines in one file and of the same kind accepted."
-        );
-
-        let (ln1, ln2) = change.get_lns();
-
-        if ln1 < self.ln1_start {
-            self.ln1_start = ln1
-        }
-
-        if ln1 > self.ln1_end {
-            self.ln1_end = ln1
-        }
-
-        if ln2 < self.ln2_start {
-            self.ln2_start = ln2
-        }
-
-        if ln2 > self.ln2_end {
-            self.ln2_end = ln2
-        }
-
-        self.changes.push(change);
-    }
-
     pub fn ln1_start(&self) -> usize {
         self.ln1_start
     }
@@ -104,19 +64,6 @@ impl Hunk {
 
     pub fn ln2_end(&self) -> usize {
         self.ln2_end
-    }
-
-    pub fn change_sequence_acceptable(&self, change: &Change) -> bool {
-        let sequence_is_allowed = if let Some(_) = self.changes.last() {
-            change.get_ln1().abs_diff(self.ln1_start) == 1
-                || change.get_ln1().abs_diff(self.ln1_end) == 1
-                || change.get_ln2().abs_diff(self.ln2_start) == 1
-                || change.get_ln2().abs_diff(self.ln2_end) == 1
-        } else {
-            true
-        };
-
-        sequence_is_allowed && self.kind == *change
     }
 
     pub fn print_default(&mut self, file1: &FileData, file2: &FileData, is_last: bool) {

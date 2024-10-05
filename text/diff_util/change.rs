@@ -8,14 +8,6 @@ impl ChangeData {
     pub fn new(ln1: usize, ln2: usize) -> Self {
         Self { ln1, ln2 }
     }
-
-    pub fn ln1(&self) -> usize {
-        self.ln1
-    }
-
-    pub fn ln2(&self) -> usize {
-        self.ln2
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Hash)]
@@ -47,30 +39,6 @@ impl Change {
 
     pub fn is_unchanged(&self) -> bool {
         *self == Change::Unchanged(Default::default())
-    }
-
-    pub fn is_insert(&self) -> bool {
-        *self == Change::Insert(Default::default())
-    }
-
-    pub fn is_delete(&self) -> bool {
-        *self == Change::Delete(Default::default())
-    }
-
-    pub fn is_substitute(&self) -> bool {
-        *self == Change::Substitute(Default::default())
-    }
-
-    /// returns (ln1,ln2)
-    /// panics if self is None
-    pub fn get_lns(&self) -> (usize, usize) {
-        match self {
-            Change::None => Default::default(),
-            Change::Unchanged(data) => (data.ln1, data.ln2),
-            Change::Insert(data) => (data.ln1, data.ln2),
-            Change::Delete(data) => (data.ln1, data.ln2),
-            Change::Substitute(data) => (data.ln1, data.ln2),
-        }
     }
 
     pub fn get_ln1(&self) -> usize {

@@ -7,10 +7,7 @@ use super::{
     hunks::Hunks,
 };
 
-use crate::diff_util::{
-    change::{Change, ChangeContext},
-    constants::NO_NEW_LINE_AT_END_OF_FILE,
-};
+use crate::diff_util::constants::NO_NEW_LINE_AT_END_OF_FILE;
 
 use std::{
     collections::HashMap,
@@ -291,75 +288,6 @@ impl<'a> FileDiff<'a> {
         }
     }
 
-    fn get_context_ranges(&self, context: usize) -> Vec<ChangeContext> {
-        let f1_lines = self.file1.lines().len();
-        let f2_lines = self.file2.lines().len();
-
-        let mut change_ranges = self
-            .hunks
-            .hunks()
-            .iter()
-            .filter(|hunk| !Change::is_none(&hunk.kind()) && !Change::is_unchanged(&hunk.kind()))
-            .map(|hunk| {
-                (
-                    hunk.kind().clone(),
-                    hunk.ln1_start() as i64,
-                    hunk.ln1_end() as i64,
-                    hunk.ln2_start() as i64,
-                    hunk.ln2_end() as i64,
-                )
-            })
-            .collect::<Vec<(Change, i64, i64, i64, i64)>>();
-
-        change_ranges.sort_by_key(|change| (change.1, change.3));
-
-        let mut context_ranges: Vec<ChangeContext> = Vec::new();
-
-        let f1_max = if self.file1.ends_with_newline() && f1_lines - 1 >= 1 {
-            f1_lines - 1
-        } else {
-            f1_lines
-        };
-
-        let f2_max = if self.file2.ends_with_newline() && f2_lines - 1 >= 1 {
-            f2_lines - 1
-        } else {
-            f2_lines
-        };
-
-        for cr in change_ranges {
-            let ln1s = i64::clamp(cr.1 - context as i64, 1, f1_max as i64);
-            let ln1e = i64::clamp(cr.2 + context as i64, 1, f1_max as i64);
-            let ln2s = i64::clamp(cr.3 - context as i64, 1, f2_max as i64);
-            let ln2e = i64::clamp(cr.4 + context as i64, 1, f2_max as i64);
-
-            if context_ranges.len() > 0 {
-                // Overlap check
-                if let Some(change_ctx) = context_ranges.last_mut() {
-                    if change_ctx.ln1_end >= ln1s as usize || change_ctx.ln2_end >= ln2s as usize {
-                        change_ctx.ln1_end = ln1e as usize;
-                        change_ctx.ln2_end = ln2e as usize;
-                        continue;
-                    }
-                }
-            }
-
-            context_ranges.push(ChangeContext {
-                change: cr.0,
-                ln1_start: ln1s as usize,
-                ln1_end: ln1e as usize,
-                hk1_start: cr.1 as usize,
-                hk1_end: cr.2 as usize,
-                ln2_start: ln2s as usize,
-                ln2_end: ln2e as usize,
-                hk2_start: cr.3 as usize,
-                hk2_end: cr.4 as usize,
-            });
-        }
-
-        context_ranges
-    }
-
     fn order_hunks_by_output_format(&mut self) {
         match self.format_options.output_format {
             OutputFormat::Debug => self.order_hunks_ascending(),
@@ -392,55 +320,61 @@ impl<'a> FileDiff<'a> {
             Self::get_header(self.file2, &self.format_options.label2)
         );
 
-        let change_ranges = self.get_context_ranges(context);
-
-        for cr_index in 0..change_ranges.len() {
-            let cr = &change_ranges[cr_index];
-
+        for hunk in self.hunks.hunks() {
             println!("***************");
-            println!("*** {} ***", format!("{},{}", cr.ln1_start, cr.ln1_end));
-            // if self.file1.expected_changed_in_range(
-            //     cr.0 - 1,
-            //     cr.1 - 1,
-            //     &vec![Change::is_delete, Change::is_substitute],
-            // ) {
-            //     for i in cr.0..=cr.1 {
-            //         println!(
-            //             "{}",
-            //             // self.file1.get_context_identifier(i - 1),
-            //             self.file1.line(i - 1)
-            //         );
-            //     }
-            // }
+            let mut hunk_len = (hunk.ln1_end() - hunk.ln1_start() + 2 * context).min(self.file1.lines().len());
+            let hunk_start = hunk.ln1_start().saturating_sub(context);
 
-            if cr_index == change_ranges.len() - 1 {
-                if self.file1.ends_with_newline() == false {
-                    println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
+            // make sure we don't go out of bounds
+            if hunk_start + hunk_len > self.file1.lines().len() - 1 {
+                hunk_len = self.file1.lines().len() - hunk_start;
+            }
+
+            println!("*** {},{} ***", hunk_start + 1, hunk_start + hunk_len);
+            let h1_prefix = if hunk.ln2_start() == hunk.ln2_end() { "- " } else { "! " };
+
+            // dont print context for empty hunk
+            if hunk.ln1_start() == hunk.ln1_end() {
+                continue;
+            }
+
+            for i in hunk_start..hunk_start + hunk_len {
+                if i < hunk.ln1_start() {
+                    println!("  {}", self.file1.line(i));
+                } else if i < hunk.ln1_end() {
+                    println!("{h1_prefix}{}", self.file1.line(i));
+                } else {
+                    println!("  {}", self.file1.line(i));
                 }
             }
 
-            println!("--- {} ---", format!("{},{}", cr.ln2_start, cr.ln2_end));
+            let mut hunk_len = (hunk.ln2_end() - hunk.ln2_start() + 2 * context).min(self.file2.lines().len());
+            let hunk_start = hunk.ln2_start().saturating_sub(context);
 
-            // if self.file2.expected_changed_in_range(
-            //     cr.2 - 1,
-            //     cr.3 - 1,
-            //     &vec![Change::is_insert, Change::is_substitute],
-            // ) {
-            //     for i in cr.2..=cr.3 {
-            //         println!(
-            //             "{}",
-            //             // self.file2.get_context_identifier(i - 1),
-            //             self.file2.line(i - 1)
-            //         );
-            //     }
-            // }
+            // make sure we don't go out of bounds
+            if hunk_start + hunk_len > self.file2.lines().len() - 1 {
+                hunk_len = self.file2.lines().len() - hunk_start;
+            }
 
-            if cr_index == change_ranges.len() - 1 {
-                if self.file2.ends_with_newline() == false {
-                    println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
+            println!("--- {},{} ---", hunk_start + 1, hunk_start + hunk_len);
+            let h2_prefix = if hunk.ln1_start() == hunk.ln1_end() { "+ " } else { "! " };
+
+            // dont print context for empty hunk
+            if hunk.ln2_start() == hunk.ln2_end() {
+                continue;
+            }
+
+            for i in hunk_start..hunk_start + hunk_len {
+                if i < hunk.ln2_start() {
+                    println!("  {}", self.file2.line(i));
+                } else if i < hunk.ln2_end() {
+                    println!("{h2_prefix}{}", self.file2.line(i));
+                } else {
+                    println!("  {}", self.file2.line(i));
                 }
             }
         }
+
     }
 
     fn print_line(&self, lines: &mut String, start: usize, end: usize, prefix: &str) -> Result<usize, std::fmt::Error> {

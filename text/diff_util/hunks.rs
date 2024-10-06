@@ -283,12 +283,12 @@ impl Hunks {
         num_lines2: usize,
     ) {
         let mut hunk_start1 = 0;
-        let mut hunk_end1 = 0;
+        let mut hunk_end1: usize;
         let mut hunk_start2 = 0;
-        let mut hunk_end2 = 0;
+        let mut hunk_end2: usize;
         let mut prev_val = 0 as i32;
         for i in 0..lcs_indices.len() {
-            if ((lcs_indices[i] == -1) && (prev_val != -1)) {
+            if (lcs_indices[i] == -1) && (prev_val != -1) {
                 // We reach a new deletion/substitution block
                 hunk_start1 = i;
                 hunk_start2 = if prev_val == 0 {

@@ -59,22 +59,23 @@ pub enum OutputMode {
     /// The format of the default output from df is unspecified,
     /// but all space figures are reported in 512-byte units
     Unspecified,
+    Unspecified1K,
 }
 
 impl OutputMode {
     pub fn new(kilo: bool, portable: bool) -> Self {
         match (kilo, portable) {
             (true, true) => Self::Posix,
+            (true, false) => Self::Unspecified1K,
             (false, true) => Self::PosixLegacy,
-            _ => Self::Unspecified,
+            (false, false) => Self::Unspecified,
         }
     }
 
     pub fn get_block_size(&self) -> u64 {
         match self {
-            OutputMode::Posix => 1024,
-            OutputMode::PosixLegacy => 512,
-            OutputMode::Unspecified => 512,
+            OutputMode::Posix | OutputMode::Unspecified1K => 1024,
+            OutputMode::PosixLegacy | OutputMode::Unspecified => 512,
         }
     }
 }

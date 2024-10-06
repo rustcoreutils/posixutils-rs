@@ -93,6 +93,7 @@ impl<'a> FileDiff<'a> {
                 &mut lcs_indices,
             );
 
+            println!("lcs_indices: {:?}", lcs_indices);
             diff.hunks
                 .create_hunks_from_lcs(&lcs_indices, num_lines1, num_lines2);
 
@@ -412,29 +413,40 @@ impl<'a> FileDiff<'a> {
             // do we have enough context between hunks?
             if (diff_disp.curr_pos1 != 0) && (hunk.ln1_start() - diff_disp.curr_pos1 > unified * 2)
             {
-                // print the context after the previous hunk
+                // add context after the previous hunk
                 diff_disp.write_line(
                     self.file1,
                     diff_disp.curr_pos1,
                     diff_disp.curr_pos1 + unified,
                     " ",
                 )?;
-                // print a new section start
+                // update current position and print the whole section
                 diff_disp.update_curr_pos(hunk.ln1_start() - unified, hunk.ln2_start() - unified);
                 diff_disp.print_section();
             }
 
-            // print context before current hunk
+            // add context before current hunk
             diff_disp.write_line(self.file1, diff_disp.curr_pos1, hunk.ln1_start(), " ")?;
-            // print delete hunk
+            // add delete hunk
             diff_disp.write_line(self.file1, hunk.ln1_start(), hunk.ln1_end(), "-")?;
-            // print insert hunk
+            // add insert hunk
             diff_disp.write_line(self.file2, hunk.ln2_start(), hunk.ln2_end(), "+")?;
         }
 
         // print final hunk
         if !diff_disp.hunk_lines.is_empty() {
             diff_disp.print_section();
+            // display the remaining context if possible
+            if diff_disp.curr_pos1 < self.file1.lines().len() {
+                let end = self.file1.lines().len().min(diff_disp.curr_pos1 + unified);
+                diff_disp.write_line(
+                    self.file1,
+                    diff_disp.curr_pos1,
+                    end,
+                    " ",
+                )?;
+                diff_disp.print_hunk();
+            }
         }
 
         if !self.file1.ends_with_newline() {
@@ -524,14 +536,19 @@ impl DiffDisplay {
             "@@ -{},{} +{},{} @@",
             self.context_start1, self.hunk1_len, self.context_start2, self.hunk2_len
         );
-        if self.hunk_lines.ends_with('\n') {
-            self.hunk_lines.pop();
-        }
-        println!("{}", self.hunk_lines);
-        self.hunk_lines.clear();
+        self.print_hunk();
         self.context_start1 = self.curr_pos1 + 1;
         self.context_start2 = self.curr_pos2 + 1;
         self.hunk1_len = 0;
         self.hunk2_len = 0;
     }
+
+    pub fn print_hunk(&mut self) {
+        if self.hunk_lines.ends_with('\n') {
+            self.hunk_lines.pop();
+        }
+        println!("{}", self.hunk_lines);
+        self.hunk_lines.clear();
+    }
+
 }

@@ -1,6 +1,9 @@
 use crate::diff_util::constants::NO_NEW_LINE_AT_END_OF_FILE;
 
-use super::{change::{Change, ChangeData}, file_data::FileData};
+use super::{
+    change::{Change, ChangeData},
+    file_data::FileData,
+};
 
 #[derive(Clone, Debug)]
 pub struct Hunk {
@@ -46,10 +49,6 @@ impl Hunk {
         }
     }
 
-    pub fn kind(&self) -> &Change {
-        &self.kind
-    }
-
     pub fn ln1_start(&self) -> usize {
         self.ln1_start
     }
@@ -89,7 +88,6 @@ impl Hunk {
                 }
             }
             Change::Substitute(_) => {
-
                 println!("{}c{}", self.f1_range(), self.f2_range());
 
                 for i in self.ln1_start..self.ln1_end {
@@ -278,133 +276,81 @@ impl Hunks {
         &mut self.hunks[index]
     }
 
-    pub fn create_hunks_from_lcs(&mut self, lcs_indices: &Vec<i32>, num_lines1: usize, num_lines2: usize) {
-        let mut curr_line1 = 0;
-        let mut curr_line2 = 0;
-        let mut prev_i = 0;
-        let mut prev_l = 0;
-        let mut block_start_1 = 0;
-        let mut block_start_2 = 0;
-        let max_index_2 = lcs_indices.iter().max().unwrap();
-        lcs_indices.iter().enumerate().filter(|(_i, l)| **l != -1).for_each(|(i, l)| {
-            // check if we reach the end of the block
-            if (i - prev_i > 1) || (*l as usize - prev_l > 1) || (l == max_index_2) {
-                let hunk_start_1 = curr_line1;
-                let hunk_start_2 = curr_line2;
-
-                // handle delete lines from lines1
-                let mut has_deleted_lines = false;
-                while curr_line1 < block_start_1 {
-                    curr_line1 += 1;
-                }
-                if curr_line1 != hunk_start_1 {
-                    has_deleted_lines = true;
-                }
-
-                // handle added lines from lines2
-                let mut has_added_lines = false;
-                while curr_line2 < block_start_2 {
-                    curr_line2 += 1;
-                }
-                if curr_line2 != hunk_start_2 {
-                    has_added_lines = true;
-                }
-
-                // Add the hunk
-                if has_deleted_lines && has_added_lines {
-                    self.hunks.push(Hunk {
-                        kind: Change::Substitute(ChangeData::new(hunk_start_1, hunk_start_2)),
-                        changes: vec![Change::default()],
-                        ln2_start: hunk_start_2,
-                        ln1_start: hunk_start_1,
-                        ln2_end: curr_line2,
-                        ln1_end: curr_line1,
-                    });
-                } else if has_deleted_lines {
-                    let mut changes: Vec<Change> = Vec::new();
-                    for i in hunk_start_1+1..curr_line1 {
-                        changes.push(Change::Delete(ChangeData::new(i, i+1)));
-                    }
-                    self.hunks.push(Hunk {
-                        kind: Change::Delete(ChangeData::new(hunk_start_1, hunk_start_2)),
-                        changes: vec![Change::default()],
-                        ln2_start: hunk_start_2,
-                        ln1_start: hunk_start_1,
-                        ln2_end: curr_line2,
-                        ln1_end: curr_line1,
-                    });
-                } else if has_added_lines {
-                    self.hunks.push(Hunk {
-                        kind: Change::Insert(ChangeData::new(hunk_start_1, hunk_start_2)),
-                        changes: vec![Change::default()],
-                        ln2_start: hunk_start_2,
-                        ln1_start: hunk_start_1,
-                        ln2_end: curr_line2,
-                        ln1_end: curr_line1,
-                    });
-                }
-
-                // position current line directly after previous block end
-                curr_line1 = prev_i + 1;
-                curr_line2 = prev_l + 1;
-
-                // new block start
-                block_start_1 = i;
-                block_start_2 = *l as usize;
+    pub fn create_hunks_from_lcs(
+        &mut self,
+        lcs_indices: &Vec<i32>,
+        num_lines1: usize,
+        num_lines2: usize,
+    ) {
+        let mut hunk_start1 = 0;
+        let mut hunk_end1 = 0;
+        let mut hunk_start2 = 0;
+        let mut hunk_end2 = 0;
+        let mut prev_val = 0 as i32;
+        for i in 0..lcs_indices.len() {
+            if ((lcs_indices[i] == -1) && (prev_val != -1)) {
+                // We reach a new deletion/substitution block
+                hunk_start1 = i;
+                hunk_start2 = if prev_val == 0 {
+                    0
+                } else {
+                    (prev_val + 1) as usize
+                };
+            } else if (prev_val != -1) && (lcs_indices[i] != -1) && (lcs_indices[i] != prev_val + 1) {
+                // there was an insertion (but no deletion)
+                // no -1 values but a bump in the values, eg [136, 145]
+                hunk_start1 = i;
+                hunk_start2 = (prev_val + 1) as usize;
+                hunk_end1 = i;
+                hunk_end2 = lcs_indices[i] as usize;
+                self.add_hunk(hunk_start1, hunk_end1, hunk_start2, hunk_end2);
             }
-            prev_i = i;
-            prev_l = *l as usize;
+            if (lcs_indices[i] != -1) && (prev_val == -1) {
+                // we reach the end of deletion/substitution block
+                hunk_end1 = i;
+                hunk_end2 = lcs_indices[i] as usize;
+                self.add_hunk(hunk_start1, hunk_end1, hunk_start2, hunk_end2);
+            }
+            prev_val = lcs_indices[i];
+        }
 
+        // final hunk: we might have only -1 at the end
+        if lcs_indices[lcs_indices.len() - 1] == -1 {
+            hunk_end1 = num_lines1;
+            hunk_end2 = num_lines2;
+            self.add_hunk(hunk_start1, hunk_end1, hunk_start2, hunk_end2);
+        } else if lcs_indices[lcs_indices.len() - 1] < ((num_lines2 - 1) as i32) {
+            // there might be some insertions after the last lcs block
+            hunk_start1 = num_lines1 - 1;
+            hunk_end1 = num_lines1 - 1;
+            hunk_start2 = (lcs_indices[lcs_indices.len() - 1] + 1) as usize;
+            hunk_end2 = num_lines2;
+            self.add_hunk(hunk_start1, hunk_end1, hunk_start2, hunk_end2);
+        }
+    }
+
+    pub fn add_hunk(
+        &mut self,
+        hunk_start1: usize,
+        hunk_end1: usize,
+        hunk_start2: usize,
+        hunk_end2: usize,
+    ) {
+        let kind: Change;
+        if hunk_start1 == hunk_end1 {
+            kind = Change::Insert(ChangeData::new(hunk_start1, hunk_start2));
+        } else if hunk_start2 == hunk_end2 {
+            kind = Change::Delete(ChangeData::new(hunk_start1, hunk_start2));
+        } else {
+            kind = Change::Substitute(ChangeData::new(hunk_start1, hunk_start2));
+        }
+        self.hunks.push(Hunk {
+            kind,
+            changes: vec![Change::default()],
+            ln2_start: hunk_start2,
+            ln1_start: hunk_start1,
+            ln2_end: hunk_end2,
+            ln1_end: hunk_end1,
         });
-
-        // Get last hunk (if any) after the last lcs block
-        let mut has_deleted_lines = false;
-        curr_line1 = prev_i + 1;
-        let hunk_start_1 = curr_line1;
-        while curr_line1 < num_lines1 {
-            curr_line1 += 1;
-        }
-        if curr_line1 != hunk_start_1 {
-            has_deleted_lines = true;
-        }
-
-        let mut has_added_lines = false;
-        curr_line2 = prev_l + 1;
-        let hunk_start_2 = curr_line2;
-        while curr_line2 < num_lines2 {
-            curr_line2 += 1;
-        }
-        if curr_line2 != hunk_start_2 {
-            has_added_lines = true;
-        }
-
-        if has_deleted_lines && has_added_lines {
-            self.hunks.push(Hunk {
-                kind: Change::Substitute(ChangeData::new(hunk_start_1, hunk_start_2)),
-                changes: vec![Change::default()],
-                ln2_start: hunk_start_2,
-                ln1_start: hunk_start_1,
-                ln2_end: curr_line2,
-                ln1_end: curr_line1,
-            });
-        } else if has_deleted_lines {
-            self.hunks.push(Hunk {
-                kind: Change::Delete(ChangeData::new(hunk_start_1, hunk_start_2)),
-                changes: vec![Change::default()],
-                ln2_start: hunk_start_2,
-                ln1_start: hunk_start_1,
-                ln2_end: curr_line2,
-                ln1_end: curr_line1,
-            });
-        } else if has_added_lines {
-            self.hunks.push(Hunk {
-                kind: Change::Insert(ChangeData::new(hunk_start_1, hunk_start_2)),
-                changes: vec![Change::default()],
-                ln2_start: hunk_start_2,
-                ln1_start: hunk_start_1,
-                ln2_end: curr_line2,
-                ln1_end: curr_line1,
-            });
-        }
     }
 }

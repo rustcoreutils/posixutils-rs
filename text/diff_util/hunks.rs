@@ -33,17 +33,21 @@ impl Hunk {
         Self::default()
     }
 
-    pub fn f1_range(&self) -> String {
+    pub fn f1_range(&self, is_ed: bool) -> String {
         if self.ln1_start == self.ln1_end {
             format!("{}", self.ln1_start)
+        } else if is_ed && (self.ln1_start == self.ln1_end - 1) {
+            format!("{}", self.ln1_end)
         } else {
             format!("{},{}", self.ln1_start, self.ln1_end)
         }
     }
 
-    pub fn f2_range(&self) -> String {
+    pub fn f2_range(&self, is_ed: bool) -> String {
         if self.ln2_start == self.ln2_end {
             format!("{}", self.ln2_start)
+        } else if is_ed && (self.ln2_start == self.ln2_end - 1) {
+            format!("{}", self.ln2_end)
         } else {
             format!("{},{}", self.ln2_start, self.ln2_end)
         }
@@ -70,14 +74,14 @@ impl Hunk {
             Change::None => {}
             Change::Unchanged(_) => {}
             Change::Insert(_) => {
-                println!("{}a{}", self.ln1_start, self.f2_range());
+                println!("{}a{}", self.ln1_start, self.f2_range(false));
 
                 for i in self.ln2_start..self.ln2_end {
                     println!("> {}", file2.line(i));
                 }
             }
             Change::Delete(_) => {
-                println!("{}d{}", self.f1_range(), self.ln2_end);
+                println!("{}d{}", self.f1_range(false), self.ln2_end);
 
                 for i in self.ln1_start..self.ln1_end {
                     println!("< {}", file1.line(i));
@@ -88,7 +92,7 @@ impl Hunk {
                 }
             }
             Change::Substitute(_) => {
-                println!("{}c{}", self.f1_range(), self.f2_range());
+                println!("{}c{}", self.f1_range(false), self.f2_range(false));
 
                 for i in self.ln1_start..self.ln1_end {
                     println!("< {}", file1.line(i));
@@ -115,10 +119,10 @@ impl Hunk {
             "{}-{} ({}) <> {}-{} ({})",
             self.ln1_start,
             self.ln1_end,
-            self.f1_range(),
+            self.f1_range(false),
             self.ln2_start,
             self.ln2_end,
-            self.f2_range()
+            self.f2_range(false)
         );
 
         match &self.kind {
@@ -164,24 +168,20 @@ impl Hunk {
             Change::None => {}
             Change::Unchanged(_) => {}
             Change::Insert(_) => {
-                self.changes.sort_by_key(|change| change.get_ln2());
-
                 println!("{}a", self.ln1_end);
-                for change in &self.changes {
-                    println!("{}", file2.line(change.get_ln2() - 1));
+                for i in self.ln2_start..self.ln2_end {
+                    println!("{}", file2.line(i));
                 }
 
                 println!(".")
             }
             Change::Delete(_) => {
-                println!("{}d", self.f1_range());
+                println!("{}d", self.f1_range(true));
             }
             Change::Substitute(_) => {
-                self.changes.sort_by_key(|change| change.get_ln2());
-                println!("{}c", self.f1_range());
-
-                for change in &self.changes {
-                    println!("{}", file2.line(change.get_ln2() - 1));
+                println!("{}c", self.f1_range(true));
+                for i in self.ln2_start..self.ln2_end {
+                    println!("{}", file2.line(i));
                 }
 
                 println!(".")
@@ -220,11 +220,11 @@ impl Hunk {
                 println!(".")
             }
             Change::Delete(_) => {
-                println!("d{}", self.f1_range().replace(",", " "));
+                println!("d{}", self.f1_range(true).replace(",", " "));
             }
             Change::Substitute(_) => {
                 self.changes.sort_by_key(|change| change.get_ln2());
-                println!("c{}", self.f1_range().replace(",", " "));
+                println!("c{}", self.f1_range(true).replace(",", " "));
 
                 for change in &self.changes {
                     println!("{}", file2.line(change.get_ln2() - 1));
@@ -286,17 +286,17 @@ impl Hunks {
         let mut hunk_end1: usize;
         let mut hunk_start2 = 0;
         let mut hunk_end2: usize;
-        let mut prev_val = 0 as i32;
+        let mut prev_val = -2 as i32;
         for i in 0..lcs_indices.len() {
             if (lcs_indices[i] == -1) && (prev_val != -1) {
                 // We reach a new deletion/substitution block
                 hunk_start1 = i;
-                hunk_start2 = if prev_val == 0 {
+                hunk_start2 = if prev_val == -2 {
                     0
                 } else {
                     (prev_val + 1) as usize
                 };
-            } else if (prev_val != -1) && (lcs_indices[i] != -1) && (lcs_indices[i] != prev_val + 1) {
+            } else if (i != 0) && (prev_val != -1) && (lcs_indices[i] != -1) && (lcs_indices[i] != prev_val + 1) {
                 // there was an insertion (but no deletion)
                 // no -1 values but a bump in the values, eg [136, 145]
                 hunk_start1 = i;

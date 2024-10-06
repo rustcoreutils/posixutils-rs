@@ -93,6 +93,7 @@ impl<'a> FileDiff<'a> {
                 &mut lcs_indices,
             );
 
+            println!("{:?}", lcs_indices);
             diff.hunks
                 .create_hunks_from_lcs(&lcs_indices, num_lines1, num_lines2);
 

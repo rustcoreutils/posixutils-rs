@@ -434,18 +434,12 @@ impl<'a> FileDiff<'a> {
 
         // print final hunk
         if !diff_disp.hunk_lines.is_empty() {
-            diff_disp.print_section();
             // display the remaining context if possible
             if diff_disp.curr_pos1 < self.file1.lines().len() {
                 let end = self.file1.lines().len().min(diff_disp.curr_pos1 + unified);
-                diff_disp.write_line(
-                    self.file1,
-                    diff_disp.curr_pos1,
-                    end,
-                    " ",
-                )?;
-                diff_disp.print_hunk();
+                diff_disp.write_line(self.file1, diff_disp.curr_pos1, end, " ")?;
             }
+            diff_disp.print_section();
         }
 
         if !self.file1.ends_with_newline() {
@@ -549,5 +543,4 @@ impl DiffDisplay {
         println!("{}", self.hunk_lines);
         self.hunk_lines.clear();
     }
-
 }

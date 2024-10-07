@@ -39,7 +39,7 @@ impl Hunk {
         } else if is_ed && (self.ln1_start == self.ln1_end - 1) {
             format!("{}", self.ln1_end)
         } else {
-            format!("{},{}", self.ln1_start, self.ln1_end)
+            format!("{},{}", self.ln1_start+1, self.ln1_end)
         }
     }
 
@@ -49,7 +49,7 @@ impl Hunk {
         } else if is_ed && (self.ln2_start == self.ln2_end - 1) {
             format!("{}", self.ln2_end)
         } else {
-            format!("{},{}", self.ln2_start, self.ln2_end)
+            format!("{},{}", self.ln2_start+1, self.ln2_end)
         }
     }
 
@@ -74,14 +74,14 @@ impl Hunk {
             Change::None => {}
             Change::Unchanged(_) => {}
             Change::Insert(_) => {
-                println!("{}a{}", self.ln1_start, self.f2_range(false));
+                println!("{}a{}", self.ln1_start, self.f2_range(true));
 
                 for i in self.ln2_start..self.ln2_end {
                     println!("> {}", file2.line(i));
                 }
             }
             Change::Delete(_) => {
-                println!("{}d{}", self.f1_range(false), self.ln2_end);
+                println!("{}d{}", self.f1_range(true), self.ln2_end);
 
                 for i in self.ln1_start..self.ln1_end {
                     println!("< {}", file1.line(i));
@@ -92,7 +92,7 @@ impl Hunk {
                 }
             }
             Change::Substitute(_) => {
-                println!("{}c{}", self.f1_range(false), self.f2_range(false));
+                println!("{}c{}", self.f1_range(true), self.f2_range(true));
 
                 for i in self.ln1_start..self.ln1_end {
                     println!("< {}", file1.line(i));
@@ -204,52 +204,6 @@ impl Hunk {
             );
         }
     }
-
-    pub fn print_forward_edit_script(&mut self, file1: &FileData, file2: &FileData, is_last: bool) {
-        match &self.kind {
-            Change::None => {}
-            Change::Unchanged(_) => {}
-            Change::Insert(_) => {
-                self.changes.sort_by_key(|change| change.get_ln2());
-
-                println!("a{}", self.ln1_end);
-                for change in &self.changes {
-                    println!("{}", file2.line(change.get_ln2() - 1));
-                }
-
-                println!(".")
-            }
-            Change::Delete(_) => {
-                println!("d{}", self.f1_range(true).replace(",", " "));
-            }
-            Change::Substitute(_) => {
-                self.changes.sort_by_key(|change| change.get_ln2());
-                println!("c{}", self.f1_range(true).replace(",", " "));
-
-                for change in &self.changes {
-                    println!("{}", file2.line(change.get_ln2() - 1));
-                }
-
-                println!(".")
-            }
-        }
-
-        if is_last && !file1.ends_with_newline() {
-            println!(
-                "diff: {}:{}\n",
-                file1.name(),
-                &NO_NEW_LINE_AT_END_OF_FILE[1..]
-            );
-        }
-
-        if is_last && !file2.ends_with_newline() {
-            println!(
-                "diff: {}:{}\n",
-                file2.name(),
-                &NO_NEW_LINE_AT_END_OF_FILE[1..]
-            );
-        }
-    }
 }
 
 pub struct Hunks {
@@ -273,6 +227,10 @@ impl Hunks {
 
     pub fn hunk_at_mut(&mut self, index: usize) -> &mut Hunk {
         &mut self.hunks[index]
+    }
+
+    pub fn hunk_count(&self) -> usize {
+        self.hunks.len()
     }
 
     pub fn create_hunks_from_lcs(

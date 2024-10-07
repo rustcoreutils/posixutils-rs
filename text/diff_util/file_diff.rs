@@ -31,6 +31,10 @@ impl<'a> FileDiff<'a> {
         self.are_different
     }
 
+    pub fn set_different(&mut self, are_different: bool) {
+        self.are_different = are_different;
+    }
+
     fn new(
         file1: &'a mut FileData<'a>,
         file2: &'a mut FileData<'a>,
@@ -59,7 +63,11 @@ impl<'a> FileDiff<'a> {
             let ends_with_newline1 = linereader1.ends_with_newline();
             let mut lines1 = Vec::new();
             for line in linereader1 {
-                lines1.push(line);
+                if !format_options.ignore_trailing_white_spaces {
+                    lines1.push(line);
+                } else {
+                    lines1.push(line.trim_end());
+                }
             }
 
             let content2 = read_to_string(&path2)?.into_bytes();
@@ -67,7 +75,11 @@ impl<'a> FileDiff<'a> {
             let ends_with_newline2 = linereader2.ends_with_newline();
             let mut lines2 = Vec::new();
             for line in linereader2 {
-                lines2.push(line);
+                if !format_options.ignore_trailing_white_spaces {
+                    lines2.push(line);
+                } else {
+                    lines2.push(line.trim_end());
+                }
             }
             let mut file1 = FileData::get_file(path1, lines1, ends_with_newline1)?;
             let mut file2 = FileData::get_file(path2, lines2, ends_with_newline2)?;
@@ -90,6 +102,10 @@ impl<'a> FileDiff<'a> {
 
             diff.hunks
                 .create_hunks_from_lcs(&lcs_indices, num_lines1, num_lines2);
+
+            if diff.hunks.hunk_count() > 0 {
+                diff.set_different(true);
+            }
 
             if diff.are_different() {
                 if let Some(show_if_different) = show_if_different {
@@ -186,7 +202,7 @@ impl<'a> FileDiff<'a> {
                         eprintln!("OutputFormat::Context should be handled in other place");
                         return Ok(DiffExitStatus::Trouble);
                     }
-                    OutputFormat::ForwardEditScript => hunk.print_forward_edit_script(
+                    OutputFormat::ForwardEditScript => hunk.print_edit_script(
                         self.file1,
                         self.file2,
                         hunk_index == hunks_count - 1,
@@ -269,7 +285,7 @@ impl<'a> FileDiff<'a> {
             .map(|(k, _v)| *k);
 
         match key {
-            None => {},
+            None => {}
             Some(k) => {
                 let rec = hist.get(k).unwrap();
                 let x1_new = rec[1] as usize;

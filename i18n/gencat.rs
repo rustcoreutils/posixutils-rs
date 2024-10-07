@@ -1,6 +1,6 @@
 use byteorder::{BigEndian, ByteOrder, LittleEndian, NativeEndian, WriteBytesExt};
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use std::{
     cell::RefCell,
@@ -27,14 +27,13 @@ pub mod osx {
     pub const FIRST_SET_OFFSET: i64 = 32;
 }
 
-/// gencat - generate a formatted message catalog
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about = gettext("gencat - generate a formatted message catalog"))]
 struct Args {
-    /// A pathname of the formatted message catalog.
+    #[arg(help = gettext("A pathname of the formatted message catalog"))]
     catfile: PathBuf,
 
-    /// A pathname of a message text source file.
+    #[arg(help = gettext("A pathname of a message text source file"))]
     msgfile: PathBuf,
 }
 
@@ -611,10 +610,7 @@ impl MessageCatalog {
                     + string_offset;
 
                 let msg = String::from_utf8_lossy(&string_pool[string_offset..msg_end]).to_string();
-                set_msg
-                    .entry(set_id)
-                    .or_insert_with(BTreeMap::new)
-                    .insert(msg_id, msg);
+                set_msg.entry(set_id).or_default().insert(msg_id, msg);
             }
         }
 

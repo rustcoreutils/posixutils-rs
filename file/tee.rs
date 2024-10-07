@@ -8,25 +8,22 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use libc::{signal, SIGINT, SIG_IGN};
 use plib::PROJECT_NAME;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 
-/// tee - duplicate standard input
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about = gettext("tee - duplicate standard input"))]
 struct Args {
-    /// Append the output to the files.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Append the output to the files"))]
     append: bool,
 
-    /// Ignore the SIGINT signal.
-    #[arg(short, long)]
+    #[arg(short, long, help = gettext("Ignore the SIGINT signal"))]
     ignore: bool,
 
-    /// One or more output files.
+    #[arg(short, long, help = gettext("One or more output files"))]
     files: Vec<String>,
 }
 

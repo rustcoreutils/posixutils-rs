@@ -71,14 +71,13 @@ const CONV_ASCII_EBCDIC: [u8; 256] = [
     0xdd, 0xde, 0xdf, 0xea, 0xeb, 0xec, 0xed, 0xee, 0xef, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff,
 ];
 
-#[derive(Debug)]
+#[allow(clippy::upper_case_acronyms)]
 enum AsciiConv {
     Ascii,
     EBCDIC,
     IBM,
 }
 
-#[derive(Debug)]
 enum Conversion {
     Ascii(AsciiConv),
     Lcase,
@@ -89,7 +88,6 @@ enum Conversion {
     Sync,
 }
 
-#[derive(Debug)]
 struct Config {
     ifile: String,
     ofile: String,
@@ -151,7 +149,7 @@ fn convert_swab(data: &mut [u8]) {
 fn convert_lcase(data: &mut [u8]) {
     for byte in data.iter_mut() {
         if *byte >= b'A' && *byte <= b'Z' {
-            *byte = *byte + 32;
+            *byte += 32;
         }
     }
 }
@@ -159,7 +157,7 @@ fn convert_lcase(data: &mut [u8]) {
 fn convert_ucase(data: &mut [u8]) {
     for byte in data.iter_mut() {
         if *byte >= b'a' && *byte <= b'z' {
-            *byte = *byte - 32;
+            *byte -= 32;
         }
     }
 }

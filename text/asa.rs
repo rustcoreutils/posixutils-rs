@@ -18,8 +18,8 @@ use std::io::{self, BufRead};
 use std::path::PathBuf;
 
 /// asa - interpret carriage-control characters
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Files to read as input.
     files: Vec<PathBuf>,
@@ -72,7 +72,7 @@ fn asa_file(pathname: &PathBuf) -> io::Result<()> {
     let mut state = AsaState::new();
 
     loop {
-        line_no = line_no + 1;
+        line_no += 1;
 
         let mut raw_line = String::new();
         let n_read = reader.read_line(&mut raw_line)?;
@@ -90,7 +90,7 @@ fn asa_file(pathname: &PathBuf) -> io::Result<()> {
         // exclude first char, and trailing newline
         let mut line_len = raw_line.len() - 1;
         if raw_line.ends_with('\n') {
-            line_len = line_len - 1;
+            line_len -= 1;
         }
         let line = &raw_line[1..line_len];
 

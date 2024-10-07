@@ -14,15 +14,17 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-/// what — identify SCCS files
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about = gettext("what - identify SCCS files"))]
 struct Args {
-    /// Display at most one identification string per file
-    #[arg(short = 's', long)]
+    #[arg(
+        short = 's',
+        long,
+        help = gettext("Display at most one identification string per file")
+    )]
     single: bool,
 
-    /// Input files
+    #[arg(help = gettext("Input files"))]
     files: Vec<PathBuf>,
 }
 

@@ -23,8 +23,8 @@ use std::{
 };
 
 /// rm - remove directory entries
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Do not prompt for confirmation.
     #[arg(short, long, overrides_with_all = ["force", "interactive"])]
@@ -379,8 +379,7 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
             }
             ftw::ErrorKind::ReadLink => unreachable!(), // rm doesn't follow symlinks
         },
-        false, // Don't follow symlinks on `filepath`
-        false, // Don't follow any encountered symlinks
+        ftw::TraverseDirectoryOpts::default(),
     );
 
     Ok(success)
@@ -392,7 +391,7 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
 /// signature is only to match `rm_directory`.
 fn rm_file(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
     let filename_cstr = CString::new(filepath.as_os_str().as_bytes())?;
-    let metadata = ftw::Metadata::new(libc::AT_FDCWD, filename_cstr.as_ptr(), false)?;
+    let metadata = ftw::Metadata::new(libc::AT_FDCWD, &filename_cstr, false)?;
 
     if should_remove_file(cfg, &metadata, || display_cleaned(filepath)) {
         fs::remove_file(filepath).map_err(|e| {

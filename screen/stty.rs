@@ -13,7 +13,7 @@
 mod osdata;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use osdata::{ParamType, PARG, PNEG};
 use plib::PROJECT_NAME;
 use std::collections::HashMap;
@@ -25,19 +25,30 @@ use termios::{
 
 const HDR_SAVE: &'static str = "pfmt1";
 
-/// stty - set the options for a terminal
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about = gettext("stty - set the options for a terminal"))]
 struct Args {
-    /// Write to standard output all the current settings, in human-readable form.
-    #[arg(short, long, group = "mode")]
+    #[arg(
+        short,
+        long,
+        group = "mode",
+        help = gettext(
+            "Write to standard output all the current settings, in human-readable form"
+        )
+    )]
     all: bool,
 
-    /// Write to standard output all the current settings, in stty-readable form.
-    #[arg(short = 'g', long, group = "mode")]
+    #[arg(
+        short = 'g',
+        long,
+        group = "mode",
+        help = gettext(
+            "Write to standard output all the current settings, in stty-readable form"
+        )
+    )]
     save: bool,
 
-    /// List of terminal configuration commands
+    #[arg(help = gettext("List of terminal configuration commands"))]
     operands: Vec<String>,
 }
 
@@ -296,7 +307,7 @@ fn set_ti_flag(
 
     // set flag bits (unless negation)
     if !negate {
-        newflags = newflags | val_set;
+        newflags |= val_set;
     }
 
     // commit flag bits to termio struct, if changed
@@ -450,7 +461,7 @@ fn stty_set_long(mut ti: Termios, args: &Args) -> io::Result<()> {
         if operand.parse::<u64>().is_ok() {
             set_ti_speed(&mut ti, &speedmap, true, operand)?;
             set_ti_speed(&mut ti, &speedmap, false, operand)?;
-            idx = idx + 1;
+            idx += 1;
             continue;
         }
 
@@ -478,7 +489,7 @@ fn stty_set_long(mut ti: Termios, args: &Args) -> io::Result<()> {
 
         let mut op_arg = String::new();
         if (flags & PARG) != 0 {
-            idx = idx + 1;
+            idx += 1;
 
             if idx == args.operands.len() {
                 let errstr = format!("Missing operand for {}", operand);
@@ -519,7 +530,7 @@ fn stty_set_long(mut ti: Termios, args: &Args) -> io::Result<()> {
             }
         }
 
-        idx = idx + 1;
+        idx += 1;
     }
 
     // finally, commit new termio settings (if any)

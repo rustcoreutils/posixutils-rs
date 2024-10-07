@@ -10,7 +10,6 @@
 use crate::platform::{self, endutxent, getutxent, setutxent};
 use std::ffi::CStr;
 
-#[derive(Debug)]
 pub struct Utmpx {
     pub user: String,
     pub id: String,

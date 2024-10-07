@@ -13,20 +13,23 @@
 //   continue to the next file, rather than stopping.
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
-/// cat - concatenate and print files
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about = gettext("cat - concatenate and print files"))]
 struct Args {
-    /// Disable output buffering (a no-op, for POSIX compat.)
-    #[arg(short, long, default_value_t = true)]
+    #[arg(
+        short,
+        long,
+        default_value_t = true,
+        help = gettext("Disable output buffering (a no-op, for POSIX compat)")
+    )]
     unbuffered: bool,
 
-    /// Files to read as input.  Use "-" or no-args for stdin.
+    #[arg(help = gettext("Files to read as input. Use '-' or no-args for stdin"))]
     files: Vec<PathBuf>,
 }
 

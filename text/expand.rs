@@ -14,8 +14,8 @@ use std::io::{self, BufWriter, Read, Write};
 use std::path::PathBuf;
 
 /// expand - convert tabs to spaces
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Tab stops, either a single positive decimal integer or a list of tabstops separated by commas.
     #[arg(short, long)]
@@ -57,7 +57,7 @@ fn parse_tablist(tablist: &str) -> Result<TabList, &'static str> {
 }
 
 fn space_out(column: &mut usize, writer: &mut BufWriter<dyn Write>) -> io::Result<()> {
-    *column = *column + 1;
+    *column += 1;
 
     writer.write_all(b" ")?;
 
@@ -89,14 +89,14 @@ fn expand_file(tablist: &TabList, pathname: &PathBuf) -> io::Result<()> {
                 // backspace
                 writer.write_all(&[byte])?;
                 if column > 1 {
-                    column = column - 1;
+                    column -= 1;
                 }
             } else if byte == b'\r' || byte == b'\n' {
                 writer.write_all(&[byte])?;
                 column = 1;
             } else if byte != b'\t' {
                 writer.write_all(&[byte])?;
-                column = column + 1;
+                column += 1;
             } else {
                 match tablist {
                     TabList::UniStop(n) => {
@@ -115,7 +115,7 @@ fn expand_file(tablist: &TabList, pathname: &PathBuf) -> io::Result<()> {
                             while column < next_tab {
                                 space_out(&mut column, &mut writer)?;
                             }
-                            cur_stop = cur_stop + 1;
+                            cur_stop += 1;
                             space_out(&mut column, &mut writer)?;
                         }
                     }

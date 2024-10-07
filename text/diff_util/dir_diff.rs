@@ -34,10 +34,10 @@ impl<'a> DirDiff<'a> {
         format_options: &FormatOptions,
         recursive: bool,
     ) -> io::Result<DiffExitStatus> {
-        let mut dir1: DirData = DirData::load(PathBuf::from(path1))?;
-        let mut dir2: DirData = DirData::load(PathBuf::from(path2))?;
+        let mut dir1: DirData = DirData::load(path1)?;
+        let mut dir2: DirData = DirData::load(path2)?;
 
-        let mut dir_diff = DirDiff::new(&mut dir1, &mut dir2, &format_options, recursive);
+        let mut dir_diff = DirDiff::new(&mut dir1, &mut dir2, format_options, recursive);
         return dir_diff.analyze();
     }
 
@@ -117,15 +117,15 @@ impl<'a> DirDiff<'a> {
                             show_if_different.push_str("-b ");
                         }
 
-                        if let Some(label1) = &self.format_options.label1 {
+                        if let Some(label1) = &self.format_options.label1() {
                             show_if_different.push_str(format!("--label {} ", label1).as_str())
                         }
 
-                        if let Some(label2) = &self.format_options.label2 {
+                        if let Some(label2) = &self.format_options.label2() {
                             show_if_different.push_str(format!("--label2 {} ", label2).as_str())
                         }
 
-                        if let Some(label1) = &self.format_options.label1 {
+                        if let Some(label1) = &self.format_options.label1() {
                             show_if_different.push_str(format!("{} ", label1).as_str())
                         } else {
                             show_if_different
@@ -133,7 +133,7 @@ impl<'a> DirDiff<'a> {
                             show_if_different.push(' ');
                         }
 
-                        if let Some(label2) = &self.format_options.label2 {
+                        if let Some(label2) = &self.format_options.label2() {
                             show_if_different.push_str(format!("{} ", label2).as_str())
                         } else {
                             show_if_different
@@ -177,13 +177,13 @@ impl<'a> DirDiff<'a> {
                     } else {
                         let (file, dir) = if in_dir1_is_file && !in_dir2_is_file {
                             (
-                                path1.to_str().unwrap_or(&COULD_NOT_UNWRAP_FILENAME),
-                                path2.to_str().unwrap_or(&COULD_NOT_UNWRAP_FILENAME),
+                                path1.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME),
+                                path2.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME),
                             )
                         } else {
                             (
-                                path2.to_str().unwrap_or(&COULD_NOT_UNWRAP_FILENAME),
-                                path1.to_str().unwrap_or(&COULD_NOT_UNWRAP_FILENAME),
+                                path2.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME),
+                                path1.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME),
                             )
                         };
 

@@ -17,8 +17,8 @@ use plib::{platform, PROJECT_NAME};
 use std::path::PathBuf;
 
 /// who - display who is on the system
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Process all utmpx entries
     #[arg(short, long)]
@@ -171,7 +171,7 @@ fn show_utmpx_summary() {
     let mut count = 0;
     let entries = plib::utmpx::load();
     for entry in &entries {
-        if entry.user.len() > 0 {
+        if !entry.user.is_empty() {
             println!("{}", entry.user);
             count += 1;
         }

@@ -21,8 +21,8 @@ use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 
 /// Sort, merge, or sequence check text files
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Check that the single input file is ordered as specified
     #[arg(short = 'c')]
@@ -223,12 +223,10 @@ fn update_range_field(mut field1: RangeField, mut field2: RangeField) -> (RangeF
 /// the second RangeField object based on their field numbers and first characters.
 ///
 fn compare_range_fields(field1: &RangeField, field2: &RangeField) -> bool {
-    if field1.field_number < field2.field_number {
-        true
-    } else if field1.field_number == field2.field_number {
-        field1.first_character <= field2.first_character
-    } else {
-        false
+    match field1.field_number.cmp(&field2.field_number) {
+        Ordering::Less => true,
+        Ordering::Equal => field1.first_character <= field2.first_character,
+        Ordering::Greater => false,
     }
 }
 

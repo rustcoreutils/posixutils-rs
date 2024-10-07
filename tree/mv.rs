@@ -25,8 +25,8 @@ use std::{
 };
 
 /// mv - move files
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Do not prompt for confirmation if the destination path exists
     #[arg(short, long, overrides_with_all = ["force", "interactive"])]
@@ -107,7 +107,7 @@ fn move_file(
     let source_filename = CString::new(source.as_os_str().as_bytes()).unwrap();
     let target_filename = CString::new(target.as_os_str().as_bytes()).unwrap();
 
-    let target_md = match ftw::Metadata::new(libc::AT_FDCWD, target_filename.as_ptr(), true) {
+    let target_md = match ftw::Metadata::new(libc::AT_FDCWD, &target_filename, true) {
         Ok(md) => Some(md),
         Err(e) => {
             if e.kind() == io::ErrorKind::NotFound {
@@ -125,7 +125,7 @@ fn move_file(
     };
     let target_is_writable = target_md.map(|md| md.is_writable()).unwrap_or(false);
 
-    let source_md = match ftw::Metadata::new(libc::AT_FDCWD, source_filename.as_ptr(), true) {
+    let source_md = match ftw::Metadata::new(libc::AT_FDCWD, &source_filename, true) {
         Ok(md) => Some(md),
         Err(e) => {
             if e.kind() == io::ErrorKind::NotFound {
@@ -153,8 +153,8 @@ fn move_file(
 
     // 2. source and target are same dirent
     if let (Ok(smd), Ok(tmd), Some(deref_smd)) = (
-        ftw::Metadata::new(libc::AT_FDCWD, source_filename.as_ptr(), false),
-        ftw::Metadata::new(libc::AT_FDCWD, target_filename.as_ptr(), false),
+        ftw::Metadata::new(libc::AT_FDCWD, &source_filename, false),
+        ftw::Metadata::new(libc::AT_FDCWD, &target_filename, false),
         &source_md,
     ) {
         // `true` for hard links to the same file and when `source == target`

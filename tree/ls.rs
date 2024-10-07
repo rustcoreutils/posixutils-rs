@@ -9,23 +9,24 @@
 
 mod ls_util;
 
+use self::ls_util::{ls_from_utf8_lossy, Entry, LongFormatPadding, MultiColumnPadding};
 use clap::{CommandFactory, FromArgMatches, Parser};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::{platform::P_WINSIZE_REQUEST_CODE, PROJECT_NAME};
-use std::collections::HashMap;
-use std::ffi::{CStr, CString, OsStr, OsString};
-use std::fs;
-use std::io;
-use std::mem::MaybeUninit;
-use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
-use std::process::ExitCode;
-
-use self::ls_util::{ls_from_utf8_lossy, Entry, LongFormatPadding, MultiColumnPadding};
+use std::{
+    collections::HashMap,
+    ffi::{CString, OsStr},
+    io,
+    mem::MaybeUninit,
+    os::unix::{ffi::OsStrExt, fs::MetadataExt},
+    path::{Path, PathBuf},
+    process::ExitCode,
+    sync::atomic::{AtomicU8, Ordering},
+};
 
 /// ls - list directory contents
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Write out all directory entries, including those whose names begin with
     /// a <period> ( '.' ).
@@ -295,9 +296,9 @@ struct LongFormatOptions {
 enum OutputFormat {
     MultiColumn,
     MultiColumnAcross,
-    StreamOutputFormat,
+    Stream,
     OneEntryPerLine,
-    LongFormat(LongFormatOptions),
+    Long(LongFormatOptions),
 }
 
 enum SortBy {
@@ -319,6 +320,7 @@ enum DereferenceSymbolicLink {
     None,
 }
 
+#[allow(clippy::enum_variant_names)]
 enum FileTimeOption {
     LastModificationTime,
     LastStatusChangeTime,
@@ -450,7 +452,7 @@ impl Config {
         ) {
             (false, false, false, false) => {
                 if long_format_enabled {
-                    OutputFormat::LongFormat(long_format_options)
+                    OutputFormat::Long(long_format_options)
                 } else {
                     // According to the specification:
                     //
@@ -463,7 +465,7 @@ impl Config {
                 }
             }
             (true, false, false, false) => OutputFormat::MultiColumn,
-            (false, true, false, false) => OutputFormat::StreamOutputFormat,
+            (false, true, false, false) => OutputFormat::Stream,
             (false, false, true, false) => OutputFormat::MultiColumnAcross,
             (false, false, false, true) => OutputFormat::OneEntryPerLine,
             _ => unreachable!(), // -C, -m, -x, and -1 are mutually exclusive
@@ -696,96 +698,9 @@ fn calc_optimal_padding(
     unreachable!()
 }
 
-// Used by the -f option. This had to be done through `libc` because it needs to
-// output the entries `.` and `..` which `std::fs::read_dir` does not do.
-fn get_file_names_in_directory_order(directory: &str) -> io::Result<Vec<OsString>> {
-    unsafe {
-        // Convert `directory` to a C-style string
-        let path = CString::new(directory)?;
-
-        let dirp = libc::opendir(path.as_ptr());
-        if dirp.is_null() {
-            // This returns the error from `errno`
-            return Err(io::Error::last_os_error());
-        }
-
-        let mut filenames = Vec::new();
-
-        let mut loop_over_entries = || -> io::Result<()> {
-            loop {
-                let dirent = libc::readdir(dirp);
-                if dirent.is_null() {
-                    // Check if an error or just end of the stream
-                    let e = io::Error::last_os_error();
-                    let errno = e.raw_os_error().unwrap();
-                    if errno != 0 {
-                        return Err(e);
-                    }
-                    break;
-                }
-
-                // `CStr::from_ptr` is less verbose but doing it this way
-                // makes sure that the string is at most 255 characters in
-                // length
-                let dirent_ref = &*dirent;
-                let bytes = std::slice::from_raw_parts(
-                    dirent_ref.d_name.as_ptr() as *const u8,
-                    dirent_ref.d_name.len(),
-                );
-                let cstr = CStr::from_bytes_until_nul(bytes).map_err(io::Error::other)?;
-
-                // Using an `OsString` because `to_string_lossy()` could
-                // possibly cause a name collision:
-                //
-                // `a?` and `a?` with different non-UTF-8 code points for the
-                // second character.
-                filenames.push(OsStr::from_bytes(cstr.to_bytes()).to_os_string());
-            }
-            Ok(())
-        };
-
-        let loop_result = loop_over_entries();
-
-        // *Always* close the `dirp` pointer even if `loop_over_entries` has an
-        // error
-        if libc::closedir(dirp) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        loop_result?;
-
-        Ok(filenames)
-    }
-}
-
 fn display_entries(entries: &mut [Entry], config: &Config, dir_path: Option<&str>) {
     match &config.sort_by {
-        SortBy::DirectoryOrder => {
-            if let Some(dir_path) = dir_path {
-                // Only considering the no-error case since the sorting
-                // order will get messed up anyway if even one entry in the
-                // `libc::readdir` call fails.
-                if let Ok(mut file_names) = get_file_names_in_directory_order(dir_path) {
-                    if config.reverse_sorting {
-                        file_names.reverse();
-                    }
-
-                    // Map of file_name -> directory_order_index
-                    let index_map: HashMap<OsString, usize> = file_names
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, s)| (s, i))
-                        .collect();
-
-                    entries.sort_by_key(|entry| {
-                        index_map
-                            .get(entry.file_name_os_str())
-                            .copied()
-                            .unwrap_or(usize::MAX)
-                    });
-                }
-            }
-        }
+        SortBy::DirectoryOrder => (), // Already sorted by directory order
         other_sorting => {
             entries.sort_by(|a, b| {
                 let sort_fn = match other_sorting {
@@ -804,7 +719,7 @@ fn display_entries(entries: &mut [Entry], config: &Config, dir_path: Option<&str
     }
 
     let mut display_total_size = config.display_size;
-    if let OutputFormat::LongFormat(_) = &config.output_format {
+    if let OutputFormat::Long(_) = &config.output_format {
         display_total_size = true;
     }
 
@@ -829,7 +744,7 @@ fn display_entries(entries: &mut [Entry], config: &Config, dir_path: Option<&str
     }
 
     match &config.output_format {
-        OutputFormat::LongFormat(_) => {
+        OutputFormat::Long(_) => {
             let mut padding = LongFormatPadding::default();
 
             // Calculate required padding
@@ -915,7 +830,7 @@ fn display_entries(entries: &mut [Entry], config: &Config, dir_path: Option<&str
                 println!();
             }
         }
-        OutputFormat::StreamOutputFormat => {
+        OutputFormat::Stream => {
             let stream_outputs: Vec<_> = entries
                 .iter()
                 .map(|entry| entry.build_stream_mode_string())
@@ -1012,7 +927,8 @@ fn ls(paths: Vec<PathBuf>, config: &Config) -> io::Result<u8> {
     // Files get processed first
     let mut file_entries = Vec::new();
     for path in files {
-        let metadata = match fs::symlink_metadata(&path) {
+        let path_cstr = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let metadata = match ftw::Metadata::new(libc::AT_FDCWD, &path_cstr, false) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("ls: {e}");
@@ -1020,12 +936,65 @@ fn ls(paths: Vec<PathBuf>, config: &Config) -> io::Result<u8> {
                 continue;
             }
         };
+
+        let is_commandline_arg = true;
+        let dereference_symlink = match config.dereference_symbolic_link {
+            DereferenceSymbolicLink::CommandLine => is_commandline_arg,
+            DereferenceSymbolicLink::All => true,
+            DereferenceSymbolicLink::None => false,
+        };
+
+        // If -H or -L are enabled, the metadata to be reported is from the file
+        // that the symbolic link points to.
+        let metadata = if metadata.is_symlink() && dereference_symlink {
+            match ftw::Metadata::new(libc::AT_FDCWD, &path_cstr, true) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("ls: {e}");
+                    exit_code = exit_code.max(1);
+                    continue;
+                }
+            }
+        } else {
+            metadata
+        };
+
+        // Target of the symlink
+        let target_path = {
+            let mut target_path = None;
+            if metadata.is_symlink() && !dereference_symlink {
+                if let OutputFormat::Long(_) = &config.output_format {
+                    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+
+                    let path_cstr = CString::new(path.as_os_str().as_bytes()).unwrap();
+                    let ret = unsafe {
+                        libc::readlinkat(
+                            libc::AT_FDCWD,
+                            path_cstr.as_ptr(),
+                            buf.as_mut_ptr().cast(),
+                            buf.len(),
+                        )
+                    };
+                    if ret < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    let num_bytes = ret as usize;
+                    buf.shrink_to(num_bytes);
+
+                    let target_path_cstr = CString::from_vec_with_nul(buf).unwrap();
+
+                    target_path = Some(ls_from_utf8_lossy(target_path_cstr.to_bytes()));
+                }
+            }
+
+            target_path
+        };
+
         let entry = match Entry::new(
-            &path,
+            target_path,
             path.as_os_str().to_os_string(),
             &metadata,
             config,
-            true,
         ) {
             Ok(x) => x,
             Err(e) => {
@@ -1042,160 +1011,315 @@ fn ls(paths: Vec<PathBuf>, config: &Config) -> io::Result<u8> {
 
     let mut is_first_dir_arg = true;
     for path in directories.into_iter() {
-        // Stack for depth-first directory traversal
-        let mut subdirectories = vec![path];
+        exit_code = exit_code.max(process_single_dir(
+            path,
+            config,
+            num_args,
+            num_file_args,
+            &mut is_first_dir_arg,
+        )?);
+    }
+    Ok(exit_code)
+}
 
-        // Stores visited paths to prevent infinite loops due to symbolic links
-        // Map of canonical path -> path
-        let mut visited: HashMap<PathBuf, PathBuf> = HashMap::new();
+fn process_single_dir(
+    path: PathBuf,
+    config: &Config,
+    num_args: usize,
+    num_file_args: usize,
+    is_first_dir_arg: &mut bool,
+) -> io::Result<u8> {
+    // Shared between closures so need to be a type that can be internally
+    // mutated
+    let exit_code = AtomicU8::new(0);
 
-        while let Some(dir) = subdirectories.pop() {
-            let canonical_dir_path = fs::canonicalize(&dir)?;
-            if let Some(noncanonical_dir_path) = visited.get(&canonical_dir_path) {
-                eprintln!(
-                    "ls: {}: {}",
-                    ls_from_utf8_lossy(noncanonical_dir_path.as_os_str().as_bytes()),
-                    gettext("not listing already-listed directory")
-                );
-                // This is the only error that has exit code 2 for now.
-                exit_code = exit_code.max(2);
-                continue;
-            }
+    // Stores visited paths to prevent infinite loops due to symbolic links
+    // Map of canonical path -> path
+    let mut visited: HashMap<(u64, u64), PathBuf> = HashMap::new();
 
-            visited.insert(canonical_dir_path, dir.clone());
+    let mut entries: Vec<Entry> = Vec::new();
+    let mut errors: Vec<io::Error> = Vec::new();
 
-            let mut entries = Vec::new();
-            let mut errors = Vec::new();
+    let mut current_dir: Option<PathBuf> = None;
 
-            // For sorting the subdirectories on recursion
-            let mut new_subdirectories = Vec::new();
+    // Always true. According to the reference:
+    // "For each operand that names a file of a type other than directory
+    // or symbolic link to a directory, ls shall write..."
+    let follow_symlinks_on_args = true;
 
-            for dir_entry in fs::read_dir(&dir)? {
-                // Helper closure to easily catch the `io::Error` for printing
-                let process_dir_entry = || -> io::Result<()> {
-                    let dir_entry = dir_entry?;
+    let follow_symlinks = match config.dereference_symbolic_link {
+        DereferenceSymbolicLink::CommandLine => false,
+        DereferenceSymbolicLink::All => true,
+        DereferenceSymbolicLink::None => false,
+    };
 
-                    let mut path = dir_entry.path();
-                    let path_str = ls_from_utf8_lossy(path.as_os_str().as_bytes());
+    fn print_header(
+        config: &Config,
+        num_args: usize,
+        num_file_args: usize,
+        is_first_dir_arg: &mut bool,
+        dir: &Path,
+    ) {
+        let dir_path = ls_from_utf8_lossy(dir.as_os_str().as_bytes());
 
-                    let mut metadata = dir_entry.metadata().map_err(|e| {
-                        io::Error::other(format!("{} '{path_str}': {e}", gettext("cannot access")))
-                    })?;
+        // If more than one directory, or a combination of non-directory
+        // files and directories are written, either as a result of
+        // specifying multiple operands, or the -R option
+        let display_directory_header = num_args > 1 || config.recursive;
 
-                    let file_name_raw = path
-                        .file_name()
-                        .map(|s| s.to_os_string())
-                        .unwrap_or(OsString::from(".."));
-                    let entry = Entry::new(&path, file_name_raw, &metadata, config, false)
-                        .map_err(|e| io::Error::other(format!("'{path_str}': {e}")))?;
-
-                    let mut include_entry = false;
-
-                    // Check if file starts with `.`
-                    let is_hidden_file = {
-                        let byte = dir_entry.file_name().as_bytes()[0];
-                        byte == b'.'
-                    };
-
-                    if is_hidden_file {
-                        match &config.file_inclusion {
-                            FileInclusion::IncludeHidden | FileInclusion::All => {
-                                include_entry = true;
-                            }
-                            FileInclusion::Default => (), // Do nothing
-                        }
-                    } else {
-                        include_entry = true;
-                    }
-
-                    if include_entry {
-                        entries.push(entry);
-
-                        if config.recursive {
-                            if metadata.is_symlink() {
-                                // -L only. On the description for the -R flag:
-                                //
-                                // When a symbolic link to a directory is
-                                // encountered, the directory shall not be
-                                // recursively listed unless the -L option is
-                                // specified
-                                if let DereferenceSymbolicLink::All =
-                                    config.dereference_symbolic_link
-                                {
-                                    path = fs::read_link(&path)?;
-                                    metadata = path.metadata()?;
-                                }
-                            }
-
-                            if metadata.is_dir() {
-                                new_subdirectories.push(path);
-                            }
-                        }
-                    }
-
-                    Ok(())
-                };
-
-                if let Err(e) = process_dir_entry() {
-                    errors.push(e);
-                }
-            }
-
-            new_subdirectories.sort();
-            while let Some(subdir) = new_subdirectories.pop() {
-                subdirectories.push(subdir);
-            }
-
-            // `.` and `..` are excluded from `fs::read_dir` so it's guaranteed
-            // we haven't added them yet.
-            if let FileInclusion::All = &config.file_inclusion {
-                for s in [".", ".."] {
-                    let mut process_dot_dirs = || -> io::Result<()> {
-                        let mut path = dir.clone();
-                        path.push(s);
-
-                        let metadata = fs::symlink_metadata(&path)?;
-                        let entry = Entry::new(&path, OsString::from(s), &metadata, config, false)?;
-
-                        entries.push(entry);
-
-                        Ok(())
-                    };
-
-                    if let Err(e) = process_dot_dirs() {
-                        errors.push(e);
-                    }
-                }
-            }
-
-            // If more than one directory, or a combination of non-directory
-            // files and directories are written, either as a result of
-            // specifying multiple operands, or the -R option
-            let display_directory_header = num_args > 1 || config.recursive;
-
-            let dir_path = ls_from_utf8_lossy(dir.as_os_str().as_bytes());
-            if display_directory_header {
-                if is_first_dir_arg && num_file_args == 0 {
-                    // Trimming the newline on the first directory isn't
-                    // strictly required by the specification
-                    println!("{}:", dir_path);
-                    is_first_dir_arg = false;
-                } else {
-                    println!("\n{}:", dir_path);
-                }
-            }
-
-            for e in errors {
-                eprintln!("ls: {e}");
-                exit_code = exit_code.max(1);
-            }
-
-            if !entries.is_empty() {
-                display_entries(&mut entries, config, Some(&dir_path));
+        if display_directory_header {
+            if *is_first_dir_arg && num_file_args == 0 {
+                // Trimming the newline on the first directory isn't
+                // strictly required by the specification
+                println!("{}:", dir_path);
+                *is_first_dir_arg = false;
+            } else {
+                println!("\n{}:", dir_path);
             }
         }
     }
-    Ok(exit_code)
+
+    fn print_contents(
+        config: &Config,
+        dir: &Path,
+        entries: &mut Vec<Entry>,
+        errors: &mut Vec<io::Error>,
+        exit_code: &AtomicU8,
+    ) {
+        let dir_path = ls_from_utf8_lossy(dir.as_os_str().as_bytes());
+
+        for e in errors.drain(..) {
+            eprintln!("ls: {e}");
+            exit_code.fetch_max(1, Ordering::SeqCst);
+        }
+
+        if !entries.is_empty() {
+            display_entries(entries, config, Some(&dir_path));
+
+            // Already displayed so clear the entries
+            entries.clear();
+        }
+    }
+
+    let mut terminate = false;
+
+    let _ = ftw::traverse_directory(
+        path,
+        |dir_entry| {
+            if terminate {
+                return Ok(false);
+            }
+
+            let metadata = dir_entry.metadata().unwrap();
+            let is_dot_or_double_dot = dir_entry.is_dot_or_double_dot();
+
+            // Get the metadata of the file, equivalent to `std::fs::symlink_metadata`
+            let marker = {
+                let metadata =
+                    match ftw::Metadata::new(dir_entry.dir_fd(), dir_entry.file_name(), false) {
+                        Ok(md) => md,
+                        Err(e) => {
+                            let path_str = ls_from_utf8_lossy(
+                                dir_entry.path().as_inner().as_os_str().as_bytes(),
+                            );
+                            let err_str = gettext!("cannot access '{}': {}", path_str, e);
+                            errors.push(io::Error::other(err_str));
+                            return Ok(false);
+                        }
+                    };
+                (metadata.dev(), metadata.ino())
+            };
+
+            if current_dir.is_none() {
+                // Init `dir`. `dir_entry.path()` should still be `path` here.
+                current_dir = Some(dir_entry.path().as_inner().to_path_buf());
+                print_header(
+                    config,
+                    num_args,
+                    num_file_args,
+                    is_first_dir_arg,
+                    current_dir.as_ref().unwrap(),
+                );
+
+                visited.insert(marker, current_dir.as_ref().unwrap().clone());
+                return Ok(true);
+            }
+
+            // Helper closure to easily catch the `io::Error` for printing
+            let process_dir_entry = |entries: &mut Vec<Entry>| -> io::Result<bool> {
+                let path = dir_entry.path();
+                let path_str = ls_from_utf8_lossy(path.as_os_str().as_bytes());
+
+                {
+                    let include_dot_and_double_dot = match config.file_inclusion {
+                        FileInclusion::All => true,
+                        _ => false,
+                    };
+
+                    if is_dot_or_double_dot && !include_dot_and_double_dot {
+                        // Skip
+                        return Ok(true);
+                    }
+                }
+
+                let file_name_raw = OsStr::from_bytes(dir_entry.file_name().to_bytes()).to_owned();
+
+                // Symlink target
+                let target_path = {
+                    let is_commandline_arg = false;
+                    let dereference_symlink = match config.dereference_symbolic_link {
+                        DereferenceSymbolicLink::CommandLine => is_commandline_arg,
+                        DereferenceSymbolicLink::All => true,
+                        DereferenceSymbolicLink::None => false,
+                    };
+
+                    let mut target_path = None;
+                    if metadata.is_symlink() && !dereference_symlink {
+                        if let OutputFormat::Long(_) = &config.output_format {
+                            target_path = Some(ls_from_utf8_lossy(
+                                dir_entry.read_link().unwrap().to_bytes(),
+                            ));
+                        }
+                    }
+
+                    target_path
+                };
+
+                let entry = Entry::new(target_path, file_name_raw, metadata, config)
+                    .map_err(|e| io::Error::other(format!("'{path_str}': {e}")))?;
+
+                let mut include_entry = false;
+
+                // Check if file starts with `.`
+                let is_hidden_file = {
+                    let byte = dir_entry.file_name().to_bytes_with_nul()[0];
+                    byte == b'.'
+                };
+
+                if is_hidden_file {
+                    match &config.file_inclusion {
+                        FileInclusion::IncludeHidden | FileInclusion::All => {
+                            include_entry = true;
+                        }
+                        FileInclusion::Default => (), // Do nothing
+                    }
+                } else {
+                    include_entry = true;
+                }
+
+                if include_entry {
+                    entries.push(entry);
+
+                    if config.recursive {
+                        if metadata.is_dir() {
+                            return Ok(true);
+                        }
+                    }
+                }
+
+                Ok(false)
+            };
+
+            let canonical_dir_path = dir_entry.path();
+            let current_dir_ref = current_dir.as_mut().unwrap();
+
+            // Get the parent of the path like in `std::path::Path::parent` but mapping
+            // `parent/.` and `parent/..` to `parent`
+            let dir_parent = {
+                let mut comps = canonical_dir_path.as_inner().components();
+
+                let is_dot = dir_entry.file_name().to_bytes_with_nul() == &[b'.', 0];
+
+                if !is_dot {
+                    comps.next_back();
+                }
+
+                comps.as_path()
+            };
+
+            if let Some(file_name) = visited.get(&marker) {
+                // Exclude . and .. from loop detection logic
+                if !is_dot_or_double_dot {
+                    // Process and print previous entries before showing the infinite loop error
+                    if let Err(e) = process_dir_entry(&mut entries) {
+                        errors.push(e);
+                    }
+                    print_contents(
+                        config,
+                        current_dir_ref,
+                        &mut entries,
+                        &mut errors,
+                        &exit_code,
+                    );
+
+                    eprintln!(
+                        "ls: {}: {}",
+                        ls_from_utf8_lossy(file_name.as_os_str().as_bytes()),
+                        gettext("not listing already-listed directory")
+                    );
+
+                    // This is the only error that has exit code 2 for now.
+                    exit_code.fetch_max(2, Ordering::SeqCst);
+                    terminate = true;
+                    return Ok(false);
+                }
+            } else {
+                visited.insert(marker, current_dir_ref.clone());
+            }
+
+            // If moving to a new subdirectory
+            if dir_parent != current_dir_ref.as_path() {
+                print_contents(
+                    config,
+                    current_dir_ref,
+                    &mut entries,
+                    &mut errors,
+                    &exit_code,
+                );
+
+                current_dir = Some(dir_parent.to_path_buf());
+                print_header(
+                    config,
+                    num_args,
+                    num_file_args,
+                    is_first_dir_arg,
+                    current_dir.as_ref().unwrap(),
+                );
+            }
+
+            match process_dir_entry(&mut entries) {
+                Ok(b) => Ok(b),
+                Err(e) => {
+                    errors.push(e);
+                    Ok(false)
+                }
+            }
+        },
+        |_| Ok(()),
+        |entry, error| {
+            let path_str = ls_from_utf8_lossy(entry.path().as_inner().as_os_str().as_bytes());
+            eprintln!(
+                "ls: {}",
+                gettext!("cannot access '{}': {}", path_str, error.inner())
+            );
+            exit_code.fetch_max(1, Ordering::SeqCst);
+        },
+        ftw::TraverseDirectoryOpts {
+            follow_symlinks_on_args,
+            follow_symlinks,
+            include_dot_and_double_dot: true,
+            list_contents_first: true,
+        },
+    );
+
+    // If there are remaining unprinted entries
+    if !entries.is_empty() {
+        if let Some(dir) = &current_dir {
+            print_contents(config, dir, &mut entries, &mut errors, &exit_code);
+        }
+    }
+
+    Ok(exit_code.load(Ordering::SeqCst))
 }
 
 fn main() -> ExitCode {

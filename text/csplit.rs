@@ -19,8 +19,8 @@ use std::io::{self, BufRead, Error, ErrorKind, Read, Write};
 use std::path::PathBuf;
 
 /// csplit - split files based on context
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Name the created files prefix 00, prefix 01, ..., prefixn.
     #[arg(short = 'f', long, default_value = "xx")]
@@ -45,14 +45,12 @@ struct Args {
     operands: Vec<String>,
 }
 
-#[derive(Debug)]
 enum Operand {
     Rx(Regex, isize, bool),
     LineNum(usize),
     Repeat(usize),
 }
 
-#[derive(Debug)]
 struct SplitOps {
     ops: Vec<Operand>,
 }

@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::{env, fs};
 use walkdir::{DirEntry, WalkDir};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum Expr {
     And(Box<Expr>),
     Or(Box<Expr>),
@@ -38,7 +38,7 @@ enum Expr {
     Newer(PathBuf),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum FileType {
     BlockDevice,
     CharDevice,
@@ -388,7 +388,7 @@ fn evaluate_expression(
                 Expr::Newer(f) => {
                     if let Ok(metadata) = fs::metadata(f) {
                         if let Ok(file_metadata) = file.metadata() {
-                            if !(file_metadata.modified().unwrap() > metadata.modified().unwrap()) {
+                            if file_metadata.modified().unwrap() <= metadata.modified().unwrap() {
                                 c_files.remove(file.path());
                             }
                         }

@@ -57,7 +57,7 @@ impl<'a> FileData<'a> {
     }
 
     pub fn path(&self) -> &str {
-        self.path.to_str().unwrap_or(&COULD_NOT_UNWRAP_FILENAME)
+        self.path.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME)
     }
 }
 

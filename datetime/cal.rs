@@ -16,7 +16,7 @@ use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(version, about = gettext("cal - print a calendar"))]
 struct Args {
     #[arg(

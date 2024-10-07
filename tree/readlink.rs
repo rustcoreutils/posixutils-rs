@@ -15,8 +15,8 @@ use std::path::PathBuf;
 use std::{fs, io};
 
 /// readlink — display the contents of a symbolic link
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Do not output a trailing <newline> character.
     #[arg(short, long)]

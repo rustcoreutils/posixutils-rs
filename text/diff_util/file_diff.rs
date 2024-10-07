@@ -18,7 +18,6 @@ use std::{
     path::PathBuf,
 };
 
-#[derive(Debug)]
 pub struct FileDiff<'a> {
     file1: &'a mut FileData<'a>,
     file2: &'a mut FileData<'a>,
@@ -37,7 +36,7 @@ impl<'a> FileDiff<'a> {
         file2: &'a mut FileData<'a>,
         format_options: &'a FormatOptions,
     ) -> Self {
-        if format_options.label1.is_none() && format_options.label2.is_some() {
+        if format_options.label1().is_none() && format_options.label2().is_some() {
             panic!("label1 can not be NONE when label2 is available");
         }
 
@@ -313,11 +312,11 @@ impl<'a> FileDiff<'a> {
     fn print_context(&mut self, context: usize) {
         println!(
             "*** {}",
-            Self::get_header(self.file1, &self.format_options.label1)
+            Self::get_header(self.file1, &self.format_options.label1())
         );
         println!(
             "--- {}",
-            Self::get_header(self.file2, &self.format_options.label2)
+            Self::get_header(self.file2, &self.format_options.label2())
         );
 
         for hunk in self.hunks.hunks() {
@@ -389,11 +388,11 @@ impl<'a> FileDiff<'a> {
     fn print_unified(&mut self, unified: usize) -> Result<(), std::fmt::Error> {
         println!(
             "--- {}",
-            Self::get_header(self.file1, &self.format_options.label1)
+            Self::get_header(self.file1, &self.format_options.label1())
         );
         println!(
             "+++ {}",
-            Self::get_header(self.file2, &self.format_options.label2)
+            Self::get_header(self.file2, &self.format_options.label2())
         );
 
         let mut diff_disp = DiffDisplay::new();

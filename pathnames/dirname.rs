@@ -8,14 +8,16 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-/// dirname - return the directory portion of a pathname
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(
+    version,
+    about = gettext("dirname - return the directory portion of a pathname")
+)]
 struct Args {
     pathname: OsString,
 }

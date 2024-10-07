@@ -18,8 +18,8 @@ use std::io::{self, Error, ErrorKind, IsTerminal};
 use std::mem;
 
 /// mesg - permit or deny messages
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// "y" or "n":  Grant (y) or deny (n) permission to other users to send messages to the terminal device.
     operand: Option<String>,
@@ -87,6 +87,7 @@ fn parse_setting(setting: &str) -> Result<bool, &'static str> {
     }
 }
 
+#[allow(clippy::assign_op_pattern)]
 fn set_mesg(fd: i32, st: libc::stat, setting: &str) -> io::Result<()> {
     let res = parse_setting(setting);
     if let Err(e) = res {

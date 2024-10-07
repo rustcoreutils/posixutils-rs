@@ -64,7 +64,7 @@ pub fn finalize(crc_in: u32, n_in: usize) -> u32 {
 
     while n != 0 {
         let c = (n & 0o377) as u32;
-        n = n >> 8;
+        n >>= 8;
         s = (s << 8) ^ CRCTAB[(((s >> 24) ^ c) & 0xff) as usize];
     }
 

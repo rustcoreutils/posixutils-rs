@@ -1,10 +1,10 @@
 [package]
 name = "posixutils-process"
 version = "0.2.1"
-edition = "2021"
 authors = ["Jeff Garzik"]
-license = "MIT"
-repository = "https://github.com/rustcoreutils/posixutils-rs.git"
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
 
 [dependencies]
 plib = { path = "../plib" }
@@ -13,11 +13,14 @@ gettext-rs.workspace = true
 libc.workspace = true
 dirs = "5.0"
 
-[dev-dependencies]
-tokio = { version = "1.39", features = ["net", "macros", "rt"]}
-
 [build-dependencies]
 bindgen = { version = "0.70.0", features = ["runtime"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+sysinfo = "0.31"
 
 [[bin]]
 name = "fuser"
@@ -42,6 +45,10 @@ path = "./nohup.rs"
 [[bin]]
 name = "renice"
 path = "./renice.rs"
+
+[[bin]]
+name = "timeout"
+path = "./timeout.rs"
 
 [[bin]]
 name = "xargs"

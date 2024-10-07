@@ -16,8 +16,8 @@ use std::io;
 use std::path::PathBuf;
 
 /// mkdir - make directories
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// Create any missing intermediate pathname components.
     #[arg(short, long)]

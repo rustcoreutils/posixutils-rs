@@ -10,14 +10,16 @@
 use clap::{CommandFactory, Parser};
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
+use std::fs::{metadata, Metadata};
 use std::io::{self, Write};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 use std::{
     collections::BTreeMap,
-    ffi::{CStr, CString},
+    ffi::CStr,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    sync::mpsc,
-    thread,
-    time::Duration,
 };
 
 const NAME_FIELD: usize = 20;
@@ -436,8 +438,8 @@ mod linux {
                     Err(_) => continue,
                 };
 
-                let st = timeout(&entry.path().to_string_lossy(), 5)?;
-                let uid = st.st_uid;
+                let st = fs::metadata(&entry.path())?;
+                let uid = st.uid();
 
                 check_root_access(names, pid, uid, &root_stat, device_list, inode_list)?;
                 check_cwd_access(names, pid, uid, &cwd_stat, device_list, inode_list)?;
@@ -486,20 +488,24 @@ mod linux {
         names: &mut Names,
         pid: i32,
         uid: u32,
-        root_stat: &libc::stat,
+        root_stat: &Metadata,
         device_list: &DeviceList,
         inode_list: &InodeList,
     ) -> Result<(), io::Error> {
+        let root_device_id = root_stat.dev();
+        let root_inode_number = root_stat.ino();
+
         if device_list
             .iter()
-            .any(|device| device.device_id == root_stat.st_dev)
+            .any(|device| device.device_id == root_device_id)
         {
             add_process(names, pid, uid, Access::Root, ProcType::Normal);
             return Ok(());
         }
+
         if inode_list
             .iter()
-            .any(|inode| inode.device_id == root_stat.st_dev && inode.inode == root_stat.st_ino)
+            .any(|inode| inode.device_id == root_device_id && inode.inode == root_inode_number)
         {
             add_process(names, pid, uid, Access::Root, ProcType::Normal);
             return Ok(());
@@ -507,7 +513,6 @@ mod linux {
 
         Ok(())
     }
-
     /// Checks if a process has access to the current working directory and updates the `Names` object if it does.
     ///
     /// # Arguments
@@ -530,20 +535,24 @@ mod linux {
         names: &mut Names,
         pid: i32,
         uid: u32,
-        cwd_stat: &libc::stat,
+        cwd_stat: &Metadata,
         device_list: &DeviceList,
         inode_list: &InodeList,
-    ) -> Result<(), std::io::Error> {
+    ) -> Result<(), io::Error> {
+        let cwd_device_id = cwd_stat.dev();
+        let cwd_inode_number = cwd_stat.ino();
+
         if device_list
             .iter()
-            .any(|device| device.device_id == cwd_stat.st_dev)
+            .any(|device| device.device_id == cwd_device_id)
         {
             add_process(names, pid, uid, Access::Cwd, ProcType::Normal);
             return Ok(());
         }
+
         if inode_list
             .iter()
-            .any(|inode| inode.device_id == cwd_stat.st_dev && inode.inode == cwd_stat.st_ino)
+            .any(|inode| inode.device_id == cwd_device_id && inode.inode == cwd_inode_number)
         {
             add_process(names, pid, uid, Access::Cwd, ProcType::Normal);
             return Ok(());
@@ -551,7 +560,6 @@ mod linux {
 
         Ok(())
     }
-
     /// Checks if a process has access to the executable file and updates the `Names` object if it does.
     ///
     /// # Arguments
@@ -574,20 +582,24 @@ mod linux {
         names: &mut Names,
         pid: i32,
         uid: u32,
-        exe_stat: &libc::stat,
+        exe_stat: &Metadata,
         device_list: &DeviceList,
         inode_list: &InodeList,
     ) -> Result<(), io::Error> {
+        let exe_device_id = exe_stat.dev();
+        let exe_inode_number = exe_stat.ino();
+
         if device_list
             .iter()
-            .any(|device| device.device_id == exe_stat.st_dev)
+            .any(|device| device.device_id == exe_device_id)
         {
             add_process(names, pid, uid, Access::Exe, ProcType::Normal);
             return Ok(());
         }
+
         if inode_list
             .iter()
-            .any(|inode| inode.device_id == exe_stat.st_dev && inode.inode == exe_stat.st_ino)
+            .any(|inode| inode.device_id == exe_device_id && inode.inode == exe_inode_number)
         {
             add_process(names, pid, uid, Access::Exe, ProcType::Normal);
             return Ok(());
@@ -618,6 +630,7 @@ mod linux {
     /// # Returns
     ///
     /// Returns `Ok(())` on success.
+    #[allow(clippy::too_many_arguments)]
     fn check_dir(
         names: &mut Names,
         pid: i32,
@@ -630,37 +643,55 @@ mod linux {
         net_dev: u64,
     ) -> Result<(), io::Error> {
         let dir_path = format!("/proc/{}/{}", pid, dirname);
-        let dir_entries = fs::read_dir(&dir_path)?;
+        let dir_entries = match fs::read_dir(&dir_path) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+                eprintln!("Permission denied for directory: {:?}", dir_path);
+                return Ok(());
+            }
+            Err(err) => {
+                eprintln!("Failed to read directory {:?}: {:?}", dir_path, err);
+                return Err(err);
+            }
+        };
         for entry in dir_entries {
             let entry = entry?;
             let path = entry.path();
             let path_str = path.to_string_lossy();
 
-            let mut stat = match timeout(&path_str, 5) {
-                Ok(stat) => stat,
-                Err(_) => continue,
-            };
+            match timeout(&path_str, 5) {
+                Ok(metadata) => {
+                    let st_dev = metadata.dev();
+                    let st_ino = metadata.ino();
 
-            if stat.st_dev == net_dev {
-                if let Some(unix_socket) = unix_socket_list
-                    .iter()
-                    .find(|sock| sock.net_inode == stat.st_ino)
-                {
-                    stat.st_dev = unix_socket.device_id;
-                    stat.st_ino = unix_socket.inode;
+                    let mut stat_dev = st_dev;
+                    let mut stat_ino = st_ino;
+
+                    if stat_dev == net_dev {
+                        if let Some(unix_socket) = unix_socket_list
+                            .iter()
+                            .find(|sock| sock.net_inode == stat_ino)
+                        {
+                            stat_dev = unix_socket.device_id;
+                            stat_ino = unix_socket.inode;
+                        }
+                    }
+
+                    let new_access = match access {
+                        Access::File => Access::Filewr,
+                        _ => access.clone(),
+                    };
+
+                    if device_list.iter().any(|dev| {
+                        dev.name.filename != PathBuf::from("") && stat_dev == dev.device_id
+                    }) || inode_list.iter().any(|inode| inode.inode == stat_ino)
+                    {
+                        add_process(names, pid, uid, new_access, ProcType::Normal);
+                    }
                 }
-            }
-
-            let new_access = match access {
-                Access::File => Access::Filewr,
-                _ => access.clone(),
-            };
-            if device_list
-                .iter()
-                .any(|dev| dev.name.filename != PathBuf::from("") && stat.st_dev == dev.device_id)
-                || inode_list.iter().any(|inode| inode.inode == stat.st_ino)
-            {
-                add_process(names, pid, uid, new_access, ProcType::Normal);
+                Err(_) => {
+                    continue;
+                }
             }
         }
 
@@ -735,9 +766,9 @@ mod linux {
     }
 
     /// get stat of current /proc/{pid}/{filename}
-    fn get_pid_stat(pid: i32, filename: &str) -> Result<libc::stat, io::Error> {
+    fn get_pid_stat(pid: i32, filename: &str) -> Result<fs::Metadata, io::Error> {
         let path = format!("{}/{}{}", PROC_PATH, pid, filename);
-        timeout(&path, 5)
+        fs::metadata(&path)
     }
 
     /// Fills the `unix_socket_list` with information from the `/proc/net/unix` file.
@@ -766,19 +797,20 @@ mod linux {
                 let path = normalize_path(scanned_path);
 
                 match timeout(&path, 5) {
-                    Ok(stat) => UnixSocketList::add_socket(
-                        unix_socket_list,
-                        stat.st_dev,
-                        stat.st_ino,
-                        net_inode,
-                    ),
+                    Ok(stat) => {
+                        UnixSocketList::add_socket(
+                            unix_socket_list,
+                            stat.dev(),
+                            stat.ino(),
+                            net_inode,
+                        );
+                    }
                     Err(_) => continue,
                 }
             }
         }
         Ok(())
     }
-
     /// Reads the `/proc/mounts` file and updates the `mount_list` with mount points.
     ///
     /// # Arguments
@@ -1053,7 +1085,7 @@ mod linux {
                     None
                 }
             })
-            .unwrap_or_else(NameSpace::default)
+            .unwrap_or_default()
     }
 
     /// Processes file namespaces by expanding paths and updating lists based on the mount flag.
@@ -1082,16 +1114,17 @@ mod linux {
         need_check_map: &mut bool,
     ) -> Result<(), std::io::Error> {
         names.filename = expand_path(&names.filename)?;
+
         let st = timeout(&names.filename.to_string_lossy(), 5)?;
         read_proc_mounts(mount_list)?;
 
         if mount {
-            *device_list = DeviceList::new(names.clone(), st.st_dev);
+            *device_list = DeviceList::new(names.clone(), st.dev());
             *need_check_map = true;
         } else {
-            let st = stat(&names.filename.to_string_lossy())?;
-            *inode_list = InodeList::new(st.st_dev, st.st_ino);
+            *inode_list = InodeList::new(st.dev(), st.ino());
         }
+
         Ok(())
     }
 
@@ -1194,7 +1227,7 @@ mod macos {
         include!(concat!(env!("OUT_DIR"), "/osx_libproc_bindings.rs"));
     }
     use libc::{c_char, c_int, c_void};
-    use std::{os::unix::ffi::OsStrExt, ptr};
+    use std::{ffi::CString, os::unix::ffi::OsStrExt, ptr};
 
     // similar to list_pids_ret() below, there are two cases when 0 is returned, one when there are
     // no pids, and the other when there is an error
@@ -1283,7 +1316,7 @@ mod macos {
 
         for name in names.iter_mut() {
             let st = timeout(&name.filename.to_string_lossy(), 5)?;
-            let uid = st.st_uid;
+            let uid = st.uid();
 
             let pids = listpidspath(
                 osx_libproc_bindings::PROC_ALL_PIDS,
@@ -1308,8 +1341,8 @@ mod macos {
 }
 
 /// fuser - list process IDs of all processes that have one or more files open
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// The file is treated as a mount point and the utility shall report on any files open in the file system.
     #[arg(short = 'c')]
@@ -1442,21 +1475,37 @@ fn print_matches(name: &mut Names, user: bool) -> Result<(), io::Error> {
     Ok(())
 }
 
-/// Execute stat() system call with timeout to avoid deadlock
-/// on network based file systems.
-fn timeout(path: &str, seconds: u32) -> Result<libc::stat, io::Error> {
-    let (tx, rx) = mpsc::channel();
+/// Adds a new process to the `Names` object with specified access and process type.
+fn add_process(names: &mut Names, pid: i32, uid: u32, access: Access, proc_type: ProcType) {
+    let proc = Procs::new(pid, uid, access, proc_type);
+    names.add_procs(proc);
+}
 
-    thread::scope(|s| {
-        s.spawn(|| {
-            if let Err(e) = tx.send(stat(path)) {
-                eprintln!("Failed to send result through channel: {}", e);
-            }
-        });
+/// Executes `metadata()` system call with timeout to avoid deadlock on network-based file systems.
+///
+/// **Arguments:**
+/// - `path`: The file path to retrieve metadata for.
+/// - `seconds`: The number of seconds to wait before timing out.
+///
+/// **Returns:**
+/// - `Ok(fs::Metadata)` if the metadata is successfully retrieved within the timeout.
+/// - `Err(io::Error)` if the operation fails or times out.
+fn timeout(path: &str, seconds: u32) -> Result<Metadata, io::Error> {
+    let (tx, rx) = mpsc::channel();
+    let path = path.to_string(); // Clone path into a `String` with `'static` lifetime
+
+    // Spawn a thread to retrieve the metadata
+    thread::spawn(move || {
+        let metadata = metadata(&path); // Use the cloned `String` here
+        if let Err(e) = tx.send(metadata) {
+            eprintln!("Failed to send result through channel: {}", e);
+        }
     });
 
+    // Wait for the result or timeout
     match rx.recv_timeout(Duration::from_secs(seconds.into())) {
-        Ok(stat) => stat,
+        Ok(Ok(metadata)) => Ok(metadata), // Successfully retrieved metadata
+        Ok(Err(e)) => Err(e),             // Metadata retrieval failed with an error
         Err(mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
             io::ErrorKind::TimedOut,
             "Operation timed out",
@@ -1465,25 +1514,4 @@ fn timeout(path: &str, seconds: u32) -> Result<libc::stat, io::Error> {
             Err(io::Error::new(io::ErrorKind::Other, "Channel disconnected"))
         }
     }
-}
-
-/// Retrieves the status of a file given its filename.
-fn stat(filename_str: &str) -> io::Result<libc::stat> {
-    let filename = CString::new(filename_str)?;
-
-    unsafe {
-        let mut st: libc::stat = std::mem::zeroed();
-        let rc = libc::stat(filename.as_ptr(), &mut st);
-        if rc == 0 {
-            Ok(st)
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    }
-}
-
-/// Adds a new process to the `Names` object with specified access and process type.
-fn add_process(names: &mut Names, pid: i32, uid: u32, access: Access, proc_type: ProcType) {
-    let proc = Procs::new(pid, uid, access, proc_type);
-    names.add_procs(proc);
 }

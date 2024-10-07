@@ -28,7 +28,7 @@ mod platform {
 
 /// ps - report process status
 #[derive(Parser)]
-#[command(author, version, about, long_about)]
+#[command(version, about)]
 struct Args {
     /// List all processes
     #[arg(short = 'A', long)]
@@ -65,7 +65,7 @@ fn parse_output_format<'a>(
     posix_fields: &'a HashMap<&'a str, &'a str>,
 ) -> Vec<&'a str> {
     format
-        .split(|c| c == ' ' || c == ',')
+        .split([' ', ','])
         .map(|s| {
             let field = s.split('=').next().unwrap_or("").trim();
             if posix_fields.contains_key(field) {
@@ -148,7 +148,7 @@ fn main() {
 
     // Print the header
     for field in &output_fields {
-        let header = posix_fields.get(*field).unwrap_or(&field);
+        let header = posix_fields.get(*field).unwrap_or(field);
         print!("{:<10} ", header);
     }
     println!();

@@ -13,8 +13,8 @@ use plib::PROJECT_NAME;
 use std::{fs, io};
 
 /// unlink - call the unlink function
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about)]
 struct Args {
     /// An existing pathname to be unlinked (removed).
     pathname: String,

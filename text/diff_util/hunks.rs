@@ -5,7 +5,7 @@ use super::{
     file_data::FileData,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Hunk {
     pub kind: Change,
     pub changes: Vec<Change>,
@@ -252,7 +252,6 @@ impl Hunk {
     }
 }
 
-#[derive(Debug)]
 pub struct Hunks {
     hunks: Vec<Hunk>,
 }

@@ -9,7 +9,7 @@
 //
 use crate::io::ErrorKind;
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use std::fs::File;
 use std::io::{self, BufReader, Error, Read, Seek, SeekFrom};
@@ -18,58 +18,69 @@ use std::path::PathBuf;
 use std::slice::Chunks;
 use std::str::FromStr;
 
-/// Hex, octal, ASCII, and other types of dumps
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about = gettext("od - dump files in octal and other formats"))]
 struct Args {
-    /// Address base (d for decimal, o for octal, x for hexadecimal, n for none)
-    #[arg(short = 'A')]
+    #[arg(
+        short = 'A',
+        help = gettext(
+            "Address base (d for decimal, o for octal, x for hexadecimal, n for none)"
+        )
+    )]
     address_base: Option<char>,
 
-    /// Skip bytes from the beginning of the input
-    #[arg(short = 'j')]
+    #[arg(short = 'j', help = gettext("Skip bytes from the beginning of the input"))]
     skip: Option<String>,
 
-    /// Read only the specified number of bytes
-    #[arg(short = 'N')]
+    #[arg(short = 'N', help = gettext("Read only the specified number of bytes"))]
     count: Option<String>,
 
-    /// Select the output format
-    #[arg(short = 't')]
+    #[arg(short = 't', help = gettext("Select the output format"))]
     type_strings: Vec<String>,
 
-    /// Interpret bytes in octal
-    #[arg(short = 'b')]
+    #[arg(
+        short = 'b',
+        help = gettext("Interpret bytes in octal")
+    )]
     octal_bytes: bool,
 
-    /// Interpret words (two-byte units) in unsigned decimal
-    #[arg(short = 'd')]
+    #[arg(
+        short = 'd',
+        help = gettext("Interpret words (two-byte units) in unsigned decimal")
+    )]
     unsigned_decimal_words: bool,
 
-    /// Interpret words (two-byte units) in octal
-    #[arg(short = 'o')]
+    #[arg(
+        short = 'o',
+        help = gettext("Interpret words (two-byte units) in octal")
+    )]
     octal_words: bool,
 
-    /// Interpret bytes as characters
-    #[arg(short = 'c')]
+    #[arg(
+        short = 'c',
+        help = gettext("Interpret bytes as characters")
+    )]
     bytes_char: bool,
 
-    /// Interpret words (two-byte units) in signed decimal
-    #[arg(short = 's')]
+    #[arg(
+        short = 's',
+        help = gettext("Interpret words (two-byte units) in signed decimal")
+    )]
     signed_decimal_words: bool,
 
-    /// Interpret words (two-byte units) in hexadecimal
-    #[arg(short = 'x')]
+    #[arg(
+        short = 'x',
+        help = gettext("Interpret words (two-byte units) in hexadecimal")
+    )]
     hex_words: bool,
 
-    /// Verbose output
-    #[arg(short = 'v')]
+    #[arg(short = 'v', help = gettext("Verbose output"))]
     verbose: bool,
 
-    /// Input files
+    #[arg(help = gettext("Input files"))]
     files: Vec<PathBuf>,
 
-    #[clap(skip)]
+    #[arg(skip)]
     /// Offset in the file where dumping is to commence, must start with "+"]
     offset: Option<String>,
 }
@@ -250,21 +261,21 @@ impl FromStrRadix for u64 {
 ///
 /// # Returns
 ///
-/// - `Result<u64, Box<dyn std::error::Error>>`: This function returns a `Result` which is:
+/// - `Result<u64, ParseIntError>>`: This function returns a `Result` which is:
 ///   - `Ok(u64)`: On success, the parsed and multiplied offset as a `u64`.
-///   - `Err(Box<dyn std::error::Error>)`: On failure, an error boxed as a `dyn std::error::Error`.
+///   - `Err(ParseIntError)`: On failure, an error.
 ///
-fn parse_offset(offset: &str) -> Result<u64, Box<dyn std::error::Error>> {
+fn parse_offset(offset: &str) -> Result<u64, ParseIntError> {
     let mut base = 8;
     let mut multiplier = 1;
 
     // Handle special suffixes
-    let offset = if offset.ends_with('b') {
+    let offset = if let Some(offset) = offset.strip_suffix('b') {
         multiplier = 512;
-        &offset[..offset.len() - 1]
-    } else if offset.ends_with('.') {
+        offset
+    } else if let Some(offset) = offset.strip_suffix('.') {
         base = 10;
-        &offset[..offset.len() - 1]
+        offset
     } else {
         offset
     };
@@ -1140,4 +1151,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     std::process::exit(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::IntErrorKind;
+
+    use super::*;
+
+    #[test]
+    fn test_parse_offset() {
+        assert_eq!(parse_offset("777b"), Ok(0o777 * 512));
+        assert_eq!(parse_offset("777."), Ok(777));
+        assert_eq!(parse_offset("777"), Ok(0o777));
+    }
+
+    #[test]
+    fn test_parse_offset_invalid() {
+        let result = parse_offset("7.7");
+        assert!(result.is_err());
+        let result = result.unwrap_err();
+        assert_eq!(result.kind(), &IntErrorKind::InvalidDigit);
+    }
 }

@@ -17,15 +17,13 @@ use plib::PROJECT_NAME;
 use std::io;
 use terminfo::{capability as cap, Database};
 
-/// tput - change terminal characteristics
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about = gettext("tput - change terminal characteristics"))]
 struct Args {
-    /// Indicate the type of terminal.
-    #[arg(short = 'T', long)]
+    #[arg(short = 'T', long, help = gettext("Indicate the type of terminal"))]
     term: Option<String>,
 
-    /// Terminal operand to execute
+    #[arg(help = gettext("Terminal operand to execute"))]
     operand: String,
 }
 

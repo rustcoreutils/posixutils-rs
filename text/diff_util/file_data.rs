@@ -39,7 +39,7 @@ impl<'a> FileData<'a> {
     }
 
     pub fn line(&self, index: usize) -> &str {
-        &self.lines[index]
+        self.lines[index]
     }
 
     pub fn modified(&self) -> SystemTime {
@@ -53,7 +53,7 @@ impl<'a> FileData<'a> {
             }
         }
 
-        return COULD_NOT_UNWRAP_FILENAME;
+        COULD_NOT_UNWRAP_FILENAME
     }
 
     pub fn path(&self) -> &str {

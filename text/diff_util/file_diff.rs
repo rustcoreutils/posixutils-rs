@@ -52,7 +52,7 @@ impl<'a> FileDiff<'a> {
         show_if_different: Option<String>,
     ) -> io::Result<DiffExitStatus> {
         if is_binary(&path1)? || is_binary(&path2)? {
-            return Self::binary_file_diff(&path1, &path2);
+            Self::binary_file_diff(&path1, &path2)
         } else {
             let content1 = read_to_string(&path1)?.into_bytes();
             let linereader1 = LineReader::new(&content1);
@@ -79,8 +79,8 @@ impl<'a> FileDiff<'a> {
             let num_lines1 = diff.file1.lines().len();
             let num_lines2 = diff.file2.lines().len();
             FileDiff::histogram_lcs(
-                &diff.file1,
-                &diff.file2,
+                diff.file1,
+                diff.file2,
                 0,
                 num_lines1,
                 0,
@@ -97,7 +97,7 @@ impl<'a> FileDiff<'a> {
                 }
             }
 
-            return diff.print();
+            diff.print()
         }
     }
 
@@ -110,24 +110,24 @@ impl<'a> FileDiff<'a> {
 
         if path1_file_type.is_file() {
             let path1_file = path1.clone();
-            let path1_file = path1_file.file_name().expect(&COULD_NOT_UNWRAP_FILENAME);
+            let path1_file = path1_file.file_name().expect(COULD_NOT_UNWRAP_FILENAME);
             let path2 = path2.join(path1_file);
 
             if !check_existance(&path2)? {
                 return Ok(DiffExitStatus::Trouble);
             }
 
-            return FileDiff::file_diff(path1, path2, format_options, None);
+            FileDiff::file_diff(path1, path2, format_options, None)
         } else {
             let path2_file = path2.clone();
-            let path2_file = path2_file.file_name().expect(&COULD_NOT_UNWRAP_FILENAME);
+            let path2_file = path2_file.file_name().expect(COULD_NOT_UNWRAP_FILENAME);
             let path1 = path1.join(path2_file);
 
             if !check_existance(&path1)? {
                 return Ok(DiffExitStatus::Trouble);
             }
 
-            return FileDiff::file_diff(path1, path2, format_options, None);
+            FileDiff::file_diff(path1, path2, format_options, None)
         }
     }
 
@@ -173,13 +173,13 @@ impl<'a> FileDiff<'a> {
             for hunk_index in 0..hunks_count {
                 let hunk = self.hunks.hunk_at_mut(hunk_index);
                 match self.format_options.output_format {
-                    OutputFormat::Debug => hunk.print_debug(&self.file1, &self.file2),
+                    OutputFormat::Debug => hunk.print_debug(self.file1, self.file2),
                     OutputFormat::Default => {
-                        hunk.print_default(&self.file1, &self.file2, hunk_index == hunks_count - 1)
+                        hunk.print_default(self.file1, self.file2, hunk_index == hunks_count - 1)
                     }
                     OutputFormat::EditScript => hunk.print_edit_script(
-                        &self.file1,
-                        &self.file2,
+                        self.file1,
+                        self.file2,
                         hunk_index == hunks_count - 1,
                     ),
                     OutputFormat::Context(_) => {
@@ -187,8 +187,8 @@ impl<'a> FileDiff<'a> {
                         return Ok(DiffExitStatus::Trouble);
                     }
                     OutputFormat::ForwardEditScript => hunk.print_forward_edit_script(
-                        &self.file1,
-                        &self.file2,
+                        self.file1,
+                        self.file2,
                         hunk_index == hunks_count - 1,
                     ),
                     OutputFormat::Unified(_) => {
@@ -200,9 +200,9 @@ impl<'a> FileDiff<'a> {
         }
 
         if self.are_different() {
-            return Ok(DiffExitStatus::Different);
+            Ok(DiffExitStatus::Different)
         } else {
-            return Ok(DiffExitStatus::NotDifferent);
+            Ok(DiffExitStatus::NotDifferent)
         }
     }
 
@@ -269,9 +269,7 @@ impl<'a> FileDiff<'a> {
             .map(|(k, _v)| *k);
 
         match key {
-            None => {
-                return;
-            }
+            None => {},
             Some(k) => {
                 let rec = hist.get(k).unwrap();
                 let x1_new = rec[1] as usize;
@@ -308,11 +306,11 @@ impl<'a> FileDiff<'a> {
     fn print_context(&mut self, context: usize) {
         println!(
             "*** {}",
-            Self::get_header(self.file1, &self.format_options.label1())
+            Self::get_header(self.file1, self.format_options.label1())
         );
         println!(
             "--- {}",
-            Self::get_header(self.file2, &self.format_options.label2())
+            Self::get_header(self.file2, self.format_options.label2())
         );
 
         for hunk in self.hunks.hunks() {
@@ -384,11 +382,11 @@ impl<'a> FileDiff<'a> {
     fn print_unified(&mut self, unified: usize) -> Result<(), std::fmt::Error> {
         println!(
             "--- {}",
-            Self::get_header(self.file1, &self.format_options.label1())
+            Self::get_header(self.file1, self.format_options.label1())
         );
         println!(
             "+++ {}",
-            Self::get_header(self.file2, &self.format_options.label2())
+            Self::get_header(self.file2, self.format_options.label2())
         );
 
         let mut diff_disp = DiffDisplay::new();
@@ -448,13 +446,13 @@ impl<'a> FileDiff<'a> {
 
     pub fn get_header(file: &FileData, label: &Option<String>) -> String {
         if let Some(label) = label {
-            return format!("{}", label);
+            label.to_string()
         } else {
-            return format!(
+            format!(
                 "{}\t{}",
                 file.path(),
                 system_time_to_rfc2822(file.modified())
-            );
+            )
         }
     }
 }

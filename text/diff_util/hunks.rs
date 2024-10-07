@@ -87,7 +87,7 @@ impl Hunk {
                     println!("< {}", file1.line(i));
                 }
 
-                if is_last && file1.ends_with_newline() == false {
+                if is_last && !file1.ends_with_newline() {
                     println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
                 }
             }
@@ -188,7 +188,7 @@ impl Hunk {
             }
         }
 
-        if is_last && file1.ends_with_newline() == false {
+        if is_last && !file1.ends_with_newline() {
             println!(
                 "diff: {}:{}\n",
                 file1.name(),
@@ -196,7 +196,7 @@ impl Hunk {
             );
         }
 
-        if is_last && file2.ends_with_newline() == false {
+        if is_last && !file2.ends_with_newline() {
             println!(
                 "diff: {}:{}\n",
                 file2.name(),
@@ -234,7 +234,7 @@ impl Hunk {
             }
         }
 
-        if is_last && file1.ends_with_newline() == false {
+        if is_last && !file1.ends_with_newline() {
             println!(
                 "diff: {}:{}\n",
                 file1.name(),
@@ -242,7 +242,7 @@ impl Hunk {
             );
         }
 
-        if is_last && file2.ends_with_newline() == false {
+        if is_last && !file2.ends_with_newline() {
             println!(
                 "diff: {}:{}\n",
                 file2.name(),
@@ -259,7 +259,7 @@ pub struct Hunks {
 impl Hunks {
     pub fn new() -> Self {
         Self {
-            hunks: vec![Hunk::new(); 0],
+            hunks: { Hunk::new(); vec![] as Vec<Hunk>},
         }
     }
 
@@ -277,7 +277,7 @@ impl Hunks {
 
     pub fn create_hunks_from_lcs(
         &mut self,
-        lcs_indices: &Vec<i32>,
+        lcs_indices: &[i32],
         num_lines1: usize,
         num_lines2: usize,
     ) {
@@ -285,9 +285,9 @@ impl Hunks {
         let mut hunk_end1: usize;
         let mut hunk_start2 = 0;
         let mut hunk_end2: usize;
-        let mut prev_val = -2 as i32;
-        for i in 0..lcs_indices.len() {
-            if (lcs_indices[i] == -1) && (prev_val != -1) {
+        let mut prev_val = -2_i32;
+        for (i, lcs_index) in lcs_indices.iter().enumerate() {
+            if (lcs_index == &-1) && (prev_val != -1) {
                 // We reach a new deletion/substitution block
                 hunk_start1 = i;
                 hunk_start2 = if prev_val == -2 {
@@ -295,22 +295,22 @@ impl Hunks {
                 } else {
                     (prev_val + 1) as usize
                 };
-            } else if (i != 0) && (prev_val != -1) && (lcs_indices[i] != -1) && (lcs_indices[i] != prev_val + 1) {
+            } else if (i != 0) && (prev_val != -1) && (lcs_index != &-1) && (lcs_index != &(prev_val + 1)) {
                 // there was an insertion (but no deletion)
                 // no -1 values but a bump in the values, eg [136, 145]
                 hunk_start1 = i;
                 hunk_start2 = (prev_val + 1) as usize;
                 hunk_end1 = i;
-                hunk_end2 = lcs_indices[i] as usize;
+                hunk_end2 = *lcs_index as usize;
                 self.add_hunk(hunk_start1, hunk_end1, hunk_start2, hunk_end2);
             }
-            if (lcs_indices[i] != -1) && (prev_val == -1) {
+            if (lcs_index != &-1) && (prev_val == -1) {
                 // we reach the end of deletion/substitution block
                 hunk_end1 = i;
-                hunk_end2 = lcs_indices[i] as usize;
+                hunk_end2 = *lcs_index as usize;
                 self.add_hunk(hunk_start1, hunk_end1, hunk_start2, hunk_end2);
             }
-            prev_val = lcs_indices[i];
+            prev_val = *lcs_index;
         }
 
         // final hunk: we might have only -1 at the end

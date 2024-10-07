@@ -39,7 +39,7 @@ impl Hunk {
         } else if is_ed && (self.ln1_start == self.ln1_end - 1) {
             format!("{}", self.ln1_end)
         } else {
-            format!("{},{}", self.ln1_start+1, self.ln1_end)
+            format!("{},{}", self.ln1_start + 1, self.ln1_end)
         }
     }
 
@@ -49,7 +49,7 @@ impl Hunk {
         } else if is_ed && (self.ln2_start == self.ln2_end - 1) {
             format!("{}", self.ln2_end)
         } else {
-            format!("{},{}", self.ln2_start+1, self.ln2_end)
+            format!("{},{}", self.ln2_start + 1, self.ln2_end)
         }
     }
 
@@ -213,7 +213,10 @@ pub struct Hunks {
 impl Hunks {
     pub fn new() -> Self {
         Self {
-            hunks: { Hunk::new(); vec![] as Vec<Hunk>},
+            hunks: {
+                Hunk::new();
+                vec![] as Vec<Hunk>
+            },
         }
     }
 
@@ -253,7 +256,11 @@ impl Hunks {
                 } else {
                     (prev_val + 1) as usize
                 };
-            } else if (i != 0) && (prev_val != -1) && (lcs_index != &-1) && (lcs_index != &(prev_val + 1)) {
+            } else if (i != 0)
+                && (prev_val != -1)
+                && (lcs_index != &-1)
+                && (lcs_index != &(prev_val + 1))
+            {
                 // there was an insertion (but no deletion)
                 // no -1 values but a bump in the values, eg [136, 145]
                 hunk_start1 = i;

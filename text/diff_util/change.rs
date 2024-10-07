@@ -21,7 +21,6 @@ pub enum Change {
 }
 
 impl Change {
-
     pub fn get_ln1(&self) -> usize {
         match self {
             Change::None => panic!("Change::None is not allowed in hunk."),

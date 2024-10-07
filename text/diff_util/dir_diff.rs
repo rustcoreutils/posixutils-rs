@@ -48,11 +48,15 @@ impl<'a> DirDiff<'a> {
             let is_file = dir_data
                 .files()
                 .get_key_value(file_name)
-                .unwrap_or_else(|| panic!("Could not find file in {}",
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Could not find file in {}",
                         dir_data
-                        .path()
-                        .to_str()
-                        .unwrap_or(COULD_NOT_UNWRAP_FILENAME)))
+                            .path()
+                            .to_str()
+                            .unwrap_or(COULD_NOT_UNWRAP_FILENAME)
+                    )
+                })
                 .1
                 .file_type()?
                 .is_file();

@@ -36,10 +36,6 @@ impl<'a> FileDiff<'a> {
         file2: &'a mut FileData<'a>,
         format_options: &'a FormatOptions,
     ) -> Self {
-        if format_options.label1().is_none() && format_options.label2().is_some() {
-            panic!("label1 can not be NONE when label2 is available");
-        }
-
         Self {
             file1,
             file2,

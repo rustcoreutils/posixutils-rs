@@ -290,6 +290,7 @@ impl<'src> Parser<'src> {
                         ),
                     );
                     self.match_word_token(WordToken::Backtick);
+                    continue;
                 }
                 WordToken::CommandSubstitutionStart => {
                     push_literal_and_insert(
@@ -300,6 +301,7 @@ impl<'src> Parser<'src> {
                         ),
                     );
                     self.match_word_token(WordToken::Char(')'));
+                    continue;
                 }
                 WordToken::EscapedBacktick => {
                     todo!("implement nested command substitution");
@@ -315,6 +317,7 @@ impl<'src> Parser<'src> {
                     // expected ')' instead of expected '))'
                     self.match_word_token(WordToken::Char(')'));
                     self.match_word_token(WordToken::Char(')'));
+                    continue;
                 }
                 WordToken::Char(c) => {
                     if !inside_double_quotes && (is_operator(c) || is_blank(c)) {
@@ -423,9 +426,8 @@ impl<'src> Parser<'src> {
                                 break;
                             }
                         }
-                    } else {
-                        // the only case in which the word was none is if we've reached `word_stop`
-                        // meaning there are no more words to parse
+                    }
+                    if word_stop != WordToken::EOF && self.word_lookahead == word_stop {
                         return command;
                     }
                 }
@@ -445,9 +447,8 @@ impl<'src> Parser<'src> {
                 ShellToken::WordStart => {
                     if let Some(word) = self.parse_word_until(word_stop, true) {
                         command.arguments.push(word);
-                    } else {
-                        // the only case in which the word was none is if we've reached `word_stop`
-                        // meaning there are no more words to parse
+                    }
+                    if word_stop != WordToken::EOF && self.word_lookahead == word_stop {
                         return command;
                     }
                 }
@@ -1198,25 +1199,38 @@ mod tests {
                 })]
             }
         );
+        assert_eq!(parse_word("`echo hello`"), parse_word("$(echo hello)"));
+    }
+
+    #[test]
+    fn parse_command_substitution_inside_string() {
         assert_eq!(
-            parse_word("`echo hello`"),
+            parse_word("\"hello $(echo world)\""),
             Word {
-                parts: vec![WordPart::CommandSubstitution(CompleteCommand {
-                    commands: vec![Conjunction {
-                        elements: vec![(
-                            Pipeline {
-                                commands: vec![Command::SimpleCommand(SimpleCommand {
-                                    command: Some(literal_word("echo")),
-                                    arguments: vec![literal_word("hello")],
-                                    ..Default::default()
-                                })]
-                            },
-                            LogicalOp::None
-                        )],
-                        is_async: false
-                    }]
-                })]
+                parts: vec![
+                    WordPart::Literal(Rc::from("\"hello ")),
+                    WordPart::CommandSubstitution(CompleteCommand {
+                        commands: vec![Conjunction {
+                            elements: vec![(
+                                Pipeline {
+                                    commands: vec![Command::SimpleCommand(SimpleCommand {
+                                        command: Some(literal_word("echo")),
+                                        arguments: vec![literal_word("world")],
+                                        ..Default::default()
+                                    })]
+                                },
+                                LogicalOp::None
+                            )],
+                            is_async: false
+                        }]
+                    }),
+                    WordPart::Literal(Rc::from("\""))
+                ]
             }
+        );
+        assert_eq!(
+            parse_word("\"hello `echo world`\""),
+            parse_word("\"hello $(echo world)\"")
         );
     }
 }

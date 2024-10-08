@@ -86,6 +86,13 @@ impl<'src> Parser<'src> {
         self.advance_shell();
     }
 
+    fn match_word_token(&mut self, token: WordToken) {
+        if self.word_lookahead != token {
+            todo!()
+        }
+        self.advance_word();
+    }
+
     fn skip_linebreak(&mut self) {
         // "\n"*
         while self.shell_lookahead == ShellToken::Newline {
@@ -274,12 +281,25 @@ impl<'src> Parser<'src> {
                         WordPart::ParameterExpansion(self.parse_parameter_expansion()),
                     );
                 }
-                WordToken::Backtick | WordToken::CommandSubstitutionStart => {
+                WordToken::Backtick => {
                     push_literal_and_insert(
                         &mut current_literal,
                         &mut word_parts,
-                        WordPart::CommandSubstitution(self.parse_complete_command()),
+                        WordPart::CommandSubstitution(
+                            self.parse_complete_command(WordToken::Backtick),
+                        ),
                     );
+                    self.match_word_token(WordToken::Backtick);
+                }
+                WordToken::CommandSubstitutionStart => {
+                    push_literal_and_insert(
+                        &mut current_literal,
+                        &mut word_parts,
+                        WordPart::CommandSubstitution(
+                            self.parse_complete_command(WordToken::Char(')')),
+                        ),
+                    );
+                    self.match_word_token(WordToken::Char(')'));
                 }
                 WordToken::EscapedBacktick => {
                     todo!("implement nested command substitution");
@@ -291,6 +311,10 @@ impl<'src> Parser<'src> {
                         &mut word_parts,
                         WordPart::ArithmeticExpansion(self.parse_arithmetic_expansion()),
                     );
+                    // TODO: should improve this for better errors. Now it would produce
+                    // expected ')' instead of expected '))'
+                    self.match_word_token(WordToken::Char(')'));
+                    self.match_word_token(WordToken::Char(')'));
                 }
                 WordToken::Char(c) => {
                     if !inside_double_quotes && (is_operator(c) || is_blank(c)) {
@@ -382,7 +406,7 @@ impl<'src> Parser<'src> {
         }
     }
 
-    fn parse_simple_command(&mut self) -> SimpleCommand {
+    fn parse_simple_command(&mut self, word_stop: WordToken) -> SimpleCommand {
         // simple_command = (io_redirect | assignment_word)* word? (io_redirect | word)*
 
         let mut command = SimpleCommand::default();
@@ -390,16 +414,19 @@ impl<'src> Parser<'src> {
         loop {
             match self.shell_lookahead {
                 ShellToken::WordStart => {
-                    // if word is assignment add it to assignments, else break
-                    match try_word_to_assignment(
-                        self.parse_word_until(WordToken::EOF, true).unwrap(),
-                    ) {
-                        Ok(assignment) => command.assignments.push(assignment),
-                        Err(cmd) => {
-                            command.command = Some(cmd);
-                            self.advance_shell();
-                            break;
+                    if let Some(word) = self.parse_word_until(word_stop, true) {
+                        match try_word_to_assignment(word) {
+                            Ok(assignment) => command.assignments.push(assignment),
+                            Err(cmd) => {
+                                command.command = Some(cmd);
+                                self.advance_shell();
+                                break;
+                            }
                         }
+                    } else {
+                        // the only case in which the word was none is if we've reached `word_stop`
+                        // meaning there are no more words to parse
+                        return command;
                     }
                 }
                 _ => {
@@ -416,9 +443,13 @@ impl<'src> Parser<'src> {
         loop {
             match self.shell_lookahead {
                 ShellToken::WordStart => {
-                    command
-                        .arguments
-                        .push(self.parse_word_until(WordToken::EOF, true).unwrap());
+                    if let Some(word) = self.parse_word_until(word_stop, true) {
+                        command.arguments.push(word);
+                    } else {
+                        // the only case in which the word was none is if we've reached `word_stop`
+                        // meaning there are no more words to parse
+                        return command;
+                    }
                 }
                 _ => {
                     if let Some(redirection) = self.parse_redirection_opt() {
@@ -436,31 +467,31 @@ impl<'src> Parser<'src> {
         todo!()
     }
 
-    fn parse_command(&mut self) -> Command {
+    fn parse_command(&mut self, word_stop: WordToken) -> Command {
         // command =
         // 			| compound_command redirect_list?
         // 			| simple_command
         // 			| function_definition
-        Command::SimpleCommand(self.parse_simple_command())
+        Command::SimpleCommand(self.parse_simple_command(word_stop))
         // TODO: other commands
     }
 
-    fn parse_pipeline(&mut self) -> Pipeline {
+    fn parse_pipeline(&mut self, word_stop: WordToken) -> Pipeline {
         // pipeline = "!" command ("|" linebreak command)*
         // TODO: implement the "!"* part
         let mut commands = Vec::new();
-        commands.push(self.parse_command());
+        commands.push(self.parse_command(word_stop));
         while self.shell_lookahead == ShellToken::Pipe {
             self.advance_shell();
             self.skip_linebreak();
-            commands.push(self.parse_command());
+            commands.push(self.parse_command(word_stop));
         }
         Pipeline { commands }
     }
 
-    fn parse_and_or(&mut self) -> Conjunction {
+    fn parse_and_or(&mut self, word_stop: WordToken) -> Conjunction {
         // and_or = pipeline (("&&" | "||") linebreak pipeline)*
-        let mut last = self.parse_pipeline();
+        let mut last = self.parse_pipeline(word_stop);
         let mut elements = Vec::new();
         while let Some(op) = self.matches_shell_alterntives(&[ShellToken::AndIf, ShellToken::OrIf])
         {
@@ -470,7 +501,7 @@ impl<'src> Parser<'src> {
                 _ => unreachable!(),
             };
             self.skip_linebreak();
-            let next = self.parse_pipeline();
+            let next = self.parse_pipeline(word_stop);
             let previous = last;
             last = next;
             elements.push((previous, op));
@@ -482,11 +513,11 @@ impl<'src> Parser<'src> {
         }
     }
 
-    fn parse_complete_command(&mut self) -> CompleteCommand {
+    fn parse_complete_command(&mut self, word_stop: WordToken) -> CompleteCommand {
         // complete_command = and_or (separator_op and_or)* separator_op?
         let mut commands = Vec::new();
         while self.shell_lookahead != ShellToken::Newline {
-            let mut and_or = self.parse_and_or();
+            let mut and_or = self.parse_and_or(word_stop);
             // FIXME: very ugly, should move is_async somewhere else
             if self.shell_lookahead == ShellToken::And {
                 and_or.is_async = true;
@@ -517,7 +548,7 @@ impl<'src> Parser<'src> {
             if self.shell_lookahead == ShellToken::EOF {
                 break;
             }
-            commands.push(self.parse_complete_command());
+            commands.push(self.parse_complete_command(WordToken::EOF));
         }
 
         Program { commands }
@@ -1143,5 +1174,49 @@ mod tests {
                 is_async: false,
             }
         )
+    }
+
+    #[test]
+    fn parse_simple_command_substitution() {
+        assert_eq!(
+            parse_word("$(echo hello)"),
+            Word {
+                parts: vec![WordPart::CommandSubstitution(CompleteCommand {
+                    commands: vec![Conjunction {
+                        elements: vec![(
+                            Pipeline {
+                                commands: vec![Command::SimpleCommand(SimpleCommand {
+                                    command: Some(literal_word("echo")),
+                                    arguments: vec![literal_word("hello")],
+                                    ..Default::default()
+                                })]
+                            },
+                            LogicalOp::None
+                        )],
+                        is_async: false
+                    }]
+                })]
+            }
+        );
+        assert_eq!(
+            parse_word("`echo hello`"),
+            Word {
+                parts: vec![WordPart::CommandSubstitution(CompleteCommand {
+                    commands: vec![Conjunction {
+                        elements: vec![(
+                            Pipeline {
+                                commands: vec![Command::SimpleCommand(SimpleCommand {
+                                    command: Some(literal_word("echo")),
+                                    arguments: vec![literal_word("hello")],
+                                    ..Default::default()
+                                })]
+                            },
+                            LogicalOp::None
+                        )],
+                        is_async: false
+                    }]
+                })]
+            }
+        );
     }
 }

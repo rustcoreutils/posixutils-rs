@@ -122,7 +122,7 @@ pub fn is_operator(c: char) -> bool {
     char_to_operator_token(c).is_some()
 }
 
-fn advance_and_return(lex: &mut Lexer, complete_token: ShellToken) -> ShellToken {
+fn advance_and_return<Tok>(lex: &mut Lexer, complete_token: Tok) -> Tok {
     lex.advance_char();
     complete_token
 }
@@ -131,6 +131,9 @@ pub struct Lexer<'src> {
     source: &'src str,
     source_iter: CharIndices<'src>,
     current_char_index: usize,
+    previous_iter: CharIndices<'src>,
+    previous_lookahead: char,
+    previous_char_index: usize,
     lookahead: char,
 }
 
@@ -140,6 +143,9 @@ impl<'src> Lexer<'src> {
     }
 
     fn advance_char(&mut self) {
+        self.previous_iter = self.source_iter.clone();
+        self.previous_lookahead = self.lookahead;
+        self.previous_char_index = self.current_char_index;
         if let Some((n, c)) = self.source_iter.next() {
             self.lookahead = c;
             self.current_char_index = n;
@@ -308,6 +314,12 @@ impl<'src> Lexer<'src> {
         &self.source[start..end]
     }
 
+    pub fn rollback_last_char(&mut self) {
+        self.source_iter = self.previous_iter.clone();
+        self.lookahead = self.previous_lookahead;
+        self.current_char_index = self.previous_char_index;
+    }
+
     pub fn new(source: &'src str) -> Self {
         let mut source_iter = source.char_indices();
         let lookahead;
@@ -318,6 +330,9 @@ impl<'src> Lexer<'src> {
         }
         Self {
             source,
+            previous_iter: source_iter.clone(),
+            previous_char_index: 0,
+            previous_lookahead: lookahead,
             source_iter,
             current_char_index: 0,
             lookahead,

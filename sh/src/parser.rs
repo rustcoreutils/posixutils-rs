@@ -294,6 +294,8 @@ impl<'src> Parser<'src> {
                 }
                 WordToken::Char(c) => {
                     if !inside_double_quotes && (is_operator(c) || is_blank(c)) {
+                        // the last character is not part of a word
+                        self.lexer.rollback_last_char();
                         break;
                     }
                     current_literal.push(c);
@@ -610,6 +612,10 @@ mod tests {
 
     fn parse_conjunction(text: &str) -> Conjunction {
         unwrap_conjunction(parse(text))
+    }
+
+    fn parse_complete_command(text: &str) -> CompleteCommand {
+        unwrap_complete_command(parse(text))
     }
 
     #[test]
@@ -1101,5 +1107,41 @@ mod tests {
                 LogicalOp::None
             )
         );
+    }
+
+    #[test]
+    fn parse_commands_separated_by_semicolon() {
+        let command = parse_complete_command("a; b");
+        assert_eq!(command.commands.len(), 2);
+        assert_eq!(
+            command.commands[0],
+            Conjunction {
+                elements: vec![(
+                    Pipeline {
+                        commands: vec![Command::SimpleCommand(SimpleCommand {
+                            command: Some(literal_word("a")),
+                            ..Default::default()
+                        })]
+                    },
+                    LogicalOp::None
+                )],
+                is_async: false,
+            }
+        );
+        assert_eq!(
+            command.commands[1],
+            Conjunction {
+                elements: vec![(
+                    Pipeline {
+                        commands: vec![Command::SimpleCommand(SimpleCommand {
+                            command: Some(literal_word("b")),
+                            ..Default::default()
+                        })]
+                    },
+                    LogicalOp::None
+                )],
+                is_async: false,
+            }
+        )
     }
 }

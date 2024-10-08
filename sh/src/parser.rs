@@ -1233,4 +1233,45 @@ mod tests {
             parse_word("\"hello $(echo world)\"")
         );
     }
+
+    #[test]
+    fn parse_recursive_command_substitution() {
+        let inner = Word {
+            parts: vec![WordPart::CommandSubstitution(CompleteCommand {
+                commands: vec![Conjunction {
+                    elements: vec![(
+                        Pipeline {
+                            commands: vec![Command::SimpleCommand(SimpleCommand {
+                                command: Some(literal_word("echo")),
+                                arguments: vec![literal_word("hello")],
+                                ..Default::default()
+                            })],
+                        },
+                        LogicalOp::None,
+                    )],
+                    is_async: false,
+                }],
+            })],
+        };
+        assert_eq!(
+            parse_word("$(echo $(echo hello))"),
+            Word {
+                parts: vec![WordPart::CommandSubstitution(CompleteCommand {
+                    commands: vec![Conjunction {
+                        elements: vec![(
+                            Pipeline {
+                                commands: vec![Command::SimpleCommand(SimpleCommand {
+                                    command: Some(literal_word("echo")),
+                                    arguments: vec![inner],
+                                    ..Default::default()
+                                })]
+                            },
+                            LogicalOp::None
+                        )],
+                        is_async: false
+                    }]
+                })]
+            }
+        );
+    }
 }

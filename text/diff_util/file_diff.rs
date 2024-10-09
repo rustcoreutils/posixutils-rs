@@ -365,9 +365,13 @@ impl<'a> FileDiff<'a> {
                 // update current position and print the whole section
                 diff_disp.update_curr_pos(hunk.ln1_start() - context, hunk.ln2_start() - context);
                 // check if we have something to display other than just context
-                let print_lines1 = diff_disp.hunk_lines[0].split('\n').any(|x| x.starts_with('-') || x.starts_with('!'));
+                let print_lines1 = diff_disp.hunk_lines[0]
+                    .split('\n')
+                    .any(|x| x.starts_with('-') || x.starts_with('!'));
                 diff_disp.print_section(true, print_lines1);
-                let print_lines2 = diff_disp.hunk_lines[1].split('\n').any(|x| x.starts_with('-') || x.starts_with('!'));
+                let print_lines2 = diff_disp.hunk_lines[1]
+                    .split('\n')
+                    .any(|x| x.starts_with('-') || x.starts_with('!'));
                 diff_disp.print_section(false, print_lines2);
             }
 
@@ -425,9 +429,13 @@ impl<'a> FileDiff<'a> {
                 diff_disp.write_line(self.file1, diff_disp.curr_pos1, end1, " ", true)?;
                 diff_disp.write_line(self.file2, diff_disp.curr_pos2, end2, " ", false)?;
             }
-            let print_lines1 = diff_disp.hunk_lines[0].split('\n').any(|x| x.starts_with('-') || x.starts_with('!'));
+            let print_lines1 = diff_disp.hunk_lines[0]
+                .split('\n')
+                .any(|x| x.starts_with('-') || x.starts_with('!'));
             diff_disp.print_section(true, print_lines1);
-            let print_lines2 = diff_disp.hunk_lines[1].split('\n').any(|x| x.starts_with('+') || x.starts_with('!'));
+            let print_lines2 = diff_disp.hunk_lines[1]
+                .split('\n')
+                .any(|x| x.starts_with('+') || x.starts_with('!'));
             diff_disp.print_section(false, print_lines2);
         }
 

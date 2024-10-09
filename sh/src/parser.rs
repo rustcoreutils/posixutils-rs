@@ -281,6 +281,7 @@ impl<'src> Parser<'src> {
                 WordToken::DoubleQuote => {
                     inside_double_quotes = !inside_double_quotes;
                     current_literal.push('"');
+                    self.advance_word();
                 }
                 WordToken::SingleQuote => {
                     current_literal.push('\'');
@@ -296,6 +297,7 @@ impl<'src> Parser<'src> {
                             }
                         }
                     }
+                    self.advance_word();
                 }
                 WordToken::Dollar => {
                     push_literal_and_insert(
@@ -303,7 +305,6 @@ impl<'src> Parser<'src> {
                         &mut word_parts,
                         WordPart::ParameterExpansion(self.parse_parameter_expansion()),
                     );
-                    continue;
                 }
                 WordToken::Backtick => {
                     self.advance_word();
@@ -315,7 +316,6 @@ impl<'src> Parser<'src> {
                         ),
                     );
                     self.match_word_token(WordToken::Backtick);
-                    continue;
                 }
                 WordToken::CommandSubstitutionStart => {
                     self.advance_word();
@@ -327,7 +327,6 @@ impl<'src> Parser<'src> {
                         ),
                     );
                     self.match_word_token(WordToken::Char(')'));
-                    continue;
                 }
                 WordToken::EscapedBacktick => {
                     todo!("implement nested command substitution");
@@ -343,17 +342,16 @@ impl<'src> Parser<'src> {
                     // expected ')' instead of expected '))'
                     self.match_word_token(WordToken::Char(')'));
                     self.match_word_token(WordToken::Char(')'));
-                    continue;
                 }
                 WordToken::Char(c) => {
                     if !inside_double_quotes && (is_operator(c) || is_blank(c)) {
                         break;
                     }
                     current_literal.push(c);
+                    self.advance_word();
                 }
                 WordToken::EOF => break,
             }
-            self.advance_word();
         }
 
         if inside_double_quotes {

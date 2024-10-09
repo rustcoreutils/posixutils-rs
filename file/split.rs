@@ -151,11 +151,8 @@ impl OutputState {
 
     fn write(&mut self, buf: &[u8]) -> io::Result<()> {
         match &mut self.outf {
-            None => {
-                assert!(false);
-                Ok(())
-            }
             Some(ref mut f) => f.write_all(buf),
+            None => Ok(()),
         }
     }
 

@@ -37,10 +37,16 @@ struct Args {
 fn normalize<P: AsRef<Path>>(path: P) -> std::io::Result<PathBuf> {
     let mut out = PathBuf::new();
 
+    // TODO
+    // MSRV
+    let path_buf: PathBuf;
+
     let abs_path = if path.as_ref().is_absolute() {
         path.as_ref()
     } else {
-        &std::env::current_dir()?.join(path)
+        path_buf = std::env::current_dir()?.join(path);
+
+        &path_buf
     };
 
     // from cargo/src/cargo/util/paths.rs

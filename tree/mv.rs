@@ -288,10 +288,19 @@ fn move_file(
             .map_err(err_inter_device)?;
     }
 
+    // TODO
+    // MSRV
+    let mut hash_set: HashSet<PathBuf>;
+
     let created_files = match created_files {
         Some(set) => set,
-        None => &mut HashSet::new(),
+        None => {
+            hash_set = HashSet::<PathBuf>::new();
+
+            &mut hash_set
+        }
     };
+
     copy_hierarchy(cfg, source, target, inode_map, created_files).map_err(err_inter_device)?;
 
     Ok(false)

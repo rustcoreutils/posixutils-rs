@@ -139,10 +139,21 @@ pub struct SourceLocation {
     pub column: u32,
 }
 
-#[derive(Debug, PartialEq, Default)]
+#[derive(Debug, PartialEq)]
 pub struct DebugInfo {
     pub file: Rc<str>,
     pub source_locations: Vec<SourceLocation>,
+}
+
+// TODO
+// MSRV
+impl Default for DebugInfo {
+    fn default() -> Self {
+        DebugInfo {
+            file: Rc::from(""),
+            source_locations: Default::default(),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -164,12 +175,25 @@ pub struct AwkRule {
     pub action: Action,
 }
 
-#[derive(Debug, PartialEq, Default)]
+#[derive(Debug, PartialEq)]
 pub struct Function {
     pub name: Rc<str>,
     pub parameters_count: usize,
     pub instructions: Vec<OpCode>,
     pub debug_info: DebugInfo,
+}
+
+// TODO
+// MSRV
+impl Default for Function {
+    fn default() -> Self {
+        Function {
+            name: Rc::from(""),
+            parameters_count: Default::default(),
+            instructions: Default::default(),
+            debug_info: Default::default(),
+        }
+    }
 }
 
 pub struct Program {

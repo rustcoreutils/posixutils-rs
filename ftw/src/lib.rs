@@ -794,9 +794,18 @@ where
     // Depth first traversal main loop
     'outer: while let Some(current) = stack.last() {
         let dir = &current.dir;
+
+        // TODO
+        // MSRV
+        let file_descriptor: FileDescriptor;
+
         let dir_fd = match dir {
             HybridDir::Owned(dir) => dir.file_descriptor(),
-            HybridDir::Deferred(dir) => &dir.open_file_descriptor(),
+            HybridDir::Deferred(dir) => {
+                file_descriptor = dir.open_file_descriptor();
+
+                &file_descriptor
+            }
         };
 
         // Resize `path_stack` to the appropriate depth.
@@ -820,13 +829,23 @@ where
                     // Errors in reading the entry usually occurs due to lack of permissions
                     Err(e) => {
                         let second_last_index = stack.len().checked_sub(2);
+
+                        // TODO
+                        // MSRV
+                        let file_descriptor: FileDescriptor;
+
                         let prev_dir = match second_last_index {
                             Some(index) => match &stack.get(index).unwrap().dir {
                                 HybridDir::Owned(dir) => dir.file_descriptor(),
-                                HybridDir::Deferred(dir) => &dir.open_file_descriptor(),
+                                HybridDir::Deferred(dir) => {
+                                    file_descriptor = dir.open_file_descriptor();
+
+                                    &file_descriptor
+                                }
                             },
                             None => &starting_dir,
                         };
+
                         err_reporter(
                             Entry::new(
                                 prev_dir,
@@ -958,13 +977,23 @@ where
         path_stack.pop();
 
         let second_last_index = stack.len().checked_sub(2);
+
+        // TODO
+        // MSRV
+        let file_descriptor: FileDescriptor;
+
         let prev_dir = match second_last_index {
             Some(index) => match &stack.get(index).unwrap().dir {
                 HybridDir::Owned(dir) => dir.file_descriptor(),
-                HybridDir::Deferred(dir) => &dir.open_file_descriptor(),
+                HybridDir::Deferred(dir) => {
+                    file_descriptor = dir.open_file_descriptor();
+
+                    &file_descriptor
+                }
             },
             None => &starting_dir,
         };
+
         if postprocess_dir(Entry::new(
             prev_dir,
             &path_stack,

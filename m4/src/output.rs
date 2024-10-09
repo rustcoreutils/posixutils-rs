@@ -1,7 +1,8 @@
 use crate::{error::Result, input::InputStateRef, state::StackFrame};
 use std::{
-    cell::RefCell,
+    cell::{RefCell, RefMut},
     io::{Seek, Write},
+    ops::DerefMut,
     rc::Rc,
 };
 
@@ -195,15 +196,33 @@ impl TryFrom<usize> for DivertBufferNumber {
 
 impl Write for Output {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let output: &mut dyn Write = match self.divert_number {
-            0 => &mut *self.stdout.borrow_mut(),
+        // TODO
+        // MSRV
+        // First branch
+        let rc: Rc<RefCell<dyn Write>>;
+
+        let mut dyn_write_ref_mut: RefMut<dyn Write>;
+
+        // Second branch
+        let mut divertable_buffer_ref_mut: RefMut<DivertableBuffer>;
+
+        let output = match self.divert_number {
+            0 => {
+                rc = self.stdout();
+
+                dyn_write_ref_mut = rc.borrow_mut();
+
+                dyn_write_ref_mut.deref_mut()
+            }
             1..=9 => {
-                &mut self.divert_buffers[self
+                let divert_buffers_index = self
                     .divert_buffer_number()
                     .expect("valid divert buffer number")
-                    .index()]
-                .borrow_mut()
-                .0
+                    .index();
+
+                divertable_buffer_ref_mut = self.divert_buffers[divert_buffers_index].borrow_mut();
+
+                &mut divertable_buffer_ref_mut.0
             }
             i if i < 0 => return Ok(buf.len()),
             _ => unreachable!("unreachable, was checked in Self::divert()"),

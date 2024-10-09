@@ -1954,10 +1954,22 @@ pub fn interpret(
             .get_mut()
             .value = AwkValueVariant::String(maybe_numeric_string(arg.clone()));
 
+        // TODO
+        // MSRV
+        // First branch
+        let mut stdin_record_reader: StdinRecordReader;
+
+        // Second branch
+        let mut file_stream: FileStream;
+
         let reader: &mut dyn RecordReader = if arg.as_str() == "-" {
-            &mut StdinRecordReader::default()
+            stdin_record_reader = StdinRecordReader::default();
+
+            &mut stdin_record_reader
         } else {
-            &mut FileStream::open(&arg)?
+            file_stream = FileStream::open(&arg)?;
+
+            &mut file_stream
         };
 
         // at this point we know that some input will be read

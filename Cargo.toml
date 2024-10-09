@@ -31,6 +31,7 @@ members = [
 repository = "https://github.com/rustcoreutils/posixutils-rs"
 license = "MIT"
 edition = "2021"
+rust-version = "1.77.0"
 
 [workspace.dependencies]
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "cargo"] }
@@ -42,3 +43,5 @@ errno = "0.3"
 
 [workspace.lints]
 
+[workspace.lints.clippy]
+incompatible_msrv = "warn"

@@ -10,16 +10,12 @@
 mod magic;
 
 use crate::magic::{get_type_from_magic_file_dbs, DEFAULT_MAGIC_FILE};
-use ftw::FileType;
+use ftw::{FileType, Metadata};
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
-use std::{
-    fs::{self, read_link},
-    io,
-    path::PathBuf,
-};
+use std::{fs::read_link, io, path::PathBuf};
 
 #[derive(Parser)]
 #[command(
@@ -113,12 +109,12 @@ fn get_magic_files(args: &Args) -> Vec<PathBuf> {
 }
 
 fn analyze_file(path: &String, args: &Args, magic_files: &Vec<PathBuf>) -> String {
-    let met = match fs::symlink_metadata(&path) {
-        Ok(met) => met,
+    let meta = match Metadata::symlink_metadata(&path) {
+        Ok(meta) => meta,
         Err(_) => return gettext("cannot open"),
     };
 
-    match FileType::from(met.file_type()) {
+    match meta.file_type() {
         FileType::Socket => gettext("socket"),
         FileType::BlockDevice => gettext("block special"),
         FileType::Directory => gettext("directory"),
@@ -145,7 +141,7 @@ fn analyze_file(path: &String, args: &Args, magic_files: &Vec<PathBuf>) -> Strin
                 assert!(magic_files.is_empty());
                 return gettext("regular file");
             }
-            if met.len() == 0 {
+            if meta.len() == 0 {
                 return gettext("empty");
             }
             get_type_from_magic_file_dbs(&PathBuf::from(&path), &magic_files)

@@ -1,6 +1,9 @@
 mod dir;
+mod small_c_string;
 
-use dir::{DeferredDir, HybridDir, OwnedDir};
+use crate::dir::{DeferredDir, HybridDir, OwnedDir};
+use crate::small_c_string::run_path_with_cstr;
+
 use std::{
     ffi::{CStr, CString, OsStr},
     fmt, io,
@@ -107,7 +110,9 @@ impl AsRawFd for FileDescriptor {
     }
 }
 
-/// Metadata of an entry. This is analogous to [`std::fs::Metadata`].
+/// Metadata information about a file.
+///
+/// This is analogous to [`std::fs::Metadata`].
 #[derive(Clone)]
 pub struct Metadata(libc::stat);
 
@@ -140,9 +145,25 @@ impl Metadata {
         Ok(Metadata(unsafe { statbuf.assume_init() }))
     }
 
+    /// Queries the metadata about a file without following symlinks.
+    ///
+    /// This is analogous to [`std::fs::symlink_metadata`].
+    pub fn symlink_metadata<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let p: &Path = path.as_ref();
+        run_path_with_cstr(p, &|p| Self::new(libc::AT_FDCWD, p, false))
+    }
+
+    /// Returns the size of the file, in bytes, this metadata is for.
+    ///
+    /// This is analogous to [`std::fs::Metadata::len`].
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.0.st_size as u64
+    }
+
     /// Query the file type.
     pub fn file_type(&self) -> FileType {
-        FileType::from(self.0.st_mode)
+        FileType::new(self.0.st_mode)
     }
 
     // These are "effective" IDs and not "real" to allow for things like sudo
@@ -268,7 +289,10 @@ impl unix::fs::MetadataExt for Metadata {
     }
 }
 
-/// File type of an entry.
+/// A structure representing a type of file with accessors for each file type.
+/// It is returned by [`Metadata::file_type`] method.
+///
+/// This is analogous to [`std::fs::FileType`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
     Socket,
@@ -281,6 +305,19 @@ pub enum FileType {
 }
 
 impl FileType {
+    fn new(value: libc::mode_t) -> Self {
+        match value & libc::S_IFMT {
+            libc::S_IFSOCK => FileType::Socket,
+            libc::S_IFLNK => FileType::SymbolicLink,
+            libc::S_IFREG => FileType::RegularFile,
+            libc::S_IFBLK => FileType::BlockDevice,
+            libc::S_IFDIR => FileType::Directory,
+            libc::S_IFCHR => FileType::CharacterDevice,
+            libc::S_IFIFO => FileType::Fifo,
+            _ => unreachable!(),
+        }
+    }
+
     /// Tests whether this file type represents a directory.
     pub fn is_dir(&self) -> bool {
         *self == FileType::Directory
@@ -312,31 +349,6 @@ impl unix::fs::FileTypeExt for FileType {
 
     fn is_socket(&self) -> bool {
         *self == FileType::Socket
-    }
-}
-
-impl From<libc::mode_t> for FileType {
-    fn from(value: libc::mode_t) -> Self {
-        match value & libc::S_IFMT {
-            libc::S_IFSOCK => FileType::Socket,
-            libc::S_IFLNK => FileType::SymbolicLink,
-            libc::S_IFREG => FileType::RegularFile,
-            libc::S_IFBLK => FileType::BlockDevice,
-            libc::S_IFDIR => FileType::Directory,
-            libc::S_IFCHR => FileType::CharacterDevice,
-            libc::S_IFIFO => FileType::Fifo,
-            _ => unreachable!(),
-        }
-    }
-}
-
-impl From<std::fs::FileType> for FileType {
-    fn from(value: std::fs::FileType) -> Self {
-        struct FileTypeCopy {
-            mode: libc::mode_t,
-        }
-        let ft = unsafe { std::mem::transmute::<std::fs::FileType, FileTypeCopy>(value) };
-        Self::from(ft.mode)
     }
 }
 

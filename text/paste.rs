@@ -17,7 +17,7 @@
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
-use std::cell::{LazyCell, RefCell};
+use std::cell::{OnceCell, RefCell};
 use std::error::Error;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Stdin, Write};
@@ -237,7 +237,7 @@ fn parse_delims_argument(delims: Option<String>) -> Result<Box<[Box<[u8]>]>, Str
 }
 
 fn open_inputs(files: Vec<String>) -> Result<PasteInfo, Box<dyn Error>> {
-    let stdin_lazy_cell = LazyCell::new(|| Rc::new(RefCell::new(io::stdin())));
+    let stdin_once_cell = OnceCell::<Rc<RefCell<Stdin>>>::new();
 
     let mut paste_file_vec = Vec::<PasteFile>::with_capacity(files.len());
 
@@ -249,7 +249,9 @@ fn open_inputs(files: Vec<String>) -> Result<PasteInfo, Box<dyn Error>> {
         match file.as_str() {
             "-" => {
                 paste_file_vec.push(PasteFile::new(Source::StandardInput(
-                    stdin_lazy_cell.clone(),
+                    stdin_once_cell
+                        .get_or_init(|| Rc::new(RefCell::new(io::stdin())))
+                        .clone(),
                 )));
             }
             "" => {

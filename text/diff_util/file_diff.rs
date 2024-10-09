@@ -10,6 +10,7 @@ use super::{
 use crate::diff_util::constants::NO_NEW_LINE_AT_END_OF_FILE;
 
 use std::{
+    cmp::Reverse,
     collections::HashMap,
     fmt::Write,
     fs::{read_to_string, File},
@@ -180,7 +181,7 @@ impl<'a> FileDiff<'a> {
         self.order_hunks_by_output_format();
 
         if let OutputFormat::Context(context) = self.format_options.output_format {
-            self.print_context(context);
+            let _ = self.print_context(context);
         } else if let OutputFormat::Unified(unified) = self.format_options.output_format {
             let _ = self.print_unified(unified);
         } else {
@@ -315,11 +316,12 @@ impl<'a> FileDiff<'a> {
     }
 
     fn order_hunks_descending(&mut self) {
-        self.order_hunks_ascending();
-        self.hunks.hunks_mut().reverse();
+        self.hunks
+            .hunks_mut()
+            .sort_by_key(|hunk| Reverse((hunk.ln1_end(), hunk.ln2_end())));
     }
 
-    fn print_context(&mut self, context: usize) {
+    fn print_context(&mut self, context: usize) -> Result<(), std::fmt::Error> {
         println!(
             "*** {}",
             Self::get_header(self.file1, self.format_options.label1())
@@ -329,70 +331,113 @@ impl<'a> FileDiff<'a> {
             Self::get_header(self.file2, self.format_options.label2())
         );
 
+        let mut diff_disp = ContextDiffDisplay::new();
+
         for hunk in self.hunks.hunks() {
-            println!("***************");
-            let mut hunk_len =
-                (hunk.ln1_end() - hunk.ln1_start() + 2 * context).min(self.file1.lines().len());
-            let hunk_start = hunk.ln1_start().saturating_sub(context);
-
-            // make sure we don't go out of bounds
-            if hunk_start + hunk_len > self.file1.lines().len() - 1 {
-                hunk_len = self.file1.lines().len() - hunk_start;
+            // move cursor to the start of context for first hunk
+            if diff_disp.curr_pos1 == 0 {
+                if hunk.ln1_start() > context {
+                    // this is guaranteed to be >= 0 due to the above conditions
+                    diff_disp
+                        .update_curr_pos(hunk.ln1_start() - context, hunk.ln2_start() - context);
+                }
+                diff_disp.set_context_start();
             }
 
-            println!("*** {},{} ***", hunk_start + 1, hunk_start + hunk_len);
-            let h1_prefix = if hunk.ln2_start() == hunk.ln2_end() {
+            // do we have enough context between hunks?
+            if (diff_disp.curr_pos1 != 0) && (hunk.ln1_start() - diff_disp.curr_pos1 > context * 2)
+            {
+                // add context after the previous hunk
+                diff_disp.write_line(
+                    self.file1,
+                    diff_disp.curr_pos1,
+                    diff_disp.curr_pos1 + context,
+                    "  ",
+                    true,
+                )?;
+                diff_disp.write_line(
+                    self.file2,
+                    diff_disp.curr_pos2,
+                    diff_disp.curr_pos2 + context,
+                    "  ",
+                    false,
+                )?;
+                // update current position and print the whole section
+                diff_disp.update_curr_pos(hunk.ln1_start() - context, hunk.ln2_start() - context);
+                // check if we have something to display other than just context
+                let print_lines1 = diff_disp.hunk_lines[0].split('\n').any(|x| x.starts_with('-') || x.starts_with('!'));
+                diff_disp.print_section(true, print_lines1);
+                let print_lines2 = diff_disp.hunk_lines[1].split('\n').any(|x| x.starts_with('-') || x.starts_with('!'));
+                diff_disp.print_section(false, print_lines2);
+            }
+
+            // add context before current hunk
+            diff_disp.write_line(
+                self.file1,
+                diff_disp.curr_pos1,
+                hunk.ln1_start(),
+                "  ",
+                true,
+            )?;
+            // add delete hunk
+            let h1_prefix = if hunk.ln2_end() - hunk.ln2_start() > 0 {
+                "! "
+            } else {
                 "- "
-            } else {
-                "! "
             };
+            diff_disp.write_line(
+                self.file1,
+                hunk.ln1_start(),
+                hunk.ln1_end(),
+                h1_prefix,
+                true,
+            )?;
 
-            // dont print context for empty hunk
-            if hunk.ln1_start() == hunk.ln1_end() {
-                continue;
-            }
-
-            for i in hunk_start..hunk_start + hunk_len {
-                if i < hunk.ln1_start() {
-                    println!("  {}", self.file1.line(i));
-                } else if i < hunk.ln1_end() {
-                    println!("{h1_prefix}{}", self.file1.line(i));
-                } else {
-                    println!("  {}", self.file1.line(i));
-                }
-            }
-
-            let mut hunk_len =
-                (hunk.ln2_end() - hunk.ln2_start() + 2 * context).min(self.file2.lines().len());
-            let hunk_start = hunk.ln2_start().saturating_sub(context);
-
-            // make sure we don't go out of bounds
-            if hunk_start + hunk_len > self.file2.lines().len() - 1 {
-                hunk_len = self.file2.lines().len() - hunk_start;
-            }
-
-            println!("--- {},{} ---", hunk_start + 1, hunk_start + hunk_len);
-            let h2_prefix = if hunk.ln1_start() == hunk.ln1_end() {
+            // context before insertion
+            diff_disp.write_line(
+                self.file2,
+                diff_disp.curr_pos2,
+                hunk.ln2_start(),
+                "  ",
+                false,
+            )?;
+            // add insert hunk
+            let h2_prefix = if hunk.ln1_end() - hunk.ln1_start() > 0 {
+                "! "
+            } else {
                 "+ "
-            } else {
-                "! "
             };
-
-            // dont print context for empty hunk
-            if hunk.ln2_start() == hunk.ln2_end() {
-                continue;
-            }
-
-            for i in hunk_start..hunk_start + hunk_len {
-                if i < hunk.ln2_start() {
-                    println!("  {}", self.file2.line(i));
-                } else if i < hunk.ln2_end() {
-                    println!("{h2_prefix}{}", self.file2.line(i));
-                } else {
-                    println!("  {}", self.file2.line(i));
-                }
-            }
+            diff_disp.write_line(
+                self.file2,
+                hunk.ln2_start(),
+                hunk.ln2_end(),
+                h2_prefix,
+                false,
+            )?;
         }
+
+        // print final hunk
+        if !diff_disp.hunk_lines.is_empty() {
+            // display the remaining context if possible
+            if diff_disp.curr_pos1 < self.file1.lines().len() {
+                let end1 = self.file1.lines().len().min(diff_disp.curr_pos1 + context);
+                let end2 = self.file2.lines().len().min(diff_disp.curr_pos2 + context);
+                diff_disp.write_line(self.file1, diff_disp.curr_pos1, end1, " ", true)?;
+                diff_disp.write_line(self.file2, diff_disp.curr_pos2, end2, " ", false)?;
+            }
+            let print_lines1 = diff_disp.hunk_lines[0].split('\n').any(|x| x.starts_with('-') || x.starts_with('!'));
+            diff_disp.print_section(true, print_lines1);
+            let print_lines2 = diff_disp.hunk_lines[1].split('\n').any(|x| x.starts_with('+') || x.starts_with('!'));
+            diff_disp.print_section(false, print_lines2);
+        }
+
+        if !self.file1.ends_with_newline() {
+            println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
+        }
+        if !self.file2.ends_with_newline() {
+            println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
+        }
+        Ok(())
     }
 
     fn print_unified(&mut self, unified: usize) -> Result<(), std::fmt::Error> {
@@ -405,7 +450,7 @@ impl<'a> FileDiff<'a> {
             Self::get_header(self.file2, self.format_options.label2())
         );
 
-        let mut diff_disp = DiffDisplay::new();
+        let mut diff_disp = UnifiedDiffDisplay::new();
 
         for hunk in self.hunks.hunks() {
             // move cursor to the start of context for first hunk
@@ -473,7 +518,7 @@ impl<'a> FileDiff<'a> {
     }
 }
 
-pub struct DiffDisplay {
+pub struct UnifiedDiffDisplay {
     curr_pos1: usize,
     curr_pos2: usize,
     //`context_start` and `hunk_len` to get the values for the hunk header
@@ -486,7 +531,7 @@ pub struct DiffDisplay {
     hunk_lines: String,
 }
 
-impl DiffDisplay {
+impl UnifiedDiffDisplay {
     pub fn new() -> Self {
         Self {
             curr_pos1: 0,
@@ -551,5 +596,118 @@ impl DiffDisplay {
         }
         println!("{}", self.hunk_lines);
         self.hunk_lines.clear();
+    }
+}
+
+pub struct ContextDiffDisplay {
+    curr_pos1: usize,
+    curr_pos2: usize,
+    //`context_start` and `hunk_len` to get the values for the hunk header
+    //keep track of the lines where context start
+    context_start1: usize,
+    context_start2: usize,
+    //keep track of the length of the current hunk
+    hunk1_len: usize,
+    hunk2_len: usize,
+    hunk_lines: [String; 2],
+}
+
+impl ContextDiffDisplay {
+    pub fn new() -> Self {
+        Self {
+            curr_pos1: 0,
+            curr_pos2: 0,
+            context_start1: 0,
+            context_start2: 0,
+            hunk1_len: 0,
+            hunk2_len: 0,
+            hunk_lines: [String::new(), String::new()],
+        }
+    }
+
+    pub fn set_context_start(&mut self) {
+        self.context_start1 = self.curr_pos1 + 1;
+        self.context_start2 = self.curr_pos2 + 1;
+    }
+    pub fn update_curr_pos(&mut self, curr1: usize, curr2: usize) {
+        self.curr_pos1 = curr1;
+        self.curr_pos2 = curr2;
+    }
+
+    pub fn write_line(
+        &mut self,
+        file: &FileData,
+        start: usize,
+        end: usize,
+        prefix: &str,
+        is_file1: bool,
+    ) -> Result<(), std::fmt::Error> {
+        let mut offset = 0;
+        let file_index = if is_file1 { 0 } else { 1 };
+
+        for i in start..end {
+            writeln!(self.hunk_lines[file_index], "{prefix}{}", file.line(i))?;
+            offset += 1;
+        }
+        if prefix.starts_with(" ") {
+            if is_file1 {
+                self.curr_pos1 += offset;
+                self.hunk1_len += offset;
+            } else {
+                self.curr_pos2 += offset;
+                self.hunk2_len += offset;
+            }
+        } else if prefix.starts_with("-") {
+            self.curr_pos1 += offset;
+            self.hunk1_len += offset;
+        } else if prefix.starts_with("+") {
+            self.curr_pos2 += offset;
+            self.hunk2_len += offset;
+        } else if prefix.starts_with("!") {
+            if is_file1 {
+                self.curr_pos1 += offset;
+                self.hunk1_len += offset;
+            } else {
+                self.curr_pos2 += offset;
+                self.hunk2_len += offset;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn print_section(&mut self, is_file1: bool, print_lines: bool) {
+        if is_file1 {
+            println!(
+                "***************\n*** {},{} ****",
+                self.context_start1,
+                self.context_start1 + self.hunk1_len - 1
+            );
+            if print_lines {
+                self.print_hunk(true);
+            }
+            self.context_start1 = self.curr_pos1 + 1;
+            self.hunk1_len = 0;
+        } else {
+            println!(
+                "--- {},{} ----",
+                self.context_start2,
+                self.context_start2 + self.hunk2_len - 1
+            );
+            if print_lines {
+                self.print_hunk(false);
+            }
+            self.context_start2 = self.curr_pos2 + 1;
+            self.hunk2_len = 0;
+        }
+    }
+
+    pub fn print_hunk(&mut self, is_file1: bool) {
+        let file_index = if is_file1 { 0 } else { 1 };
+        let lines = &mut self.hunk_lines[file_index];
+        if lines.ends_with('\n') {
+            lines.pop();
+        }
+        println!("{}", lines);
+        self.hunk_lines[file_index].clear();
     }
 }

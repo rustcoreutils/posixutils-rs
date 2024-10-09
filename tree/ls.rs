@@ -1228,7 +1228,7 @@ fn process_single_dir(
             let dir_parent = {
                 let mut comps = canonical_dir_path.as_inner().components();
 
-                let is_dot = dir_entry.file_name().to_bytes_with_nul() == &[b'.', 0];
+                let is_dot = dir_entry.file_name().to_bytes_with_nul() == [b'.', 0];
 
                 if !is_dot {
                     comps.next_back();

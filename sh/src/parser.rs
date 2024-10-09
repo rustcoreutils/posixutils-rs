@@ -184,6 +184,10 @@ impl<'src> Parser<'src> {
                 return ParameterExpansion::StrLen(self.parse_parameter(false));
             }
             let parameter = self.parse_parameter(false);
+            if self.word_lookahead() == WordToken::Char('}') {
+                self.advance_word();
+                return ParameterExpansion::Simple(parameter);
+            }
 
             if self.word_lookahead() == WordToken::Char('%') {
                 self.advance_word();
@@ -299,6 +303,7 @@ impl<'src> Parser<'src> {
                         &mut word_parts,
                         WordPart::ParameterExpansion(self.parse_parameter_expansion()),
                     );
+                    continue;
                 }
                 WordToken::Backtick => {
                     self.advance_word();
@@ -1289,6 +1294,34 @@ mod tests {
                         is_async: false
                     }]
                 })]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_parameter_expansion_inside_a_string() {
+        assert_eq!(
+            parse_word("\"hello $test\""),
+            Word {
+                parts: vec![
+                    WordPart::Literal(Rc::from("\"hello ")),
+                    WordPart::ParameterExpansion(ParameterExpansion::Simple(Parameter::Name(
+                        Rc::from("test")
+                    ))),
+                    WordPart::Literal(Rc::from("\""))
+                ]
+            }
+        );
+        assert_eq!(
+            parse_word("\"hello ${test}\""),
+            Word {
+                parts: vec![
+                    WordPart::Literal(Rc::from("\"hello ")),
+                    WordPart::ParameterExpansion(ParameterExpansion::Simple(Parameter::Name(
+                        Rc::from("test")
+                    ))),
+                    WordPart::Literal(Rc::from("\""))
+                ]
             }
         );
     }

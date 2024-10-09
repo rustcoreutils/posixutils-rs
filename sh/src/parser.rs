@@ -10,7 +10,7 @@
 use std::{path::is_separator, rc::Rc};
 
 use crate::{
-    lexer::{is_blank, is_operator, Lexer, ShellToken, WordToken},
+    lexer::{is_blank, is_operator, Lexer, ShellToken, SourceLocation, WordToken},
     program::{
         ArithmeticExpr, Assignment, Command, CompleteCommand, CompoundCommand, Conjunction,
         IORedirectionKind, LogicalOp, Parameter, ParameterExpansion, Pipeline, Program,
@@ -52,17 +52,40 @@ fn try_into_name(word: Word) -> Result<Rc<str>, Word> {
 
 struct Parser<'src> {
     lexer: Lexer<'src>,
-    shell_lookahead: ShellToken,
-    word_lookahead: WordToken,
+    shell_lookahead: (ShellToken, SourceLocation),
+    word_lookahead: (WordToken, SourceLocation),
 }
 
 impl<'src> Parser<'src> {
     fn advance_shell(&mut self) {
         self.shell_lookahead = self.lexer.next_shell_token();
+        if self.shell_lookahead.0 == ShellToken::WordStart {
+            self.advance_word();
+        }
     }
 
     fn advance_word(&mut self) {
         self.word_lookahead = self.lexer.next_word_token();
+    }
+
+    fn shell_lookahead(&mut self) -> ShellToken {
+        if self.shell_lookahead.1.start < self.word_lookahead.1.start {
+            self.lexer.rollback_last_token();
+            self.advance_shell();
+            self.shell_lookahead.0
+        } else {
+            self.shell_lookahead.0
+        }
+    }
+
+    fn word_lookahead(&mut self) -> WordToken {
+        if self.word_lookahead.1.start < self.shell_lookahead.1.start {
+            self.lexer.rollback_last_token();
+            self.advance_word();
+            self.word_lookahead.0
+        } else {
+            self.word_lookahead.0
+        }
     }
 
     fn match_str(&mut self, s: &str) {
@@ -71,7 +94,7 @@ impl<'src> Parser<'src> {
 
     fn matches_shell_alterntives(&mut self, tokens: &[ShellToken]) -> Option<ShellToken> {
         for token in tokens {
-            if self.shell_lookahead == *token {
+            if self.shell_lookahead() == *token {
                 self.advance_shell();
                 return Some(*token);
             }
@@ -80,14 +103,14 @@ impl<'src> Parser<'src> {
     }
 
     fn match_shell_token(&mut self, token: ShellToken) {
-        if self.shell_lookahead != token {
+        if self.shell_lookahead() != token {
             todo!();
         }
         self.advance_shell();
     }
 
     fn match_word_token(&mut self, token: WordToken) {
-        if self.word_lookahead != token {
+        if self.word_lookahead() != token {
             todo!()
         }
         self.advance_word();
@@ -95,7 +118,7 @@ impl<'src> Parser<'src> {
 
     fn skip_linebreak(&mut self) {
         // "\n"*
-        while self.shell_lookahead == ShellToken::Newline {
+        while self.shell_lookahead() == ShellToken::Newline {
             self.advance_shell();
         }
     }
@@ -105,7 +128,7 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_parameter(&mut self, only_consider_first_digit: bool) -> Parameter {
-        match self.word_lookahead {
+        match self.word_lookahead() {
             WordToken::Char('@') => todo!(),
             WordToken::Char('*') => todo!(),
             WordToken::Char('#') => todo!(),
@@ -121,7 +144,7 @@ impl<'src> Parser<'src> {
                     let mut number = String::new();
                     number.push(d);
                     self.advance_word();
-                    while let WordToken::Char(d) = self.word_lookahead {
+                    while let WordToken::Char(d) = self.word_lookahead() {
                         if d.is_ascii_digit() {
                             number.push(d);
                         } else {
@@ -136,7 +159,7 @@ impl<'src> Parser<'src> {
                 let mut name = String::new();
                 name.push(c);
                 self.advance_word();
-                while let WordToken::Char(c) = self.word_lookahead {
+                while let WordToken::Char(c) = self.word_lookahead() {
                     if c.is_alphanumeric() || c == '_' {
                         name.push(c);
                     } else {
@@ -154,44 +177,44 @@ impl<'src> Parser<'src> {
         // skip '$'
         self.advance_word();
 
-        if self.word_lookahead == WordToken::Char('{') {
+        if self.word_lookahead() == WordToken::Char('{') {
             self.advance_word();
-            if self.word_lookahead == WordToken::Char('#') {
+            if self.word_lookahead() == WordToken::Char('#') {
                 self.advance_word();
                 return ParameterExpansion::StrLen(self.parse_parameter(false));
             }
             let parameter = self.parse_parameter(false);
 
-            if self.word_lookahead == WordToken::Char('%') {
+            if self.word_lookahead() == WordToken::Char('%') {
                 self.advance_word();
-                if self.word_lookahead == WordToken::Char('%') {
+                if self.word_lookahead() == WordToken::Char('%') {
                     self.advance_word();
-                    let word = self.parse_word_until(WordToken::Char('}'), false);
+                    let word = self.parse_word_until(WordToken::Char('}'));
                     return ParameterExpansion::RemoveLargestSuffix(parameter, word);
                 } else {
-                    let word = self.parse_word_until(WordToken::Char('}'), false);
+                    let word = self.parse_word_until(WordToken::Char('}'));
                     return ParameterExpansion::RemoveSmallestSuffix(parameter, word);
                 }
             }
 
-            if self.word_lookahead == WordToken::Char('#') {
+            if self.word_lookahead() == WordToken::Char('#') {
                 self.advance_word();
-                if self.word_lookahead == WordToken::Char('#') {
+                if self.word_lookahead() == WordToken::Char('#') {
                     self.advance_word();
-                    let word = self.parse_word_until(WordToken::Char('}'), false);
+                    let word = self.parse_word_until(WordToken::Char('}'));
                     return ParameterExpansion::RemoveLargestPrefix(parameter, word);
                 } else {
-                    let word = self.parse_word_until(WordToken::Char('}'), false);
+                    let word = self.parse_word_until(WordToken::Char('}'));
 
                     return ParameterExpansion::RemoveSmallestPrefix(parameter, word);
                 }
             }
             // TODO: restructure this for better errors
-            if self.word_lookahead == WordToken::Char(':') {
+            if self.word_lookahead() == WordToken::Char(':') {
                 self.advance_word();
-                let operation = self.word_lookahead;
+                let operation = self.word_lookahead();
                 self.advance_word();
-                let word = self.parse_word_until(WordToken::Char('}'), false);
+                let word = self.parse_word_until(WordToken::Char('}'));
                 match operation {
                     WordToken::Char('-') => {
                         ParameterExpansion::NullUnsetUseDefault(parameter, word)
@@ -204,9 +227,9 @@ impl<'src> Parser<'src> {
                     _ => todo!("error"),
                 }
             } else {
-                let operation = self.word_lookahead;
+                let operation = self.word_lookahead();
                 self.advance_word();
-                let word = self.parse_word_until(WordToken::Char('}'), false);
+                let word = self.parse_word_until(WordToken::Char('}'));
                 if word.is_none() && operation == WordToken::Char('}') {
                     return ParameterExpansion::Simple(parameter);
                 }
@@ -225,11 +248,7 @@ impl<'src> Parser<'src> {
         }
     }
 
-    fn parse_word_until(&mut self, end: WordToken, set_lookahead: bool) -> Option<Word> {
-        if set_lookahead {
-            self.advance_word();
-        }
-
+    fn parse_word_until(&mut self, end: WordToken) -> Option<Word> {
         let mut current_literal = String::new();
         let mut word_parts = Vec::new();
         fn push_literal(literal: &mut String, parts: &mut Vec<WordPart>) {
@@ -251,10 +270,10 @@ impl<'src> Parser<'src> {
         let mut inside_double_quotes = false;
 
         loop {
-            if !inside_double_quotes && self.word_lookahead == end {
+            if !inside_double_quotes && self.word_lookahead() == end {
                 break;
             }
-            match self.word_lookahead {
+            match self.word_lookahead() {
                 WordToken::DoubleQuote => {
                     inside_double_quotes = !inside_double_quotes;
                     current_literal.push('"');
@@ -263,7 +282,7 @@ impl<'src> Parser<'src> {
                     current_literal.push('\'');
                     if !inside_double_quotes {
                         loop {
-                            if let Some(c) = self.lexer.next_char() {
+                            if let Some((c, _)) = self.lexer.next_char() {
                                 current_literal.push(c);
                                 if c == '\'' {
                                     break;
@@ -282,6 +301,7 @@ impl<'src> Parser<'src> {
                     );
                 }
                 WordToken::Backtick => {
+                    self.advance_word();
                     push_literal_and_insert(
                         &mut current_literal,
                         &mut word_parts,
@@ -293,6 +313,7 @@ impl<'src> Parser<'src> {
                     continue;
                 }
                 WordToken::CommandSubstitutionStart => {
+                    self.advance_word();
                     push_literal_and_insert(
                         &mut current_literal,
                         &mut word_parts,
@@ -321,8 +342,6 @@ impl<'src> Parser<'src> {
                 }
                 WordToken::Char(c) => {
                     if !inside_double_quotes && (is_operator(c) || is_blank(c)) {
-                        // the last character is not part of a word
-                        self.lexer.rollback_last_char();
                         break;
                     }
                     current_literal.push(c);
@@ -346,14 +365,14 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_redirection_kind(&mut self) -> Option<RedirectionKind> {
-        if self.shell_lookahead == ShellToken::DLess
-            || self.shell_lookahead == ShellToken::DLessDash
+        if self.shell_lookahead() == ShellToken::DLess
+            || self.shell_lookahead() == ShellToken::DLessDash
         {
-            let remove_leading_tabs = self.shell_lookahead == ShellToken::DLessDash;
+            let remove_leading_tabs = self.shell_lookahead() == ShellToken::DLessDash;
             let mut contents = String::new();
-            let end = self.lexer.next_line();
+            let end = self.lexer.next_line().0;
             loop {
-                let line = self.lexer.next_line();
+                let line = self.lexer.next_line().0;
                 if line == end {
                     break;
                 }
@@ -365,7 +384,7 @@ impl<'src> Parser<'src> {
             }
             return Some(RedirectionKind::HereDocument { contents });
         }
-        let kind = match self.shell_lookahead {
+        let kind = match self.shell_lookahead() {
             ShellToken::Greater => IORedirectionKind::RedirectOutput,
             ShellToken::Clobber => IORedirectionKind::RedirectOutputClobber,
             ShellToken::DGreat => IORedirectionKind::RedirectOuputAppend,
@@ -377,8 +396,8 @@ impl<'src> Parser<'src> {
         };
         // advance the operator
         self.advance_shell();
-        if self.shell_lookahead == ShellToken::WordStart {
-            let file = self.parse_word_until(WordToken::EOF, true).unwrap();
+        if self.shell_lookahead() == ShellToken::WordStart {
+            let file = self.parse_word_until(WordToken::EOF).unwrap();
             Some(RedirectionKind::IORedirection { kind, file })
         } else {
             todo!("error: expected word, got ..")
@@ -386,7 +405,7 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_redirection_opt(&mut self) -> Option<Redirection> {
-        if let ShellToken::IoNumber(n) = self.shell_lookahead {
+        if let ShellToken::IoNumber(n) = self.shell_lookahead() {
             if !(0..9).contains(&n) {
                 // TODO: bash supports (0..1023), should look into this
                 todo!("error: bad file descriptor");
@@ -415,19 +434,18 @@ impl<'src> Parser<'src> {
         let mut command = SimpleCommand::default();
 
         loop {
-            match self.shell_lookahead {
+            match self.shell_lookahead() {
                 ShellToken::WordStart => {
-                    if let Some(word) = self.parse_word_until(word_stop, true) {
+                    if let Some(word) = self.parse_word_until(word_stop) {
                         match try_word_to_assignment(word) {
                             Ok(assignment) => command.assignments.push(assignment),
                             Err(cmd) => {
                                 command.command = Some(cmd);
-                                self.advance_shell();
                                 break;
                             }
                         }
                     }
-                    if word_stop != WordToken::EOF && self.word_lookahead == word_stop {
+                    if word_stop != WordToken::EOF && self.word_lookahead() == word_stop {
                         return command;
                     }
                 }
@@ -443,12 +461,12 @@ impl<'src> Parser<'src> {
         }
 
         loop {
-            match self.shell_lookahead {
+            match self.shell_lookahead() {
                 ShellToken::WordStart => {
-                    if let Some(word) = self.parse_word_until(word_stop, true) {
+                    if let Some(word) = self.parse_word_until(word_stop) {
                         command.arguments.push(word);
                     }
-                    if word_stop != WordToken::EOF && self.word_lookahead == word_stop {
+                    if word_stop != WordToken::EOF && self.word_lookahead() == word_stop {
                         return command;
                     }
                 }
@@ -482,7 +500,7 @@ impl<'src> Parser<'src> {
         // TODO: implement the "!"* part
         let mut commands = Vec::new();
         commands.push(self.parse_command(word_stop));
-        while self.shell_lookahead == ShellToken::Pipe {
+        while self.shell_lookahead() == ShellToken::Pipe {
             self.advance_shell();
             self.skip_linebreak();
             commands.push(self.parse_command(word_stop));
@@ -517,15 +535,15 @@ impl<'src> Parser<'src> {
     fn parse_complete_command(&mut self, word_stop: WordToken) -> CompleteCommand {
         // complete_command = and_or (separator_op and_or)* separator_op?
         let mut commands = Vec::new();
-        while self.shell_lookahead != ShellToken::Newline {
+        while self.shell_lookahead() != ShellToken::Newline {
             let mut and_or = self.parse_and_or(word_stop);
             // FIXME: very ugly, should move is_async somewhere else
-            if self.shell_lookahead == ShellToken::And {
+            if self.shell_lookahead() == ShellToken::And {
                 and_or.is_async = true;
             }
             commands.push(and_or);
-            if self.shell_lookahead == ShellToken::And
-                || self.shell_lookahead == ShellToken::SemiColon
+            if self.shell_lookahead() == ShellToken::And
+                || self.shell_lookahead() == ShellToken::SemiColon
             {
                 self.advance_shell();
             } else {
@@ -541,12 +559,12 @@ impl<'src> Parser<'src> {
         self.advance_shell();
         self.skip_linebreak();
         let mut commands = Vec::new();
-        while self.shell_lookahead != ShellToken::EOF {
+        while self.shell_lookahead() != ShellToken::EOF {
             if commands.len() > 0 {
                 self.match_shell_token(ShellToken::Newline);
                 self.skip_linebreak();
             }
-            if self.shell_lookahead == ShellToken::EOF {
+            if self.shell_lookahead() == ShellToken::EOF {
                 break;
             }
             commands.push(self.parse_complete_command(WordToken::EOF));
@@ -558,8 +576,8 @@ impl<'src> Parser<'src> {
     fn new(source: &'src str) -> Self {
         Self {
             lexer: Lexer::new(source),
-            shell_lookahead: ShellToken::EOF,
-            word_lookahead: WordToken::EOF,
+            shell_lookahead: (ShellToken::EOF, SourceLocation::default()),
+            word_lookahead: (WordToken::EOF, SourceLocation::default()),
         }
     }
 }

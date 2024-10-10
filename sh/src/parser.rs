@@ -485,8 +485,53 @@ impl<'src> Parser<'src> {
         }
     }
 
-    fn parse_compound_command(&mut self) -> Option<CompoundCommand> {
+    fn parse_brace_group(&mut self) -> CompoundCommand {
         todo!()
+    }
+
+    fn parse_subshell(&mut self) -> CompoundCommand {
+        todo!()
+    }
+
+    fn parse_for_clause(&mut self) -> CompoundCommand {
+        todo!()
+    }
+
+    fn parse_case_clause(&mut self) -> CompoundCommand {
+        todo!()
+    }
+
+    fn parse_if_clause(&mut self) -> CompoundCommand {
+        todo!()
+    }
+
+    fn parse_while_clause(&mut self) -> CompoundCommand {
+        todo!()
+    }
+
+    fn parse_until_clause(&mut self) -> CompoundCommand {
+        todo!()
+    }
+
+    fn parse_compound_command(&mut self) -> Option<Command> {
+        let command = match self.shell_lookahead() {
+            ShellToken::LBrace => self.parse_brace_group(),
+            ShellToken::LParen => self.parse_subshell(),
+            ShellToken::For => self.parse_for_clause(),
+            ShellToken::Case => self.parse_case_clause(),
+            ShellToken::If => self.parse_if_clause(),
+            ShellToken::While => self.parse_while_clause(),
+            ShellToken::Until => self.parse_until_clause(),
+            _ => return None,
+        };
+        let mut redirections = Vec::new();
+        while let Some(redirection) = self.parse_redirection_opt() {
+            redirections.push(redirection);
+        }
+        Some(Command::CompoundCommand {
+            command,
+            redirections,
+        })
     }
 
     fn parse_command(&mut self, word_stop: WordToken) -> Command {
@@ -494,8 +539,12 @@ impl<'src> Parser<'src> {
         // 			| compound_command redirect_list?
         // 			| simple_command
         // 			| function_definition
-        Command::SimpleCommand(self.parse_simple_command(word_stop))
-        // TODO: other commands
+        if let Some(command) = self.parse_compound_command() {
+            command
+        } else {
+            // TODO: decide between function definition and simple command
+            Command::SimpleCommand(self.parse_simple_command(word_stop))
+        }
     }
 
     fn parse_pipeline(&mut self, word_stop: WordToken) -> Pipeline {

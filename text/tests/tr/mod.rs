@@ -371,3 +371,19 @@ fn tr_reverse_order_simple() {
 fn tr_duplicate_string1_character_precedence() {
     tr_test(&["AA", "CB"], "AAAA", "BBBB");
 }
+
+// Prevent regression to:
+//
+//    Error: Missing symbol after '['
+#[test]
+fn tr_left_square_bracket_literal() {
+    tr_test(&["1", "["], "123", "[23");
+}
+
+// Prevent regression to:
+//
+//    Error: Missing '*' after '[' for symbol ':'
+#[test]
+fn tr_multiple_transformations() {
+    tr_test(&["3[:lower:]", "![:upper:]"], "abc123", "ABC12!");
+}

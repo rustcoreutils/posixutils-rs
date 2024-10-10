@@ -278,8 +278,8 @@ fn test_od_22() {
 // Given that most other implementations of `od` print one or more leading spaces, for compatibility, one
 // leading space will be printed.
 //
-// Busybox, GNU Core Utilities, uutils's coreutils: 1 leading space
-// Toybox: 2 leading spaces
+// BusyBox, GNU Core Utilities, uutils's coreutils: 1 leading space
+// toybox: 2 leading spaces
 //
 // Also, none of these implementations print trailing spaces
 #[test]

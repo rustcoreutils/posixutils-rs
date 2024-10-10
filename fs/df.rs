@@ -323,7 +323,7 @@ fn read_mount_info() -> io::Result<MountList> {
 fn read_mount_info() -> io::Result<MountList> {
     let mut info = MountList::new();
 
-    let mounts = MountTable::try_new()?;
+    let mounts = MountTable::open_system()?;
     for mount in mounts {
         unsafe {
             let mut buf: libc::statfs = std::mem::zeroed();

@@ -4,7 +4,12 @@ use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Read};
+use std::error::Error;
+use std::io::{self, Read, Write};
+use std::iter::{self, Peekable};
+use std::process;
+use std::slice::Iter;
+use std::sync::OnceLock;
 
 /// tr - translate or delete characters
 #[derive(Parser)]
@@ -37,26 +42,33 @@ impl Args {
     fn validate_args(&self) -> Result<(), String> {
         // Check if conflicting options are used together
         if self.complement_char && self.complement_val {
-            return Err("Options '-c' and '-C' cannot be used together".to_string());
+            return Err("Options '-c' and '-C' cannot be used together".to_owned());
         }
+
         if self.squeeze_repeats
             && self.string2.is_none()
             && (self.complement_char || self.complement_val)
             && !self.delete
         {
-            return Err("Option '-c' or '-C' may only be used with 2 strings".to_string());
+            return Err("Option '-c' or '-C' may only be used with 2 strings".to_owned());
         }
 
         if !self.squeeze_repeats && !self.delete && self.string2.is_none() {
-            return Err("Need two strings operand".to_string());
+            return Err("Need two strings operand".to_owned());
         }
 
         if self.string1.is_empty() {
-            return Err("At least 1 string operand is required".to_string());
+            return Err("At least 1 string operand is required".to_owned());
         }
 
         Ok(())
     }
+}
+
+#[derive(Clone)]
+enum CharRepetition {
+    AsManyAsNeeded,
+    N(usize),
 }
 
 // The Char struct represents a character along with its repetition count.
@@ -65,13 +77,13 @@ struct Char {
     // The character.
     char: char,
     // The number of times the character is repeated
-    repeated: usize,
+    char_repetition: CharRepetition,
 }
 
-// The Equiv struct represents a character equivalent.
+// The Equiv struct represents a character equivalent
 #[derive(Clone)]
 struct Equiv {
-    // The character equivalent.
+    // The character equivalent
     char: char,
 }
 
@@ -93,101 +105,24 @@ impl Operand {
     /// # Returns
     ///
     /// `true` if the target character is found, `false` otherwise.
-    fn contains(operands: &Vec<Operand>, target: &char) -> bool {
+    fn contains(operands: &[Operand], target: &char) -> bool {
         for operand in operands {
             match operand {
-                Operand::Equiv(e) => {
-                    if compare_deunicoded_chars(e.char, *target) {
+                Operand::Equiv(eq) => {
+                    if compare_deunicoded_chars(eq.char, *target) {
                         return true;
                     }
                 }
-                Operand::Char(c) => {
-                    if c.char == *target {
+                Operand::Char(ch) => {
+                    if ch.char == *target {
                         return true;
                     }
                 }
             }
         }
+
         false
     }
-}
-
-/// Filters out `Char` elements from a vector of `Operand` elements.
-///
-/// # Arguments
-///
-/// * `operands` - A vector of `Operand` elements.
-///
-/// # Returns
-///
-/// A vector of `Char` elements.
-fn filter_chars(operands: Vec<Operand>) -> Vec<Char> {
-    operands
-        .into_iter()
-        .filter_map(|operand| {
-            if let Operand::Char(c) = operand {
-                Some(c)
-            } else {
-                None
-            }
-        })
-        .collect()
-}
-
-/// Creates a minimal string with a given size using a vector of `Char` elements.
-///
-/// # Arguments
-///
-/// * `chars` - A vector of `Char` elements.
-/// * `size` - The desired size of the resulting string.
-///
-/// # Returns
-///
-/// A vector of characters representing the minimal string.
-fn create_minimal_string(chars: Vec<Char>, size: usize) -> Vec<char> {
-    let mut result = vec![];
-    let mut remaining_space = size;
-    let mut overflow_chars: Vec<(usize, Char)> = vec![];
-
-    // Add chars with repeated == 1 to the result
-    for ch in &chars {
-        if ch.repeated == 1 {
-            if remaining_space > 0 {
-                result.push(ch.char);
-                remaining_space -= 1;
-            }
-        } else if remaining_space >= ch.repeated {
-            for _ in 0..ch.repeated {
-                result.push(ch.char);
-            }
-
-            remaining_space -= ch.repeated;
-        } else {
-            overflow_chars.push((result.len(), ch.clone()));
-        }
-    }
-
-    // Add remaining chars from overflow_chars if there's still space
-    if !overflow_chars.is_empty() {
-        for (insert_position, char) in overflow_chars.iter().rev() {
-            if remaining_space > 0 {
-                let chars_to_add = remaining_space.min(char.repeated);
-                let replace_with = vec![char.char; chars_to_add];
-                result.splice(insert_position..insert_position, replace_with);
-
-                remaining_space -= chars_to_add;
-            }
-        }
-    }
-
-    if result.len() < size {
-        let last = *result.last().unwrap();
-        for _ in 0..size - result.len() {
-            result.push(last);
-        }
-    }
-
-    result
 }
 
 /// Parses a sequence in the format `[=equiv=]` from the given character iterator.
@@ -212,33 +147,39 @@ fn create_minimal_string(chars: Vec<Char>, size: usize) -> Vec<char> {
 /// - The sequence does not contain a closing `]`.
 /// - The sequence contains no characters between the `=` symbols.
 ///
-fn parse_equiv(chars: &mut std::iter::Peekable<std::str::Chars>) -> Result<Vec<Operand>, String> {
-    chars.next(); // Skip '='
+fn parse_equiv(chars: &mut Peekable<Iter<char>>) -> Result<Vec<Operand>, String> {
+    // Skip '[='
+    assert!(chars.next() == Some(&'['));
+    assert!(chars.next() == Some(&'='));
+
     let mut equiv = String::new();
 
     while let Some(&next_ch) = chars.peek() {
-        if next_ch == '=' {
+        if next_ch == &'=' {
             break;
         }
-        equiv.push(next_ch);
+
         chars.next();
+
+        equiv.push(*next_ch);
     }
 
     if equiv.is_empty() {
-        return Err("Error: Missing equiv symbol after '[='".to_string());
+        return Err("Error: Missing equiv symbol after '[='".to_owned());
     }
 
     // Skip '='
     let Some('=') = chars.next() else {
-        return Err("Error: Missing '=' before ']' for '[=equiv=]'".to_string());
+        return Err("Error: Missing '=' before ']' for '[=equiv=]'".to_owned());
     };
 
     // Skip ']'
     let Some(']') = chars.next() else {
-        return Err("Error: Missing closing ']' for '[=equiv=]'".to_string());
+        return Err("Error: Missing closing ']' for '[=equiv=]'".to_owned());
     };
 
-    let mut operands = Vec::new();
+    let mut operands = Vec::<Operand>::new();
+
     for equiv_char in equiv.chars() {
         operands.push(Operand::Equiv(Equiv { char: equiv_char }));
     }
@@ -246,63 +187,63 @@ fn parse_equiv(chars: &mut std::iter::Peekable<std::str::Chars>) -> Result<Vec<O
     Ok(operands)
 }
 
-/// Parses a sequence in the format `[x*n]` from the given character iterator.
-///
-/// The function expects the iterator to be positioned just before the symbol `x`.
-/// It reads the symbol, the repetition count `n`, and creates an `Operand::Char`
-/// entry with the specified number of repetitions.
-///
-/// # Arguments
-///
-/// * `chars` - A mutable reference to a peekable character iterator.
-/// * `symbol` - The symbol that is being repeated.
-///
-/// # Returns
-///
-/// A `Result` containing an `Operand::Char` entry if successful, or a `String`
-/// describing the error if parsing fails.
-///
-/// # Errors
-///
-/// This function will return an error if:
-/// - The sequence does not contain a `*` after the symbol.
-/// - The sequence does not contain a closing `]`.
-/// - The repetition count `n` is not a valid positive integer.
-///
-fn parse_repeated_char(
-    chars: &mut std::iter::Peekable<std::str::Chars>,
-    symbol: char,
-) -> Result<Operand, String> {
-    // Skip '*'
-    let Some('*') = chars.next() else {
-        return Err(format!(
-            "Error: Missing '*' after '[' for symbol '{}'",
-            symbol
-        ));
-    };
+fn parse_repeated_char(chars: &[char]) -> Result<Operand, String> {
+    fn fill_repeat_str(iter: &mut Iter<char>, repeat_string: &mut String) {
+        while let Some(&ch) = iter.next() {
+            if ch == ']' {
+                assert!(iter.next().is_none());
 
-    let mut repeat_str = String::new();
-    while let Some(&digit) = chars.peek() {
-        if !digit.is_ascii_digit() {
-            break;
+                return;
+            }
+
+            repeat_string.push(ch);
         }
-        repeat_str.push(digit);
-        chars.next();
+
+        unreachable!();
     }
 
-    // Skip ']'
-    let Some(']') = chars.next() else {
-        return Err("Error: Missing closing ']'".to_string());
-    };
+    let mut iter = chars.iter();
 
-    let repeated = match repeat_str.parse::<usize>() {
-        Ok(n) if n > 0 => n,
-        _ => usize::MAX,
+    // Skip '['
+    assert!(iter.next() == Some(&'['));
+
+    // Get character before '*'
+    let char = iter.next().unwrap().to_owned();
+
+    // Skip '*'
+    assert!(iter.next() == Some(&'*'));
+
+    let mut repeat_string = String::with_capacity(chars.len());
+
+    fill_repeat_str(&mut iter, &mut repeat_string);
+
+    // "If n is omitted or is zero, it shall be interpreted as large enough to extend the string2-based sequence to the length of the string1-based sequence. If n has a leading zero, it shall be interpreted as an octal value. Otherwise, it shall be interpreted as a decimal value."
+    // https://pubs.opengroup.org/onlinepubs/9799919799/utilities/tr.html
+    let char_repetition = match repeat_string.as_str() {
+        "" => CharRepetition::AsManyAsNeeded,
+        st => {
+            let radix = if st.starts_with('0') {
+                // Octal
+                8_u32
+            } else {
+                10_u32
+            };
+
+            match usize::from_str_radix(st, radix) {
+                Ok(0_usize) => CharRepetition::AsManyAsNeeded,
+                Ok(n) => CharRepetition::N(n),
+                Err(_pa) => {
+                    return Err(format!(
+                        "tr: invalid repeat count ‘{st}’ in [c*n] construct",
+                    ));
+                }
+            }
+        }
     };
 
     Ok(Operand::Char(Char {
-        char: symbol,
-        repeated,
+        char,
+        char_repetition,
     }))
 }
 
@@ -326,36 +267,143 @@ fn parse_repeated_char(
 /// This function will return an error if:
 /// - It encounters an invalid format.
 /// - It encounters any specific error from `parse_equiv` or `parse_repeated_char`.
-///
-fn parse_symbols(input: &str) -> Result<Vec<Operand>, String> {
-    let mut operands: Vec<Operand> = Vec::new();
-    let mut chars = input.chars().peekable();
+fn parse_symbols(string1_or_string2: &str) -> Result<Vec<Operand>, String> {
+    // This capacity will be sufficient at least some of the time
+    let mut operand_vec = Vec::<Operand>::with_capacity(string1_or_string2.len());
 
-    while let Some(&ch) = chars.peek() {
+    let mut iterator = string1_or_string2.chars().peekable();
+
+    while let Some(&ch) = iterator.peek() {
         match ch {
             '[' => {
-                // Skip '['
-                chars.next();
-                let Some('=') = chars.peek() else {
-                    let symbol = chars
-                        .next()
-                        .ok_or("Error: Missing symbol after '['".to_string())?;
-                    operands.push(parse_repeated_char(&mut chars, symbol)?);
-                    continue;
-                };
+                // Use a String instead?
+                let mut vec = Vec::<char>::with_capacity(1_usize);
 
-                operands.extend(parse_equiv(&mut chars)?);
+                let mut found_closing_square_bracket = false;
+
+                for ch in iterator.by_ref() {
+                    vec.push(ch);
+
+                    // Length check is a hacky fix for "[:]", "[=]", "[]*]", etc.
+                    if ch == ']' && vec.len() > 3_usize {
+                        found_closing_square_bracket = true;
+
+                        break;
+                    }
+                }
+
+                if found_closing_square_bracket {
+                    let after_opening_square_bracket = vec.get(1_usize);
+
+                    let before_closing_square_bracket = vec.iter().rev().nth(1_usize);
+
+                    if after_opening_square_bracket == Some(&':')
+                        && before_closing_square_bracket == Some(&':')
+                    {
+                        // "[:class:]" construct
+                        let mut into_iter = vec.into_iter();
+
+                        assert!(into_iter.next() == Some('['));
+                        assert!(into_iter.next() == Some(':'));
+
+                        assert!(into_iter.next_back() == Some(']'));
+                        assert!(into_iter.next_back() == Some(':'));
+
+                        // TODO
+                        // Performance
+                        let class = into_iter.collect::<String>();
+
+                        expand_character_class(&class, &mut operand_vec)?;
+
+                        continue;
+                    }
+
+                    if after_opening_square_bracket == Some(&'=')
+                        && before_closing_square_bracket == Some(&'=')
+                    {
+                        // "[=equiv=]" construct
+                        operand_vec.extend(parse_equiv(&mut vec.iter().peekable())?);
+
+                        continue;
+                    }
+
+                    if vec.get(2_usize) == Some(&'*') {
+                        // "[x*n]" construct
+                        let operand = parse_repeated_char(&vec)?;
+
+                        operand_vec.push(operand);
+
+                        continue;
+                    }
+                }
+
+                // Not "[:class:]", "[=equiv=]", or "[x*n]"
+                // TODO
+                // This is not correct
+                // "c-c" and backslash-escape sequences must be handled
+                for ch in vec {
+                    operand_vec.push(Operand::Char(Char {
+                        char: ch,
+                        char_repetition: CharRepetition::N(1),
+                    }))
+                }
             }
             // A single backslash character (0x5C)
             // https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/V1_chap05.html#tagtcjh_2
             // https://www.unicode.org/Public/UCD/latest/ucd/NameAliases.txt
             '\\' => {
-                // Skip '\'
-                chars.next();
+                // Move past '\'
+                iterator.next();
 
-                let char_after_initial_backslash = chars.next();
+                let char_for_operand = match iterator.peek() {
+                    /* #region \octal */
+                    Some(&first_octal_digit @ '0'..='7') => {
+                        // Move past `first_octal_digit`
+                        iterator.next();
 
-                let char_for_operand = match char_after_initial_backslash {
+                        let mut st = String::with_capacity(3_usize);
+
+                        st.push(first_octal_digit);
+
+                        for _ in 0_usize..2_usize {
+                            if let Some(&octal_digit @ '0'..='7') = iterator.peek() {
+                                // Move past `octal_digit`
+                                iterator.next();
+
+                                st.push(octal_digit);
+                            } else {
+                                break;
+                            }
+                        }
+
+                        let from_str_radix_result = u16::from_str_radix(&st, 8_u32);
+
+                        let octal_digits_parsed = match from_str_radix_result {
+                            Ok(uo) => uo,
+                            Err(pa) => {
+                                return Err(format!(
+                                    "tr: failed to parse octal sequence '{st}' ({pa})"
+                                ));
+                            }
+                        };
+
+                        let byte = match u8::try_from(octal_digits_parsed) {
+                            Ok(ue) => ue,
+                            Err(tr) => {
+                                return Err(format!("tr: invalid octal sequence '{st}' ({tr})"));
+                            }
+                        };
+
+                        operand_vec.push(Operand::Char(Char {
+                            char: char::from(byte),
+                            char_repetition: CharRepetition::N(1),
+                        }));
+
+                        continue;
+                    }
+                    /* #endregion */
+                    //
+                    /* #region \character */
                     // <alert>
                     // Code point 0007
                     Some('a') => '\u{0007}',
@@ -383,7 +431,9 @@ fn parse_symbols(input: &str) -> Result<Vec<Operand>, String> {
                         // An escaped backslash
                         '\u{005C}'
                     }
-                    Some(cha) => {
+                    /* #endregion */
+                    //
+                    Some(&cha) => {
                         // If a backslash is not at the end of the string, and is not followed by one of the valid
                         // escape characters (including another backslash), the backslash is basically just ignored:
                         // the following character is the character added to the set.
@@ -400,31 +450,32 @@ fn parse_symbols(input: &str) -> Result<Vec<Operand>, String> {
                     }
                 };
 
-                operands.push(Operand::Char(Char {
+                // Move past character following '\'
+                iterator.next();
+
+                operand_vec.push(Operand::Char(Char {
                     char: char_for_operand,
-                    repeated: 1,
+                    char_repetition: CharRepetition::N(1),
                 }));
             }
-            _ => {
+            cha => {
+                // Move past `cha`
+                iterator.next();
+
                 // Add a regular character with a repetition of 1
-                operands.push(Operand::Char(Char {
-                    char: ch,
-                    repeated: 1,
+                operand_vec.push(Operand::Char(Char {
+                    char: cha,
+                    char_repetition: CharRepetition::N(1),
                 }));
-                chars.next();
             }
         }
     }
 
-    Ok(operands)
-}
+    // eprintln!("{operand_vec:?}");
 
-/// Represents the case sensitivity of character classes.
-#[derive(PartialEq)]
-enum CaseSensitive {
-    UpperCase,
-    LowerCase,
-    None,
+    // eprintln!();
+
+    Ok(operand_vec)
 }
 
 /// Compares two characters after normalizing them.
@@ -442,119 +493,55 @@ enum CaseSensitive {
 fn compare_deunicoded_chars(char1: char, char2: char) -> bool {
     let normalized_char1 = deunicode_char(char1);
     let normalized_char2 = deunicode_char(char2);
+
     normalized_char1 == normalized_char2
 }
 
-/// Expands a character class name into a vector of `Operand` elements and determines the case sensitivity.
-/// This function expands the given character class name into its corresponding characters
-/// and wraps them in `Operand::Char`. It also determines the case sensitivity of the class
-/// based on the class name. If the class name is invalid, it returns an error message.
-/// # Arguments
-///
-/// * `class` - A string slice representing the character class name.
-///
-/// # Returns
-///
-/// * `Result<(Vec<Operand>, CaseSensitive), String>` - On success, returns a tuple containing a vector of `Operand` elements and a `CaseSensitive` value.
-///   On failure, returns an error message.
-fn expand_character_class(class: &str) -> Result<(Vec<Operand>, CaseSensitive), String> {
-    let mut case_sensitive = CaseSensitive::None;
-    let result = match class {
-        "alnum" => ('0'..='9').chain('A'..='Z').chain('a'..='z').collect(),
-        "alpha" => ('A'..='Z').chain('a'..='z').collect(),
-        "digit" => ('0'..='9').collect(),
-        "lower" => {
-            case_sensitive = CaseSensitive::LowerCase;
-            ('a'..='z').collect()
-        }
-        "upper" => {
-            case_sensitive = CaseSensitive::UpperCase;
-            ('A'..='Z').collect()
-        }
+fn expand_character_class(class: &str, operand_vec: &mut Vec<Operand>) -> Result<(), String> {
+    let char_vec = match class {
+        "alnum" => ('0'..='9')
+            .chain('A'..='Z')
+            .chain('a'..='z')
+            .collect::<Vec<_>>(),
+        "alpha" => ('A'..='Z').chain('a'..='z').collect::<Vec<_>>(),
+        "digit" => ('0'..='9').collect::<Vec<_>>(),
+        "lower" => ('a'..='z').collect::<Vec<_>>(),
+        "upper" => ('A'..='Z').collect::<Vec<_>>(),
         "space" => vec![' ', '\t', '\n', '\r', '\x0b', '\x0c'],
         "blank" => vec![' ', '\t'],
         "cntrl" => (0..=31)
-            .chain(std::iter::once(127))
-            .map(|c| c as u8 as char)
-            .collect(),
-        "graph" => (33..=126).map(|c| c as u8 as char).collect(),
-        "print" => (32..=126).map(|c| c as u8 as char).collect(),
+            .chain(iter::once(127))
+            .map(|it| char::from(it as u8))
+            .collect::<Vec<_>>(),
+        "graph" => (33..=126)
+            .map(|it| char::from(it as u8))
+            .collect::<Vec<_>>(),
+        "print" => (32..=126)
+            .map(|it| char::from(it as u8))
+            .collect::<Vec<_>>(),
         "punct" => (33..=47)
             .chain(58..=64)
             .chain(91..=96)
             .chain(123..=126)
-            .map(|c| c as u8 as char)
-            .collect(),
-        "xdigit" => ('0'..='9').chain('A'..='F').chain('a'..='f').collect(),
-        _ => return Err("Error: Invalid class name ".to_string()),
+            .map(|it| char::from(it as u8))
+            .collect::<Vec<_>>(),
+        "xdigit" => ('0'..='9')
+            .chain('A'..='F')
+            .chain('a'..='f')
+            .collect::<Vec<_>>(),
+        _ => return Err("Error: Invalid class name ".to_owned()),
     };
-    Ok((
-        result
-            .into_iter()
-            .map(|c| {
-                Operand::Char(Char {
-                    char: c,
-                    repeated: 1,
-                })
-            })
-            .collect(),
-        case_sensitive,
-    ))
-}
 
-/// Parses character classes from a string input and expands them into a vector of `Operand` elements.
-///
-/// This function parses the input string for character classes in the `[:class:]` format and expands them
-/// using the `expand_character_class` function. It collects the resulting `Operand` elements and determines
-/// the case sensitivity of the character classes encountered.
-///
-/// If an invalid format is detected, the function returns an error message.
-/// # Arguments
-///
-/// * `input` - A string slice containing the input to parse.
-///
-/// # Returns
-///
-/// * `Result<(Vec<Operand>, CaseSensitive), String>` - On success, returns a tuple containing a vector of `Operand` elements and a `CaseSensitive` value.
-///   On failure, returns an error message.
-fn parse_classes(input: &str) -> Result<(Vec<Operand>, CaseSensitive), String> {
-    let mut classes: Vec<Operand> = Vec::new();
-    let mut chars = input.chars().peekable();
-    let mut case_sensitive = CaseSensitive::None;
-    while let Some(ch) = chars.next() {
-        if ch == '[' {
-            let Some(':') = chars.next() else {
-                continue;
-            };
-            // Processing the [:class:] format
+    operand_vec.reserve(char_vec.len());
 
-            let mut class = String::new();
-            while let Some(&next_ch) = chars.peek() {
-                if next_ch == ':' {
-                    break;
-                }
-                class.push(next_ch);
-                chars.next();
-            }
-            if class.is_empty() {
-                return Err("Error: Missing class name after '[:'".to_string());
-            }
-            // Skip ':'
-            let Some(':') = chars.next() else {
-                return Err("Error: Missing ':' before ']' for '[:class:]'".to_string());
-            };
-            // Skip ']'
-            let Some(']') = chars.next() else {
-                return Err("Error: Missing closing ']' for '[:class:]'".to_string());
-            };
-
-            let res = expand_character_class(&class)?;
-            case_sensitive = res.1;
-            classes.extend(res.0);
-        }
+    for ch in char_vec {
+        operand_vec.push(Operand::Char(Char {
+            char: ch,
+            char_repetition: CharRepetition::N(1),
+        }));
     }
 
-    Ok((classes, case_sensitive))
+    Ok(())
 }
 
 /// Parses an octal string and returns the corresponding character, if valid.
@@ -597,13 +584,17 @@ fn parse_octal(s: &str) -> Option<char> {
 /// - The input string does not contain a valid range.
 /// - The octal values in the range cannot be parsed into valid characters.
 ///
-fn parse_ranges(input: &str) -> Result<Vec<Operand>, String> {
-    let mut chars = Vec::new();
-    let s = input.trim_matches(|c| c == '[' || c == ']'); // Remove square brackets
-    let parts: Vec<&str> = s.split('-').collect();
+fn parse_ranges(string1_or_string2: &str) -> Result<Vec<Operand>, String> {
+    // Remove square brackets
+    let input_without_square_brackets =
+        string1_or_string2.trim_matches(|ch| ch == '[' || ch == ']');
 
-    let start = parts[0];
-    let end = parts[1];
+    let mut split = input_without_square_brackets.split('-');
+
+    let start = split.next().ok_or("Iteration failed")?;
+    let end = split.next().ok_or("Iteration failed")?;
+
+    let mut chars = Vec::<char>::new();
 
     if start.starts_with('\\') && end.starts_with('\\') {
         // Processing the \octal-\octal range
@@ -624,47 +615,34 @@ fn parse_ranges(input: &str) -> Result<Vec<Operand>, String> {
         let start_char = start.chars().next().unwrap();
         let end_char = end.chars().next().unwrap();
 
-        for c in start_char..=end_char {
-            chars.push(c);
+        for ch in start_char..=end_char {
+            chars.push(ch);
         }
     }
 
-    Ok(chars
+    let vec = chars
         .into_iter()
-        .map(|c| {
+        .map(|ch| {
             Operand::Char(Char {
-                char: c,
-                repeated: 1,
+                char: ch,
+                char_repetition: CharRepetition::N(1),
             })
         })
-        .collect())
+        .collect::<Vec<_>>();
+
+    Ok(vec)
 }
 
-/// Parses a set expression and returns a vector of `Operand`s and a `CaseSensitive` flag.
-///
-/// The function determines the type of set based on its format and delegates
-/// the parsing to the appropriate helper function. The supported formats are:
-/// - Character classes in the form of `[:class:]`
-/// - Single ranges such as `[a-z]` or `[\\141-\\172]`
-/// - Symbols and characters not fitting the above categories
-///
-/// # Arguments
-///
-/// * `set` - A string slice representing the set expression to be parsed.
-///
-/// # Returns
-///
-/// * `Result<(Vec<Operand>, CaseSensitive), String>` - Returns `Ok((Vec<Operand>, CaseSensitive))`
-///   on successful parsing. Returns `Err(String)` with an error message if the input is invalid.
-///
-fn parse_set(set: &str) -> Result<(Vec<Operand>, CaseSensitive), String> {
-    if set.starts_with("[:") && set.ends_with(":]") {
-        Ok(parse_classes(set)?)
-    } else if contains_single_range(set) {
-        Ok((parse_ranges(set)?, CaseSensitive::None))
+fn parse_string1_or_string2(string1_or_string2: &str) -> Result<Vec<Operand>, String> {
+    let vec = if contains_single_range(string1_or_string2) {
+        // TODO
+        // Ranges need to be handled in all cases
+        parse_ranges(string1_or_string2)?
     } else {
-        Ok((parse_symbols(set)?, CaseSensitive::None))
-    }
+        parse_symbols(string1_or_string2)?
+    };
+
+    Ok(vec)
 }
 
 /// Determines if a string contains a single valid range expression.
@@ -684,18 +662,22 @@ fn parse_set(set: &str) -> Result<(Vec<Operand>, CaseSensitive), String> {
 /// * `bool` - Returns `true` if the input string matches any of the valid range formats.
 ///   Returns `false` otherwise.
 ///
-fn contains_single_range(s: &str) -> bool {
-    // Regular expression for a range of characters or \octal
-    let re = Regex::new(
-        r"(?x)
-        ^ \[ [a-zA-Z0-9\\]+ - [a-zA-Z0-9\\]+ \] $ |   # Range in square brackets
-        ^ \\ [0-7]{1,3} - \\ [0-7]{1,3} $ |           # Range \octal-\octal
-        ^ [a-zA-Z0-9] - [a-zA-Z0-9] $                 # Character-symbol range
-    ",
-    )
-    .unwrap();
+fn contains_single_range(string1_or_string2: &str) -> bool {
+    static REGEX_ONCE_CELL: OnceLock<Regex> = OnceLock::<Regex>::new();
 
-    re.is_match(s)
+    let regex = REGEX_ONCE_CELL.get_or_init(|| {
+        // Regular expression for a range of characters or \octal
+        Regex::new(
+            r"(?x)
+            ^ \[ [a-zA-Z0-9\\]+ - [a-zA-Z0-9\\]+ \] $ |   # Range in square brackets
+            ^ \\ [0-7]{1,3} - \\ [0-7]{1,3} $ |           # Range \octal-\octal
+            ^ [a-zA-Z0-9] - [a-zA-Z0-9] $                 # Character-symbol range
+        ",
+        )
+        .unwrap()
+    });
+
+    regex.is_match(string1_or_string2)
 }
 
 /// Computes the complement of a string with respect to two sets of characters.
@@ -717,34 +699,60 @@ fn contains_single_range(s: &str) -> bool {
 ///
 /// * `String` - Returns a string representing the complement of the input string.
 ///
-fn complement_chars(input: &str, chars1: Vec<Operand>, mut chars2: Vec<Operand>) -> String {
+fn complement_chars(
+    input: &str,
+    chars1: &[Operand],
+    chars2: &[Operand],
+) -> Result<String, Box<dyn Error>> {
+    let mut depleted = Vec::<usize>::with_capacity(chars2.len());
+
+    for op in chars2 {
+        if let Operand::Char(ch) = op {
+            if let CharRepetition::N(n) = ch.char_repetition {
+                depleted.push(n);
+
+                continue;
+            }
+        }
+
+        depleted.push(usize::MAX);
+    }
+
+    let depleted_clone = depleted.clone();
+
     // Create a variable to store the result
     let mut result = String::new();
-    let chars_2_const = chars2.clone();
 
     // Initialize the index for the chars2 vector
     let mut chars2_index = 0;
 
-    // Convert the input string to a character vector for easy processing
-    let input_chars: Vec<char> = input.chars().collect();
-
     // Go through each character in the input string
-    for &ch in &input_chars {
+    for ch in input.chars() {
         // Check if the character is in the chars1 vector
-        if Operand::contains(&chars1, &ch) {
+        if Operand::contains(chars1, &ch) {
             // If the character is in the chars1 vector, add it to the result without changing it
             result.push(ch);
+
             continue;
         }
+
         // If the character is not in the chars1 vector, replace it with a character from the chars2 vector
         // Add the character from the chars2 vector to the result
-        let operand = &mut chars2[chars2_index];
+        // TODO
+        // Indexing
+        let operand = chars2.get(chars2_index).ok_or("Indexing failed")?;
+
         match operand {
             Operand::Char(char) => {
                 result.push(char.char);
-                char.repeated -= 1;
 
-                if char.repeated > 0 {
+                let mut_ref = depleted.get_mut(chars2_index).ok_or("Indexing failed")?;
+
+                let decremented = (*mut_ref) - 1_usize;
+
+                *mut_ref = decremented;
+
+                if decremented > 0_usize {
                     continue;
                 }
             }
@@ -759,11 +767,12 @@ fn complement_chars(input: &str, chars1: Vec<Operand>, mut chars2: Vec<Operand>)
         // If the index has reached the end of the chars2 vector, reset it to zero
         if chars2_index >= chars2.len() {
             chars2_index = 0;
-            chars2.clone_from(&chars_2_const);
+
+            depleted.clone_from(&depleted_clone);
         }
     }
 
-    result
+    Ok(result)
 }
 
 /// Checks if a character is repeatable based on certain conditions.
@@ -787,21 +796,181 @@ fn complement_chars(input: &str, chars1: Vec<Operand>, mut chars2: Vec<Operand>)
 ///            Returns `false` otherwise.
 ///
 fn check_repeatable(
-    c: char,
+    ch: char,
     char_counts: &HashMap<char, usize>,
     seen: &mut HashSet<char>,
-    set2: &Vec<Operand>,
+    set2: &[Operand],
 ) -> bool {
-    if char_counts[&c] > 1 && Operand::contains(set2, &c) {
-        if seen.contains(&c) {
+    if char_counts[&ch] > 1 && Operand::contains(set2, &ch) {
+        if seen.contains(&ch) {
             false
         } else {
-            seen.insert(c);
+            seen.insert(ch);
+
             true
         }
     } else {
         true
     }
+}
+
+// TODO
+// This should be optimized
+fn generate_transformation_hash_map(
+    string1_operands: &[Operand],
+    string2_operands: &[Operand],
+) -> Result<HashMap<char, char>, Box<dyn Error>> {
+    let mut char_repeating_total = 0_usize;
+
+    let mut string1_operands_flattened = Vec::<char>::new();
+
+    for op in string1_operands {
+        match op {
+            Operand::Char(ch) => match ch.char_repetition {
+                CharRepetition::AsManyAsNeeded => {
+                    return Err(Box::from(
+                        "tr: the [c*] repeat construct may not appear in string1".to_owned(),
+                    ));
+                }
+                CharRepetition::N(n) => {
+                    char_repeating_total = char_repeating_total
+                        .checked_add(n)
+                        .ok_or("Arithmetic overflow")?;
+
+                    for _ in 0_usize..n {
+                        string1_operands_flattened.push(ch.char);
+                    }
+                }
+            },
+            _ => {
+                return Err(Box::from("Expectation violated".to_owned()));
+            }
+        }
+    }
+
+    let mut as_many_as_needed_index = Option::<usize>::None;
+
+    let mut replacement_char_repeating_total = 0_usize;
+
+    for (us, op) in string2_operands.iter().enumerate() {
+        match op {
+            Operand::Char(ch) => match ch.char_repetition {
+                CharRepetition::AsManyAsNeeded => {
+                    if as_many_as_needed_index.is_some() {
+                        return Err(Box::from(
+                            "tr: only one [c*] repeat construct may appear in string2".to_owned(),
+                        ));
+                    }
+
+                    as_many_as_needed_index = Some(us);
+                }
+                CharRepetition::N(n) => {
+                    replacement_char_repeating_total = replacement_char_repeating_total
+                        .checked_add(n)
+                        .ok_or("Arithmetic overflow")?;
+                }
+            },
+            _ => {
+                return Err(Box::from("Expectation violated".to_owned()));
+            }
+        }
+    }
+
+    let mut string2_operands_with_leftover: Vec<Operand>;
+
+    let string2_operands_to_use = if replacement_char_repeating_total < char_repeating_total {
+        let leftover = char_repeating_total
+            .checked_sub(replacement_char_repeating_total)
+            .ok_or("Arithmetic overflow")?;
+
+        string2_operands_with_leftover = string2_operands.to_vec();
+
+        match as_many_as_needed_index {
+            Some(us) => {
+                let op = string2_operands_with_leftover
+                    .get_mut(us)
+                    .ok_or("Indexing failed")?;
+
+                match op {
+                    Operand::Char(ch) => {
+                        *op = Operand::Char(Char {
+                            char: ch.char,
+                            char_repetition: CharRepetition::N(leftover),
+                        });
+                    }
+                    _ => {
+                        return Err(Box::from("Expectation violated".to_owned()));
+                    }
+                }
+            }
+            None => {
+                let op = string2_operands_with_leftover
+                    .last_mut()
+                    .ok_or("Unexpected empty collection")?;
+
+                match op {
+                    Operand::Char(ch) => {
+                        let current_n = match ch.char_repetition {
+                            CharRepetition::N(n) => n,
+                            _ => {
+                                return Err(Box::from("Expectation violated".to_owned()));
+                            }
+                        };
+
+                        let current_n_plus_leftover = current_n
+                            .checked_add(leftover)
+                            .ok_or("Arithmetic overflow")?;
+
+                        *op = Operand::Char(Char {
+                            char: ch.char,
+                            char_repetition: CharRepetition::N(current_n_plus_leftover),
+                        });
+                    }
+                    _ => {
+                        return Err(Box::from("Expectation violated".to_owned()));
+                    }
+                }
+            }
+        }
+
+        &string2_operands_with_leftover
+    } else {
+        string2_operands
+    };
+
+    // TODO
+    // Capacity
+    let mut string2_operands_to_use_flattened = Vec::<char>::new();
+
+    for op in string2_operands_to_use {
+        match op {
+            Operand::Char(ch) => match ch.char_repetition {
+                CharRepetition::N(n) => {
+                    for _ in 0_usize..n {
+                        string2_operands_to_use_flattened.push(ch.char);
+                    }
+                }
+                CharRepetition::AsManyAsNeeded => {
+                    // The "[c*]" construct was not needed, ignore it
+                }
+            },
+            _ => {
+                return Err(Box::from("Expectation violated".to_owned()));
+            }
+        }
+    }
+
+    let mut translation_hash_map = HashMap::<char, char>::new();
+
+    for (us, ch) in string1_operands_flattened.into_iter().enumerate() {
+        let cha = string2_operands_to_use_flattened
+            .get(us)
+            .ok_or("Indexing failed")?;
+
+        translation_hash_map.insert(ch, *cha);
+    }
+
+    Ok(translation_hash_map)
 }
 
 /// Translates or deletes characters from standard input, according to specified arguments.
@@ -821,81 +990,103 @@ fn check_repeatable(
 ///
 fn tr(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut input = String::new();
+
+    // TODO
+    // tr should be streaming
     io::stdin()
         .read_to_string(&mut input)
         .expect("Failed to read input");
 
-    let (set1, set_1_collection) = parse_set(&args.string1)?;
-    let (mut set2, mut set_2_collection) = (None, CaseSensitive::None);
-    if let Some(string2) = &args.string2 {
-        let result = parse_set(string2)?;
-        set2 = Some(result.0);
-        set_2_collection = result.1;
-    }
+    let string1_operands = parse_string1_or_string2(&args.string1)?;
+
+    let string2_operands_option = match &args.string2 {
+        Some(st) => Some(parse_string1_or_string2(st)?),
+        None => None,
+    };
+
+    let mut stdout_lock = io::stdout().lock();
 
     if args.delete {
-        let mut filtered_string: String;
-
-        if args.complement_char || args.complement_val {
-            filtered_string = input
+        let filtered_string = if args.complement_char || args.complement_val {
+            input
                 .chars()
-                .filter(|c| Operand::contains(&set1, c))
-                .collect();
+                .filter(|c| Operand::contains(&string1_operands, c))
+                .collect::<String>()
         } else {
-            filtered_string = input
+            input
                 .chars()
-                .filter(|c| !Operand::contains(&set1, c))
-                .collect();
-        }
+                .filter(|c| !Operand::contains(&string1_operands, c))
+                .collect::<String>()
+        };
 
-        if args.squeeze_repeats && set2.is_some() {
+        let filtered_string_to_use = if args.squeeze_repeats && string2_operands_option.is_some() {
             // Counting the frequency of characters in the chars vector
-            let mut char_counts = HashMap::new();
-            for c in filtered_string.chars() {
-                *char_counts.entry(c).or_insert(0) += 1;
+            let mut char_counts = HashMap::<char, usize>::new();
+
+            for ch in filtered_string.chars() {
+                *(char_counts.entry(ch).or_insert(0)) += 1;
             }
 
-            let mut seen = HashSet::new();
-            filtered_string = filtered_string
+            let mut seen = HashSet::<char>::new();
+
+            filtered_string
                 .chars()
-                .filter(|&c| check_repeatable(c, &char_counts, &mut seen, set2.as_ref().unwrap()))
-                .collect();
-        }
+                .filter(|&ch| {
+                    check_repeatable(
+                        ch,
+                        &char_counts,
+                        &mut seen,
+                        string2_operands_option.as_deref().unwrap(),
+                    )
+                })
+                .collect::<String>()
+        } else {
+            filtered_string
+        };
 
-        print!("{filtered_string}");
+        stdout_lock.write_all(filtered_string_to_use.as_bytes())?;
+
         Ok(())
-    } else if args.squeeze_repeats && set2.is_none() {
-        let mut char_counts = HashMap::new();
-        for c in input.chars() {
-            *char_counts.entry(c).or_insert(0) += 1;
+    } else if args.squeeze_repeats && string2_operands_option.is_none() {
+        let mut char_counts = HashMap::<char, i32>::new();
+
+        for ch in input.chars() {
+            *(char_counts.entry(ch).or_insert(0)) += 1;
         }
 
-        let mut seen = HashSet::new();
-        let filtered_string: String = input
+        let mut seen = HashSet::<char>::new();
+
+        let filtered_string = input
             .chars()
-            .filter(|&c| {
-                if char_counts[&c] > 1 && Operand::contains(&set1, &c) {
-                    if seen.contains(&c) {
+            .filter(|&ch| {
+                if char_counts[&ch] > 1 && Operand::contains(&string1_operands, &ch) {
+                    if seen.contains(&ch) {
                         false
                     } else {
-                        seen.insert(c);
+                        seen.insert(ch);
+
                         true
                     }
                 } else {
                     true
                 }
             })
-            .collect();
-        print!("{filtered_string}");
+            .collect::<String>();
+
+        stdout_lock.write_all(filtered_string.as_bytes())?;
+
         return Ok(());
     } else {
-        let mut result_string: String;
-
-        if args.complement_char || args.complement_val {
+        let result_string = if args.complement_char || args.complement_val {
             if args.complement_char {
-                result_string = complement_chars(&input, set1, set2.clone().unwrap());
+                complement_chars(
+                    &input,
+                    &string1_operands,
+                    string2_operands_option.as_deref().unwrap(),
+                )?
             } else {
-                let mut set2 = set2.clone().unwrap();
+                let mut set2 = string2_operands_option.as_deref().unwrap().to_vec();
+
                 set2.sort_by(|a, b| match (a, b) {
                     (Operand::Char(char1), Operand::Char(char2)) => char1.char.cmp(&char2.char),
                     (Operand::Equiv(equiv1), Operand::Equiv(equiv2)) => {
@@ -905,108 +1096,84 @@ fn tr(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                     (Operand::Equiv(equiv1), Operand::Char(char2)) => equiv1.char.cmp(&char2.char),
                 });
 
-                result_string = complement_chars(&input, set1, set2);
+                complement_chars(&input, &string1_operands, &set2)?
             }
         } else {
-            if set_1_collection != CaseSensitive::None
-                && set_2_collection != CaseSensitive::None
-                && set_1_collection != set_2_collection
-            {
-                match set_1_collection {
-                    CaseSensitive::UpperCase => print!("{}", input.to_lowercase()),
-
-                    CaseSensitive::LowerCase => print!("{}", input.to_uppercase()),
-                    _ => (),
+            let string2_operands = match string2_operands_option.as_deref() {
+                Some(op) => op,
+                None => {
+                    return Err(Box::from("tr: missing operand".to_owned()));
                 }
-                return Ok(());
+            };
+
+            if string2_operands.is_empty() {
+                return Err(Box::from(
+                    "tr: when not truncating set1, string2 must be non-empty".to_owned(),
+                ));
             }
 
-            let set_2 = set2.clone().unwrap();
-            let input_chars: Vec<char> = input.chars().collect();
+            let transformation_map =
+                generate_transformation_hash_map(&string1_operands, string2_operands)?;
 
-            let mut result_chars = input_chars.clone();
-            let input_len = input_chars.len();
+            let mut result = String::with_capacity(input.len());
 
-            let mut start = 0;
-            let end_loop = input_len;
+            for ch in input.chars() {
+                let char_to_use = match transformation_map.get(&ch) {
+                    Some(cha) => *cha,
+                    None => ch,
+                };
 
-            while start < end_loop {
-                let mut match_len = 0;
-                let mut j = 0;
-                let mut end = start;
-
-                while j < set1.len() && end < input_len {
-                    let mut count = 0;
-
-                    if let Operand::Equiv(equiv) = &set1[j] {
-                        if end < input_len && compare_deunicoded_chars(equiv.char, input_chars[end])
-                        {
-                            j += 1;
-                            end += 1;
-                            match_len = end - start;
-                        }
-                    } else if let Operand::Char(char_struct) = &set1[j] {
-                        while end < input_len && input_chars[end] == char_struct.char {
-                            count += 1;
-                            end += 1;
-                        }
-                        if count != 0 && count <= char_struct.repeated {
-                            j += 1;
-                            match_len = end - start;
-                        } else {
-                            break;
-                        }
-                    }
-                }
-
-                if match_len > 0 {
-                    let set_2_chars = filter_chars(set_2.clone());
-                    let string_for_replace = create_minimal_string(set_2_chars, match_len);
-
-                    result_chars.splice(start..start + match_len, string_for_replace);
-
-                    start += match_len;
-                    continue;
-                }
-
-                start += 1;
+                result.push(char_to_use);
             }
 
-            result_string = result_chars.into_iter().collect();
-        }
+            result
+        };
 
-        if args.squeeze_repeats {
+        let result_string_to_use = if args.squeeze_repeats {
             // Counting the frequency of characters in the chars vector
-            let mut char_counts = HashMap::new();
-            for c in result_string.chars() {
-                *char_counts.entry(c).or_insert(0) += 1;
+            let mut char_counts = HashMap::<char, usize>::new();
+
+            for ch in result_string.chars() {
+                *(char_counts.entry(ch).or_insert(0)) += 1;
             }
 
-            let mut seen = HashSet::new();
-            result_string = result_string
-                .chars()
-                .filter(|&c| check_repeatable(c, &char_counts, &mut seen, set2.as_ref().unwrap()))
-                .collect();
-        }
+            let mut seen = HashSet::<char>::new();
 
-        print!("{result_string}");
+            result_string
+                .chars()
+                .filter(|&ch| {
+                    check_repeatable(
+                        ch,
+                        &char_counts,
+                        &mut seen,
+                        string2_operands_option.as_deref().unwrap(),
+                    )
+                })
+                .collect::<String>()
+        } else {
+            result_string
+        };
+
+        stdout_lock.write_all(result_string_to_use.as_bytes())?;
+
         return Ok(());
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn Error>> {
     setlocale(LocaleCategory::LcAll, "");
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
     let args = Args::parse();
+
     args.validate_args()?;
-    let mut exit_code = 0;
 
     if let Err(err) = tr(&args) {
-        exit_code = 1;
-        eprint!("{}", err);
+        eprintln!("{}", err);
+
+        process::exit(1);
     }
 
-    std::process::exit(exit_code)
+    Ok(())
 }

@@ -339,15 +339,51 @@ fn tr_d_space_n() {
 546869732069732061207375697465206f6620527573742d6e617469766520636f726520636f6d6d616e64206c696e65207574696c74696573202863702c206d762c0a61776b2c206d616b652c2076692c202e2e2e29207573696e6720504f5349582e323032342061732074686520626173656c696e652073706563696669636174696f6e2e0a\
 ";
 
-    tr_test(&["-d", r#" \n"#], input, output);
+    tr_test(&["-d", r" \n"], input, output);
 }
 
 #[test]
 fn tr_ignored_backslash() {
-    tr_test(&["-d", r#"\z"#], "xyz", "xy");
+    tr_test(&["-d", r"\z"], "xyz", "xy");
 }
 
 #[test]
 fn tr_escaped_backslash() {
-    tr_test(&["-d", r#"\\"#], r#"a\b\c"#, "abc");
+    tr_test(&["-d", r"\\"], r"a\b\c", "abc");
+}
+
+#[test]
+fn tr_octal_sequence() {
+    tr_test(&["2", r"\44"], "123\n", "1$3\n");
+}
+
+#[test]
+fn tr_octal_sequence_two() {
+    tr_test(&["21", r"\44Z"], "123123\n", "Z$3Z$3\n");
+}
+
+#[test]
+fn tr_reverse_order_simple() {
+    tr_test(&["21", "AB"], "12\n", "BA\n");
+}
+
+#[test]
+fn tr_duplicate_string1_character_precedence() {
+    tr_test(&["AA", "CB"], "AAAA", "BBBB");
+}
+
+// Prevent regression to:
+//
+//    Error: Missing symbol after '['
+#[test]
+fn tr_left_square_bracket_literal() {
+    tr_test(&["1", "["], "123", "[23");
+}
+
+// Prevent regression to:
+//
+//    Error: Missing '*' after '[' for symbol ':'
+#[test]
+fn tr_multiple_transformations() {
+    tr_test(&["3[:lower:]", "![:upper:]"], "abc123", "ABC12!");
 }

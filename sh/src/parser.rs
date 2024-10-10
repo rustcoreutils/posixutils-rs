@@ -1323,4 +1323,14 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn test_parse_empty_double_string_word() {
+        assert_eq!(parse_word("\"\""), literal_word("\"\""));
+    }
+
+    #[test]
+    fn test_parse_empty_single_string_word() {
+        assert_eq!(parse_word("''"), literal_word("''"));
+    }
 }

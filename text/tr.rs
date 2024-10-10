@@ -65,14 +65,14 @@ impl Args {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 enum CharRepetition {
     AsManyAsNeeded,
     N(usize),
 }
 
 // The Char struct represents a character along with its repetition count.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct Char {
     // The character.
     char: char,
@@ -81,14 +81,14 @@ struct Char {
 }
 
 // The Equiv struct represents a character equivalent
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct Equiv {
     // The character equivalent
     char: char,
 }
 
 // The Operand enum can be either a Char or an Equiv
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 enum Operand {
     Char(Char),
     Equiv(Equiv),

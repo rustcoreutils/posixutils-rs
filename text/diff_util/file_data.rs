@@ -1,72 +1,42 @@
-use std::{
-    fs::File,
-    io::{self, BufReader, Read},
-    path::PathBuf,
-    time::SystemTime,
-};
+use std::{fs::File, io, mem::take, path::PathBuf, str::from_utf8, time::SystemTime};
 
-use super::{change::Change, constants::COULD_NOT_UNWRAP_FILENAME};
+use super::constants::COULD_NOT_UNWRAP_FILENAME;
 
-pub struct FileData {
+#[derive(Debug)]
+pub struct FileData<'a> {
     path: PathBuf,
-    lines: Vec<String>,
-    changes: Vec<Change>,
+    lines: Vec<&'a str>,
     modified: SystemTime,
     ends_with_newline: bool,
 }
 
-impl FileData {
+impl<'a> FileData<'a> {
     pub fn ends_with_newline(&self) -> bool {
         self.ends_with_newline
     }
 
-    pub fn get_file(path: PathBuf) -> io::Result<Self> {
-        let file = File::open(path.clone())?;
+    pub fn get_file(
+        path: PathBuf,
+        lines: Vec<&'a str>,
+        ends_with_newline: bool,
+    ) -> io::Result<Self> {
+        let file = File::open(&path)?;
         let modified = file.metadata()?.modified()?;
-        let mut buf_reader = BufReader::new(file);
-        let mut content = String::new();
-        buf_reader.read_to_string(&mut content)?;
 
-        let mut lines = content
-            .lines()
-            .map(|line| line.to_string())
-            .collect::<Vec<String>>();
-
-        let ends_with_newline = content.ends_with("\n");
-
-        if ends_with_newline {
-            lines.push(String::from(""));
-        }
-
-        let changes = vec![Change::None; lines.len()];
-
-        let result = Self {
+        Ok(Self {
             path,
             lines,
-            changes,
             modified,
             ends_with_newline,
-        };
-
-        Ok(result)
+        })
     }
 
-    pub fn get_context_identifier(&self, change_index: usize) -> &str {
-        match self.changes[change_index] {
-            Change::None => " ",
-            Change::Unchanged(_) => " ",
-            Change::Insert(_) => "+",
-            Change::Delete(_) => "-",
-            Change::Substitute(_) => "!",
-        }
-    }
-
-    pub fn lines(&self) -> &Vec<String> {
+    pub fn lines(&self) -> &Vec<&str> {
         &self.lines
     }
 
-    pub fn line(&self, index: usize) -> &String {
-        &self.lines[index]
+    pub fn line(&self, index: usize) -> &str {
+        self.lines[index]
     }
 
     pub fn modified(&self) -> SystemTime {
@@ -80,35 +50,54 @@ impl FileData {
             }
         }
 
-        return COULD_NOT_UNWRAP_FILENAME;
-    }
-
-    pub fn set_change(&mut self, change: Change, index: usize) {
-        self.changes[index] = change;
-    }
-
-    pub fn expected_changed_in_range(
-        &self,
-        start: usize,
-        end: usize,
-        expected_changes: &Vec<fn(&Change) -> bool>,
-    ) -> bool {
-        for i in start..=end {
-            for expected_change in expected_changes {
-                if expected_change(&self.changes[i]) {
-                    return true;
-                }
-            }
-        }
-
-        return false;
-    }
-
-    pub fn change(&self, index: usize) -> &Change {
-        &self.changes[index]
+        COULD_NOT_UNWRAP_FILENAME
     }
 
     pub fn path(&self) -> &str {
         self.path.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME)
+    }
+}
+
+pub struct LineReader<'a> {
+    content: &'a [u8],
+    ends_with_newline: bool,
+}
+
+impl<'a> LineReader<'a> {
+    pub fn new(content: &'a [u8]) -> Self {
+        let ends_with_newline = content.last() == Some(&b'\n');
+        Self {
+            content,
+            ends_with_newline,
+        }
+    }
+    pub fn ends_with_newline(&self) -> bool {
+        self.ends_with_newline
+    }
+}
+
+impl<'a> Iterator for LineReader<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut carriage = false;
+        let mut iter = self.content.iter().enumerate();
+        let mut line_len = loop {
+            match iter.next() {
+                Some((i, b'\n')) => break i + 1,
+                None => {
+                    return (!self.content.is_empty()).then(|| {
+                        from_utf8(take(&mut self.content)).expect("Failed to convert to str")
+                    });
+                }
+                Some((_, &it)) => carriage = it == b'\r',
+            }
+        };
+        let (line, rest) = self.content.split_at(line_len);
+        if carriage {
+            line_len -= 1;
+        }
+        self.content = rest;
+        Some(from_utf8(&line[..line_len - 1]).expect("Failed to convert to str"))
     }
 }

@@ -229,6 +229,28 @@ impl<'src> Lexer<'src> {
             '!' => advance_and_return(self, ShellToken::Bang),
             '{' => advance_and_return(self, ShellToken::LBrace),
             '}' => advance_and_return(self, ShellToken::RBrace),
+            d if d.is_digit(10) => {
+                let start = self.current_char_index;
+                let previous_iter_value = self.source_iter.clone();
+                let previous_lookahead_value = self.lookahead;
+
+                let mut number = d.to_digit(10).unwrap();
+                self.advance_char();
+                // TODO: make this robust to integer overflow
+                while let Some(d) = self.lookahead.to_digit(10) {
+                    number *= 10;
+                    number += d;
+                    self.advance_char();
+                }
+                if self.lookahead == '>' || self.lookahead == '<' {
+                    ShellToken::IoNumber(number)
+                } else {
+                    self.current_char_index = start;
+                    self.source_iter = previous_iter_value;
+                    self.lookahead = previous_lookahead_value;
+                    ShellToken::WordStart
+                }
+            }
             other if other.is_alphabetic() => {
                 let start = self.current_char_index;
                 let previous_iter_value = self.source_iter.clone();
@@ -416,6 +438,14 @@ mod tests {
         assert_eq!(lex.next_shell_token().0, ShellToken::Until);
         assert_eq!(lex.next_shell_token().0, ShellToken::While);
         assert_eq!(lex.next_shell_token().0, ShellToken::EOF);
+    }
+
+    #[test]
+    fn lex_io_number() {
+        let mut lex = Lexer::new("123>");
+        assert_eq!(lex.next_shell_token().0, ShellToken::IoNumber(123));
+        let mut lex = Lexer::new("123");
+        assert_eq!(lex.next_shell_token().0, ShellToken::WordStart);
     }
 
     #[test]

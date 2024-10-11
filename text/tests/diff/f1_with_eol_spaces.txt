@@ -5,7 +5,6 @@ line 4
 line 5   
 line 6 will change   
 line 7   
-
 This line will be removed  
 
 line 8   

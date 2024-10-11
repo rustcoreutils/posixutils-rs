@@ -2,14 +2,13 @@ use clap::Parser;
 use deunicode::deunicode_char;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
-use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
-use std::io::{self, Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::iter::{self, Peekable};
 use std::process;
 use std::slice::Iter;
-use std::sync::OnceLock;
+use std::str::Chars;
 
 /// tr - translate or delete characters
 #[derive(Parser)]
@@ -42,7 +41,7 @@ impl Args {
     fn validate_args(&self) -> Result<(), String> {
         // Check if conflicting options are used together
         if self.complement_char && self.complement_val {
-            return Err("Options '-c' and '-C' cannot be used together".to_owned());
+            return Err("tr: options '-c' and '-C' cannot be used together".to_owned());
         }
 
         if self.squeeze_repeats
@@ -50,15 +49,14 @@ impl Args {
             && (self.complement_char || self.complement_val)
             && !self.delete
         {
-            return Err("Option '-c' or '-C' may only be used with 2 strings".to_owned());
+            return Err("tr: option '-c' or '-C' may only be used with 2 strings".to_owned());
         }
 
         if !self.squeeze_repeats && !self.delete && self.string2.is_none() {
-            return Err("Need two strings operand".to_owned());
-        }
-
-        if self.string1.is_empty() {
-            return Err("At least 1 string operand is required".to_owned());
+            return Err(format!(
+                "tr: missing operand after ‘{}’. Two strings must be given when translating.",
+                self.string1
+            ));
         }
 
         Ok(())
@@ -71,27 +69,33 @@ enum CharRepetition {
     N(usize),
 }
 
-// The Char struct represents a character along with its repetition count.
 #[derive(Clone)]
-struct Char {
-    // The character.
+struct CharOperand {
+    // The character
     char: char,
     // The number of times the character is repeated
     char_repetition: CharRepetition,
 }
 
-// The Equiv struct represents a character equivalent
 #[derive(Clone)]
-struct Equiv {
+struct EquivOperand {
     // The character equivalent
     char: char,
 }
 
-// The Operand enum can be either a Char or an Equiv
 #[derive(Clone)]
 enum Operand {
-    Char(Char),
-    Equiv(Equiv),
+    Char(CharOperand),
+    Equiv(EquivOperand),
+}
+
+impl Operand {
+    fn char(&self) -> &char {
+        match self {
+            Operand::Char(CharOperand { char, .. }) => char,
+            Operand::Equiv(EquivOperand { char }) => char,
+        }
+    }
 }
 
 impl Operand {
@@ -108,13 +112,13 @@ impl Operand {
     fn contains(operands: &[Operand], target: &char) -> bool {
         for operand in operands {
             match operand {
-                Operand::Equiv(eq) => {
-                    if compare_deunicoded_chars(eq.char, *target) {
+                Operand::Equiv(EquivOperand { char }) => {
+                    if compare_deunicoded_chars(*char, *target) {
                         return true;
                     }
                 }
-                Operand::Char(ch) => {
-                    if ch.char == *target {
+                Operand::Char(CharOperand { char, .. }) => {
+                    if char == target {
                         return true;
                     }
                 }
@@ -147,47 +151,55 @@ impl Operand {
 /// - The sequence does not contain a closing `]`.
 /// - The sequence contains no characters between the `=` symbols.
 ///
-fn parse_equiv(chars: &mut Peekable<Iter<char>>) -> Result<Vec<Operand>, String> {
+fn parse_equiv(square_bracket_constructs_buffer: &[char]) -> Result<Operand, String> {
+    let mut iter = square_bracket_constructs_buffer.iter();
+
     // Skip '[='
-    assert!(chars.next() == Some(&'['));
-    assert!(chars.next() == Some(&'='));
+    assert!(iter.next() == Some(&'['));
+    assert!(iter.next() == Some(&'='));
 
-    let mut equiv = String::new();
+    let mut between_equals_signs = Vec::<char>::with_capacity(1_usize);
 
-    while let Some(&next_ch) = chars.peek() {
-        if next_ch == &'=' {
-            break;
+    between_equals_signs.extend(iter.take_while(|&&ch| ch != '='));
+
+    let char_between_equals_signs = match between_equals_signs.as_slice() {
+        &[ch] => ch,
+        &[] => {
+            unreachable!();
         }
+        sl => {
+            const ERROR_MESSAGE_PREFIX: &str = "tr: ";
+            const ERROR_MESSAGE_SUFFIX: &str =
+                ": equivalence class operand must be a single character";
 
-        chars.next();
+            const ERROR_MESSAGE_PREFIX_AND_SUFFIX_LENGTH: usize =
+                ERROR_MESSAGE_PREFIX.len() + ERROR_MESSAGE_SUFFIX.len();
 
-        equiv.push(*next_ch);
-    }
+            let mut error_message =
+                String::with_capacity(ERROR_MESSAGE_PREFIX_AND_SUFFIX_LENGTH + sl.len());
 
-    if equiv.is_empty() {
-        return Err("Error: Missing equiv symbol after '[='".to_owned());
-    }
+            error_message.push_str(ERROR_MESSAGE_PREFIX);
 
-    // Skip '='
-    let Some('=') = chars.next() else {
-        return Err("Error: Missing '=' before ']' for '[=equiv=]'".to_owned());
+            for &ch in sl {
+                error_message.push(ch);
+            }
+
+            error_message.push_str(ERROR_MESSAGE_SUFFIX);
+
+            return Err(error_message);
+        }
     };
 
-    // Skip ']'
-    let Some(']') = chars.next() else {
-        return Err("Error: Missing closing ']' for '[=equiv=]'".to_owned());
-    };
+    let operand = Operand::Equiv(EquivOperand {
+        char: char_between_equals_signs,
+    });
 
-    let mut operands = Vec::<Operand>::new();
-
-    for equiv_char in equiv.chars() {
-        operands.push(Operand::Equiv(Equiv { char: equiv_char }));
-    }
-
-    Ok(operands)
+    Ok(operand)
 }
 
-fn parse_repeated_char(chars: &[char]) -> Result<Operand, String> {
+fn parse_repeated_char(square_bracket_constructs_buffer: &[char]) -> Result<Operand, String> {
+    // TODO
+    // Clean this up
     fn fill_repeat_str(iter: &mut Iter<char>, repeat_string: &mut String) {
         while let Some(&ch) = iter.next() {
             if ch == ']' {
@@ -202,7 +214,7 @@ fn parse_repeated_char(chars: &[char]) -> Result<Operand, String> {
         unreachable!();
     }
 
-    let mut iter = chars.iter();
+    let mut iter = square_bracket_constructs_buffer.iter();
 
     // Skip '['
     assert!(iter.next() == Some(&'['));
@@ -213,7 +225,7 @@ fn parse_repeated_char(chars: &[char]) -> Result<Operand, String> {
     // Skip '*'
     assert!(iter.next() == Some(&'*'));
 
-    let mut repeat_string = String::with_capacity(chars.len());
+    let mut repeat_string = String::with_capacity(square_bracket_constructs_buffer.len());
 
     fill_repeat_str(&mut iter, &mut repeat_string);
 
@@ -241,51 +253,279 @@ fn parse_repeated_char(chars: &[char]) -> Result<Operand, String> {
         }
     };
 
-    Ok(Operand::Char(Char {
+    let operand = Operand::Char(CharOperand {
         char,
         char_repetition,
-    }))
+    });
+
+    Ok(operand)
 }
 
-/// Parses an input string and converts it into a vector of `Operand` entries.
-///
-/// This function processes the input string, looking for sequences in the formats
-/// `[=equiv=]` and `[x*n]`, as well as regular characters. It delegates the parsing
-/// of the specific formats to helper functions `parse_equiv` and `parse_repeated_char`.
-///
-/// # Arguments
-///
-/// * `input` - A string slice containing the input to be parsed.
-///
-/// # Returns
-///
-/// A `Result` containing a vector of `Operand` entries if successful, or a `String`
-/// describing the error if parsing fails.
-///
-/// # Errors
-///
-/// This function will return an error if:
-/// - It encounters an invalid format.
-/// - It encounters any specific error from `parse_equiv` or `parse_repeated_char`.
-fn parse_symbols(string1_or_string2: &str) -> Result<Vec<Operand>, String> {
+fn parse_octal_sequence(
+    first_octal_digit: char,
+    peekable: &mut Peekable<Chars>,
+) -> Result<char, String> {
+    let mut st = String::with_capacity(3_usize);
+
+    st.push(first_octal_digit);
+
+    let mut added_octal_digit_to_buffer = |pe: &mut Peekable<Chars>| {
+        if let Some(&second_octal_digit @ '0'..='7') = pe.peek() {
+            st.push(second_octal_digit);
+
+            true
+        } else {
+            false
+        }
+    };
+
+    let advance_peekable_if_parsing_succeed = if added_octal_digit_to_buffer(peekable) {
+        peekable.next();
+
+        added_octal_digit_to_buffer(peekable)
+    } else {
+        false
+    };
+
+    let from_str_radix_result = u16::from_str_radix(&st, 8_u32);
+
+    let octal_digits_parsed = match from_str_radix_result {
+        Ok(uo) => uo,
+        Err(pa) => {
+            return Err(format!("tr: failed to parse octal sequence '{st}' ({pa})"));
+        }
+    };
+
+    // There is no consensus on how to handle this:
+    //
+    // BusyBox and GNU Core Utilities:
+    //     parse "\501" as \050 (which is '(') and '1'
+    //         GNU Core Utilities prints a warning, BusyBox does not
+    // uutils' coreutils:
+    //     parses "\501" as '1'
+    // bsdutils:
+    //     parses "\501" as 'Ł' (U+0141)
+    //
+    // None of these implementations treat this as a fatal error
+    // POSIX says: "Multi-byte characters require multiple, concatenated escape sequences of this type, including the leading <backslash> for each byte."
+    //
+    // Following BusyBox and GNU Core Utilities, because their handling seems to be most in keeping with the POSIX
+    // specification
+    let byte = match u8::try_from(octal_digits_parsed) {
+        Ok(ue) => {
+            if advance_peekable_if_parsing_succeed {
+                peekable.next();
+            }
+
+            ue
+        }
+        Err(_tr) => {
+            // This should only happen when the sequence is \400 and above
+            // Cannot happen with a two character sequence like \77, because 8^2 is 64 (within u8 bounds)
+            assert!(st.len() == 3_usize);
+
+            let mut chars = st.chars();
+
+            let third_octal_digit = chars.next_back().unwrap();
+
+            // `chars_str` is a view of the first two octal digits
+            let chars_str = chars.as_str();
+
+            assert!(chars_str.len() == 2_usize);
+
+            // Treat the sequence \abc (where a, b, and c are octal digits) as \0abc
+            // The byte represented by \0ab is what will be returned from this function
+            // Parsing of c is handled outside this function
+            match u8::from_str_radix(chars_str, 8_u32) {
+                Ok(ue) => {
+                    eprintln!(
+                        "tr: warning: the ambiguous octal escape \\{st} is being interpreted as the 2-byte sequence \\0{chars_str}, {third_octal_digit}"
+                    );
+
+                    ue
+                }
+                Err(pa) => {
+                    return Err(format!("tr: invalid octal sequence '{chars_str}' ({pa})"));
+                }
+            }
+        }
+    };
+
+    let char = char::from(byte);
+
+    Ok(char)
+}
+
+fn parse_single_char(peekable: &mut Peekable<Chars>) -> Result<Option<char>, String> {
+    let option = match peekable.next() {
+        Some('\\') => {
+            let char = match peekable.next() {
+                /* #region \octal */
+                Some(first_octal_digit @ '0'..='7') => {
+                    parse_octal_sequence(first_octal_digit, peekable)?
+                }
+                /* #endregion */
+                //
+                /* #region \character */
+                // <alert>
+                // Code point 0007
+                Some('a') => '\u{0007}',
+                // <backspace>
+                // Code point 0008
+                Some('b') => '\u{0008}',
+                // <tab>
+                // Code point 0009
+                Some('t') => '\u{0009}',
+                // <newline>
+                // Code point 000A
+                Some('n') => '\u{000A}',
+                // <vertical-tab>
+                // Code point 000B
+                Some('v') => '\u{000B}',
+                // <form-feed>
+                // Code point 000C
+                Some('f') => '\u{000C}',
+                // <carriage-return>
+                // Code point 000D
+                Some('r') => '\u{000D}',
+                // <backslash>
+                // Code point 005C
+                Some('\\') => {
+                    // An escaped backslash
+                    '\u{005C}'
+                }
+                /* #endregion */
+                //
+                Some(cha) => {
+                    // If a backslash is not at the end of the string, and is not followed by one of the valid
+                    // escape characters (including another backslash), the backslash is basically just ignored:
+                    // the following character is the character added to the set.
+                    cha
+                }
+                None => {
+                    eprintln!(
+                        "tr: warning: an unescaped backslash at end of string is not portable"
+                    );
+
+                    // If an unescaped backslash is the last character of the string, treat it as though it were
+                    // escaped (backslash is added to the set)
+                    '\u{005C}'
+                }
+            };
+
+            Some(char)
+        }
+        op => op,
+    };
+
+    Ok(option)
+}
+
+fn parse_range_or_single_char(
+    starting_char: char,
+    peekable: &mut Peekable<Chars>,
+    operand_vec: &mut Vec<Operand>,
+) -> Result<(), String> {
+    match peekable.peek() {
+        Some(&hyphen @ '-') => {
+            // Possible "c-c" construct
+            // Move past `hyphen`
+            peekable.next();
+
+            // The parsed character after the hyphen
+            // e.g. "tr 'A-Z' '\044-1'"
+            match parse_single_char(peekable)? {
+                Some(after_hyphen) => {
+                    // Ranges are inclusive
+                    let range_inclusive = starting_char..=after_hyphen;
+
+                    if range_inclusive.is_empty() {
+                        let message =
+                            format!(
+                                "tr: range-endpoints of '{}-{}' are in reverse collating sequence order",
+                                starting_char.escape_default(),
+                                after_hyphen.escape_default()
+                            );
+
+                        return Err(message);
+                    }
+
+                    let range_inclusive_to_operand_iterator = range_inclusive.map(|ch| {
+                        Operand::Char(CharOperand {
+                            char: ch,
+                            char_repetition: CharRepetition::N(1_usize),
+                        })
+                    });
+
+                    // TODO
+                    // Does this reserve the right capacity?
+                    operand_vec.extend(range_inclusive_to_operand_iterator);
+                }
+                None => {
+                    // End of input, do not handle as a range
+                    // e.g. "tr 'ab' 'c-'"
+                    operand_vec.extend_from_slice(&[
+                        Operand::Char(CharOperand {
+                            char: starting_char,
+                            char_repetition: CharRepetition::N(1_usize),
+                        }),
+                        Operand::Char(CharOperand {
+                            char: hyphen,
+                            char_repetition: CharRepetition::N(1_usize),
+                        }),
+                    ]);
+                }
+            }
+        }
+        _ => {
+            // Not a "c-c" construct
+            operand_vec.push(Operand::Char(CharOperand {
+                char: starting_char,
+                char_repetition: CharRepetition::N(1_usize),
+            }))
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_string1_or_string2(string1_or_string2: &str) -> Result<Vec<Operand>, String> {
+    // The longest valid "[:class:]", "[=equiv=]", or "[x*n]" construct is a "[x*n]" construct
+    // These are (seemingly) the shortest invalid "[x*n]" constructs (octal and decimal):
+    // [a*010000000000000000000000]
+    // [a*100000000000000000000]
+    // Therefore, the longest valid one should be:
+    // [a*01000000000000000000000]
+    // Rounding up to 32
+    const SQUARE_BRACKET_CONSTRUCTS_BUFFER_CAPACITY: usize = 32_usize;
+
     // This capacity will be sufficient at least some of the time
     let mut operand_vec = Vec::<Operand>::with_capacity(string1_or_string2.len());
 
-    let mut iterator = string1_or_string2.chars().peekable();
+    let mut peekable = string1_or_string2.chars().peekable();
 
-    while let Some(&ch) = iterator.peek() {
-        match ch {
-            '[' => {
-                // Use a String instead?
-                let mut vec = Vec::<char>::with_capacity(1_usize);
+    let mut parse_left_square_bracket_normally = false;
+
+    while let Some(&ch) = peekable.peek() {
+        match (ch, parse_left_square_bracket_normally) {
+            ('[', false) => {
+                // Save the state of `peekable` before advancing it, see note below
+                let peekable_saved = peekable.clone();
+
+                // TODO
+                // Avoid repeated allocation
+                let mut square_bracket_constructs_buffer =
+                    Vec::<char>::with_capacity(SQUARE_BRACKET_CONSTRUCTS_BUFFER_CAPACITY);
 
                 let mut found_closing_square_bracket = false;
 
-                for ch in iterator.by_ref() {
-                    vec.push(ch);
+                for ch in peekable.by_ref() {
+                    square_bracket_constructs_buffer.push(ch);
+
+                    let vec_len = square_bracket_constructs_buffer.len();
 
                     // Length check is a hacky fix for "[:]", "[=]", "[]*]", etc.
-                    if ch == ']' && vec.len() > 3_usize {
+                    if ch == ']' && vec_len > 3_usize {
                         found_closing_square_bracket = true;
 
                         break;
@@ -293,27 +533,19 @@ fn parse_symbols(string1_or_string2: &str) -> Result<Vec<Operand>, String> {
                 }
 
                 if found_closing_square_bracket {
-                    let after_opening_square_bracket = vec.get(1_usize);
+                    let after_opening_square_bracket =
+                        square_bracket_constructs_buffer.get(1_usize);
 
-                    let before_closing_square_bracket = vec.iter().rev().nth(1_usize);
+                    let before_closing_square_bracket =
+                        square_bracket_constructs_buffer.iter().rev().nth(1_usize);
 
                     if after_opening_square_bracket == Some(&':')
                         && before_closing_square_bracket == Some(&':')
                     {
-                        // "[:class:]" construct
-                        let mut into_iter = vec.into_iter();
-
-                        assert!(into_iter.next() == Some('['));
-                        assert!(into_iter.next() == Some(':'));
-
-                        assert!(into_iter.next_back() == Some(']'));
-                        assert!(into_iter.next_back() == Some(':'));
-
-                        // TODO
-                        // Performance
-                        let class = into_iter.collect::<String>();
-
-                        expand_character_class(&class, &mut operand_vec)?;
+                        expand_character_class(
+                            &square_bracket_constructs_buffer,
+                            &mut operand_vec,
+                        )?;
 
                         continue;
                     }
@@ -322,161 +554,51 @@ fn parse_symbols(string1_or_string2: &str) -> Result<Vec<Operand>, String> {
                         && before_closing_square_bracket == Some(&'=')
                     {
                         // "[=equiv=]" construct
-                        operand_vec.extend(parse_equiv(&mut vec.iter().peekable())?);
-
-                        continue;
-                    }
-
-                    if vec.get(2_usize) == Some(&'*') {
-                        // "[x*n]" construct
-                        let operand = parse_repeated_char(&vec)?;
+                        let operand = parse_equiv(&square_bracket_constructs_buffer)?;
 
                         operand_vec.push(operand);
 
                         continue;
                     }
-                }
 
-                // Not "[:class:]", "[=equiv=]", or "[x*n]"
-                // TODO
-                // This is not correct
-                // "c-c" and backslash-escape sequences must be handled
-                for ch in vec {
-                    operand_vec.push(Operand::Char(Char {
-                        char: ch,
-                        char_repetition: CharRepetition::N(1),
-                    }))
-                }
-            }
-            // A single backslash character (0x5C)
-            // https://pubs.opengroup.org/onlinepubs/9799919799/basedefs/V1_chap05.html#tagtcjh_2
-            // https://www.unicode.org/Public/UCD/latest/ucd/NameAliases.txt
-            '\\' => {
-                // Move past '\'
-                iterator.next();
-
-                let char_for_operand = match iterator.peek() {
-                    /* #region \octal */
-                    Some(&first_octal_digit @ '0'..='7') => {
-                        // Move past `first_octal_digit`
-                        iterator.next();
-
-                        let mut st = String::with_capacity(3_usize);
-
-                        st.push(first_octal_digit);
-
-                        for _ in 0_usize..2_usize {
-                            if let Some(&octal_digit @ '0'..='7') = iterator.peek() {
-                                // Move past `octal_digit`
-                                iterator.next();
-
-                                st.push(octal_digit);
-                            } else {
-                                break;
-                            }
-                        }
-
-                        let from_str_radix_result = u16::from_str_radix(&st, 8_u32);
-
-                        let octal_digits_parsed = match from_str_radix_result {
-                            Ok(uo) => uo,
-                            Err(pa) => {
-                                return Err(format!(
-                                    "tr: failed to parse octal sequence '{st}' ({pa})"
-                                ));
-                            }
-                        };
-
-                        let byte = match u8::try_from(octal_digits_parsed) {
-                            Ok(ue) => ue,
-                            Err(tr) => {
-                                return Err(format!("tr: invalid octal sequence '{st}' ({tr})"));
-                            }
-                        };
-
-                        operand_vec.push(Operand::Char(Char {
-                            char: char::from(byte),
-                            char_repetition: CharRepetition::N(1),
-                        }));
+                    if square_bracket_constructs_buffer.get(2_usize) == Some(&'*') {
+                        // "[x*n]" construct
+                        operand_vec.push(parse_repeated_char(&square_bracket_constructs_buffer)?);
 
                         continue;
                     }
-                    /* #endregion */
-                    //
-                    /* #region \character */
-                    // <alert>
-                    // Code point 0007
-                    Some('a') => '\u{0007}',
-                    // <backspace>
-                    // Code point 0008
-                    Some('b') => '\u{0008}',
-                    // <tab>
-                    // Code point 0009
-                    Some('t') => '\u{0009}',
-                    // <newline>
-                    // Code point 000A
-                    Some('n') => '\u{000A}',
-                    // <vertical-tab>
-                    // Code point 000B
-                    Some('v') => '\u{000B}',
-                    // <form-feed>
-                    // Code point 000C
-                    Some('f') => '\u{000C}',
-                    // <carriage-return>
-                    // Code point 000D
-                    Some('r') => '\u{000D}',
-                    // <backslash>
-                    // Code point 005C
-                    Some('\\') => {
-                        // An escaped backslash
-                        '\u{005C}'
-                    }
-                    /* #endregion */
-                    //
-                    Some(&cha) => {
-                        // If a backslash is not at the end of the string, and is not followed by one of the valid
-                        // escape characters (including another backslash), the backslash is basically just ignored:
-                        // the following character is the character added to the set.
-                        cha
-                    }
-                    None => {
-                        eprintln!(
-                            "tr: warning: an unescaped backslash at end of string is not portable"
-                        );
+                }
 
-                        // If an unescaped backslash is the last character of the string, treat it as though it were
-                        // escaped (backslash is added to the set)
-                        '\u{005C}'
-                    }
-                };
-
-                // Move past character following '\'
-                iterator.next();
-
-                operand_vec.push(Operand::Char(Char {
-                    char: char_for_operand,
-                    char_repetition: CharRepetition::N(1),
-                }));
+                // Not a "[:class:]", "[=equiv=]", or "[x*n]" construct
+                // The hacky way to continue is to reset `peekable` (to `peekable_saved`)
+                // This moves the Peekable back to the point it was at before attempting to parse square bracket
+                // constructs
+                parse_left_square_bracket_normally = true;
+                peekable = peekable_saved;
             }
-            cha => {
-                // Move past `cha`
-                iterator.next();
+            (cha, bo) => {
+                // '[' is not the start of a square bracket construct, so handle it normally
+                if bo {
+                    assert!(cha == '[');
 
-                // Add a regular character with a repetition of 1
-                operand_vec.push(Operand::Char(Char {
-                    char: cha,
-                    char_repetition: CharRepetition::N(1),
-                }));
+                    // When encountering '[' in the future, try to parse square bracket constructs first
+                    parse_left_square_bracket_normally = false;
+                }
+
+                if let Some(char) = parse_single_char(&mut peekable)? {
+                    parse_range_or_single_char(char, &mut peekable, &mut operand_vec)?;
+                }
             }
         }
     }
 
-    // eprintln!("{operand_vec:?}");
-
-    // eprintln!();
-
     Ok(operand_vec)
 }
+
+// TODO
+// No other implementations actually seem to do anything with equivalence classes:
+// they seem to just treat them as the parsed character (e.g. "[=a=]" is treated as "a").
+// Should this implementation continue to try to actually handle them?
 
 /// Compares two characters after normalizing them.
 /// This function uses the hypothetical `deunicode_char` function to normalize
@@ -494,11 +616,34 @@ fn compare_deunicoded_chars(char1: char, char2: char) -> bool {
     let normalized_char1 = deunicode_char(char1);
     let normalized_char2 = deunicode_char(char2);
 
-    normalized_char1 == normalized_char2
+    match (normalized_char1, normalized_char2) {
+        (Some(st), Some(str)) => st == str,
+        (None, None) => {
+            // Purpose of match: prevent this from being considered equal
+            false
+        }
+        _ => false,
+    }
 }
 
-fn expand_character_class(class: &str, operand_vec: &mut Vec<Operand>) -> Result<(), String> {
-    let char_vec = match class {
+fn expand_character_class(
+    square_bracket_constructs_buffer: &[char],
+    operand_vec: &mut Vec<Operand>,
+) -> Result<(), String> {
+    // "[:class:]" construct
+    let mut into_iter = square_bracket_constructs_buffer.iter();
+
+    assert!(into_iter.next() == Some(&'['));
+    assert!(into_iter.next() == Some(&':'));
+
+    assert!(into_iter.next_back() == Some(&']'));
+    assert!(into_iter.next_back() == Some(&':'));
+
+    // TODO
+    // Performance
+    let class = into_iter.collect::<String>();
+
+    let char_vec = match class.as_str() {
         "alnum" => ('0'..='9')
             .chain('A'..='Z')
             .chain('a'..='z')
@@ -529,155 +674,19 @@ fn expand_character_class(class: &str, operand_vec: &mut Vec<Operand>) -> Result
             .chain('A'..='F')
             .chain('a'..='f')
             .collect::<Vec<_>>(),
-        _ => return Err("Error: Invalid class name ".to_owned()),
+        st => return Err(format!("tr: invalid character class ‘{st}’")),
     };
 
     operand_vec.reserve(char_vec.len());
 
     for ch in char_vec {
-        operand_vec.push(Operand::Char(Char {
+        operand_vec.push(Operand::Char(CharOperand {
             char: ch,
-            char_repetition: CharRepetition::N(1),
+            char_repetition: CharRepetition::N(1_usize),
         }));
     }
 
     Ok(())
-}
-
-/// Parses an octal string and returns the corresponding character, if valid.
-///
-/// # Arguments
-///
-/// * `s` - A string slice that holds the octal representation of the character.
-///
-/// # Returns
-///
-/// * `Option<char>` - Returns `Some(char)` if the input string is a valid octal
-///   representation of a Unicode character. Returns `None` if the string is
-///   not a valid octal number or if the resulting number does not correspond
-///   to a valid Unicode character.
-///
-fn parse_octal(s: &str) -> Option<char> {
-    u32::from_str_radix(s, 8).ok().and_then(char::from_u32)
-}
-
-/// Parses a string representing a range of characters or octal values and returns a vector of `Operand`s.
-///
-/// This function handles ranges specified in square brackets, such as `[a-z]` or `[\\141-\\172]`.
-/// It supports ranges of plain characters and ranges of octal-encoded characters. The function
-/// trims the square brackets from the input string, splits the range into start and end parts,
-/// and then expands the range into a list of `Operand`s.
-///
-/// # Arguments
-///
-/// * `input` - A string slice containing the range to be parsed. The range can be in the form of
-///   `[a-z]`, `[\\141-\\172]`, etc.
-///
-/// # Returns
-///
-/// * `Result<Vec<Operand>, String>` - Returns `Ok(Vec<Operand>)` if the input string represents
-///   a valid range. Returns `Err(String)` with an error message if the input is invalid.
-///
-/// # Errors
-///
-/// This function returns an error if:
-/// - The input string does not contain a valid range.
-/// - The octal values in the range cannot be parsed into valid characters.
-///
-fn parse_ranges(string1_or_string2: &str) -> Result<Vec<Operand>, String> {
-    // Remove square brackets
-    let input_without_square_brackets =
-        string1_or_string2.trim_matches(|ch| ch == '[' || ch == ']');
-
-    let mut split = input_without_square_brackets.split('-');
-
-    let start = split.next().ok_or("Iteration failed")?;
-    let end = split.next().ok_or("Iteration failed")?;
-
-    let mut chars = Vec::<char>::new();
-
-    if start.starts_with('\\') && end.starts_with('\\') {
-        // Processing the \octal-\octal range
-        if let (Some(start_char), Some(end_char)) =
-            (parse_octal(&start[1..]), parse_octal(&end[1..]))
-        {
-            let start_u32 = start_char as u32;
-            let end_u32 = end_char as u32;
-
-            for code in start_u32..=end_u32 {
-                if let Some(c) = char::from_u32(code) {
-                    chars.push(c);
-                }
-            }
-        }
-    } else if !start.starts_with('\\') && !end.starts_with('\\') {
-        // Processing the c-c range
-        let start_char = start.chars().next().unwrap();
-        let end_char = end.chars().next().unwrap();
-
-        for ch in start_char..=end_char {
-            chars.push(ch);
-        }
-    }
-
-    let vec = chars
-        .into_iter()
-        .map(|ch| {
-            Operand::Char(Char {
-                char: ch,
-                char_repetition: CharRepetition::N(1),
-            })
-        })
-        .collect::<Vec<_>>();
-
-    Ok(vec)
-}
-
-fn parse_string1_or_string2(string1_or_string2: &str) -> Result<Vec<Operand>, String> {
-    let vec = if contains_single_range(string1_or_string2) {
-        // TODO
-        // Ranges need to be handled in all cases
-        parse_ranges(string1_or_string2)?
-    } else {
-        parse_symbols(string1_or_string2)?
-    };
-
-    Ok(vec)
-}
-
-/// Determines if a string contains a single valid range expression.
-///
-/// This function uses a regular expression to check if the input string matches any
-/// of the following range formats:
-/// - `[a-z]` or `[A-Z]` or `[0-9]`: Character ranges enclosed in square brackets
-/// - `\\octal-\\octal`: Ranges of octal-encoded characters
-/// - `a-z` or `A-Z` or `0-9`: Simple character-symbol ranges
-///
-/// # Arguments
-///
-/// * `s` - A string slice to be checked for containing a single valid range.
-///
-/// # Returns
-///
-/// * `bool` - Returns `true` if the input string matches any of the valid range formats.
-///   Returns `false` otherwise.
-///
-fn contains_single_range(string1_or_string2: &str) -> bool {
-    static REGEX_ONCE_CELL: OnceLock<Regex> = OnceLock::new();
-
-    let regex = REGEX_ONCE_CELL.get_or_init(|| {
-        // Regular expression for a range of characters or \octal
-        Regex::new(
-            r"(?x)
-            ^ \[ [a-zA-Z0-9\\]+ - [a-zA-Z0-9\\]+ \] $ |   # Range in square brackets
-            ^ \\ [0-7]{1,3} - \\ [0-7]{1,3} $ |           # Range \octal-\octal
-            ^ [a-zA-Z0-9] - [a-zA-Z0-9] $                 # Character-symbol range
-        ",
-        )
-        .unwrap()
-    });
-
-    regex.is_match(string1_or_string2)
 }
 
 /// Computes the complement of a string with respect to two sets of characters.
@@ -707,15 +716,15 @@ fn complement_chars(
     let mut depleted = Vec::<usize>::with_capacity(chars2.len());
 
     for op in chars2 {
-        if let Operand::Char(ch) = op {
-            if let CharRepetition::N(n) = ch.char_repetition {
-                depleted.push(n);
+        let us = match op {
+            Operand::Char(CharOperand {
+                char_repetition: CharRepetition::N(n),
+                ..
+            }) => *n,
+            _ => usize::MAX,
+        };
 
-                continue;
-            }
-        }
-
-        depleted.push(usize::MAX);
+        depleted.push(us);
     }
 
     let depleted_clone = depleted.clone();
@@ -743,8 +752,8 @@ fn complement_chars(
         let operand = chars2.get(chars2_index).ok_or("Indexing failed")?;
 
         match operand {
-            Operand::Char(char) => {
-                result.push(char.char);
+            Operand::Char(CharOperand { char, .. }) => {
+                result.push(*char);
 
                 let mut_ref = depleted.get_mut(chars2_index).ok_or("Indexing failed")?;
 
@@ -756,8 +765,8 @@ fn complement_chars(
                     continue;
                 }
             }
-            Operand::Equiv(equiv) => {
-                result.push(equiv.char);
+            Operand::Equiv(EquivOperand { char }) => {
+                result.push(*char);
             }
         }
 
@@ -816,17 +825,20 @@ fn check_repeatable(
 
 // TODO
 // This should be optimized
-fn generate_transformation_hash_map(
-    string1_operands: &[Operand],
-    string2_operands: &[Operand],
-) -> Result<HashMap<char, char>, Box<dyn Error>> {
+fn generate_for_translation(
+    string1_operands: Vec<Operand>,
+    string2_operands: Vec<Operand>,
+) -> Result<ForTranslation, Box<dyn Error>> {
     let mut char_repeating_total = 0_usize;
 
-    let mut string1_operands_flattened = Vec::<char>::new();
+    let mut string1_operands_flattened = Vec::<Operand>::new();
 
     for op in string1_operands {
         match op {
-            Operand::Char(ch) => match ch.char_repetition {
+            Operand::Char(CharOperand {
+                char_repetition,
+                char,
+            }) => match char_repetition {
                 CharRepetition::AsManyAsNeeded => {
                     return Err(Box::from(
                         "tr: the [c*] repeat construct may not appear in string1".to_owned(),
@@ -837,26 +849,38 @@ fn generate_transformation_hash_map(
                         .checked_add(n)
                         .ok_or("Arithmetic overflow")?;
 
+                    let new_char = Operand::Char(CharOperand {
+                        char,
+                        char_repetition: CharRepetition::N(1_usize),
+                    });
+
                     for _ in 0_usize..n {
-                        string1_operands_flattened.push(ch.char);
+                        string1_operands_flattened.push(new_char.clone());
                     }
                 }
             },
-            _ => {
-                return Err(Box::from("Expectation violated".to_owned()));
+            op @ Operand::Equiv(_) => {
+                // Take up one position?
+                string1_operands_flattened.push(op);
             }
         }
     }
 
+    // TODO
+    // Indexing is a workaround for the borrow checker
     let mut as_many_as_needed_index = Option::<usize>::None;
 
     let mut replacement_char_repeating_total = 0_usize;
 
     for (us, op) in string2_operands.iter().enumerate() {
         match op {
-            Operand::Char(ch) => match ch.char_repetition {
+            Operand::Char(CharOperand {
+                char_repetition, ..
+            }) => match char_repetition {
                 CharRepetition::AsManyAsNeeded => {
                     if as_many_as_needed_index.is_some() {
+                        // TODO
+                        // Do this validation earlier?
                         return Err(Box::from(
                             "tr: only one [c*] repeat construct may appear in string2".to_owned(),
                         ));
@@ -866,24 +890,28 @@ fn generate_transformation_hash_map(
                 }
                 CharRepetition::N(n) => {
                     replacement_char_repeating_total = replacement_char_repeating_total
-                        .checked_add(n)
+                        .checked_add(*n)
                         .ok_or("Arithmetic overflow")?;
                 }
             },
-            _ => {
-                return Err(Box::from("Expectation violated".to_owned()));
+            Operand::Equiv { .. } => {
+                // TODO
+                // Do this validation earlier?
+                return Err(Box::from(
+                    "tr: [=c=] expressions may not appear in string2 when translating".to_owned(),
+                ));
             }
         }
     }
-
-    let mut string2_operands_with_leftover: Vec<Operand>;
 
     let string2_operands_to_use = if replacement_char_repeating_total < char_repeating_total {
         let leftover = char_repeating_total
             .checked_sub(replacement_char_repeating_total)
             .ok_or("Arithmetic overflow")?;
 
-        string2_operands_with_leftover = string2_operands.to_vec();
+        // TODO
+        // to_vec
+        let mut string2_operands_with_leftover = string2_operands.to_vec();
 
         match as_many_as_needed_index {
             Some(us) => {
@@ -892,48 +920,42 @@ fn generate_transformation_hash_map(
                     .ok_or("Indexing failed")?;
 
                 match op {
-                    Operand::Char(ch) => {
-                        *op = Operand::Char(Char {
-                            char: ch.char,
-                            char_repetition: CharRepetition::N(leftover),
-                        });
+                    Operand::Char(CharOperand {
+                        ref mut char_repetition,
+                        ..
+                    }) => {
+                        *char_repetition = CharRepetition::N(leftover);
                     }
-                    _ => {
-                        return Err(Box::from("Expectation violated".to_owned()));
+                    Operand::Equiv(_) => {
+                        unreachable!();
                     }
                 }
             }
             None => {
-                let op = string2_operands_with_leftover
-                    .last_mut()
-                    .ok_or("Unexpected empty collection")?;
+                let mut n_updated = false;
 
-                match op {
-                    Operand::Char(ch) => {
-                        let current_n = match ch.char_repetition {
-                            CharRepetition::N(n) => n,
-                            _ => {
-                                return Err(Box::from("Expectation violated".to_owned()));
-                            }
-                        };
+                for op in string2_operands_with_leftover.iter_mut().rev() {
+                    if let Operand::Char(CharOperand {
+                        char_repetition: CharRepetition::N(ref mut n),
+                        ..
+                    }) = op
+                    {
+                        let n_plus_leftover =
+                            n.checked_add(leftover).ok_or("Arithmetic overflow")?;
 
-                        let current_n_plus_leftover = current_n
-                            .checked_add(leftover)
-                            .ok_or("Arithmetic overflow")?;
+                        *n = n_plus_leftover;
 
-                        *op = Operand::Char(Char {
-                            char: ch.char,
-                            char_repetition: CharRepetition::N(current_n_plus_leftover),
-                        });
-                    }
-                    _ => {
-                        return Err(Box::from("Expectation violated".to_owned()));
+                        n_updated = true;
+
+                        break;
                     }
                 }
+
+                assert!(n_updated);
             }
         }
 
-        &string2_operands_with_leftover
+        string2_operands_with_leftover
     } else {
         string2_operands
     };
@@ -944,33 +966,483 @@ fn generate_transformation_hash_map(
 
     for op in string2_operands_to_use {
         match op {
-            Operand::Char(ch) => match ch.char_repetition {
+            Operand::Char(CharOperand {
+                char_repetition,
+                char,
+            }) => match char_repetition {
                 CharRepetition::N(n) => {
                     for _ in 0_usize..n {
-                        string2_operands_to_use_flattened.push(ch.char);
+                        string2_operands_to_use_flattened.push(char);
                     }
                 }
                 CharRepetition::AsManyAsNeeded => {
                     // The "[c*]" construct was not needed, ignore it
                 }
             },
-            _ => {
-                return Err(Box::from("Expectation violated".to_owned()));
+            Operand::Equiv(_) => {
+                unreachable!();
             }
         }
     }
 
-    let mut translation_hash_map = HashMap::<char, char>::new();
+    // TODO
+    // Capacities
+    let mut equiv_translation_chars = Vec::<(char, char)>::new();
+    let mut multi_byte_translation_hash_map = HashMap::<char, char>::new();
+    let mut single_byte_translation_lookup_table = [Option::<char>::None; 128_usize];
 
-    for (us, ch) in string1_operands_flattened.into_iter().enumerate() {
-        let cha = string2_operands_to_use_flattened
+    let mut encoding_buffer = [0_u8; 4_usize];
+
+    let mut add_normal_char = |ch: char, replacement_char: char| {
+        let sl = ch.encode_utf8(&mut encoding_buffer);
+
+        match sl.as_bytes() {
+            &[ue] => {
+                single_byte_translation_lookup_table[usize::from(ue)] = Some(replacement_char);
+            }
+            _ => {
+                multi_byte_translation_hash_map.insert(ch, replacement_char);
+            }
+        }
+    };
+
+    for (us, op) in string1_operands_flattened.into_iter().enumerate() {
+        let replacement_char = string2_operands_to_use_flattened
             .get(us)
-            .ok_or("Indexing failed")?;
+            .ok_or("Indexing failed")?
+            .to_owned();
 
-        translation_hash_map.insert(ch, *cha);
+        match op {
+            Operand::Char(CharOperand {
+                char,
+                char_repetition,
+            }) => {
+                // TODO
+                // Enforce with types
+                assert!(matches!(char_repetition, CharRepetition::N(1_usize)));
+
+                add_normal_char(char, replacement_char);
+            }
+            Operand::Equiv(EquivOperand { char }) => {
+                equiv_translation_chars.push((char, replacement_char));
+
+                // TODO
+                // Fix for `tr_equivalence_class_low_priority`
+                add_normal_char(char, replacement_char);
+            }
+        }
     }
 
-    Ok(translation_hash_map)
+    let for_translate = ForTranslation {
+        equiv_translation_chars,
+        multi_byte_translation_hash_map,
+        single_byte_translation_lookup_table: Box::new(single_byte_translation_lookup_table),
+    };
+
+    Ok(for_translate)
+}
+
+fn generate_for_removal(string1_operands: Vec<Operand>) -> Result<ForRemoval, Box<dyn Error>> {
+    let mut equiv_removal_chars = Vec::<char>::new();
+    let mut multi_byte_removal_hash_set = HashSet::<char>::new();
+    let mut single_byte_removal_lookup_table = [false; 128_usize];
+
+    let mut encoding_buffer = [0_u8; 4_usize];
+
+    for op in string1_operands {
+        match op {
+            Operand::Char(CharOperand {
+                char_repetition,
+                char,
+            }) => match char_repetition {
+                CharRepetition::AsManyAsNeeded => {
+                    return Err(Box::from(
+                        "tr: the [c*] repeat construct may not appear in string1".to_owned(),
+                    ));
+                }
+                CharRepetition::N(_) => {
+                    let char_to_owned = char.to_owned();
+
+                    let sl = char_to_owned.encode_utf8(&mut encoding_buffer);
+
+                    match sl.as_bytes() {
+                        &[ue] => {
+                            single_byte_removal_lookup_table[usize::from(ue)] = true;
+                        }
+                        _ => {
+                            multi_byte_removal_hash_set.insert(char_to_owned);
+                        }
+                    }
+                }
+            },
+            Operand::Equiv(EquivOperand { char }) => {
+                equiv_removal_chars.push(char);
+            }
+        }
+    }
+
+    let delete_or_squeeze = ForRemoval {
+        multi_byte_removal_hash_set,
+        single_byte_removal_lookup_table: Box::new(single_byte_removal_lookup_table),
+        equiv_removal_chars,
+    };
+
+    Ok(delete_or_squeeze)
+}
+
+fn streaming_transform(transformation_type: TransformationType) -> Result<(), Box<dyn Error>> {
+    const SIZE: usize = 8_usize * 1_024;
+
+    // Buffers
+    let mut input = vec![0_u8; SIZE];
+    let mut output = Vec::<u8>::with_capacity(SIZE);
+    let mut temporary_leftover = Vec::<u8>::new();
+
+    // TODO
+    // Improve this
+    let mut leftover_bytes = 0_usize;
+
+    let mut stdin_lock = io::stdin().lock();
+    let mut stdout_lock = io::stdout().lock();
+
+    loop {
+        let buf = &mut input[leftover_bytes..];
+
+        match stdin_lock.read(buf) {
+            Ok(0_usize) => {
+                assert!(leftover_bytes == 0_usize);
+
+                assert!(!buf.is_empty());
+
+                break;
+            }
+            Ok(us) => {
+                let read_slice = &input[..(leftover_bytes + us)];
+
+                let for_transform = match std::str::from_utf8(read_slice) {
+                    Ok(st) => st,
+                    Err(ut) => {
+                        let (valid, remainder) = read_slice.split_at(ut.valid_up_to());
+
+                        temporary_leftover.extend_from_slice(remainder);
+
+                        // https://doc.rust-lang.org/std/str/struct.Utf8Error.html#examples
+                        unsafe { std::str::from_utf8_unchecked(valid) }
+                    }
+                };
+
+                transformation_type.transform(for_transform, &mut output);
+
+                // TODO
+                // Do this in a nicer way
+                for (us, ue) in temporary_leftover.iter().enumerate() {
+                    // TODO
+                    // Indexing
+                    input[us] = *ue;
+                }
+
+                leftover_bytes = temporary_leftover.len();
+
+                temporary_leftover.clear();
+
+                stdout_lock.write_all(&output)?;
+
+                output.clear();
+            }
+            Err(er) => {
+                if er.kind() == ErrorKind::Interrupted {
+                    continue;
+                }
+
+                return Err(Box::from(er));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+struct ForRemoval {
+    equiv_removal_chars: Vec<char>,
+    multi_byte_removal_hash_set: HashSet<char>,
+    single_byte_removal_lookup_table: Box<[bool; 128_usize]>,
+}
+
+#[derive(Debug)]
+struct ForTranslation {
+    equiv_translation_chars: Vec<(char, char)>,
+    multi_byte_translation_hash_map: HashMap<char, char>,
+    single_byte_translation_lookup_table: Box<[Option<char>; 128_usize]>,
+}
+
+enum TransformationType {
+    Delete(ForRemoval),
+    Squeeze(ForRemoval),
+    SqueezeAndTranslate(ForTranslation),
+    Translate(ForTranslation),
+}
+
+impl TransformationType {
+    fn transform(&self, input: &str, output: &mut Vec<u8>) {
+        match self {
+            TransformationType::Delete(ForRemoval {
+                equiv_removal_chars,
+                multi_byte_removal_hash_set,
+                single_byte_removal_lookup_table,
+            }) => {
+                let mut encoding_buffer = [0_u8; 4_usize];
+
+                'process_next_char_label: for ch in input.chars() {
+                    let as_bytes = ch.encode_utf8(&mut encoding_buffer).as_bytes();
+
+                    let is_deleted_char = match as_bytes {
+                        &[ue] => single_byte_removal_lookup_table[usize::from(ue)],
+                        _ => multi_byte_removal_hash_set.contains(&ch),
+                    };
+
+                    if is_deleted_char {
+                        continue 'process_next_char_label;
+                    }
+
+                    for &cha in equiv_removal_chars {
+                        if compare_deunicoded_chars(ch, cha) {
+                            continue 'process_next_char_label;
+                        }
+                    }
+
+                    output.extend_from_slice(as_bytes);
+                }
+            }
+            TransformationType::Squeeze(ForRemoval {
+                equiv_removal_chars,
+                multi_byte_removal_hash_set,
+                single_byte_removal_lookup_table,
+            }) => {
+                let is_squeezed = |ch: char, char_slice: &[u8]| {
+                    let first_check = match char_slice {
+                        &[ue] => single_byte_removal_lookup_table[usize::from(ue)],
+                        _ => multi_byte_removal_hash_set.contains(&ch),
+                    };
+
+                    if first_check {
+                        true
+                    } else {
+                        let mut bo = false;
+
+                        for &cha in equiv_removal_chars {
+                            if compare_deunicoded_chars(ch, cha) {
+                                bo = true;
+
+                                break;
+                            }
+                        }
+
+                        bo
+                    }
+                };
+
+                let mut chars = input.chars();
+
+                let Some(first_char_encountered) = chars.next() else {
+                    return;
+                };
+
+                let mut encoding_buffer = [0_u8; 4_usize];
+
+                // Add the first char
+                let (first_char_is_squeezed, first_char_slice) = {
+                    let char_slice = first_char_encountered
+                        .encode_utf8(&mut encoding_buffer)
+                        .as_bytes();
+
+                    output.extend_from_slice(char_slice);
+
+                    let char_is_squeezed = is_squeezed(first_char_encountered, char_slice);
+
+                    (char_is_squeezed, char_slice)
+                };
+
+                let mut last_char_encountered = first_char_encountered;
+                let mut last_char_is_squeezed = first_char_is_squeezed;
+                let mut last_char_slice = first_char_slice;
+
+                for ch in chars {
+                    if last_char_encountered == ch {
+                        if !last_char_is_squeezed {
+                            output.extend_from_slice(last_char_slice);
+                        }
+
+                        continue;
+                    }
+
+                    let char_slice = ch.encode_utf8(&mut encoding_buffer).as_bytes();
+
+                    output.extend_from_slice(char_slice);
+
+                    last_char_encountered = ch;
+                    last_char_is_squeezed = is_squeezed(ch, char_slice);
+                    last_char_slice = char_slice;
+                }
+            }
+            TransformationType::SqueezeAndTranslate(ForTranslation {
+                equiv_translation_chars,
+                multi_byte_translation_hash_map,
+                single_byte_translation_lookup_table,
+            }) => {
+                let has_squeezed_translation = |ch: char, char_slice: &[u8]| {
+                    let first_check = match char_slice {
+                        &[ue] => single_byte_translation_lookup_table[usize::from(ue)],
+                        _ => multi_byte_translation_hash_map.get(&ch).copied(),
+                    };
+
+                    match first_check {
+                        op @ Some(_) => op,
+                        None => {
+                            let mut op = Option::<char>::None;
+
+                            for (cha, char) in equiv_translation_chars {
+                                if compare_deunicoded_chars(ch, *cha) {
+                                    op = Some(*char);
+
+                                    break;
+                                }
+                            }
+
+                            op
+                        }
+                    }
+                };
+
+                let mut chars = input.chars();
+
+                let Some(first_char_encountered) = chars.next() else {
+                    return;
+                };
+
+                let mut encoding_buffer = [0_u8; 4_usize];
+
+                // Add the first char
+                let (first_char_has_squeezed_translation, first_char_slice) = {
+                    let char_slice = first_char_encountered
+                        .encode_utf8(&mut encoding_buffer)
+                        .as_bytes();
+
+                    let char_has_squeezed_translation =
+                        has_squeezed_translation(first_char_encountered, char_slice);
+
+                    let char_slice_to_use = match char_has_squeezed_translation {
+                        Some(replacement_char) => {
+                            let replacement_char_str =
+                                replacement_char.encode_utf8(&mut encoding_buffer);
+
+                            replacement_char_str.as_bytes()
+                        }
+                        None => char_slice,
+                    };
+
+                    output.extend_from_slice(char_slice_to_use);
+
+                    (char_has_squeezed_translation, char_slice_to_use)
+                };
+
+                let mut last_char_encountered = first_char_encountered;
+                let mut last_char_has_squeezed_translation = first_char_has_squeezed_translation;
+                let mut last_char_slice = first_char_slice;
+
+                for ch in chars {
+                    if last_char_encountered == ch {
+                        if last_char_has_squeezed_translation.is_none() {
+                            output.extend_from_slice(last_char_slice);
+                        }
+
+                        continue;
+                    }
+
+                    let char_slice = ch.encode_utf8(&mut encoding_buffer).as_bytes();
+
+                    let char_has_squeezed_translation = has_squeezed_translation(ch, char_slice);
+
+                    match (
+                        char_has_squeezed_translation,
+                        last_char_has_squeezed_translation,
+                    ) {
+                        (Some(ch), Some(cha)) if ch == cha => {
+                            last_char_slice = char_slice;
+
+                            continue;
+                        }
+                        _ => {}
+                    }
+
+                    let char_slice_to_use = match char_has_squeezed_translation {
+                        Some(replacement_char) => {
+                            let replacement_char_str =
+                                replacement_char.encode_utf8(&mut encoding_buffer);
+
+                            replacement_char_str.as_bytes()
+                        }
+                        None => char_slice,
+                    };
+
+                    output.extend_from_slice(char_slice_to_use);
+
+                    last_char_encountered = ch;
+                    last_char_has_squeezed_translation = char_has_squeezed_translation;
+                    last_char_slice = char_slice_to_use;
+                }
+            }
+            TransformationType::Translate(ForTranslation {
+                equiv_translation_chars,
+                multi_byte_translation_hash_map,
+                single_byte_translation_lookup_table,
+            }) => {
+                let mut encoding_buffer = [0_u8; 4_usize];
+
+                for ch in input.chars() {
+                    let as_bytes = ch.encode_utf8(&mut encoding_buffer).as_bytes();
+
+                    let replacement_char_option = match as_bytes {
+                        &[ue] => single_byte_translation_lookup_table[usize::from(ue)],
+                        _ => multi_byte_translation_hash_map.get(&ch).copied(),
+                    };
+
+                    // TODO
+                    // What is the precedence of equivalence classes?
+                    // GNU Core Utilities de-prioritizes them
+
+                    // Only use equivalence classes if normal translation failed
+                    let replacement_char_option_to_use = match replacement_char_option {
+                        Some(cha) => Some(cha),
+                        None => {
+                            let mut op = Option::<char>::None;
+
+                            for (equiv_char, equiv_char_replacement) in equiv_translation_chars {
+                                if compare_deunicoded_chars(ch, *equiv_char) {
+                                    op = Some(*equiv_char_replacement);
+
+                                    break;
+                                }
+                            }
+
+                            op
+                        }
+                    };
+
+                    let for_output = match replacement_char_option_to_use {
+                        Some(replacement_char) => {
+                            let replacement_char_str =
+                                replacement_char.encode_utf8(&mut encoding_buffer);
+
+                            replacement_char_str.as_bytes()
+                        }
+                        None => as_bytes,
+                    };
+
+                    output.extend_from_slice(for_output);
+                }
+            }
+        }
+    }
 }
 
 /// Translates or deletes characters from standard input, according to specified arguments.
@@ -989,14 +1461,6 @@ fn generate_transformation_hash_map(
 ///   if there is an error reading from standard input or processing the input string.
 ///
 fn tr(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    let mut input = String::new();
-
-    // TODO
-    // tr should be streaming
-    io::stdin()
-        .read_to_string(&mut input)
-        .expect("Failed to read input");
-
     let string1_operands = parse_string1_or_string2(&args.string1)?;
 
     let string2_operands_option = match &args.string2 {
@@ -1004,9 +1468,76 @@ fn tr(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
-    let mut stdout_lock = io::stdout().lock();
+    if !args.complement_char && !args.complement_val {
+        // Fast path for "tr", "tr -d", and "tr -s" (without any other options)
+        match (args.delete, args.squeeze_repeats) {
+            (false, false) => {
+                // "tr"
+                let string2_operands = match string2_operands_option {
+                    Some(op) => op,
+                    None => {
+                        return Err(Box::from("tr: missing operand".to_owned()));
+                    }
+                };
 
-    if args.delete {
+                if string2_operands.is_empty() {
+                    return Err(Box::from(
+                        "tr: when not truncating set1, string2 must be non-empty".to_owned(),
+                    ));
+                }
+
+                let for_translation = generate_for_translation(string1_operands, string2_operands)?;
+
+                let transformation_type = TransformationType::Translate(for_translation);
+
+                return streaming_transform(transformation_type);
+            }
+            (true, false) => {
+                // "tr -d"
+                let delete_or_squeeze = generate_for_removal(string1_operands)?;
+
+                let transformation_type = TransformationType::Delete(delete_or_squeeze);
+
+                return streaming_transform(transformation_type);
+            }
+            (false, true) => {
+                // "tr -s"
+                let transformation_type = match string2_operands_option {
+                    Some(string2_operands) => {
+                        if string2_operands.is_empty() {
+                            return Err(Box::from(
+                                "tr: when not truncating set1, string2 must be non-empty"
+                                    .to_owned(),
+                            ));
+                        }
+
+                        let for_translation =
+                            generate_for_translation(string1_operands, string2_operands)?;
+
+                        TransformationType::SqueezeAndTranslate(for_translation)
+                    }
+                    None => {
+                        let delete_or_squeeze = generate_for_removal(string1_operands)?;
+
+                        TransformationType::Squeeze(delete_or_squeeze)
+                    }
+                };
+
+                return streaming_transform(transformation_type);
+            }
+            _ => {}
+        };
+    }
+
+    // TODO
+    // These paths are not streaming yet
+    let mut input = String::new();
+
+    io::stdin()
+        .read_to_string(&mut input)
+        .expect("Failed to read input");
+
+    let string_to_write = if args.delete {
         let filtered_string = if args.complement_char || args.complement_val {
             input
                 .chars()
@@ -1044,9 +1575,7 @@ fn tr(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             filtered_string
         };
 
-        stdout_lock.write_all(filtered_string_to_use.as_bytes())?;
-
-        Ok(())
+        filtered_string_to_use
     } else if args.squeeze_repeats && string2_operands_option.is_none() {
         let mut char_counts = HashMap::<char, i32>::new();
 
@@ -1073,11 +1602,11 @@ fn tr(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             })
             .collect::<String>();
 
-        stdout_lock.write_all(filtered_string.as_bytes())?;
-
-        return Ok(());
+        filtered_string
     } else {
-        let result_string = if args.complement_char || args.complement_val {
+        let result_string = {
+            assert!(args.complement_char || args.complement_val);
+
             if args.complement_char {
                 complement_chars(
                     &input,
@@ -1087,46 +1616,10 @@ fn tr(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 let mut set2 = string2_operands_option.as_deref().unwrap().to_vec();
 
-                set2.sort_by(|a, b| match (a, b) {
-                    (Operand::Char(char1), Operand::Char(char2)) => char1.char.cmp(&char2.char),
-                    (Operand::Equiv(equiv1), Operand::Equiv(equiv2)) => {
-                        equiv1.char.cmp(&equiv2.char)
-                    }
-                    (Operand::Char(char1), Operand::Equiv(equiv2)) => char1.char.cmp(&equiv2.char),
-                    (Operand::Equiv(equiv1), Operand::Char(char2)) => equiv1.char.cmp(&char2.char),
-                });
+                set2.sort_by(|op, ope| op.char().cmp(ope.char()));
 
                 complement_chars(&input, &string1_operands, &set2)?
             }
-        } else {
-            let string2_operands = match string2_operands_option.as_deref() {
-                Some(op) => op,
-                None => {
-                    return Err(Box::from("tr: missing operand".to_owned()));
-                }
-            };
-
-            if string2_operands.is_empty() {
-                return Err(Box::from(
-                    "tr: when not truncating set1, string2 must be non-empty".to_owned(),
-                ));
-            }
-
-            let transformation_map =
-                generate_transformation_hash_map(&string1_operands, string2_operands)?;
-
-            let mut result = String::with_capacity(input.len());
-
-            for ch in input.chars() {
-                let char_to_use = match transformation_map.get(&ch) {
-                    Some(cha) => *cha,
-                    None => ch,
-                };
-
-                result.push(char_to_use);
-            }
-
-            result
         };
 
         let result_string_to_use = if args.squeeze_repeats {
@@ -1154,10 +1647,12 @@ fn tr(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             result_string
         };
 
-        stdout_lock.write_all(result_string_to_use.as_bytes())?;
+        result_string_to_use
+    };
 
-        return Ok(());
-    }
+    io::stdout().write_all(string_to_write.as_bytes())?;
+
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -1167,12 +1662,16 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let args = Args::parse();
 
-    args.validate_args()?;
+    if let Err(st) = args.validate_args() {
+        eprintln!("{st}");
+
+        process::exit(1_i32);
+    }
 
     if let Err(err) = tr(&args) {
-        eprintln!("{}", err);
+        eprintln!("{err}");
 
-        process::exit(1);
+        process::exit(1_i32);
     }
 
     Ok(())

@@ -11,15 +11,34 @@
 use plib::{run_test, TestPlan};
 
 fn tr_test(args: &[&str], test_data: &str, expected_output: &str) {
-    let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
+    let str_args = args
+        .iter()
+        .map(|st| st.to_owned().to_owned())
+        .collect::<Vec<String>>();
 
     run_test(TestPlan {
-        cmd: String::from("tr"),
+        cmd: "tr".to_owned(),
         args: str_args,
-        stdin_data: String::from(test_data),
-        expected_out: String::from(expected_output),
-        expected_err: String::from(""),
+        stdin_data: test_data.to_owned(),
+        expected_out: expected_output.to_owned(),
+        expected_err: String::new(),
         expected_exit_code: 0,
+    });
+}
+
+fn tr_bad_arguments_failure_test(args: &[&str], expected_stderr: &str) {
+    let str_args = args
+        .iter()
+        .map(|st| st.to_owned().to_owned())
+        .collect::<Vec<_>>();
+
+    run_test(TestPlan {
+        cmd: "tr".to_owned(),
+        args: str_args,
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: expected_stderr.to_owned(),
+        expected_exit_code: 1,
     });
 }
 
@@ -386,4 +405,161 @@ fn tr_left_square_bracket_literal() {
 #[test]
 fn tr_multiple_transformations() {
     tr_test(&["3[:lower:]", "![:upper:]"], "abc123", "ABC12!");
+}
+
+#[test]
+fn tr_equiv_not_one_char() {
+    tr_bad_arguments_failure_test(
+        &["-d", "[=aa=]"],
+        "tr: aa: equivalence class operand must be a single character\n",
+    );
+}
+
+#[test]
+fn tr_backwards_range_normal() {
+    tr_bad_arguments_failure_test(
+        &["-d", "b-a"],
+        "tr: range-endpoints of 'b-a' are in reverse collating sequence order\n",
+    );
+}
+
+#[test]
+fn tr_backwards_range_backslash() {
+    tr_bad_arguments_failure_test(
+        &["-d", r"\t-\b"],
+        r"tr: range-endpoints of '\t-\u{8}' are in reverse collating sequence order
+",
+    );
+}
+
+#[test]
+fn tr_backwards_range_octal() {
+    tr_bad_arguments_failure_test(
+        &["-d", r"\045-\044"],
+        "tr: range-endpoints of '%-$' are in reverse collating sequence order\n",
+    );
+}
+
+#[test]
+fn tr_backwards_range_mixed() {
+    tr_bad_arguments_failure_test(
+        &["-d", r"A-\t"],
+        r"tr: range-endpoints of 'A-\t' are in reverse collating sequence order
+",
+    );
+}
+
+#[test]
+fn tr_mixed_range() {
+    tr_test(
+        &["-d", r"\044-Z"],
+        "$123456789ABCDEFGHIabcdefghi",
+        "abcdefghi",
+    );
+}
+
+#[test]
+fn tr_two_ranges() {
+    tr_test(&["ab12", r"\044-\045Y-Z"], "21ba", "ZY%$");
+}
+
+#[test]
+fn tr_bad_octal_range() {
+    tr_bad_arguments_failure_test(
+        &["-d", r"\046-\048"],
+        r"tr: range-endpoints of '&-\u{4}' are in reverse collating sequence order
+",
+    );
+}
+
+#[test]
+fn tr_bad_x_n_construct_decimal() {
+    tr_bad_arguments_failure_test(
+        &["-d", "[a*100000000000000000000]"],
+        "tr: invalid repeat count ‘100000000000000000000’ in [c*n] construct\n",
+    );
+}
+
+#[test]
+fn tr_bad_x_n_construct_octal() {
+    tr_bad_arguments_failure_test(
+        &["-d", "[a*010000000000000000000000]"],
+        "tr: invalid repeat count ‘010000000000000000000000’ in [c*n] construct\n",
+    );
+}
+
+#[test]
+fn tr_bad_x_n_construct_non_decimal_non_octal() {
+    tr_bad_arguments_failure_test(
+        &["-d", "[a*a]"],
+        "tr: invalid repeat count ‘a’ in [c*n] construct\n",
+    );
+}
+
+#[test]
+fn tr_trailing_hyphen() {
+    tr_test(&["ab", "c-"], "abc123", "c-c123");
+}
+
+#[test]
+fn tr_backslash_range() {
+    tr_test(
+        &["1-9", r"\b-\r"],
+        r"\ 987654321 -",
+        "\\ \x0D\x0D\x0D\x0D\x0C\x0B\x0A\x09\x08 -",
+    );
+}
+
+#[test]
+fn tr_fill_with_last_char() {
+    tr_test(&["1-34-8", "A-C!"], "987654321", "9!!!!!CBA");
+}
+
+#[test]
+fn tr_octal_above_one_byte_value() {
+    let args = &["-d", r"\501"];
+
+    let str_args = args
+        .iter()
+        .map(|st| st.to_owned().to_owned())
+        .collect::<Vec<String>>();
+
+    run_test(TestPlan {
+        cmd: "tr".to_owned(),
+        args: str_args,
+        stdin_data: "(1Ł)".to_owned(),
+        expected_out: "Ł)".to_owned(),
+        expected_err: r"tr: warning: the ambiguous octal escape \501 is being interpreted as the 2-byte sequence \050, 1
+".to_owned(),
+        expected_exit_code: 0,
+    });
+}
+
+#[test]
+fn tr_short_octal_with_non_octal_digits_after() {
+    // Interpret as \004, '8', and the range from '1' through '3'
+    tr_test(&["-d", r"\0481-3"], "A 123 \x04 456 789 Z", "A   456 79 Z");
+}
+
+#[test]
+fn tr_octal_parsing_ambiguous() {
+    // "If an ordinary digit (representing itself) is to follow an octal sequence, the octal sequence must use the full three digits to avoid ambiguity."
+    // https://pubs.opengroup.org/onlinepubs/9799919799/utilities/tr.html
+    // Interpret as \123, not \012 and '3'
+    tr_test(
+        &["-d", r"\123"],
+        "321 \\ \x0A \x53 \x50 \x02 \x01 \\ CBA",
+        "321 \\ \x0A  \x50 \x02 \x01 \\ CBA",
+    );
+}
+
+#[test]
+fn tr_octal_parsing_non_ambiguous() {
+    // See above
+    // Interpret as \012 and 'A'
+    tr_test(
+        &["-d", r"\12A"],
+        "321 \\ \x0A \x53 \x50 \x02 \x01 \\ CBA",
+        "321 \\  \x53 \x50 \x02 \x01 \\ CB",
+    );
 }

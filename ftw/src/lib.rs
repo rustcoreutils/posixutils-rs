@@ -324,14 +324,16 @@ impl Metadata {
         }
     }
 
+    #[allow(clippy::unnecessary_cast)]
     #[must_use]
     pub fn dev(&self) -> u64 {
-        self.0.st_dev
+        self.0.st_dev as u64
     }
 
+    #[allow(clippy::unnecessary_cast)]
     #[must_use]
     pub fn rdev(&self) -> u64 {
-        self.0.st_rdev
+        self.0.st_rdev as u64
     }
 }
 

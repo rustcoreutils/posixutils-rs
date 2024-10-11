@@ -20,6 +20,7 @@ use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleC
 use plib::PROJECT_NAME;
 #[cfg(target_os = "macos")]
 use std::ffi::CStr;
+use std::os::unix::fs::MetadataExt;
 use std::{cmp, ffi::CString, fmt::Display, io};
 
 #[derive(Parser)]
@@ -132,8 +133,11 @@ impl Display for Fields {
     }
 }
 
+#[derive(Debug)]
 pub struct Mount {
+    /// mount point
     pub target: CString,
+    /// file system
     pub source: CString,
     pub fsstat: FilesystemStatistics,
     pub dev: i64,
@@ -207,8 +211,8 @@ impl MountList {
         Ok(MountList { info })
     }
 
-    pub fn mask_by_files(&mut self, files: Vec<String>) {
-        if files.is_empty() {
+    pub fn mask_by_files(&mut self, files: Files) {
+        if files.devs.is_empty() {
             return;
         }
 
@@ -223,6 +227,25 @@ impl MountList {
             mount.masked = false;
         }
 
+        for dev in files.devs {
+            for mount in &mut self.info {
+                if mount.dev == dev {
+                    mount.masked = true;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Files {
+    pub devs: Vec<i64>,
+}
+
+impl Files {
+    pub fn new(files: Vec<String>) -> Self {
+        let mut devs = vec![];
+
         for path in files {
             let meta = match metadata(&path) {
                 Ok(m) => m,
@@ -231,12 +254,10 @@ impl MountList {
                     continue;
                 }
             };
-            for mount in &mut self.info {
-                if mount.dev == meta.dev() as i64 {
-                    mount.masked = true;
-                }
-            }
+            devs.push(meta.dev() as i64);
         }
+
+        Self {devs}
     }
 }
 
@@ -310,7 +331,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let block_size: u64 = if args.kilo { 1024 } else { 512 };
 
     let mut info = MountList::new()?;
-    info.mask_by_files(args.files);
+    let files = Files::new(args.files);
+    info.mask_by_files(files);
 
     let fields = Fields::new(block_size);
     // Print header
@@ -333,11 +355,14 @@ mod tests {
     #[test]
     fn test_only_one_row() {
         let mut info = MountList::new().unwrap();
-        info.mask_by_files(vec!["/tmp/".into()]);
+        let files = Files::new(vec!["/tmp/".into()]);
+        dbg!(&files);
+        info.mask_by_files(files);
 
         let mut count = 0;
         for mount in &info.info {
             if mount.masked {
+                dbg!(&mount);
                 count += 1;
             }
         }

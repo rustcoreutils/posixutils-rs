@@ -53,86 +53,6 @@ struct Args {
     files: Vec<String>,
 }
 
-pub enum FieldType {
-    Str,
-    Num,
-    Pcent,
-}
-
-pub struct Field {
-    caption: String,
-    width: usize,
-    typ: FieldType,
-}
-
-impl Field {
-    pub fn new(caption: String, min_width: usize, typ: FieldType) -> Self {
-        let width = cmp::max(caption.len(), min_width);
-        Self {
-            caption,
-            width,
-            typ,
-        }
-    }
-
-    pub fn format<T: Display>(&self, value: &T) -> String {
-        match self.typ {
-            FieldType::Str => format!("{value: <width$}", width = self.width),
-            FieldType::Num => format!("{value: >width$}", width = self.width),
-            FieldType::Pcent => format!("{value: >width$}", width = self.width - 1),
-        }
-    }
-}
-
-/// Print header
-impl Display for Field {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.format(&self.caption))
-    }
-}
-
-pub struct Fields {
-    /// file system
-    pub source: Field,
-    /// FS size
-    pub size: Field,
-    /// FS size used
-    pub used: Field,
-    /// FS size available
-    pub avail: Field,
-    /// percent used
-    pub pcent: Field,
-    /// mount point
-    pub target: Field,
-    // /// specified file name
-    // file: Field,
-}
-
-impl Fields {
-    pub fn new(block_size: u64) -> Self {
-        let size_caption = format!("{}-{}", block_size, gettext("blocks"));
-        Self {
-            source: Field::new(gettext("Filesystem"), 14, FieldType::Str),
-            size: Field::new(size_caption, 10, FieldType::Num),
-            used: Field::new(gettext("Used"), 10, FieldType::Num),
-            avail: Field::new(gettext("Available"), 10, FieldType::Num),
-            pcent: Field::new(gettext("Capacity"), 5, FieldType::Pcent),
-            target: Field::new(gettext("Mounted on"), 0, FieldType::Str),
-        }
-    }
-}
-
-/// Print header
-impl Display for Fields {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} {} {} {} {} {}",
-            self.source, self.size, self.used, self.avail, self.pcent, self.target
-        )
-    }
-}
-
 #[derive(Debug)]
 pub struct Mount {
     /// mount point
@@ -258,6 +178,86 @@ impl Files {
         }
 
         Self { devs }
+    }
+}
+
+pub enum FieldType {
+    Str,
+    Num,
+    Pcent,
+}
+
+pub struct Field {
+    caption: String,
+    width: usize,
+    typ: FieldType,
+}
+
+impl Field {
+    pub fn new(caption: String, min_width: usize, typ: FieldType) -> Self {
+        let width = cmp::max(caption.len(), min_width);
+        Self {
+            caption,
+            width,
+            typ,
+        }
+    }
+
+    pub fn format<T: Display>(&self, value: &T) -> String {
+        match self.typ {
+            FieldType::Str => format!("{value: <width$}", width = self.width),
+            FieldType::Num => format!("{value: >width$}", width = self.width),
+            FieldType::Pcent => format!("{value: >width$}", width = self.width - 1),
+        }
+    }
+}
+
+/// Print header
+impl Display for Field {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.format(&self.caption))
+    }
+}
+
+pub struct Fields {
+    /// file system
+    pub source: Field,
+    /// FS size
+    pub size: Field,
+    /// FS size used
+    pub used: Field,
+    /// FS size available
+    pub avail: Field,
+    /// percent used
+    pub pcent: Field,
+    /// mount point
+    pub target: Field,
+    // /// specified file name
+    // file: Field,
+}
+
+impl Fields {
+    pub fn new(block_size: u64) -> Self {
+        let size_caption = format!("{}-{}", block_size, gettext("blocks"));
+        Self {
+            source: Field::new(gettext("Filesystem"), 14, FieldType::Str),
+            size: Field::new(size_caption, 10, FieldType::Num),
+            used: Field::new(gettext("Used"), 10, FieldType::Num),
+            avail: Field::new(gettext("Available"), 10, FieldType::Num),
+            pcent: Field::new(gettext("Capacity"), 5, FieldType::Pcent),
+            target: Field::new(gettext("Mounted on"), 0, FieldType::Str),
+        }
+    }
+}
+
+/// Print header
+impl Display for Fields {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {} {} {} {} {}",
+            self.source, self.size, self.used, self.avail, self.pcent, self.target
+        )
     }
 }
 

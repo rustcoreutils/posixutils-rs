@@ -13,6 +13,8 @@ mod mntent;
 #[cfg(target_os = "linux")]
 use crate::mntent::MountTable;
 
+use ftw::{metadata, symlink_metadata_cstr, FilesystemStatistics};
+
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
@@ -48,36 +50,6 @@ struct Args {
         help = gettext("A pathname of a file within the hierarchy of the desired file system")
     )]
     files: Vec<String>,
-}
-
-/// Display modes
-pub enum OutputMode {
-    /// When both the -k and -P options are specified
-    Posix,
-    /// When the -P option is specified without the -k option
-    PosixLegacy,
-    /// The format of the default output from df is unspecified,
-    /// but all space figures are reported in 512-byte units
-    Unspecified,
-    Unspecified1K,
-}
-
-impl OutputMode {
-    pub fn new(kilo: bool, portable: bool) -> Self {
-        match (kilo, portable) {
-            (true, true) => Self::Posix,
-            (true, false) => Self::Unspecified1K,
-            (false, true) => Self::PosixLegacy,
-            (false, false) => Self::Unspecified,
-        }
-    }
-
-    pub fn get_block_size(&self) -> u64 {
-        match self {
-            OutputMode::Posix | OutputMode::Unspecified1K => 1024,
-            OutputMode::PosixLegacy | OutputMode::Unspecified => 512,
-        }
-    }
 }
 
 pub enum FieldType {
@@ -119,7 +91,6 @@ impl Display for Field {
 }
 
 pub struct Fields {
-    pub mode: OutputMode,
     /// file system
     pub source: Field,
     /// FS size
@@ -137,10 +108,9 @@ pub struct Fields {
 }
 
 impl Fields {
-    pub fn new(mode: OutputMode) -> Self {
-        let size_caption = format!("{}-{}", mode.get_block_size(), gettext("blocks"));
+    pub fn new(block_size: u64) -> Self {
+        let size_caption = format!("{}-{}", block_size, gettext("blocks"));
         Self {
-            mode,
             source: Field::new(gettext("Filesystem"), 14, FieldType::Str),
             size: Field::new(size_caption, 10, FieldType::Num),
             used: Field::new(gettext("Used"), 10, FieldType::Num),
@@ -162,14 +132,149 @@ impl Display for Fields {
     }
 }
 
+pub struct Mount {
+    pub target: CString,
+    pub source: CString,
+    pub fsstat: FilesystemStatistics,
+    pub dev: i64,
+    pub masked: bool,
+}
+
+impl Mount {
+    pub fn new(dir: CString, fsname: CString, fsstat: FilesystemStatistics) -> Self {
+        Self {
+            target: dir,
+            source: fsname,
+            fsstat,
+            dev: -1,
+            masked: true,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn to_cstr(array: &[libc::c_char]) -> &CStr {
+    unsafe {
+        // Assuming the array is null-terminated, as it should be for C strings.
+        CStr::from_ptr(array.as_ptr())
+    }
+}
+
+pub struct MountList {
+    info: Vec<Mount>,
+}
+
+impl MountList {
+    #[cfg(target_os = "linux")]
+    pub fn new() -> io::Result<Self> {
+        let mut info = vec![];
+
+        let mounts = MountTable::open_system()?;
+        for mount in mounts {
+            let fsstat = match FilesystemStatistics::new_cstr(mount.dir.as_c_str()) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("{}: {}", mount.dir.to_str().unwrap(), e);
+                    continue;
+                }
+            };
+            info.push(Mount::new(mount.dir, mount.fsname, fsstat));
+        }
+
+        Ok(MountList { info })
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn new() -> io::Result<Self> {
+        let mut info = vec![];
+
+        unsafe {
+            let mut mounts: *mut libc::statfs = std::ptr::null_mut();
+            let n_mnt = libc::getmntinfo(&mut mounts, libc::MNT_WAIT);
+            if n_mnt < 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            let mounts: &[libc::statfs] = std::slice::from_raw_parts(mounts as _, n_mnt as _);
+            for mount in mounts {
+                let dir = to_cstr(&mount.f_mntonname).into();
+                let fsname = to_cstr(&mount.f_mntfromname).into();
+                let fsstat = FilesystemStatistics::from(mount);
+                info.push(Mount::new(dir, fsname, fsstat));
+            }
+        }
+
+        Ok(MountList { info })
+    }
+
+    pub fn mask_by_files(&mut self, files: Vec<String>) {
+        if files.is_empty() {
+            return;
+        }
+
+        for mount in &mut self.info {
+            mount.dev = if let Ok(m) = symlink_metadata_cstr(&mount.target) {
+                m.dev() as i64
+            } else if let Ok(m) = symlink_metadata_cstr(&mount.source) {
+                m.rdev() as i64
+            } else {
+                -1
+            };
+            mount.masked = false;
+        }
+
+        for path in files {
+            let meta = match metadata(&path) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("{}: {}", path, e);
+                    continue;
+                }
+            };
+            for mount in &mut self.info {
+                if mount.dev == meta.dev() as i64 {
+                    mount.masked = true;
+                }
+            }
+        }
+    }
+}
+
 pub struct FieldsData<'a> {
-    pub fields: &'a Fields,
-    pub source: &'a String,
-    pub size: u64,
-    pub used: u64,
-    pub avail: u64,
-    pub pcent: u32,
-    pub target: &'a String,
+    fields: &'a Fields,
+    source: String,
+    size: u64,
+    used: u64,
+    avail: u64,
+    pcent: u32,
+    target: String,
+}
+
+impl<'a> FieldsData<'a> {
+    pub fn new(fields: &'a Fields, mount: &Mount, block_size: u64) -> Self {
+        let blksz = mount.fsstat.bsize();
+
+        let total = (mount.fsstat.blocks() * blksz) / block_size;
+        let avail = (mount.fsstat.bavail() * blksz) / block_size;
+        let free = (mount.fsstat.bfree() * blksz) / block_size;
+        let used = total - free;
+
+        // The percentage value shall be expressed as a positive integer,
+        // with any fractional result causing it to be rounded to the next highest integer.
+        let percentage_used = f64::from(used as u32) / f64::from((used + free) as u32);
+        let percentage_used = percentage_used * 100.0;
+        let percentage_used = percentage_used.ceil() as u32;
+
+        FieldsData {
+            fields,
+            source: String::from(mount.source.to_str().unwrap()),
+            size: total,
+            used,
+            avail,
+            pcent: percentage_used,
+            target: String::from(mount.target.to_str().unwrap()),
+        }
+    }
 }
 
 impl Display for FieldsData<'_> {
@@ -182,185 +287,14 @@ impl Display for FieldsData<'_> {
         write!(
             f,
             "{} {} {} {} {}% {}",
-            self.fields.source.format(self.source),
+            self.fields.source.format(&self.source),
             self.fields.size.format(&self.size),
             self.fields.used.format(&self.used),
             self.fields.avail.format(&self.avail),
             self.fields.pcent.format(&self.pcent),
-            self.fields.target.format(self.target)
+            self.fields.target.format(&self.target)
         )
     }
-}
-
-#[cfg(target_os = "macos")]
-fn to_cstr(array: &[libc::c_char]) -> &CStr {
-    unsafe {
-        // Assuming the array is null-terminated, as it should be for C strings.
-        CStr::from_ptr(array.as_ptr())
-    }
-}
-
-fn stat(filename: &CString) -> io::Result<libc::stat> {
-    unsafe {
-        let mut st: libc::stat = std::mem::zeroed();
-        let rc = libc::stat(filename.as_ptr(), &mut st);
-        if rc == 0 {
-            Ok(st)
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    }
-}
-
-struct Mount {
-    devname: String,
-    dir: String,
-    dev: i64,
-    masked: bool,
-    cached_statfs: libc::statfs,
-}
-
-impl Mount {
-    fn to_row<'a>(&'a self, fields: &'a Fields) -> FieldsData<'a> {
-        let sf = self.cached_statfs;
-
-        let block_size = fields.mode.get_block_size();
-        let blksz = sf.f_bsize as u64;
-
-        let total = (sf.f_blocks * blksz) / block_size;
-        let avail = (sf.f_bavail * blksz) / block_size;
-        let free = (sf.f_bfree * blksz) / block_size;
-        let used = total - free;
-
-        // The percentage value shall be expressed as a positive integer,
-        // with any fractional result causing it to be rounded to the next highest integer.
-        let percentage_used = f64::from(used as u32) / f64::from((used + free) as u32);
-        let percentage_used = percentage_used * 100.0;
-        let percentage_used = percentage_used.ceil() as u32;
-
-        FieldsData {
-            fields: &fields,
-            source: &self.devname,
-            size: total,
-            used,
-            avail,
-            pcent: percentage_used,
-            target: &self.dir,
-        }
-    }
-}
-
-struct MountList {
-    mounts: Vec<Mount>,
-    has_masks: bool,
-}
-
-impl MountList {
-    fn new() -> MountList {
-        MountList {
-            mounts: Vec::new(),
-            has_masks: false,
-        }
-    }
-
-    fn mask_all(&mut self) {
-        for mount in &mut self.mounts {
-            mount.masked = true;
-        }
-    }
-
-    fn ensure_masked(&mut self) {
-        if !self.has_masks {
-            self.mask_all();
-            self.has_masks = true;
-        }
-    }
-
-    fn push(&mut self, fsstat: &libc::statfs, devname: &CString, dirname: &CString) {
-        let dev = {
-            if let Ok(st) = stat(devname) {
-                st.st_rdev as i64
-            } else if let Ok(st) = stat(dirname) {
-                st.st_dev as i64
-            } else {
-                -1
-            }
-        };
-
-        self.mounts.push(Mount {
-            devname: String::from(devname.to_str().unwrap()),
-            dir: String::from(dirname.to_str().unwrap()),
-            dev,
-            masked: false,
-            cached_statfs: *fsstat,
-        });
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn read_mount_info() -> io::Result<MountList> {
-    let mut info = MountList::new();
-
-    unsafe {
-        let mut mounts: *mut libc::statfs = std::ptr::null_mut();
-        let n_mnt = libc::getmntinfo(&mut mounts, libc::MNT_WAIT);
-        if n_mnt < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        let mounts: &[libc::statfs] = std::slice::from_raw_parts(mounts as _, n_mnt as _);
-        for mount in mounts {
-            let devname = to_cstr(&mount.f_mntfromname).into();
-            let dirname = to_cstr(&mount.f_mntonname).into();
-            info.push(mount, &devname, &dirname);
-        }
-    }
-
-    Ok(info)
-}
-
-#[cfg(target_os = "linux")]
-fn read_mount_info() -> io::Result<MountList> {
-    let mut info = MountList::new();
-
-    let mounts = MountTable::open_system()?;
-    for mount in mounts {
-        unsafe {
-            let mut buf: libc::statfs = std::mem::zeroed();
-            let rc = libc::statfs(mount.dir.as_ptr(), &mut buf);
-            if rc < 0 {
-                eprintln!(
-                    "{}: {}",
-                    mount.dir.to_str().unwrap(),
-                    io::Error::last_os_error()
-                );
-                continue;
-            }
-
-            info.push(&buf, &mount.fsname, &mount.dir);
-        }
-    }
-
-    Ok(info)
-}
-
-fn mask_fs_by_file(info: &mut MountList, filename: &str) -> io::Result<()> {
-    let c_filename = CString::new(filename).expect("`filename` contains an internal 0 byte");
-    let stat_res = stat(&c_filename);
-    if let Err(e) = stat_res {
-        eprintln!("{}: {}", filename, e);
-        return Err(e);
-    }
-    let stat = stat_res.unwrap();
-
-    for mount in &mut info.mounts {
-        if stat.st_dev as i64 == mount.dev {
-            info.has_masks = true;
-            mount.masked = true;
-        }
-    }
-
-    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -371,29 +305,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
-    let mut info = read_mount_info()?;
+    // The format of the default output from df is unspecified,
+    // but all space figures are reported in 512-byte units
+    let block_size: u64 = if args.kilo { 1024 } else { 512 };
 
-    if args.files.is_empty() {
-        info.mask_all();
-    } else {
-        for file in &args.files {
-            mask_fs_by_file(&mut info, file)?;
-        }
-    }
+    let mut info = MountList::new()?;
+    info.mask_by_files(args.files);
 
-    info.ensure_masked();
-
-    let mode = OutputMode::new(args.kilo, args.portable);
-    let fields = Fields::new(mode);
+    let fields = Fields::new(block_size);
     // Print header
     println!("{}", fields);
 
-    for mount in &info.mounts {
+    for mount in &info.info {
         if mount.masked {
-            let row = mount.to_row(&fields);
+            let row = FieldsData::new(&fields, mount, block_size);
             println!("{}", row);
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_only_one_row() {
+        let mut info = MountList::new().unwrap();
+        info.mask_by_files(vec!["/tmp/".into()]);
+
+        let mut count = 0;
+        for mount in &info.info {
+            if mount.masked {
+                count += 1;
+            }
+        }
+        assert_eq!(count, 1);
+    }
 }

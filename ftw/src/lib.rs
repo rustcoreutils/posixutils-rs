@@ -277,7 +277,7 @@ impl Metadata {
     /// This is analogous to [`std::fs::Metadata::len`].
     #[must_use]
     pub fn len(&self) -> u64 {
-        self.0.st_size as u64
+        self.0.st_size as _
     }
 
     // These are "effective" IDs and not "real" to allow for things like sudo
@@ -323,81 +323,103 @@ impl Metadata {
             self.0.st_mode & libc::S_IXOTH != 0
         }
     }
-
-    #[allow(clippy::unnecessary_cast)]
-    #[must_use]
-    pub fn dev(&self) -> u64 {
-        self.0.st_dev as u64
-    }
-
-    #[allow(clippy::unnecessary_cast)]
-    #[must_use]
-    pub fn rdev(&self) -> u64 {
-        self.0.st_rdev as u64
-    }
 }
 
 impl unix::fs::MetadataExt for Metadata {
+    /// Returns the ID of the device containing the file.
+    #[must_use]
     fn dev(&self) -> u64 {
         self.0.st_dev as _
     }
 
+    /// Returns the inode number.
+    #[must_use]
     fn ino(&self) -> u64 {
         self.0.st_ino
     }
 
+    /// Returns the rights applied to this file.
+    #[must_use]
     fn mode(&self) -> u32 {
         self.0.st_mode as _
     }
 
+    /// Returns the number of hard links pointing to this file.
+    #[must_use]
     fn nlink(&self) -> u64 {
         self.0.st_nlink as _
     }
 
+    /// Returns the user ID of the owner of this file.
+    #[must_use]
     fn uid(&self) -> u32 {
         self.0.st_uid
     }
 
+    /// Returns the group ID of the owner of this file.
+    #[must_use]
     fn gid(&self) -> u32 {
         self.0.st_gid
     }
 
+    /// Returns the device ID of this file (if it is a special one).
+    #[must_use]
     fn rdev(&self) -> u64 {
         self.0.st_rdev as _
     }
 
+    /// Returns the total size of this file in bytes.
+    #[must_use]
     fn size(&self) -> u64 {
         self.0.st_size as _
     }
 
+    /// Returns the last access time of the file, in seconds since Unix Epoch.
+    #[must_use]
     fn atime(&self) -> i64 {
         self.0.st_atime
     }
 
+    /// Returns the last access time of the file, in nanoseconds since [`atime`].
+    #[must_use]
     fn atime_nsec(&self) -> i64 {
         self.0.st_atime_nsec
     }
 
+    /// Returns the last modification time of the file, in seconds since Unix Epoch.
+    #[must_use]
     fn mtime(&self) -> i64 {
         self.0.st_mtime
     }
 
+    /// Returns the last modification time of the file, in nanoseconds since [`mtime`].
+    #[must_use]
     fn mtime_nsec(&self) -> i64 {
         self.0.st_mtime_nsec
     }
 
+    /// Returns the last status change time of the file, in seconds since Unix Epoch.
+    #[must_use]
     fn ctime(&self) -> i64 {
         self.0.st_ctime
     }
 
+    /// Returns the last status change time of the file, in nanoseconds since [`ctime`].
+    #[must_use]
     fn ctime_nsec(&self) -> i64 {
         self.0.st_ctime_nsec
     }
 
+    /// Returns the block size for filesystem I/O.
+    #[must_use]
     fn blksize(&self) -> u64 {
         self.0.st_blksize as _
     }
 
+    /// Returns the number of blocks allocated to the file, in 512-byte units.
+    ///
+    /// Please note that this may be smaller than `st_size / 512` when the file has holes.
+    #[must_use]
     fn blocks(&self) -> u64 {
         self.0.st_blocks as _
     }

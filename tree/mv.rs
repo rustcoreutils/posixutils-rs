@@ -6,9 +6,10 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-//
 
 mod common;
+
+use ftw::{metadata, symlink_metadata};
 
 use self::common::{copy_file, error_string};
 use clap::Parser;
@@ -20,7 +21,7 @@ use std::{
     ffi::CString,
     fs,
     io::{self, IsTerminal},
-    os::unix::{ffi::OsStrExt, fs::MetadataExt},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 
@@ -104,11 +105,8 @@ fn move_file(
     inode_map: &mut HashMap<(u64, u64), (ftw::FileDescriptor, CString)>,
     created_files: Option<&mut HashSet<PathBuf>>,
 ) -> io::Result<bool> {
-    let source_filename = CString::new(source.as_os_str().as_bytes()).unwrap();
-    let target_filename = CString::new(target.as_os_str().as_bytes()).unwrap();
-
-    let target_md = match ftw::Metadata::new(libc::AT_FDCWD, &target_filename, true) {
-        Ok(md) => Some(md),
+    let target_md = match metadata(&target) {
+        Ok(m) => Some(m),
         Err(e) => {
             if e.kind() == io::ErrorKind::NotFound {
                 None
@@ -120,13 +118,13 @@ fn move_file(
     };
     let target_exists = target_md.is_some();
     let target_is_dir = match &target_md {
-        Some(md) => md.file_type() == ftw::FileType::Directory,
+        Some(m) => m.file_type() == ftw::FileType::Directory,
         None => false,
     };
-    let target_is_writable = target_md.map(|md| md.is_writable()).unwrap_or(false);
+    let target_is_writable = target_md.map(|m| m.is_writable()).unwrap_or(false);
 
-    let source_md = match ftw::Metadata::new(libc::AT_FDCWD, &source_filename, true) {
-        Ok(md) => Some(md),
+    let source_md = match metadata(&source) {
+        Ok(m) => Some(m),
         Err(e) => {
             if e.kind() == io::ErrorKind::NotFound {
                 None
@@ -138,7 +136,7 @@ fn move_file(
     };
     let source_exists = source_md.is_some();
     let source_is_dir = match &source_md {
-        Some(md) => md.file_type() == ftw::FileType::Directory,
+        Some(m) => m.file_type() == ftw::FileType::Directory,
         None => false,
     };
 
@@ -153,8 +151,8 @@ fn move_file(
 
     // 2. source and target are same dirent
     if let (Ok(smd), Ok(tmd), Some(deref_smd)) = (
-        ftw::Metadata::new(libc::AT_FDCWD, &source_filename, false),
-        ftw::Metadata::new(libc::AT_FDCWD, &target_filename, false),
+        symlink_metadata(&source),
+        symlink_metadata(&target),
         &source_md,
     ) {
         // `true` for hard links to the same file and when `source == target`
@@ -394,7 +392,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // choose mode based on whether target is a directory
     let dir_exists = {
         match fs::metadata(target) {
-            Ok(md) => md.is_dir(),
+            Ok(m) => m.is_dir(),
             Err(e) => {
                 if e.kind() == io::ErrorKind::NotFound {
                     false

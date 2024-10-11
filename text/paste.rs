@@ -6,13 +6,9 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
+
 // TODO:
-// - stdin ("-")
-// -- Fixed
-// - fix:  empty-string delimiters \0
-// -- Fixed
 // - improve:  don't open all files at once in --serial mode
-//
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
@@ -34,9 +30,9 @@ struct Args {
     serial: bool,
 
     /// Delimiter list
-    // Other implementations use "delimiters"
-    #[arg(alias = "delimiters", short, long)]
-    delims: Option<String>,
+    // Other implementations use "delimiters" as the long form, so mirror that
+    #[arg(short, long)]
+    delimiters: Option<String>,
 
     /// One or more input files
     files: Vec<String>,
@@ -95,7 +91,7 @@ struct PasteInfo {
     pub inputs: Vec<PasteFile>,
 }
 
-enum DelimsInfo<'a> {
+enum DelimiterState<'a> {
     NoDelimiters,
     SingleDelimiter(&'a [u8]),
     MultipleDelimiters {
@@ -104,9 +100,9 @@ enum DelimsInfo<'a> {
     },
 }
 
-impl<'a> DelimsInfo<'a> {
-    fn new(parsed_delims_argument_ref: &'a [Box<[u8]>]) -> DelimsInfo<'a> {
-        match parsed_delims_argument_ref {
+impl<'a> DelimiterState<'a> {
+    fn new(parsed_delimiters_argument_ref: &'a [Box<[u8]>]) -> DelimiterState<'a> {
+        match parsed_delimiters_argument_ref {
             [] => Self::NoDelimiters,
             [only_delimiter] => {
                 // -d '\0' has the same effect as -d ''
@@ -117,18 +113,18 @@ impl<'a> DelimsInfo<'a> {
                 }
             }
             _ => Self::MultipleDelimiters {
-                delimiters: parsed_delims_argument_ref,
-                delimiters_iterator: parsed_delims_argument_ref.iter().cycle(),
+                delimiters: parsed_delimiters_argument_ref,
+                delimiters_iterator: parsed_delimiters_argument_ref.iter().cycle(),
             },
         }
     }
 
     fn write(&mut self, write: &mut impl io::Write) -> io::Result<()> {
         match *self {
-            DelimsInfo::SingleDelimiter(sl) => {
+            DelimiterState::SingleDelimiter(sl) => {
                 write.write_all(sl)?;
             }
-            DelimsInfo::MultipleDelimiters {
+            DelimiterState::MultipleDelimiters {
                 ref mut delimiters_iterator,
                 ..
             } => {
@@ -145,7 +141,7 @@ impl<'a> DelimsInfo<'a> {
 
     fn reset(&mut self) {
         match self {
-            DelimsInfo::MultipleDelimiters {
+            DelimiterState::MultipleDelimiters {
                 delimiters,
                 ref mut delimiters_iterator,
                 ..
@@ -159,7 +155,7 @@ impl<'a> DelimsInfo<'a> {
     }
 }
 
-/// `delims`: Delimiters parsed from "-d"/"--delims" argument
+/// `delimiters`: Delimiters parsed from "-d"/"--delimiters" argument
 // Support for empty delimiter list:
 //
 // bsdutils: no, supports "-d" but requires the delimiter list to be non-empty
@@ -171,14 +167,14 @@ impl<'a> DelimsInfo<'a> {
 // POSIX seems to almost forbid this:
 // "These elements specify one or more delimiters to use, instead of the default <tab>, to replace the <newline> of the input lines."
 // https://pubs.opengroup.org/onlinepubs/9799919799/utilities/paste.html
-fn parse_delims_argument(delims: Option<String>) -> Result<Box<[Box<[u8]>]>, String> {
+fn parse_delimiters_argument(delimiters: Option<String>) -> Result<Box<[Box<[u8]>]>, String> {
     const BACKSLASH: char = '\\';
 
     fn add_normal_delimiter(ve: &mut Vec<Box<[u8]>>, byte: u8) {
         ve.push(Box::new([byte]));
     }
 
-    let Some(delims_string) = delims else {
+    let Some(delimiters_string) = delimiters else {
         // Default when no delimiter argument is provided
         return Ok(Box::new([Box::new([b'\t'])]));
     };
@@ -191,9 +187,9 @@ fn parse_delims_argument(delims: Option<String>) -> Result<Box<[Box<[u8]>]>, Str
         ve.push(Box::from(encoded.as_bytes()));
     };
 
-    let mut vec = Vec::<Box<[u8]>>::with_capacity(delims_string.len());
+    let mut vec = Vec::<Box<[u8]>>::with_capacity(delimiters_string.len());
 
-    let mut chars = delims_string.chars();
+    let mut chars = delimiters_string.chars();
 
     while let Some(char) = chars.next() {
         match char {
@@ -223,7 +219,7 @@ fn parse_delims_argument(delims: Option<String>) -> Result<Box<[Box<[u8]>]>, Str
                 }
                 None => {
                     return Err(format!(
-                        "delimiter list ends with an unescaped backslash: {delims_string}"
+                        "delimiter list ends with an unescaped backslash: {delimiters_string}"
                     ));
                 }
             },
@@ -295,7 +291,7 @@ fn open_inputs(files: Vec<String>) -> Result<PasteInfo, Box<dyn Error>> {
 
 fn paste_files_serial(
     mut paste_info: PasteInfo,
-    mut delims_info: DelimsInfo,
+    mut delimiter_state: DelimiterState,
 ) -> Result<(), Box<dyn Error>> {
     let mut stdout_lock = io::stdout().lock();
 
@@ -320,7 +316,7 @@ fn paste_files_serial(
                 break;
             } else {
                 if !first_line {
-                    delims_info.write(&mut stdout_lock)?;
+                    delimiter_state.write(&mut stdout_lock)?;
                 }
 
                 // output line segment
@@ -351,7 +347,7 @@ fn paste_files_serial(
         //    When the -s option is specified:
         //    The last <newline> in a file shall not be modified.
         //    The delimiter shall be reset to the first element of list after each file operand is processed.
-        delims_info.reset();
+        delimiter_state.reset();
     }
 
     Ok(())
@@ -359,7 +355,7 @@ fn paste_files_serial(
 
 fn paste_files(
     mut paste_info: PasteInfo,
-    mut delims_info: DelimsInfo,
+    mut delimiter_state: DelimiterState,
 ) -> Result<(), Box<dyn Error>> {
     // for each input line, across N files
 
@@ -406,7 +402,7 @@ fn paste_files(
                 output.push(b'\n');
             } else {
                 // next delimiter
-                delims_info.write(&mut output)?;
+                delimiter_state.write(&mut output)?;
             }
         }
 
@@ -417,7 +413,7 @@ fn paste_files(
         // output all segments to stdout at once (one write per line)
         io::stdout().write_all(output.as_slice())?;
 
-        delims_info.reset();
+        delimiter_state.reset();
     }
 
     Ok(())
@@ -432,12 +428,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
     let Args {
-        delims,
+        delimiters,
         files,
         serial,
     } = args;
 
-    let parsed_delims_argument = match parse_delims_argument(delims) {
+    let parsed_delimiters_argument = match parse_delimiters_argument(delimiters) {
         Ok(bo) => bo,
         Err(st) => {
             eprintln!("paste: {st}");
@@ -459,12 +455,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let delims_info = DelimsInfo::new(&parsed_delims_argument);
+    let delimiter_state = DelimiterState::new(&parsed_delimiters_argument);
 
     if serial {
-        paste_files_serial(paste_info, delims_info)?;
+        paste_files_serial(paste_info, delimiter_state)?;
     } else {
-        paste_files(paste_info, delims_info)?;
+        paste_files(paste_info, delimiter_state)?;
     }
 
     Ok(())

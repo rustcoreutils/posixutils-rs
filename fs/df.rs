@@ -217,10 +217,10 @@ impl MountList {
         }
 
         for mount in &mut self.info {
-            mount.dev = if let Ok(m) = symlink_metadata_cstr(&mount.target) {
-                m.dev() as i64
-            } else if let Ok(m) = symlink_metadata_cstr(&mount.source) {
+            mount.dev = if let Ok(m) = symlink_metadata_cstr(&mount.source) {
                 m.rdev() as i64
+            } else if let Ok(m) = symlink_metadata_cstr(&mount.target) {
+                m.dev() as i64
             } else {
                 -1
             };
@@ -257,7 +257,7 @@ impl Files {
             devs.push(meta.dev() as i64);
         }
 
-        Self {devs}
+        Self { devs }
     }
 }
 

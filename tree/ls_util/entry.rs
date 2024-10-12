@@ -612,22 +612,14 @@ fn get_file_mode_string(metadata: &ftw::Metadata) -> String {
         _ => '-',
     });
 
-    let mode = metadata.mode();
+    let perm = metadata.permissions();
 
     // Owner permissions
-    file_mode.push(if mode & (libc::S_IRUSR as u32) != 0 {
-        'r'
-    } else {
-        '-'
-    });
-    file_mode.push(if mode & (libc::S_IWUSR as u32) != 0 {
-        'w'
-    } else {
-        '-'
-    });
+    file_mode.push(if perm.is_read_owner() { 'r' } else { '-' });
+    file_mode.push(if perm.is_write_owner() { 'w' } else { '-' });
     file_mode.push({
-        let executable = mode & (libc::S_IXUSR as u32) != 0;
-        let set_user_id = mode & (libc::S_ISUID as u32) != 0;
+        let executable = perm.is_executable_owner();
+        let set_user_id = perm.is_set_user_id();
         match (executable, set_user_id) {
             (true, true) => 's',
             (true, false) => 'x',
@@ -637,37 +629,17 @@ fn get_file_mode_string(metadata: &ftw::Metadata) -> String {
     });
 
     // Group permissions
-    file_mode.push(if mode & (libc::S_IRGRP as u32) != 0 {
-        'r'
-    } else {
-        '-'
-    });
-    file_mode.push(if mode & (libc::S_IWGRP as u32) != 0 {
-        'w'
-    } else {
-        '-'
-    });
-    file_mode.push(if mode & (libc::S_IXGRP as u32) != 0 {
-        'x'
-    } else {
-        '-'
-    });
+    file_mode.push(if perm.is_read_group() { 'r' } else { '-' });
+    file_mode.push(if perm.is_write_group() { 'w' } else { '-' });
+    file_mode.push(if perm.is_executable_group() { 'x' } else { '-' });
 
     // Other permissions
-    file_mode.push(if mode & (libc::S_IROTH as u32) != 0 {
-        'r'
-    } else {
-        '-'
-    });
-    file_mode.push(if mode & (libc::S_IWOTH as u32) != 0 {
-        'w'
-    } else {
-        '-'
-    });
+    file_mode.push(if perm.is_read_other() { 'r' } else { '-' });
+    file_mode.push(if perm.is_write_other() { 'w' } else { '-' });
     file_mode.push({
         if file_type.is_dir() {
-            let searchable = mode & (libc::S_IXOTH as u32) != 0;
-            let restricted_deletion = mode & (libc::S_ISVTX as u32) != 0;
+            let searchable = perm.is_executable_other();
+            let restricted_deletion = perm.is_sticky();
             match (searchable, restricted_deletion) {
                 (true, true) => 't',
                 (true, false) => 'x',
@@ -675,7 +647,7 @@ fn get_file_mode_string(metadata: &ftw::Metadata) -> String {
                 (false, false) => '-',
             }
         } else {
-            if mode & (libc::S_IXOTH as u32) != 0 {
+            if perm.is_executable_other() {
                 'x'
             } else {
                 '-'

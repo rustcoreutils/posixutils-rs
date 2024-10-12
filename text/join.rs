@@ -103,22 +103,28 @@ fn process_files2(
                     let mut res: Vec<String> = Vec::new();
                     for num in order {
                         let f_num: Vec<&str> = num.split('.').collect();
+                        assert_eq!(f_num.len(), 2);
+                        let mut n: usize = f_num[1].parse()?;
+                        n -= 1;
                         if f_num[0] == "1" {
-                            if fields1.len() <= f_num[1].parse::<usize>()? - 1 {
+                            if fields1.len() <= n {
                                 if let Some(e) = &e {
                                     res.push(e.to_string());
                                 }
                             } else {
-                                res.push(fields1[f_num[1].parse::<usize>()? - 1].clone());
+                                res.push(fields1[n].clone());
                             }
                         } else if f_num[0] == "2" {
-                            if fields2.len() <= f_num[1].parse::<usize>()? - 1 {
+                            if fields2.len() <= n {
                                 if let Some(e) = &e {
                                     res.push(e.to_string());
                                 }
                             } else {
-                                res.push(fields2[f_num[1].parse::<usize>()? - 1].clone());
+                                res.push(fields2[n].clone());
                             }
+                        } else {
+                            // TODO:
+                            panic!("f_num[0] not in (1, 2)");
                         }
                     }
                     if v == 0 {

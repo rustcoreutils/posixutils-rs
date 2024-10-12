@@ -280,6 +280,13 @@ impl Metadata {
         self.0.st_size as _
     }
 
+    /// Returns the permissions of the file this metadata is for.
+    ///
+    /// This is analogous to [`std::fs::Metadata::permissions`].
+    pub fn permissions(&self) -> Permissions {
+        Permissions(self.0.st_mode)
+    }
+
     // These are "effective" IDs and not "real" to allow for things like sudo
     #[must_use]
     fn get_uid_and_gid(&self) -> (libc::uid_t, libc::gid_t) {
@@ -489,20 +496,117 @@ impl FileType {
 }
 
 impl unix::fs::FileTypeExt for FileType {
+    /// Returns `true` if this file type is a block device.
+    ///   
+    /// This is analogous to [`std::fs::FileType::is_block_device`].
+    #[must_use]
     fn is_block_device(&self) -> bool {
         *self == FileType::BlockDevice
     }
 
+    /// Returns `true` if this file type is a char device.
+    ///  
+    /// This is analogous to [`std::fs::FileType::is_char_device`].
+    #[must_use]
     fn is_char_device(&self) -> bool {
         *self == FileType::CharacterDevice
     }
 
+    /// Returns `true` if this file type is a fifo.
+    ///
+    /// This is analogous to [`std::fs::FileType::is_fifo`].
+    #[must_use]
     fn is_fifo(&self) -> bool {
         *self == FileType::Fifo
     }
 
+    /// Returns `true` if this file type is a socket.
+    ///
+    /// This is analogous to [`std::fs::FileType::is_socket`].
+    #[must_use]
     fn is_socket(&self) -> bool {
         *self == FileType::Socket
+    }
+}
+
+/// Representation of the various permissions on a file.
+///
+/// Returned by [`Metadata::permissions`].
+#[must_use]
+pub struct Permissions(libc::mode_t);
+
+impl Permissions {
+    /// Read permission bit for the owner of the file.
+    #[must_use]
+    pub fn is_read_owner(&self) -> bool {
+        self.0 & libc::S_IRUSR != 0
+    }
+
+    /// Write permission bit for the owner of the file.
+    #[must_use]
+    pub fn is_write_owner(&self) -> bool {
+        self.0 & libc::S_IWUSR != 0
+    }
+
+    /// Execute (for ordinary files) or search (for directories)
+    /// permission bit for the owner of the file.
+    #[must_use]
+    pub fn is_executable_owner(&self) -> bool {
+        self.0 & libc::S_IXUSR != 0
+    }
+
+    /// Read permission bit for the group owner of the file.
+    #[must_use]
+    pub fn is_read_group(&self) -> bool {
+        self.0 & libc::S_IRGRP != 0
+    }
+
+    /// Write permission bit for the group owner of the file.
+    #[must_use]
+    pub fn is_write_group(&self) -> bool {
+        self.0 & libc::S_IWGRP != 0
+    }
+
+    /// Execute or search permission bit for the group owner of the file.
+    #[must_use]
+    pub fn is_executable_group(&self) -> bool {
+        self.0 & libc::S_IXGRP != 0
+    }
+
+    /// Read permission bit for other users.
+    #[must_use]
+    pub fn is_read_other(&self) -> bool {
+        self.0 & libc::S_IROTH != 0
+    }
+
+    /// Write permission bit for other users.
+    #[must_use]
+    pub fn is_write_other(&self) -> bool {
+        self.0 & libc::S_IWOTH != 0
+    }
+
+    /// Execute or search permission bit for other users.
+    #[must_use]
+    pub fn is_executable_other(&self) -> bool {
+        self.0 & libc::S_IXOTH != 0
+    }
+
+    /// This is the set-user-ID on execute bit.
+    #[must_use]
+    pub fn is_set_user_id(&self) -> bool {
+        self.0 & libc::S_ISUID != 0
+    }
+
+    /// This is the set-group-ID on execute bit.
+    #[must_use]
+    pub fn is_set_group_id(&self) -> bool {
+        self.0 & libc::S_ISGID != 0
+    }
+
+    /// This is the sticky bit.
+    #[must_use]
+    pub fn is_sticky(&self) -> bool {
+        self.0 & libc::S_ISVTX != 0
     }
 }
 

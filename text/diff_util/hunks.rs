@@ -33,10 +33,6 @@ impl Default for Hunk {
 }
 
 impl Hunk {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn f1_range(&self, is_ed: bool) -> String {
         if self.ln1_start == self.ln1_end {
             format!("{}", self.ln1_start)
@@ -193,20 +189,12 @@ impl Hunk {
     }
 }
 
+#[derive(Default)]
 pub struct Hunks {
     hunks: Vec<Hunk>,
 }
 
 impl Hunks {
-    pub fn new() -> Self {
-        Self {
-            hunks: {
-                Hunk::new();
-                vec![] as Vec<Hunk>
-            },
-        }
-    }
-
     pub fn hunks(&self) -> &Vec<Hunk> {
         &self.hunks
     }

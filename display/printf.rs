@@ -31,17 +31,17 @@ struct ConvSpec {
     zero_pad: bool,
 }
 
-impl ConvSpec {
-    fn new() -> ConvSpec {
-        ConvSpec {
+impl Default for ConvSpec {
+    fn default() -> Self {
+        Self {
             spec: ' ',
-            width: None,
-            precision: None,
-            left_justify: false,
-            sign: false,
-            space: false,
-            alt_form: false,
-            zero_pad: false,
+            width: Default::default(),
+            precision: Default::default(),
+            left_justify: Default::default(),
+            sign: Default::default(),
+            space: Default::default(),
+            alt_form: Default::default(),
+            zero_pad: Default::default(),
         }
     }
 }
@@ -81,7 +81,7 @@ fn escaped_char(c: char) -> char {
 fn tokenize_format_str(format: &str) -> Vec<Token> {
     let mut tokens: Vec<Token> = Vec::new();
     let mut literal = String::with_capacity(format.len());
-    let mut conversion = ConvSpec::new();
+    let mut conversion = ConvSpec::default();
     let mut width = String::with_capacity(8);
     let mut precision = String::with_capacity(8);
     let mut state = ParseState::Literal;
@@ -164,7 +164,7 @@ fn tokenize_format_str(format: &str) -> Vec<Token> {
                 ParseState::Specifier => {
                     conversion.spec = c;
                     tokens.push(Token::Conversion(conversion));
-                    conversion = ConvSpec::new();
+                    conversion = ConvSpec::default();
                     state = ParseState::Literal;
                     done_with_char = true;
                 }

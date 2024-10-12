@@ -24,32 +24,10 @@ pub struct FileDiff<'a> {
     file2: &'a mut FileData<'a>,
     hunks: Hunks,
     format_options: &'a FormatOptions,
-    are_different: bool,
+    pub are_different: bool,
 }
 
 impl<'a> FileDiff<'a> {
-    pub fn are_different(&self) -> bool {
-        self.are_different
-    }
-
-    pub fn set_different(&mut self, are_different: bool) {
-        self.are_different = are_different;
-    }
-
-    fn new(
-        file1: &'a mut FileData<'a>,
-        file2: &'a mut FileData<'a>,
-        format_options: &'a FormatOptions,
-    ) -> Self {
-        Self {
-            file1,
-            file2,
-            hunks: Hunks::new(),
-            format_options,
-            are_different: false,
-        }
-    }
-
     pub fn file_diff(
         path1: PathBuf,
         path2: PathBuf,
@@ -85,7 +63,13 @@ impl<'a> FileDiff<'a> {
             let mut file1 = FileData::get_file(path1, lines1, ends_with_newline1)?;
             let mut file2 = FileData::get_file(path2, lines2, ends_with_newline2)?;
 
-            let mut diff = FileDiff::new(&mut file1, &mut file2, format_options);
+            let mut diff = FileDiff {
+                file1: &mut file1,
+                file2: &mut file2,
+                hunks: Default::default(),
+                format_options,
+                are_different: Default::default(),
+            };
 
             // histogram diff
             let mut lcs_indices: Vec<i32> = vec![-1; diff.file1.lines().len()];
@@ -105,10 +89,10 @@ impl<'a> FileDiff<'a> {
                 .create_hunks_from_lcs(&lcs_indices, num_lines1, num_lines2);
 
             if diff.hunks.hunk_count() > 0 {
-                diff.set_different(true);
+                diff.are_different = true;
             }
 
-            if diff.are_different() {
+            if diff.are_different {
                 if let Some(show_if_different) = show_if_different {
                     println!("{}", show_if_different);
                 }
@@ -216,7 +200,7 @@ impl<'a> FileDiff<'a> {
             }
         }
 
-        if self.are_different() {
+        if self.are_different {
             Ok(DiffExitStatus::Different)
         } else {
             Ok(DiffExitStatus::NotDifferent)
@@ -331,7 +315,7 @@ impl<'a> FileDiff<'a> {
             Self::get_header(self.file2, self.format_options.label2())
         );
 
-        let mut diff_disp = ContextDiffDisplay::new();
+        let mut diff_disp = ContextDiffDisplay::default();
 
         for hunk in self.hunks.hunks() {
             // move cursor to the start of context for first hunk
@@ -458,7 +442,7 @@ impl<'a> FileDiff<'a> {
             Self::get_header(self.file2, self.format_options.label2())
         );
 
-        let mut diff_disp = UnifiedDiffDisplay::new();
+        let mut diff_disp = UnifiedDiffDisplay::default();
 
         for hunk in self.hunks.hunks() {
             // move cursor to the start of context for first hunk
@@ -526,6 +510,7 @@ impl<'a> FileDiff<'a> {
     }
 }
 
+#[derive(Default)]
 pub struct UnifiedDiffDisplay {
     curr_pos1: usize,
     curr_pos2: usize,
@@ -540,18 +525,6 @@ pub struct UnifiedDiffDisplay {
 }
 
 impl UnifiedDiffDisplay {
-    pub fn new() -> Self {
-        Self {
-            curr_pos1: 0,
-            curr_pos2: 0,
-            context_start1: 0,
-            context_start2: 0,
-            hunk1_len: 0,
-            hunk2_len: 0,
-            hunk_lines: String::new(),
-        }
-    }
-
     pub fn write_line(
         &mut self,
         file: &FileData,
@@ -607,6 +580,7 @@ impl UnifiedDiffDisplay {
     }
 }
 
+#[derive(Default)]
 pub struct ContextDiffDisplay {
     curr_pos1: usize,
     curr_pos2: usize,
@@ -621,18 +595,6 @@ pub struct ContextDiffDisplay {
 }
 
 impl ContextDiffDisplay {
-    pub fn new() -> Self {
-        Self {
-            curr_pos1: 0,
-            curr_pos2: 0,
-            context_start1: 0,
-            context_start2: 0,
-            hunk1_len: 0,
-            hunk2_len: 0,
-            hunk_lines: [String::new(), String::new()],
-        }
-    }
-
     pub fn set_context_start(&mut self) {
         self.context_start1 = self.curr_pos1 + 1;
         self.context_start2 = self.curr_pos2 + 1;

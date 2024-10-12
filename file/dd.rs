@@ -102,20 +102,20 @@ struct Config {
     notrunc: bool,
 }
 
-impl Config {
-    fn new() -> Config {
-        Config {
-            ifile: String::new(),
-            ofile: String::new(),
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            ifile: Default::default(),
+            ofile: Default::default(),
             ibs: DEF_BLOCK_SIZE,
             obs: DEF_BLOCK_SIZE,
-            cbs: 0,
-            seek: 0,
-            skip: 0,
-            count: 0,
-            conversions: Vec::new(),
-            noerror: false,
-            notrunc: false,
+            cbs: Default::default(),
+            seek: Default::default(),
+            skip: Default::default(),
+            count: Default::default(),
+            conversions: Default::default(),
+            noerror: Default::default(),
+            notrunc: Default::default(),
         }
     }
 }
@@ -341,7 +341,7 @@ fn parse_block_size(s: &str) -> Result<usize, Box<dyn std::error::Error>> {
 }
 
 fn parse_cmdline(args: &[String]) -> Result<Config, Box<dyn std::error::Error>> {
-    let mut config = Config::new();
+    let mut config = Config::default();
 
     for arg in args {
         // Split arg into option and argument

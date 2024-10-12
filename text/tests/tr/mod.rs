@@ -563,3 +563,34 @@ fn tr_octal_parsing_non_ambiguous() {
         "321 \\  \x53 \x50 \x02 \x01 \\ CB",
     );
 }
+
+#[test]
+fn tr_equiv_class_and_other_deletions() {
+    tr_test(&["-d", "4[=a=]2"], "1 3 A a 2 4", "1 3 A   ");
+}
+
+#[test]
+fn tr_string2_equiv_inappropriate() {
+    tr_bad_arguments_failure_test(
+        &["1", "[=a=]"],
+        "tr: [=c=] expressions may not appear in string2 when translating\n",
+    );
+}
+
+#[test]
+fn tr_equivalence_class_low_priority() {
+    const INPUT: &str = "aaa bbb ccc 123";
+    const OUTPUT: &str = "YYY bbb ccc 123";
+
+    tr_test(&["[=a=]a", "XY"], INPUT, OUTPUT);
+
+    tr_test(&["a[=a=]", "XY"], INPUT, OUTPUT);
+}
+
+#[test]
+fn tr_arguments_validation_error_message_format() {
+    tr_bad_arguments_failure_test(
+        &["a"],
+        "tr: missing operand after ‘a’. Two strings must be given when translating.\n",
+    );
+}

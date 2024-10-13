@@ -553,6 +553,7 @@ impl MessageCatalog {
     }
 
     /// Read the **GNU based** binary catalog file and build [MessageCatalog]
+    #[allow(clippy::needless_range_loop)]
     pub fn read_catfile<T: Read>(
         mut input: T,
     ) -> Result<MessageCatalog, Box<dyn std::error::Error>> {
@@ -590,7 +591,7 @@ impl MessageCatalog {
             ptr += 4;
         }
 
-        // note: probably compare be_array and le_array as they should be the same
+        // TODO: probably compare be_array and le_array as they should be the same
 
         let string_pool = &buf[ptr..];
 

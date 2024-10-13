@@ -12,6 +12,8 @@ clap.workspace = true
 gettext-rs.workspace = true
 bytemuck = { version = "1.17.0", features = ["derive"] }
 byteorder = "1.5.0"
+strum = "0.26.3"
+strum_macros = "0.26.4"
 
 [lints]
 workspace = true
@@ -19,3 +21,7 @@ workspace = true
 [[bin]]
 name = "gencat"
 path = "./gencat.rs"
+
+[[bin]]
+name = "iconv"
+path = "./iconv.rs"

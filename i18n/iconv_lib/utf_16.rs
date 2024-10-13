@@ -128,7 +128,7 @@ pub fn from_ucs4(
     suppress_error: bool,
     variant: UTF16Variant,
 ) -> (u32, Vec<u8>) {
-    let mut utf16: Vec<u8> = Vec::with_capacity(input.len() * 4); // Pre-allocate assuming worst case
+    let mut utf16: Vec<u16> = Vec::new();
     let variant = match variant {
         UTF16Variant::UTF16LE => UTF16Variant::UTF16LE,
         UTF16Variant::UTF16BE => UTF16Variant::UTF16BE,
@@ -142,49 +142,48 @@ pub fn from_ucs4(
     };
 
     for &code_point in input {
-        if code_point <= 0xFFFF {
-            if (0xD800..=0xDFFF).contains(&code_point) {
-                if !suppress_error {
-                    eprintln!("Error: Isolated surrogate code point U+{:04X}", code_point);
-                }
-                if omit_invalid {
-                    continue;
-                } else {
-                    return (1, utf16);
-                }
+        if code_point <= 0xD7FF || (0xE000..=0xFFFF).contains(&code_point) {
+            utf16.push(u16::try_from(code_point).unwrap());
+        } else if (0xD800..=0xDFFF).contains(&code_point) {
+            if !suppress_error {
+                eprintln!("Error: Isolated surrogate code point U+{:04X}", code_point);
             }
-
-            match variant {
-                UTF16Variant::UTF16LE => LittleEndian::write_u16(&mut utf16, code_point as u16),
-                UTF16Variant::UTF16BE => BigEndian::write_u16(&mut utf16, code_point as u16),
-                _ => unreachable!(),
+            if !omit_invalid {
+                return (1, to_bytes(&utf16, variant));
             }
         } else if code_point <= 0x10FFFF {
             let code_point = code_point - 0x10000;
-            let high_surrogate = (code_point >> 10) as u16 + 0xD800;
-            let low_surrogate = (code_point & 0x3FF) as u16 + 0xDC00;
-            match variant {
-                UTF16Variant::UTF16LE => {
-                    LittleEndian::write_u16(&mut utf16, high_surrogate);
-                    LittleEndian::write_u16(&mut utf16, low_surrogate);
-                }
-                UTF16Variant::UTF16BE => {
-                    BigEndian::write_u16(&mut utf16, high_surrogate);
-                    BigEndian::write_u16(&mut utf16, low_surrogate);
-                }
-                _ => unreachable!(),
-            }
+            let high_surrogate = ((code_point >> 10) as u16) + 0xD800;
+            let low_surrogate = ((code_point & 0x3FF) as u16) + 0xDC00;
+            utf16.push(high_surrogate);
+            utf16.push(low_surrogate);
         } else {
             if !suppress_error {
                 eprintln!("Error: Invalid Unicode code point U+{:X}", code_point);
             }
-            if omit_invalid {
-                continue;
-            } else {
-                return (1, utf16);
+            if !omit_invalid {
+                return (1, to_bytes(&utf16, variant));
             }
         }
     }
 
-    (0, utf16)
+    (0, to_bytes(&utf16, variant))
+}
+
+fn to_bytes(utf16: &[u16], variant: UTF16Variant) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(utf16.len() * 2);
+    match variant {
+        UTF16Variant::UTF16LE => {
+            for &code_unit in utf16 {
+                bytes.extend_from_slice(&code_unit.to_le_bytes());
+            }
+        }
+        UTF16Variant::UTF16BE => {
+            for &code_unit in utf16 {
+                bytes.extend_from_slice(&code_unit.to_be_bytes());
+            }
+        }
+        _ => unreachable!(),
+    }
+    bytes
 }

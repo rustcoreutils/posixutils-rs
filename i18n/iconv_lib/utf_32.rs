@@ -102,17 +102,13 @@ pub fn from_ucs4(
     };
 
     if include_bom {
-        match variant {
-            UTF32Variant::UTF32LE => LittleEndian::write_u32(&mut utf32, BOM),
-            UTF32Variant::UTF32BE => BigEndian::write_u32(&mut utf32, BOM),
-            _ => unreachable!(),
-        }
+        write_u32(&mut utf32, BOM, variant);
     }
 
     for &code_point in input {
-        if code_point >= 0x110000 {
+        if code_point > 0x10FFFF {
             if !suppress_error {
-                eprintln!("Error: Invalid code point U+{:X}", code_point);
+                eprintln!("Error: Invalid Unicode code point U+{:X}", code_point);
             }
             if omit_invalid {
                 continue;
@@ -120,12 +116,18 @@ pub fn from_ucs4(
                 return (1, utf32);
             }
         }
-        match variant {
-            UTF32Variant::UTF32LE => LittleEndian::write_u32(&mut utf32, code_point),
-            UTF32Variant::UTF32BE => BigEndian::write_u32(&mut utf32, code_point),
-            _ => unreachable!(),
-        }
+        write_u32(&mut utf32, code_point, variant);
     }
 
     (0, utf32)
+}
+
+fn write_u32(buffer: &mut Vec<u8>, value: u32, variant: UTF32Variant) {
+    let mut temp = [0u8; 4];
+    match variant {
+        UTF32Variant::UTF32LE => LittleEndian::write_u32(&mut temp, value),
+        UTF32Variant::UTF32BE => BigEndian::write_u32(&mut temp, value),
+        _ => unreachable!(),
+    }
+    buffer.extend_from_slice(&temp);
 }

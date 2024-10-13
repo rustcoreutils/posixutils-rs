@@ -180,7 +180,7 @@ pub struct If {
 
 #[derive(Debug, PartialEq)]
 pub enum CompoundCommand {
-    BraceGroup(CompleteCommandList),
+    BraceGroup(CompleteCommand),
     Subshell(CompleteCommandList),
     ForClause {
         name: String,

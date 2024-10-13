@@ -12,9 +12,9 @@ use std::{path::is_separator, rc::Rc};
 use crate::{
     lexer::{is_blank, is_operator, Lexer, ShellToken, SourceLocation, WordToken},
     program::{
-        ArithmeticExpr, Assignment, Command, CompleteCommand, CompoundCommand, Conjunction,
-        IORedirectionKind, LogicalOp, Parameter, ParameterExpansion, Pipeline, Program,
-        Redirection, RedirectionKind, SimpleCommand, Word, WordPart,
+        ArithmeticExpr, Assignment, Command, CompleteCommand, CompleteCommandList, CompoundCommand,
+        Conjunction, IORedirectionKind, LogicalOp, Parameter, ParameterExpansion, Pipeline,
+        Program, Redirection, RedirectionKind, SimpleCommand, Word, WordPart,
     },
 };
 
@@ -485,8 +485,37 @@ impl<'src> Parser<'src> {
         }
     }
 
+    fn parse_compound_list(&mut self, end: ShellToken, word_stop: WordToken) -> CompleteCommand {
+        self.skip_linebreak();
+
+        let mut last_conjunction = self.parse_and_or(word_stop);
+        let mut commands = Vec::new();
+        loop {
+            match self.shell_lookahead() {
+                ShellToken::And => {
+                    last_conjunction.is_async = true;
+                }
+                ShellToken::SemiColon | ShellToken::Newline => {}
+                _ => break,
+            }
+            self.advance_shell();
+            self.skip_linebreak();
+            if self.shell_lookahead() == end {
+                break;
+            }
+            commands.push(last_conjunction);
+            last_conjunction = self.parse_and_or(word_stop);
+        }
+        commands.push(last_conjunction);
+        CompleteCommand { commands }
+    }
+
     fn parse_brace_group(&mut self) -> CompoundCommand {
-        todo!()
+        // consume '{'
+        self.advance_shell();
+        let inner = self.parse_compound_list(ShellToken::RBrace, WordToken::Char('}'));
+        self.match_shell_token(ShellToken::RBrace);
+        CompoundCommand::BraceGroup(inner)
     }
 
     fn parse_subshell(&mut self) -> CompoundCommand {
@@ -648,6 +677,28 @@ mod tests {
         }
     }
 
+    fn pipeline_from_word(word: Word) -> Pipeline {
+        Pipeline {
+            commands: vec![Command::SimpleCommand(SimpleCommand {
+                command: Some(word),
+                ..Default::default()
+            })],
+        }
+    }
+
+    fn conjunction_from_word(word: Word, is_async: bool) -> Conjunction {
+        Conjunction {
+            elements: vec![(pipeline_from_word(word), LogicalOp::None)],
+            is_async,
+        }
+    }
+
+    fn complete_command_from_word(word: Word, is_async: bool) -> CompleteCommand {
+        CompleteCommand {
+            commands: vec![conjunction_from_word(word, is_async)],
+        }
+    }
+
     fn unwrap_complete_command(program: Program) -> CompleteCommand {
         assert_eq!(program.commands.len(), 1);
         program.commands.into_iter().next().unwrap()
@@ -706,6 +757,23 @@ mod tests {
         assert!(cmd.assignments.is_empty());
         assert_eq!(cmd.redirections.len(), 1);
         cmd.redirections.into_iter().next().unwrap()
+    }
+
+    fn parse_compound_command(text: &str) -> (CompoundCommand, Vec<Redirection>) {
+        let command = unwrap_command(parse(text));
+        if let Command::CompoundCommand {
+            command,
+            redirections,
+        } = command
+        {
+            (command, redirections)
+        } else {
+            panic!("expected compound command, got {:?}", command)
+        }
+    }
+
+    fn parse_command(text: &str) -> Command {
+        unwrap_command(parse(text))
     }
 
     fn parse_pipeline(text: &str) -> Pipeline {
@@ -1381,5 +1449,24 @@ mod tests {
     #[test]
     fn test_parse_empty_single_string_word() {
         assert_eq!(parse_word("''"), literal_word("''"));
+    }
+
+    #[test]
+    fn parse_brace_group() {
+        assert_eq!(
+            parse_compound_command("{word}").0,
+            CompoundCommand::BraceGroup(complete_command_from_word(literal_word("word"), false))
+        );
+        assert_eq!(
+            parse_compound_command("{\ncmd1; cmd2;\ncmd3\n\n\ncmd4 &\n}").0,
+            CompoundCommand::BraceGroup(CompleteCommand {
+                commands: vec![
+                    conjunction_from_word(literal_word("cmd1"), false),
+                    conjunction_from_word(literal_word("cmd2"), false),
+                    conjunction_from_word(literal_word("cmd3"), false),
+                    conjunction_from_word(literal_word("cmd4"), true)
+                ]
+            })
+        )
     }
 }

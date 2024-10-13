@@ -207,6 +207,7 @@ pub struct Osockaddr {
     pub sa_data: [u8; 14],
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for Osockaddr {
     fn default() -> Self {
         Osockaddr {

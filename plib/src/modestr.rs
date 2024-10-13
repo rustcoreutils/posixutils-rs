@@ -12,14 +12,15 @@ use libc::{
     S_IWUSR, S_IXGRP, S_IXOTH, S_IXUSR,
 };
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Default)]
 pub enum ChmodActionOp {
     Add,
     Remove,
+    #[default]
     Set,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ChmodAction {
     pub op: ChmodActionOp,
 
@@ -37,25 +38,7 @@ pub struct ChmodAction {
     dirty: bool,
 }
 
-impl ChmodAction {
-    pub fn new() -> ChmodAction {
-        ChmodAction {
-            op: ChmodActionOp::Set,
-            copy_user: false,
-            copy_group: false,
-            copy_others: false,
-            read: false,
-            write: false,
-            execute: false,
-            execute_dir: false,
-            setuid: false,
-            sticky: false,
-            dirty: false,
-        }
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ChmodClause {
     // wholist
     pub user: bool,
@@ -68,29 +51,9 @@ pub struct ChmodClause {
     dirty: bool,
 }
 
-impl ChmodClause {
-    pub fn new() -> ChmodClause {
-        ChmodClause {
-            user: false,
-            group: false,
-            others: false,
-            actions: Vec::new(),
-            dirty: false,
-        }
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ChmodSymbolic {
     pub clauses: Vec<ChmodClause>,
-}
-
-impl ChmodSymbolic {
-    pub fn new() -> ChmodSymbolic {
-        ChmodSymbolic {
-            clauses: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -99,8 +62,9 @@ pub enum ChmodMode {
     Symbolic(ChmodSymbolic),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 enum ParseState {
+    #[default]
     Wholist,
     Actionlist,
     ListOrCopy,
@@ -114,11 +78,11 @@ pub fn parse(mode: &str) -> Result<ChmodMode, String> {
         return Ok(ChmodMode::Absolute(m));
     }
 
-    let mut state = ParseState::Wholist;
     let mut done_with_char;
-    let mut symbolic = ChmodSymbolic::new();
-    let mut clause = ChmodClause::new();
-    let mut action = ChmodAction::new();
+    let mut state = ParseState::default();
+    let mut symbolic = ChmodSymbolic::default();
+    let mut clause = ChmodClause::default();
+    let mut action = ChmodAction::default();
 
     for c in mode.chars() {
         done_with_char = false;
@@ -156,7 +120,7 @@ pub fn parse(mode: &str) -> Result<ChmodMode, String> {
                             action.dirty = false;
                             done_with_char = false;
                             symbolic.clauses.push(clause);
-                            clause = ChmodClause::new();
+                            clause = ChmodClause::default();
                             state = ParseState::NextClause;
                         }
                     }
@@ -177,7 +141,7 @@ pub fn parse(mode: &str) -> Result<ChmodMode, String> {
                             done_with_char = false;
                             clause.actions.push(action);
                             clause.dirty = true;
-                            action = ChmodAction::new();
+                            action = ChmodAction::default();
                             state = ParseState::Actionlist;
                         }
                     }
@@ -196,7 +160,7 @@ pub fn parse(mode: &str) -> Result<ChmodMode, String> {
                             done_with_char = false;
                             clause.actions.push(action);
                             clause.dirty = true;
-                            action = ChmodAction::new();
+                            action = ChmodAction::default();
                             state = ParseState::Actionlist;
                         }
                     }

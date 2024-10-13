@@ -31,7 +31,7 @@ use std::{
     },
     os::fd::AsRawFd,
     process, ptr,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, LazyLock, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -53,12 +53,9 @@ pub struct State {
     pub talkd_addr: SocketAddr,
 }
 
-fn get_delete_invitations() -> &'static Arc<Mutex<Option<State>>> {
-    /// A static variable to hold the state of delete invitations on SIGINT signal.
-    static DELETE_INVITATIONS: OnceLock<Arc<Mutex<Option<State>>>> = OnceLock::new();
-
-    DELETE_INVITATIONS.get_or_init(|| Arc::new(Mutex::new(None)))
-}
+/// A static variable to hold the state of delete invitations on SIGINT signal.
+static DELETE_INVITATIONS: LazyLock<Arc<Mutex<Option<State>>>> =
+    LazyLock::new(|| Arc::new(Mutex::new(None)));
 
 /// The size of the buffer for control message fields like l_name, r_name, and r_tty in CtlMsg.
 const BUFFER_SIZE: usize = 12;
@@ -962,7 +959,7 @@ fn handle_new_invitation(
 
     let clone_socket = Arc::clone(&socket);
 
-    *get_delete_invitations().lock().unwrap() = Some(State {
+    *DELETE_INVITATIONS.lock().unwrap() = Some(State {
         msg_bytes1,
         msg_bytes2,
         socket: clone_socket,
@@ -1630,7 +1627,7 @@ pub fn handle_signals(signal_code: libc::c_int) {
     eprintln!("Connection closed, exiting...");
 
     // Lock the DELETE_INVITATIONS mutex and check for an existing invitation
-    if let Some(state) = get_delete_invitations().lock().unwrap().as_ref() {
+    if let Some(state) = DELETE_INVITATIONS.lock().unwrap().as_ref() {
         // Handle the deletion of invitations
         handle_delete_invitations(&state.socket, &state.msg_bytes1, &state.talkd_addr);
         handle_delete_invitations(&state.socket, &state.msg_bytes2, &state.talkd_addr);

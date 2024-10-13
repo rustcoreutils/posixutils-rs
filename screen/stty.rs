@@ -23,7 +23,7 @@ use termios::{
     Termios, TCSANOW,
 };
 
-const HDR_SAVE: &'static str = "pfmt1";
+const HDR_SAVE: &str = "pfmt1";
 
 #[derive(Parser)]
 #[command(version, about = gettext("stty - set the options for a terminal"))]

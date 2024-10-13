@@ -18,7 +18,7 @@ pub mod sccsfile;
 pub mod testing;
 pub mod utmpx;
 
-pub const PROJECT_NAME: &'static str = "posixutils-rs";
+pub const PROJECT_NAME: &str = "posixutils-rs";
 
 pub const BUFSZ: usize = 8 * 1024;
 

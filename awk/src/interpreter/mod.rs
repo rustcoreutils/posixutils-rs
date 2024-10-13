@@ -675,7 +675,8 @@ fn is_valid_record_index(index: usize) -> Result<(), String> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(test, derive(Debug))]
+#[derive(Clone, PartialEq)]
 enum AwkValueVariant {
     Number(f64),
     String(AwkString),
@@ -688,14 +689,16 @@ enum AwkValueVariant {
     UninitializedScalar,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(test, derive(Debug))]
+#[derive(Clone, Copy, PartialEq)]
 enum AwkRefType {
     None,
     Field(u16),
     SpecialGlobalVar(SpecialVar),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(test, derive(Debug))]
+#[derive(Clone, PartialEq)]
 struct AwkValue {
     value: AwkValueVariant,
     ref_type: AwkRefType,
@@ -889,14 +892,16 @@ impl From<Array> for AwkValue {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(test, derive(Debug))]
+#[derive(Clone, PartialEq)]
 struct ArrayIterator {
     array: *mut AwkValue,
     iter_var: *mut AwkValue,
     key_iter: KeyIterator,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(test, derive(Debug))]
+#[derive(Clone, PartialEq)]
 struct ArrayElementRef {
     array: *mut AwkValue,
     value_index: ValueIndex,

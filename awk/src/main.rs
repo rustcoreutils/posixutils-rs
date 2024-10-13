@@ -49,7 +49,7 @@ fn exit_if_error<T, U: Display>(r: Result<T, U>) -> T {
     match r {
         Ok(v) => v,
         Err(err) => {
-            eprintln!("{}", err);
+            eprintln!("{err}");
             std::process::exit(1);
         }
     }
@@ -65,10 +65,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         let mut sources = Vec::new();
         for source_file in &args.program_files {
             let mut file = std::fs::File::open(source_file)
-                .map_err(|_| format!("could not open file '{}'", source_file))?;
+                .map_err(|_| gettext!("could not open file '{}'", source_file))?;
             let mut contents = String::new();
             file.read_to_string(&mut contents)
-                .map_err(|_| format!("could not read file '{}'", source_file))?;
+                .map_err(|_| gettext!("could not read file '{}'", source_file))?;
             sources.push(SourceFile {
                 contents,
                 filename: source_file.clone(),
@@ -92,7 +92,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             args.separator_string,
         ))
     } else {
-        eprintln!("missing program argument");
+        eprintln!("{}", gettext("missing program argument"));
         1
     };
     std::process::exit(return_status);

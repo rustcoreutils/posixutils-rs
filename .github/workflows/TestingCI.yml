@@ -18,8 +18,6 @@ jobs:
         run: cargo build --release --verbose
       - name: Run tests
         run: cargo test --release --verbose
-      - name: Run fmt check
-        run: cargo fmt --all -- --check
 
   macos-homebrew:
     runs-on: macos-latest
@@ -45,3 +43,12 @@ jobs:
         run: cargo build --release --verbose
       - name: Run tests
         run: cargo test --release --verbose
+
+  lints:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run fmt check
+        run: cargo fmt --all -- --check
+      - name: Run clippy check
+        run: cargo clippy --all-features -- -D warnings

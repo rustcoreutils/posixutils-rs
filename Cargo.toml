@@ -43,3 +43,33 @@ errno = "0.3"
 
 [workspace.lints]
 
+[workspace.lints.clippy]
+# TODO https://github.com/rustcoreutils/posixutils-rs/pull/310
+unnecessary_cast = { level = "allow", priority = 1 }
+needless_borrow = { level = "allow", priority = 1 }
+
+# TODO remove this
+too_many_arguments = { level = "allow", priority = 1 }
+collapsible_else_if = { level = "allow", priority = 1 }
+if_same_then_else = { level = "allow", priority = 1 }
+ptr_arg = { level = "allow", priority = 1 }
+manual_inspect = { level = "allow", priority = 1 }
+manual_flatten = { level = "allow", priority = 1 }
+explicit_auto_deref = { level = "allow", priority = 1 }
+match_like_matches_macro = { level = "allow", priority = 1 }
+single_match = { level = "allow", priority = 1 }
+result_large_err = { level = "allow", priority = 1 }
+let_and_return = { level = "allow", priority = 1 }
+needless_borrows_for_generic_args = { level = "allow", priority = 1 }
+precedence = { level = "allow", priority = 1 }
+redundant_pattern_matching = { level = "allow", priority = 1 }
+unnecessary_filter_map = { level = "allow", priority = 1 }
+needless_lifetimes = { level = "allow", priority = 1 }
+expect_fun_call = { level = "allow", priority = 1 }
+doc_lazy_continuation = { level = "allow", priority = 1 }
+manual_range_contains = { level = "allow", priority = 1 }
+print_literal = { level = "allow", priority = 1 }
+collapsible_if = { level = "allow", priority = 1 }
+while_let_loop = { level = "allow", priority = 1 }
+
+all = "warn"

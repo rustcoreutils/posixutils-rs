@@ -1,3 +1,12 @@
+//
+// Copyright (c) 2024 Jeff Garzik
+//
+// This file is part of the posixutils-rs project covered under
+// the MIT License.  For the full license text, please see the LICENSE
+// file in the root directory of this project.
+// SPDX-License-Identifier: MIT
+//
+
 /// Convert UTF-8 to UCS-4
 pub fn to_ucs4(input: &[u8], omit_invalid: bool, supress_error: bool) -> (u32, Vec<u32>) {
     let mut result = Vec::new();

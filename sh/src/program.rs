@@ -183,9 +183,9 @@ pub enum CompoundCommand {
     BraceGroup(CompleteCommand),
     Subshell(CompleteCommand),
     ForClause {
-        name: String,
-        words: Vec<String>,
-        body: CompleteCommandList,
+        iter_var: Name,
+        words: Vec<Word>,
+        body: CompleteCommand,
     },
     CaseClause {
         arg: Word,

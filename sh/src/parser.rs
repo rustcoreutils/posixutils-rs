@@ -526,8 +526,46 @@ impl<'src> Parser<'src> {
         CompoundCommand::Subshell(inner)
     }
 
+    fn parse_do_group(&mut self) -> CompleteCommand {
+        self.match_shell_token(ShellToken::Do);
+        let inner = self.parse_compound_list(ShellToken::Done, WordToken::EOF);
+        self.match_shell_token(ShellToken::Done);
+        inner
+    }
+
     fn parse_for_clause(&mut self) -> CompoundCommand {
-        todo!()
+        // consume 'for'
+        self.advance_shell();
+        let iter_var = if let Some(name) = self
+            .parse_word_until(WordToken::EOF)
+            .map(|w| try_into_name(w).ok())
+            .flatten()
+        {
+            name
+        } else {
+            todo!("error: expected name")
+        };
+        self.skip_linebreak();
+        let mut words = Vec::new();
+        if self.shell_lookahead() == ShellToken::In {
+            self.advance_shell();
+            while self.shell_lookahead() == ShellToken::WordStart {
+                words.push(self.parse_word_until(WordToken::EOF).unwrap());
+            }
+        }
+        match self.shell_lookahead() {
+            ShellToken::SemiColon | ShellToken::Newline => {
+                self.advance_shell();
+                self.skip_linebreak();
+            }
+            _ => {}
+        }
+        let body = self.parse_do_group();
+        CompoundCommand::ForClause {
+            iter_var,
+            words,
+            body,
+        }
     }
 
     fn parse_case_clause(&mut self) -> CompoundCommand {
@@ -1491,5 +1529,19 @@ mod tests {
                 ]
             })
         )
+    }
+
+    #[test]
+    fn parse_for_clause() {
+        assert_eq!(
+            parse_compound_command("for i in 1 2 3; do\ncmd\ndone").0,
+            CompoundCommand::ForClause {
+                iter_var: Rc::from("i"),
+                words: vec![literal_word("1"), literal_word("2"), literal_word("3")],
+                body: CompleteCommand {
+                    commands: vec![conjunction_from_word(literal_word("cmd"), false)]
+                }
+            }
+        );
     }
 }

@@ -663,7 +663,7 @@ fn parse_string1_or_string2(string1_or_string2: &str) -> Result<Vec<Operand>, St
 ///   Returns `false` otherwise.
 ///
 fn contains_single_range(string1_or_string2: &str) -> bool {
-    static REGEX_ONCE_CELL: OnceLock<Regex> = OnceLock::<Regex>::new();
+    static REGEX_ONCE_CELL: OnceLock<Regex> = OnceLock::new();
 
     let regex = REGEX_ONCE_CELL.get_or_init(|| {
         // Regular expression for a range of characters or \octal

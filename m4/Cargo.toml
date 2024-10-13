@@ -6,6 +6,7 @@ authors = ["Luke Frisken"]
 repository.workspace = true
 license.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 clap.workspace = true

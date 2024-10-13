@@ -181,7 +181,7 @@ pub struct If {
 #[derive(Debug, PartialEq)]
 pub enum CompoundCommand {
     BraceGroup(CompleteCommand),
-    Subshell(CompleteCommandList),
+    Subshell(CompleteCommand),
     ForClause {
         name: String,
         words: Vec<String>,

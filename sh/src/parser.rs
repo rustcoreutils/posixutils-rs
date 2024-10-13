@@ -519,7 +519,11 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_subshell(&mut self) -> CompoundCommand {
-        todo!()
+        // consume '('
+        self.advance_shell();
+        let inner = self.parse_compound_list(ShellToken::RParen, WordToken::Char(')'));
+        self.match_shell_token(ShellToken::RParen);
+        CompoundCommand::Subshell(inner)
     }
 
     fn parse_for_clause(&mut self) -> CompoundCommand {
@@ -1463,6 +1467,25 @@ mod tests {
                 commands: vec![
                     conjunction_from_word(literal_word("cmd1"), false),
                     conjunction_from_word(literal_word("cmd2"), false),
+                    conjunction_from_word(literal_word("cmd3"), false),
+                    conjunction_from_word(literal_word("cmd4"), true)
+                ]
+            })
+        )
+    }
+
+    #[test]
+    fn parse_subshell() {
+        assert_eq!(
+            parse_compound_command("(word)").0,
+            CompoundCommand::Subshell(complete_command_from_word(literal_word("word"), false))
+        );
+        assert_eq!(
+            parse_compound_command("(\ncmd1; cmd2 & cmd3;\n\n\ncmd4 &\n)").0,
+            CompoundCommand::Subshell(CompleteCommand {
+                commands: vec![
+                    conjunction_from_word(literal_word("cmd1"), false),
+                    conjunction_from_word(literal_word("cmd2"), true),
                     conjunction_from_word(literal_word("cmd3"), false),
                     conjunction_from_word(literal_word("cmd4"), true)
                 ]

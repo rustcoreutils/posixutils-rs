@@ -594,3 +594,18 @@ fn tr_arguments_validation_error_message_format() {
         "tr: missing operand after ‘a’. Two strings must be given when translating.\n",
     );
 }
+
+// POSIX does not specify how invalid backslash sequences are handled, so there is some flexibility here
+// Still, something useful should be done (for instance, tr should not abort in this case)
+#[test]
+fn tr_ranges_with_invalid_escape_sequences() {
+    const INPUT: &str = "abcdef ABCDEF -\\ \x07 -\\ 123456789";
+
+    // "\7-\9" is:
+    //     treated as a range from \007 through '9' by bsdutils and GNU Core Utilities
+    //     treated as: 1) a range from \007 through '\', and 2) separately the character '9', by BusyBox
+    tr_test(&["-d", r"\7-\9"], INPUT, r"abcdefABCDEF\\");
+
+    // Similar to above
+    tr_test(&["-d", r"\7-\A"], INPUT, r"abcdefBCDEF\\");
+}

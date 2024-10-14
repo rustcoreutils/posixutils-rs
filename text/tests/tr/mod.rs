@@ -288,7 +288,13 @@ fn tr_ross_1b() {
 
 #[test]
 fn tr_ross_2() {
-    tr_test(&["-dcs", "[:lower:]", "n-rs-z"], "amzAMZ123.-+amz", "amzam");
+    // Modified expected output to match other implementations
+    // "amzam" -> "amzamz"
+    tr_test(
+        &["-dcs", "[:lower:]", "n-rs-z"],
+        "amzAMZ123.-+amz",
+        "amzamz",
+    );
 }
 
 #[test]
@@ -531,7 +537,7 @@ fn tr_octal_above_one_byte_value() {
         expected_out: "Ł)".to_owned(),
         expected_err: r"tr: warning: the ambiguous octal escape \501 is being interpreted as the 2-byte sequence \050, 1
 ".to_owned(),
-        expected_exit_code: 0,
+        expected_exit_code: 0_i32,
     });
 }
 
@@ -608,4 +614,17 @@ fn tr_ranges_with_invalid_escape_sequences() {
 
     // Similar to above
     tr_test(&["-d", r"\7-\A"], INPUT, r"abcdefBCDEF\\");
+}
+
+// Make sure state is persisted through multiple calls to `transform`
+#[test]
+fn tr_streaming_state() {
+    let a_s = "a".repeat(16_usize * 1_024_usize);
+
+    tr_test(&["-s", "a", "b"], &a_s, "b");
+}
+
+#[test]
+fn tr_minimal_d_s() {
+    tr_test(&["-d", "-s", "", "A"], "1AA", "1A");
 }

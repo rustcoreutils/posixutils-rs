@@ -44,7 +44,7 @@ impl<'a> FileDiff<'a> {
         Self {
             file1,
             file2,
-            hunks: Hunks::new(),
+            hunks: Default::default(),
             format_options,
             are_different: false,
         }
@@ -331,7 +331,7 @@ impl<'a> FileDiff<'a> {
             Self::get_header(self.file2, self.format_options.label2())
         );
 
-        let mut diff_disp = ContextDiffDisplay::new();
+        let mut diff_disp = ContextDiffDisplay::default();
 
         for hunk in self.hunks.hunks() {
             // move cursor to the start of context for first hunk
@@ -458,7 +458,7 @@ impl<'a> FileDiff<'a> {
             Self::get_header(self.file2, self.format_options.label2())
         );
 
-        let mut diff_disp = UnifiedDiffDisplay::new();
+        let mut diff_disp = UnifiedDiffDisplay::default();
 
         for hunk in self.hunks.hunks() {
             // move cursor to the start of context for first hunk
@@ -526,6 +526,7 @@ impl<'a> FileDiff<'a> {
     }
 }
 
+#[derive(Default)]
 pub struct UnifiedDiffDisplay {
     curr_pos1: usize,
     curr_pos2: usize,
@@ -540,18 +541,6 @@ pub struct UnifiedDiffDisplay {
 }
 
 impl UnifiedDiffDisplay {
-    pub fn new() -> Self {
-        Self {
-            curr_pos1: 0,
-            curr_pos2: 0,
-            context_start1: 0,
-            context_start2: 0,
-            hunk1_len: 0,
-            hunk2_len: 0,
-            hunk_lines: String::new(),
-        }
-    }
-
     pub fn write_line(
         &mut self,
         file: &FileData,
@@ -607,6 +596,7 @@ impl UnifiedDiffDisplay {
     }
 }
 
+#[derive(Default)]
 pub struct ContextDiffDisplay {
     curr_pos1: usize,
     curr_pos2: usize,
@@ -621,18 +611,6 @@ pub struct ContextDiffDisplay {
 }
 
 impl ContextDiffDisplay {
-    pub fn new() -> Self {
-        Self {
-            curr_pos1: 0,
-            curr_pos2: 0,
-            context_start1: 0,
-            context_start2: 0,
-            hunk1_len: 0,
-            hunk2_len: 0,
-            hunk_lines: [String::new(), String::new()],
-        }
-    }
-
     pub fn set_context_start(&mut self) {
         self.context_start1 = self.curr_pos1 + 1;
         self.context_start2 = self.curr_pos2 + 1;

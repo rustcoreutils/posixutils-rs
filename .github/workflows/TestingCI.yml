@@ -12,6 +12,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Rust version 1.80.0 is posixutil's current Minimum Supported Rust Version (MSRV)
+      # Do not modify this without updating all other references to posixutil's MSRV
+      - uses: dtolnay/rust-toolchain@1.80.0
       - name: Fetch
         run: cargo fetch
       - name: Build

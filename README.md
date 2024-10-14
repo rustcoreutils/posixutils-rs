@@ -248,3 +248,7 @@ sudo -E cargo test --release --features posixutils_test_all,requires_root <test_
 ```
 
 Integration tests may generate test data under `CARGO_TARGET_TMPDIR` (usually resolves to `target/tmp`) and `/dev/shm` (Linux only).
+
+## Minimum Supported Rust Version (MSRV)
+
+posixutils can be built using Rust version **1.80.0** or higher.

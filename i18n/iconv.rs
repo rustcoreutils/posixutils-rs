@@ -8,7 +8,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use iconv_lib::{
     ascii,
     utf_16::{self, UTF16Variant},
@@ -30,31 +30,25 @@ use strum_macros::{Display, EnumIter, EnumString};
 
 mod iconv_lib;
 
-/// iconv — codeset conversion
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[derive(Parser)]
+#[command(version, about=gettext("iconv — codeset conversion"))]
 struct Args {
-    /// Omit invalid characters of the input file from the output
-    #[arg(short = 'c')]
+    #[arg(short = 'c', help=gettext("Omit invalid characters of the input file from the output"))]
     omit_invalid: bool,
 
-    /// Suppress messages about invalid characters
-    #[arg(short = 's')]
+    #[arg(short = 's', help=gettext("Suppress messages about invalid characters"))]
     suppress_messages: bool,
 
-    /// Identify the codeset of the input file
-    #[arg(short = 'f')]
+    #[arg(short = 'f', help=gettext("Identify the codeset of the input file"))]
     from_codeset: Option<String>,
 
-    /// List all supported codeset values
-    #[arg(short = 'l')]
+    #[arg(short = 'l', help=gettext("List all supported codeset values"))]
     list_codesets: bool,
 
-    /// Identify the codeset for the output file
-    #[arg(short = 't')]
+    #[arg(short = 't', help=gettext("Identify the codeset of the output file"))]
     to_codeset: Option<String>,
 
-    /// Input files (reads from stdin if not provided)
+    #[arg(help=gettext("Input files (reads from stdin if empty)"))]
     files: Option<Vec<PathBuf>>,
 }
 

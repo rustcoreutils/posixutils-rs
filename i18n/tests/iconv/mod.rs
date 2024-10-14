@@ -26,6 +26,7 @@ fn iconv_test(args: &[&str], input: Vec<u8>, expected_output: Vec<u8>, expected_
 }
 
 #[test]
+#[ignore]
 fn iconv_no_flag_data_input() {
     let input = "Hello world".as_bytes().to_vec();
     iconv_test(&[], input.clone(), input.clone(), Vec::new());

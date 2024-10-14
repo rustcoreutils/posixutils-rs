@@ -628,3 +628,16 @@ fn tr_streaming_state() {
 fn tr_minimal_d_s() {
     tr_test(&["-d", "-s", "", "A"], "1AA", "1A");
 }
+
+#[test]
+fn tr_missing_equiv() {
+    tr_bad_arguments_failure_test(
+        &["-d", "[==]"],
+        "tr: missing equivalence class character '[==]'\n",
+    );
+}
+
+#[test]
+fn tr_missing_character_class() {
+    tr_bad_arguments_failure_test(&["-d", "[::]"], "tr: missing character class name '[::]'\n");
+}

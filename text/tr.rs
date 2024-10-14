@@ -388,7 +388,7 @@ mod parsing {
         let char_between_equals_signs = match between_equals_signs.as_slice() {
             &[ch] => ch,
             &[] => {
-                unreachable!();
+                return Err("tr: missing equivalence class character '[==]'".to_owned());
             }
             sl => {
                 const ERROR_MESSAGE_PREFIX: &str = "tr: ";
@@ -756,6 +756,9 @@ mod parsing {
                 .chain('A'..='F')
                 .chain('a'..='f')
                 .collect::<Vec<_>>(),
+            "" => {
+                return Err("tr: missing character class name '[::]'".to_string());
+            }
             st => return Err(format!("tr: invalid character class ‘{st}’")),
         };
 

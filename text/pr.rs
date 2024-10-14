@@ -462,14 +462,12 @@ fn pr_merged(paths: &[PathBuf], params: &Parameters) -> io::Result<()> {
             );
         }
 
-        let mut required_rows = 0;
-        for page in pages.iter() {
-            if let Some(p) = page {
-                if p.num_nonpadding_lines > required_rows {
-                    required_rows = p.num_nonpadding_lines;
-                }
-            }
-        }
+        let required_rows = pages
+            .iter()
+            .flatten()
+            .map(|p| p.num_nonpadding_lines)
+            .max()
+            .unwrap_or_default();
 
         let mut pages: Vec<_> = pages
             .into_iter()

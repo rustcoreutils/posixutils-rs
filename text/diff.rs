@@ -108,8 +108,6 @@ fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
-    let output_format: OutputFormat = (&args).into();
-
     let path1 = PathBuf::from(&args.file1);
     let path2 = PathBuf::from(&args.file2);
 
@@ -124,27 +122,25 @@ fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
         return Ok(DiffExitStatus::Trouble);
     }
 
+    let output_format: OutputFormat = (&args).into();
+
+    let format_options = FormatOptions::try_new(
+        args.ignore_eol_space,
+        output_format,
+        args.label,
+        args.label2,
+    );
+    let format_options = format_options.unwrap();
+
     let path1_is_file = fs::metadata(&path1)?.is_file();
     let path2_is_file = fs::metadata(&path2)?.is_file();
 
-    let format_options = FormatOptions {
-        ignore_trailing_white_spaces: args.ignore_eol_space,
-        label1: args.label,
-        label2: args.label2,
-        output_format: output_format,
-    };
-
     if path1_is_file && path2_is_file {
-        return FileDiff::file_diff(path1, path2, &format_options, None);
+        FileDiff::file_diff(path1, path2, &format_options, None)
     } else if !path1_is_file && !path2_is_file {
-        return DirDiff::dir_diff(
-            PathBuf::from(path1),
-            PathBuf::from(path2),
-            &format_options,
-            args.recurse,
-        );
+        DirDiff::dir_diff(path1, path2, &format_options, args.recurse)
     } else {
-        return FileDiff::file_dir_diff(path1, path2, &format_options);
+        FileDiff::file_dir_diff(path1, path2, &format_options)
     }
 }
 

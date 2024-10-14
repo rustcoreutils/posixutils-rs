@@ -1,0 +1,2 @@
+/dev/sdb1 / ext3 rw,relatime,errors=remount-ro 0 0
+proc /proc proc rw,noexec,nosuid,nodev 0 0

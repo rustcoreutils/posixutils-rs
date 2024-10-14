@@ -5,6 +5,7 @@ authors = ["Jeff Garzik"]
 repository.workspace = true
 license.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 plib = { path = "../plib" }
@@ -15,7 +16,6 @@ regex.workspace = true
 chrono.workspace = true
 libc.workspace = true
 notify-debouncer-full = "0.3"
-ctor = "0.2"
 diff = "0.1"
 dirs = "5.0"
 deunicode = "1.6"

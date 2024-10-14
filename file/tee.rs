@@ -32,16 +32,9 @@ struct TeeFile {
     f: File,
 }
 
+#[derive(Default)]
 struct TeeInfo {
     outputs: Vec<TeeFile>,
-}
-
-impl TeeInfo {
-    fn new() -> TeeInfo {
-        TeeInfo {
-            outputs: Vec::new(),
-        }
-    }
 }
 
 fn open_outputs(args: &Args, info: &mut TeeInfo) -> io::Result<()> {
@@ -113,7 +106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let mut state = TeeInfo::new();
+    let mut state = TeeInfo::default();
 
     open_outputs(&args, &mut state)?;
     tee_stdin(&mut state)?;

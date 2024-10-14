@@ -553,6 +553,7 @@ impl MessageCatalog {
     }
 
     /// Read the **GNU based** binary catalog file and build [MessageCatalog]
+    #[allow(clippy::needless_range_loop)]
     pub fn read_catfile<T: Read>(
         mut input: T,
     ) -> Result<MessageCatalog, Box<dyn std::error::Error>> {
@@ -590,7 +591,7 @@ impl MessageCatalog {
             ptr += 4;
         }
 
-        // note: probably compare be_array and le_array as they should be the same
+        // TODO: probably compare be_array and le_array as they should be the same
 
         let string_pool = &buf[ptr..];
 
@@ -610,10 +611,7 @@ impl MessageCatalog {
                     + string_offset;
 
                 let msg = String::from_utf8_lossy(&string_pool[string_offset..msg_end]).to_string();
-                set_msg
-                    .entry(set_id)
-                    .or_insert_with(BTreeMap::new)
-                    .insert(msg_id, msg);
+                set_msg.entry(set_id).or_default().insert(msg_id, msg);
             }
         }
 

@@ -16,7 +16,7 @@ use plib::PROJECT_NAME;
 use std::ffi::OsStr;
 use std::path::{Component, Path};
 
-const PWD_ENV: &'static str = "PWD";
+const PWD_ENV: &str = "PWD";
 
 /// pwd - return working directory name
 #[derive(Parser)]

@@ -35,7 +35,7 @@ fn cksum_file(filename: &PathBuf) -> io::Result<()> {
     let mut file = plib::io::input_stream(filename, false)?;
 
     let mut buffer = [0; plib::BUFSZ];
-    let mut n_bytes: u64 = 0;
+    let mut n_bytes: usize = 0;
     let mut crc: u32 = 0;
 
     loop {
@@ -44,7 +44,7 @@ fn cksum_file(filename: &PathBuf) -> io::Result<()> {
             break;
         }
 
-        n_bytes = n_bytes + n_read as u64;
+        n_bytes += n_read;
         crc = crc32::update(crc, &buffer[0..n_read]);
     }
 
@@ -57,7 +57,7 @@ fn cksum_file(filename: &PathBuf) -> io::Result<()> {
     };
     println!(
         "{} {}{}{}",
-        crc32::finalize(crc, n_bytes as usize),
+        crc32::finalize(crc, n_bytes),
         n_bytes,
         filename_prefix,
         filename.display()

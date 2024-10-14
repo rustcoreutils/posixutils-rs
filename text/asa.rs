@@ -30,14 +30,16 @@ struct AsaState {
     lines: Vec<String>,
 }
 
-impl AsaState {
-    fn new() -> AsaState {
-        AsaState {
+impl Default for AsaState {
+    fn default() -> Self {
+        Self {
             first_line: true,
-            lines: Vec::new(),
+            lines: Default::default(),
         }
     }
+}
 
+impl AsaState {
     fn push(&mut self, line: &str) {
         self.lines.push(line.to_string());
         if self.first_line {
@@ -69,10 +71,10 @@ impl AsaState {
 fn asa_file(pathname: &PathBuf) -> io::Result<()> {
     let mut reader = plib::io::input_reader(pathname, false)?;
     let mut line_no: usize = 0;
-    let mut state = AsaState::new();
+    let mut state = AsaState::default();
 
     loop {
-        line_no = line_no + 1;
+        line_no += 1;
 
         let mut raw_line = String::new();
         let n_read = reader.read_line(&mut raw_line)?;
@@ -90,7 +92,7 @@ fn asa_file(pathname: &PathBuf) -> io::Result<()> {
         // exclude first char, and trailing newline
         let mut line_len = raw_line.len() - 1;
         if raw_line.ends_with('\n') {
-            line_len = line_len - 1;
+            line_len -= 1;
         }
         let line = &raw_line[1..line_len];
 

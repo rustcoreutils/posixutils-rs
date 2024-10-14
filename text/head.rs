@@ -56,10 +56,10 @@ fn head_file(args: &Args, pathname: &PathBuf, first: bool, want_header: bool) ->
         for chv in buf {
             // LF character encountered
             if *chv == 10 {
-                nl = nl + 1;
+                nl += 1;
             }
 
-            pos = pos + 1;
+            pos += 1;
 
             // if user-specified limit reached, stop
             if nl >= args.n {

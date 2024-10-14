@@ -71,6 +71,7 @@ const CONV_ASCII_EBCDIC: [u8; 256] = [
     0xdd, 0xde, 0xdf, 0xea, 0xeb, 0xec, 0xed, 0xee, 0xef, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff,
 ];
 
+#[allow(clippy::upper_case_acronyms)]
 enum AsciiConv {
     Ascii,
     EBCDIC,
@@ -101,20 +102,20 @@ struct Config {
     notrunc: bool,
 }
 
-impl Config {
-    fn new() -> Config {
-        Config {
-            ifile: String::new(),
-            ofile: String::new(),
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            ifile: Default::default(),
+            ofile: Default::default(),
             ibs: DEF_BLOCK_SIZE,
             obs: DEF_BLOCK_SIZE,
-            cbs: 0,
-            seek: 0,
-            skip: 0,
-            count: 0,
-            conversions: Vec::new(),
-            noerror: false,
-            notrunc: false,
+            cbs: Default::default(),
+            seek: Default::default(),
+            skip: Default::default(),
+            count: Default::default(),
+            conversions: Default::default(),
+            noerror: Default::default(),
+            notrunc: Default::default(),
         }
     }
 }
@@ -148,7 +149,7 @@ fn convert_swab(data: &mut [u8]) {
 fn convert_lcase(data: &mut [u8]) {
     for byte in data.iter_mut() {
         if *byte >= b'A' && *byte <= b'Z' {
-            *byte = *byte + 32;
+            *byte += 32;
         }
     }
 }
@@ -156,7 +157,7 @@ fn convert_lcase(data: &mut [u8]) {
 fn convert_ucase(data: &mut [u8]) {
     for byte in data.iter_mut() {
         if *byte >= b'a' && *byte <= b'z' {
-            *byte = *byte - 32;
+            *byte -= 32;
         }
     }
 }
@@ -340,7 +341,7 @@ fn parse_block_size(s: &str) -> Result<usize, Box<dyn std::error::Error>> {
 }
 
 fn parse_cmdline(args: &[String]) -> Result<Config, Box<dyn std::error::Error>> {
-    let mut config = Config::new();
+    let mut config = Config::default();
 
     for arg in args {
         // Split arg into option and argument

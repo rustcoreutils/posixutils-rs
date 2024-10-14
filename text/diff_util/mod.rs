@@ -1,4 +1,3 @@
-pub(crate) mod change;
 pub(crate) mod common;
 pub(crate) mod constants;
 pub(crate) mod diff_exit_status;

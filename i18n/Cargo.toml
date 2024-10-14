@@ -10,10 +10,10 @@ edition.workspace = true
 plib = { path = "../plib" }
 clap.workspace = true
 gettext-rs.workspace = true
-bytemuck = { version = "1.17.0", features = ["derive"] }
-byteorder = "1.5.0"
-strum = "0.26.3"
-strum_macros = "0.26.4"
+bytemuck = { version = "1.17", features = ["derive"] }
+byteorder = "1.5"
+strum = "0.26"
+strum_macros = "0.26"
 
 [lints]
 workspace = true

@@ -28,14 +28,6 @@ pub struct FileDiff<'a> {
 }
 
 impl<'a> FileDiff<'a> {
-    pub fn are_different(&self) -> bool {
-        self.are_different
-    }
-
-    pub fn set_different(&mut self, are_different: bool) {
-        self.are_different = are_different;
-    }
-
     fn new(
         file1: &'a mut FileData<'a>,
         file2: &'a mut FileData<'a>,
@@ -105,10 +97,10 @@ impl<'a> FileDiff<'a> {
                 .create_hunks_from_lcs(&lcs_indices, num_lines1, num_lines2);
 
             if diff.hunks.hunk_count() > 0 {
-                diff.set_different(true);
+                diff.are_different = true;
             }
 
-            if diff.are_different() {
+            if diff.are_different {
                 if let Some(show_if_different) = show_if_different {
                     println!("{}", show_if_different);
                 }
@@ -216,7 +208,7 @@ impl<'a> FileDiff<'a> {
             }
         }
 
-        if self.are_different() {
+        if self.are_different {
             Ok(DiffExitStatus::Different)
         } else {
             Ok(DiffExitStatus::NotDifferent)

@@ -1,4 +1,17 @@
+//
+// Copyright (c) 2024 Jeff Garzik
+//
+// This file is part of the posixutils-rs project covered under
+// the MIT License.  For the full license text, please see the LICENSE
+// file in the root directory of this project.
+// SPDX-License-Identifier: MIT
+//
+
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
+use std::{
+    iter::{self},
+    process::exit,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UTF16Variant {
@@ -10,128 +23,125 @@ pub enum UTF16Variant {
 const BOM: u16 = 0xFEFF;
 const BOM_SWAPPED: u16 = 0xFFFE;
 
-pub fn to_ucs4(
-    input: &[u8],
+// Convert UTF-16 to UCS-4
+pub fn to_ucs4<I: Iterator<Item = u8> + 'static>(
+    mut input: I,
     omit_invalid: bool,
     suppress_error: bool,
     variant: UTF16Variant,
-) -> (u32, Vec<u32>) {
-    if input.len() < 2 {
-        if !suppress_error {
-            eprintln!("Error: Input is too short");
-        }
-        return (1, Vec::new());
-    }
+) -> Box<dyn Iterator<Item = u32>> {
+    let mut buffer = Vec::with_capacity(4);
+    let mut determined_variant = variant;
+    let mut bom_checked = false;
 
-    let (variant, mut index) = match variant {
-        UTF16Variant::UTF16LE => (UTF16Variant::UTF16LE, 0),
-        UTF16Variant::UTF16BE => (UTF16Variant::UTF16BE, 0),
-        UTF16Variant::UTF16 => {
-            let first_word = BigEndian::read_u16(&input[0..2]);
-            if first_word == BOM {
-                (UTF16Variant::UTF16BE, 2)
-            } else if first_word == BOM_SWAPPED {
-                (UTF16Variant::UTF16LE, 2)
-            } else {
-                if cfg!(target_endian = "little") {
-                    (UTF16Variant::UTF16LE, 0)
-                } else {
-                    (UTF16Variant::UTF16BE, 0)
-                }
-            }
-        }
-    };
-    let mut ucs4: Vec<u32> = Vec::new();
-
-    while index < input.len() {
-        if index + 2 > input.len() {
-            break;
-        }
-
-        let code_unit = match variant {
-            UTF16Variant::UTF16LE => LittleEndian::read_u16(&input[index..index + 2]),
-            UTF16Variant::UTF16BE => BigEndian::read_u16(&input[index..index + 2]),
-            _ => {
-                if !suppress_error {
-                    eprintln!("Error: Unknown UTF-16 variant");
-                }
-                return (1, ucs4);
-            }
-        };
-
-        // Surrogate pair
-        if (0xD800..=0xDBFF).contains(&code_unit) {
-            if index + 4 > input.len() {
-                if !suppress_error {
-                    eprintln!("Error: Unpaired surrogate at end of input");
-                }
-                if omit_invalid {
-                    break;
-                } else {
-                    return (1, ucs4);
+    let iter = iter::from_fn(move || {
+        loop {
+            if buffer.len() < 2 {
+                buffer.extend(input.by_ref().take(4 - buffer.len()));
+                if buffer.len() < 2 {
+                    return None; // End of input
                 }
             }
 
-            let low_surrogate = match variant {
-                UTF16Variant::UTF16LE => LittleEndian::read_u16(&input[(index + 2)..(index + 4)]),
-                UTF16Variant::UTF16BE => BigEndian::read_u16(&input[(index + 2)..(index + 4)]),
-                _ => {
-                    if !suppress_error {
-                        eprintln!("Error: Unknown UTF-16 variant");
+            if !bom_checked {
+                bom_checked = true;
+                if variant == UTF16Variant::UTF16 {
+                    let first_word = BigEndian::read_u16(&buffer[0..2]);
+                    if first_word == BOM {
+                        determined_variant = UTF16Variant::UTF16BE;
+                        buffer.drain(0..2);
+                        continue;
+                    } else if first_word == BOM_SWAPPED {
+                        determined_variant = UTF16Variant::UTF16LE;
+                        buffer.drain(0..2);
+                        continue;
+                    } else {
+                        determined_variant = if cfg!(target_endian = "little") {
+                            UTF16Variant::UTF16LE
+                        } else {
+                            UTF16Variant::UTF16BE
+                        };
                     }
-                    return (1, ucs4);
                 }
+            }
+
+            let code_unit = match determined_variant {
+                UTF16Variant::UTF16LE => LittleEndian::read_u16(&buffer[0..2]),
+                UTF16Variant::UTF16BE => BigEndian::read_u16(&buffer[0..2]),
+                UTF16Variant::UTF16 => unreachable!(),
             };
 
-            if !(0xDC00..=0xDFFF).contains(&low_surrogate) {
-                if !suppress_error {
-                    eprintln!("Error: Invalid low surrogate at position {}", index + 2);
+            // Surrogate pair
+            if (0xD800..=0xDBFF).contains(&code_unit) {
+                if buffer.len() < 4 {
+                    buffer.extend(input.by_ref().take(4 - buffer.len()));
+                    if buffer.len() < 4 {
+                        if omit_invalid {
+                            buffer.clear();
+                            continue;
+                        } else {
+                            if !suppress_error {
+                                eprintln!("Error: Unpaired surrogate at end of input");
+                            }
+                            return None;
+                        }
+                    }
                 }
-                if omit_invalid {
-                    index += 2;
-                    continue;
-                } else {
-                    return (1, ucs4);
+
+                let low_surrogate = match determined_variant {
+                    UTF16Variant::UTF16LE => LittleEndian::read_u16(&buffer[2..4]),
+                    UTF16Variant::UTF16BE => BigEndian::read_u16(&buffer[2..4]),
+                    UTF16Variant::UTF16 => unreachable!(),
+                };
+
+                if !(0xDC00..=0xDFFF).contains(&low_surrogate) {
+                    if omit_invalid {
+                        buffer.drain(0..2);
+                        continue;
+                    } else {
+                        if !suppress_error {
+                            eprintln!("Error: Invalid low surrogate");
+                        }
+                        return None;
+                    }
                 }
-            }
 
-            let high = u32::from(code_unit - 0xD800);
-            let low = u32::from(low_surrogate - 0xDC00);
-            let code_point = (high << 10) + low + 0x10000;
-
-            ucs4.push(code_point);
-            index += 4;
+                let high = u32::from(code_unit - 0xD800);
+                let low = u32::from(low_surrogate - 0xDC00);
+                let code_point = (high << 10) + low + 0x10000;
+                buffer.drain(0..4);
+                return Some(code_point);
 
             // Unpaired low surrogate
-        } else if (0xDC00..=0xDFFF).contains(&code_unit) {
-            if !suppress_error {
-                eprintln!("Error: Unpaired low surrogate at position {}", index);
-            }
-            if omit_invalid {
-                index += 2;
-                continue;
+            } else if (0xDC00..=0xDFFF).contains(&code_unit) {
+                if omit_invalid {
+                    buffer.drain(0..2);
+                    continue;
+                } else {
+                    if !suppress_error {
+                        eprintln!("Error: Unpaired low surrogate");
+                    }
+                    return None;
+                }
             } else {
-                return (1, ucs4);
+                buffer.drain(0..2);
+                return Some(u32::from(code_unit));
             }
-        } else {
-            ucs4.push(u32::from(code_unit));
-            index += 2;
         }
-    }
+    });
 
-    (0, ucs4)
+    Box::new(iter)
 }
 
-pub fn from_ucs4(
-    input: &[u32],
+/// Convert UTF-32 from UCS-4
+pub fn from_ucs4<I: Iterator<Item = u32> + 'static>(
+    input: I,
     omit_invalid: bool,
     suppress_error: bool,
     variant: UTF16Variant,
-) -> (u32, Vec<u8>) {
-    let mut utf16: Vec<u16> = Vec::new();
+) -> Box<dyn Iterator<Item = u8>> {
     let variant = match variant {
-        UTF16Variant::UTF16LE => UTF16Variant::UTF16LE,
-        UTF16Variant::UTF16BE => UTF16Variant::UTF16BE,
+        UTF16Variant::UTF16LE | UTF16Variant::UTF16BE => variant,
         UTF16Variant::UTF16 => {
             if cfg!(target_endian = "little") {
                 UTF16Variant::UTF16LE
@@ -141,49 +151,50 @@ pub fn from_ucs4(
         }
     };
 
-    for &code_point in input {
+    let iter = input.flat_map(move |code_point| {
+        let mut utf16 = Vec::new();
+
         if code_point <= 0xD7FF || (0xE000..=0xFFFF).contains(&code_point) {
-            utf16.push(u16::try_from(code_point).unwrap());
+            utf16.push(code_point as u16);
         } else if (0xD800..=0xDFFF).contains(&code_point) {
-            if !suppress_error {
-                eprintln!("Error: Isolated surrogate code point U+{:04X}", code_point);
-            }
             if !omit_invalid {
-                return (1, to_bytes(&utf16, variant));
+                return Vec::new();
+            } else {
+                if !suppress_error {
+                    eprintln!("Error: Isolated surrogate code point U+{:04X}", code_point);
+                }
+                exit(1)
             }
         } else if code_point <= 0x10FFFF {
             let code_point = code_point - 0x10000;
             let high_surrogate = ((code_point >> 10) as u16) + 0xD800;
             let low_surrogate = ((code_point & 0x3FF) as u16) + 0xDC00;
-            utf16.push(high_surrogate);
-            utf16.push(low_surrogate);
+            utf16.extend_from_slice(&[high_surrogate, low_surrogate]);
         } else {
-            if !suppress_error {
-                eprintln!("Error: Invalid Unicode code point U+{:X}", code_point);
-            }
             if !omit_invalid {
-                return (1, to_bytes(&utf16, variant));
+                return Vec::new();
+            } else {
+                if !suppress_error {
+                    eprintln!("Error: Invalid Unicode code point U+{:X}", code_point);
+                }
+                exit(1)
             }
         }
-    }
 
-    (0, to_bytes(&utf16, variant))
+        to_bytes(&utf16, variant)
+    });
+
+    Box::new(iter)
 }
 
+#[inline]
 fn to_bytes(utf16: &[u16], variant: UTF16Variant) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(utf16.len() * 2);
-    match variant {
-        UTF16Variant::UTF16LE => {
-            for &code_unit in utf16 {
-                bytes.extend_from_slice(&code_unit.to_le_bytes());
-            }
-        }
-        UTF16Variant::UTF16BE => {
-            for &code_unit in utf16 {
-                bytes.extend_from_slice(&code_unit.to_be_bytes());
-            }
-        }
-        _ => unreachable!(),
-    }
-    bytes
+    utf16
+        .iter()
+        .flat_map(|&code_unit| match variant {
+            UTF16Variant::UTF16LE => code_unit.to_le_bytes().to_vec(),
+            UTF16Variant::UTF16BE => code_unit.to_be_bytes().to_vec(),
+            _ => unreachable!(),
+        })
+        .collect()
 }

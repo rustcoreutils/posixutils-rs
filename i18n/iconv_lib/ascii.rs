@@ -1,38 +1,64 @@
+//
+// Copyright (c) 2024 Jeff Garzik
+//
+// This file is part of the posixutils-rs project covered under
+// the MIT License.  For the full license text, please see the LICENSE
+// file in the root directory of this project.
+// SPDX-License-Identifier: MIT
+//
+
+use std::{iter, process::exit};
+
 // Convert ASCII to UCS-4
-pub fn to_ucs4(input: &[u8], omit_invalid: bool, supress_error: bool) -> (u32, Vec<u32>) {
-    let mut result = Vec::new();
+pub fn to_ucs4<I: Iterator<Item = u8> + 'static>(
+    mut input: I,
+    omit_invalid: bool,
+    suppress_error: bool,
+) -> Box<dyn Iterator<Item = u32>> {
+    let mut position = 0;
 
-    for (i, &code_point) in input.iter().enumerate() {
-        if code_point <= 127 {
-            result.push(code_point as u32);
-        } else if omit_invalid {
-            continue;
-        } else {
-            if !supress_error {
-                eprintln!("Error: Invalid input position {i}");
+    let iter = std::iter::from_fn(move || {
+        while let Some(code_point) = input.next() {
+            position += 1;
+            if code_point <= 127 {
+                return Some(code_point as u32);
+            } else if omit_invalid {
+                continue;
+            } else if !suppress_error {
+                eprintln!("Error: Invalid input position {}", position - 1);
+                std::process::exit(1);
+            } else {
+                return None;
             }
-            return (1, result);
         }
-    }
+        None
+    });
 
-    (0, result)
+    Box::new(iter)
 }
 
-/// Convert UCS-4 to ASCII
-pub fn from_ucs4(input: &[u32], omit_invalid: bool, supress_error: bool) -> (u32, Vec<u8>) {
-    let mut result = Vec::new();
-
-    for (i, &code_point) in input.iter().enumerate() {
-        if code_point <= 127 {
-            result.push(code_point as u8);
-        } else if omit_invalid {
-            continue;
-        } else {
-            if !supress_error {
-                eprintln!("Error: Invalid input position {i}");
+pub fn from_ucs4<I: Iterator<Item = u32> + 'static>(
+    mut input: I,
+    omit_invalid: bool,
+    suppress_error: bool,
+) -> Box<dyn Iterator<Item = u8>> {
+    let mut position = 0;
+    let iter = iter::from_fn(move || {
+        while let Some(code_point) = input.next() {
+            position += 1;
+            if code_point <= 127 {
+                return Some(code_point as u8);
+            } else if omit_invalid {
+                continue;
+            } else {
+                if !suppress_error {
+                    eprintln!("Error: Invalid input position {}", position - 1);
+                    exit(1)
+                }
+                return None;
             }
-            return (1, result);
         }
-    }
-    (0, result)
+        None
+    });
+    Box::new(iter)
 }

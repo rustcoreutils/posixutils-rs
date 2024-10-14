@@ -58,6 +58,101 @@ struct Args {
     files: Option<Vec<PathBuf>>,
 }
 
+struct CircularBuffer<R: Read> {
+    reader: R,
+    buffer: [u8; 10000],
+    capacity: usize,
+    read_pos: usize,
+    write_pos: usize,
+    length: usize,
+}
+
+impl<R: Read> CircularBuffer<R> {
+    fn new(reader: R) -> Self {
+        CircularBuffer {
+            reader,
+            buffer: [0; 10000],
+            capacity: 10000,
+            read_pos: 0,
+            write_pos: 0,
+            length: 0,
+        }
+    }
+
+    fn available_space(&self) -> usize {
+        self.capacity - self.length
+    }
+
+    fn fill_buffer(&mut self) -> io::Result<()> {
+        while self.length < self.capacity {
+            let mut temp_buf = vec![0; self.available_space()];
+            match self.reader.read(&mut temp_buf) {
+                Ok(0) => return Ok(()), // EOF reached
+                Ok(n) => {
+                    self.write(&temp_buf[..n]);
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, data: &[u8]) -> usize {
+        let mut bytes_written = 0;
+        for &byte in data.iter().take(self.available_space()) {
+            self.buffer[self.write_pos] = byte;
+            self.write_pos = (self.write_pos + 1) % self.capacity;
+            self.length += 1;
+            bytes_written += 1;
+        }
+        bytes_written
+    }
+
+    fn iter(self) -> CircularBufferIterator<R> {
+        CircularBufferIterator { buffer: self }
+    }
+}
+
+struct CircularBufferIterator<R: Read> {
+    buffer: CircularBuffer<R>,
+}
+
+impl<R: Read> Iterator for CircularBufferIterator<R> {
+    type Item = u8;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.buffer.length == 0 {
+            match self.buffer.fill_buffer() {
+                Ok(()) if self.buffer.length == 0 => return None, // EOF reached
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    exit(1);
+                }
+            }
+        }
+
+        if self.buffer.length > 0 {
+            let item = self.buffer.buffer[self.buffer.read_pos];
+            self.buffer.read_pos = (self.buffer.read_pos + 1) % self.buffer.capacity;
+            self.buffer.length -= 1;
+            Some(item)
+        } else {
+            None
+        }
+    }
+}
+
+impl<R: Read> IntoIterator for CircularBuffer<R> {
+    type Item = u8;
+    type IntoIter = CircularBufferIterator<R>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 #[derive(EnumString, EnumIter, Debug, PartialEq, Display)]
 #[strum(serialize_all = "SCREAMING-KEBAB-CASE")]
 #[allow(non_camel_case_types)]
@@ -267,122 +362,127 @@ fn parse_codeset(codeset: &str) -> Result<CodesetType, Box<dyn std::error::Error
 fn encoding_conversion(
     from: &Encodings,
     to: &Encodings,
-    input: &[u8],
+    input: CircularBuffer<Box<dyn Read>>,
     omit_invalid: bool,
     supress_error: bool,
-) -> (Vec<u8>, u32) {
-    let (input_exit_code, input) = match from {
-        Encodings::UTF_8 => utf_8::to_ucs4(input, omit_invalid, supress_error),
+) {
+    let iter = input.into_iter();
+    let ucs4 = match from {
+        Encodings::UTF_8 => utf_8::to_ucs4(iter, omit_invalid, supress_error),
         Encodings::UTF_16 => {
-            utf_16::to_ucs4(input, omit_invalid, supress_error, UTF16Variant::UTF16)
+            utf_16::to_ucs4(iter, omit_invalid, supress_error, UTF16Variant::UTF16)
         }
         Encodings::UTF_16LE => {
-            utf_16::to_ucs4(input, omit_invalid, supress_error, UTF16Variant::UTF16LE)
+            utf_16::to_ucs4(iter, omit_invalid, supress_error, UTF16Variant::UTF16LE)
         }
         Encodings::UTF_16BE => {
-            utf_16::to_ucs4(input, omit_invalid, supress_error, UTF16Variant::UTF16BE)
+            utf_16::to_ucs4(iter, omit_invalid, supress_error, UTF16Variant::UTF16BE)
         }
         Encodings::UTF_32 => {
-            utf_32::to_ucs4(input, omit_invalid, supress_error, UTF32Variant::UTF32)
+            utf_32::to_ucs4(iter, omit_invalid, supress_error, UTF32Variant::UTF32)
         }
         Encodings::UTF_32LE => {
-            utf_32::to_ucs4(input, omit_invalid, supress_error, UTF32Variant::UTF32LE)
+            utf_32::to_ucs4(iter, omit_invalid, supress_error, UTF32Variant::UTF32LE)
         }
         Encodings::UTF_32BE => {
-            utf_32::to_ucs4(input, omit_invalid, supress_error, UTF32Variant::UTF32BE)
+            utf_32::to_ucs4(iter, omit_invalid, supress_error, UTF32Variant::UTF32BE)
         }
-        Encodings::ASCII => ascii::to_ucs4(input, omit_invalid, supress_error),
+        Encodings::ASCII => ascii::to_ucs4(iter, omit_invalid, supress_error),
     };
 
-    let (output_exit_code, output) = match to {
-        Encodings::UTF_8 => utf_8::from_ucs4(input.as_slice(), omit_invalid, supress_error),
-        Encodings::UTF_16 => utf_16::from_ucs4(
-            input.as_slice(),
-            omit_invalid,
-            supress_error,
-            UTF16Variant::UTF16,
-        ),
-        Encodings::UTF_16LE => utf_16::from_ucs4(
-            input.as_slice(),
-            omit_invalid,
-            supress_error,
-            UTF16Variant::UTF16LE,
-        ),
-        Encodings::UTF_16BE => utf_16::from_ucs4(
-            input.as_slice(),
-            omit_invalid,
-            supress_error,
-            UTF16Variant::UTF16BE,
-        ),
-        Encodings::UTF_32 => utf_32::from_ucs4(
-            input.as_slice(),
-            omit_invalid,
-            supress_error,
-            UTF32Variant::UTF32,
-        ),
-        Encodings::UTF_32LE => utf_32::from_ucs4(
-            input.as_slice(),
-            omit_invalid,
-            supress_error,
-            UTF32Variant::UTF32LE,
-        ),
-        Encodings::UTF_32BE => utf_32::from_ucs4(
-            input.as_slice(),
-            omit_invalid,
-            supress_error,
-            UTF32Variant::UTF32BE,
-        ),
-        Encodings::ASCII => ascii::from_ucs4(input.as_slice(), omit_invalid, supress_error),
+    let expected = match to {
+        Encodings::UTF_8 => utf_8::from_ucs4(ucs4, omit_invalid, supress_error),
+        Encodings::UTF_16 => {
+            utf_16::from_ucs4(ucs4, omit_invalid, supress_error, UTF16Variant::UTF16)
+        }
+        Encodings::UTF_16BE => {
+            utf_16::from_ucs4(ucs4, omit_invalid, supress_error, UTF16Variant::UTF16BE)
+        }
+        Encodings::UTF_16LE => {
+            utf_16::from_ucs4(ucs4, omit_invalid, supress_error, UTF16Variant::UTF16LE)
+        }
+        Encodings::UTF_32 => {
+            utf_32::from_ucs4(ucs4, omit_invalid, supress_error, UTF32Variant::UTF32)
+        }
+        Encodings::UTF_32LE => {
+            utf_32::from_ucs4(ucs4, omit_invalid, supress_error, UTF32Variant::UTF32LE)
+        }
+        Encodings::UTF_32BE => {
+            utf_32::from_ucs4(ucs4, omit_invalid, supress_error, UTF32Variant::UTF32BE)
+        }
+        Encodings::ASCII => ascii::from_ucs4(ucs4, omit_invalid, supress_error),
     };
 
-    let exit_code = input_exit_code.max(output_exit_code);
-
-    (output, exit_code)
+    expected.for_each(|byte| {
+        io::stdout().write_all(&[byte]).unwrap();
+        io::stdout().flush().unwrap();
+    });
 }
+
 fn charmap_conversion(
     from: &Charmap,
     to: &Charmap,
-    input: &[u8],
+    input: CircularBuffer<Box<dyn Read>>,
     omit_invalid: bool,
     suppress_error: bool,
-) -> (Vec<u8>, u32) {
-    let mut output = Vec::new();
-    let mut error_count = 0;
+) {
+    let mut buffer = Vec::new();
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
 
-    let mut i = 0;
-    while i < input.len() {
+    for byte in input {
+        buffer.push(byte);
         let mut found = false;
         for (_, entry) in &from.entries {
-            if input[i..].starts_with(&entry.encoding) {
+            if buffer.starts_with(&entry.encoding) {
                 if let Some(to_entry) = to
                     .entries
                     .values()
                     .find(|e| e.symbolic_name == entry.symbolic_name)
                 {
-                    output.extend_from_slice(&to_entry.encoding);
-                    i += entry.encoding.len();
+                    if let Err(e) = stdout.write_all(&to_entry.encoding) {
+                        eprintln!("Error writing to stdout: {}", e);
+                    }
+                    if let Err(e) = stdout.flush() {
+                        eprintln!("Error flushing stdout: {}", e);
+                    }
+                    buffer.clear();
                     found = true;
                     break;
                 }
             }
         }
-
-        if !found {
+        if !found && buffer.len() >= from.header.mb_cur_max {
             if !suppress_error {
-                eprintln!("Error: Invalid or unmapped character at position {}", i);
+                eprintln!("Error: Invalid or unmapped character");
             }
-            error_count += 1;
             if omit_invalid {
-                i += 1;
+                buffer.clear();
             } else {
-                output.push(input[i]);
-                i += 1;
+                if let Err(e) = stdout.write_all(&[buffer[0]]) {
+                    eprintln!("Error writing to stdout: {}", e);
+                }
+                if let Err(e) = stdout.flush() {
+                    eprintln!("Error flushing stdout: {}", e);
+                }
+                buffer.remove(0);
             }
         }
     }
 
-    let exit_code = if error_count > 0 { 1 } else { 0 };
-    (output, exit_code)
+    for &byte in &buffer {
+        if !omit_invalid {
+            if let Err(e) = stdout.write_all(&[byte]) {
+                eprintln!("Error writing to stdout: {}", e);
+            }
+            if let Err(e) = stdout.flush() {
+                eprintln!("Error flushing stdout: {}", e);
+            }
+        }
+        if !suppress_error {
+            eprintln!("Error: Invalid or unmapped character at end of input");
+        }
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -428,35 +528,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => vec![Box::new(io::stdin().lock())],
     };
 
-    for mut input in inputs {
-        let mut inp_buf = Vec::new();
-        input.read_to_end(&mut inp_buf)?;
-
+    for input in inputs {
+        let buf = CircularBuffer::new(input);
         match (&from_codeset, &to_codeset) {
             (CodesetType::Encoding(from), CodesetType::Encoding(to)) => {
-                let (output, exit_code) = encoding_conversion(
-                    from,
-                    to,
-                    &inp_buf,
-                    args.omit_invalid,
-                    args.suppress_messages,
-                );
-
-                io::stdout().write_all(&output)?;
-                exit(exit_code as i32);
+                encoding_conversion(from, to, buf, args.omit_invalid, args.suppress_messages);
             }
-
             (CodesetType::Charmap(from), CodesetType::Charmap(to)) => {
-                let (output, exit_code) = charmap_conversion(
-                    from,
-                    to,
-                    &inp_buf,
-                    args.omit_invalid,
-                    args.suppress_messages,
-                );
-
-                io::stdout().write_all(&output)?;
-                exit(exit_code as i32);
+                charmap_conversion(from, to, buf, args.omit_invalid, args.suppress_messages);
             }
             _ => {
                 eprintln!(

@@ -8,6 +8,7 @@
 //
 
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
+use std::{iter, process::exit};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UTF32Variant {
@@ -19,115 +20,134 @@ pub enum UTF32Variant {
 const BOM: u32 = 0x0000FEFF;
 const BOM_OE: u32 = 0xFFFE0000;
 
-pub fn to_ucs4(
-    input: &[u8],
+/// Convert UTF-32 to UCS-4
+pub fn to_ucs4<I: Iterator<Item = u8> + 'static>(
+    mut input: I,
     omit_invalid: bool,
     suppress_error: bool,
     variant: UTF32Variant,
-) -> (u32, Vec<u32>) {
-    if input.len() < 4 {
-        if !suppress_error {
-            eprintln!("Error: Input is too short");
-        }
-        return (1, Vec::new());
-    }
+) -> Box<dyn Iterator<Item = u32>> {
+    let mut buffer = Vec::with_capacity(4);
+    let mut variant = variant;
+    let mut bom_checked = false;
 
-    let (variant, start_index) = match variant {
-        UTF32Variant::UTF32LE => (UTF32Variant::UTF32LE, 0),
-        UTF32Variant::UTF32BE => (UTF32Variant::UTF32BE, 0),
-        UTF32Variant::UTF32 => {
-            let first_word = BigEndian::read_u32(&input[0..4]);
-            if first_word == BOM {
-                (UTF32Variant::UTF32BE, 4)
-            } else if first_word == BOM_OE {
-                (UTF32Variant::UTF32LE, 4)
-            } else {
-                if cfg!(target_endian = "little") {
-                    (UTF32Variant::UTF32LE, 0)
-                } else {
-                    (UTF32Variant::UTF32BE, 0)
+    let iter = iter::from_fn(move || {
+        loop {
+            if buffer.len() < 4 {
+                buffer.extend(input.by_ref().take(4 - buffer.len()));
+                if buffer.len() < 4 {
+                    return None; // End of input
                 }
             }
-        }
-    };
 
-    let mut ucs4: Vec<u32> = Vec::new();
-    let mut index = start_index;
-
-    while index < input.len() {
-        if index + 4 > input.len() {
-            break;
-        }
-        let code_point = match variant {
-            UTF32Variant::UTF32LE => LittleEndian::read_u32(&input[index..index + 4]),
-            UTF32Variant::UTF32BE => BigEndian::read_u32(&input[index..index + 4]),
-            _ => unreachable!(),
-        };
-
-        if code_point >= 0x110000 {
-            if !suppress_error {
-                eprintln!("Error: Invalid code point U+{:X}", code_point);
+            if !bom_checked {
+                let first_word = BigEndian::read_u32(&buffer);
+                match variant {
+                    UTF32Variant::UTF32 => {
+                        if first_word == BOM {
+                            variant = UTF32Variant::UTF32BE;
+                            buffer.clear();
+                        } else if first_word == BOM_OE {
+                            variant = UTF32Variant::UTF32LE;
+                            buffer.clear();
+                        } else {
+                            variant = if cfg!(target_endian = "little") {
+                                UTF32Variant::UTF32LE
+                            } else {
+                                UTF32Variant::UTF32BE
+                            };
+                        }
+                    }
+                    _ => {}
+                }
+                bom_checked = true;
+                if buffer.is_empty() {
+                    continue;
+                }
             }
-            if omit_invalid {
-                index += 4;
-                continue;
-            } else {
-                return (1, ucs4);
-            }
-        }
-        ucs4.push(code_point);
-        index += 4;
-    }
 
-    (0, ucs4)
+            let code_point = match variant {
+                UTF32Variant::UTF32LE => LittleEndian::read_u32(&buffer),
+                UTF32Variant::UTF32BE => BigEndian::read_u32(&buffer),
+                UTF32Variant::UTF32 => unreachable!(),
+            };
+
+            buffer.clear();
+
+            if code_point >= 0x110000 {
+                if !suppress_error {
+                    eprintln!("Error: Invalid code point U+{:X}", code_point);
+                }
+                if omit_invalid {
+                    continue;
+                } else {
+                    return None;
+                }
+            }
+
+            return Some(code_point);
+        }
+    });
+    Box::new(iter)
 }
 
-pub fn from_ucs4(
-    input: &[u32],
+/// Convert UCS-4 to UTF-32
+pub fn from_ucs4<I: Iterator<Item = u32> + 'static>(
+    input: I,
     omit_invalid: bool,
     suppress_error: bool,
     variant: UTF32Variant,
-) -> (u32, Vec<u8>) {
-    let mut utf32: Vec<u8> = Vec::with_capacity(input.len() * 4);
-    let (variant, include_bom) = match variant {
-        UTF32Variant::UTF32LE => (UTF32Variant::UTF32LE, false),
-        UTF32Variant::UTF32BE => (UTF32Variant::UTF32BE, false),
+) -> Box<dyn Iterator<Item = u8>> {
+    let variant = match variant {
+        UTF32Variant::UTF32LE => UTF32Variant::UTF32LE,
+        UTF32Variant::UTF32BE => UTF32Variant::UTF32BE,
         UTF32Variant::UTF32 => {
             if cfg!(target_endian = "little") {
-                (UTF32Variant::UTF32LE, true)
+                UTF32Variant::UTF32LE
             } else {
-                (UTF32Variant::UTF32BE, true)
+                UTF32Variant::UTF32BE
             }
         }
     };
 
-    if include_bom {
-        write_u32(&mut utf32, BOM, variant);
-    }
+    let mut code_point = input.peekable();
+    let mut buf = [0u8; 4];
+    let mut idx = 4;
 
-    for &code_point in input {
-        if code_point > 0x10FFFF {
-            if !suppress_error {
-                eprintln!("Error: Invalid Unicode code point U+{:X}", code_point);
-            }
-            if omit_invalid {
-                continue;
-            } else {
-                return (1, utf32);
-            }
+    let iter = iter::from_fn(move || loop {
+        if idx < 4 {
+            let byte = buf[idx];
+            idx += 1;
+            return Some(byte);
         }
-        write_u32(&mut utf32, code_point, variant);
-    }
 
-    (0, utf32)
+        match code_point.next() {
+            Some(cp) => {
+                if cp > 0x10FFFF {
+                    if omit_invalid {
+                        continue;
+                    } else {
+                        if !suppress_error {
+                            eprintln!("Error: Invalid Unicode code point U+{:X}", cp);
+                        }
+                        exit(1);
+                    }
+                }
+                write_u32(&mut buf, cp, variant); // Write code point to buffer
+                idx = 0;
+            }
+            None => return None,
+        }
+    });
+
+    Box::new(iter)
 }
 
-fn write_u32(buffer: &mut Vec<u8>, value: u32, variant: UTF32Variant) {
-    let mut temp = [0u8; 4];
+#[inline]
+fn write_u32(buffer: &mut [u8; 4], value: u32, variant: UTF32Variant) {
     match variant {
-        UTF32Variant::UTF32LE => LittleEndian::write_u32(&mut temp, value),
-        UTF32Variant::UTF32BE => BigEndian::write_u32(&mut temp, value),
+        UTF32Variant::UTF32LE => LittleEndian::write_u32(buffer, value),
+        UTF32Variant::UTF32BE => BigEndian::write_u32(buffer, value),
         _ => unreachable!(),
     }
-    buffer.extend_from_slice(&temp);
 }

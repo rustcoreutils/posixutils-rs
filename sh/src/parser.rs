@@ -12,9 +12,9 @@ use std::{path::is_separator, rc::Rc};
 use crate::{
     lexer::{is_blank, is_operator, Lexer, ShellToken, SourceLocation, WordToken},
     program::{
-        ArithmeticExpr, Assignment, Command, CompleteCommand, CompleteCommandList, CompoundCommand,
-        Conjunction, IORedirectionKind, LogicalOp, Parameter, ParameterExpansion, Pipeline,
-        Program, Redirection, RedirectionKind, SimpleCommand, Word, WordPart,
+        ArithmeticExpr, Assignment, CaseItem, Command, CompleteCommand, CompleteCommandList,
+        CompoundCommand, Conjunction, IORedirectionKind, LogicalOp, Parameter, ParameterExpansion,
+        Pipeline, Program, Redirection, RedirectionKind, SimpleCommand, Word, WordPart,
     },
 };
 
@@ -107,6 +107,12 @@ impl<'src> Parser<'src> {
             todo!();
         }
         self.advance_shell();
+    }
+
+    fn match_shell_token_opt(&mut self, token: ShellToken) {
+        if self.shell_lookahead() == token {
+            self.advance_shell();
+        }
     }
 
     fn match_word_token(&mut self, token: WordToken) {
@@ -484,8 +490,19 @@ impl<'src> Parser<'src> {
         }
     }
 
-    fn parse_compound_list(&mut self, end: ShellToken, word_stop: WordToken) -> CompleteCommand {
+    fn parse_compound_list(&mut self, word_stop: WordToken) -> CompleteCommand {
         self.skip_linebreak();
+
+        const END_TOKENS: &[ShellToken] = &[
+            ShellToken::RParen,
+            ShellToken::RBrace,
+            ShellToken::Done,
+            ShellToken::Elif,
+            ShellToken::Else,
+            ShellToken::Esac,
+            ShellToken::Fi,
+            ShellToken::Then,
+        ];
 
         let mut last_conjunction = self.parse_and_or(word_stop);
         let mut commands = Vec::new();
@@ -499,7 +516,7 @@ impl<'src> Parser<'src> {
             }
             self.advance_shell();
             self.skip_linebreak();
-            if self.shell_lookahead() == end {
+            if END_TOKENS.contains(&self.shell_lookahead()) {
                 break;
             }
             commands.push(last_conjunction);
@@ -512,7 +529,7 @@ impl<'src> Parser<'src> {
     fn parse_brace_group(&mut self) -> CompoundCommand {
         // consume '{'
         self.advance_shell();
-        let inner = self.parse_compound_list(ShellToken::RBrace, WordToken::Char('}'));
+        let inner = self.parse_compound_list(WordToken::Char('}'));
         self.match_shell_token(ShellToken::RBrace);
         CompoundCommand::BraceGroup(inner)
     }
@@ -520,14 +537,14 @@ impl<'src> Parser<'src> {
     fn parse_subshell(&mut self) -> CompoundCommand {
         // consume '('
         self.advance_shell();
-        let inner = self.parse_compound_list(ShellToken::RParen, WordToken::Char(')'));
+        let inner = self.parse_compound_list(WordToken::Char(')'));
         self.match_shell_token(ShellToken::RParen);
         CompoundCommand::Subshell(inner)
     }
 
     fn parse_do_group(&mut self) -> CompleteCommand {
         self.match_shell_token(ShellToken::Do);
-        let inner = self.parse_compound_list(ShellToken::Done, WordToken::EOF);
+        let inner = self.parse_compound_list(WordToken::EOF);
         self.match_shell_token(ShellToken::Done);
         inner
     }
@@ -567,8 +584,48 @@ impl<'src> Parser<'src> {
         }
     }
 
+    fn parse_case_item(&mut self) -> CaseItem {
+        self.match_shell_token_opt(ShellToken::LParen);
+        let mut pattern = Vec::new();
+        while self.shell_lookahead() != ShellToken::RParen {
+            pattern.push(self.parse_word_until(WordToken::EOF).unwrap());
+            if self.shell_lookahead() != ShellToken::Pipe {
+                break;
+            }
+            self.advance_shell();
+        }
+        self.match_shell_token(ShellToken::RParen);
+
+        let body = self.parse_compound_list(WordToken::EOF);
+
+        if self.shell_lookahead() == ShellToken::DSemi {
+            self.advance_shell();
+            self.skip_linebreak();
+        } else if self.shell_lookahead() != ShellToken::Esac {
+            todo!("error: expected ';;', found ...")
+        }
+
+        CaseItem { body, pattern }
+    }
+
     fn parse_case_clause(&mut self) -> CompoundCommand {
-        todo!()
+        // consume 'case'
+        self.advance_shell();
+        let arg = self.parse_word_until(WordToken::EOF).unwrap();
+        self.skip_linebreak();
+        self.match_shell_token(ShellToken::In);
+        self.skip_linebreak();
+        let mut cases = Vec::new();
+        loop {
+            match self.shell_lookahead() {
+                ShellToken::Esac => break,
+                _ => {
+                    cases.push(self.parse_case_item());
+                }
+            }
+        }
+        self.match_shell_token(ShellToken::Esac);
+        CompoundCommand::CaseClause { arg, cases }
     }
 
     fn parse_if_clause(&mut self) -> CompoundCommand {
@@ -1541,6 +1598,94 @@ mod tests {
                     commands: vec![conjunction_from_word(literal_word("cmd"), false)]
                 }
             }
+        );
+    }
+
+    #[test]
+    fn parse_empty_case_clause() {
+        assert_eq!(
+            parse_compound_command("case word in esac").0,
+            CompoundCommand::CaseClause {
+                arg: literal_word("word"),
+                cases: Vec::new()
+            }
+        );
+        assert_eq!(
+            parse_compound_command("case word \n\nin\n esac").0,
+            CompoundCommand::CaseClause {
+                arg: literal_word("word"),
+                cases: Vec::new()
+            }
+        )
+    }
+
+    #[test]
+    fn parse_case_clause_one_case() {
+        assert_eq!(
+            parse_compound_command("case word in (pattern) cmd esac").0,
+            CompoundCommand::CaseClause {
+                arg: literal_word("word"),
+                cases: vec![CaseItem {
+                    pattern: vec![literal_word("pattern")],
+                    body: complete_command_from_word(literal_word("cmd"), false)
+                }]
+            }
+        );
+        assert_eq!(
+            parse_compound_command("case word in (pattern) cmd esac"),
+            parse_compound_command("case word in pattern) cmd esac")
+        );
+        assert_eq!(
+            parse_compound_command("case word in (pattern) cmd esac"),
+            parse_compound_command("case word\n in \n(pattern)\n\ncmd\nesac")
+        );
+
+        assert_eq!(
+            parse_compound_command("case word in (pattern) cmd esac"),
+            parse_compound_command("case word in (pattern) cmd ;; esac")
+        );
+    }
+
+    #[test]
+    fn parse_case_clause_multiple_cases() {
+        assert_eq!(
+            parse_compound_command(
+                "case word in (pattern1) cmd1;; (pattern2) cmd2;; (pattern3) cmd3;; esac"
+            )
+            .0,
+            CompoundCommand::CaseClause {
+                arg: literal_word("word"),
+                cases: vec![
+                    CaseItem {
+                        pattern: vec![literal_word("pattern1")],
+                        body: complete_command_from_word(literal_word("cmd1"), false)
+                    },
+                    CaseItem {
+                        pattern: vec![literal_word("pattern2")],
+                        body: complete_command_from_word(literal_word("cmd2"), false)
+                    },
+                    CaseItem {
+                        pattern: vec![literal_word("pattern3")],
+                        body: complete_command_from_word(literal_word("cmd3"), false)
+                    }
+                ]
+            }
+        );
+        assert_eq!(
+            parse_compound_command(
+                "case word in (pattern1) cmd1;; (pattern2) cmd2;; (pattern3) cmd3;; esac"
+            ),
+            parse_compound_command(
+                "case word in (pattern1) cmd1;; (pattern2) cmd2;; (pattern3) cmd3 esac"
+            )
+        );
+        assert_eq!(
+            parse_compound_command(
+                "case word in (pattern1) cmd1;; (pattern2) cmd2;; (pattern3) cmd3;; esac"
+            ),
+            parse_compound_command(
+                "case word in\n(pattern1)\n cmd1\n;;\n (pattern2) \ncmd2\n;;\n (pattern3)\n cmd3\n esac"
+            )
         );
     }
 }

@@ -169,7 +169,7 @@ impl std::fmt::Debug for SimpleCommand {
 #[derive(Debug, PartialEq)]
 pub struct CaseItem {
     pub pattern: Vec<Word>,
-    pub body: CompleteCommandList,
+    pub body: CompleteCommand,
 }
 
 #[derive(Debug, PartialEq)]

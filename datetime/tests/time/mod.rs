@@ -14,12 +14,7 @@ use std::{
 
 use plib::testing::{run_test, TestPlan};
 
-fn time_test(
-    args: &[&str],
-    expected_output: &str,
-    expected_error: &str,
-    expected_exit_code: i32,
-) {
+fn time_test(args: &[&str], expected_output: &str, expected_error: &str, expected_exit_code: i32) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
 
     run_test(TestPlan {

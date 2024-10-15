@@ -1087,7 +1087,7 @@ fn test_rm_fail_2eperm() {
         if passwd.is_null() {
             panic!("{}", io::Error::last_os_error());
         }
-        let uid = (&*passwd).pw_uid;
+        let uid = (*passwd).pw_uid;
 
         let test_dir_cstr = CString::new(test_dir.as_bytes()).unwrap();
 
@@ -1161,7 +1161,7 @@ fn test_rm_no_give_up() {
         if passwd.is_null() {
             panic!("{}", io::Error::last_os_error());
         }
-        let uid = (&*passwd).pw_uid;
+        let uid = (*passwd).pw_uid;
 
         // The two calls below to `libc::chown` is equivalent to:
         // chown -R $NON_ROOT_USERNAME d

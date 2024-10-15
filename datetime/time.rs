@@ -45,10 +45,10 @@ struct Args {
     arguments: Vec<String>,
 
     #[arg(short, long, help = gettext("Print help"), action = clap::ArgAction::HelpLong)]
-    help: bool,
+    help: Option<bool>,
 
     #[arg(short = 'V', long, help = gettext("Print version"), action = clap::ArgAction::Version)]
-    version: bool,
+    version: Option<bool>,
 }
 
 enum TimeError {

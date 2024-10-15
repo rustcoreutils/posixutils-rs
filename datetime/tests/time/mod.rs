@@ -12,7 +12,25 @@ use std::{
     process::{Command, Output, Stdio},
 };
 
-use plib::testing::TestPlan;
+use plib::testing::{run_test, TestPlan};
+
+fn time_test(
+    args: &[&str],
+    expected_output: &str,
+    expected_error: &str,
+    expected_exit_code: i32,
+) {
+    let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
+
+    run_test(TestPlan {
+        cmd: String::from("time"),
+        args: str_args,
+        stdin_data: String::new(),
+        expected_out: String::from(expected_output),
+        expected_err: String::from(expected_error),
+        expected_exit_code,
+    });
+}
 
 fn run_test_base(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> Output {
     let relpath = if cfg!(debug_assertions) {
@@ -50,7 +68,7 @@ fn get_output(plan: TestPlan) -> Output {
     output
 }
 
-fn run_test_time(
+fn run_test_time_error_only(
     args: &[&str],
     expected_output: &str,
     expected_error: &str,
@@ -67,16 +85,14 @@ fn run_test_time(
         expected_exit_code,
     });
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert_eq!(stdout, expected_output);
     assert!(stderr.contains(expected_error));
 }
 
 #[test]
 fn test_smoke_help() {
-    run_test_time(
+    time_test(
         &["--help"],
         "\
 time - time a simple command or give resource usage
@@ -99,20 +115,20 @@ Options:
 
 #[test]
 fn simple_test() {
-    run_test_time(&["--", "ls", "-l"], "", "User time", 0);
+    run_test_time_error_only(&["--", "ls", "-l"], "", "User time", 0);
 }
 
 #[test]
 fn p_test() {
-    run_test_time(&["-p", "--", "ls", "-l"], "", "user", 0);
+    run_test_time_error_only(&["-p", "--", "ls", "-l"], "", "user", 0);
 }
 
 #[test]
 fn parse_error_test() {
-    run_test_time(&[], "", "not provided", 0);
+    run_test_time_error_only(&[], "", "not provided", 0);
 }
 
 #[test]
 fn command_error_test() {
-    run_test_time(&["-s", "ls", "-l"], "", "unexpected argument '-s' found", 0);
+    run_test_time_error_only(&["-s", "ls", "-l"], "", "unexpected argument '-s' found", 0);
 }

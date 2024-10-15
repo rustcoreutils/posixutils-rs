@@ -12,7 +12,7 @@ use std::{
     process::{Command, Output, Stdio},
 };
 
-use plib::TestPlan;
+use plib::testing::TestPlan;
 
 fn run_test_base(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> Output {
     let relpath = if cfg!(debug_assertions) {
@@ -67,9 +67,34 @@ fn run_test_time(
         expected_exit_code,
     });
 
+    let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
+    assert_eq!(stdout, expected_output);
     assert!(stderr.contains(expected_error));
+}
+
+#[test]
+fn test_smoke_help() {
+    run_test_time(
+        &["--help"],
+        "\
+time - time a simple command or give resource usage
+
+Usage: time [OPTIONS] <UTILITY> [ARGUMENT]...
+
+Arguments:
+  <UTILITY>      The utility to be invoked
+  [ARGUMENT]...  Arguments for the utility
+
+Options:
+  -p, --posix    Write timing output to standard error in POSIX format
+  -h, --help     Print help
+  -V, --version  Print version
+",
+        "",
+        0,
+    );
 }
 
 #[test]

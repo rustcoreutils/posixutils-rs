@@ -10,13 +10,15 @@
 use core::fmt;
 use std::{ffi::CString, ops::Deref, rc::Rc};
 
-#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(test, derive(Debug))]
+#[derive(Clone, PartialEq)]
 enum AwkStringVariant {
     Owned(String),
     Shared(Rc<str>),
 }
 
-#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(Debug))]
+#[derive(Clone)]
 pub struct AwkString {
     value: AwkStringVariant,
     pub is_numeric: bool,

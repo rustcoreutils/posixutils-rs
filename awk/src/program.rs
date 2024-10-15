@@ -8,12 +8,12 @@
 //
 
 use crate::regex::Regex;
-use core::fmt;
 use std::{collections::HashMap, rc::Rc};
 
 pub type VarId = u32;
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(test, derive(Debug))]
+#[derive(PartialEq, Eq, Clone, Copy)]
 pub enum OpCode {
     // binary operations
     Add,
@@ -108,7 +108,8 @@ pub enum OpCode {
     Invalid,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(test, derive(Debug))]
+#[derive(Clone, PartialEq)]
 pub enum Constant {
     Number(f64),
     String(Rc<str>),
@@ -133,38 +134,44 @@ impl From<Rc<Regex>> for Constant {
     }
 }
 
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[cfg_attr(test, derive(Debug))]
+#[derive(PartialEq, Clone, Copy)]
 pub struct SourceLocation {
     pub line: u32,
     pub column: u32,
 }
 
-#[derive(Debug, PartialEq, Default)]
+#[cfg_attr(test, derive(Debug))]
+#[derive(PartialEq, Default)]
 pub struct DebugInfo {
     pub file: Rc<str>,
     pub source_locations: Vec<SourceLocation>,
 }
 
-#[derive(Debug, PartialEq)]
+#[cfg_attr(test, derive(Debug))]
+#[derive(PartialEq)]
 pub struct Action {
     pub instructions: Vec<OpCode>,
     pub debug_info: DebugInfo,
 }
 
-#[derive(Debug, PartialEq)]
+#[cfg_attr(test, derive(Debug))]
+#[derive(PartialEq)]
 pub enum Pattern {
     Expr(Action),
     Range { start: Action, end: Action },
     All,
 }
 
-#[derive(Debug, PartialEq)]
+#[cfg_attr(test, derive(Debug))]
+#[derive(PartialEq)]
 pub struct AwkRule {
     pub pattern: Pattern,
     pub action: Action,
 }
 
-#[derive(Debug, PartialEq, Default)]
+#[cfg_attr(test, derive(Debug))]
+#[derive(PartialEq, Default)]
 pub struct Function {
     pub name: Rc<str>,
     pub parameters_count: usize,
@@ -182,13 +189,14 @@ pub struct Program {
     pub functions: Vec<Function>,
 }
 
-impl fmt::Debug for Program {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+#[cfg(test)]
+impl core::fmt::Debug for Program {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         writeln!(f, "Program:")?;
         for action in &self.begin_actions {
             writeln!(f, "  BEGIN {{")?;
             for instruction in &action.instructions {
-                writeln!(f, "    {:?}", instruction)?;
+                writeln!(f, "    {instruction:?}")?;
             }
             writeln!(f, "  }}")?;
         }
@@ -198,18 +206,18 @@ impl fmt::Debug for Program {
                 Pattern::Expr(action) => {
                     writeln!(f, "  /")?;
                     for instruction in &action.instructions {
-                        writeln!(f, "    {:?}", instruction)?;
+                        writeln!(f, "    {instruction:?}")?;
                     }
                     writeln!(f, "  / {{")?;
                 }
                 Pattern::Range { start, end } => {
                     writeln!(f, "  /")?;
                     for instruction in &start.instructions {
-                        writeln!(f, "    {:?}", instruction)?;
+                        writeln!(f, "    {instruction:?}")?;
                     }
                     writeln!(f, "  /, /")?;
                     for instruction in &end.instructions {
-                        writeln!(f, "    {:?}", instruction)?;
+                        writeln!(f, "    {instruction:?}")?;
                     }
                     writeln!(f, "  / {{")?;
                 }
@@ -218,7 +226,7 @@ impl fmt::Debug for Program {
                 }
             }
             for instruction in &rule.action.instructions {
-                writeln!(f, "    {:?}", instruction)?;
+                writeln!(f, "    {instruction:?}")?;
             }
             writeln!(f, "  }}")?;
         }
@@ -226,7 +234,7 @@ impl fmt::Debug for Program {
         for action in &self.end_actions {
             writeln!(f, "  END {{")?;
             for instruction in &action.instructions {
-                writeln!(f, "    {:?}", instruction)?;
+                writeln!(f, "    {instruction:?}")?;
             }
             writeln!(f, "  }}")?;
         }
@@ -234,20 +242,21 @@ impl fmt::Debug for Program {
         for function in &self.functions {
             writeln!(f, "  {}({}) {{", function.name, function.parameters_count)?;
             for instruction in &function.instructions {
-                writeln!(f, "    {:?}", instruction)?;
+                writeln!(f, "    {instruction:?}")?;
             }
             writeln!(f, "  }}")?;
         }
         writeln!(f, "Constants:")?;
         for (i, constant) in self.constants.iter().enumerate() {
-            writeln!(f, "  {}: {:?}", i, constant)?;
+            writeln!(f, "  {i}: {constant:?}")?;
         }
         Ok(())
     }
 }
 
 #[repr(u32)]
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(test, derive(Debug))]
+#[derive(PartialEq, Eq, Clone, Copy)]
 pub enum SpecialVar {
     Argc,
     Argv,
@@ -271,7 +280,8 @@ pub enum SpecialVar {
 }
 
 #[repr(u32)]
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(test, derive(Debug))]
+#[derive(PartialEq, Eq, Clone, Copy)]
 pub enum BuiltinFunction {
     // arithmetic functions
     Atan2,

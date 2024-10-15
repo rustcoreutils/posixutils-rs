@@ -385,6 +385,7 @@ impl<'src> Parser<'src> {
                     contents.push_str(line);
                 }
             }
+            self.advance_shell();
             return Some(RedirectionKind::HereDocument { contents });
         }
         let kind = match self.shell_lookahead() {
@@ -460,7 +461,6 @@ impl<'src> Parser<'src> {
                     }
                 }
             }
-            self.advance_shell();
         }
 
         loop {
@@ -481,7 +481,6 @@ impl<'src> Parser<'src> {
                     }
                 }
             }
-            self.advance_shell();
         }
     }
 

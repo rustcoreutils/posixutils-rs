@@ -13,8 +13,9 @@ use crate::{
     lexer::{is_blank, is_operator, Lexer, ShellToken, SourceLocation, WordToken},
     program::{
         ArithmeticExpr, Assignment, CaseItem, Command, CompleteCommand, CompleteCommandList,
-        CompoundCommand, Conjunction, IORedirectionKind, LogicalOp, Parameter, ParameterExpansion,
-        Pipeline, Program, Redirection, RedirectionKind, SimpleCommand, Word, WordPart,
+        CompoundCommand, Conjunction, IORedirectionKind, If, LogicalOp, Parameter,
+        ParameterExpansion, Pipeline, Program, Redirection, RedirectionKind, SimpleCommand, Word,
+        WordPart,
     },
 };
 
@@ -643,7 +644,39 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_if_clause(&mut self) -> CompoundCommand {
-        todo!()
+        // consume 'if'
+        self.advance_shell();
+        let mut if_chain = Vec::new();
+        let condition = self.parse_compound_list(WordToken::EOF);
+        self.match_shell_token(ShellToken::Then);
+        let then_part = self.parse_compound_list(WordToken::EOF);
+        if_chain.push(If {
+            condition,
+            body: then_part,
+        });
+        while self.shell_lookahead() == ShellToken::Elif {
+            // consume 'elif'
+            self.advance_shell();
+            let condition = self.parse_compound_list(WordToken::EOF);
+            self.match_shell_token(ShellToken::Then);
+            let then_part = self.parse_compound_list(WordToken::EOF);
+            if_chain.push(If {
+                condition,
+                body: then_part,
+            });
+        }
+        if self.shell_lookahead() == ShellToken::Else {
+            self.advance_shell();
+            let else_part = self.parse_compound_list(WordToken::EOF);
+            if_chain.push(If {
+                condition: CompleteCommand {
+                    commands: Vec::new(),
+                },
+                body: else_part,
+            });
+        }
+        self.match_shell_token(ShellToken::Fi);
+        CompoundCommand::IfClause { if_chain }
     }
 
     fn parse_while_clause(&mut self) -> CompoundCommand {
@@ -1715,6 +1748,102 @@ mod tests {
             parse_compound_command(
                 "case word in\n(pattern1)\n cmd1\n;;\n (pattern2) \ncmd2\n;;\n (pattern3)\n cmd3\n esac"
             )
+        );
+    }
+
+    #[test]
+    fn parse_if_clause_no_else() {
+        assert_eq!(
+            parse_compound_command("if condition; then cmd; fi").0,
+            CompoundCommand::IfClause {
+                if_chain: vec![If {
+                    condition: CompleteCommand {
+                        commands: vec![conjunction_from_word(literal_word("condition"), false)]
+                    },
+                    body: CompleteCommand {
+                        commands: vec![conjunction_from_word(literal_word("cmd"), false)]
+                    }
+                }]
+            }
+        );
+    }
+
+    #[test]
+    fn parse_if_clause_one_else() {
+        assert_eq!(
+            parse_compound_command("if condition; then cmd; else cmd2; fi").0,
+            CompoundCommand::IfClause {
+                if_chain: vec![
+                    If {
+                        condition: CompleteCommand {
+                            commands: vec![conjunction_from_word(literal_word("condition"), false)]
+                        },
+                        body: CompleteCommand {
+                            commands: vec![conjunction_from_word(literal_word("cmd"), false)]
+                        }
+                    },
+                    If {
+                        condition: CompleteCommand {
+                            commands: Vec::new()
+                        },
+                        body: CompleteCommand {
+                            commands: vec![conjunction_from_word(literal_word("cmd2"), false)]
+                        }
+                    }
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn parse_if_clause_with_elif_chain() {
+        assert_eq!(
+            parse_compound_command("if condition1; then cmd1; elif condition2; then cmd2; elif condition3; then cmd3; else cmd4; fi").0,
+            CompoundCommand::IfClause {
+                if_chain: vec![
+                    If {
+                        condition: CompleteCommand {
+                            commands: vec![conjunction_from_word(
+                                literal_word("condition1"),
+                                false
+                            )]
+                        },
+                        body: CompleteCommand {
+                            commands: vec![conjunction_from_word(literal_word("cmd1"), false)]
+                        }
+                    },
+                    If {
+                        condition: CompleteCommand {
+                            commands: vec![conjunction_from_word(
+                                literal_word("condition2"),
+                                false
+                            )]
+                        },
+                        body: CompleteCommand {
+                            commands: vec![conjunction_from_word(literal_word("cmd2"), false)]
+                        }
+                    },
+                    If {
+                        condition: CompleteCommand {
+                            commands: vec![conjunction_from_word(
+                                literal_word("condition3"),
+                                false
+                            )]
+                        },
+                        body: CompleteCommand {
+                            commands: vec![conjunction_from_word(literal_word("cmd3"), false)]
+                        }
+                    },
+                    If {
+                        condition: CompleteCommand {
+                            commands: Vec::new()
+                        },
+                        body: CompleteCommand {
+                            commands: vec![conjunction_from_word(literal_word("cmd4"), false)]
+                        }
+                    }
+                ]
+            }
         );
     }
 }

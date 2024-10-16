@@ -174,8 +174,8 @@ pub struct CaseItem {
 
 #[derive(Debug, PartialEq)]
 pub struct If {
-    pub condition: CompleteCommandList,
-    pub body: CompleteCommandList,
+    pub condition: CompleteCommand,
+    pub body: CompleteCommand,
 }
 
 #[derive(Debug, PartialEq)]

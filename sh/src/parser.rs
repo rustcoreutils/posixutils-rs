@@ -1884,4 +1884,32 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn parse_compound_command_with_redirections() {
+        let (command, redirections) = parse_compound_command("if a then b fi > file.txt");
+        assert_eq!(
+            command,
+            CompoundCommand::IfClause {
+                if_chain: vec![If {
+                    condition: CompleteCommand {
+                        commands: vec![conjunction_from_word(literal_word("a"), false)]
+                    },
+                    body: CompleteCommand {
+                        commands: vec![conjunction_from_word(literal_word("b"), false)]
+                    }
+                }]
+            }
+        );
+        assert_eq!(
+            redirections,
+            vec![Redirection {
+                file_descriptor: None,
+                kind: RedirectionKind::IORedirection {
+                    kind: IORedirectionKind::RedirectOutput,
+                    file: literal_word("file.txt")
+                }
+            }]
+        );
+    }
 }

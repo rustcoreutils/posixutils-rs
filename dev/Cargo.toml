@@ -8,12 +8,14 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-plib = { path = "../plib" }
 clap.workspace = true
 gettext-rs.workspace = true
 object =  { version = "0.35", features = ["read", "build", "elf"]}
 chrono.workspace = true
 ar = "0.9"
+
+[dev-dependencies]
+plib = { path = "../plib" }
 
 [lints]
 workspace = true

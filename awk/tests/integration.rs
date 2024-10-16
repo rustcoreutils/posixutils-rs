@@ -1,4 +1,4 @@
-use plib::{run_test, run_test_with_checker, TestPlan};
+use plib::testing::{run_test, run_test_with_checker, TestPlan};
 
 fn test_awk(args: Vec<String>, expected_output: &str) {
     run_test(TestPlan {

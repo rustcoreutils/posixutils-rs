@@ -43,5 +43,3 @@ errno = "0.3"
 
 [workspace.lints]
 
-[workspace.lints.clippy]
-needless_borrow = "deny"

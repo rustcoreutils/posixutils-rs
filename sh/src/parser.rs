@@ -438,10 +438,18 @@ impl<'src> Parser<'src> {
         }
     }
 
-    fn parse_simple_command(&mut self, word_stop: WordToken) -> SimpleCommand {
+    fn parse_simple_command(&mut self, word_stop: WordToken) -> Option<SimpleCommand> {
         // simple_command = (io_redirect | assignment_word)* word? (io_redirect | word)*
 
         let mut command = SimpleCommand::default();
+
+        fn wrap_command(command: SimpleCommand) -> Option<SimpleCommand> {
+            if command == SimpleCommand::default() {
+                None
+            } else {
+                Some(command)
+            }
+        }
 
         loop {
             match self.shell_lookahead() {
@@ -456,14 +464,14 @@ impl<'src> Parser<'src> {
                         }
                     }
                     if word_stop != WordToken::EOF && self.word_lookahead() == word_stop {
-                        return command;
+                        return wrap_command(command);
                     }
                 }
                 _ => {
                     if let Some(redirection) = self.parse_redirection_opt() {
                         command.redirections.push(redirection);
                     } else {
-                        return command;
+                        return wrap_command(command);
                     }
                 }
             }
@@ -476,14 +484,14 @@ impl<'src> Parser<'src> {
                         command.arguments.push(word);
                     }
                     if word_stop != WordToken::EOF && self.word_lookahead() == word_stop {
-                        return command;
+                        return wrap_command(command);
                     }
                 }
                 _ => {
                     if let Some(redirection) = self.parse_redirection_opt() {
                         command.redirections.push(redirection);
                     } else {
-                        return command;
+                        return wrap_command(command);
                     }
                 }
             }
@@ -506,23 +514,29 @@ impl<'src> Parser<'src> {
 
         let mut last_conjunction = self.parse_and_or(word_stop);
         let mut commands = Vec::new();
-        loop {
+        while let Some(mut conjunction) = last_conjunction {
             match self.shell_lookahead() {
                 ShellToken::And => {
-                    last_conjunction.is_async = true;
+                    conjunction.is_async = true;
                 }
                 ShellToken::SemiColon | ShellToken::Newline => {}
-                _ => break,
+                _ => {
+                    commands.push(conjunction);
+                    break;
+                }
             }
             self.advance_shell();
             self.skip_linebreak();
             if END_TOKENS.contains(&self.shell_lookahead()) {
+                commands.push(conjunction);
                 break;
             }
-            commands.push(last_conjunction);
+            commands.push(conjunction);
             last_conjunction = self.parse_and_or(word_stop);
         }
-        commands.push(last_conjunction);
+        if commands.is_empty() {
+            todo!("error: expected command, found ...")
+        }
         CompleteCommand { commands }
     }
 
@@ -661,35 +675,40 @@ impl<'src> Parser<'src> {
         })
     }
 
-    fn parse_command(&mut self, word_stop: WordToken) -> Command {
+    fn parse_command(&mut self, word_stop: WordToken) -> Option<Command> {
         // command =
         // 			| compound_command redirect_list?
         // 			| simple_command
         // 			| function_definition
-        if let Some(command) = self.parse_compound_command() {
-            command
+        if let Some(compound_command) = self.parse_compound_command() {
+            Some(compound_command)
         } else {
             // TODO: decide between function definition and simple command
-            Command::SimpleCommand(self.parse_simple_command(word_stop))
+            self.parse_simple_command(word_stop)
+                .map(Command::SimpleCommand)
         }
     }
 
-    fn parse_pipeline(&mut self, word_stop: WordToken) -> Pipeline {
+    fn parse_pipeline(&mut self, word_stop: WordToken) -> Option<Pipeline> {
         // pipeline = "!" command ("|" linebreak command)*
         // TODO: implement the "!"* part
         let mut commands = Vec::new();
-        commands.push(self.parse_command(word_stop));
+        commands.push(self.parse_command(word_stop)?);
         while self.shell_lookahead() == ShellToken::Pipe {
             self.advance_shell();
             self.skip_linebreak();
-            commands.push(self.parse_command(word_stop));
+            if let Some(command) = self.parse_command(word_stop) {
+                commands.push(command);
+            } else {
+                todo!("error: expected command, found ...")
+            }
         }
-        Pipeline { commands }
+        Some(Pipeline { commands })
     }
 
-    fn parse_and_or(&mut self, word_stop: WordToken) -> Conjunction {
+    fn parse_and_or(&mut self, word_stop: WordToken) -> Option<Conjunction> {
         // and_or = pipeline (("&&" | "||") linebreak pipeline)*
-        let mut last = self.parse_pipeline(word_stop);
+        let mut last = self.parse_pipeline(word_stop)?;
         let mut elements = Vec::new();
         while let Some(op) = self.matches_shell_alterntives(&[ShellToken::AndIf, ShellToken::OrIf])
         {
@@ -699,23 +718,33 @@ impl<'src> Parser<'src> {
                 _ => unreachable!(),
             };
             self.skip_linebreak();
-            let next = self.parse_pipeline(word_stop);
+            let next = if let Some(next) = self.parse_pipeline(word_stop) {
+                next
+            } else {
+                todo!("error: expected command, found ...")
+            };
             let previous = last;
             last = next;
             elements.push((previous, op));
         }
         elements.push((last, LogicalOp::None));
-        Conjunction {
+        Some(Conjunction {
             elements,
             is_async: false,
-        }
+        })
     }
 
     fn parse_complete_command(&mut self, word_stop: WordToken) -> CompleteCommand {
         // complete_command = and_or (separator_op and_or)* separator_op?
         let mut commands = Vec::new();
-        while self.shell_lookahead() != ShellToken::Newline {
-            let mut and_or = self.parse_and_or(word_stop);
+        while self.shell_lookahead() != ShellToken::Newline
+            || self.shell_lookahead() != ShellToken::EOF
+        {
+            let mut and_or = if let Some(and_or) = self.parse_and_or(word_stop) {
+                and_or
+            } else {
+                todo!("error: expected command, found ...")
+            };
             // FIXME: very ugly, should move is_async somewhere else
             if self.shell_lookahead() == ShellToken::And {
                 and_or.is_async = true;

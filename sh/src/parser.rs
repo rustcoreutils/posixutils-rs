@@ -680,7 +680,11 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_while_clause(&mut self) -> CompoundCommand {
-        todo!()
+        // consume 'while'
+        self.advance_shell();
+        let condition = self.parse_compound_list(WordToken::EOF);
+        let body = self.parse_do_group();
+        CompoundCommand::WhileClause { condition, body }
     }
 
     fn parse_until_clause(&mut self) -> CompoundCommand {
@@ -1843,6 +1847,21 @@ mod tests {
                         }
                     }
                 ]
+            }
+        );
+    }
+
+    #[test]
+    fn parse_while_clause() {
+        assert_eq!(
+            parse_compound_command("while condition; do cmd; done").0,
+            CompoundCommand::WhileClause {
+                condition: CompleteCommand {
+                    commands: vec![conjunction_from_word(literal_word("condition"), false)]
+                },
+                body: CompleteCommand {
+                    commands: vec![conjunction_from_word(literal_word("cmd"), false)]
+                }
             }
         );
     }

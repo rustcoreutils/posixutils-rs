@@ -195,8 +195,8 @@ pub enum CompoundCommand {
         if_chain: Vec<If>,
     },
     WhileClause {
-        condition: CompleteCommandList,
-        body: CompleteCommandList,
+        condition: CompleteCommand,
+        body: CompleteCommand,
     },
     UntilClause {
         condition: CompleteCommandList,

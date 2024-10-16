@@ -1,7 +1,7 @@
 use byteorder::{BigEndian, ByteOrder, LittleEndian, NativeEndian, WriteBytesExt};
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
+use plib::io::input_stream;
 use std::{
     cell::RefCell,
     collections::BTreeMap,
@@ -295,7 +295,7 @@ impl MessageCatalog {
         input_path: &PathBuf,
         catfile_catalog: Option<MessageCatalog>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut file = plib::io::input_stream(input_path, true)?;
+        let mut file = input_stream(input_path, true)?;
 
         let mut input = String::new();
         file.read_to_string(&mut input)?;
@@ -774,11 +774,11 @@ impl MessageCatalog {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
+
+    let args = Args::parse();
 
     let mut exit_code = 0;
 

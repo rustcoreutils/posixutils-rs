@@ -15,7 +15,7 @@ use iconv_lib::{
     utf_32::{self, UTF32Variant},
     utf_8,
 };
-use plib::PROJECT_NAME;
+use plib::io::input_stream;
 use std::{
     collections::HashMap,
     env,
@@ -480,11 +480,11 @@ fn charmap_conversion(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
+
+    let args = Args::parse();
 
     if args.list_codesets {
         list_encodings();
@@ -517,7 +517,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let inputs: Vec<Box<dyn Read>> = match args.files {
         Some(files) => files
             .into_iter()
-            .map(|file| plib::io::input_stream(&file, true))
+            .map(|file| input_stream(&file, true))
             .collect::<Result<Vec<_>, _>>()?,
         None => vec![Box::new(io::stdin().lock())],
     };

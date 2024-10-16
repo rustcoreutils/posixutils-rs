@@ -11,8 +11,8 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::PathBuf;
 
+/// open file, or stdin
 pub fn input_stream(pathname: &PathBuf, dashed_stdin: bool) -> io::Result<Box<dyn Read>> {
-    // open file, or stdin
     let path_str = pathname.as_os_str();
     let file: Box<dyn Read> =
         if (dashed_stdin && path_str == "-") || (!dashed_stdin && path_str.is_empty()) {

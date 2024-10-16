@@ -7,7 +7,6 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-plib = { path = "../plib" }
 gettext-rs.workspace = true
 regex.workspace = true
 clap.workspace = true
@@ -16,6 +15,9 @@ pest_derive = "2.7"
 lazy_static = "1.4"
 bigdecimal = "0.4"
 rustyline = { version = "14.0", default-features = false }
+
+[dev-dependencies]
+plib = { path = "../plib" }
 
 [lints]
 workspace = true

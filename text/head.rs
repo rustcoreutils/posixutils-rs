@@ -10,70 +10,130 @@
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
-use std::io::{self, Read, Write};
+use std::error::Error;
+use std::io::{self, Read, StdoutLock, Write};
 use std::path::PathBuf;
 
-/// head - copy the first part of files
+const N_C_GROUP: &str = "N_C_GROUP";
+
+/// head - copy the first part of files.
+/// If neither -n nor -c are specified, copies the first 10 lines of each file (-n 10).
 #[derive(Parser)]
 #[command(version, about)]
 struct Args {
-    /// The first <N> lines of each input file shall be copied to standard output.
-    #[arg(short, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..))]
-    n: u64,
+    /// The first <N> lines of each input file shall be copied to standard output (mutually exclusive with -c)
+    #[arg(long = "lines", short, value_parser = clap::value_parser!(usize), group = N_C_GROUP)]
+    n: Option<usize>,
+
+    // Note: -c was added to POSIX in POSIX.1-2024, but has been supported on most platforms since the late 1990s
+    // https://pubs.opengroup.org/onlinepubs/9799919799/utilities/head.html
+    //
+    /// The first <N> bytes of each input file shall be copied to standard output (mutually exclusive with -n)
+    #[arg(long = "bytes", short, value_parser = clap::value_parser!(usize), group = N_C_GROUP)]
+    c: Option<usize>,
 
     /// Files to read as input.
     files: Vec<PathBuf>,
 }
 
-fn head_file(args: &Args, pathname: &PathBuf, first: bool, want_header: bool) -> io::Result<()> {
+enum CountType {
+    Bytes(usize),
+    Lines(usize),
+}
+
+fn head_file(
+    count_type: &CountType,
+    pathname: &PathBuf,
+    first: bool,
+    want_header: bool,
+    stdout_lock: &mut StdoutLock,
+) -> Result<(), Box<dyn Error>> {
+    const BUFFER_SIZE: usize = plib::BUFSZ;
+
     // print file header
     if want_header {
         if first {
-            println!("==> {} <==\n", pathname.display());
+            writeln!(stdout_lock, "==> {} <==", pathname.display())?;
         } else {
-            println!("\n==> {} <==\n", pathname.display());
+            writeln!(stdout_lock, "\n==> {} <==", pathname.display())?;
         }
     }
 
     // open file, or stdin
     let mut file = plib::io::input_stream(pathname, false)?;
 
-    let mut raw_buffer = [0; plib::BUFSZ];
-    let mut nl = 0;
+    let mut raw_buffer = [0_u8; BUFFER_SIZE];
 
-    loop {
-        // read a chunk of file data
-        let n_read = file.read(&mut raw_buffer[..])?;
-        if n_read == 0 {
-            break;
-        }
+    match *count_type {
+        CountType::Bytes(c) => {
+            let mut bytes_remaining = c;
 
-        // slice of buffer containing file data
-        let buf = &raw_buffer[0..n_read];
-        let mut pos = 0;
+            loop {
+                let number_of_bytes_read = {
+                    // Do not read more bytes than necessary
+                    let read_up_to_n_bytes = BUFFER_SIZE.min(bytes_remaining);
 
-        // count newlines
-        for chv in buf {
-            // LF character encountered
-            if *chv == 10 {
-                nl += 1;
+                    file.read(&mut raw_buffer[..read_up_to_n_bytes])?
+                };
+
+                if number_of_bytes_read == 0_usize {
+                    // Reached EOF
+                    break;
+                }
+
+                let bytes_to_write = &raw_buffer[..number_of_bytes_read];
+
+                stdout_lock.write_all(bytes_to_write)?;
+
+                bytes_remaining -= number_of_bytes_read;
+
+                if bytes_remaining == 0_usize {
+                    break;
+                }
             }
-
-            pos += 1;
-
-            // if user-specified limit reached, stop
-            if nl >= args.n {
-                break;
-            }
         }
+        CountType::Lines(n) => {
+            let mut nl = 0_usize;
 
-        // output full or partial buffer
-        let final_buf = &raw_buffer[0..pos];
-        io::stdout().write_all(final_buf)?;
+            loop {
+                // read a chunk of file data
+                let n_read = file.read(&mut raw_buffer)?;
 
-        // if user-specified limit reached, stop
-        if nl >= args.n {
-            break;
+                if n_read == 0_usize {
+                    // Reached EOF
+                    break;
+                }
+
+                // slice of buffer containing file data
+                let buf = &raw_buffer[..n_read];
+
+                let mut position = 0_usize;
+
+                // count newlines
+                for &byte in buf {
+                    position += 1;
+
+                    // LF character encountered
+                    if byte == b'\n' {
+                        nl += 1;
+
+                        // if user-specified limit reached, stop
+                        if nl >= n {
+                            break;
+                        }
+                    }
+                }
+
+                // output full or partial buffer
+                let bytes_to_write = &raw_buffer[..position];
+
+                stdout_lock.write_all(bytes_to_write)?;
+
+                // if user-specified limit reached, stop
+                if nl >= n {
+                    break;
+                }
+            }
         }
     }
 
@@ -83,6 +143,40 @@ fn head_file(args: &Args, pathname: &PathBuf, first: bool, want_header: bool) ->
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // parse command line arguments
     let mut args = Args::parse();
+
+    // bsdutils (FreeBSD) enforces n > 0 (and c > 0)
+    // BusyBox, coreutils' uutils, GNU Core Utilities, and toybox do not (and just print nothing)
+    // POSIX says:
+    // "The application shall ensure that the number option-argument is a positive decimal integer."
+    let count_type = match (args.n, args.c) {
+        (None, None) => {
+            // If no arguments are provided, the default is 10 lines
+            CountType::Lines(10_usize)
+        }
+        (Some(n), None) => {
+            if n == 0_usize {
+                eprintln!("head: when a value for -n is provided, it must be greater than 0");
+
+                std::process::exit(1_i32);
+            }
+
+            CountType::Lines(n)
+        }
+        (None, Some(c)) => {
+            if c == 0_usize {
+                eprintln!("head: when a value for -c is provided, it must be greater than 0");
+
+                std::process::exit(1_i32);
+            }
+
+            CountType::Bytes(c)
+        }
+
+        (Some(_), Some(_)) => {
+            // Will be caught by clap
+            unreachable!();
+        }
+    };
 
     setlocale(LocaleCategory::LcAll, "");
     textdomain(PROJECT_NAME)?;
@@ -97,8 +191,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let want_header = args.files.len() > 1;
     let mut first = true;
 
+    let mut stdout_lock = io::stdout().lock();
+
     for filename in &args.files {
-        if let Err(e) = head_file(&args, filename, first, want_header) {
+        if let Err(e) = head_file(&count_type, filename, first, want_header, &mut stdout_lock) {
             exit_code = 1;
             eprintln!("{}: {}", filename.display(), e);
         }

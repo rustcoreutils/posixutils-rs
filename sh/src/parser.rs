@@ -688,7 +688,11 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_until_clause(&mut self) -> CompoundCommand {
-        todo!()
+        // consume 'until'
+        self.advance_shell();
+        let condition = self.parse_compound_list(WordToken::EOF);
+        let body = self.parse_do_group();
+        CompoundCommand::UntilClause { condition, body }
     }
 
     fn parse_compound_command(&mut self) -> Option<Command> {
@@ -1856,6 +1860,21 @@ mod tests {
         assert_eq!(
             parse_compound_command("while condition; do cmd; done").0,
             CompoundCommand::WhileClause {
+                condition: CompleteCommand {
+                    commands: vec![conjunction_from_word(literal_word("condition"), false)]
+                },
+                body: CompleteCommand {
+                    commands: vec![conjunction_from_word(literal_word("cmd"), false)]
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_until_clause() {
+        assert_eq!(
+            parse_compound_command("until condition; do cmd; done").0,
+            CompoundCommand::UntilClause {
                 condition: CompleteCommand {
                     commands: vec![conjunction_from_word(literal_word("condition"), false)]
                 },

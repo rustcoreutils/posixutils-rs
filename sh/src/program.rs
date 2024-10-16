@@ -199,8 +199,8 @@ pub enum CompoundCommand {
         body: CompleteCommand,
     },
     UntilClause {
-        condition: CompleteCommandList,
-        body: CompleteCommandList,
+        condition: CompleteCommand,
+        body: CompleteCommand,
     },
 }
 

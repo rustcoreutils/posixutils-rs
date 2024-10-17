@@ -1,6 +1,8 @@
+use std::process::exit;
+
 use clap::Parser;
 use gettextrs::gettext;
-use locale_lib::read_available_locale_names;
+use locale_lib::{read_available_charmap_names, read_available_locale_names};
 
 mod locale_lib;
 
@@ -31,11 +33,27 @@ fn display_all_locale_names() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn display_all_charmap_names() -> Result<(), Box<dyn std::error::Error>> {
+    let charmap_names = read_available_charmap_names()?;
+    for charmap_name in charmap_names {
+        if charmap_name.len() > 0 {
+            println!("{charmap_name}");
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     if args.all_locales {
         display_all_locale_names()?;
+        exit(0)
+    }
+
+    if args.charmap {
+        display_all_charmap_names()?;
+        exit(0)
     }
 
     Ok(())

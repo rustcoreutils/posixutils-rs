@@ -15,6 +15,7 @@ bytemuck = { version = "1.17", features = ["derive"] }
 byteorder = "1.5"
 strum = "0.26"
 strum_macros = "0.26"
+flate2 = "1.0.34"
 
 [lints]
 workspace = true

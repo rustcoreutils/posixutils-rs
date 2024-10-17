@@ -718,7 +718,7 @@ impl<'a> Hunks<'a> {
                 )?);
 
                 path
-            },
+            }
             None => match &self.options.output_file {
                 Some(path) => path,
                 None => {
@@ -726,7 +726,7 @@ impl<'a> Hunks<'a> {
                         "Could not recognize destination/output file.",
                     ))
                 }
-            }
+            },
         };
 
         let output_file: File = File::create(output_file)?;

@@ -6,9 +6,9 @@ use unified::initialize_unified_regex_cache;
 
 pub mod context;
 pub mod ed;
+pub mod envvars;
 pub mod normal;
 pub mod unified;
-pub mod envvars;
 
 pub fn init() {
     initialize_normal_regex_cache();

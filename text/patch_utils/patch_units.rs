@@ -387,7 +387,7 @@ impl<'a> PatchUnits<'a> {
             hunks: vec![],
             total_count: 0,
             failures: vec![],
-            fail_count: 0
+            fail_count: 0,
         };
 
         for unit in &self.patches {

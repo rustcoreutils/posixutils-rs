@@ -72,12 +72,11 @@ pub fn is_unfied_header(l0: &str, l1: &str) -> bool {
 pub fn context_unified_date_convert(date: &str) -> Option<DateTime<Utc>> {
     let formats = ["%Y-%m-%d %H:%M:%S.%f %z"];
 
-    
     // let input = "Thu Feb 21 23:30:39 2002";
     // let datetime = NaiveDateTime::parse_from_str(input , "%a %b %d %H:%M:%S %Y");
 
     // println!("{:?}", datetime.unwrap());
-    
+
     for format in formats {
         if let Ok(date_time) = DateTime::parse_from_str(date, format) {
             return Some(date_time.to_utc());

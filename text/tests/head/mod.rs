@@ -11,49 +11,49 @@
 use plib::{run_test, TestPlan};
 use rand::{seq::SliceRandom, thread_rng};
 
-fn generate_valid_arguments(n: Option<&str>, c: Option<&str>) -> Vec<Vec<String>> {
-    let mut argument_forms = Vec::<Vec<(String, String)>>::new();
-
-    let mut args_outer = Vec::<(String, String)>::new();
-
-    for n_form in ["-n", "--lines"] {
-        args_outer.clear();
-
-        if let Some(n_str) = n {
-            args_outer.push((n_form.to_owned(), n_str.to_owned()));
-        };
-
-        for c_form in ["-c", "--bytes"] {
-            let mut args_inner = args_outer.clone();
-
-            if let Some(c_str) = c {
-                args_inner.push((c_form.to_owned(), c_str.to_owned()));
-            };
-
-            argument_forms.push(args_inner);
-        }
-    }
-
-    argument_forms.shuffle(&mut thread_rng());
-
-    let mut flattened = Vec::<Vec<String>>::with_capacity(argument_forms.len());
-
-    for ve in argument_forms {
-        let mut vec = Vec::<String>::new();
-
-        for (st, str) in ve {
-            vec.push(st);
-            vec.push(str);
-        }
-
-        flattened.push(vec);
-    }
-
-    flattened
-}
-
 /* #region Normal tests */
 fn head_test(n: Option<&str>, c: Option<&str>, test_data: &str, expected_output: &str) {
+    fn generate_valid_arguments(n: Option<&str>, c: Option<&str>) -> Vec<Vec<String>> {
+        let mut argument_forms = Vec::<Vec<(String, String)>>::new();
+
+        let mut args_outer = Vec::<(String, String)>::new();
+
+        for n_form in ["-n", "--lines"] {
+            args_outer.clear();
+
+            if let Some(n_str) = n {
+                args_outer.push((n_form.to_owned(), n_str.to_owned()));
+            };
+
+            for c_form in ["-c", "--bytes"] {
+                let mut args_inner = args_outer.clone();
+
+                if let Some(c_str) = c {
+                    args_inner.push((c_form.to_owned(), c_str.to_owned()));
+                };
+
+                argument_forms.push(args_inner);
+            }
+        }
+
+        argument_forms.shuffle(&mut thread_rng());
+
+        let mut flattened = Vec::<Vec<String>>::with_capacity(argument_forms.len());
+
+        for ve in argument_forms {
+            let mut vec = Vec::<String>::new();
+
+            for (st, str) in ve {
+                vec.push(st);
+                vec.push(str);
+            }
+
+            flattened.push(vec);
+        }
+
+        flattened
+    }
+
     for ve in generate_valid_arguments(n, c) {
         run_test(TestPlan {
             cmd: "head".to_owned(),
@@ -123,6 +123,11 @@ fn test_head_c() {
 mod property_tests {
     use plib::run_test_base;
     use proptest::{prelude::TestCaseError, prop_assert, test_runner::TestRunner};
+    use std::{
+        sync::mpsc::{self, RecvTimeoutError},
+        thread::{self},
+        time::Duration,
+    };
 
     fn get_test_runner(cases: u32) -> TestRunner {
         TestRunner::new(proptest::test_runner::Config {
@@ -134,7 +139,7 @@ mod property_tests {
     }
 
     fn run_head_and_verify_output(
-        input: Vec<u8>,
+        input: &[u8],
         true_if_lines_false_if_bytes: bool,
         count: usize,
     ) -> Result<(), TestCaseError> {
@@ -144,11 +149,7 @@ mod property_tests {
             "-c"
         };
 
-        let output = run_test_base(
-            "head",
-            &vec![n_or_c.to_owned(), count.to_string()],
-            input.as_slice(),
-        );
+        let output = run_test_base("head", &vec![n_or_c.to_owned(), count.to_string()], input);
 
         let stdout = &output.stdout;
 
@@ -167,8 +168,46 @@ mod property_tests {
         Ok(())
     }
 
+    fn run_head_and_verify_output_with_timeout(
+        true_if_lines_false_if_bytes: bool,
+        count: usize,
+        input: Vec<u8>,
+    ) -> Result<(), TestCaseError> {
+        let (sender, receiver) = mpsc::channel::<Result<(), TestCaseError>>();
+
+        let input_len = input.len();
+
+        thread::spawn(move || {
+            sender.send(run_head_and_verify_output(
+                input.as_slice(),
+                true_if_lines_false_if_bytes,
+                count,
+            ))
+        });
+
+        match receiver.recv_timeout(Duration::from_secs(60_u64)) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => {
+                eprint!(
+                        "\
+head property test has been running for more than a minute. The spawned process will have to be killed manually.
+
+true_if_lines_false_if_bytes: {true_if_lines_false_if_bytes}
+count: {count}
+input_len: {input_len}
+"
+                    );
+
+                Err(TestCaseError::fail("Spawned process did not terminate"))
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                unreachable!();
+            }
+        }
+    }
+
     #[test]
-    fn property_test_random() {
+    fn test_head_property_test_small_or_large() {
         get_test_runner(16_u32)
             .run(
                 &(
@@ -177,14 +216,18 @@ mod property_tests {
                     proptest::collection::vec(proptest::num::u8::ANY, 0_usize..65_536_usize),
                 ),
                 |(true_if_lines_false_if_bytes, count, input)| {
-                    run_head_and_verify_output(input, true_if_lines_false_if_bytes, count)
+                    run_head_and_verify_output_with_timeout(
+                        true_if_lines_false_if_bytes,
+                        count,
+                        input,
+                    )
                 },
             )
             .unwrap();
     }
 
     #[test]
-    fn property_test_small() {
+    fn test_head_property_test_small() {
         get_test_runner(128_u32)
             .run(
                 &(
@@ -193,7 +236,31 @@ mod property_tests {
                     proptest::collection::vec(proptest::num::u8::ANY, 0_usize..16_384_usize),
                 ),
                 |(true_if_lines_false_if_bytes, count, input)| {
-                    run_head_and_verify_output(input, true_if_lines_false_if_bytes, count)
+                    run_head_and_verify_output_with_timeout(
+                        true_if_lines_false_if_bytes,
+                        count,
+                        input,
+                    )
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn test_head_property_test_very_small() {
+        get_test_runner(128_u32)
+            .run(
+                &(
+                    proptest::bool::ANY,
+                    (0_usize..512_usize),
+                    proptest::collection::vec(proptest::num::u8::ANY, 0_usize..512_usize),
+                ),
+                |(true_if_lines_false_if_bytes, count, input)| {
+                    run_head_and_verify_output_with_timeout(
+                        true_if_lines_false_if_bytes,
+                        count,
+                        input,
+                    )
                 },
             )
             .unwrap();

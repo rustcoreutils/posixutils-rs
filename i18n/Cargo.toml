@@ -26,3 +26,7 @@ path = "./gencat.rs"
 [[bin]]
 name = "iconv"
 path = "./iconv.rs"
+
+[[bin]]
+name = "locale"
+path = "./locale.rs"

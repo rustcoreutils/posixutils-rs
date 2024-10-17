@@ -68,7 +68,7 @@ const MAX_USER_INPUT_LENGTH: usize = 128;
 /// The version number for the talk protocol.
 const TALK_VERSION: u8 = 1;
 
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Default, Copy, Clone, PartialEq)]
 #[binrw]
 #[brw(repr(u8))]
 /// Represents the types of messages exchanged in the communication.
@@ -76,6 +76,7 @@ enum MessageType {
     /// Leave invitation with server.
     LeaveInvite,
     /// Check for invitation by callee.
+    #[default]
     LookUp,
     /// Delete invitation by caller.
     Delete,
@@ -295,7 +296,7 @@ impl Default for CtlMsg {
     fn default() -> Self {
         CtlMsg {
             vers: 1,
-            r#type: MessageType::LookUp as u8,
+            r#type: MessageType::default() as u8,
             answer: Answer::Success as u8,
             pad: 0,
             id_num: 0,
@@ -360,14 +361,11 @@ impl Default for CtlRes {
     fn default() -> Self {
         CtlRes {
             vers: 0,
-            r#type: MessageType::LookUp,
+            r#type: MessageType::default(),
             answer: Answer::Failed,
             pad: 0,
             id_num: 0,
-            addr: Osockaddr {
-                sa_family: 0,
-                sa_data: [0; 14],
-            },
+            addr: Osockaddr::default(),
         }
     }
 }

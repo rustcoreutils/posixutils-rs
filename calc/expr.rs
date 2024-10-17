@@ -8,7 +8,6 @@
 //
 
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 use regex::Regex;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -370,10 +369,9 @@ fn eval_expression(tokens: &[Token]) -> Result<Token, &'static str> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // initialize translations
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
 
     // tokenize and evaluate the expression
     let arg_tokens = tokenize();

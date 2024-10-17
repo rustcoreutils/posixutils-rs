@@ -314,7 +314,8 @@ pub fn parse_conversion_specifier_args(iter: &mut Chars) -> Result<(char, Format
     Ok((next, result))
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(test, derive(Debug))]
+#[derive(PartialEq, Eq, Clone, Copy)]
 pub enum IntegerFormat {
     Decimal,
     Octal,

@@ -68,7 +68,7 @@ impl Suffix {
     }
 
     fn inc_char(ch: char) -> char {
-        debug_assert!('a' <= ch && ch < 'z');
+        debug_assert!(('a'..='y').contains(&ch));
         ((ch as u8) + 1) as char
     }
 }

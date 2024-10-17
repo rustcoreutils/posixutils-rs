@@ -182,7 +182,7 @@ fn analyze_file(mut path: String, args: &Args, magic_files: &Vec<PathBuf>) {
             println!("{path}: empty");
             return;
         }
-        match get_type_from_magic_file_dbs(&PathBuf::from(&path), &magic_files) {
+        match get_type_from_magic_file_dbs(&PathBuf::from(&path), magic_files) {
             Some(f_type) => println!("{path}: {f_type}"),
             None => println!("{path}: data"),
         }

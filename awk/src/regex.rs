@@ -7,9 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use core::fmt;
 use std::ffi::CString;
-use std::fmt::Formatter;
 use std::ptr;
 
 fn regex_compilation_result(
@@ -41,7 +39,8 @@ pub struct Regex {
     regex_string: CString,
 }
 
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(test, derive(Debug))]
+#[derive(Copy, Clone, Default, PartialEq, Eq)]
 pub struct RegexMatch {
     pub start: usize,
     pub end: usize,
@@ -126,8 +125,9 @@ impl Drop for Regex {
     }
 }
 
-impl fmt::Debug for Regex {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+#[cfg(test)]
+impl core::fmt::Debug for Regex {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         writeln!(f, "/{}/", self.regex_string.to_str().unwrap())
     }
 }

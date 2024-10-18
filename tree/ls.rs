@@ -421,20 +421,16 @@ impl Config {
                 MULTI_COLUMN | STREAM_OUTPUT_FORMAT | MUTI_COLUMN_ACROSS => {
                     long_format_state.push(false);
                 }
-                ONE_ENTRY_PER_LINE => loop {
+                ONE_ENTRY_PER_LINE => {
                     // Remove any `false` that was added by -C, -m or -x until
                     // a `true` is reached or the vec is empty
-                    match long_format_state.last().copied() {
-                        Some(enabled) => {
-                            if enabled {
-                                break;
-                            } else {
-                                long_format_state.pop();
-                            }
+                    while let Some(enabled) = long_format_state.last().copied() {
+                        if enabled {
+                            break;
                         }
-                        None => break,
+                        long_format_state.pop();
                     }
-                },
+                }
                 _ => unreachable!(),
             }
         }

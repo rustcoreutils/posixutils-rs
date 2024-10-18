@@ -286,7 +286,7 @@ impl WritePipes {
             Entry::Vacant(e) => {
                 let command: CString = command.try_into()?;
                 let file = unsafe {
-                    let file = libc::popen(command.as_ptr(), "w\0".as_ptr() as *const i8);
+                    let file = libc::popen(command.as_ptr(), c"w".as_ptr());
                     if file.is_null() {
                         return Err("failed to open pipe".to_string());
                     }
@@ -351,7 +351,7 @@ impl PipeRecordReader {
     pub fn open(command: &str) -> Result<Self, String> {
         let command = CString::new(command).map_err(|e| e.to_string())?;
         let file = unsafe {
-            let file = libc::popen(command.as_ptr(), "r\0".as_ptr() as *const i8);
+            let file = libc::popen(command.as_ptr(), c"r".as_ptr());
             if file.is_null() {
                 return Err("failed to open pipe".to_string());
             }

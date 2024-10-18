@@ -464,7 +464,8 @@ impl Entry {
     }
 }
 
-// Used for padding in long format
+/// Used for padding in long format
+#[derive(Default)]
 pub struct LongFormatPadding {
     pub blocks_str_width: usize,
     pub inode_str_width: usize,
@@ -475,22 +476,6 @@ pub struct LongFormatPadding {
     pub device_id_major_width: usize,
     pub device_id_minor_width: usize,
     pub time_width: usize,
-}
-
-impl Default for LongFormatPadding {
-    fn default() -> Self {
-        Self {
-            blocks_str_width: 0,
-            inode_str_width: 0,
-            num_links_width: 0,
-            owner_name_width: 0,
-            group_name_width: 0,
-            file_size_width: 0,
-            device_id_major_width: 0,
-            device_id_minor_width: 0,
-            time_width: 0,
-        }
-    }
 }
 
 impl LongFormatPadding {
@@ -525,23 +510,13 @@ impl LongFormatPadding {
     }
 }
 
-// Used for padding in multi-column format
+/// Used for padding in multi-column format
+#[derive(Default)]
 pub struct MultiColumnPadding {
     pub total_width: usize,
     pub inode_str_width: usize,
     pub blocks_str_width: usize,
     pub file_name_width: usize,
-}
-
-impl Default for MultiColumnPadding {
-    fn default() -> Self {
-        Self {
-            total_width: 0,
-            inode_str_width: 0,
-            blocks_str_width: 0,
-            file_name_width: 0,
-        }
-    }
 }
 
 impl MultiColumnPadding {

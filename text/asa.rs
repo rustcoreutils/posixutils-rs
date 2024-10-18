@@ -30,14 +30,16 @@ struct AsaState {
     lines: Vec<String>,
 }
 
-impl AsaState {
-    fn new() -> AsaState {
-        AsaState {
+impl Default for AsaState {
+    fn default() -> Self {
+        Self {
             first_line: true,
-            lines: Vec::new(),
+            lines: Default::default(),
         }
     }
+}
 
+impl AsaState {
     fn push(&mut self, line: &str) {
         self.lines.push(line.to_string());
         if self.first_line {
@@ -69,7 +71,7 @@ impl AsaState {
 fn asa_file(pathname: &PathBuf) -> io::Result<()> {
     let mut reader = plib::io::input_reader(pathname, false)?;
     let mut line_no: usize = 0;
-    let mut state = AsaState::new();
+    let mut state = AsaState::default();
 
     loop {
         line_no += 1;

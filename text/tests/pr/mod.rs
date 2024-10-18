@@ -68,14 +68,14 @@ fn pr_single_column() {
         None,
         None,
     );
-    pr_test(&[&input], "", &output);
+    pr_test(&[input], "", &output);
 }
 
 #[test]
 fn pr_multi_column() {
     let input = "tests/pr/lorem_ipsum.txt";
     let output = pr_read_test_file("tests/pr/lorem_ipsum_output_9_cols.txt", input, None, None);
-    pr_test(&["-9", &input], "", &output);
+    pr_test(&["-9", input], "", &output);
 }
 
 #[test]
@@ -87,7 +87,7 @@ fn pr_multi_column_across() {
         None,
         None,
     );
-    pr_test(&["-2", "-a", &input], "", &output);
+    pr_test(&["-2", "-a", input], "", &output);
 }
 
 #[test]
@@ -103,7 +103,7 @@ fn pr_multi_column_merge() {
     // Apr 18 14:13 2024
 
     let input = "tests/pr/lorem_ipsum.txt";
-    let args = &["+1:1", "-m", &input, &input, &input];
+    let args = &["+1:1", "-m", input, input, input];
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
 
     let test_plan = TestPlan {
@@ -143,7 +143,7 @@ fn pr_page_skip() {
         None,
         None,
     );
-    pr_test(&["-9", "+15", &input], "", &output);
+    pr_test(&["-9", "+15", input], "", &output);
 }
 
 #[test]
@@ -156,14 +156,14 @@ fn pr_header_replacement() {
         Some(header),
         None,
     );
-    pr_test(&["+1:1", "-h", header, &input], "", &output);
+    pr_test(&["+1:1", "-h", header, input], "", &output);
 }
 
 #[test]
 fn pr_limit_lines() {
     let input = "tests/pr/numbers.txt";
     let output = pr_read_test_file("tests/pr/numbers_output_l20.txt", input, None, None);
-    pr_test(&["+1:1", "-l20", &input], "", &output);
+    pr_test(&["+1:1", "-l20", input], "", &output);
 }
 
 #[test]
@@ -171,35 +171,35 @@ fn pr_limit_lines_trim() {
     // Lines <= 10 behave like -t is used
     let input = "tests/pr/numbers.txt";
     let output = pr_read_test_file("tests/pr/numbers_output_l10.txt", input, None, None);
-    pr_test(&["+1:1", "-l10", &input], "", &output);
+    pr_test(&["+1:1", "-l10", input], "", &output);
 }
 
 #[test]
 fn pr_omit_header() {
     let input = "tests/pr/numbers.txt";
     let output = pr_read_test_file("tests/pr/numbers_output_omit_header.txt", input, None, None);
-    pr_test(&["+1:1", "-l20", "-t", &input], "", &output);
+    pr_test(&["+1:1", "-l20", "-t", input], "", &output);
 }
 
 #[test]
 fn pr_offset() {
     let input = "tests/pr/numbers.txt";
     let output = pr_read_test_file("tests/pr/numbers_output_offset.txt", input, None, None);
-    pr_test(&["+1:1", "-o7", &input], "", &output);
+    pr_test(&["+1:1", "-o7", input], "", &output);
 }
 
 #[test]
 fn pr_width() {
     let input = "tests/pr/long_line.txt";
     let output = pr_read_test_file("tests/pr/long_line_output_w72.txt", input, None, None);
-    pr_test(&["-2", "-t", "-w72", &input], "", &output);
+    pr_test(&["-2", "-t", "-w72", input], "", &output);
 
     let output = pr_read_test_file("tests/pr/long_line_output_w200.txt", input, None, None);
-    pr_test(&["-2", "-t", "-w200", &input], "", &output);
+    pr_test(&["-2", "-t", "-w200", input], "", &output);
 
     // -s without -w causes the width to be 512
     let output = pr_read_test_file("tests/pr/long_line_output_s.txt", input, None, None);
-    pr_test(&["-2", "-t", "-s", &input], "", &output);
+    pr_test(&["-2", "-t", "-s", input], "", &output);
 }
 
 #[test]
@@ -211,7 +211,7 @@ fn pr_number_line() {
         None,
         None,
     );
-    pr_test(&["-9", "-n3", &input], "", &output);
+    pr_test(&["-9", "-n3", input], "", &output);
 }
 
 #[test]
@@ -223,5 +223,5 @@ fn pr_expand_and_replace() {
         None,
         None,
     );
-    pr_test(&["-i?3", "-e", "-t", &input], "", &output);
+    pr_test(&["-i?3", "-e", "-t", input], "", &output);
 }

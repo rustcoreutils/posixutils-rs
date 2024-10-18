@@ -145,8 +145,12 @@ mod tests {
     fn test_open_system() {
         let mtab = MountTable::open_system();
         assert!(mtab.is_ok());
+
+        let mut count = 0;
         for i in mtab.unwrap() {
             let _ = i.dir;
+            count += 1;
         }
+        assert!(count > 0);
     }
 }

@@ -73,12 +73,8 @@ const BYTE_TABLE: [bool; 256] = create_table();
 fn build_display_str(args: &Args, count: &CountInfo, filename: &OsStr) -> String {
     let mut output = String::with_capacity(filename.len() + (3 * 10));
 
-    let multi_file = args.files.len() > 1;
-    let only_lines = (args.words == false) && (args.bytes == false) && (args.chars == false);
-    let only_words = (args.lines == false) && (args.bytes == false) && (args.chars == false);
-    let only_bytechars = (args.lines == false) && (args.words == false);
-
     if args.lines {
+        let only_lines = !args.words && !args.bytes && !args.chars;
         let numstr = match only_lines {
             true => format!("{}", count.nl),
             false => format!("{:>8}", count.nl),
@@ -89,6 +85,7 @@ fn build_display_str(args: &Args, count: &CountInfo, filename: &OsStr) -> String
         if !output.is_empty() {
             output.push(' ');
         }
+        let only_words = !args.lines && !args.bytes && !args.chars;
         let numstr = match only_words {
             true => format!("{}", count.words),
             false => format!("{:>8}", count.words),
@@ -99,6 +96,7 @@ fn build_display_str(args: &Args, count: &CountInfo, filename: &OsStr) -> String
         if !output.is_empty() {
             output.push(' ');
         }
+        let only_bytechars = !args.lines && !args.words;
         let numstr = match only_bytechars {
             true => format!("{}", count.chars),
             false => format!("{:>8}", count.chars),
@@ -106,6 +104,7 @@ fn build_display_str(args: &Args, count: &CountInfo, filename: &OsStr) -> String
         output.push_str(&numstr);
     }
 
+    let multi_file = args.files.len() > 1;
     if multi_file {
         output.push(' ');
 

@@ -1082,7 +1082,7 @@ fn test_mv_part_symlink() {
 
         unix::fs::symlink(&reg_abs, &slink).unwrap();
 
-        cd_and_mv_test(&dir, &args, &err_str, err_code);
+        cd_and_mv_test(dir, &args, &err_str, err_code);
 
         fs::remove_dir_all(test_dir).unwrap();
         fs::remove_dir_all(other_dir).unwrap();
@@ -1333,7 +1333,7 @@ fn test_mv_i_link_no() {
     fs::set_permissions(b_bar, Permissions::from_mode(mode & !write_all)).unwrap();
 
     // Not using -i so have to use a fake tty to enable the overwrite prompt
-    mv_test_fake_tty(&[a_bar, a_foo, b], "n\n", &script_output, 0);
+    mv_test_fake_tty(&[a_bar, a_foo, b], "n\n", script_output, 0);
 
     {
         let mut buf = Vec::new();
@@ -1406,7 +1406,7 @@ fn test_mv_sticky_to_xpart() {
         if passwd.is_null() {
             panic!("{}", io::Error::last_os_error());
         }
-        let uid = (&*passwd).pw_uid;
+        let uid = (*passwd).pw_uid;
 
         // chown "$NON_ROOT_USERNAME" "$other_partition_tmpdir"
         let md = fs::metadata(other_dir).unwrap();

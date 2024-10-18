@@ -55,48 +55,37 @@ struct Args {
     prefix: String,
 }
 
-fn inc_char(ch: char) -> char {
-    ((ch as u8) + 1) as char
-}
-
-struct OutputState {
-    prefix: String,
-    boundary: u64,
-
+pub struct Suffix {
     suffix: String,
-    suffix_len: u32,
-    count: u64,
-    outf: Option<File>,
 }
 
-impl OutputState {
-    fn new(prefix: &str, boundary: u64, suffix_len: u32) -> OutputState {
-        OutputState {
-            prefix: String::from(prefix),
-            boundary,
-            suffix_len,
-            suffix: String::new(),
-            count: 0,
-            outf: None,
+impl Suffix {
+    pub fn new(len: usize) -> Self {
+        debug_assert!(len > 0);
+        Self {
+            suffix: "a".repeat(len),
         }
     }
 
-    fn incr_suffix(&mut self) -> Result<(), &'static str> {
-        assert!(self.suffix_len > 1);
+    fn inc_char(ch: char) -> char {
+        debug_assert!(('a'..='y').contains(&ch));
+        ((ch as u8) + 1) as char
+    }
+}
 
-        if self.suffix.is_empty() {
-            self.suffix = "a".repeat(self.suffix_len as usize);
-            return Ok(());
-        }
+impl Iterator for Suffix {
+    type Item = String;
 
-        assert!(self.suffix.len() > 1);
+    fn next(&mut self) -> Option<Self::Item> {
+        let current = self.suffix.clone();
+
         let mut i = self.suffix.len() - 1;
         loop {
             let ch = self.suffix.chars().nth(i).unwrap();
             if ch != 'z' {
                 self.suffix
-                    .replace_range(i..i + 1, inc_char(ch).to_string().as_str());
-                return Ok(());
+                    .replace_range(i..i + 1, Self::inc_char(ch).to_string().as_str());
+                return Some(current);
             }
 
             self.suffix
@@ -107,8 +96,28 @@ impl OutputState {
             }
             i -= 1;
         }
+        None
+    }
+}
 
-        Err("maximum suffix reached")
+struct OutputState {
+    prefix: String,
+    boundary: u64,
+
+    suffix: Suffix,
+    count: u64,
+    outf: Option<File>,
+}
+
+impl OutputState {
+    fn new(prefix: &str, boundary: u64, suffix_len: u32) -> OutputState {
+        OutputState {
+            prefix: String::from(prefix),
+            boundary,
+            suffix: Suffix::new(suffix_len as usize),
+            count: 0,
+            outf: None,
+        }
     }
 
     fn open_output(&mut self) -> io::Result<()> {
@@ -116,12 +125,14 @@ impl OutputState {
             return Ok(());
         }
 
-        let inc_res = self.incr_suffix();
-        if let Err(e) = inc_res {
-            return Err(Error::new(ErrorKind::Other, e));
-        }
+        let suffix = match self.suffix.next() {
+            Some(s) => s,
+            None => {
+                return Err(Error::new(ErrorKind::Other, "maximum suffix reached"));
+            }
+        };
 
-        let out_fn = format!("{}{}", self.prefix, self.suffix);
+        let out_fn = format!("{}{}", self.prefix, suffix);
         let f = OpenOptions::new()
             .read(false)
             .write(true)
@@ -152,7 +163,8 @@ impl OutputState {
     fn write(&mut self, buf: &[u8]) -> io::Result<()> {
         match &mut self.outf {
             Some(ref mut f) => f.write_all(buf),
-            None => Ok(()),
+            // TODO:
+            None => panic!("unreachable"),
         }
     }
 
@@ -264,4 +276,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_suffix_inc_char() {
+        assert_eq!(Suffix::inc_char('a'), 'b');
+        assert_eq!(Suffix::inc_char('b'), 'c');
+        assert_eq!(Suffix::inc_char('y'), 'z');
+    }
+
+    #[ignore]
+    #[test]
+    fn test_suffix_iterable() {
+        let suffix = Suffix::new(1);
+        assert_eq!(suffix.count(), 26);
+    }
 }

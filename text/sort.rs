@@ -121,7 +121,7 @@ impl Args {
 }
 
 /// A struct representing a range field with various sorting and comparison options.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct RangeField {
     /// The number of the field to be considered in the range.
     field_number: usize,
@@ -147,21 +147,6 @@ struct RangeField {
     /// A boolean flag to indicate if the field should be compared in dictionary order
     /// (considers only alphanumeric characters and blanks).
     dictionary_order: bool,
-}
-
-impl RangeField {
-    fn new() -> RangeField {
-        Self {
-            field_number: 0,
-            first_character: 0,
-            numeric_sort: false,
-            ignore_leading_blanks: false,
-            reverse: false,
-            ignore_nonprintable: false,
-            fold_case: false,
-            dictionary_order: false,
-        }
-    }
 }
 
 /// Updates two RangeField objects based on their comparison options.
@@ -744,7 +729,7 @@ fn create_ranges(
     let mut key_ranges = key_ranges.iter();
 
     // Convert key ranges to numeric representations
-    let mut ranges: (RangeField, Option<RangeField>) = (RangeField::new(), None);
+    let mut ranges: (RangeField, Option<RangeField>) = (RangeField::default(), None);
 
     ranges.0 = {
         let key_range = key_ranges.next().unwrap().to_string();

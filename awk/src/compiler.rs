@@ -343,7 +343,8 @@ fn normalize_builtin_function_arguments(
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(test, derive(Debug))]
+#[derive(PartialEq, Eq)]
 enum ExprKind {
     LValue,
     Number,
@@ -373,7 +374,8 @@ pub enum GlobalName {
 type NameMap = HashMap<String, GlobalName>;
 type LocalMap = HashMap<String, VarId>;
 
-#[derive(Debug, Default)]
+#[cfg_attr(test, derive(Debug))]
+#[derive(Default)]
 struct Instructions {
     opcodes: Vec<OpCode>,
     source_locations: Vec<SourceLocation>,
@@ -1702,7 +1704,8 @@ fn location_end(loc: &InputLocation) -> usize {
     }
 }
 
-#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(Debug))]
+#[derive(Clone)]
 pub struct CompilerErrors {
     errors: Vec<PestError>,
 }

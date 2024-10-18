@@ -14,21 +14,24 @@ use std::{
 
 use super::AwkValue;
 
-#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(test, derive(Debug))]
+#[derive(Clone, PartialEq)]
 pub struct KeyIterator {
     index: usize,
 }
 
 pub type Key = Rc<str>;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(test, derive(Debug))]
+#[derive(Clone, Copy, PartialEq)]
 pub struct ValueIndex {
     index: usize,
 }
 
 pub type KeyValuePair = (Key, AwkValue);
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[cfg_attr(test, derive(Debug))]
+#[derive(Clone, PartialEq, Default)]
 pub struct Array {
     key_map: HashMap<Key, usize>,
     pairs: Vec<Option<KeyValuePair>>,

@@ -5,13 +5,16 @@ authors = ["Jeff Garzik"]
 repository.workspace = true
 license.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 plib = { path = "../plib" }
 clap.workspace = true
 gettext-rs.workspace = true
-bytemuck = { version = "1.17.0", features = ["derive"] }
-byteorder = "1.5.0"
+bytemuck = { version = "1.17", features = ["derive"] }
+byteorder = "1.5"
+strum = "0.26"
+strum_macros = "0.26"
 
 [lints]
 workspace = true
@@ -19,3 +22,7 @@ workspace = true
 [[bin]]
 name = "gencat"
 path = "./gencat.rs"
+
+[[bin]]
+name = "iconv"
+path = "./iconv.rs"

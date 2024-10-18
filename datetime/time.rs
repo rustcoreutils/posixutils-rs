@@ -13,13 +13,16 @@ use std::time::Instant;
 
 use clap::Parser;
 
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{
+    bind_textdomain_codeset, bindtextdomain, gettext, setlocale, textdomain, LocaleCategory,
+};
 use plib::PROJECT_NAME;
 
 #[derive(Parser)]
 #[command(
     version,
-    about = gettext("time - time a simple command or give resource usage")
+    about = gettext("time - time a simple command or give resource usage"),
+    help_template = gettext("{about-with-newline}\nUsage: {usage}\n\nArguments:\n{positionals}\n\nOptions:\n{options}")
 )]
 struct Args {
     #[arg(
@@ -122,11 +125,12 @@ impl Status {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
     textdomain(PROJECT_NAME)?;
+    bindtextdomain(PROJECT_NAME, "locale")?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+
+    let args = Args::parse();
 
     if let Err(err) = time(args) {
         match err {

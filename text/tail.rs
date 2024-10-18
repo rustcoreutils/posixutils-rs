@@ -8,13 +8,14 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt::Display;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, StdoutLock, Write};
+use std::io::{
+    self, BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, StdinLock, StdoutLock, Write,
+};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::mpsc;
 use std::time::Duration;
 
-#[derive(Clone)]
 enum RelativeFrom {
     StartOfFile(usize),
     EndOfFile(usize),
@@ -75,6 +76,7 @@ impl FromStr for RelativeFrom {
 }
 
 /// tail - copy the last part of a file
+/// If neither -n nor -c are specified, copies the last 10 lines (-n 10).
 #[derive(Parser)]
 #[command(version, about)]
 struct Args {
@@ -118,6 +120,24 @@ impl Args {
 
         Ok(bytes_or_lines)
     }
+}
+
+enum FileOrStdin {
+    File(PathBuf, BufReader<File>),
+    Stdin(StdinLock<'static>),
+}
+
+impl FileOrStdin {
+    fn get_buf_read(&mut self) -> &mut dyn BufRead {
+        match self {
+            Self::File(_, ref mut bu) => bu,
+            Self::Stdin(ref mut st) => st,
+        }
+    }
+}
+
+fn print_bytes(stdout_lock: &mut StdoutLock, bytes: &[u8]) -> io::Result<()> {
+    stdout_lock.write_all(bytes)
 }
 
 fn print_n_lines<R: Read + BufRead>(
@@ -263,7 +283,7 @@ fn print_n_bytes<R: Read>(
             let mut buffer_1 = vec![0_u8; n];
 
             // Buffer to store the last `n` bytes read.
-            let mut buffer_2 = vec![];
+            let mut buffer_2 = Vec::<u8>::new();
 
             // Continuously read bytes into buffer_1.
             loop {
@@ -334,18 +354,11 @@ fn print_n_bytes<R: Read>(
     Ok(())
 }
 
-fn print_bytes(stdout_lock: &mut StdoutLock, bytes: &[u8]) -> io::Result<()> {
-    stdout_lock.write_all(bytes)
-}
-
 /// The main logic for the `tail` command.
 ///
 /// This function processes the command-line arguments to determine how many lines or bytes
 /// to print from the end of a specified file or standard input. It supports an option to
 /// follow the file, printing new data as it is appended to the file.
-///
-/// # Arguments
-/// * `args` - The command-line arguments parsed into an `Args` struct.
 ///
 /// # Returns
 /// * `Ok(())` - If the operation completes successfully.
@@ -356,54 +369,54 @@ fn print_bytes(stdout_lock: &mut StdoutLock, bytes: &[u8]) -> io::Result<()> {
 /// - The specified file cannot be opened.
 /// - An error occurs while reading from the file or stdin.
 /// - An error occurs while watching the file for changes.
-///
 fn tail(
     file: Option<PathBuf>,
     follow: bool,
     bytes_or_lines: BytesOrLines,
 ) -> Result<(), Box<dyn Error>> {
-    fn get_stdin() -> (Box<dyn Read>, bool) {
-        (Box::new(io::stdin().lock()), false)
+    fn get_stdin() -> FileOrStdin {
+        FileOrStdin::Stdin(io::stdin().lock())
     }
 
-    // open file, or stdin
-    let (box_dyn_read, reading_from_file): (Box<dyn Read>, bool) = match &file {
+    let mut file_or_stdin = match file {
         Some(pa) => {
             if pa.as_os_str() == "-" {
                 get_stdin()
             } else {
-                (Box::new(File::open(pa)?), true)
+                let fi = File::open(pa.as_path())?;
+
+                FileOrStdin::File(pa, BufReader::new(fi))
             }
         }
         None => get_stdin(),
     };
 
-    let mut buf_reader = io::BufReader::new(box_dyn_read);
-
     let mut stdout_lock = io::stdout().lock();
 
-    match bytes_or_lines {
-        BytesOrLines::Bytes(re) => {
-            print_n_bytes(&mut stdout_lock, &mut buf_reader, re)?;
-        }
-        BytesOrLines::Lines(re) => {
-            print_n_lines(&mut stdout_lock, &mut buf_reader, re)?;
+    {
+        let mut buf_reader = file_or_stdin.get_buf_read();
+
+        match bytes_or_lines {
+            BytesOrLines::Bytes(re) => {
+                print_n_bytes(&mut stdout_lock, &mut buf_reader, re)?;
+            }
+            BytesOrLines::Lines(re) => {
+                print_n_lines(&mut stdout_lock, &mut buf_reader, re)?;
+            }
         }
     }
 
-    // If follow option is specified, continue monitoring the file
-    if let Some(pa) = file {
-        if follow && reading_from_file {
-            // Opening a file and placing the cursor at the end of the file
-            let mut file = File::open(pa.as_path())?;
-            file.seek(SeekFrom::End(0))?;
-
-            let mut reader = BufReader::new(&file);
+    if follow {
+        // If follow option is specified, continue monitoring the file
+        if let FileOrStdin::File(pa, mut bu) = file_or_stdin {
+            // Move the the cursor to the end of the file
+            // Is this still necessary now that the `BufReader` and underlying `File` are being reused?
+            bu.seek(SeekFrom::End(0_i64))?;
 
             let (tx, rx) = mpsc::channel();
 
             // Automatically select the best implementation for your platform.
-            let mut debouncer = new_debouncer(Duration::from_millis(1), None, tx).unwrap();
+            let mut debouncer = new_debouncer(Duration::from_millis(1_u64), None, tx).unwrap();
 
             // Add a path to be watched.
             // below will be monitored for changes.
@@ -420,19 +433,19 @@ fn tail(
                             | EventKind::Modify(ModifyKind::Data(_))
                             | EventKind::Modify(ModifyKind::Other) => {
                                 // If the file has been modified, check if the file was truncated
-                                let metadata = file.metadata()?;
+                                let metadata = bu.get_mut().metadata()?;
                                 let current_size = metadata.len();
 
-                                if current_size < reader.stream_position()? {
+                                if current_size < bu.stream_position()? {
                                     eprintln!("\ntail: {}: file truncated", pa.display());
 
-                                    reader.seek(SeekFrom::Start(0_u64))?;
+                                    bu.seek(SeekFrom::Start(0_u64))?;
                                 }
 
                                 // Read the new lines and output them
-                                let mut new_data = vec![];
+                                let mut new_data = Vec::<u8>::new();
 
-                                let bytes_read = reader.read_to_end(&mut new_data)?;
+                                let bytes_read = bu.read_to_end(&mut new_data)?;
 
                                 if bytes_read > 0_usize {
                                     print_bytes(&mut stdout_lock, &new_data)?;
@@ -447,7 +460,7 @@ fn tail(
                         }
                     }
                     Err(ve) => {
-                        eprintln!("watch error: {ve:?}");
+                        eprintln!("tail: watch error: {ve:?}");
                     }
                 }
             }
@@ -473,10 +486,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let mut exit_code = 0;
+    let mut exit_code = 0_i32;
 
     if let Err(er) = tail(args.file, args.follow, bytes_or_lines) {
-        exit_code = 1;
+        exit_code = 1_i32;
 
         eprintln!("tail: {}", er);
     }

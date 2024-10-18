@@ -20,9 +20,9 @@ use plib::PROJECT_NAME;
 
 #[derive(Parser)]
 #[command(
+    version,
     about = gettext("time - time a simple command or give resource usage"),
     help_template = gettext("{about}\n\nUsage: {usage}\n\nArguments:\n{positionals}\n\nOptions:\n{options}"),
-    version = env!("CARGO_PKG_VERSION"),
     disable_help_flag = true,
     disable_version_flag = true,
 )]

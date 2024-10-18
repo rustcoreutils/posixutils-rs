@@ -147,9 +147,9 @@ impl<R: Read> IntoIterator for CircularBuffer<R> {
     }
 }
 
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 #[derive(EnumString, EnumIter, Debug, PartialEq, Display)]
 #[strum(serialize_all = "SCREAMING-KEBAB-CASE")]
-#[allow(non_camel_case_types)]
 enum Encodings {
     ASCII,
     UTF_8,
@@ -427,7 +427,7 @@ fn charmap_conversion(
     for byte in input {
         buffer.push(byte);
         let mut found = false;
-        for (_, entry) in &from.entries {
+        for entry in from.entries.values() {
             if buffer.starts_with(&entry.encoding) {
                 if let Some(to_entry) = to
                     .entries

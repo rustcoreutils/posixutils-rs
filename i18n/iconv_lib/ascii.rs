@@ -17,8 +17,8 @@ pub fn to_ucs4<I: Iterator<Item = u8> + 'static>(
 ) -> Box<dyn Iterator<Item = u32>> {
     let mut position = 0;
 
-    let iter = std::iter::from_fn(move || {
-        while let Some(code_point) = input.next() {
+    let iter = iter::from_fn(move || {
+        for code_point in input.by_ref() {
             position += 1;
             if code_point <= 127 {
                 return Some(code_point as u32);
@@ -43,8 +43,9 @@ pub fn from_ucs4<I: Iterator<Item = u32> + 'static>(
     suppress_error: bool,
 ) -> Box<dyn Iterator<Item = u8>> {
     let mut position = 0;
+
     let iter = iter::from_fn(move || {
-        while let Some(code_point) = input.next() {
+        for code_point in input.by_ref() {
             position += 1;
             if code_point <= 127 {
                 return Some(code_point as u8);

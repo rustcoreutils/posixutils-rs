@@ -22,8 +22,8 @@ deunicode = "1.6"
 walkdir = "2"
 
 [dev-dependencies]
-proptest = "1.5.0"
-rand = "0.8.5"
+proptest = "1"
+rand = "0.8"
 
 [lints]
 workspace = true

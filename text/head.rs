@@ -29,8 +29,8 @@ struct Args {
     // https://pubs.opengroup.org/onlinepubs/9799919799/utilities/head.html
     //
     /// The first <N> bytes of each input file shall be copied to standard output (mutually exclusive with -n)
-    #[arg(long = "bytes", short, value_parser = clap::value_parser!(usize), group = N_C_GROUP)]
-    c: Option<usize>,
+    #[arg(long = "bytes", short = 'c', value_parser = clap::value_parser!(usize), group = N_C_GROUP)]
+    bytes_to_copy: Option<usize>,
 
     /// Files to read as input.
     files: Vec<PathBuf>,
@@ -65,8 +65,8 @@ fn head_file(
     let mut raw_buffer = [0_u8; BUFFER_SIZE];
 
     match *count_type {
-        CountType::Bytes(c) => {
-            let mut bytes_remaining = c;
+        CountType::Bytes(bytes_to_copy) => {
+            let mut bytes_remaining = bytes_to_copy;
 
             loop {
                 let number_of_bytes_read = {
@@ -148,7 +148,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // BusyBox, coreutils' uutils, GNU Core Utilities, and toybox do not (and just print nothing)
     // POSIX says:
     // "The application shall ensure that the number option-argument is a positive decimal integer."
-    let count_type = match (args.n, args.c) {
+    let count_type = match (args.n, args.bytes_to_copy) {
         (None, None) => {
             // If no arguments are provided, the default is 10 lines
             CountType::Lines(10_usize)
@@ -162,14 +162,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             CountType::Lines(n)
         }
-        (None, Some(c)) => {
-            if c == 0_usize {
+        (None, Some(bytes_to_copy)) => {
+            if bytes_to_copy == 0_usize {
                 eprintln!("head: when a value for -c is provided, it must be greater than 0");
 
                 std::process::exit(1_i32);
             }
 
-            CountType::Bytes(c)
+            CountType::Bytes(bytes_to_copy)
         }
 
         (Some(_), Some(_)) => {
@@ -182,18 +182,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
+    let files = &mut args.files;
+
     // if no files, read from stdin
-    if args.files.is_empty() {
-        args.files.push(PathBuf::new());
+    if files.is_empty() {
+        files.push(PathBuf::new());
     }
 
+    let want_header = files.len() > 1;
+
     let mut exit_code = 0;
-    let want_header = args.files.len() > 1;
     let mut first = true;
 
     let mut stdout_lock = io::stdout().lock();
 
-    for filename in &args.files {
+    for filename in files {
         if let Err(e) = head_file(&count_type, filename, first, want_header, &mut stdout_lock) {
             exit_code = 1;
             eprintln!("{}: {}", filename.display(), e);

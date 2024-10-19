@@ -31,6 +31,10 @@ struct Args {
     #[arg(short = 'f')]
     canonicalize: bool,
 
+    /// Print an error description to standard error when an error occurs and the specified file could not be resolved
+    #[arg(short = 'v')]
+    verbose: bool,
+
     /// The pathname of an existing symbolic link
     pathname: PathBuf,
 }
@@ -42,13 +46,10 @@ struct Args {
 // Behavior of "readlink -f /non-existent-directory/non-existent-file" does not vary
 // All implementations: print nothing, exit code 1
 fn do_readlink(args: Args) -> Result<String, String> {
-    // TODO
-    // Add --verbose option and mirror other implementations (which are quiet by default)?
-    let verbose = true;
-
     let Args {
         no_newline,
         canonicalize,
+        verbose,
         pathname,
     } = args;
 
@@ -185,11 +186,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             0_i32
         }
         Err(error_description) => {
-            let mut stderr_lock = stderr().lock();
+            if !error_description.is_empty() {
+                let mut stderr_lock = stderr().lock();
 
-            writeln!(&mut stderr_lock, "readlink: {error_description}").unwrap();
+                writeln!(&mut stderr_lock, "readlink: {error_description}").unwrap();
 
-            stderr_lock.flush().unwrap();
+                stderr_lock.flush().unwrap();
+            }
 
             1_i32
         }

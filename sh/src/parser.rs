@@ -98,10 +98,6 @@ impl<'src> Parser<'src> {
         }
     }
 
-    fn match_str(&mut self, s: &str) {
-        todo!();
-    }
-
     fn matches_shell_alterntives(&mut self, tokens: &[ShellToken]) -> Option<ShellToken> {
         for token in tokens {
             if self.shell_lookahead() == *token {

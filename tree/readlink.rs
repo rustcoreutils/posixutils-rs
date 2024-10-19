@@ -210,14 +210,25 @@ fn recursive_resolve(starting_path_buf: PathBuf) -> Result<PathBuf, String> {
     loop {
         match fs::read_link(current_path_buf.as_path()) {
             Ok(pa) => {
-                if !encountered_paths.insert(pa.as_os_str().to_owned()) {
-                    return Err(format!(
-                        "Infinite symbolic link loop detected at \"{}\")",
-                        pa.to_string_lossy()
-                    ));
+                if pa.is_absolute() {
+                    current_path_buf = pa;
+                } else {
+                    if !current_path_buf.pop() {
+                        return Err(format!(
+                            "Could not remove last path segment from path \"{}\")",
+                            current_path_buf.to_string_lossy()
+                        ));
+                    }
+
+                    current_path_buf.push(pa);
                 }
 
-                current_path_buf = pa;
+                if !encountered_paths.insert(current_path_buf.as_os_str().to_owned()) {
+                    return Err(format!(
+                        "Infinite symbolic link loop detected at \"{}\")",
+                        current_path_buf.to_string_lossy()
+                    ));
+                }
             }
             Err(_) => {
                 break;

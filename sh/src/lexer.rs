@@ -100,6 +100,11 @@ impl SourceLocation {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Default)]
+pub struct TokenId {
+    id: u64,
+}
+
 pub fn is_blank(c: char) -> bool {
     c == ' ' || c == '\t'
 }
@@ -135,6 +140,7 @@ pub struct Lexer<'src> {
     previous_token_lookahead: char,
     previous_token_char_index: usize,
     lookahead: char,
+    last_token_id: u64,
 }
 
 impl<'src> Lexer<'src> {
@@ -166,7 +172,13 @@ impl<'src> Lexer<'src> {
         }
     }
 
-    pub fn next_shell_token(&mut self) -> (ShellToken, SourceLocation) {
+    fn token_id(&mut self) -> TokenId {
+        let token_id = self.last_token_id;
+        self.last_token_id += 1;
+        TokenId { id: token_id }
+    }
+
+    pub fn next_shell_token(&mut self) -> (ShellToken, SourceLocation, TokenId) {
         self.previous_token_iter = self.source_iter.clone();
         self.previous_token_lookahead = self.lookahead;
         self.previous_token_char_index = self.current_char_index;
@@ -174,8 +186,14 @@ impl<'src> Lexer<'src> {
         self.skip_blanks();
         self.skip_comment();
 
+        let token_id = self.token_id();
+
         if self.reached_eof() {
-            return (ShellToken::EOF, SourceLocation::eof(self.source.len()));
+            return (
+                ShellToken::EOF,
+                SourceLocation::eof(self.source.len()),
+                token_id,
+            );
         }
 
         let token_start = self.current_char_index;
@@ -222,6 +240,7 @@ impl<'src> Lexer<'src> {
             return (
                 complete_token,
                 SourceLocation::new(token_start, self.current_char_index),
+                token_id,
             );
         }
 
@@ -285,16 +304,22 @@ impl<'src> Lexer<'src> {
             _ => ShellToken::WordStart,
         };
         let source_location = SourceLocation::new(token_start, self.current_char_index);
-        (token, source_location)
+        (token, source_location, token_id)
     }
 
-    pub fn next_word_token(&mut self) -> (WordToken, SourceLocation) {
+    pub fn next_word_token(&mut self) -> (WordToken, SourceLocation, TokenId) {
         self.previous_token_iter = self.source_iter.clone();
         self.previous_token_lookahead = self.lookahead;
         self.previous_token_char_index = self.current_char_index;
 
+        let token_id = self.token_id();
+
         if self.reached_eof() {
-            return (WordToken::EOF, SourceLocation::eof(self.source.len()));
+            return (
+                WordToken::EOF,
+                SourceLocation::eof(self.source.len()),
+                token_id,
+            );
         }
         let token_start = self.current_char_index;
         let result = match self.lookahead {
@@ -325,7 +350,7 @@ impl<'src> Lexer<'src> {
             other => advance_and_return(self, WordToken::Char(other)),
         };
         let source_location = SourceLocation::new(token_start, self.current_char_index);
-        (result, source_location)
+        (result, source_location, token_id)
     }
 
     pub fn next_char(&mut self) -> Option<(char, SourceLocation)> {
@@ -373,6 +398,7 @@ impl<'src> Lexer<'src> {
             source_iter,
             current_char_index: 0,
             lookahead,
+            last_token_id: 0,
         }
     }
 }

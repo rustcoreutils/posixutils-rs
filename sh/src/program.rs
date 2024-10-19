@@ -205,8 +205,14 @@ pub enum CompoundCommand {
 }
 
 #[derive(Debug, PartialEq)]
+pub struct FunctionDefinition {
+    pub name: Name,
+    pub body: CompoundCommand,
+}
+
+#[derive(Debug, PartialEq)]
 pub enum Command {
-    FunctionDefinition,
+    FunctionDefinition(FunctionDefinition),
     SimpleCommand(SimpleCommand),
     CompoundCommand {
         command: CompoundCommand,

@@ -15,13 +15,14 @@ use chrono::Datelike;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
+use tr::tr;
 
 #[derive(Parser)]
-#[command(version, about = gettext("cal - print a calendar"))]
+#[command(version, about = tr!("cal - print a calendar"))]
 struct Args {
     #[arg(
         value_parser = clap::value_parser!(u32).range(1..),
-        help = gettext(
+        help = tr!(
             "Specify the month to be displayed, represented as a decimal integer from 1 (January) to 12 (December)"
         )
     )]
@@ -29,7 +30,7 @@ struct Args {
 
     #[arg(
         value_parser = clap::value_parser!(u32).range(1..),
-        help = gettext(
+        help = tr!(
             "Specify the year for which the calendar is displayed, represented as a decimal integer from 1 to 9999"
         )
     )]
@@ -38,23 +39,23 @@ struct Args {
 
 fn print_month(month: u32, year: u32) {
     let month_name = match month {
-        1 => gettext("January"),
-        2 => gettext("February"),
-        3 => gettext("March"),
-        4 => gettext("April"),
-        5 => gettext("May"),
-        6 => gettext("June"),
-        7 => gettext("July"),
-        8 => gettext("August"),
-        9 => gettext("September"),
-        10 => gettext("October"),
-        11 => gettext("November"),
-        12 => gettext("December"),
+        1 => tr!("January"),
+        2 => tr!("February"),
+        3 => tr!("March"),
+        4 => tr!("April"),
+        5 => tr!("May"),
+        6 => tr!("June"),
+        7 => tr!("July"),
+        8 => tr!("August"),
+        9 => tr!("September"),
+        10 => tr!("October"),
+        11 => tr!("November"),
+        12 => tr!("December"),
         _ => unreachable!(),
     };
 
     println!("{} {}", month_name, year);
-    println!("{}", gettext("Su Mo Tu We Th Fr Sa"));
+    println!("{}", tr!("Su Mo Tu We Th Fr Sa"));
 
     let mut day = 1;
     let mut weekday = 1;
@@ -94,12 +95,25 @@ fn print_year(year: u32) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // TODO: replace with libc set locale
+    // setlocale(LocaleCategory::LcAll, "");
+
+    if let Some(locale) = std::env::var_os("LC_ALL") {
+        std::ffi::CStr::from(locale.as_os_str())
+        unsafe {
+            // TODO: perhaps its better to get environment variable with libc, and avoid the conversion
+            // nonsense
+            libc::setlocale(libc::LC_ALL, locale);
+        }
+    }
+    
+    
+    
+
     // parse command line arguments
     let mut args = Args::parse();
 
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    
 
     // If no arguments are provided, display the current month
     if args.month.is_none() && args.year.is_none() {
@@ -116,7 +130,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let year = match args.year {
         Some(year) => {
             if year > 9999 {
-                return Err(gettext("year must be between 1 and 9999").into());
+                return Err(tr!("year must be between 1 and 9999").into());
             }
             year
         }
@@ -125,7 +139,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(month) = args.month {
         if month > 12 {
-            return Err(gettext("month must be between 1 and 12").into());
+            return Err(tr!("month must be between 1 and 12").into());
         }
         print_month(month, year);
     } else {

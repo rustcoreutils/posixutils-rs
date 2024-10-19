@@ -13,6 +13,8 @@ clap.workspace = true
 gettext-rs.workspace = true
 chrono.workspace = true
 libc.workspace = true
+tr.workspace = true
+gettext.workspace = true
 
 [lints]
 workspace = true

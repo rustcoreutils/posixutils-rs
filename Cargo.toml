@@ -40,6 +40,8 @@ libc = "0.2"
 regex = "1.10"
 gettext-rs = { path = "./gettext-rs" }
 errno = "0.3"
+tr = { version = "0.1.10", default-features = false, features = ["gettext"]}
+gettext = "0.4.0"
 
 [workspace.lints]
 

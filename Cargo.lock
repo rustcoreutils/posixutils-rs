@@ -1261,7 +1261,9 @@ name = "plib"
 version = "0.2.1"
 dependencies = [
  "cfg-if",
+ "clap",
  "errno",
+ "gettext-rs",
  "libc",
 ]
 

@@ -9,6 +9,8 @@ rust-version.workspace = true
 
 [dependencies]
 cfg-if = "1.0"
+clap.workspace = true
+gettext-rs.workspace = true
 libc.workspace = true
 errno.workspace = true
 

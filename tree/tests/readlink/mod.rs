@@ -63,7 +63,10 @@ fn test_readlink_non_existent_file() {
 
     run_test(TestPlan {
         cmd: String::from("readlink"),
-        args: vec![non_existent_path.to_str().unwrap().to_string()],
+        args: vec![
+            "-v".to_owned(),
+            non_existent_path.to_str().unwrap().to_string(),
+        ],
         stdin_data: String::new(),
         expected_out: String::new(),
         expected_err: format!(
@@ -84,7 +87,7 @@ fn test_readlink_not_a_symlink() {
 
     run_test(TestPlan {
         cmd: String::from("readlink"),
-        args: vec![file_path.to_str().unwrap().to_string()],
+        args: vec!["-v".to_owned(), file_path.to_str().unwrap().to_string()],
         stdin_data: String::new(),
         expected_out: String::new(),
         expected_err: format!(

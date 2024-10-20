@@ -199,7 +199,7 @@ fn patch_operation() -> io::Result<()> {
                 }
 
                 for _failures in into_hunks.failures.iter_mut() {
-                    // let reject_path = 
+                    // let reject_path =
                 }
             }
             Err(_) => todo!(),

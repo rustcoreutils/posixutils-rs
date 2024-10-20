@@ -9,6 +9,8 @@
 
 mod ls_util;
 
+use ftw::{metadata, symlink_metadata, Metadata};
+
 use self::ls_util::{ls_from_utf8_lossy, Entry, LongFormatPadding, MultiColumnPadding};
 use clap::{CommandFactory, FromArgMatches, Parser};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
@@ -923,8 +925,7 @@ fn ls(paths: Vec<PathBuf>, config: &Config) -> io::Result<u8> {
     // Files get processed first
     let mut file_entries = Vec::new();
     for path in files {
-        let path_cstr = CString::new(path.as_os_str().as_bytes()).unwrap();
-        let metadata = match ftw::Metadata::new(libc::AT_FDCWD, &path_cstr, false) {
+        let meta = match symlink_metadata(&path) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("ls: {e}");
@@ -942,8 +943,8 @@ fn ls(paths: Vec<PathBuf>, config: &Config) -> io::Result<u8> {
 
         // If -H or -L are enabled, the metadata to be reported is from the file
         // that the symbolic link points to.
-        let metadata = if metadata.is_symlink() && dereference_symlink {
-            match ftw::Metadata::new(libc::AT_FDCWD, &path_cstr, true) {
+        let meta = if meta.is_symlink() && dereference_symlink {
+            match metadata(&path) {
                 Ok(m) => m,
                 Err(e) => {
                     eprintln!("ls: {e}");
@@ -952,13 +953,13 @@ fn ls(paths: Vec<PathBuf>, config: &Config) -> io::Result<u8> {
                 }
             }
         } else {
-            metadata
+            meta
         };
 
         // Target of the symlink
         let target_path = {
             let mut target_path = None;
-            if metadata.is_symlink() && !dereference_symlink {
+            if meta.is_symlink() && !dereference_symlink {
                 if let OutputFormat::Long(_) = &config.output_format {
                     let mut buf = vec![0u8; libc::PATH_MAX as usize];
 
@@ -986,12 +987,7 @@ fn ls(paths: Vec<PathBuf>, config: &Config) -> io::Result<u8> {
             target_path
         };
 
-        let entry = match Entry::new(
-            target_path,
-            path.as_os_str().to_os_string(),
-            &metadata,
-            config,
-        ) {
+        let entry = match Entry::new(target_path, path.as_os_str().to_os_string(), &meta, config) {
             Ok(x) => x,
             Err(e) => {
                 eprintln!("ls: {e}");
@@ -1106,24 +1102,22 @@ fn process_single_dir(
                 return Ok(false);
             }
 
-            let metadata = dir_entry.metadata().unwrap();
+            let meta = dir_entry.metadata().unwrap();
             let is_dot_or_double_dot = dir_entry.is_dot_or_double_dot();
 
             // Get the metadata of the file, equivalent to `std::fs::symlink_metadata`
             let marker = {
-                let metadata =
-                    match ftw::Metadata::new(dir_entry.dir_fd(), dir_entry.file_name(), false) {
-                        Ok(md) => md,
-                        Err(e) => {
-                            let path_str = ls_from_utf8_lossy(
-                                dir_entry.path().as_inner().as_os_str().as_bytes(),
-                            );
-                            let err_str = gettext!("cannot access '{}': {}", path_str, e);
-                            errors.push(io::Error::other(err_str));
-                            return Ok(false);
-                        }
-                    };
-                (metadata.dev(), metadata.ino())
+                let meta = match Metadata::new(dir_entry.dir_fd(), dir_entry.file_name(), false) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        let path_str =
+                            ls_from_utf8_lossy(dir_entry.path().as_inner().as_os_str().as_bytes());
+                        let err_str = gettext!("cannot access '{}': {}", path_str, e);
+                        errors.push(io::Error::other(err_str));
+                        return Ok(false);
+                    }
+                };
+                (meta.dev(), meta.ino())
             };
 
             if current_dir.is_none() {
@@ -1170,7 +1164,7 @@ fn process_single_dir(
                     };
 
                     let mut target_path = None;
-                    if metadata.is_symlink() && !dereference_symlink {
+                    if meta.is_symlink() && !dereference_symlink {
                         if let OutputFormat::Long(_) = &config.output_format {
                             target_path = Some(ls_from_utf8_lossy(
                                 dir_entry.read_link().unwrap().to_bytes(),
@@ -1181,7 +1175,7 @@ fn process_single_dir(
                     target_path
                 };
 
-                let entry = Entry::new(target_path, file_name_raw, metadata, config)
+                let entry = Entry::new(target_path, file_name_raw, meta, config)
                     .map_err(|e| io::Error::other(format!("'{path_str}': {e}")))?;
 
                 let mut include_entry = false;
@@ -1207,7 +1201,7 @@ fn process_single_dir(
                     entries.push(entry);
 
                     if config.recursive {
-                        if metadata.is_dir() {
+                        if meta.is_dir() {
                             return Ok(true);
                         }
                     }

@@ -23,7 +23,7 @@ use std::{
 use clap::Parser;
 use patch_utils::{
     constants::init,
-    functions::{file_exists, if_else, print_error},
+    functions::{context_unified_date_convert, file_exists, if_else, print_error},
     hunks::Apply,
     patch_file::PatchFile,
     patch_file_kind::FileKind,
@@ -199,7 +199,7 @@ fn patch_operation() -> io::Result<()> {
                 }
 
                 for _failures in into_hunks.failures.iter_mut() {
-                    // reject failures.0
+                    // let reject_path = 
                 }
             }
             Err(_) => todo!(),

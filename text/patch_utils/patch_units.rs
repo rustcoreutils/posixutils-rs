@@ -391,9 +391,13 @@ impl<'a> PatchUnits<'a> {
         };
 
         for unit in &self.patches {
+            into_hunks.total_count += 1;
             match unit.verify_patch() {
                 Ok(_) => into_hunks.hunks.push(unit.into_hunks()),
-                Err(error) => into_hunks.failures.push((unit, error)),
+                Err(error) => {
+                    into_hunks.fail_count += 1;
+                    into_hunks.failures.push((unit, error));
+                }
             }
         }
 

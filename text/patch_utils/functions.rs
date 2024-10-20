@@ -1,6 +1,6 @@
-use std::{fs, path::PathBuf, str::FromStr};
+use std::{fs, path::PathBuf};
 
-use chrono::{Date, DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 
 use crate::patch_utils::constants::context::{context_regex_cache, ContextRegexKind};
 
@@ -70,17 +70,12 @@ pub fn is_unfied_header(l0: &str, l1: &str) -> bool {
 }
 
 pub fn context_unified_date_convert(date: &str) -> Option<DateTime<Utc>> {
-    let formats = ["%Y-%m-%d %H:%M:%S.%f %z"];
+    if let Ok(date_time) = DateTime::parse_from_str(date, "%Y-%m-%d %H:%M:%S.%f %z") {
+        return Some(date_time.to_utc());
+    }
 
-    // let input = "Thu Feb 21 23:30:39 2002";
-    // let datetime = NaiveDateTime::parse_from_str(input , "%a %b %d %H:%M:%S %Y");
-
-    // println!("{:?}", datetime.unwrap());
-
-    for format in formats {
-        if let Ok(date_time) = DateTime::parse_from_str(date, format) {
-            return Some(date_time.to_utc());
-        }
+    if let Ok(naive_date_time) = NaiveDateTime::parse_from_str(date, "%a %b %d %H:%M:%S %Y") {
+        return Some(Utc.from_utc_datetime(&naive_date_time));
     }
 
     None

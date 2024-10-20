@@ -9,9 +9,7 @@
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use std::collections::HashSet;
 use std::error::Error;
-use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::io::{stderr, stdout, ErrorKind};
@@ -204,30 +202,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn recursive_resolve(starting_path_buf: PathBuf) -> Result<PathBuf, String> {
     let mut current_path_buf = starting_path_buf;
 
-    let mut encountered_paths = HashSet::<OsString>::new();
+    let mut recursion_level = 0_usize;
 
     #[allow(clippy::while_let_loop)]
     loop {
         match fs::read_link(current_path_buf.as_path()) {
             Ok(pa) => {
+                recursion_level += 1_usize;
+
+                // https://unix.stackexchange.com/questions/53087/how-do-you-increase-maxsymlinks
+                if recursion_level == 40_usize {
+                    return Err(format!(
+                        "Symbolic link chain is circular or just too long, gave up at \"{}\"",
+                        current_path_buf.to_string_lossy()
+                    ));
+                }
+
                 if pa.is_absolute() {
                     current_path_buf = pa;
                 } else {
                     if !current_path_buf.pop() {
                         return Err(format!(
-                            "Could not remove last path segment from path \"{}\")",
+                            "Could not remove last path segment from path \"{}\"",
                             current_path_buf.to_string_lossy()
                         ));
                     }
 
                     current_path_buf.push(pa);
-                }
-
-                if !encountered_paths.insert(current_path_buf.as_os_str().to_owned()) {
-                    return Err(format!(
-                        "Infinite symbolic link loop detected at \"{}\")",
-                        current_path_buf.to_string_lossy()
-                    ));
                 }
             }
             Err(_) => {

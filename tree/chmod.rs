@@ -10,7 +10,7 @@
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use modestr::{ChmodMode, ChmodSymbolic};
-use plib::{modestr, PROJECT_NAME};
+use plib::modestr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::{fs, io};
@@ -75,13 +75,11 @@ fn chmod_file(filename: &str, mode: &ChmodMode, recurse: bool) -> Result<(), io:
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
-    let args = Args::parse();
-
-    // initialize translations
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
+
+    let args = Args::parse();
 
     let mut exit_code = 0;
 

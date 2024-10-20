@@ -7,8 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
+use plib::curuser::login_name;
+
 fn main() {
-    let username = plib::curuser::login_name();
+    let username = login_name();
 
     println!("{}", username);
 }

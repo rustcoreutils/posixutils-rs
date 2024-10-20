@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::{run_test, TestPlan};
+use plib::testing::{run_test, TestPlan};
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::symlink;

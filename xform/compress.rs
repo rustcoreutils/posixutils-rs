@@ -9,8 +9,8 @@
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use plib::io::input_stream;
 use plib::lzw::UnixLZWWriter;
-use plib::PROJECT_NAME;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -49,7 +49,7 @@ fn prompt_user(prompt: &str) -> bool {
 }
 
 fn compress_file(args: &Args, pathname: &PathBuf) -> io::Result<i32> {
-    let mut file = plib::io::input_stream(pathname, false)?;
+    let mut file = input_stream(pathname, false)?;
 
     let mut encoder = UnixLZWWriter::new(args.bits);
 
@@ -115,11 +115,11 @@ fn compress_file(args: &Args, pathname: &PathBuf) -> io::Result<i32> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
+
+    let mut args = Args::parse();
 
     if args.files.is_empty() {
         args.files.push(PathBuf::new());

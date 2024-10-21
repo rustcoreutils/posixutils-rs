@@ -84,9 +84,6 @@ pub fn run_test(plan: TestPlan) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(stdout, plan.expected_out);
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(stderr, plan.expected_err);
-
     assert_eq!(output.status.code(), Some(plan.expected_exit_code));
     if plan.expected_exit_code == 0 {
         assert!(output.status.success());

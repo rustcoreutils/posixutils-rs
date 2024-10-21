@@ -13,8 +13,6 @@
 
 use chrono::Datelike;
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 use tr::tr;
 
 #[derive(Parser)]
@@ -95,25 +93,10 @@ fn print_year(year: u32) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // TODO: replace with libc set locale
-    // setlocale(LocaleCategory::LcAll, "");
-
-    if let Some(locale) = std::env::var_os("LC_ALL") {
-        std::ffi::CStr::from(locale.as_os_str())
-        unsafe {
-            // TODO: perhaps its better to get environment variable with libc, and avoid the conversion
-            // nonsense
-            libc::setlocale(libc::LC_ALL, locale);
-        }
-    }
-    
-    
-    
+    plib::initialize_i18n!()?;
 
     // parse command line arguments
     let mut args = Args::parse();
-
-    
 
     // If no arguments are provided, display the current month
     if args.month.is_none() && args.year.is_none() {

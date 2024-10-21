@@ -7,27 +7,25 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::rc::Rc;
-
-use pest::{error::InputLocation, iterators::Pair, pratt_parser::PrattParser, Parser, Position};
-
 use super::instructions::*;
 
-lazy_static::lazy_static! {
-    static ref PRATT_PARSER: PrattParser<Rule> = {
-        use pest::pratt_parser::{Assoc, Op};
+use pest::error::InputLocation;
+use pest::iterators::Pair;
+use pest::pratt_parser::{Assoc, Op, PrattParser};
+use pest::{Parser, Position};
+use std::rc::Rc;
+use std::sync::LazyLock;
 
-        // Precedence is defined lowest to highest
-        PrattParser::new()
-        .op(Op::infix(Rule::add, Assoc::Left)
-            | Op::infix(Rule::sub, Assoc::Left))
+static PRATT_PARSER: LazyLock<PrattParser<Rule>> = LazyLock::new(|| {
+    // Precedence is defined lowest to highest
+    PrattParser::new()
+        .op(Op::infix(Rule::add, Assoc::Left) | Op::infix(Rule::sub, Assoc::Left))
         .op(Op::infix(Rule::mul, Assoc::Left)
             | Op::infix(Rule::div, Assoc::Left)
             | Op::infix(Rule::modulus, Assoc::Left))
         .op(Op::infix(Rule::pow, Assoc::Right))
         .op(Op::prefix(Rule::neg))
-    };
-}
+});
 
 fn first_char(s: &str) -> char {
     s.chars().next().unwrap()

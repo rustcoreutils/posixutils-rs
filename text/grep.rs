@@ -359,7 +359,7 @@ impl Patterns {
 
                 let mut any_pattern_matched = false;
 
-                'next_pattern: for p in patterns {
+                for p in patterns {
                     let mut current_string_index = 0_usize;
 
                     loop {
@@ -390,7 +390,7 @@ impl Patterns {
                         if regexec_return_value != 0 {
                             debug_assert!(regexec_return_value == REG_NOMATCH);
 
-                            continue 'next_pattern;
+                            break;
                         }
 
                         if !collect_matching_substrings {
@@ -404,11 +404,16 @@ impl Patterns {
                         let start = usize::try_from(regmatch_t.rm_so).unwrap();
                         let end = usize::try_from(regmatch_t.rm_eo).unwrap();
 
-                        debug_assert!(end > 0_usize);
+                        // TODO
+                        // Is this the right fix?
+                        // The edge case is:
+                        //
+                        // grep -o ''
+                        if end == 0_usize {
+                            break;
+                        }
 
                         matching_substrings.push(current_string_slice[start..end].to_vec());
-
-                        debug_assert!(end > current_string_index);
 
                         current_string_index += end;
                     }

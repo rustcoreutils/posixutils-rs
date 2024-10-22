@@ -8,14 +8,14 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use libc::{regcomp, regex_t, regexec, regfree, REG_EXTENDED, REG_ICASE, REG_NOMATCH};
+use gettextrs::{bind_textdomain_codeset, textdomain};
+use libc::{regcomp, regex_t, regexec, regfree, regmatch_t, REG_EXTENDED, REG_ICASE, REG_NOMATCH};
+use plib::PROJECT_NAME;
 use std::{
     ffi::CString,
     fs::File,
-    io::{self, BufRead, BufReader},
+    io::{self, BufRead, BufReader, StdoutLock, Write},
     path::{Path, PathBuf},
-    ptr,
 };
 
 /// grep - search a file for a pattern.
@@ -46,7 +46,7 @@ struct Args {
     #[arg(short, long)]
     ignore_case: bool,
 
-    /// Write only the names of input_files containing selected lines to standard output.
+    /// Write only the names of input files containing selected lines to standard output.
     #[arg(short = 'l', long)]
     files_with_matches: bool,
 
@@ -54,7 +54,11 @@ struct Args {
     #[arg(short = 'n', long)]
     line_number: bool,
 
-    /// Write only the names of input_files containing selected lines to standard output.
+    /// Only print the matching characters in each line.
+    #[arg(short = 'o', long = "only-matching")]
+    only_matching: bool,
+
+    /// Do not print to standard output. The presence or absence of a match is communicated with the exit status.
     #[arg(short, long)]
     quiet: bool,
 
@@ -105,7 +109,7 @@ impl Args {
             return Err("Options '-l' and '-q' cannot be used together".to_string());
         }
         if self.regexp.is_empty() && self.file.is_empty() && self.single_pattern.is_none() {
-            return Err("Required at least one pattern list or file".to_string());
+            return Err("A pattern list or at least one file is required".to_string());
         }
         Ok(())
     }
@@ -197,6 +201,8 @@ impl Args {
             output_mode,
             patterns,
             input_files: self.input_files,
+            stdout_lock: io::stdout().lock(),
+            only_matching: self.only_matching,
         })
     }
 }
@@ -297,8 +303,13 @@ impl Patterns {
     /// # Returns
     ///
     /// Returns [bool](bool) - `true` if input matches present patterns, else `false`.
-    fn matches(&self, input: impl AsRef<str>) -> bool {
+    fn matches(
+        &self,
+        input: impl AsRef<str>,
+        collect_matching_substrings: bool,
+    ) -> (bool, Vec<Vec<u8>>) {
         let input = input.as_ref();
+
         match self {
             Patterns::Fixed(patterns, ignore_case, line_regexp) => {
                 let input = if *ignore_case {
@@ -306,19 +317,104 @@ impl Patterns {
                 } else {
                     input.to_string()
                 };
-                patterns.iter().any(|p| {
+
+                let mut matching_substrings = Vec::<Vec<u8>>::new();
+
+                let mut any_pattern_matched = false;
+
+                for pattern in patterns {
                     if *line_regexp {
-                        input == *p
+                        if input != *pattern {
+                            continue;
+                        }
+
+                        if !collect_matching_substrings {
+                            return (true, Vec::<Vec<u8>>::new());
+                        }
+
+                        any_pattern_matched = true;
+
+                        matching_substrings.push(pattern.as_bytes().to_vec());
                     } else {
-                        input.contains(p)
+                        for st in input.matches(pattern) {
+                            if !collect_matching_substrings {
+                                return (true, Vec::<Vec<u8>>::new());
+                            }
+
+                            any_pattern_matched = true;
+
+                            matching_substrings.push(st.as_bytes().to_vec());
+                        }
                     }
-                })
+                }
+
+                (any_pattern_matched, matching_substrings)
             }
             Patterns::Regex(patterns) => {
-                let c_input = CString::new(input).unwrap();
-                patterns.iter().any(|p| unsafe {
-                    regexec(p, c_input.as_ptr(), 0, ptr::null_mut(), 0) != REG_NOMATCH
-                })
+                let nmatch_to_use = if collect_matching_substrings { 1 } else { 0 };
+
+                let input_slice = input.as_bytes();
+
+                let mut matching_substrings = Vec::<Vec<u8>>::new();
+
+                let mut any_pattern_matched = false;
+
+                'next_pattern: for p in patterns {
+                    let mut current_string_index = 0_usize;
+
+                    loop {
+                        let current_string_slice = &input_slice[current_string_index..];
+
+                        let current_string_c_string = CString::new(current_string_slice).unwrap();
+
+                        let mut regmatch_t_vec = vec![
+                            regmatch_t {
+                                rm_so: -1,
+                                rm_eo: -1,
+                            };
+                            nmatch_to_use
+                        ];
+
+                        let regmatch_vec_pointer = regmatch_t_vec.as_mut_ptr();
+
+                        let regexec_return_value = unsafe {
+                            regexec(
+                                p,
+                                current_string_c_string.as_ptr(),
+                                nmatch_to_use,
+                                regmatch_vec_pointer,
+                                0,
+                            )
+                        };
+
+                        if regexec_return_value != 0 {
+                            debug_assert!(regexec_return_value == REG_NOMATCH);
+
+                            continue 'next_pattern;
+                        }
+
+                        if !collect_matching_substrings {
+                            return (true, Vec::<Vec<u8>>::new());
+                        }
+
+                        any_pattern_matched = true;
+
+                        let regmatch_t = regmatch_t_vec.first().unwrap();
+
+                        let start = usize::try_from(regmatch_t.rm_so).unwrap();
+                        let end = usize::try_from(regmatch_t.rm_eo).unwrap();
+
+                        debug_assert!(end > 0_usize);
+
+                        matching_substrings.push(current_string_slice[start..end].to_vec());
+
+                        debug_assert!(end > current_string_index);
+
+                        current_string_index += end;
+                    }
+                }
+
+                (any_pattern_matched, matching_substrings)
             }
         }
     }
@@ -357,6 +453,8 @@ struct GrepModel {
     output_mode: OutputMode,
     patterns: Patterns,
     input_files: Vec<String>,
+    stdout_lock: StdoutLock<'static>,
+    only_matching: bool,
 }
 
 impl GrepModel {
@@ -398,6 +496,16 @@ impl GrepModel {
         }
     }
 
+    fn print_line_prefix(&mut self, input_name: &str, line_number: u64) {
+        if self.multiple_inputs {
+            write!(self.stdout_lock, "{input_name}:").unwrap();
+        }
+
+        if self.line_number {
+            write!(self.stdout_lock, "{line_number}:").unwrap();
+        }
+    }
+
     /// Reads lines from buffer and processes them.
     ///
     /// # Arguments
@@ -405,78 +513,93 @@ impl GrepModel {
     /// * `input_name` - [str](str) that represents content source name.
     /// * `reader` - [Box](Box) that contains object that implements [BufRead] and reads lines.
     fn process_input(&mut self, input_name: &str, mut reader: Box<dyn BufRead>) {
-        let mut line_number: u64 = 0;
+        let mut line_number = 0_u64;
+
+        let mut line = String::new();
+
         loop {
-            let mut line = String::new();
             line_number += 1;
+
+            line.clear();
+
+            // TODO
+            // Probably should work on non-UTF-8 input
             match reader.read_line(&mut line) {
                 Ok(n_read) => {
                     if n_read == 0 {
                         break;
                     }
-                    let trimmed = if line.ends_with('\n') {
-                        &line[..line.len() - 1]
-                    } else {
-                        &line
+
+                    let mut chars = line.chars();
+
+                    let line_without_newline = match chars.next_back() {
+                        Some('\n') => chars.as_str(),
+                        _ => line.as_str(),
                     };
 
-                    let init_matches = self.patterns.matches(trimmed);
+                    let (line_matches_any_pattern, matching_substrings) = self.patterns.matches(
+                        line_without_newline,
+                        self.only_matching && matches!(self.output_mode, OutputMode::Default),
+                    );
+
                     let matches = if self.invert_match {
-                        !init_matches
+                        !line_matches_any_pattern
                     } else {
-                        init_matches
+                        line_matches_any_pattern
                     };
+
                     if matches {
                         self.any_matches = true;
+
                         match &mut self.output_mode {
                             OutputMode::Count(count) => {
                                 *count += 1;
                             }
                             OutputMode::FilesWithMatches => {
-                                println!("{input_name}");
+                                writeln!(&mut self.stdout_lock, "{input_name}").unwrap();
+
                                 break;
                             }
                             OutputMode::Quiet => {
                                 return;
                             }
                             OutputMode::Default => {
-                                let result = format!(
-                                    "{}{}{}",
-                                    if self.multiple_inputs {
-                                        format!("{input_name}:")
-                                    } else {
-                                        String::new()
-                                    },
-                                    if self.line_number {
-                                        format!("{line_number}:")
-                                    } else {
-                                        String::new()
-                                    },
-                                    trimmed
-                                );
-                                println!("{result}");
+                                if self.only_matching {
+                                    for matching_substring in matching_substrings {
+                                        self.print_line_prefix(input_name, line_number);
+
+                                        self.stdout_lock
+                                            .write_all(matching_substring.as_slice())
+                                            .unwrap();
+
+                                        self.stdout_lock.write_all(b"\n").unwrap();
+                                    }
+                                } else {
+                                    self.print_line_prefix(input_name, line_number);
+
+                                    writeln!(self.stdout_lock, "{line_without_newline}").unwrap();
+                                }
                             }
                         }
                     }
-                    line.clear();
                 }
                 Err(err) => {
                     self.any_errors = true;
+
                     if !self.no_messages {
-                        eprintln!(
-                            "{}: Error reading line {} ({})",
-                            input_name, line_number, err
-                        );
+                        eprintln!("{input_name}: Error reading line {line_number} ({err})",);
                     }
                 }
             }
         }
+
         if let OutputMode::Count(count) = &mut self.output_mode {
             if self.multiple_inputs {
-                println!("{input_name}:{count}");
+                writeln!(&mut self.stdout_lock, "{input_name}:{count}").unwrap();
             } else {
-                println!("{count}");
+                writeln!(&mut self.stdout_lock, "{count}").unwrap();
             }
+
             *count = 0;
         }
     }
@@ -487,10 +610,9 @@ impl GrepModel {
 //     1 - No lines were selected.
 //     >1 - An error occurred.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain(env!("PROJECT_NAME"))?;
-    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
-
+    textdomain(PROJECT_NAME)?;
+    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    // Parse command line arguments
     let mut args = Args::parse();
 
     let exit_code = args
@@ -501,7 +623,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .map(|mut grep_model| grep_model.grep())
         .unwrap_or_else(|err| {
-            eprintln!("{}", err);
+            eprintln!("{err}");
             2
         });
 

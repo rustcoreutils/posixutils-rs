@@ -16,6 +16,7 @@ use std::{
     fs::File,
     io::{self, BufRead, BufReader, StdoutLock, Write},
     path::{Path, PathBuf},
+    ptr,
 };
 
 /// grep - search a file for a pattern.
@@ -303,12 +304,12 @@ impl Patterns {
     /// # Returns
     ///
     /// Returns [bool](bool) - `true` if input matches present patterns, else `false`.
-    fn matches(
-        &self,
-        input: impl AsRef<str>,
-        collect_matching_substrings: bool,
-    ) -> (bool, Vec<Vec<u8>>) {
+    fn matches(&self, input: impl AsRef<str>, collect_matching_substrings: bool) -> MatchesResult {
         let input = input.as_ref();
+
+        let mut matching_substrings = Vec::<Vec<u8>>::new();
+
+        let mut any_pattern_matched = false;
 
         match self {
             Patterns::Fixed(patterns, ignore_case, line_regexp) => {
@@ -318,10 +319,6 @@ impl Patterns {
                     input.to_string()
                 };
 
-                let mut matching_substrings = Vec::<Vec<u8>>::new();
-
-                let mut any_pattern_matched = false;
-
                 for pattern in patterns {
                     if *line_regexp {
                         if input != *pattern {
@@ -329,7 +326,7 @@ impl Patterns {
                         }
 
                         if !collect_matching_substrings {
-                            return (true, Vec::<Vec<u8>>::new());
+                            return MatchesResult::fast_path_match();
                         }
 
                         any_pattern_matched = true;
@@ -338,7 +335,7 @@ impl Patterns {
                     } else {
                         for st in input.matches(pattern) {
                             if !collect_matching_substrings {
-                                return (true, Vec::<Vec<u8>>::new());
+                                return MatchesResult::fast_path_match();
                             }
 
                             any_pattern_matched = true;
@@ -347,45 +344,45 @@ impl Patterns {
                         }
                     }
                 }
-
-                (any_pattern_matched, matching_substrings)
             }
             Patterns::Regex(patterns) => {
-                let nmatch_to_use = if collect_matching_substrings { 1 } else { 0 };
+                const SINGLE_ELEMENT_ARRAY_SIZE: usize = 1_usize;
 
                 let input_slice = input.as_bytes();
 
-                let mut matching_substrings = Vec::<Vec<u8>>::new();
+                let mut regmatch_t_array = [const {
+                    regmatch_t {
+                        rm_so: -1,
+                        rm_eo: -1,
+                    }
+                }; SINGLE_ELEMENT_ARRAY_SIZE];
 
-                let mut any_pattern_matched = false;
+                let (nmatch, pmatch) = if collect_matching_substrings {
+                    (SINGLE_ELEMENT_ARRAY_SIZE, regmatch_t_array.as_mut_ptr())
+                } else {
+                    (0_usize, ptr::null_mut())
+                };
 
-                for p in patterns {
+                for pattern in patterns {
                     let mut current_string_index = 0_usize;
 
                     loop {
+                        // Clear values from the last iteration
+                        if collect_matching_substrings {
+                            let [ref mut regmatch_t] = regmatch_t_array;
+
+                            regmatch_t.rm_so = -1;
+                            regmatch_t.rm_eo = -1;
+                        }
+
                         let current_string_slice = &input_slice[current_string_index..];
 
                         let current_string_c_string = CString::new(current_string_slice).unwrap();
 
-                        let mut regmatch_t_vec = vec![
-                            regmatch_t {
-                                rm_so: -1,
-                                rm_eo: -1,
-                            };
-                            nmatch_to_use
-                        ];
+                        let current_string_pointer = current_string_c_string.as_ptr();
 
-                        let regmatch_vec_pointer = regmatch_t_vec.as_mut_ptr();
-
-                        let regexec_return_value = unsafe {
-                            regexec(
-                                p,
-                                current_string_c_string.as_ptr(),
-                                nmatch_to_use,
-                                regmatch_vec_pointer,
-                                0,
-                            )
-                        };
+                        let regexec_return_value =
+                            unsafe { regexec(pattern, current_string_pointer, nmatch, pmatch, 0) };
 
                         if regexec_return_value != 0 {
                             debug_assert!(regexec_return_value == REG_NOMATCH);
@@ -394,15 +391,20 @@ impl Patterns {
                         }
 
                         if !collect_matching_substrings {
-                            return (true, Vec::<Vec<u8>>::new());
+                            return MatchesResult::fast_path_match();
                         }
 
                         any_pattern_matched = true;
 
-                        let regmatch_t = regmatch_t_vec.first().unwrap();
+                        let [regmatch_t] = regmatch_t_array;
 
-                        let start = usize::try_from(regmatch_t.rm_so).unwrap();
-                        let end = usize::try_from(regmatch_t.rm_eo).unwrap();
+                        let regmatch_t { rm_so, rm_eo } = regmatch_t;
+
+                        debug_assert!(rm_so != -1);
+                        debug_assert!(rm_eo != -1);
+
+                        let start = usize::try_from(rm_so).unwrap();
+                        let end = usize::try_from(rm_eo).unwrap();
 
                         // TODO
                         // Is this the right fix?
@@ -418,9 +420,12 @@ impl Patterns {
                         current_string_index += end;
                     }
                 }
-
-                (any_pattern_matched, matching_substrings)
             }
+        }
+
+        MatchesResult {
+            any_pattern_matched,
+            matching_substrings,
         }
     }
 }
@@ -460,6 +465,21 @@ struct GrepModel {
     input_files: Vec<String>,
     stdout_lock: StdoutLock<'static>,
     only_matching: bool,
+}
+
+struct MatchesResult {
+    any_pattern_matched: bool,
+    /// Will always be empty if the -o option is not being used
+    matching_substrings: Vec<Vec<u8>>,
+}
+
+impl MatchesResult {
+    pub fn fast_path_match() -> MatchesResult {
+        MatchesResult {
+            any_pattern_matched: true,
+            matching_substrings: Vec::<Vec<u8>>::new(),
+        }
+    }
 }
 
 impl GrepModel {
@@ -542,15 +562,20 @@ impl GrepModel {
                         _ => line.as_str(),
                     };
 
-                    let (line_matches_any_pattern, matching_substrings) = self.patterns.matches(
+                    let matches_result = self.patterns.matches(
                         line_without_newline,
                         self.only_matching && matches!(self.output_mode, OutputMode::Default),
                     );
 
+                    let MatchesResult {
+                        any_pattern_matched,
+                        matching_substrings,
+                    } = matches_result;
+
                     let matches = if self.invert_match {
-                        !line_matches_any_pattern
+                        !any_pattern_matched
                     } else {
-                        line_matches_any_pattern
+                        any_pattern_matched
                     };
 
                     if matches {

@@ -228,7 +228,7 @@ impl Walker {
             }
         } else {
             for (str, _) in vec {
-                writeln!(output, "msgid {}", str)?;
+                writeln!(output, "msgid \"{}\"", str)?;
                 writeln!(output, "msgstr \"\"")?;
                 writeln!(output, "")?;
             }

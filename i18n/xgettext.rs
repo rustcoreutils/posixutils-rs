@@ -8,8 +8,10 @@
 //
 
 use std::collections::{HashMap, HashSet};
+use std::env::current_dir;
 use std::ffi::OsStr;
-use std::fs::read_to_string;
+use std::fs::{read_to_string, File};
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::exit;
 
@@ -38,10 +40,9 @@ struct Args {
 
     #[arg(
         short,
-        default_value_t = String::from("messages"),
         help = gettext("Name the default output file DEFAULT_DOMAIN.po instead of messages.po")
     )]
-    default_domain: String,
+    default_domain: Option<String>,
 
     #[arg(
         short,
@@ -208,6 +209,32 @@ impl Walker {
             }
         };
     }
+
+    pub fn write(&self, output: PathBuf, numbers_lines: bool) -> std::io::Result<()> {
+        let mut output = File::create(output)?;
+
+        let mut vec: Vec<_> = self.messages.iter().collect();
+        vec.sort_by(|a, b| a.0.cmp(b.0));
+
+        if numbers_lines {
+            for (str, lines) in vec {
+                // TODO lines.sort();
+                for line in lines {
+                    writeln!(output, "#: {}", line)?;
+                }
+                writeln!(output, "msgid \"{}\"", str)?;
+                writeln!(output, "msgstr \"\"")?;
+                writeln!(output, "")?;
+            }
+        } else {
+            for (str, _) in vec {
+                writeln!(output, "msgid {}", str)?;
+                writeln!(output, "msgstr \"\"")?;
+                writeln!(output, "")?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -241,8 +268,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // TODO walker.to_file()
-    dbg!(&walker);
+    let output = args
+        .pathname
+        .unwrap_or_else(|| current_dir().unwrap())
+        .join(format!(
+            "{}.pot",
+            args.default_domain
+                .unwrap_or_else(|| { "messages".to_string() })
+        ));
+
+    walker.write(output, args.numbers_lines)?;
 
     exit(0)
 }

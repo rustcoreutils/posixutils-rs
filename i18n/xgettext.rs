@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::read_to_string;
 use std::path::PathBuf;
@@ -108,7 +108,29 @@ struct Args {
 pub struct Walker {
     keywords: HashSet<String>,
     /// msgid
-    messages: Vec<LitStr>,
+    messages: HashMap<String, Vec<Line>>,
+}
+
+#[derive(PartialEq)]
+pub struct Line {
+    path: String,
+    line: usize,
+    // column: usize,
+}
+
+impl std::fmt::Display for Line {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.path, self.line)?;
+        Ok(())
+    }
+}
+
+// #[cfg(test)]
+impl std::fmt::Debug for Line {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self)?;
+        Ok(())
+    }
 }
 
 impl Walker {
@@ -121,7 +143,7 @@ impl Walker {
 
         Self {
             keywords,
-            messages: vec![],
+            messages: HashMap::new(),
         }
     }
 
@@ -129,28 +151,25 @@ impl Walker {
         todo!();
     }
 
-    pub fn process_rust_file(&mut self, path: PathBuf) -> std::io::Result<()> {
-        let content = read_to_string(path)?;
-        // TODO remove unwrap()
-        let file = parse_file(&content).unwrap();
-        self.walk(file.into_token_stream());
+    pub fn process_rust_file(&mut self, content: String, path: String) -> Result<(), syn::Error> {
+        let file = parse_file(&content)?;
+        self.walk(file.into_token_stream(), &path);
         Ok(())
     }
 
-    fn walk(&mut self, stream: TokenStream) {
+    fn walk(&mut self, stream: TokenStream, path: &String) {
         let mut iter = stream.into_iter().peekable();
         while let Some(token) = iter.next() {
             match token {
                 TokenTree::Group(group) => {
                     // going into recursion
-                    self.walk(group.stream());
+                    self.walk(group.stream(), path);
                 }
                 TokenTree::Ident(ident) => {
                     if self.keywords.contains(&ident.to_string()) {
                         if let Some(TokenTree::Group(group)) = iter.peek() {
                             if let Some(literal) = Self::extract(group.stream()) {
-                                // TODO filename
-                                self.messages.push(literal);
+                                self.push(literal, path);
                             }
                             let _ = iter.next();
                         }
@@ -165,9 +184,29 @@ impl Walker {
     fn extract(stream: TokenStream) -> Option<LitStr> {
         let mut iter = stream.into_iter().peekable();
         if let Some(TokenTree::Literal(literal)) = iter.next() {
-            return parse_str(&literal.to_string()).ok();
+            let span = literal.span();
+            let literal: Option<LitStr> = parse_str(&literal.to_string()).ok();
+            if let Some(mut literal) = literal {
+                literal.set_span(span);
+                return Some(literal);
+            }
         }
         None
+    }
+
+    fn push(&mut self, literal: LitStr, path: &String) {
+        let path = path.clone();
+        let lc = literal.span().start();
+        let line = lc.line;
+        // let column = lc.column;
+        let line = Line { path, line };
+        let value = literal.value();
+        match self.messages.get_mut(&value) {
+            Some(v) => v.push(line),
+            None => {
+                self.messages.insert(value, vec![line]);
+            }
+        };
     }
 }
 
@@ -193,7 +232,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for path in args.files {
         match path.extension().and_then(OsStr::to_str) {
             Some("c") => walker.process_c_file(path)?,
-            Some("rs") => walker.process_rust_file(path)?,
+            Some("rs") => {
+                let content = read_to_string(&path)?;
+                let path = path.into_os_string().into_string().unwrap();
+                walker.process_rust_file(content, path)?;
+            }
             _ => todo!(),
         }
     }
@@ -208,19 +251,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
-    use quote::quote;
-
-    #[ignore]
     #[test]
-    fn test_walk() {
-        let stream = quote! {
-            fn main() {
-                assert_eq!("Hello, world!", gettext("Hello, world!"));
-            }
-        };
-
+    fn test_process_rust_file() {
+        let code = String::from(
+            r#"fn main() {
+    assert_eq!("Hello, world!", gettext("Hello, world!"));
+}
+"#,
+        );
         let mut walker = Walker::new(vec!["gettext".into()]);
-        walker.walk(stream);
-        // assert_eq!(walker.messages, vec!["Hello, world!".into()]);
+        walker
+            .process_rust_file(code, "test_process_rust_file.rs".to_string())
+            .unwrap();
+        assert_eq!(walker.messages.keys().len(), 1);
+        let lines = &walker.messages["Hello, world!"];
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0],
+            Line {
+                path: "test_process_rust_file.rs".into(),
+                line: 2
+            }
+        );
     }
 }

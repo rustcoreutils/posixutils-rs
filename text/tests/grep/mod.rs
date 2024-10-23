@@ -81,7 +81,7 @@ fn test_absent_pattern() {
         &[],
         "",
         "",
-        "Required at least one pattern list or file\n",
+        "A pattern list or at least one file is required\n",
         2,
     );
 }
@@ -1388,4 +1388,48 @@ fn test_long_names_files() {
             "",
             0,
         );
+}
+
+#[test]
+fn test_dash_o() {
+    const INPUT: &str = "\
+Contains KEYWORD here and also here: KEYWORD
+Output is not organized: one KEYWORD per output line
+Regardless of which input line it was found in
+";
+
+    grep_test(
+        &["-o", "KEYWORD"],
+        INPUT,
+        "\
+KEYWORD
+KEYWORD
+KEYWORD
+",
+        "",
+        0_i32,
+    );
+
+    grep_test(&["-o", "NOT PRESENT"], INPUT, "", "", 1_i32);
+
+    grep_test(&["-o", "-v", "NOT PRESENT"], INPUT, "", "", 0_i32);
+
+    grep_test(
+        &["-o", "KEYWORD", "--", "-", "-"],
+        INPUT,
+        "\
+(standard input):KEYWORD
+(standard input):KEYWORD
+(standard input):KEYWORD
+",
+        "",
+        0_i32,
+    );
+}
+
+// Disabled due to implementation replacing empty patterns with ".*" on this platform
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn test_dash_o_empty_pattern() {
+    grep_test(&["-o", ""], "ABC", "", "", 0_i32);
 }

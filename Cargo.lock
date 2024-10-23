@@ -1359,8 +1359,11 @@ dependencies = [
  "clap",
  "gettext-rs",
  "plib",
+ "proc-macro2",
+ "quote",
  "strum",
  "strum_macros",
+ "syn 2.0.79",
 ]
 
 [[package]]

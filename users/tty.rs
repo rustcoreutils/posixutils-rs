@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+use plib::curuser::tty;
 use std::io::{self, IsTerminal};
 
 fn main() {
@@ -16,7 +17,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    let ttyname = plib::curuser::tty();
+    let ttyname = tty();
 
     println!("{}", ttyname);
 }

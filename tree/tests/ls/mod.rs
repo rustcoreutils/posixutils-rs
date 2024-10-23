@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::{run_test, run_test_with_checker, TestPlan};
+use plib::testing::{run_test, run_test_with_checker, TestPlan};
 use regex::Regex;
 use std::ffi::CString;
 use std::fs;

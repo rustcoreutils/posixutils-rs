@@ -43,16 +43,20 @@ const MAX_GROUPS: usize = libc::KERN_NGROUPS_MAX as usize;
 #[cfg(target_os = "macos")]
 const MAX_GROUPS: usize = 16;
 
-/// newgrp — change to a new group
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[derive(Parser)]
+#[command(version, about = "newgrp — change to a new group")]
 struct Args {
-    /// Change the environment to what would be expected if the user actually logged in again (letter `l`).
-    #[arg(short = 'l')]
+    #[arg(
+        short = 'l',
+        help = "Change the environment to what would be expected if the user actually logged in again (letter 'l')."
+    )]
     login: bool,
 
-    /// Specifies the group ID or group name. This is a positional argument that must be provided.
-    #[arg(value_name = "GROUP", required = true)]
+    #[arg(
+        value_name = "GROUP",
+        required = true,
+        help = "Specifies the group ID or group name. This is a positional argument that must be provided."
+    )]
     group: String,
 }
 
@@ -496,49 +500,16 @@ fn find_matching_group(group_identifier: &str, groups: &Vec<Group>) -> Option<Gr
 ///
 fn logger(name: &str, gid: u32) {
     // Get the current login name
-    let loginname = get_current_login().unwrap_or("???".to_string());
+    let loginname = plib::curuser::login_name();
 
     // Get the current tty device name
-    let tty = get_current_tty().unwrap_or("???".to_string());
+    let tty = plib::curuser::tty();
 
     // Log the message
     eprintln!(
         "user '{}' (login '{}' on {}) switched to group with id '{}'",
         name, loginname, tty, gid
     );
-}
-
-/// Retrieves the current login name.
-fn get_current_login() -> Option<String> {
-    unsafe {
-        let login_ptr = libc::getlogin();
-        if !login_ptr.is_null() {
-            CStr::from_ptr(login_ptr)
-                .to_str()
-                .ok()
-                .map(|s| s.to_string())
-        } else {
-            None
-        }
-    }
-}
-
-/// Retrieves the current tty name.
-fn get_current_tty() -> Option<String> {
-    unsafe {
-        let tty_ptr = libc::ttyname(0);
-        if !tty_ptr.is_null() {
-            CStr::from_ptr(tty_ptr).to_str().ok().map(|s| {
-                if s.starts_with("/dev/") {
-                    s[5..].to_string()
-                } else {
-                    s.to_string()
-                }
-            })
-        } else {
-            None
-        }
-    }
 }
 
 /// Checks permissions for accessing a specified group based on the provided user credentials.
@@ -822,6 +793,11 @@ fn set_login_environment(user: &str) -> Result<(), io::Error> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    setlocale(LocaleCategory::LcAll, "");
+    textdomain(PROJECT_NAME)?;
+    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    let mut exit_code = 0;
+
     let args = Args::try_parse().unwrap_or_else(|err| {
         if err.kind() == ErrorKind::DisplayHelp || err.kind() == ErrorKind::DisplayVersion {
             // Print help or version message
@@ -834,11 +810,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Exit with a non-zero status code
         std::process::exit(1);
     });
-
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
-    let mut exit_code = 0;
 
     if let Err(err) = newgrp(args) {
         exit_code = 1;

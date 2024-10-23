@@ -14,7 +14,7 @@ gettext-rs.workspace = true
 libc.workspace = true
 chrono.workspace = true
 syslog = "6.1"
-libcrypt-rs = "0.1.2"
+libcrypt-rs = "0.1"
 thiserror = "1.0"
 binrw = "0.14"
 

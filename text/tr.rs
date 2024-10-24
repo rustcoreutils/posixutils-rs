@@ -47,13 +47,23 @@ impl Args {
             return Err("options '-c' and '-C' cannot be used together".to_owned());
         }
 
-        #[allow(clippy::collapsible_if)]
-        if self.string2.is_none() {
-            if !self.delete && !self.squeeze_repeats {
-                return Err(format!(
-                    "missing operand after '{}'. Two strings must be given when translating.",
-                    self.string1
-                ));
+        match &self.string2 {
+            Some(st) => {
+                if self.delete && !self.squeeze_repeats {
+                    return Err(format!(
+                        "\
+extra operand '{st}'
+Only one string may be given when deleting without squeezing repeats."
+                    ));
+                }
+            }
+            None => {
+                if !self.delete && !self.squeeze_repeats {
+                    return Err(format!(
+                        "missing operand after '{}'. Two strings must be given when translating.",
+                        self.string1
+                    ));
+                }
             }
         }
 

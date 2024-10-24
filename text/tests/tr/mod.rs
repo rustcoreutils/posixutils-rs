@@ -782,3 +782,14 @@ A ᚠᛏᛘᛌᛏᛏᛧᛧ B",
 fn tr_multi_byte_squeeze_translate() {
     tr_test(&["-s", "ᚢ", "A"], "123 ᚢᚢᚢᚢᚢᚢ 456", "123 A 456");
 }
+
+#[test]
+fn tr_dash_d_two_strings() {
+    tr_bad_arguments_failure_test(
+        &["-d", "A", "B"],
+        "\
+tr: extra operand 'B'
+Only one string may be given when deleting without squeezing repeats.
+",
+    );
+}

@@ -103,7 +103,7 @@ static MONITORED_PID: AtomicI32 = AtomicI32::new(0);
 static TIMED_OUT: AtomicBool = AtomicBool::new(false);
 
 #[derive(Parser)]
-#[command(version, about = gettext("timeout — execute a utility with a time limit"))]
+#[command(version, about = gettext("timeout - execute a utility with a time limit"))]
 struct Args {
     #[arg(short = 'f', long, help=gettext("Only time out the utility itself, not its descendants."))]
     foreground: bool,

@@ -108,15 +108,15 @@ struct Args {
 // #[cfg_attr(test, derive(Debug))]
 pub struct Walker {
     keywords: HashSet<String>,
+    numbers_lines: bool,
     /// msgid
     messages: HashMap<String, Vec<Line>>,
 }
 
-#[derive(PartialEq)]
+#[derive(Eq, PartialEq, PartialOrd, Ord)]
 pub struct Line {
     path: String,
     line: usize,
-    // column: usize,
 }
 
 impl std::fmt::Display for Line {
@@ -135,7 +135,7 @@ impl std::fmt::Debug for Line {
 }
 
 impl Walker {
-    pub fn new(keyword_spec: Vec<String>) -> Self {
+    pub fn new(keyword_spec: Vec<String>, numbers_lines: bool) -> Self {
         assert!(!keyword_spec.is_empty());
         let mut keywords = HashSet::new();
         for value in keyword_spec {
@@ -144,6 +144,7 @@ impl Walker {
 
         Self {
             keywords,
+            numbers_lines,
             messages: HashMap::new(),
         }
     }
@@ -196,42 +197,61 @@ impl Walker {
     }
 
     fn push(&mut self, literal: LitStr, path: &String) {
-        let path = path.clone();
-        let lc = literal.span().start();
-        let line = lc.line;
-        // let column = lc.column;
-        let line = Line { path, line };
         let value = literal.value();
-        match self.messages.get_mut(&value) {
-            Some(v) => v.push(line),
-            None => {
-                self.messages.insert(value, vec![line]);
-            }
-        };
+        if self.numbers_lines {
+            let path = path.clone();
+            let lc = literal.span().start();
+            let line = lc.line;
+            // let column = lc.column;
+            let line = Line { path, line };
+            match self.messages.get_mut(&value) {
+                Some(v) => v.push(line),
+                None => {
+                    self.messages.insert(value, vec![line]);
+                }
+            };
+        } else {
+            match self.messages.get_mut(&value) {
+                Some(_) => {}
+                None => {
+                    self.messages.insert(value, vec![]);
+                }
+            };
+        }
     }
 
-    pub fn write(&self, output: PathBuf, numbers_lines: bool) -> std::io::Result<()> {
-        let mut output = File::create(output)?;
+    pub fn sort(&mut self) {
+        if !self.numbers_lines {
+            return;
+        }
+        for (_, lines) in &mut self.messages {
+            lines.sort();
+        }
+    }
 
+    fn escape(value: &String) -> String {
+        format!(
+            "\"{}\"",
+            value.replace("\"", "\\\"").replace("\n", "\\n\"\n\"")
+        )
+    }
+}
+
+impl std::fmt::Display for Walker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut vec: Vec<_> = self.messages.iter().collect();
         vec.sort_by(|a, b| a.0.cmp(b.0));
-
-        if numbers_lines {
-            for (str, lines) in vec {
-                // TODO lines.sort();
-                for line in lines {
-                    writeln!(output, "#: {}", line)?;
-                }
-                writeln!(output, "msgid \"{}\"", str)?;
-                writeln!(output, "msgstr \"\"")?;
-                writeln!(output, "")?;
+        for (str, lines) in vec {
+            debug_assert!(
+                (self.numbers_lines && !lines.is_empty())
+                    || (!self.numbers_lines && lines.is_empty())
+            );
+            for line in lines {
+                writeln!(f, "#: {}", line)?;
             }
-        } else {
-            for (str, _) in vec {
-                writeln!(output, "msgid \"{}\"", str)?;
-                writeln!(output, "msgstr \"\"")?;
-                writeln!(output, "")?;
-            }
+            writeln!(f, "msgid {}", Self::escape(str))?;
+            writeln!(f, "msgstr \"\"")?;
+            writeln!(f, "")?;
         }
         Ok(())
     }
@@ -254,7 +274,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // TODO remove this
     args.keyword_spec.push("gettext".into());
 
-    let mut walker = Walker::new(args.keyword_spec);
+    let mut walker = Walker::new(args.keyword_spec, args.numbers_lines);
 
     for path in args.files {
         match path.extension().and_then(OsStr::to_str) {
@@ -268,6 +288,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    walker.sort();
+
     let output = args
         .pathname
         .unwrap_or_else(|| current_dir().unwrap())
@@ -277,7 +299,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or_else(|| { "messages".to_string() })
         ));
 
-    walker.write(output, args.numbers_lines)?;
+    let mut output = File::create(output)?;
+    write!(output, "{}", walker)?;
 
     exit(0)
 }
@@ -285,6 +308,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn test_process_rust_file() {
@@ -294,7 +319,7 @@ mod tests {
 }
 "#,
         );
-        let mut walker = Walker::new(vec!["gettext".into()]);
+        let mut walker = Walker::new(vec!["gettext".into()], true);
         walker
             .process_rust_file(code, "test_process_rust_file.rs".to_string())
             .unwrap();
@@ -308,5 +333,52 @@ mod tests {
                 line: 2
             }
         );
+    }
+
+    #[test]
+    fn test_process_rust_file_format() {
+        let code = String::from(
+            r#"fn main() {
+    assert_eq!("Hello, world!", gettext("Hello, world!"));
+}
+"#,
+        );
+        let mut walker = Walker::new(vec!["gettext".into()], true);
+        walker
+            .process_rust_file(code, "test_process_rust_file_format.rs".to_string())
+            .unwrap();
+        assert_eq!(
+            format!("{}", walker),
+            r#"#: test_process_rust_file_format.rs:2
+msgid "Hello, world!"
+msgstr ""
+
+"#
+        );
+    }
+
+    #[test]
+    fn test_escape() {
+        let value = Walker::escape(
+            &"{about}\n\nUsage: {usage}\n\nArguments:\n{positionals}\n\nOptions:\n{options}".into(),
+        );
+        assert_eq!(
+            value,
+            r#""{about}\n"
+"\n"
+"Usage: {usage}\n"
+"\n"
+"Arguments:\n"
+"{positionals}\n"
+"\n"
+"Options:\n"
+"{options}""#
+        );
+    }
+
+    #[test]
+    fn test_escape2() {
+        let value = Walker::escape(&"string \"string2\" string".into());
+        assert_eq!(value, r#""string \"string2\" string""#);
     }
 }

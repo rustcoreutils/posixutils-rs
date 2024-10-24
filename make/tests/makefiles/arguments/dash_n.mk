@@ -1,0 +1,2 @@
+rule:
+	exit 1

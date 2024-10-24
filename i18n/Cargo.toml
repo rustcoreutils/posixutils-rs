@@ -15,6 +15,13 @@ bytemuck = { version = "1.17", features = ["derive"] }
 byteorder = "1.5"
 strum = "0.26"
 strum_macros = "0.26"
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+syn = { version = "2", features = ["parsing", "full"] }
+
+[dev-dependencies]
+tempfile = "3.10"
+pretty_assertions = "1.4"
 
 [lints]
 workspace = true
@@ -26,3 +33,7 @@ path = "./gencat.rs"
 [[bin]]
 name = "iconv"
 path = "./iconv.rs"
+
+[[bin]]
+name = "xgettext"
+path = "./xgettext.rs"

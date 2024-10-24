@@ -33,7 +33,7 @@ pub fn to_ucs4<I: Iterator<Item = u8> + 'static>(
                 return Some(code_point);
 
             // 2 bytes
-            } else if byte >= 0xC0 && byte <= 0xDF {
+            } else if (0xC0..=0xDF).contains(&byte) {
                 if buffer.len() < 2 {
                     let add_bytes = input.by_ref().take(2 - buffer.len()).collect::<Vec<_>>();
                     buffer.extend(add_bytes);
@@ -76,7 +76,7 @@ pub fn to_ucs4<I: Iterator<Item = u8> + 'static>(
                 return Some(code_point);
 
             // 3 bytes
-            } else if byte >= 0xE0 && byte <= 0xEF {
+            } else if (0xE0..=0xEF).contains(&byte) {
                 if buffer.len() < 3 {
                     let add_bytes = input.by_ref().take(3 - buffer.len()).collect::<Vec<_>>();
                     buffer.extend(add_bytes);
@@ -121,7 +121,7 @@ pub fn to_ucs4<I: Iterator<Item = u8> + 'static>(
                 return Some(code_point);
 
             // 4 bytes
-            } else if byte >= 0xF0 && byte <= 0xF4 {
+            } else if (0xF0..=0xF4).contains(&byte) {
                 if buffer.len() < 4 {
                     let add_bytes = input.by_ref().take(4 - buffer.len()).collect::<Vec<_>>();
                     buffer.extend(add_bytes);
@@ -155,7 +155,7 @@ pub fn to_ucs4<I: Iterator<Item = u8> + 'static>(
                     | ((buffer[1] as u32 & 0x3F) << 12)
                     | ((buffer[2] as u32 & 0x3F) << 6)
                     | (buffer[3] as u32 & 0x3F);
-                if code_point > 0x10FFFF || code_point < 0x10000 {
+                if !(0x10000..=0x10FFFF).contains(&code_point) {
                     if omit_invalid {
                         buffer.drain(0..4);
                         continue;

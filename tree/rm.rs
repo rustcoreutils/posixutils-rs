@@ -14,7 +14,6 @@ use ftw::{symlink_metadata, traverse_directory};
 use self::common::error_string;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 use std::{
     fs,
     io::{self, IsTerminal},
@@ -432,12 +431,11 @@ fn rm_path(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
-    let args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
+
+    let args = Args::parse();
 
     let is_tty = io::stdin().is_terminal();
     let cfg = RmConfig { args, is_tty };

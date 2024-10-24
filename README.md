@@ -80,6 +80,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] gencat (i18n)
  - [x] grep
  - [x] head
+ - [x] iconv (i18n)
  - [x] join
  - [x] link
  - [x] ls
@@ -127,12 +128,14 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] logname
  - [x] mesg
  - [x] mkfifo
+ - [x] newgrp
  - [x] nice
  - [x] nohup
  - [x] pathchk
  - [x] pwd
  - [x] renice
  - [x] sleep
+ - [x] talk
  - [x] tee
  - [x] touch
  - [x] tty
@@ -190,12 +193,11 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
  ### i18n category
  - [ ] gettext (i18n)
- - [ ] iconv (i18n) (status: in progress)
- - [ ] locale (i18n)
+ - [ ] locale (i18n) -- status: in progress
  - [ ] localedef (i18n)
  - [ ] msgfmt (i18n)
  - [ ] ngettext (i18n)
- - [ ] xgettext (i18n)
+ - [ ] xgettext (i18n) -- status: in progress
 
 ### UUCP category 
  - [ ] uucp (UUCP)
@@ -213,12 +215,10 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] make (status: in progress)
  - [ ] man (status: in progress)
  - [ ] more
- - [ ] newgrp
  - [ ] patch (status: in progress)
  - [ ] pax
  - [ ] sed
- - [ ] sh -- Volunteer starting point at https://github.com/rustcoreutils/posixutils-rs/tree/shell
- - [ ] talk (status: in progress)
+ - [ ] sh (status: in progress)
 
 ## Installation
 

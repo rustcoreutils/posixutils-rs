@@ -14,7 +14,7 @@ use ftw::{metadata, symlink_metadata, Metadata};
 use self::ls_util::{ls_from_utf8_lossy, Entry, LongFormatPadding, MultiColumnPadding};
 use clap::{CommandFactory, FromArgMatches, Parser};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::{platform::P_WINSIZE_REQUEST_CODE, PROJECT_NAME};
+use plib::platform::P_WINSIZE_REQUEST_CODE;
 use std::{
     collections::HashMap,
     ffi::{CString, OsStr},
@@ -1314,9 +1314,8 @@ fn process_single_dir(
 
 fn main() -> ExitCode {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME).unwrap();
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8").unwrap();
-
+    textdomain(env!("PROJECT_NAME")).unwrap();
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8").unwrap();
     let (config, paths) = Config::new();
 
     match ls(paths, &config) {

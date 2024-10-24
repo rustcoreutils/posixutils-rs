@@ -7,12 +7,14 @@
 // SPDX-License-Identifier: MIT
 //
 
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 use std::error::Error;
 use std::io::{self, Read, StdoutLock, Write};
 use std::path::PathBuf;
+
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use plib::io::input_stream;
+use plib::BUFSZ;
 
 const N_C_GROUP: &str = "N_C_GROUP";
 
@@ -48,7 +50,7 @@ fn head_file(
     want_header: bool,
     stdout_lock: &mut StdoutLock,
 ) -> Result<(), Box<dyn Error>> {
-    const BUFFER_SIZE: usize = plib::BUFSZ;
+    const BUFFER_SIZE: usize = BUFSZ;
 
     // print file header
     if want_header {
@@ -60,7 +62,7 @@ fn head_file(
     }
 
     // open file, or stdin
-    let mut file = plib::io::input_stream(pathname, false)?;
+    let mut file = input_stream(pathname, false)?;
 
     let mut raw_buffer = [0_u8; BUFFER_SIZE];
 
@@ -141,7 +143,10 @@ fn head_file(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
+    setlocale(LocaleCategory::LcAll, "");
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
+
     let mut args = Args::parse();
 
     // bsdutils (FreeBSD) enforces n > 0 (and c > 0)
@@ -177,10 +182,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             unreachable!();
         }
     };
-
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
     let files = &mut args.files;
 

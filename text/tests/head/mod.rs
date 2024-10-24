@@ -8,7 +8,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::{run_test, TestPlan};
+use plib::testing::{run_test, TestPlan};
 use rand::{seq::SliceRandom, thread_rng};
 
 /* #region Normal tests */
@@ -121,7 +121,7 @@ fn test_head_c() {
 
 /* #region Property-based tests */
 mod property_tests {
-    use plib::run_test_base;
+    use plib::testing::run_test_base;
     use proptest::{prelude::TestCaseError, prop_assert, test_runner::TestRunner};
     use std::{
         sync::mpsc::{self, RecvTimeoutError},

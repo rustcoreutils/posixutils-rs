@@ -8,7 +8,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::{run_test, TestPlan};
+use plib::testing::{run_test, TestPlan};
 
 fn tr_test(args: &[&str], test_data: &str, expected_output: &str) {
     let str_args = args

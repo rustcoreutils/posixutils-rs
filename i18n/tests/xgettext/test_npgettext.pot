@@ -1,0 +1,7 @@
+#: tests/xgettext/test_npgettext.rs:10
+msgctxt "This is the context"
+msgid "One thing"
+msgid_plural "Multiple things"
+msgstr[0] ""
+msgstr[1] ""
+

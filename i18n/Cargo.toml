@@ -21,6 +21,7 @@ syn = { version = "2", features=["full", "visit", "extra-traits", "printing"] }
 
 [dev-dependencies]
 tempfile = "3.10"
+pretty_assertions = "1.4"
 
 [lints]
 workspace = true

@@ -16,6 +16,7 @@ use clap::Parser;
 use gettextrs::{
     bind_textdomain_codeset, bindtextdomain, gettext, setlocale, textdomain, LocaleCategory,
 };
+use plib::i18n::ClapLocale;
 use plib::PROJECT_NAME;
 
 #[derive(Parser)]
@@ -50,6 +51,8 @@ struct Args {
     #[arg(short = 'V', long, help = gettext("Print version"), action = clap::ArgAction::Version)]
     version: Option<bool>,
 }
+
+impl ClapLocale for Args {}
 
 enum TimeError {
     ExecCommand(String),
@@ -138,7 +141,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     bindtextdomain(PROJECT_NAME, "locale")?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
-    let args = Args::parse();
+    let args = Args::parse_with_locale();
 
     if let Err(err) = time(args) {
         match err {
@@ -157,5 +160,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    Status::Ok.exit()
+    Status::Ok.exit();
 }

@@ -1,6 +1,5 @@
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 use setup::{ForRemoval, ForTranslation};
 use std::error::Error;
 use std::process;
@@ -290,8 +289,8 @@ fn tr(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
 fn main() -> Result<(), Box<dyn Error>> {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
 
     let args = Args::parse();
 

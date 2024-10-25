@@ -12,12 +12,12 @@
 // - Proper -v specification support.  is it even necessary?
 //
 
+use std::collections::HashMap;
+use std::ffi::CString;
+
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use libc::{pathconf, sysconf};
-use plib::PROJECT_NAME;
-use std::collections::HashMap;
-use std::ffi::CString;
 
 #[derive(Parser)]
 #[command(version, about = gettext("getconf - get configuration values"))]
@@ -324,13 +324,11 @@ fn load_pathconf_mapping() -> HashMap<&'static str, libc::c_int> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Parse command line arguments
-    let args = Args::parse();
-
-    // Set locale and text domain for localization
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
+
+    let args = Args::parse();
 
     if let Some(pathname) = args.pathname {
         let pathconf_mappings = load_pathconf_mapping();

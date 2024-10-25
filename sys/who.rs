@@ -11,10 +11,12 @@
 // - implement -T, -u options
 //
 
+use std::path::PathBuf;
+
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::{platform, PROJECT_NAME};
-use std::path::PathBuf;
+use plib::utmpx::Utmpx;
+use plib::{curuser, platform, utmpx};
 
 /// who - display who is on the system
 #[derive(Parser)]
@@ -86,7 +88,7 @@ fn fmt_timestamp(ts: libc::time_t) -> String {
     dt.format("%b %e %H:%M").to_string()
 }
 
-fn print_fmt_short(entry: &plib::utmpx::Utmpx, line: &str) {
+fn print_fmt_short(entry: &Utmpx, line: &str) {
     println!(
         "{:<16} {:<12} {}",
         entry.user,
@@ -95,7 +97,7 @@ fn print_fmt_short(entry: &plib::utmpx::Utmpx, line: &str) {
     );
 }
 
-fn print_fmt_term(entry: &plib::utmpx::Utmpx, line: &str) {
+fn print_fmt_term(entry: &Utmpx, line: &str) {
     let term_state = '?';
     println!(
         "{:<16} {} {:<12} {}",
@@ -107,7 +109,7 @@ fn print_fmt_term(entry: &plib::utmpx::Utmpx, line: &str) {
 }
 
 fn current_terminal() -> String {
-    let s = plib::curuser::tty();
+    let s = curuser::tty();
     if let Some(st) = s.strip_prefix("/dev/") {
         st.to_owned()
     } else {
@@ -115,7 +117,7 @@ fn current_terminal() -> String {
     }
 }
 
-fn print_entry(args: &Args, entry: &plib::utmpx::Utmpx) {
+fn print_entry(args: &Args, entry: &Utmpx) {
     // Skip if current_terminal option is set and this entry is not for the current terminal
     if args.current_terminal {
         let current_tty = current_terminal();
@@ -161,7 +163,7 @@ fn show_utmpx_entries(args: &Args) {
         );
     }
 
-    let entries = plib::utmpx::load();
+    let entries = utmpx::load();
     for entry in &entries {
         print_entry(args, entry);
     }
@@ -169,7 +171,7 @@ fn show_utmpx_entries(args: &Args) {
 
 fn show_utmpx_summary() {
     let mut count = 0;
-    let entries = plib::utmpx::load();
+    let entries = utmpx::load();
     for entry in &entries {
         if !entry.user.is_empty() {
             println!("{}", entry.user);
@@ -181,7 +183,10 @@ fn show_utmpx_summary() {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // manual CLI parse for special "who am i" case
+    setlocale(LocaleCategory::LcAll, "");
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let am_i = args.len() == 2 && args[0] == "am" && (args[1] == "i" || args[1] == "I");
 
@@ -206,10 +211,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else if !args.boot && !args.dead && !args.login && !args.process && !args.runlevel {
         args.userproc = true;
     }
-
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
     let mut exit_code = 0;
 

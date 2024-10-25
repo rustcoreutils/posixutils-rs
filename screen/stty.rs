@@ -12,12 +12,12 @@
 
 mod osdata;
 
+use std::collections::HashMap;
+use std::io::{self, Error, ErrorKind};
+
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use osdata::{ParamType, PARG, PNEG};
-use plib::PROJECT_NAME;
-use std::collections::HashMap;
-use std::io::{self, Error, ErrorKind};
 use termios::{
     cc_t, cfgetispeed, cfgetospeed, cfsetispeed, cfsetospeed, speed_t, tcflag_t, tcsetattr,
     Termios, TCSANOW,
@@ -552,12 +552,11 @@ fn stty_set(ti: Termios, args: &Args) -> io::Result<()> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
-    let args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
+
+    let args = Args::parse();
 
     // load termio settings
     let ti = Termios::from_fd(libc::STDIN_FILENO)?;

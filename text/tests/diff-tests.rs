@@ -16,15 +16,36 @@ use plib::testing::{run_test, TestPlan};
 use std::{collections::HashMap, path::PathBuf, process::Stdio, sync::LazyLock};
 
 fn diff_test(args: &[&str], expected_output: &str, expected_diff_exit_status: u8) {
-    let str_args = args.iter().cloned().map(str::to_owned).collect();
+    let str_args = args
+        .iter()
+        .cloned()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
 
     run_test(TestPlan {
-        cmd: String::from("diff"),
+        cmd: "diff".to_owned(),
         args: str_args,
-        stdin_data: String::from(""),
-        expected_out: String::from(expected_output),
-        expected_err: String::from(""),
+        stdin_data: "".to_owned(),
+        expected_out: expected_output.to_owned(),
+        expected_err: "".to_owned(),
         expected_exit_code: i32::from(expected_diff_exit_status),
+    });
+}
+
+fn diff_test_failure(args: &[&str], expected_error: &str, exit_status: i32) {
+    let str_args = args
+        .iter()
+        .cloned()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+
+    run_test(TestPlan {
+        cmd: "diff".to_owned(),
+        args: str_args,
+        stdin_data: "".to_owned(),
+        expected_out: "".to_owned(),
+        expected_err: expected_error.to_owned(),
+        expected_exit_code: exit_status,
     });
 }
 
@@ -80,21 +101,29 @@ struct DiffTestHelper {
 
 impl DiffTestHelper {
     fn new(options: &str, file1_path: String, file2_path: String) -> Self {
-        let args = format!(
-            "run --release --bin diff --{} {} {}",
-            options, file1_path, file2_path
-        );
+        let mut command = std::process::Command::new("cargo");
 
-        let args_list = args.split(' ').collect::<Vec<&str>>();
+        // Arguments
+        {
+            command.args(["run", "--release", "--bin", "diff", "--"]);
 
-        let output = std::process::Command::new("cargo")
-            .args(args_list)
-            // .stdout(output_file)
+            for (us, st) in options.split(' ').enumerate() {
+                if us == 0_usize && st.is_empty() {
+                    continue;
+                }
+
+                command.arg(st);
+            }
+
+            command.args([file1_path.as_str(), file2_path.as_str()]);
+        }
+
+        let output = command
             .stdout(Stdio::piped())
             .output()
             .expect("Could not run cargo command!");
 
-        let content = String::from_utf8(output.stdout).expect("Failed to read output of Command!");
+        let content = String::from_utf8(output.stdout).expect("Failed to read stdout of `Command`");
 
         Self {
             file1_path,
@@ -119,57 +148,47 @@ impl DiffTestHelper {
 fn get_diff_test_helper_hash_map() -> HashMap<String, DiffTestHelper> {
     let diff_test_helper_init_data = [
         ("", f1_txt_path(), f2_txt_path(), "test_diff_normal"),
-        (" -c", f1_txt_path(), f2_txt_path(), "test_diff_context3"),
-        (" -C 1", f1_txt_path(), f2_txt_path(), "test_diff_context1"),
+        ("-c", f1_txt_path(), f2_txt_path(), "test_diff_context3"),
+        ("-C 1", f1_txt_path(), f2_txt_path(), "test_diff_context1"),
+        ("-C 10", f1_txt_path(), f2_txt_path(), "test_diff_context10"),
+        ("-e", f1_txt_path(), f2_txt_path(), "test_diff_edit_script"),
         (
-            " -C 10",
-            f1_txt_path(),
-            f2_txt_path(),
-            "test_diff_context10",
-        ),
-        (" -e", f1_txt_path(), f2_txt_path(), "test_diff_edit_script"),
-        (
-            " -f",
+            "-f",
             f1_txt_path(),
             f2_txt_path(),
             "test_diff_forward_edit_script",
         ),
-        (" -u", f1_txt_path(), f2_txt_path(), "test_diff_unified3"),
-        (" -U 0", f1_txt_path(), f2_txt_path(), "test_diff_unified0"),
-        (
-            " -U 10",
-            f1_txt_path(),
-            f2_txt_path(),
-            "test_diff_unified10",
-        ),
+        ("-u", f1_txt_path(), f2_txt_path(), "test_diff_unified3"),
+        ("-U 0", f1_txt_path(), f2_txt_path(), "test_diff_unified0"),
+        ("-U 10", f1_txt_path(), f2_txt_path(), "test_diff_unified10"),
         ("", f1_txt_path(), f2_dir_path(), "test_diff_file_directory"),
         ("", f1_dir_path(), f2_dir_path(), "test_diff_directories"),
         (
-            " -r",
+            "-r",
             f1_dir_path(),
             f2_dir_path(),
             "test_diff_directories_recursive",
         ),
         (
-            " -r -c",
+            "-r -c",
             f1_dir_path(),
             f2_dir_path(),
             "test_diff_directories_recursive_context",
         ),
         (
-            " -r -e",
+            "-r -e",
             f1_dir_path(),
             f2_dir_path(),
             "test_diff_directories_recursive_edit_script",
         ),
         (
-            " -r -f",
+            "-r -f",
             f1_dir_path(),
             f2_dir_path(),
             "test_diff_directories_recursive_forward_edit_script",
         ),
         (
-            " -r -u",
+            "-r -u",
             f1_dir_path(),
             f2_dir_path(),
             "test_diff_directories_recursive_unified",
@@ -181,17 +200,18 @@ fn get_diff_test_helper_hash_map() -> HashMap<String, DiffTestHelper> {
             "test_diff_counting_eol_spaces",
         ),
         (
-            " -b",
+            "-b",
             f1_txt_path(),
             f1_txt_with_eol_spaces_path(),
             "test_diff_ignoring_eol_spaces",
         ),
         (
-            " --label F1 --label2 F2 -u",
+            "--label F1 --label2 F2 -u",
             f1_txt_path(),
             f1_txt_with_eol_spaces_path(),
             "test_diff_unified_two_labels",
         ),
+        ("-s", f1_txt_path(), f1_txt_path(), "test_diff_s"),
     ];
 
     let mut diff_test_helper_hash_map =
@@ -431,5 +451,37 @@ fn test_diff_unified_two_labels() {
         ],
         data.content(),
         EXIT_STATUS_DIFFERENCE,
+    );
+}
+
+// If the paths are the same, BusyBox exits with exit status 0, but does not print the
+// "Files [...] and [...] are identical" message
+//
+// GNU Diffutils does print the message, and exits with exit status 0
+#[test]
+fn test_diff_s() {
+    let diff_test_helper = f1_txt_path();
+
+    let path = diff_test_helper.as_str();
+
+    for short_or_long in ["-s", "--report-identical-files"] {
+        diff_test(
+            &[short_or_long, path, path],
+            format!("Files {path} and {path} are identical\n").as_str(),
+            EXIT_STATUS_NO_DIFFERENCE,
+        );
+    }
+}
+
+// Errors like this were being printed to stdout instead of stderr
+#[test]
+fn test_diff_print_errors_to_stderr() {
+    diff_test_failure(
+        &["/7349c3b5970ba9c3", "/a74c002739306869"],
+        "\
+diff: /7349c3b5970ba9c3: No such file or directory
+diff: /a74c002739306869: No such file or directory
+",
+        2_i32,
     );
 }

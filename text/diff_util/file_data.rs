@@ -1,10 +1,17 @@
-use std::{fs::File, io, mem::take, path::PathBuf, str::from_utf8, time::SystemTime};
+use std::{
+    fs::File,
+    io,
+    mem::take,
+    path::{Display, Path},
+    str::from_utf8,
+    time::SystemTime,
+};
 
 use super::constants::COULD_NOT_UNWRAP_FILENAME;
 
 #[derive(Debug)]
 pub struct FileData<'a> {
-    path: PathBuf,
+    path: &'a Path,
     lines: Vec<&'a str>,
     modified: SystemTime,
     ends_with_newline: bool,
@@ -16,11 +23,11 @@ impl<'a> FileData<'a> {
     }
 
     pub fn get_file(
-        path: PathBuf,
+        path: &'a Path,
         lines: Vec<&'a str>,
         ends_with_newline: bool,
     ) -> io::Result<Self> {
-        let file = File::open(&path)?;
+        let file = File::open(path)?;
         let modified = file.metadata()?.modified()?;
 
         Ok(Self {
@@ -53,8 +60,8 @@ impl<'a> FileData<'a> {
         COULD_NOT_UNWRAP_FILENAME
     }
 
-    pub fn path(&self) -> &str {
-        self.path.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME)
+    pub fn path(&self) -> Display {
+        self.path.display()
     }
 }
 

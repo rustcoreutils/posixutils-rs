@@ -1,4 +1,4 @@
-use std::{collections::HashSet, ffi::OsString, io, path::PathBuf};
+use std::{collections::HashSet, ffi::OsString, io, path::Path};
 
 use crate::diff_util::{
     constants::COULD_NOT_UNWRAP_FILENAME, diff_exit_status::DiffExitStatus, file_diff::FileDiff,
@@ -7,16 +7,16 @@ use crate::diff_util::{
 use super::{common::FormatOptions, dir_data::DirData};
 
 pub struct DirDiff<'a> {
-    dir1: &'a mut DirData,
-    dir2: &'a mut DirData,
+    dir1: &'a mut DirData<'a>,
+    dir2: &'a mut DirData<'a>,
     format_options: &'a FormatOptions,
     recursive: bool,
 }
 
 impl<'a> DirDiff<'a> {
     fn new(
-        dir1: &'a mut DirData,
-        dir2: &'a mut DirData,
+        dir1: &'a mut DirData<'a>,
+        dir2: &'a mut DirData<'a>,
         format_options: &'a FormatOptions,
         recursive: bool,
     ) -> Self {
@@ -29,8 +29,8 @@ impl<'a> DirDiff<'a> {
     }
 
     pub fn dir_diff(
-        path1: PathBuf,
-        path2: PathBuf,
+        path1: &Path,
+        path2: &Path,
         format_options: &FormatOptions,
         recursive: bool,
     ) -> io::Result<DiffExitStatus> {
@@ -48,15 +48,7 @@ impl<'a> DirDiff<'a> {
             let is_file = dir_data
                 .files()
                 .get_key_value(file_name)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "Could not find file in {}",
-                        dir_data
-                            .path()
-                            .to_str()
-                            .unwrap_or(COULD_NOT_UNWRAP_FILENAME)
-                    )
-                })
+                .unwrap_or_else(|| panic!("Could not find file in {}", dir_data.path().display()))
                 .1
                 .file_type()?
                 .is_file();
@@ -141,8 +133,8 @@ impl<'a> DirDiff<'a> {
                         }
 
                         let inner_exit_status = FileDiff::file_diff(
-                            path1,
-                            path2,
+                            path1.as_path(),
+                            path2.as_path(),
                             self.format_options,
                             Some(show_if_different),
                         )?;
@@ -153,37 +145,23 @@ impl<'a> DirDiff<'a> {
                     } else if !in_dir1_is_file && !in_dir2_is_file {
                         if self.recursive {
                             Self::dir_diff(
-                                self.dir1.path().join(file_name),
-                                self.dir2.path().join(file_name),
+                                self.dir1.path().join(file_name).as_path(),
+                                self.dir2.path().join(file_name).as_path(),
                                 self.format_options,
                                 self.recursive,
                             )?;
                         } else {
                             println!(
                                 "Common subdirectories: \"{}\" and \"{}\"",
-                                self.dir1
-                                    .path()
-                                    .join(file_name)
-                                    .to_str()
-                                    .unwrap_or(COULD_NOT_UNWRAP_FILENAME),
-                                self.dir2
-                                    .path()
-                                    .join(file_name)
-                                    .to_str()
-                                    .unwrap_or(COULD_NOT_UNWRAP_FILENAME)
+                                self.dir1.path().join(file_name).display(),
+                                self.dir2.path().join(file_name).display()
                             );
                         }
                     } else {
                         let (file, dir) = if in_dir1_is_file && !in_dir2_is_file {
-                            (
-                                path1.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME),
-                                path2.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME),
-                            )
+                            (path1.display(), path2.display())
                         } else {
-                            (
-                                path2.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME),
-                                path1.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME),
-                            )
+                            (path2.display(), path1.display())
                         };
 
                         println!(

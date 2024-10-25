@@ -7,10 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::path::{Component, Path, PathBuf};
+
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
-use std::path::{Component, Path, PathBuf};
 
 /// realpath -- return resolved canonical path
 #[derive(Parser)]
@@ -63,11 +63,11 @@ fn normalize<P: AsRef<Path>>(path: P) -> std::io::Result<PathBuf> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
+
+    let args = Args::parse();
 
     let mut exit_code = 0;
 

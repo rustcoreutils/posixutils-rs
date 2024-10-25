@@ -12,7 +12,6 @@
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 use std::cell::{OnceCell, RefCell};
 use std::error::Error;
 use std::fs::File;
@@ -420,12 +419,11 @@ fn paste_files(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
-    let args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
+
+    let args = Args::parse();
 
     let Args {
         delimiters,

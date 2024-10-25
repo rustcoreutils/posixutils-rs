@@ -7,15 +7,17 @@
 // SPDX-License-Identifier: MIT
 //
 
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 use std::{
     ffi::OsStr,
     io::{self, Read},
     ops::AddAssign,
     path::PathBuf,
 };
+
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use plib::io::input_stream;
+use plib::BUFSZ;
 
 /// wc - word, line, and byte or character count
 #[derive(Parser)]
@@ -119,9 +121,9 @@ fn build_display_str(args: &Args, count: &CountInfo, filename: &OsStr) -> String
 }
 
 fn wc_file_bytes(count: &mut CountInfo, pathname: &PathBuf, chars_mode: bool) -> io::Result<()> {
-    let mut file = plib::io::input_stream(pathname, false)?;
+    let mut file = input_stream(pathname, false)?;
 
-    let mut buffer = [0; plib::BUFSZ];
+    let mut buffer = [0; BUFSZ];
     let mut was_space = true;
 
     loop {
@@ -167,7 +169,10 @@ fn wc_file(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
+    setlocale(LocaleCategory::LcAll, "");
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
+
     let mut args = Args::parse();
 
     let mut chars_mode = false;
@@ -181,10 +186,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.bytes = false;
         chars_mode = true;
     }
-
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
     let mut exit_code = 0;
     let mut totals = CountInfo::default();

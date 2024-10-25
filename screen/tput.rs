@@ -11,10 +11,10 @@
 // - read init-file and reset-file data from filesystem
 //
 
+use std::io;
+
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
-use std::io;
 use terminfo::{capability as cap, Database};
 
 #[derive(Parser)]
@@ -72,12 +72,11 @@ fn tput_clear(info: Database) -> terminfo::Result<()> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
-    let args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
+
+    let args = Args::parse();
 
     let info = match args.term {
         None => Database::from_env().unwrap(),

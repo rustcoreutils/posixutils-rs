@@ -488,32 +488,32 @@ fn do_printf<'a>(
     Ok(())
 }
 
-fn start() -> Result<(), Box<dyn Error>> {
+fn main() -> ExitCode {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(env!("PROJECT_NAME"))?;
-    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
+    // TODO
+    // unwrap
+    textdomain(env!("PROJECT_NAME")).unwrap();
+    // TODO
+    // unwrap
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8").unwrap();
 
     let args = std::env::args_os().collect::<Vec<_>>();
 
-    match &args.as_slice() {
-        &&[ref _program_file_name, ref format, ref arguments @ ..] => {
+    match args.as_slice() {
+        &[ref _program_file_name, ref format, ref arguments @ ..] => {
             let arguments_iterator = arguments.iter().map(|os| os.as_bytes());
 
-            do_printf(format.as_bytes(), arguments_iterator)?;
+            match do_printf(format.as_bytes(), arguments_iterator) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(er) => {
+                    eprint!("printf: {er}");
+
+                    ExitCode::FAILURE
+                }
+            }
         }
         _ => {
-            return Err(Box::from(gettext("not enough arguments")));
-        }
-    }
-
-    Ok(())
-}
-
-fn main() -> ExitCode {
-    match start() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(bo) => {
-            eprint!("printf: {bo}");
+            eprintln!("printf: {}", gettext("not enough arguments"));
 
             ExitCode::FAILURE
         }

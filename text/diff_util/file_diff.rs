@@ -3,7 +3,7 @@ use super::{
     constants::COULD_NOT_UNWRAP_FILENAME,
     diff_exit_status::DiffExitStatus,
     file_data::{FileData, LineReader},
-    functions::{check_existence, is_binary, system_time_to_rfc2822},
+    functions::{check_existence, system_time_to_rfc2822},
     hunks::Hunks,
 };
 use crate::diff_util::constants::NO_NEW_LINE_AT_END_OF_FILE;
@@ -11,10 +11,11 @@ use std::{
     cmp::Reverse,
     collections::HashMap,
     fmt::Write,
-    fs::{read_to_string, File},
+    fs::{self, File},
     io::{self, BufReader, Read},
     os::unix::fs::MetadataExt,
-    path::Path,
+    path::{Display, Path},
+    str,
 };
 
 pub struct FileDiff<'a> {
@@ -46,72 +47,78 @@ impl<'a> FileDiff<'a> {
         format_options: &FormatOptions,
         show_if_different: Option<String>,
     ) -> io::Result<DiffExitStatus> {
-        if is_binary(path1)? || is_binary(path2)? {
-            Self::binary_file_diff(path1, path2)
-        } else {
-            let content1 = read_to_string(path1)?.into_bytes();
-            let linereader1 = LineReader::new(&content1);
-            let ends_with_newline1 = linereader1.ends_with_newline();
-            let mut lines1 = Vec::new();
-            for line in linereader1 {
-                if !format_options.ignore_trailing_white_spaces {
-                    lines1.push(line);
-                } else {
-                    lines1.push(line.trim_end());
+        let path1_vec = fs::read(path1)?;
+        let path2_vec = fs::read(path2)?;
+
+        // Try normal diff first
+        if let Ok(path1_str) = str::from_utf8(path1_vec.as_slice()) {
+            if let Ok(path2_str) = str::from_utf8(path2_vec.as_slice()) {
+                // Both files consist only of valid UTF-8 data
+                let linereader1 = LineReader::new(path1_str.as_bytes());
+                let ends_with_newline1 = linereader1.ends_with_newline();
+                let mut lines1 = Vec::new();
+                for line in linereader1 {
+                    if !format_options.ignore_trailing_white_spaces {
+                        lines1.push(line);
+                    } else {
+                        lines1.push(line.trim_end());
+                    }
                 }
-            }
 
-            let content2 = read_to_string(path2)?.into_bytes();
-            let linereader2 = LineReader::new(&content2);
-            let ends_with_newline2 = linereader2.ends_with_newline();
-            let mut lines2 = Vec::new();
-            for line in linereader2 {
-                if !format_options.ignore_trailing_white_spaces {
-                    lines2.push(line);
-                } else {
-                    lines2.push(line.trim_end());
+                let linereader2 = LineReader::new(path2_str.as_bytes());
+                let ends_with_newline2 = linereader2.ends_with_newline();
+                let mut lines2 = Vec::new();
+                for line in linereader2 {
+                    if !format_options.ignore_trailing_white_spaces {
+                        lines2.push(line);
+                    } else {
+                        lines2.push(line.trim_end());
+                    }
                 }
-            }
-            let mut file1 = FileData::get_file(path1, lines1, ends_with_newline1)?;
-            let mut file2 = FileData::get_file(path2, lines2, ends_with_newline2)?;
+                let mut file1 = FileData::get_file(path1, lines1, ends_with_newline1)?;
+                let mut file2 = FileData::get_file(path2, lines2, ends_with_newline2)?;
 
-            let mut diff = FileDiff::new(&mut file1, &mut file2, format_options);
+                let mut diff = FileDiff::new(&mut file1, &mut file2, format_options);
 
-            // histogram diff
-            let mut lcs_indices = vec![-1_i32; diff.file1.lines().len()];
-            let num_lines1 = diff.file1.lines().len();
-            let num_lines2 = diff.file2.lines().len();
-            FileDiff::histogram_lcs(
-                diff.file1,
-                diff.file2,
-                0,
-                num_lines1,
-                0,
-                num_lines2,
-                &mut lcs_indices,
-            );
-
-            diff.hunks
-                .create_hunks_from_lcs(&lcs_indices, num_lines1, num_lines2);
-
-            if diff.hunks.hunk_count() > 0 {
-                diff.are_different = true;
-            }
-
-            if diff.are_different {
-                if let Some(show_if_different) = show_if_different {
-                    println!("{show_if_different}");
-                }
-            } else if format_options.report_identical_files {
-                println!(
-                    "Files {} and {} are identical",
-                    path1.display(),
-                    path2.display()
+                // histogram diff
+                let mut lcs_indices = vec![-1_i32; diff.file1.lines().len()];
+                let num_lines1 = diff.file1.lines().len();
+                let num_lines2 = diff.file2.lines().len();
+                FileDiff::histogram_lcs(
+                    diff.file1,
+                    diff.file2,
+                    0,
+                    num_lines1,
+                    0,
+                    num_lines2,
+                    &mut lcs_indices,
                 );
-            }
 
-            diff.print()
+                diff.hunks
+                    .create_hunks_from_lcs(&lcs_indices, num_lines1, num_lines2);
+
+                if diff.hunks.hunk_count() > 0 {
+                    diff.are_different = true;
+                }
+
+                if diff.are_different {
+                    if let Some(show_if_different) = show_if_different {
+                        println!("{show_if_different}");
+                    }
+                } else {
+                    Self::print_identical_message_if_appropriate(
+                        format_options,
+                        path1.display(),
+                        path2.display(),
+                    );
+                }
+
+                return diff.print();
+            }
         }
+
+        // Fall back to binary diff
+        Self::binary_file_diff(format_options, path1, path2)
     }
 
     pub fn file_dir_diff(
@@ -148,18 +155,33 @@ impl<'a> FileDiff<'a> {
         }
     }
 
-    fn binary_file_diff(file1_path: &Path, file2_path: &Path) -> io::Result<DiffExitStatus> {
-        let differ_report = format!(
-            "Binary files {} and {} differ",
-            file1_path.display(),
-            file2_path.display()
-        );
+    fn print_identical_message_if_appropriate(
+        format_options: &FormatOptions,
+        path_1_display: Display,
+        path_2_display: Display,
+    ) {
+        if format_options.report_identical_files {
+            println!("Files {path_1_display} and {path_2_display} are identical",);
+        }
+    }
+
+    fn binary_file_diff(
+        format_options: &FormatOptions,
+        file1_path: &Path,
+        file2_path: &Path,
+    ) -> io::Result<DiffExitStatus> {
+        let file1_path_display = file1_path.display();
+        let file2_path_display = file2_path.display();
+
+        let differ_report =
+            format!("Binary files {file1_path_display} and {file2_path_display} differ",);
 
         let file1 = File::open(file1_path)?;
         let file2 = File::open(file2_path)?;
 
         if file1.metadata()?.size() != file2.metadata()?.size() {
-            println!("{}", differ_report);
+            println!("{differ_report}");
+
             return Ok(DiffExitStatus::Different);
         }
 
@@ -168,11 +190,19 @@ impl<'a> FileDiff<'a> {
 
         for bytes_pair in file1.bytes().zip(file2.bytes()) {
             let (b1, b2) = (bytes_pair.0?, bytes_pair.1?);
+
             if b1 != b2 {
-                println!("{}", differ_report);
+                println!("{differ_report}");
+
                 return Ok(DiffExitStatus::Different);
             }
         }
+
+        Self::print_identical_message_if_appropriate(
+            format_options,
+            file1_path_display,
+            file2_path_display,
+        );
 
         Ok(DiffExitStatus::NotDifferent)
     }

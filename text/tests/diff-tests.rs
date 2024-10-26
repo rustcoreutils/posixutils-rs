@@ -93,6 +93,30 @@ fn f1_txt_with_eol_spaces_path() -> String {
         .to_string()
 }
 
+fn binary_a_path() -> String {
+    diff_base_path()
+        .join("binary-a")
+        .to_str()
+        .expect("Could not unwrap binary_a_path")
+        .to_string()
+}
+
+fn binary_b_path() -> String {
+    diff_base_path()
+        .join("binary-b")
+        .to_str()
+        .expect("Could not unwrap binary_b_path")
+        .to_string()
+}
+
+fn binary_c_path() -> String {
+    diff_base_path()
+        .join("binary-c")
+        .to_str()
+        .expect("Could not unwrap binary_c_path")
+        .to_string()
+}
+
 struct DiffTestHelper {
     content: String,
     file1_path: String,
@@ -484,4 +508,38 @@ diff: /a74c002739306869: No such file or directory
 ",
         2_i32,
     );
+}
+
+#[test]
+fn test_diff_s_binary() {
+    let binary_a = binary_a_path();
+    let binary_b = binary_b_path();
+
+    let binary_a_str = binary_a.as_str();
+    let binary_b_str = binary_b.as_str();
+
+    for short_or_long in ["-s", "--report-identical-files"] {
+        diff_test(
+            &[short_or_long, binary_a_str, binary_b_str],
+            format!("Files {binary_a_str} and {binary_b_str} are identical\n").as_str(),
+            EXIT_STATUS_NO_DIFFERENCE,
+        );
+    }
+}
+
+#[test]
+fn test_diff_binary_differ() {
+    let binary_a = binary_a_path();
+    let binary_c = binary_c_path();
+
+    let binary_a_str = binary_a.as_str();
+    let binary_c_str = binary_c.as_str();
+
+    for short_or_long in ["-s", "--report-identical-files"] {
+        diff_test(
+            &[short_or_long, binary_a_str, binary_c_str],
+            format!("Binary files {binary_a_str} and {binary_c_str} differ\n").as_str(),
+            EXIT_STATUS_DIFFERENCE,
+        );
+    }
 }

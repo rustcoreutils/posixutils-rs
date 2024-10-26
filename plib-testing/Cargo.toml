@@ -1,5 +1,5 @@
 [package]
-name = "posixutils-sccs"
+name = "plib-testing"
 version = "0.2.1"
 authors = ["Jeff Garzik"]
 repository.workspace = true
@@ -8,15 +8,9 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-clap.workspace = true
-gettext-rs.workspace = true
-
-[dev-dependencies]
-plib-testing.workspace = true
 
 [lints]
 workspace = true
 
-[[bin]]
-name = "what"
-path = "./what.rs"
+[lib]
+doctest = false

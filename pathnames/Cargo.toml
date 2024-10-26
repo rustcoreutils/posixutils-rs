@@ -13,7 +13,7 @@ gettext-rs.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
-plib = { path = "../plib" }
+plib-testing.workspace = true
 
 [lints]
 workspace = true

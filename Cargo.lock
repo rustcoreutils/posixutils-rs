@@ -1298,6 +1298,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "plib-testing"
+version = "0.2.1"
+
+[[package]]
 name = "posixutils-awk"
 version = "0.2.1"
 dependencies = [
@@ -1308,7 +1312,7 @@ dependencies = [
  "libc",
  "pest",
  "pest_derive",
- "plib",
+ "plib-testing",
  "rand",
 ]
 
@@ -1322,7 +1326,7 @@ dependencies = [
  "lazy_static",
  "pest",
  "pest_derive",
- "plib",
+ "plib-testing",
  "regex",
  "rustyline",
 ]
@@ -1335,7 +1339,7 @@ dependencies = [
  "clap",
  "gettext-rs",
  "libc",
- "plib",
+ "plib-testing",
 ]
 
 [[package]]
@@ -1347,7 +1351,7 @@ dependencies = [
  "clap",
  "gettext-rs",
  "object",
- "plib",
+ "plib-testing",
 ]
 
 [[package]]
@@ -1356,7 +1360,7 @@ version = "0.2.1"
 dependencies = [
  "clap",
  "gettext-rs",
- "plib",
+ "plib-testing",
 ]
 
 [[package]]
@@ -1367,6 +1371,7 @@ dependencies = [
  "gettext-rs",
  "libc",
  "plib",
+ "plib-testing",
  "regex",
  "users",
  "walkdir",
@@ -1390,6 +1395,7 @@ dependencies = [
  "clap",
  "gettext-rs",
  "plib",
+ "plib-testing",
  "strum",
  "strum_macros",
 ]
@@ -1420,7 +1426,7 @@ dependencies = [
  "const_format",
  "gettext-rs",
  "libc",
- "plib",
+ "plib-testing",
  "rowan",
 ]
 
@@ -1431,7 +1437,7 @@ dependencies = [
  "clap",
  "gettext-rs",
  "libc",
- "plib",
+ "plib-testing",
 ]
 
 [[package]]
@@ -1441,7 +1447,7 @@ dependencies = [
  "clap",
  "gettext-rs",
  "libc",
- "plib",
+ "plib-testing",
 ]
 
 [[package]]
@@ -1454,6 +1460,7 @@ dependencies = [
  "gettext-rs",
  "libc",
  "plib",
+ "plib-testing",
  "sysinfo",
 ]
 
@@ -1463,7 +1470,7 @@ version = "0.2.1"
 dependencies = [
  "clap",
  "gettext-rs",
- "plib",
+ "plib-testing",
 ]
 
 [[package]]
@@ -1486,6 +1493,7 @@ dependencies = [
  "gettext-rs",
  "libc",
  "plib",
+ "plib-testing",
  "uname",
 ]
 
@@ -1501,6 +1509,7 @@ dependencies = [
  "libc",
  "notify-debouncer-full",
  "plib",
+ "plib-testing",
  "proptest",
  "rand",
  "regex",
@@ -1519,6 +1528,7 @@ dependencies = [
  "gettext-rs",
  "libc",
  "plib",
+ "plib-testing",
  "regex",
  "tempfile",
 ]
@@ -1534,6 +1544,7 @@ dependencies = [
  "libc",
  "libcrypt-rs",
  "plib",
+ "plib-testing",
  "syslog",
  "thiserror",
 ]
@@ -1547,6 +1558,7 @@ dependencies = [
  "gettext-rs",
  "libc",
  "plib",
+ "plib-testing",
 ]
 
 [[package]]

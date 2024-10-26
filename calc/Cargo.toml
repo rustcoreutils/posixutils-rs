@@ -17,7 +17,7 @@ bigdecimal = "0.4"
 rustyline = { version = "14.0", default-features = false }
 
 [dev-dependencies]
-plib = { path = "../plib" }
+plib-testing.workspace = true
 
 [lints]
 workspace = true

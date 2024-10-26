@@ -15,7 +15,7 @@ chrono.workspace = true
 ar = "0.9"
 
 [dev-dependencies]
-plib = { path = "../plib" }
+plib-testing.workspace = true
 
 [lints]
 workspace = true

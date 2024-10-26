@@ -12,7 +12,7 @@ use std::{
     process::{Command, Output, Stdio},
 };
 
-use plib::testing::TestPlan;
+use plib_testing::TestPlan;
 
 fn run_test_base(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> Output {
     let relpath = if cfg!(debug_assertions) {

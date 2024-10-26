@@ -12,7 +12,7 @@ clap.workspace = true
 gettext-rs.workspace = true
 
 [dev-dependencies]
-plib = { path = "../plib" }
+plib-testing.workspace = true
 
 [lints]
 workspace = true

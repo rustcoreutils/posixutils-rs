@@ -8,7 +8,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-plib = { path = "../plib" }
+plib.workspace = true
 clap.workspace = true
 gettext-rs.workspace = true
 topological-sort = "0.2"
@@ -21,6 +21,7 @@ dirs = "5.0"
 walkdir = "2"
 
 [dev-dependencies]
+plib-testing.workspace = true
 proptest = "1"
 rand = "0.8"
 

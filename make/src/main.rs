@@ -7,26 +7,23 @@
 // SPDX-License-Identifier: MIT
 //
 
+use core::str::FromStr;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering::Relaxed;
+use std::{env, fs, io, process};
+
 use clap::Parser;
 use const_format::formatcp;
-use core::str::FromStr;
-use gettextrs::{bind_textdomain_codeset, gettext, textdomain};
-use plib::PROJECT_NAME;
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+
 use posixutils_make::{
     config::Config,
     error_code::ErrorCode::{self, *},
     parser::{preprocessor::ENV_MACROS, Makefile},
     Make,
-};
-use std::sync::atomic::Ordering::Relaxed;
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    env,
-    ffi::OsString,
-    fs,
-    io::{self, Read},
-    path::{Path, PathBuf},
-    process,
 };
 
 const MAKEFILE_NAME: [&str; 2] = ["makefile", "Makefile"];
@@ -110,9 +107,62 @@ struct Args {
     targets: Vec<OsString>,
 }
 
+fn print_rules(rules: &BTreeMap<String, BTreeSet<String>>) {
+    print!("{:?}", rules);
+}
+
+/// Parse the makefile at the given path, or the first default makefile found.
+/// If no makefile is found, print an error message and exit.
+fn parse_makefile(path: Option<impl AsRef<Path>>) -> Result<Makefile, ErrorCode> {
+    let path = path.as_ref().map(|p| p.as_ref());
+
+    let path = match path {
+        Some(path) => path,
+        None => {
+            let mut makefile = None;
+            for m in MAKEFILE_PATH.iter() {
+                let path = Path::new(m);
+                if path.exists() {
+                    makefile = Some(path);
+                    break;
+                }
+            }
+            if let Some(makefile) = makefile {
+                makefile
+            } else {
+                return Err(NoMakefile);
+            }
+        }
+    };
+
+    let contents = if path == Path::new("-") {
+        read_stdin()?
+    } else {
+        match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(err) => {
+                return Err(IoError(err.kind()));
+            }
+        }
+    };
+
+    match Makefile::from_str(&contents) {
+        Ok(makefile) => Ok(makefile),
+        Err(err) => Err(ErrorCode::ParserError { constraint: err }),
+    }
+}
+
+/// Reads the makefile from `stdin` until EOF (Ctrl + D)
+fn read_stdin() -> Result<String, ErrorCode> {
+    let mut buffer = String::new();
+    io::stdin().read_to_string(&mut buffer)?;
+    Ok(buffer)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    setlocale(LocaleCategory::LcAll, "");
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
 
     let Args {
         directory,
@@ -230,56 +280,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         status_code = 2;
     }
     process::exit(status_code);
-}
-
-fn print_rules(rules: &BTreeMap<String, BTreeSet<String>>) {
-    print!("{:?}", rules);
-}
-
-/// Parse the makefile at the given path, or the first default makefile found.
-/// If no makefile is found, print an error message and exit.
-fn parse_makefile(path: Option<impl AsRef<Path>>) -> Result<Makefile, ErrorCode> {
-    let path = path.as_ref().map(|p| p.as_ref());
-
-    let path = match path {
-        Some(path) => path,
-        None => {
-            let mut makefile = None;
-            for m in MAKEFILE_PATH.iter() {
-                let path = Path::new(m);
-                if path.exists() {
-                    makefile = Some(path);
-                    break;
-                }
-            }
-            if let Some(makefile) = makefile {
-                makefile
-            } else {
-                return Err(NoMakefile);
-            }
-        }
-    };
-
-    let contents = if path == Path::new("-") {
-        read_stdin()?
-    } else {
-        match fs::read_to_string(path) {
-            Ok(contents) => contents,
-            Err(err) => {
-                return Err(IoError(err.kind()));
-            }
-        }
-    };
-
-    match Makefile::from_str(&contents) {
-        Ok(makefile) => Ok(makefile),
-        Err(err) => Err(ErrorCode::ParserError { constraint: err }),
-    }
-}
-
-/// Reads the makefile from `stdin` until EOF (Ctrl + D)
-fn read_stdin() -> Result<String, ErrorCode> {
-    let mut buffer = String::new();
-    io::stdin().read_to_string(&mut buffer)?;
-    Ok(buffer)
 }

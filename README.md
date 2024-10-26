@@ -84,6 +84,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] join
  - [x] link
  - [x] ls
+ - [x] make
  - [x] m4
  - [x] mkdir
  - [x] mv
@@ -212,7 +213,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
 ### Misc. category
  - [ ] lp
  - [ ] mailx
- - [ ] make (status: in progress)
  - [ ] man (status: in progress)
  - [ ] more
  - [ ] patch (status: in progress)

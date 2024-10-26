@@ -10,6 +10,7 @@ members = [
 	"file",
 	"fs",
 	"ftw",
+	"make",
 	"m4",
 	"m4/test-manager",
 	"gettext-rs",

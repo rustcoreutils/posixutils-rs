@@ -7,26 +7,23 @@
 // SPDX-License-Identifier: MIT
 //
 
+use core::str::FromStr;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering::Relaxed;
+use std::{env, fs, io, process};
+
 use clap::Parser;
 use const_format::formatcp;
-use core::str::FromStr;
-use gettextrs::{bind_textdomain_codeset, gettext, textdomain};
-use plib::PROJECT_NAME;
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+
 use posixutils_make::{
     config::Config,
     error_code::ErrorCode::{self, *},
     parser::{preprocessor::ENV_MACROS, Makefile},
     Make,
-};
-use std::sync::atomic::Ordering::Relaxed;
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    env,
-    ffi::OsString,
-    fs,
-    io::{self, Read},
-    path::{Path, PathBuf},
-    process,
 };
 
 const MAKEFILE_NAME: [&str; 2] = ["makefile", "Makefile"];
@@ -111,8 +108,9 @@ struct Args {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    setlocale(LocaleCategory::LcAll, "");
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
 
     let Args {
         directory,

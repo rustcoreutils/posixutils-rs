@@ -18,7 +18,7 @@ use libc::{
 use libc::{ECHO, ECHONL, TCSANOW};
 #[cfg(target_os = "linux")]
 use libcrypt_rs::Crypt;
-use plib::{group::Group, PROJECT_NAME};
+use plib::group::Group;
 
 use std::{
     env,
@@ -794,8 +794,9 @@ fn set_login_environment(user: &str) -> Result<(), io::Error> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
+
     let mut exit_code = 0;
 
     let args = Args::try_parse().unwrap_or_else(|err| {

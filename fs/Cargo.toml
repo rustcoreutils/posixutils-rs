@@ -8,7 +8,6 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-plib = { path = "../plib" }
 ftw = { path = "../ftw" }
 clap.workspace = true
 gettext-rs.workspace = true

@@ -9,15 +9,15 @@
 
 mod magic;
 
-use crate::magic::{get_type_from_magic_file_dbs, DEFAULT_MAGIC_FILE};
-use ftw::{symlink_metadata, FileType};
-
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 use std::fs::read_link;
 use std::io;
 use std::path::{Path, PathBuf};
+
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use ftw::{symlink_metadata, FileType};
+
+use crate::magic::{get_type_from_magic_file_dbs, DEFAULT_MAGIC_FILE};
 
 #[derive(Parser)]
 #[command(
@@ -152,12 +152,11 @@ fn analyze_file<P: AsRef<Path>>(path: P, args: &Args, magic_files: &Vec<PathBuf>
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
-
-    // Initialize translation system
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME).unwrap();
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8").unwrap();
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
+
+    let args = Args::parse();
 
     let magic_files = get_magic_files(&args);
 

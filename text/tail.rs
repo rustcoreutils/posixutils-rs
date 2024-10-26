@@ -1,9 +1,3 @@
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use notify_debouncer_full::new_debouncer;
-use notify_debouncer_full::notify::event::{ModifyKind, RemoveKind};
-use notify_debouncer_full::notify::{EventKind, RecursiveMode, Watcher};
-use plib::PROJECT_NAME;
 use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt::Display;
@@ -15,6 +9,13 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::mpsc;
 use std::time::Duration;
+
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use notify_debouncer_full::new_debouncer;
+use notify_debouncer_full::notify::event::{ModifyKind, RemoveKind};
+use notify_debouncer_full::notify::{EventKind, RecursiveMode, Watcher};
+use plib::BUFSZ;
 
 enum RelativeFrom {
     StartOfFile(usize),
@@ -158,7 +159,7 @@ fn print_n_lines<R: Read + BufRead>(
             let mut lines = VecDeque::<Vec<u8>>::with_capacity(n);
 
             // Temporary buffer for the line currently being processed
-            let mut line = Vec::<u8>::with_capacity(plib::BUFSZ);
+            let mut line = Vec::<u8>::with_capacity(BUFSZ);
 
             // Read each line and store the last `n` lines.
             loop {
@@ -243,7 +244,7 @@ fn print_n_lines<R: Read + BufRead>(
             }
 
             // Buffer to read chunks of data from the reader.
-            let mut buffer = [0_u8; plib::BUFSZ];
+            let mut buffer = [0_u8; BUFSZ];
 
             // Read and print the remaining lines.
             loop {
@@ -332,7 +333,7 @@ fn print_n_bytes<R: Read>(
             }
 
             // Buffer to read chunks of data from the reader.
-            let mut buffer = [0_u8; plib::BUFSZ];
+            let mut buffer = [0_u8; BUFSZ];
 
             // Read and print the remaining bytes.
             loop {
@@ -472,8 +473,8 @@ fn tail(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
 
     let args = Args::parse();
 

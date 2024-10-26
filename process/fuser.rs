@@ -7,20 +7,18 @@
 // SPDX-License-Identifier: MIT
 //
 
-use clap::{CommandFactory, Parser};
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
+use std::collections::BTreeMap;
+use std::ffi::CStr;
 use std::fs::{metadata, Metadata};
 use std::io::{self, Write};
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
-use std::{
-    collections::BTreeMap,
-    ffi::CStr,
-    os::unix::fs::MetadataExt,
-    path::{Path, PathBuf},
-};
+
+use clap::{CommandFactory, Parser};
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 
 const NAME_FIELD: usize = 20;
 
@@ -1358,39 +1356,6 @@ struct Args {
     /// A pathname on which the file or file system is to be reported.
     file: Vec<PathBuf>,
 }
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
-
-    let Args {
-        mount, user, file, ..
-    } = Args::try_parse().unwrap_or_else(|err| match err.kind() {
-        clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
-            print!("{err}");
-            std::process::exit(1);
-        }
-        _ => {
-            let mut stdout = std::io::stdout();
-            let mut cmd = Args::command();
-            eprintln!("No process specification given");
-            cmd.write_help(&mut stdout).unwrap();
-            std::process::exit(1);
-        }
-    });
-
-    #[cfg(target_os = "linux")]
-    let mut names = linux::get_matched_procs(file, mount)?;
-
-    #[cfg(target_os = "macos")]
-    let mut names = macos::get_matched_procs(file, mount)?;
-
-    for name in names.iter_mut() {
-        print_matches(name, user)?;
-    }
-
-    std::process::exit(0);
-}
 
 /// Prints process matches for a given `Names` object to `stderr` and `stdout`.
 ///
@@ -1514,4 +1479,38 @@ fn timeout(path: &str, seconds: u32) -> Result<Metadata, io::Error> {
             Err(io::Error::new(io::ErrorKind::Other, "Channel disconnected"))
         }
     }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    setlocale(LocaleCategory::LcAll, "");
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
+
+    let Args {
+        mount, user, file, ..
+    } = Args::try_parse().unwrap_or_else(|err| match err.kind() {
+        clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
+            print!("{err}");
+            std::process::exit(1);
+        }
+        _ => {
+            let mut stdout = std::io::stdout();
+            let mut cmd = Args::command();
+            eprintln!("No process specification given");
+            cmd.write_help(&mut stdout).unwrap();
+            std::process::exit(1);
+        }
+    });
+
+    #[cfg(target_os = "linux")]
+    let mut names = linux::get_matched_procs(file, mount)?;
+
+    #[cfg(target_os = "macos")]
+    let mut names = macos::get_matched_procs(file, mount)?;
+
+    for name in names.iter_mut() {
+        print_matches(name, user)?;
+    }
+
+    std::process::exit(0);
 }

@@ -17,7 +17,6 @@ use ftw::{metadata, symlink_metadata_cstr, FilesystemStatistics};
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 #[cfg(target_os = "macos")]
 use std::ffi::CStr;
 use std::os::unix::fs::MetadataExt;
@@ -319,12 +318,11 @@ impl Display for FieldsData<'_> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
-    let args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
+
+    let args = Args::parse();
 
     // The format of the default output from df is unspecified,
     // but all space figures are reported in 512-byte units

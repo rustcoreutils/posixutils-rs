@@ -1,19 +1,16 @@
 use clap::Parser;
-use deunicode::deunicode_char;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use parsing::parse_string1_or_string2;
-use plib::PROJECT_NAME;
-use setup::{generate_for_removal, generate_for_translation};
+use setup::{ForRemoval, ForTranslation};
 use std::error::Error;
 use std::process;
-use transformation::delete::{DeleteState, DeleteTransformation};
+use transformation::delete::DeleteTransformation;
 use transformation::delete_and_squeeze::{DeleteAndSqueezeState, DeleteAndSqueezeTransformation};
 use transformation::squeeze::{SqueezeState, SqueezeTransformation};
 use transformation::squeeze_and_translate::{
     SqueezeAndTranslateState, SqueezeAndTranslateTransformation,
 };
+use transformation::streaming_transform;
 use transformation::translate::TranslateTransformation;
-use transformation::Transformation;
 
 /// tr - translate or delete characters
 #[derive(Parser)]
@@ -46,22 +43,27 @@ impl Args {
     fn validate_args(&self) -> Result<(), String> {
         // Check if conflicting options are used together
         if self.complement_char && self.complement_val {
-            return Err("tr: options '-c' and '-C' cannot be used together".to_owned());
+            return Err("options '-c' and '-C' cannot be used together".to_owned());
         }
 
-        if self.squeeze_repeats
-            && self.string2.is_none()
-            && (self.complement_char || self.complement_val)
-            && !self.delete
-        {
-            return Err("tr: option '-c' or '-C' may only be used with 2 strings".to_owned());
-        }
-
-        if !self.squeeze_repeats && !self.delete && self.string2.is_none() {
-            return Err(format!(
-                "tr: missing operand after ‘{}’. Two strings must be given when translating.",
-                self.string1
-            ));
+        match &self.string2 {
+            Some(st) => {
+                if self.delete && !self.squeeze_repeats {
+                    return Err(format!(
+                        "\
+extra operand '{st}'
+Only one string may be given when deleting without squeezing repeats."
+                    ));
+                }
+            }
+            None => {
+                if !self.delete && !self.squeeze_repeats {
+                    return Err(format!(
+                        "missing operand after '{}'. Two strings must be given when translating.",
+                        self.string1
+                    ));
+                }
+            }
         }
 
         Ok(())
@@ -84,10 +86,10 @@ impl Args {
 ///   if there is an error reading from standard input or processing the input string.
 ///
 fn tr(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    let string1_operands = parse_string1_or_string2(&args.string1)?;
+    let string1_operands = parsing::parse_string1_or_string2(&args.string1)?;
 
-    let string2_operands_option = match &args.string2 {
-        Some(st) => Some(parse_string1_or_string2(st)?),
+    let string2_operands = match &args.string2 {
+        Some(st) => Some(parsing::parse_string1_or_string2(st)?),
         None => None,
     };
 
@@ -95,118 +97,211 @@ fn tr(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     // How are these different?
     let complement = args.complement_char || args.complement_val;
 
-    let mut transformation: Box<dyn Transformation> = match (args.delete, args.squeeze_repeats) {
+    let result = match (args.delete, args.squeeze_repeats) {
         (false, false) => {
             // "tr"
-            let string2_operands = match string2_operands_option {
-                Some(op) => op,
+            let string2_operands = match string2_operands {
+                Some(ve) => ve,
                 None => {
-                    return Err(Box::from("tr: missing operand".to_owned()));
+                    return Err(Box::from("missing operand".to_owned()));
                 }
             };
 
             if string2_operands.is_empty() {
                 return Err(Box::from(
-                    "tr: when not truncating set1, string2 must be non-empty".to_owned(),
+                    "when not truncating set1, string2 must be non-empty".to_owned(),
                 ));
             }
 
-            let for_translation =
-                generate_for_translation(complement, string1_operands, string2_operands)?;
+            let for_translation = setup::generate_for_translation(
+                complement,
+                string1_operands,
+                string2_operands.as_slice(),
+            )?;
 
-            let bo: Box<dyn Transformation> =
-                Box::from(TranslateTransformation { for_translation });
+            match for_translation {
+                ForTranslation::Complemented(complemented_translation) => {
+                    let mut t = TranslateTransformation {
+                        translation: *complemented_translation,
+                    };
 
-            bo
+                    streaming_transform(&mut t)
+                }
+                ForTranslation::NotComplemented(not_complemented_translation) => {
+                    let mut t = TranslateTransformation {
+                        translation: *not_complemented_translation,
+                    };
+
+                    streaming_transform(&mut t)
+                }
+            }
         }
         (true, false) => {
             // "tr -d"
-            let for_removal = generate_for_removal(complement, string1_operands)?;
+            let for_removal = setup::generate_for_removal(complement, string1_operands, true)?;
 
-            let bo: Box<dyn Transformation> = Box::from(DeleteTransformation {
-                for_removal,
-                delete_state: DeleteState::Start,
-            });
+            match for_removal {
+                ForRemoval::Complemented(complemented_removal) => {
+                    let mut t = DeleteTransformation {
+                        removal: *complemented_removal,
+                    };
 
-            bo
+                    streaming_transform(&mut t)
+                }
+                ForRemoval::NotComplemented(not_complemented_removal) => {
+                    let mut t = DeleteTransformation {
+                        removal: *not_complemented_removal,
+                    };
+
+                    streaming_transform(&mut t)
+                }
+            }
         }
         (false, true) => {
             // "tr -s"
-            match string2_operands_option {
+            match string2_operands {
                 Some(string2_operands) => {
                     if string2_operands.is_empty() {
                         return Err(Box::from(
-                            "tr: when not truncating set1, string2 must be non-empty".to_owned(),
+                            "when not truncating set1, string2 must be non-empty".to_owned(),
                         ));
                     }
 
-                    let for_translation =
-                        generate_for_translation(complement, string1_operands, string2_operands)?;
+                    let for_translation = setup::generate_for_translation(
+                        complement,
+                        string1_operands,
+                        string2_operands.as_slice(),
+                    )?;
 
-                    let bo: Box<dyn Transformation> =
-                        Box::from(SqueezeAndTranslateTransformation {
-                            for_translation,
-                            squeeze_and_translate_state: SqueezeAndTranslateState::Start,
-                        });
+                    // Complement does not apply to string2
+                    let squeeze_for_removal =
+                        setup::generate_for_removal(false, string2_operands, false)?;
 
-                    bo
+                    let ForRemoval::NotComplemented(squeeze) = squeeze_for_removal else {
+                        unreachable!()
+                    };
+
+                    match for_translation {
+                        ForTranslation::Complemented(bo) => {
+                            let mut t = SqueezeAndTranslateTransformation {
+                                translation: *bo,
+                                squeeze: *squeeze,
+                                squeeze_and_translate_state: SqueezeAndTranslateState {
+                                    last_printed_character: None,
+                                },
+                            };
+
+                            streaming_transform(&mut t)
+                        }
+                        ForTranslation::NotComplemented(bo) => {
+                            let mut t = SqueezeAndTranslateTransformation {
+                                translation: *bo,
+                                squeeze: *squeeze,
+                                squeeze_and_translate_state: SqueezeAndTranslateState {
+                                    last_printed_character: None,
+                                },
+                            };
+
+                            streaming_transform(&mut t)
+                        }
+                    }
                 }
                 None => {
-                    let for_removal = generate_for_removal(complement, string1_operands)?;
+                    let for_removal =
+                        setup::generate_for_removal(complement, string1_operands, true)?;
 
-                    let bo: Box<dyn Transformation> = Box::from(SqueezeTransformation {
-                        for_removal,
-                        squeeze_state: SqueezeState::Start,
-                    });
+                    match for_removal {
+                        ForRemoval::Complemented(bo) => {
+                            let mut t = SqueezeTransformation {
+                                squeeze: *bo,
+                                squeeze_state: SqueezeState {
+                                    last_printed_character: None,
+                                },
+                            };
 
-                    bo
+                            streaming_transform(&mut t)
+                        }
+                        ForRemoval::NotComplemented(bo) => {
+                            let mut t = SqueezeTransformation {
+                                squeeze: *bo,
+                                squeeze_state: SqueezeState {
+                                    last_printed_character: None,
+                                },
+                            };
+
+                            streaming_transform(&mut t)
+                        }
+                    }
                 }
             }
         }
         (true, true) => {
             // "tr -d -s"
-            let string2_operands = match string2_operands_option {
-                Some(op) => op,
+            let string2_operands = match string2_operands {
+                Some(ve) => ve,
                 None => {
-                    return Err(Box::from("tr: missing operand".to_owned()));
+                    return Err(Box::from("missing operand".to_owned()));
                 }
             };
 
             // "The same string cannot be used for both the -d and the -s option; when both options are specified, both string1 (used for deletion) and string2 (used for squeezing) shall be required."
-            let delete = generate_for_removal(complement, string1_operands)?;
+            let delete_for_removal =
+                setup::generate_for_removal(complement, string1_operands, true)?;
 
-            let squeeze = generate_for_removal(complement, string2_operands)?;
+            // Complement does not apply to squeeze, only delete, in this case
+            let squeeze_for_removal = setup::generate_for_removal(false, string2_operands, false)?;
 
-            let bo: Box<dyn Transformation> = Box::from(DeleteAndSqueezeTransformation {
-                delete,
-                squeeze,
-                delete_and_squeeze_state: DeleteAndSqueezeState::Start,
-            });
+            let ForRemoval::NotComplemented(squeeze) = squeeze_for_removal else {
+                unreachable!()
+            };
 
-            bo
+            match delete_for_removal {
+                ForRemoval::Complemented(bo) => {
+                    let mut t = DeleteAndSqueezeTransformation {
+                        delete: *bo,
+                        delete_and_squeeze_state: DeleteAndSqueezeState {
+                            last_printed_character: None,
+                        },
+                        squeeze: *squeeze,
+                    };
+
+                    streaming_transform(&mut t)
+                }
+                ForRemoval::NotComplemented(bo) => {
+                    let mut t = DeleteAndSqueezeTransformation {
+                        delete: *bo,
+                        delete_and_squeeze_state: DeleteAndSqueezeState {
+                            last_printed_character: None,
+                        },
+                        squeeze: *squeeze,
+                    };
+
+                    streaming_transform(&mut t)
+                }
+            }
         }
     };
 
-    transformation.streaming_transform()?;
+    result?;
 
     Ok(())
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
 
     let args = Args::parse();
 
-    if let Err(st) = args.validate_args() {
-        eprintln!("{st}");
+    if let Err(error_string) = args.validate_args() {
+        eprintln!("tr: {error_string}");
 
         process::exit(1_i32);
     }
 
-    if let Err(err) = tr(&args) {
-        eprintln!("{err}");
+    if let Err(error) = tr(&args) {
+        eprintln!("tr: {error}");
 
         process::exit(1_i32);
     }
@@ -216,8 +311,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 mod parsing {
     use std::iter::{self, Peekable};
-    use std::slice::Iter;
     use std::str::Chars;
+
+    use crate::setup::FullChar;
 
     #[derive(Clone)]
     pub enum CharRepetition {
@@ -228,7 +324,7 @@ mod parsing {
     #[derive(Clone)]
     pub struct CharOperand {
         // The character
-        pub char: char,
+        pub char: DataTypeWithData,
         // The number of times the character is repeated
         pub char_repetition: CharRepetition,
     }
@@ -236,13 +332,73 @@ mod parsing {
     #[derive(Clone)]
     pub struct EquivOperand {
         // The character equivalent
-        pub char: char,
+        pub char: DataTypeWithData,
     }
 
     #[derive(Clone)]
     pub enum Operand {
         Char(CharOperand),
         Equiv(EquivOperand),
+    }
+
+    // TODO
+    // Optimize
+    pub fn categorize_char(char: char) -> DataTypeWithData {
+        let mut encoding_buffer = [0_u8; 4_usize];
+
+        let slice = char.encode_utf8(&mut encoding_buffer).as_bytes();
+
+        match slice {
+            &[single_byte] => categorize_byte(single_byte),
+            _ => DataTypeWithData::IsMultiByte(char),
+        }
+    }
+
+    pub fn categorize_byte(byte: u8) -> DataTypeWithData {
+        if (0_u8..128_u8).contains(&byte) {
+            DataTypeWithData::Is7Bit(byte)
+        } else {
+            DataTypeWithData::Is8Bit(byte)
+        }
+    }
+
+    #[derive(Clone)]
+    pub enum DataTypeWithData {
+        Is7Bit(u8),
+        Is8Bit(u8),
+        IsMultiByte(char),
+    }
+
+    impl DataTypeWithData {
+        pub fn convert_to_replacement(&self) -> FullChar {
+            match self {
+                Self::IsMultiByte(ch) => FullChar::new_from_char(*ch),
+                Self::Is7Bit(ue) | Self::Is8Bit(ue) => FullChar::new_from_u8(*ue),
+            }
+        }
+
+        pub fn convert_to_char(&self) -> char {
+            match *self {
+                Self::IsMultiByte(ch) => ch,
+                Self::Is7Bit(ue) => char::from(ue),
+                _ => {
+                    // 8-bit equiv?
+                    unreachable!()
+                }
+            }
+        }
+
+        // TODO
+        // Optimize
+        fn printable(&self) -> String {
+            match *self {
+                DataTypeWithData::IsMultiByte(ch) => ch.escape_default().to_string(),
+                DataTypeWithData::Is7Bit(ue) => char::from(ue).escape_default().to_string(),
+                DataTypeWithData::Is8Bit(ue) => {
+                    format!("\\{ue:03o}")
+                }
+            }
+        }
     }
 
     pub fn parse_string1_or_string2(string1_or_string2: &str) -> Result<Vec<Operand>, String> {
@@ -317,10 +473,9 @@ mod parsing {
                             continue;
                         }
 
-                        if square_bracket_constructs_buffer.get(2_usize) == Some(&'*') {
+                        if let Some(op) = parse_repeated_char(&square_bracket_constructs_buffer)? {
                             // "[x*n]" construct
-                            operand_vec
-                                .push(parse_repeated_char(&square_bracket_constructs_buffer)?);
+                            operand_vec.push(op);
 
                             continue;
                         }
@@ -328,8 +483,8 @@ mod parsing {
 
                     // Not a "[:class:]", "[=equiv=]", or "[x*n]" construct
                     // The hacky way to continue is to reset `peekable` (to `peekable_saved`)
-                    // This moves the Peekable back to the point it was at before attempting to parse square bracket
-                    // constructs
+                    // This moves the `Peekable` back to the point it was at before attempting to parse square
+                    // bracket constructs
                     parse_left_square_bracket_normally = true;
                     peekable = peekable_saved;
                 }
@@ -388,20 +543,18 @@ mod parsing {
         let char_between_equals_signs = match between_equals_signs.as_slice() {
             &[ch] => ch,
             &[] => {
-                return Err("tr: missing equivalence class character '[==]'".to_owned());
+                return Err(
+                    "input '[==]' is invalid: missing equivalence class character".to_owned(),
+                );
             }
             sl => {
-                const ERROR_MESSAGE_PREFIX: &str = "tr: ";
                 const ERROR_MESSAGE_SUFFIX: &str =
                     ": equivalence class operand must be a single character";
 
-                const ERROR_MESSAGE_PREFIX_AND_SUFFIX_LENGTH: usize =
-                    ERROR_MESSAGE_PREFIX.len() + ERROR_MESSAGE_SUFFIX.len();
+                const ERROR_MESSAGE_SUFFIX_LENGTH: usize = ERROR_MESSAGE_SUFFIX.len();
 
                 let mut error_message =
-                    String::with_capacity(ERROR_MESSAGE_PREFIX_AND_SUFFIX_LENGTH + sl.len());
-
-                error_message.push_str(ERROR_MESSAGE_PREFIX);
+                    String::with_capacity(ERROR_MESSAGE_SUFFIX_LENGTH + sl.len());
 
                 for &ch in sl {
                     error_message.push(ch);
@@ -413,18 +566,22 @@ mod parsing {
             }
         };
 
-        let operand = Operand::Equiv(EquivOperand {
-            char: char_between_equals_signs,
-        });
+        let char = categorize_char(char_between_equals_signs);
+
+        // TODO
+        // Validate this char
+        let operand = Operand::Equiv(EquivOperand { char });
 
         Ok(operand)
     }
 
-    fn parse_repeated_char(square_bracket_constructs_buffer: &[char]) -> Result<Operand, String> {
+    fn parse_repeated_char(
+        square_bracket_constructs_buffer: &[char],
+    ) -> Result<Option<Operand>, String> {
         // TODO
         // Clean this up
-        fn fill_repeat_str(iter: &mut Iter<char>, repeat_string: &mut String) {
-            while let Some(&ch) = iter.next() {
+        fn fill_repeat_str(iter: &mut Peekable<Chars>, repeat_string: &mut String) {
+            while let Some(ch) = iter.next() {
                 if ch == ']' {
                     assert!(iter.next().is_none());
 
@@ -437,20 +594,31 @@ mod parsing {
             unreachable!();
         }
 
-        let mut iter = square_bracket_constructs_buffer.iter();
+        // TODO
+        // Performance
+        let square_bracket_constructs_buffer_string =
+            square_bracket_constructs_buffer.iter().collect::<String>();
+
+        let mut peekable = square_bracket_constructs_buffer_string.chars().peekable();
 
         // Skip '['
-        assert!(iter.next() == Some(&'['));
+        assert!(peekable.next() == Some('['));
 
-        // Get character before '*'
-        let char = iter.next().unwrap().to_owned();
+        let parse_single_char_result = parse_single_char(&mut peekable)?;
+
+        let Some(char) = parse_single_char_result else {
+            return Err(format!("could not parse [x*n] construct: bad input near \"{square_bracket_constructs_buffer_string}\""));
+        };
 
         // Skip '*'
-        assert!(iter.next() == Some(&'*'));
+        if peekable.next() != Some('*') {
+            // Cannot parse as a repeated character
+            return Ok(None);
+        }
 
         let mut repeat_string = String::with_capacity(square_bracket_constructs_buffer.len());
 
-        fill_repeat_str(&mut iter, &mut repeat_string);
+        fill_repeat_str(&mut peekable, &mut repeat_string);
 
         // "If n is omitted or is zero, it shall be interpreted as large enough to extend the string2-based sequence to the length of the string1-based sequence. If n has a leading zero, it shall be interpreted as an octal value. Otherwise, it shall be interpreted as a decimal value."
         // https://pubs.opengroup.org/onlinepubs/9799919799/utilities/tr.html
@@ -468,9 +636,7 @@ mod parsing {
                     Ok(0_usize) => CharRepetition::AsManyAsNeeded,
                     Ok(n) => CharRepetition::N(n),
                     Err(_pa) => {
-                        return Err(format!(
-                            "tr: invalid repeat count ‘{st}’ in [c*n] construct",
-                        ));
+                        return Err(format!("invalid repeat count '{st}' in [c*n] construct",));
                     }
                 }
             }
@@ -481,13 +647,18 @@ mod parsing {
             char_repetition,
         });
 
-        Ok(operand)
+        Ok(Some(operand))
     }
 
+    // TODO
+    // How should multiple consecutive octal sequences which together compose a valid UTF-8 character be handled?
+    // For example:
+    // ❯ printf '\303\274\n'
+    // ü
     fn parse_octal_sequence(
         first_octal_digit: char,
         peekable: &mut Peekable<Chars>,
-    ) -> Result<char, String> {
+    ) -> Result<DataTypeWithData, String> {
         let mut st = String::with_capacity(3_usize);
 
         st.push(first_octal_digit);
@@ -515,7 +686,7 @@ mod parsing {
         let octal_digits_parsed = match from_str_radix_result {
             Ok(uo) => uo,
             Err(pa) => {
-                return Err(format!("tr: failed to parse octal sequence '{st}' ({pa})"));
+                return Err(format!("failed to parse octal sequence '{st}' ({pa})"));
             }
         };
 
@@ -568,21 +739,23 @@ mod parsing {
                         ue
                     }
                     Err(pa) => {
-                        return Err(format!("tr: invalid octal sequence '{chars_str}' ({pa})"));
+                        return Err(format!("invalid octal sequence '{chars_str}' ({pa})"));
                     }
                 }
             }
         };
 
-        let char = char::from(byte);
+        let data_type_with_data = categorize_byte(byte);
 
-        Ok(char)
+        Ok(data_type_with_data)
     }
 
-    fn parse_single_char(peekable: &mut Peekable<Chars>) -> Result<Option<char>, String> {
+    fn parse_single_char(
+        peekable: &mut Peekable<Chars>,
+    ) -> Result<Option<DataTypeWithData>, String> {
         let option = match peekable.next() {
             Some('\\') => {
-                let char = match peekable.next() {
+                let data_type_with_data = match peekable.next() {
                     /* #region \octal */
                     Some(first_octal_digit @ '0'..='7') => {
                         parse_octal_sequence(first_octal_digit, peekable)?
@@ -592,30 +765,30 @@ mod parsing {
                     /* #region \character */
                     // <alert>
                     // Code point 0007
-                    Some('a') => '\u{0007}',
+                    Some('a') => categorize_char('\u{0007}'),
                     // <backspace>
                     // Code point 0008
-                    Some('b') => '\u{0008}',
+                    Some('b') => categorize_char('\u{0008}'),
                     // <tab>
                     // Code point 0009
-                    Some('t') => '\u{0009}',
+                    Some('t') => categorize_char('\u{0009}'),
                     // <newline>
                     // Code point 000A
-                    Some('n') => '\u{000A}',
+                    Some('n') => categorize_char('\u{000A}'),
                     // <vertical-tab>
                     // Code point 000B
-                    Some('v') => '\u{000B}',
+                    Some('v') => categorize_char('\u{000B}'),
                     // <form-feed>
                     // Code point 000C
-                    Some('f') => '\u{000C}',
+                    Some('f') => categorize_char('\u{000C}'),
                     // <carriage-return>
                     // Code point 000D
-                    Some('r') => '\u{000D}',
+                    Some('r') => categorize_char('\u{000D}'),
                     // <backslash>
                     // Code point 005C
                     Some('\\') => {
                         // An escaped backslash
-                        '\u{005C}'
+                        categorize_char('\u{005C}')
                     }
                     /* #endregion */
                     //
@@ -623,7 +796,7 @@ mod parsing {
                         // If a backslash is not at the end of the string, and is not followed by one of the valid
                         // escape characters (including another backslash), the backslash is basically just ignored:
                         // the following character is the character added to the set.
-                        cha
+                        categorize_char(cha)
                     }
                     None => {
                         eprintln!(
@@ -632,23 +805,31 @@ mod parsing {
 
                         // If an unescaped backslash is the last character of the string, treat it as though it were
                         // escaped (backslash is added to the set)
-                        '\u{005C}'
+                        categorize_char('\u{005C}')
                     }
                 };
 
-                Some(char)
+                Some(data_type_with_data)
             }
-            op => op,
+            op => op.map(categorize_char),
         };
 
         Ok(option)
     }
 
     fn parse_range_or_single_char(
-        starting_char: char,
+        starting: DataTypeWithData,
         peekable: &mut Peekable<Chars>,
         operand_vec: &mut Vec<Operand>,
     ) -> Result<(), String> {
+        fn backwards_range_error(da: DataTypeWithData, dat: DataTypeWithData) -> String {
+            format!(
+                "range-endpoints of '{}-{}' are in reverse collating sequence order",
+                da.printable(),
+                dat.printable()
+            )
+        }
+
         match peekable.peek() {
             Some(&hyphen @ '-') => {
                 // Possible "c-c" construct
@@ -660,50 +841,85 @@ mod parsing {
                 match parse_single_char(peekable)? {
                     Some(after_hyphen) => {
                         // Ranges are inclusive
-                        let range_inclusive = starting_char..=after_hyphen;
+                        let operands_to_add = match (starting, after_hyphen) {
+                            (
+                                da @ DataTypeWithData::Is7Bit(ue)
+                                | da @ DataTypeWithData::Is8Bit(ue),
+                                dat @ DataTypeWithData::Is7Bit(uei)
+                                | dat @ DataTypeWithData::Is8Bit(uei),
+                            ) => {
+                                let range_inclusive = ue..=uei;
 
-                        if range_inclusive.is_empty() {
-                            let message =
-                                format!(
-                                    "tr: range-endpoints of '{}-{}' are in reverse collating sequence order",
-                                    starting_char.escape_default(),
-                                    after_hyphen.escape_default()
-                                );
+                                if range_inclusive.is_empty() {
+                                    return Err(backwards_range_error(da, dat));
+                                }
 
-                            return Err(message);
-                        }
+                                range_inclusive
+                                    .map(|ue| {
+                                        Operand::Char(CharOperand {
+                                            char: categorize_byte(ue),
+                                            char_repetition: CharRepetition::N(1_usize),
+                                        })
+                                    })
+                                    .collect::<Vec<_>>()
+                            }
+                            (
+                                da @ DataTypeWithData::Is7Bit(_)
+                                | da @ DataTypeWithData::IsMultiByte(_),
+                                dat @ DataTypeWithData::Is7Bit(_)
+                                | dat @ DataTypeWithData::IsMultiByte(_),
+                            ) => {
+                                let ch = da.convert_to_char();
+                                let cha = dat.convert_to_char();
 
-                        let range_inclusive_to_operand_iterator = range_inclusive.map(|ch| {
-                            Operand::Char(CharOperand {
-                                char: ch,
-                                char_repetition: CharRepetition::N(1_usize),
-                            })
-                        });
+                                let range_inclusive = ch..=cha;
 
-                        // TODO
-                        // Does this reserve the right capacity?
-                        operand_vec.extend(range_inclusive_to_operand_iterator);
+                                if range_inclusive.is_empty() {
+                                    return Err(backwards_range_error(da, dat));
+                                }
+
+                                range_inclusive
+                                    .map(|ch| {
+                                        Operand::Char(CharOperand {
+                                            char: categorize_char(ch),
+                                            char_repetition: CharRepetition::N(1_usize),
+                                        })
+                                    })
+                                    .collect::<Vec<_>>()
+                            }
+                            _ => {
+                                // TODO
+                                return Err("cannot produce a range between 8 bit and multi-byte characters".to_string());
+                            }
+                        };
+
+                        operand_vec.extend_from_slice(operands_to_add.as_slice());
                     }
                     None => {
                         // End of input, do not handle as a range
                         // e.g. "tr 'ab' 'c-'"
-                        operand_vec.extend_from_slice(&[
-                            Operand::Char(CharOperand {
-                                char: starting_char,
-                                char_repetition: CharRepetition::N(1_usize),
-                            }),
-                            Operand::Char(CharOperand {
-                                char: hyphen,
-                                char_repetition: CharRepetition::N(1_usize),
-                            }),
-                        ]);
+                        operand_vec.extend_from_slice(
+                            [
+                                Operand::Char(CharOperand {
+                                    char: starting,
+                                    char_repetition: CharRepetition::N(1_usize),
+                                }),
+                                Operand::Char(CharOperand {
+                                    // TODO
+                                    // Optimize
+                                    char: categorize_char(hyphen),
+                                    char_repetition: CharRepetition::N(1_usize),
+                                }),
+                            ]
+                            .as_slice(),
+                        );
                     }
                 }
             }
             _ => {
                 // Not a "c-c" construct
                 operand_vec.push(Operand::Char(CharOperand {
-                    char: starting_char,
+                    char: starting,
                     char_repetition: CharRepetition::N(1_usize),
                 }))
             }
@@ -757,14 +973,18 @@ mod parsing {
                 .chain('a'..='f')
                 .collect::<Vec<_>>(),
             "" => {
-                return Err("tr: missing character class name '[::]'".to_string());
+                return Err("input '[::]' is invalid: missing character class name".to_string());
             }
-            st => return Err(format!("tr: invalid character class ‘{st}’")),
+            st => {
+                return Err(format!(
+                    "input '[:{st}:]' is invalid: invalid character class '{st}'"
+                ))
+            }
         };
 
         operand_vec.extend(char_vec.into_iter().map(|ch| {
             Operand::Char(CharOperand {
-                char: ch,
+                char: categorize_char(ch),
                 char_repetition: CharRepetition::N(1_usize),
             })
         }));
@@ -774,46 +994,72 @@ mod parsing {
 }
 
 mod setup {
-    use crate::compare_deunicoded_chars;
-    use crate::parsing::{CharOperand, CharRepetition, EquivOperand, Operand};
-    use std::collections::{HashMap, HashSet};
+    use crate::parsing::{CharOperand, CharRepetition, DataTypeWithData, EquivOperand, Operand};
     use std::error::Error;
 
-    fn complement_operands(operand_slice: &[Operand]) -> Vec<Operand> {
-        let mut hash_set = HashSet::<u8>::with_capacity(operand_slice.len());
+    fn add_normal_char(
+        data_type_with_data: DataTypeWithData,
+        seven_bit: &mut [bool; 128_usize],
+        eight_bit: &mut [bool; 128_usize],
+        multi_byte: &mut [Option<Vec<Search>>; 128_usize],
+    ) {
+        match data_type_with_data {
+            DataTypeWithData::Is7Bit(ue) => {
+                let index = usize::from(ue);
 
-        for op in operand_slice {
-            match op {
-                Operand::Char(char_operand) => {
-                    let char = char_operand.char;
+                seven_bit[index] = true;
+            }
+            DataTypeWithData::Is8Bit(ue) => {
+                let adjusted = ue - 128_u8;
 
-                    match u8::try_from(char) {
-                        Ok(ue) => {
-                            hash_set.insert(ue);
-                        }
-                        Err(_) => {
-                            // Ignore
-                        }
-                    }
-                }
-                Operand::Equiv(_) => {
+                let index = usize::from(adjusted);
+
+                eight_bit[index] = true;
+            }
+            DataTypeWithData::IsMultiByte(ch) => {
+                let mut encoding_buffer = [0_u8; 4_usize];
+
+                let st = ch.encode_utf8(&mut encoding_buffer);
+
+                let &[ue, ref rest @ ..] = st.as_bytes() else {
                     unreachable!();
+                };
+
+                let adjusted = ue - 128_u8;
+
+                let index = usize::from(adjusted);
+
+                // TODO
+                if multi_byte[index].is_none() {
+                    multi_byte[index] = Some(Vec::<Search>::new())
                 }
+
+                // TODO
+                let vec = multi_byte.get_mut(index).unwrap().as_mut().unwrap();
+
+                let search = match *rest {
+                    [a] => Search {
+                        number_of_bytes: SearchNumberOfBytes::One,
+                        payload: [a, 0_u8, 0_u8],
+                    },
+                    [a, b] => Search {
+                        number_of_bytes: SearchNumberOfBytes::Two,
+                        payload: [a, b, 0_u8],
+                    },
+                    [a, b, c] => Search {
+                        number_of_bytes: SearchNumberOfBytes::Three,
+                        payload: [a, b, c],
+                    },
+                    _ => {
+                        unreachable!();
+                    }
+                };
+
+                // TODO
+                // Order?
+                vec.push(search);
             }
-        }
-
-        let mut vec = Vec::<Operand>::new();
-
-        for ue in 0_u8..=255_u8 {
-            if !hash_set.contains(&ue) {
-                vec.push(Operand::Char(CharOperand {
-                    char: char::from(ue),
-                    char_repetition: CharRepetition::N(1_usize),
-                }));
-            }
-        }
-
-        vec
+        };
     }
 
     // TODO
@@ -821,19 +1067,13 @@ mod setup {
     pub fn generate_for_translation(
         complement: bool,
         string1_operands: Vec<Operand>,
-        string2_operands: Vec<Operand>,
+        string2_operands: &[Operand],
     ) -> Result<ForTranslation, Box<dyn Error>> {
-        let string1_operands_to_use = if complement {
-            complement_operands(&string1_operands)
-        } else {
-            string1_operands
-        };
-
         let mut char_repeating_total = 0_usize;
 
         let mut string1_operands_flattened = Vec::<Operand>::new();
 
-        for op in string1_operands_to_use {
+        for op in string1_operands {
             match op {
                 Operand::Char(CharOperand {
                     char_repetition,
@@ -841,7 +1081,7 @@ mod setup {
                 }) => match char_repetition {
                     CharRepetition::AsManyAsNeeded => {
                         return Err(Box::from(
-                            "tr: the [c*] repeat construct may not appear in string1".to_owned(),
+                            "the [c*] repeat construct may not appear in string1".to_owned(),
                         ));
                     }
                     CharRepetition::N(n) => {
@@ -882,8 +1122,7 @@ mod setup {
                             // TODO
                             // Do this validation earlier?
                             return Err(Box::from(
-                                "tr: only one [c*] repeat construct may appear in string2"
-                                    .to_owned(),
+                                "only one [c*] repeat construct may appear in string2".to_owned(),
                             ));
                         }
 
@@ -899,270 +1138,800 @@ mod setup {
                     // TODO
                     // Do this validation earlier?
                     return Err(Box::from(
-                        "tr: [=c=] expressions may not appear in string2 when translating"
-                            .to_owned(),
+                        "[=c=] expressions may not appear in string2 when translating".to_owned(),
                     ));
                 }
             }
         }
 
-        let string2_operands_to_use = if replacement_char_repeating_total < char_repeating_total {
-            let leftover = char_repeating_total
-                .checked_sub(replacement_char_repeating_total)
-                .ok_or("Arithmetic overflow")?;
-
-            // TODO
-            // to_vec
-            let mut string2_operands_with_leftover = string2_operands.to_vec();
-
-            match as_many_as_needed_index {
+        let translation = if complement {
+            // Replacement is: the only repeat construct, or the last character. No equiv is allowed.
+            let replacement = match as_many_as_needed_index {
                 Some(us) => {
-                    let op = string2_operands_with_leftover
-                        .get_mut(us)
-                        .ok_or("Indexing failed")?;
+                    let Some(Operand::Char(CharOperand {
+                        char_repetition: CharRepetition::AsManyAsNeeded,
+                        char,
+                    })) = string2_operands.get(us)
+                    else {
+                        unreachable!();
+                    };
 
-                    match op {
-                        Operand::Char(CharOperand {
-                            ref mut char_repetition,
-                            ..
-                        }) => {
-                            *char_repetition = CharRepetition::N(leftover);
-                        }
-                        Operand::Equiv(_) => {
-                            unreachable!();
-                        }
-                    }
+                    char.convert_to_replacement()
                 }
                 None => {
-                    let mut n_updated = false;
+                    let Some(Operand::Char(CharOperand {
+                        char_repetition: CharRepetition::N(_),
+                        char,
+                    })) = string2_operands.iter().next_back()
+                    else {
+                        // TODO
+                        unreachable!();
+                    };
 
-                    for op in string2_operands_with_leftover.iter_mut().rev() {
-                        if let Operand::Char(CharOperand {
-                            char_repetition: CharRepetition::N(ref mut n),
-                            ..
-                        }) = op
-                        {
-                            let n_plus_leftover =
-                                n.checked_add(leftover).ok_or("Arithmetic overflow")?;
+                    char.convert_to_replacement()
+                }
+            };
 
-                            *n = n_plus_leftover;
+            let mut equiv = Vec::<DataTypeWithData>::new();
 
-                            n_updated = true;
+            let mut seven_bit = [false; 128_usize];
+            let mut eight_bit = [false; 128_usize];
+            let mut multi_byte = [const { Option::<Vec<Search>>::None }; 128_usize];
 
-                            break;
+            {
+                for op in string1_operands_flattened.into_iter() {
+                    match op {
+                        Operand::Char(CharOperand {
+                            char,
+                            char_repetition,
+                        }) => {
+                            // TODO
+                            // Enforce with types
+                            assert!(matches!(char_repetition, CharRepetition::N(1_usize)));
+
+                            add_normal_char(char, &mut seven_bit, &mut eight_bit, &mut multi_byte);
+                        }
+                        Operand::Equiv(EquivOperand { char }) => {
+                            equiv.push(char.clone());
+
+                            // TODO
+                            // Fix for `tr_equivalence_class_low_priority`
+                            add_normal_char(char, &mut seven_bit, &mut eight_bit, &mut multi_byte);
                         }
                     }
-
-                    assert!(n_updated);
                 }
             }
 
-            string2_operands_with_leftover
+            ForTranslation::Complemented(Box::new(ComplementedTranslation {
+                replacement,
+                seven_bit,
+                eight_bit,
+                multi_byte,
+                equiv,
+            }))
         } else {
-            string2_operands
-        };
+            // Hoist for lifetime
+            let string2_operands_with_leftover;
 
-        // TODO
-        // Capacity
-        let mut string2_operands_to_use_flattened = Vec::<char>::new();
+            let string2_operands_to_use = if replacement_char_repeating_total < char_repeating_total
+            {
+                let leftover = char_repeating_total
+                    .checked_sub(replacement_char_repeating_total)
+                    .ok_or("Arithmetic overflow")?;
 
-        for op in string2_operands_to_use {
-            match op {
-                Operand::Char(CharOperand {
-                    char_repetition,
-                    char,
-                }) => match char_repetition {
-                    CharRepetition::N(n) => {
-                        for _ in 0_usize..n {
-                            string2_operands_to_use_flattened.push(char);
+                // TODO
+                // to_vec
+                let mut vec = string2_operands.to_vec();
+
+                match as_many_as_needed_index {
+                    Some(us) => {
+                        let op = vec.get_mut(us).ok_or("Indexing failed")?;
+
+                        match op {
+                            Operand::Char(CharOperand {
+                                ref mut char_repetition,
+                                ..
+                            }) => {
+                                *char_repetition = CharRepetition::N(leftover);
+                            }
+                            Operand::Equiv(_) => {
+                                unreachable!();
+                            }
                         }
                     }
-                    CharRepetition::AsManyAsNeeded => {
-                        // The "[c*]" construct was not needed, ignore it
+                    None => {
+                        let mut n_updated = false;
+
+                        for op in vec.iter_mut().rev() {
+                            if let Operand::Char(CharOperand {
+                                char_repetition: CharRepetition::N(ref mut n),
+                                ..
+                            }) = op
+                            {
+                                let n_plus_leftover =
+                                    n.checked_add(leftover).ok_or("Arithmetic overflow")?;
+
+                                *n = n_plus_leftover;
+
+                                n_updated = true;
+
+                                break;
+                            }
+                        }
+
+                        assert!(n_updated);
                     }
-                },
-                Operand::Equiv(_) => {
-                    unreachable!();
+                }
+
+                string2_operands_with_leftover = vec;
+
+                &string2_operands_with_leftover
+            } else {
+                string2_operands
+            };
+
+            // TODO
+            // Capacity
+            let mut string2_operands_to_use_flattened = Vec::<DataTypeWithData>::new();
+
+            for op in string2_operands_to_use {
+                match op {
+                    Operand::Char(CharOperand {
+                        char_repetition,
+                        char,
+                    }) => match char_repetition {
+                        CharRepetition::N(n) => {
+                            for _ in 0_usize..(*n) {
+                                string2_operands_to_use_flattened.push(char.to_owned());
+                            }
+                        }
+                        CharRepetition::AsManyAsNeeded => {
+                            // The "[c*]" construct was not needed, ignore it
+                        }
+                    },
+                    Operand::Equiv(_) => {
+                        unreachable!();
+                    }
                 }
             }
-        }
 
-        // TODO
-        // Capacities
-        let mut equiv_translation_chars = Vec::<(char, char)>::new();
-        let mut multi_byte_translation_hash_map = HashMap::<char, char>::new();
-        let mut single_byte_translation_lookup_table = [Option::<char>::None; 128_usize];
+            let mut equiv = Vec::<(DataTypeWithData, FullChar)>::new();
 
-        let mut encoding_buffer = [0_u8; 4_usize];
+            let mut seven_bit = [const { Option::<FullChar>::None }; 128_usize];
+            let mut eight_bit = [const { Option::<FullChar>::None }; 256_usize];
+            let mut multi_byte = [const { Option::<Vec<SearchAndReplace>>::None }; 256_usize];
 
-        let mut add_normal_char = |ch: char, replacement_char: char| {
-            let sl = ch.encode_utf8(&mut encoding_buffer);
+            let mut encoding_buffer = [0_u8; 4_usize];
 
-            match sl.as_bytes() {
-                &[ue] => {
-                    single_byte_translation_lookup_table[usize::from(ue)] = Some(replacement_char);
-                }
-                _ => {
-                    multi_byte_translation_hash_map.insert(ch, replacement_char);
+            let mut add_normal_char_with_replacement =
+                |da: DataTypeWithData, replacement_char: FullChar| {
+                    match da {
+                        DataTypeWithData::Is7Bit(ue) => {
+                            let index = usize::from(ue);
+
+                            seven_bit[index] = Some(replacement_char);
+                        }
+                        DataTypeWithData::Is8Bit(ue) => {
+                            let adjusted = ue - 128_u8;
+
+                            let index = usize::from(adjusted);
+
+                            eight_bit[index] = Some(replacement_char);
+                        }
+                        DataTypeWithData::IsMultiByte(ch) => {
+                            let st = ch.encode_utf8(&mut encoding_buffer);
+
+                            let &[ue, ref rest @ ..] = st.as_bytes() else {
+                                unreachable!();
+                            };
+
+                            let adjusted = ue - 128_u8;
+
+                            let index = usize::from(adjusted);
+
+                            // TODO
+                            if multi_byte[index].is_none() {
+                                multi_byte[index] = Some(Vec::<SearchAndReplace>::new())
+                            }
+
+                            // TODO
+                            let vec = multi_byte.get_mut(index).unwrap().as_mut().unwrap();
+
+                            let search_and_replace = match *rest {
+                                [a] => SearchAndReplace {
+                                    replacement: replacement_char,
+                                    number_of_bytes: SearchNumberOfBytes::One,
+                                    payload: [a, 0_u8, 0_u8],
+                                },
+                                [a, b] => SearchAndReplace {
+                                    replacement: replacement_char,
+                                    number_of_bytes: SearchNumberOfBytes::Two,
+                                    payload: [a, b, 0_u8],
+                                },
+                                [a, b, c] => SearchAndReplace {
+                                    replacement: replacement_char,
+                                    number_of_bytes: SearchNumberOfBytes::Three,
+                                    payload: [a, b, c],
+                                },
+                                _ => {
+                                    unreachable!();
+                                }
+                            };
+
+                            // TODO
+                            // Order?
+                            vec.push(search_and_replace);
+                        }
+                    }
+                };
+
+            for (us, op) in string1_operands_flattened.into_iter().enumerate() {
+                let da = string2_operands_to_use_flattened
+                    .get(us)
+                    .ok_or("Indexing failed")?;
+
+                let replacement = da.convert_to_replacement();
+
+                match op {
+                    Operand::Char(CharOperand {
+                        char,
+                        char_repetition,
+                    }) => {
+                        // TODO
+                        // Enforce with types
+                        assert!(matches!(char_repetition, CharRepetition::N(1_usize)));
+
+                        add_normal_char_with_replacement(char, replacement);
+                    }
+                    Operand::Equiv(EquivOperand { char }) => {
+                        equiv.push((char.clone(), replacement.clone()));
+
+                        // TODO
+                        // Fix for `tr_equivalence_class_low_priority`
+                        add_normal_char_with_replacement(char, replacement);
+                    }
                 }
             }
+
+            ForTranslation::NotComplemented(Box::new(NotComplementedTranslation {
+                seven_bit,
+                eight_bit,
+                multi_byte,
+                equiv,
+            }))
         };
 
-        for (us, op) in string1_operands_flattened.into_iter().enumerate() {
-            let replacement_char = *(string2_operands_to_use_flattened
-                .get(us)
-                .ok_or("Indexing failed")?);
-
-            match op {
-                Operand::Char(CharOperand {
-                    char,
-                    char_repetition,
-                }) => {
-                    // TODO
-                    // Enforce with types
-                    assert!(matches!(char_repetition, CharRepetition::N(1_usize)));
-
-                    add_normal_char(char, replacement_char);
-                }
-                Operand::Equiv(EquivOperand { char }) => {
-                    equiv_translation_chars.push((char, replacement_char));
-
-                    // TODO
-                    // Fix for `tr_equivalence_class_low_priority`
-                    add_normal_char(char, replacement_char);
-                }
-            }
-        }
-
-        let for_translate = ForTranslation {
-            equiv_translation_chars,
-            multi_byte_translation_hash_map,
-            single_byte_translation_lookup_table: Box::new(single_byte_translation_lookup_table),
-        };
-
-        Ok(for_translate)
+        Ok(translation)
     }
 
     pub fn generate_for_removal(
         complement: bool,
-        string1_operands: Vec<Operand>,
+        string1_or_string2_operands: Vec<Operand>,
+        is_string1: bool,
     ) -> Result<ForRemoval, Box<dyn Error>> {
-        let mut equiv_removal_chars = Vec::<char>::new();
-        let mut multi_byte_removal_hash_set = HashSet::<char>::new();
-        let mut single_byte_removal_lookup_table = [false; 128_usize];
+        let mut equiv = Vec::<DataTypeWithData>::new();
 
-        let mut encoding_buffer = [0_u8; 4_usize];
+        let mut seven_bit = [false; 128_usize];
+        let mut eight_bit = [false; 128_usize];
+        let mut multi_byte = [const { Option::<Vec<Search>>::None }; 128_usize];
 
-        for op in string1_operands {
+        for op in string1_or_string2_operands {
             match op {
                 Operand::Char(CharOperand {
                     char_repetition,
                     char,
                 }) => match char_repetition {
                     CharRepetition::AsManyAsNeeded => {
-                        return Err(Box::from(
-                            "tr: the [c*] repeat construct may not appear in string1".to_owned(),
-                        ));
+                        if is_string1 {
+                            return Err(Box::from(
+                                "the [c*] repeat construct may not appear in string1".to_owned(),
+                            ));
+                        } else {
+                            // Squeezing, allowed
+                            // See `tr_non_standard_d_s`
+                            add_normal_char(char, &mut seven_bit, &mut eight_bit, &mut multi_byte);
+                        }
                     }
                     CharRepetition::N(_) => {
-                        let sl = char.encode_utf8(&mut encoding_buffer);
-
-                        match sl.as_bytes() {
-                            &[ue] => {
-                                single_byte_removal_lookup_table[usize::from(ue)] = true;
-                            }
-                            _ => {
-                                multi_byte_removal_hash_set.insert(char);
-                            }
-                        }
+                        add_normal_char(char, &mut seven_bit, &mut eight_bit, &mut multi_byte);
                     }
                 },
                 Operand::Equiv(EquivOperand { char }) => {
-                    equiv_removal_chars.push(char);
+                    equiv.push(char);
                 }
             }
         }
 
-        let for_removal = ForRemoval {
-            complement,
-            multi_byte_removal_hash_set,
-            single_byte_removal_lookup_table: Box::new(single_byte_removal_lookup_table),
-            equiv_removal_chars,
+        let removal = RemovalShared {
+            eight_bit,
+            equiv,
+            multi_byte,
+            seven_bit,
+        };
+
+        let for_removal = if complement {
+            ForRemoval::Complemented(Box::new(ComplementedRemoval { removal }))
+        } else {
+            ForRemoval::NotComplemented(Box::new(NotComplementedRemoval { removal }))
         };
 
         Ok(for_removal)
     }
 
-    pub struct ForTranslation {
-        pub equiv_translation_chars: Vec<(char, char)>,
-        pub multi_byte_translation_hash_map: HashMap<char, char>,
-        pub single_byte_translation_lookup_table: Box<[Option<char>; 128_usize]>,
+    #[derive(Clone, Copy)]
+    #[repr(u8)]
+    pub enum FullCharNumberOfBytes {
+        One = 1_u8,
+        Two = 2_u8,
+        Three = 3_u8,
+        Four = 4_u8,
     }
 
-    impl ForTranslation {
-        pub fn char_has_translation(&self, ch: char, char_slice: &[u8]) -> Option<char> {
-            let first_check = match char_slice {
-                &[ue] => self.single_byte_translation_lookup_table[usize::from(ue)],
-                _ => self.multi_byte_translation_hash_map.get(&ch).copied(),
-            };
+    #[derive(Clone)]
+    pub struct FullChar {
+        // TODO
+        // Determine how many bytes to write by the payload?
+        pub number_of_bytes: FullCharNumberOfBytes,
+        pub payload: [u8; 4_usize],
+    }
 
-            match first_check {
-                op @ Some(_) => {
-                    return op;
+    impl FullChar {
+        pub fn fast_check(&self, byte_a: u8, next_bytes: &[u8]) -> bool {
+            // Fast check
+            if byte_a == self.payload[0_usize] {
+                let number_of_bytes_usize = self.number_of_bytes as usize;
+
+                let check_against = &self.payload[1_usize..number_of_bytes_usize];
+
+                return next_bytes.starts_with(check_against);
+            }
+
+            false
+        }
+
+        pub fn write_full_char(&self, to: &mut [u8]) -> usize {
+            let to_write = self.number_of_bytes as usize;
+
+            to[..to_write].clone_from_slice(&self.payload[..to_write]);
+
+            to_write
+        }
+
+        pub fn new_from_u8(byte: u8) -> FullChar {
+            FullChar {
+                number_of_bytes: FullCharNumberOfBytes::One,
+                payload: [byte, 0_u8, 0_u8, 0_u8],
+            }
+        }
+
+        pub fn new_from_char(char: char) -> FullChar {
+            let mut encoding_buffer = [0_u8; 4_usize];
+
+            let st = char.encode_utf8(&mut encoding_buffer);
+
+            match *st.as_bytes() {
+                [a, b] => FullChar {
+                    number_of_bytes: FullCharNumberOfBytes::Two,
+                    payload: [a, b, 0_u8, 0_u8],
+                },
+                [a, b, c] => FullChar {
+                    number_of_bytes: FullCharNumberOfBytes::Three,
+                    payload: [a, b, c, 0_u8],
+                },
+                [a, b, c, d] => FullChar {
+                    number_of_bytes: FullCharNumberOfBytes::Four,
+                    payload: [a, b, c, d],
+                },
+                _ => {
+                    unreachable!();
                 }
-                None => {
-                    for (cha, char) in &self.equiv_translation_chars {
-                        if compare_deunicoded_chars(ch, *cha) {
-                            return Some(*char);
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    #[repr(u8)]
+    pub enum SearchNumberOfBytes {
+        One = 1_u8,
+        Two = 2_u8,
+        Three = 3_u8,
+    }
+
+    impl SearchNumberOfBytes {
+        pub fn increment(&self) -> FullCharNumberOfBytes {
+            match self {
+                SearchNumberOfBytes::One => FullCharNumberOfBytes::Two,
+                SearchNumberOfBytes::Two => FullCharNumberOfBytes::Three,
+                SearchNumberOfBytes::Three => FullCharNumberOfBytes::Four,
+            }
+        }
+    }
+
+    pub struct SearchAndReplace {
+        number_of_bytes: SearchNumberOfBytes,
+        payload: [u8; 3_usize],
+        replacement: FullChar,
+    }
+
+    pub enum ForTranslation {
+        NotComplemented(Box<NotComplementedTranslation>),
+        Complemented(Box<ComplementedTranslation>),
+    }
+
+    pub struct ReplacementCheckResult<'a> {
+        pub replacement: Option<&'a FullChar>,
+        pub match_lookahead_length: Option<SearchNumberOfBytes>,
+        pub found_match: bool,
+    }
+
+    impl Translation for NotComplementedTranslation {
+        #[inline]
+        fn get_seven_bit_replacement(&self, ue: u8) -> ReplacementCheckResult {
+            let index = usize::from(ue);
+
+            let replacement = self.seven_bit[index].as_ref();
+
+            ReplacementCheckResult {
+                replacement,
+                match_lookahead_length: None,
+                found_match: replacement.is_some(),
+            }
+        }
+
+        #[inline]
+        fn get_eight_bit_replacement<'a>(
+            &'a self,
+            ue: u8,
+            next_bytes: &[u8],
+        ) -> ReplacementCheckResult<'a> {
+            let index = usize::from(ue);
+
+            if let Some(fu) = self.eight_bit[index].as_ref() {
+                ReplacementCheckResult {
+                    replacement: Some(fu),
+                    match_lookahead_length: None,
+                    found_match: true,
+                }
+            } else {
+                match &self.multi_byte[index] {
+                    Some(ve) => {
+                        // TODO
+                        // Order
+                        for se in ve {
+                            let number_of_bytes = se.number_of_bytes;
+
+                            let test =
+                                next_bytes.starts_with(&se.payload[..(number_of_bytes as usize)]);
+
+                            if test {
+                                return ReplacementCheckResult {
+                                    replacement: Some(&se.replacement),
+                                    match_lookahead_length: Some(number_of_bytes),
+                                    found_match: true,
+                                };
+                            }
                         }
+
+                        ReplacementCheckResult {
+                            replacement: None,
+                            match_lookahead_length: None,
+                            found_match: false,
+                        }
+                    }
+                    None => ReplacementCheckResult {
+                        replacement: None,
+                        match_lookahead_length: None,
+                        found_match: false,
+                    },
+                }
+            }
+        }
+
+        #[inline]
+        fn get_equiv_result(&self, ue: u8) -> ReplacementCheckResult<'_> {
+            for (da, fu) in &self.equiv {
+                match da {
+                    DataTypeWithData::Is7Bit(uei) | DataTypeWithData::Is8Bit(uei) => {
+                        if ue == *uei {
+                            return ReplacementCheckResult {
+                                replacement: Some(fu),
+                                match_lookahead_length: None,
+                                found_match: true,
+                            };
+                        }
+                    }
+                    DataTypeWithData::IsMultiByte(_) => {
+                        unreachable!();
                     }
                 }
             }
 
-            None
+            ReplacementCheckResult {
+                replacement: None,
+                match_lookahead_length: None,
+                found_match: false,
+            }
         }
     }
 
-    pub struct ForRemoval {
-        complement: bool,
-        equiv_removal_chars: Vec<char>,
-        multi_byte_removal_hash_set: HashSet<char>,
-        single_byte_removal_lookup_table: Box<[bool; 128_usize]>,
-    }
+    impl Translation for ComplementedTranslation {
+        #[inline]
+        fn get_seven_bit_replacement(&self, ue: u8) -> ReplacementCheckResult {
+            let index = usize::from(ue);
 
-    impl ForRemoval {
-        pub fn char_matches(&self, ch: char, char_slice: &[u8]) -> bool {
-            let first_check = match char_slice {
-                &[ue] => self.single_byte_removal_lookup_table[usize::from(ue)],
-                _ => self.multi_byte_removal_hash_set.contains(&ch),
-            };
+            let value_is_true = self.seven_bit[index];
 
-            let first_check_to_use = if self.complement {
-                !first_check
-            } else {
-                first_check
-            };
-
-            if first_check_to_use {
-                return true;
-            }
-
-            // Second check
-            for &cha in &self.equiv_removal_chars {
-                let second_check = compare_deunicoded_chars(ch, cha);
-
-                let second_check_to_use = if self.complement {
-                    !second_check
+            ReplacementCheckResult {
+                replacement: if value_is_true {
+                    None
                 } else {
-                    second_check
-                };
+                    Some(&self.replacement)
+                },
+                match_lookahead_length: None,
+                found_match: value_is_true,
+            }
+        }
 
-                if second_check_to_use {
-                    return true;
+        #[inline]
+        fn get_eight_bit_replacement(&self, ue: u8, next_bytes: &[u8]) -> ReplacementCheckResult {
+            let index = usize::from(ue);
+
+            if self.eight_bit[index] {
+                ReplacementCheckResult {
+                    replacement: None,
+                    match_lookahead_length: None,
+                    found_match: true,
+                }
+            } else {
+                match &self.multi_byte[index] {
+                    Some(ve) => {
+                        // TODO
+                        // Order
+                        for se in ve {
+                            let number_of_bytes = se.number_of_bytes;
+
+                            let test =
+                                next_bytes.starts_with(&se.payload[..(number_of_bytes as usize)]);
+
+                            if test {
+                                return ReplacementCheckResult {
+                                    replacement: None,
+                                    match_lookahead_length: Some(number_of_bytes),
+                                    found_match: true,
+                                };
+                            }
+                        }
+
+                        ReplacementCheckResult {
+                            replacement: Some(&self.replacement),
+                            match_lookahead_length: None,
+                            found_match: false,
+                        }
+                    }
+                    None => ReplacementCheckResult {
+                        replacement: Some(&self.replacement),
+                        match_lookahead_length: None,
+                        found_match: false,
+                    },
+                }
+            }
+        }
+
+        #[inline]
+        fn get_equiv_result(&self, ue: u8) -> ReplacementCheckResult<'_> {
+            for da in &self.equiv {
+                match da {
+                    DataTypeWithData::Is7Bit(uei) | DataTypeWithData::Is8Bit(uei) => {
+                        if ue == *uei {
+                            return ReplacementCheckResult {
+                                replacement: None,
+                                match_lookahead_length: None,
+                                found_match: true,
+                            };
+                        }
+                    }
+                    DataTypeWithData::IsMultiByte(_) => {
+                        unreachable!();
+                    }
                 }
             }
 
-            false
+            ReplacementCheckResult {
+                replacement: Some(&self.replacement),
+                match_lookahead_length: None,
+                found_match: false,
+            }
+        }
+    }
+
+    pub trait Translation {
+        #[inline]
+        fn check(&self, ue: u8, next_bytes: &[u8]) -> ReplacementCheckResult {
+            let first_check = if ue < 128_u8 {
+                self.get_seven_bit_replacement(ue)
+            } else {
+                self.get_eight_bit_replacement(ue - 128_u8, next_bytes)
+            };
+
+            if first_check.found_match {
+                return first_check;
+            }
+
+            self.get_equiv_result(ue)
+        }
+
+        fn get_seven_bit_replacement(&self, ue: u8) -> ReplacementCheckResult;
+
+        fn get_eight_bit_replacement<'a>(
+            &'a self,
+            ue: u8,
+            next_bytes: &[u8],
+        ) -> ReplacementCheckResult<'a>;
+
+        fn get_equiv_result(&self, ue: u8) -> ReplacementCheckResult<'_>;
+    }
+
+    pub struct NotComplementedTranslation {
+        pub seven_bit: [Option<FullChar>; 128_usize],
+        pub eight_bit: [Option<FullChar>; 256_usize],
+        pub multi_byte: [Option<Vec<SearchAndReplace>>; 256_usize],
+        pub equiv: Vec<(DataTypeWithData, FullChar)>,
+    }
+
+    pub struct ComplementedTranslation {
+        pub replacement: FullChar,
+        pub seven_bit: [bool; 128_usize],
+        pub eight_bit: [bool; 128_usize],
+        pub multi_byte: [Option<Vec<Search>>; 128_usize],
+        pub equiv: Vec<DataTypeWithData>,
+    }
+
+    pub struct Search {
+        number_of_bytes: SearchNumberOfBytes,
+        payload: [u8; 3_usize],
+    }
+
+    pub struct RemovalShared {
+        seven_bit: [bool; 128_usize],
+        eight_bit: [bool; 128_usize],
+        multi_byte: [Option<Vec<Search>>; 128_usize],
+        equiv: Vec<DataTypeWithData>,
+    }
+
+    pub struct RemovalCheckResult {
+        pub matched: bool,
+        pub match_lookahead_length: Option<SearchNumberOfBytes>,
+        pub found_match: bool,
+    }
+
+    impl RemovalShared {
+        #[inline]
+        fn check(&self, ue: u8, next_bytes: &[u8]) -> RemovalCheckResult {
+            let first_check = if ue < 128_u8 {
+                self.get_seven_bit_deletion(ue)
+            } else {
+                self.get_eight_bit_deletion(ue - 128_u8, next_bytes)
+            };
+
+            if first_check.found_match {
+                return first_check;
+            }
+
+            for da in &self.equiv {
+                match da {
+                    DataTypeWithData::Is7Bit(uei) | DataTypeWithData::Is8Bit(uei) => {
+                        if ue == *uei {
+                            return RemovalCheckResult {
+                                matched: true,
+                                match_lookahead_length: None,
+                                found_match: true,
+                            };
+                        }
+                    }
+                    DataTypeWithData::IsMultiByte(_) => {
+                        unreachable!();
+                    }
+                }
+            }
+
+            RemovalCheckResult {
+                matched: false,
+                match_lookahead_length: None,
+                found_match: false,
+            }
+        }
+
+        #[inline]
+        fn get_seven_bit_deletion(&self, ue: u8) -> RemovalCheckResult {
+            let index = usize::from(ue);
+
+            let value_is_true = self.seven_bit[index];
+
+            RemovalCheckResult {
+                match_lookahead_length: None,
+                matched: value_is_true,
+                found_match: value_is_true,
+            }
+        }
+
+        #[inline]
+        fn get_eight_bit_deletion(&self, ue: u8, next_bytes: &[u8]) -> RemovalCheckResult {
+            let index = usize::from(ue);
+
+            if self.eight_bit[index] {
+                RemovalCheckResult {
+                    matched: true,
+                    match_lookahead_length: None,
+                    found_match: true,
+                }
+            } else {
+                match &self.multi_byte[index] {
+                    Some(ve) => {
+                        // TODO
+                        // Order
+                        for se in ve {
+                            let number_of_bytes = se.number_of_bytes;
+
+                            let test =
+                                next_bytes.starts_with(&se.payload[..(number_of_bytes as usize)]);
+
+                            if test {
+                                return RemovalCheckResult {
+                                    matched: true,
+                                    match_lookahead_length: Some(number_of_bytes),
+                                    found_match: true,
+                                };
+                            }
+                        }
+
+                        RemovalCheckResult {
+                            matched: false,
+                            match_lookahead_length: None,
+                            found_match: false,
+                        }
+                    }
+                    None => RemovalCheckResult {
+                        matched: false,
+                        match_lookahead_length: None,
+                        found_match: false,
+                    },
+                }
+            }
+        }
+    }
+
+    pub struct NotComplementedRemoval {
+        removal: RemovalShared,
+    }
+
+    pub struct ComplementedRemoval {
+        removal: RemovalShared,
+    }
+
+    pub enum ForRemoval {
+        NotComplemented(Box<NotComplementedRemoval>),
+        Complemented(Box<ComplementedRemoval>),
+    }
+
+    pub trait Removal {
+        fn check(&self, ue: u8, next_bytes: &[u8]) -> RemovalCheckResult;
+    }
+
+    impl Removal for NotComplementedRemoval {
+        #[inline]
+        fn check(&self, ue: u8, next_bytes: &[u8]) -> RemovalCheckResult {
+            self.removal.check(ue, next_bytes)
+        }
+    }
+
+    impl Removal for ComplementedRemoval {
+        #[inline]
+        fn check(&self, ue: u8, next_bytes: &[u8]) -> RemovalCheckResult {
+            let mut re = self.removal.check(ue, next_bytes);
+
+            re.matched = !re.matched;
+
+            re
         }
     }
 }
@@ -1171,730 +1940,535 @@ mod transformation {
     use std::error::Error;
     use std::io::{self, ErrorKind, Read, Write};
 
-    pub trait Transformation {
-        fn transform(&mut self, input: &str, output: &mut Vec<u8>);
+    pub struct TransformResult {
+        pub bytes_written: usize,
+        pub leftover_bytes: usize,
     }
 
-    impl dyn Transformation {
-        pub fn streaming_transform(&mut self) -> Result<(), Box<dyn Error>> {
-            // Must be big enough to hold at least one UTF-8 character
-            const SIZE: usize = 8_usize * 1_024_usize;
+    pub trait Transformation {
+        fn process_current_byte_with_window(
+            &mut self,
+            byte_a: u8,
+            next_bytes: &[u8],
+            index: &mut usize,
+            bytes_written: &mut usize,
+            output: &mut [u8],
+        );
 
-            // Buffers
-            let mut input = vec![0_u8; SIZE];
-            let mut output = Vec::<u8>::with_capacity(SIZE);
-            let mut temporary_leftover = Vec::<u8>::new();
+        #[inline]
+        fn transform_buffer(
+            &mut self,
+            input: &mut [u8],
+            output: &mut [u8],
+            last_iteration: bool,
+        ) -> TransformResult {
+            let input_len = input.len();
 
-            // TODO
-            // Improve this
-            let mut leftover_bytes = 0_usize;
+            let mut bytes_written = 0_usize;
 
-            let mut stdin_lock = io::stdin().lock();
-            let mut stdout_lock = io::stdout().lock();
+            let mut index = 0_usize;
 
             loop {
-                let buf = &mut input[leftover_bytes..];
+                let option = input.get(index..(index + 4_usize));
 
-                match stdin_lock.read(buf) {
-                    Ok(0_usize) => {
-                        assert!(leftover_bytes == 0_usize);
+                let Some(&[byte_a, byte_b, byte_c, byte_d]) = option else {
+                    break;
+                };
 
-                        assert!(!buf.is_empty());
-
-                        break;
-                    }
-                    Ok(us) => {
-                        let read_slice = &input[..(leftover_bytes + us)];
-
-                        let for_transform = match std::str::from_utf8(read_slice) {
-                            Ok(st) => st,
-                            Err(ut) => {
-                                let (valid, remainder) = read_slice.split_at(ut.valid_up_to());
-
-                                temporary_leftover.extend_from_slice(remainder);
-
-                                // https://doc.rust-lang.org/std/str/struct.Utf8Error.html#examples
-                                unsafe { std::str::from_utf8_unchecked(valid) }
-                            }
-                        };
-
-                        self.transform(for_transform, &mut output);
-
-                        // TODO
-                        // Do this in a nicer way
-                        for (us, ue) in temporary_leftover.iter().enumerate() {
-                            // TODO
-                            // Indexing
-                            input[us] = *ue;
-                        }
-
-                        leftover_bytes = temporary_leftover.len();
-
-                        temporary_leftover.clear();
-
-                        stdout_lock.write_all(&output)?;
-
-                        output.clear();
-                    }
-                    Err(er) => {
-                        if er.kind() == ErrorKind::Interrupted {
-                            continue;
-                        }
-
-                        return Err(Box::from(er));
-                    }
-                }
+                self.process_current_byte_with_window(
+                    byte_a,
+                    &[byte_b, byte_c, byte_d],
+                    &mut index,
+                    &mut bytes_written,
+                    output,
+                );
             }
 
-            Ok(())
+            debug_assert!((input_len - index) <= 4_usize);
+
+            let leftover_bytes = if last_iteration {
+                loop {
+                    let Some(&byte_a) = input.get(index) else {
+                        break;
+                    };
+
+                    let next_bytes = &input[(index + 1_usize)..];
+
+                    debug_assert!(next_bytes.len() <= 4_usize);
+
+                    self.process_current_byte_with_window(
+                        byte_a,
+                        next_bytes,
+                        &mut index,
+                        &mut bytes_written,
+                        output,
+                    );
+                }
+
+                0_usize
+            } else {
+                let range = index..input_len;
+
+                let range_len = range.len();
+
+                input.copy_within(range, 0_usize);
+
+                range_len
+            };
+
+            TransformResult {
+                bytes_written,
+                leftover_bytes,
+            }
         }
+    }
+
+    pub fn streaming_transform<T: Transformation>(t: &mut T) -> Result<(), Box<dyn Error>> {
+        const SIZE: usize = 8_usize * 1_024_usize;
+
+        // Buffers
+        let mut input = vec![0_u8; SIZE];
+        // Most pessimistic case is every input character is a one byte character, and is being translated to a four byte character
+        let mut output = vec![0_u8; SIZE * 4_usize];
+
+        let mut leftover_bytes = 0_usize;
+
+        // TODO
+        // Improve this
+        let mut stdin_lock = io::stdin().lock();
+        let mut stdout_lock = io::stdout().lock();
+
+        loop {
+            let buf = &mut input[leftover_bytes..];
+
+            match stdin_lock.read(buf) {
+                Ok(0_usize) => {
+                    let transform_result =
+                        t.transform_buffer(&mut input[..leftover_bytes], &mut output, true);
+
+                    stdout_lock.write_all(&output[..(transform_result.bytes_written)])?;
+
+                    break;
+                }
+                Ok(us) => {
+                    let read_slice = &mut input[..(leftover_bytes + us)];
+
+                    let transform_result = t.transform_buffer(read_slice, &mut output, false);
+
+                    leftover_bytes = transform_result.leftover_bytes;
+
+                    stdout_lock.write_all(&output[..(transform_result.bytes_written)])?;
+                }
+                Err(er) => {
+                    if er.kind() == ErrorKind::Interrupted {
+                        continue;
+                    }
+
+                    return Err(Box::from(er));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub mod delete {
         use super::Transformation;
-        use crate::setup::ForRemoval;
+        use crate::setup::Removal;
 
-        struct PreviousChar<'a> {
-            char: char,
-            bytes_to_print: Option<&'a [u8]>,
+        pub struct DeleteTransformation<T: Removal> {
+            pub removal: T,
         }
 
-        impl PreviousChar<'_> {
-            fn get_owned(&self) -> PreviousCharOwned {
-                PreviousCharOwned {
-                    char: self.char,
-                    bytes_to_print: self.bytes_to_print.map(|sl| sl.to_vec()),
-                }
-            }
-        }
+        impl<T: Removal> Transformation for DeleteTransformation<T> {
+            #[inline]
+            fn process_current_byte_with_window(
+                &mut self,
+                byte_a: u8,
+                next_bytes: &[u8],
+                index: &mut usize,
+                bytes_written: &mut usize,
+                output: &mut [u8],
+            ) {
+                let output_slice = &mut output[(*bytes_written)..];
 
-        #[derive(Clone)]
-        pub struct PreviousCharOwned {
-            char: char,
-            bytes_to_print: Option<Vec<u8>>,
-        }
+                let removal_check_result = self.removal.check(byte_a, next_bytes);
 
-        impl<'a> PreviousCharOwned {
-            fn get_borrowed(&'a self) -> PreviousChar<'a> {
-                PreviousChar {
-                    char: self.char,
-                    bytes_to_print: self.bytes_to_print.as_deref(),
-                }
-            }
-        }
-
-        #[derive(Clone)]
-        pub enum DeleteState {
-            Start,
-            Continuation(PreviousCharOwned),
-        }
-
-        pub struct DeleteTransformation {
-            pub delete_state: DeleteState,
-            pub for_removal: ForRemoval,
-        }
-
-        impl Transformation for DeleteTransformation {
-            fn transform(&mut self, input: &str, output: &mut Vec<u8>) {
-                let mut chars = input.chars();
-
-                let mut encoding_buffer = [0_u8; 4_usize];
-
-                let previous_char_owned = match self.delete_state.to_owned() {
-                    DeleteState::Continuation(pr) => pr,
-                    DeleteState::Start => {
-                        // First character
-                        if let Some(ch) = chars.next() {
-                            let char_slice = ch.encode_utf8(&mut encoding_buffer).as_bytes();
-
-                            let delete_char = self.for_removal.char_matches(ch, char_slice);
-
-                            if delete_char {
-                                PreviousCharOwned {
-                                    char: ch,
-                                    bytes_to_print: None,
-                                }
-                            } else {
-                                output.extend_from_slice(char_slice);
-
-                                PreviousCharOwned {
-                                    bytes_to_print: Some(char_slice.to_vec()),
-                                    char: ch,
-                                }
-                            }
-                        } else {
-                            // No input to process
-                            return;
-                        }
-                    }
-                };
-
-                let mut previous_char = previous_char_owned.get_borrowed();
-
-                for ch in chars {
-                    // Optimization for repeated deletions
-                    // TODO
-                    // Track state across calls to `transform`
-                    if ch == previous_char.char {
-                        if let Some(sl) = previous_char.bytes_to_print {
-                            output.extend_from_slice(sl);
-                        }
-
-                        continue;
-                    }
-
-                    let char_slice = ch.encode_utf8(&mut encoding_buffer).as_bytes();
-
-                    let delete_char = self.for_removal.char_matches(ch, char_slice);
-
-                    previous_char = if delete_char {
-                        PreviousChar {
-                            char: ch,
-                            bytes_to_print: None,
-                        }
-                    } else {
-                        output.extend_from_slice(char_slice);
-
-                        PreviousChar {
-                            char: ch,
-                            bytes_to_print: Some(char_slice),
-                        }
-                    };
+                if let Some(se) = removal_check_result.match_lookahead_length {
+                    *index += se as usize;
                 }
 
-                self.delete_state = DeleteState::Continuation(previous_char.get_owned());
+                *index += 1_usize;
+
+                if removal_check_result.matched {
+                    return;
+                }
+
+                // Not deleted
+                {
+                    output_slice[0_usize] = byte_a;
+
+                    *bytes_written += 1_usize;
+                }
             }
         }
     }
 
     pub mod delete_and_squeeze {
         use super::Transformation;
-        use crate::setup::ForRemoval;
+        use crate::setup::{FullChar, FullCharNumberOfBytes, NotComplementedRemoval, Removal};
 
-        enum Behavior<'a> {
-            Delete,
-            Print {
-                squeeze_char: bool,
-                bytes_to_print: &'a [u8],
-            },
-        }
-
-        #[derive(Clone)]
-        pub enum BehaviorOwned {
-            Delete,
-            Print {
-                squeeze_char: bool,
-                bytes_to_print: Vec<u8>,
-            },
-        }
-
-        #[derive(Clone)]
         pub struct LastPrintedChar {
-            char: char,
+            char: FullChar,
             squeeze_char: bool,
         }
 
-        pub struct PreviousChar<'a> {
-            char: char,
-            on_consecutive_appearance: Behavior<'a>,
+        pub struct DeleteAndSqueezeState {
+            pub last_printed_character: Option<LastPrintedChar>,
         }
 
-        impl PreviousChar<'_> {
-            fn get_owned(&self) -> PreviousCharOwned {
-                PreviousCharOwned {
-                    char: self.char,
-                    on_consecutive_appearance: match self.on_consecutive_appearance {
-                        Behavior::Delete => BehaviorOwned::Delete,
-                        Behavior::Print {
-                            squeeze_char,
-                            bytes_to_print,
-                        } => BehaviorOwned::Print {
-                            squeeze_char,
-                            bytes_to_print: bytes_to_print.to_vec(),
-                        },
-                    },
-                }
-            }
-        }
-
-        #[derive(Clone)]
-        pub struct PreviousCharOwned {
-            char: char,
-            on_consecutive_appearance: BehaviorOwned,
-        }
-
-        impl<'a> PreviousCharOwned {
-            fn get_borrowed(&'a self) -> PreviousChar<'a> {
-                PreviousChar {
-                    char: self.char,
-                    on_consecutive_appearance: match &self.on_consecutive_appearance {
-                        BehaviorOwned::Delete => Behavior::Delete,
-                        BehaviorOwned::Print {
-                            squeeze_char,
-                            bytes_to_print,
-                        } => Behavior::Print {
-                            squeeze_char: *squeeze_char,
-                            bytes_to_print,
-                        },
-                    },
-                }
-            }
-        }
-
-        pub enum DeleteAndSqueezeState {
-            Start,
-            Continuation(Option<LastPrintedChar>, PreviousCharOwned),
-        }
-
-        pub struct DeleteAndSqueezeTransformation {
+        pub struct DeleteAndSqueezeTransformation<T: Removal> {
             pub delete_and_squeeze_state: DeleteAndSqueezeState,
-            pub delete: ForRemoval,
-            pub squeeze: ForRemoval,
+            pub delete: T,
+            pub squeeze: NotComplementedRemoval,
         }
 
-        impl Transformation for DeleteAndSqueezeTransformation {
-            fn transform(&mut self, input: &str, output: &mut Vec<u8>) {
-                let mut chars = input.chars();
+        impl<T: Removal> Transformation for DeleteAndSqueezeTransformation<T> {
+            #[inline]
+            fn process_current_byte_with_window(
+                &mut self,
+                byte_a: u8,
+                next_bytes: &[u8],
+                index: &mut usize,
+                bytes_written: &mut usize,
+                output: &mut [u8],
+            ) {
+                let delete_removal_check_result = self.delete.check(byte_a, next_bytes);
 
-                let mut encoding_buffer = [0_u8; 4_usize];
+                if let Some(se) = delete_removal_check_result.match_lookahead_length {
+                    *index += se as usize;
+                }
 
-                // TODO
-                // to_owned()
-                let (mut last_printed_char_option, previous_char_state_owned) = match &self
-                    .delete_and_squeeze_state
-                {
-                    DeleteAndSqueezeState::Continuation(op, pr) => (op.to_owned(), pr.to_owned()),
-                    DeleteAndSqueezeState::Start => {
-                        // First character
-                        if let Some(ch) = chars.next() {
-                            let sl = ch.encode_utf8(&mut encoding_buffer).as_bytes();
+                if delete_removal_check_result.matched {
+                    *index += 1_usize;
 
-                            let (op, behavior) = if self.delete.char_matches(ch, sl) {
-                                // Do not print anything
-                                (None, BehaviorOwned::Delete)
-                            } else {
-                                let squeeze_char = self.squeeze.char_matches(ch, sl);
+                    return;
+                }
 
-                                output.extend_from_slice(sl);
+                if let Some(la) = &self.delete_and_squeeze_state.last_printed_character {
+                    if la.squeeze_char {
+                        let full_char = &la.char;
 
-                                (
-                                    Some(LastPrintedChar {
-                                        char: ch,
-                                        squeeze_char,
-                                    }),
-                                    BehaviorOwned::Print {
-                                        squeeze_char,
-                                        bytes_to_print: sl.to_vec(),
-                                    },
-                                )
-                            };
+                        if full_char.fast_check(byte_a, next_bytes) {
+                            *index += full_char.number_of_bytes as usize;
 
-                            (
-                                op,
-                                PreviousCharOwned {
-                                    char: ch,
-                                    on_consecutive_appearance: behavior,
-                                },
-                            )
-                        } else {
-                            // No input to process
                             return;
                         }
                     }
-                };
-
-                let mut previous_char_state = previous_char_state_owned.get_borrowed();
-
-                for ch in chars {
-                    if ch == previous_char_state.char {
-                        match previous_char_state.on_consecutive_appearance {
-                            Behavior::Delete => {
-                                // Do not print anything
-                            }
-                            Behavior::Print {
-                                squeeze_char,
-                                bytes_to_print,
-                            } => {
-                                if squeeze_char {
-                                    match last_printed_char_option {
-                                        Some(LastPrintedChar { char, .. }) if ch == char => {
-                                            // Do not print anything
-                                        }
-                                        _ => {
-                                            output.extend_from_slice(bytes_to_print);
-                                        }
-                                    }
-                                } else {
-                                    output.extend_from_slice(bytes_to_print);
-                                }
-                            }
-                        }
-
-                        continue;
-                    }
-
-                    let char_slice = ch.encode_utf8(&mut encoding_buffer).as_bytes();
-
-                    /* #region Delete */
-                    let delete_char = self.delete.char_matches(ch, char_slice);
-
-                    if delete_char {
-                        previous_char_state = PreviousChar {
-                            char: ch,
-                            on_consecutive_appearance: Behavior::Delete,
-                        };
-
-                        continue;
-                    }
-                    /* #endregion */
-
-                    /* #region Squeeze */
-                    match last_printed_char_option {
-                        Some(LastPrintedChar { char, squeeze_char }) if ch == char => {
-                            if squeeze_char {
-                                // Squeeze
-                            } else {
-                                // Do not squeeze
-                                output.extend_from_slice(char_slice);
-                            }
-
-                            previous_char_state = PreviousChar {
-                                char: ch,
-                                on_consecutive_appearance: Behavior::Print {
-                                    squeeze_char,
-                                    bytes_to_print: char_slice,
-                                },
-                            };
-                        }
-                        _ => {
-                            let squeeze_char = self.squeeze.char_matches(ch, char_slice);
-
-                            previous_char_state = PreviousChar {
-                                char: ch,
-                                on_consecutive_appearance: Behavior::Print {
-                                    squeeze_char,
-                                    bytes_to_print: char_slice,
-                                },
-                            };
-
-                            last_printed_char_option = Some(LastPrintedChar {
-                                char: ch,
-                                squeeze_char,
-                            });
-
-                            output.extend_from_slice(char_slice);
-                        }
-                    }
-                    /* #endregion */
                 }
 
-                self.delete_and_squeeze_state = DeleteAndSqueezeState::Continuation(
-                    last_printed_char_option,
-                    previous_char_state.get_owned(),
-                );
+                let output_slice = &mut output[(*bytes_written)..];
+
+                let squeeze_removal_check_result = self.squeeze.check(byte_a, next_bytes);
+
+                let squeeze_char = squeeze_removal_check_result.matched;
+
+                if squeeze_char {
+                    let full_char_number_of_bytes =
+                        if let Some(se) = squeeze_removal_check_result.match_lookahead_length {
+                            se.increment()
+                        } else {
+                            FullCharNumberOfBytes::One
+                        };
+
+                    let mut payload = [0_u8; 4_usize];
+
+                    // TODO
+                    for (us, &ue) in [byte_a]
+                        .iter()
+                        .chain(next_bytes)
+                        .take(full_char_number_of_bytes as usize)
+                        .enumerate()
+                    {
+                        payload[us] = ue;
+                    }
+
+                    let char = FullChar {
+                        number_of_bytes: full_char_number_of_bytes,
+                        payload,
+                    };
+
+                    let additional_bytes_written = char.write_full_char(output_slice);
+
+                    *bytes_written += additional_bytes_written;
+                    *index += additional_bytes_written;
+
+                    self.delete_and_squeeze_state = DeleteAndSqueezeState {
+                        last_printed_character: Some(LastPrintedChar { squeeze_char, char }),
+                    };
+                } else {
+                    output_slice[0_usize] = byte_a;
+
+                    *bytes_written += 1_usize;
+                    *index += 1_usize;
+
+                    self.delete_and_squeeze_state = DeleteAndSqueezeState {
+                        last_printed_character: Some(LastPrintedChar {
+                            char: FullChar::new_from_u8(byte_a),
+                            squeeze_char,
+                        }),
+                    };
+                }
             }
         }
     }
 
     pub mod squeeze {
         use super::Transformation;
-        use crate::setup::ForRemoval;
+        use crate::setup::{FullChar, FullCharNumberOfBytes, Removal};
 
-        pub struct PreviousChar {
-            char: char,
+        pub struct LastPrintedChar {
+            char: FullChar,
             squeeze_char: bool,
-            bytes_to_print: Vec<u8>,
         }
 
-        pub enum SqueezeState {
-            Start,
-            Continuation(PreviousChar),
+        pub struct SqueezeState {
+            pub last_printed_character: Option<LastPrintedChar>,
         }
 
-        pub struct SqueezeTransformation {
-            pub for_removal: ForRemoval,
+        pub struct SqueezeTransformation<T: Removal> {
             pub squeeze_state: SqueezeState,
+            pub squeeze: T,
         }
 
-        impl Transformation for SqueezeTransformation {
-            fn transform(&mut self, input: &str, output: &mut Vec<u8>) {
-                let mut chars = input.chars();
+        impl<T: Removal> Transformation for SqueezeTransformation<T> {
+            #[inline]
+            fn process_current_byte_with_window(
+                &mut self,
+                byte_a: u8,
+                next_bytes: &[u8],
+                index: &mut usize,
+                bytes_written: &mut usize,
+                output: &mut [u8],
+            ) {
+                if let Some(la) = &self.squeeze_state.last_printed_character {
+                    if la.squeeze_char {
+                        let full_char = &la.char;
 
-                let mut encoding_buffer = [0_u8; 4_usize];
+                        if full_char.fast_check(byte_a, next_bytes) {
+                            *index += full_char.number_of_bytes as usize;
 
-                // TODO
-                // Improve code style
-                let (
-                    mut previous_char,
-                    mut previous_char_squeeze_char,
-                    mut previous_char_bytes_to_print,
-                ) = match &self.squeeze_state {
-                    SqueezeState::Continuation(sq) => {
-                        (sq.char, sq.squeeze_char, sq.bytes_to_print.as_slice())
-                    }
-                    SqueezeState::Start => {
-                        // First character
-                        let Some(char) = chars.next() else {
-                            // No input to process
                             return;
-                        };
-
-                        let char_slice = char.encode_utf8(&mut encoding_buffer).as_bytes();
-
-                        // Add the first char
-                        output.extend_from_slice(char_slice);
-
-                        let squeeze_char = self.for_removal.char_matches(char, char_slice);
-
-                        (char, squeeze_char, char_slice)
-                    }
-                };
-
-                for ch in chars {
-                    if ch == previous_char {
-                        if !previous_char_squeeze_char {
-                            output.extend_from_slice(previous_char_bytes_to_print);
                         }
-
-                        continue;
-                    }
-
-                    let char_slice = ch.encode_utf8(&mut encoding_buffer).as_bytes();
-
-                    output.extend_from_slice(char_slice);
-
-                    // Atomic, do all of these or none
-                    {
-                        previous_char = ch;
-                        previous_char_bytes_to_print = char_slice;
-                        previous_char_squeeze_char = self.for_removal.char_matches(ch, char_slice);
                     }
                 }
 
-                // Persist state for handling of next chunk
-                self.squeeze_state = SqueezeState::Continuation(PreviousChar {
-                    bytes_to_print: previous_char_bytes_to_print.to_vec(),
-                    char: previous_char,
-                    squeeze_char: previous_char_squeeze_char,
-                });
+                let output_slice = &mut output[(*bytes_written)..];
+
+                let squeeze_removal_check_result = self.squeeze.check(byte_a, next_bytes);
+
+                let squeeze_char = squeeze_removal_check_result.matched;
+
+                if squeeze_char {
+                    let full_char_number_of_bytes =
+                        if let Some(se) = squeeze_removal_check_result.match_lookahead_length {
+                            se.increment()
+                        } else {
+                            FullCharNumberOfBytes::One
+                        };
+
+                    let mut payload = [0_u8; 4_usize];
+
+                    // TODO
+                    for (us, &ue) in [byte_a]
+                        .iter()
+                        .chain(next_bytes)
+                        .take(full_char_number_of_bytes as usize)
+                        .enumerate()
+                    {
+                        payload[us] = ue;
+                    }
+
+                    let char = FullChar {
+                        number_of_bytes: full_char_number_of_bytes,
+                        payload,
+                    };
+
+                    let additional_bytes_written = char.write_full_char(output_slice);
+
+                    *bytes_written += additional_bytes_written;
+                    *index += additional_bytes_written;
+
+                    self.squeeze_state = SqueezeState {
+                        last_printed_character: Some(LastPrintedChar { squeeze_char, char }),
+                    };
+                } else {
+                    output_slice[0_usize] = byte_a;
+
+                    *bytes_written += 1_usize;
+                    *index += 1_usize;
+
+                    self.squeeze_state = SqueezeState {
+                        last_printed_character: Some(LastPrintedChar {
+                            char: FullChar::new_from_u8(byte_a),
+                            squeeze_char,
+                        }),
+                    };
+                }
             }
         }
     }
 
     pub mod squeeze_and_translate {
         use super::Transformation;
-        use crate::setup::ForTranslation;
+        use crate::setup::{FullChar, NotComplementedRemoval, Removal, Translation};
 
-        #[derive(Clone)]
-        pub struct PreviousChar {
-            char: char,
-            translate_char: Option<char>,
-            last_printed_bytes: Vec<u8>,
+        pub struct LastPrintedChar {
+            char: FullChar,
+            squeeze_char: bool,
         }
 
-        pub enum SqueezeAndTranslateState {
-            Start,
-            Continuation(PreviousChar),
+        pub struct SqueezeAndTranslateState {
+            pub last_printed_character: Option<LastPrintedChar>,
         }
 
-        pub struct SqueezeAndTranslateTransformation {
-            pub for_translation: ForTranslation,
+        pub struct SqueezeAndTranslateTransformation<T: Translation> {
+            pub translation: T,
+            pub squeeze: NotComplementedRemoval,
             pub squeeze_and_translate_state: SqueezeAndTranslateState,
         }
 
-        impl Transformation for SqueezeAndTranslateTransformation {
-            fn transform(&mut self, input: &str, output: &mut Vec<u8>) {
-                let mut chars = input.chars();
+        impl<T: Translation> Transformation for SqueezeAndTranslateTransformation<T> {
+            #[inline]
+            fn process_current_byte_with_window(
+                &mut self,
+                byte_a: u8,
+                next_bytes: &[u8],
+                index: &mut usize,
+                bytes_written: &mut usize,
+                output: &mut [u8],
+            ) {
+                let replacement_check_result = self.translation.check(byte_a, next_bytes);
 
-                let mut encoding_buffer = [0_u8; 4_usize];
+                let fu_payload: [u8; 4];
+                let full_char_from_byte: FullChar;
 
-                let mut previous_char = match &self.squeeze_and_translate_state {
-                    SqueezeAndTranslateState::Continuation(pr) => pr.to_owned(),
-                    SqueezeAndTranslateState::Start => {
-                        // First character
-                        let Some(char) = chars.next() else {
-                            // No input to process
-                            return;
-                        };
+                let (byte_a_to_use, next_bytes_to_use, full_char_to_write) =
+                    match replacement_check_result.replacement {
+                        Some(fu) => {
+                            fu_payload = fu.payload;
 
-                        let char_vec = char.encode_utf8(&mut encoding_buffer).as_bytes().to_vec();
+                            let [fu_byte_a, ..] = fu_payload;
 
-                        let translate_char =
-                            self.for_translation.char_has_translation(char, &char_vec);
+                            let fu_rest = &fu_payload[1_usize..(fu.number_of_bytes as usize)];
 
-                        let char_vec_to_use = match translate_char {
-                            Some(replacement_char) => {
-                                let replacement_char_str =
-                                    replacement_char.encode_utf8(&mut encoding_buffer);
-
-                                replacement_char_str.as_bytes().to_vec()
-                            }
-                            None => char_vec.clone(),
-                        };
-
-                        // Add the first char
-                        output.extend_from_slice(char_vec_to_use.as_slice());
-
-                        PreviousChar {
-                            char,
-                            last_printed_bytes: char_vec_to_use,
-                            translate_char,
+                            (fu_byte_a, fu_rest, fu)
                         }
-                    }
-                };
+                        None => {
+                            full_char_from_byte = FullChar::new_from_u8(byte_a);
 
-                for ch in chars {
-                    if ch == previous_char.char {
-                        if previous_char.translate_char.is_some() {
-                            // Have the same translation because they're the same character, so will need to be squeezed
-                        } else {
-                            // Fast path for repeated, non-squeezed characters
-                            output.extend_from_slice(previous_char.last_printed_bytes.as_slice());
+                            (byte_a, next_bytes, &full_char_from_byte)
                         }
-
-                        continue;
-                    }
-
-                    let char_slice = ch.encode_utf8(&mut encoding_buffer).as_bytes();
-
-                    let translate_char = self.for_translation.char_has_translation(ch, char_slice);
-
-                    match (translate_char, previous_char.translate_char) {
-                        (Some(ch), Some(cha)) if ch == cha => {
-                            // Squeeze if not the same character as the last, but has the same translation
-                            previous_char.char = ch;
-
-                            continue;
-                        }
-                        _ => {}
-                    }
-
-                    let char_slice_to_use = match translate_char {
-                        Some(replacement_char) => {
-                            let replacement_char_str =
-                                replacement_char.encode_utf8(&mut encoding_buffer);
-
-                            replacement_char_str.as_bytes()
-                        }
-                        None => char_slice,
                     };
 
-                    output.extend_from_slice(char_slice_to_use);
-
-                    previous_char.char = ch;
-                    previous_char.translate_char = translate_char;
-
-                    // TODO
-                    previous_char.last_printed_bytes.clear();
-                    previous_char
-                        .last_printed_bytes
-                        .extend_from_slice(char_slice_to_use);
+                // TODO
+                // Is this in the right place?
+                if let Some(se) = replacement_check_result.match_lookahead_length {
+                    *index += se as usize;
                 }
 
-                // Persist state for handling of next chunk
-                // TODO
-                // Improve code style
-                self.squeeze_and_translate_state =
-                    SqueezeAndTranslateState::Continuation(previous_char);
+                if let Some(la) = &self.squeeze_and_translate_state.last_printed_character {
+                    if la.squeeze_char {
+                        let full_char = &la.char;
+
+                        // TODO
+                        // Verify
+                        if full_char.fast_check(byte_a_to_use, next_bytes_to_use) {
+                            *index += full_char.number_of_bytes as usize;
+
+                            return;
+                        }
+                    }
+                }
+
+                let output_slice = &mut output[(*bytes_written)..];
+
+                let squeeze_remove_check_result =
+                    self.squeeze.check(byte_a_to_use, next_bytes_to_use);
+
+                let squeeze_char = squeeze_remove_check_result.matched;
+
+                let additional_bytes_written = full_char_to_write.write_full_char(output_slice);
+
+                *bytes_written += additional_bytes_written;
+                *index += 1_usize;
+
+                self.squeeze_and_translate_state = SqueezeAndTranslateState {
+                    last_printed_character: Some(LastPrintedChar {
+                        squeeze_char,
+                        char: full_char_to_write.to_owned(),
+                    }),
+                };
             }
         }
     }
 
     pub mod translate {
         use super::Transformation;
-        use crate::{compare_deunicoded_chars, setup::ForTranslation};
+        use crate::setup::{ReplacementCheckResult, Translation};
 
-        pub struct TranslateTransformation {
-            pub for_translation: ForTranslation,
+        pub struct TranslateTransformation<T: Translation> {
+            pub translation: T,
         }
 
-        impl Transformation for TranslateTransformation {
-            fn transform(&mut self, input: &str, output: &mut Vec<u8>) {
-                let mut encoding_buffer = [0_u8; 4_usize];
+        impl<T: Translation> Transformation for TranslateTransformation<T> {
+            #[inline]
+            fn process_current_byte_with_window(
+                &mut self,
+                byte_a: u8,
+                next_bytes: &[u8],
+                index: &mut usize,
+                bytes_written: &mut usize,
+                output: &mut [u8],
+            ) {
+                let output_slice = &mut output[(*bytes_written)..];
 
-                for ch in input.chars() {
-                    let char_slice = ch.encode_utf8(&mut encoding_buffer).as_bytes();
+                let ReplacementCheckResult {
+                    replacement,
+                    match_lookahead_length,
+                    ..
+                } = self.translation.check(byte_a, next_bytes);
 
-                    let replacement_char_option = match char_slice {
-                        &[ue] => {
-                            self.for_translation.single_byte_translation_lookup_table
-                                [usize::from(ue)]
-                        }
-                        _ => self
-                            .for_translation
-                            .multi_byte_translation_hash_map
-                            .get(&ch)
-                            .copied(),
-                    };
+                let extra_bytes_to_write = if let Some(se) = match_lookahead_length {
+                    let match_lookahead_length_usize = se as usize;
 
-                    // TODO
-                    // What is the precedence of equivalence classes?
-                    // GNU Core Utilities de-prioritizes them
+                    *index += match_lookahead_length_usize;
 
-                    // Only use equivalence classes if normal translation failed
-                    let replacement_char_option_to_use = match replacement_char_option {
-                        Some(cha) => Some(cha),
-                        None => {
-                            let mut op = Option::<char>::None;
+                    match_lookahead_length_usize
+                } else {
+                    0_usize
+                };
 
-                            for (equiv_char, equiv_char_replacement) in
-                                &self.for_translation.equiv_translation_chars
-                            {
-                                if compare_deunicoded_chars(ch, *equiv_char) {
-                                    op = Some(*equiv_char_replacement);
+                *index += 1_usize;
 
-                                    break;
-                                }
-                            }
+                if let Some(fu) = replacement {
+                    let additional_bytes_written = fu.write_full_char(output_slice);
 
-                            op
-                        }
-                    };
+                    *bytes_written += additional_bytes_written;
 
-                    let for_output = match replacement_char_option_to_use {
-                        Some(replacement_char) => {
-                            let replacement_char_str =
-                                replacement_char.encode_utf8(&mut encoding_buffer);
+                    return;
+                }
 
-                            replacement_char_str.as_bytes()
-                        }
-                        None => char_slice,
-                    };
+                // No replacement was found, so write the original byte
+                {
+                    output_slice[0_usize] = byte_a;
 
-                    output.extend_from_slice(for_output);
+                    output_slice[1_usize..(1_usize + extra_bytes_to_write)]
+                        .copy_from_slice(&next_bytes[..extra_bytes_to_write]);
+
+                    *bytes_written += 1_usize + extra_bytes_to_write;
                 }
             }
         }
-    }
-}
-
-// TODO
-// No other implementations actually seem to do anything with equivalence classes:
-// they seem to just treat them as the parsed character (e.g. "[=a=]" is treated as "a").
-// Should this implementation continue to try to actually handle them?
-
-/// Compares two characters after normalizing them.
-/// This function uses the hypothetical `deunicode_char` function to normalize
-/// the input characters and then compares them for equality.
-/// # Arguments
-///
-/// * `char1` - The first character to compare.
-/// * `char2` - The second character to compare.
-///
-/// # Returns
-///
-/// * `true` if the normalized characters are equal.
-/// * `false` otherwise.
-pub fn compare_deunicoded_chars(char1: char, char2: char) -> bool {
-    let normalized_char1 = deunicode_char(char1);
-    let normalized_char2 = deunicode_char(char2);
-
-    match (normalized_char1, normalized_char2) {
-        (Some(st), Some(str)) => st == str,
-        (None, None) => {
-            // Purpose of match: prevent this from being considered equal
-            false
-        }
-        _ => false,
     }
 }

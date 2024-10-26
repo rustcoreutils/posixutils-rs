@@ -14,8 +14,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use ftw::{symlink_metadata, FileType};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 
 use crate::magic::{get_type_from_magic_file_dbs, DEFAULT_MAGIC_FILE};
 

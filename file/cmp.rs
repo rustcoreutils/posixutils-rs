@@ -140,7 +140,7 @@ fn main() -> ExitCode {
     textdomain(env!("PROJECT_NAME")).unwrap();
     bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8").unwrap();
 
-    let mut args = Args::parse();
+    let args = Args::parse();
 
     match cmp_main(&args) {
         Ok(x) => ExitCode::from(x),

@@ -1651,9 +1651,7 @@ fn test_recurse() {
 #[test]
 fn test_recursive_defines() {
     init();
-    let output = run_command(Path::new(
-        "fixtures/integration_tests/recursive_defines.m4",
-    ));
+    let output = run_command(Path::new("fixtures/integration_tests/recursive_defines.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/recursive_defines.out");
     assert_eq!(

@@ -9,7 +9,7 @@ members = [
 	"display",
 	"file",
 	"fs",
-    "ftw",
+	"ftw",
 	"make",
 	"m4",
 	"m4/test-manager",

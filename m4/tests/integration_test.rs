@@ -109,7 +109,7 @@ fn run_command(input: &Path) -> std::process::Output {
 #[test]
 fn test_bsd() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/bsd.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/bsd.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/bsd.out");
     assert_eq!(
@@ -135,7 +135,7 @@ fn test_bsd() {
 #[test]
 fn test_bsd_math() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/bsd_math.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/bsd_math.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/bsd_math.out");
     assert_eq!(
@@ -160,7 +160,7 @@ fn test_bsd_math() {
 #[test]
 fn test_changecom() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/changecom.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/changecom.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/changecom.out");
     assert_eq!(
@@ -185,7 +185,7 @@ fn test_changecom() {
 #[test]
 fn test_changequote() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/changequote.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/changequote.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/changequote.out");
     assert_eq!(
@@ -210,7 +210,7 @@ fn test_changequote() {
 #[test]
 fn test_decr() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/decr.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/decr.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/decr.out");
     assert_eq!(
@@ -235,7 +235,7 @@ fn test_decr() {
 #[test]
 fn test_define() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/define.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/define.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/define.out");
     assert_eq!(
@@ -260,7 +260,7 @@ fn test_define() {
 #[test]
 fn test_define_args() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/define_args.args"));
+    let output = run_command(&Path::new("fixtures/integration_tests/define_args.args"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/define_args.out");
     assert_eq!(
@@ -286,7 +286,7 @@ fn test_define_args() {
 #[test]
 fn test_define_eval_order_unquoted() {
     init();
-    let output = run_command(Path::new(
+    let output = run_command(&Path::new(
         "fixtures/integration_tests/define_eval_order_unquoted.m4",
     ));
 
@@ -314,7 +314,7 @@ fn test_define_eval_order_unquoted() {
 #[test]
 fn test_define_eval_syntax_order_quoted_evaluated() {
     init();
-    let output = run_command(Path::new(
+    let output = run_command(&Path::new(
         "fixtures/integration_tests/define_eval_syntax_order_quoted_evaluated.m4",
     ));
 
@@ -342,7 +342,7 @@ fn test_define_eval_syntax_order_quoted_evaluated() {
 #[test]
 fn test_define_eval_syntax_order_quoted_unevaluated() {
     init();
-    let output = run_command(Path::new(
+    let output = run_command(&Path::new(
         "fixtures/integration_tests/define_eval_syntax_order_quoted_unevaluated.m4",
     ));
 
@@ -371,7 +371,7 @@ fn test_define_eval_syntax_order_quoted_unevaluated() {
 #[test]
 fn test_define_eval_syntax_order_unquoted() {
     init();
-    let output = run_command(Path::new(
+    let output = run_command(&Path::new(
         "fixtures/integration_tests/define_eval_syntax_order_unquoted.m4",
     ));
 
@@ -399,7 +399,7 @@ fn test_define_eval_syntax_order_unquoted() {
 #[test]
 fn test_define_hanging_quotes() {
     init();
-    let output = run_command(Path::new(
+    let output = run_command(&Path::new(
         "fixtures/integration_tests/define_hanging_quotes.m4",
     ));
 
@@ -426,7 +426,7 @@ fn test_define_hanging_quotes() {
 #[test]
 fn test_define_invalid_macro_name() {
     init();
-    let output = run_command(Path::new(
+    let output = run_command(&Path::new(
         "fixtures/integration_tests/define_invalid_macro_name.m4",
     ));
 
@@ -453,7 +453,7 @@ fn test_define_invalid_macro_name() {
 #[test]
 fn test_define_iterative() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/define_iterative.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/define_iterative.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/define_iterative.out");
     assert_eq!(
@@ -478,7 +478,7 @@ fn test_define_iterative() {
 #[test]
 fn test_define_iterative_2() {
     init();
-    let output = run_command(Path::new(
+    let output = run_command(&Path::new(
         "fixtures/integration_tests/define_iterative_2.m4",
     ));
 
@@ -505,7 +505,7 @@ fn test_define_iterative_2() {
 #[test]
 fn test_define_nested() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/define_nested.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/define_nested.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/define_nested.out");
     assert_eq!(
@@ -531,7 +531,7 @@ fn test_define_nested() {
 #[test]
 fn test_define_nested_first_arg() {
     init();
-    let output = run_command(Path::new(
+    let output = run_command(&Path::new(
         "fixtures/integration_tests/define_nested_first_arg.m4",
     ));
 
@@ -558,7 +558,7 @@ fn test_define_nested_first_arg() {
 #[test]
 fn test_define_number_parsing() {
     init();
-    let output = run_command(Path::new(
+    let output = run_command(&Path::new(
         "fixtures/integration_tests/define_number_parsing.m4",
     ));
 
@@ -583,7 +583,7 @@ fn test_define_number_parsing() {
 #[test]
 fn test_define_order_defined() {
     init();
-    let output = run_command(Path::new(
+    let output = run_command(&Path::new(
         "fixtures/integration_tests/define_order_defined.m4",
     ));
 
@@ -610,7 +610,7 @@ fn test_define_order_defined() {
 #[test]
 fn test_define_order_undefined() {
     init();
-    let output = run_command(Path::new(
+    let output = run_command(&Path::new(
         "fixtures/integration_tests/define_order_undefined.m4",
     ));
 
@@ -637,7 +637,7 @@ fn test_define_order_undefined() {
 #[test]
 fn test_define_parse_brackets() {
     init();
-    let output = run_command(Path::new(
+    let output = run_command(&Path::new(
         "fixtures/integration_tests/define_parse_brackets.m4",
     ));
 
@@ -662,7 +662,7 @@ fn test_define_parse_brackets() {
 #[test]
 fn test_define_pushpopdef_undefine() {
     init();
-    let output = run_command(Path::new(
+    let output = run_command(&Path::new(
         "fixtures/integration_tests/define_pushpopdef_undefine.m4",
     ));
 
@@ -689,7 +689,7 @@ fn test_define_pushpopdef_undefine() {
 #[test]
 fn test_define_quoted_number_stacked() {
     init();
-    let output = run_command(Path::new(
+    let output = run_command(&Path::new(
         "fixtures/integration_tests/define_quoted_number_stacked.m4",
     ));
 
@@ -715,7 +715,7 @@ fn test_define_quoted_number_stacked() {
 #[test]
 fn test_define_stacked() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/define_stacked.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/define_stacked.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/define_stacked.out");
     assert_eq!(
@@ -740,7 +740,7 @@ fn test_define_stacked() {
 #[test]
 fn test_define_undefine_order() {
     init();
-    let output = run_command(Path::new(
+    let output = run_command(&Path::new(
         "fixtures/integration_tests/define_undefine_order.m4",
     ));
 
@@ -767,7 +767,7 @@ fn test_define_undefine_order() {
 #[test]
 fn test_define_unquoted_number_arg() {
     init();
-    let output = run_command(Path::new(
+    let output = run_command(&Path::new(
         "fixtures/integration_tests/define_unquoted_number_arg.m4",
     ));
 
@@ -792,7 +792,7 @@ fn test_define_unquoted_number_arg() {
 #[test]
 fn test_defn() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/defn.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/defn.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/defn.out");
     assert_eq!(
@@ -817,7 +817,7 @@ fn test_defn() {
 #[test]
 fn test_divert() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/divert.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/divert.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/divert.out");
     assert_eq!(
@@ -842,7 +842,7 @@ fn test_divert() {
 #[test]
 fn test_divert_nested() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/divert_nested.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/divert_nested.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/divert_nested.out");
     assert_eq!(
@@ -867,7 +867,7 @@ fn test_divert_nested() {
 #[test]
 fn test_divert_nested_2() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/divert_nested_2.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/divert_nested_2.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/divert_nested_2.out");
     assert_eq!(
@@ -892,7 +892,7 @@ fn test_divert_nested_2() {
 #[test]
 fn test_divert_nested_3() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/divert_nested_3.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/divert_nested_3.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/divert_nested_3.out");
     assert_eq!(
@@ -917,7 +917,7 @@ fn test_divert_nested_3() {
 #[test]
 fn test_divert_nested_4() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/divert_nested_4.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/divert_nested_4.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/divert_nested_4.out");
     assert_eq!(
@@ -942,7 +942,7 @@ fn test_divert_nested_4() {
 #[test]
 fn test_dnl() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/dnl.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/dnl.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/dnl.out");
     assert_eq!(
@@ -967,7 +967,7 @@ fn test_dnl() {
 #[test]
 fn test_dnl_nested() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/dnl_nested.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/dnl_nested.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/dnl_nested.out");
     assert_eq!(
@@ -992,7 +992,7 @@ fn test_dnl_nested() {
 #[test]
 fn test_dumpdef() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/dumpdef.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/dumpdef.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/dumpdef.out");
     assert_eq!(
@@ -1017,7 +1017,7 @@ fn test_dumpdef() {
 #[test]
 fn test_dumpdef_notexist() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/dumpdef_notexist.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/dumpdef_notexist.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/dumpdef_notexist.out");
     assert_eq!(
@@ -1040,7 +1040,7 @@ fn test_dumpdef_notexist() {
 #[test]
 fn test_eval() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/eval.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/eval.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/eval.out");
     assert_eq!(
@@ -1065,7 +1065,7 @@ fn test_eval() {
 #[test]
 fn test_evaluation_order() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/evaluation_order.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/evaluation_order.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/evaluation_order.out");
     assert_eq!(
@@ -1090,7 +1090,7 @@ fn test_evaluation_order() {
 #[test]
 fn test_file() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/file.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/file.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/file.out");
     assert_eq!(
@@ -1115,7 +1115,7 @@ fn test_file() {
 #[test]
 fn test_forloop_nested() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/forloop_nested.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/forloop_nested.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/forloop_nested.out");
     assert_eq!(
@@ -1140,7 +1140,7 @@ fn test_forloop_nested() {
 #[test]
 fn test_forloop_simple() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/forloop_simple.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/forloop_simple.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/forloop_simple.out");
     assert_eq!(
@@ -1165,7 +1165,7 @@ fn test_forloop_simple() {
 #[test]
 fn test_ifdef() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/ifdef.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/ifdef.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/ifdef.out");
     assert_eq!(
@@ -1190,7 +1190,7 @@ fn test_ifdef() {
 #[test]
 fn test_ifelse() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/ifelse.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/ifelse.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/ifelse.out");
     assert_eq!(
@@ -1215,7 +1215,7 @@ fn test_ifelse() {
 #[test]
 fn test_include() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/include.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/include.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/include.out");
     assert_eq!(
@@ -1240,7 +1240,7 @@ fn test_include() {
 #[test]
 fn test_include_divert() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/include_divert.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/include_divert.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/include_divert.out");
     assert_eq!(
@@ -1265,7 +1265,7 @@ fn test_include_divert() {
 #[test]
 fn test_incr() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/incr.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/incr.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/incr.out");
     assert_eq!(
@@ -1290,7 +1290,7 @@ fn test_incr() {
 #[test]
 fn test_index() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/index.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/index.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/index.out");
     assert_eq!(
@@ -1315,7 +1315,7 @@ fn test_index() {
 #[test]
 fn test_index_too_few_args() {
     init();
-    let output = run_command(Path::new(
+    let output = run_command(&Path::new(
         "fixtures/integration_tests/index_too_few_args.m4",
     ));
 
@@ -1340,7 +1340,7 @@ fn test_index_too_few_args() {
 #[test]
 fn test_len() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/len.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/len.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/len.out");
     assert_eq!(
@@ -1365,7 +1365,7 @@ fn test_len() {
 #[test]
 fn test_m4exit_error() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/m4exit_error.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/m4exit_error.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/m4exit_error.out");
     assert_eq!(
@@ -1390,7 +1390,7 @@ fn test_m4exit_error() {
 #[test]
 fn test_m4exit_no_args() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/m4exit_no_args.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/m4exit_no_args.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/m4exit_no_args.out");
     assert_eq!(
@@ -1415,7 +1415,7 @@ fn test_m4exit_no_args() {
 #[test]
 fn test_m4exit_success() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/m4exit_success.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/m4exit_success.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/m4exit_success.out");
     assert_eq!(
@@ -1440,7 +1440,7 @@ fn test_m4exit_success() {
 #[test]
 fn test_m4wrap() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/m4wrap.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/m4wrap.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/m4wrap.out");
     assert_eq!(
@@ -1465,7 +1465,7 @@ fn test_m4wrap() {
 #[test]
 fn test_macro_errprint_evaluation() {
     init();
-    let output = run_command(Path::new(
+    let output = run_command(&Path::new(
         "fixtures/integration_tests/macro_errprint_evaluation.m4",
     ));
 
@@ -1492,7 +1492,7 @@ fn test_macro_errprint_evaluation() {
 #[test]
 fn test_macro_errprint_no_evaluation() {
     init();
-    let output = run_command(Path::new(
+    let output = run_command(&Path::new(
         "fixtures/integration_tests/macro_errprint_no_evaluation.m4",
     ));
 
@@ -1520,7 +1520,7 @@ fn test_macro_errprint_no_evaluation() {
 #[test]
 fn test_macro_errprint_no_evaluation_quoted() {
     init();
-    let output = run_command(Path::new(
+    let output = run_command(&Path::new(
         "fixtures/integration_tests/macro_errprint_no_evaluation_quoted.m4",
     ));
 
@@ -1548,7 +1548,7 @@ fn test_macro_errprint_no_evaluation_quoted() {
 #[test]
 fn test_maketemp() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/maketemp.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/maketemp.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/maketemp.out");
     assert_eq!(
@@ -1574,7 +1574,7 @@ fn test_maketemp() {
 #[test]
 fn test_mkstemp() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/mkstemp.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/mkstemp.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/mkstemp.out");
     assert_eq!(
@@ -1600,7 +1600,7 @@ fn test_mkstemp() {
 #[test]
 fn test_quoted_nested_eof_in_string() {
     init();
-    let output = run_command(Path::new(
+    let output = run_command(&Path::new(
         "fixtures/integration_tests/quoted_nested_eof_in_string.m4",
     ));
 
@@ -1626,7 +1626,7 @@ fn test_quoted_nested_eof_in_string() {
 #[test]
 fn test_recurse() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/recurse.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/recurse.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/recurse.out");
     assert_eq!(
@@ -1651,7 +1651,9 @@ fn test_recurse() {
 #[test]
 fn test_recursive_defines() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/recursive_defines.m4"));
+    let output = run_command(&Path::new(
+        "fixtures/integration_tests/recursive_defines.m4",
+    ));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/recursive_defines.out");
     assert_eq!(
@@ -1676,7 +1678,7 @@ fn test_recursive_defines() {
 #[test]
 fn test_redefine_inbuilt() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/redefine_inbuilt.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/redefine_inbuilt.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/redefine_inbuilt.out");
     assert_eq!(
@@ -1701,7 +1703,7 @@ fn test_redefine_inbuilt() {
 #[test]
 fn test_reverse() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/reverse.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/reverse.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/reverse.out");
     assert_eq!(
@@ -1726,7 +1728,7 @@ fn test_reverse() {
 #[test]
 fn test_shift() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/shift.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/shift.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/shift.out");
     assert_eq!(
@@ -1751,7 +1753,7 @@ fn test_shift() {
 #[test]
 fn test_sinclude() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/sinclude.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/sinclude.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/sinclude.out");
     assert_eq!(
@@ -1776,7 +1778,7 @@ fn test_sinclude() {
 #[test]
 fn test_substr() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/substr.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/substr.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/substr.out");
     assert_eq!(
@@ -1802,7 +1804,7 @@ fn test_substr() {
 #[test]
 fn test_synclines_1() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/synclines_1.args"));
+    let output = run_command(&Path::new("fixtures/integration_tests/synclines_1.args"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/synclines_1.out");
     assert_eq!(
@@ -1828,7 +1830,7 @@ fn test_synclines_1() {
 #[test]
 fn test_synclines_2() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/synclines_2.args"));
+    let output = run_command(&Path::new("fixtures/integration_tests/synclines_2.args"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/synclines_2.out");
     assert_eq!(
@@ -1854,7 +1856,7 @@ fn test_synclines_2() {
 #[test]
 fn test_syscmd_sysval() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/syscmd_sysval.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/syscmd_sysval.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/syscmd_sysval.out");
     assert_eq!(
@@ -1879,7 +1881,7 @@ fn test_syscmd_sysval() {
 #[test]
 fn test_trace() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/trace.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/trace.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/trace.out");
     assert_eq!(
@@ -1904,7 +1906,7 @@ fn test_trace() {
 #[test]
 fn test_translit() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/translit.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/translit.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/translit.out");
     assert_eq!(
@@ -1929,7 +1931,7 @@ fn test_translit() {
 #[test]
 fn test_two_files() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/two_files.args"));
+    let output = run_command(&Path::new("fixtures/integration_tests/two_files.args"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/two_files.out");
     assert_eq!(
@@ -1954,7 +1956,7 @@ fn test_two_files() {
 #[test]
 fn test_undivert() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/undivert.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/undivert.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/undivert.out");
     assert_eq!(
@@ -1979,7 +1981,7 @@ fn test_undivert() {
 #[test]
 fn test_undivert_2() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/undivert_2.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/undivert_2.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/undivert_2.out");
     assert_eq!(
@@ -2004,7 +2006,7 @@ fn test_undivert_2() {
 #[test]
 fn test_undivert_current() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/undivert_current.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/undivert_current.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/undivert_current.out");
     assert_eq!(
@@ -2029,7 +2031,7 @@ fn test_undivert_current() {
 #[test]
 fn test_undivert_nested() {
     init();
-    let output = run_command(Path::new("fixtures/integration_tests/undivert_nested.m4"));
+    let output = run_command(&Path::new("fixtures/integration_tests/undivert_nested.m4"));
 
     let test: TestSnapshot = read_test("fixtures/integration_tests/undivert_nested.out");
     assert_eq!(

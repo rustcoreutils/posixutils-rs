@@ -107,6 +107,58 @@ struct Args {
     targets: Vec<OsString>,
 }
 
+fn print_rules(rules: &BTreeMap<String, BTreeSet<String>>) {
+    print!("{:?}", rules);
+}
+
+/// Parse the makefile at the given path, or the first default makefile found.
+/// If no makefile is found, print an error message and exit.
+fn parse_makefile(path: Option<impl AsRef<Path>>) -> Result<Makefile, ErrorCode> {
+    let path = path.as_ref().map(|p| p.as_ref());
+
+    let path = match path {
+        Some(path) => path,
+        None => {
+            let mut makefile = None;
+            for m in MAKEFILE_PATH.iter() {
+                let path = Path::new(m);
+                if path.exists() {
+                    makefile = Some(path);
+                    break;
+                }
+            }
+            if let Some(makefile) = makefile {
+                makefile
+            } else {
+                return Err(NoMakefile);
+            }
+        }
+    };
+
+    let contents = if path == Path::new("-") {
+        read_stdin()?
+    } else {
+        match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(err) => {
+                return Err(IoError(err.kind()));
+            }
+        }
+    };
+
+    match Makefile::from_str(&contents) {
+        Ok(makefile) => Ok(makefile),
+        Err(err) => Err(ErrorCode::ParserError { constraint: err }),
+    }
+}
+
+/// Reads the makefile from `stdin` until EOF (Ctrl + D)
+fn read_stdin() -> Result<String, ErrorCode> {
+    let mut buffer = String::new();
+    io::stdin().read_to_string(&mut buffer)?;
+    Ok(buffer)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     setlocale(LocaleCategory::LcAll, "");
     textdomain(env!("PROJECT_NAME"))?;
@@ -228,56 +280,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         status_code = 2;
     }
     process::exit(status_code);
-}
-
-fn print_rules(rules: &BTreeMap<String, BTreeSet<String>>) {
-    print!("{:?}", rules);
-}
-
-/// Parse the makefile at the given path, or the first default makefile found.
-/// If no makefile is found, print an error message and exit.
-fn parse_makefile(path: Option<impl AsRef<Path>>) -> Result<Makefile, ErrorCode> {
-    let path = path.as_ref().map(|p| p.as_ref());
-
-    let path = match path {
-        Some(path) => path,
-        None => {
-            let mut makefile = None;
-            for m in MAKEFILE_PATH.iter() {
-                let path = Path::new(m);
-                if path.exists() {
-                    makefile = Some(path);
-                    break;
-                }
-            }
-            if let Some(makefile) = makefile {
-                makefile
-            } else {
-                return Err(NoMakefile);
-            }
-        }
-    };
-
-    let contents = if path == Path::new("-") {
-        read_stdin()?
-    } else {
-        match fs::read_to_string(path) {
-            Ok(contents) => contents,
-            Err(err) => {
-                return Err(IoError(err.kind()));
-            }
-        }
-    };
-
-    match Makefile::from_str(&contents) {
-        Ok(makefile) => Ok(makefile),
-        Err(err) => Err(ErrorCode::ParserError { constraint: err }),
-    }
-}
-
-/// Reads the makefile from `stdin` until EOF (Ctrl + D)
-fn read_stdin() -> Result<String, ErrorCode> {
-    let mut buffer = String::new();
-    io::stdin().read_to_string(&mut buffer)?;
-    Ok(buffer)
 }

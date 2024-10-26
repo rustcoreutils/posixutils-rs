@@ -9,6 +9,7 @@
 
 pub mod curuser;
 pub mod group;
+pub mod i18n;
 pub mod io;
 pub mod lzw;
 pub mod modestr;

@@ -11,6 +11,10 @@ rust-version.workspace = true
 cfg-if = "1.0"
 libc.workspace = true
 errno.workspace = true
+gettext = "0.4.0"
+sys-locale = "0.3.1"
+fluent-langneg = "0.14.1"
+tr.workspace = true
 
 [lints]
 workspace = true

@@ -13,8 +13,10 @@ mod psmacos;
 #[cfg(target_os = "linux")]
 mod pslinux;
 
-use clap::Parser;
 use std::collections::HashMap;
+
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 
 #[cfg(target_os = "macos")]
 mod platform {
@@ -98,8 +100,13 @@ fn posix_field_map() -> HashMap<&'static str, &'static str> {
     ])
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    setlocale(LocaleCategory::LcAll, "");
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
+
     let mut args = Args::parse();
+
     if args.all2 {
         args.all = true;
     }
@@ -108,7 +115,7 @@ fn main() {
         Ok(processes) => processes,
         Err(e) => {
             eprintln!("Error: {}", e);
-            return;
+            return Ok(());
         }
     };
 
@@ -170,4 +177,6 @@ fn main() {
         }
         println!();
     }
+
+    Ok(())
 }

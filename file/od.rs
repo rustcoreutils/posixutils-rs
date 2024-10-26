@@ -6,17 +6,18 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-//
-use crate::io::ErrorKind;
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
+
 use std::fs::File;
 use std::io::{self, BufReader, Error, Read, Seek, SeekFrom};
 use std::num::ParseIntError;
 use std::path::PathBuf;
 use std::slice::Chunks;
 use std::str::FromStr;
+
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+
+use crate::io::ErrorKind;
 
 #[derive(Parser)]
 #[command(version, about = gettext("od - dump files in octal and other formats"))]
@@ -1138,10 +1139,11 @@ fn od(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
 
     let mut args = Args::parse();
+
     args.validate_args()?;
     let mut exit_code = 0;
 

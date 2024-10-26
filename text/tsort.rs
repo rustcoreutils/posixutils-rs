@@ -7,11 +7,12 @@
 // SPDX-License-Identifier: MIT
 //
 
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 use std::io::{self, BufRead};
 use std::path::PathBuf;
+
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use plib::io::input_stream_opt;
 use topological_sort::TopologicalSort;
 
 /// tsort - topological sort
@@ -23,7 +24,7 @@ struct Args {
 }
 
 fn tsort_file(pathname: &Option<PathBuf>) -> io::Result<()> {
-    let file = plib::io::input_stream_opt(pathname)?;
+    let file = input_stream_opt(pathname)?;
     let mut reader = io::BufReader::new(file);
 
     let mut ts = TopologicalSort::<String>::new();
@@ -65,12 +66,11 @@ fn pathname_display(path: &Option<PathBuf>) -> String {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
-    let args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
+
+    let args = Args::parse();
 
     let mut exit_code = 0;
 

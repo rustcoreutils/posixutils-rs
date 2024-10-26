@@ -11,7 +11,7 @@
 //! newly created files in `integration.rs`. They are located here in
 //! `integration2.rs` because umask is a per-process.
 
-use plib::{run_test, TestPlan};
+use plib::testing::{run_test, TestPlan};
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::Path;

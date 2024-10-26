@@ -8,7 +8,6 @@
 
 use clap::{error::ErrorKind, Parser};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 use thiserror::Error;
 
 use binrw::{binrw, BinReaderExt, BinWrite, Endian};
@@ -1721,6 +1720,10 @@ fn get_terminal_size() -> (u16, u16) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    setlocale(LocaleCategory::LcAll, "");
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
+
     let args = Args::try_parse().unwrap_or_else(|err| {
         if err.kind() == ErrorKind::DisplayHelp || err.kind() == ErrorKind::DisplayVersion {
             // Print help or version message
@@ -1733,9 +1736,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Exit with a non-zero status code
         std::process::exit(1);
     });
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
     let mut exit_code = 0;
 

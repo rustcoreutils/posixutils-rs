@@ -12,12 +12,10 @@ use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use clap::Parser;
-
 use gettextrs::{
     bind_textdomain_codeset, bindtextdomain, gettext, setlocale, textdomain, LocaleCategory,
 };
 use plib::i18n::ClapLocale;
-use plib::PROJECT_NAME;
 
 #[derive(Parser)]
 #[command(
@@ -137,9 +135,9 @@ impl Status {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bindtextdomain(PROJECT_NAME, "locale")?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bindtextdomain(env!("PROJECT_NAME"), "locale")?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
 
     let args = Args::parse_with_locale();
 

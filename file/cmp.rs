@@ -7,12 +7,13 @@
 // SPDX-License-Identifier: MIT
 //
 
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 use std::io::{self, ErrorKind, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
+
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use plib::io::input_reader;
 
 #[derive(Parser)]
 #[command(version, about = gettext("cmp - compare two files"))]
@@ -76,8 +77,8 @@ fn cmp_main(args: &Args) -> io::Result<u8> {
         return Ok(0);
     }
 
-    let mut reader1 = plib::io::input_reader(&args.file1, true)?;
-    let mut reader2 = plib::io::input_reader(&args.file2, true)?;
+    let mut reader1 = input_reader(&args.file1, true)?;
+    let mut reader2 = input_reader(&args.file2, true)?;
 
     let mut lines: u64 = 1;
     let mut bytes: u64 = 0;
@@ -135,12 +136,11 @@ fn cmp_main(args: &Args) -> io::Result<u8> {
 }
 
 fn main() -> ExitCode {
-    let args = Args::parse();
-
-    // Initialize translation system
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME).unwrap();
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8").unwrap();
+    textdomain(env!("PROJECT_NAME")).unwrap();
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8").unwrap();
+
+    let args = Args::parse();
 
     match cmp_main(&args) {
         Ok(x) => ExitCode::from(x),

@@ -12,7 +12,7 @@
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
+use plib::group;
 use std::collections::HashMap;
 use std::io::Error;
 
@@ -122,7 +122,7 @@ fn get_user_info(args: &Args) -> Result<UserInfo, Box<dyn std::error::Error>> {
 }
 
 fn get_group_info(userinfo: &mut UserInfo) -> Result<(), Box<dyn std::error::Error>> {
-    let groups = plib::group::load();
+    let groups = group::load();
 
     for group in &groups {
         // skip groups that the user is not a member of
@@ -193,12 +193,11 @@ fn display_user_info(args: &Args, userinfo: &UserInfo) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
-    let args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
+
+    let args = Args::parse();
 
     let mut userinfo = get_user_info(&args)?;
     get_group_info(&mut userinfo)?;

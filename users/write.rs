@@ -10,9 +10,8 @@
 use chrono::Local;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::{platform, PROJECT_NAME};
-use std::fs;
-use std::fs::OpenOptions;
+use plib::{curuser, platform, utmpx};
+use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
@@ -38,7 +37,7 @@ struct Args {
 // Select terminal in an implementation-defined manner and return terminal
 // Print an informational message about the chosen terminal
 fn select_terminal(user_name: &str) -> String {
-    let entries = plib::utmpx::load();
+    let entries = utmpx::load();
 
     // Filter the entries to find terminals for the specified user
     let user_entries: Vec<_> = entries
@@ -104,15 +103,6 @@ fn check_write_permission(terminal: &str) -> bool {
             false
         }
     }
-}
-
-// Retrieve the sender's login ID
-fn get_login_id() -> String {
-    plib::curuser::login_name()
-}
-
-fn get_terminal() -> String {
-    plib::curuser::tty()
 }
 
 fn get_current_date() -> String {
@@ -213,12 +203,11 @@ fn process_non_printable(line: &str) -> String {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
-    let args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
+
+    let args = Args::parse();
 
     let user_name = args.username;
     let terminal = match args.terminal {
@@ -237,8 +226,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         exit(1);
     }
 
-    let sender_login_id = get_login_id();
-    let sending_terminal = get_terminal();
+    let sender_login_id = curuser::login_name();
+    let sending_terminal = curuser::tty();
     let date = get_current_date();
 
     let message = format!(

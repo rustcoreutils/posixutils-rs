@@ -1,57 +1,93 @@
+use std::collections::VecDeque;
+use std::error::Error;
+use std::fmt::Display;
+use std::fs::File;
+use std::io::{
+    self, BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, StdinLock, StdoutLock, Write,
+};
+use std::path::PathBuf;
+use std::str::FromStr;
+use std::sync::mpsc;
+use std::time::Duration;
+
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use notify_debouncer_full::new_debouncer;
 use notify_debouncer_full::notify::event::{ModifyKind, RemoveKind};
 use notify_debouncer_full::notify::{EventKind, RecursiveMode, Watcher};
-use plib::PROJECT_NAME;
-use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
-use std::str::FromStr;
-use std::time::Duration;
+use plib::BUFSZ;
 
-/// A wrapper type for `isize` that defaults to negative values if no sign is provided.
-///
-/// The `SignedIsize` struct is a simple wrapper around the `isize` type, designed to parse
-/// a string into an `isize` value that defaults to negative if no explicit sign is provided.
-#[derive(Clone)]
-struct SignedIsize(isize);
+enum RelativeFrom {
+    StartOfFile(usize),
+    EndOfFile(usize),
+}
 
-impl FromStr for SignedIsize {
-    type Err = <isize as FromStr>::Err;
+#[derive(Debug)]
+enum RelativeFromFromStrError {
+    EmptyString,
+    IntegerParseError,
+}
 
-    /// Parses a string slice into a `SignedIsize`.
-    ///
-    /// If the string starts with a '-' or '+' sign, it parses it as is. If no sign is provided,
-    /// it defaults to a negative value.
-    ///
-    /// # Arguments
-    /// * `s` - A string slice to parse into a `SignedIsize`.
-    ///
-    /// # Returns
-    /// * `Ok(SignedIsize)` - If parsing is successful.
-    /// * `Err(Self::Err)` - If parsing fails (e.g., due to an invalid integer string).
-    ///
+impl Display for RelativeFromFromStrError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let st = match self {
+            RelativeFromFromStrError::EmptyString => {
+                "'number' argument following -c or -n was empty"
+            }
+            RelativeFromFromStrError::IntegerParseError => {
+                "'number' argument following -c or -n could not be parsed as an integer"
+            }
+        };
+
+        write!(f, "{st}")
+    }
+}
+
+impl Error for RelativeFromFromStrError {}
+
+impl FromStr for RelativeFrom {
+    type Err = RelativeFromFromStrError;
+
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.starts_with('-') || s.starts_with('+') {
-            Ok(SignedIsize(s.parse()?))
+        let mut chars = s.chars();
+
+        let (chars_to_use, relative_from_start_of_file) = match chars.next() {
+            Some('+') => (chars, true),
+            Some('-') => (chars, false),
+            // If no explicit sign is provided, then relative from end of file
+            Some(_) => (s.chars(), false),
+            None => {
+                return Err(RelativeFromFromStrError::EmptyString);
+            }
+        };
+
+        let usize = chars_to_use
+            .as_str()
+            .parse::<usize>()
+            .map_err(|_| RelativeFromFromStrError::IntegerParseError)?;
+
+        let relative_from = if relative_from_start_of_file {
+            RelativeFrom::StartOfFile(usize)
         } else {
-            Ok(SignedIsize(-s.parse::<isize>()?))
-        }
+            RelativeFrom::EndOfFile(usize)
+        };
+
+        Ok(relative_from)
     }
 }
 
 /// tail - copy the last part of a file
+/// If neither -n nor -c are specified, copies the last 10 lines (-n 10).
 #[derive(Parser)]
 #[command(version, about)]
 struct Args {
     /// The number of lines to print from the end of the file
-    #[arg(short = 'n')]
-    lines: Option<SignedIsize>,
+    #[arg(short = 'n', long = "lines", allow_hyphen_values = true)]
+    lines: Option<String>,
 
     /// The number of bytes to print from the end of the file
-    #[arg(short = 'c')]
-    bytes: Option<SignedIsize>,
+    #[arg(short = 'c', long = "bytes", allow_hyphen_values = true)]
+    bytes: Option<String>,
 
     /// Output appended data as the file grows
     #[arg(short = 'f')]
@@ -61,253 +97,262 @@ struct Args {
     file: Option<PathBuf>,
 }
 
+enum BytesOrLines {
+    Lines(RelativeFrom),
+    Bytes(RelativeFrom),
+}
+
 impl Args {
-    /// Validates the command-line arguments to ensure they meet the required constraints.
-    ///
-    /// # Returns
-    /// * `Ok(())` if arguments are valid.
-    /// * `Err(String)` if arguments are invalid, with an error message describing the issue.
-    fn validate_args(&mut self) -> Result<(), String> {
-        // Check if conflicting options are used together
-        if self.bytes.is_some() && self.lines.is_some() {
-            return Err("Options '-c' and '-n' cannot be used together".to_string());
-        }
+    fn get_bytes_or_lines(&self) -> Result<BytesOrLines, Box<dyn Error>> {
+        let bytes_or_lines = match (&self.bytes, &self.lines) {
+            (Some(st), None) => BytesOrLines::Bytes(RelativeFrom::from_str(st.as_str())?),
+            (None, Some(st)) => BytesOrLines::Lines(RelativeFrom::from_str(st.as_str())?),
+            (Some(_), Some(_)) => {
+                // Check if conflicting options are used together
+                return Err(Box::from("options '-c' and '-n' cannot be used together"));
+            }
+            (None, None) => {
+                // The default behavior is the last 10 lines (-n 10)
+                // "If neither -c nor -n is specified, -n 10 shall be assumed."
+                // https://pubs.opengroup.org/onlinepubs/9699919799/utilities/tail.html
+                BytesOrLines::Lines(RelativeFrom::EndOfFile(10_usize))
+            }
+        };
 
-        if self.bytes.is_none() && self.lines.is_none() {
-            self.lines = Some(SignedIsize(-10));
-        }
-
-        Ok(())
+        Ok(bytes_or_lines)
     }
 }
 
-/// Prints the last `n` lines from the given reader.
-///
-/// This function reads from a reader and prints the last `n` lines to standard output.
-/// If `n` is negative, it treats `n` as counting from the end of the file. If `n` is
-/// non-negative, it counts lines from the start of the file until `n` lines are skipped,
-/// then it prints the rest of the file.
-///
-/// # Type Parameters
-/// * `R` - A type that implements `Read` and `BufRead`.
-///
-/// # Arguments
-/// * `reader` - A mutable reference to a reader to read bytes from.
-/// * `n` - The number of lines to print from the end. Negative values indicate counting from the end.
-///
-/// # Returns
-/// * `Ok(())` - If the operation completes successfully.
-/// * `Err(Box<dyn std::error::Error>)` - If an error occurs during reading.
-///
-fn print_last_n_lines<R: Read + BufRead>(
-    reader: &mut R,
-    n: isize,
+enum FileOrStdin {
+    File(PathBuf, BufReader<File>),
+    Stdin(StdinLock<'static>),
+}
+
+impl FileOrStdin {
+    fn get_buf_read(&mut self) -> &mut dyn BufRead {
+        match self {
+            Self::File(_, ref mut bu) => bu,
+            Self::Stdin(ref mut st) => st,
+        }
+    }
+}
+
+fn print_bytes(stdout_lock: &mut StdoutLock, bytes: &[u8]) -> io::Result<()> {
+    stdout_lock.write_all(bytes)
+}
+
+fn print_n_lines<R: Read + BufRead>(
+    stdout_lock: &mut StdoutLock,
+    read: &mut R,
+    relative_from: RelativeFrom,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Check if `n` is negative. If so, treat `n` as counting from the end.
-    if n < 0 {
-        // Convert `n` to an unsigned integer.
-        let n = n.unsigned_abs();
+    match relative_from {
+        RelativeFrom::EndOfFile(us) => {
+            let n = if us == 0_usize {
+                // Nothing to read or print
+                return Ok(());
+            } else {
+                us
+            };
 
-        // Create a vector to store the last `n` lines. Preallocate memory for efficiency.
-        let mut lines = Vec::with_capacity(n);
+            // Create a vector to store the last `n` lines. Preallocate memory for efficiency.
+            let mut lines = VecDeque::<Vec<u8>>::with_capacity(n);
 
-        // Temporary storage for each line read from the reader.
-        let mut line = String::new();
+            // Temporary buffer for the line currently being processed
+            let mut line = Vec::<u8>::with_capacity(BUFSZ);
 
-        // Read each line and store the last `n` lines.
-        while reader.read_line(&mut line).map_err(|e| e.to_string())? != 0 {
-            // If the vector is full, remove the first (oldest) line.
-            if lines.len() == n {
-                lines.remove(0);
+            // Read each line and store the last `n` lines.
+            loop {
+                match read.read_until(b'\n', &mut line) {
+                    Ok(us) => {
+                        if us == 0_usize {
+                            // Reached EOF
+                            break;
+                        }
+
+                        let lines_len = lines.len();
+
+                        if let Some(ve) = lines.pop_front() {
+                            if lines_len == n {
+                                // If the vector is full, remove the first (oldest) line.
+                                let mut ve_mut = ve;
+
+                                ve_mut.clear();
+
+                                ve_mut.extend_from_slice(line.as_slice());
+
+                                lines.push_back(ve_mut);
+                            } else {
+                                // Undo `pop_front`, since it was premature
+                                lines.push_front(ve);
+
+                                // Add the current line to the vector.
+                                lines.push_back(line.clone());
+                            }
+                        } else {
+                            // Add the current line to the vector.
+                            lines.push_back(line.clone());
+                        }
+
+                        // Clear the temporary storage for the next line.
+                        line.clear();
+                    }
+                    Err(er) => {
+                        if er.kind() == ErrorKind::Interrupted {
+                            continue;
+                        }
+
+                        return Err(Box::from(er));
+                    }
+                }
             }
 
-            // Add the current line to the vector.
-            lines.push(line.clone());
-
-            // Clear the temporary storage for the next line.
-            line.clear();
+            // Print the collected lines
+            for line in lines {
+                stdout_lock.write_all(line.as_slice())?;
+            }
         }
+        RelativeFrom::StartOfFile(us) => {
+            // Ensure `n` is at least 1 to avoid unnecessary work when `n` is 0.
+            let n = if us == 0_usize { 1_usize } else { us };
 
-        // Print the collected lines, removing any trailing newline characters.
-        for line in lines {
-            println!("{}", line.trim_end());
-        }
-    } else {
-        // If `n` is non-negative, count lines from the start of the file.
-        let mut n = n as usize;
+            // TODO: performance
+            // Buffer to read a single byte at a time.
+            let mut empty_buffer = [0_u8; 1_usize];
+            let mut line_count = 0_usize;
 
-        // Ensure `n` is at least 1 to avoid unnecessary work when `n` is 0.
-        if n == 0 {
-            n = 1;
-        }
+            // Skip the first `n` lines.
+            if n != 1_usize {
+                'skip_lines: loop {
+                    // Read a single byte from the reader.
+                    let bytes_read = read.read(&mut empty_buffer)?;
 
-        // Buffer to read a single byte at a time.
-        let mut empty_buffer = [0; 1];
-        let mut line_count = 0;
+                    if bytes_read == 0_usize {
+                        break;
+                    }
 
-        // Skip the first `n` lines.
-        if n != 1 {
-            'skip_lines: loop {
-                // Read a single byte from the reader.
-                let bytes_read = reader.read(&mut empty_buffer)?;
+                    // Check if the byte is a newline character.
+                    if empty_buffer[0_usize] == b'\n' {
+                        line_count += 1;
+
+                        // If the required number of lines are skipped, exit the loop.
+                        if line_count == n - 1_usize {
+                            break 'skip_lines;
+                        }
+                    }
+                }
+            }
+
+            // Buffer to read chunks of data from the reader.
+            let mut buffer = [0_u8; BUFSZ];
+
+            // Read and print the remaining lines.
+            loop {
+                let bytes_read = read
+                    .read(&mut buffer)
+                    .map_err(|er| format!("Failed to read: {er}"))?;
+
+                // If no more bytes are read, exit the loop.
                 if bytes_read == 0 {
                     break;
                 }
 
-                // Check if the byte is a newline character.
-                if empty_buffer[0] == b'\n' {
-                    line_count += 1;
+                // Print the bytes read.
+                print_bytes(stdout_lock, &buffer[..bytes_read])?;
+            }
+        }
+    }
 
-                    // If the required number of lines are skipped, exit the loop.
-                    if line_count == n - 1 {
-                        break 'skip_lines;
+    Ok(())
+}
+
+fn print_n_bytes<R: Read>(
+    stdout_lock: &mut StdoutLock,
+    read: &mut R,
+    relative_from: RelativeFrom,
+) -> Result<(), Box<dyn Error>> {
+    match relative_from {
+        RelativeFrom::EndOfFile(us) => {
+            let n = if us == 0_usize {
+                // Nothing to read or print
+                return Ok(());
+            } else {
+                us
+            };
+
+            // Buffer to read `n` bytes at a time.
+            let mut buffer_1 = vec![0_u8; n];
+
+            // Buffer to store the last `n` bytes read.
+            let mut buffer_2 = Vec::<u8>::new();
+
+            // Continuously read bytes into buffer_1.
+            loop {
+                let bytes_read = read
+                    .read(&mut buffer_1)
+                    .map_err(|er| format!("Failed to read: {er}"))?;
+
+                // If the number of bytes read is less than the buffer size, we're at the end of the file.
+                if bytes_read < buffer_1.len() {
+                    // Add the bytes read to buffer_2.
+                    buffer_2.extend(&buffer_1[..bytes_read]);
+
+                    // If buffer_2 contains fewer than `n` bytes, print all of them.
+                    if buffer_2.len() < n {
+                        print_bytes(stdout_lock, &buffer_2)?;
+                    } else {
+                        // Otherwise, print the last `n` bytes from buffer_2.
+                        let start = buffer_2.len() - n;
+                        print_bytes(stdout_lock, &buffer_2[start..])?;
                     }
-                }
-            }
-        }
 
-        // Buffer to read chunks of data from the reader.
-        let mut buffer = [0; 1024];
-
-        // Read and print the remaining lines.
-        loop {
-            // Read up to 1024 bytes into the buffer.
-            let bytes_read = reader
-                .read(&mut buffer)
-                .map_err(|e| format!("Failed to read: {}", e))?;
-
-            // If no more bytes are read, exit the loop.
-            if bytes_read == 0 {
-                break;
-            }
-
-            // Print the bytes read as a string.
-            print_bytes(&buffer[..bytes_read]);
-        }
-    }
-
-    // Return `Ok(())` to indicate successful execution.
-    Ok(())
-}
-
-/// Prints the last `n` bytes from the given reader.
-///
-/// This function reads from a reader and prints the last `n` bytes to standard output.
-/// If `n` is negative, it treats `n` as counting from the end of the file. If `n` is
-/// non-negative, it skips `n` bytes from the start of the file and then prints the rest
-/// of the file.
-///
-/// # Type Parameters
-/// * `R` - A type that implements `Read`.
-///
-/// # Arguments
-/// * `buf_reader` - A mutable reference to a reader to read bytes from.
-/// * `n` - The number of bytes to print from the end. Negative values indicate counting from the end.
-///
-/// # Returns
-/// * `Ok(())` - If the operation completes successfully.
-/// * `Err(Box<dyn std::error::Error>)` - If an error occurs during reading.
-///
-fn print_last_n_bytes<R: Read>(
-    buf_reader: &mut R,
-    n: isize,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Check if `n` is negative. If so, treat `n` as counting from the end.
-    if n < 0 {
-        // Convert `n` to an unsigned integer.
-        let n = n.unsigned_abs();
-
-        // Buffer to read `n` bytes at a time.
-        let mut buffer_1 = vec![0; n];
-
-        // Buffer to store the last `n` bytes read.
-        let mut buffer_2 = vec![];
-
-        // Continuously read bytes into buffer_1.
-        loop {
-            let bytes_read = buf_reader
-                .read(&mut buffer_1)
-                .map_err(|e| format!("Failed to read: {}", e))?;
-
-            // If the number of bytes read is less than the buffer size, we're at the end of the file.
-            if bytes_read < buffer_1.len() {
-                // Add the bytes read to buffer_2.
-                buffer_2.extend(&buffer_1[..bytes_read]);
-
-                // If buffer_2 contains fewer than `n` bytes, print all of them.
-                if buffer_2.len() < n {
-                    print_bytes(&buffer_2);
-                } else {
-                    // Otherwise, print the last `n` bytes from buffer_2.
-                    let start = buffer_2.len() - n;
-                    print_bytes(&buffer_2[start..]);
+                    // Exit the loop since we've reached the end of the file.
+                    break;
                 }
 
-                // Exit the loop since we've reached the end of the file.
-                break;
+                // Clone buffer_1 into buffer_2 for the next iteration.
+                buffer_2.clone_from(&buffer_1);
             }
-
-            // Clone buffer_1 into buffer_2 for the next iteration.
-            buffer_2.clone_from(&buffer_1);
         }
-    } else {
-        // If `n` is non-negative, skip the first `n` bytes.
+        RelativeFrom::StartOfFile(us) => {
+            let mut skip = us;
 
-        // Convert `n` to an unsigned integer.
-        let mut skip = n as usize;
+            // TODO: performance
+            // Buffer to read one byte at a time.
+            let mut empty_buffer = [0_u8; 1_usize];
 
-        // Buffer to read one byte at a time.
-        let mut empty_buffer = [0; 1];
+            // Skip the first `n` bytes.
+            while skip > 1_usize {
+                let bytes_read = read.read(&mut empty_buffer)?;
 
-        // Skip the first `n` bytes.
-        while skip > 1 {
-            let bytes_read = buf_reader.read(&mut empty_buffer)?;
-            if bytes_read == 0 {
-                break;
-            }
-            skip -= 1;
-        }
+                if bytes_read == 0_usize {
+                    break;
+                }
 
-        // Buffer to read chunks of data from the reader.
-        let mut buffer = [0; 1024];
-
-        // Read and print the remaining bytes.
-        loop {
-            let bytes_read = buf_reader
-                .read(&mut buffer)
-                .map_err(|e| format!("Failed to read: {}", e))?;
-
-            // If no more bytes are read, exit the loop.
-            if bytes_read == 0 {
-                break;
+                skip -= 1_usize;
             }
 
-            // Print the bytes read as a string.
-            print_bytes(&buffer[..bytes_read]);
+            // Buffer to read chunks of data from the reader.
+            let mut buffer = [0_u8; BUFSZ];
+
+            // Read and print the remaining bytes.
+            loop {
+                let bytes_read = read
+                    .read(&mut buffer)
+                    .map_err(|er| format!("Failed to read: {er}"))?;
+
+                // If no more bytes are read, exit the loop.
+                if bytes_read == 0_usize {
+                    break;
+                }
+
+                // Print the bytes read.
+                print_bytes(stdout_lock, &buffer[..bytes_read])?;
+            }
         }
     }
 
-    // Return `Ok(())` to indicate successful execution.
     Ok(())
-}
-
-/// Prints a slice of bytes to standard output.
-///
-/// This function attempts to interpret the byte slice as a UTF-8 string and prints it.
-/// If the byte slice is not valid UTF-8, it prints each byte as a character.
-///
-/// # Arguments
-/// * `bytes` - A slice of bytes to print.
-///
-fn print_bytes(bytes: &[u8]) {
-    match std::str::from_utf8(bytes) {
-        Ok(valid_str) => print!("{}", valid_str),
-        Err(_) => {
-            for byte in bytes {
-                print!("{}", *byte as char);
-            }
-        }
-    }
 }
 
 /// The main logic for the `tail` command.
@@ -315,9 +360,6 @@ fn print_bytes(bytes: &[u8]) {
 /// This function processes the command-line arguments to determine how many lines or bytes
 /// to print from the end of a specified file or standard input. It supports an option to
 /// follow the file, printing new data as it is appended to the file.
-///
-/// # Arguments
-/// * `args` - The command-line arguments parsed into an `Args` struct.
 ///
 /// # Returns
 /// * `Ok(())` - If the operation completes successfully.
@@ -328,77 +370,99 @@ fn print_bytes(bytes: &[u8]) {
 /// - The specified file cannot be opened.
 /// - An error occurs while reading from the file or stdin.
 /// - An error occurs while watching the file for changes.
-///
-fn tail(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    // open file, or stdin
-    let file: Box<dyn Read> = {
-        if args.file == Some(PathBuf::from("-")) || args.file.is_none() {
-            Box::new(io::stdin().lock())
-        } else {
-            Box::new(File::open(args.file.as_ref().unwrap())?)
-        }
-    };
-
-    let mut reader = io::BufReader::new(file);
-
-    if let Some(bytes) = &args.bytes {
-        print_last_n_bytes(&mut reader, bytes.0)?;
-    } else {
-        print_last_n_lines(&mut reader, args.lines.as_ref().unwrap().0)?;
+fn tail(
+    file: Option<PathBuf>,
+    follow: bool,
+    bytes_or_lines: BytesOrLines,
+) -> Result<(), Box<dyn Error>> {
+    fn get_stdin() -> FileOrStdin {
+        FileOrStdin::Stdin(io::stdin().lock())
     }
 
-    // If follow option is specified, continue monitoring the file
-    if args.follow && !(args.file == Some(PathBuf::from("-")) || args.file.is_none()) {
-        let file_path = args.file.as_ref().unwrap();
+    let mut file_or_stdin = match file {
+        Some(pa) => {
+            if pa.as_os_str() == "-" {
+                get_stdin()
+            } else {
+                let fi = File::open(pa.as_path())?;
 
-        // Opening a file and placing the cursor at the end of the file
-        let mut file = File::open(file_path)?;
-        file.seek(SeekFrom::End(0))?;
-        let mut reader = BufReader::new(&file);
+                FileOrStdin::File(pa, BufReader::new(fi))
+            }
+        }
+        None => get_stdin(),
+    };
 
-        let (tx, rx) = std::sync::mpsc::channel();
-        // Automatically select the best implementation for your platform.
-        let mut debouncer = new_debouncer(Duration::from_millis(1), None, tx).unwrap();
+    let mut stdout_lock = io::stdout().lock();
 
-        // Add a path to be watched.
-        // below will be monitored for changes.
-        debouncer
-            .watcher()
-            .watch(Path::new(file_path), RecursiveMode::NonRecursive)?;
+    {
+        let mut buf_reader = file_or_stdin.get_buf_read();
 
-        for res in rx {
-            match res {
-                Ok(events) => {
-                    let event = events.first().unwrap();
-                    match event.kind {
-                        EventKind::Modify(ModifyKind::Any)
-                        | EventKind::Modify(ModifyKind::Data(_))
-                        | EventKind::Modify(ModifyKind::Other) => {
-                            // If the file has been modified, check if the file was truncated
-                            let metadata = file.metadata()?;
-                            let current_size = metadata.len();
+        match bytes_or_lines {
+            BytesOrLines::Bytes(re) => {
+                print_n_bytes(&mut stdout_lock, &mut buf_reader, re)?;
+            }
+            BytesOrLines::Lines(re) => {
+                print_n_lines(&mut stdout_lock, &mut buf_reader, re)?;
+            }
+        }
+    }
 
-                            if current_size < reader.stream_position()? {
-                                eprintln!("\ntail: {}: file truncated", file_path.display());
-                                reader.seek(SeekFrom::Start(0))?;
+    if follow {
+        // If follow option is specified, continue monitoring the file
+        if let FileOrStdin::File(pa, mut bu) = file_or_stdin {
+            // Move the the cursor to the end of the file
+            // Is this still necessary now that the `BufReader` and underlying `File` are being reused?
+            bu.seek(SeekFrom::End(0_i64))?;
+
+            let (tx, rx) = mpsc::channel();
+
+            // Automatically select the best implementation for your platform.
+            let mut debouncer = new_debouncer(Duration::from_millis(1_u64), None, tx).unwrap();
+
+            // Add a path to be watched.
+            // below will be monitored for changes.
+            debouncer
+                .watcher()
+                .watch(pa.as_path(), RecursiveMode::NonRecursive)?;
+
+            for res in rx {
+                match res {
+                    Ok(events) => {
+                        let event = events.first().unwrap();
+                        match event.kind {
+                            EventKind::Modify(ModifyKind::Any)
+                            | EventKind::Modify(ModifyKind::Data(_))
+                            | EventKind::Modify(ModifyKind::Other) => {
+                                // If the file has been modified, check if the file was truncated
+                                let metadata = bu.get_mut().metadata()?;
+                                let current_size = metadata.len();
+
+                                if current_size < bu.stream_position()? {
+                                    eprintln!("\ntail: {}: file truncated", pa.display());
+
+                                    bu.seek(SeekFrom::Start(0_u64))?;
+                                }
+
+                                // Read the new lines and output them
+                                let mut new_data = Vec::<u8>::new();
+
+                                let bytes_read = bu.read_to_end(&mut new_data)?;
+
+                                if bytes_read > 0_usize {
+                                    print_bytes(&mut stdout_lock, &new_data)?;
+
+                                    io::stdout().flush()?;
+                                }
                             }
-
-                            // Read the new lines and output them
-                            let mut new_data = vec![];
-                            let bytes_read = reader.read_to_end(&mut new_data)?;
-                            if bytes_read > 0 {
-                                print_bytes(&new_data);
-                                io::stdout().flush()?;
+                            EventKind::Remove(RemoveKind::File) => {
+                                debouncer.watcher().unwatch(pa.as_path())?
                             }
+                            _ => {}
                         }
-                        EventKind::Remove(RemoveKind::File) => {
-                            debouncer.watcher().unwatch(Path::new(file_path))?
-                        }
-                        _ => {}
                     }
-                }
-                Err(e) => {
-                    eprintln!("watch error: {:?}", e);
+                    Err(ve) => {
+                        eprintln!("tail: watch error: {ve:?}");
+                    }
                 }
             }
         }
@@ -409,15 +473,26 @@ fn tail(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
-    let mut args = Args::parse();
-    args.validate_args()?;
-    let mut exit_code = 0;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
 
-    if let Err(err) = tail(&args) {
-        exit_code = 1;
-        eprint!("{}", err);
+    let args = Args::parse();
+
+    let bytes_or_lines = match args.get_bytes_or_lines() {
+        Ok(by) => by,
+        Err(bo) => {
+            eprintln!("tail: {bo}");
+
+            std::process::exit(1_i32)
+        }
+    };
+
+    let mut exit_code = 0_i32;
+
+    if let Err(er) = tail(args.file, args.follow, bytes_or_lines) {
+        exit_code = 1_i32;
+
+        eprintln!("tail: {}", er);
     }
 
     std::process::exit(exit_code)

@@ -12,7 +12,6 @@
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::{fs, io};
@@ -104,19 +103,16 @@ fn du_cli_arg(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
+    setlocale(LocaleCategory::LcAll, "");
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
+
     let mut args = Args::parse();
 
     // default to current directory
     if args.files.is_empty() {
         args.files.push(".".to_string());
     }
-
-    // initialize translations
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
-
     let mut exit_code = 0;
     let mut total = 0;
 

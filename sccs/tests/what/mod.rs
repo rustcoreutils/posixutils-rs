@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::{run_test, TestPlan};
+use plib::testing::{run_test, TestPlan};
 use std::path::PathBuf;
 
 fn test_file_path(file_name: &str) -> PathBuf {

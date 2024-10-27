@@ -664,8 +664,8 @@ mod parsing {
         st.push(first_octal_digit);
 
         let mut added_octal_digit_to_buffer = |pe: &mut Peekable<Chars>| {
-            if let Some(&second_octal_digit @ '0'..='7') = pe.peek() {
-                st.push(second_octal_digit);
+            if let Some(&octal_digit @ '0'..='7') = pe.peek() {
+                st.push(octal_digit);
 
                 true
             } else {

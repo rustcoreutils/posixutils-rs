@@ -46,9 +46,9 @@ dependencies = [
 
 [[package]]
 name = "anstream"
-version = "0.6.15"
+version = "0.6.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "64e15c1ab1f89faffbf04a634d5e1962e9074f2741eef6d97f3c4e322426d526"
+checksum = "23a1e53f0f5d86382dafe1cf314783b2044280f406e7e1506368220ad11b1338"
 dependencies = [
  "anstyle",
  "anstyle-parse",
@@ -61,36 +61,36 @@ dependencies = [
 
 [[package]]
 name = "anstyle"
-version = "1.0.8"
+version = "1.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1bec1de6f59aedf83baf9ff929c98f2ad654b97c9510f4e70cf6f661d49fd5b1"
+checksum = "8365de52b16c035ff4fcafe0092ba9390540e3e352870ac09933bebcaa2c8c56"
 
 [[package]]
 name = "anstyle-parse"
-version = "0.2.5"
+version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb47de1e80c2b463c735db5b217a0ddc39d612e7ac9e2e96a5aed1f57616c1cb"
+checksum = "3b2d16507662817a6a20a9ea92df6652ee4f94f914589377d69f3b21bc5798a9"
 dependencies = [
  "utf8parse",
 ]
 
 [[package]]
 name = "anstyle-query"
-version = "1.1.1"
+version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d36fc52c7f6c869915e99412912f22093507da8d9e942ceaf66fe4b7c14422a"
+checksum = "79947af37f4177cfead1110013d678905c37501914fba0efea834c3fe9a8d60c"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "anstyle-wincon"
-version = "3.0.4"
+version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5bf74e1b6e971609db8ca7a9ce79fd5768ab6ae46441c572e46cf596f59e57f8"
+checksum = "2109dbce0e72be3ec00bed26e6a7479ca384ad226efdd66db8fa2e3a38c83125"
 dependencies = [
  "anstyle",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -147,7 +147,7 @@ dependencies = [
  "regex",
  "rustc-hash",
  "shlex",
- "syn 2.0.82",
+ "syn 2.0.85",
 ]
 
 [[package]]
@@ -244,7 +244,7 @@ checksum = "bcfcc3cd946cb52f0bbfdbbcfa2f4e24f75ebb6c0e1002f7c25904fada18b9ec"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.82",
+ "syn 2.0.85",
 ]
 
 [[package]]
@@ -335,7 +335,7 @@ dependencies = [
  "heck",
  "proc-macro2",
  "quote",
- "syn 2.0.82",
+ "syn 2.0.85",
 ]
 
 [[package]]
@@ -355,9 +355,9 @@ dependencies = [
 
 [[package]]
 name = "colorchoice"
-version = "1.0.2"
+version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3fd119d74b830634cea2a0f58bbd0d54540518a14397557951e79340abc28c0"
+checksum = "5b63caa9aa9397e2d9480a9b13673856c78d8ac123288526c37d7839f2a86990"
 
 [[package]]
 name = "console"
@@ -482,7 +482,7 @@ checksum = "5f33878137e4dafd7fa914ad4e259e18a4e8e532b9617a2d0150262bf53abfce"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.82",
+ "syn 2.0.85",
 ]
 
 [[package]]
@@ -616,11 +616,11 @@ checksum = "e8c02a5121d4ea3eb16a80748c74f5549a5665e4c21333c6098f283870fbdea6"
 
 [[package]]
 name = "file-id"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6584280525fb2059cba3db2c04abf947a1a29a45ddae89f3870f8281704fafc9"
+checksum = "6bc904b9bbefcadbd8e3a9fb0d464a9b979de6324c03b3c663e8994f46a5be36"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -662,7 +662,7 @@ dependencies = [
 
 [[package]]
 name = "ftw"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "errno",
  "libc",
@@ -692,7 +692,7 @@ dependencies = [
 
 [[package]]
 name = "gettext-rs"
-version = "0.2.1"
+version = "0.2.2"
 
 [[package]]
 name = "glob"
@@ -944,9 +944,9 @@ dependencies = [
 
 [[package]]
 name = "libm"
-version = "0.2.8"
+version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ec2a862134d2a7d32d7983ddcdd1c4923530833c9f2ea1a44fc5fa473989058"
+checksum = "3bda4c6077b0b08da2c48b172195795498381a7c8988c9e6212a6c55c5b9bd70"
 
 [[package]]
 name = "libredox"
@@ -983,7 +983,7 @@ checksum = "a7a70ba024b9dc04c27ea2f0c0548feb474ec5c54bba33a7f72f873a39d07b24"
 
 [[package]]
 name = "m4-test-manager"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "clap",
 ]
@@ -1230,7 +1230,7 @@ dependencies = [
  "pest_meta",
  "proc-macro2",
  "quote",
- "syn 2.0.82",
+ "syn 2.0.85",
 ]
 
 [[package]]
@@ -1284,13 +1284,13 @@ dependencies = [
 
 [[package]]
 name = "pin-project-lite"
-version = "0.2.14"
+version = "0.2.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bda66fc9667c18cb2758a2ac84d1167245054bcf85d5d1aaa6923f45801bdd02"
+checksum = "915a1e146535de9163f3987b8944ed8cf49a18bb0056bcebcdcece385cece4ff"
 
 [[package]]
 name = "plib"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "cfg-if",
  "errno",
@@ -1299,7 +1299,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-awk"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -1314,7 +1314,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-calc"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "bigdecimal",
  "clap",
@@ -1329,7 +1329,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-datetime"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "chrono",
  "clap",
@@ -1340,7 +1340,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-dev"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "ar",
  "chrono",
@@ -1352,7 +1352,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-display"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -1361,7 +1361,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-file"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -1374,7 +1374,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-fs"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -1383,7 +1383,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-i18n"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "bytemuck",
  "byteorder",
@@ -1396,7 +1396,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-m4"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "clap",
  "env_logger",
@@ -1414,7 +1414,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-make"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "clap",
  "const_format",
@@ -1426,7 +1426,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-misc"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -1436,7 +1436,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-pathnames"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -1446,7 +1446,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-process"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "bindgen",
  "clap",
@@ -1459,7 +1459,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-sccs"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -1468,7 +1468,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-screen"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -1479,7 +1479,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-sys"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "chrono",
  "clap",
@@ -1491,7 +1491,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-text"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "chrono",
  "clap",
@@ -1510,7 +1510,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-tree"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "chrono",
  "clap",
@@ -1525,7 +1525,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-users"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "binrw",
  "chrono",
@@ -1540,7 +1540,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-xform"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "base64",
  "clap",
@@ -1566,12 +1566,12 @@ dependencies = [
 
 [[package]]
 name = "prettyplease"
-version = "0.2.24"
+version = "0.2.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "910d41a655dac3b764f1ade94821093d3610248694320cd072303a8eedcf221d"
+checksum = "64d1ec885c64d0457d564db4ec299b2dae3f9c02808b8ad9c3a089c591b18033"
 dependencies = [
  "proc-macro2",
- "syn 2.0.82",
+ "syn 2.0.85",
 ]
 
 [[package]]
@@ -1699,9 +1699,9 @@ dependencies = [
 
 [[package]]
 name = "regex"
-version = "1.11.0"
+version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38200e5ee88914975b69f657f0801b6f6dccafd44fd9326302a4aaeecfacb1d8"
+checksum = "b544ef1b4eac5dc2db33ea63606ae9ffcfac26c1416a2806ae0bf5f56b201191"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -1767,9 +1767,9 @@ checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 
 [[package]]
 name = "rustix"
-version = "0.38.37"
+version = "0.38.38"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8acb788b847c24f28525660c4d7758620a7210875711f79e7f663cc152726811"
+checksum = "aa260229e6538e52293eeb577aabd09945a09d6d9cc0fc550ed7529056c2e32a"
 dependencies = [
  "bitflags 2.6.0",
  "errno",
@@ -1858,7 +1858,7 @@ checksum = "7e85ad2009c50b58e87caa8cd6dac16bdf511bbfb7af6c33df902396aa480fa5"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.82",
+ "syn 2.0.85",
 ]
 
 [[package]]
@@ -1941,7 +1941,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rustversion",
- "syn 2.0.82",
+ "syn 2.0.85",
 ]
 
 [[package]]
@@ -1957,9 +1957,9 @@ dependencies = [
 
 [[package]]
 name = "syn"
-version = "2.0.82"
+version = "2.0.85"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83540f837a8afc019423a8edb95b52a8effe46957ee402287f4292fae35be021"
+checksum = "5023162dfcd14ef8f32034d8bcd4cc5ddc61ef7a247c024a33e24e1f24d21b56"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2047,7 +2047,7 @@ checksum = "5999e24eaa32083191ba4e425deb75cdf25efefabe5aaccb7446dd0d4122a3f5"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.82",
+ "syn 2.0.85",
 ]
 
 [[package]]
@@ -2073,7 +2073,7 @@ checksum = "ae71770322cbd277e69d762a16c444af02aa0575ac0d174f0b9562d3b37f8602"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.82",
+ "syn 2.0.85",
 ]
 
 [[package]]
@@ -2308,7 +2308,7 @@ dependencies = [
  "once_cell",
  "proc-macro2",
  "quote",
- "syn 2.0.82",
+ "syn 2.0.85",
  "wasm-bindgen-shared",
 ]
 
@@ -2330,7 +2330,7 @@ checksum = "26c6ab57572f7a24a4985830b120de1594465e5d500f24afe89e16b4e833ef68"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.82",
+ "syn 2.0.85",
  "wasm-bindgen-backend",
  "wasm-bindgen-shared",
 ]
@@ -2411,7 +2411,7 @@ checksum = "9107ddc059d5b6fbfbffdfa7a7fe3e22a226def0b2608f72e9d552763d3e1ad7"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.82",
+ "syn 2.0.85",
 ]
 
 [[package]]
@@ -2422,7 +2422,7 @@ checksum = "29bee4b38ea3cde66011baa44dba677c432a78593e202392d1e9070cf2a7fca7"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.82",
+ "syn 2.0.85",
 ]
 
 [[package]]
@@ -2600,5 +2600,5 @@ checksum = "fa4f8080344d4671fb4e831a13ad1e68092748387dfc4f55e356242fae12ce3e"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.82",
+ "syn 2.0.85",
 ]

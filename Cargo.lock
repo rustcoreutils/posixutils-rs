@@ -1303,7 +1303,6 @@ version = "0.2.2"
 dependencies = [
  "clap",
  "gettext-rs",
- "lazy_static",
  "lexical",
  "libc",
  "pest",
@@ -1319,7 +1318,6 @@ dependencies = [
  "bigdecimal",
  "clap",
  "gettext-rs",
- "lazy_static",
  "pest",
  "pest_derive",
  "plib",

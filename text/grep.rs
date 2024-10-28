@@ -10,10 +10,13 @@
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use libc::{regcomp, regex_t, regexec, regfree, regmatch_t, REG_EXTENDED, REG_ICASE, REG_NOMATCH};
+use memchr::memmem;
 use std::{
+    error::Error,
     ffi::CString,
     fs::File,
     io::{self, BufRead, BufReader, StdoutLock, Write},
+    mem::MaybeUninit,
     path::{Path, PathBuf},
     ptr,
 };
@@ -62,7 +65,7 @@ struct Args {
     #[arg(short, long)]
     quiet: bool,
 
-    /// Suppress the error messages ordinarily written for nonexistent or unreadable input_files.
+    /// Suppress the error messages ordinarily written for nonexistent or unreadable input files.
     #[arg(short = 's', long)]
     no_messages: bool,
 
@@ -84,9 +87,6 @@ struct Args {
     /// standard input shall be used.
     #[arg(name = "FILE")]
     input_files: Vec<String>,
-
-    #[arg(skip)]
-    any_errors: bool,
 }
 
 impl Args {
@@ -95,34 +95,42 @@ impl Args {
     /// # Errors
     ///
     /// Returns an error if conflicting options are found.
-    fn validate_args(&self) -> Result<(), String> {
+    fn validate_args(&self) -> Result<(), Box<dyn Error>> {
         if self.extended_regexp && self.fixed_strings {
-            return Err("Options '-E' and '-F' cannot be used together".to_string());
+            return Err(Box::from("options '-E' and '-F' cannot be used together"));
         }
+
         if self.count && self.files_with_matches {
-            return Err("Options '-c' and '-l' cannot be used together".to_string());
+            return Err(Box::from("options '-c' and '-l' cannot be used together"));
         }
+
         if self.count && self.quiet {
-            return Err("Options '-c' and '-q' cannot be used together".to_string());
+            return Err(Box::from("options '-c' and '-q' cannot be used together"));
         }
+
         if self.files_with_matches && self.quiet {
-            return Err("Options '-l' and '-q' cannot be used together".to_string());
+            return Err(Box::from("options '-l' and '-q' cannot be used together"));
         }
+
         if self.regexp.is_empty() && self.file.is_empty() && self.single_pattern.is_none() {
-            return Err("A pattern list or at least one file is required".to_string());
+            return Err(Box::from("a pattern list or at least one file is required"));
         }
+
         Ok(())
     }
 
     /// Resolves input patterns and input files. Reads patterns from pattern files and merges them with specified as argument. Handles input files if empty.
-    fn resolve(&mut self) {
+    fn resolve(&mut self, grep_model_state: &mut GrepModelState) {
         for path_buf in &self.file {
             match Self::get_file_patterns(path_buf) {
                 Ok(patterns) => self.regexp.extend(patterns),
                 Err(err) => {
-                    self.any_errors = true;
+                    grep_model_state.any_errors = true;
+
                     if !self.no_messages {
-                        eprintln!("{}: {}", path_buf.display(), err);
+                        let path_buf_display = path_buf.display();
+
+                        eprintln!("grep: {path_buf_display}: {err}");
                     }
                 }
             }
@@ -132,9 +140,9 @@ impl Args {
             None => {}
             Some(pattern) => {
                 if !self.regexp.is_empty() {
-                    self.input_files.insert(0, pattern.clone());
+                    self.input_files.insert(0, pattern.to_owned());
                 } else {
-                    self.regexp = vec![pattern.clone()];
+                    self.regexp = vec![pattern.to_owned()];
                 }
             }
         }
@@ -142,7 +150,7 @@ impl Args {
         self.regexp = self
             .regexp
             .iter()
-            .flat_map(|pattern| pattern.split('\n').map(String::from))
+            .flat_map(|pattern| pattern.split('\n').map(ToOwned::to_owned))
             .collect();
         self.regexp.sort_by_key(|r| r.len());
         self.regexp.dedup();
@@ -172,17 +180,7 @@ impl Args {
     /// # Returns
     ///
     /// Returns [GrepModel](GrepModel) object.
-    fn into_grep_model(self) -> Result<GrepModel, String> {
-        let output_mode = if self.count {
-            OutputMode::Count(0)
-        } else if self.files_with_matches {
-            OutputMode::FilesWithMatches
-        } else if self.quiet {
-            OutputMode::Quiet
-        } else {
-            OutputMode::Default
-        };
-
+    fn into_grep_model(self) -> Result<GrepModel, Box<dyn Error>> {
         let patterns = Patterns::new(
             self.regexp,
             self.extended_regexp,
@@ -191,18 +189,17 @@ impl Args {
             self.line_regexp,
         )?;
 
+        let multiple_inputs = self.input_files.len() > 1_usize;
+
         Ok(GrepModel {
-            any_matches: false,
-            any_errors: self.any_errors,
-            line_number: self.line_number,
-            no_messages: self.no_messages,
-            invert_match: self.invert_match,
-            multiple_inputs: self.input_files.len() > 1,
-            output_mode,
-            patterns,
             input_files: self.input_files,
-            stdout_lock: io::stdout().lock(),
+            invert_match: self.invert_match,
+            line_number: self.line_number,
+            multiple_inputs,
+            no_messages: self.no_messages,
             only_matching: self.only_matching,
+            patterns,
+            quiet: self.quiet,
         })
     }
 }
@@ -237,7 +234,7 @@ impl Patterns {
         fixed_string: bool,
         ignore_case: bool,
         line_regexp: bool,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, Box<dyn Error>> {
         if fixed_string {
             Ok(Self::Fixed(
                 patterns
@@ -248,15 +245,18 @@ impl Patterns {
                 line_regexp,
             ))
         } else {
-            let mut ps = vec![];
-
             let mut cflags = 0;
+
             if extended_regexp {
                 cflags |= REG_EXTENDED;
             }
+
             if ignore_case {
                 cflags |= REG_ICASE;
             }
+
+            let mut regex_vec = Vec::<regex_t>::with_capacity(patterns.len());
+
             for mut pattern in patterns {
                 // macOS version of [regcomp](regcomp) from `libc`
                 // provides additional check for empty regex. In this case,
@@ -272,25 +272,39 @@ impl Patterns {
                         pattern
                     };
                 }
+
                 pattern = if line_regexp {
                     format!("^{pattern}$")
                 } else {
                     pattern
                 };
 
-                let c_pattern = CString::new(pattern).map_err(|err| err.to_string())?;
-                let mut regex = unsafe { std::mem::zeroed::<regex_t>() };
+                let pattern_c_string = CString::new(pattern)?;
 
-                let result = unsafe { regcomp(&mut regex, c_pattern.as_ptr(), cflags) };
-                if result != 0 {
-                    return Err(format!(
-                        "Error compiling regex '{}'",
-                        c_pattern.to_string_lossy()
-                    ));
+                let pattern_c_string_pointer = pattern_c_string.as_ptr();
+
+                let mut regex_maybe_uninit = MaybeUninit::<regex_t>::uninit();
+
+                let regex_maybe_uninit_pointer = regex_maybe_uninit.as_mut_ptr();
+
+                let regcomp_result = unsafe {
+                    regcomp(regex_maybe_uninit_pointer, pattern_c_string_pointer, cflags)
+                };
+
+                if regcomp_result == 0 {
+                    // Safety: just checked regcomp return value
+                    let regex = unsafe { regex_maybe_uninit.assume_init() };
+
+                    regex_vec.push(regex);
+                } else {
+                    return Err(Box::from(format!(
+                        "error compiling regex '{}'",
+                        pattern_c_string.to_string_lossy()
+                    )));
                 }
-                ps.push(regex);
             }
-            Ok(Self::Regex(ps))
+
+            Ok(Self::Regex(regex_vec))
         }
     }
 
@@ -303,7 +317,11 @@ impl Patterns {
     /// # Returns
     ///
     /// Returns [bool](bool) - `true` if input matches present patterns, else `false`.
-    fn matches(&self, input: impl AsRef<str>, collect_matching_substrings: bool) -> MatchesResult {
+    fn matches(
+        &self,
+        input: impl AsRef<[u8]>,
+        collect_matching_substrings: bool,
+    ) -> Result<MatchesData, Box<dyn Error>> {
         let input = input.as_ref();
 
         let mut matching_substrings = Vec::<Vec<u8>>::new();
@@ -312,42 +330,48 @@ impl Patterns {
 
         match self {
             Patterns::Fixed(patterns, ignore_case, line_regexp) => {
+                let input_ascii_lowercase: Vec<u8>;
+
                 let input = if *ignore_case {
-                    input.to_lowercase()
+                    input_ascii_lowercase = input.to_ascii_lowercase();
+
+                    input_ascii_lowercase.as_slice()
                 } else {
-                    input.to_string()
+                    input
                 };
 
                 for pattern in patterns {
                     if *line_regexp {
-                        if input != *pattern {
+                        if input != pattern.as_bytes() {
                             continue;
                         }
 
                         if !collect_matching_substrings {
-                            return MatchesResult::fast_path_match();
+                            return Ok(MatchesData::fast_path_match());
                         }
 
                         any_pattern_matched = true;
 
                         matching_substrings.push(pattern.as_bytes().to_vec());
                     } else {
-                        for st in input.matches(pattern) {
+                        let pattern_len = pattern.len();
+
+                        for index in memmem::find_iter(input, pattern) {
                             if !collect_matching_substrings {
-                                return MatchesResult::fast_path_match();
+                                return Ok(MatchesData::fast_path_match());
                             }
 
                             any_pattern_matched = true;
 
-                            matching_substrings.push(st.as_bytes().to_vec());
+                            let match_slice = &input[index..(index + pattern_len)];
+
+                            matching_substrings.push(match_slice.to_vec());
                         }
                     }
                 }
             }
             Patterns::Regex(patterns) => {
                 const SINGLE_ELEMENT_ARRAY_SIZE: usize = 1_usize;
-
-                let input_slice = input.as_bytes();
 
                 let mut regmatch_t_array = [const {
                     regmatch_t {
@@ -363,7 +387,7 @@ impl Patterns {
                 };
 
                 for pattern in patterns {
-                    let mut current_string_index = 0_usize;
+                    let mut current_position = 0_usize;
 
                     loop {
                         // Clear values from the last iteration
@@ -374,9 +398,11 @@ impl Patterns {
                             regmatch_t.rm_eo = -1;
                         }
 
-                        let current_string_slice = &input_slice[current_string_index..];
+                        let forward_slice = &input[current_position..];
 
-                        let current_string_c_string = CString::new(current_string_slice).unwrap();
+                        // TODO
+                        // How should slices containing null bytes be handled?
+                        let current_string_c_string = CString::new(forward_slice)?;
 
                         let current_string_pointer = current_string_c_string.as_ptr();
 
@@ -390,7 +416,7 @@ impl Patterns {
                         }
 
                         if !collect_matching_substrings {
-                            return MatchesResult::fast_path_match();
+                            return Ok(MatchesData::fast_path_match());
                         }
 
                         any_pattern_matched = true;
@@ -402,8 +428,8 @@ impl Patterns {
                         debug_assert!(rm_so != -1);
                         debug_assert!(rm_eo != -1);
 
-                        let start = usize::try_from(rm_so).unwrap();
-                        let end = usize::try_from(rm_eo).unwrap();
+                        let start = usize::try_from(rm_so)?;
+                        let end = usize::try_from(rm_eo)?;
 
                         // TODO
                         // Is this the right fix?
@@ -414,18 +440,18 @@ impl Patterns {
                             break;
                         }
 
-                        matching_substrings.push(current_string_slice[start..end].to_vec());
+                        matching_substrings.push(forward_slice[start..end].to_vec());
 
-                        current_string_index += end;
+                        current_position += end;
                     }
                 }
             }
         }
 
-        MatchesResult {
+        Ok(MatchesData {
             any_pattern_matched,
             matching_substrings,
-        }
+        })
     }
 }
 
@@ -451,30 +477,34 @@ enum OutputMode {
     Default,
 }
 
-/// Structure that contains all necessary information for `grep` utility processing.
-struct GrepModel {
-    any_matches: bool,
+struct GrepModelState {
     any_errors: bool,
-    line_number: bool,
-    no_messages: bool,
-    invert_match: bool,
-    multiple_inputs: bool,
+    any_matches: bool,
     output_mode: OutputMode,
-    patterns: Patterns,
-    input_files: Vec<String>,
     stdout_lock: StdoutLock<'static>,
-    only_matching: bool,
 }
 
-struct MatchesResult {
+/// Structure that contains all necessary information for `grep` utility processing.
+struct GrepModel {
+    input_files: Vec<String>,
+    invert_match: bool,
+    line_number: bool,
+    multiple_inputs: bool,
+    no_messages: bool,
+    only_matching: bool,
+    patterns: Patterns,
+    quiet: bool,
+}
+
+struct MatchesData {
     any_pattern_matched: bool,
     /// Will always be empty if the -o option is not being used
     matching_substrings: Vec<Vec<u8>>,
 }
 
-impl MatchesResult {
-    pub fn fast_path_match() -> MatchesResult {
-        MatchesResult {
+impl MatchesData {
+    pub fn fast_path_match() -> MatchesData {
+        MatchesData {
             any_pattern_matched: true,
             matching_substrings: Vec::<Vec<u8>>::new(),
         }
@@ -487,47 +517,60 @@ impl GrepModel {
     /// # Returns
     ///
     /// Returns [i32](i32) that represents *exit status code*.
-    fn grep(&mut self) -> i32 {
-        for input_name in self.input_files.drain(..).collect::<Vec<_>>() {
-            if input_name == "-" {
+    fn grep(&self, grep_model_state: &mut GrepModelState) -> Result<(), Box<dyn Error>> {
+        for input_name in &self.input_files {
+            let input_name_str = input_name.as_str();
+
+            if input_name_str == "-" {
                 let reader = Box::new(BufReader::new(io::stdin()));
-                self.process_input("(standard input)", reader);
+
+                if let Err(bo) = self.process_input(grep_model_state, "(standard input)", reader) {
+                    grep_model_state.any_errors = true;
+
+                    if !self.no_messages {
+                        eprintln!("grep: {input_name_str}: {bo}");
+                    }
+                }
             } else {
-                match File::open(&input_name) {
+                match File::open(input_name_str) {
                     Ok(file) => {
                         let reader = Box::new(BufReader::new(file));
-                        self.process_input(&input_name, reader)
+
+                        self.process_input(grep_model_state, input_name_str, reader)?;
                     }
-                    Err(err) => {
-                        self.any_errors = true;
+                    Err(er) => {
+                        grep_model_state.any_errors = true;
+
                         if !self.no_messages {
-                            eprintln!("{}: {}", input_name, err);
+                            eprintln!("grep: {input_name_str}: {er}");
                         }
                     }
                 }
             }
-            if self.any_matches && self.output_mode == OutputMode::Quiet {
-                return 0;
+
+            if grep_model_state.any_matches && grep_model_state.output_mode == OutputMode::Quiet {
+                return Ok(());
             }
         }
 
-        if self.any_errors {
-            2
-        } else if !self.any_matches {
-            1
-        } else {
-            0
-        }
+        Ok(())
     }
 
-    fn print_line_prefix(&mut self, input_name: &str, line_number: u64) {
+    fn print_line_prefix(
+        &self,
+        grep_model_state: &mut GrepModelState,
+        input_name: &str,
+        line_number: u64,
+    ) -> Result<(), Box<dyn Error>> {
         if self.multiple_inputs {
-            write!(self.stdout_lock, "{input_name}:").unwrap();
+            write!(grep_model_state.stdout_lock, "{input_name}:")?;
         }
 
         if self.line_number {
-            write!(self.stdout_lock, "{line_number}:").unwrap();
+            write!(grep_model_state.stdout_lock, "{line_number}:")?;
         }
+
+        Ok(())
     }
 
     /// Reads lines from buffer and processes them.
@@ -536,40 +579,55 @@ impl GrepModel {
     ///
     /// * `input_name` - [str](str) that represents content source name.
     /// * `reader` - [Box](Box) that contains object that implements [BufRead] and reads lines.
-    fn process_input(&mut self, input_name: &str, mut reader: Box<dyn BufRead>) {
+    fn process_input(
+        &self,
+        grep_model_state: &mut GrepModelState,
+        input_name: &str,
+        mut reader: Box<dyn BufRead>,
+    ) -> Result<(), Box<dyn Error>> {
         let mut line_number = 0_u64;
 
-        let mut line = String::new();
+        let mut line = Vec::<u8>::new();
 
         loop {
-            line_number += 1;
-
             line.clear();
 
-            // TODO
-            // Probably should work on non-UTF-8 input
-            match reader.read_line(&mut line) {
+            match reader.read_until(b'\n', &mut line) {
                 Ok(n_read) => {
                     if n_read == 0 {
                         break;
                     }
 
-                    let mut chars = line.chars();
+                    line_number += 1;
 
-                    let line_without_newline = match chars.next_back() {
-                        Some('\n') => chars.as_str(),
-                        _ => line.as_str(),
+                    let mut iter = line.iter();
+
+                    let line_without_newline = match iter.next_back() {
+                        Some(b'\n') => iter.as_slice(),
+                        _ => line.as_slice(),
                     };
 
                     let matches_result = self.patterns.matches(
                         line_without_newline,
-                        self.only_matching && matches!(self.output_mode, OutputMode::Default),
+                        self.only_matching
+                            && matches!(grep_model_state.output_mode, OutputMode::Default),
                     );
 
-                    let MatchesResult {
+                    let matches_data = match matches_result {
+                        Ok(ma) => ma,
+                        Err(bo) => {
+                            if !self.no_messages {
+                                eprintln!("grep: {input_name}: error matching patterns against line {line_number} ({bo})");
+                            }
+
+                            return Err(bo);
+                        }
+                    };
+
+                    let MatchesData {
                         any_pattern_matched,
                         matching_substrings,
-                    } = matches_result;
+                    } = matches_data;
 
                     let matches = if self.invert_match {
                         !any_pattern_matched
@@ -578,59 +636,73 @@ impl GrepModel {
                     };
 
                     if matches {
-                        self.any_matches = true;
+                        grep_model_state.any_matches = true;
 
-                        match &mut self.output_mode {
+                        match &mut grep_model_state.output_mode {
                             OutputMode::Count(count) => {
                                 *count += 1;
                             }
                             OutputMode::FilesWithMatches => {
-                                writeln!(&mut self.stdout_lock, "{input_name}").unwrap();
+                                writeln!(&mut grep_model_state.stdout_lock, "{input_name}")?;
 
                                 break;
                             }
                             OutputMode::Quiet => {
-                                return;
+                                return Ok(());
                             }
                             OutputMode::Default => {
                                 if self.only_matching {
                                     for matching_substring in matching_substrings {
-                                        self.print_line_prefix(input_name, line_number);
+                                        self.print_line_prefix(
+                                            grep_model_state,
+                                            input_name,
+                                            line_number,
+                                        )?;
 
-                                        self.stdout_lock
-                                            .write_all(matching_substring.as_slice())
-                                            .unwrap();
+                                        grep_model_state
+                                            .stdout_lock
+                                            .write_all(matching_substring.as_slice())?;
 
-                                        self.stdout_lock.write_all(b"\n").unwrap();
+                                        grep_model_state.stdout_lock.write_all(b"\n")?;
                                     }
                                 } else {
-                                    self.print_line_prefix(input_name, line_number);
+                                    self.print_line_prefix(
+                                        grep_model_state,
+                                        input_name,
+                                        line_number,
+                                    )?;
 
-                                    writeln!(self.stdout_lock, "{line_without_newline}").unwrap();
+                                    grep_model_state
+                                        .stdout_lock
+                                        .write_all(line_without_newline)?;
+
+                                    grep_model_state.stdout_lock.write_all(b"\n")?;
                                 }
                             }
                         }
                     }
                 }
-                Err(err) => {
-                    self.any_errors = true;
-
+                Err(er) => {
                     if !self.no_messages {
-                        eprintln!("{input_name}: Error reading line {line_number} ({err})",);
+                        eprintln!("grep: {input_name}: error reading line {line_number} ({er})");
                     }
+
+                    return Err(Box::new(er));
                 }
             }
         }
 
-        if let OutputMode::Count(count) = &mut self.output_mode {
+        if let OutputMode::Count(count) = &mut grep_model_state.output_mode {
             if self.multiple_inputs {
-                writeln!(&mut self.stdout_lock, "{input_name}:{count}").unwrap();
+                writeln!(grep_model_state.stdout_lock, "{input_name}:{count}")?;
             } else {
-                writeln!(&mut self.stdout_lock, "{count}").unwrap();
+                writeln!(grep_model_state.stdout_lock, "{count}")?;
             }
 
             *count = 0;
         }
+
+        Ok(())
     }
 }
 
@@ -645,17 +717,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut args = Args::parse();
 
-    let exit_code = args
+    let output_mode = if args.count {
+        OutputMode::Count(0)
+    } else if args.files_with_matches {
+        OutputMode::FilesWithMatches
+    } else if args.quiet {
+        OutputMode::Quiet
+    } else {
+        OutputMode::Default
+    };
+
+    let mut grep_model_state = GrepModelState {
+        any_errors: false,
+        any_matches: false,
+        output_mode,
+        stdout_lock: io::stdout().lock(),
+    };
+
+    let result = args
         .validate_args()
         .and_then(|_| {
-            args.resolve();
+            args.resolve(&mut grep_model_state);
             args.into_grep_model()
         })
-        .map(|mut grep_model| grep_model.grep())
-        .unwrap_or_else(|err| {
-            eprintln!("{err}");
-            2
+        .and_then(|gr| match gr.grep(&mut grep_model_state) {
+            Ok(()) => Ok(gr),
+            Err(bo) => Err(bo),
         });
+
+    let exit_code = match result {
+        Ok(grep_model) => {
+            if grep_model.quiet && grep_model_state.any_matches {
+                0
+            } else if grep_model_state.any_errors {
+                2
+            } else if !grep_model_state.any_matches {
+                1
+            } else {
+                0
+            }
+        }
+        Err(error_message) => {
+            eprintln!("grep: {error_message}");
+
+            2
+        }
+    };
 
     std::process::exit(exit_code);
 }

@@ -787,6 +787,10 @@ impl<'src> Parser<'src> {
     fn parse_pipeline(&mut self, word_stop: WordToken) -> Option<Pipeline> {
         // pipeline = "!" command ("|" linebreak command)*
         // TODO: implement the "!"* part
+
+        let negate_status = self
+            .matches_shell_alterntives(&[ShellToken::Bang])
+            .is_some();
         let mut commands = Vec::new();
         commands.push(self.parse_command(word_stop)?);
         while self.shell_lookahead() == ShellToken::Pipe {
@@ -798,7 +802,10 @@ impl<'src> Parser<'src> {
                 todo!("error: expected command, found ...")
             }
         }
-        Some(Pipeline { commands })
+        Some(Pipeline {
+            commands,
+            negate_status,
+        })
     }
 
     fn parse_and_or(&mut self, word_stop: WordToken) -> Option<Conjunction> {
@@ -904,6 +911,7 @@ mod tests {
                 command: Some(word),
                 ..Default::default()
             })],
+            negate_status: false,
         }
     }
 
@@ -1481,7 +1489,8 @@ mod tests {
                     commands: vec![Command::SimpleCommand(SimpleCommand {
                         command: Some(literal_word("a")),
                         ..Default::default()
-                    })]
+                    })],
+                    negate_status: false
                 },
                 LogicalOp::And
             )
@@ -1493,7 +1502,8 @@ mod tests {
                     commands: vec![Command::SimpleCommand(SimpleCommand {
                         command: Some(literal_word("b")),
                         ..Default::default()
-                    })]
+                    })],
+                    negate_status: false
                 },
                 LogicalOp::None
             )
@@ -1512,7 +1522,8 @@ mod tests {
                         commands: vec![Command::SimpleCommand(SimpleCommand {
                             command: Some(literal_word("a")),
                             ..Default::default()
-                        })]
+                        })],
+                        negate_status: false
                     },
                     LogicalOp::None
                 )],
@@ -1527,7 +1538,8 @@ mod tests {
                         commands: vec![Command::SimpleCommand(SimpleCommand {
                             command: Some(literal_word("b")),
                             ..Default::default()
-                        })]
+                        })],
+                        negate_status: false
                     },
                     LogicalOp::None
                 )],
@@ -1549,7 +1561,8 @@ mod tests {
                                     command: Some(literal_word("echo")),
                                     arguments: vec![literal_word("hello")],
                                     ..Default::default()
-                                })]
+                                })],
+                                negate_status: false
                             },
                             LogicalOp::None
                         )],
@@ -1576,7 +1589,8 @@ mod tests {
                                         command: Some(literal_word("echo")),
                                         arguments: vec![literal_word("world")],
                                         ..Default::default()
-                                    })]
+                                    })],
+                                    negate_status: false
                                 },
                                 LogicalOp::None
                             )],
@@ -1605,6 +1619,7 @@ mod tests {
                                 arguments: vec![literal_word("hello")],
                                 ..Default::default()
                             })],
+                            negate_status: false,
                         },
                         LogicalOp::None,
                     )],
@@ -1623,7 +1638,8 @@ mod tests {
                                     command: Some(literal_word("echo")),
                                     arguments: vec![inner],
                                     ..Default::default()
-                                })]
+                                })],
+                                negate_status: false
                             },
                             LogicalOp::None
                         )],
@@ -1987,6 +2003,20 @@ mod tests {
                     commands: vec![conjunction_from_word(literal_word("cmd1"), false),]
                 })
             })
+        );
+    }
+
+    #[test]
+    fn parse_pipeline_negate_status() {
+        assert_eq!(
+            parse_pipeline("!cmd"),
+            Pipeline {
+                commands: vec![Command::SimpleCommand(SimpleCommand {
+                    command: Some(literal_word("cmd")),
+                    ..Default::default()
+                })],
+                negate_status: true
+            }
         );
     }
 }

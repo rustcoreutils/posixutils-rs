@@ -223,6 +223,7 @@ pub enum Command {
 #[derive(PartialEq)]
 pub struct Pipeline {
     pub commands: Vec<Command>,
+    pub negate_status: bool,
 }
 
 impl std::fmt::Debug for Pipeline {

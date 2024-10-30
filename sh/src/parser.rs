@@ -894,13 +894,9 @@ pub fn parse(text: &str) -> Program {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::program::test_utils::literal_word;
 
-    fn literal_word(contents: &str) -> Word {
-        Word {
-            parts: vec![WordPart::Literal(Rc::from(contents))],
-        }
-    }
+    use super::*;
 
     fn pipeline_from_word(word: Word) -> Pipeline {
         Pipeline {

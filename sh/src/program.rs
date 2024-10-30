@@ -302,3 +302,14 @@ fn indent<D: std::fmt::Debug>(val: &D) -> String {
         .collect::<Vec<String>>()
         .join("\n")
 }
+
+#[cfg(test)]
+pub mod test_utils {
+    use super::*;
+
+    pub fn literal_word(contents: &str) -> Word {
+        Word {
+            parts: vec![WordPart::Literal(Rc::from(contents))],
+        }
+    }
+}

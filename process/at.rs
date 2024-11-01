@@ -334,6 +334,8 @@ mod time {
 mod timespec {
     use std::str::FromStr;
 
+    use crate::tokens::{DayNumber, DayOfWeek, MonthName, TokenParsingError, YearNumber};
+
     // TODO: Proper errors for each case and token
     #[derive(Debug, PartialEq)]
     pub struct TimespecParsingError;
@@ -352,6 +354,12 @@ mod timespec {
 
     impl From<std::char::TryFromCharError> for TimespecParsingError {
         fn from(_value: std::char::TryFromCharError) -> Self {
+            Self
+        }
+    }
+
+    impl From<TokenParsingError> for TimespecParsingError {
+        fn from(_value: TokenParsingError) -> Self {
             Self
         }
     }
@@ -427,6 +435,81 @@ mod timespec {
                     false => Err(TimespecParsingError)?,
                 },
             };
+
+            Ok(result)
+        }
+    }
+
+    pub enum Date {
+        MontDay {
+            month_name: MonthName,
+            day_number: DayNumber,
+        },
+        MontDayYear {
+            month_name: MonthName,
+            day_number: DayNumber,
+            year_number: YearNumber,
+        },
+        DayOfWeek(DayOfWeek),
+        Today,
+        Tomorrow,
+    }
+
+    impl FromStr for Date {
+        type Err = TimespecParsingError;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            let result = match s {
+                "today" => Self::Today,
+                "tomorrow" => Self::Tomorrow,
+                _ => match s.contains(",") {
+                    true => {
+                        let parts = s.split(',').collect::<Vec<_>>();
+
+                        if parts.len() != 2 {
+                            Err(TimespecParsingError)?
+                        }
+
+                        let (month_name, day_number) = parse_month_and_day(&parts[0])?;
+                        let year_number = YearNumber::from_str(&parts[1])?;
+
+                        Self::MontDayYear {
+                            month_name,
+                            day_number,
+                            year_number,
+                        }
+                    }
+                    false => match DayOfWeek::from_str(s) {
+                        Ok(day) => Self::DayOfWeek(day),
+                        Err(_) => {
+                            let (month_name, day_number) = parse_month_and_day(s)?;
+
+                            Self::MontDay {
+                                month_name,
+                                day_number,
+                            }
+                        }
+                    },
+                },
+            };
+
+            fn parse_month_and_day(
+                s: &str,
+            ) -> Result<(MonthName, DayNumber), TimespecParsingError> {
+                let month = s
+                    .chars()
+                    .take_while(|this| !this.is_numeric())
+                    .collect::<String>()
+                    .parse::<MonthName>()?;
+
+                let day = s
+                    .chars()
+                    .skip_while(|this| !this.is_numeric())
+                    .collect::<String>()
+                    .parse::<DayNumber>()?;
+
+                Ok((month, day))
+            }
 
             Ok(result)
         }
@@ -701,19 +784,55 @@ mod tokens {
     /// implementation-defined format.
     pub struct TimezoneName(String);
 
+    impl FromStr for TimezoneName {
+        type Err = TokenParsingError;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            todo!()
+        }
+    }
+
     /// One of the values from the mon or abmon keywords in the LC_TIME
     /// locale category.
     pub struct MonthName(String);
 
+    impl FromStr for MonthName {
+        type Err = TokenParsingError;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            todo!()
+        }
+    }
+
     /// One of the values from the day or abday keywords in the LC_TIME
     /// locale category.
     pub struct DayOfWeek(String);
+
+    impl FromStr for DayOfWeek {
+        type Err = TokenParsingError;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            todo!()
+        }
+    }
 
     /// One of the values from the am_pm keyword in the LC_TIME locale
     /// category.
     pub enum AmPm {
         Am,
         Pm,
+    }
+
+    impl FromStr for AmPm {
+        type Err = TokenParsingError;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            Ok(match s.to_lowercase().as_str() {
+                "am" => Self::Am,
+                "pm" => Self::Pm,
+                _ => Err(TokenParsingError)?,
+            })
+        }
     }
 
     #[cfg(test)]

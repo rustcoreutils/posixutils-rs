@@ -344,6 +344,18 @@ mod timespec {
         }
     }
 
+    impl From<std::num::ParseIntError> for TimespecParsingError {
+        fn from(_value: std::num::ParseIntError) -> Self {
+            Self
+        }
+    }
+
+    impl From<std::char::TryFromCharError> for TimespecParsingError {
+        fn from(_value: std::char::TryFromCharError) -> Self {
+            Self
+        }
+    }
+
     pub enum IncPeriod {
         Minute,
         Minutes,
@@ -392,15 +404,31 @@ mod timespec {
         type Err = TimespecParsingError;
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
-            match s.contains("+") {
-                true => todo!(),
+            let result = match s.starts_with("+") {
+                true => {
+                    let number: u16 = s
+                        .chars()
+                        .skip(1)
+                        .take_while(|this| this.is_numeric())
+                        .collect::<String>()
+                        .parse()?;
+
+                    let period = s
+                        .chars()
+                        .skip(1)
+                        .skip_while(|this| this.is_numeric())
+                        .collect::<String>()
+                        .parse::<IncPeriod>()?;
+
+                    Self::Plus { number, period }
+                }
                 false => match s.starts_with("next") {
                     true => Self::Next(IncPeriod::from_str(&s.replace("next", ""))?),
                     false => Err(TimespecParsingError)?,
                 },
             };
 
-            todo!()
+            Ok(result)
         }
     }
 }
@@ -666,18 +694,6 @@ mod tokens {
             }
 
             Ok(Self(year))
-        }
-    }
-
-    /// The inc_number is the number of times the succeeding increment
-    /// period is to be added to the specified date and time.
-    pub struct IncNumber(u16);
-
-    impl FromStr for IncNumber {
-        type Err = TokenParsingError;
-
-        fn from_str(s: &str) -> Result<Self, Self::Err> {
-            u16::from_str(s).map(Self).map_err(TokenParsingError::from)
         }
     }
 

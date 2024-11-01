@@ -9,7 +9,11 @@ rust-version.workspace = true
 
 [dependencies]
 clap.workspace = true
+clap.features = ["env"]
 gettext-rs.workspace = true
+libc = { version = "0.2", default-features = false }
+termion = "4.0"
+thiserror = "1.0"
 
 [dev-dependencies]
 plib = { path = "../plib" }
@@ -24,3 +28,7 @@ path = "./echo.rs"
 [[bin]]
 name = "printf"
 path = "./printf.rs"
+
+[[bin]]
+name = "more"
+path = "./more.rs"

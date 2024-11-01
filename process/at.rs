@@ -561,7 +561,100 @@ mod timespec {
         type Err = TimespecParsingError;
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
-            todo!()
+            match s {
+                "noon" => return Ok(Self::Noon),
+                "midnight" => return Ok(Self::Midnight),
+                _ => (),
+            };
+
+            if let Ok(hour) = Hr24clockHour::from_str(s) {
+                return Ok(Self::Hr24clockHour(hour));
+            }
+
+            if let Some((possible_hour, other)) = s.split_once(':') {
+                if let Ok(hour) = Hr24clockHour::from_str(possible_hour) {
+                    let result = match Minute::from_str(other) {
+                        Ok(minute) => Self::Hr24clockHourMinute { hour, minute },
+                        Err(_) => {
+                            let minute = other
+                                .chars()
+                                .take_while(|this| this.is_alphabetic())
+                                .collect::<String>()
+                                .parse::<Minute>()?;
+                            let timezone = other
+                                .chars()
+                                .skip_while(|this| this.is_alphabetic())
+                                .collect::<String>()
+                                .parse::<TimezoneName>()?;
+
+                            Self::Hr24clockHourMinuteTimezone {
+                                hour,
+                                minute,
+                                timezone,
+                            }
+                        }
+                    };
+
+                    return Ok(result);
+                }
+
+                if let Ok(clock) = WallclockHour::from_str(possible_hour) {
+                    let minute = other
+                        .chars()
+                        .take_while(|this| this.is_numeric())
+                        .collect::<String>();
+                    let minutes_len = minute.len();
+                    let minute = Minute::from_str(&minute)?;
+
+                    let other = other.chars().skip(minutes_len).collect::<String>();
+
+                    if let Ok(am) = AmPm::from_str(&other) {
+                        return Ok(Self::WallclockHourMinute { clock, minute, am });
+                    }
+
+                    let am = AmPm::from_str(&other[..2])?;
+                    let timezone = TimezoneName::from_str(&other[2..])?;
+
+                    return Ok(Self::WallclockHourMinuteTimezone {
+                        clock,
+                        minute,
+                        am,
+                        timezone,
+                    });
+                }
+            }
+
+            let number = s
+                .chars()
+                .take_while(|this| this.is_numeric())
+                .collect::<String>();
+            let other = s
+                .chars()
+                .skip_while(|this| this.is_numeric())
+                .collect::<String>();
+
+            if let Ok(hour) = Hr24clockHour::from_str(&number) {
+                let timezone = TimezoneName::from_str(&other)?;
+
+                return Ok(Self::Hr24clockHourTimezone { hour, timezone });
+            }
+
+            if let Ok(clock) = WallclockHour::from_str(&number) {
+                if let Ok(am) = AmPm::from_str(&other) {
+                    return Ok(Self::WallclockHour { clock, am });
+                }
+
+                let timezone = TimezoneName::from_str(&other[2..])?;
+                let am = AmPm::from_str(&other[..2])?;
+
+                return Ok(Self::WallclockHourTimezone {
+                    clock,
+                    am,
+                    timezone,
+                });
+            }
+
+            Err(TimespecParsingError)
         }
     }
 

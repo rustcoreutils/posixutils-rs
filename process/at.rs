@@ -334,7 +334,10 @@ mod time {
 mod timespec {
     use std::str::FromStr;
 
-    use crate::tokens::{DayNumber, DayOfWeek, MonthName, TokenParsingError, YearNumber};
+    use crate::tokens::{
+        AmPm, DayNumber, DayOfWeek, Hr24clockHour, Minute, MonthName, TimezoneName,
+        TokenParsingError, WallclockHour, YearNumber,
+    };
 
     // TODO: Proper errors for each case and token
     #[derive(Debug, PartialEq)]
@@ -512,6 +515,100 @@ mod timespec {
             }
 
             Ok(result)
+        }
+    }
+
+    pub enum Time {
+        Midnight,
+        Noon,
+        Hr24clockHour(Hr24clockHour),
+        Hr24clockHourTimezone {
+            hour: Hr24clockHour,
+            timezone: TimezoneName,
+        },
+        Hr24clockHourMinute {
+            hour: Hr24clockHour,
+            minute: Minute,
+        },
+        Hr24clockHourMinuteTimezone {
+            hour: Hr24clockHour,
+            minute: Minute,
+            timezone: TimezoneName,
+        },
+        WallclockHour {
+            clock: WallclockHour,
+            am: AmPm,
+        },
+        WallclockHourTimezone {
+            clock: WallclockHour,
+            am: AmPm,
+            timezone: TimezoneName,
+        },
+        WallclockHourMinute {
+            clock: WallclockHour,
+            minute: Minute,
+            am: AmPm,
+        },
+        WallclockHourMinuteTimezone {
+            clock: WallclockHour,
+            minute: Minute,
+            am: AmPm,
+            timezone: TimezoneName,
+        },
+    }
+
+    impl FromStr for Time {
+        type Err = TimespecParsingError;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            todo!()
+        }
+    }
+
+    pub enum Nowspec {
+        Now,
+        NowIncrement(Increment),
+    }
+
+    impl FromStr for Nowspec {
+        type Err = TimespecParsingError;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            const NOW: &str = "now";
+
+            match s {
+                NOW => Self::Now,
+                _ if s.starts_with(NOW) => {
+                    let (_, increment) = s.split_once(NOW).ok_or(TimespecParsingError)?;
+
+                    Self::NowIncrement(Increment::from_str(increment)?)
+                }
+                _ => Err(TimespecParsingError)?,
+            };
+
+            todo!()
+        }
+    }
+
+    pub enum Timespec {
+        Time(Time),
+        TimeDate {
+            time: Time,
+            date: Date,
+        },
+        TimeDateIncrement {
+            time: Time,
+            date: Date,
+            inrement: Increment,
+        },
+        Nowspec(Nowspec),
+    }
+
+    impl FromStr for Timespec {
+        type Err = TimespecParsingError;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            todo!()
         }
     }
 }

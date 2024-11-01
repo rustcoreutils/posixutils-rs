@@ -24,6 +24,10 @@ workspace = true
 sysinfo = "0.31"
 
 [[bin]]
+name = "at"
+path = "./at.rs"
+
+[[bin]]
 name = "fuser"
 path = "./fuser.rs"
 

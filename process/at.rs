@@ -335,8 +335,8 @@ mod timespec {
     use std::str::FromStr;
 
     use crate::tokens::{
-        AmPm, DayNumber, DayOfWeek, Hr24clockHour, Minute, MonthName, TimezoneName,
-        TokenParsingError, WallclockHour, YearNumber,
+        AmPm, DayNumber, DayOfWeek, Hr24clockHour, Minute, Month, TimezoneName, TokenParsingError,
+        WallclockHour, YearNumber,
     };
 
     // TODO: Proper errors for each case and token
@@ -445,11 +445,11 @@ mod timespec {
 
     pub enum Date {
         MontDay {
-            month_name: MonthName,
+            month_name: Month,
             day_number: DayNumber,
         },
         MontDayYear {
-            month_name: MonthName,
+            month_name: Month,
             day_number: DayNumber,
             year_number: YearNumber,
         },
@@ -496,14 +496,12 @@ mod timespec {
                 },
             };
 
-            fn parse_month_and_day(
-                s: &str,
-            ) -> Result<(MonthName, DayNumber), TimespecParsingError> {
+            fn parse_month_and_day(s: &str) -> Result<(Month, DayNumber), TimespecParsingError> {
                 let month = s
                     .chars()
                     .take_while(|this| !this.is_numeric())
                     .collect::<String>()
-                    .parse::<MonthName>()?;
+                    .parse::<Month>()?;
 
                 let day = s
                     .chars()
@@ -669,7 +667,7 @@ mod timespec {
         fn from_str(s: &str) -> Result<Self, Self::Err> {
             const NOW: &str = "now";
 
-            match s {
+            let result = match s {
                 NOW => Self::Now,
                 _ if s.starts_with(NOW) => {
                     let (_, increment) = s.split_once(NOW).ok_or(TimespecParsingError)?;
@@ -679,7 +677,7 @@ mod timespec {
                 _ => Err(TimespecParsingError)?,
             };
 
-            todo!()
+            Ok(result)
         }
     }
 
@@ -701,7 +699,57 @@ mod timespec {
         type Err = TimespecParsingError;
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
-            todo!()
+            if let Ok(time) = Time::from_str(s) {
+                return Ok(Self::Time(time));
+            }
+
+            if let Ok(time) = Nowspec::from_str(s) {
+                return Ok(Self::Nowspec(time));
+            }
+
+            let mut time_index = 0;
+            for slice_index in 0..=s.len() {
+                // return error before we hit panic with out of bounds
+                if slice_index == s.len() {
+                    Err(TimespecParsingError)?;
+                }
+
+                let time = Time::from_str(&s[..slice_index]);
+                if let Ok(_) = time {
+                    time_index = slice_index;
+                    break;
+                }
+            }
+
+            let time = Time::from_str(&s[..time_index])?;
+
+            let mut date_index = 0;
+            for slice_index in time_index..=s.len() {
+                // return error before we hit panic with out of bounds
+                if slice_index == s.len() {
+                    Err(TimespecParsingError)?;
+                }
+
+                let date = Date::from_str(&s[..slice_index]);
+                if let Ok(_) = date {
+                    date_index = slice_index;
+                    break;
+                }
+            }
+
+            let date = Date::from_str(&s[time_index..date_index])?;
+
+            if date_index != s.len() {
+                let inrement = Increment::from_str(&s[date_index..])?;
+
+                return Ok(Self::TimeDateIncrement {
+                    time,
+                    date,
+                    inrement,
+                });
+            }
+
+            Ok(Self::TimeDate { time, date })
         }
     }
 }
@@ -942,13 +990,19 @@ mod tokens {
         }
     }
 
-    pub struct DayNumber(u8);
+    pub struct DayNumber(NonZero<u8>);
 
     impl FromStr for DayNumber {
         type Err = TokenParsingError;
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
-            u8::from_str(s).map(Self).map_err(TokenParsingError::from)
+            let number = NonZero::from_str(s).map_err(TokenParsingError::from)?;
+
+            if number.get() > 31 {
+                Err(TokenParsingError)?;
+            }
+
+            Ok(Self(number))
         }
     }
 
@@ -978,31 +1032,59 @@ mod tokens {
         type Err = TokenParsingError;
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
-            todo!()
+            // TODO: how to validate this? C impl simply reads env
+            Ok(Self(s.to_owned()))
         }
     }
 
     /// One of the values from the mon or abmon keywords in the LC_TIME
     /// locale category.
-    pub struct MonthName(String);
+    pub struct Month(u8);
 
-    impl FromStr for MonthName {
+    impl FromStr for Month {
         type Err = TokenParsingError;
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
-            todo!()
+            let number = match s {
+                "JAN" => 0,
+                "FEB" => 1,
+                "MAR" => 2,
+                "APR" => 3,
+                "MAY" => 4,
+                "JUN" => 5,
+                "JUL" => 6,
+                "AUG" => 7,
+                "SEP" => 8,
+                "OCT" => 9,
+                "NOV" => 10,
+                "DEC" => 11,
+                _ => Err(TokenParsingError)?,
+            };
+
+            Ok(Self(number))
         }
     }
 
     /// One of the values from the day or abday keywords in the LC_TIME
     /// locale category.
-    pub struct DayOfWeek(String);
+    pub struct DayOfWeek(u8);
 
     impl FromStr for DayOfWeek {
         type Err = TokenParsingError;
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
-            todo!()
+            let number = match s {
+                "SUN" => 0,
+                "MON" => 1,
+                "TUE" => 2,
+                "WED" => 3,
+                "THU" => 4,
+                "FRI" => 5,
+                "SAT" => 6,
+                _ => Err(TokenParsingError)?,
+            };
+
+            Ok(Self(number))
         }
     }
 

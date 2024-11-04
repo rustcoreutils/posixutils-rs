@@ -309,21 +309,11 @@ impl Patterns {
     }
 
     /// Checks if input string matches the present patterns.
-    ///
-    /// # Arguments
-    ///
-    /// * `input` - object that implements [AsRef](AsRef) for [str](str) and describes line.
-    ///
-    /// # Returns
-    ///
-    /// Returns [bool](bool) - `true` if input matches present patterns, else `false`.
     fn matches(
         &self,
-        input: impl AsRef<[u8]>,
+        input: &[u8],
         collect_matching_substrings: bool,
     ) -> Result<MatchesData, Box<dyn Error>> {
-        let input = input.as_ref();
-
         let mut matching_substrings = Vec::<Vec<u8>>::new();
 
         let mut any_pattern_matched = false;
@@ -332,7 +322,7 @@ impl Patterns {
             Patterns::Fixed(patterns, ignore_case, line_regexp) => {
                 let input_ascii_lowercase: Vec<u8>;
 
-                let input = if *ignore_case {
+                let input_after_ignore_case = if *ignore_case {
                     input_ascii_lowercase = input.to_ascii_lowercase();
 
                     input_ascii_lowercase.as_slice()
@@ -341,8 +331,10 @@ impl Patterns {
                 };
 
                 for pattern in patterns {
+                    let pattern_as_bytes = pattern.as_bytes();
+
                     if *line_regexp {
-                        if input != pattern.as_bytes() {
+                        if input_after_ignore_case != pattern_as_bytes {
                             continue;
                         }
 
@@ -352,20 +344,24 @@ impl Patterns {
 
                         any_pattern_matched = true;
 
-                        matching_substrings.push(pattern.as_bytes().to_vec());
+                        matching_substrings.push(input.to_vec());
                     } else {
-                        let pattern_len = pattern.len();
+                        if collect_matching_substrings {
+                            let pattern_as_bytes_len = pattern_as_bytes.len();
 
-                        for index in memmem::find_iter(input, pattern) {
-                            if !collect_matching_substrings {
+                            for index in
+                                memmem::find_iter(input_after_ignore_case, pattern_as_bytes)
+                            {
+                                any_pattern_matched = true;
+
+                                let match_slice = &input[index..(index + pattern_as_bytes_len)];
+
+                                matching_substrings.push(match_slice.to_vec());
+                            }
+                        } else {
+                            if memmem::find(input_after_ignore_case, pattern_as_bytes).is_some() {
                                 return Ok(MatchesData::fast_path_match());
                             }
-
-                            any_pattern_matched = true;
-
-                            let match_slice = &input[index..(index + pattern_len)];
-
-                            matching_substrings.push(match_slice.to_vec());
                         }
                     }
                 }
@@ -503,6 +499,7 @@ struct MatchesData {
 }
 
 impl MatchesData {
+    #[inline]
     pub fn fast_path_match() -> MatchesData {
         MatchesData {
             any_pattern_matched: true,

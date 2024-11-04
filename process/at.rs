@@ -335,8 +335,8 @@ mod timespec {
     use std::str::FromStr;
 
     use crate::tokens::{
-        AmPm, DayNumber, DayOfWeek, Hr24clockHour, Minute, Month, TimezoneName, TokenParsingError,
-        WallclockHour, YearNumber,
+        AmPm, DayNumber, DayOfWeek, Hr24Clock, Hr24ClockHour, Minute, Month, TimezoneName,
+        TokenParsingError, WallClock, WallClockHour, YearNumber,
     };
 
     // TODO: Proper errors for each case and token
@@ -367,19 +367,14 @@ mod timespec {
         }
     }
 
+    #[derive(Debug, PartialEq)]
     pub enum IncPeriod {
         Minute,
-        Minutes,
         Hour,
-        Hours,
         Day,
-        Days,
         Week,
-        Weeks,
         Month,
-        Months,
         Year,
-        Years,
     }
 
     impl FromStr for IncPeriod {
@@ -387,18 +382,12 @@ mod timespec {
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
             let result = match s {
-                "minute" => Self::Minute,
-                "minutes" => Self::Minutes,
-                "hour" => Self::Hour,
-                "hours" => Self::Hours,
-                "day" => Self::Day,
-                "days" => Self::Days,
-                "week" => Self::Week,
-                "weeks" => Self::Weeks,
-                "month" => Self::Month,
-                "months" => Self::Months,
-                "year" => Self::Year,
-                "years" => Self::Years,
+                "minute" | "minutes" => Self::Minute,
+                "hour" | "hours" => Self::Hour,
+                "day" | "days" => Self::Day,
+                "week" | "weeks" => Self::Week,
+                "month" | "months" => Self::Month,
+                "year" | "years" => Self::Year,
                 _ => Err(TimespecParsingError)?,
             };
 
@@ -406,6 +395,7 @@ mod timespec {
         }
     }
 
+    #[derive(Debug, PartialEq)]
     pub enum Increment {
         Next(IncPeriod),
         Plus { number: u16, period: IncPeriod },
@@ -516,39 +506,40 @@ mod timespec {
         }
     }
 
+    #[derive(Debug, PartialEq)]
     pub enum Time {
         Midnight,
         Noon,
-        Hr24clockHour(Hr24clockHour),
+        Hr24clockHour(Hr24Clock),
         Hr24clockHourTimezone {
-            hour: Hr24clockHour,
+            hour: Hr24Clock,
             timezone: TimezoneName,
         },
         Hr24clockHourMinute {
-            hour: Hr24clockHour,
+            hour: Hr24ClockHour,
             minute: Minute,
         },
         Hr24clockHourMinuteTimezone {
-            hour: Hr24clockHour,
+            hour: Hr24ClockHour,
             minute: Minute,
             timezone: TimezoneName,
         },
         WallclockHour {
-            clock: WallclockHour,
+            clock: WallClock,
             am: AmPm,
         },
         WallclockHourTimezone {
-            clock: WallclockHour,
+            clock: WallClock,
             am: AmPm,
             timezone: TimezoneName,
         },
         WallclockHourMinute {
-            clock: WallclockHour,
+            clock: WallClockHour,
             minute: Minute,
             am: AmPm,
         },
         WallclockHourMinuteTimezone {
-            clock: WallclockHour,
+            clock: WallClockHour,
             minute: Minute,
             am: AmPm,
             timezone: TimezoneName,
@@ -565,41 +556,15 @@ mod timespec {
                 _ => (),
             };
 
-            if let Ok(hour) = Hr24clockHour::from_str(s) {
+            if let Ok(hour) = Hr24Clock::from_str(s) {
                 return Ok(Self::Hr24clockHour(hour));
             }
 
             if let Some((possible_hour, other)) = s.split_once(':') {
-                if let Ok(hour) = Hr24clockHour::from_str(possible_hour) {
-                    let result = match Minute::from_str(other) {
-                        Ok(minute) => Self::Hr24clockHourMinute { hour, minute },
-                        Err(_) => {
-                            let minute = other
-                                .chars()
-                                .take_while(|this| this.is_alphabetic())
-                                .collect::<String>()
-                                .parse::<Minute>()?;
-                            let timezone = other
-                                .chars()
-                                .skip_while(|this| this.is_alphabetic())
-                                .collect::<String>()
-                                .parse::<TimezoneName>()?;
-
-                            Self::Hr24clockHourMinuteTimezone {
-                                hour,
-                                minute,
-                                timezone,
-                            }
-                        }
-                    };
-
-                    return Ok(result);
-                }
-
-                if let Ok(clock) = WallclockHour::from_str(possible_hour) {
+                if let Ok(clock) = WallClockHour::from_str(possible_hour) {
                     let minute = other
                         .chars()
-                        .take_while(|this| this.is_numeric())
+                        .take_while(|this: &char| this.is_numeric())
                         .collect::<String>();
                     let minutes_len = minute.len();
                     let minute = Minute::from_str(&minute)?;
@@ -620,6 +585,33 @@ mod timespec {
                         timezone,
                     });
                 }
+
+                if let Ok(hour) = Hr24ClockHour::from_str(possible_hour) {
+                    let result = match Minute::from_str(other) {
+                        Ok(minute) => Self::Hr24clockHourMinute { hour, minute },
+                        Err(_) => {
+                            let minute = other
+                                .chars()
+                                .take_while(|this| this.is_numeric())
+                                .collect::<String>()
+                                .parse::<Minute>()?;
+
+                            let timezone = other
+                                .chars()
+                                .skip_while(|this| this.is_numeric())
+                                .collect::<String>()
+                                .parse::<TimezoneName>()?;
+
+                            Self::Hr24clockHourMinuteTimezone {
+                                hour,
+                                minute,
+                                timezone,
+                            }
+                        }
+                    };
+
+                    return Ok(result);
+                }
             }
 
             let number = s
@@ -631,31 +623,34 @@ mod timespec {
                 .skip_while(|this| this.is_numeric())
                 .collect::<String>();
 
-            if let Ok(hour) = Hr24clockHour::from_str(&number) {
-                let timezone = TimezoneName::from_str(&other)?;
-
-                return Ok(Self::Hr24clockHourTimezone { hour, timezone });
+            if let Ok(clock) = WallClock::from_str(&number) {
+                if let Ok(am) = AmPm::from_str(&other[..2]) {
+                    let timezone = TimezoneName::from_str(&other[2..]);
+                    if let Ok(timezone) = timezone {
+                        return Ok(Self::WallclockHourTimezone {
+                            clock,
+                            am,
+                            timezone,
+                        });
+                    } else {
+                        return Ok(Self::WallclockHour { clock, am });
+                    }
+                }
             }
 
-            if let Ok(clock) = WallclockHour::from_str(&number) {
-                if let Ok(am) = AmPm::from_str(&other) {
-                    return Ok(Self::WallclockHour { clock, am });
+            if let Ok(hour) = Hr24Clock::from_str(&number) {
+                let timezone = TimezoneName::from_str(&other);
+
+                if let Ok(timezone) = timezone {
+                    return Ok(Self::Hr24clockHourTimezone { hour, timezone });
                 }
-
-                let timezone = TimezoneName::from_str(&other[2..])?;
-                let am = AmPm::from_str(&other[..2])?;
-
-                return Ok(Self::WallclockHourTimezone {
-                    clock,
-                    am,
-                    timezone,
-                });
             }
 
             Err(TimespecParsingError)
         }
     }
 
+    #[derive(Debug, PartialEq)]
     pub enum Nowspec {
         Now,
         NowIncrement(Increment),
@@ -752,6 +747,245 @@ mod timespec {
             Ok(Self::TimeDate { time, date })
         }
     }
+
+    #[cfg(test)]
+    mod test {
+        use std::num::NonZero;
+
+        use super::*;
+
+        // increment
+        #[test]
+        fn increment_period_simple() {
+            let actual = Increment::from_str("+1day");
+
+            assert_eq!(
+                Ok(Increment::Plus {
+                    number: 1,
+                    period: IncPeriod::Day
+                }),
+                actual
+            )
+        }
+
+        #[test]
+        fn increment_period_two_numbers() {
+            let actual = Increment::from_str("+12days");
+
+            assert_eq!(
+                Ok(Increment::Plus {
+                    number: 12,
+                    period: IncPeriod::Day
+                }),
+                actual
+            )
+        }
+
+        #[test]
+        fn increment_period_next() {
+            let actual = Increment::from_str("nextday");
+
+            assert_eq!(Ok(Increment::Next(IncPeriod::Day)), actual)
+        }
+
+        #[test]
+        fn increment_period_no_number_after_sign() {
+            let actual = Increment::from_str("+day");
+
+            assert_eq!(Err(TimespecParsingError), actual)
+        }
+
+        #[test]
+        fn increment_period_empty() {
+            let actual = Increment::from_str("");
+
+            assert_eq!(Err(TimespecParsingError), actual)
+        }
+
+        #[test]
+        fn increment_period_next_no_perid_fails() {
+            let actual = Increment::from_str("next");
+
+            assert_eq!(Err(TimespecParsingError), actual)
+        }
+
+        // nowspec
+
+        #[test]
+        fn nowspec_simple_now() {
+            let actual = Nowspec::from_str("now");
+
+            assert_eq!(Ok(Nowspec::Now), actual)
+        }
+
+        #[test]
+        fn nowspec_incremented_number() {
+            let actual = Nowspec::from_str("now+1day");
+
+            assert_eq!(
+                Ok(Nowspec::NowIncrement(Increment::Plus {
+                    number: 1,
+                    period: IncPeriod::Day
+                })),
+                actual
+            );
+        }
+
+        #[test]
+        fn nowspec_incremented_by_next() {
+            let actual = Nowspec::from_str("nownextday");
+
+            assert_eq!(
+                Ok(Nowspec::NowIncrement(Increment::Next(IncPeriod::Day))),
+                actual
+            );
+        }
+
+        // time
+
+        #[test]
+        fn time_simple_24_hour_single_number() {
+            let actual = Time::from_str("1");
+
+            assert_eq!(Ok(Time::Hr24clockHour(Hr24Clock([1, 0]))), actual)
+        }
+
+        #[test]
+        fn time_24_hour_full() {
+            let actual = Time::from_str("1453");
+
+            assert_eq!(Ok(Time::Hr24clockHour(Hr24Clock([14, 53]))), actual)
+        }
+
+        #[test]
+        fn time_24_hour_noon() {
+            let actual = Time::from_str("noon");
+
+            assert_eq!(Ok(Time::Noon), actual)
+        }
+
+        #[test]
+        fn time_24_hour_midnight() {
+            let actual = Time::from_str("midnight");
+
+            assert_eq!(Ok(Time::Midnight), actual)
+        }
+
+        #[test]
+        fn time_24_hour_plus_timezone() {
+            let actual = Time::from_str("1453UTC");
+
+            assert_eq!(
+                Ok(Time::Hr24clockHourTimezone {
+                    hour: Hr24Clock([14, 53]),
+                    timezone: TimezoneName("UTC".to_owned())
+                }),
+                actual
+            )
+        }
+
+        #[test]
+        fn time_24_hour_plus_timezone_2_digits() {
+            let actual = Time::from_str("14UTC");
+
+            assert_eq!(
+                Ok(Time::Hr24clockHourTimezone {
+                    hour: Hr24Clock([14, 00]),
+                    timezone: TimezoneName("UTC".to_owned())
+                }),
+                actual
+            )
+        }
+
+        #[test]
+        fn time_hr24clock_hour_plus_minute() {
+            let actual = Time::from_str("14:53");
+
+            assert_eq!(
+                Ok(Time::Hr24clockHourMinute {
+                    hour: Hr24ClockHour(14),
+                    minute: Minute(53)
+                }),
+                actual
+            )
+        }
+
+        #[test]
+        fn time_hr24clock_hour_plus_minute_timezone() {
+            let actual = Time::from_str("14:53UTC");
+
+            assert_eq!(
+                Ok(Time::Hr24clockHourMinuteTimezone {
+                    hour: Hr24ClockHour(14),
+                    minute: Minute(53),
+                    timezone: TimezoneName("UTC".to_owned())
+                }),
+                actual
+            )
+        }
+
+        #[test]
+        fn time_wallclock_hr_min_am() {
+            let actual = Time::from_str("0500am");
+
+            assert_eq!(
+                Ok(Time::WallclockHour {
+                    clock: WallClock {
+                        hour: NonZero::new(5).expect("valid"),
+                        minutes: 0
+                    },
+                    am: AmPm::Am
+                }),
+                actual
+            )
+        }
+
+        #[test]
+        fn time_wallclock_hr_min_plus_am_timezone() {
+            let actual = Time::from_str("0500amUTC");
+
+            assert_eq!(
+                Ok(Time::WallclockHourTimezone {
+                    clock: WallClock {
+                        hour: NonZero::new(5).expect("valid"),
+                        minutes: 0
+                    },
+                    am: AmPm::Am,
+                    timezone: TimezoneName("UTC".to_owned())
+                }),
+                actual
+            )
+        }
+
+        #[test]
+        fn time_wallclock_hour_minute_am() {
+            let actual = Time::from_str("05:53am");
+
+            assert_eq!(
+                Ok(Time::WallclockHourMinute {
+                    clock: WallClockHour(NonZero::new(5).expect("valid")),
+                    minute: Minute(53),
+                    am: AmPm::Am,
+                }),
+                actual
+            )
+        }
+
+        #[test]
+        fn time_wallclock_hour_minute_am_timezone() {
+            let actual = Time::from_str("05:53amUTC");
+
+            assert_eq!(
+                Ok(Time::WallclockHourMinuteTimezone {
+                    clock: WallClockHour(NonZero::new(5).expect("valid")),
+                    minute: Minute(53),
+                    am: AmPm::Am,
+                    timezone: TimezoneName("UTC".to_owned())
+                }),
+                actual
+            )
+        }
+    }
 }
 
 mod tokens {
@@ -832,15 +1066,16 @@ mod tokens {
     /// from `[00,23]`. If an `Hr24clockHour` is a four-digit number, the
     /// first two digits shall be a valid `Hr24clockHour`, while the last two
     /// represent the number of minutes, from `[00,59]`.
-    pub struct Hr24clockHour([u8; 2]);
+    #[derive(Debug, PartialEq)]
+    pub struct Hr24Clock(pub(crate) [u8; 2]);
 
-    impl Hr24clockHour {
+    impl Hr24Clock {
         pub fn into_inner(self) -> [u8; 2] {
             self.0
         }
     }
 
-    impl FromStr for Hr24clockHour {
+    impl FromStr for Hr24Clock {
         type Err = TokenParsingError;
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -885,6 +1120,23 @@ mod tokens {
         }
     }
 
+    #[derive(Debug, PartialEq)]
+    pub struct Hr24ClockHour(pub(crate) u8);
+
+    impl FromStr for Hr24ClockHour {
+        type Err = TokenParsingError;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            let number = u8::from_str(s)?;
+
+            if number > 23 {
+                Err(TokenParsingError)?
+            }
+
+            Ok(Self(number))
+        }
+    }
+
     /// A `WallclockHour` is a one, two-digit, or four-digit number.
     /// A one-digit or two-digit number constitutes a `WallclockHour`.
     /// A `WallclockHour` may be any of the single digits `[1..=9]`, or may
@@ -892,19 +1144,19 @@ mod tokens {
     /// is a four-digit number, the first two digits shall be a valid
     /// `WallclockHour`, while the last two represent the number of
     /// minutes, from `[00..=59]`.
-
-    pub struct WallclockHour {
-        hour: NonZero<u8>,
-        minutes: u8,
+    #[derive(Debug, PartialEq)]
+    pub struct WallClock {
+        pub(crate) hour: NonZero<u8>,
+        pub(crate) minutes: u8,
     }
 
-    impl WallclockHour {
+    impl WallClock {
         pub fn into_inner(self) -> (NonZero<u8>, u8) {
             (self.hour, self.minutes)
         }
     }
 
-    impl FromStr for WallclockHour {
+    impl FromStr for WallClock {
         type Err = TokenParsingError;
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -949,9 +1201,27 @@ mod tokens {
         }
     }
 
+    #[derive(Debug, PartialEq)]
+    pub struct WallClockHour(pub(crate) NonZero<u8>);
+
+    impl FromStr for WallClockHour {
+        type Err = TokenParsingError;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            let number = NonZero::from_str(s)?;
+
+            if number.get() > 12 {
+                Err(TokenParsingError)?;
+            }
+
+            Ok(Self(number))
+        }
+    }
+
     /// A `Minute` is a one or two-digit number whose value
     /// can be `[0..=9]` or` [00..=59]`.
-    pub struct Minute(u8);
+    #[derive(Debug, PartialEq)]
+    pub struct Minute(pub(crate) u8);
 
     impl Minute {
         pub fn into_inner(self) -> u8 {
@@ -963,30 +1233,13 @@ mod tokens {
         type Err = TokenParsingError;
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
-            let chars_count = s.chars().count();
+            let minute = u8::from_str(s)?;
 
-            let result = match chars_count {
-                1 => {
-                    let minute = u8::from_str(s)?;
-                    if minute > 9 {
-                        Err(TokenParsingError)?
-                    }
+            if minute > 59 {
+                Err(TokenParsingError)?
+            }
 
-                    minute
-                }
-                2 => {
-                    let minute = u8::from_str(s)?;
-
-                    if minute > 59 {
-                        Err(TokenParsingError)?
-                    }
-
-                    minute
-                }
-                _ => Err(TokenParsingError)?,
-            };
-
-            Ok(Self(result))
+            Ok(Self(minute))
         }
     }
 
@@ -1026,12 +1279,19 @@ mod tokens {
 
     /// The name of an optional timezone suffix to the time field, in an
     /// implementation-defined format.
-    pub struct TimezoneName(String);
+    #[derive(Debug, PartialEq)]
+    pub struct TimezoneName(pub(crate) String);
 
     impl FromStr for TimezoneName {
         type Err = TokenParsingError;
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
+            match s {
+                "am" | "pm" | "" => return Err(TokenParsingError),
+                _ if s.trim() == "" => return Err(TokenParsingError),
+                _ => (),
+            }
+
             // TODO: how to validate this? C impl simply reads env
             Ok(Self(s.to_owned()))
         }
@@ -1090,6 +1350,7 @@ mod tokens {
 
     /// One of the values from the am_pm keyword in the LC_TIME locale
     /// category.
+    #[derive(Debug, PartialEq)]
     pub enum AmPm {
         Am,
         Pm,
@@ -1113,7 +1374,7 @@ mod tokens {
 
         #[test]
         fn hour24_empty_char() {
-            let actual = Hr24clockHour::from_str("").map(Hr24clockHour::into_inner);
+            let actual = Hr24Clock::from_str("").map(Hr24Clock::into_inner);
 
             assert_eq!(Err(TokenParsingError), actual)
         }
@@ -1121,8 +1382,7 @@ mod tokens {
         #[test]
         fn hour24_single_char_ok() {
             for value in 0..=9 {
-                let actual =
-                    Hr24clockHour::from_str(&value.to_string()).map(Hr24clockHour::into_inner);
+                let actual = Hr24Clock::from_str(&value.to_string()).map(Hr24Clock::into_inner);
 
                 assert_eq!(Ok([value, 0,]), actual)
             }
@@ -1130,7 +1390,7 @@ mod tokens {
 
         #[test]
         fn hour24_single_char_not_a_number() {
-            let actual = Hr24clockHour::from_str("a").map(Hr24clockHour::into_inner);
+            let actual = Hr24Clock::from_str("a").map(Hr24Clock::into_inner);
 
             assert_eq!(Err(TokenParsingError), actual)
         }
@@ -1138,8 +1398,7 @@ mod tokens {
         #[test]
         fn hour24_two_chars_ok() {
             for hour in 10..23 {
-                let actual =
-                    Hr24clockHour::from_str(&hour.to_string()).map(Hr24clockHour::into_inner);
+                let actual = Hr24Clock::from_str(&hour.to_string()).map(Hr24Clock::into_inner);
 
                 assert_eq!(Ok([hour, 0]), actual)
             }
@@ -1147,14 +1406,14 @@ mod tokens {
 
         #[test]
         fn hour24_two_chars_out_of_range() {
-            let actual = Hr24clockHour::from_str(&format!("24")).map(Hr24clockHour::into_inner);
+            let actual = Hr24Clock::from_str(&format!("24")).map(Hr24Clock::into_inner);
 
             assert_eq!(Err(TokenParsingError), actual)
         }
 
         #[test]
         fn hour24_two_chars_not_a_number() {
-            let actual = Hr24clockHour::from_str(&format!("aa")).map(Hr24clockHour::into_inner);
+            let actual = Hr24Clock::from_str(&format!("aa")).map(Hr24Clock::into_inner);
 
             assert_eq!(Err(TokenParsingError), actual)
         }
@@ -1163,15 +1422,15 @@ mod tokens {
         fn hour24_four_chars() {
             for hour in 10..23 {
                 for minute in 0..10 {
-                    let actual = Hr24clockHour::from_str(&format!("{hour}0{minute}"))
-                        .map(Hr24clockHour::into_inner);
+                    let actual =
+                        Hr24Clock::from_str(&format!("{hour}0{minute}")).map(Hr24Clock::into_inner);
 
                     assert_eq!(Ok([hour, minute]), actual)
                 }
 
                 for minute in 10..=59 {
-                    let actual = Hr24clockHour::from_str(&format!("{hour}{minute}"))
-                        .map(Hr24clockHour::into_inner);
+                    let actual =
+                        Hr24Clock::from_str(&format!("{hour}{minute}")).map(Hr24Clock::into_inner);
 
                     assert_eq!(Ok([hour, minute]), actual)
                 }
@@ -1180,25 +1439,25 @@ mod tokens {
 
         #[test]
         fn hour24_four_chars_out_of_range() {
-            let actual = Hr24clockHour::from_str(&format!("2400")).map(Hr24clockHour::into_inner);
+            let actual = Hr24Clock::from_str(&format!("2400")).map(Hr24Clock::into_inner);
 
             assert_eq!(Err(TokenParsingError), actual);
 
-            let actual = Hr24clockHour::from_str(&format!("2360")).map(Hr24clockHour::into_inner);
+            let actual = Hr24Clock::from_str(&format!("2360")).map(Hr24Clock::into_inner);
 
             assert_eq!(Err(TokenParsingError), actual)
         }
 
         #[test]
         fn hour24_four_chars_not_a_number() {
-            let actual = Hr24clockHour::from_str(&format!("aaaa")).map(Hr24clockHour::into_inner);
+            let actual = Hr24Clock::from_str(&format!("aaaa")).map(Hr24Clock::into_inner);
 
             assert_eq!(Err(TokenParsingError), actual)
         }
 
         #[test]
         fn wallclock_hour_empty_char() {
-            let actual = WallclockHour::from_str("").map(WallclockHour::into_inner);
+            let actual = WallClock::from_str("").map(WallClock::into_inner);
 
             assert_eq!(Err(TokenParsingError), actual)
         }
@@ -1206,8 +1465,7 @@ mod tokens {
         #[test]
         fn wallclock_hour_single_char_ok() {
             for value in 1..=9 {
-                let actual =
-                    WallclockHour::from_str(&value.to_string()).map(WallclockHour::into_inner);
+                let actual = WallClock::from_str(&value.to_string()).map(WallClock::into_inner);
 
                 assert_eq!(
                     Ok((NonZero::new(value).expect("not a zero"), 0_u8,)),
@@ -1218,7 +1476,7 @@ mod tokens {
 
         #[test]
         fn wallclock_hour_single_char_not_a_number() {
-            let actual = WallclockHour::from_str("a").map(WallclockHour::into_inner);
+            let actual = WallClock::from_str("a").map(WallClock::into_inner);
 
             assert_eq!(Err(TokenParsingError), actual)
         }
@@ -1226,8 +1484,7 @@ mod tokens {
         #[test]
         fn wallclock_hour_two_chars_ok() {
             for hour in 10..23 {
-                let actual =
-                    WallclockHour::from_str(&hour.to_string()).map(WallclockHour::into_inner);
+                let actual = WallClock::from_str(&hour.to_string()).map(WallClock::into_inner);
 
                 assert_eq!(Ok((NonZero::new(hour).expect("not a zero"), 0)), actual)
             }
@@ -1235,14 +1492,14 @@ mod tokens {
 
         #[test]
         fn wallclock_hour_two_chars_out_of_range() {
-            let actual = WallclockHour::from_str("24").map(WallclockHour::into_inner);
+            let actual = WallClock::from_str("24").map(WallClock::into_inner);
 
             assert_eq!(Err(TokenParsingError), actual)
         }
 
         #[test]
         fn wallclock_hour_two_chars_not_a_number() {
-            let actual = WallclockHour::from_str("aa").map(WallclockHour::into_inner);
+            let actual = WallClock::from_str("aa").map(WallClock::into_inner);
 
             assert_eq!(Err(TokenParsingError), actual)
         }
@@ -1251,8 +1508,8 @@ mod tokens {
         fn wallclock_hour_four_chars() {
             for hour in 10..23 {
                 for minute in 0..10 {
-                    let actual = WallclockHour::from_str(&format!("{hour}0{minute}"))
-                        .map(WallclockHour::into_inner);
+                    let actual =
+                        WallClock::from_str(&format!("{hour}0{minute}")).map(WallClock::into_inner);
 
                     assert_eq!(
                         Ok((NonZero::new(hour).expect("not a zero"), minute)),
@@ -1261,8 +1518,8 @@ mod tokens {
                 }
 
                 for minute in 10..=59 {
-                    let actual = WallclockHour::from_str(&format!("{hour}{minute}"))
-                        .map(WallclockHour::into_inner);
+                    let actual =
+                        WallClock::from_str(&format!("{hour}{minute}")).map(WallClock::into_inner);
 
                     assert_eq!(
                         Ok((NonZero::new(hour).expect("not a zero"), minute)),
@@ -1274,39 +1531,39 @@ mod tokens {
 
         #[test]
         fn wallclock_hour_four_chars_out_of_range() {
-            let actual = WallclockHour::from_str(&format!("2400")).map(WallclockHour::into_inner);
+            let actual = WallClock::from_str(&format!("2400")).map(WallClock::into_inner);
 
             assert_eq!(Err(TokenParsingError), actual);
 
-            let actual = WallclockHour::from_str(&format!("2360")).map(WallclockHour::into_inner);
+            let actual = WallClock::from_str(&format!("2360")).map(WallClock::into_inner);
 
             assert_eq!(Err(TokenParsingError), actual)
         }
 
         #[test]
         fn wallclock_hour_four_chars_not_a_number() {
-            let actual = WallclockHour::from_str("aaaa").map(WallclockHour::into_inner);
+            let actual = WallClock::from_str("aaaa").map(WallClock::into_inner);
 
             assert_eq!(Err(TokenParsingError), actual)
         }
 
         #[test]
         fn wallclock_hour_singe_char_zero_fails() {
-            let actual = WallclockHour::from_str("0").map(WallclockHour::into_inner);
+            let actual = WallClock::from_str("0").map(WallClock::into_inner);
 
             assert_eq!(Err(TokenParsingError), actual)
         }
 
         #[test]
         fn wallclock_hour_two_chars_zero_fails() {
-            let actual = WallclockHour::from_str("00").map(WallclockHour::into_inner);
+            let actual = WallClock::from_str("00").map(WallClock::into_inner);
 
             assert_eq!(Err(TokenParsingError), actual)
         }
 
         #[test]
         fn wallclock_hour_four_chars_zero_fails() {
-            let actual = WallclockHour::from_str("0035").map(WallclockHour::into_inner);
+            let actual = WallClock::from_str("0035").map(WallClock::into_inner);
 
             assert_eq!(Err(TokenParsingError), actual)
         }

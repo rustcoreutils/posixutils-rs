@@ -433,6 +433,7 @@ mod timespec {
         }
     }
 
+    #[derive(Debug, PartialEq)]
     pub enum Date {
         MontDay {
             month_name: Month,
@@ -985,6 +986,56 @@ mod timespec {
                 actual
             )
         }
+
+        // date
+
+        #[test]
+        fn date_month_name_day_number() {
+            let actual = Date::from_str("NOV4");
+
+            assert_eq!(
+                Ok(Date::MontDay {
+                    month_name: Month(10),
+                    day_number: DayNumber(NonZero::new(4).expect("valid"))
+                }),
+                actual
+            );
+        }
+
+        #[test]
+        fn date_month_name_day_number_year_number() {
+            let actual = Date::from_str("NOV4,2024");
+
+            assert_eq!(
+                Ok(Date::MontDayYear {
+                    month_name: Month(10),
+                    day_number: DayNumber(NonZero::new(4).expect("valid")),
+                    year_number: YearNumber(2024)
+                }),
+                actual
+            );
+        }
+
+        #[test]
+        fn date_day_of_week() {
+            let actual = Date::from_str("MON");
+
+            assert_eq!(Ok(Date::DayOfWeek(DayOfWeek(1))), actual);
+        }
+
+        #[test]
+        fn date_today() {
+            let actual = Date::from_str("today");
+
+            assert_eq!(Ok(Date::Today), actual);
+        }
+
+        #[test]
+        fn date_tomorrow() {
+            let actual = Date::from_str("tomorrow");
+
+            assert_eq!(Ok(Date::Tomorrow), actual);
+        }
     }
 }
 
@@ -1069,6 +1120,7 @@ mod tokens {
     #[derive(Debug, PartialEq)]
     pub struct Hr24Clock(pub(crate) [u8; 2]);
 
+    #[cfg(test)]
     impl Hr24Clock {
         pub fn into_inner(self) -> [u8; 2] {
             self.0
@@ -1150,6 +1202,7 @@ mod tokens {
         pub(crate) minutes: u8,
     }
 
+    #[cfg(test)]
     impl WallClock {
         pub fn into_inner(self) -> (NonZero<u8>, u8) {
             (self.hour, self.minutes)
@@ -1223,6 +1276,7 @@ mod tokens {
     #[derive(Debug, PartialEq)]
     pub struct Minute(pub(crate) u8);
 
+    #[cfg(test)]
     impl Minute {
         pub fn into_inner(self) -> u8 {
             self.0
@@ -1243,7 +1297,8 @@ mod tokens {
         }
     }
 
-    pub struct DayNumber(NonZero<u8>);
+    #[derive(Debug, PartialEq)]
+    pub struct DayNumber(pub(crate) NonZero<u8>);
 
     impl FromStr for DayNumber {
         type Err = TokenParsingError;
@@ -1261,7 +1316,8 @@ mod tokens {
 
     /// A `YearNumber` is a four-digit number representing the year A.D., in
     /// which the at_job is to be run.
-    pub struct YearNumber(u16);
+    #[derive(Debug, PartialEq)]
+    pub struct YearNumber(pub(crate) u16);
 
     impl FromStr for YearNumber {
         type Err = TokenParsingError;
@@ -1299,7 +1355,8 @@ mod tokens {
 
     /// One of the values from the mon or abmon keywords in the LC_TIME
     /// locale category.
-    pub struct Month(u8);
+    #[derive(Debug, PartialEq)]
+    pub struct Month(pub(crate) u8);
 
     impl FromStr for Month {
         type Err = TokenParsingError;
@@ -1327,7 +1384,8 @@ mod tokens {
 
     /// One of the values from the day or abday keywords in the LC_TIME
     /// locale category.
-    pub struct DayOfWeek(u8);
+    #[derive(Debug, PartialEq)]
+    pub struct DayOfWeek(pub(crate) u8);
 
     impl FromStr for DayOfWeek {
         type Err = TokenParsingError;

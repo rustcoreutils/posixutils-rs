@@ -339,31 +339,26 @@ mod timespec {
         TokenParsingError, WallClock, WallClockHour, YearNumber,
     };
 
-    // TODO: Proper errors for each case and token
     #[derive(Debug, PartialEq)]
-    pub struct TimespecParsingError;
+    pub enum TimespecParsingError {
+        IncPeriodPatternNotFound(String),
+        IncrementParsing {
+            err: std::num::ParseIntError,
+            input: String,
+        },
+        IncrementPatternNotFound(String),
+        DateTokenParsing(TokenParsingError),
+        DatePatternNotFound(String),
+        TimeTokenParsing(TokenParsingError),
+        TimePatternNotFound(String),
+        NowspecParsing(String),
+        NowspecPatternNotFound(String),
+        TimespecPatternNotFound(String),
+    }
 
     impl std::fmt::Display for TimespecParsingError {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             writeln!(f, "Failed to parse token in str")
-        }
-    }
-
-    impl From<std::num::ParseIntError> for TimespecParsingError {
-        fn from(_value: std::num::ParseIntError) -> Self {
-            Self
-        }
-    }
-
-    impl From<std::char::TryFromCharError> for TimespecParsingError {
-        fn from(_value: std::char::TryFromCharError) -> Self {
-            Self
-        }
-    }
-
-    impl From<TokenParsingError> for TimespecParsingError {
-        fn from(_value: TokenParsingError) -> Self {
-            Self
         }
     }
 
@@ -388,7 +383,7 @@ mod timespec {
                 "week" | "weeks" => Self::Week,
                 "month" | "months" => Self::Month,
                 "year" | "years" => Self::Year,
-                _ => Err(TimespecParsingError)?,
+                _ => Err(TimespecParsingError::IncPeriodPatternNotFound(s.to_owned()))?,
             };
 
             Ok(result)
@@ -412,7 +407,11 @@ mod timespec {
                         .skip(1)
                         .take_while(|this| this.is_numeric())
                         .collect::<String>()
-                        .parse()?;
+                        .parse()
+                        .map_err(|err| TimespecParsingError::IncrementParsing {
+                            err,
+                            input: s.to_owned(),
+                        })?;
 
                     let period = s
                         .chars()
@@ -425,7 +424,7 @@ mod timespec {
                 }
                 false => match s.starts_with("next") {
                     true => Self::Next(IncPeriod::from_str(&s.replace("next", ""))?),
-                    false => Err(TimespecParsingError)?,
+                    false => Err(TimespecParsingError::IncrementPatternNotFound(s.to_owned()))?,
                 },
             };
 
@@ -461,11 +460,12 @@ mod timespec {
                         let parts = s.split(',').collect::<Vec<_>>();
 
                         if parts.len() != 2 {
-                            Err(TimespecParsingError)?
+                            Err(TimespecParsingError::DatePatternNotFound(s.to_owned()))?
                         }
 
                         let (month_name, day_number) = parse_month_and_day(&parts[0])?;
-                        let year_number = YearNumber::from_str(&parts[1])?;
+                        let year_number = YearNumber::from_str(&parts[1])
+                            .map_err(|e| TimespecParsingError::DateTokenParsing(e))?;
 
                         Self::MontDayYear {
                             month_name,
@@ -492,13 +492,15 @@ mod timespec {
                     .chars()
                     .take_while(|this| !this.is_numeric())
                     .collect::<String>()
-                    .parse::<Month>()?;
+                    .parse::<Month>()
+                    .map_err(|e| TimespecParsingError::DateTokenParsing(e))?;
 
                 let day = s
                     .chars()
                     .skip_while(|this| !this.is_numeric())
                     .collect::<String>()
-                    .parse::<DayNumber>()?;
+                    .parse::<DayNumber>()
+                    .map_err(|e| TimespecParsingError::DateTokenParsing(e))?;
 
                 Ok((month, day))
             }
@@ -568,7 +570,8 @@ mod timespec {
                         .take_while(|this: &char| this.is_numeric())
                         .collect::<String>();
                     let minutes_len = minute.len();
-                    let minute = Minute::from_str(&minute)?;
+                    let minute = Minute::from_str(&minute)
+                        .map_err(|e| TimespecParsingError::TimeTokenParsing(e))?;
 
                     let other = other.chars().skip(minutes_len).collect::<String>();
 
@@ -576,8 +579,10 @@ mod timespec {
                         return Ok(Self::WallclockHourMinute { clock, minute, am });
                     }
 
-                    let am = AmPm::from_str(&other[..2])?;
-                    let timezone = TimezoneName::from_str(&other[2..])?;
+                    let am = AmPm::from_str(&other[..2])
+                        .map_err(|e| TimespecParsingError::TimeTokenParsing(e))?;
+                    let timezone = TimezoneName::from_str(&other[2..])
+                        .map_err(|e| TimespecParsingError::TimeTokenParsing(e))?;
 
                     return Ok(Self::WallclockHourMinuteTimezone {
                         clock,
@@ -595,13 +600,15 @@ mod timespec {
                                 .chars()
                                 .take_while(|this| this.is_numeric())
                                 .collect::<String>()
-                                .parse::<Minute>()?;
+                                .parse::<Minute>()
+                                .map_err(|e| TimespecParsingError::TimeTokenParsing(e))?;
 
                             let timezone = other
                                 .chars()
                                 .skip_while(|this| this.is_numeric())
                                 .collect::<String>()
-                                .parse::<TimezoneName>()?;
+                                .parse::<TimezoneName>()
+                                .map_err(|e| TimespecParsingError::TimeTokenParsing(e))?;
 
                             Self::Hr24clockHourMinuteTimezone {
                                 hour,
@@ -647,7 +654,7 @@ mod timespec {
                 }
             }
 
-            Err(TimespecParsingError)
+            Err(TimespecParsingError::TimePatternNotFound(s.to_owned()))
         }
     }
 
@@ -666,11 +673,13 @@ mod timespec {
             let result = match s {
                 NOW => Self::Now,
                 _ if s.starts_with(NOW) => {
-                    let (_, increment) = s.split_once(NOW).ok_or(TimespecParsingError)?;
+                    let (_, increment) = s
+                        .split_once(NOW)
+                        .ok_or(TimespecParsingError::NowspecParsing(s.to_owned()))?;
 
                     Self::NowIncrement(Increment::from_str(increment)?)
                 }
-                _ => Err(TimespecParsingError)?,
+                _ => Err(TimespecParsingError::NowspecPatternNotFound(s.to_owned()))?,
             };
 
             Ok(result)
@@ -715,7 +724,7 @@ mod timespec {
                 }
 
                 if slice_index == 0 {
-                    Err(TimespecParsingError)?;
+                    Err(TimespecParsingError::TimespecPatternNotFound(s.to_owned()))?;
                 }
             }
 
@@ -730,7 +739,7 @@ mod timespec {
                 }
 
                 if slice_index == time_index {
-                    Err(TimespecParsingError)?;
+                    Err(TimespecParsingError::TimespecPatternNotFound(s.to_owned()))?;
                 }
             }
 
@@ -794,21 +803,27 @@ mod timespec {
         fn increment_period_no_number_after_sign() {
             let actual = Increment::from_str("+day");
 
-            assert_eq!(Err(TimespecParsingError), actual)
+            assert!(actual.is_err())
         }
 
         #[test]
         fn increment_period_empty() {
             let actual = Increment::from_str("");
 
-            assert_eq!(Err(TimespecParsingError), actual)
+            assert_eq!(
+                Err(TimespecParsingError::IncrementPatternNotFound(String::new())),
+                actual
+            )
         }
 
         #[test]
         fn increment_period_next_no_perid_fails() {
             let actual = Increment::from_str("next");
 
-            assert_eq!(Err(TimespecParsingError), actual)
+            assert_eq!(
+                Err(TimespecParsingError::IncPeriodPatternNotFound(String::new())),
+                actual
+            )
         }
 
         // nowspec

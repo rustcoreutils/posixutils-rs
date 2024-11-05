@@ -1169,25 +1169,104 @@ mod timespec {
 mod tokens {
     use std::{num::NonZero, str::FromStr};
 
-    // TODO: Proper errors for each case and token
     #[derive(Debug, PartialEq)]
-    pub struct TokenParsingError;
-
-    impl From<std::num::ParseIntError> for TokenParsingError {
-        fn from(_value: std::num::ParseIntError) -> Self {
-            Self
-        }
-    }
-
-    impl From<std::char::TryFromCharError> for TokenParsingError {
-        fn from(_value: std::char::TryFromCharError) -> Self {
-            Self
-        }
+    pub enum TokenParsingError {
+        TimeOperand(String),
+        DateOperant(String),
+        H24HourParsing {
+            err: std::num::ParseIntError,
+            input: String,
+        },
+        H24HourOverflow(&'static str),
+        H24HourPatternNotFound(String),
+        WallClockParsing {
+            err: std::num::ParseIntError,
+            input: String,
+        },
+        WallClockOverflow(&'static str),
+        WallClockPatternNotFound(String),
+        MinuteParsing {
+            err: std::num::ParseIntError,
+            input: String,
+        },
+        MinuteOverflow,
+        DayNumberParsing {
+            err: std::num::ParseIntError,
+            input: String,
+        },
+        DayNumberOverflow,
+        YearNumberParsing {
+            err: std::num::ParseIntError,
+            input: String,
+        },
+        YearNumberInvalid,
+        TimezonePatternNotFound(String),
+        MonthPatternNotFound(String),
+        DayOfWeekPatternNotFound(String),
+        AmPmPatternNotFound(String),
     }
 
     impl std::fmt::Display for TokenParsingError {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            writeln!(f, "Failed to parse token in str")
+            match self {
+                TokenParsingError::TimeOperand(input) => {
+                    writeln!(f, "Failed to parse `time` operand in {input}")
+                }
+                TokenParsingError::DateOperant(input) => {
+                    writeln!(f, "Failed to parse `date` operand in {input}")
+                }
+                TokenParsingError::H24HourParsing { err: _, input } => {
+                    writeln!(f, "Failed to parse `hr24clock_hour` token in `{input}`")
+                }
+                TokenParsingError::H24HourOverflow(who) => writeln!(
+                    f,
+                    "Failed to parse `hr24clock_hour` token due overflow in `{who}`"
+                ),
+                TokenParsingError::H24HourPatternNotFound(input) => {
+                    writeln!(f, "Failed to find `hr24clock_hour` token in `{input}`")
+                }
+                TokenParsingError::WallClockParsing { err: _, input } => {
+                    writeln!(f, "Failed to parse `wallclock_hour` token in `{input}`")
+                }
+                TokenParsingError::WallClockOverflow(who) => writeln!(
+                    f,
+                    "Failed to parse `wallclock_hour` token due overflow in `{who}`"
+                ),
+                TokenParsingError::WallClockPatternNotFound(input) => {
+                    writeln!(f, "Failed to find `wallclock_hour` token in `{input}`")
+                }
+                TokenParsingError::MinuteParsing { err: _, input } => {
+                    writeln!(f, "Failed to parse `minute` token in `{input}`")
+                }
+                TokenParsingError::MinuteOverflow => {
+                    writeln!(f, "Failed to parse `minute` token due overflow")
+                }
+                TokenParsingError::DayNumberParsing { err: _, input } => {
+                    writeln!(f, "Failed to parse `day_number` token in `{input}`")
+                }
+                TokenParsingError::DayNumberOverflow => {
+                    writeln!(f, "Failed to parse `day_number` token due overflow")
+                }
+                TokenParsingError::YearNumberParsing { err: _, input } => {
+                    writeln!(f, "Failed to parse `year_number` token in `{input}`")
+                }
+                TokenParsingError::YearNumberInvalid => writeln!(
+                    f,
+                    "Failed to parse `year_number` token. Year should be 4 digit number"
+                ),
+                TokenParsingError::TimezonePatternNotFound(input) => {
+                    writeln!(f, "Failed to find `timezone_name` token in `{input}`")
+                }
+                TokenParsingError::MonthPatternNotFound(input) => {
+                    writeln!(f, "Failed to find `month_name` token in `{input}`")
+                }
+                TokenParsingError::DayOfWeekPatternNotFound(input) => {
+                    writeln!(f, "Failed to find `day_of_week` token in `{input}`")
+                }
+                TokenParsingError::AmPmPatternNotFound(input) => {
+                    writeln!(f, "Failed to find `am_pm` token in `{input}`")
+                }
+            }
         }
     }
 
@@ -1209,7 +1288,7 @@ mod tokens {
                 "midnight" => Self::Midnight,
                 "noon" => Self::Noon,
                 "now" => Self::Now,
-                _ => Err(TokenParsingError)?,
+                _ => Err(TokenParsingError::TimeOperand(s.to_string()))?,
             };
 
             Ok(result)
@@ -1231,7 +1310,7 @@ mod tokens {
             let result = match s {
                 "today" => Self::Today,
                 "tomorrow" => Self::Tomorrow,
-                _ => Err(TokenParsingError)?,
+                _ => Err(TokenParsingError::DateOperant(s.to_owned()))?,
             };
 
             Ok(result)
@@ -1261,19 +1340,14 @@ mod tokens {
             let chars_count = s.chars().count();
 
             let result = match chars_count {
-                1 => {
-                    let hour = u8::from_str(s)?;
-                    if hour > 9 {
-                        Err(TokenParsingError)?
-                    }
-
-                    [hour, 0]
-                }
-                2 => {
-                    let hour = u8::from_str(s)?;
-
+                1 | 2 => {
+                    let hour =
+                        u8::from_str(s).map_err(|err| TokenParsingError::H24HourParsing {
+                            err,
+                            input: s.to_owned(),
+                        })?;
                     if hour > 23 {
-                        Err(TokenParsingError)?
+                        Err(TokenParsingError::H24HourOverflow("hour"))?
                     }
 
                     [hour, 0]
@@ -1283,16 +1357,28 @@ mod tokens {
                     let hour = &s[..2];
                     let minutes = &s[2..];
 
-                    let hour = u8::from_str(hour)?;
-                    let minutes = u8::from_str(minutes)?;
+                    let hour =
+                        u8::from_str(hour).map_err(|err| TokenParsingError::H24HourParsing {
+                            err,
+                            input: s.to_owned(),
+                        })?;
+                    let minutes =
+                        u8::from_str(minutes).map_err(|err| TokenParsingError::H24HourParsing {
+                            err,
+                            input: s.to_owned(),
+                        })?;
 
-                    if hour > 23 || minutes > 59 {
-                        Err(TokenParsingError)?
+                    if hour > 23 {
+                        Err(TokenParsingError::H24HourOverflow("hour"))?
+                    }
+
+                    if minutes > 59 {
+                        Err(TokenParsingError::H24HourOverflow("minute"))?
                     }
 
                     [hour, minutes]
                 }
-                _ => Err(TokenParsingError)?,
+                _ => Err(TokenParsingError::H24HourPatternNotFound(s.to_owned()))?,
             };
 
             Ok(Self(result))
@@ -1306,10 +1392,13 @@ mod tokens {
         type Err = TokenParsingError;
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
-            let number = u8::from_str(s)?;
+            let number = u8::from_str(s).map_err(|err| TokenParsingError::H24HourParsing {
+                err,
+                input: s.to_owned(),
+            })?;
 
             if number > 23 {
-                Err(TokenParsingError)?
+                Err(TokenParsingError::H24HourOverflow("hour"))?
             }
 
             Ok(Self(number))
@@ -1343,38 +1432,48 @@ mod tokens {
             let chars_count = s.chars().count();
 
             let result = match chars_count {
-                1 => {
-                    let hour = NonZero::<u8>::from_str(s)?;
-                    if hour.get() > 9 {
-                        Err(TokenParsingError)?
-                    }
-
-                    Self { hour, minutes: 0 }
-                }
-                2 => {
-                    let hour = NonZero::<u8>::from_str(s)?;
+                1 | 2 => {
+                    let hour = NonZero::<u8>::from_str(s).map_err(|err| {
+                        TokenParsingError::WallClockParsing {
+                            err,
+                            input: s.to_owned(),
+                        }
+                    })?;
 
                     if hour.get() > 23 {
-                        Err(TokenParsingError)?
+                        Err(TokenParsingError::WallClockOverflow("hour"))?
                     }
 
                     Self { hour, minutes: 0 }
                 }
                 4 => {
-                    // TODO: should be fine?
                     let hour = &s[..2];
                     let minutes = &s[2..];
 
-                    let hour = NonZero::<u8>::from_str(hour)?;
-                    let minutes = u8::from_str(minutes)?;
+                    let hour = NonZero::<u8>::from_str(hour).map_err(|err| {
+                        TokenParsingError::WallClockParsing {
+                            err,
+                            input: s.to_owned(),
+                        }
+                    })?;
+                    let minutes = u8::from_str(minutes).map_err(|err| {
+                        TokenParsingError::WallClockParsing {
+                            err,
+                            input: s.to_owned(),
+                        }
+                    })?;
 
-                    if hour.get() > 23 || minutes > 59 {
-                        Err(TokenParsingError)?
+                    if hour.get() > 23 {
+                        Err(TokenParsingError::WallClockOverflow("hour"))?
+                    }
+
+                    if minutes > 59 {
+                        Err(TokenParsingError::WallClockOverflow("minute"))?
                     }
 
                     Self { hour, minutes }
                 }
-                _ => Err(TokenParsingError)?,
+                _ => Err(TokenParsingError::WallClockPatternNotFound(s.to_owned()))?,
             };
 
             Ok(result)
@@ -1388,10 +1487,14 @@ mod tokens {
         type Err = TokenParsingError;
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
-            let number = NonZero::from_str(s)?;
+            let number =
+                NonZero::from_str(s).map_err(|err| TokenParsingError::WallClockParsing {
+                    err,
+                    input: s.to_owned(),
+                })?;
 
             if number.get() > 12 {
-                Err(TokenParsingError)?;
+                Err(TokenParsingError::WallClockOverflow("hour"))?
             }
 
             Ok(Self(number))
@@ -1414,10 +1517,13 @@ mod tokens {
         type Err = TokenParsingError;
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
-            let minute = u8::from_str(s)?;
+            let minute = u8::from_str(s).map_err(|err| TokenParsingError::MinuteParsing {
+                err,
+                input: s.to_owned(),
+            })?;
 
             if minute > 59 {
-                Err(TokenParsingError)?
+                Err(TokenParsingError::MinuteOverflow)?
             }
 
             Ok(Self(minute))
@@ -1431,10 +1537,14 @@ mod tokens {
         type Err = TokenParsingError;
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
-            let number = NonZero::from_str(s).map_err(TokenParsingError::from)?;
+            let number =
+                NonZero::from_str(s).map_err(|err| TokenParsingError::DayNumberParsing {
+                    err,
+                    input: s.to_owned(),
+                })?;
 
             if number.get() > 31 {
-                Err(TokenParsingError)?;
+                Err(TokenParsingError::DayNumberOverflow)?;
             }
 
             Ok(Self(number))
@@ -1450,10 +1560,13 @@ mod tokens {
         type Err = TokenParsingError;
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
-            let year = u16::from_str(s)?;
-            if year < 1000 {
+            let year = u16::from_str(s).map_err(|err| TokenParsingError::YearNumberParsing {
+                err,
+                input: s.to_owned(),
+            })?;
+            if year < 1000 || year > 9999 {
                 // it should be 4 number, so yeah...
-                Err(TokenParsingError)?
+                Err(TokenParsingError::YearNumberInvalid)?
             }
 
             Ok(Self(year))
@@ -1471,7 +1584,7 @@ mod tokens {
         fn from_str(s: &str) -> Result<Self, Self::Err> {
             match s {
                 "UTC" => (), // TODO: Seems like implementation only reads UTC, but look more into it
-                _ => return Err(TokenParsingError),
+                _ => return Err(TokenParsingError::TimezonePatternNotFound(s.to_owned())),
             }
 
             Ok(Self(s.to_owned()))
@@ -1500,7 +1613,7 @@ mod tokens {
                 "OCT" => 9,
                 "NOV" => 10,
                 "DEC" => 11,
-                _ => Err(TokenParsingError)?,
+                _ => Err(TokenParsingError::MonthPatternNotFound(s.to_owned()))?,
             };
 
             Ok(Self(number))
@@ -1524,7 +1637,7 @@ mod tokens {
                 "THU" => 4,
                 "FRI" => 5,
                 "SAT" => 6,
-                _ => Err(TokenParsingError)?,
+                _ => Err(TokenParsingError::DayOfWeekPatternNotFound(s.to_owned()))?,
             };
 
             Ok(Self(number))
@@ -1546,7 +1659,7 @@ mod tokens {
             Ok(match s.to_lowercase().as_str() {
                 "am" => Self::Am,
                 "pm" => Self::Pm,
-                _ => Err(TokenParsingError)?,
+                _ => Err(TokenParsingError::AmPmPatternNotFound(s.to_owned()))?,
             })
         }
     }
@@ -1559,7 +1672,10 @@ mod tokens {
         fn hour24_empty_char() {
             let actual = Hr24Clock::from_str("").map(Hr24Clock::into_inner);
 
-            assert_eq!(Err(TokenParsingError), actual)
+            assert_eq!(
+                Err(TokenParsingError::H24HourPatternNotFound("".to_owned())),
+                actual
+            )
         }
 
         #[test]
@@ -1575,7 +1691,7 @@ mod tokens {
         fn hour24_single_char_not_a_number() {
             let actual = Hr24Clock::from_str("a").map(Hr24Clock::into_inner);
 
-            assert_eq!(Err(TokenParsingError), actual)
+            assert!(actual.is_err())
         }
 
         #[test]
@@ -1591,14 +1707,14 @@ mod tokens {
         fn hour24_two_chars_out_of_range() {
             let actual = Hr24Clock::from_str(&format!("24")).map(Hr24Clock::into_inner);
 
-            assert_eq!(Err(TokenParsingError), actual)
+            assert_eq!(Err(TokenParsingError::H24HourOverflow("hour")), actual)
         }
 
         #[test]
         fn hour24_two_chars_not_a_number() {
             let actual = Hr24Clock::from_str(&format!("aa")).map(Hr24Clock::into_inner);
 
-            assert_eq!(Err(TokenParsingError), actual)
+            assert!(actual.is_err())
         }
 
         #[test]
@@ -1624,25 +1740,28 @@ mod tokens {
         fn hour24_four_chars_out_of_range() {
             let actual = Hr24Clock::from_str(&format!("2400")).map(Hr24Clock::into_inner);
 
-            assert_eq!(Err(TokenParsingError), actual);
+            assert_eq!(Err(TokenParsingError::H24HourOverflow("hour")), actual);
 
             let actual = Hr24Clock::from_str(&format!("2360")).map(Hr24Clock::into_inner);
 
-            assert_eq!(Err(TokenParsingError), actual)
+            assert_eq!(Err(TokenParsingError::H24HourOverflow("minute")), actual);
         }
 
         #[test]
         fn hour24_four_chars_not_a_number() {
             let actual = Hr24Clock::from_str(&format!("aaaa")).map(Hr24Clock::into_inner);
 
-            assert_eq!(Err(TokenParsingError), actual)
+            assert!(actual.is_err())
         }
 
         #[test]
         fn wallclock_hour_empty_char() {
             let actual = WallClock::from_str("").map(WallClock::into_inner);
 
-            assert_eq!(Err(TokenParsingError), actual)
+            assert_eq!(
+                Err(TokenParsingError::WallClockPatternNotFound("".to_owned())),
+                actual
+            )
         }
 
         #[test]
@@ -1661,7 +1780,7 @@ mod tokens {
         fn wallclock_hour_single_char_not_a_number() {
             let actual = WallClock::from_str("a").map(WallClock::into_inner);
 
-            assert_eq!(Err(TokenParsingError), actual)
+            assert!(actual.is_err())
         }
 
         #[test]
@@ -1677,14 +1796,14 @@ mod tokens {
         fn wallclock_hour_two_chars_out_of_range() {
             let actual = WallClock::from_str("24").map(WallClock::into_inner);
 
-            assert_eq!(Err(TokenParsingError), actual)
+            assert_eq!(Err(TokenParsingError::WallClockOverflow("hour")), actual)
         }
 
         #[test]
         fn wallclock_hour_two_chars_not_a_number() {
             let actual = WallClock::from_str("aa").map(WallClock::into_inner);
 
-            assert_eq!(Err(TokenParsingError), actual)
+            assert!(actual.is_err())
         }
 
         #[test]
@@ -1716,46 +1835,46 @@ mod tokens {
         fn wallclock_hour_four_chars_out_of_range() {
             let actual = WallClock::from_str(&format!("2400")).map(WallClock::into_inner);
 
-            assert_eq!(Err(TokenParsingError), actual);
+            assert_eq!(Err(TokenParsingError::WallClockOverflow("hour")), actual);
 
             let actual = WallClock::from_str(&format!("2360")).map(WallClock::into_inner);
 
-            assert_eq!(Err(TokenParsingError), actual)
+            assert_eq!(Err(TokenParsingError::WallClockOverflow("minute")), actual);
         }
 
         #[test]
         fn wallclock_hour_four_chars_not_a_number() {
             let actual = WallClock::from_str("aaaa").map(WallClock::into_inner);
 
-            assert_eq!(Err(TokenParsingError), actual)
+            assert!(actual.is_err())
         }
 
         #[test]
         fn wallclock_hour_singe_char_zero_fails() {
             let actual = WallClock::from_str("0").map(WallClock::into_inner);
 
-            assert_eq!(Err(TokenParsingError), actual)
+            assert!(actual.is_err())
         }
 
         #[test]
         fn wallclock_hour_two_chars_zero_fails() {
             let actual = WallClock::from_str("00").map(WallClock::into_inner);
 
-            assert_eq!(Err(TokenParsingError), actual)
+            assert!(actual.is_err())
         }
 
         #[test]
         fn wallclock_hour_four_chars_zero_fails() {
             let actual = WallClock::from_str("0035").map(WallClock::into_inner);
 
-            assert_eq!(Err(TokenParsingError), actual)
+            assert!(actual.is_err())
         }
 
         #[test]
         fn minute_empty_char() {
             let actual = Minute::from_str("").map(Minute::into_inner);
 
-            assert_eq!(Err(TokenParsingError), actual)
+            assert!(actual.is_err())
         }
 
         #[test]
@@ -1771,7 +1890,7 @@ mod tokens {
         fn minute_single_char_not_a_number() {
             let actual = Minute::from_str("a").map(Minute::into_inner);
 
-            assert_eq!(Err(TokenParsingError), actual)
+            assert!(actual.is_err())
         }
 
         #[test]
@@ -1787,14 +1906,14 @@ mod tokens {
         fn minute_two_chars_out_of_range() {
             let actual = Minute::from_str("60").map(Minute::into_inner);
 
-            assert_eq!(Err(TokenParsingError), actual)
+            assert_eq!(Err(TokenParsingError::MinuteOverflow), actual)
         }
 
         #[test]
         fn minute_two_chars_not_a_number() {
             let actual = Minute::from_str("aa").map(Minute::into_inner);
 
-            assert_eq!(Err(TokenParsingError), actual)
+            assert!(actual.is_err())
         }
     }
 }

@@ -677,6 +677,7 @@ mod timespec {
         }
     }
 
+    #[derive(Debug, PartialEq)]
     pub enum Timespec {
         Time(Time),
         TimeDate {
@@ -703,39 +704,39 @@ mod timespec {
                 return Ok(Self::Nowspec(time));
             }
 
+            let string_length = s.len();
             let mut time_index = 0;
-            for slice_index in 0..=s.len() {
-                // return error before we hit panic with out of bounds
-                if slice_index == s.len() {
-                    Err(TimespecParsingError)?;
-                }
 
+            for slice_index in (0..string_length).rev() {
                 let time = Time::from_str(&s[..slice_index]);
                 if let Ok(_) = time {
                     time_index = slice_index;
                     break;
+                }
+
+                if slice_index == 0 {
+                    Err(TimespecParsingError)?;
                 }
             }
 
             let time = Time::from_str(&s[..time_index])?;
 
             let mut date_index = 0;
-            for slice_index in time_index..=s.len() {
-                // return error before we hit panic with out of bounds
-                if slice_index == s.len() {
-                    Err(TimespecParsingError)?;
-                }
-
-                let date = Date::from_str(&s[..slice_index]);
+            for slice_index in (time_index..=string_length).rev() {
+                let date = Date::from_str(&s[time_index..slice_index]);
                 if let Ok(_) = date {
                     date_index = slice_index;
                     break;
+                }
+
+                if slice_index == time_index {
+                    Err(TimespecParsingError)?;
                 }
             }
 
             let date = Date::from_str(&s[time_index..date_index])?;
 
-            if date_index != s.len() {
+            if date_index != string_length {
                 let inrement = Increment::from_str(&s[date_index..])?;
 
                 return Ok(Self::TimeDateIncrement {
@@ -1035,6 +1036,132 @@ mod timespec {
             let actual = Date::from_str("tomorrow");
 
             assert_eq!(Ok(Date::Tomorrow), actual);
+        }
+
+        // timespec
+
+        #[test]
+        fn timespec_time_24_hour_full() {
+            let actual = Timespec::from_str("1453");
+
+            assert_eq!(
+                Ok(Timespec::Time(Time::Hr24clockHour(Hr24Clock([14, 53])))),
+                actual
+            )
+        }
+
+        #[test]
+        fn timespec_time_24_hour_plus_timezone_2_digits() {
+            let actual = Timespec::from_str("14UTC");
+
+            assert_eq!(
+                Ok(Timespec::Time(Time::Hr24clockHourTimezone {
+                    hour: Hr24Clock([14, 00]),
+                    timezone: TimezoneName("UTC".to_owned())
+                })),
+                actual
+            )
+        }
+
+        #[test]
+        fn timespec_time_hr24clock_hour_plus_minute() {
+            let actual = Timespec::from_str("14:53");
+
+            assert_eq!(
+                Ok(Timespec::Time(Time::Hr24clockHourMinute {
+                    hour: Hr24ClockHour(14),
+                    minute: Minute(53)
+                })),
+                actual
+            )
+        }
+
+        #[test]
+        fn timespec_time_wallclock_hour_minute_am_timezone() {
+            let actual = Timespec::from_str("05:53amUTC");
+
+            assert_eq!(
+                Ok(Timespec::Time(Time::WallclockHourMinuteTimezone {
+                    clock: WallClockHour(NonZero::new(5).expect("valid")),
+                    minute: Minute(53),
+                    am: AmPm::Am,
+                    timezone: TimezoneName("UTC".to_owned())
+                })),
+                actual
+            )
+        }
+
+        #[test]
+        fn timespec_nowspec() {
+            let actual = Timespec::from_str("now");
+
+            assert_eq!(Ok(Timespec::Nowspec(Nowspec::Now)), actual)
+        }
+
+        #[test]
+        fn timespec_time_date() {
+            let actual = Timespec::from_str("05:53amUTCtoday");
+
+            assert_eq!(
+                Ok(Timespec::TimeDate {
+                    time: Time::WallclockHourMinuteTimezone {
+                        clock: WallClockHour(NonZero::new(5).expect("valid")),
+                        minute: Minute(53),
+                        am: AmPm::Am,
+                        timezone: TimezoneName("UTC".to_owned())
+                    },
+                    date: Date::Today
+                }),
+                actual
+            )
+        }
+
+        #[test]
+        fn timespec_time_date_harder() {
+            let actual = Timespec::from_str("05:53amUTCNOV4,2024");
+
+            assert_eq!(
+                Ok(Timespec::TimeDate {
+                    time: Time::WallclockHourMinuteTimezone {
+                        clock: WallClockHour(NonZero::new(5).expect("valid")),
+                        minute: Minute(53),
+                        am: AmPm::Am,
+                        timezone: TimezoneName("UTC".to_owned())
+                    },
+                    date: Date::MontDayYear {
+                        month_name: Month(10),
+                        day_number: DayNumber(NonZero::new(4).expect("valid")),
+                        year_number: YearNumber(2024)
+                    }
+                }),
+                actual
+            )
+        }
+
+        #[test]
+        fn timespec_time_date_harder_plus_increment() {
+            let actual = Timespec::from_str("05:53amUTCNOV4,2024+1day");
+
+            assert_eq!(
+                Ok(Timespec::TimeDateIncrement {
+                    time: Time::WallclockHourMinuteTimezone {
+                        clock: WallClockHour(NonZero::new(5).expect("valid")),
+                        minute: Minute(53),
+                        am: AmPm::Am,
+                        timezone: TimezoneName("UTC".to_owned())
+                    },
+                    date: Date::MontDayYear {
+                        month_name: Month(10),
+                        day_number: DayNumber(NonZero::new(4).expect("valid")),
+                        year_number: YearNumber(2024)
+                    },
+                    inrement: Increment::Plus {
+                        number: 1,
+                        period: IncPeriod::Day
+                    }
+                }),
+                actual
+            )
         }
     }
 }
@@ -1343,12 +1470,10 @@ mod tokens {
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
             match s {
-                "am" | "pm" | "" => return Err(TokenParsingError),
-                _ if s.trim() == "" => return Err(TokenParsingError),
-                _ => (),
+                "UTC" => (), // TODO: Seems like implementation only reads UTC, but look more into it
+                _ => return Err(TokenParsingError),
             }
 
-            // TODO: how to validate this? C impl simply reads env
             Ok(Self(s.to_owned()))
         }
     }

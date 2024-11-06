@@ -12,6 +12,7 @@ plib = { path = "../plib" }
 clap.workspace = true
 gettext-rs.workspace = true
 libc.workspace = true
+chrono.workspace = true
 dirs = "5.0"
 
 [build-dependencies]

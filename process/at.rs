@@ -68,7 +68,7 @@ struct Args {
     time: Option<String>,
 
     /// Group ID or group name.
-    #[arg(value_name = "GROUP", required = true)]
+    #[arg(value_name = "GROUP", required = false)]
     group: String,
 
     /// Job IDs for reporting jobs scheduled for the invoking user.
@@ -76,24 +76,11 @@ struct Args {
     at_job_ids: Vec<String>,
 }
 
-/// TODO: Validated user email and info?
-pub struct User;
-
-// TODO
-/// All commands supplied by user via stdin
-pub struct Commands;
-
-// TODO
-///
-pub struct Timespec {
-    _time: std::time::SystemTime,
-}
-
 /// Structure to represent future job or script to be saved in [`SPOOL_DIRECTORY`]
 pub struct Job {
     shell: String,
-    user_uid: u16,
-    user_gid: u16,
+    user_uid: u32,
+    user_gid: u32,
     user_name: String,
     env: std::env::Vars,
     call_place: PathBuf,
@@ -101,6 +88,27 @@ pub struct Job {
 }
 
 impl Job {
+    pub fn new(
+        User {
+            shell,
+            uid,
+            gid,
+            name,
+        }: User,
+        env: std::env::Vars,
+        cmd: impl Into<String>,
+    ) -> Option<Self> {
+        Some(Self {
+            shell,
+            user_uid: uid,
+            user_gid: gid,
+            user_name: name,
+            env,
+            call_place: std::env::current_dir().ok()?,
+            cmd: cmd.into(),
+        })
+    }
+
     pub fn into_script(self) -> String {
         let Self {
             shell,
@@ -116,23 +124,25 @@ impl Job {
             .into_iter()
             .map(|(key, value)| format!("{}={}; export {}", key, value, key))
             .collect::<Vec<_>>()
-            .concat();
+            .join("\n");
 
         format!(
-            "#!{shell}\n
-            # atrun uid={user_uid} gid={user_gid}\n
-            # mail {user_name} 0\n
-            umask 22\n
-            {env}\n
-            cd {} || {{ echo 'Execution directory inaccessible' >&2 exit 1 }}\n
-            {cmd}",
+            "#!{shell}\n# atrun uid={user_uid} gid={user_gid}\n# mail {user_name} 0\numask 22\n{env}\ncd {} || {{\n\techo 'Execution directory inaccessible' >&2\n\texit 1 \n}}\n{cmd}",
             call_place.to_string_lossy()
         )
     }
 }
 
-fn at() -> Result<(), std::io::Error> {
-    let _jobno = next_job_id().inspect_err(|_| eprintln!("Cannot generate job number"))?;
+fn at() -> Result<(), Box<dyn std::error::Error>> {
+    // let _jobno = next_job_id().inspect_err(|_| eprintln!("Cannot generate job number"))?;
+
+    let user = User::new().ok_or("todo")?;
+
+    let job = Job::new(user, std::env::vars(), "")
+        .ok_or("todo")?
+        .into_script();
+
+    println!("{job}",);
 
     Ok(())
 }
@@ -161,7 +171,7 @@ fn next_job_id() -> Result<u32, std::io::Error> {
     Ok(next_job_id)
 }
 
-fn get_login_name() -> Option<String> {
+fn login_name() -> Option<String> {
     // Try to get the login name using getlogin
     unsafe {
         let login_ptr = getlogin();
@@ -176,18 +186,51 @@ fn get_login_name() -> Option<String> {
     env::var("LOGNAME").ok()
 }
 
-fn get_user_info_by_name(name: &str) -> Option<passwd> {
-    let c_name = CString::new(name).unwrap();
-    let pw_ptr = unsafe { getpwnam(c_name.as_ptr()) };
-    if pw_ptr.is_null() {
-        None
-    } else {
-        Some(unsafe { *pw_ptr })
+pub struct User {
+    pub name: String,
+    pub shell: String,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+impl User {
+    pub fn new() -> Option<Self> {
+        const DEFAULT_SHELL: &str = "/bin/sh";
+
+        let login_name = login_name()?;
+
+        let passwd {
+            pw_uid,
+            pw_gid,
+            pw_shell,
+            ..
+        } = user_info_by_name(&login_name)?;
+
+        let pw_shell = match pw_shell.is_null() {
+            true => std::env::var("SHELL")
+                .ok()
+                .unwrap_or(DEFAULT_SHELL.to_owned()),
+            false => unsafe {
+                CStr::from_ptr(pw_shell)
+                    .to_str()
+                    .ok()
+                    .unwrap_or(DEFAULT_SHELL)
+                    .to_owned()
+            },
+        };
+
+        Some(Self {
+            shell: pw_shell,
+            uid: pw_uid,
+            gid: pw_gid,
+            name: login_name,
+        })
     }
 }
 
-fn get_user_info_by_uid(uid: uid_t) -> Option<passwd> {
-    let pw_ptr = unsafe { getpwuid(uid) };
+fn user_info_by_name(name: &str) -> Option<passwd> {
+    let c_name = CString::new(name).unwrap();
+    let pw_ptr = unsafe { getpwnam(c_name.as_ptr()) };
     if pw_ptr.is_null() {
         None
     } else {
@@ -205,29 +248,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     textdomain(PROJECT_NAME)?;
     bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
-    if args.mail {
-        let real_uid = unsafe { libc::getuid() };
-        let mut mailname = get_login_name();
+    // if args.mail {
+    //     let real_uid = unsafe { libc::getuid() };
+    //     let mut mailname = get_login_name();
 
-        if mailname
-            .as_ref()
-            .and_then(|name| get_user_info_by_name(name))
-            .is_none()
-        {
-            if let Some(pass_entry) = get_user_info_by_uid(real_uid) {
-                mailname = unsafe {
-                    // Safely convert pw_name using CString, avoiding memory leaks.
-                    let cstr = CString::from_raw(pass_entry.pw_name as *mut i8);
-                    cstr.to_str().ok().map(|s| s.to_string())
-                };
-            }
-        }
+    //     if mailname
+    //         .as_ref()
+    //         .and_then(|name| user_info_by_name(name))
+    //         .is_none()
+    //     {
+    //         if let Some(pass_entry) = user_info_by_uid(real_uid) {
+    //             mailname = unsafe {
+    //                 // Safely convert pw_name using CString, avoiding memory leaks.
+    //                 let cstr = CString::from_raw(pass_entry.pw_name as *mut i8);
+    //                 cstr.to_str().ok().map(|s| s.to_string())
+    //             };
+    //         }
+    //     }
 
-        match mailname {
-            Some(name) => println!("Mailname: {}", name),
-            None => println!("Failed to retrieve mailname."),
-        }
-    }
+    //     match mailname {
+    //         Some(name) => println!("Mailname: {}", name),
+    //         None => println!("Failed to retrieve mailname."),
+    //     }
+    // }
 
     let exit_code = match at() {
         Ok(_) => 0,
@@ -332,7 +375,9 @@ mod time {
 }
 
 mod timespec {
-    use std::str::FromStr;
+    use std::{num::NonZero, str::FromStr};
+
+    use chrono::{DateTime, Datelike, Days, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Utc};
 
     use crate::tokens::{
         AmPm, DayNumber, DayOfWeek, Hr24Clock, Hr24ClockHour, Minute, Month, TimezoneName,
@@ -396,6 +441,28 @@ mod timespec {
         Plus { number: u16, period: IncPeriod },
     }
 
+    impl Increment {
+        pub fn to_duration(&self) -> std::time::Duration {
+            fn increment_date(number: Option<u16>, period: &IncPeriod) -> std::time::Duration {
+                let number = u64::from(number.unwrap_or(1));
+
+                match period {
+                    IncPeriod::Minute => std::time::Duration::from_secs(60 * number),
+                    IncPeriod::Hour => std::time::Duration::from_secs((60 * 60) * number),
+                    IncPeriod::Day => std::time::Duration::from_secs((60 * 60 * 24) * number),
+                    IncPeriod::Week => std::time::Duration::from_secs((60 * 60 * 24 * 7) * number),
+                    IncPeriod::Month => std::time::Duration::from_secs(2628000 * number),
+                    IncPeriod::Year => std::time::Duration::from_secs(31557600 * number),
+                }
+            }
+
+            match self {
+                Increment::Next(period) => increment_date(None, period),
+                Increment::Plus { number, period } => increment_date(Some(*number), period),
+            }
+        }
+    }
+
     impl FromStr for Increment {
         type Err = TimespecParsingError;
 
@@ -446,6 +513,47 @@ mod timespec {
         DayOfWeek(DayOfWeek),
         Today,
         Tomorrow,
+    }
+
+    impl Date {
+        pub fn to_naive_date(&self) -> Option<chrono::NaiveDate> {
+            match self {
+                Date::MontDay {
+                    month_name,
+                    day_number,
+                } => NaiveDate::from_ymd_opt(
+                    Utc::now().year(),
+                    u32::from(month_name.0) + 1,
+                    day_number.0.get().into(),
+                ),
+                Date::MontDayYear {
+                    month_name,
+                    day_number,
+                    year_number,
+                } => NaiveDate::from_ymd_opt(
+                    year_number.0.into(),
+                    u32::from(month_name.0) + 1,
+                    day_number.0.get().into(),
+                ),
+                Date::DayOfWeek(day_of_week) => {
+                    let now = Utc::now();
+
+                    // Check if date should be in current week or next
+                    let n = match day_of_week.0.num_days_from_sunday()
+                        > now.weekday().number_from_sunday()
+                    {
+                        true => 1,
+                        false => 2,
+                    };
+
+                    NaiveDate::from_weekday_of_month_opt(now.year(), now.month(), day_of_week.0, n)
+                }
+                Date::Today => Some(Utc::now().date_naive()),
+                Date::Tomorrow => Utc::now()
+                    .checked_add_days(Days::new(1))
+                    .map(|this| this.date_naive()),
+            }
+        }
     }
 
     impl FromStr for Date {
@@ -547,6 +655,100 @@ mod timespec {
             am: AmPm,
             timezone: TimezoneName,
         },
+    }
+
+    impl Time {
+        pub fn to_naive_time(&self) -> Option<chrono::NaiveTime> {
+            match self {
+                Time::Midnight => NaiveTime::from_hms_opt(0, 0, 0),
+                Time::Noon => NaiveTime::from_hms_opt(12, 0, 0),
+                Time::Hr24clockHour(hr24_clock) => {
+                    let Hr24Clock([hour, minute]) = *hr24_clock;
+
+                    NaiveTime::from_hms_opt(hour.into(), minute.into(), 0)
+                }
+                Time::Hr24clockHourTimezone { hour, timezone } => {
+                    let Hr24Clock([hour, minute]) = *hour;
+
+                    NaiveTime::from_hms_opt(hour.into(), minute.into(), 0)
+                }
+                Time::Hr24clockHourMinute { hour, minute } => {
+                    let Hr24ClockHour(hour) = *hour;
+                    let Minute(minute) = *minute;
+
+                    NaiveTime::from_hms_opt(hour.into(), minute.into(), 0)
+                }
+                Time::Hr24clockHourMinuteTimezone {
+                    hour,
+                    minute,
+                    timezone,
+                } => {
+                    let Hr24ClockHour(hour) = *hour;
+                    let Minute(minute) = *minute;
+
+                    NaiveTime::from_hms_opt(hour.into(), minute.into(), 0)
+                }
+                Time::WallclockHour { clock, am } => {
+                    let WallClock { hour, minutes } = *clock;
+
+                    chrono::NaiveTime::from_hms_opt(
+                        u32::from(match am {
+                            AmPm::Am => hour.get(),
+                            AmPm::Pm => hour.get() + 12,
+                        }),
+                        u32::from(minutes),
+                        0,
+                    )
+                }
+                Time::WallclockHourTimezone {
+                    clock,
+                    am,
+                    timezone,
+                } => {
+                    let WallClock { hour, minutes } = *clock;
+
+                    chrono::NaiveTime::from_hms_opt(
+                        u32::from(match am {
+                            AmPm::Am => hour.get(),
+                            AmPm::Pm => hour.get() + 12,
+                        }),
+                        u32::from(minutes),
+                        0,
+                    )
+                }
+                Time::WallclockHourMinute { clock, minute, am } => {
+                    let WallClockHour(hour) = *clock;
+                    let Minute(minutes) = *minute;
+
+                    chrono::NaiveTime::from_hms_opt(
+                        u32::from(match am {
+                            AmPm::Am => hour.get(),
+                            AmPm::Pm => hour.get() + 12,
+                        }),
+                        u32::from(minutes),
+                        0,
+                    )
+                }
+                Time::WallclockHourMinuteTimezone {
+                    clock,
+                    minute,
+                    am,
+                    timezone,
+                } => {
+                    let WallClockHour(hour) = *clock;
+                    let Minute(minutes) = *minute;
+
+                    chrono::NaiveTime::from_hms_opt(
+                        u32::from(match am {
+                            AmPm::Am => hour.get(),
+                            AmPm::Pm => hour.get() + 12,
+                        }),
+                        u32::from(minutes),
+                        0,
+                    )
+                }
+            }
+        }
     }
 
     impl FromStr for Time {
@@ -756,6 +958,69 @@ mod timespec {
             }
 
             Ok(Self::TimeDate { time, date })
+        }
+    }
+
+    impl Timespec {
+        pub fn to_date_time(&self) -> Option<DateTime<Utc>> {
+            let date_time = match self {
+                Timespec::Time(time) => {
+                    let time = time.to_naive_time()?;
+                    let now = Utc::now();
+
+                    match time < now.time() {
+                        true => now
+                            .checked_add_days(Days::new(1))?
+                            .with_time(time)
+                            .single()?
+                            .to_utc(),
+                        false => now.with_time(time).single()?.to_utc(),
+                    }
+                }
+                Timespec::TimeDate { time, date } => {
+                    let time = time.to_naive_time()?;
+                    let date = date.to_naive_date()?;
+
+                    // TODO: Unsure about this case
+                    let date_time = NaiveDateTime::new(date, time).and_utc();
+                    let date_time = match date_time < Utc::now() {
+                        true => date_time.checked_add_months(chrono::Months::new(12))?,
+                        false => date_time,
+                    };
+
+                    date_time
+                }
+                Timespec::TimeDateIncrement {
+                    time,
+                    date,
+                    inrement,
+                } => {
+                    let time = time.to_naive_time()?;
+                    let date = date.to_naive_date()?;
+
+                    let date_time = NaiveDateTime::new(date, time)
+                        .and_utc()
+                        .checked_add_signed(
+                            chrono::TimeDelta::from_std(inrement.to_duration()).ok()?,
+                        )?;
+
+                    // TODO: Unsure about this case
+                    let date_time = match date_time < Utc::now() {
+                        true => date_time.checked_add_months(chrono::Months::new(12))?,
+                        false => date_time,
+                    };
+
+                    date_time
+                }
+                Timespec::Nowspec(nowspec) => match nowspec {
+                    Nowspec::Now => Utc::now(),
+                    Nowspec::NowIncrement(increment) => Utc::now().checked_add_signed(
+                        chrono::TimeDelta::from_std(increment.to_duration()).ok()?,
+                    )?,
+                },
+            };
+
+            Some(date_time)
         }
     }
 
@@ -1036,7 +1301,7 @@ mod timespec {
         fn date_day_of_week() {
             let actual = Date::from_str("MON");
 
-            assert_eq!(Ok(Date::DayOfWeek(DayOfWeek(1))), actual);
+            assert_eq!(Ok(Date::DayOfWeek(DayOfWeek(chrono::Weekday::Mon))), actual);
         }
 
         #[test]
@@ -1597,12 +1862,12 @@ mod tokens {
         type Err = TokenParsingError;
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
-            match s {
-                "UTC" => (), // TODO: Seems like implementation only reads UTC, but look more into it
-                _ => return Err(TokenParsingError::TimezonePatternNotFound(s.to_owned())),
-            }
+            let tz = std::env::var("TZ").ok().unwrap_or("UTC".to_owned());
 
-            Ok(Self(s.to_owned()))
+            match s == &tz {
+                true => Ok(Self(tz)), // TODO: Seems like implementation only reads UTC, but it should be influenced by TZ variable
+                false => Err(TokenParsingError::TimezonePatternNotFound(tz)),
+            }
         }
     }
 
@@ -1638,30 +1903,30 @@ mod tokens {
     /// One of the values from the day or abday keywords in the LC_TIME
     /// locale category.
     #[derive(Debug, PartialEq)]
-    pub struct DayOfWeek(pub(crate) u8);
+    pub struct DayOfWeek(pub(crate) chrono::Weekday);
 
     impl FromStr for DayOfWeek {
         type Err = TokenParsingError;
 
         fn from_str(s: &str) -> Result<Self, Self::Err> {
-            let number = match s {
-                "SUN" => 0,
-                "MON" => 1,
-                "TUE" => 2,
-                "WED" => 3,
-                "THU" => 4,
-                "FRI" => 5,
-                "SAT" => 6,
+            let day = match s {
+                "SUN" => chrono::Weekday::Sun,
+                "MON" => chrono::Weekday::Mon,
+                "TUE" => chrono::Weekday::Tue,
+                "WED" => chrono::Weekday::Wed,
+                "THU" => chrono::Weekday::Thu,
+                "FRI" => chrono::Weekday::Fri,
+                "SAT" => chrono::Weekday::Sat,
                 _ => Err(TokenParsingError::DayOfWeekPatternNotFound(s.to_owned()))?,
             };
 
-            Ok(Self(number))
+            Ok(Self(day))
         }
     }
 
     /// One of the values from the am_pm keyword in the LC_TIME locale
     /// category.
-    #[derive(Debug, PartialEq)]
+    #[derive(Debug, PartialEq, Clone, Copy)]
     pub enum AmPm {
         Am,
         Pm,

@@ -1443,6 +1443,54 @@ mod timespec {
                 actual
             )
         }
+
+        #[test]
+        fn timespec_time_date_harder_to_date_time() {
+            let timespec = Timespec::TimeDate {
+                time: Time::WallclockHourMinute {
+                    clock: WallClockHour(NonZero::new(5).expect("valid")),
+                    minute: Minute(53),
+                    am: AmPm::Am,
+                },
+                date: Date::MontDayYear {
+                    month_name: Month(10),
+                    day_number: DayNumber(NonZero::new(4).expect("valid")),
+                    year_number: YearNumber(3000),
+                },
+            };
+
+            let expected = DateTime::parse_from_rfc3339("3000-11-04T05:53:00Z")
+                .expect("expected is valid")
+                .to_utc();
+
+            assert_eq!(Some(expected), timespec.to_date_time())
+        }
+
+        #[test]
+        fn timespec_time_date_harder_plus_increment_to_date_time() {
+            let timespec = Timespec::TimeDateIncrement {
+                time: Time::WallclockHourMinute {
+                    clock: WallClockHour(NonZero::new(5).expect("valid")),
+                    minute: Minute(53),
+                    am: AmPm::Am,
+                },
+                date: Date::MontDayYear {
+                    month_name: Month(10),
+                    day_number: DayNumber(NonZero::new(4).expect("valid")),
+                    year_number: YearNumber(3000),
+                },
+                inrement: Increment::Plus {
+                    number: 1,
+                    period: IncPeriod::Day,
+                },
+            };
+
+            let expected = DateTime::parse_from_rfc3339("3000-11-05T05:53:00Z")
+                .expect("expected is valid")
+                .to_utc();
+
+            assert_eq!(Some(expected), timespec.to_date_time())
+        }
     }
 }
 

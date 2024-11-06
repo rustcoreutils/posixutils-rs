@@ -66,9 +66,6 @@ impl<'src> Parser<'src> {
         self.shell_lookahead = lookahead;
         self.lookahead_source_location = source_location;
         self.shell_lookahead_token_id = id;
-        if self.shell_lookahead == ShellToken::WordStart {
-            self.advance_word();
-        }
     }
 
     fn advance_word(&mut self) {
@@ -95,6 +92,24 @@ impl<'src> Parser<'src> {
             self.word_lookahead
         } else {
             self.word_lookahead
+        }
+    }
+
+    // TODO: look into renaming this, its kind of confusing as it seems like this should be
+    // in `parse_word_until`
+    fn go_to_word_start(&mut self, ignore_reserved_words: bool) -> bool {
+        if self.shell_lookahead() == ShellToken::WordStart {
+            self.advance_word();
+            true
+        } else if ignore_reserved_words && self.shell_lookahead().is_reserved_word() {
+            self.lexer.rollback_last_token();
+            // the reserved word could be after blanks, which we need to skip
+            self.lexer.skip_blanks();
+            self.advance_word();
+            true
+        } else {
+            // there is no word here
+            false
         }
     }
 
@@ -412,7 +427,7 @@ impl<'src> Parser<'src> {
         };
         // advance the operator
         self.advance_shell();
-        if self.shell_lookahead() == ShellToken::WordStart {
+        if self.go_to_word_start(true) {
             let file = self.parse_word_until(WordToken::EOF).unwrap();
             Some(RedirectionKind::IORedirection { kind, file })
         } else {
@@ -478,47 +493,41 @@ impl<'src> Parser<'src> {
             if command.command.is_some() {
                 break;
             }
-            match self.shell_lookahead() {
-                ShellToken::WordStart => {
-                    if let Some(word) = self.parse_word_until(word_stop) {
-                        match try_word_to_assignment(word) {
-                            Ok(assignment) => command.assignments.push(assignment),
-                            Err(cmd) => {
-                                command.command = Some(cmd);
-                                break;
-                            }
+            if self.go_to_word_start(true) {
+                if let Some(word) = self.parse_word_until(word_stop) {
+                    match try_word_to_assignment(word) {
+                        Ok(assignment) => command.assignments.push(assignment),
+                        Err(cmd) => {
+                            command.command = Some(cmd);
+                            break;
                         }
                     }
-                    if word_stop != WordToken::EOF && self.word_lookahead() == word_stop {
-                        return wrap_command(command);
-                    }
                 }
-                _ => {
-                    if let Some(redirection) = self.parse_redirection_opt() {
-                        command.redirections.push(redirection);
-                    } else {
-                        return wrap_command(command);
-                    }
+                if word_stop != WordToken::EOF && self.word_lookahead() == word_stop {
+                    return wrap_command(command);
+                }
+            } else {
+                if let Some(redirection) = self.parse_redirection_opt() {
+                    command.redirections.push(redirection);
+                } else {
+                    return wrap_command(command);
                 }
             }
         }
 
         loop {
-            match self.shell_lookahead() {
-                ShellToken::WordStart => {
-                    if let Some(word) = self.parse_word_until(word_stop) {
-                        command.arguments.push(word);
-                    }
-                    if word_stop != WordToken::EOF && self.word_lookahead() == word_stop {
-                        return wrap_command(command);
-                    }
+            if self.go_to_word_start(true) {
+                if let Some(word) = self.parse_word_until(word_stop) {
+                    command.arguments.push(word);
                 }
-                _ => {
-                    if let Some(redirection) = self.parse_redirection_opt() {
-                        command.redirections.push(redirection);
-                    } else {
-                        return wrap_command(command);
-                    }
+                if word_stop != WordToken::EOF && self.word_lookahead() == word_stop {
+                    return wrap_command(command);
+                }
+            } else {
+                if let Some(redirection) = self.parse_redirection_opt() {
+                    command.redirections.push(redirection);
+                } else {
+                    return wrap_command(command);
                 }
             }
         }
@@ -593,6 +602,7 @@ impl<'src> Parser<'src> {
     fn parse_for_clause(&mut self) -> CompoundCommand {
         // consume 'for'
         self.advance_shell();
+        self.go_to_word_start(true);
         let iter_var = if let Some(name) = self
             .parse_word_until(WordToken::EOF)
             .map(|w| try_into_name(w).ok())
@@ -606,7 +616,7 @@ impl<'src> Parser<'src> {
         let mut words = Vec::new();
         if self.shell_lookahead() == ShellToken::In {
             self.advance_shell();
-            while self.shell_lookahead() == ShellToken::WordStart {
+            while self.go_to_word_start(true) {
                 words.push(self.parse_word_until(WordToken::EOF).unwrap());
             }
         }
@@ -629,6 +639,7 @@ impl<'src> Parser<'src> {
         self.match_shell_token_opt(ShellToken::LParen);
         let mut pattern = Vec::new();
         while self.shell_lookahead() != ShellToken::RParen {
+            self.go_to_word_start(true);
             pattern.push(self.parse_word_until(WordToken::EOF).unwrap());
             if self.shell_lookahead() != ShellToken::Pipe {
                 break;
@@ -652,6 +663,7 @@ impl<'src> Parser<'src> {
     fn parse_case_clause(&mut self) -> CompoundCommand {
         // consume 'case'
         self.advance_shell();
+        self.go_to_word_start(true);
         let arg = self.parse_word_until(WordToken::EOF).unwrap();
         self.skip_linebreak();
         self.match_shell_token(ShellToken::In);
@@ -761,6 +773,7 @@ impl<'src> Parser<'src> {
                 redirections,
             })
         } else {
+            self.go_to_word_start(false);
             if let Some(start) = self.parse_word_until(word_stop) {
                 match try_into_name(start) {
                     Ok(name) if self.shell_lookahead() == ShellToken::LParen => Some(
@@ -1761,7 +1774,7 @@ mod tests {
     #[test]
     fn parse_case_clause_one_case() {
         assert_eq!(
-            parse_compound_command("case word in (pattern) cmd esac").0,
+            parse_compound_command("case word in (pattern) cmd;; esac").0,
             CompoundCommand::CaseClause {
                 arg: literal_word("word"),
                 cases: vec![CaseItem {
@@ -1771,17 +1784,12 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_compound_command("case word in (pattern) cmd esac"),
-            parse_compound_command("case word in pattern) cmd esac")
+            parse_compound_command("case word in (pattern) cmd;; esac"),
+            parse_compound_command("case word in pattern) cmd;; esac")
         );
         assert_eq!(
-            parse_compound_command("case word in (pattern) cmd esac"),
+            parse_compound_command("case word in (pattern) cmd;; esac"),
             parse_compound_command("case word\n in \n(pattern)\n\ncmd\nesac")
-        );
-
-        assert_eq!(
-            parse_compound_command("case word in (pattern) cmd esac"),
-            parse_compound_command("case word in (pattern) cmd ;; esac")
         );
     }
 
@@ -1809,14 +1817,6 @@ mod tests {
                     }
                 ]
             }
-        );
-        assert_eq!(
-            parse_compound_command(
-                "case word in (pattern1) cmd1;; (pattern2) cmd2;; (pattern3) cmd3;; esac"
-            ),
-            parse_compound_command(
-                "case word in (pattern1) cmd1;; (pattern2) cmd2;; (pattern3) cmd3 esac"
-            )
         );
         assert_eq!(
             parse_compound_command(
@@ -1956,7 +1956,7 @@ mod tests {
 
     #[test]
     fn parse_compound_command_with_redirections() {
-        let (command, redirections) = parse_compound_command("if a then b fi > file.txt");
+        let (command, redirections) = parse_compound_command("if a; then b; fi > file.txt");
         assert_eq!(
             command,
             CompoundCommand::IfClause {
@@ -2016,6 +2016,57 @@ mod tests {
                     ..Default::default()
                 })],
                 negate_status: true
+            }
+        );
+    }
+
+    #[test]
+    fn parse_reserved_word_as_simple_word_when_used_as_command_argument() {
+        assert_eq!(
+            parse_simple_command("echo if"),
+            SimpleCommand {
+                command: Some(literal_word("echo")),
+                arguments: vec![literal_word("if")],
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn for_iterator_variable_can_be_a_reserved_word() {
+        assert_eq!(
+            parse_compound_command("for for in 1 2 3; do\ncmd\ndone").0,
+            CompoundCommand::ForClause {
+                iter_var: Rc::from("for"),
+                words: vec![literal_word("1"), literal_word("2"), literal_word("3")],
+                body: CompleteCommand {
+                    commands: vec![conjunction_from_word(literal_word("cmd"), false)]
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn case_arg_can_be_a_reserved_word() {
+        assert_eq!(
+            parse_compound_command("case case in esac").0,
+            CompoundCommand::CaseClause {
+                arg: literal_word("case"),
+                cases: Vec::new()
+            }
+        );
+    }
+
+    #[test]
+    fn word_after_in_can_be_a_reserved_word() {
+        assert_eq!(
+            parse_compound_command("for word in in; do cmd; done").0,
+            CompoundCommand::ForClause {
+                iter_var: Rc::from("word"),
+                words: vec![literal_word("in")],
+                body: CompleteCommand {
+                    commands: vec![conjunction_from_word(literal_word("cmd"), false)]
+                }
             }
         );
     }

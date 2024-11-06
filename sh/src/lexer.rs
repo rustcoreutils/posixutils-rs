@@ -60,6 +60,30 @@ pub enum ShellToken {
     EOF,
 }
 
+impl ShellToken {
+    pub fn is_reserved_word(&self) -> bool {
+        match self {
+            ShellToken::Bang
+            | ShellToken::LBrace
+            | ShellToken::RBrace
+            | ShellToken::Case
+            | ShellToken::Do
+            | ShellToken::Done
+            | ShellToken::Elif
+            | ShellToken::Else
+            | ShellToken::Esac
+            | ShellToken::Fi
+            | ShellToken::For
+            | ShellToken::If
+            | ShellToken::In
+            | ShellToken::Then
+            | ShellToken::Until
+            | ShellToken::While => true,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WordToken {
     DoubleQuote,              // "
@@ -158,7 +182,7 @@ impl<'src> Lexer<'src> {
         }
     }
 
-    fn skip_blanks(&mut self) {
+    pub fn skip_blanks(&mut self) {
         while is_blank(self.lookahead) {
             self.advance_char();
         }

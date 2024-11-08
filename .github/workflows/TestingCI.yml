@@ -2,8 +2,6 @@ name: Rust
 
 on:
   push:
-    branches:
-      - more
   pull_request:
 
 env:

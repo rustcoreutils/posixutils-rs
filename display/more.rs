@@ -8,7 +8,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use libc::{
     getegid, getgid, getuid, regcomp, regex_t, regexec, setgid, setuid, REG_ICASE, REG_NOMATCH,
 };
@@ -42,53 +42,83 @@ static NEED_QUIT: Mutex<bool> = Mutex::new(false);
 #[derive(Parser)]
 #[command(version, about = "more - display files on a page-by-page basis")]
 struct Args {
-    // Enable interactive session test
-    #[arg(long = "test", help = "Enable interactive session test.")]
-    test: bool,
-
     /// Do not scroll, display text and clean line ends
-    #[arg(short = 'c', help = "Do not scroll, display text and clean line ends.")]
+    #[arg(
+        short = 'c',
+        long = "print-over",
+        help = gettext("Do not scroll, display text and clean line ends")
+    )]
     print_over: bool,
 
     /// Exit on end-of-file
-    #[arg(short = 'e', help = "Exit on end-of-file.")]
+    #[arg(
+        short = 'e',
+        long = "exit-on-eof",
+        help = gettext("Exit on end-of-file")
+    )]
     exit_on_eof: bool,
 
     /// Perform pattern matching in searches without regard to case
     #[arg(
         short = 'i',
-        help = "Perform pattern matching in searches without regard to case."
+        long = "ignore-case",
+        help = gettext("Perform pattern matching in searches without regard to case")
     )]
     case_insensitive: bool,
 
     /// Execute the more command(s) in the command arguments in the order specified
     #[arg(
         short = 'p',
-        help = "Execute the more command(s) in the command arguments in the order specified."
+        long = "execute",
+        help = gettext("Execute the more command(s) in the command arguments in the order specified")
     )]
     commands: Option<String>,
 
     /// Squeeze multiple blank lines into one
-    #[arg(short = 's', help = "Squeeze multiple blank lines into one.")]
+    #[arg(
+        short = 's',
+        long = "squeeze",
+        help = gettext("Squeeze multiple blank lines into one")
+    )]
     squeeze: bool,
 
     /// Write the screenful of the file containing the tag named by the tagstring argument
     #[arg(
         short = 't',
-        help = "Write the screenful of the file containing the tag named by the tagstring argument."
+        long = "tag",
+        help = gettext("Write the screenful of the file containing the tag named by the tagstring argument")
     )]
     tag: Option<String>,
 
     /// Suppress underlining and bold
-    #[arg(short = 'u', help = "Suppress underlining and bold.")]
+    #[arg(
+        short = 'u',
+        long = "plain",
+        help = gettext("Suppress underlining and bold")
+    )]
     plain: bool,
 
     /// The number of lines per screenful
-    #[arg(short = 'n', help = "The number of lines per screenful.")]
+    #[arg(
+        short = 'n',
+        long = "lines",
+        help = gettext("The number of lines per screenful")
+    )]
     lines: Option<u16>,
 
+    /// Enable interactive session test
+    #[arg(
+        short = 'd',
+        long = "test",
+        help = gettext("Enable interactive session test")
+    )]
+    test: bool,
+
     /// A pathnames of an input files
-    #[arg(name = "FILE", help = "A pathnames of an input files.")]
+    #[arg(
+        name = "FILES",
+        help = gettext("A pathnames of input files")
+    )]
     input_files: Vec<String>,
 }
 

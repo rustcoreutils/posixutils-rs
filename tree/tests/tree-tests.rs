@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod chmod;
 mod cp;
 mod link;
 mod ls;

@@ -28,7 +28,7 @@ struct Args {
 fn do_mkfifo(filename: &str, mode: &ChmodMode) -> io::Result<()> {
     let mode_val = match mode {
         ChmodMode::Absolute(mode) => *mode,
-        ChmodMode::Symbolic(sym) => modestr::mutate(0o666, sym),
+        ChmodMode::Symbolic(sym) => modestr::mutate(0o666, false, sym),
     };
 
     let res = unsafe { libc::mkfifo(filename.as_ptr() as *const i8, mode_val as libc::mode_t) };

@@ -9,11 +9,9 @@
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use modestr::{ChmodMode, ChmodSymbolic};
+use modestr::ChmodMode;
 use plib::modestr;
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
-use std::{fs, io};
+use std::{cell::RefCell, io, os::unix::fs::MetadataExt};
 
 /// chmod - change the file modes
 #[derive(Parser)]
@@ -30,48 +28,43 @@ struct Args {
     files: Vec<String>,
 }
 
-// apply symbolic mutations to the given file at path
-fn set_permissions_symbolic(path: &Path, symbolic: &ChmodSymbolic) -> Result<(), io::Error> {
-    // query the current mode bits
-    let metadata = fs::metadata(path)?;
-    let mut perms = metadata.permissions();
-
-    // perform mutations on the mode bits
-    let new_mode = modestr::mutate(perms.mode(), symbolic);
-
-    // update path in filesystem
-    perms.set_mode(new_mode);
-    fs::set_permissions(path, perms)?;
-
-    Ok(())
-}
-
 fn chmod_file(filename: &str, mode: &ChmodMode, recurse: bool) -> Result<(), io::Error> {
-    let path = Path::new(filename);
-    let metadata = fs::metadata(path)?;
+    let terminate = RefCell::new(false);
+    let result = RefCell::new(Ok(())); // Either `Ok(())` or the last error encountered
 
-    if metadata.is_dir() && recurse {
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            let entry_path = entry.path();
-            let entry_filename = entry_path.to_str().unwrap();
-            chmod_file(entry_filename, mode, recurse)?;
-        }
-    }
+    ftw::traverse_directory(
+        filename,
+        |entry| {
+            if *terminate.borrow() {
+                return Ok(false);
+            }
 
-    match mode {
-        // set the mode bits to the given value
-        ChmodMode::Absolute(m) => {
-            fs::set_permissions(path, fs::Permissions::from_mode(*m))?;
-        }
+            let md = entry.metadata().unwrap();
+            let is_dir = md.is_dir();
 
-        // apply symbolic mutations to the mode bits
-        ChmodMode::Symbolic(s) => {
-            set_permissions_symbolic(path, s)?;
-        }
-    }
+            let new_mode = match mode {
+                ChmodMode::Absolute(m) => *m,
+                ChmodMode::Symbolic(s) => modestr::mutate(md.mode(), is_dir, s),
+            };
 
-    Ok(())
+            let ret =
+                unsafe { libc::fchmodat(entry.dir_fd(), entry.file_name().as_ptr(), new_mode, 0) };
+            if ret != 0 {
+                let e = io::Error::last_os_error();
+
+                *result.borrow_mut() = Err(e);
+                *terminate.borrow_mut() = true;
+                return Err(());
+            }
+
+            Ok(is_dir && recurse)
+        },
+        |_| Ok(()), // No-op
+        |_entry, _error| todo!(),
+        ftw::TraverseDirectoryOpts::default(),
+    );
+
+    result.into_inner()
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

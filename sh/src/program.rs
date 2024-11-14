@@ -12,13 +12,13 @@ use std::rc::Rc;
 pub type CompleteCommandList = Vec<CompleteCommand>;
 pub type Name = Rc<str>;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Parameter {
     Number(u32),
     Name(Name),
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ParameterExpansion {
     // $parameter or ${parameter}
     Simple(Parameter),
@@ -50,7 +50,7 @@ pub enum ParameterExpansion {
     RemoveLargestPrefix(Parameter, Option<Word>),
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ArithmeticExpr {
     // arithmetic operations
     Add(Box<ArithmeticExpr>, Box<ArithmeticExpr>),
@@ -92,7 +92,7 @@ pub enum ArithmeticExpr {
     },
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum WordPart {
     UnquotedLiteral(String),
     QuotedLiteral(String),
@@ -101,12 +101,12 @@ pub enum WordPart {
     CommandSubstitution(CompleteCommand),
 }
 
-#[derive(Debug, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Word {
     pub parts: Vec<WordPart>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum IORedirectionKind {
     // >
     RedirectOutput,
@@ -124,19 +124,19 @@ pub enum IORedirectionKind {
     OpenRW,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum RedirectionKind {
     IORedirection { kind: IORedirectionKind, file: Word },
     HereDocument { contents: String },
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct Redirection {
     pub file_descriptor: Option<u32>,
     pub kind: RedirectionKind,
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone)]
 pub struct Assignment {
     pub name: Name,
     pub value: Word,
@@ -148,7 +148,7 @@ impl std::fmt::Debug for Assignment {
     }
 }
 
-#[derive(PartialEq, Default)]
+#[derive(PartialEq, Default, Clone)]
 pub struct SimpleCommand {
     pub command: Option<Word>,
     pub assignments: Vec<Assignment>,
@@ -167,19 +167,19 @@ impl std::fmt::Debug for SimpleCommand {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct CaseItem {
     pub pattern: Vec<Word>,
     pub body: CompleteCommand,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct If {
     pub condition: CompleteCommand,
     pub body: CompleteCommand,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum CompoundCommand {
     BraceGroup(CompleteCommand),
     Subshell(CompleteCommand),
@@ -205,13 +205,13 @@ pub enum CompoundCommand {
     },
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct FunctionDefinition {
     pub name: Name,
     pub body: CompoundCommand,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Command {
     FunctionDefinition(FunctionDefinition),
     SimpleCommand(SimpleCommand),
@@ -221,7 +221,7 @@ pub enum Command {
     },
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone)]
 pub struct Pipeline {
     pub commands: Vec<Command>,
     pub negate_status: bool,
@@ -237,14 +237,14 @@ impl std::fmt::Debug for Pipeline {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum LogicalOp {
     And,
     Or,
     None,
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone)]
 pub struct Conjunction {
     pub elements: Vec<(Pipeline, LogicalOp)>,
     pub is_async: bool,
@@ -267,7 +267,7 @@ impl std::fmt::Debug for Conjunction {
     }
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone)]
 pub struct CompleteCommand {
     pub commands: Vec<Conjunction>,
 }

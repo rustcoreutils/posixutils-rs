@@ -20,12 +20,15 @@ use crate::{
 };
 
 fn try_word_to_assignment(word: Word) -> Result<Assignment, Word> {
-    if let Some(WordPart::Literal(name)) = word.parts.first() {
+    if let Some(WordPart::UnquotedLiteral(name)) = word.parts.first() {
         if let Some(eq_pos) = name.find('=') {
             let (name, rest) = name.split_at(eq_pos);
             let name = Rc::<str>::from(name);
             let word_start = rest[1..].to_string();
-            let mut word_parts = vec![WordPart::Literal(Rc::from(word_start))];
+            let mut word_parts = Vec::with_capacity(word.parts.len());
+            if !word_start.is_empty() {
+                word_parts.push(WordPart::UnquotedLiteral(word_start));
+            }
             word_parts.extend(word.parts.into_iter().skip(1));
             Ok(Assignment {
                 name,
@@ -41,8 +44,8 @@ fn try_word_to_assignment(word: Word) -> Result<Assignment, Word> {
 
 fn try_into_name(word: Word) -> Result<Name, Word> {
     if word.parts.len() == 1 {
-        if let WordPart::Literal(name) = word.parts.first().unwrap() {
-            Ok(name.clone())
+        if let WordPart::UnquotedLiteral(name) = word.parts.first().unwrap() {
+            Ok(Rc::from(name.as_str()))
         } else {
             Err(word)
         }
@@ -280,24 +283,29 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_word_until(&mut self, end: WordToken) -> Option<Word> {
-        let mut current_literal = String::new();
-        let mut word_parts = Vec::new();
-        fn push_literal(literal: &mut String, parts: &mut Vec<WordPart>) {
+        fn push_literal(literal: &mut String, parts: &mut Vec<WordPart>, quoted: bool) {
             let mut temp = String::new();
             std::mem::swap(&mut temp, literal);
-            if !temp.is_empty() {
-                parts.push(WordPart::Literal(Rc::from(temp)));
+            if quoted {
+                // we want to push regardless of the fact that the string is empty,
+                // since we consumed the quote character
+                parts.push(WordPart::QuotedLiteral(temp));
+            } else if !temp.is_empty() {
+                parts.push(WordPart::UnquotedLiteral(temp));
             }
         }
         fn push_literal_and_insert(
             literal: &mut String,
             parts: &mut Vec<WordPart>,
             part: WordPart,
+            quoted: bool,
         ) {
-            push_literal(literal, parts);
+            push_literal(literal, parts, quoted);
             parts.push(part);
         }
 
+        let mut current_literal = String::new();
+        let mut word_parts = Vec::new();
         let mut inside_double_quotes = false;
 
         loop {
@@ -306,23 +314,30 @@ impl<'src> Parser<'src> {
             }
             match self.word_lookahead() {
                 WordToken::DoubleQuote => {
+                    if inside_double_quotes {
+                        push_literal(&mut current_literal, &mut word_parts, true);
+                    } else {
+                        push_literal(&mut current_literal, &mut word_parts, false);
+                    }
                     inside_double_quotes = !inside_double_quotes;
-                    current_literal.push('"');
                     self.advance_word();
                 }
                 WordToken::SingleQuote => {
-                    current_literal.push('\'');
                     if !inside_double_quotes {
+                        push_literal(&mut current_literal, &mut word_parts, false);
                         loop {
                             if let Some((c, _)) = self.lexer.next_char() {
-                                current_literal.push(c);
                                 if c == '\'' {
                                     break;
                                 }
+                                current_literal.push(c);
                             } else {
                                 todo!("error: expected ', got end of file")
                             }
                         }
+                        push_literal(&mut current_literal, &mut word_parts, true);
+                    } else {
+                        current_literal.push('\'');
                     }
                     self.advance_word();
                 }
@@ -331,6 +346,7 @@ impl<'src> Parser<'src> {
                         &mut current_literal,
                         &mut word_parts,
                         WordPart::ParameterExpansion(self.parse_parameter_expansion()),
+                        inside_double_quotes,
                     );
                 }
                 WordToken::Backtick => {
@@ -341,6 +357,7 @@ impl<'src> Parser<'src> {
                         WordPart::CommandSubstitution(
                             self.parse_complete_command(WordToken::Backtick),
                         ),
+                        inside_double_quotes,
                     );
                     self.match_word_token(WordToken::Backtick);
                 }
@@ -352,6 +369,7 @@ impl<'src> Parser<'src> {
                         WordPart::CommandSubstitution(
                             self.parse_complete_command(WordToken::Char(')')),
                         ),
+                        inside_double_quotes,
                     );
                     self.match_word_token(WordToken::Char(')'));
                 }
@@ -364,6 +382,7 @@ impl<'src> Parser<'src> {
                         &mut current_literal,
                         &mut word_parts,
                         WordPart::ArithmeticExpansion(self.parse_arithmetic_expansion()),
+                        inside_double_quotes,
                     );
                     // TODO: should improve this for better errors. Now it would produce
                     // expected ')' instead of expected '))'
@@ -385,7 +404,7 @@ impl<'src> Parser<'src> {
             todo!("error: unclosed double quotes");
         }
 
-        push_literal(&mut current_literal, &mut word_parts);
+        push_literal(&mut current_literal, &mut word_parts, false);
 
         if word_parts.is_empty() {
             None
@@ -781,7 +800,7 @@ impl<'src> Parser<'src> {
                     ),
                     Ok(name) => {
                         let start = Word {
-                            parts: vec![WordPart::Literal(name)],
+                            parts: vec![WordPart::UnquotedLiteral(name.to_string())],
                         };
                         self.parse_simple_command(Some(start), word_stop)
                             .map(Command::SimpleCommand)
@@ -914,7 +933,7 @@ pub fn parse(text: &str) -> Program {
 
 #[cfg(test)]
 mod tests {
-    use crate::program::test_utils::literal_word;
+    use crate::program::test_utils::{quoted_literal, unquoted_literal};
 
     use super::*;
 
@@ -1032,29 +1051,29 @@ mod tests {
 
     #[test]
     fn parse_simple_word() {
-        assert_eq!(parse_word("hello"), literal_word("hello"));
+        assert_eq!(parse_word("hello"), unquoted_literal("hello"));
     }
 
     #[test]
     fn parse_word_with_single_quotes() {
         assert_eq!(
             parse_word("'single quoted string ${test} `command` $((1 + 1)) $(command2) \nnewline'"),
-            literal_word(
-                "'single quoted string ${test} `command` $((1 + 1)) $(command2) \nnewline'"
+            quoted_literal(
+                "single quoted string ${test} `command` $((1 + 1)) $(command2) \nnewline"
             )
         );
     }
 
     #[test]
     fn sigle_quotes_inside_dobule_quotes_are_ignored() {
-        assert_eq!(parse_word("\"'\""), literal_word("\"'\""));
+        assert_eq!(parse_word("\"'\""), quoted_literal("'"));
     }
 
     #[test]
     fn parse_simple_word_with_double_quotes() {
         assert_eq!(
             parse_word("\"double quoted string \nnewline\""),
-            literal_word("\"double quoted string \nnewline\"")
+            quoted_literal("double quoted string \nnewline")
         );
     }
 
@@ -1084,56 +1103,56 @@ mod tests {
             parse_parameter_expansion("${test:-default}"),
             ParameterExpansion::NullUnsetUseDefault(
                 Parameter::Name(Rc::from("test")),
-                Some(literal_word("default"))
+                Some(unquoted_literal("default"))
             )
         );
         assert_eq!(
             parse_parameter_expansion("${test-default}"),
             ParameterExpansion::UnsetUseDefault(
                 Parameter::Name(Rc::from("test")),
-                Some(literal_word("default"))
+                Some(unquoted_literal("default"))
             )
         );
         assert_eq!(
             parse_parameter_expansion("${test:=default}"),
             ParameterExpansion::NullUnsetAssignDefault(
                 Parameter::Name(Rc::from("test")),
-                Some(literal_word("default"))
+                Some(unquoted_literal("default"))
             )
         );
         assert_eq!(
             parse_parameter_expansion("${test=default}"),
             ParameterExpansion::UnsetAssignDefault(
                 Parameter::Name(Rc::from("test")),
-                Some(literal_word("default"))
+                Some(unquoted_literal("default"))
             )
         );
         assert_eq!(
             parse_parameter_expansion("${test:?default}"),
             ParameterExpansion::NullUnsetError(
                 Parameter::Name(Rc::from("test")),
-                Some(literal_word("default"))
+                Some(unquoted_literal("default"))
             )
         );
         assert_eq!(
             parse_parameter_expansion("${test?default}"),
             ParameterExpansion::UnsetError(
                 Parameter::Name(Rc::from("test")),
-                Some(literal_word("default"))
+                Some(unquoted_literal("default"))
             )
         );
         assert_eq!(
             parse_parameter_expansion("${test:+default}"),
             ParameterExpansion::SetUseAlternative(
                 Parameter::Name(Rc::from("test")),
-                Some(literal_word("default"))
+                Some(unquoted_literal("default"))
             )
         );
         assert_eq!(
             parse_parameter_expansion("${test+default}"),
             ParameterExpansion::SetNullUseAlternative(
                 Parameter::Name(Rc::from("test")),
-                Some(literal_word("default"))
+                Some(unquoted_literal("default"))
             )
         );
     }
@@ -1184,28 +1203,28 @@ mod tests {
             parse_parameter_expansion("${test%pattern}"),
             ParameterExpansion::RemoveSmallestSuffix(
                 Parameter::Name(Rc::from("test")),
-                Some(literal_word("pattern"))
+                Some(unquoted_literal("pattern"))
             )
         );
         assert_eq!(
             parse_parameter_expansion("${test%%pattern}"),
             ParameterExpansion::RemoveLargestSuffix(
                 Parameter::Name(Rc::from("test")),
-                Some(literal_word("pattern"))
+                Some(unquoted_literal("pattern"))
             )
         );
         assert_eq!(
             parse_parameter_expansion("${test#pattern}"),
             ParameterExpansion::RemoveSmallestPrefix(
                 Parameter::Name(Rc::from("test")),
-                Some(literal_word("pattern"))
+                Some(unquoted_literal("pattern"))
             )
         );
         assert_eq!(
             parse_parameter_expansion("${test##pattern}"),
             ParameterExpansion::RemoveLargestPrefix(
                 Parameter::Name(Rc::from("test")),
-                Some(literal_word("pattern"))
+                Some(unquoted_literal("pattern"))
             )
         );
     }
@@ -1213,7 +1232,7 @@ mod tests {
     #[test]
     fn parse_simple_command_no_assignments_no_redirections_no_arguments() {
         let command = parse_simple_command("pwd");
-        assert_eq!(command.command, Some(literal_word("pwd")));
+        assert_eq!(command.command, Some(unquoted_literal("pwd")));
         assert!(command.arguments.is_empty());
         assert!(command.assignments.is_empty());
         assert!(command.redirections.is_empty());
@@ -1225,7 +1244,7 @@ mod tests {
         assert!(command.command.is_none());
         assert_eq!(command.assignments.len(), 1);
         assert_eq!(command.assignments[0].name, Rc::from("a"));
-        assert_eq!(command.assignments[0].value, literal_word("1"));
+        assert_eq!(command.assignments[0].value, unquoted_literal("1"));
         assert!(command.redirections.is_empty());
         assert!(command.arguments.is_empty());
     }
@@ -1239,14 +1258,14 @@ mod tests {
         assert_eq!(command.assignments[0].name, Rc::from("PATH"));
         assert_eq!(
             command.assignments[0].value,
-            literal_word("/bin:/usr/bin:/usr/local/bin")
+            unquoted_literal("/bin:/usr/bin:/usr/local/bin")
         );
         assert_eq!(command.assignments[1].name, Rc::from("a"));
-        assert_eq!(command.assignments[1].value, literal_word("1"));
+        assert_eq!(command.assignments[1].value, unquoted_literal("1"));
         assert_eq!(command.assignments[2].name, Rc::from("b"));
         assert_eq!(
             command.assignments[2].value,
-            literal_word("\"this is a test\"")
+            quoted_literal("this is a test")
         );
         assert!(command.redirections.is_empty());
         assert!(command.arguments.is_empty());
@@ -1260,7 +1279,7 @@ mod tests {
                 file_descriptor: None,
                 kind: RedirectionKind::IORedirection {
                     kind: IORedirectionKind::RedirectOutput,
-                    file: literal_word("test_file")
+                    file: unquoted_literal("test_file")
                 }
             }
         );
@@ -1270,7 +1289,7 @@ mod tests {
                 file_descriptor: None,
                 kind: RedirectionKind::IORedirection {
                     kind: IORedirectionKind::RedirectOutputClobber,
-                    file: literal_word("test_file")
+                    file: unquoted_literal("test_file")
                 }
             }
         );
@@ -1280,7 +1299,7 @@ mod tests {
                 file_descriptor: None,
                 kind: RedirectionKind::IORedirection {
                     kind: IORedirectionKind::RedirectOuputAppend,
-                    file: literal_word("test_file")
+                    file: unquoted_literal("test_file")
                 }
             }
         );
@@ -1290,7 +1309,7 @@ mod tests {
                 file_descriptor: None,
                 kind: RedirectionKind::IORedirection {
                     kind: IORedirectionKind::DuplicateOutput,
-                    file: literal_word("test_file")
+                    file: unquoted_literal("test_file")
                 }
             }
         );
@@ -1300,7 +1319,7 @@ mod tests {
                 file_descriptor: None,
                 kind: RedirectionKind::IORedirection {
                     kind: IORedirectionKind::RedirectInput,
-                    file: literal_word("test_file")
+                    file: unquoted_literal("test_file")
                 }
             }
         );
@@ -1310,7 +1329,7 @@ mod tests {
                 file_descriptor: None,
                 kind: RedirectionKind::IORedirection {
                     kind: IORedirectionKind::DuplicateInput,
-                    file: literal_word("test_file")
+                    file: unquoted_literal("test_file")
                 }
             }
         );
@@ -1320,7 +1339,7 @@ mod tests {
                 file_descriptor: None,
                 kind: RedirectionKind::IORedirection {
                     kind: IORedirectionKind::OpenRW,
-                    file: literal_word("test_file")
+                    file: unquoted_literal("test_file")
                 }
             }
         );
@@ -1334,7 +1353,7 @@ mod tests {
                 file_descriptor: Some(2),
                 kind: RedirectionKind::IORedirection {
                     kind: IORedirectionKind::RedirectOutput,
-                    file: literal_word("test_file")
+                    file: unquoted_literal("test_file")
                 }
             }
         );
@@ -1351,7 +1370,7 @@ mod tests {
             command.redirections[0].kind,
             RedirectionKind::IORedirection {
                 kind: IORedirectionKind::RedirectOutput,
-                file: literal_word("file.txt")
+                file: unquoted_literal("file.txt")
             }
         );
     }
@@ -1359,7 +1378,7 @@ mod tests {
     #[test]
     fn parse_command_with_redirections() {
         let command = parse_simple_command("< input command > output");
-        assert_eq!(command.command, Some(literal_word("command")));
+        assert_eq!(command.command, Some(unquoted_literal("command")));
         assert_eq!(
             command.redirections,
             vec![
@@ -1367,14 +1386,14 @@ mod tests {
                     file_descriptor: None,
                     kind: RedirectionKind::IORedirection {
                         kind: IORedirectionKind::RedirectInput,
-                        file: literal_word("input")
+                        file: unquoted_literal("input")
                     }
                 },
                 Redirection {
                     file_descriptor: None,
                     kind: RedirectionKind::IORedirection {
                         kind: IORedirectionKind::RedirectOutput,
-                        file: literal_word("output")
+                        file: unquoted_literal("output")
                     }
                 }
             ]
@@ -1388,14 +1407,14 @@ mod tests {
         let command = parse_simple_command("echo this is a test");
         assert!(command.assignments.is_empty());
         assert!(command.redirections.is_empty());
-        assert_eq!(command.command, Some(literal_word("echo")));
+        assert_eq!(command.command, Some(unquoted_literal("echo")));
         assert_eq!(
             command.arguments,
             vec![
-                literal_word("this"),
-                literal_word("is"),
-                literal_word("a"),
-                literal_word("test")
+                unquoted_literal("this"),
+                unquoted_literal("is"),
+                unquoted_literal("a"),
+                unquoted_literal("test")
             ]
         )
     }
@@ -1403,15 +1422,15 @@ mod tests {
     #[test]
     fn parse_simple_command_with_arguments_and_redirections() {
         let command = parse_simple_command("cat test_file.txt >> ../other_file.txt");
-        assert_eq!(command.command, Some(literal_word("cat")));
-        assert_eq!(command.arguments, vec![literal_word("test_file.txt")]);
+        assert_eq!(command.command, Some(unquoted_literal("cat")));
+        assert_eq!(command.arguments, vec![unquoted_literal("test_file.txt")]);
         assert_eq!(
             command.redirections,
             vec![Redirection {
                 file_descriptor: None,
                 kind: RedirectionKind::IORedirection {
                     kind: IORedirectionKind::RedirectOuputAppend,
-                    file: literal_word("../other_file.txt")
+                    file: unquoted_literal("../other_file.txt")
                 }
             }]
         );
@@ -1421,22 +1440,22 @@ mod tests {
     #[test]
     fn parse_simple_command_with_arguments_redirections_and_assignments() {
         let command = parse_simple_command("CARGO_LOG=warn cargo build > build_result.txt");
-        assert_eq!(command.command, Some(literal_word("cargo")));
+        assert_eq!(command.command, Some(unquoted_literal("cargo")));
         assert_eq!(
             command.assignments,
             vec![Assignment {
                 name: Rc::from("CARGO_LOG"),
-                value: literal_word("warn")
+                value: unquoted_literal("warn")
             }]
         );
-        assert_eq!(command.arguments, vec![literal_word("build")]);
+        assert_eq!(command.arguments, vec![unquoted_literal("build")]);
         assert_eq!(
             command.redirections,
             vec![Redirection {
                 file_descriptor: None,
                 kind: RedirectionKind::IORedirection {
                     kind: IORedirectionKind::RedirectOutput,
-                    file: literal_word("build_result.txt")
+                    file: unquoted_literal("build_result.txt")
                 }
             }]
         )
@@ -1475,16 +1494,16 @@ mod tests {
         assert_eq!(
             pipeline.commands[0],
             Command::SimpleCommand(SimpleCommand {
-                command: Some(literal_word("echo")),
-                arguments: vec![literal_word("hello")],
+                command: Some(unquoted_literal("echo")),
+                arguments: vec![unquoted_literal("hello")],
                 ..Default::default()
             })
         );
         assert_eq!(
             pipeline.commands[1],
             Command::SimpleCommand(SimpleCommand {
-                command: Some(literal_word("wc")),
-                arguments: vec![literal_word("-l")],
+                command: Some(unquoted_literal("wc")),
+                arguments: vec![unquoted_literal("-l")],
                 ..Default::default()
             })
         );
@@ -1500,7 +1519,7 @@ mod tests {
             (
                 Pipeline {
                     commands: vec![Command::SimpleCommand(SimpleCommand {
-                        command: Some(literal_word("a")),
+                        command: Some(unquoted_literal("a")),
                         ..Default::default()
                     })],
                     negate_status: false
@@ -1513,7 +1532,7 @@ mod tests {
             (
                 Pipeline {
                     commands: vec![Command::SimpleCommand(SimpleCommand {
-                        command: Some(literal_word("b")),
+                        command: Some(unquoted_literal("b")),
                         ..Default::default()
                     })],
                     negate_status: false
@@ -1533,7 +1552,7 @@ mod tests {
                 elements: vec![(
                     Pipeline {
                         commands: vec![Command::SimpleCommand(SimpleCommand {
-                            command: Some(literal_word("a")),
+                            command: Some(unquoted_literal("a")),
                             ..Default::default()
                         })],
                         negate_status: false
@@ -1549,7 +1568,7 @@ mod tests {
                 elements: vec![(
                     Pipeline {
                         commands: vec![Command::SimpleCommand(SimpleCommand {
-                            command: Some(literal_word("b")),
+                            command: Some(unquoted_literal("b")),
                             ..Default::default()
                         })],
                         negate_status: false
@@ -1571,8 +1590,8 @@ mod tests {
                         elements: vec![(
                             Pipeline {
                                 commands: vec![Command::SimpleCommand(SimpleCommand {
-                                    command: Some(literal_word("echo")),
-                                    arguments: vec![literal_word("hello")],
+                                    command: Some(unquoted_literal("echo")),
+                                    arguments: vec![unquoted_literal("hello")],
                                     ..Default::default()
                                 })],
                                 negate_status: false
@@ -1593,14 +1612,14 @@ mod tests {
             parse_word("\"hello $(echo world)\""),
             Word {
                 parts: vec![
-                    WordPart::Literal(Rc::from("\"hello ")),
+                    WordPart::QuotedLiteral("hello ".to_string()),
                     WordPart::CommandSubstitution(CompleteCommand {
                         commands: vec![Conjunction {
                             elements: vec![(
                                 Pipeline {
                                     commands: vec![Command::SimpleCommand(SimpleCommand {
-                                        command: Some(literal_word("echo")),
-                                        arguments: vec![literal_word("world")],
+                                        command: Some(unquoted_literal("echo")),
+                                        arguments: vec![unquoted_literal("world")],
                                         ..Default::default()
                                     })],
                                     negate_status: false
@@ -1610,7 +1629,7 @@ mod tests {
                             is_async: false
                         }]
                     }),
-                    WordPart::Literal(Rc::from("\""))
+                    WordPart::QuotedLiteral("".to_string())
                 ]
             }
         );
@@ -1628,8 +1647,8 @@ mod tests {
                     elements: vec![(
                         Pipeline {
                             commands: vec![Command::SimpleCommand(SimpleCommand {
-                                command: Some(literal_word("echo")),
-                                arguments: vec![literal_word("hello")],
+                                command: Some(unquoted_literal("echo")),
+                                arguments: vec![unquoted_literal("hello")],
                                 ..Default::default()
                             })],
                             negate_status: false,
@@ -1648,7 +1667,7 @@ mod tests {
                         elements: vec![(
                             Pipeline {
                                 commands: vec![Command::SimpleCommand(SimpleCommand {
-                                    command: Some(literal_word("echo")),
+                                    command: Some(unquoted_literal("echo")),
                                     arguments: vec![inner],
                                     ..Default::default()
                                 })],
@@ -1669,11 +1688,11 @@ mod tests {
             parse_word("\"hello $test\""),
             Word {
                 parts: vec![
-                    WordPart::Literal(Rc::from("\"hello ")),
+                    WordPart::QuotedLiteral("hello ".to_string()),
                     WordPart::ParameterExpansion(ParameterExpansion::Simple(Parameter::Name(
                         Rc::from("test")
                     ))),
-                    WordPart::Literal(Rc::from("\""))
+                    WordPart::QuotedLiteral("".to_string())
                 ]
             }
         );
@@ -1681,11 +1700,11 @@ mod tests {
             parse_word("\"hello ${test}\""),
             Word {
                 parts: vec![
-                    WordPart::Literal(Rc::from("\"hello ")),
+                    WordPart::QuotedLiteral("hello ".to_string()),
                     WordPart::ParameterExpansion(ParameterExpansion::Simple(Parameter::Name(
                         Rc::from("test")
                     ))),
-                    WordPart::Literal(Rc::from("\""))
+                    WordPart::QuotedLiteral("".to_string())
                 ]
             }
         );
@@ -1693,28 +1712,31 @@ mod tests {
 
     #[test]
     fn test_parse_empty_double_string_word() {
-        assert_eq!(parse_word("\"\""), literal_word("\"\""));
+        assert_eq!(parse_word("\"\""), quoted_literal(""));
     }
 
     #[test]
     fn test_parse_empty_single_string_word() {
-        assert_eq!(parse_word("''"), literal_word("''"));
+        assert_eq!(parse_word("''"), quoted_literal(""));
     }
 
     #[test]
     fn parse_brace_group() {
         assert_eq!(
             parse_compound_command("{word}").0,
-            CompoundCommand::BraceGroup(complete_command_from_word(literal_word("word"), false))
+            CompoundCommand::BraceGroup(complete_command_from_word(
+                unquoted_literal("word"),
+                false
+            ))
         );
         assert_eq!(
             parse_compound_command("{\ncmd1; cmd2;\ncmd3\n\n\ncmd4 &\n}").0,
             CompoundCommand::BraceGroup(CompleteCommand {
                 commands: vec![
-                    conjunction_from_word(literal_word("cmd1"), false),
-                    conjunction_from_word(literal_word("cmd2"), false),
-                    conjunction_from_word(literal_word("cmd3"), false),
-                    conjunction_from_word(literal_word("cmd4"), true)
+                    conjunction_from_word(unquoted_literal("cmd1"), false),
+                    conjunction_from_word(unquoted_literal("cmd2"), false),
+                    conjunction_from_word(unquoted_literal("cmd3"), false),
+                    conjunction_from_word(unquoted_literal("cmd4"), true)
                 ]
             })
         )
@@ -1724,16 +1746,16 @@ mod tests {
     fn parse_subshell() {
         // assert_eq!(
         //     parse_compound_command("(word)").0,
-        //     CompoundCommand::Subshell(complete_command_from_word(literal_word("word"), false))
+        //     CompoundCommand::Subshell(complete_command_from_word(unquoted_literal("word"), false))
         // );
         assert_eq!(
             parse_compound_command("(\ncmd1; cmd2 & cmd3;\n\n\ncmd4 &\n)").0,
             CompoundCommand::Subshell(CompleteCommand {
                 commands: vec![
-                    conjunction_from_word(literal_word("cmd1"), false),
-                    conjunction_from_word(literal_word("cmd2"), true),
-                    conjunction_from_word(literal_word("cmd3"), false),
-                    conjunction_from_word(literal_word("cmd4"), true)
+                    conjunction_from_word(unquoted_literal("cmd1"), false),
+                    conjunction_from_word(unquoted_literal("cmd2"), true),
+                    conjunction_from_word(unquoted_literal("cmd3"), false),
+                    conjunction_from_word(unquoted_literal("cmd4"), true)
                 ]
             })
         )
@@ -1745,9 +1767,13 @@ mod tests {
             parse_compound_command("for i in 1 2 3; do\ncmd\ndone").0,
             CompoundCommand::ForClause {
                 iter_var: Rc::from("i"),
-                words: vec![literal_word("1"), literal_word("2"), literal_word("3")],
+                words: vec![
+                    unquoted_literal("1"),
+                    unquoted_literal("2"),
+                    unquoted_literal("3")
+                ],
                 body: CompleteCommand {
-                    commands: vec![conjunction_from_word(literal_word("cmd"), false)]
+                    commands: vec![conjunction_from_word(unquoted_literal("cmd"), false)]
                 }
             }
         );
@@ -1758,14 +1784,14 @@ mod tests {
         assert_eq!(
             parse_compound_command("case word in esac").0,
             CompoundCommand::CaseClause {
-                arg: literal_word("word"),
+                arg: unquoted_literal("word"),
                 cases: Vec::new()
             }
         );
         assert_eq!(
             parse_compound_command("case word \n\nin\n esac").0,
             CompoundCommand::CaseClause {
-                arg: literal_word("word"),
+                arg: unquoted_literal("word"),
                 cases: Vec::new()
             }
         )
@@ -1776,10 +1802,10 @@ mod tests {
         assert_eq!(
             parse_compound_command("case word in (pattern) cmd;; esac").0,
             CompoundCommand::CaseClause {
-                arg: literal_word("word"),
+                arg: unquoted_literal("word"),
                 cases: vec![CaseItem {
-                    pattern: vec![literal_word("pattern")],
-                    body: complete_command_from_word(literal_word("cmd"), false)
+                    pattern: vec![unquoted_literal("pattern")],
+                    body: complete_command_from_word(unquoted_literal("cmd"), false)
                 }]
             }
         );
@@ -1801,19 +1827,19 @@ mod tests {
             )
             .0,
             CompoundCommand::CaseClause {
-                arg: literal_word("word"),
+                arg: unquoted_literal("word"),
                 cases: vec![
                     CaseItem {
-                        pattern: vec![literal_word("pattern1")],
-                        body: complete_command_from_word(literal_word("cmd1"), false)
+                        pattern: vec![unquoted_literal("pattern1")],
+                        body: complete_command_from_word(unquoted_literal("cmd1"), false)
                     },
                     CaseItem {
-                        pattern: vec![literal_word("pattern2")],
-                        body: complete_command_from_word(literal_word("cmd2"), false)
+                        pattern: vec![unquoted_literal("pattern2")],
+                        body: complete_command_from_word(unquoted_literal("cmd2"), false)
                     },
                     CaseItem {
-                        pattern: vec![literal_word("pattern3")],
-                        body: complete_command_from_word(literal_word("cmd3"), false)
+                        pattern: vec![unquoted_literal("pattern3")],
+                        body: complete_command_from_word(unquoted_literal("cmd3"), false)
                     }
                 ]
             }
@@ -1835,10 +1861,10 @@ mod tests {
             CompoundCommand::IfClause {
                 if_chain: vec![If {
                     condition: CompleteCommand {
-                        commands: vec![conjunction_from_word(literal_word("condition"), false)]
+                        commands: vec![conjunction_from_word(unquoted_literal("condition"), false)]
                     },
                     body: CompleteCommand {
-                        commands: vec![conjunction_from_word(literal_word("cmd"), false)]
+                        commands: vec![conjunction_from_word(unquoted_literal("cmd"), false)]
                     }
                 }]
             }
@@ -1853,10 +1879,13 @@ mod tests {
                 if_chain: vec![
                     If {
                         condition: CompleteCommand {
-                            commands: vec![conjunction_from_word(literal_word("condition"), false)]
+                            commands: vec![conjunction_from_word(
+                                unquoted_literal("condition"),
+                                false
+                            )]
                         },
                         body: CompleteCommand {
-                            commands: vec![conjunction_from_word(literal_word("cmd"), false)]
+                            commands: vec![conjunction_from_word(unquoted_literal("cmd"), false)]
                         }
                     },
                     If {
@@ -1864,7 +1893,7 @@ mod tests {
                             commands: Vec::new()
                         },
                         body: CompleteCommand {
-                            commands: vec![conjunction_from_word(literal_word("cmd2"), false)]
+                            commands: vec![conjunction_from_word(unquoted_literal("cmd2"), false)]
                         }
                     }
                 ]
@@ -1881,34 +1910,34 @@ mod tests {
                     If {
                         condition: CompleteCommand {
                             commands: vec![conjunction_from_word(
-                                literal_word("condition1"),
+                                unquoted_literal("condition1"),
                                 false
                             )]
                         },
                         body: CompleteCommand {
-                            commands: vec![conjunction_from_word(literal_word("cmd1"), false)]
+                            commands: vec![conjunction_from_word(unquoted_literal("cmd1"), false)]
                         }
                     },
                     If {
                         condition: CompleteCommand {
                             commands: vec![conjunction_from_word(
-                                literal_word("condition2"),
+                                unquoted_literal("condition2"),
                                 false
                             )]
                         },
                         body: CompleteCommand {
-                            commands: vec![conjunction_from_word(literal_word("cmd2"), false)]
+                            commands: vec![conjunction_from_word(unquoted_literal("cmd2"), false)]
                         }
                     },
                     If {
                         condition: CompleteCommand {
                             commands: vec![conjunction_from_word(
-                                literal_word("condition3"),
+                                unquoted_literal("condition3"),
                                 false
                             )]
                         },
                         body: CompleteCommand {
-                            commands: vec![conjunction_from_word(literal_word("cmd3"), false)]
+                            commands: vec![conjunction_from_word(unquoted_literal("cmd3"), false)]
                         }
                     },
                     If {
@@ -1916,7 +1945,7 @@ mod tests {
                             commands: Vec::new()
                         },
                         body: CompleteCommand {
-                            commands: vec![conjunction_from_word(literal_word("cmd4"), false)]
+                            commands: vec![conjunction_from_word(unquoted_literal("cmd4"), false)]
                         }
                     }
                 ]
@@ -1930,10 +1959,10 @@ mod tests {
             parse_compound_command("while condition; do cmd; done").0,
             CompoundCommand::WhileClause {
                 condition: CompleteCommand {
-                    commands: vec![conjunction_from_word(literal_word("condition"), false)]
+                    commands: vec![conjunction_from_word(unquoted_literal("condition"), false)]
                 },
                 body: CompleteCommand {
-                    commands: vec![conjunction_from_word(literal_word("cmd"), false)]
+                    commands: vec![conjunction_from_word(unquoted_literal("cmd"), false)]
                 }
             }
         );
@@ -1945,10 +1974,10 @@ mod tests {
             parse_compound_command("until condition; do cmd; done").0,
             CompoundCommand::UntilClause {
                 condition: CompleteCommand {
-                    commands: vec![conjunction_from_word(literal_word("condition"), false)]
+                    commands: vec![conjunction_from_word(unquoted_literal("condition"), false)]
                 },
                 body: CompleteCommand {
-                    commands: vec![conjunction_from_word(literal_word("cmd"), false)]
+                    commands: vec![conjunction_from_word(unquoted_literal("cmd"), false)]
                 }
             }
         );
@@ -1962,10 +1991,10 @@ mod tests {
             CompoundCommand::IfClause {
                 if_chain: vec![If {
                     condition: CompleteCommand {
-                        commands: vec![conjunction_from_word(literal_word("a"), false)]
+                        commands: vec![conjunction_from_word(unquoted_literal("a"), false)]
                     },
                     body: CompleteCommand {
-                        commands: vec![conjunction_from_word(literal_word("b"), false)]
+                        commands: vec![conjunction_from_word(unquoted_literal("b"), false)]
                     }
                 }]
             }
@@ -1976,7 +2005,7 @@ mod tests {
                 file_descriptor: None,
                 kind: RedirectionKind::IORedirection {
                     kind: IORedirectionKind::RedirectOutput,
-                    file: literal_word("file.txt")
+                    file: unquoted_literal("file.txt")
                 }
             }]
         );
@@ -1989,7 +2018,7 @@ mod tests {
             Command::FunctionDefinition(FunctionDefinition {
                 name: Rc::from("function_name"),
                 body: CompoundCommand::BraceGroup(complete_command_from_word(
-                    literal_word("cmd"),
+                    unquoted_literal("cmd"),
                     false
                 ))
             })
@@ -2000,7 +2029,7 @@ mod tests {
             Command::FunctionDefinition(FunctionDefinition {
                 name: Rc::from("function_name"),
                 body: CompoundCommand::Subshell(CompleteCommand {
-                    commands: vec![conjunction_from_word(literal_word("cmd1"), false),]
+                    commands: vec![conjunction_from_word(unquoted_literal("cmd1"), false),]
                 })
             })
         );
@@ -2012,7 +2041,7 @@ mod tests {
             parse_pipeline("!cmd"),
             Pipeline {
                 commands: vec![Command::SimpleCommand(SimpleCommand {
-                    command: Some(literal_word("cmd")),
+                    command: Some(unquoted_literal("cmd")),
                     ..Default::default()
                 })],
                 negate_status: true
@@ -2025,8 +2054,8 @@ mod tests {
         assert_eq!(
             parse_simple_command("echo if"),
             SimpleCommand {
-                command: Some(literal_word("echo")),
-                arguments: vec![literal_word("if")],
+                command: Some(unquoted_literal("echo")),
+                arguments: vec![unquoted_literal("if")],
                 ..Default::default()
             }
         );
@@ -2038,9 +2067,13 @@ mod tests {
             parse_compound_command("for for in 1 2 3; do\ncmd\ndone").0,
             CompoundCommand::ForClause {
                 iter_var: Rc::from("for"),
-                words: vec![literal_word("1"), literal_word("2"), literal_word("3")],
+                words: vec![
+                    unquoted_literal("1"),
+                    unquoted_literal("2"),
+                    unquoted_literal("3")
+                ],
                 body: CompleteCommand {
-                    commands: vec![conjunction_from_word(literal_word("cmd"), false)]
+                    commands: vec![conjunction_from_word(unquoted_literal("cmd"), false)]
                 }
             }
         );
@@ -2051,7 +2084,7 @@ mod tests {
         assert_eq!(
             parse_compound_command("case case in esac").0,
             CompoundCommand::CaseClause {
-                arg: literal_word("case"),
+                arg: unquoted_literal("case"),
                 cases: Vec::new()
             }
         );
@@ -2063,9 +2096,9 @@ mod tests {
             parse_compound_command("for word in in; do cmd; done").0,
             CompoundCommand::ForClause {
                 iter_var: Rc::from("word"),
-                words: vec![literal_word("in")],
+                words: vec![unquoted_literal("in")],
                 body: CompleteCommand {
-                    commands: vec![conjunction_from_word(literal_word("cmd"), false)]
+                    commands: vec![conjunction_from_word(unquoted_literal("cmd"), false)]
                 }
             }
         );

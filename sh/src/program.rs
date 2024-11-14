@@ -94,7 +94,8 @@ pub enum ArithmeticExpr {
 
 #[derive(Debug, PartialEq)]
 pub enum WordPart {
-    Literal(Rc<str>),
+    UnquotedLiteral(String),
+    QuotedLiteral(String),
     ParameterExpansion(ParameterExpansion),
     ArithmeticExpansion(ArithmeticExpr),
     CommandSubstitution(CompleteCommand),
@@ -308,9 +309,15 @@ fn indent<D: std::fmt::Debug>(val: &D) -> String {
 pub mod test_utils {
     use super::*;
 
-    pub fn literal_word(contents: &str) -> Word {
+    pub fn quoted_literal(contents: &str) -> Word {
         Word {
-            parts: vec![WordPart::Literal(Rc::from(contents))],
+            parts: vec![WordPart::QuotedLiteral(contents.to_string())],
+        }
+    }
+
+    pub fn unquoted_literal(contents: &str) -> Word {
+        Word {
+            parts: vec![WordPart::UnquotedLiteral(contents.to_string())],
         }
     }
 }

@@ -19,10 +19,18 @@ use crate::{
     },
 };
 
+fn is_valid_name(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 fn try_word_to_assignment(word: Word) -> Result<Assignment, Word> {
     if let Some(WordPart::UnquotedLiteral(name)) = word.parts.first() {
         if let Some(eq_pos) = name.find('=') {
             let (name, rest) = name.split_at(eq_pos);
+            if !is_valid_name(name) {
+                return Err(word);
+            }
             let name = Rc::<str>::from(name);
             let word_start = rest[1..].to_string();
             let mut word_parts = Vec::with_capacity(word.parts.len());
@@ -43,8 +51,12 @@ fn try_word_to_assignment(word: Word) -> Result<Assignment, Word> {
 }
 
 fn try_into_name(word: Word) -> Result<Name, Word> {
-    if word.parts.len() == 1 {
-        if let WordPart::UnquotedLiteral(name) = word.parts.first().unwrap() {
+    if word.parts.len() != 1 {
+        return Err(word);
+    }
+
+    if let WordPart::UnquotedLiteral(name) = word.parts.first().unwrap() {
+        if is_valid_name(name) {
             Ok(Rc::from(name.as_str()))
         } else {
             Err(word)

@@ -11,7 +11,7 @@ rust-version.workspace = true
 clap.workspace = true
 clap.features = ["env"]
 gettext-rs.workspace = true
-libc = { version = "0.2", default-features = false }
+libc.workspace = true
 termion = "4.0"
 thiserror = "1.0"
 

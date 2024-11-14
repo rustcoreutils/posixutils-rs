@@ -40,7 +40,7 @@ static NEED_QUIT: Mutex<bool> = Mutex::new(false);
 
 /// more - display files on a page-by-page basis.
 #[derive(Parser)]
-#[command(version, about = "more - display files on a page-by-page basis")]
+#[command(version, about = gettext("more - display files on a page-by-page basis"))]
 struct Args {
     /// Do not scroll, display text and clean line ends
     #[arg(

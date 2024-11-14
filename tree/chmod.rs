@@ -8,7 +8,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use modestr::ChmodMode;
 use plib::modestr;
 use std::{cell::RefCell, io, os::unix::fs::MetadataExt};
@@ -77,7 +77,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut exit_code = 0;
 
     // parse the mode string
-    let mode = modestr::parse(&args.mode)?;
+    let Ok(mode) = modestr::parse(&args.mode) else {
+        eprintln!("chmod: {}", gettext!("invalid mode: '{}'", args.mode));
+        std::process::exit(1);
+    };
 
     // apply the mode to each file
     for filename in &args.files {

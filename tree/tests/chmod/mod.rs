@@ -9,15 +9,8 @@
 
 use plib::testing::{run_test, TestPlan};
 use std::{
-    ffi::{CStr, CString},
-    fs, io,
-    os::unix::{
-        self,
-        fs::{MetadataExt, PermissionsExt},
-    },
-    sync::Once,
-    thread,
-    time::Duration,
+    fs,
+    os::unix::{self, fs::PermissionsExt},
 };
 
 fn chmod_test(args: &[&str], expected_output: &str, expected_error: &str, expected_exit_code: i32) {
@@ -33,6 +26,58 @@ fn chmod_test(args: &[&str], expected_output: &str, expected_error: &str, expect
     });
 }
 
+// Port of coreutils/tests/chmod/ignore-symlink.sh
+#[test]
+fn test_chmod_ignore_symlink() {
+    let test_dir = &format!("{}/test_chmod_ignore_symlink", env!("CARGO_TARGET_TMPDIR"));
+    let f = &format!("{test_dir}/f");
+    let l = &format!("{test_dir}/l");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::File::create(f).unwrap();
+    unix::fs::symlink(f, l).unwrap();
+
+    chmod_test(&["u+w", "-R", test_dir], "", "", 0);
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// Port of coreutils/tests/chmod/inaccessible.sh
+#[test]
+fn test_chmod_inaccessible() {
+    let test_dir = &format!("{}/test_chmod_inaccessible", env!("CARGO_TARGET_TMPDIR"));
+    let d = &format!("{test_dir}/d");
+    let d_e = &format!("{test_dir}/d/e");
+
+    fs::create_dir(test_dir).unwrap();
+    fs::create_dir_all(d_e).unwrap();
+
+    chmod_test(&["0", d_e, d], "", "", 0);
+    chmod_test(&["u+rwx", d, d_e], "", "", 0);
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// Port of coreutils/tests/chmod/octal.sh
+#[test]
+fn test_chmod_octal() {
+    let test_dir = &format!("{}/test_chmod_octal", env!("CARGO_TARGET_TMPDIR"));
+
+    fs::create_dir(test_dir).unwrap();
+
+    for perm in ["0-anything", "7-anything", "8"] {
+        chmod_test(
+            &[perm, test_dir],
+            "",
+            &format!("chmod: invalid mode: '{perm}'\n"),
+            1,
+        );
+    }
+
+    fs::remove_dir_all(test_dir).unwrap();
+}
+
+// TODO: isolate libc::umask
 // Port of coreutils/tests/chmod/equals.sh
 #[test]
 fn test_chmod_equals() {
@@ -57,6 +102,19 @@ fn test_chmod_equals() {
             }
         }
     }
+
+    // let m = unsafe { libc::umask(0o27) };
+
+    // chmod_test(&["a=,u=rwx,=u", f], "", "", 0);
+
+    // let perm = fs::metadata(f).unwrap().permissions();
+    // let actual = perm.mode() & !libc::S_IFMT;
+    // assert_eq!(actual, 0o750);
+
+    // // Revert umask
+    // unsafe {
+    //     libc::umask(m);
+    // }
 
     fs::remove_dir_all(test_dir).unwrap();
 }

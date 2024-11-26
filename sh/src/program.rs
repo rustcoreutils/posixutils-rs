@@ -15,7 +15,7 @@ pub type Name = Rc<str>;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Parameter {
     Number(u32),
-    Name(Name),
+    Variable(Name),
 }
 
 #[derive(Debug, Clone, PartialEq)]

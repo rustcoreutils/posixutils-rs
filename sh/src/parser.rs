@@ -209,7 +209,7 @@ impl<'src> Parser<'src> {
                     }
                     self.advance_word();
                 }
-                Parameter::Name(Rc::from(name))
+                Parameter::Variable(Rc::from(name))
             }
             _ => todo!("error: expected parameter"),
         }
@@ -1093,7 +1093,7 @@ mod tests {
     fn parse_simple_parameter_expansion() {
         assert_eq!(
             parse_parameter_expansion("$test"),
-            ParameterExpansion::Simple(Parameter::Name(Rc::from("test")))
+            ParameterExpansion::Simple(Parameter::Variable(Rc::from("test")))
         );
         assert_eq!(
             parse_parameter_expansion("$1"),
@@ -1101,7 +1101,7 @@ mod tests {
         );
         assert_eq!(
             parse_parameter_expansion("${test}"),
-            ParameterExpansion::Simple(Parameter::Name(Rc::from("test")))
+            ParameterExpansion::Simple(Parameter::Variable(Rc::from("test")))
         );
         assert_eq!(
             parse_parameter_expansion("${12345}"),
@@ -1114,56 +1114,56 @@ mod tests {
         assert_eq!(
             parse_parameter_expansion("${test:-default}"),
             ParameterExpansion::NullUnsetUseDefault(
-                Parameter::Name(Rc::from("test")),
+                Parameter::Variable(Rc::from("test")),
                 Some(unquoted_literal("default"))
             )
         );
         assert_eq!(
             parse_parameter_expansion("${test-default}"),
             ParameterExpansion::UnsetUseDefault(
-                Parameter::Name(Rc::from("test")),
+                Parameter::Variable(Rc::from("test")),
                 Some(unquoted_literal("default"))
             )
         );
         assert_eq!(
             parse_parameter_expansion("${test:=default}"),
             ParameterExpansion::NullUnsetAssignDefault(
-                Parameter::Name(Rc::from("test")),
+                Parameter::Variable(Rc::from("test")),
                 Some(unquoted_literal("default"))
             )
         );
         assert_eq!(
             parse_parameter_expansion("${test=default}"),
             ParameterExpansion::UnsetAssignDefault(
-                Parameter::Name(Rc::from("test")),
+                Parameter::Variable(Rc::from("test")),
                 Some(unquoted_literal("default"))
             )
         );
         assert_eq!(
             parse_parameter_expansion("${test:?default}"),
             ParameterExpansion::NullUnsetError(
-                Parameter::Name(Rc::from("test")),
+                Parameter::Variable(Rc::from("test")),
                 Some(unquoted_literal("default"))
             )
         );
         assert_eq!(
             parse_parameter_expansion("${test?default}"),
             ParameterExpansion::UnsetError(
-                Parameter::Name(Rc::from("test")),
+                Parameter::Variable(Rc::from("test")),
                 Some(unquoted_literal("default"))
             )
         );
         assert_eq!(
             parse_parameter_expansion("${test:+default}"),
             ParameterExpansion::SetUseAlternative(
-                Parameter::Name(Rc::from("test")),
+                Parameter::Variable(Rc::from("test")),
                 Some(unquoted_literal("default"))
             )
         );
         assert_eq!(
             parse_parameter_expansion("${test+default}"),
             ParameterExpansion::SetNullUseAlternative(
-                Parameter::Name(Rc::from("test")),
+                Parameter::Variable(Rc::from("test")),
                 Some(unquoted_literal("default"))
             )
         );
@@ -1173,35 +1173,35 @@ mod tests {
     fn test_parse_parameter_expansion_expression_with_no_default() {
         assert_eq!(
             parse_parameter_expansion("${test:-}"),
-            ParameterExpansion::NullUnsetUseDefault(Parameter::Name(Rc::from("test")), None)
+            ParameterExpansion::NullUnsetUseDefault(Parameter::Variable(Rc::from("test")), None)
         );
         assert_eq!(
             parse_parameter_expansion("${test-}"),
-            ParameterExpansion::UnsetUseDefault(Parameter::Name(Rc::from("test")), None)
+            ParameterExpansion::UnsetUseDefault(Parameter::Variable(Rc::from("test")), None)
         );
         assert_eq!(
             parse_parameter_expansion("${test:=}"),
-            ParameterExpansion::NullUnsetAssignDefault(Parameter::Name(Rc::from("test")), None)
+            ParameterExpansion::NullUnsetAssignDefault(Parameter::Variable(Rc::from("test")), None)
         );
         assert_eq!(
             parse_parameter_expansion("${test=}"),
-            ParameterExpansion::UnsetAssignDefault(Parameter::Name(Rc::from("test")), None)
+            ParameterExpansion::UnsetAssignDefault(Parameter::Variable(Rc::from("test")), None)
         );
         assert_eq!(
             parse_parameter_expansion("${test:?}"),
-            ParameterExpansion::NullUnsetError(Parameter::Name(Rc::from("test")), None)
+            ParameterExpansion::NullUnsetError(Parameter::Variable(Rc::from("test")), None)
         );
         assert_eq!(
             parse_parameter_expansion("${test?}"),
-            ParameterExpansion::UnsetError(Parameter::Name(Rc::from("test")), None)
+            ParameterExpansion::UnsetError(Parameter::Variable(Rc::from("test")), None)
         );
         assert_eq!(
             parse_parameter_expansion("${test:+}"),
-            ParameterExpansion::SetUseAlternative(Parameter::Name(Rc::from("test")), None)
+            ParameterExpansion::SetUseAlternative(Parameter::Variable(Rc::from("test")), None)
         );
         assert_eq!(
             parse_parameter_expansion("${test+}"),
-            ParameterExpansion::SetNullUseAlternative(Parameter::Name(Rc::from("test")), None)
+            ParameterExpansion::SetNullUseAlternative(Parameter::Variable(Rc::from("test")), None)
         );
     }
 
@@ -1209,33 +1209,33 @@ mod tests {
     fn parse_string_operations_in_parameter_expansion() {
         assert_eq!(
             parse_parameter_expansion("${#test}"),
-            ParameterExpansion::StrLen(Parameter::Name(Rc::from("test")))
+            ParameterExpansion::StrLen(Parameter::Variable(Rc::from("test")))
         );
         assert_eq!(
             parse_parameter_expansion("${test%pattern}"),
             ParameterExpansion::RemoveSmallestSuffix(
-                Parameter::Name(Rc::from("test")),
+                Parameter::Variable(Rc::from("test")),
                 Some(unquoted_literal("pattern"))
             )
         );
         assert_eq!(
             parse_parameter_expansion("${test%%pattern}"),
             ParameterExpansion::RemoveLargestSuffix(
-                Parameter::Name(Rc::from("test")),
+                Parameter::Variable(Rc::from("test")),
                 Some(unquoted_literal("pattern"))
             )
         );
         assert_eq!(
             parse_parameter_expansion("${test#pattern}"),
             ParameterExpansion::RemoveSmallestPrefix(
-                Parameter::Name(Rc::from("test")),
+                Parameter::Variable(Rc::from("test")),
                 Some(unquoted_literal("pattern"))
             )
         );
         assert_eq!(
             parse_parameter_expansion("${test##pattern}"),
             ParameterExpansion::RemoveLargestPrefix(
-                Parameter::Name(Rc::from("test")),
+                Parameter::Variable(Rc::from("test")),
                 Some(unquoted_literal("pattern"))
             )
         );
@@ -1701,7 +1701,7 @@ mod tests {
             Word {
                 parts: vec![
                     WordPart::QuotedLiteral("hello ".to_string()),
-                    WordPart::ParameterExpansion(ParameterExpansion::Simple(Parameter::Name(
+                    WordPart::ParameterExpansion(ParameterExpansion::Simple(Parameter::Variable(
                         Rc::from("test")
                     ))),
                     WordPart::QuotedLiteral("".to_string())
@@ -1713,7 +1713,7 @@ mod tests {
             Word {
                 parts: vec![
                     WordPart::QuotedLiteral("hello ".to_string()),
-                    WordPart::ParameterExpansion(ParameterExpansion::Simple(Parameter::Name(
+                    WordPart::ParameterExpansion(ParameterExpansion::Simple(Parameter::Variable(
                         Rc::from("test")
                     ))),
                     WordPart::QuotedLiteral("".to_string())

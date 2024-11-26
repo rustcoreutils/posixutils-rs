@@ -285,14 +285,26 @@ impl<'src> Parser<'src> {
                 self.advance_word();
                 let word = self.parse_word_until(WordToken::Char('}'));
                 match operation {
-                    WordToken::Char('-') => {
-                        ParameterExpansion::NullUnsetUseDefault(parameter, word)
-                    }
-                    WordToken::Char('=') => {
-                        ParameterExpansion::NullUnsetAssignDefault(parameter, word)
-                    }
-                    WordToken::Char('?') => ParameterExpansion::NullUnsetError(parameter, word),
-                    WordToken::Char('+') => ParameterExpansion::SetUseAlternative(parameter, word),
+                    WordToken::Char('-') => ParameterExpansion::UnsetUseDefault {
+                        parameter,
+                        word,
+                        default_on_null: true,
+                    },
+                    WordToken::Char('=') => ParameterExpansion::UnsetAssignDefault {
+                        parameter,
+                        word,
+                        assign_on_null: true,
+                    },
+                    WordToken::Char('?') => ParameterExpansion::UnsetError {
+                        parameter,
+                        word,
+                        error_on_null: true,
+                    },
+                    WordToken::Char('+') => ParameterExpansion::SetUseAlternative {
+                        parameter,
+                        word,
+                        substitute_null_with_word: false,
+                    },
                     _ => todo!("error"),
                 }
             } else {
@@ -303,12 +315,26 @@ impl<'src> Parser<'src> {
                     return ParameterExpansion::Simple(parameter);
                 }
                 match operation {
-                    WordToken::Char('-') => ParameterExpansion::UnsetUseDefault(parameter, word),
-                    WordToken::Char('=') => ParameterExpansion::UnsetAssignDefault(parameter, word),
-                    WordToken::Char('?') => ParameterExpansion::UnsetError(parameter, word),
-                    WordToken::Char('+') => {
-                        ParameterExpansion::SetNullUseAlternative(parameter, word)
-                    }
+                    WordToken::Char('-') => ParameterExpansion::UnsetUseDefault {
+                        parameter,
+                        word,
+                        default_on_null: false,
+                    },
+                    WordToken::Char('=') => ParameterExpansion::UnsetAssignDefault {
+                        parameter,
+                        word,
+                        assign_on_null: false,
+                    },
+                    WordToken::Char('?') => ParameterExpansion::UnsetError {
+                        parameter,
+                        word,
+                        error_on_null: false,
+                    },
+                    WordToken::Char('+') => ParameterExpansion::SetUseAlternative {
+                        parameter,
+                        word,
+                        substitute_null_with_word: true,
+                    },
                     _ => todo!("error"),
                 }
             }
@@ -1172,59 +1198,67 @@ mod tests {
     fn parse_parameter_expansion_expression() {
         assert_eq!(
             parse_parameter_expansion("${test:-default}"),
-            ParameterExpansion::NullUnsetUseDefault(
-                Parameter::Variable(Rc::from("test")),
-                Some(unquoted_literal("default"))
-            )
+            ParameterExpansion::UnsetUseDefault {
+                parameter: Parameter::Variable(Rc::from("test")),
+                word: Some(unquoted_literal("default")),
+                default_on_null: true,
+            }
         );
         assert_eq!(
             parse_parameter_expansion("${test-default}"),
-            ParameterExpansion::UnsetUseDefault(
-                Parameter::Variable(Rc::from("test")),
-                Some(unquoted_literal("default"))
-            )
+            ParameterExpansion::UnsetUseDefault {
+                parameter: Parameter::Variable(Rc::from("test")),
+                word: Some(unquoted_literal("default")),
+                default_on_null: false,
+            }
         );
         assert_eq!(
             parse_parameter_expansion("${test:=default}"),
-            ParameterExpansion::NullUnsetAssignDefault(
-                Parameter::Variable(Rc::from("test")),
-                Some(unquoted_literal("default"))
-            )
+            ParameterExpansion::UnsetAssignDefault {
+                parameter: Parameter::Variable(Rc::from("test")),
+                word: Some(unquoted_literal("default")),
+                assign_on_null: true,
+            }
         );
         assert_eq!(
             parse_parameter_expansion("${test=default}"),
-            ParameterExpansion::UnsetAssignDefault(
-                Parameter::Variable(Rc::from("test")),
-                Some(unquoted_literal("default"))
-            )
+            ParameterExpansion::UnsetAssignDefault {
+                parameter: Parameter::Variable(Rc::from("test")),
+                word: Some(unquoted_literal("default")),
+                assign_on_null: false,
+            }
         );
         assert_eq!(
             parse_parameter_expansion("${test:?default}"),
-            ParameterExpansion::NullUnsetError(
-                Parameter::Variable(Rc::from("test")),
-                Some(unquoted_literal("default"))
-            )
+            ParameterExpansion::UnsetError {
+                parameter: Parameter::Variable(Rc::from("test")),
+                word: Some(unquoted_literal("default")),
+                error_on_null: true,
+            }
         );
         assert_eq!(
             parse_parameter_expansion("${test?default}"),
-            ParameterExpansion::UnsetError(
-                Parameter::Variable(Rc::from("test")),
-                Some(unquoted_literal("default"))
-            )
+            ParameterExpansion::UnsetError {
+                parameter: Parameter::Variable(Rc::from("test")),
+                word: Some(unquoted_literal("default")),
+                error_on_null: false,
+            }
         );
         assert_eq!(
             parse_parameter_expansion("${test:+default}"),
-            ParameterExpansion::SetUseAlternative(
-                Parameter::Variable(Rc::from("test")),
-                Some(unquoted_literal("default"))
-            )
+            ParameterExpansion::SetUseAlternative {
+                parameter: Parameter::Variable(Rc::from("test")),
+                word: Some(unquoted_literal("default")),
+                substitute_null_with_word: false,
+            }
         );
         assert_eq!(
             parse_parameter_expansion("${test+default}"),
-            ParameterExpansion::SetNullUseAlternative(
-                Parameter::Variable(Rc::from("test")),
-                Some(unquoted_literal("default"))
-            )
+            ParameterExpansion::SetUseAlternative {
+                parameter: Parameter::Variable(Rc::from("test")),
+                word: Some(unquoted_literal("default")),
+                substitute_null_with_word: true,
+            }
         );
     }
 
@@ -1232,35 +1266,67 @@ mod tests {
     fn test_parse_parameter_expansion_expression_with_no_default() {
         assert_eq!(
             parse_parameter_expansion("${test:-}"),
-            ParameterExpansion::NullUnsetUseDefault(Parameter::Variable(Rc::from("test")), None)
+            ParameterExpansion::UnsetUseDefault {
+                parameter: Parameter::Variable(Rc::from("test")),
+                word: None,
+                default_on_null: true
+            }
         );
         assert_eq!(
             parse_parameter_expansion("${test-}"),
-            ParameterExpansion::UnsetUseDefault(Parameter::Variable(Rc::from("test")), None)
+            ParameterExpansion::UnsetUseDefault {
+                parameter: Parameter::Variable(Rc::from("test")),
+                word: None,
+                default_on_null: false
+            }
         );
         assert_eq!(
             parse_parameter_expansion("${test:=}"),
-            ParameterExpansion::NullUnsetAssignDefault(Parameter::Variable(Rc::from("test")), None)
+            ParameterExpansion::UnsetAssignDefault {
+                parameter: Parameter::Variable(Rc::from("test")),
+                word: None,
+                assign_on_null: true
+            }
         );
         assert_eq!(
             parse_parameter_expansion("${test=}"),
-            ParameterExpansion::UnsetAssignDefault(Parameter::Variable(Rc::from("test")), None)
+            ParameterExpansion::UnsetAssignDefault {
+                parameter: Parameter::Variable(Rc::from("test")),
+                word: None,
+                assign_on_null: false,
+            }
         );
         assert_eq!(
             parse_parameter_expansion("${test:?}"),
-            ParameterExpansion::NullUnsetError(Parameter::Variable(Rc::from("test")), None)
+            ParameterExpansion::UnsetError {
+                parameter: Parameter::Variable(Rc::from("test")),
+                word: None,
+                error_on_null: true
+            }
         );
         assert_eq!(
             parse_parameter_expansion("${test?}"),
-            ParameterExpansion::UnsetError(Parameter::Variable(Rc::from("test")), None)
+            ParameterExpansion::UnsetError {
+                parameter: Parameter::Variable(Rc::from("test")),
+                word: None,
+                error_on_null: false
+            }
         );
         assert_eq!(
             parse_parameter_expansion("${test:+}"),
-            ParameterExpansion::SetUseAlternative(Parameter::Variable(Rc::from("test")), None)
+            ParameterExpansion::SetUseAlternative {
+                parameter: Parameter::Variable(Rc::from("test")),
+                word: None,
+                substitute_null_with_word: false
+            }
         );
         assert_eq!(
             parse_parameter_expansion("${test+}"),
-            ParameterExpansion::SetNullUseAlternative(Parameter::Variable(Rc::from("test")), None)
+            ParameterExpansion::SetUseAlternative {
+                parameter: Parameter::Variable(Rc::from("test")),
+                word: None,
+                substitute_null_with_word: true
+            }
         );
     }
 

@@ -35,22 +35,30 @@ pub enum Parameter {
 pub enum ParameterExpansion {
     // $parameter or ${parameter}
     Simple(Parameter),
-    // ${parameter:-[word]}
-    NullUnsetUseDefault(Parameter, Option<Word>),
-    // ${parameter-[word]}
-    UnsetUseDefault(Parameter, Option<Word>),
-    // ${parameter:=[word]}
-    NullUnsetAssignDefault(Parameter, Option<Word>),
-    // ${parameter=[word]}
-    UnsetAssignDefault(Parameter, Option<Word>),
-    // ${parameter:?[word]}
-    NullUnsetError(Parameter, Option<Word>),
-    // ${parameter?[word]}
-    UnsetError(Parameter, Option<Word>),
-    // ${parameter:+[word]}
-    SetUseAlternative(Parameter, Option<Word>),
-    // ${parameter+[word]}
-    SetNullUseAlternative(Parameter, Option<Word>),
+    // ${parameter[:]-[word]}
+    UnsetUseDefault {
+        parameter: Parameter,
+        word: Option<Word>,
+        default_on_null: bool,
+    },
+    // ${parameter[:]=[word]}
+    UnsetAssignDefault {
+        parameter: Parameter,
+        word: Option<Word>,
+        assign_on_null: bool,
+    },
+    // ${parameter[:]?[word]}
+    UnsetError {
+        parameter: Parameter,
+        word: Option<Word>,
+        error_on_null: bool,
+    },
+    // ${parameter[:]+[word]}
+    SetUseAlternative {
+        parameter: Parameter,
+        word: Option<Word>,
+        substitute_null_with_word: bool,
+    },
     // ${#parameter}
     StrLen(Parameter),
     // ${parameter%[word]}

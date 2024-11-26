@@ -21,6 +21,7 @@ pub enum SpecialParameter {
     Minus,
     Dollar,
     Bang,
+    Zero,
 }
 
 #[derive(Debug, Clone, PartialEq)]

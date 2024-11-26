@@ -198,6 +198,9 @@ impl<'src> Parser<'src> {
             WordToken::Char('!') => {
                 advance_and_return(self, Parameter::Special(SpecialParameter::Bang))
             }
+            WordToken::Char('0') => {
+                advance_and_return(self, Parameter::Special(SpecialParameter::Zero))
+            }
             WordToken::Char(d) if d.is_ascii_digit() => {
                 if only_consider_first_digit {
                     Parameter::Number(d.to_digit(10).unwrap())
@@ -1158,6 +1161,10 @@ mod tests {
         assert_eq!(
             parse_parameter_expansion("$!"),
             ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Bang))
+        );
+        assert_eq!(
+            parse_parameter_expansion("$0"),
+            ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Zero))
         );
     }
 

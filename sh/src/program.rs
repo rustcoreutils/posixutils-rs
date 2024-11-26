@@ -13,9 +13,21 @@ pub type CompleteCommandList = Vec<CompleteCommand>;
 pub type Name = Rc<str>;
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum SpecialParameter {
+    At,
+    Asterisk,
+    Hash,
+    QuestionMark,
+    Minus,
+    Dollar,
+    Bang,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Parameter {
     Number(u32),
     Variable(Name),
+    Special(SpecialParameter),
 }
 
 #[derive(Debug, Clone, PartialEq)]

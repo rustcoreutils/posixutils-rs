@@ -9,6 +9,7 @@
 
 use std::{path::is_separator, rc::Rc};
 
+use crate::program::SpecialParameter;
 use crate::{
     lexer::{is_blank, is_operator, Lexer, ShellToken, SourceLocation, TokenId, WordToken},
     program::{
@@ -170,14 +171,33 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_parameter(&mut self, only_consider_first_digit: bool) -> Parameter {
+        fn advance_and_return(parser: &mut Parser, parameter: Parameter) -> Parameter {
+            parser.advance_word();
+            parameter
+        }
+
         match self.word_lookahead() {
-            WordToken::Char('@') => todo!(),
-            WordToken::Char('*') => todo!(),
-            WordToken::Char('#') => todo!(),
-            WordToken::Char('?') => todo!(),
-            WordToken::Char('-') => todo!(),
-            WordToken::Char('$') => todo!(),
-            WordToken::Char('!') => todo!(),
+            WordToken::Char('@') => {
+                advance_and_return(self, Parameter::Special(SpecialParameter::At))
+            }
+            WordToken::Char('*') => {
+                advance_and_return(self, Parameter::Special(SpecialParameter::Asterisk))
+            }
+            WordToken::Char('#') => {
+                advance_and_return(self, Parameter::Special(SpecialParameter::Hash))
+            }
+            WordToken::Char('?') => {
+                advance_and_return(self, Parameter::Special(SpecialParameter::QuestionMark))
+            }
+            WordToken::Char('-') => {
+                advance_and_return(self, Parameter::Special(SpecialParameter::Minus))
+            }
+            WordToken::Dollar => {
+                advance_and_return(self, Parameter::Special(SpecialParameter::Dollar))
+            }
+            WordToken::Char('!') => {
+                advance_and_return(self, Parameter::Special(SpecialParameter::Bang))
+            }
             WordToken::Char(d) if d.is_ascii_digit() => {
                 if only_consider_first_digit {
                     Parameter::Number(d.to_digit(10).unwrap())
@@ -1106,6 +1126,38 @@ mod tests {
         assert_eq!(
             parse_parameter_expansion("${12345}"),
             ParameterExpansion::Simple(Parameter::Number(12345))
+        );
+    }
+
+    #[test]
+    fn parse_special_parameters() {
+        assert_eq!(
+            parse_parameter_expansion("$@"),
+            ParameterExpansion::Simple(Parameter::Special(SpecialParameter::At))
+        );
+        assert_eq!(
+            parse_parameter_expansion("$*"),
+            ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Asterisk))
+        );
+        assert_eq!(
+            parse_parameter_expansion("$#"),
+            ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Hash))
+        );
+        assert_eq!(
+            parse_parameter_expansion("$?"),
+            ParameterExpansion::Simple(Parameter::Special(SpecialParameter::QuestionMark))
+        );
+        assert_eq!(
+            parse_parameter_expansion("$-"),
+            ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Minus))
+        );
+        assert_eq!(
+            parse_parameter_expansion("$$"),
+            ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Dollar))
+        );
+        assert_eq!(
+            parse_parameter_expansion("$!"),
+            ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Bang))
         );
     }
 

@@ -19,6 +19,7 @@ notify-debouncer-full = "0.3"
 diff = "0.1"
 dirs = "5.0"
 walkdir = "2"
+memchr = "2"
 
 [dev-dependencies]
 proptest = "1"

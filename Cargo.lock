@@ -1364,9 +1364,8 @@ version = "0.2.2"
 dependencies = [
  "clap",
  "gettext-rs",
- "plib-testing",
  "libc",
- "plib",
+ "plib-testing",
  "termion",
  "thiserror",
 ]

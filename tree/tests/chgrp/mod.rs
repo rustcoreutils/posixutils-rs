@@ -7,7 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
 use std::{
     ffi::{CStr, CString},
     fs, io,
@@ -19,6 +18,8 @@ use std::{
     thread,
     time::Duration,
 };
+
+use plib_testing::{run_test, TestPlan};
 
 fn chgrp_test(args: &[&str], expected_output: &str, expected_error: &str, expected_exit_code: i32) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();

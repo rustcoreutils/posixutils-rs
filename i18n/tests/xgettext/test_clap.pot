@@ -1,0 +1,36 @@
+#: tests/xgettext/test_clap.rs:29
+msgid "Arguments for the utility"
+msgstr ""
+
+#: tests/xgettext/test_clap.rs:33
+msgid "Print help"
+msgstr ""
+
+#: tests/xgettext/test_clap.rs:36
+msgid "Print version"
+msgstr ""
+
+#: tests/xgettext/test_clap.rs:23
+msgid "The utility to be invoked"
+msgstr ""
+
+#: tests/xgettext/test_clap.rs:19
+msgid "Write timing output to standard error in POSIX format"
+msgstr ""
+
+#: tests/xgettext/test_clap.rs:10
+msgid "time - time a simple command or give resource usage"
+msgstr ""
+
+#: tests/xgettext/test_clap.rs:11
+msgid "{about}\n"
+"\n"
+"Usage: {usage}\n"
+"\n"
+"Arguments:\n"
+"{positionals}\n"
+"\n"
+"Options:\n"
+"{options}"
+msgstr ""
+

@@ -7,11 +7,13 @@
 // SPDX-License-Identifier: MIT
 //
 
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
+
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use plib::io::input_stream;
+use plib::BUFSZ;
 
 const TABSTOP: usize = 8;
 
@@ -100,9 +102,9 @@ fn find_last_blank(v: &[u8]) -> Option<usize> {
 
 fn fold_file(args: &Args, pathname: &PathBuf) -> io::Result<()> {
     // open file, or stdin
-    let mut file = plib::io::input_stream(pathname, false)?;
+    let mut file = input_stream(pathname, false)?;
 
-    let mut raw_buffer = [0; plib::BUFSZ];
+    let mut raw_buffer = [0; BUFSZ];
     let mut state = OutputState::new(args);
 
     loop {
@@ -165,12 +167,11 @@ fn fold_file(args: &Args, pathname: &PathBuf) -> io::Result<()> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
-    let mut args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
+
+    let mut args = Args::parse();
 
     // if no files, read from stdin
     if args.files.is_empty() {

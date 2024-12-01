@@ -14,20 +14,18 @@ use crate::program::{
     SourceLocation, SpecialVar, VarId,
 };
 use crate::regex::Regex;
+
 use pest::error::InputLocation;
-use pest::{
-    iterators::{Pair, Pairs},
-    pratt_parser::PrattParser,
-    Parser,
-};
+use pest::iterators::{Pair, Pairs};
+use pest::pratt_parser::{Assoc, Op, PrattParser};
+use pest::Parser;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::ffi::CString;
+use std::hash::Hash;
 use std::rc::Rc;
 use std::str::Chars;
-use std::{
-    cell::{Cell, RefCell},
-    collections::HashMap,
-    hash::Hash,
-};
+use std::sync::LazyLock;
 
 struct BuiltinFunctionInfo {
     function: BuiltinFunction,
@@ -35,151 +33,205 @@ struct BuiltinFunctionInfo {
     max_args: u16,
 }
 
-lazy_static::lazy_static! {
-    static ref BUILTIN_FUNCTIONS: HashMap<Rule, BuiltinFunctionInfo> = HashMap::from([
-        (Rule::atan2, BuiltinFunctionInfo {
-            function: BuiltinFunction::Atan2,
-            min_args: 2,
-            max_args: 2,
-        }),
-        (Rule::cos, BuiltinFunctionInfo {
-            function: BuiltinFunction::Cos,
-            min_args: 1,
-            max_args: 1,
-        }),
-        (Rule::sin, BuiltinFunctionInfo {
-            function: BuiltinFunction::Sin,
-            min_args: 1,
-            max_args: 1,
-        }),
-        (Rule::exp, BuiltinFunctionInfo {
-            function: BuiltinFunction::Exp,
-            min_args: 1,
-            max_args: 1,
-        }),
-        (Rule::log, BuiltinFunctionInfo {
-            function: BuiltinFunction::Log,
-            min_args: 1,
-            max_args: 1,
-        }),
-        (Rule::sqrt, BuiltinFunctionInfo {
-            function: BuiltinFunction::Sqrt,
-            min_args: 1,
-            max_args: 1,
-        }),
-        (Rule::int, BuiltinFunctionInfo {
-            function: BuiltinFunction::Int,
-            min_args: 1,
-            max_args: 1,
-        }),
-        (Rule::rand, BuiltinFunctionInfo {
-            function: BuiltinFunction::Rand,
-            min_args: 0,
-            max_args: 0,
-        }),
-        (Rule::srand, BuiltinFunctionInfo {
-            function: BuiltinFunction::Srand,
-            min_args: 0,
-            max_args: 1,
-        }),
+static BUILTIN_FUNCTIONS: LazyLock<HashMap<Rule, BuiltinFunctionInfo>> = LazyLock::new(|| {
+    HashMap::from([
+        (
+            Rule::atan2,
+            BuiltinFunctionInfo {
+                function: BuiltinFunction::Atan2,
+                min_args: 2,
+                max_args: 2,
+            },
+        ),
+        (
+            Rule::cos,
+            BuiltinFunctionInfo {
+                function: BuiltinFunction::Cos,
+                min_args: 1,
+                max_args: 1,
+            },
+        ),
+        (
+            Rule::sin,
+            BuiltinFunctionInfo {
+                function: BuiltinFunction::Sin,
+                min_args: 1,
+                max_args: 1,
+            },
+        ),
+        (
+            Rule::exp,
+            BuiltinFunctionInfo {
+                function: BuiltinFunction::Exp,
+                min_args: 1,
+                max_args: 1,
+            },
+        ),
+        (
+            Rule::log,
+            BuiltinFunctionInfo {
+                function: BuiltinFunction::Log,
+                min_args: 1,
+                max_args: 1,
+            },
+        ),
+        (
+            Rule::sqrt,
+            BuiltinFunctionInfo {
+                function: BuiltinFunction::Sqrt,
+                min_args: 1,
+                max_args: 1,
+            },
+        ),
+        (
+            Rule::int,
+            BuiltinFunctionInfo {
+                function: BuiltinFunction::Int,
+                min_args: 1,
+                max_args: 1,
+            },
+        ),
+        (
+            Rule::rand,
+            BuiltinFunctionInfo {
+                function: BuiltinFunction::Rand,
+                min_args: 0,
+                max_args: 0,
+            },
+        ),
+        (
+            Rule::srand,
+            BuiltinFunctionInfo {
+                function: BuiltinFunction::Srand,
+                min_args: 0,
+                max_args: 1,
+            },
+        ),
+        (
+            Rule::gsub,
+            BuiltinFunctionInfo {
+                function: BuiltinFunction::Gsub,
+                min_args: 2,
+                max_args: 3,
+            },
+        ),
+        (
+            Rule::index,
+            BuiltinFunctionInfo {
+                function: BuiltinFunction::Index,
+                min_args: 2,
+                max_args: 2,
+            },
+        ),
+        (
+            Rule::length,
+            BuiltinFunctionInfo {
+                function: BuiltinFunction::Length,
+                min_args: 0,
+                max_args: 1,
+            },
+        ),
+        (
+            Rule::match_fn,
+            BuiltinFunctionInfo {
+                function: BuiltinFunction::Match,
+                min_args: 2,
+                max_args: 2,
+            },
+        ),
+        (
+            Rule::split,
+            BuiltinFunctionInfo {
+                function: BuiltinFunction::Split,
+                min_args: 2,
+                max_args: 3,
+            },
+        ),
+        (
+            Rule::sprintf,
+            BuiltinFunctionInfo {
+                function: BuiltinFunction::Sprintf,
+                min_args: 1,
+                max_args: u16::MAX,
+            },
+        ),
+        (
+            Rule::sub,
+            BuiltinFunctionInfo {
+                function: BuiltinFunction::Sub,
+                min_args: 2,
+                max_args: 3,
+            },
+        ),
+        (
+            Rule::substr,
+            BuiltinFunctionInfo {
+                function: BuiltinFunction::Substr,
+                min_args: 2,
+                max_args: 3,
+            },
+        ),
+        (
+            Rule::tolower,
+            BuiltinFunctionInfo {
+                function: BuiltinFunction::ToLower,
+                min_args: 1,
+                max_args: 1,
+            },
+        ),
+        (
+            Rule::toupper,
+            BuiltinFunctionInfo {
+                function: BuiltinFunction::ToUpper,
+                min_args: 1,
+                max_args: 1,
+            },
+        ),
+        (
+            Rule::close,
+            BuiltinFunctionInfo {
+                function: BuiltinFunction::Close,
+                min_args: 1,
+                max_args: 1,
+            },
+        ),
+        (
+            Rule::fflush,
+            BuiltinFunctionInfo {
+                function: BuiltinFunction::FFlush,
+                min_args: 0,
+                max_args: 1,
+            },
+        ),
+        (
+            Rule::system,
+            BuiltinFunctionInfo {
+                function: BuiltinFunction::System,
+                min_args: 1,
+                max_args: 1,
+            },
+        ),
+    ])
+});
 
-        (Rule::gsub, BuiltinFunctionInfo {
-            function: BuiltinFunction::Gsub,
-            min_args: 2,
-            max_args: 3,
-        }),
-        (Rule::index, BuiltinFunctionInfo {
-            function: BuiltinFunction::Index,
-            min_args: 2,
-            max_args: 2,
-        }),
-        (Rule::length, BuiltinFunctionInfo {
-            function: BuiltinFunction::Length,
-            min_args: 0,
-            max_args: 1,
-        }),
-        (Rule::match_fn, BuiltinFunctionInfo {
-            function: BuiltinFunction::Match,
-            min_args: 2,
-            max_args: 2,
-        }),
-        (Rule::split, BuiltinFunctionInfo {
-            function: BuiltinFunction::Split,
-            min_args: 2,
-            max_args: 3,
-        }),
-        (Rule::sprintf, BuiltinFunctionInfo {
-            function: BuiltinFunction::Sprintf,
-            min_args: 1,
-            max_args: u16::MAX,
-        }),
-        (Rule::sub, BuiltinFunctionInfo {
-            function: BuiltinFunction::Sub,
-            min_args: 2,
-            max_args: 3,
-        }),
-        (Rule::substr, BuiltinFunctionInfo {
-            function: BuiltinFunction::Substr,
-            min_args: 2,
-            max_args: 3,
-        }),
-        (Rule::tolower, BuiltinFunctionInfo {
-            function: BuiltinFunction::ToLower,
-            min_args: 1,
-            max_args: 1,
-        }),
-        (Rule::toupper, BuiltinFunctionInfo {
-            function: BuiltinFunction::ToUpper,
-            min_args: 1,
-            max_args: 1,
-        }),
-
-        (Rule::close, BuiltinFunctionInfo {
-            function: BuiltinFunction::Close,
-            min_args: 1,
-            max_args: 1,
-        }),
-        (Rule::fflush, BuiltinFunctionInfo {
-            function: BuiltinFunction::FFlush,
-            min_args: 0,
-            max_args: 1,
-        }),
-        (Rule::system, BuiltinFunctionInfo {
-            function: BuiltinFunction::System,
-            min_args: 1,
-            max_args: 1,
-        })
-    ]);
-}
-
-lazy_static::lazy_static! {
-    static ref PRATT_PARSER: PrattParser<Rule> = {
-        use pest::pratt_parser::{Assoc, Op};
-
-        // Precedence is defined lowest to highest
-        PrattParser::new()
+static PRATT_PARSER: LazyLock<PrattParser<Rule>> = LazyLock::new(|| {
+    // Precedence is defined lowest to highest
+    PrattParser::new()
         .op(Op::infix(Rule::or, Assoc::Left))
         .op(Op::infix(Rule::and, Assoc::Left))
-            .op(Op::infix(Rule::in_op, Assoc::Left))
-        .op(Op::infix(Rule::match_op, Assoc::Left)
-            | Op::infix(Rule::not_match, Assoc::Left))
+        .op(Op::infix(Rule::in_op, Assoc::Left))
+        .op(Op::infix(Rule::match_op, Assoc::Left) | Op::infix(Rule::not_match, Assoc::Left))
         .op(Op::infix(Rule::comp_op, Assoc::Left))
         .op(Op::infix(Rule::concat, Assoc::Left))
-        .op(Op::infix(Rule::add, Assoc::Left)
-            | Op::infix(Rule::binary_sub, Assoc::Left))
+        .op(Op::infix(Rule::add, Assoc::Left) | Op::infix(Rule::binary_sub, Assoc::Left))
         .op(Op::infix(Rule::mul, Assoc::Left)
             | Op::infix(Rule::div, Assoc::Left)
             | Op::infix(Rule::modulus, Assoc::Left))
-        .op(Op::prefix(Rule::not)
-            | Op::prefix(Rule::negate)
-            | Op::prefix(Rule::unary_plus))
+        .op(Op::prefix(Rule::not) | Op::prefix(Rule::negate) | Op::prefix(Rule::unary_plus))
         .op(Op::infix(Rule::pow, Assoc::Right))
-        .op(Op::prefix(Rule::pre_inc)
-            | Op::prefix(Rule::pre_dec))
-        .op(Op::postfix(Rule::post_inc)
-            | Op::postfix(Rule::post_dec))
-    };
-}
+        .op(Op::prefix(Rule::pre_inc) | Op::prefix(Rule::pre_dec))
+        .op(Op::postfix(Rule::post_inc) | Op::postfix(Rule::post_dec))
+});
 
 #[derive(pest_derive::Parser, Default)]
 #[grammar = "grammar.pest"]

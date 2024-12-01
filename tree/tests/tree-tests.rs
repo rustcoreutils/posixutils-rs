@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod chgrp;
 mod cp;
 mod link;
 mod ls;

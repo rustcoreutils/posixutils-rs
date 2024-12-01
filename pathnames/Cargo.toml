@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-pathnames"
-version = "0.2.1"
+version = "0.2.2"
 authors = ["Jeff Garzik"]
 repository.workspace = true
 license.workspace = true
@@ -8,10 +8,12 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-plib = { path = "../plib" }
 clap.workspace = true
 gettext-rs.workspace = true
 libc.workspace = true
+
+[dev-dependencies]
+plib = { path = "../plib" }
 
 [lints]
 workspace = true

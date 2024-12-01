@@ -8,7 +8,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::{run_test, TestPlan};
+use plib::testing::{run_test, TestPlan};
 
 fn test_test(args: &[&str], expected_code: i32) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();

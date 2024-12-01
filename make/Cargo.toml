@@ -1,0 +1,21 @@
+[package]
+name = "posixutils-make"
+version = "0.2.2"
+edition = "2021"
+authors = ["Jeff Garzik"]
+license = "MIT"
+repository = "https://github.com/rustcoreutils/posixutils-rs.git"
+
+[dependencies]
+clap.workspace = true
+libc.workspace = true
+gettext-rs.workspace = true
+const_format = "0.2"
+rowan = "0.15"
+
+[dev-dependencies]
+plib = { path = "../plib" }
+
+[[bin]]
+name = "make"
+path = "src/main.rs"

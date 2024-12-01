@@ -12,11 +12,13 @@
 // - Questionable behavior:  if write_all() produces Err, the program will
 //   continue to the next file, rather than stopping.
 
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
+
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use plib::io::input_stream;
+use plib::BUFSZ;
 
 #[derive(Parser)]
 #[command(version, about = gettext("cat - concatenate and print files"))]
@@ -34,8 +36,8 @@ struct Args {
 }
 
 fn cat_file(pathname: &PathBuf) -> io::Result<()> {
-    let mut file = plib::io::input_stream(pathname, true)?;
-    let mut buffer = [0; plib::BUFSZ];
+    let mut file = input_stream(pathname, true)?;
+    let mut buffer = [0; BUFSZ];
 
     loop {
         let n_read = file.read(&mut buffer[..])?;
@@ -50,12 +52,11 @@ fn cat_file(pathname: &PathBuf) -> io::Result<()> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
-    let mut args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
+
+    let mut args = Args::parse();
 
     // if no file args, read from stdin
     if args.files.is_empty() {

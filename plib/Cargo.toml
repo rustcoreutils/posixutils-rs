@@ -1,6 +1,6 @@
 [package]
 name = "plib"
-version = "0.2.1"
+version = "0.2.2"
 authors = ["Jeff Garzik"]
 repository.workspace = true
 license.workspace = true

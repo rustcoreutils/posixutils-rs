@@ -7,13 +7,15 @@
 // SPDX-License-Identifier: MIT
 //
 
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 use std::cmp;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, Error, ErrorKind, Read, Write};
 use std::path::PathBuf;
+
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use plib::io::{input_reader, input_stream};
+use plib::BUFSZ;
 
 #[derive(Parser)]
 #[command(version, about = gettext("split - split a file into pieces"))]
@@ -213,8 +215,8 @@ fn split_by_bytes(args: &Args, bytesplit: String) -> io::Result<()> {
     };
 
     // open file, or stdin
-    let mut file = plib::io::input_stream(&args.file, false)?;
-    let mut raw_buffer = [0; plib::BUFSZ];
+    let mut file = input_stream(&args.file, false)?;
+    let mut raw_buffer = [0; BUFSZ];
     let mut state = OutputState::new(&args.prefix, boundary, args.suffix_len);
 
     loop {
@@ -237,7 +239,7 @@ fn split_by_lines(args: &Args, linesplit: u64) -> io::Result<()> {
     assert!(linesplit > 0);
 
     // open file, or stdin
-    let mut reader = plib::io::input_reader(&args.file, false)?;
+    let mut reader = input_reader(&args.file, false)?;
     let mut state = OutputState::new(&args.prefix, linesplit, args.suffix_len);
 
     loop {
@@ -258,12 +260,11 @@ fn split_by_lines(args: &Args, linesplit: u64) -> io::Result<()> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
-    let mut args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
+
+    let mut args = Args::parse();
 
     if args.lines.is_none() && args.bytes.is_none() {
         args.lines = Some(1000);

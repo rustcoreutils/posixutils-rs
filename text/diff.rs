@@ -25,7 +25,6 @@ use diff_util::{
     functions::check_existance,
 };
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 
 /// diff - compare two files
 #[derive(Parser, Clone)]
@@ -104,10 +103,6 @@ impl From<&Args> for OutputFormat {
 }
 
 fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
-
     let path1 = PathBuf::from(&args.file1);
     let path2 = PathBuf::from(&args.file2);
 
@@ -145,7 +140,10 @@ fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
 }
 
 fn main() -> DiffExitStatus {
-    // parse command line arguments
+    setlocale(LocaleCategory::LcAll, "");
+    textdomain(env!("PROJECT_NAME")).unwrap();
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8").unwrap();
+
     let args = Args::parse();
 
     let result = check_difference(args);

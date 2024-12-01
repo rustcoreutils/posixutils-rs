@@ -1,6 +1,5 @@
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
@@ -21,22 +20,6 @@ struct Args {
 
 fn parse_tablist(s: &str) -> Result<Vec<usize>, std::num::ParseIntError> {
     s.split(',').map(|item| item.parse::<usize>()).collect()
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
-    let args = Args::parse();
-
-    let mut exit_code = 0;
-
-    if let Err(err) = unexpand(&args) {
-        exit_code = 1;
-        eprintln!("{}", err);
-    }
-
-    std::process::exit(exit_code)
 }
 
 fn unexpand(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
@@ -179,4 +162,21 @@ fn convert_spaces_to_tabs(line: &str, tabstop: usize) -> String {
 
     result.push_str(&chars.collect::<String>());
     result
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    setlocale(LocaleCategory::LcAll, "");
+    textdomain(env!("PROJECT_NAME"))?;
+    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
+
+    let args = Args::parse();
+
+    let mut exit_code = 0;
+
+    if let Err(err) = unexpand(&args) {
+        exit_code = 1;
+        eprintln!("{}", err);
+    }
+
+    std::process::exit(exit_code)
 }

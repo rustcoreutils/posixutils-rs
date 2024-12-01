@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-calc"
-version = "0.2.1"
+version = "0.2.2"
 repository.workspace = true
 license.workspace = true
 edition.workspace = true
@@ -12,7 +12,6 @@ regex.workspace = true
 clap.workspace = true
 pest = { version = "2.7", default-features = false }
 pest_derive = "2.7"
-lazy_static = "1.4"
 bigdecimal = "0.4"
 rustyline = { version = "14.0", default-features = false }
 

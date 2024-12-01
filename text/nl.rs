@@ -310,8 +310,8 @@ fn nl_main(args: &Args) -> io::Result<()> {
 
 fn main() -> ExitCode {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(env!("PROJECT_NAME")).unwrap();
-    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8").unwrap();
+    textdomain("posixutils-rs").unwrap();
+    bind_textdomain_codeset("posixutils-rs", "UTF-8").unwrap();
 
     let mut args = Args::parse();
 

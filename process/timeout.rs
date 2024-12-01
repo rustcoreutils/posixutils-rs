@@ -469,8 +469,8 @@ fn timeout(args: Args) -> i32 {
 ///     127 - The utility specified by utility could not be found.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(env!("PROJECT_NAME"))?;
-    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
+    textdomain("posixutils-rs")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
 
     let args = Args::try_parse().unwrap_or_else(|err| match err.kind() {
         clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {

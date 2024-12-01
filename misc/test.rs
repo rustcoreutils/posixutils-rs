@@ -279,8 +279,8 @@ fn eval_binary(s1: &str, op_str: &str, s2: &str) -> bool {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(env!("PROJECT_NAME"))?;
-    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
+    textdomain("posixutils-rs")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
 
     let mut args: Vec<String> = std::env::args().collect();
 

@@ -1320,8 +1320,8 @@ fn process_single_dir(
 
 fn main() -> ExitCode {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(env!("PROJECT_NAME")).unwrap();
-    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8").unwrap();
+    textdomain("posixutils-rs").unwrap();
+    bind_textdomain_codeset("posixutils-rs", "UTF-8").unwrap();
     let (config, paths) = Config::new();
 
     match ls(paths, &config) {

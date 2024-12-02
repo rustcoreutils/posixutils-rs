@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod interpreter;
 mod lexer;
 mod parser;
 mod program;

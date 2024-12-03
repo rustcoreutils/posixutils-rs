@@ -33,8 +33,9 @@ fn chgrp_test(args: &[&str], expected_output: &str, expected_error: &str, expect
     });
 }
 
+static INIT_GROUPS: Once = Once::new();
 static mut PRIMARY_GROUP: String = String::new();
-static INIT_PRIMARY_GROUP: Once = Once::new();
+static mut SECONDARY_GROUP: String = String::new();
 
 static mut GID1: u32 = 0;
 static mut GID2: u32 = 0;
@@ -53,11 +54,12 @@ fn get_group_id(name: &CStr) -> u32 {
 
 // Return two groups that the current user belongs to.
 fn get_groups() -> ((String, u32), (String, u32)) {
-    // Linux - (primary group of current user, "adm")
+    // Linux - (primary group of current user, a group in the supplemental group list that
+    //          is not the primary group)
     // macOS - ("staff", "admin")
     let (g1, g2) = if cfg!(target_os = "linux") {
         unsafe {
-            INIT_PRIMARY_GROUP.call_once(|| {
+            INIT_GROUPS.call_once(|| {
                 let uid = libc::getuid();
                 let pw = libc::getpwuid(uid);
                 if pw.is_null() {
@@ -72,8 +74,63 @@ fn get_groups() -> ((String, u32), (String, u32)) {
 
                 let gr_name = CStr::from_ptr((&*gr).gr_name).to_owned();
                 PRIMARY_GROUP = gr_name.to_str().unwrap().to_owned();
+
+                let mut count = libc::getgroups(0, std::ptr::null_mut());
+                if count < 0 {
+                    panic!(
+                        "unable to determine number of secondary groups {}",
+                        io::Error::last_os_error()
+                    );
+                }
+
+                let mut groups_ptr: *mut libc::gid_t =
+                    libc::malloc(std::mem::size_of::<libc::gid_t>() * count as usize)
+                        as *mut libc::gid_t;
+
+                if groups_ptr.is_null() {
+                    panic!(
+                        "unable to allocate memory for groups list: {}",
+                        io::Error::last_os_error()
+                    );
+                }
+
+                count = libc::getgroups(count, groups_ptr);
+                match count {
+                    _ if count < 2 => panic!("user must be a member of at least two groups"),
+                    -1 => panic!(
+                        "unable to get secondary groups: {}",
+                        io::Error::last_os_error()
+                    ),
+                    _ => {}
+                }
+
+                for _ in 0..count {
+                    if groups_ptr.is_null() {
+                        panic!("unable to get second group: reached end of group list");
+                    }
+
+                    // Skip over the primary_gid
+                    if *groups_ptr == primary_gid {
+                        groups_ptr = groups_ptr.offset(1);
+                        continue;
+                    } else {
+                        let second_gid = *groups_ptr;
+                        let sec_grent = libc::getgrgid(second_gid);
+                        if sec_grent.is_null() {
+                            panic!("Unable to get group entry for secondary group id {second_gid}");
+                        }
+
+                        let sec_gr_name = CStr::from_ptr((&*sec_grent).gr_name).to_owned();
+                        SECONDARY_GROUP = sec_gr_name.to_str().unwrap().to_owned();
+                        break;
+                    }
+                }
+                if SECONDARY_GROUP == "" {
+                    panic!("unable to find suitable secondary group");
+                }
             });
-            (PRIMARY_GROUP.clone(), "adm".to_owned())
+
+            (PRIMARY_GROUP.clone(), SECONDARY_GROUP.clone())
         }
     } else if cfg!(target_os = "macos") {
         ("staff".to_owned(), "admin".to_owned())

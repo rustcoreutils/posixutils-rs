@@ -532,8 +532,8 @@ fn pr_merged(paths: &[PathBuf], params: &Parameters) -> io::Result<()> {
 
 fn main() -> ExitCode {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(env!("PROJECT_NAME")).unwrap();
-    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8").unwrap();
+    textdomain("posixutils-rs").unwrap();
+    bind_textdomain_codeset("posixutils-rs", "UTF-8").unwrap();
 
     let args = Args::parse_custom();
 

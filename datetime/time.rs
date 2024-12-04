@@ -132,9 +132,9 @@ impl Status {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(env!("PROJECT_NAME"))?;
-    bindtextdomain(env!("PROJECT_NAME"), "locale")?;
-    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8")?;
+    textdomain("posixutils-rs")?;
+    bindtextdomain("posixutils-rs", "locale")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
 
     let args = Args::parse();
 

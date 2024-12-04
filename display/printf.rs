@@ -492,10 +492,10 @@ fn main() -> ExitCode {
     setlocale(LocaleCategory::LcAll, "");
     // TODO
     // unwrap
-    textdomain(env!("PROJECT_NAME")).unwrap();
+    textdomain("posixutils-rs").unwrap();
     // TODO
     // unwrap
-    bind_textdomain_codeset(env!("PROJECT_NAME"), "UTF-8").unwrap();
+    bind_textdomain_codeset("posixutils-rs", "UTF-8").unwrap();
 
     let args = std::env::args_os().collect::<Vec<_>>();
 

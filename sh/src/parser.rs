@@ -259,10 +259,20 @@ impl<'src> Parser<'src> {
                 if self.word_lookahead() == WordToken::Char('%') {
                     self.advance_word();
                     let word = self.parse_word_until(WordToken::Char('}'));
-                    return ParameterExpansion::RemoveLargestSuffix(parameter, word);
+                    return ParameterExpansion::RemovePattern {
+                        parameter,
+                        pattern: word,
+                        remove_largest: true,
+                        remove_prefix: false,
+                    };
                 } else {
                     let word = self.parse_word_until(WordToken::Char('}'));
-                    return ParameterExpansion::RemoveSmallestSuffix(parameter, word);
+                    return ParameterExpansion::RemovePattern {
+                        parameter,
+                        pattern: word,
+                        remove_largest: false,
+                        remove_prefix: false,
+                    };
                 }
             }
 
@@ -271,11 +281,20 @@ impl<'src> Parser<'src> {
                 if self.word_lookahead() == WordToken::Char('#') {
                     self.advance_word();
                     let word = self.parse_word_until(WordToken::Char('}'));
-                    return ParameterExpansion::RemoveLargestPrefix(parameter, word);
+                    return ParameterExpansion::RemovePattern {
+                        parameter,
+                        pattern: word,
+                        remove_largest: true,
+                        remove_prefix: true,
+                    };
                 } else {
                     let word = self.parse_word_until(WordToken::Char('}'));
-
-                    return ParameterExpansion::RemoveSmallestPrefix(parameter, word);
+                    return ParameterExpansion::RemovePattern {
+                        parameter,
+                        pattern: word,
+                        remove_largest: false,
+                        remove_prefix: true,
+                    };
                 }
             }
             // TODO: restructure this for better errors
@@ -1338,31 +1357,39 @@ mod tests {
         );
         assert_eq!(
             parse_parameter_expansion("${test%pattern}"),
-            ParameterExpansion::RemoveSmallestSuffix(
-                Parameter::Variable(Rc::from("test")),
-                Some(unquoted_literal("pattern"))
-            )
+            ParameterExpansion::RemovePattern {
+                parameter: Parameter::Variable(Rc::from("test")),
+                pattern: Some(unquoted_literal("pattern")),
+                remove_prefix: false,
+                remove_largest: false,
+            }
         );
         assert_eq!(
             parse_parameter_expansion("${test%%pattern}"),
-            ParameterExpansion::RemoveLargestSuffix(
-                Parameter::Variable(Rc::from("test")),
-                Some(unquoted_literal("pattern"))
-            )
+            ParameterExpansion::RemovePattern {
+                parameter: Parameter::Variable(Rc::from("test")),
+                pattern: Some(unquoted_literal("pattern")),
+                remove_prefix: false,
+                remove_largest: true,
+            }
         );
         assert_eq!(
             parse_parameter_expansion("${test#pattern}"),
-            ParameterExpansion::RemoveSmallestPrefix(
-                Parameter::Variable(Rc::from("test")),
-                Some(unquoted_literal("pattern"))
-            )
+            ParameterExpansion::RemovePattern {
+                parameter: Parameter::Variable(Rc::from("test")),
+                pattern: Some(unquoted_literal("pattern")),
+                remove_prefix: true,
+                remove_largest: false,
+            }
         );
         assert_eq!(
             parse_parameter_expansion("${test##pattern}"),
-            ParameterExpansion::RemoveLargestPrefix(
-                Parameter::Variable(Rc::from("test")),
-                Some(unquoted_literal("pattern"))
-            )
+            ParameterExpansion::RemovePattern {
+                parameter: Parameter::Variable(Rc::from("test")),
+                pattern: Some(unquoted_literal("pattern")),
+                remove_prefix: true,
+                remove_largest: true,
+            }
         );
     }
 

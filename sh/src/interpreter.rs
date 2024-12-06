@@ -46,6 +46,57 @@ fn is_portable_filename_character(c: char) -> bool {
     c.is_ascii_alphanumeric() || "._-".contains(c)
 }
 
+fn remove_prefix_pattern(mut parameter: Vec<u8>, pattern: CString, remove_largest: bool) -> String {
+    let mut prefix_end = 0;
+    parameter.push(b'\0');
+    for i in 1..parameter.len() {
+        let temp = parameter[i];
+        parameter[i] = b'\0';
+        let match_result = unsafe {
+            libc::fnmatch(
+                pattern.as_ptr(),
+                parameter[..=i].as_ptr() as *const c_char,
+                0,
+            )
+        };
+        parameter[i] = temp;
+        if match_result == 0 {
+            prefix_end = i;
+            if !remove_largest {
+                break;
+            }
+        }
+    }
+    parameter.drain(..prefix_end);
+    // remove '\0' at the end
+    parameter.pop();
+    // if this fails, the above code is wrong
+    String::from_utf8(parameter).unwrap()
+}
+
+fn remove_suffix_pattern(mut parameter: Vec<u8>, pattern: CString, remove_largest: bool) -> String {
+    parameter.push(b'\0');
+    let mut suffix_end = parameter.len() - 1;
+    for i in (0..parameter.len() - 2).rev() {
+        let match_result = unsafe {
+            libc::fnmatch(
+                pattern.as_ptr(),
+                parameter[i..].as_ptr() as *const c_char,
+                0,
+            )
+        };
+        if match_result == 0 {
+            suffix_end = i;
+            if !remove_largest {
+                break;
+            }
+        }
+    }
+    parameter.truncate(suffix_end);
+    // if this fails, the above code is wrong
+    String::from_utf8(parameter).unwrap()
+}
+
 struct Variable {
     value: String,
     export: bool,
@@ -307,17 +358,28 @@ impl Interpreter {
                     }
                 }
             }
-            ParameterExpansion::RemoveSmallestSuffix(_, _) => {
-                todo!()
-            }
-            ParameterExpansion::RemoveLargestSuffix(_, _) => {
-                todo!()
-            }
-            ParameterExpansion::RemoveSmallestPrefix(_, _) => {
-                todo!()
-            }
-            ParameterExpansion::RemoveLargestPrefix(_, _) => {
-                todo!()
+            ParameterExpansion::RemovePattern {
+                parameter,
+                pattern,
+                remove_prefix,
+                remove_largest,
+            } => {
+                let param_str = self.expand_simple_parameter(parameter).unwrap_or_default();
+                if param_str.is_empty() {
+                    return String::new();
+                }
+                if let Some(pattern) = pattern {
+                    // TODO: determine if this unwrap is safe
+                    let pattern = CString::new(self.expand_word(pattern, false)).unwrap();
+                    let bytes = param_str.into_bytes();
+                    if *remove_prefix {
+                        remove_prefix_pattern(bytes, pattern, *remove_largest)
+                    } else {
+                        remove_suffix_pattern(bytes, pattern, *remove_largest)
+                    }
+                } else {
+                    param_str
+                }
             }
         }
     }
@@ -436,6 +498,13 @@ mod test {
         env: HashMap<String, String>,
         user_homes: HashMap<String, String>,
         pid: i32,
+    }
+
+    impl TestSystem {
+        fn add_environment_var(mut self, key: &str, value: &str) -> Self {
+            self.env.insert(key.to_string(), value.to_string());
+            self
+        }
     }
 
     impl SystemInterface for TestSystem {
@@ -668,6 +737,210 @@ mod test {
                 "PWD".into()
             ))),
             "9".to_string()
+        );
+    }
+
+    #[test]
+    fn remove_smallest_suffix() {
+        let mut interpreter =
+            Interpreter::with_system(TestSystem::default().add_environment_var("TEST", "aabbc"));
+        assert_eq!(
+            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+                parameter: Parameter::Variable("HOME".into()),
+                pattern: Some(unquoted_literal("test_user")),
+                remove_largest: false,
+                remove_prefix: false,
+            }),
+            "/home/".to_string()
+        );
+        assert_eq!(
+            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+                parameter: Parameter::Variable("TEST".into()),
+                pattern: Some(unquoted_literal("a*c")),
+                remove_largest: false,
+                remove_prefix: false,
+            }),
+            "a".to_string()
+        );
+        assert_eq!(
+            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+                parameter: Parameter::Variable("NULL".into()),
+                pattern: Some(unquoted_literal("anything")),
+                remove_largest: false,
+                remove_prefix: false,
+            }),
+            "".to_string()
+        );
+        assert_eq!(
+            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+                parameter: Parameter::Variable("UNDEFINED".into()),
+                pattern: Some(unquoted_literal("anything")),
+                remove_largest: false,
+                remove_prefix: false,
+            }),
+            "".to_string()
+        );
+        assert_eq!(
+            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+                parameter: Parameter::Variable("HOME".into()),
+                pattern: None,
+                remove_largest: false,
+                remove_prefix: false,
+            }),
+            "/home/test_user".to_string()
+        );
+    }
+
+    #[test]
+    fn remove_largest_suffix() {
+        let mut interpreter =
+            Interpreter::with_system(TestSystem::default().add_environment_var("TEST", "aabbc"));
+        assert_eq!(
+            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+                parameter: Parameter::Variable("HOME".into()),
+                pattern: Some(unquoted_literal("test_user")),
+                remove_largest: true,
+                remove_prefix: false,
+            }),
+            "/home/".to_string()
+        );
+        assert_eq!(
+            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+                parameter: Parameter::Variable("TEST".into()),
+                pattern: Some(unquoted_literal("a*c")),
+                remove_largest: true,
+                remove_prefix: false,
+            }),
+            "".to_string()
+        );
+        assert_eq!(
+            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+                parameter: Parameter::Variable("NULL".into()),
+                pattern: Some(unquoted_literal("anything")),
+                remove_largest: true,
+                remove_prefix: false,
+            }),
+            "".to_string()
+        );
+        assert_eq!(
+            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+                parameter: Parameter::Variable("UNDEFINED".into()),
+                pattern: Some(unquoted_literal("anything")),
+                remove_largest: true,
+                remove_prefix: false,
+            }),
+            "".to_string()
+        );
+        assert_eq!(
+            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+                parameter: Parameter::Variable("HOME".into()),
+                pattern: None,
+                remove_largest: true,
+                remove_prefix: false,
+            }),
+            "/home/test_user".to_string()
+        );
+    }
+
+    #[test]
+    fn remove_smallest_prefix() {
+        let mut interpreter =
+            Interpreter::with_system(TestSystem::default().add_environment_var("TEST", "abbcc"));
+        assert_eq!(
+            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+                parameter: Parameter::Variable("HOME".into()),
+                pattern: Some(unquoted_literal("/home/")),
+                remove_largest: false,
+                remove_prefix: true,
+            }),
+            "test_user".to_string()
+        );
+        assert_eq!(
+            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+                parameter: Parameter::Variable("TEST".into()),
+                pattern: Some(unquoted_literal("a*c")),
+                remove_largest: false,
+                remove_prefix: true,
+            }),
+            "c".to_string()
+        );
+        assert_eq!(
+            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+                parameter: Parameter::Variable("NULL".into()),
+                pattern: Some(unquoted_literal("anything")),
+                remove_largest: false,
+                remove_prefix: true,
+            }),
+            "".to_string()
+        );
+        assert_eq!(
+            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+                parameter: Parameter::Variable("UNDEFINED".into()),
+                pattern: Some(unquoted_literal("anything")),
+                remove_largest: false,
+                remove_prefix: true,
+            }),
+            "".to_string()
+        );
+        assert_eq!(
+            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+                parameter: Parameter::Variable("HOME".into()),
+                pattern: None,
+                remove_largest: false,
+                remove_prefix: true,
+            }),
+            "/home/test_user".to_string()
+        );
+    }
+
+    #[test]
+    fn remove_largest_prefix() {
+        let mut interpreter =
+            Interpreter::with_system(TestSystem::default().add_environment_var("TEST", "abbcc"));
+        assert_eq!(
+            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+                parameter: Parameter::Variable("HOME".into()),
+                pattern: Some(unquoted_literal("/home/")),
+                remove_largest: true,
+                remove_prefix: true,
+            }),
+            "test_user".to_string()
+        );
+        assert_eq!(
+            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+                parameter: Parameter::Variable("TEST".into()),
+                pattern: Some(unquoted_literal("a*c")),
+                remove_largest: true,
+                remove_prefix: true,
+            }),
+            "".to_string()
+        );
+        assert_eq!(
+            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+                parameter: Parameter::Variable("NULL".into()),
+                pattern: Some(unquoted_literal("anything")),
+                remove_largest: true,
+                remove_prefix: true,
+            }),
+            "".to_string()
+        );
+        assert_eq!(
+            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+                parameter: Parameter::Variable("UNDEFINED".into()),
+                pattern: Some(unquoted_literal("anything")),
+                remove_largest: true,
+                remove_prefix: true,
+            }),
+            "".to_string()
+        );
+        assert_eq!(
+            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+                parameter: Parameter::Variable("HOME".into()),
+                pattern: None,
+                remove_largest: true,
+                remove_prefix: true,
+            }),
+            "/home/test_user".to_string()
         );
     }
 }

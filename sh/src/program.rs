@@ -61,14 +61,15 @@ pub enum ParameterExpansion {
     },
     // ${#parameter}
     StrLen(Parameter),
-    // ${parameter%[word]}
-    RemoveSmallestSuffix(Parameter, Option<Word>),
-    // ${parameter%%[word]}
-    RemoveLargestSuffix(Parameter, Option<Word>),
-    // ${parameter#[word]}
-    RemoveSmallestPrefix(Parameter, Option<Word>),
-    // ${parameter##[word]}
-    RemoveLargestPrefix(Parameter, Option<Word>),
+    // ${parameter(%[%]|#[#])[word]}
+    RemovePattern {
+        parameter: Parameter,
+        pattern: Option<Word>,
+        /// otherwise remove smallest
+        remove_largest: bool,
+        /// otherwise remove suffix
+        remove_prefix: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

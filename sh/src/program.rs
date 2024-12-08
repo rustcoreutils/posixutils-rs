@@ -172,18 +172,16 @@ impl std::fmt::Debug for Assignment {
 
 #[derive(PartialEq, Default, Clone)]
 pub struct SimpleCommand {
-    pub command: Option<Word>,
     pub assignments: Vec<Assignment>,
     pub redirections: Vec<Redirection>,
-    pub arguments: Vec<Word>,
+    pub words: Vec<Word>,
 }
 
 impl std::fmt::Debug for SimpleCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "SimpleCommand:")?;
         writeln!(f, "  assignments: {:?}", self.assignments)?;
-        writeln!(f, "  command: {:?}", self.command)?;
-        writeln!(f, "  arguments: {:?}", self.arguments)?;
+        writeln!(f, "  words: {:?}", self.words)?;
         writeln!(f, "  redirections: {:?}", self.redirections)?;
         Ok(())
     }

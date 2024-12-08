@@ -575,34 +575,36 @@ impl<'src> Parser<'src> {
             }
         }
 
-        if let Some(start) = start {
-            // TODO: temporary code, this shoud be refactored
-            match try_word_to_assignment(start) {
-                Ok(assignment) => command.assignments.push(assignment),
-                Err(cmd) => {
-                    command.command = Some(cmd);
+        /// returns true if there are no more words to parse
+        fn add_word_or_assignment(
+            parser: &mut Parser,
+            word_stop: WordToken,
+            word: Option<Word>,
+            command: &mut SimpleCommand,
+        ) -> bool {
+            if let Some(word) = word {
+                match try_word_to_assignment(word) {
+                    Ok(assignment) => command.assignments.push(assignment),
+                    Err(cmd) => {
+                        command.words.push(cmd);
+                    }
                 }
             }
-            if word_stop != WordToken::EOF && self.word_lookahead() == word_stop {
-                return wrap_command(command);
+            if word_stop != WordToken::EOF && parser.word_lookahead() == word_stop {
+                true
+            } else {
+                false
             }
         }
 
-        loop {
-            if command.command.is_some() {
-                break;
-            }
+        if add_word_or_assignment(self, word_stop, start, &mut command) {
+            return wrap_command(command);
+        }
+
+        while command.words.is_empty() {
             if self.go_to_word_start(true) {
-                if let Some(word) = self.parse_word_until(word_stop) {
-                    match try_word_to_assignment(word) {
-                        Ok(assignment) => command.assignments.push(assignment),
-                        Err(cmd) => {
-                            command.command = Some(cmd);
-                            break;
-                        }
-                    }
-                }
-                if word_stop != WordToken::EOF && self.word_lookahead() == word_stop {
+                let word = self.parse_word_until(word_stop);
+                if add_word_or_assignment(self, word_stop, word, &mut command) {
                     return wrap_command(command);
                 }
             } else {
@@ -617,7 +619,7 @@ impl<'src> Parser<'src> {
         loop {
             if self.go_to_word_start(true) {
                 if let Some(word) = self.parse_word_until(word_stop) {
-                    command.arguments.push(word);
+                    command.words.push(word);
                 }
                 if word_stop != WordToken::EOF && self.word_lookahead() == word_stop {
                     return wrap_command(command);
@@ -1020,7 +1022,7 @@ mod tests {
     fn pipeline_from_word(word: Word) -> Pipeline {
         Pipeline {
             commands: vec![Command::SimpleCommand(SimpleCommand {
-                command: Some(word),
+                words: vec![word],
                 ..Default::default()
             })],
             negate_status: false,
@@ -1074,8 +1076,8 @@ mod tests {
     }
 
     fn parse_word(word: &str) -> Word {
-        let command = unwrap_simple_command(parse(&format!("fake_cmd {}", word)));
-        command.arguments.into_iter().next().unwrap()
+        let command = unwrap_simple_command(parse(word));
+        command.words.into_iter().next().unwrap()
     }
 
     fn parse_parameter_expansion(word: &str) -> ParameterExpansion {
@@ -1093,8 +1095,7 @@ mod tests {
 
     fn parse_single_redirection(text: &str) -> Redirection {
         let cmd = parse_simple_command(text);
-        assert_eq!(cmd.command, None);
-        assert!(cmd.arguments.is_empty());
+        assert!(cmd.words.is_empty());
         assert!(cmd.assignments.is_empty());
         assert_eq!(cmd.redirections.len(), 1);
         cmd.redirections.into_iter().next().unwrap()
@@ -1396,8 +1397,7 @@ mod tests {
     #[test]
     fn parse_simple_command_no_assignments_no_redirections_no_arguments() {
         let command = parse_simple_command("pwd");
-        assert_eq!(command.command, Some(unquoted_literal("pwd")));
-        assert!(command.arguments.is_empty());
+        assert_eq!(command.words, vec![unquoted_literal("pwd")]);
         assert!(command.assignments.is_empty());
         assert!(command.redirections.is_empty());
     }
@@ -1405,19 +1405,17 @@ mod tests {
     #[test]
     fn parse_simple_command_single_assignment() {
         let command = parse_simple_command("a=1");
-        assert!(command.command.is_none());
         assert_eq!(command.assignments.len(), 1);
         assert_eq!(command.assignments[0].name, Rc::from("a"));
         assert_eq!(command.assignments[0].value, unquoted_literal("1"));
         assert!(command.redirections.is_empty());
-        assert!(command.arguments.is_empty());
+        assert!(command.words.is_empty());
     }
 
     #[test]
     fn parse_simple_command_multiple_assignment() {
         let command =
             parse_simple_command("PATH=/bin:/usr/bin:/usr/local/bin a=1 b=\"this is a test\"");
-        assert!(command.command.is_none());
         assert_eq!(command.assignments.len(), 3);
         assert_eq!(command.assignments[0].name, Rc::from("PATH"));
         assert_eq!(
@@ -1432,7 +1430,7 @@ mod tests {
             quoted_literal("this is a test")
         );
         assert!(command.redirections.is_empty());
-        assert!(command.arguments.is_empty());
+        assert!(command.words.is_empty());
     }
 
     #[test]
@@ -1526,8 +1524,7 @@ mod tests {
     #[test]
     fn parse_simple_command_single_redirection() {
         let command = parse_simple_command("> file.txt");
-        assert!(command.command.is_none());
-        assert!(command.arguments.is_empty());
+        assert!(command.words.is_empty());
         assert!(command.assignments.is_empty());
         assert_eq!(command.redirections.len(), 1);
         assert_eq!(
@@ -1542,7 +1539,7 @@ mod tests {
     #[test]
     fn parse_command_with_redirections() {
         let command = parse_simple_command("< input command > output");
-        assert_eq!(command.command, Some(unquoted_literal("command")));
+        assert_eq!(command.words, vec![unquoted_literal("command")]);
         assert_eq!(
             command.redirections,
             vec![
@@ -1562,7 +1559,6 @@ mod tests {
                 }
             ]
         );
-        assert!(command.arguments.is_empty());
         assert!(command.assignments.is_empty());
     }
 
@@ -1571,10 +1567,10 @@ mod tests {
         let command = parse_simple_command("echo this is a test");
         assert!(command.assignments.is_empty());
         assert!(command.redirections.is_empty());
-        assert_eq!(command.command, Some(unquoted_literal("echo")));
         assert_eq!(
-            command.arguments,
+            command.words,
             vec![
+                unquoted_literal("echo"),
                 unquoted_literal("this"),
                 unquoted_literal("is"),
                 unquoted_literal("a"),
@@ -1586,8 +1582,10 @@ mod tests {
     #[test]
     fn parse_simple_command_with_arguments_and_redirections() {
         let command = parse_simple_command("cat test_file.txt >> ../other_file.txt");
-        assert_eq!(command.command, Some(unquoted_literal("cat")));
-        assert_eq!(command.arguments, vec![unquoted_literal("test_file.txt")]);
+        assert_eq!(
+            command.words,
+            vec![unquoted_literal("cat"), unquoted_literal("test_file.txt")]
+        );
         assert_eq!(
             command.redirections,
             vec![Redirection {
@@ -1604,7 +1602,6 @@ mod tests {
     #[test]
     fn parse_simple_command_with_arguments_redirections_and_assignments() {
         let command = parse_simple_command("CARGO_LOG=warn cargo build > build_result.txt");
-        assert_eq!(command.command, Some(unquoted_literal("cargo")));
         assert_eq!(
             command.assignments,
             vec![Assignment {
@@ -1612,7 +1609,10 @@ mod tests {
                 value: unquoted_literal("warn")
             }]
         );
-        assert_eq!(command.arguments, vec![unquoted_literal("build")]);
+        assert_eq!(
+            command.words,
+            vec![unquoted_literal("cargo"), unquoted_literal("build")]
+        );
         assert_eq!(
             command.redirections,
             vec![Redirection {
@@ -1658,16 +1658,14 @@ mod tests {
         assert_eq!(
             pipeline.commands[0],
             Command::SimpleCommand(SimpleCommand {
-                command: Some(unquoted_literal("echo")),
-                arguments: vec![unquoted_literal("hello")],
+                words: vec![unquoted_literal("echo"), unquoted_literal("hello")],
                 ..Default::default()
             })
         );
         assert_eq!(
             pipeline.commands[1],
             Command::SimpleCommand(SimpleCommand {
-                command: Some(unquoted_literal("wc")),
-                arguments: vec![unquoted_literal("-l")],
+                words: vec![unquoted_literal("wc"), unquoted_literal("-l")],
                 ..Default::default()
             })
         );
@@ -1683,7 +1681,7 @@ mod tests {
             (
                 Pipeline {
                     commands: vec![Command::SimpleCommand(SimpleCommand {
-                        command: Some(unquoted_literal("a")),
+                        words: vec![unquoted_literal("a")],
                         ..Default::default()
                     })],
                     negate_status: false
@@ -1696,7 +1694,7 @@ mod tests {
             (
                 Pipeline {
                     commands: vec![Command::SimpleCommand(SimpleCommand {
-                        command: Some(unquoted_literal("b")),
+                        words: vec![unquoted_literal("b")],
                         ..Default::default()
                     })],
                     negate_status: false
@@ -1716,7 +1714,7 @@ mod tests {
                 elements: vec![(
                     Pipeline {
                         commands: vec![Command::SimpleCommand(SimpleCommand {
-                            command: Some(unquoted_literal("a")),
+                            words: vec![unquoted_literal("a")],
                             ..Default::default()
                         })],
                         negate_status: false
@@ -1732,7 +1730,7 @@ mod tests {
                 elements: vec![(
                     Pipeline {
                         commands: vec![Command::SimpleCommand(SimpleCommand {
-                            command: Some(unquoted_literal("b")),
+                            words: vec![unquoted_literal("b")],
                             ..Default::default()
                         })],
                         negate_status: false
@@ -1754,8 +1752,10 @@ mod tests {
                         elements: vec![(
                             Pipeline {
                                 commands: vec![Command::SimpleCommand(SimpleCommand {
-                                    command: Some(unquoted_literal("echo")),
-                                    arguments: vec![unquoted_literal("hello")],
+                                    words: vec![
+                                        unquoted_literal("echo"),
+                                        unquoted_literal("hello")
+                                    ],
                                     ..Default::default()
                                 })],
                                 negate_status: false
@@ -1782,8 +1782,10 @@ mod tests {
                             elements: vec![(
                                 Pipeline {
                                     commands: vec![Command::SimpleCommand(SimpleCommand {
-                                        command: Some(unquoted_literal("echo")),
-                                        arguments: vec![unquoted_literal("world")],
+                                        words: vec![
+                                            unquoted_literal("echo"),
+                                            unquoted_literal("world")
+                                        ],
                                         ..Default::default()
                                     })],
                                     negate_status: false
@@ -1811,8 +1813,7 @@ mod tests {
                     elements: vec![(
                         Pipeline {
                             commands: vec![Command::SimpleCommand(SimpleCommand {
-                                command: Some(unquoted_literal("echo")),
-                                arguments: vec![unquoted_literal("hello")],
+                                words: vec![unquoted_literal("echo"), unquoted_literal("hello")],
                                 ..Default::default()
                             })],
                             negate_status: false,
@@ -1831,8 +1832,7 @@ mod tests {
                         elements: vec![(
                             Pipeline {
                                 commands: vec![Command::SimpleCommand(SimpleCommand {
-                                    command: Some(unquoted_literal("echo")),
-                                    arguments: vec![inner],
+                                    words: vec![unquoted_literal("echo"), inner],
                                     ..Default::default()
                                 })],
                                 negate_status: false
@@ -2205,7 +2205,7 @@ mod tests {
             parse_pipeline("!cmd"),
             Pipeline {
                 commands: vec![Command::SimpleCommand(SimpleCommand {
-                    command: Some(unquoted_literal("cmd")),
+                    words: vec![unquoted_literal("cmd")],
                     ..Default::default()
                 })],
                 negate_status: true
@@ -2218,8 +2218,7 @@ mod tests {
         assert_eq!(
             parse_simple_command("echo if"),
             SimpleCommand {
-                command: Some(unquoted_literal("echo")),
-                arguments: vec![unquoted_literal("if")],
+                words: vec![unquoted_literal("echo"), unquoted_literal("if")],
                 ..Default::default()
             }
         );

@@ -119,7 +119,7 @@ impl Variable {
 }
 
 pub struct Interpreter {
-    variables: HashMap<String, Variable>,
+    environment: HashMap<String, Variable>,
     most_recent_pipeline_status: i32,
     shell_pid: i32,
     most_recent_background_command_pid: i32,
@@ -131,7 +131,7 @@ impl Interpreter {
         if login_name.is_empty() {
             // > If the login name is null (that is, the tilde-prefix contains only the tilde),
             // > the tilde-prefix is replaced by the value of the variable HOME
-            self.variables
+            self.environment
                 .get("HOME")
                 .map(|v| v.value.clone())
                 .unwrap_or_else(|| todo!("error: HOME not set"))
@@ -215,7 +215,7 @@ impl Interpreter {
                 todo!()
             }
             Parameter::Variable(var_name) => self
-                .variables
+                .environment
                 .get(var_name.as_ref())
                 .map(|v| v.value.clone()),
             Parameter::Special(special_parameter) => match special_parameter {
@@ -285,12 +285,12 @@ impl Interpreter {
                             .as_ref()
                             .map(|w| self.expand_word(w, false))
                             .unwrap_or_default();
-                        match self.variables.get_mut(variable_name.as_ref()) {
+                        match self.environment.get_mut(variable_name.as_ref()) {
                             Some(variable) if *assign_on_null && variable.value.is_empty() => {
                                 variable.value = value.clone();
                             }
                             None => {
-                                self.variables.insert(
+                                self.environment.insert(
                                     variable_name.to_string(),
                                     Variable::new(value.clone()),
                                 );
@@ -463,7 +463,7 @@ impl Interpreter {
             .map(|(k, v)| (k, Variable::new_exported(v)))
             .collect();
         Interpreter {
-            variables,
+            environment: variables,
             most_recent_pipeline_status: 0,
             shell_pid: system.get_pid(),
             most_recent_background_command_pid: 0,

@@ -396,6 +396,11 @@ impl Interpreter {
         }
     }
 
+    /// performs:
+    /// - tilde expansion
+    /// - parameter expansion
+    /// - command substitution
+    /// - arithmetic expansion
     fn expand_word(&mut self, word: &Word, is_assignment: bool) -> String {
         let mut word = word.clone();
         self.tilde_expansion(&mut word, is_assignment);

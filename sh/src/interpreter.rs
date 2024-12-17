@@ -1,10 +1,12 @@
 use crate::program::{
-    Command, CompleteCommand, CompoundCommand, Conjunction, LogicalOp, Parameter,
-    ParameterExpansion, Pipeline, Program, SimpleCommand, SpecialParameter, Word, WordPart,
+    Command, CompleteCommand, CompoundCommand, Conjunction, IORedirectionKind, LogicalOp,
+    Parameter, ParameterExpansion, Pipeline, Program, Redirection, RedirectionKind, SimpleCommand,
+    SpecialParameter, Word, WordPart,
 };
 use std::collections::HashMap;
 use std::ffi::{c_char, CStr, CString};
-use std::process::Stdio;
+use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
+use std::rc::Rc;
 
 trait SystemInterface {
     fn environment_variables(&self) -> HashMap<String, String>;
@@ -13,6 +15,9 @@ trait SystemInterface {
     /// https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap03.html#tag_03_282
     fn get_user_home(&self, login_name: &str) -> Option<String>;
     fn get_pid(&self) -> i32;
+
+    // TODO: change args to something better
+    fn exec(&self, command: &str, args: &[String], interpreter: &Interpreter) -> i32;
 }
 
 #[derive(Default)]
@@ -38,6 +43,57 @@ impl SystemInterface for System {
 
     fn get_pid(&self) -> i32 {
         unsafe { libc::getpid() }
+    }
+
+    fn exec(&self, command: &str, args: &[String], interpreter: &Interpreter) -> i32 {
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            todo!("error: fork failed")
+        } else if pid == 0 {
+            // child
+            for (id, file) in &interpreter.opened_files {
+                let dest = *id as i32;
+                let src = file.as_raw_fd();
+                unsafe { libc::dup2(src, dest) };
+            }
+
+            let command = CString::new(command).unwrap();
+            let args = args
+                .iter()
+                .map(|s| CString::new(s.as_str()).unwrap())
+                .collect::<Vec<_>>();
+            let args = std::iter::once(command.as_ptr())
+                .chain(args.iter().map(|s| s.as_ptr()))
+                .chain(std::iter::once(std::ptr::null() as *const c_char))
+                .collect::<Vec<_>>();
+
+            let env = interpreter
+                .environment
+                .iter()
+                .filter_map(|(name, value)| {
+                    if value.export {
+                        // TODO: look into this unwrap
+                        Some(CString::new(format!("{name}={}", value.value)).unwrap())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<CString>>();
+            let env = env
+                .iter()
+                .map(|s| s.as_ptr())
+                .chain(std::iter::once(std::ptr::null()))
+                .collect::<Vec<_>>();
+            unsafe { libc::execve(command.as_ptr(), args.as_ptr(), env.as_ptr()) }
+        } else {
+            // parent
+            let mut status = 0;
+            let wait_result = unsafe { libc::waitpid(pid, &mut status, 0) };
+            if wait_result != pid {
+                panic!("failed to wait for child process");
+            }
+            libc::WEXITSTATUS(status)
+        }
     }
 }
 
@@ -97,6 +153,7 @@ fn remove_suffix_pattern(mut parameter: Vec<u8>, pattern: CString, remove_larges
     String::from_utf8(parameter).unwrap()
 }
 
+#[derive(Clone)]
 struct Variable {
     value: String,
     export: bool,
@@ -118,12 +175,15 @@ impl Variable {
     }
 }
 
+#[derive(Clone)]
 pub struct Interpreter {
     environment: HashMap<String, Variable>,
+    opened_files: HashMap<u32, Rc<std::fs::File>>,
     most_recent_pipeline_status: i32,
+    last_command_substitution_status: i32,
     shell_pid: i32,
     most_recent_background_command_pid: i32,
-    system: Box<dyn SystemInterface>,
+    system: Rc<dyn SystemInterface>,
 }
 
 impl Interpreter {
@@ -260,7 +320,7 @@ impl Interpreter {
                     Some(value) if !default_on_null || !value.is_empty() => value,
                     _ => {
                         if let Some(default) = default {
-                            self.expand_word(default, false)
+                            self.expand_word_to_string(default, false)
                         } else {
                             String::new()
                         }
@@ -283,7 +343,7 @@ impl Interpreter {
                     Parameter::Variable(variable_name) => {
                         let value = word
                             .as_ref()
-                            .map(|w| self.expand_word(w, false))
+                            .map(|w| self.expand_word_to_string(w, false))
                             .unwrap_or_default();
                         match self.environment.get_mut(variable_name.as_ref()) {
                             Some(variable) if *assign_on_null && variable.value.is_empty() => {
@@ -316,7 +376,7 @@ impl Interpreter {
                     Some(value) if !error_on_null || !value.is_empty() => value,
                     _ => {
                         if let Some(word) = word {
-                            eprintln!("{}", self.expand_word(word, false));
+                            eprintln!("{}", self.expand_word_to_string(word, false));
                         } else if *error_on_null {
                             eprintln!("parameter is unset or null");
                         } else {
@@ -335,7 +395,7 @@ impl Interpreter {
                 // > expansion of word (or an empty string if word is omitted) shall be substituted.
                 match self.expand_simple_parameter(parameter) {
                     Some(value) if *substitute_null_with_word || !value.is_empty() => {
-                        self.expand_word(word.as_ref().unwrap(), false)
+                        self.expand_word_to_string(word.as_ref().unwrap(), false)
                     }
                     _ => String::new(),
                 }
@@ -370,7 +430,7 @@ impl Interpreter {
                 }
                 if let Some(pattern) = pattern {
                     // TODO: determine if this unwrap is safe
-                    let pattern = CString::new(self.expand_word(pattern, false)).unwrap();
+                    let pattern = CString::new(self.expand_word_to_string(pattern, false)).unwrap();
                     let bytes = param_str.into_bytes();
                     if *remove_prefix {
                         remove_prefix_pattern(bytes, pattern, *remove_largest)
@@ -396,12 +456,35 @@ impl Interpreter {
         }
     }
 
+    fn split_fields(&self, expanded_word: String) -> Vec<String> {
+        let ifs = self
+            .environment
+            .get("IFS")
+            .map(|v| v.value.as_str())
+            .unwrap_or(" \t\n");
+        if ifs.is_empty() {
+            return vec![expanded_word];
+        }
+        expanded_word
+            .split(|c| ifs.contains(c))
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn pathname_expansion(&self, pathname: String) -> String {
+        pathname
+    }
+
+    fn quote_removal(&self, quoted_literal: String) -> String {
+        quoted_literal
+    }
+
     /// performs:
     /// - tilde expansion
     /// - parameter expansion
     /// - command substitution
     /// - arithmetic expansion
-    fn expand_word(&mut self, word: &Word, is_assignment: bool) -> String {
+    fn expand_word_to_string(&mut self, word: &Word, is_assignment: bool) -> String {
         let mut word = word.clone();
         self.tilde_expansion(&mut word, is_assignment);
         self.parameter_expansion(&mut word);
@@ -415,8 +498,107 @@ impl Interpreter {
             .collect()
     }
 
+    fn perform_redirection(&mut self, redirection: &Redirection) {
+        match &redirection.kind {
+            RedirectionKind::IORedirection { kind, file } => {
+                // > the word that follows the redirection operator shall be subjected to tilde
+                // > expansion, parameter expansion, command substitution, arithmetic expansion,
+                // > and quote removal.
+                let path = self.expand_word_to_string(file, false);
+                let path = self.quote_removal(path);
+                // TODO: pathname expansion is not allowed if the shell is non-interactive,
+                // optional otherwise. Bash does implement this, maybe we should too.
+                match kind {
+                    IORedirectionKind::RedirectOutput
+                    | IORedirectionKind::RedirectOutputClobber
+                    | IORedirectionKind::RedirectOuputAppend => {
+                        // TODO: fail if noclobber is set and file exists and is a regular file
+
+                        // TODO: fix unwrap
+                        let file = if *kind == IORedirectionKind::RedirectOuputAppend {
+                            std::fs::OpenOptions::new()
+                                .append(true)
+                                .create(true)
+                                .open(path)
+                                .unwrap()
+                        } else {
+                            std::fs::File::create(path).unwrap()
+                        };
+                        let source_fd = redirection
+                            .file_descriptor
+                            .unwrap_or(libc::STDOUT_FILENO as u32);
+                        self.opened_files.insert(source_fd, Rc::new(file));
+                    }
+                    IORedirectionKind::DuplicateOutput => {}
+                    IORedirectionKind::RedirectInput => {}
+                    IORedirectionKind::DuplicateInput => {}
+                    IORedirectionKind::OpenRW => {}
+                }
+            }
+            RedirectionKind::HereDocument { contents } => {}
+        }
+    }
+
     fn interpret_simple_command(&mut self, simple_command: &SimpleCommand) -> i32 {
-        todo!()
+        // > 1. The words that are recognized as variable assignments or redirections according to
+        // >    Shell Grammar Rules are saved for processing in steps 3 and 4.
+        // > 2. The words that are not variable assignments or redirections shall be expanded. If
+        // >    any fields remain following their expansion, the first field shall be considered
+        // >    the command name and remaining fields are the arguments for the command.
+        // > 4. Redirections shall be performed [..].
+        // > 5. Each variable assignment shall be expanded for tilde expansion, parameter expansion,
+        // >    command substitution, arithmetic expansion, and quote removal prior to assigning the
+        // >    value.
+        let mut expanded_words = Vec::new();
+        for word in &simple_command.words {
+            let word_str = self.expand_word_to_string(word, false);
+            let fields = self.split_fields(word_str);
+            let expanded_word = fields
+                .into_iter()
+                .map(|f| self.pathname_expansion(f))
+                .map(|f| self.quote_removal(f));
+            expanded_words.extend(expanded_word);
+        }
+        if expanded_words.is_empty() {
+            // > If there is no command name, any redirections shall be performed in a
+            // > subshell environment;
+            if !simple_command.redirections.is_empty() {
+                let mut subshell = self.clone();
+                for redirection in &simple_command.redirections {
+                    subshell.perform_redirection(redirection);
+                }
+            }
+            // > If no command name results, variable assignments shall affect the current
+            // > execution environment.
+            for assignment in &simple_command.assignments {
+                let word_str = self.expand_word_to_string(&assignment.value, true);
+                self.environment
+                    .insert(assignment.name.to_string(), Variable::new(word_str));
+            }
+            // > If there is no command name, but the command contained a command substitution,
+            // > the command shall complete with the exit status of the last command substitution
+            // > performed.
+            return self.last_command_substitution_status;
+        }
+
+        // TODO: consider all other cases specified in Command Search and Execution
+        let mut command_environment = self.clone();
+        for assignment in &simple_command.assignments {
+            let word_str = self.expand_word_to_string(&assignment.value, true);
+            command_environment.environment.insert(
+                assignment.name.to_string(),
+                Variable::new_exported(word_str),
+            );
+        }
+
+        for redirection in &simple_command.redirections {
+            command_environment.perform_redirection(redirection);
+        }
+        self.system.exec(
+            &expanded_words[0],
+            &expanded_words[1..],
+            &command_environment,
+        )
     }
 
     fn interpret_command(&mut self, command: &Command) -> i32 {
@@ -430,7 +612,16 @@ impl Interpreter {
     }
 
     fn interpret_pipeline(&mut self, pipeline: &Pipeline) -> i32 {
-        todo!()
+        if pipeline.commands.len() > 1 {
+            todo!()
+        }
+        let command = &pipeline.commands[0];
+        let status = self.interpret_command(command);
+        if pipeline.negate_status {
+            (status == 0) as i32
+        } else {
+            status
+        }
     }
 
     fn interpret_conjunction(&mut self, conjunction: &Conjunction) -> i32 {
@@ -459,7 +650,7 @@ impl Interpreter {
     }
 
     fn with_system<S: SystemInterface + 'static>(system: S) -> Self {
-        let system = Box::new(system);
+        let system = Rc::new(system);
         // > If a variable is initialized from the environment, it shall be marked for
         // > export immediately
         let variables = system
@@ -469,7 +660,9 @@ impl Interpreter {
             .collect();
         Interpreter {
             environment: variables,
+            opened_files: HashMap::new(),
             most_recent_pipeline_status: 0,
+            last_command_substitution_status: 0,
             shell_pid: system.get_pid(),
             most_recent_background_command_pid: 0,
             system,
@@ -524,6 +717,10 @@ mod test {
         fn get_pid(&self) -> i32 {
             self.pid
         }
+
+        fn exec(&self, command: &str, args: &[String], interpreter: &Interpreter) -> i32 {
+            0
+        }
     }
 
     impl Default for TestSystem {
@@ -549,15 +746,15 @@ mod test {
     fn expand_tilde() {
         let mut interpreter = Interpreter::with_system(TestSystem::default());
         assert_eq!(
-            interpreter.expand_word(&unquoted_literal("~/"), false),
+            interpreter.expand_word_to_string(&unquoted_literal("~/"), false),
             "/home/test_user/".to_string()
         );
         assert_eq!(
-            interpreter.expand_word(&unquoted_literal("~test_user/"), false),
+            interpreter.expand_word_to_string(&unquoted_literal("~test_user/"), false),
             "/home/test_user/".to_string()
         );
         assert_eq!(
-            interpreter.expand_word(&unquoted_literal("~test_user2"), false),
+            interpreter.expand_word_to_string(&unquoted_literal("~test_user2"), false),
             "/home/test_user2".to_string()
         );
     }
@@ -566,11 +763,14 @@ mod test {
     fn expand_tilde_in_assignments() {
         let mut interpreter = Interpreter::with_system(TestSystem::default());
         assert_eq!(
-            interpreter.expand_word(&unquoted_literal("~/test1:~:~/test3"), true),
+            interpreter.expand_word_to_string(&unquoted_literal("~/test1:~:~/test3"), true),
             "/home/test_user/test1:/home/test_user:/home/test_user/test3".to_string()
         );
         assert_eq!(
-            interpreter.expand_word(&unquoted_literal("~test_user/test1:~test_user2/:~::"), true),
+            interpreter.expand_word_to_string(
+                &unquoted_literal("~test_user/test1:~test_user2/:~::"),
+                true
+            ),
             "/home/test_user/test1:/home/test_user2/:/home/test_user::"
         );
     }

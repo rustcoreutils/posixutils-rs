@@ -8,13 +8,16 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-plib = { path = "../plib" }
+plib.workspace = true
 clap.workspace = true
 gettext-rs.workspace = true
 bytemuck = { version = "1.17", features = ["derive"] }
 byteorder = "1.5"
 strum = "0.26"
 strum_macros = "0.26"
+
+[dev-dependencies]
+plib-testing.workspace = true
 
 [lints]
 workspace = true

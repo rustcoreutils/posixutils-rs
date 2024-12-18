@@ -12,7 +12,7 @@ use std::fs::{remove_file, File};
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
 
-use plib::testing::{run_test, run_test_base, TestPlan};
+use plib_testing::{run_test, run_test_base, TestPlan};
 
 use posixutils_make::error_code::ErrorCode;
 

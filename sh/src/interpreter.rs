@@ -303,7 +303,7 @@ impl Interpreter {
         }
     }
 
-    fn expand_complex_parameter(&mut self, parameter_expansion: &ParameterExpansion) -> String {
+    fn expand_parameter(&mut self, parameter_expansion: &ParameterExpansion) -> String {
         match parameter_expansion {
             ParameterExpansion::Simple(parameter) => {
                 self.expand_simple_parameter(parameter).unwrap_or_default()
@@ -444,16 +444,8 @@ impl Interpreter {
         }
     }
 
-    fn parameter_expansion(&mut self, word: &mut Word) {
-        // TODO:
-        // > If a parameter expansion occurs inside double-quotes:
-        // > - Pathname expansion shall not be performed on the results of the expansion.
-        // > - Field splitting shall not be performed on the results of the expansion.
-        for part in &mut word.parts {
-            if let WordPart::ParameterExpansion { expansion, inside_double_quotes } = part {
-                *part = WordPart::UnquotedLiteral(self.expand_complex_parameter(expansion));
-            }
-        }
+    fn interpret_complete_command_to_string(&self, complete_command: &CompleteCommand) -> String {
+        todo!()
     }
 
     fn split_fields(&self, expanded_word: String) -> Vec<String> {
@@ -480,10 +472,48 @@ impl Interpreter {
     /// - parameter expansion
     /// - command substitution
     /// - arithmetic expansion
-    fn expand_word_to_string(&mut self, word: &Word, is_assignment: bool) -> String {
+    fn expand_word_simple(&mut self, word: &Word, is_assignment: bool) -> Word {
         let mut word = word.clone();
         self.tilde_expansion(&mut word, is_assignment);
-        self.parameter_expansion(&mut word);
+        for part in &mut word.parts {
+            match part {
+                WordPart::ParameterExpansion { expansion, inside_double_quotes } => {
+                    // > If a parameter expansion occurs inside double-quotes:
+                    // > - Pathname expansion shall not be performed on the results of the
+                    // >   expansion.
+                    // > - Field splitting shall not be performed on the results of the expansion.
+                    if *inside_double_quotes {
+                        *part = WordPart::QuotedLiteral(self.expand_parameter(expansion))
+                    } else {
+                        *part = WordPart::UnquotedLiteral(self.expand_parameter(expansion))
+                    }
+                }
+                WordPart::ArithmeticExpansion(_) => {
+                    todo!()
+                }
+                WordPart::CommandSubstitution { command, inside_double_quotes } => {
+                    // > If a command substitution occurs inside double-quotes, field splitting
+                    // > and pathname expansion shall not be performed on the results of
+                    // > the substitution.
+                    if *inside_double_quotes {
+                        *part = WordPart::QuotedLiteral(self.interpret_complete_command_to_string(command))
+                    } else {
+                        *part = WordPart::UnquotedLiteral(self.interpret_complete_command_to_string(command))
+                    }
+                }
+                _ => {}
+            }
+        }
+        word
+    }
+
+    /// performs:
+    /// - tilde expansion
+    /// - parameter expansion
+    /// - command substitution
+    /// - arithmetic expansion
+    fn expand_word_to_string(&mut self, word: &Word, is_assignment: bool) -> String {
+        let word = self.expand_word_simple(word, is_assignment);
         word.parts
             .into_iter()
             .filter_map(|p| match p {
@@ -799,7 +829,7 @@ mod test {
     fn unset_use_default_parameter_expansion() {
         let mut interpreter = Interpreter::with_system(TestSystem::default());
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::UnsetUseDefault {
+            interpreter.expand_parameter(&ParameterExpansion::UnsetUseDefault {
                 parameter: Parameter::Variable("HOME".into()),
                 word: None,
                 default_on_null: false,
@@ -807,7 +837,7 @@ mod test {
             "/home/test_user".to_string()
         );
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::UnsetUseDefault {
+            interpreter.expand_parameter(&ParameterExpansion::UnsetUseDefault {
                 parameter: Parameter::Variable("unset_var".into()),
                 word: Some(unquoted_literal("default")),
                 default_on_null: false,
@@ -815,7 +845,7 @@ mod test {
             "default".to_string()
         );
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::UnsetUseDefault {
+            interpreter.expand_parameter(&ParameterExpansion::UnsetUseDefault {
                 parameter: Parameter::Variable("NULL".into()),
                 word: Some(unquoted_literal("default")),
                 default_on_null: true,
@@ -828,7 +858,7 @@ mod test {
     fn unset_assign_default_parameter_expansion() {
         let mut interpreter = Interpreter::with_system(TestSystem::default());
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::UnsetAssignDefault {
+            interpreter.expand_parameter(&ParameterExpansion::UnsetAssignDefault {
                 parameter: Parameter::Variable("unset_var".into()),
                 word: Some(unquoted_literal("value")),
                 assign_on_null: false,
@@ -836,13 +866,13 @@ mod test {
             "value".to_string()
         );
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::Simple(Parameter::Variable(
+            interpreter.expand_parameter(&ParameterExpansion::Simple(Parameter::Variable(
                 "unset_var".into()
             ))),
             "value".to_string()
         );
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::UnsetAssignDefault {
+            interpreter.expand_parameter(&ParameterExpansion::UnsetAssignDefault {
                 parameter: Parameter::Variable("unset_var".into()),
                 word: None,
                 assign_on_null: false,
@@ -850,13 +880,13 @@ mod test {
             "".to_string()
         );
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::Simple(Parameter::Variable(
+            interpreter.expand_parameter(&ParameterExpansion::Simple(Parameter::Variable(
                 "unset_var".into()
             ))),
             "value".to_string()
         );
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::UnsetAssignDefault {
+            interpreter.expand_parameter(&ParameterExpansion::UnsetAssignDefault {
                 parameter: Parameter::Variable("NULL".into()),
                 word: Some(unquoted_literal("default")),
                 assign_on_null: false,
@@ -864,13 +894,13 @@ mod test {
             "default".to_string()
         );
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::Simple(Parameter::Variable(
+            interpreter.expand_parameter(&ParameterExpansion::Simple(Parameter::Variable(
                 "NULL".into()
             ))),
             "".to_string()
         );
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::UnsetAssignDefault {
+            interpreter.expand_parameter(&ParameterExpansion::UnsetAssignDefault {
                 parameter: Parameter::Variable("NULL".into()),
                 word: Some(unquoted_literal("default")),
                 assign_on_null: true,
@@ -878,7 +908,7 @@ mod test {
             "default".to_string()
         );
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::Simple(Parameter::Variable(
+            interpreter.expand_parameter(&ParameterExpansion::Simple(Parameter::Variable(
                 "NULL".into()
             ))),
             "default".to_string()
@@ -889,7 +919,7 @@ mod test {
     fn set_use_alternative_parameter_expansion() {
         let mut interpreter = Interpreter::with_system(TestSystem::default());
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::SetUseAlternative {
+            interpreter.expand_parameter(&ParameterExpansion::SetUseAlternative {
                 parameter: Parameter::Variable("HOME".into()),
                 word: Some(unquoted_literal("word")),
                 substitute_null_with_word: false,
@@ -897,7 +927,7 @@ mod test {
             "word".to_string()
         );
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::SetUseAlternative {
+            interpreter.expand_parameter(&ParameterExpansion::SetUseAlternative {
                 parameter: Parameter::Variable("unset_var".into()),
                 word: Some(unquoted_literal("word")),
                 substitute_null_with_word: false,
@@ -905,7 +935,7 @@ mod test {
             "".to_string()
         );
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::SetUseAlternative {
+            interpreter.expand_parameter(&ParameterExpansion::SetUseAlternative {
                 parameter: Parameter::Variable("NULL".into()),
                 word: Some(unquoted_literal("word")),
                 substitute_null_with_word: false,
@@ -913,7 +943,7 @@ mod test {
             "".to_string()
         );
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::SetUseAlternative {
+            interpreter.expand_parameter(&ParameterExpansion::SetUseAlternative {
                 parameter: Parameter::Variable("NULL".into()),
                 word: Some(unquoted_literal("word")),
                 substitute_null_with_word: true,
@@ -926,13 +956,13 @@ mod test {
     fn string_length_parameter_expansion() {
         let mut interpreter = Interpreter::with_system(TestSystem::default());
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::StrLen(Parameter::Variable(
+            interpreter.expand_parameter(&ParameterExpansion::StrLen(Parameter::Variable(
                 "HOME".into()
             ))),
             "15".to_string()
         );
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::StrLen(Parameter::Variable(
+            interpreter.expand_parameter(&ParameterExpansion::StrLen(Parameter::Variable(
                 "PWD".into()
             ))),
             "9".to_string()
@@ -944,7 +974,7 @@ mod test {
         let mut interpreter =
             Interpreter::with_system(TestSystem::default().add_environment_var("TEST", "aabbc"));
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable("HOME".into()),
                 pattern: Some(unquoted_literal("test_user")),
                 remove_largest: false,
@@ -953,7 +983,7 @@ mod test {
             "/home/".to_string()
         );
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable("TEST".into()),
                 pattern: Some(unquoted_literal("a*c")),
                 remove_largest: false,
@@ -962,7 +992,7 @@ mod test {
             "a".to_string()
         );
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable("NULL".into()),
                 pattern: Some(unquoted_literal("anything")),
                 remove_largest: false,
@@ -971,7 +1001,7 @@ mod test {
             "".to_string()
         );
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable("UNDEFINED".into()),
                 pattern: Some(unquoted_literal("anything")),
                 remove_largest: false,
@@ -980,7 +1010,7 @@ mod test {
             "".to_string()
         );
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable("HOME".into()),
                 pattern: None,
                 remove_largest: false,
@@ -995,7 +1025,7 @@ mod test {
         let mut interpreter =
             Interpreter::with_system(TestSystem::default().add_environment_var("TEST", "aabbc"));
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable("HOME".into()),
                 pattern: Some(unquoted_literal("test_user")),
                 remove_largest: true,
@@ -1004,7 +1034,7 @@ mod test {
             "/home/".to_string()
         );
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable("TEST".into()),
                 pattern: Some(unquoted_literal("a*c")),
                 remove_largest: true,
@@ -1013,7 +1043,7 @@ mod test {
             "".to_string()
         );
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable("NULL".into()),
                 pattern: Some(unquoted_literal("anything")),
                 remove_largest: true,
@@ -1022,7 +1052,7 @@ mod test {
             "".to_string()
         );
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable("UNDEFINED".into()),
                 pattern: Some(unquoted_literal("anything")),
                 remove_largest: true,
@@ -1031,7 +1061,7 @@ mod test {
             "".to_string()
         );
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable("HOME".into()),
                 pattern: None,
                 remove_largest: true,
@@ -1046,7 +1076,7 @@ mod test {
         let mut interpreter =
             Interpreter::with_system(TestSystem::default().add_environment_var("TEST", "abbcc"));
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable("HOME".into()),
                 pattern: Some(unquoted_literal("/home/")),
                 remove_largest: false,
@@ -1055,7 +1085,7 @@ mod test {
             "test_user".to_string()
         );
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable("TEST".into()),
                 pattern: Some(unquoted_literal("a*c")),
                 remove_largest: false,
@@ -1064,7 +1094,7 @@ mod test {
             "c".to_string()
         );
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable("NULL".into()),
                 pattern: Some(unquoted_literal("anything")),
                 remove_largest: false,
@@ -1073,7 +1103,7 @@ mod test {
             "".to_string()
         );
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable("UNDEFINED".into()),
                 pattern: Some(unquoted_literal("anything")),
                 remove_largest: false,
@@ -1082,7 +1112,7 @@ mod test {
             "".to_string()
         );
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable("HOME".into()),
                 pattern: None,
                 remove_largest: false,
@@ -1097,7 +1127,7 @@ mod test {
         let mut interpreter =
             Interpreter::with_system(TestSystem::default().add_environment_var("TEST", "abbcc"));
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable("HOME".into()),
                 pattern: Some(unquoted_literal("/home/")),
                 remove_largest: true,
@@ -1106,7 +1136,7 @@ mod test {
             "test_user".to_string()
         );
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable("TEST".into()),
                 pattern: Some(unquoted_literal("a*c")),
                 remove_largest: true,
@@ -1115,7 +1145,7 @@ mod test {
             "".to_string()
         );
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable("NULL".into()),
                 pattern: Some(unquoted_literal("anything")),
                 remove_largest: true,
@@ -1124,7 +1154,7 @@ mod test {
             "".to_string()
         );
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable("UNDEFINED".into()),
                 pattern: Some(unquoted_literal("anything")),
                 remove_largest: true,
@@ -1133,7 +1163,7 @@ mod test {
             "".to_string()
         );
         assert_eq!(
-            interpreter.expand_complex_parameter(&ParameterExpansion::RemovePattern {
+            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable("HOME".into()),
                 pattern: None,
                 remove_largest: true,

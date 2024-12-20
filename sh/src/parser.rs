@@ -425,7 +425,7 @@ impl<'src> Parser<'src> {
                     push_literal_and_insert(
                         &mut current_literal,
                         &mut word_parts,
-                        WordPart::ParameterExpansion(self.parse_parameter_expansion()),
+                        WordPart::ParameterExpansion { expansion: self.parse_parameter_expansion(), inside_double_quotes },
                         inside_double_quotes,
                     );
                 }
@@ -434,9 +434,10 @@ impl<'src> Parser<'src> {
                     push_literal_and_insert(
                         &mut current_literal,
                         &mut word_parts,
-                        WordPart::CommandSubstitution(
-                            self.parse_complete_command(WordToken::Backtick),
-                        ),
+                        WordPart::CommandSubstitution {
+                            command: self.parse_complete_command(WordToken::Backtick),
+                            inside_double_quotes,
+                        },
                         inside_double_quotes,
                     );
                     self.match_word_token(WordToken::Backtick);
@@ -446,9 +447,10 @@ impl<'src> Parser<'src> {
                     push_literal_and_insert(
                         &mut current_literal,
                         &mut word_parts,
-                        WordPart::CommandSubstitution(
-                            self.parse_complete_command(WordToken::Char(')')),
-                        ),
+                        WordPart::CommandSubstitution {
+                            command: self.parse_complete_command(WordToken::Char(')')),
+                            inside_double_quotes,
+                        },
                         inside_double_quotes,
                     );
                     self.match_word_token(WordToken::Char(')'));
@@ -1094,10 +1096,21 @@ mod tests {
         command.words.into_iter().next().unwrap()
     }
 
-    fn parse_parameter_expansion(word: &str) -> ParameterExpansion {
+    fn parse_unquoted_parameter_expansion(word: &str) -> ParameterExpansion {
         let word = parse_word(word);
-        if let WordPart::ParameterExpansion(expansion) = word.parts.into_iter().next().unwrap() {
+        if let WordPart::ParameterExpansion { expansion, inside_double_quotes } = word.parts.into_iter().next().unwrap() {
+            assert!(!inside_double_quotes);
             expansion
+        } else {
+            panic!("expected parameter expansion")
+        }
+    }
+
+    fn parse_unquoted_command_substitution(word: &str) -> CompleteCommand {
+        let word = parse_word(word);
+        if let WordPart::CommandSubstitution { command, inside_double_quotes } = word.parts.into_iter().next().unwrap() {
+            assert!(!inside_double_quotes);
+            command
         } else {
             panic!("expected parameter expansion")
         }
@@ -1175,19 +1188,19 @@ mod tests {
     #[test]
     fn parse_simple_parameter_expansion() {
         assert_eq!(
-            parse_parameter_expansion("$test"),
+            parse_unquoted_parameter_expansion("$test"),
             ParameterExpansion::Simple(Parameter::Variable(Rc::from("test")))
         );
         assert_eq!(
-            parse_parameter_expansion("$1"),
+            parse_unquoted_parameter_expansion("$1"),
             ParameterExpansion::Simple(Parameter::Number(1))
         );
         assert_eq!(
-            parse_parameter_expansion("${test}"),
+            parse_unquoted_parameter_expansion("${test}"),
             ParameterExpansion::Simple(Parameter::Variable(Rc::from("test")))
         );
         assert_eq!(
-            parse_parameter_expansion("${12345}"),
+            parse_unquoted_parameter_expansion("${12345}"),
             ParameterExpansion::Simple(Parameter::Number(12345))
         );
     }
@@ -1195,35 +1208,35 @@ mod tests {
     #[test]
     fn parse_special_parameters() {
         assert_eq!(
-            parse_parameter_expansion("$@"),
+            parse_unquoted_parameter_expansion("$@"),
             ParameterExpansion::Simple(Parameter::Special(SpecialParameter::At))
         );
         assert_eq!(
-            parse_parameter_expansion("$*"),
+            parse_unquoted_parameter_expansion("$*"),
             ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Asterisk))
         );
         assert_eq!(
-            parse_parameter_expansion("$#"),
+            parse_unquoted_parameter_expansion("$#"),
             ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Hash))
         );
         assert_eq!(
-            parse_parameter_expansion("$?"),
+            parse_unquoted_parameter_expansion("$?"),
             ParameterExpansion::Simple(Parameter::Special(SpecialParameter::QuestionMark))
         );
         assert_eq!(
-            parse_parameter_expansion("$-"),
+            parse_unquoted_parameter_expansion("$-"),
             ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Minus))
         );
         assert_eq!(
-            parse_parameter_expansion("$$"),
+            parse_unquoted_parameter_expansion("$$"),
             ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Dollar))
         );
         assert_eq!(
-            parse_parameter_expansion("$!"),
+            parse_unquoted_parameter_expansion("$!"),
             ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Bang))
         );
         assert_eq!(
-            parse_parameter_expansion("$0"),
+            parse_unquoted_parameter_expansion("$0"),
             ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Zero))
         );
     }
@@ -1231,7 +1244,7 @@ mod tests {
     #[test]
     fn parse_parameter_expansion_expression() {
         assert_eq!(
-            parse_parameter_expansion("${test:-default}"),
+            parse_unquoted_parameter_expansion("${test:-default}"),
             ParameterExpansion::UnsetUseDefault {
                 parameter: Parameter::Variable(Rc::from("test")),
                 word: Some(unquoted_literal("default")),
@@ -1239,7 +1252,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_parameter_expansion("${test-default}"),
+            parse_unquoted_parameter_expansion("${test-default}"),
             ParameterExpansion::UnsetUseDefault {
                 parameter: Parameter::Variable(Rc::from("test")),
                 word: Some(unquoted_literal("default")),
@@ -1247,7 +1260,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_parameter_expansion("${test:=default}"),
+            parse_unquoted_parameter_expansion("${test:=default}"),
             ParameterExpansion::UnsetAssignDefault {
                 parameter: Parameter::Variable(Rc::from("test")),
                 word: Some(unquoted_literal("default")),
@@ -1255,7 +1268,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_parameter_expansion("${test=default}"),
+            parse_unquoted_parameter_expansion("${test=default}"),
             ParameterExpansion::UnsetAssignDefault {
                 parameter: Parameter::Variable(Rc::from("test")),
                 word: Some(unquoted_literal("default")),
@@ -1263,7 +1276,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_parameter_expansion("${test:?default}"),
+            parse_unquoted_parameter_expansion("${test:?default}"),
             ParameterExpansion::UnsetError {
                 parameter: Parameter::Variable(Rc::from("test")),
                 word: Some(unquoted_literal("default")),
@@ -1271,7 +1284,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_parameter_expansion("${test?default}"),
+            parse_unquoted_parameter_expansion("${test?default}"),
             ParameterExpansion::UnsetError {
                 parameter: Parameter::Variable(Rc::from("test")),
                 word: Some(unquoted_literal("default")),
@@ -1279,7 +1292,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_parameter_expansion("${test:+default}"),
+            parse_unquoted_parameter_expansion("${test:+default}"),
             ParameterExpansion::SetUseAlternative {
                 parameter: Parameter::Variable(Rc::from("test")),
                 word: Some(unquoted_literal("default")),
@@ -1287,7 +1300,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_parameter_expansion("${test+default}"),
+            parse_unquoted_parameter_expansion("${test+default}"),
             ParameterExpansion::SetUseAlternative {
                 parameter: Parameter::Variable(Rc::from("test")),
                 word: Some(unquoted_literal("default")),
@@ -1299,7 +1312,7 @@ mod tests {
     #[test]
     fn test_parse_parameter_expansion_expression_with_no_default() {
         assert_eq!(
-            parse_parameter_expansion("${test:-}"),
+            parse_unquoted_parameter_expansion("${test:-}"),
             ParameterExpansion::UnsetUseDefault {
                 parameter: Parameter::Variable(Rc::from("test")),
                 word: None,
@@ -1307,7 +1320,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_parameter_expansion("${test-}"),
+            parse_unquoted_parameter_expansion("${test-}"),
             ParameterExpansion::UnsetUseDefault {
                 parameter: Parameter::Variable(Rc::from("test")),
                 word: None,
@@ -1315,7 +1328,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_parameter_expansion("${test:=}"),
+            parse_unquoted_parameter_expansion("${test:=}"),
             ParameterExpansion::UnsetAssignDefault {
                 parameter: Parameter::Variable(Rc::from("test")),
                 word: None,
@@ -1323,7 +1336,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_parameter_expansion("${test=}"),
+            parse_unquoted_parameter_expansion("${test=}"),
             ParameterExpansion::UnsetAssignDefault {
                 parameter: Parameter::Variable(Rc::from("test")),
                 word: None,
@@ -1331,7 +1344,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_parameter_expansion("${test:?}"),
+            parse_unquoted_parameter_expansion("${test:?}"),
             ParameterExpansion::UnsetError {
                 parameter: Parameter::Variable(Rc::from("test")),
                 word: None,
@@ -1339,7 +1352,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_parameter_expansion("${test?}"),
+            parse_unquoted_parameter_expansion("${test?}"),
             ParameterExpansion::UnsetError {
                 parameter: Parameter::Variable(Rc::from("test")),
                 word: None,
@@ -1347,7 +1360,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_parameter_expansion("${test:+}"),
+            parse_unquoted_parameter_expansion("${test:+}"),
             ParameterExpansion::SetUseAlternative {
                 parameter: Parameter::Variable(Rc::from("test")),
                 word: None,
@@ -1355,7 +1368,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_parameter_expansion("${test+}"),
+            parse_unquoted_parameter_expansion("${test+}"),
             ParameterExpansion::SetUseAlternative {
                 parameter: Parameter::Variable(Rc::from("test")),
                 word: None,
@@ -1367,11 +1380,11 @@ mod tests {
     #[test]
     fn parse_string_operations_in_parameter_expansion() {
         assert_eq!(
-            parse_parameter_expansion("${#test}"),
+            parse_unquoted_parameter_expansion("${#test}"),
             ParameterExpansion::StrLen(Parameter::Variable(Rc::from("test")))
         );
         assert_eq!(
-            parse_parameter_expansion("${test%pattern}"),
+            parse_unquoted_parameter_expansion("${test%pattern}"),
             ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable(Rc::from("test")),
                 pattern: Some(unquoted_literal("pattern")),
@@ -1380,7 +1393,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_parameter_expansion("${test%%pattern}"),
+            parse_unquoted_parameter_expansion("${test%%pattern}"),
             ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable(Rc::from("test")),
                 pattern: Some(unquoted_literal("pattern")),
@@ -1389,7 +1402,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_parameter_expansion("${test#pattern}"),
+            parse_unquoted_parameter_expansion("${test#pattern}"),
             ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable(Rc::from("test")),
                 pattern: Some(unquoted_literal("pattern")),
@@ -1398,7 +1411,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_parameter_expansion("${test##pattern}"),
+            parse_unquoted_parameter_expansion("${test##pattern}"),
             ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable(Rc::from("test")),
                 pattern: Some(unquoted_literal("pattern")),
@@ -1759,56 +1772,57 @@ mod tests {
     #[test]
     fn parse_simple_command_substitution() {
         assert_eq!(
-            parse_word("$(echo hello)"),
-            Word {
-                parts: vec![WordPart::CommandSubstitution(CompleteCommand {
-                    commands: vec![Conjunction {
-                        elements: vec![(
-                            Pipeline {
-                                commands: vec![Command::SimpleCommand(SimpleCommand {
-                                    words: vec![
-                                        unquoted_literal("echo"),
-                                        unquoted_literal("hello")
-                                    ],
-                                    ..Default::default()
-                                })],
-                                negate_status: false
-                            },
-                            LogicalOp::None
-                        )],
-                        is_async: false
-                    }]
-                })]
+            parse_unquoted_command_substitution("$(echo hello)"),
+            CompleteCommand {
+                commands: vec![Conjunction {
+                    elements: vec![(
+                        Pipeline {
+                            commands: vec![Command::SimpleCommand(SimpleCommand {
+                                words: vec![
+                                    unquoted_literal("echo"),
+                                    unquoted_literal("hello")
+                                ],
+                                ..Default::default()
+                            })],
+                            negate_status: false
+                        },
+                        LogicalOp::None
+                    )],
+                    is_async: false
+                }]
             }
         );
         assert_eq!(parse_word("`echo hello`"), parse_word("$(echo hello)"));
     }
 
     #[test]
-    fn parse_command_substitution_inside_string() {
+    fn parse_command_substitution_inside_double_quotes() {
         assert_eq!(
             parse_word("\"hello $(echo world)\""),
             Word {
                 parts: vec![
                     WordPart::QuotedLiteral("hello ".to_string()),
-                    WordPart::CommandSubstitution(CompleteCommand {
-                        commands: vec![Conjunction {
-                            elements: vec![(
-                                Pipeline {
-                                    commands: vec![Command::SimpleCommand(SimpleCommand {
-                                        words: vec![
-                                            unquoted_literal("echo"),
-                                            unquoted_literal("world")
-                                        ],
-                                        ..Default::default()
-                                    })],
-                                    negate_status: false
-                                },
-                                LogicalOp::None
-                            )],
-                            is_async: false
-                        }]
-                    }),
+                    WordPart::CommandSubstitution {
+                        command: CompleteCommand {
+                            commands: vec![Conjunction {
+                                elements: vec![(
+                                    Pipeline {
+                                        commands: vec![Command::SimpleCommand(SimpleCommand {
+                                            words: vec![
+                                                unquoted_literal("echo"),
+                                                unquoted_literal("world")
+                                            ],
+                                            ..Default::default()
+                                        })],
+                                        negate_status: false
+                                    },
+                                    LogicalOp::None
+                                )],
+                                is_async: false
+                            }]
+                        },
+                        inside_double_quotes: true
+                    },
                     WordPart::QuotedLiteral("".to_string())
                 ]
             }
@@ -1822,54 +1836,58 @@ mod tests {
     #[test]
     fn parse_recursive_command_substitution() {
         let inner = Word {
-            parts: vec![WordPart::CommandSubstitution(CompleteCommand {
-                commands: vec![Conjunction {
-                    elements: vec![(
-                        Pipeline {
-                            commands: vec![Command::SimpleCommand(SimpleCommand {
-                                words: vec![unquoted_literal("echo"), unquoted_literal("hello")],
-                                ..Default::default()
-                            })],
-                            negate_status: false,
-                        },
-                        LogicalOp::None,
-                    )],
-                    is_async: false,
-                }],
-            })],
-        };
-        assert_eq!(
-            parse_word("$(echo $(echo hello))"),
-            Word {
-                parts: vec![WordPart::CommandSubstitution(CompleteCommand {
+            parts: vec![WordPart::CommandSubstitution {
+                command: CompleteCommand {
                     commands: vec![Conjunction {
                         elements: vec![(
                             Pipeline {
                                 commands: vec![Command::SimpleCommand(SimpleCommand {
-                                    words: vec![unquoted_literal("echo"), inner],
+                                    words: vec![unquoted_literal("echo"), unquoted_literal("hello")],
                                     ..Default::default()
                                 })],
-                                negate_status: false
+                                negate_status: false,
                             },
-                            LogicalOp::None
+                            LogicalOp::None,
                         )],
-                        is_async: false
-                    }]
-                })]
+                        is_async: false,
+                    }],
+                },
+                inside_double_quotes: false
+            }],
+        };
+        assert_eq!(
+            parse_unquoted_command_substitution("$(echo $(echo hello))"),
+            CompleteCommand {
+                commands: vec![Conjunction {
+                    elements: vec![(
+                        Pipeline {
+                            commands: vec![Command::SimpleCommand(SimpleCommand {
+                                words: vec![unquoted_literal("echo"), inner],
+                                ..Default::default()
+                            })],
+                            negate_status: false
+                        },
+                        LogicalOp::None
+                    )],
+                    is_async: false
+                }]
             }
         );
     }
 
     #[test]
-    fn test_parse_parameter_expansion_inside_a_string() {
+    fn test_parse_parameter_expansion_inside_double_quotes() {
         assert_eq!(
             parse_word("\"hello $test\""),
             Word {
                 parts: vec![
                     WordPart::QuotedLiteral("hello ".to_string()),
-                    WordPart::ParameterExpansion(ParameterExpansion::Simple(Parameter::Variable(
-                        Rc::from("test")
-                    ))),
+                    WordPart::ParameterExpansion {
+                        expansion: ParameterExpansion::Simple(Parameter::Variable(
+                            Rc::from("test")
+                        )),
+                        inside_double_quotes: true
+                    },
                     WordPart::QuotedLiteral("".to_string())
                 ]
             }
@@ -1879,9 +1897,12 @@ mod tests {
             Word {
                 parts: vec![
                     WordPart::QuotedLiteral("hello ".to_string()),
-                    WordPart::ParameterExpansion(ParameterExpansion::Simple(Parameter::Variable(
-                        Rc::from("test")
-                    ))),
+                    WordPart::ParameterExpansion {
+                        expansion: ParameterExpansion::Simple(Parameter::Variable(
+                            Rc::from("test")
+                        )),
+                        inside_double_quotes: true
+                    },
                     WordPart::QuotedLiteral("".to_string())
                 ]
             }
@@ -2003,7 +2024,7 @@ mod tests {
             parse_compound_command(
                 "case word in (pattern1) cmd1;; (pattern2) cmd2;; (pattern3) cmd3;; esac"
             )
-            .0,
+                .0,
             CompoundCommand::CaseClause {
                 arg: unquoted_literal("word"),
                 cases: vec![
@@ -2207,7 +2228,7 @@ mod tests {
             Command::FunctionDefinition(FunctionDefinition {
                 name: Rc::from("function_name"),
                 body: CompoundCommand::Subshell(CompleteCommand {
-                    commands: vec![conjunction_from_word(unquoted_literal("cmd1"), false),]
+                    commands: vec![conjunction_from_word(unquoted_literal("cmd1"), false), ]
                 })
             })
         );

@@ -118,9 +118,9 @@ pub enum ArithmeticExpr {
 pub enum WordPart {
     UnquotedLiteral(String),
     QuotedLiteral(String),
-    ParameterExpansion(ParameterExpansion),
+    ParameterExpansion{expansion: ParameterExpansion, inside_double_quotes: bool},
     ArithmeticExpansion(ArithmeticExpr),
-    CommandSubstitution(CompleteCommand),
+    CommandSubstitution{command: CompleteCommand, inside_double_quotes: bool},
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]

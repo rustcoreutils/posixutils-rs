@@ -450,7 +450,7 @@ impl Interpreter {
         // > - Pathname expansion shall not be performed on the results of the expansion.
         // > - Field splitting shall not be performed on the results of the expansion.
         for part in &mut word.parts {
-            if let WordPart::ParameterExpansion(expansion) = part {
+            if let WordPart::ParameterExpansion { expansion, inside_double_quotes } = part {
                 *part = WordPart::UnquotedLiteral(self.expand_complex_parameter(expansion));
             }
         }
@@ -727,7 +727,7 @@ mod test {
                 ("test_user".to_string(), "/home/test_user".to_string()),
                 ("test_user2".to_string(), "/home/test_user2".to_string()),
             ]
-            .into();
+                .into();
             TestSystem {
                 env,
                 user_homes,

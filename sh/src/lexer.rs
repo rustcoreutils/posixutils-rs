@@ -91,6 +91,7 @@ pub enum WordToken {
     Dollar,                   // $
     Backtick,                 // `
     EscapedBacktick,          // \`
+    Backslash,                // \
     CommandSubstitutionStart, // $(
     ArithmeticExpansionStart, // $((
 
@@ -355,7 +356,7 @@ impl<'src> Lexer<'src> {
                 if self.lookahead == '`' {
                     advance_and_return(self, WordToken::EscapedBacktick)
                 } else {
-                    WordToken::Char('\\')
+                    WordToken::Backslash
                 }
             }
             '$' => {

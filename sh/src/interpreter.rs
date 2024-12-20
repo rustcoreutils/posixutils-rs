@@ -475,10 +475,6 @@ impl Interpreter {
         pathname
     }
 
-    fn quote_removal(&self, quoted_literal: String) -> String {
-        quoted_literal
-    }
-
     /// performs:
     /// - tilde expansion
     /// - parameter expansion
@@ -505,7 +501,6 @@ impl Interpreter {
                 // > expansion, parameter expansion, command substitution, arithmetic expansion,
                 // > and quote removal.
                 let path = self.expand_word_to_string(file, false);
-                let path = self.quote_removal(path);
                 // TODO: pathname expansion is not allowed if the shell is non-interactive,
                 // optional otherwise. Bash does implement this, maybe we should too.
                 match kind {
@@ -555,8 +550,7 @@ impl Interpreter {
             let fields = self.split_fields(word_str);
             let expanded_word = fields
                 .into_iter()
-                .map(|f| self.pathname_expansion(f))
-                .map(|f| self.quote_removal(f));
+                .map(|f| self.pathname_expansion(f));
             expanded_words.extend(expanded_word);
         }
         if expanded_words.is_empty() {

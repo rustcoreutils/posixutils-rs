@@ -456,6 +456,20 @@ impl<'src> Parser<'src> {
                 WordToken::EscapedBacktick => {
                     todo!("implement nested command substitution");
                 }
+                WordToken::Backslash => {
+                    if inside_double_quotes {
+                        current_literal.push('\\');
+                    } else {
+                        push_literal(&mut current_literal, &mut word_parts, false);
+                        if let Some((c, _)) = self.lexer.next_char() {
+                            current_literal.push(c);
+                        } else {
+                            todo!("error: expected character, got end of file")
+                        }
+                        push_literal(&mut current_literal, &mut word_parts, true);
+                    }
+                    self.advance_word();
+                }
                 WordToken::ArithmeticExpansionStart => {
                     // the closing )) should be consumed by `parse_arithmetic_expansion`
                     push_literal_and_insert(
@@ -2265,5 +2279,36 @@ mod tests {
                 }
             }
         );
+    }
+
+    #[test]
+    fn remove_quotes_from_word() {
+        assert_eq!(
+            parse_word("\"hello\""),
+            quoted_literal("hello")
+        );
+        assert_eq!(
+            parse_word("'hello'"),
+            quoted_literal("hello")
+        );
+        assert_eq!(
+            parse_word("\"\""),
+            quoted_literal("")
+        );
+        assert_eq!(
+            parse_word("''"),
+            quoted_literal("")
+        );
+        assert_eq!(parse_word("'\"hello\"'"), quoted_literal("\"hello\""));
+        assert_eq!(parse_word("\"'hello'\""), quoted_literal("'hello'"));
+        assert_eq!(parse_word("\\'"), quoted_literal("'"));
+        assert_eq!(parse_word("\\\""), quoted_literal("\""));
+        assert_eq!(parse_word("\\\\"), quoted_literal("\\"));
+        assert_eq!(parse_word("\\$1"), Word {
+            parts: vec![WordPart::QuotedLiteral("$".into()), WordPart::UnquotedLiteral("1".into())]
+        });
+        assert_eq!(parse_word("\\$"), quoted_literal("$"));
+        assert_eq!(parse_word("\"\\\""), quoted_literal("\\"));
+        assert_eq!(parse_word("'\\'"), quoted_literal("\\"));
     }
 }

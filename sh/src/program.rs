@@ -117,10 +117,12 @@ pub enum ArithmeticExpr {
 #[derive(Debug, Clone, PartialEq)]
 pub enum WordPart {
     UnquotedLiteral(String),
+    // used in the interpreter to control field splitting
+    GeneratedUnquotedLiteral(String),
     QuotedLiteral(String),
-    ParameterExpansion{expansion: ParameterExpansion, inside_double_quotes: bool},
+    ParameterExpansion { expansion: ParameterExpansion, inside_double_quotes: bool },
     ArithmeticExpansion(ArithmeticExpr),
-    CommandSubstitution{command: CompleteCommand, inside_double_quotes: bool},
+    CommandSubstitution { command: CompleteCommand, inside_double_quotes: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]

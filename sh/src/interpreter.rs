@@ -485,7 +485,7 @@ impl Interpreter {
                     if *inside_double_quotes {
                         *part = WordPart::QuotedLiteral(self.expand_parameter(expansion))
                     } else {
-                        *part = WordPart::UnquotedLiteral(self.expand_parameter(expansion))
+                        *part = WordPart::GeneratedUnquotedLiteral(self.expand_parameter(expansion))
                     }
                 }
                 WordPart::ArithmeticExpansion(_) => {
@@ -498,7 +498,7 @@ impl Interpreter {
                     if *inside_double_quotes {
                         *part = WordPart::QuotedLiteral(self.interpret_complete_command_to_string(command))
                     } else {
-                        *part = WordPart::UnquotedLiteral(self.interpret_complete_command_to_string(command))
+                        *part = WordPart::GeneratedUnquotedLiteral(self.interpret_complete_command_to_string(command))
                     }
                 }
                 _ => {}

@@ -684,10 +684,10 @@ impl Interpreter {
         // >    value.
         let mut expanded_words = Vec::new();
         for word in &simple_command.words {
-            let word_str = self.expand_word_to_string(word, false);
-            // let fields = self.split_fields(word_str);
+            let word_str = self.expand_word_simple(word, false);
+            let fields = self.split_fields(word_str);
             // let expanded_word = fields.into_iter().map(|f| self.pathname_expansion(f));
-            expanded_words.push(word_str);
+            expanded_words.extend(fields);
         }
         if expanded_words.is_empty() {
             // > If there is no command name, any redirections shall be performed in a

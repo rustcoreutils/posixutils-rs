@@ -120,9 +120,28 @@ pub enum WordPart {
     // used in the interpreter to control field splitting
     GeneratedUnquotedLiteral(String),
     QuotedLiteral(String),
-    ParameterExpansion { expansion: ParameterExpansion, inside_double_quotes: bool },
+    ParameterExpansion {
+        expansion: ParameterExpansion,
+        inside_double_quotes: bool,
+    },
     ArithmeticExpansion(ArithmeticExpr),
-    CommandSubstitution { command: CompleteCommand, inside_double_quotes: bool },
+    CommandSubstitution {
+        command: CompleteCommand,
+        inside_double_quotes: bool,
+    },
+}
+
+impl TryFrom<WordPart> for String {
+    type Error = ();
+
+    fn try_from(value: WordPart) -> Result<Self, Self::Error> {
+        match value {
+            WordPart::UnquotedLiteral(lit)
+            | WordPart::GeneratedUnquotedLiteral(lit)
+            | WordPart::QuotedLiteral(lit) => Ok(lit),
+            _ => Err(()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]

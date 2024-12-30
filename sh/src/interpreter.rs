@@ -102,6 +102,28 @@ fn is_portable_filename_character(c: char) -> bool {
     c.is_ascii_alphanumeric() || "._-".contains(c)
 }
 
+fn is_ifs_whitespace(c: char) -> bool {
+    c == ' ' || c == '\t' || c == '\n'
+}
+
+/// Converts a `Word` to a `String` by concatenating all its parts
+/// # Panics
+/// Panics if a `WordPart` is encountered that is not
+/// - `UnquotedLiteral`
+/// - `QuotedLiteral`
+/// - `GeneratedUnquotedLiteral`
+fn word_to_string(word: &Word) -> String {
+    word.parts
+        .iter()
+        .map(|p| match p {
+            WordPart::UnquotedLiteral(s) => s.as_str(),
+            WordPart::QuotedLiteral(s) => s.as_str(),
+            WordPart::GeneratedUnquotedLiteral(s) => s.as_str(),
+            _ => panic!("encountered {:?} while converting word to string", p),
+        })
+        .collect()
+}
+
 fn remove_prefix_pattern(mut parameter: Vec<u8>, pattern: CString, remove_largest: bool) -> String {
     let mut prefix_end = 0;
     parameter.push(b'\0');
@@ -448,19 +470,102 @@ impl Interpreter {
         todo!()
     }
 
-    fn split_fields(&self, expanded_word: String) -> Vec<String> {
+    fn split_fields(&self, expanded_word: Word) -> Vec<String> {
+        // TODO: look into "Note that the shell processes arbitrary bytes from the input fields;
+        // there is no requirement that those bytes form valid characters."
+        if expanded_word.parts.is_empty() {
+            return Vec::new();
+        }
+        // > If the IFS variable is unset [..], its value shall be considered to contain the three
+        // > single-byte characters <space>, <tab>, and <newline>
         let ifs = self
             .environment
             .get("IFS")
             .map(|v| v.value.as_str())
             .unwrap_or(" \t\n");
         if ifs.is_empty() {
-            return vec![expanded_word];
+            // > If the IFS variable is set and has an empty string as its value, no field
+            // > splitting shall occur
+            return vec![word_to_string(&expanded_word)];
         }
-        expanded_word
-            .split(|c| ifs.contains(c))
-            .map(str::to_string)
-            .collect()
+
+        let mut word_iter = expanded_word.parts.into_iter();
+        let mut merged_parts = vec![word_iter.next().unwrap()];
+        for part in word_iter {
+            match (part, merged_parts.last_mut().unwrap()) {
+                (WordPart::UnquotedLiteral(lit), WordPart::UnquotedLiteral(dest)) => {
+                    dest.push_str(&lit)
+                }
+                (
+                    WordPart::GeneratedUnquotedLiteral(lit),
+                    WordPart::GeneratedUnquotedLiteral(dest),
+                ) => dest.push_str(&lit),
+                (WordPart::QuotedLiteral(lit), WordPart::QuotedLiteral(dest)) => {
+                    dest.push_str(&lit)
+                }
+                (part, _) => merged_parts.push(part),
+            }
+        }
+
+        let mut result: Vec<String> = Vec::with_capacity(merged_parts.len());
+        let mut last_field = String::new();
+        for part in merged_parts.into_iter() {
+            match part {
+                WordPart::UnquotedLiteral(lit) | WordPart::QuotedLiteral(lit) => {
+                    // > Fields which contain no results from expansions shall not be affected by
+                    // > field splitting, and shall remain unaltered, simply moving from the list
+                    // > of input fields to be next in the list of output fields.
+                    last_field.push_str(lit.as_str());
+                }
+                WordPart::GeneratedUnquotedLiteral(lit) => {
+                    if lit.is_empty() {
+                        continue;
+                    }
+                    // TODO: this could probably be done more cleanly
+                    let mut iter = lit.chars();
+                    let mut next_char = iter.next().unwrap();
+                    'outer: loop {
+                        if ifs.contains(next_char) {
+                            if is_ifs_whitespace(next_char) {
+                                loop {
+                                    match iter.next() {
+                                        Some(c) => {
+                                            next_char = c;
+                                            if !is_ifs_whitespace(next_char) {
+                                                break;
+                                            }
+                                        }
+                                        None => break 'outer,
+                                    }
+                                }
+                            } else {
+                                if let Some(c) = iter.next() {
+                                    next_char = c;
+                                } else {
+                                    break;
+                                }
+                            }
+                            if !last_field.is_empty() {
+                                result.push(last_field);
+                                last_field = String::new();
+                            }
+                        } else {
+                            last_field.push(next_char);
+                            if let Some(c) = iter.next() {
+                                next_char = c;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+                _ => unreachable!("unexpected word part in field splitting"),
+            }
+        }
+        if !last_field.is_empty() {
+            result.push(last_field);
+        }
+        result
     }
 
     fn pathname_expansion(&self, pathname: String) -> String {
@@ -477,7 +582,10 @@ impl Interpreter {
         self.tilde_expansion(&mut word, is_assignment);
         for part in &mut word.parts {
             match part {
-                WordPart::ParameterExpansion { expansion, inside_double_quotes } => {
+                WordPart::ParameterExpansion {
+                    expansion,
+                    inside_double_quotes,
+                } => {
                     // > If a parameter expansion occurs inside double-quotes:
                     // > - Pathname expansion shall not be performed on the results of the
                     // >   expansion.
@@ -491,14 +599,21 @@ impl Interpreter {
                 WordPart::ArithmeticExpansion(_) => {
                     todo!()
                 }
-                WordPart::CommandSubstitution { command, inside_double_quotes } => {
+                WordPart::CommandSubstitution {
+                    command,
+                    inside_double_quotes,
+                } => {
                     // > If a command substitution occurs inside double-quotes, field splitting
                     // > and pathname expansion shall not be performed on the results of
                     // > the substitution.
                     if *inside_double_quotes {
-                        *part = WordPart::QuotedLiteral(self.interpret_complete_command_to_string(command))
+                        *part = WordPart::QuotedLiteral(
+                            self.interpret_complete_command_to_string(command),
+                        )
                     } else {
-                        *part = WordPart::GeneratedUnquotedLiteral(self.interpret_complete_command_to_string(command))
+                        *part = WordPart::GeneratedUnquotedLiteral(
+                            self.interpret_complete_command_to_string(command),
+                        )
                     }
                 }
                 _ => {}
@@ -514,14 +629,7 @@ impl Interpreter {
     /// - arithmetic expansion
     fn expand_word_to_string(&mut self, word: &Word, is_assignment: bool) -> String {
         let word = self.expand_word_simple(word, is_assignment);
-        word.parts
-            .into_iter()
-            .filter_map(|p| match p {
-                WordPart::UnquotedLiteral(s) => Some(s),
-                WordPart::QuotedLiteral(s) => Some(s),
-                _ => None,
-            })
-            .collect()
+        word_to_string(&word)
     }
 
     fn perform_redirection(&mut self, redirection: &Redirection) {
@@ -577,11 +685,9 @@ impl Interpreter {
         let mut expanded_words = Vec::new();
         for word in &simple_command.words {
             let word_str = self.expand_word_to_string(word, false);
-            let fields = self.split_fields(word_str);
-            let expanded_word = fields
-                .into_iter()
-                .map(|f| self.pathname_expansion(f));
-            expanded_words.extend(expanded_word);
+            // let fields = self.split_fields(word_str);
+            // let expanded_word = fields.into_iter().map(|f| self.pathname_expansion(f));
+            expanded_words.push(word_str);
         }
         if expanded_words.is_empty() {
             // > If there is no command name, any redirections shall be performed in a
@@ -723,7 +829,7 @@ mod test {
     }
 
     impl TestSystem {
-        fn add_environment_var(mut self, key: &str, value: &str) -> Self {
+        fn set_environment_var(mut self, key: &str, value: &str) -> Self {
             self.env.insert(key.to_string(), value.to_string());
             self
         }
@@ -757,7 +863,7 @@ mod test {
                 ("test_user".to_string(), "/home/test_user".to_string()),
                 ("test_user2".to_string(), "/home/test_user2".to_string()),
             ]
-                .into();
+            .into();
             TestSystem {
                 env,
                 user_homes,
@@ -972,7 +1078,7 @@ mod test {
     #[test]
     fn remove_smallest_suffix() {
         let mut interpreter =
-            Interpreter::with_system(TestSystem::default().add_environment_var("TEST", "aabbc"));
+            Interpreter::with_system(TestSystem::default().set_environment_var("TEST", "aabbc"));
         assert_eq!(
             interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable("HOME".into()),
@@ -1023,7 +1129,7 @@ mod test {
     #[test]
     fn remove_largest_suffix() {
         let mut interpreter =
-            Interpreter::with_system(TestSystem::default().add_environment_var("TEST", "aabbc"));
+            Interpreter::with_system(TestSystem::default().set_environment_var("TEST", "aabbc"));
         assert_eq!(
             interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable("HOME".into()),
@@ -1074,7 +1180,7 @@ mod test {
     #[test]
     fn remove_smallest_prefix() {
         let mut interpreter =
-            Interpreter::with_system(TestSystem::default().add_environment_var("TEST", "abbcc"));
+            Interpreter::with_system(TestSystem::default().set_environment_var("TEST", "abbcc"));
         assert_eq!(
             interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable("HOME".into()),
@@ -1125,7 +1231,7 @@ mod test {
     #[test]
     fn remove_largest_prefix() {
         let mut interpreter =
-            Interpreter::with_system(TestSystem::default().add_environment_var("TEST", "abbcc"));
+            Interpreter::with_system(TestSystem::default().set_environment_var("TEST", "abbcc"));
         assert_eq!(
             interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable("HOME".into()),
@@ -1170,6 +1276,136 @@ mod test {
                 remove_prefix: true,
             }),
             "/home/test_user".to_string()
+        );
+    }
+
+    #[test]
+    fn split_fields_on_empty_literal() {
+        let interpreter = Interpreter::with_system(TestSystem::default());
+        assert_eq!(
+            interpreter.split_fields(Word {
+                parts: vec![WordPart::GeneratedUnquotedLiteral("".to_string())]
+            }),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn split_fields_on_single_non_whitespace_char() {
+        let interpreter =
+            Interpreter::with_system(TestSystem::default().set_environment_var("IFS", ":"));
+        assert_eq!(
+            interpreter.split_fields(Word {
+                parts: vec![WordPart::GeneratedUnquotedLiteral("a:b:c:".to_string())]
+            }),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+    }
+
+    #[test]
+    fn split_fields_on_multiple_non_whitespace_char() {
+        let interpreter =
+            Interpreter::with_system(TestSystem::default().set_environment_var("IFS", ":/-"));
+        assert_eq!(
+            interpreter.split_fields(Word {
+                parts: vec![WordPart::GeneratedUnquotedLiteral(
+                    "a:b/c-d-:/x y".to_string()
+                )]
+            }),
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+                "x y".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn split_fields_on_single_whitespace_char() {
+        let interpreter =
+            Interpreter::with_system(TestSystem::default().set_environment_var("IFS", " "));
+        assert_eq!(
+            interpreter.split_fields(Word {
+                parts: vec![WordPart::GeneratedUnquotedLiteral("a b c ".to_string())]
+            }),
+            vec!["a".to_string(), "b".to_string(), "c".to_string(),]
+        );
+    }
+
+    #[test]
+    fn split_fields_on_multiple_whitespace_char() {
+        let interpreter =
+            Interpreter::with_system(TestSystem::default().set_environment_var("IFS", "\t\n"));
+        assert_eq!(
+            interpreter.split_fields(Word {
+                parts: vec![WordPart::GeneratedUnquotedLiteral(
+                    "  a\t\n\t\nb  \tc\nd  e f".to_string()
+                )]
+            }),
+            vec![
+                "  a".to_string(),
+                "b  ".to_string(),
+                "c".to_string(),
+                "d  e f".to_string(),
+            ]
+        )
+    }
+
+    #[test]
+    fn split_fields_default_ifs() {
+        let interpreter = Interpreter::with_system(TestSystem::default());
+        assert_eq!(
+            interpreter.split_fields(Word {
+                parts: vec![WordPart::GeneratedUnquotedLiteral(
+                    "\t\n   a\n\n\t  \n\t word,and\n\t\n \n\tc\n\n\n   \t\n\t ".to_string()
+                )]
+            }),
+            vec!["a".to_string(), "word,and".to_string(), "c".to_string()]
+        );
+    }
+
+    #[test]
+    fn split_fields_by_mixed_ifs() {
+        let interpreter =
+            Interpreter::with_system(TestSystem::default().set_environment_var("IFS", ",.:  \n"));
+        assert_eq!(
+            interpreter.split_fields(Word {
+                parts: vec![WordPart::GeneratedUnquotedLiteral(
+                    "a,b.c  d\n\ne  f".to_string()
+                )]
+            }),
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+                "e".to_string(),
+                "f".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn field_splitting_does_not_affect_non_generated_literals() {
+        let interpreter =
+            Interpreter::with_system(TestSystem::default().set_environment_var("IFS", ":"));
+        assert_eq!(
+            interpreter.split_fields(Word {
+                parts: vec![WordPart::UnquotedLiteral("a:b:c".to_string()),]
+            }),
+            vec!["a:b:c".to_string()]
+        );
+        assert_eq!(
+            interpreter.split_fields(Word {
+                parts: vec![
+                    WordPart::UnquotedLiteral("a:".to_string()),
+                    WordPart::GeneratedUnquotedLiteral("b:c".to_string()),
+                    WordPart::UnquotedLiteral(":d".to_string())
+                ]
+            }),
+            vec!["a:b".to_string(), "c:d".to_string()]
         );
     }
 }

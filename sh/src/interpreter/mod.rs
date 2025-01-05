@@ -8,6 +8,8 @@ use std::ffi::{c_char, CStr, CString};
 use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 use std::rc::Rc;
 
+mod pattern;
+
 trait SystemInterface {
     fn environment_variables(&self) -> HashMap<String, String>;
     /// # Panics

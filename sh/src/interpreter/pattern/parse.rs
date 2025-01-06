@@ -38,11 +38,13 @@ fn is_valid_range_endpoint(item: &BracketItem) -> bool {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub struct BracketExpression {
     pub items: Vec<BracketItem>,
     pub matching: bool,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub enum PatternItem {
     Char(char),
     QuestionMark,
@@ -50,6 +52,7 @@ pub enum PatternItem {
     BracketExpression(BracketExpression),
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub struct ParsedPattern {
     pub items: Vec<PatternItem>,
 }
@@ -286,6 +289,7 @@ impl Parser<'_> {
                 Token::QuotedChar(c) => items.push(PatternItem::Char(c)),
                 Token::Eof => break,
             }
+            self.advance();
         }
         Ok(ParsedPattern { items })
     }
@@ -295,7 +299,6 @@ pub fn parse_pattern(
     pattern: ExpandedWord,
     used_in_filename_expansion: bool,
 ) -> Result<ParsedPattern, String> {
-    let mut items = Vec::new();
     let mut parser = Parser {
         lookahead: Token::Eof,
         inside_quoted_string: false,
@@ -303,6 +306,149 @@ pub fn parse_pattern(
         word_parts: pattern.parts.iter(),
     };
     parser.advance();
+    parser.parse_pattern()
+}
 
-    Ok(ParsedPattern { items })
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_correct_pattern(pattern: ExpandedWord) -> ParsedPattern {
+        parse_pattern(pattern, false).unwrap()
+    }
+
+    #[test]
+    fn parse_empty_pattern() {
+        assert_eq!(
+            parse_correct_pattern(ExpandedWord { parts: vec![] }),
+            ParsedPattern { items: vec![] }
+        );
+    }
+
+    #[test]
+    fn parse_single_char_pattern() {
+        assert_eq!(
+            parse_correct_pattern(ExpandedWord {
+                parts: vec![ExpandedWordPart::UnquotedLiteral("a".to_string())]
+            }),
+            ParsedPattern {
+                items: vec![PatternItem::Char('a')]
+            }
+        );
+    }
+
+    #[test]
+    fn parse_multiple_char_pattern() {
+        assert_eq!(
+            parse_correct_pattern(ExpandedWord {
+                parts: vec![ExpandedWordPart::UnquotedLiteral("abc".to_string()),]
+            }),
+            ParsedPattern {
+                items: vec![
+                    PatternItem::Char('a'),
+                    PatternItem::Char('b'),
+                    PatternItem::Char('c')
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn parse_question_mark_pattern() {
+        assert_eq!(
+            parse_correct_pattern(ExpandedWord {
+                parts: vec![ExpandedWordPart::UnquotedLiteral("a?c".to_string()),]
+            }),
+            ParsedPattern {
+                items: vec![
+                    PatternItem::Char('a'),
+                    PatternItem::QuestionMark,
+                    PatternItem::Char('c')
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn parse_asterisk_pattern() {
+        assert_eq!(
+            parse_correct_pattern(ExpandedWord {
+                parts: vec![ExpandedWordPart::UnquotedLiteral("a*c".to_string()),]
+            }),
+            ParsedPattern {
+                items: vec![
+                    PatternItem::Char('a'),
+                    PatternItem::Asterisk,
+                    PatternItem::Char('c')
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn parse_bracket_with_single_character() {
+        assert_eq!(
+            parse_correct_pattern(ExpandedWord {
+                parts: vec![ExpandedWordPart::UnquotedLiteral("[a]".to_string()),]
+            }),
+            ParsedPattern {
+                items: vec![PatternItem::BracketExpression(BracketExpression {
+                    matching: true,
+                    items: vec![BracketItem::Char('a')]
+                })]
+            }
+        );
+    }
+
+    #[test]
+    fn parse_bracket_expression_with_multiple_characters() {
+        assert_eq!(
+            parse_correct_pattern(ExpandedWord {
+                parts: vec![ExpandedWordPart::UnquotedLiteral("[abc]".to_string()),]
+            }),
+            ParsedPattern {
+                items: vec![PatternItem::BracketExpression(BracketExpression {
+                    matching: true,
+                    items: vec![
+                        BracketItem::Char('a'),
+                        BracketItem::Char('b'),
+                        BracketItem::Char('c')
+                    ]
+                })]
+            }
+        );
+    }
+
+    #[test]
+    fn parse_bracket_expression_with_character_class() {
+        assert_eq!(
+            parse_correct_pattern(ExpandedWord {
+                parts: vec![ExpandedWordPart::UnquotedLiteral("[[:class:]]".to_string()),]
+            }),
+            ParsedPattern {
+                items: vec![PatternItem::BracketExpression(BracketExpression {
+                    matching: true,
+                    items: vec![BracketItem::CharacterClass("class".to_string())]
+                })]
+            }
+        );
+    }
+
+    #[test]
+    fn parse_bracket_with_simple_range() {
+        assert_eq!(
+            parse_correct_pattern(ExpandedWord {
+                parts: vec![ExpandedWordPart::UnquotedLiteral("[a-z]".to_string()),]
+            }),
+            ParsedPattern {
+                items: vec![PatternItem::BracketExpression(BracketExpression {
+                    matching: true,
+                    items: vec![BracketItem::RangeExpression(
+                        RangeEndpoint::Char('a'),
+                        RangeEndpoint::Char('z')
+                    )]
+                })]
+            }
+        );
+    }
 }

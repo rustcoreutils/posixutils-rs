@@ -1,12 +1,13 @@
 use crate::interpreter::{ExpandedWord, ExpandedWordPart};
 
+#[derive(Debug, PartialEq, Eq)]
 pub enum RangeEndpoint {
     Char(char),
     CollatingElement(String),
     CollatingSymbol(String),
-    EquivalenceClass(String),
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub enum BracketItem {
     Char(char),
     CollatingElements(String),
@@ -14,6 +15,27 @@ pub enum BracketItem {
     EquivalenceClass(String),
     CharacterClass(String),
     RangeExpression(RangeEndpoint, RangeEndpoint),
+}
+
+impl TryInto<RangeEndpoint> for BracketItem {
+    type Error = BracketItem;
+    fn try_into(self) -> Result<RangeEndpoint, BracketItem> {
+        match self {
+            BracketItem::Char(c) => Ok(RangeEndpoint::Char(c)),
+            BracketItem::CollatingElements(s) => Ok(RangeEndpoint::CollatingElement(s)),
+            BracketItem::CollatingSymbol(s) => Ok(RangeEndpoint::CollatingSymbol(s)),
+            _ => Err(self),
+        }
+    }
+}
+
+fn is_valid_range_endpoint(item: &BracketItem) -> bool {
+    match item {
+        BracketItem::Char(_)
+        | BracketItem::CollatingElements(_)
+        | BracketItem::CollatingSymbol(_) => true,
+        _ => false,
+    }
 }
 
 pub struct BracketExpression {
@@ -47,6 +69,40 @@ impl Token {
             Self::Char(c)
         }
     }
+}
+
+/// Creates range expressions from a list of bracket items. This function assumes that the `items`
+/// is not empty and has at least one element
+fn create_range_expressions(items: Vec<BracketItem>) -> Vec<BracketItem> {
+    let mut result = Vec::with_capacity(items.len());
+    let mut iter = items.into_iter();
+    result.push(iter.next().unwrap());
+    while let Some(item) = iter.next() {
+        if let BracketItem::Char('-') = item {
+            match (result.pop().unwrap(), iter.next()) {
+                (start, Some(end))
+                    if is_valid_range_endpoint(&start) && is_valid_range_endpoint(&end) =>
+                {
+                    result.push(BracketItem::RangeExpression(
+                        start.try_into().unwrap(),
+                        end.try_into().unwrap(),
+                    ));
+                }
+                (item, Some(next)) => {
+                    result.push(item);
+                    result.push(BracketItem::Char('-'));
+                    result.push(next);
+                }
+                (item, None) => {
+                    result.push(item);
+                    result.push(BracketItem::Char('-'));
+                }
+            }
+        } else {
+            result.push(item);
+        }
+    }
+    result
 }
 
 struct Parser<'w> {
@@ -172,7 +228,7 @@ impl Parser<'_> {
                 Token::Char(']') => {
                     self.advance();
                     return Ok(BracketExpression {
-                        items: expression_items,
+                        items: create_range_expressions(expression_items),
                         matching,
                     });
                 }
@@ -194,9 +250,6 @@ impl Parser<'_> {
                             todo!()
                         }
                         Token::Char('=') => {
-                            todo!()
-                        }
-                        Token::Char('-') => {
                             todo!()
                         }
                         _ => {

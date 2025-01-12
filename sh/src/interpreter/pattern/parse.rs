@@ -79,6 +79,7 @@ impl Token {
 fn create_range_expressions(items: Vec<BracketItem>) -> Vec<BracketItem> {
     let mut result = Vec::with_capacity(items.len());
     let mut iter = items.into_iter();
+    // there is at least one element by contract
     result.push(iter.next().unwrap());
     while let Some(item) = iter.next() {
         if let BracketItem::Char('-') = item {
@@ -193,7 +194,7 @@ impl Parser<'_> {
                 self.store_and_advance(&mut pattern_items);
             }
             Token::Char('!') => {
-                matching = true;
+                matching = false;
                 self.store_and_advance(&mut pattern_items);
                 if self.lookahead == Token::Char(']') {
                     expression_items.push(BracketItem::Char(']'));

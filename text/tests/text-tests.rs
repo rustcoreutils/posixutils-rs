@@ -18,6 +18,7 @@ mod join;
 mod nl;
 mod paste;
 mod pr;
+mod sed;
 mod sort;
 mod tail;
 mod tr;

@@ -15,6 +15,7 @@ topological-sort = "0.2"
 regex.workspace = true
 chrono.workspace = true
 libc.workspace = true
+thiserror = "1.0"
 notify-debouncer-full = "0.3"
 diff = "0.1"
 dirs = "5.0"
@@ -98,6 +99,10 @@ path = "./paste.rs"
 [[bin]]
 name = "pr"
 path = "./pr.rs"
+
+[[bin]]
+name = "sed"
+path = "./sed.rs"
 
 [[bin]]
 name = "tsort"

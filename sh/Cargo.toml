@@ -7,7 +7,6 @@ edition = "2021"
 plib = { path = "../plib" }
 gettext-rs.workspace = true
 clap.workspace = true
-regex.workspace = true
 libc.workspace = true
 
 [[bin]]

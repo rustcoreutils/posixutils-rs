@@ -596,6 +596,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_bracket_expression_with_collating_symbol() {
+        assert_eq!(parse_correct_pattern(ExpandedWord { parts: vec![ExpandedWordPart::UnquotedLiteral("[.ch.]".to_string())] }), ParsedPattern {
+            items: vec![PatternItem::BracketExpression(BracketExpression { items: vec![BracketItem::CollatingSymbol("ch".to_string())], matching: true })]
+        });
+    }
+
+    #[test]
+    fn parse_bracket_expression_with_equivalence_class() {
+        assert_eq!(parse_correct_pattern(ExpandedWord { parts: vec![ExpandedWordPart::UnquotedLiteral("[=a=]".to_string())] }), ParsedPattern {
+            items: vec![PatternItem::BracketExpression(BracketExpression { items: vec![BracketItem::EquivalenceClass("a".to_string())], matching: true })]
+        });
+    }
+
+    #[test]
     fn parse_bracket_with_simple_range() {
         assert_eq!(
             parse_correct_pattern(ExpandedWord {

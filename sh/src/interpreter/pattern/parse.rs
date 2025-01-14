@@ -10,7 +10,6 @@ pub enum RangeEndpoint {
 #[derive(Debug, PartialEq, Eq)]
 pub enum BracketItem {
     Char(char),
-    CollatingElements(String),
     CollatingSymbol(String),
     EquivalenceClass(String),
     CharacterClass(String),
@@ -22,7 +21,6 @@ impl TryInto<RangeEndpoint> for BracketItem {
     fn try_into(self) -> Result<RangeEndpoint, BracketItem> {
         match self {
             BracketItem::Char(c) => Ok(RangeEndpoint::Char(c)),
-            BracketItem::CollatingElements(s) => Ok(RangeEndpoint::CollatingElement(s)),
             BracketItem::CollatingSymbol(s) => Ok(RangeEndpoint::CollatingSymbol(s)),
             _ => Err(self),
         }
@@ -32,7 +30,6 @@ impl TryInto<RangeEndpoint> for BracketItem {
 fn is_valid_range_endpoint(item: &BracketItem) -> bool {
     match item {
         BracketItem::Char(_)
-        | BracketItem::CollatingElements(_)
         | BracketItem::CollatingSymbol(_) => true,
         _ => false,
     }
@@ -180,6 +177,33 @@ impl Parser<'_> {
         }
     }
 
+    fn try_parse_collating_symbol(&mut self) -> Result<String, Vec<PatternItem>> {
+        let mut items = Vec::new();
+        // skip '.'
+        self.store_and_advance(&mut items);
+        let mut symbol = String::new();
+        loop {
+            match self.lookahead {
+                Token::Char('.') => {
+                    self.store_and_advance(&mut items);
+                    return if self.lookahead == Token::Char(']') {
+                        self.advance();
+                        Ok(symbol)
+                    } else {
+                        Err(items)
+                    };
+                }
+                Token::Char(c) | Token::QuotedChar(c) => {
+                    self.store_and_advance(&mut items);
+                    symbol.push(c);
+                }
+                _ => {
+                    return Err(items);
+                }
+            }
+        }
+    }
+
     /// Tries to parse a bracket expression, if it fails it returns the literal that was parsed
     fn try_parse_bracket_expression(&mut self) -> Result<BracketExpression, Vec<PatternItem>> {
         // we store all tokens in `pattern_items`, if parsing the bracket expression fails we
@@ -203,8 +227,6 @@ impl Parser<'_> {
             }
             Token::Char(':') => match self.try_parse_character_class() {
                 Ok(class) => {
-                    // remove '[' since it is part of a character class
-                    pattern_items.pop();
                     // simple character class, the standard specifies that it is implementation
                     // defined whether these patterns are supported, but bash does support them
                     // so we do too.
@@ -218,8 +240,17 @@ impl Parser<'_> {
                     expression_items.push(BracketItem::Char('['));
                 }
             },
-            Token::Char('.') => {
-                todo!()
+            Token::Char('.') => match self.try_parse_collating_symbol() {
+                Ok(symbol) => {
+                    return Ok(BracketExpression {
+                        items: vec![BracketItem::CollatingSymbol(symbol)],
+                        matching,
+                    });
+                }
+                Err(items) => {
+                    pattern_items.extend(items);
+                    expression_items.push(BracketItem::Char('['));
+                }
             }
             Token::Char('=') => {
                 todo!()
@@ -250,8 +281,16 @@ impl Parser<'_> {
                                 expression_items.push(BracketItem::Char('['));
                             }
                         },
-                        Token::Char('.') => {
-                            todo!()
+                        Token::Char('.') => match self.try_parse_collating_symbol() {
+                            Ok(symbol) => {
+                                // remove '[' since it is part of the collating symbol
+                                pattern_items.pop();
+                                expression_items.push(BracketItem::CollatingSymbol(symbol));
+                            }
+                            Err(items) => {
+                                pattern_items.extend(items);
+                                expression_items.push(BracketItem::Char('['));
+                            }
                         }
                         Token::Char('=') => {
                             todo!()

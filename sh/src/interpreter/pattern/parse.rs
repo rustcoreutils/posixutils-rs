@@ -204,6 +204,33 @@ impl Parser<'_> {
         }
     }
 
+    fn try_parse_equivalence_class(&mut self) -> Result<String, Vec<PatternItem>> {
+        let mut items = Vec::new();
+        // skip '='
+        self.store_and_advance(&mut items);
+        let mut class = String::new();
+        loop {
+            match self.lookahead {
+                Token::Char('=') => {
+                    self.store_and_advance(&mut items);
+                    return if self.lookahead == Token::Char(']') {
+                        self.advance();
+                        Ok(class)
+                    } else {
+                        Err(items)
+                    };
+                }
+                Token::Char(c) | Token::QuotedChar(c) => {
+                    self.store_and_advance(&mut items);
+                    class.push(c);
+                }
+                _ => {
+                    return Err(items);
+                }
+            }
+        }
+    }
+
     /// Tries to parse a bracket expression, if it fails it returns the literal that was parsed
     fn try_parse_bracket_expression(&mut self) -> Result<BracketExpression, Vec<PatternItem>> {
         // we store all tokens in `pattern_items`, if parsing the bracket expression fails we
@@ -252,8 +279,17 @@ impl Parser<'_> {
                     expression_items.push(BracketItem::Char('['));
                 }
             }
-            Token::Char('=') => {
-                todo!()
+            Token::Char('=') => match self.try_parse_equivalence_class() {
+                Ok(class) => {
+                    return Ok(BracketExpression {
+                        items: vec![BracketItem::EquivalenceClass(class)],
+                        matching,
+                    });
+                }
+                Err(items) => {
+                    pattern_items.extend(items);
+                    expression_items.push(BracketItem::Char('['));
+                }
             }
             _ => {}
         }
@@ -292,8 +328,16 @@ impl Parser<'_> {
                                 expression_items.push(BracketItem::Char('['));
                             }
                         }
-                        Token::Char('=') => {
-                            todo!()
+                        Token::Char('=') => match self.try_parse_character_class() {
+                            Ok(class) => {
+                                // remove '[' since it is part of a character class
+                                pattern_items.pop();
+                                expression_items.push(BracketItem::EquivalenceClass(class));
+                            }
+                            Err(items) => {
+                                pattern_items.extend(items);
+                                expression_items.push(BracketItem::Char('['));
+                            }
                         }
                         _ => {
                             expression_items.push(BracketItem::Char('['));

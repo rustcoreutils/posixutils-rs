@@ -111,6 +111,7 @@ struct Parser<'w> {
     chars: std::str::Chars<'w>,
     inside_quoted_string: bool,
     lookahead: Token,
+    used_in_filename_expansion: bool,
 }
 
 impl Parser<'_> {
@@ -344,6 +345,10 @@ impl Parser<'_> {
                         }
                     }
                 }
+                Token::Char('/') | Token::QuotedChar('/') if self.used_in_filename_expansion => {
+                    pattern_items.push(PatternItem::Char('/'));
+                    return Err(pattern_items);
+                }
                 Token::QuotedChar(c) | Token::Char(c) => {
                     expression_items.push(BracketItem::Char(c));
                     self.store_and_advance(&mut pattern_items);
@@ -380,7 +385,7 @@ impl Parser<'_> {
 }
 
 pub fn parse_pattern(
-    pattern: ExpandedWord,
+    pattern: &ExpandedWord,
     used_in_filename_expansion: bool,
 ) -> Result<ParsedPattern, String> {
     let mut parser = Parser {
@@ -388,6 +393,7 @@ pub fn parse_pattern(
         inside_quoted_string: false,
         chars: "".chars(),
         word_parts: pattern.parts.iter(),
+        used_in_filename_expansion,
     };
     parser.advance();
     parser.parse_pattern()
@@ -398,7 +404,7 @@ mod tests {
     use super::*;
 
     fn parse_correct_pattern(pattern: ExpandedWord) -> ParsedPattern {
-        parse_pattern(pattern, false).unwrap()
+        parse_pattern(&pattern, false).unwrap()
     }
 
     #[test]
@@ -703,6 +709,14 @@ mod tests {
     fn short_version_of_character_class_is_parsed_correctly() {
         assert_eq!(parse_correct_pattern(ExpandedWord { parts: vec![ExpandedWordPart::UnquotedLiteral("[:class:]".to_string())] }), ParsedPattern {
             items: vec![PatternItem::BracketExpression(BracketExpression { items: vec![BracketItem::CharacterClass("class".to_string())], matching: true })]
+        });
+    }
+
+    #[test]
+    fn patterns_used_in_filename_expansion_ignore_open_square_bracket_if_it_contains_slash() {
+        let parsed_pattern = parse_pattern(&ExpandedWord { parts: vec![ExpandedWordPart::UnquotedLiteral("a[b/c]d".to_string())] }, true).expect("parsing failed");
+        assert_eq!(parsed_pattern, ParsedPattern {
+            items: vec![PatternItem::Char('a'), PatternItem::Char('['), PatternItem::Char('b'), PatternItem::Char('/'), PatternItem::Char('c'), PatternItem::Char(']'), PatternItem::Char('d')]
         });
     }
 }

@@ -162,9 +162,9 @@ fn push_bracket_expression(expr: &BracketExpression, string: &mut String) {
     string.push(']');
 }
 
-pub fn parsed_pattern_to_regex(parsed_pattern: &ParsedPattern) -> Result<Regex, String> {
+pub fn parsed_pattern_to_regex(parsed_pattern: &[PatternItem]) -> Result<Regex, String> {
     let mut regex_str = String::new();
-    for item in &parsed_pattern.items {
+    for item in parsed_pattern {
         match item {
             PatternItem::Char(c) => push_char_literal(*c, &mut regex_str),
             PatternItem::QuestionMark => regex_str.push('.'),
@@ -180,7 +180,7 @@ pub fn parsed_pattern_to_regex(parsed_pattern: &ParsedPattern) -> Result<Regex, 
 mod tests {
     use super::*;
 
-    fn pattern_to_regex_string(parsed_pattern: ParsedPattern) -> String {
+    fn pattern_to_regex_string(parsed_pattern: &[PatternItem]) -> String {
         parsed_pattern_to_regex(&parsed_pattern)
             .expect("failed to convert pattern")
             .to_string()
@@ -188,106 +188,99 @@ mod tests {
 
     #[test]
     fn convert_empty_pattern() {
-        let regex = pattern_to_regex_string(ParsedPattern { items: vec![] });
+        let regex = pattern_to_regex_string(&[]);
         assert_eq!(regex, "");
     }
 
     #[test]
     fn convert_single_char_pattern() {
-        let regex = pattern_to_regex_string(ParsedPattern {
-            items: vec![PatternItem::Char('a')],
-        });
+        let regex = pattern_to_regex_string(&[PatternItem::Char('a')],
+        );
         assert_eq!(regex, "a");
     }
 
     #[test]
     fn convert_multiple_char_pattern() {
-        let regex = pattern_to_regex_string(ParsedPattern {
-            items: vec![
-                PatternItem::Char('a'),
-                PatternItem::Char('b'),
-                PatternItem::Char('c'),
-            ],
-        });
+        let regex = pattern_to_regex_string(&[
+            PatternItem::Char('a'),
+            PatternItem::Char('b'),
+            PatternItem::Char('c'),
+        ],
+        );
         assert_eq!(regex, "abc");
     }
 
     #[test]
     fn convert_question_mark_pattern() {
-        let regex = pattern_to_regex_string(ParsedPattern {
-            items: vec![
-                PatternItem::Char('a'),
-                PatternItem::QuestionMark,
-                PatternItem::Char('b'),
-            ],
-        });
+        let regex = pattern_to_regex_string(&[
+            PatternItem::Char('a'),
+            PatternItem::QuestionMark,
+            PatternItem::Char('b'),
+        ],
+        );
         assert_eq!(regex, "a.b");
     }
 
     #[test]
     fn convert_asterisk_pattern() {
-        let regex = pattern_to_regex_string(ParsedPattern {
-            items: vec![
-                PatternItem::Char('a'),
-                PatternItem::Asterisk,
-                PatternItem::Char('b'),
-            ],
-        });
+        let regex = pattern_to_regex_string(&[
+            PatternItem::Char('a'),
+            PatternItem::Asterisk,
+            PatternItem::Char('b'),
+        ],
+        );
         assert_eq!(regex, "a.*b");
     }
 
     #[test]
     fn convert_bracket_with_single_character() {
-        let regex = pattern_to_regex_string(ParsedPattern {
-            items: vec![PatternItem::BracketExpression(BracketExpression {
-                matching: true,
-                items: vec![BracketItem::Char('a')],
-            })],
-        });
+        let regex = pattern_to_regex_string(&[PatternItem::BracketExpression(BracketExpression {
+            matching: true,
+            items: vec![BracketItem::Char('a')],
+        })],
+        );
         assert_eq!(regex, "[a]");
     }
 
     #[test]
     fn convert_bracket_with_multiple_characters() {
-        let regex = pattern_to_regex_string(ParsedPattern {
-            items: vec![PatternItem::BracketExpression(BracketExpression {
-                matching: true,
-                items: vec![
-                    BracketItem::Char('a'),
-                    BracketItem::Char('b'),
-                    BracketItem::Char('c'),
-                ],
-            })],
-        });
+        let regex = pattern_to_regex_string(&[PatternItem::BracketExpression(BracketExpression {
+            matching: true,
+            items: vec![
+                BracketItem::Char('a'),
+                BracketItem::Char('b'),
+                BracketItem::Char('c'),
+            ],
+        })],
+        );
         assert_eq!(regex, "[abc]");
     }
 
     #[test]
     fn convert_bracket_with_character_class() {
-        let regex = pattern_to_regex_string(ParsedPattern {
-            items: vec![PatternItem::BracketExpression(BracketExpression {
+        let regex = pattern_to_regex_string(
+            &[PatternItem::BracketExpression(BracketExpression {
                 matching: true,
                 items: vec![BracketItem::CharacterClass("digit".to_string())],
             })],
-        });
+        );
         assert_eq!(regex, "[[:digit:]]");
     }
 
     #[test]
     fn convert_non_matching_bracket_expression_with_single_character() {
-        let regex = pattern_to_regex_string(ParsedPattern {
-            items: vec![PatternItem::BracketExpression(BracketExpression {
-                matching: false,
-                items: vec![BracketItem::Char('a')],
-            })],
-        });
+        let regex = pattern_to_regex_string(&[PatternItem::BracketExpression(BracketExpression {
+            matching: false,
+            items: vec![BracketItem::Char('a')],
+        })],
+        );
         assert_eq!(regex, "[^a]");
     }
 
     #[test]
     fn convert_non_matching_bracket_expression_with_multiple_characters() {
-        let regex = pattern_to_regex_string(ParsedPattern {
-            items: vec![PatternItem::BracketExpression(BracketExpression {
+        let regex = pattern_to_regex_string(
+            &[PatternItem::BracketExpression(BracketExpression {
                 matching: false,
                 items: vec![
                     BracketItem::Char('a'),
@@ -295,63 +288,59 @@ mod tests {
                     BracketItem::Char('c'),
                 ],
             })],
-        });
+        );
         assert_eq!(regex, "[^abc]");
     }
 
     #[test]
     fn convert_non_matching_bracket_expression_with_character_class() {
-        let regex = pattern_to_regex_string(ParsedPattern {
-            items: vec![PatternItem::BracketExpression(BracketExpression {
-                matching: false,
-                items: vec![BracketItem::CharacterClass("digit".to_string())],
-            })],
-        });
+        let regex = pattern_to_regex_string(&[PatternItem::BracketExpression(BracketExpression {
+            matching: false,
+            items: vec![BracketItem::CharacterClass("digit".to_string())],
+        })],
+        );
         assert_eq!(regex, "[^[:digit:]]");
     }
 
     #[test]
     fn convert_bracket_expression_with_characters_and_character_class() {
-        let regex = pattern_to_regex_string(ParsedPattern {
-            items: vec![PatternItem::BracketExpression(BracketExpression {
-                matching: true,
-                items: vec![
-                    BracketItem::Char('a'),
-                    BracketItem::CharacterClass("digit".to_string()),
-                    BracketItem::Char('b'),
-                ],
-            })],
-        });
+        let regex = pattern_to_regex_string(&[PatternItem::BracketExpression(BracketExpression {
+            matching: true,
+            items: vec![
+                BracketItem::Char('a'),
+                BracketItem::CharacterClass("digit".to_string()),
+                BracketItem::Char('b'),
+            ],
+        })],
+        );
         assert_eq!(regex, "[a[:digit:]b]");
     }
 
     #[test]
     fn convert_non_matching_bracket_expression_with_characters_character_class() {
-        let regex = pattern_to_regex_string(ParsedPattern {
-            items: vec![PatternItem::BracketExpression(BracketExpression {
-                matching: false,
-                items: vec![
-                    BracketItem::Char('a'),
-                    BracketItem::CharacterClass("digit".to_string()),
-                    BracketItem::Char('b'),
-                ],
-            })],
-        });
+        let regex = pattern_to_regex_string(&[PatternItem::BracketExpression(BracketExpression {
+            matching: false,
+            items: vec![
+                BracketItem::Char('a'),
+                BracketItem::CharacterClass("digit".to_string()),
+                BracketItem::Char('b'),
+            ],
+        })],
+        );
         assert_eq!(regex, "[^a[:digit:]b]");
     }
 
     #[test]
     fn special_bre_characters_are_escaped() {
-        let regex = pattern_to_regex_string(ParsedPattern {
-            items: vec![
-                PatternItem::Char('.'),
-                PatternItem::Char('['),
-                PatternItem::Char('\\'),
-                PatternItem::Char('*'),
-                PatternItem::Char('^'),
-                PatternItem::Char('$'),
-            ],
-        });
+        let regex = pattern_to_regex_string(&[
+            PatternItem::Char('.'),
+            PatternItem::Char('['),
+            PatternItem::Char('\\'),
+            PatternItem::Char('*'),
+            PatternItem::Char('^'),
+            PatternItem::Char('$'),
+        ],
+        );
         assert_eq!(regex, "\\.\\[\\\\\\*\\^\\$");
     }
 }

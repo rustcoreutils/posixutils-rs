@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::ffi::{c_char, CStr, CString};
 use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 use std::rc::Rc;
+use crate::interpreter::pattern::Pattern;
 
 mod pattern;
 
@@ -106,57 +107,6 @@ fn is_portable_filename_character(c: char) -> bool {
 
 fn is_ifs_whitespace(c: char) -> bool {
     c == ' ' || c == '\t' || c == '\n'
-}
-
-fn remove_prefix_pattern(mut parameter: Vec<u8>, pattern: CString, remove_largest: bool) -> String {
-    let mut prefix_end = 0;
-    parameter.push(b'\0');
-    for i in 1..parameter.len() {
-        let temp = parameter[i];
-        parameter[i] = b'\0';
-        let match_result = unsafe {
-            libc::fnmatch(
-                pattern.as_ptr(),
-                parameter[..=i].as_ptr() as *const c_char,
-                0,
-            )
-        };
-        parameter[i] = temp;
-        if match_result == 0 {
-            prefix_end = i;
-            if !remove_largest {
-                break;
-            }
-        }
-    }
-    parameter.drain(..prefix_end);
-    // remove '\0' at the end
-    parameter.pop();
-    // if this fails, the above code is wrong
-    String::from_utf8(parameter).unwrap()
-}
-
-fn remove_suffix_pattern(mut parameter: Vec<u8>, pattern: CString, remove_largest: bool) -> String {
-    parameter.push(b'\0');
-    let mut suffix_end = parameter.len() - 1;
-    for i in (0..parameter.len() - 2).rev() {
-        let match_result = unsafe {
-            libc::fnmatch(
-                pattern.as_ptr(),
-                parameter[i..].as_ptr() as *const c_char,
-                0,
-            )
-        };
-        if match_result == 0 {
-            suffix_end = i;
-            if !remove_largest {
-                break;
-            }
-        }
-    }
-    parameter.truncate(suffix_end);
-    // if this fails, the above code is wrong
-    String::from_utf8(parameter).unwrap()
 }
 
 #[derive(Clone)]
@@ -500,8 +450,23 @@ impl Interpreter {
                 if param_str.is_empty() {
                     return String::new();
                 }
-                if let Some(pattern) = pattern {
-                    todo!()
+                if let Some(word) = pattern {
+                    let expanded_word = self.expand_word(word, false);
+                    // TODO: fix unwrap
+                    let pattern = Pattern::new(&expanded_word).unwrap();
+                    if *remove_prefix {
+                        if *remove_largest {
+                            pattern.remove_largest_prefix(param_str)
+                        } else {
+                            pattern.remove_shortest_prefix(param_str)
+                        }
+                    } else {
+                        if *remove_largest {
+                            pattern.remove_largest_suffix(param_str)
+                        } else {
+                            pattern.remove_shortest_suffix(param_str)
+                        }
+                    }
                 } else {
                     param_str
                 }
@@ -584,7 +549,7 @@ impl Interpreter {
                                     ExpandedWord {
                                         parts: parts_for_last_word,
                                     }
-                                    .normalize(),
+                                        .normalize(),
                                 );
                                 parts_for_last_word = Vec::new();
                             }
@@ -608,7 +573,7 @@ impl Interpreter {
                 ExpandedWord {
                     parts: parts_for_last_word,
                 }
-                .normalize(),
+                    .normalize(),
             );
         }
         result
@@ -909,7 +874,7 @@ mod test {
                 ("test_user".to_string(), "/home/test_user".to_string()),
                 ("test_user2".to_string(), "/home/test_user2".to_string()),
             ]
-            .into();
+                .into();
             TestSystem {
                 env,
                 user_homes,
@@ -1468,7 +1433,7 @@ mod test {
             Interpreter::with_system(TestSystem::default().set_environment_var("IFS", ":"));
         assert_eq!(
             interpreter.split_fields(ExpandedWord {
-                parts: vec![ExpandedWordPart::UnquotedLiteral("a:b:c".to_string()),]
+                parts: vec![ExpandedWordPart::UnquotedLiteral("a:b:c".to_string()), ]
             }),
             vec![expanded_word_from_str("a:b:c")]
         );

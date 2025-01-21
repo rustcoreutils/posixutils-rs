@@ -1,5 +1,5 @@
 use core::fmt;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use crate::interpreter::pattern::parse::{
     BracketExpression, BracketItem, ParsedPattern, PatternItem,
 };
@@ -43,16 +43,16 @@ pub struct RegexMatch {
     pub end: usize,
 }
 
-pub struct MatchIter<'re> {
-    string: CString,
+pub struct MatchIter<'a> {
+    string: &'a CStr,
     next_start: usize,
-    regex: &'re Regex,
+    regex: &'a Regex,
 }
 
 impl Iterator for MatchIter<'_> {
     type Item = RegexMatch;
     fn next(&mut self) -> Option<Self::Item> {
-        if self.next_start >= self.string.as_bytes().len() {
+        if self.next_start >= self.string.to_bytes().len() {
             return None;
         }
         let mut match_range = libc::regmatch_t {
@@ -93,7 +93,7 @@ impl Regex {
         })
     }
 
-    pub fn match_locations(&self, string: CString) -> MatchIter {
+    pub fn match_locations<'a>(&'a self, string: &'a CStr) -> MatchIter<'a> {
         MatchIter {
             next_start: 0,
             regex: self,
@@ -101,8 +101,8 @@ impl Regex {
         }
     }
 
-    pub fn matches(&self, string: &CString) -> bool {
-        self.match_locations(string.clone()).next().is_some()
+    pub fn matches(&self, string: &CStr) -> bool {
+        self.match_locations(string).next().is_some()
     }
 }
 

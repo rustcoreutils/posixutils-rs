@@ -1,6 +1,6 @@
 use std::ffi::{CStr, CString};
 use crate::interpreter::ExpandedWord;
-use crate::interpreter::pattern::parse::parse_pattern;
+use crate::interpreter::pattern::parse::{parse_pattern, PatternItem};
 use crate::interpreter::pattern::regex::{parsed_pattern_to_regex, Regex};
 
 mod parse;
@@ -93,6 +93,39 @@ impl Pattern {
 impl From<Pattern> for String {
     fn from(value: Pattern) -> Self {
         value.pattern_string
+    }
+}
+
+pub struct FilenamePattern {
+    path_parts: Vec<Regex>,
+    pattern_string: String,
+}
+
+impl FilenamePattern {
+    pub fn new(word: &ExpandedWord) -> Result<Self, String> {
+        let parsed_pattern = parse_pattern(word, true)?;
+        let mut path_parts = Vec::new();
+
+        parsed_pattern.split(|item| *item == PatternItem::Char('/')).filter(|items| !items.is_empty()).try_for_each(|items| {
+            path_parts.push(parsed_pattern_to_regex(items)?);
+            Ok::<(), String>(())
+        })?;
+
+        Ok(Self {
+            path_parts,
+            pattern_string: word.to_string(),
+        })
+    }
+
+    /// # Panics
+    /// panics if `depth` is larger than `self.max_depth()`
+    pub fn matches(&self, depth: usize, s: &CStr) -> bool {
+        self.path_parts[depth].matches(s)
+    }
+
+    pub fn max_depth(&self) -> usize {
+        assert!(self.path_parts.len() > 0, "TODO: empty patterns should never be created");
+        self.path_parts.len() - 1
     }
 }
 

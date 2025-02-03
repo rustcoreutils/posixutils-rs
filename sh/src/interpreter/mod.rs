@@ -10,6 +10,7 @@ use std::rc::Rc;
 use crate::interpreter::pattern::Pattern;
 
 mod pattern;
+mod wordexp;
 
 trait SystemInterface {
     fn environment_variables(&self) -> HashMap<String, String>;

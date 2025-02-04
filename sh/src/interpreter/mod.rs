@@ -6,6 +6,7 @@ use crate::program::{
 use std::collections::HashMap;
 use std::ffi::{c_char, CString, OsString};
 use std::os::fd::{AsRawFd, IntoRawFd};
+use std::path::PathBuf;
 use std::rc::Rc;
 
 mod wordexp;
@@ -46,6 +47,17 @@ impl Variable {
             export: false,
         }
     }
+}
+
+fn find_in_path(command: &str, env_path: &str) -> Option<String> {
+    for path in env_path.split(':') {
+        let mut command_path = PathBuf::from(path);
+        command_path.push(command);
+        if command_path.is_file() {
+            return Some(command_path.into_os_string().to_string_lossy().into());
+        }
+    }
+    None
 }
 
 pub type Environment = HashMap<String, Variable>;
@@ -209,12 +221,19 @@ impl Interpreter {
             let mut command_environment = self.clone();
             command_environment.perform_assignments(&simple_command.assignments);
             command_environment.perform_redirections(&simple_command.redirections);
-            let command = &expanded_words[0];
-            let arguments = expanded_words[1..]
-                .iter()
-                .map(|w| w.clone())
-                .collect::<Vec<String>>();
-            command_environment.exec(&command, &arguments)
+            if let Some(command) = find_in_path(
+                &expanded_words[0],
+                &self.environment.get("PATH").unwrap().value,
+            ) {
+                let arguments = expanded_words[1..]
+                    .iter()
+                    .map(|w| w.clone())
+                    .collect::<Vec<String>>();
+                command_environment.exec(&command, &arguments)
+            } else {
+                eprintln!("{}: command not found", expanded_words[0]);
+                127
+            }
         }
     }
 

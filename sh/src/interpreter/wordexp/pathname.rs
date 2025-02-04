@@ -59,7 +59,7 @@ fn list_files_rec(
             DirEntry::File(file_name) if search_file => {
                 let file_name_cstring =
                     CString::new(file_name.clone().into_encoded_bytes()).unwrap();
-                if pattern.matches(component_index, &file_name_cstring) {
+                if pattern.matches_all(component_index, &file_name_cstring) {
                     let mut path = prefix.clone();
                     path.push(file_name);
                     result.push(path.into_os_string())
@@ -69,7 +69,7 @@ fn list_files_rec(
                 prefix.push(&dir_name);
                 current_directory.push(&dir_name);
                 let dir_name_cstring = CString::new(dir_name.into_encoded_bytes()).unwrap();
-                if pattern.matches(component_index, &dir_name_cstring) {
+                if pattern.matches_all(component_index, &dir_name_cstring) {
                     list_files_rec(
                         filesystem,
                         pattern,
@@ -245,5 +245,15 @@ pub mod tests {
             list_files(&filesystem, &pattern, OsStr::new("/dir/")),
             vec![OsString::from("file1"), "file2".into(), "file3".into()]
         );
+    }
+
+    #[test]
+    fn nothing_is_listed_if_pattern_matches_nothing() {
+        let filesystem = TestFileSystem::default()
+            .add_file("/file1")
+            .add_file("/file2")
+            .add_file("/file3");
+        let pattern = filename_pattern_from_str("file");
+        assert!(list_files(&filesystem, &pattern, OsStr::new("/")).is_empty());
     }
 }

@@ -134,7 +134,7 @@ impl FilenamePattern {
 
     /// # Panics
     /// panics if `depth` is smaller than 1 or bigger than `component_count`
-    pub fn matches(&self, depth: usize, s: &CStr) -> bool {
+    pub fn matches_all(&self, depth: usize, s: &CStr) -> bool {
         assert!(
             depth > 0 && depth <= self.component_count(),
             "invalid depth"
@@ -145,7 +145,11 @@ impl FilenamePattern {
             // dot at the start is only matched explicitly
             return false;
         }
-        self.path_parts[component_index].matches(s)
+        if let Some(loc) = self.path_parts[component_index].match_locations(s).next() {
+            loc.start == 0 && loc.end == s.count_bytes()
+        } else {
+            false
+        }
     }
 
     /// Returns number of components in the path
@@ -224,25 +228,25 @@ pub mod tests {
     #[test]
     fn filename_pattern_matches_simple_components_in_path() {
         let pattern = filename_pattern_from_str("/path/to/file");
-        assert!(pattern.matches(1, &cstring_from_str("path")));
-        assert!(pattern.matches(2, &cstring_from_str("to")));
-        assert!(pattern.matches(3, &cstring_from_str("file")));
+        assert!(pattern.matches_all(1, &cstring_from_str("path")));
+        assert!(pattern.matches_all(2, &cstring_from_str("to")));
+        assert!(pattern.matches_all(3, &cstring_from_str("file")));
     }
 
     #[test]
     fn period_at_the_start_is_only_matched_explicitly() {
         let pattern = filename_pattern_from_str("*test");
-        assert!(!pattern.matches(1, &cstring_from_str(".test")));
-        assert!(pattern.matches(1, &cstring_from_str("atest")));
+        assert!(!pattern.matches_all(1, &cstring_from_str(".test")));
+        assert!(pattern.matches_all(1, &cstring_from_str("atest")));
 
         let pattern = filename_pattern_from_str(".test");
-        assert!(pattern.matches(1, &cstring_from_str(".test")));
+        assert!(pattern.matches_all(1, &cstring_from_str(".test")));
     }
 
     #[test]
     fn period_at_the_start_is_not_matched_by_bracket_expression_with_multiple_chars() {
         // the standard leaves this case to the implementation, here we follow what bash does
         let pattern = filename_pattern_from_str("[.abc]*");
-        assert!(!pattern.matches(1, &cstring_from_str(".a")));
+        assert!(!pattern.matches_all(1, &cstring_from_str(".a")));
     }
 }

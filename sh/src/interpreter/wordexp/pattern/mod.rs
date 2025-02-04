@@ -1,6 +1,6 @@
-use crate::interpreter::pattern::parse::{parse_pattern, PatternItem};
-use crate::interpreter::pattern::regex::{parsed_pattern_to_regex, Regex};
-use crate::interpreter::ExpandedWord;
+use crate::interpreter::wordexp::pattern::parse::{parse_pattern, PatternItem};
+use crate::interpreter::wordexp::pattern::regex::{parsed_pattern_to_regex, Regex};
+use crate::interpreter::wordexp::ExpandedWord;
 use std::ffi::{CStr, CString};
 
 mod parse;
@@ -160,10 +160,16 @@ impl FilenamePattern {
     }
 }
 
+impl From<FilenamePattern> for String {
+    fn from(value: FilenamePattern) -> Self {
+        value.pattern_string
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::interpreter::ExpandedWordPart;
+    use crate::interpreter::wordexp::ExpandedWordPart;
 
     pub fn pattern_from_str(pat: &str) -> Pattern {
         Pattern::new(&ExpandedWord {

@@ -1,4 +1,4 @@
-use crate::interpreter::{ExpandedWord, ExpandedWordPart};
+use crate::interpreter::wordexp::{ExpandedWord, ExpandedWordPart};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RangeEndpoint {
@@ -29,8 +29,7 @@ impl TryInto<RangeEndpoint> for BracketItem {
 
 fn is_valid_range_endpoint(item: &BracketItem) -> bool {
     match item {
-        BracketItem::Char(_)
-        | BracketItem::CollatingSymbol(_) => true,
+        BracketItem::Char(_) | BracketItem::CollatingSymbol(_) => true,
         _ => false,
     }
 }
@@ -79,13 +78,13 @@ fn create_range_expressions(items: Vec<BracketItem>) -> Vec<BracketItem> {
         if let BracketItem::Char('-') = item {
             match (result.pop().unwrap(), iter.next()) {
                 (start, Some(end))
-                if is_valid_range_endpoint(&start) && is_valid_range_endpoint(&end) =>
-                    {
-                        result.push(BracketItem::RangeExpression(
-                            start.try_into().unwrap(),
-                            end.try_into().unwrap(),
-                        ));
-                    }
+                    if is_valid_range_endpoint(&start) && is_valid_range_endpoint(&end) =>
+                {
+                    result.push(BracketItem::RangeExpression(
+                        start.try_into().unwrap(),
+                        end.try_into().unwrap(),
+                    ));
+                }
                 (item, Some(next)) => {
                     result.push(item);
                     result.push(BracketItem::Char('-'));
@@ -276,7 +275,7 @@ impl Parser<'_> {
                     pattern_items.extend(items);
                     expression_items.push(BracketItem::Char('['));
                 }
-            }
+            },
             Token::Char('=') => match self.try_parse_equivalence_class() {
                 Ok(class) => {
                     return Ok(BracketExpression {
@@ -288,7 +287,7 @@ impl Parser<'_> {
                     pattern_items.extend(items);
                     expression_items.push(BracketItem::Char('['));
                 }
-            }
+            },
             _ => {}
         }
 
@@ -325,7 +324,7 @@ impl Parser<'_> {
                                 pattern_items.extend(items);
                                 expression_items.push(BracketItem::Char('['));
                             }
-                        }
+                        },
                         Token::Char('=') => match self.try_parse_character_class() {
                             Ok(class) => {
                                 // remove '[' since it is part of a character class
@@ -336,7 +335,7 @@ impl Parser<'_> {
                                 pattern_items.extend(items);
                                 expression_items.push(BracketItem::Char('['));
                             }
-                        }
+                        },
                         _ => {
                             expression_items.push(BracketItem::Char('['));
                         }
@@ -426,7 +425,7 @@ mod tests {
     fn parse_multiple_char_pattern() {
         assert_eq!(
             parse_correct_pattern(ExpandedWord {
-                parts: vec![ExpandedWordPart::UnquotedLiteral("abc".to_string()), ]
+                parts: vec![ExpandedWordPart::UnquotedLiteral("abc".to_string()),]
             }),
             vec![
                 PatternItem::Char('a'),
@@ -464,7 +463,7 @@ mod tests {
     fn parse_question_mark_pattern() {
         assert_eq!(
             parse_correct_pattern(ExpandedWord {
-                parts: vec![ExpandedWordPart::UnquotedLiteral("a?c".to_string()), ]
+                parts: vec![ExpandedWordPart::UnquotedLiteral("a?c".to_string()),]
             }),
             vec![
                 PatternItem::Char('a'),
@@ -478,7 +477,11 @@ mod tests {
     fn quoted_question_mark_is_parsed_as_char() {
         assert_eq!(
             parse_correct_pattern(ExpandedWord {
-                parts: vec![ExpandedWordPart::UnquotedLiteral("a".to_string()), ExpandedWordPart::QuotedLiteral("?".to_string()), ExpandedWordPart::UnquotedLiteral("c".to_string()), ]
+                parts: vec![
+                    ExpandedWordPart::UnquotedLiteral("a".to_string()),
+                    ExpandedWordPart::QuotedLiteral("?".to_string()),
+                    ExpandedWordPart::UnquotedLiteral("c".to_string()),
+                ]
             }),
             vec![
                 PatternItem::Char('a'),
@@ -492,7 +495,7 @@ mod tests {
     fn parse_asterisk_pattern() {
         assert_eq!(
             parse_correct_pattern(ExpandedWord {
-                parts: vec![ExpandedWordPart::UnquotedLiteral("a*c".to_string()), ]
+                parts: vec![ExpandedWordPart::UnquotedLiteral("a*c".to_string()),]
             }),
             vec![
                 PatternItem::Char('a'),
@@ -506,7 +509,11 @@ mod tests {
     fn quoted_asterisk_is_parsed_as_char() {
         assert_eq!(
             parse_correct_pattern(ExpandedWord {
-                parts: vec![ExpandedWordPart::UnquotedLiteral("a".to_string()), ExpandedWordPart::QuotedLiteral("*".to_string()), ExpandedWordPart::UnquotedLiteral("c".to_string()), ]
+                parts: vec![
+                    ExpandedWordPart::UnquotedLiteral("a".to_string()),
+                    ExpandedWordPart::QuotedLiteral("*".to_string()),
+                    ExpandedWordPart::UnquotedLiteral("c".to_string()),
+                ]
             }),
             vec![
                 PatternItem::Char('a'),
@@ -520,7 +527,7 @@ mod tests {
     fn parse_bracket_with_single_character() {
         assert_eq!(
             parse_correct_pattern(ExpandedWord {
-                parts: vec![ExpandedWordPart::UnquotedLiteral("[a]".to_string()), ]
+                parts: vec![ExpandedWordPart::UnquotedLiteral("[a]".to_string()),]
             }),
             vec![PatternItem::BracketExpression(BracketExpression {
                 matching: true,
@@ -533,7 +540,7 @@ mod tests {
     fn parse_bracket_expression_with_multiple_characters() {
         assert_eq!(
             parse_correct_pattern(ExpandedWord {
-                parts: vec![ExpandedWordPart::UnquotedLiteral("[abc]".to_string()), ]
+                parts: vec![ExpandedWordPart::UnquotedLiteral("[abc]".to_string()),]
             }),
             vec![PatternItem::BracketExpression(BracketExpression {
                 matching: true,
@@ -550,7 +557,7 @@ mod tests {
     fn parse_non_matching_bracket_expression() {
         assert_eq!(
             parse_correct_pattern(ExpandedWord {
-                parts: vec![ExpandedWordPart::UnquotedLiteral("[!abc]".to_string()), ]
+                parts: vec![ExpandedWordPart::UnquotedLiteral("[!abc]".to_string()),]
             }),
             vec![PatternItem::BracketExpression(BracketExpression {
                 matching: false,
@@ -567,7 +574,7 @@ mod tests {
     fn parse_bracket_expression_with_character_class() {
         assert_eq!(
             parse_correct_pattern(ExpandedWord {
-                parts: vec![ExpandedWordPart::UnquotedLiteral("[[:class:]]".to_string()), ]
+                parts: vec![ExpandedWordPart::UnquotedLiteral("[[:class:]]".to_string()),]
             }),
             vec![PatternItem::BracketExpression(BracketExpression {
                 matching: true,
@@ -578,15 +585,27 @@ mod tests {
 
     #[test]
     fn parse_bracket_expression_with_collating_symbol() {
-        assert_eq!(parse_correct_pattern(ExpandedWord { parts: vec![ExpandedWordPart::UnquotedLiteral("[.ch.]".to_string())] }),
-                   vec![PatternItem::BracketExpression(BracketExpression { items: vec![BracketItem::CollatingSymbol("ch".to_string())], matching: true })]
+        assert_eq!(
+            parse_correct_pattern(ExpandedWord {
+                parts: vec![ExpandedWordPart::UnquotedLiteral("[.ch.]".to_string())]
+            }),
+            vec![PatternItem::BracketExpression(BracketExpression {
+                items: vec![BracketItem::CollatingSymbol("ch".to_string())],
+                matching: true
+            })]
         );
     }
 
     #[test]
     fn parse_bracket_expression_with_equivalence_class() {
-        assert_eq!(parse_correct_pattern(ExpandedWord { parts: vec![ExpandedWordPart::UnquotedLiteral("[=a=]".to_string())] }),
-                   vec![PatternItem::BracketExpression(BracketExpression { items: vec![BracketItem::EquivalenceClass("a".to_string())], matching: true })]
+        assert_eq!(
+            parse_correct_pattern(ExpandedWord {
+                parts: vec![ExpandedWordPart::UnquotedLiteral("[=a=]".to_string())]
+            }),
+            vec![PatternItem::BracketExpression(BracketExpression {
+                items: vec![BracketItem::EquivalenceClass("a".to_string())],
+                matching: true
+            })]
         );
     }
 
@@ -594,7 +613,7 @@ mod tests {
     fn parse_bracket_with_simple_range() {
         assert_eq!(
             parse_correct_pattern(ExpandedWord {
-                parts: vec![ExpandedWordPart::UnquotedLiteral("[a-z]".to_string()), ]
+                parts: vec![ExpandedWordPart::UnquotedLiteral("[a-z]".to_string()),]
             }),
             vec![PatternItem::BracketExpression(BracketExpression {
                 matching: true,
@@ -610,7 +629,7 @@ mod tests {
     fn minus_is_parsed_as_char_if_it_occurs_first_in_bracket_expression() {
         assert_eq!(
             parse_correct_pattern(ExpandedWord {
-                parts: vec![ExpandedWordPart::UnquotedLiteral("[-a]".to_string()), ]
+                parts: vec![ExpandedWordPart::UnquotedLiteral("[-a]".to_string()),]
             }),
             vec![PatternItem::BracketExpression(BracketExpression {
                 matching: true,
@@ -620,7 +639,7 @@ mod tests {
 
         assert_eq!(
             parse_correct_pattern(ExpandedWord {
-                parts: vec![ExpandedWordPart::UnquotedLiteral("[!-a]".to_string()), ]
+                parts: vec![ExpandedWordPart::UnquotedLiteral("[!-a]".to_string()),]
             }),
             vec![PatternItem::BracketExpression(BracketExpression {
                 matching: false,
@@ -633,7 +652,7 @@ mod tests {
     fn minus_is_parsed_as_char_if_it_occurs_last_in_bracket_expression() {
         assert_eq!(
             parse_correct_pattern(ExpandedWord {
-                parts: vec![ExpandedWordPart::UnquotedLiteral("[a-]".to_string()), ]
+                parts: vec![ExpandedWordPart::UnquotedLiteral("[a-]".to_string()),]
             }),
             vec![PatternItem::BracketExpression(BracketExpression {
                 matching: true,
@@ -646,7 +665,11 @@ mod tests {
     fn quoted_minus_is_parsed_as_char() {
         assert_eq!(
             parse_correct_pattern(ExpandedWord {
-                parts: vec![ExpandedWordPart::UnquotedLiteral("[".to_string()), ExpandedWordPart::QuotedLiteral("-".to_string()), ExpandedWordPart::UnquotedLiteral("]".to_string())]
+                parts: vec![
+                    ExpandedWordPart::UnquotedLiteral("[".to_string()),
+                    ExpandedWordPart::QuotedLiteral("-".to_string()),
+                    ExpandedWordPart::UnquotedLiteral("]".to_string())
+                ]
             }),
             vec![PatternItem::BracketExpression(BracketExpression {
                 matching: true,
@@ -656,28 +679,64 @@ mod tests {
     }
 
     #[test]
-    fn short_version_of_collating_symbol_is_parsed_correctly()
-    {
-        assert_eq!(parse_correct_pattern(ExpandedWord { parts: vec![ExpandedWordPart::UnquotedLiteral("[.seq.]".to_string())] }), vec![PatternItem::BracketExpression(BracketExpression { items: vec![BracketItem::CollatingSymbol("seq".to_string())], matching: true })]
+    fn short_version_of_collating_symbol_is_parsed_correctly() {
+        assert_eq!(
+            parse_correct_pattern(ExpandedWord {
+                parts: vec![ExpandedWordPart::UnquotedLiteral("[.seq.]".to_string())]
+            }),
+            vec![PatternItem::BracketExpression(BracketExpression {
+                items: vec![BracketItem::CollatingSymbol("seq".to_string())],
+                matching: true
+            })]
         );
     }
 
     #[test]
     fn short_version_of_equivalence_class_is_parsed_correctly() {
-        assert_eq!(parse_correct_pattern(ExpandedWord { parts: vec![ExpandedWordPart::UnquotedLiteral("[=eq=]".to_string())] }), vec![PatternItem::BracketExpression(BracketExpression { items: vec![BracketItem::EquivalenceClass("eq".to_string())], matching: true })]
+        assert_eq!(
+            parse_correct_pattern(ExpandedWord {
+                parts: vec![ExpandedWordPart::UnquotedLiteral("[=eq=]".to_string())]
+            }),
+            vec![PatternItem::BracketExpression(BracketExpression {
+                items: vec![BracketItem::EquivalenceClass("eq".to_string())],
+                matching: true
+            })]
         );
     }
 
     #[test]
     fn short_version_of_character_class_is_parsed_correctly() {
-        assert_eq!(parse_correct_pattern(ExpandedWord { parts: vec![ExpandedWordPart::UnquotedLiteral("[:class:]".to_string())] }), vec![PatternItem::BracketExpression(BracketExpression { items: vec![BracketItem::CharacterClass("class".to_string())], matching: true })]
+        assert_eq!(
+            parse_correct_pattern(ExpandedWord {
+                parts: vec![ExpandedWordPart::UnquotedLiteral("[:class:]".to_string())]
+            }),
+            vec![PatternItem::BracketExpression(BracketExpression {
+                items: vec![BracketItem::CharacterClass("class".to_string())],
+                matching: true
+            })]
         );
     }
 
     #[test]
     fn patterns_used_in_filename_expansion_ignore_open_square_bracket_if_it_contains_slash() {
-        let parsed_pattern = parse_pattern(&ExpandedWord { parts: vec![ExpandedWordPart::UnquotedLiteral("a[b/c]d".to_string())] }, true).expect("parsing failed");
-        assert_eq!(parsed_pattern, vec![PatternItem::Char('a'), PatternItem::Char('['), PatternItem::Char('b'), PatternItem::Char('/'), PatternItem::Char('c'), PatternItem::Char(']'), PatternItem::Char('d')]
+        let parsed_pattern = parse_pattern(
+            &ExpandedWord {
+                parts: vec![ExpandedWordPart::UnquotedLiteral("a[b/c]d".to_string())],
+            },
+            true,
+        )
+        .expect("parsing failed");
+        assert_eq!(
+            parsed_pattern,
+            vec![
+                PatternItem::Char('a'),
+                PatternItem::Char('['),
+                PatternItem::Char('b'),
+                PatternItem::Char('/'),
+                PatternItem::Char('c'),
+                PatternItem::Char(']'),
+                PatternItem::Char('d')
+            ]
         );
     }
 }

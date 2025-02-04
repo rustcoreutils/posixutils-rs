@@ -1,105 +1,14 @@
+use crate::interpreter::wordexp::{expand_word, expand_word_to_string};
 use crate::program::{
-    Command, CompleteCommand, CompoundCommand, Conjunction, IORedirectionKind, LogicalOp,
-    Parameter, ParameterExpansion, Pipeline, Program, Redirection, RedirectionKind, SimpleCommand,
-    SpecialParameter, Word, WordPart,
+    Command, CompleteCommand, Conjunction, IORedirectionKind, LogicalOp, Pipeline, Program,
+    Redirection, RedirectionKind, SimpleCommand,
 };
 use std::collections::HashMap;
-use std::ffi::{c_char, CStr, CString};
-use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
+use std::ffi::{c_char, CString, OsString};
+use std::os::fd::{AsRawFd, IntoRawFd};
 use std::rc::Rc;
-use crate::interpreter::pattern::Pattern;
 
-mod pattern;
 mod wordexp;
-
-trait SystemInterface {
-    fn environment_variables(&self) -> HashMap<String, String>;
-    /// # Panics
-    /// Panics if `login_name` contains non-portable filename characters as defined in
-    /// https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap03.html#tag_03_282
-    fn get_user_home(&self, login_name: &str) -> Option<String>;
-    fn get_pid(&self) -> i32;
-
-    // TODO: change args to something better
-    fn exec(&self, command: &str, args: &[String], interpreter: &Interpreter) -> i32;
-}
-
-#[derive(Default)]
-struct System {}
-
-impl SystemInterface for System {
-    fn environment_variables(&self) -> HashMap<String, String> {
-        std::env::vars().collect()
-    }
-
-    fn get_user_home(&self, login_name: &str) -> Option<String> {
-        // it cannot contain a null char as part of the method's contract
-        let login_name = CString::new(login_name).unwrap();
-        let passwd = unsafe { libc::getpwnam(login_name.as_ptr()) };
-        if passwd == std::ptr::null_mut() {
-            return None;
-        }
-        // this is safe, since the pointer is not null
-        // https://pubs.opengroup.org/onlinepubs/9699919799/functions/getpwnam.html
-        let user_home_dir = unsafe { CStr::from_ptr((*passwd).pw_dir as *const c_char) };
-        Some(user_home_dir.to_string_lossy().into_owned())
-    }
-
-    fn get_pid(&self) -> i32 {
-        unsafe { libc::getpid() }
-    }
-
-    fn exec(&self, command: &str, args: &[String], interpreter: &Interpreter) -> i32 {
-        let pid = unsafe { libc::fork() };
-        if pid < 0 {
-            todo!("error: fork failed")
-        } else if pid == 0 {
-            // child
-            for (id, file) in &interpreter.opened_files {
-                let dest = *id as i32;
-                let src = file.as_raw_fd();
-                unsafe { libc::dup2(src, dest) };
-            }
-
-            let command = CString::new(command).unwrap();
-            let args = args
-                .iter()
-                .map(|s| CString::new(s.as_str()).unwrap())
-                .collect::<Vec<_>>();
-            let args = std::iter::once(command.as_ptr())
-                .chain(args.iter().map(|s| s.as_ptr()))
-                .chain(std::iter::once(std::ptr::null() as *const c_char))
-                .collect::<Vec<_>>();
-
-            let env = interpreter
-                .environment
-                .iter()
-                .filter_map(|(name, value)| {
-                    if value.export {
-                        // TODO: look into this unwrap
-                        Some(CString::new(format!("{name}={}", value.value)).unwrap())
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<CString>>();
-            let env = env
-                .iter()
-                .map(|s| s.as_ptr())
-                .chain(std::iter::once(std::ptr::null()))
-                .collect::<Vec<_>>();
-            unsafe { libc::execve(command.as_ptr(), args.as_ptr(), env.as_ptr()) }
-        } else {
-            // parent
-            let mut status = 0;
-            let wait_result = unsafe { libc::waitpid(pid, &mut status, 0) };
-            if wait_result != pid {
-                panic!("failed to wait for child process");
-            }
-            libc::WEXITSTATUS(status)
-        }
-    }
-}
 
 fn is_portable_filename_character(c: char) -> bool {
     // https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap03.html#tag_03_282
@@ -132,515 +41,73 @@ impl Variable {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ExpandedWordPart {
-    QuotedLiteral(String),
-    UnquotedLiteral(String),
-    GeneratedUnquotedLiteral(String),
-}
-
-/// Word that has undergone:
-/// - tilde expansion
-/// - parameter expansion
-/// - command substitution
-/// - arithmetic expansion
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ExpandedWord {
-    parts: Vec<ExpandedWordPart>,
-}
-
-impl From<ExpandedWord> for String {
-    fn from(value: ExpandedWord) -> Self {
-        value.to_string()
-    }
-}
-
-impl ToString for ExpandedWord {
-    fn to_string(&self) -> String {
-        self.parts
-            .iter()
-            .map(|p| match p {
-                ExpandedWordPart::UnquotedLiteral(s) => s.as_str(),
-                ExpandedWordPart::QuotedLiteral(s) => s.as_str(),
-                ExpandedWordPart::GeneratedUnquotedLiteral(s) => s.as_str(),
-            })
-            .collect()
-    }
-}
-
-impl ExpandedWord {
-    /// joins adjacent parts that are the same
-    fn normalize(self) -> Self {
-        if self.parts.is_empty() {
-            return Self { parts: Vec::new() };
-        }
-        let mut word_iter = self.parts.into_iter();
-        let mut merged_parts = vec![word_iter.next().unwrap()];
-        for part in word_iter {
-            match (part, merged_parts.last_mut().unwrap()) {
-                (
-                    ExpandedWordPart::UnquotedLiteral(lit),
-                    ExpandedWordPart::UnquotedLiteral(dest),
-                ) => dest.push_str(&lit),
-                (
-                    ExpandedWordPart::GeneratedUnquotedLiteral(lit),
-                    ExpandedWordPart::GeneratedUnquotedLiteral(dest),
-                ) => dest.push_str(&lit),
-                (ExpandedWordPart::QuotedLiteral(lit), ExpandedWordPart::QuotedLiteral(dest)) => {
-                    dest.push_str(&lit)
-                }
-                (part, _) => merged_parts.push(part),
-            }
-        }
-        Self {
-            parts: merged_parts,
-        }
-    }
-}
+pub type Environment = HashMap<String, Variable>;
 
 #[derive(Clone)]
 pub struct Interpreter {
-    environment: HashMap<String, Variable>,
+    environment: Environment,
     opened_files: HashMap<u32, Rc<std::fs::File>>,
     most_recent_pipeline_status: i32,
     last_command_substitution_status: i32,
     shell_pid: i32,
     most_recent_background_command_pid: i32,
-    system: Rc<dyn SystemInterface>,
+    current_directory: OsString,
 }
 
 impl Interpreter {
-    fn expand_home(&self, login_name: &str) -> String {
-        if login_name.is_empty() {
-            // > If the login name is null (that is, the tilde-prefix contains only the tilde),
-            // > the tilde-prefix is replaced by the value of the variable HOME
-            self.environment
-                .get("HOME")
-                .map(|v| v.value.clone())
-                .unwrap_or_else(|| todo!("error: HOME not set"))
-        } else {
-            if !login_name.chars().all(is_portable_filename_character) {
-                todo!("error: invalid character in login name")
+    fn exec(&self, command: &str, args: &[String]) -> i32 {
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            todo!("error: fork failed")
+        } else if pid == 0 {
+            // child
+            for (id, file) in &self.opened_files {
+                let dest = *id as i32;
+                let src = file.as_raw_fd();
+                unsafe { libc::dup2(src, dest) };
             }
-            self.system
-                .get_user_home(login_name)
-                .unwrap_or_else(|| todo!("error: login name not found"))
-        }
-    }
 
-    /// performs tilde expansion on `unquoted_start`. Assumes that `unquoted_start` starts with
-    /// `~`
-    fn tilde_expansion_simple(&mut self, unquoted_start: &str, is_assignment: bool) -> String {
-        if is_assignment {
-            let mut result = String::with_capacity(unquoted_start.len());
-            for sub in unquoted_start.split(':') {
-                if sub.starts_with('~') {
-                    let prefix_end = sub.find('/').unwrap_or(sub.len());
-                    let login_name = &sub[1..prefix_end];
-                    result += &self.expand_home(login_name);
-                    result += &sub[prefix_end..];
-                } else {
-                    result += sub
-                }
-                result.push(':');
-            }
-            // removes last ':'
-            result.pop();
-            result
-        } else {
-            let prefix_end = unquoted_start.find('/').unwrap_or(unquoted_start.len());
-            let login_name = &unquoted_start[1..prefix_end];
-            let mut result = self.expand_home(login_name);
-            result += &unquoted_start[prefix_end..];
-            result
-        }
-    }
+            let command = CString::new(command).unwrap();
+            let args = args
+                .iter()
+                .map(|s| CString::new(s.as_str()).unwrap())
+                .collect::<Vec<_>>();
+            let args = std::iter::once(command.as_ptr())
+                .chain(args.iter().map(|s| s.as_ptr()))
+                .chain(std::iter::once(std::ptr::null() as *const c_char))
+                .collect::<Vec<_>>();
 
-    fn tilde_expansion(&mut self, word: &mut Word, is_assignment: bool) {
-        let unquoted_start = if let Some(WordPart::UnquotedLiteral(start)) = word.parts.first() {
-            start.as_str()
-        } else {
-            return;
-        };
-
-        if is_assignment {
-            // > In an assignment (see XBD Variable Assignment), multiple tilde-prefixes can be
-            // > used: at the beginning of the word (that is, following the <equals-sign> of the
-            // > assignment), following any unquoted <colon>, or both
-
-            if unquoted_start.starts_with('~') {
-                word.parts[0] =
-                    WordPart::QuotedLiteral(self.tilde_expansion_simple(unquoted_start, true));
-            }
-            for i in 1..word.parts.len() {
-                if let WordPart::UnquotedLiteral(lit) = &word.parts[i] {
-                    if let Some(prefix_start) = lit.find(":~") {
-                        word.parts[i] = WordPart::QuotedLiteral(
-                            self.tilde_expansion_simple(&lit[prefix_start + 1..], true),
-                        )
-                    }
-                }
-            }
-        } else {
-            if !unquoted_start.starts_with('~') {
-                return;
-            }
-            // > The pathname resulting from tilde expansion shall be treated as if
-            // > quoted to prevent it being altered by field splitting and pathname expansion.
-            word.parts[0] =
-                WordPart::QuotedLiteral(self.tilde_expansion_simple(unquoted_start, false));
-        }
-    }
-
-    fn expand_simple_parameter(&mut self, parameter: &Parameter) -> Option<String> {
-        match parameter {
-            Parameter::Number(_) => {
-                todo!()
-            }
-            Parameter::Variable(var_name) => self
+            let env = self
                 .environment
-                .get(var_name.as_ref())
-                .map(|v| v.value.clone()),
-            Parameter::Special(special_parameter) => match special_parameter {
-                SpecialParameter::At => {
-                    todo!()
-                }
-                SpecialParameter::Asterisk => {
-                    todo!()
-                }
-                SpecialParameter::Hash => {
-                    todo!()
-                }
-                SpecialParameter::QuestionMark => {
-                    Some(self.most_recent_pipeline_status.to_string())
-                }
-                SpecialParameter::Minus => {
-                    todo!()
-                }
-                SpecialParameter::Dollar => Some(self.shell_pid.to_string()),
-                SpecialParameter::Bang => Some(self.most_recent_background_command_pid.to_string()),
-                SpecialParameter::Zero => {
-                    todo!()
-                }
-            },
-        }
-    }
-
-    fn expand_parameter(&mut self, parameter_expansion: &ParameterExpansion) -> String {
-        match parameter_expansion {
-            ParameterExpansion::Simple(parameter) => {
-                self.expand_simple_parameter(parameter).unwrap_or_default()
-            }
-            ParameterExpansion::UnsetUseDefault {
-                parameter,
-                word: default,
-                default_on_null,
-            } => {
-                // > If parameter is unset [or null], the expansion of word (or an empty string if
-                // > word is omitted) shall be substituted; otherwise, the value of parameter
-                // > shall be substituted.
-                match self.expand_simple_parameter(parameter) {
-                    Some(value) if !default_on_null || !value.is_empty() => value,
-                    _ => {
-                        if let Some(default) = default {
-                            self.expand_word(default, false).into()
-                        } else {
-                            String::new()
-                        }
-                    }
-                }
-            }
-            ParameterExpansion::UnsetAssignDefault {
-                parameter,
-                word,
-                assign_on_null,
-            } => {
-                // > If parameter is unset [or null], the expansion of word (or an empty string if
-                // > word is omitted) shall be assigned to parameter. In all cases, the final value
-                // > of parameter shall be substituted. Only variables, not positional parameters
-                // > or special parameters, can be assigned in this way.
-                match parameter {
-                    Parameter::Number(_) | Parameter::Special(_) => {
-                        todo!("error: cannot assign to positional argument or special parameter")
-                    }
-                    Parameter::Variable(variable_name) => {
-                        let value = word
-                            .as_ref()
-                            .map(|w| self.expand_word(w, false).to_string())
-                            .unwrap_or_default();
-                        match self.environment.get_mut(variable_name.as_ref()) {
-                            Some(variable) if *assign_on_null && variable.value.is_empty() => {
-                                variable.value = value.clone();
-                            }
-                            None => {
-                                self.environment.insert(
-                                    variable_name.to_string(),
-                                    Variable::new(value.clone()),
-                                );
-                            }
-                            _ => {
-                                // variable is set and not null
-                            }
-                        }
-                        value
-                    }
-                }
-            }
-            ParameterExpansion::UnsetError {
-                parameter,
-                word,
-                error_on_null,
-            } => {
-                // > If parameter is unset [or null], the expansion of word (or a message indicating
-                // > it is unset if word is omitted) shall be written to standard error and the
-                // > shell exits with a non-zero exit status. Otherwise, the value of parameter
-                // > shall be substituted. An interactive shell need not exit.
-                match self.expand_simple_parameter(parameter) {
-                    Some(value) if !error_on_null || !value.is_empty() => value,
-                    _ => {
-                        if let Some(word) = word {
-                            eprintln!("{}", self.expand_word(word, false).to_string());
-                        } else if *error_on_null {
-                            eprintln!("parameter is unset or null");
-                        } else {
-                            eprintln!("parameter is unset");
-                        }
-                        std::process::exit(1);
-                    }
-                }
-            }
-            ParameterExpansion::SetUseAlternative {
-                parameter,
-                word,
-                substitute_null_with_word,
-            } => {
-                // > If parameter is unset [or null], null shall be substituted; otherwise, the
-                // > expansion of word (or an empty string if word is omitted) shall be substituted.
-                match self.expand_simple_parameter(parameter) {
-                    Some(value) if *substitute_null_with_word || !value.is_empty() => {
-                        self.expand_word(word.as_ref().unwrap(), false).into()
-                    }
-                    _ => String::new(),
-                }
-            }
-            ParameterExpansion::StrLen(parameter) => {
-                // > The length in characters of the value of parameter shall be substituted.
-                // > If parameter is '*' or '@', the result of the expansion is unspecified.
-                // > If parameter is unset and set -u is in effect, the expansion shall fail.
-                if matches!(
-                    parameter,
-                    Parameter::Special(SpecialParameter::Asterisk)
-                        | Parameter::Special(SpecialParameter::At)
-                ) {
-                    todo!("error: length of '*' or '@' is unspecified")
-                }
-                match self.expand_simple_parameter(parameter) {
-                    Some(value) => value.len().to_string(),
-                    None => {
-                        todo!("fail if set -u is in effect")
-                    }
-                }
-            }
-            ParameterExpansion::RemovePattern {
-                parameter,
-                pattern,
-                remove_prefix,
-                remove_largest,
-            } => {
-                let param_str = self.expand_simple_parameter(parameter).unwrap_or_default();
-                if param_str.is_empty() {
-                    return String::new();
-                }
-                if let Some(word) = pattern {
-                    let expanded_word = self.expand_word(word, false);
-                    // TODO: fix unwrap
-                    let pattern = Pattern::new(&expanded_word).unwrap();
-                    if *remove_prefix {
-                        if *remove_largest {
-                            pattern.remove_largest_prefix(param_str)
-                        } else {
-                            pattern.remove_shortest_prefix(param_str)
-                        }
+                .iter()
+                .filter_map(|(name, value)| {
+                    if value.export {
+                        // TODO: look into this unwrap
+                        Some(CString::new(format!("{name}={}", value.value)).unwrap())
                     } else {
-                        if *remove_largest {
-                            pattern.remove_largest_suffix(param_str)
-                        } else {
-                            pattern.remove_shortest_suffix(param_str)
-                        }
+                        None
                     }
-                } else {
-                    param_str
-                }
+                })
+                .collect::<Vec<CString>>();
+            let env = env
+                .iter()
+                .map(|s| s.as_ptr())
+                .chain(std::iter::once(std::ptr::null()))
+                .collect::<Vec<_>>();
+            unsafe { libc::execve(command.as_ptr(), args.as_ptr(), env.as_ptr()) }
+        } else {
+            // parent
+            let mut status = 0;
+            let wait_result = unsafe { libc::waitpid(pid, &mut status, 0) };
+            if wait_result != pid {
+                panic!("failed to wait for child process");
             }
+            libc::WEXITSTATUS(status)
         }
     }
 
     fn interpret_complete_command_to_string(&self, complete_command: &CompleteCommand) -> String {
         todo!()
-    }
-
-    fn split_fields(&self, expanded_word: ExpandedWord) -> Vec<ExpandedWord> {
-        // TODO: look into "Note that the shell processes arbitrary bytes from the input fields;
-        // there is no requirement that those bytes form valid characters."
-        if expanded_word.parts.is_empty() {
-            return Vec::new();
-        }
-        // > If the IFS variable is unset [..], its value shall be considered to contain the three
-        // > single-byte characters <space>, <tab>, and <newline>
-        let ifs = self
-            .environment
-            .get("IFS")
-            .map(|v| v.value.as_str())
-            .unwrap_or(" \t\n");
-        if ifs.is_empty() {
-            // > If the IFS variable is set and has an empty string as its value, no field
-            // > splitting shall occur
-            return vec![expanded_word];
-        }
-
-        let normalized_word = expanded_word.normalize();
-
-        let mut result = Vec::with_capacity(normalized_word.parts.len());
-        let mut parts_for_last_word = Vec::new();
-        for part in normalized_word.parts.into_iter() {
-            match part {
-                // > Fields which contain no results from expansions shall not be affected by
-                // > field splitting, and shall remain unaltered, simply moving from the list
-                // > of input fields to be next in the list of output fields.
-                ExpandedWordPart::UnquotedLiteral(lit) => {
-                    parts_for_last_word.push(ExpandedWordPart::UnquotedLiteral(lit));
-                }
-                ExpandedWordPart::QuotedLiteral(lit) => {
-                    parts_for_last_word.push(ExpandedWordPart::QuotedLiteral(lit));
-                }
-                ExpandedWordPart::GeneratedUnquotedLiteral(lit) => {
-                    if lit.is_empty() {
-                        continue;
-                    }
-                    let mut accumulator = String::new();
-                    // TODO: this could probably be done more cleanly
-                    let mut iter = lit.chars();
-                    let mut next_char = iter.next().unwrap();
-                    'outer: loop {
-                        if ifs.contains(next_char) {
-                            if is_ifs_whitespace(next_char) {
-                                loop {
-                                    match iter.next() {
-                                        Some(c) => {
-                                            next_char = c;
-                                            if !is_ifs_whitespace(next_char) {
-                                                break;
-                                            }
-                                        }
-                                        None => break 'outer,
-                                    }
-                                }
-                            } else {
-                                if let Some(c) = iter.next() {
-                                    next_char = c;
-                                } else {
-                                    break;
-                                }
-                            }
-                            if !accumulator.is_empty() {
-                                parts_for_last_word
-                                    .push(ExpandedWordPart::UnquotedLiteral(accumulator));
-                                accumulator = String::new();
-                                result.push(
-                                    ExpandedWord {
-                                        parts: parts_for_last_word,
-                                    }
-                                        .normalize(),
-                                );
-                                parts_for_last_word = Vec::new();
-                            }
-                        } else {
-                            accumulator.push(next_char);
-                            if let Some(c) = iter.next() {
-                                next_char = c;
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                    if !accumulator.is_empty() {
-                        parts_for_last_word.push(ExpandedWordPart::UnquotedLiteral(accumulator));
-                    }
-                }
-            }
-        }
-        if !parts_for_last_word.is_empty() {
-            result.push(
-                ExpandedWord {
-                    parts: parts_for_last_word,
-                }
-                    .normalize(),
-            );
-        }
-        result
-    }
-
-    fn pathname_expansion(&self, pathname: String) -> String {
-        pathname
-    }
-
-    /// performs:
-    /// - tilde expansion
-    /// - parameter expansion
-    /// - command substitution
-    /// - arithmetic expansion
-    fn expand_word(&mut self, word: &Word, is_assignment: bool) -> ExpandedWord {
-        let mut word = word.clone();
-        self.tilde_expansion(&mut word, is_assignment);
-        let mut result = Vec::new();
-        for part in word.parts.into_iter() {
-            match part {
-                WordPart::UnquotedLiteral(lit) => {
-                    result.push(ExpandedWordPart::UnquotedLiteral(lit))
-                }
-                WordPart::QuotedLiteral(lit) => result.push(ExpandedWordPart::QuotedLiteral(lit)),
-                WordPart::ParameterExpansion {
-                    expansion,
-                    inside_double_quotes,
-                } => {
-                    // > If a parameter expansion occurs inside double-quotes:
-                    // > - Pathname expansion shall not be performed on the results of the
-                    // >   expansion.
-                    // > - Field splitting shall not be performed on the results of the expansion.
-                    if inside_double_quotes {
-                        result.push(ExpandedWordPart::QuotedLiteral(
-                            self.expand_parameter(&expansion),
-                        ))
-                    } else {
-                        result.push(ExpandedWordPart::GeneratedUnquotedLiteral(
-                            self.expand_parameter(&expansion),
-                        ))
-                    }
-                }
-                WordPart::ArithmeticExpansion(_) => {
-                    todo!()
-                }
-                WordPart::CommandSubstitution {
-                    command,
-                    inside_double_quotes,
-                } => {
-                    // > If a command substitution occurs inside double-quotes, field splitting
-                    // > and pathname expansion shall not be performed on the results of
-                    // > the substitution.
-                    if inside_double_quotes {
-                        result.push(ExpandedWordPart::QuotedLiteral(
-                            self.interpret_complete_command_to_string(&command),
-                        ));
-                    } else {
-                        result.push(ExpandedWordPart::GeneratedUnquotedLiteral(
-                            self.interpret_complete_command_to_string(&command),
-                        ))
-                    }
-                }
-                _ => {}
-            }
-        }
-        ExpandedWord { parts: result }
     }
 
     fn perform_redirection(&mut self, redirection: &Redirection) {
@@ -649,7 +116,7 @@ impl Interpreter {
                 // > the word that follows the redirection operator shall be subjected to tilde
                 // > expansion, parameter expansion, command substitution, arithmetic expansion,
                 // > and quote removal.
-                let path = self.expand_word(file, false).to_string();
+                let path = expand_word_to_string(file, false, self);
                 // TODO: pathname expansion is not allowed if the shell is non-interactive,
                 // optional otherwise. Bash does implement this, maybe we should too.
                 match kind {
@@ -695,10 +162,7 @@ impl Interpreter {
         // >    value.
         let mut expanded_words = Vec::new();
         for word in &simple_command.words {
-            let expanded_word = self.expand_word(word, false);
-            let fields = self.split_fields(expanded_word);
-            // let expanded_word = fields.into_iter().map(|f| self.pathname_expansion(f));
-            expanded_words.extend(fields);
+            expanded_words.extend(expand_word(word, false, self));
         }
         if expanded_words.is_empty() {
             // > If there is no command name, any redirections shall be performed in a
@@ -712,7 +176,7 @@ impl Interpreter {
             // > If no command name results, variable assignments shall affect the current
             // > execution environment.
             for assignment in &simple_command.assignments {
-                let word_str = self.expand_word(&assignment.value, true).to_string();
+                let word_str = expand_word_to_string(&assignment.value, true, self);
                 self.environment
                     .insert(assignment.name.to_string(), Variable::new(word_str));
             }
@@ -725,7 +189,7 @@ impl Interpreter {
         // TODO: consider all other cases specified in Command Search and Execution
         let mut command_environment = self.clone();
         for assignment in &simple_command.assignments {
-            let word_str = self.expand_word(&assignment.value, true).to_string();
+            let word_str = expand_word_to_string(&assignment.value, true, self);
             command_environment.environment.insert(
                 assignment.name.to_string(),
                 Variable::new_exported(word_str),
@@ -740,7 +204,7 @@ impl Interpreter {
             .iter()
             .map(|w| w.clone().to_string())
             .collect::<Vec<String>>();
-        self.system.exec(&command, &arguments, &command_environment)
+        self.exec(&command, &arguments)
     }
 
     fn interpret_command(&mut self, command: &Command) -> i32 {
@@ -791,662 +255,37 @@ impl Interpreter {
         }
     }
 
-    fn with_system<S: SystemInterface + 'static>(system: S) -> Self {
-        let system = Rc::new(system);
+    pub fn initialize_from_system() -> Interpreter {
         // > If a variable is initialized from the environment, it shall be marked for
         // > export immediately
-        let variables = system
-            .environment_variables()
+        let variables = std::env::vars()
             .into_iter()
             .map(|(k, v)| (k, Variable::new_exported(v)))
             .collect();
+        let pid = unsafe { libc::getpid() };
         Interpreter {
             environment: variables,
             opened_files: HashMap::new(),
             most_recent_pipeline_status: 0,
             last_command_substitution_status: 0,
-            shell_pid: system.get_pid(),
+            shell_pid: pid,
             most_recent_background_command_pid: 0,
-            system,
+            // TODO: handle error
+            current_directory: std::env::current_dir().unwrap().into_os_string(),
         }
     }
 }
 
 impl Default for Interpreter {
     fn default() -> Self {
-        Self::with_system(System::default())
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    use crate::program::test_utils::unquoted_literal;
-
-    #[rustfmt::skip]
-    const TEST_ENV: &[(&'static str, &'static str)] = &[
-        ("ENV", "test_env"),
-        ("HOME", "/home/test_user"),
-        ("PATH", "/usr/local/bin:/usr/bin:/bin"),
-        ("USER", "test_user"),
-        ("PATH", "/test_path0/:/test_path1/"),
-        ("PWD", "/test_dir"),
-        ("NULL", ""),
-    ];
-
-    struct TestSystem {
-        env: HashMap<String, String>,
-        user_homes: HashMap<String, String>,
-        pid: i32,
-    }
-
-    impl TestSystem {
-        fn set_environment_var(mut self, key: &str, value: &str) -> Self {
-            self.env.insert(key.to_string(), value.to_string());
-            self
+        Interpreter {
+            environment: Environment::default(),
+            opened_files: HashMap::new(),
+            most_recent_pipeline_status: 0,
+            last_command_substitution_status: 0,
+            shell_pid: 0,
+            most_recent_background_command_pid: 0,
+            current_directory: OsString::from("/"),
         }
-    }
-
-    impl SystemInterface for TestSystem {
-        fn environment_variables(&self) -> HashMap<String, String> {
-            self.env.clone()
-        }
-
-        fn get_user_home(&self, login_name: &str) -> Option<String> {
-            self.user_homes.get(login_name).cloned()
-        }
-
-        fn get_pid(&self) -> i32 {
-            self.pid
-        }
-
-        fn exec(&self, command: &str, args: &[String], interpreter: &Interpreter) -> i32 {
-            0
-        }
-    }
-
-    impl Default for TestSystem {
-        fn default() -> Self {
-            let env = TEST_ENV
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
-            let user_homes = [
-                ("test_user".to_string(), "/home/test_user".to_string()),
-                ("test_user2".to_string(), "/home/test_user2".to_string()),
-            ]
-                .into();
-            TestSystem {
-                env,
-                user_homes,
-                pid: 0,
-            }
-        }
-    }
-
-    fn expanded_word_from_str(s: &str) -> ExpandedWord {
-        ExpandedWord {
-            parts: vec![ExpandedWordPart::UnquotedLiteral(s.to_string())],
-        }
-    }
-
-    #[test]
-    fn expand_tilde() {
-        let mut interpreter = Interpreter::with_system(TestSystem::default());
-        assert_eq!(
-            interpreter
-                .expand_word(&unquoted_literal("~/"), false)
-                .to_string(),
-            "/home/test_user/".to_string()
-        );
-        assert_eq!(
-            interpreter
-                .expand_word(&unquoted_literal("~test_user/"), false)
-                .to_string(),
-            "/home/test_user/".to_string()
-        );
-        assert_eq!(
-            interpreter
-                .expand_word(&unquoted_literal("~test_user2"), false)
-                .to_string(),
-            "/home/test_user2".to_string()
-        );
-    }
-
-    #[test]
-    fn expand_tilde_in_assignments() {
-        let mut interpreter = Interpreter::with_system(TestSystem::default());
-        assert_eq!(
-            interpreter
-                .expand_word(&unquoted_literal("~/test1:~:~/test3"), true)
-                .to_string(),
-            "/home/test_user/test1:/home/test_user:/home/test_user/test3".to_string()
-        );
-        assert_eq!(
-            interpreter
-                .expand_word(&unquoted_literal("~test_user/test1:~test_user2/:~::"), true)
-                .to_string(),
-            "/home/test_user/test1:/home/test_user2/:/home/test_user::"
-        );
-    }
-
-    #[test]
-    fn expand_simple_named_parameter() {
-        let mut interpreter = Interpreter::with_system(TestSystem::default());
-        assert_eq!(
-            interpreter.expand_simple_parameter(&Parameter::Variable("HOME".into())),
-            Some("/home/test_user".to_string())
-        );
-        assert_eq!(
-            interpreter.expand_simple_parameter(&Parameter::Variable("PWD".into())),
-            Some("/test_dir".to_string())
-        );
-    }
-
-    #[test]
-    fn expand_special_parameters() {
-        let mut interpreter = Interpreter::with_system(TestSystem::default());
-        assert_eq!(
-            interpreter.expand_simple_parameter(&Parameter::Special(SpecialParameter::Dollar)),
-            Some("0".to_string())
-        );
-        assert_eq!(
-            interpreter.expand_simple_parameter(&Parameter::Special(SpecialParameter::Bang)),
-            Some("0".to_string())
-        );
-    }
-
-    #[test]
-    fn unset_use_default_parameter_expansion() {
-        let mut interpreter = Interpreter::with_system(TestSystem::default());
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::UnsetUseDefault {
-                parameter: Parameter::Variable("HOME".into()),
-                word: None,
-                default_on_null: false,
-            }),
-            "/home/test_user".to_string()
-        );
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::UnsetUseDefault {
-                parameter: Parameter::Variable("unset_var".into()),
-                word: Some(unquoted_literal("default")),
-                default_on_null: false,
-            }),
-            "default".to_string()
-        );
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::UnsetUseDefault {
-                parameter: Parameter::Variable("NULL".into()),
-                word: Some(unquoted_literal("default")),
-                default_on_null: true,
-            }),
-            "default".to_string()
-        );
-    }
-
-    #[test]
-    fn unset_assign_default_parameter_expansion() {
-        let mut interpreter = Interpreter::with_system(TestSystem::default());
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::UnsetAssignDefault {
-                parameter: Parameter::Variable("unset_var".into()),
-                word: Some(unquoted_literal("value")),
-                assign_on_null: false,
-            }),
-            "value".to_string()
-        );
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::Simple(Parameter::Variable(
-                "unset_var".into()
-            ))),
-            "value".to_string()
-        );
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::UnsetAssignDefault {
-                parameter: Parameter::Variable("unset_var".into()),
-                word: None,
-                assign_on_null: false,
-            }),
-            "".to_string()
-        );
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::Simple(Parameter::Variable(
-                "unset_var".into()
-            ))),
-            "value".to_string()
-        );
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::UnsetAssignDefault {
-                parameter: Parameter::Variable("NULL".into()),
-                word: Some(unquoted_literal("default")),
-                assign_on_null: false,
-            }),
-            "default".to_string()
-        );
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::Simple(Parameter::Variable(
-                "NULL".into()
-            ))),
-            "".to_string()
-        );
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::UnsetAssignDefault {
-                parameter: Parameter::Variable("NULL".into()),
-                word: Some(unquoted_literal("default")),
-                assign_on_null: true,
-            }),
-            "default".to_string()
-        );
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::Simple(Parameter::Variable(
-                "NULL".into()
-            ))),
-            "default".to_string()
-        );
-    }
-
-    #[test]
-    fn set_use_alternative_parameter_expansion() {
-        let mut interpreter = Interpreter::with_system(TestSystem::default());
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::SetUseAlternative {
-                parameter: Parameter::Variable("HOME".into()),
-                word: Some(unquoted_literal("word")),
-                substitute_null_with_word: false,
-            }),
-            "word".to_string()
-        );
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::SetUseAlternative {
-                parameter: Parameter::Variable("unset_var".into()),
-                word: Some(unquoted_literal("word")),
-                substitute_null_with_word: false,
-            }),
-            "".to_string()
-        );
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::SetUseAlternative {
-                parameter: Parameter::Variable("NULL".into()),
-                word: Some(unquoted_literal("word")),
-                substitute_null_with_word: false,
-            }),
-            "".to_string()
-        );
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::SetUseAlternative {
-                parameter: Parameter::Variable("NULL".into()),
-                word: Some(unquoted_literal("word")),
-                substitute_null_with_word: true,
-            }),
-            "word".to_string()
-        );
-    }
-
-    #[test]
-    fn string_length_parameter_expansion() {
-        let mut interpreter = Interpreter::with_system(TestSystem::default());
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::StrLen(Parameter::Variable(
-                "HOME".into()
-            ))),
-            "15".to_string()
-        );
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::StrLen(Parameter::Variable(
-                "PWD".into()
-            ))),
-            "9".to_string()
-        );
-    }
-
-    #[test]
-    fn remove_smallest_suffix() {
-        let mut interpreter =
-            Interpreter::with_system(TestSystem::default().set_environment_var("TEST", "aabbc"));
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
-                parameter: Parameter::Variable("HOME".into()),
-                pattern: Some(unquoted_literal("test_user")),
-                remove_largest: false,
-                remove_prefix: false,
-            }),
-            "/home/".to_string()
-        );
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
-                parameter: Parameter::Variable("TEST".into()),
-                pattern: Some(unquoted_literal("a*c")),
-                remove_largest: false,
-                remove_prefix: false,
-            }),
-            "a".to_string()
-        );
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
-                parameter: Parameter::Variable("NULL".into()),
-                pattern: Some(unquoted_literal("anything")),
-                remove_largest: false,
-                remove_prefix: false,
-            }),
-            "".to_string()
-        );
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
-                parameter: Parameter::Variable("UNDEFINED".into()),
-                pattern: Some(unquoted_literal("anything")),
-                remove_largest: false,
-                remove_prefix: false,
-            }),
-            "".to_string()
-        );
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
-                parameter: Parameter::Variable("HOME".into()),
-                pattern: None,
-                remove_largest: false,
-                remove_prefix: false,
-            }),
-            "/home/test_user".to_string()
-        );
-    }
-
-    #[test]
-    fn remove_largest_suffix() {
-        let mut interpreter =
-            Interpreter::with_system(TestSystem::default().set_environment_var("TEST", "aabbc"));
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
-                parameter: Parameter::Variable("HOME".into()),
-                pattern: Some(unquoted_literal("test_user")),
-                remove_largest: true,
-                remove_prefix: false,
-            }),
-            "/home/".to_string()
-        );
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
-                parameter: Parameter::Variable("TEST".into()),
-                pattern: Some(unquoted_literal("a*c")),
-                remove_largest: true,
-                remove_prefix: false,
-            }),
-            "".to_string()
-        );
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
-                parameter: Parameter::Variable("NULL".into()),
-                pattern: Some(unquoted_literal("anything")),
-                remove_largest: true,
-                remove_prefix: false,
-            }),
-            "".to_string()
-        );
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
-                parameter: Parameter::Variable("UNDEFINED".into()),
-                pattern: Some(unquoted_literal("anything")),
-                remove_largest: true,
-                remove_prefix: false,
-            }),
-            "".to_string()
-        );
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
-                parameter: Parameter::Variable("HOME".into()),
-                pattern: None,
-                remove_largest: true,
-                remove_prefix: false,
-            }),
-            "/home/test_user".to_string()
-        );
-    }
-
-    #[test]
-    fn remove_smallest_prefix() {
-        let mut interpreter =
-            Interpreter::with_system(TestSystem::default().set_environment_var("TEST", "abbcc"));
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
-                parameter: Parameter::Variable("HOME".into()),
-                pattern: Some(unquoted_literal("/home/")),
-                remove_largest: false,
-                remove_prefix: true,
-            }),
-            "test_user".to_string()
-        );
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
-                parameter: Parameter::Variable("TEST".into()),
-                pattern: Some(unquoted_literal("a*c")),
-                remove_largest: false,
-                remove_prefix: true,
-            }),
-            "c".to_string()
-        );
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
-                parameter: Parameter::Variable("NULL".into()),
-                pattern: Some(unquoted_literal("anything")),
-                remove_largest: false,
-                remove_prefix: true,
-            }),
-            "".to_string()
-        );
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
-                parameter: Parameter::Variable("UNDEFINED".into()),
-                pattern: Some(unquoted_literal("anything")),
-                remove_largest: false,
-                remove_prefix: true,
-            }),
-            "".to_string()
-        );
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
-                parameter: Parameter::Variable("HOME".into()),
-                pattern: None,
-                remove_largest: false,
-                remove_prefix: true,
-            }),
-            "/home/test_user".to_string()
-        );
-    }
-
-    #[test]
-    fn remove_largest_prefix() {
-        let mut interpreter =
-            Interpreter::with_system(TestSystem::default().set_environment_var("TEST", "abbcc"));
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
-                parameter: Parameter::Variable("HOME".into()),
-                pattern: Some(unquoted_literal("/home/")),
-                remove_largest: true,
-                remove_prefix: true,
-            }),
-            "test_user".to_string()
-        );
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
-                parameter: Parameter::Variable("TEST".into()),
-                pattern: Some(unquoted_literal("a*c")),
-                remove_largest: true,
-                remove_prefix: true,
-            }),
-            "".to_string()
-        );
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
-                parameter: Parameter::Variable("NULL".into()),
-                pattern: Some(unquoted_literal("anything")),
-                remove_largest: true,
-                remove_prefix: true,
-            }),
-            "".to_string()
-        );
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
-                parameter: Parameter::Variable("UNDEFINED".into()),
-                pattern: Some(unquoted_literal("anything")),
-                remove_largest: true,
-                remove_prefix: true,
-            }),
-            "".to_string()
-        );
-        assert_eq!(
-            interpreter.expand_parameter(&ParameterExpansion::RemovePattern {
-                parameter: Parameter::Variable("HOME".into()),
-                pattern: None,
-                remove_largest: true,
-                remove_prefix: true,
-            }),
-            "/home/test_user".to_string()
-        );
-    }
-
-    #[test]
-    fn split_fields_on_empty_literal() {
-        let interpreter = Interpreter::with_system(TestSystem::default());
-        assert_eq!(
-            interpreter.split_fields(ExpandedWord {
-                parts: vec![ExpandedWordPart::GeneratedUnquotedLiteral("".to_string())]
-            }),
-            Vec::<ExpandedWord>::new()
-        );
-    }
-
-    #[test]
-    fn split_fields_on_single_non_whitespace_char() {
-        let interpreter =
-            Interpreter::with_system(TestSystem::default().set_environment_var("IFS", ":"));
-        assert_eq!(
-            interpreter.split_fields(ExpandedWord {
-                parts: vec![ExpandedWordPart::GeneratedUnquotedLiteral(
-                    "a:b:c:".to_string()
-                )]
-            }),
-            vec![
-                expanded_word_from_str("a"),
-                expanded_word_from_str("b"),
-                expanded_word_from_str("c")
-            ]
-        );
-    }
-
-    #[test]
-    fn split_fields_on_multiple_non_whitespace_char() {
-        let interpreter =
-            Interpreter::with_system(TestSystem::default().set_environment_var("IFS", ":/-"));
-        assert_eq!(
-            interpreter.split_fields(ExpandedWord {
-                parts: vec![ExpandedWordPart::GeneratedUnquotedLiteral(
-                    "a:b/c-d-:/x y".to_string()
-                )]
-            }),
-            vec![
-                expanded_word_from_str("a"),
-                expanded_word_from_str("b"),
-                expanded_word_from_str("c"),
-                expanded_word_from_str("d"),
-                expanded_word_from_str("x y")
-            ]
-        );
-    }
-
-    #[test]
-    fn split_fields_on_single_whitespace_char() {
-        let interpreter =
-            Interpreter::with_system(TestSystem::default().set_environment_var("IFS", " "));
-        assert_eq!(
-            interpreter.split_fields(ExpandedWord {
-                parts: vec![ExpandedWordPart::GeneratedUnquotedLiteral(
-                    "a b c ".to_string()
-                )]
-            }),
-            vec![
-                expanded_word_from_str("a"),
-                expanded_word_from_str("b"),
-                expanded_word_from_str("c"),
-            ]
-        );
-    }
-
-    #[test]
-    fn split_fields_on_multiple_whitespace_char() {
-        let interpreter =
-            Interpreter::with_system(TestSystem::default().set_environment_var("IFS", "\t\n"));
-        assert_eq!(
-            interpreter.split_fields(ExpandedWord {
-                parts: vec![ExpandedWordPart::GeneratedUnquotedLiteral(
-                    "  a\t\n\t\nb  \tc\nd  e f".to_string()
-                )]
-            }),
-            vec![
-                expanded_word_from_str("  a"),
-                expanded_word_from_str("b  "),
-                expanded_word_from_str("c"),
-                expanded_word_from_str("d  e f"),
-            ]
-        )
-    }
-
-    #[test]
-    fn split_fields_default_ifs() {
-        let interpreter = Interpreter::with_system(TestSystem::default());
-        assert_eq!(
-            interpreter.split_fields(ExpandedWord {
-                parts: vec![ExpandedWordPart::GeneratedUnquotedLiteral(
-                    "\t\n   a\n\n\t  \n\t word,and\n\t\n \n\tc\n\n\n   \t\n\t ".to_string()
-                )]
-            }),
-            vec![
-                expanded_word_from_str("a"),
-                expanded_word_from_str("word,and"),
-                expanded_word_from_str("c")
-            ]
-        );
-    }
-
-    #[test]
-    fn split_fields_by_mixed_ifs() {
-        let interpreter =
-            Interpreter::with_system(TestSystem::default().set_environment_var("IFS", ",.:  \n"));
-        assert_eq!(
-            interpreter.split_fields(ExpandedWord {
-                parts: vec![ExpandedWordPart::GeneratedUnquotedLiteral(
-                    "a,b.c  d\n\ne  f".to_string()
-                )]
-            }),
-            vec![
-                expanded_word_from_str("a"),
-                expanded_word_from_str("b"),
-                expanded_word_from_str("c"),
-                expanded_word_from_str("d"),
-                expanded_word_from_str("e"),
-                expanded_word_from_str("f")
-            ]
-        );
-    }
-
-    #[test]
-    fn field_splitting_does_not_affect_non_generated_literals() {
-        let interpreter =
-            Interpreter::with_system(TestSystem::default().set_environment_var("IFS", ":"));
-        assert_eq!(
-            interpreter.split_fields(ExpandedWord {
-                parts: vec![ExpandedWordPart::UnquotedLiteral("a:b:c".to_string()), ]
-            }),
-            vec![expanded_word_from_str("a:b:c")]
-        );
-        assert_eq!(
-            interpreter.split_fields(ExpandedWord {
-                parts: vec![
-                    ExpandedWordPart::UnquotedLiteral("a:".to_string()),
-                    ExpandedWordPart::GeneratedUnquotedLiteral("b:c".to_string()),
-                    ExpandedWordPart::UnquotedLiteral(":d".to_string())
-                ]
-            }),
-            vec![expanded_word_from_str("a:b"), expanded_word_from_str("c:d")]
-        );
     }
 }

@@ -1,8 +1,8 @@
-use core::fmt;
-use std::ffi::{CStr, CString};
-use crate::interpreter::pattern::parse::{
+use crate::interpreter::wordexp::pattern::parse::{
     BracketExpression, BracketItem, ParsedPattern, PatternItem,
 };
+use core::fmt;
+use std::ffi::{CStr, CString};
 use std::fmt::{Formatter, Write};
 use std::ptr;
 
@@ -29,7 +29,6 @@ fn regex_compilation_result(
         Ok(())
     }
 }
-
 
 // TODO: the implementation is copied from awk, maybe we should consider putting it in a shared crate
 pub struct Regex {
@@ -194,8 +193,7 @@ mod tests {
 
     #[test]
     fn convert_single_char_pattern() {
-        let regex = pattern_to_regex_string(&[PatternItem::Char('a')],
-        );
+        let regex = pattern_to_regex_string(&[PatternItem::Char('a')]);
         assert_eq!(regex, "a");
     }
 
@@ -205,8 +203,7 @@ mod tests {
             PatternItem::Char('a'),
             PatternItem::Char('b'),
             PatternItem::Char('c'),
-        ],
-        );
+        ]);
         assert_eq!(regex, "abc");
     }
 
@@ -216,8 +213,7 @@ mod tests {
             PatternItem::Char('a'),
             PatternItem::QuestionMark,
             PatternItem::Char('b'),
-        ],
-        );
+        ]);
         assert_eq!(regex, "a.b");
     }
 
@@ -227,8 +223,7 @@ mod tests {
             PatternItem::Char('a'),
             PatternItem::Asterisk,
             PatternItem::Char('b'),
-        ],
-        );
+        ]);
         assert_eq!(regex, "a.*b");
     }
 
@@ -237,8 +232,7 @@ mod tests {
         let regex = pattern_to_regex_string(&[PatternItem::BracketExpression(BracketExpression {
             matching: true,
             items: vec![BracketItem::Char('a')],
-        })],
-        );
+        })]);
         assert_eq!(regex, "[a]");
     }
 
@@ -251,19 +245,16 @@ mod tests {
                 BracketItem::Char('b'),
                 BracketItem::Char('c'),
             ],
-        })],
-        );
+        })]);
         assert_eq!(regex, "[abc]");
     }
 
     #[test]
     fn convert_bracket_with_character_class() {
-        let regex = pattern_to_regex_string(
-            &[PatternItem::BracketExpression(BracketExpression {
-                matching: true,
-                items: vec![BracketItem::CharacterClass("digit".to_string())],
-            })],
-        );
+        let regex = pattern_to_regex_string(&[PatternItem::BracketExpression(BracketExpression {
+            matching: true,
+            items: vec![BracketItem::CharacterClass("digit".to_string())],
+        })]);
         assert_eq!(regex, "[[:digit:]]");
     }
 
@@ -272,23 +263,20 @@ mod tests {
         let regex = pattern_to_regex_string(&[PatternItem::BracketExpression(BracketExpression {
             matching: false,
             items: vec![BracketItem::Char('a')],
-        })],
-        );
+        })]);
         assert_eq!(regex, "[^a]");
     }
 
     #[test]
     fn convert_non_matching_bracket_expression_with_multiple_characters() {
-        let regex = pattern_to_regex_string(
-            &[PatternItem::BracketExpression(BracketExpression {
-                matching: false,
-                items: vec![
-                    BracketItem::Char('a'),
-                    BracketItem::Char('b'),
-                    BracketItem::Char('c'),
-                ],
-            })],
-        );
+        let regex = pattern_to_regex_string(&[PatternItem::BracketExpression(BracketExpression {
+            matching: false,
+            items: vec![
+                BracketItem::Char('a'),
+                BracketItem::Char('b'),
+                BracketItem::Char('c'),
+            ],
+        })]);
         assert_eq!(regex, "[^abc]");
     }
 
@@ -297,8 +285,7 @@ mod tests {
         let regex = pattern_to_regex_string(&[PatternItem::BracketExpression(BracketExpression {
             matching: false,
             items: vec![BracketItem::CharacterClass("digit".to_string())],
-        })],
-        );
+        })]);
         assert_eq!(regex, "[^[:digit:]]");
     }
 
@@ -311,8 +298,7 @@ mod tests {
                 BracketItem::CharacterClass("digit".to_string()),
                 BracketItem::Char('b'),
             ],
-        })],
-        );
+        })]);
         assert_eq!(regex, "[a[:digit:]b]");
     }
 
@@ -325,8 +311,7 @@ mod tests {
                 BracketItem::CharacterClass("digit".to_string()),
                 BracketItem::Char('b'),
             ],
-        })],
-        );
+        })]);
         assert_eq!(regex, "[^a[:digit:]b]");
     }
 
@@ -339,8 +324,7 @@ mod tests {
             PatternItem::Char('*'),
             PatternItem::Char('^'),
             PatternItem::Char('$'),
-        ],
-        );
+        ]);
         assert_eq!(regex, "\\.\\[\\\\\\*\\^\\$");
     }
 }

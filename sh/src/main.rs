@@ -7,9 +7,18 @@
 // SPDX-License-Identifier: MIT
 //
 
+use crate::interpreter::Interpreter;
+use crate::parser::parse;
+use libc::c_char;
+
 mod interpreter;
 mod lexer;
 mod parser;
 mod program;
 
-fn main() {}
+fn main() {
+    let program = parse("/bin/echo test");
+    println!("{:?}", program);
+    let mut interpreter = Interpreter::initialize_from_system();
+    interpreter.interpret(program);
+}

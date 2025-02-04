@@ -2,7 +2,7 @@ use crate::interpreter::wordexp::parameter::expand_parameter;
 use crate::interpreter::wordexp::pathname::glob;
 use crate::interpreter::wordexp::pattern::FilenamePattern;
 use crate::interpreter::wordexp::tilde::tilde_expansion;
-use crate::interpreter::{is_ifs_whitespace, Interpreter};
+use crate::interpreter::Interpreter;
 use crate::program::{Word, WordPart};
 use std::path::Path;
 
@@ -75,6 +75,10 @@ impl ExpandedWord {
             parts: merged_parts,
         }
     }
+}
+
+fn is_ifs_whitespace(c: char) -> bool {
+    c == ' ' || c == '\t' || c == '\n'
 }
 
 fn split_fields(expanded_word: ExpandedWord, ifs: Option<&str>) -> Vec<ExpandedWord> {

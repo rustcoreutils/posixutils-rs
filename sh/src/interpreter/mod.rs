@@ -1,7 +1,7 @@
 use crate::interpreter::wordexp::{expand_word, expand_word_to_string};
 use crate::program::{
-    Command, CompleteCommand, Conjunction, IORedirectionKind, LogicalOp, Pipeline, Program,
-    Redirection, RedirectionKind, SimpleCommand,
+    Assignment, Command, CompleteCommand, CompoundCommand, Conjunction, IORedirectionKind,
+    LogicalOp, Name, Pipeline, Program, Redirection, RedirectionKind, SimpleCommand,
 };
 use std::collections::HashMap;
 use std::ffi::{c_char, CString, OsString};
@@ -10,13 +10,20 @@ use std::rc::Rc;
 
 mod wordexp;
 
-fn is_portable_filename_character(c: char) -> bool {
-    // https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap03.html#tag_03_282
-    c.is_ascii_alphanumeric() || "._-".contains(c)
+trait BuiltinUtility {
+    fn exec(&self);
 }
 
-fn is_ifs_whitespace(c: char) -> bool {
-    c == ' ' || c == '\t' || c == '\n'
+fn get_special_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
+    match name {
+        _ => None,
+    }
+}
+
+fn get_bultin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
+    match name {
+        _ => None,
+    }
 }
 
 #[derive(Clone)]
@@ -47,6 +54,7 @@ pub type Environment = HashMap<String, Variable>;
 pub struct Interpreter {
     environment: Environment,
     opened_files: HashMap<u32, Rc<std::fs::File>>,
+    functions: HashMap<Name, Rc<CompoundCommand>>,
     most_recent_pipeline_status: i32,
     last_command_substitution_status: i32,
     shell_pid: i32,
@@ -106,105 +114,108 @@ impl Interpreter {
         }
     }
 
-    fn interpret_complete_command_to_string(&self, complete_command: &CompleteCommand) -> String {
-        todo!()
+    fn perform_redirections(&mut self, redirections: &[Redirection]) {
+        for redir in redirections {
+            match &redir.kind {
+                RedirectionKind::IORedirection { kind, file } => {
+                    // > the word that follows the redirection operator shall be subjected to tilde
+                    // > expansion, parameter expansion, command substitution, arithmetic expansion,
+                    // > and quote removal.
+                    let path = expand_word_to_string(file, false, self);
+                    // TODO: pathname expansion is not allowed if the shell is non-interactive,
+                    // optional otherwise. Bash does implement this, maybe we should too.
+                    match kind {
+                        IORedirectionKind::RedirectOutput
+                        | IORedirectionKind::RedirectOutputClobber
+                        | IORedirectionKind::RedirectOuputAppend => {
+                            // TODO: fail if noclobber is set and file exists and is a regular file
+
+                            // TODO: fix unwrap
+                            let file = if *kind == IORedirectionKind::RedirectOuputAppend {
+                                std::fs::OpenOptions::new()
+                                    .append(true)
+                                    .create(true)
+                                    .open(path)
+                                    .unwrap()
+                            } else {
+                                std::fs::File::create(path).unwrap()
+                            };
+                            let source_fd =
+                                redir.file_descriptor.unwrap_or(libc::STDOUT_FILENO as u32);
+                            self.opened_files.insert(source_fd, Rc::new(file));
+                        }
+                        IORedirectionKind::DuplicateOutput => {}
+                        IORedirectionKind::RedirectInput => {}
+                        IORedirectionKind::DuplicateInput => {}
+                        IORedirectionKind::OpenRW => {}
+                    }
+                }
+                RedirectionKind::HereDocument { contents } => {}
+            }
+        }
     }
 
-    fn perform_redirection(&mut self, redirection: &Redirection) {
-        match &redirection.kind {
-            RedirectionKind::IORedirection { kind, file } => {
-                // > the word that follows the redirection operator shall be subjected to tilde
-                // > expansion, parameter expansion, command substitution, arithmetic expansion,
-                // > and quote removal.
-                let path = expand_word_to_string(file, false, self);
-                // TODO: pathname expansion is not allowed if the shell is non-interactive,
-                // optional otherwise. Bash does implement this, maybe we should too.
-                match kind {
-                    IORedirectionKind::RedirectOutput
-                    | IORedirectionKind::RedirectOutputClobber
-                    | IORedirectionKind::RedirectOuputAppend => {
-                        // TODO: fail if noclobber is set and file exists and is a regular file
-
-                        // TODO: fix unwrap
-                        let file = if *kind == IORedirectionKind::RedirectOuputAppend {
-                            std::fs::OpenOptions::new()
-                                .append(true)
-                                .create(true)
-                                .open(path)
-                                .unwrap()
-                        } else {
-                            std::fs::File::create(path).unwrap()
-                        };
-                        let source_fd = redirection
-                            .file_descriptor
-                            .unwrap_or(libc::STDOUT_FILENO as u32);
-                        self.opened_files.insert(source_fd, Rc::new(file));
-                    }
-                    IORedirectionKind::DuplicateOutput => {}
-                    IORedirectionKind::RedirectInput => {}
-                    IORedirectionKind::DuplicateInput => {}
-                    IORedirectionKind::OpenRW => {}
-                }
-            }
-            RedirectionKind::HereDocument { contents } => {}
+    fn perform_assignments(&mut self, assignments: &[Assignment]) {
+        for assignment in assignments {
+            let word_str = expand_word_to_string(&assignment.value, true, self);
+            self.environment
+                .insert(assignment.name.to_string(), Variable::new(word_str));
         }
     }
 
     fn interpret_simple_command(&mut self, simple_command: &SimpleCommand) -> i32 {
-        // > 1. The words that are recognized as variable assignments or redirections according to
-        // >    Shell Grammar Rules are saved for processing in steps 3 and 4.
-        // > 2. The words that are not variable assignments or redirections shall be expanded. If
-        // >    any fields remain following their expansion, the first field shall be considered
-        // >    the command name and remaining fields are the arguments for the command.
-        // > 4. Redirections shall be performed [..].
-        // > 5. Each variable assignment shall be expanded for tilde expansion, parameter expansion,
-        // >    command substitution, arithmetic expansion, and quote removal prior to assigning the
-        // >    value.
         let mut expanded_words = Vec::new();
+        // reset
+        self.last_command_substitution_status = 0;
         for word in &simple_command.words {
             expanded_words.extend(expand_word(word, false, self));
         }
         if expanded_words.is_empty() {
-            // > If there is no command name, any redirections shall be performed in a
-            // > subshell environment;
+            // no commands to execute, perform assignments and redirections
+            self.perform_assignments(&simple_command.assignments);
             if !simple_command.redirections.is_empty() {
                 let mut subshell = self.clone();
-                for redirection in &simple_command.redirections {
-                    subshell.perform_redirection(redirection);
-                }
+                subshell.perform_redirections(&simple_command.redirections);
             }
-            // > If no command name results, variable assignments shall affect the current
-            // > execution environment.
-            for assignment in &simple_command.assignments {
-                let word_str = expand_word_to_string(&assignment.value, true, self);
-                self.environment
-                    .insert(assignment.name.to_string(), Variable::new(word_str));
-            }
-            // > If there is no command name, but the command contained a command substitution,
-            // > the command shall complete with the exit status of the last command substitution
-            // > performed.
             return self.last_command_substitution_status;
         }
 
-        // TODO: consider all other cases specified in Command Search and Execution
-        let mut command_environment = self.clone();
-        for assignment in &simple_command.assignments {
-            let word_str = expand_word_to_string(&assignment.value, true, self);
-            command_environment.environment.insert(
-                assignment.name.to_string(),
-                Variable::new_exported(word_str),
-            );
-        }
+        if expanded_words[0].contains('/') {
+            let mut command_environment = self.clone();
+            command_environment.perform_assignments(&simple_command.assignments);
+            command_environment.perform_redirections(&simple_command.redirections);
+            let command = &expanded_words[0];
+            let arguments = expanded_words[1..]
+                .iter()
+                .map(|w| w.clone())
+                .collect::<Vec<String>>();
+            command_environment.exec(&command, &arguments)
+        } else {
+            if let Some(_special_builtin_utility) = get_special_builtin_utility(&expanded_words[0])
+            {
+                self.perform_assignments(&simple_command.assignments);
+                todo!()
+            }
 
-        for redirection in &simple_command.redirections {
-            command_environment.perform_redirection(redirection);
+            if let Some(_function_body) = self.functions.get(expanded_words[0].as_str()) {
+                self.perform_assignments(&simple_command.assignments);
+                todo!()
+            }
+
+            if let Some(_builtin_utility) = get_bultin_utility(&expanded_words[0]) {
+                todo!()
+            }
+
+            let mut command_environment = self.clone();
+            command_environment.perform_assignments(&simple_command.assignments);
+            command_environment.perform_redirections(&simple_command.redirections);
+            let command = &expanded_words[0];
+            let arguments = expanded_words[1..]
+                .iter()
+                .map(|w| w.clone())
+                .collect::<Vec<String>>();
+            command_environment.exec(&command, &arguments)
         }
-        let command = expanded_words[0].clone().to_string();
-        let arguments = expanded_words[1..]
-            .iter()
-            .map(|w| w.clone().to_string())
-            .collect::<Vec<String>>();
-        self.exec(&command, &arguments)
     }
 
     fn interpret_command(&mut self, command: &Command) -> i32 {
@@ -265,13 +276,10 @@ impl Interpreter {
         let pid = unsafe { libc::getpid() };
         Interpreter {
             environment: variables,
-            opened_files: HashMap::new(),
-            most_recent_pipeline_status: 0,
-            last_command_substitution_status: 0,
             shell_pid: pid,
-            most_recent_background_command_pid: 0,
             // TODO: handle error
             current_directory: std::env::current_dir().unwrap().into_os_string(),
+            ..Default::default()
         }
     }
 }
@@ -280,7 +288,8 @@ impl Default for Interpreter {
     fn default() -> Self {
         Interpreter {
             environment: Environment::default(),
-            opened_files: HashMap::new(),
+            opened_files: HashMap::default(),
+            functions: HashMap::default(),
             most_recent_pipeline_status: 0,
             last_command_substitution_status: 0,
             shell_pid: 0,

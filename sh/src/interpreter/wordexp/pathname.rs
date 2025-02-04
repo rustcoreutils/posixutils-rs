@@ -53,10 +53,10 @@ fn list_files_rec(
     prefix: &mut PathBuf,
     result: &mut Vec<OsString>,
 ) {
-    let search_file = component_index == pattern.component_count();
+    let add_to_result = component_index == pattern.component_count();
     for entry in filesystem.read_dir(Path::new(current_directory)) {
         match entry {
-            DirEntry::File(file_name) if search_file => {
+            DirEntry::File(file_name) if add_to_result => {
                 let file_name_cstring =
                     CString::new(file_name.clone().into_encoded_bytes()).unwrap();
                 if pattern.matches_all(component_index, &file_name_cstring) {
@@ -65,19 +65,23 @@ fn list_files_rec(
                     result.push(path.into_os_string())
                 }
             }
-            DirEntry::Dir(dir_name) if !search_file => {
+            DirEntry::Dir(dir_name) => {
                 prefix.push(&dir_name);
                 current_directory.push(&dir_name);
                 let dir_name_cstring = CString::new(dir_name.into_encoded_bytes()).unwrap();
                 if pattern.matches_all(component_index, &dir_name_cstring) {
-                    list_files_rec(
-                        filesystem,
-                        pattern,
-                        component_index + 1,
-                        current_directory,
-                        prefix,
-                        result,
-                    );
+                    if add_to_result {
+                        result.push(prefix.clone().into_os_string())
+                    } else {
+                        list_files_rec(
+                            filesystem,
+                            pattern,
+                            component_index + 1,
+                            current_directory,
+                            prefix,
+                            result,
+                        );
+                    }
                 }
                 prefix.pop();
                 current_directory.pop();
@@ -226,11 +230,19 @@ pub mod tests {
         let filesystem = TestFileSystem::default()
             .add_file("/file1")
             .add_file("/file2")
-            .add_file("/file3");
+            .add_file("/file3")
+            .add_file("/dir1/file4")
+            .add_file("/dir2/file5");
         let pattern = filename_pattern_from_str("/*");
         assert_eq!(
             list_files(&filesystem, &pattern, OsStr::new("/")),
-            vec![OsString::from("/file1"), "/file2".into(), "/file3".into()]
+            vec![
+                OsString::from("/dir1"),
+                "/dir2".into(),
+                "/file1".into(),
+                "/file2".into(),
+                "/file3".into(),
+            ]
         )
     }
 
@@ -239,11 +251,19 @@ pub mod tests {
         let filesystem = TestFileSystem::default()
             .add_file("/dir/file1")
             .add_file("/dir/file2")
-            .add_file("/dir/file3");
+            .add_file("/dir/file3")
+            .add_file("/dir/dir2/file4")
+            .add_file("/dir/dir3/file5");
         let pattern = filename_pattern_from_str("*");
         assert_eq!(
             list_files(&filesystem, &pattern, OsStr::new("/dir/")),
-            vec![OsString::from("file1"), "file2".into(), "file3".into()]
+            vec![
+                OsString::from("dir2"),
+                "dir3".into(),
+                "file1".into(),
+                "file2".into(),
+                "file3".into(),
+            ]
         );
     }
 

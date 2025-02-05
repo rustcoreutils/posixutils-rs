@@ -248,15 +248,62 @@ impl Interpreter {
     }
 
     fn interpret_pipeline(&mut self, pipeline: &Pipeline) -> i32 {
-        if pipeline.commands.len() > 1 {
-            todo!()
-        }
-        let command = &pipeline.commands[0];
-        let status = self.interpret_command(command);
-        if pipeline.negate_status {
-            (status == 0) as i32
+        let pipeline_exit_status;
+        if pipeline.commands.len() == 1 {
+            let command = &pipeline.commands[0];
+            pipeline_exit_status = self.interpret_command(command);
         } else {
-            status
+            let mut current_stdin = libc::STDIN_FILENO;
+            for command in pipeline.commands.iter().take(pipeline.commands.len() - 1) {
+                let mut pipe: [libc::c_int; 2] = [0, 0];
+                if unsafe { libc::pipe(pipe.as_mut_ptr()) } == -1 {
+                    todo!("handle error");
+                }
+                let pid = unsafe { libc::fork() };
+
+                if pid < 0 {
+                    todo!("failed to fork")
+                }
+                if pid == 0 {
+                    unsafe { libc::close(pipe[0]) };
+                    unsafe { libc::dup2(current_stdin, libc::STDIN_FILENO) };
+                    unsafe { libc::dup2(pipe[1], libc::STDOUT_FILENO) };
+                    let return_status = self.interpret_command(command);
+                    if current_stdin != 0 {
+                        unsafe { libc::close(current_stdin) };
+                    }
+                    unsafe { libc::close(pipe[1]) };
+                    std::process::exit(return_status);
+                }
+                if current_stdin != 0 {
+                    unsafe { libc::close(current_stdin) };
+                }
+                unsafe { libc::close(pipe[1]) };
+                current_stdin = pipe[0];
+            }
+            let last_command_pid = unsafe { libc::fork() };
+
+            if last_command_pid < 0 {
+                todo!("failed to fork")
+            } else if last_command_pid == 0 {
+                unsafe { libc::dup2(current_stdin, libc::STDIN_FILENO) };
+                let return_status = self.interpret_command(pipeline.commands.last().unwrap());
+                unsafe { libc::close(current_stdin) };
+                std::process::exit(return_status);
+            }
+            unsafe { libc::close(current_stdin) };
+
+            let mut wait_status = 0;
+            let wait_result = unsafe { libc::waitpid(last_command_pid, &mut wait_status, 0) };
+            if wait_result != last_command_pid {
+                panic!("failed to wait for child process");
+            }
+            pipeline_exit_status = libc::WEXITSTATUS(wait_status);
+        }
+        if pipeline.negate_status {
+            (pipeline_exit_status == 0) as i32
+        } else {
+            pipeline_exit_status
         }
     }
 

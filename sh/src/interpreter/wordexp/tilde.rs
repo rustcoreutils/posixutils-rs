@@ -1,5 +1,6 @@
 use crate::interpreter::Environment;
 use crate::program::{Word, WordPart};
+use nix::libc;
 use std::ffi::{c_char, CStr, CString};
 use std::os::unix::ffi::OsStringExt;
 

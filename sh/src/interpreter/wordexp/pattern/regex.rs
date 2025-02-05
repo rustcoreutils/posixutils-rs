@@ -2,6 +2,7 @@ use crate::interpreter::wordexp::pattern::parse::{
     BracketExpression, BracketItem, ParsedPattern, PatternItem,
 };
 use core::fmt;
+use nix::libc;
 use std::ffi::{CStr, CString};
 use std::fmt::{Formatter, Write};
 use std::ptr;

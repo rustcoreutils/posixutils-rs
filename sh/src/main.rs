@@ -9,7 +9,6 @@
 
 use crate::interpreter::Interpreter;
 use crate::parser::parse;
-use libc::c_char;
 
 mod interpreter;
 mod lexer;

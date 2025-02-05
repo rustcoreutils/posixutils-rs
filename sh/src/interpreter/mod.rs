@@ -3,6 +3,10 @@ use crate::program::{
     Assignment, Command, CompleteCommand, CompoundCommand, Conjunction, IORedirectionKind,
     LogicalOp, Name, Pipeline, Program, Redirection, RedirectionKind, SimpleCommand,
 };
+use nix::libc;
+use nix::libc::pid_t;
+use nix::sys::wait::{waitpid, WaitStatus};
+use nix::unistd::{close, dup2, execve, fork, getpid, pipe, ForkResult, Pid};
 use std::collections::HashMap;
 use std::ffi::{c_char, CString, OsString};
 use std::os::fd::{AsRawFd, IntoRawFd};
@@ -76,53 +80,44 @@ pub struct Interpreter {
 
 impl Interpreter {
     fn exec(&self, command: &str, args: &[String]) -> i32 {
-        let pid = unsafe { libc::fork() };
-        if pid < 0 {
-            todo!("error: fork failed")
-        } else if pid == 0 {
-            // child
-            for (id, file) in &self.opened_files {
-                let dest = *id as i32;
-                let src = file.as_raw_fd();
-                unsafe { libc::dup2(src, dest) };
+        match unsafe { fork() } {
+            Ok(ForkResult::Child) => {
+                for (id, file) in &self.opened_files {
+                    let dest = *id as i32;
+                    let src = file.as_raw_fd();
+                    dup2(src, dest).expect("TODO: handle dup2 error");
+                }
+                let command = CString::new(command).unwrap();
+                let args = args
+                    .iter()
+                    .map(|s| CString::new(s.as_str()).unwrap())
+                    .collect::<Vec<_>>();
+                let env = self
+                    .environment
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        if value.export {
+                            // TODO: look into this unwrap
+                            Some(CString::new(format!("{name}={}", value.value)).unwrap())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<CString>>();
+                // can never fail
+                execve(&command, &args, &env).unwrap();
+                unreachable!();
             }
-
-            let command = CString::new(command).unwrap();
-            let args = args
-                .iter()
-                .map(|s| CString::new(s.as_str()).unwrap())
-                .collect::<Vec<_>>();
-            let args = std::iter::once(command.as_ptr())
-                .chain(args.iter().map(|s| s.as_ptr()))
-                .chain(std::iter::once(std::ptr::null() as *const c_char))
-                .collect::<Vec<_>>();
-
-            let env = self
-                .environment
-                .iter()
-                .filter_map(|(name, value)| {
-                    if value.export {
-                        // TODO: look into this unwrap
-                        Some(CString::new(format!("{name}={}", value.value)).unwrap())
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<CString>>();
-            let env = env
-                .iter()
-                .map(|s| s.as_ptr())
-                .chain(std::iter::once(std::ptr::null()))
-                .collect::<Vec<_>>();
-            unsafe { libc::execve(command.as_ptr(), args.as_ptr(), env.as_ptr()) }
-        } else {
-            // parent
-            let mut status = 0;
-            let wait_result = unsafe { libc::waitpid(pid, &mut status, 0) };
-            if wait_result != pid {
-                panic!("failed to wait for child process");
+            Ok(ForkResult::Parent { child }) => match waitpid(child, None) {
+                Ok(WaitStatus::Exited(_, status)) => status,
+                Err(_) => {
+                    todo!("failed to wait for child process");
+                }
+                _ => todo!(),
+            },
+            Err(_) => {
+                todo!("error: fork failed");
             }
-            libc::WEXITSTATUS(status)
         }
     }
 
@@ -255,50 +250,51 @@ impl Interpreter {
         } else {
             let mut current_stdin = libc::STDIN_FILENO;
             for command in pipeline.commands.iter().take(pipeline.commands.len() - 1) {
-                let mut pipe: [libc::c_int; 2] = [0, 0];
-                if unsafe { libc::pipe(pipe.as_mut_ptr()) } == -1 {
-                    todo!("handle error");
-                }
-                let pid = unsafe { libc::fork() };
-
-                if pid < 0 {
-                    todo!("failed to fork")
-                }
-                if pid == 0 {
-                    unsafe { libc::close(pipe[0]) };
-                    unsafe { libc::dup2(current_stdin, libc::STDIN_FILENO) };
-                    unsafe { libc::dup2(pipe[1], libc::STDOUT_FILENO) };
-                    let return_status = self.interpret_command(command);
-                    if current_stdin != 0 {
-                        unsafe { libc::close(current_stdin) };
+                let (read_pipe, write_pipe) = pipe().unwrap();
+                match unsafe { fork() } {
+                    Ok(ForkResult::Child) => {
+                        drop(read_pipe);
+                        dup2(current_stdin, libc::STDIN_FILENO);
+                        dup2(write_pipe.as_raw_fd(), libc::STDOUT_FILENO);
+                        let return_status = self.interpret_command(command);
+                        if current_stdin != libc::STDIN_FILENO {
+                            close(current_stdin);
+                        }
+                        std::process::exit(return_status);
                     }
-                    unsafe { libc::close(pipe[1]) };
+                    Ok(ForkResult::Parent { .. }) => {
+                        if current_stdin != libc::STDIN_FILENO {
+                            close(current_stdin);
+                        }
+                        current_stdin = read_pipe.into_raw_fd();
+                    }
+                    Err(_) => {
+                        todo!("failed to fork")
+                    }
+                }
+            }
+
+            match unsafe { fork() } {
+                Ok(ForkResult::Child) => {
+                    dup2(current_stdin, libc::STDIN_FILENO).unwrap();
+                    let return_status = self.interpret_command(pipeline.commands.last().unwrap());
+                    close(current_stdin);
                     std::process::exit(return_status);
                 }
-                if current_stdin != 0 {
-                    unsafe { libc::close(current_stdin) };
+                Ok(ForkResult::Parent { child }) => {
+                    close(current_stdin);
+                    match waitpid(child, None) {
+                        Ok(WaitStatus::Exited(_, status)) => pipeline_exit_status = status,
+                        Err(_) => {
+                            todo!("failed to wait for child process");
+                        }
+                        _ => todo!(),
+                    }
                 }
-                unsafe { libc::close(pipe[1]) };
-                current_stdin = pipe[0];
+                Err(_) => {
+                    todo!("handle fork error")
+                }
             }
-            let last_command_pid = unsafe { libc::fork() };
-
-            if last_command_pid < 0 {
-                todo!("failed to fork")
-            } else if last_command_pid == 0 {
-                unsafe { libc::dup2(current_stdin, libc::STDIN_FILENO) };
-                let return_status = self.interpret_command(pipeline.commands.last().unwrap());
-                unsafe { libc::close(current_stdin) };
-                std::process::exit(return_status);
-            }
-            unsafe { libc::close(current_stdin) };
-
-            let mut wait_status = 0;
-            let wait_result = unsafe { libc::waitpid(last_command_pid, &mut wait_status, 0) };
-            if wait_result != last_command_pid {
-                panic!("failed to wait for child process");
-            }
-            pipeline_exit_status = libc::WEXITSTATUS(wait_status);
         }
         if pipeline.negate_status {
             (pipeline_exit_status == 0) as i32
@@ -339,10 +335,9 @@ impl Interpreter {
             .into_iter()
             .map(|(k, v)| (k, Variable::new_exported(v)))
             .collect();
-        let pid = unsafe { libc::getpid() };
         Interpreter {
             environment: variables,
-            shell_pid: pid,
+            shell_pid: getpid().as_raw(),
             // TODO: handle error
             current_directory: std::env::current_dir().unwrap().into_os_string(),
             ..Default::default()

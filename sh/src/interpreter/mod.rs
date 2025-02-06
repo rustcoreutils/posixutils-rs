@@ -192,7 +192,7 @@ impl Interpreter {
             command_environment.perform_assignments(&simple_command.assignments);
             command_environment.perform_redirections(&simple_command.redirections);
             let command = &expanded_words[0];
-            let arguments = expanded_words[1..]
+            let arguments = expanded_words
                 .iter()
                 .map(|w| w.clone())
                 .collect::<Vec<String>>();
@@ -220,7 +220,7 @@ impl Interpreter {
                 &expanded_words[0],
                 &self.environment.get("PATH").unwrap().value,
             ) {
-                let arguments = expanded_words[1..]
+                let arguments = expanded_words
                     .iter()
                     .map(|w| w.clone())
                     .collect::<Vec<String>>();

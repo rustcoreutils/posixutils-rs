@@ -9,6 +9,7 @@
 
 use crate::interpreter::Interpreter;
 use crate::parser::parse;
+use std::io;
 
 mod interpreter;
 mod lexer;
@@ -16,8 +17,19 @@ mod parser;
 mod program;
 
 fn main() {
-    let program = parse("/bin/echo test");
-    println!("{:?}", program);
     let mut interpreter = Interpreter::initialize_from_system();
-    interpreter.interpret(program);
+    let mut buffer = String::new();
+    let stdin = io::stdin();
+    while stdin.read_line(&mut buffer).is_ok_and(|n| n > 0) {
+        match parse(&buffer) {
+            Ok(program) => {
+                interpreter.interpret(program);
+                buffer.clear();
+            }
+            Err(err) if !err.could_be_resolved_with_more_input => {
+                println!("{}", err.message);
+            }
+            Err(_) => {}
+        }
+    }
 }

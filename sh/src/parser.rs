@@ -67,6 +67,29 @@ fn try_into_name(word: Word) -> Result<Name, Word> {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ParserError {
+    pub location: SourceLocation,
+    pub message: String,
+    pub could_be_resolved_with_more_input: bool,
+}
+
+impl ParserError {
+    fn new<S: Into<String>>(
+        location: SourceLocation,
+        message: S,
+        could_be_resolved_with_more_input: bool,
+    ) -> Self {
+        Self {
+            location,
+            message: message.into(),
+            could_be_resolved_with_more_input,
+        }
+    }
+}
+
+type ParseResult<T> = Result<T, ParserError>;
+
 struct Parser<'src> {
     lexer: Lexer<'src>,
     shell_lookahead: ShellToken,
@@ -139,11 +162,16 @@ impl<'src> Parser<'src> {
         None
     }
 
-    fn match_shell_token(&mut self, token: ShellToken) {
+    fn match_shell_token(&mut self, token: ShellToken) -> ParseResult<()> {
         if self.shell_lookahead() != token {
-            todo!();
+            return Err(ParserError::new(
+                self.lookahead_source_location,
+                format!("expected {}, got {}", token, self.shell_lookahead()),
+                self.shell_lookahead() == ShellToken::EOF,
+            ));
         }
         self.advance_shell();
+        Ok(())
     }
 
     fn match_shell_token_opt(&mut self, token: ShellToken) {
@@ -152,11 +180,16 @@ impl<'src> Parser<'src> {
         }
     }
 
-    fn match_word_token(&mut self, token: WordToken) {
+    fn match_word_token(&mut self, token: WordToken) -> ParseResult<()> {
         if self.word_lookahead() != token {
-            todo!()
+            return Err(ParserError::new(
+                self.lookahead_source_location,
+                format!("expected {}, got {}", token, self.word_lookahead()),
+                self.word_lookahead() == WordToken::EOF,
+            ));
         }
         self.advance_word();
+        Ok(())
     }
 
     fn skip_linebreak(&mut self) {
@@ -170,40 +203,48 @@ impl<'src> Parser<'src> {
         todo!()
     }
 
-    fn parse_parameter(&mut self, only_consider_first_digit: bool) -> Parameter {
+    fn parse_parameter(&mut self, only_consider_first_digit: bool) -> ParseResult<Parameter> {
         fn advance_and_return(parser: &mut Parser, parameter: Parameter) -> Parameter {
             parser.advance_word();
             parameter
         }
 
         match self.word_lookahead() {
-            WordToken::Char('@') => {
-                advance_and_return(self, Parameter::Special(SpecialParameter::At))
-            }
-            WordToken::Char('*') => {
-                advance_and_return(self, Parameter::Special(SpecialParameter::Asterisk))
-            }
-            WordToken::Char('#') => {
-                advance_and_return(self, Parameter::Special(SpecialParameter::Hash))
-            }
-            WordToken::Char('?') => {
-                advance_and_return(self, Parameter::Special(SpecialParameter::QuestionMark))
-            }
-            WordToken::Char('-') => {
-                advance_and_return(self, Parameter::Special(SpecialParameter::Minus))
-            }
-            WordToken::Dollar => {
-                advance_and_return(self, Parameter::Special(SpecialParameter::Dollar))
-            }
-            WordToken::Char('!') => {
-                advance_and_return(self, Parameter::Special(SpecialParameter::Bang))
-            }
-            WordToken::Char('0') => {
-                advance_and_return(self, Parameter::Special(SpecialParameter::Zero))
-            }
+            WordToken::Char('@') => Ok(advance_and_return(
+                self,
+                Parameter::Special(SpecialParameter::At),
+            )),
+            WordToken::Char('*') => Ok(advance_and_return(
+                self,
+                Parameter::Special(SpecialParameter::Asterisk),
+            )),
+            WordToken::Char('#') => Ok(advance_and_return(
+                self,
+                Parameter::Special(SpecialParameter::Hash),
+            )),
+            WordToken::Char('?') => Ok(advance_and_return(
+                self,
+                Parameter::Special(SpecialParameter::QuestionMark),
+            )),
+            WordToken::Char('-') => Ok(advance_and_return(
+                self,
+                Parameter::Special(SpecialParameter::Minus),
+            )),
+            WordToken::Dollar => Ok(advance_and_return(
+                self,
+                Parameter::Special(SpecialParameter::Dollar),
+            )),
+            WordToken::Char('!') => Ok(advance_and_return(
+                self,
+                Parameter::Special(SpecialParameter::Bang),
+            )),
+            WordToken::Char('0') => Ok(advance_and_return(
+                self,
+                Parameter::Special(SpecialParameter::Zero),
+            )),
             WordToken::Char(d) if d.is_ascii_digit() => {
                 if only_consider_first_digit {
-                    Parameter::Number(d.to_digit(10).unwrap())
+                    Ok(Parameter::Number(d.to_digit(10).unwrap()))
                 } else {
                     // FIXME: refactor this, its almost identical to the loop below.
                     let mut number = String::new();
@@ -217,7 +258,7 @@ impl<'src> Parser<'src> {
                         }
                         self.advance_word();
                     }
-                    Parameter::Number(number.parse().expect("invalid number"))
+                    Ok(Parameter::Number(number.parse().expect("invalid number")))
                 }
             }
             WordToken::Char(c) if c == '_' || c.is_alphabetic() => {
@@ -232,13 +273,17 @@ impl<'src> Parser<'src> {
                     }
                     self.advance_word();
                 }
-                Parameter::Variable(Rc::from(name))
+                Ok(Parameter::Variable(Rc::from(name)))
             }
-            _ => todo!("error: expected parameter"),
+            other => Err(ParserError::new(
+                self.lookahead_source_location,
+                format!("{} is not the start of a valid parameter", other,),
+                other == WordToken::EOF,
+            )),
         }
     }
 
-    fn parse_parameter_expansion(&mut self) -> ParameterExpansion {
+    fn parse_parameter_expansion(&mut self) -> ParseResult<ParameterExpansion> {
         // skip '$'
         self.advance_word();
 
@@ -246,33 +291,33 @@ impl<'src> Parser<'src> {
             self.advance_word();
             if self.word_lookahead() == WordToken::Char('#') {
                 self.advance_word();
-                return ParameterExpansion::StrLen(self.parse_parameter(false));
+                return self.parse_parameter(false).map(ParameterExpansion::StrLen);
             }
-            let parameter = self.parse_parameter(false);
+            let parameter = self.parse_parameter(false)?;
             if self.word_lookahead() == WordToken::Char('}') {
                 self.advance_word();
-                return ParameterExpansion::Simple(parameter);
+                return Ok(ParameterExpansion::Simple(parameter));
             }
 
             if self.word_lookahead() == WordToken::Char('%') {
                 self.advance_word();
                 if self.word_lookahead() == WordToken::Char('%') {
                     self.advance_word();
-                    let word = self.parse_word_until(WordToken::Char('}'));
-                    return ParameterExpansion::RemovePattern {
+                    let word = self.parse_word_until(WordToken::Char('}'))?;
+                    return Ok(ParameterExpansion::RemovePattern {
                         parameter,
                         pattern: word,
                         remove_largest: true,
                         remove_prefix: false,
-                    };
+                    });
                 } else {
-                    let word = self.parse_word_until(WordToken::Char('}'));
-                    return ParameterExpansion::RemovePattern {
+                    let word = self.parse_word_until(WordToken::Char('}'))?;
+                    return Ok(ParameterExpansion::RemovePattern {
                         parameter,
                         pattern: word,
                         remove_largest: false,
                         remove_prefix: false,
-                    };
+                    });
                 }
             }
 
@@ -280,89 +325,98 @@ impl<'src> Parser<'src> {
                 self.advance_word();
                 if self.word_lookahead() == WordToken::Char('#') {
                     self.advance_word();
-                    let word = self.parse_word_until(WordToken::Char('}'));
-                    return ParameterExpansion::RemovePattern {
+                    let word = self.parse_word_until(WordToken::Char('}'))?;
+                    return Ok(ParameterExpansion::RemovePattern {
                         parameter,
                         pattern: word,
                         remove_largest: true,
                         remove_prefix: true,
-                    };
+                    });
                 } else {
-                    let word = self.parse_word_until(WordToken::Char('}'));
-                    return ParameterExpansion::RemovePattern {
+                    let word = self.parse_word_until(WordToken::Char('}'))?;
+                    return Ok(ParameterExpansion::RemovePattern {
                         parameter,
                         pattern: word,
                         remove_largest: false,
                         remove_prefix: true,
-                    };
+                    });
                 }
             }
-            // TODO: restructure this for better errors
             if self.word_lookahead() == WordToken::Char(':') {
                 self.advance_word();
                 let operation = self.word_lookahead();
+                let format_specifier_location = self.lookahead_source_location;
                 self.advance_word();
-                let word = self.parse_word_until(WordToken::Char('}'));
+                let word = self.parse_word_until(WordToken::Char('}'))?;
                 match operation {
-                    WordToken::Char('-') => ParameterExpansion::UnsetUseDefault {
+                    WordToken::Char('-') => Ok(ParameterExpansion::UnsetUseDefault {
                         parameter,
                         word,
                         default_on_null: true,
-                    },
-                    WordToken::Char('=') => ParameterExpansion::UnsetAssignDefault {
+                    }),
+                    WordToken::Char('=') => Ok(ParameterExpansion::UnsetAssignDefault {
                         parameter,
                         word,
                         assign_on_null: true,
-                    },
-                    WordToken::Char('?') => ParameterExpansion::UnsetError {
+                    }),
+                    WordToken::Char('?') => Ok(ParameterExpansion::UnsetError {
                         parameter,
                         word,
                         error_on_null: true,
-                    },
-                    WordToken::Char('+') => ParameterExpansion::SetUseAlternative {
+                    }),
+                    WordToken::Char('+') => Ok(ParameterExpansion::SetUseAlternative {
                         parameter,
                         word,
                         substitute_null_with_word: false,
-                    },
-                    _ => todo!("error"),
+                    }),
+                    other => Err(ParserError::new(
+                        format_specifier_location,
+                        "invalid format in parameter expansion",
+                        other == WordToken::EOF,
+                    )),
                 }
             } else {
                 let operation = self.word_lookahead();
+                let format_specifier_location = self.lookahead_source_location;
                 self.advance_word();
-                let word = self.parse_word_until(WordToken::Char('}'));
+                let word = self.parse_word_until(WordToken::Char('}'))?;
                 if word.is_none() && operation == WordToken::Char('}') {
-                    return ParameterExpansion::Simple(parameter);
+                    return Ok(ParameterExpansion::Simple(parameter));
                 }
                 match operation {
-                    WordToken::Char('-') => ParameterExpansion::UnsetUseDefault {
+                    WordToken::Char('-') => Ok(ParameterExpansion::UnsetUseDefault {
                         parameter,
                         word,
                         default_on_null: false,
-                    },
-                    WordToken::Char('=') => ParameterExpansion::UnsetAssignDefault {
+                    }),
+                    WordToken::Char('=') => Ok(ParameterExpansion::UnsetAssignDefault {
                         parameter,
                         word,
                         assign_on_null: false,
-                    },
-                    WordToken::Char('?') => ParameterExpansion::UnsetError {
+                    }),
+                    WordToken::Char('?') => Ok(ParameterExpansion::UnsetError {
                         parameter,
                         word,
                         error_on_null: false,
-                    },
-                    WordToken::Char('+') => ParameterExpansion::SetUseAlternative {
+                    }),
+                    WordToken::Char('+') => Ok(ParameterExpansion::SetUseAlternative {
                         parameter,
                         word,
                         substitute_null_with_word: true,
-                    },
-                    _ => todo!("error"),
+                    }),
+                    other => Err(ParserError::new(
+                        format_specifier_location,
+                        "invalid format in parameter expansion",
+                        other == WordToken::EOF,
+                    )),
                 }
             }
         } else {
-            ParameterExpansion::Simple(self.parse_parameter(true))
+            self.parse_parameter(true).map(ParameterExpansion::Simple)
         }
     }
 
-    fn parse_word_until(&mut self, end: WordToken) -> Option<Word> {
+    fn parse_word_until(&mut self, end: WordToken) -> ParseResult<Option<Word>> {
         fn push_literal(literal: &mut String, parts: &mut Vec<WordPart>, quoted: bool) {
             let mut temp = String::new();
             std::mem::swap(&mut temp, literal);
@@ -412,7 +466,11 @@ impl<'src> Parser<'src> {
                                 }
                                 current_literal.push(c);
                             } else {
-                                todo!("error: expected ', got end of file")
+                                return Err(ParserError::new(
+                                    self.lookahead_source_location,
+                                    "unterminated escaped string",
+                                    true,
+                                ));
                             }
                         }
                         push_literal(&mut current_literal, &mut word_parts, true);
@@ -425,7 +483,10 @@ impl<'src> Parser<'src> {
                     push_literal_and_insert(
                         &mut current_literal,
                         &mut word_parts,
-                        WordPart::ParameterExpansion { expansion: self.parse_parameter_expansion(), inside_double_quotes },
+                        WordPart::ParameterExpansion {
+                            expansion: self.parse_parameter_expansion()?,
+                            inside_double_quotes,
+                        },
                         inside_double_quotes,
                     );
                 }
@@ -435,12 +496,12 @@ impl<'src> Parser<'src> {
                         &mut current_literal,
                         &mut word_parts,
                         WordPart::CommandSubstitution {
-                            command: self.parse_complete_command(WordToken::Backtick),
+                            command: self.parse_complete_command(WordToken::Backtick)?,
                             inside_double_quotes,
                         },
                         inside_double_quotes,
                     );
-                    self.match_word_token(WordToken::Backtick);
+                    self.match_word_token(WordToken::Backtick)?;
                 }
                 WordToken::CommandSubstitutionStart => {
                     self.advance_word();
@@ -448,12 +509,12 @@ impl<'src> Parser<'src> {
                         &mut current_literal,
                         &mut word_parts,
                         WordPart::CommandSubstitution {
-                            command: self.parse_complete_command(WordToken::Char(')')),
+                            command: self.parse_complete_command(WordToken::Char(')'))?,
                             inside_double_quotes,
                         },
                         inside_double_quotes,
                     );
-                    self.match_word_token(WordToken::Char(')'));
+                    self.match_word_token(WordToken::Char(')'))?;
                 }
                 WordToken::EscapedBacktick => {
                     todo!("implement nested command substitution");
@@ -482,8 +543,8 @@ impl<'src> Parser<'src> {
                     );
                     // TODO: should improve this for better errors. Now it would produce
                     // expected ')' instead of expected '))'
-                    self.match_word_token(WordToken::Char(')'));
-                    self.match_word_token(WordToken::Char(')'));
+                    self.match_word_token(WordToken::Char(')'))?;
+                    self.match_word_token(WordToken::Char(')'))?;
                 }
                 WordToken::Char(c) => {
                     if !inside_double_quotes && (is_operator(c) || is_blank(c)) {
@@ -497,19 +558,23 @@ impl<'src> Parser<'src> {
         }
 
         if inside_double_quotes {
-            todo!("error: unclosed double quotes");
+            return Err(ParserError::new(
+                self.lookahead_source_location,
+                "unterminated quoted string",
+                true,
+            ));
         }
 
         push_literal(&mut current_literal, &mut word_parts, false);
 
         if word_parts.is_empty() {
-            None
+            Ok(None)
         } else {
-            Some(Word { parts: word_parts })
+            Ok(Some(Word { parts: word_parts }))
         }
     }
 
-    fn parse_redirection_kind(&mut self) -> Option<RedirectionKind> {
+    fn parse_redirection_kind(&mut self) -> ParseResult<Option<RedirectionKind>> {
         if self.shell_lookahead() == ShellToken::DLess
             || self.shell_lookahead() == ShellToken::DLessDash
         {
@@ -528,7 +593,8 @@ impl<'src> Parser<'src> {
                 }
             }
             self.advance_shell();
-            return Some(RedirectionKind::HereDocument { contents });
+            // TODO: error if its not terminated
+            return Ok(Some(RedirectionKind::HereDocument { contents }));
         }
         let kind = match self.shell_lookahead() {
             ShellToken::Greater => IORedirectionKind::RedirectOutput,
@@ -538,39 +604,51 @@ impl<'src> Parser<'src> {
             ShellToken::Less => IORedirectionKind::RedirectInput,
             ShellToken::LessAnd => IORedirectionKind::DuplicateInput,
             ShellToken::LessGreat => IORedirectionKind::OpenRW,
-            _ => return None,
+            _ => return Ok(None),
         };
         // advance the operator
         self.advance_shell();
         if self.go_to_word_start(true) {
-            let file = self.parse_word_until(WordToken::EOF).unwrap();
-            Some(RedirectionKind::IORedirection { kind, file })
+            let file = self.parse_word_until(WordToken::EOF)?.unwrap();
+            Ok(Some(RedirectionKind::IORedirection { kind, file }))
         } else {
-            todo!("error: expected word, got ..")
+            Err(ParserError::new(
+                self.lookahead_source_location,
+                format!("expected word, got {}", self.shell_lookahead()),
+                self.shell_lookahead() == ShellToken::EOF,
+            ))
         }
     }
 
-    fn parse_redirection_opt(&mut self) -> Option<Redirection> {
+    fn parse_redirection_opt(&mut self) -> ParseResult<Option<Redirection>> {
         if let ShellToken::IoNumber(n) = self.shell_lookahead() {
             if !(0..9).contains(&n) {
                 // TODO: bash supports (0..1023), should look into this
-                todo!("error: bad file descriptor");
+                return Err(ParserError::new(
+                    self.lookahead_source_location,
+                    "invalid file descriptor",
+                    false,
+                ));
             }
             // skip number
             self.advance_shell();
-            if let Some(kind) = self.parse_redirection_kind() {
-                Some(Redirection {
+            if let Some(kind) = self.parse_redirection_kind()? {
+                Ok(Some(Redirection {
                     kind,
                     file_descriptor: Some(n),
-                })
+                }))
             } else {
-                todo!("error: expected redirection, found ..")
+                Err(ParserError::new(
+                    self.lookahead_source_location,
+                    "expected redirection operator after file descriptor",
+                    self.shell_lookahead() == ShellToken::EOF,
+                ))
             }
         } else {
-            self.parse_redirection_kind().map(|kind| Redirection {
+            Ok(self.parse_redirection_kind()?.map(|kind| Redirection {
                 file_descriptor: None,
                 kind,
-            })
+            }))
         }
     }
 
@@ -578,7 +656,7 @@ impl<'src> Parser<'src> {
         &mut self,
         start: Option<Word>,
         word_stop: WordToken,
-    ) -> Option<SimpleCommand> {
+    ) -> ParseResult<Option<SimpleCommand>> {
         // simple_command = (io_redirect | assignment_word)* word? (io_redirect | word)*
 
         let mut command = SimpleCommand::default();
@@ -614,44 +692,45 @@ impl<'src> Parser<'src> {
         }
 
         if add_word_or_assignment(self, word_stop, start, &mut command) {
-            return wrap_command(command);
+            return Ok(wrap_command(command));
         }
 
         while command.words.is_empty() {
             if self.go_to_word_start(true) {
-                let word = self.parse_word_until(word_stop);
+                let word = self.parse_word_until(word_stop)?;
                 if add_word_or_assignment(self, word_stop, word, &mut command) {
-                    return wrap_command(command);
+                    return Ok(wrap_command(command));
                 }
             } else {
-                if let Some(redirection) = self.parse_redirection_opt() {
+                if let Some(redirection) = self.parse_redirection_opt()? {
                     command.redirections.push(redirection);
                 } else {
-                    return wrap_command(command);
+                    return Ok(wrap_command(command));
                 }
             }
         }
 
         loop {
             if self.go_to_word_start(true) {
-                if let Some(word) = self.parse_word_until(word_stop) {
+                if let Some(word) = self.parse_word_until(word_stop)? {
                     command.words.push(word);
                 }
                 if word_stop != WordToken::EOF && self.word_lookahead() == word_stop {
-                    return wrap_command(command);
+                    return Ok(wrap_command(command));
                 }
             } else {
-                if let Some(redirection) = self.parse_redirection_opt() {
+                if let Some(redirection) = self.parse_redirection_opt()? {
                     command.redirections.push(redirection);
                 } else {
-                    return wrap_command(command);
+                    return Ok(wrap_command(command));
                 }
             }
         }
     }
 
-    fn parse_compound_list(&mut self, word_stop: WordToken) -> CompleteCommand {
+    fn parse_compound_list(&mut self, word_stop: WordToken) -> ParseResult<CompleteCommand> {
         self.skip_linebreak();
+        let list_start = self.lookahead_source_location;
 
         const END_TOKENS: &[ShellToken] = &[
             ShellToken::RParen,
@@ -665,7 +744,7 @@ impl<'src> Parser<'src> {
             ShellToken::Then,
         ];
 
-        let mut last_conjunction = self.parse_and_or(word_stop);
+        let mut last_conjunction = self.parse_and_or(word_stop)?;
         let mut commands = Vec::new();
         while let Some(mut conjunction) = last_conjunction {
             match self.shell_lookahead() {
@@ -685,56 +764,66 @@ impl<'src> Parser<'src> {
                 break;
             }
             commands.push(conjunction);
-            last_conjunction = self.parse_and_or(word_stop);
+            last_conjunction = self.parse_and_or(word_stop)?;
         }
         if commands.is_empty() {
-            todo!("error: expected command, found ...")
+            return Err(ParserError::new(
+                list_start,
+                "expected command",
+                self.shell_lookahead() == ShellToken::EOF,
+            ));
         }
-        CompleteCommand { commands }
+        Ok(CompleteCommand { commands })
     }
 
-    fn parse_brace_group(&mut self) -> CompoundCommand {
+    fn parse_brace_group(&mut self) -> ParseResult<CompoundCommand> {
         // consume '{'
         self.advance_shell();
-        let inner = self.parse_compound_list(WordToken::Char('}'));
+        let inner = self.parse_compound_list(WordToken::Char('}'))?;
         self.match_shell_token(ShellToken::RBrace);
-        CompoundCommand::BraceGroup(inner)
+        Ok(CompoundCommand::BraceGroup(inner))
     }
 
-    fn parse_subshell(&mut self) -> CompoundCommand {
+    fn parse_subshell(&mut self) -> ParseResult<CompoundCommand> {
         // consume '('
         self.advance_shell();
-        let inner = self.parse_compound_list(WordToken::Char(')'));
+        let inner = self.parse_compound_list(WordToken::Char(')'))?;
         self.match_shell_token(ShellToken::RParen);
-        CompoundCommand::Subshell(inner)
+        Ok(CompoundCommand::Subshell(inner))
     }
 
-    fn parse_do_group(&mut self) -> CompleteCommand {
+    fn parse_do_group(&mut self) -> ParseResult<CompleteCommand> {
         self.match_shell_token(ShellToken::Do);
-        let inner = self.parse_compound_list(WordToken::EOF);
+        let inner = self.parse_compound_list(WordToken::EOF)?;
         self.match_shell_token(ShellToken::Done);
-        inner
+        Ok(inner)
     }
 
-    fn parse_for_clause(&mut self) -> CompoundCommand {
+    fn parse_for_clause(&mut self) -> ParseResult<CompoundCommand> {
         // consume 'for'
         self.advance_shell();
         self.go_to_word_start(true);
+        let word_start_location = self.lookahead_source_location;
+        let word_start_token = self.word_lookahead();
         let iter_var = if let Some(name) = self
-            .parse_word_until(WordToken::EOF)
+            .parse_word_until(WordToken::EOF)?
             .map(|w| try_into_name(w).ok())
             .flatten()
         {
             name
         } else {
-            todo!("error: expected name")
+            return Err(ParserError::new(
+                word_start_location,
+                "word is not a valid name",
+                word_start_token == WordToken::EOF,
+            ));
         };
         self.skip_linebreak();
         let mut words = Vec::new();
         if self.shell_lookahead() == ShellToken::In {
             self.advance_shell();
             while self.go_to_word_start(true) {
-                words.push(self.parse_word_until(WordToken::EOF).unwrap());
+                words.push(self.parse_word_until(WordToken::EOF)?.unwrap());
             }
         }
         match self.shell_lookahead() {
@@ -744,28 +833,28 @@ impl<'src> Parser<'src> {
             }
             _ => {}
         }
-        let body = self.parse_do_group();
-        CompoundCommand::ForClause {
+        let body = self.parse_do_group()?;
+        Ok(CompoundCommand::ForClause {
             iter_var,
             words,
             body,
-        }
+        })
     }
 
-    fn parse_case_item(&mut self) -> CaseItem {
+    fn parse_case_item(&mut self) -> ParseResult<CaseItem> {
         self.match_shell_token_opt(ShellToken::LParen);
         let mut pattern = Vec::new();
         while self.shell_lookahead() != ShellToken::RParen {
             self.go_to_word_start(true);
-            pattern.push(self.parse_word_until(WordToken::EOF).unwrap());
+            pattern.push(self.parse_word_until(WordToken::EOF)?.unwrap());
             if self.shell_lookahead() != ShellToken::Pipe {
                 break;
             }
             self.advance_shell();
         }
-        self.match_shell_token(ShellToken::RParen);
+        self.match_shell_token(ShellToken::RParen)?;
 
-        let body = self.parse_compound_list(WordToken::EOF);
+        let body = self.parse_compound_list(WordToken::EOF)?;
 
         if self.shell_lookahead() == ShellToken::DSemi {
             self.advance_shell();
@@ -774,37 +863,37 @@ impl<'src> Parser<'src> {
             todo!("error: expected ';;', found ...")
         }
 
-        CaseItem { body, pattern }
+        Ok(CaseItem { body, pattern })
     }
 
-    fn parse_case_clause(&mut self) -> CompoundCommand {
+    fn parse_case_clause(&mut self) -> ParseResult<CompoundCommand> {
         // consume 'case'
         self.advance_shell();
         self.go_to_word_start(true);
-        let arg = self.parse_word_until(WordToken::EOF).unwrap();
+        let arg = self.parse_word_until(WordToken::EOF)?.unwrap();
         self.skip_linebreak();
-        self.match_shell_token(ShellToken::In);
+        self.match_shell_token(ShellToken::In)?;
         self.skip_linebreak();
         let mut cases = Vec::new();
         loop {
             match self.shell_lookahead() {
                 ShellToken::Esac => break,
                 _ => {
-                    cases.push(self.parse_case_item());
+                    cases.push(self.parse_case_item()?);
                 }
             }
         }
-        self.match_shell_token(ShellToken::Esac);
-        CompoundCommand::CaseClause { arg, cases }
+        self.match_shell_token(ShellToken::Esac)?;
+        Ok(CompoundCommand::CaseClause { arg, cases })
     }
 
-    fn parse_if_clause(&mut self) -> CompoundCommand {
+    fn parse_if_clause(&mut self) -> ParseResult<CompoundCommand> {
         // consume 'if'
         self.advance_shell();
         let mut if_chain = Vec::new();
-        let condition = self.parse_compound_list(WordToken::EOF);
-        self.match_shell_token(ShellToken::Then);
-        let then_part = self.parse_compound_list(WordToken::EOF);
+        let condition = self.parse_compound_list(WordToken::EOF)?;
+        self.match_shell_token(ShellToken::Then)?;
+        let then_part = self.parse_compound_list(WordToken::EOF)?;
         if_chain.push(If {
             condition,
             body: then_part,
@@ -812,9 +901,9 @@ impl<'src> Parser<'src> {
         while self.shell_lookahead() == ShellToken::Elif {
             // consume 'elif'
             self.advance_shell();
-            let condition = self.parse_compound_list(WordToken::EOF);
-            self.match_shell_token(ShellToken::Then);
-            let then_part = self.parse_compound_list(WordToken::EOF);
+            let condition = self.parse_compound_list(WordToken::EOF)?;
+            self.match_shell_token(ShellToken::Then)?;
+            let then_part = self.parse_compound_list(WordToken::EOF)?;
             if_chain.push(If {
                 condition,
                 body: then_part,
@@ -822,7 +911,7 @@ impl<'src> Parser<'src> {
         }
         if self.shell_lookahead() == ShellToken::Else {
             self.advance_shell();
-            let else_part = self.parse_compound_list(WordToken::EOF);
+            let else_part = self.parse_compound_list(WordToken::EOF)?;
             if_chain.push(If {
                 condition: CompleteCommand {
                     commands: Vec::new(),
@@ -830,117 +919,130 @@ impl<'src> Parser<'src> {
                 body: else_part,
             });
         }
-        self.match_shell_token(ShellToken::Fi);
-        CompoundCommand::IfClause { if_chain }
+        self.match_shell_token(ShellToken::Fi)?;
+        Ok(CompoundCommand::IfClause { if_chain })
     }
 
-    fn parse_while_clause(&mut self) -> CompoundCommand {
+    fn parse_while_clause(&mut self) -> ParseResult<CompoundCommand> {
         // consume 'while'
         self.advance_shell();
-        let condition = self.parse_compound_list(WordToken::EOF);
-        let body = self.parse_do_group();
-        CompoundCommand::WhileClause { condition, body }
+        let condition = self.parse_compound_list(WordToken::EOF)?;
+        let body = self.parse_do_group()?;
+        Ok(CompoundCommand::WhileClause { condition, body })
     }
 
-    fn parse_until_clause(&mut self) -> CompoundCommand {
+    fn parse_until_clause(&mut self) -> ParseResult<CompoundCommand> {
         // consume 'until'
         self.advance_shell();
-        let condition = self.parse_compound_list(WordToken::EOF);
-        let body = self.parse_do_group();
-        CompoundCommand::UntilClause { condition, body }
+        let condition = self.parse_compound_list(WordToken::EOF)?;
+        let body = self.parse_do_group()?;
+        Ok(CompoundCommand::UntilClause { condition, body })
     }
 
-    fn parse_compound_command(&mut self) -> Option<CompoundCommand> {
+    fn parse_compound_command(&mut self) -> ParseResult<Option<CompoundCommand>> {
         match self.shell_lookahead() {
-            ShellToken::LBrace => Some(self.parse_brace_group()),
-            ShellToken::LParen => Some(self.parse_subshell()),
-            ShellToken::For => Some(self.parse_for_clause()),
-            ShellToken::Case => Some(self.parse_case_clause()),
-            ShellToken::If => Some(self.parse_if_clause()),
-            ShellToken::While => Some(self.parse_while_clause()),
-            ShellToken::Until => Some(self.parse_until_clause()),
-            _ => None,
+            ShellToken::LBrace => self.parse_brace_group().map(Some),
+            ShellToken::LParen => self.parse_subshell().map(Some),
+            ShellToken::For => self.parse_for_clause().map(Some),
+            ShellToken::Case => self.parse_case_clause().map(Some),
+            ShellToken::If => self.parse_if_clause().map(Some),
+            ShellToken::While => self.parse_while_clause().map(Some),
+            ShellToken::Until => self.parse_until_clause().map(Some),
+            _ => Ok(None),
         }
     }
 
-    fn parse_function_definition(&mut self, name: Name) -> FunctionDefinition {
+    fn parse_function_definition(&mut self, name: Name) -> ParseResult<FunctionDefinition> {
         // consume '('
         self.advance_shell();
-        self.match_shell_token(ShellToken::RParen);
-        let body = self.parse_compound_command();
-        if let Some(body) = body {
-            FunctionDefinition { name, body }
+        self.match_shell_token(ShellToken::RParen)?;
+        if let Some(body) = self.parse_compound_command()? {
+            Ok(FunctionDefinition { name, body })
         } else {
             todo!("error: expected compound command")
         }
     }
 
-    fn parse_command(&mut self, word_stop: WordToken) -> Option<Command> {
+    fn parse_command(&mut self, word_stop: WordToken) -> ParseResult<Option<Command>> {
         // command =
         // 			| compound_command redirect_list?
         // 			| simple_command
         // 			| function_definition
-        if let Some(compound_command) = self.parse_compound_command() {
+        if let Some(compound_command) = self.parse_compound_command()? {
             let mut redirections = Vec::new();
-            while let Some(redirection) = self.parse_redirection_opt() {
+            while let Some(redirection) = self.parse_redirection_opt()? {
                 redirections.push(redirection);
             }
-            Some(Command::CompoundCommand {
+            Ok(Some(Command::CompoundCommand {
                 command: compound_command,
                 redirections,
-            })
+            }))
         } else {
             self.go_to_word_start(false);
-            if let Some(start) = self.parse_word_until(word_stop) {
+            if let Some(start) = self.parse_word_until(word_stop)? {
                 match try_into_name(start) {
-                    Ok(name) if self.shell_lookahead() == ShellToken::LParen => Some(
-                        Command::FunctionDefinition(self.parse_function_definition(name)),
-                    ),
+                    Ok(name) if self.shell_lookahead() == ShellToken::LParen => self
+                        .parse_function_definition(name)
+                        .map(Command::FunctionDefinition)
+                        .map(Some),
                     Ok(name) => {
                         let start = Word {
                             parts: vec![WordPart::UnquotedLiteral(name.to_string())],
                         };
-                        self.parse_simple_command(Some(start), word_stop)
-                            .map(Command::SimpleCommand)
+                        Ok(self
+                            .parse_simple_command(Some(start), word_stop)?
+                            .map(Command::SimpleCommand))
                     }
-                    Err(word) => self
-                        .parse_simple_command(Some(word), word_stop)
-                        .map(Command::SimpleCommand),
+                    Err(word) => Ok(self
+                        .parse_simple_command(Some(word), word_stop)?
+                        .map(Command::SimpleCommand)),
                 }
             } else {
-                self.parse_simple_command(None, word_stop)
-                    .map(Command::SimpleCommand)
+                Ok(self
+                    .parse_simple_command(None, word_stop)?
+                    .map(Command::SimpleCommand))
             }
         }
     }
 
-    fn parse_pipeline(&mut self, word_stop: WordToken) -> Option<Pipeline> {
+    fn parse_pipeline(&mut self, word_stop: WordToken) -> ParseResult<Option<Pipeline>> {
         // pipeline = "!" command ("|" linebreak command)*
-        // TODO: implement the "!"* part
-
         let negate_status = self
             .matches_shell_alterntives(&[ShellToken::Bang])
             .is_some();
         let mut commands = Vec::new();
-        commands.push(self.parse_command(word_stop)?);
+        if let Some(command) = self.parse_command(word_stop)? {
+            commands.push(command);
+        } else {
+            return Ok(None);
+        }
         while self.shell_lookahead() == ShellToken::Pipe {
+            let pipe_location = self.lookahead_source_location;
             self.advance_shell();
             self.skip_linebreak();
-            if let Some(command) = self.parse_command(word_stop) {
+            if let Some(command) = self.parse_command(word_stop)? {
                 commands.push(command);
             } else {
-                todo!("error: expected command, found ...")
+                return Err(ParserError::new(
+                    pipe_location,
+                    "right hand side of pipe operator should be a command",
+                    self.shell_lookahead() == ShellToken::EOF,
+                ));
             }
         }
-        Some(Pipeline {
+        Ok(Some(Pipeline {
             commands,
             negate_status,
-        })
+        }))
     }
 
-    fn parse_and_or(&mut self, word_stop: WordToken) -> Option<Conjunction> {
+    fn parse_and_or(&mut self, word_stop: WordToken) -> ParseResult<Option<Conjunction>> {
         // and_or = pipeline (("&&" | "||") linebreak pipeline)*
-        let mut last = self.parse_pipeline(word_stop)?;
+        let mut last = if let Some(pipeline) = self.parse_pipeline(word_stop)? {
+            pipeline
+        } else {
+            return Ok(None);
+        };
         let mut elements = Vec::new();
         while let Some(op) = self.matches_shell_alterntives(&[ShellToken::AndIf, ShellToken::OrIf])
         {
@@ -949,35 +1051,40 @@ impl<'src> Parser<'src> {
                 ShellToken::OrIf => LogicalOp::Or,
                 _ => unreachable!(),
             };
+            let operator_location = self.lookahead_source_location;
             self.skip_linebreak();
-            let next = if let Some(next) = self.parse_pipeline(word_stop) {
+            let next = if let Some(next) = self.parse_pipeline(word_stop)? {
                 next
             } else {
-                todo!("error: expected command, found ...")
+                return Err(ParserError::new(
+                    operator_location,
+                    "right hand side of pipe operator should be a command",
+                    self.shell_lookahead() == ShellToken::EOF,
+                ));
             };
             let previous = last;
             last = next;
             elements.push((previous, op));
         }
         elements.push((last, LogicalOp::None));
-        Some(Conjunction {
+        Ok(Some(Conjunction {
             elements,
             is_async: false,
-        })
+        }))
     }
 
-    fn parse_complete_command(&mut self, word_stop: WordToken) -> CompleteCommand {
+    fn parse_complete_command(&mut self, word_stop: WordToken) -> ParseResult<CompleteCommand> {
         // complete_command = and_or (separator_op and_or)* separator_op?
         let mut commands = Vec::new();
         while self.shell_lookahead() != ShellToken::Newline
             || self.shell_lookahead() != ShellToken::EOF
         {
-            let mut and_or = if let Some(and_or) = self.parse_and_or(word_stop) {
+            let command_start = self.lookahead_source_location;
+            let mut and_or = if let Some(and_or) = self.parse_and_or(word_stop)? {
                 and_or
             } else {
-                todo!("error: expected command, found ...")
+                return Err(ParserError::new(command_start, "expected command", false));
             };
-            // FIXME: very ugly, should move is_async somewhere else
             if self.shell_lookahead() == ShellToken::And {
                 and_or.is_async = true;
             }
@@ -990,10 +1097,10 @@ impl<'src> Parser<'src> {
                 break;
             }
         }
-        CompleteCommand { commands }
+        Ok(CompleteCommand { commands })
     }
 
-    fn parse_program(mut self) -> Program {
+    fn parse_program(mut self) -> ParseResult<Program> {
         // program = linebreak (complete_command (complete_command  newline_list)*)? linebreak
         // set initial lookahead
         self.advance_shell();
@@ -1001,16 +1108,16 @@ impl<'src> Parser<'src> {
         let mut commands = Vec::new();
         while self.shell_lookahead() != ShellToken::EOF {
             if commands.len() > 0 {
-                self.match_shell_token(ShellToken::Newline);
+                self.match_shell_token(ShellToken::Newline)?;
                 self.skip_linebreak();
             }
             if self.shell_lookahead() == ShellToken::EOF {
                 break;
             }
-            commands.push(self.parse_complete_command(WordToken::EOF));
+            commands.push(self.parse_complete_command(WordToken::EOF)?);
         }
 
-        Program { commands }
+        Ok(Program { commands })
     }
 
     fn new(source: &'src str) -> Self {
@@ -1025,7 +1132,7 @@ impl<'src> Parser<'src> {
     }
 }
 
-pub fn parse(text: &str) -> Program {
+pub fn parse(text: &str) -> ParseResult<Program> {
     Parser::new(text).parse_program()
 }
 
@@ -1092,13 +1199,17 @@ mod tests {
     }
 
     fn parse_word(word: &str) -> Word {
-        let command = unwrap_simple_command(parse(word));
+        let command = unwrap_simple_command(parse(word).expect("parsing word failed"));
         command.words.into_iter().next().unwrap()
     }
 
     fn parse_unquoted_parameter_expansion(word: &str) -> ParameterExpansion {
         let word = parse_word(word);
-        if let WordPart::ParameterExpansion { expansion, inside_double_quotes } = word.parts.into_iter().next().unwrap() {
+        if let WordPart::ParameterExpansion {
+            expansion,
+            inside_double_quotes,
+        } = word.parts.into_iter().next().unwrap()
+        {
             assert!(!inside_double_quotes);
             expansion
         } else {
@@ -1108,7 +1219,11 @@ mod tests {
 
     fn parse_unquoted_command_substitution(word: &str) -> CompleteCommand {
         let word = parse_word(word);
-        if let WordPart::CommandSubstitution { command, inside_double_quotes } = word.parts.into_iter().next().unwrap() {
+        if let WordPart::CommandSubstitution {
+            command,
+            inside_double_quotes,
+        } = word.parts.into_iter().next().unwrap()
+        {
             assert!(!inside_double_quotes);
             command
         } else {
@@ -1117,7 +1232,7 @@ mod tests {
     }
 
     fn parse_simple_command(text: &str) -> SimpleCommand {
-        unwrap_simple_command(parse(text))
+        unwrap_simple_command(parse(text).expect("parsing failed"))
     }
 
     fn parse_single_redirection(text: &str) -> Redirection {
@@ -1129,7 +1244,7 @@ mod tests {
     }
 
     fn parse_compound_command(text: &str) -> (CompoundCommand, Vec<Redirection>) {
-        let command = unwrap_command(parse(text));
+        let command = unwrap_command(parse(text).expect("parsing failed"));
         if let Command::CompoundCommand {
             command,
             redirections,
@@ -1142,19 +1257,19 @@ mod tests {
     }
 
     fn parse_command(text: &str) -> Command {
-        unwrap_command(parse(text))
+        unwrap_command(parse(text).expect("parsing failed"))
     }
 
     fn parse_pipeline(text: &str) -> Pipeline {
-        unwrap_pipeline(parse(text))
+        unwrap_pipeline(parse(text).expect("parsing failed"))
     }
 
     fn parse_conjunction(text: &str) -> Conjunction {
-        unwrap_conjunction(parse(text))
+        unwrap_conjunction(parse(text).expect("parsing failed"))
     }
 
     fn parse_complete_command(text: &str) -> CompleteCommand {
-        unwrap_complete_command(parse(text))
+        unwrap_complete_command(parse(text).expect("parsing failed"))
     }
 
     #[test]
@@ -1778,10 +1893,7 @@ mod tests {
                     elements: vec![(
                         Pipeline {
                             commands: vec![Command::SimpleCommand(SimpleCommand {
-                                words: vec![
-                                    unquoted_literal("echo"),
-                                    unquoted_literal("hello")
-                                ],
+                                words: vec![unquoted_literal("echo"), unquoted_literal("hello")],
                                 ..Default::default()
                             })],
                             negate_status: false
@@ -1842,7 +1954,10 @@ mod tests {
                         elements: vec![(
                             Pipeline {
                                 commands: vec![Command::SimpleCommand(SimpleCommand {
-                                    words: vec![unquoted_literal("echo"), unquoted_literal("hello")],
+                                    words: vec![
+                                        unquoted_literal("echo"),
+                                        unquoted_literal("hello"),
+                                    ],
                                     ..Default::default()
                                 })],
                                 negate_status: false,
@@ -1852,7 +1967,7 @@ mod tests {
                         is_async: false,
                     }],
                 },
-                inside_double_quotes: false
+                inside_double_quotes: false,
             }],
         };
         assert_eq!(
@@ -1883,9 +1998,9 @@ mod tests {
                 parts: vec![
                     WordPart::QuotedLiteral("hello ".to_string()),
                     WordPart::ParameterExpansion {
-                        expansion: ParameterExpansion::Simple(Parameter::Variable(
-                            Rc::from("test")
-                        )),
+                        expansion: ParameterExpansion::Simple(Parameter::Variable(Rc::from(
+                            "test"
+                        ))),
                         inside_double_quotes: true
                     },
                     WordPart::QuotedLiteral("".to_string())
@@ -1898,9 +2013,9 @@ mod tests {
                 parts: vec![
                     WordPart::QuotedLiteral("hello ".to_string()),
                     WordPart::ParameterExpansion {
-                        expansion: ParameterExpansion::Simple(Parameter::Variable(
-                            Rc::from("test")
-                        )),
+                        expansion: ParameterExpansion::Simple(Parameter::Variable(Rc::from(
+                            "test"
+                        ))),
                         inside_double_quotes: true
                     },
                     WordPart::QuotedLiteral("".to_string())
@@ -2024,7 +2139,7 @@ mod tests {
             parse_compound_command(
                 "case word in (pattern1) cmd1;; (pattern2) cmd2;; (pattern3) cmd3;; esac"
             )
-                .0,
+            .0,
             CompoundCommand::CaseClause {
                 arg: unquoted_literal("word"),
                 cases: vec![
@@ -2228,7 +2343,7 @@ mod tests {
             Command::FunctionDefinition(FunctionDefinition {
                 name: Rc::from("function_name"),
                 body: CompoundCommand::Subshell(CompleteCommand {
-                    commands: vec![conjunction_from_word(unquoted_literal("cmd1"), false), ]
+                    commands: vec![conjunction_from_word(unquoted_literal("cmd1"), false),]
                 })
             })
         );
@@ -2304,32 +2419,55 @@ mod tests {
 
     #[test]
     fn remove_quotes_from_word() {
-        assert_eq!(
-            parse_word("\"hello\""),
-            quoted_literal("hello")
-        );
-        assert_eq!(
-            parse_word("'hello'"),
-            quoted_literal("hello")
-        );
-        assert_eq!(
-            parse_word("\"\""),
-            quoted_literal("")
-        );
-        assert_eq!(
-            parse_word("''"),
-            quoted_literal("")
-        );
+        assert_eq!(parse_word("\"hello\""), quoted_literal("hello"));
+        assert_eq!(parse_word("'hello'"), quoted_literal("hello"));
+        assert_eq!(parse_word("\"\""), quoted_literal(""));
+        assert_eq!(parse_word("''"), quoted_literal(""));
         assert_eq!(parse_word("'\"hello\"'"), quoted_literal("\"hello\""));
         assert_eq!(parse_word("\"'hello'\""), quoted_literal("'hello'"));
         assert_eq!(parse_word("\\'"), quoted_literal("'"));
         assert_eq!(parse_word("\\\""), quoted_literal("\""));
         assert_eq!(parse_word("\\\\"), quoted_literal("\\"));
-        assert_eq!(parse_word("\\$1"), Word {
-            parts: vec![WordPart::QuotedLiteral("$".into()), WordPart::UnquotedLiteral("1".into())]
-        });
+        assert_eq!(
+            parse_word("\\$1"),
+            Word {
+                parts: vec![
+                    WordPart::QuotedLiteral("$".into()),
+                    WordPart::UnquotedLiteral("1".into())
+                ]
+            }
+        );
         assert_eq!(parse_word("\\$"), quoted_literal("$"));
         assert_eq!(parse_word("\"\\\""), quoted_literal("\\"));
         assert_eq!(parse_word("'\\'"), quoted_literal("\\"));
+    }
+
+    #[test]
+    fn invalid_parameter_is_error() {
+        assert!(parse("$.").is_err_and(|err| !err.could_be_resolved_with_more_input));
+        assert!(parse("$\n0").is_err_and(|err| !err.could_be_resolved_with_more_input));
+        assert!(parse("$").is_err_and(|err| err.could_be_resolved_with_more_input))
+    }
+
+    #[test]
+    fn invalid_format_specifier_in_parameter_expansion_is_error() {
+        assert!(
+            parse("${word:.other_word}").is_err_and(|err| !err.could_be_resolved_with_more_input)
+        );
+        assert!(parse("${word:\n-}").is_err_and(|err| !err.could_be_resolved_with_more_input));
+        assert!(parse("${word:").is_err_and(|err| err.could_be_resolved_with_more_input));
+
+        assert!(parse("${word;word}").is_err_and(|err| !err.could_be_resolved_with_more_input));
+        assert!(parse("${word").is_err_and(|err| err.could_be_resolved_with_more_input));
+    }
+
+    #[test]
+    fn unclosed_double_quotes_are_error() {
+        assert!(parse("\"unclosed string").is_err_and(|err| err.could_be_resolved_with_more_input));
+    }
+
+    #[test]
+    fn out_of_range_file_descriptor_is_error() {
+        assert!(parse("2000> file.txt").is_err_and(|err| !err.could_be_resolved_with_more_input));
     }
 }

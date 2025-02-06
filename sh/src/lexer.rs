@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::fmt::{Display, Formatter};
 use std::str::CharIndices;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -60,6 +61,50 @@ pub enum ShellToken {
     EOF,
 }
 
+impl Display for ShellToken {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
+        match self {
+            ShellToken::And => write!(f, "'&'"),
+            ShellToken::LParen => write!(f, "'('"),
+            ShellToken::RParen => write!(f, "')'"),
+            ShellToken::SemiColon => write!(f, "';'"),
+            ShellToken::Newline => write!(f, "'\\n'"),
+            ShellToken::Pipe => write!(f, "'|'"),
+            ShellToken::AndIf => write!(f, "'&&'"),
+            ShellToken::OrIf => write!(f, "'||'"),
+            ShellToken::DSemi => write!(f, "';;'"),
+            ShellToken::Less => write!(f, "'<'"),
+            ShellToken::Greater => write!(f, "'>'"),
+            ShellToken::Clobber => write!(f, "'>|'"),
+            ShellToken::DLess => write!(f, "'<<'"),
+            ShellToken::DGreat => write!(f, "'>>'"),
+            ShellToken::LessAnd => write!(f, "'<&'"),
+            ShellToken::GreatAnd => write!(f, "'>&'"),
+            ShellToken::DLessDash => write!(f, "'<<-'"),
+            ShellToken::LessGreat => write!(f, "'<>'"),
+            ShellToken::Bang => write!(f, "'!'"),
+            ShellToken::LBrace => write!(f, "'{{'"),
+            ShellToken::RBrace => write!(f, "'}}'"),
+            ShellToken::Case => write!(f, "case"),
+            ShellToken::Do => write!(f, "do"),
+            ShellToken::Done => write!(f, "done"),
+            ShellToken::Elif => write!(f, "elif"),
+            ShellToken::Else => write!(f, "else"),
+            ShellToken::Esac => write!(f, "esac"),
+            ShellToken::Fi => write!(f, "fi"),
+            ShellToken::For => write!(f, "for"),
+            ShellToken::If => write!(f, "if"),
+            ShellToken::In => write!(f, "in"),
+            ShellToken::Then => write!(f, "then"),
+            ShellToken::Until => write!(f, "until"),
+            ShellToken::While => write!(f, "while"),
+            ShellToken::IoNumber(_) => write!(f, "number"),
+            ShellToken::WordStart => write!(f, "word"),
+            ShellToken::EOF => write!(f, "EOF"),
+        }
+    }
+}
+
 impl ShellToken {
     pub fn is_reserved_word(&self) -> bool {
         match self {
@@ -100,13 +145,30 @@ pub enum WordToken {
     EOF,
 }
 
+impl Display for WordToken {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WordToken::DoubleQuote => write!(f, "'\"'"),
+            WordToken::SingleQuote => write!(f, "\'"),
+            WordToken::Dollar => write!(f, "'$'"),
+            WordToken::Backtick => write!(f, "'`'"),
+            WordToken::EscapedBacktick => write!(f, "'\\`'"),
+            WordToken::Backslash => write!(f, "'\\'"),
+            WordToken::CommandSubstitutionStart => write!(f, "'$('"),
+            WordToken::ArithmeticExpansionStart => write!(f, "'$(('"),
+            WordToken::Char(c) => write!(f, "'{}'", c),
+            WordToken::EOF => write!(f, "'EOF'"),
+        }
+    }
+}
+
 pub enum ArithmeticToken {
     Plus,
     Minus,
     // ...
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct SourceLocation {
     pub start: usize,
     pub end: usize,

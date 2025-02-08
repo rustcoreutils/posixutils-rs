@@ -2462,12 +2462,24 @@ mod tests {
     }
 
     #[test]
-    fn unclosed_double_quotes_are_error() {
+    fn unclosed_quotes_are_error() {
         assert!(parse("\"unclosed string").is_err_and(|err| err.could_be_resolved_with_more_input));
+        assert!(parse("'unclosed string").is_err_and(|err| err.could_be_resolved_with_more_input));
     }
 
     #[test]
     fn out_of_range_file_descriptor_is_error() {
         assert!(parse("2000> file.txt").is_err_and(|err| !err.could_be_resolved_with_more_input));
+    }
+
+    #[test]
+    fn pipe_with_no_following_command_is_error() {
+        assert!(parse("command |").is_err_and(|err| err.could_be_resolved_with_more_input));
+    }
+
+    #[test]
+    fn logical_op_with_no_following_command_is_error() {
+        assert!(parse("command &&").is_err_and(|err| err.could_be_resolved_with_more_input));
+        assert!(parse("command ||").is_err_and(|err| err.could_be_resolved_with_more_input));
     }
 }

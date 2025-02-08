@@ -8,6 +8,7 @@ plib = { path = "../plib" }
 gettext-rs.workspace = true
 clap.workspace = true
 nix = { version = "0.29", features = ["process", "fs"] }
+atty.workspace = true
 
 [[bin]]
 name = "sh"

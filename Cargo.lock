@@ -1495,6 +1495,7 @@ dependencies = [
 name = "posixutils-sh"
 version = "0.1.7"
 dependencies = [
+ "atty",
  "clap",
  "gettext-rs",
  "nix 0.29.0",

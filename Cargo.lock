@@ -1395,6 +1395,7 @@ dependencies = [
  "bytemuck",
  "byteorder",
  "clap",
+ "flate2",
  "gettext-rs",
  "plib",
  "strum",

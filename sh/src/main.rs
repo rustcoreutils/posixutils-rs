@@ -21,15 +21,11 @@ mod program;
 
 fn main() {
     let is_attached_to_terminal = atty::is(Stream::Stdin) && atty::is(Stream::Stdout);
-    let args = parse_args(
-        std::env::args().collect::<Vec<_>>(),
-        is_attached_to_terminal,
-    )
-    .unwrap();
-    let mut interpreter = Interpreter::initialize_from_system();
-
+    let args = parse_args(std::env::args().collect(), is_attached_to_terminal).unwrap();
     match args.execution_mode {
         ExecutionMode::Interactive | ExecutionMode::ReadCommandsFromStdin => {
+            let mut interpreter =
+                Interpreter::initialize_from_system(args.program_name, args.arguments);
             let mut buffer = String::new();
             let stdin = io::stdin();
             while stdin.read_line(&mut buffer).is_ok_and(|n| n > 0) {
@@ -46,6 +42,8 @@ fn main() {
             }
         }
         ExecutionMode::ReadCommandsFromString(command_string) => {
+            let mut interpreter =
+                Interpreter::initialize_from_system(args.program_name, args.arguments);
             // TODO: impl proper error reporting
             let program = parse(&command_string).expect("parsing error");
             interpreter.interpret(program);

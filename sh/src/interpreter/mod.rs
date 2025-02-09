@@ -4,15 +4,15 @@ use crate::program::{
     LogicalOp, Name, Pipeline, Program, Redirection, RedirectionKind, SimpleCommand,
 };
 use nix::libc;
-use nix::libc::pid_t;
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{close, dup2, execve, fork, getpid, pipe, ForkResult, Pid};
 use std::collections::HashMap;
-use std::ffi::{c_char, CString, OsString};
+use std::ffi::{CString, OsString};
 use std::os::fd::{AsRawFd, IntoRawFd};
 use std::path::PathBuf;
 use std::rc::Rc;
 
+pub mod set;
 mod wordexp;
 
 trait BuiltinUtility {
@@ -69,6 +69,8 @@ pub type Environment = HashMap<String, Variable>;
 #[derive(Clone)]
 pub struct Interpreter {
     environment: Environment,
+    program_name: String,
+    positional_parameters: Vec<String>,
     opened_files: HashMap<u32, Rc<std::fs::File>>,
     functions: HashMap<Name, Rc<CompoundCommand>>,
     most_recent_pipeline_status: i32,
@@ -328,7 +330,7 @@ impl Interpreter {
         }
     }
 
-    pub fn initialize_from_system() -> Interpreter {
+    pub fn initialize_from_system(program_name: String, args: Vec<String>) -> Interpreter {
         // > If a variable is initialized from the environment, it shall be marked for
         // > export immediately
         let variables = std::env::vars()
@@ -337,6 +339,8 @@ impl Interpreter {
             .collect();
         Interpreter {
             environment: variables,
+            program_name,
+            positional_parameters: args,
             shell_pid: getpid().as_raw(),
             // TODO: handle error
             current_directory: std::env::current_dir().unwrap().into_os_string(),
@@ -349,6 +353,8 @@ impl Default for Interpreter {
     fn default() -> Self {
         Interpreter {
             environment: Environment::default(),
+            program_name: "sh".to_string(),
+            positional_parameters: Vec::default(),
             opened_files: HashMap::default(),
             functions: HashMap::default(),
             most_recent_pipeline_status: 0,

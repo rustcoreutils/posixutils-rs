@@ -41,6 +41,7 @@ libc = "0.2"
 regex = "1.10"
 gettext-rs = { path = "./gettext-rs" }
 errno = "0.3"
+chrono-tz = "0.10.0"
 
 [workspace.lints]
 

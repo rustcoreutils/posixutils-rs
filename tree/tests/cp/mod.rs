@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use plib_testing::{run_test, TestPlan};
 use std::ffi::CString;
 use std::io::{Read, Write};
 use std::os::unix::fs::FileTypeExt;

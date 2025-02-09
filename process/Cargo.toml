@@ -8,20 +8,21 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-plib = { path = "../plib" }
+plib.workspace = true
 clap.workspace = true
 gettext-rs.workspace = true
 libc.workspace = true
 dirs = "5.0"
+
+[dev-dependencies]
+plib-testing.workspace = true
+sysinfo = "0.31"
 
 [build-dependencies]
 bindgen = { version = "0.70.0", features = ["runtime"] }
 
 [lints]
 workspace = true
-
-[dev-dependencies]
-sysinfo = "0.31"
 
 [[bin]]
 name = "fuser"

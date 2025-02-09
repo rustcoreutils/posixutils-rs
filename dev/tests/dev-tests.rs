@@ -1,6 +1,7 @@
-use object::{Object, ObjectSection, ObjectSymbol};
-use plib::testing::{run_test, run_test_with_checker, TestPlan};
 use std::fs;
+
+use object::{Object, ObjectSection, ObjectSymbol};
+use plib_testing::{run_test, run_test_with_checker, TestPlan};
 
 fn ar_compare_test(
     args: &[&str],

@@ -8,11 +8,14 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-plib = { path = "../plib" }
+plib.workspace = true
 clap.workspace = true
 libc.workspace = true
 gettext-rs.workspace = true
 base64 = "0.21"
+
+[dev-dependencies]
+plib-testing.workspace = true
 
 [lints]
 workspace = true

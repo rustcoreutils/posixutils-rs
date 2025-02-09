@@ -3,21 +3,19 @@ use std::{
     ffi::OsString,
     fs::{self, DirEntry},
     io,
-    path::PathBuf,
+    path::{Display, Path},
 };
 
-use super::constants::*;
-
-pub struct DirData {
-    path: PathBuf,
+pub struct DirData<'a> {
+    path: &'a Path,
     files: HashMap<OsString, DirEntry>,
 }
 
-impl DirData {
-    pub fn load(path: PathBuf) -> io::Result<Self> {
+impl<'a> DirData<'a> {
+    pub fn load(path: &'a Path) -> io::Result<Self> {
         let mut files: HashMap<OsString, DirEntry> = Default::default();
 
-        let entries = fs::read_dir(&path)?;
+        let entries = fs::read_dir(path)?;
 
         for entry in entries {
             let entry = entry?;
@@ -31,11 +29,11 @@ impl DirData {
         &self.files
     }
 
-    pub fn path(&self) -> &PathBuf {
-        &self.path
+    pub fn path(&'a self) -> &'a Path {
+        self.path
     }
 
-    pub fn path_str(&self) -> &str {
-        self.path.to_str().unwrap_or(COULD_NOT_UNWRAP_FILENAME)
+    pub fn path_str(&self) -> Display {
+        self.path.display()
     }
 }

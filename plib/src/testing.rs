@@ -79,17 +79,154 @@ pub fn run_test_base(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> Output
 }
 
 pub fn run_test(plan: TestPlan) {
-    let output = run_test_base(&plan.cmd, &plan.args, plan.stdin_data.as_bytes());
+    use std::fmt::Write;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(stdout, plan.expected_out);
+    const LONG_MARKER: &str =
+        "------------------------------------------------------------------------------------------------------------------------";
+    const MARKER: &str =
+        "--------------------------------------------------------------------------------";
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(stderr, plan.expected_err);
+    let TestPlan {
+        cmd,
+        args,
+        stdin_data,
+        expected_out,
+        expected_err,
+        expected_exit_code,
+    } = plan;
 
-    assert_eq!(output.status.code(), Some(plan.expected_exit_code));
-    if plan.expected_exit_code == 0 {
-        assert!(output.status.success());
+    let output = run_test_base(&cmd, &args, stdin_data.as_bytes());
+
+    let Output {
+        status,
+        stdout,
+        stderr,
+    } = output;
+
+    let mut failures = Vec::<String>::new();
+
+    let stdout_cow = String::from_utf8_lossy(&stdout);
+
+    if stdout_cow != expected_out {
+        failures.push(format!(
+            "\
+stdout differs from what was expected
+{MARKER}
+
+Actual
+{MARKER}
+{stdout_cow}
+{MARKER}
+
+Expected
+{MARKER}
+{expected_out}
+{MARKER}
+"
+        ));
+    }
+
+    let stderr_cow = String::from_utf8_lossy(&stderr);
+
+    if stderr_cow != expected_err {
+        failures.push(format!(
+            "\
+stderr differs from what was expected
+{MARKER}
+
+Actual
+{MARKER}
+{stderr_cow}
+{MARKER}
+
+Expected
+{MARKER}
+{expected_err}
+{MARKER}
+"
+        ));
+    }
+
+    let status_code = status.code();
+
+    let expected_exit_code_option = Some(expected_exit_code);
+
+    if status_code != expected_exit_code_option {
+        failures.push(format!(
+            "\
+Exit status differs from what was expected
+{MARKER}
+
+Actual
+{MARKER}
+{status_code:?}
+{MARKER}
+
+Expected
+{MARKER}
+{expected_exit_code_option:?}
+{MARKER}
+"
+        ));
+    }
+
+    if expected_exit_code == 0 && !status.success() {
+        failures.push("Execution was expected to succeed, but it failed".to_owned());
+    }
+
+    let failures_len = failures.len();
+
+    if failures_len > 0 {
+        let mut buffer = String::with_capacity(4_096_usize);
+
+        let args_join = args.join(" ");
+
+        writeln!(
+            &mut buffer,
+            "\
+{LONG_MARKER}
+{MARKER}
+Test failed with {failures_len} total failure types
+{MARKER}
+
+Command executed
+{MARKER}
+{cmd} {args_join}
+{MARKER}
+"
+        )
+        .unwrap();
+
+        for (us, st) in failures.iter().enumerate() {
+            let failure_number = us + 1;
+
+            writeln!(
+                &mut buffer,
+                "Failure {failure_number} of {failures_len}: {st}"
+            )
+            .unwrap();
+        }
+
+        let stderr_truncated = stderr_cow.chars().take(1_024_usize).collect::<String>();
+
+        writeln!(
+            &mut buffer,
+            "
+stderr, for diagnosing failure{}
+{MARKER}
+{stderr_cow}
+{MARKER}",
+            if stderr_truncated.len() != stderr_cow.len() {
+                " (truncated to 1 kibibyte)"
+            } else {
+                ""
+            }
+        )
+        .unwrap();
+
+        writeln!(&mut buffer, "{LONG_MARKER}").unwrap();
+
+        panic!("{buffer}");
     }
 }
 

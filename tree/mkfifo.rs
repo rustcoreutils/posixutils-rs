@@ -27,8 +27,8 @@ struct Args {
 
 fn do_mkfifo(filename: &str, mode: &ChmodMode) -> io::Result<()> {
     let mode_val = match mode {
-        ChmodMode::Absolute(mode) => *mode,
-        ChmodMode::Symbolic(sym) => modestr::mutate(0o666, sym),
+        ChmodMode::Absolute(mode, _) => *mode,
+        ChmodMode::Symbolic(sym) => modestr::mutate(0o666, false, sym),
     };
 
     let res = unsafe { libc::mkfifo(filename.as_ptr() as *const i8, mode_val as libc::mode_t) };
@@ -51,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // parse the mode string
     let mode = match args.mode {
         Some(mode) => modestr::parse(&mode)?,
-        None => ChmodMode::Absolute(0o666),
+        None => ChmodMode::Absolute(0o666, 3),
     };
 
     // apply the mode to each file

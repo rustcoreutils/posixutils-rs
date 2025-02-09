@@ -8,6 +8,7 @@
 //
 
 mod chgrp;
+mod chmod;
 mod cp;
 mod link;
 mod ls;

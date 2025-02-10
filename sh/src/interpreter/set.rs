@@ -27,9 +27,10 @@ pub struct SetOptions {
     pub vi: bool,
 }
 
+#[derive(Debug, Eq, PartialEq)]
 pub enum ParsedArgs {
-    WriteSettingsHumanReadable,
-    WriteSettingsShellReadable,
+    PrintSettingsHumanReadable,
+    PrintSettingsShellReadable,
     ResetPositionalParameters,
     PrintVars,
     ArgsStart(usize),
@@ -87,34 +88,185 @@ impl SetOptions {
         }
         if args.len() == 1 {
             match args[0].as_str() {
-                "-o" => return Ok(ParsedArgs::WriteSettingsHumanReadable),
-                "+o" => return Ok(ParsedArgs::WriteSettingsShellReadable),
+                "-o" => return Ok(ParsedArgs::PrintSettingsHumanReadable),
+                "+o" => return Ok(ParsedArgs::PrintSettingsShellReadable),
                 "--" => return Ok(ParsedArgs::ResetPositionalParameters),
                 _ => {}
             }
         }
-        let mut options = SetOptions::default();
         let mut i = 0;
         while i < args.len() {
             match args[i].as_str() {
-                "--" if i == 0 => break,
+                "--" if i == 0 => {
+                    i += 1;
+                    break;
+                }
                 "-o" | "+o" => {
                     i += 1;
                     let option = args
                         .get(i)
                         .ok_or_else(|| "expected option".to_string())?
                         .as_str();
-                    options.set_long(option, args[i - 1] == "-o")?
+                    self.set_long(option, args[i - 1] == "-o")?
                 }
                 s if s.starts_with('-') || s.starts_with('+') => {
                     let option_value = s.starts_with('-');
                     for c in s.chars().skip(1) {
-                        options.set_short(c, option_value)?
+                        self.set_short(c, option_value)?
                     }
                 }
                 _ => break,
             }
+            i += 1;
         }
         Ok(ParsedArgs::ArgsStart(i))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_args(args: Vec<&str>) -> (SetOptions, ParsedArgs) {
+        let args = args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let mut options = SetOptions::default();
+        let parsed_args = options
+            .parse_args_and_update(&args)
+            .expect("failed to parse args");
+        (options, parsed_args)
+    }
+
+    #[test]
+    fn print_human_readable() {
+        let (options, parse_result) = parse_args(vec!["-o"]);
+        assert_eq!(parse_result, ParsedArgs::PrintSettingsHumanReadable);
+        assert_eq!(options, SetOptions::default());
+    }
+
+    #[test]
+    fn print_shell_readable() {
+        let (options, parse_result) = parse_args(vec!["+o"]);
+        assert_eq!(parse_result, ParsedArgs::PrintSettingsShellReadable);
+        assert_eq!(options, SetOptions::default());
+    }
+
+    #[test]
+    fn no_args_prints_environment_variables() {
+        let (options, parse_result) = parse_args(vec![]);
+        assert_eq!(parse_result, ParsedArgs::PrintVars);
+        assert_eq!(options, SetOptions::default());
+    }
+
+    #[test]
+    fn reset_positional_parameters() {
+        let (options, parse_result) = parse_args(vec!["--"]);
+        assert_eq!(parse_result, ParsedArgs::ResetPositionalParameters);
+        assert_eq!(options, SetOptions::default());
+    }
+
+    #[test]
+    fn parse_positive_short_options_no_args() {
+        let (options, parse_result) = parse_args(vec!["-a", "-nmh", "-C"]);
+        assert_eq!(parse_result, ParsedArgs::ArgsStart(3));
+        assert_eq!(
+            options,
+            SetOptions {
+                allexport: true,
+                noexec: true,
+                monitor: true,
+                cache_location_of_utilities_in_functions: true,
+                noclobber: true,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_negative_short_options_no_args() {
+        let (options, parse_result) = parse_args(vec!["+xvu", "+e", "+x"]);
+        assert_eq!(parse_result, ParsedArgs::ArgsStart(3));
+        assert_eq!(
+            options,
+            SetOptions {
+                xtrace: false,
+                verbose: false,
+                nounset: false,
+                errexit: false,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_short_options_with_args() {
+        let (options, parse_result) = parse_args(vec!["-hm", "+ab", "arg1", "arg2"]);
+        assert_eq!(parse_result, ParsedArgs::ArgsStart(2));
+        assert_eq!(
+            options,
+            SetOptions {
+                cache_location_of_utilities_in_functions: true,
+                monitor: true,
+                allexport: false,
+                notify: false,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_args_starting_with_minus() {
+        let (options, parse_result) = parse_args(vec!["--", "-arg", "arg2"]);
+        assert_eq!(parse_result, ParsedArgs::ArgsStart(1));
+        assert_eq!(options, SetOptions::default());
+    }
+
+    #[test]
+    fn parse_args_starting_with_plus() {
+        let (options, parse_result) = parse_args(vec!["--", "+arg", "arg2"]);
+        assert_eq!(parse_result, ParsedArgs::ArgsStart(1));
+        assert_eq!(options, SetOptions::default());
+    }
+
+    #[test]
+    fn parse_positive_long_options_no_args() {
+        let (options, parse_result) = parse_args(vec!["-o", "ignoreeof", "-o", "notify"]);
+        assert_eq!(parse_result, ParsedArgs::ArgsStart(4));
+        assert_eq!(
+            options,
+            SetOptions {
+                ignoreeof: true,
+                notify: true,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_negative_long_options_no_args() {
+        let (options, parse_result) = parse_args(vec!["+o", "vi", "+o", "nolog"]);
+        assert_eq!(parse_result, ParsedArgs::ArgsStart(4));
+        assert_eq!(
+            options,
+            SetOptions {
+                vi: false,
+                nolog: false,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_long_options_with_args() {
+        let (options, parse_result) =
+            parse_args(vec!["-o", "nounset", "+o", "noglob", "arg1", "arg2"]);
+        assert_eq!(parse_result, ParsedArgs::ArgsStart(4));
+        assert_eq!(
+            options,
+            SetOptions {
+                nounset: true,
+                noglob: false,
+                ..Default::default()
+            }
+        );
     }
 }

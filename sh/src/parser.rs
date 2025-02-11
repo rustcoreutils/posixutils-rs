@@ -100,18 +100,24 @@ struct Parser<'src> {
 }
 
 impl<'src> Parser<'src> {
-    fn advance_shell(&mut self) {
+    /// advances the current shell token and returns the previous shell lookahead
+    fn advance_shell(&mut self) -> ShellToken {
         let (lookahead, source_location, id) = self.lexer.next_shell_token();
+        let prev_lookahead = self.shell_lookahead;
         self.shell_lookahead = lookahead;
         self.lookahead_source_location = source_location;
         self.shell_lookahead_token_id = id;
+        prev_lookahead
     }
 
-    fn advance_word(&mut self) {
+    /// advances the current word token and returns the previous word lookahead
+    fn advance_word(&mut self) -> WordToken {
         let (lookahead, source_location, id) = self.lexer.next_word_token();
+        let prev_lookahead = self.word_lookahead;
         self.word_lookahead = lookahead;
         self.lookahead_source_location = source_location;
         self.word_lookahead_token_id = id;
+        prev_lookahead
     }
 
     fn shell_lookahead(&mut self) -> ShellToken {
@@ -192,6 +198,15 @@ impl<'src> Parser<'src> {
         Ok(())
     }
 
+    fn match_word_token_opt(&mut self, token: WordToken) -> bool {
+        if self.word_lookahead() == token {
+            self.advance_word();
+            true
+        } else {
+            false
+        }
+    }
+
     fn skip_linebreak(&mut self) {
         // "\n"*
         while self.shell_lookahead() == ShellToken::Newline {
@@ -204,52 +219,21 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_parameter(&mut self, only_consider_first_digit: bool) -> ParseResult<Parameter> {
-        fn advance_and_return(parser: &mut Parser, parameter: Parameter) -> Parameter {
-            parser.advance_word();
-            parameter
-        }
-
-        match self.word_lookahead() {
-            WordToken::Char('@') => Ok(advance_and_return(
-                self,
-                Parameter::Special(SpecialParameter::At),
-            )),
-            WordToken::Char('*') => Ok(advance_and_return(
-                self,
-                Parameter::Special(SpecialParameter::Asterisk),
-            )),
-            WordToken::Char('#') => Ok(advance_and_return(
-                self,
-                Parameter::Special(SpecialParameter::Hash),
-            )),
-            WordToken::Char('?') => Ok(advance_and_return(
-                self,
-                Parameter::Special(SpecialParameter::QuestionMark),
-            )),
-            WordToken::Char('-') => Ok(advance_and_return(
-                self,
-                Parameter::Special(SpecialParameter::Minus),
-            )),
-            WordToken::Dollar => Ok(advance_and_return(
-                self,
-                Parameter::Special(SpecialParameter::Dollar),
-            )),
-            WordToken::Char('!') => Ok(advance_and_return(
-                self,
-                Parameter::Special(SpecialParameter::Bang),
-            )),
-            WordToken::Char('0') => Ok(advance_and_return(
-                self,
-                Parameter::Special(SpecialParameter::Zero),
-            )),
+        match self.advance_word() {
+            WordToken::Char('@') => Ok(Parameter::Special(SpecialParameter::At)),
+            WordToken::Char('*') => Ok(Parameter::Special(SpecialParameter::Asterisk)),
+            WordToken::Char('#') => Ok(Parameter::Special(SpecialParameter::Hash)),
+            WordToken::Char('?') => Ok(Parameter::Special(SpecialParameter::QuestionMark)),
+            WordToken::Char('-') => Ok(Parameter::Special(SpecialParameter::Minus)),
+            WordToken::Dollar => Ok(Parameter::Special(SpecialParameter::Dollar)),
+            WordToken::Char('!') => Ok(Parameter::Special(SpecialParameter::Bang)),
+            WordToken::Char('0') => Ok(Parameter::Special(SpecialParameter::Zero)),
             WordToken::Char(d) if d.is_ascii_digit() => {
                 if only_consider_first_digit {
                     Ok(Parameter::Number(d.to_digit(10).unwrap()))
                 } else {
-                    // FIXME: refactor this, its almost identical to the loop below.
                     let mut number = String::new();
                     number.push(d);
-                    self.advance_word();
                     while let WordToken::Char(d) = self.word_lookahead() {
                         if d.is_ascii_digit() {
                             number.push(d);
@@ -264,7 +248,6 @@ impl<'src> Parser<'src> {
             WordToken::Char(c) if c == '_' || c.is_alphabetic() => {
                 let mut name = String::new();
                 name.push(c);
-                self.advance_word();
                 while let WordToken::Char(c) = self.word_lookahead() {
                     if c.is_alphanumeric() || c == '_' {
                         name.push(c);
@@ -289,126 +272,78 @@ impl<'src> Parser<'src> {
 
         if self.word_lookahead() == WordToken::Char('{') {
             self.advance_word();
+
             if self.word_lookahead() == WordToken::Char('#') {
                 self.advance_word();
-                return self.parse_parameter(false).map(ParameterExpansion::StrLen);
+                let expansion = self
+                    .parse_parameter(false)
+                    .map(ParameterExpansion::StrLen)?;
+                self.match_word_token(WordToken::Char('}'))?;
+                return Ok(expansion);
             }
             let parameter = self.parse_parameter(false)?;
-            if self.word_lookahead() == WordToken::Char('}') {
-                self.advance_word();
-                return Ok(ParameterExpansion::Simple(parameter));
-            }
 
-            if self.word_lookahead() == WordToken::Char('%') {
-                self.advance_word();
-                if self.word_lookahead() == WordToken::Char('%') {
-                    self.advance_word();
+            let operator_loc = self.lookahead_source_location;
+            match self.advance_word() {
+                WordToken::Char('}') => Ok(ParameterExpansion::Simple(parameter)),
+                WordToken::Char('%') => {
+                    let remove_largest = self.match_word_token_opt(WordToken::Char('%'));
                     let word = self.parse_word_until(WordToken::Char('}'))?;
-                    return Ok(ParameterExpansion::RemovePattern {
+                    self.match_word_token(WordToken::Char('}'))?;
+                    Ok(ParameterExpansion::RemovePattern {
                         parameter,
                         pattern: word,
-                        remove_largest: true,
+                        remove_largest,
                         remove_prefix: false,
-                    });
-                } else {
-                    let word = self.parse_word_until(WordToken::Char('}'))?;
-                    return Ok(ParameterExpansion::RemovePattern {
-                        parameter,
-                        pattern: word,
-                        remove_largest: false,
-                        remove_prefix: false,
-                    });
+                    })
                 }
-            }
-
-            if self.word_lookahead() == WordToken::Char('#') {
-                self.advance_word();
-                if self.word_lookahead() == WordToken::Char('#') {
-                    self.advance_word();
+                WordToken::Char('#') => {
+                    let remove_largest = self.match_word_token_opt(WordToken::Char('#'));
                     let word = self.parse_word_until(WordToken::Char('}'))?;
-                    return Ok(ParameterExpansion::RemovePattern {
+                    self.match_word_token(WordToken::Char('}'))?;
+                    Ok(ParameterExpansion::RemovePattern {
                         parameter,
                         pattern: word,
-                        remove_largest: true,
+                        remove_largest,
                         remove_prefix: true,
-                    });
-                } else {
+                    })
+                }
+                mut operation => {
+                    let alternative_version = if operation == WordToken::Char(':') {
+                        operation = self.advance_word();
+                        true
+                    } else {
+                        false
+                    };
                     let word = self.parse_word_until(WordToken::Char('}'))?;
-                    return Ok(ParameterExpansion::RemovePattern {
-                        parameter,
-                        pattern: word,
-                        remove_largest: false,
-                        remove_prefix: true,
-                    });
-                }
-            }
-            if self.word_lookahead() == WordToken::Char(':') {
-                self.advance_word();
-                let operation = self.word_lookahead();
-                let format_specifier_location = self.lookahead_source_location;
-                self.advance_word();
-                let word = self.parse_word_until(WordToken::Char('}'))?;
-                match operation {
-                    WordToken::Char('-') => Ok(ParameterExpansion::UnsetUseDefault {
-                        parameter,
-                        word,
-                        default_on_null: true,
-                    }),
-                    WordToken::Char('=') => Ok(ParameterExpansion::UnsetAssignDefault {
-                        parameter,
-                        word,
-                        assign_on_null: true,
-                    }),
-                    WordToken::Char('?') => Ok(ParameterExpansion::UnsetError {
-                        parameter,
-                        word,
-                        error_on_null: true,
-                    }),
-                    WordToken::Char('+') => Ok(ParameterExpansion::SetUseAlternative {
-                        parameter,
-                        word,
-                        substitute_null_with_word: false,
-                    }),
-                    other => Err(ParserError::new(
-                        format_specifier_location,
-                        "invalid format in parameter expansion",
-                        other == WordToken::EOF,
-                    )),
-                }
-            } else {
-                let operation = self.word_lookahead();
-                let format_specifier_location = self.lookahead_source_location;
-                self.advance_word();
-                let word = self.parse_word_until(WordToken::Char('}'))?;
-                if word.is_none() && operation == WordToken::Char('}') {
-                    return Ok(ParameterExpansion::Simple(parameter));
-                }
-                match operation {
-                    WordToken::Char('-') => Ok(ParameterExpansion::UnsetUseDefault {
-                        parameter,
-                        word,
-                        default_on_null: false,
-                    }),
-                    WordToken::Char('=') => Ok(ParameterExpansion::UnsetAssignDefault {
-                        parameter,
-                        word,
-                        assign_on_null: false,
-                    }),
-                    WordToken::Char('?') => Ok(ParameterExpansion::UnsetError {
-                        parameter,
-                        word,
-                        error_on_null: false,
-                    }),
-                    WordToken::Char('+') => Ok(ParameterExpansion::SetUseAlternative {
-                        parameter,
-                        word,
-                        substitute_null_with_word: true,
-                    }),
-                    other => Err(ParserError::new(
-                        format_specifier_location,
-                        "invalid format in parameter expansion",
-                        other == WordToken::EOF,
-                    )),
+                    self.match_word_token(WordToken::Char('}'))?;
+                    match operation {
+                        WordToken::Char('-') => Ok(ParameterExpansion::UnsetUseDefault {
+                            parameter,
+                            word,
+                            default_on_null: alternative_version,
+                        }),
+                        WordToken::Char('=') => Ok(ParameterExpansion::UnsetAssignDefault {
+                            parameter,
+                            word,
+                            assign_on_null: alternative_version,
+                        }),
+                        WordToken::Char('?') => Ok(ParameterExpansion::UnsetError {
+                            parameter,
+                            word,
+                            error_on_null: alternative_version,
+                        }),
+                        WordToken::Char('+') => Ok(ParameterExpansion::SetUseAlternative {
+                            parameter,
+                            word,
+                            substitute_null_with_word: !alternative_version,
+                        }),
+                        other => Err(ParserError::new(
+                            operator_loc,
+                            "invalid format in parameter expansion",
+                            other == WordToken::EOF,
+                        )),
+                    }
                 }
             }
         } else {
@@ -1200,34 +1135,37 @@ mod tests {
 
     fn parse_word(word: &str) -> Word {
         let command = unwrap_simple_command(parse(word).expect("parsing word failed"));
-        command.words.into_iter().next().unwrap()
+        match command.words.as_slice() {
+            [word] => word.clone(),
+            _ => panic!("expected single word"),
+        }
     }
 
     fn parse_unquoted_parameter_expansion(word: &str) -> ParameterExpansion {
         let word = parse_word(word);
-        if let WordPart::ParameterExpansion {
-            expansion,
-            inside_double_quotes,
-        } = word.parts.into_iter().next().unwrap()
-        {
-            assert!(!inside_double_quotes);
-            expansion
-        } else {
-            panic!("expected parameter expansion")
+        match word.parts.as_slice() {
+            [WordPart::ParameterExpansion {
+                expansion,
+                inside_double_quotes,
+            }] => {
+                assert!(!inside_double_quotes);
+                expansion.clone()
+            }
+            _ => panic!("expected parameter expansion, got {:?}", word),
         }
     }
 
     fn parse_unquoted_command_substitution(word: &str) -> CompleteCommand {
         let word = parse_word(word);
-        if let WordPart::CommandSubstitution {
-            command,
-            inside_double_quotes,
-        } = word.parts.into_iter().next().unwrap()
-        {
-            assert!(!inside_double_quotes);
-            command
-        } else {
-            panic!("expected parameter expansion")
+        match word.parts.as_slice() {
+            [WordPart::CommandSubstitution {
+                command,
+                inside_double_quotes,
+            }] => {
+                assert!(!inside_double_quotes);
+                command.clone()
+            }
+            _ => panic!("expected command substitution got {:?}", word),
         }
     }
 

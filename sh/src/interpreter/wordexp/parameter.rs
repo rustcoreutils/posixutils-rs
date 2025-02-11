@@ -5,9 +5,10 @@ use crate::program::{Parameter, ParameterExpansion, SpecialParameter};
 
 fn expand_simple_parameter(parameter: &Parameter, interpreter: &mut Interpreter) -> Option<String> {
     match parameter {
-        Parameter::Number(_) => {
-            todo!()
-        }
+        Parameter::Number(n) => interpreter
+            .positional_parameters
+            .get(*n as usize - 1)
+            .cloned(),
         Parameter::Variable(var_name) => interpreter
             .environment
             .get(var_name.as_ref())
@@ -32,9 +33,7 @@ fn expand_simple_parameter(parameter: &Parameter, interpreter: &mut Interpreter)
             SpecialParameter::Bang => {
                 Some(interpreter.most_recent_background_command_pid.to_string())
             }
-            SpecialParameter::Zero => {
-                todo!()
-            }
+            SpecialParameter::Zero => Some(interpreter.program_name.clone()),
         },
     }
 }

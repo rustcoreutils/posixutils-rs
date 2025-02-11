@@ -1,3 +1,5 @@
+use std::fmt::Write;
+
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct SetOptions {
     /// -a
@@ -11,7 +13,7 @@ pub struct SetOptions {
     /// -f
     pub noglob: bool,
     /// -h
-    pub cache_location_of_utilities_in_functions: bool,
+    pub hashall: bool,
     /// -m
     pub monitor: bool,
     /// -n
@@ -63,7 +65,7 @@ impl SetOptions {
             'C' => self.noclobber = value,
             'e' => self.errexit = value,
             'f' => self.noglob = value,
-            'h' => self.cache_location_of_utilities_in_functions = value,
+            'h' => self.hashall = value,
             'm' => self.monitor = value,
             'n' => self.noexec = value,
             'u' => self.nounset = value,
@@ -75,11 +77,43 @@ impl SetOptions {
     }
 
     pub fn to_string_human_readable(&self) -> String {
-        todo!()
+        let option = |v: bool| if v { "on" } else { "off" };
+        let mut result = String::new();
+        writeln!(&mut result, "allexport {}", option(self.allexport)).unwrap();
+        writeln!(&mut result, "notify    {}", option(self.notify)).unwrap();
+        writeln!(&mut result, "noclobber {}", option(self.noclobber)).unwrap();
+        writeln!(&mut result, "errexit   {}", option(self.errexit)).unwrap();
+        writeln!(&mut result, "noglob    {}", option(self.noglob)).unwrap();
+        writeln!(&mut result, "hashall   {}", option(self.hashall)).unwrap();
+        writeln!(&mut result, "monitor   {}", option(self.monitor)).unwrap();
+        writeln!(&mut result, "noexec    {}", option(self.noexec)).unwrap();
+        writeln!(&mut result, "nounset   {}", option(self.nounset)).unwrap();
+        writeln!(&mut result, "verbose   {}", option(self.verbose)).unwrap();
+        writeln!(&mut result, "xtrace    {}", option(self.xtrace)).unwrap();
+        writeln!(&mut result, "ignoreeof {}", option(self.ignoreeof)).unwrap();
+        writeln!(&mut result, "nolog     {}", option(self.nolog)).unwrap();
+        writeln!(&mut result, "vi        {}", option(self.vi)).unwrap();
+        result
     }
 
     pub fn to_string_shell_readable(&self) -> String {
-        todo!()
+        let option = |v: bool| if v { "-" } else { "+" };
+        let mut result = String::new();
+        writeln!(&mut result, "set {}o allexport", option(self.allexport)).unwrap();
+        writeln!(&mut result, "set {}o notify", option(self.notify)).unwrap();
+        writeln!(&mut result, "set {}o noclobber", option(self.noclobber)).unwrap();
+        writeln!(&mut result, "set {}o errexit", option(self.errexit)).unwrap();
+        writeln!(&mut result, "set {}o noglob", option(self.noglob)).unwrap();
+        writeln!(&mut result, "set {}h", option(self.hashall)).unwrap();
+        writeln!(&mut result, "set {}o monitor", option(self.monitor)).unwrap();
+        writeln!(&mut result, "set {}o noexec", option(self.noexec)).unwrap();
+        writeln!(&mut result, "set {}o nounset", option(self.nounset)).unwrap();
+        writeln!(&mut result, "set {}o verbose", option(self.verbose)).unwrap();
+        writeln!(&mut result, "set {}o xtrace", option(self.xtrace)).unwrap();
+        writeln!(&mut result, "set {}o ignoreeof", option(self.ignoreeof)).unwrap();
+        writeln!(&mut result, "set {}o nolog", option(self.nolog)).unwrap();
+        writeln!(&mut result, "set {}o vi", option(self.vi)).unwrap();
+        result
     }
 
     pub fn parse_args_and_update(&mut self, args: &[String]) -> Result<ParsedArgs, String> {
@@ -174,7 +208,7 @@ mod tests {
                 allexport: true,
                 noexec: true,
                 monitor: true,
-                cache_location_of_utilities_in_functions: true,
+                hashall: true,
                 noclobber: true,
                 ..Default::default()
             }
@@ -204,7 +238,7 @@ mod tests {
         assert_eq!(
             options,
             SetOptions {
-                cache_location_of_utilities_in_functions: true,
+                hashall: true,
                 monitor: true,
                 allexport: false,
                 notify: false,

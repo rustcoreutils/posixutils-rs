@@ -36,6 +36,7 @@ pub fn parse_args(args: Vec<String>, is_attached_to_terminal: bool) -> Result<Sh
     let mut iter = args.into_iter();
     let mut program_name = iter.next().unwrap();
     let mut arguments = Vec::new();
+    let mut monitor_turned_off_explicitely = false;
 
     while let Some(next) = iter.next() {
         match next.as_str() {
@@ -43,6 +44,9 @@ pub fn parse_args(args: Vec<String>, is_attached_to_terminal: bool) -> Result<Sh
                 let option = iter
                     .next()
                     .ok_or_else(|| format!("{} requires an option name", next))?;
+                if option == "monitor" && next == "+o" {
+                    monitor_turned_off_explicitely = true;
+                }
                 set_options.set_long(&option, next == "-o")?;
             }
             s if s.starts_with('-') => {
@@ -61,6 +65,9 @@ pub fn parse_args(args: Vec<String>, is_attached_to_terminal: bool) -> Result<Sh
             }
             s if s.starts_with('+') => {
                 for c in s.chars().skip(1) {
+                    if c == 'm' {
+                        monitor_turned_off_explicitely = true;
+                    }
                     set_options.set_short(c, false)?;
                 }
             }
@@ -104,6 +111,10 @@ pub fn parse_args(args: Vec<String>, is_attached_to_terminal: bool) -> Result<Sh
         Some('s') => ExecutionMode::ReadCommandsFromStdin,
         _ => unreachable!(),
     };
+
+    if execution_mode == ExecutionMode::Interactive && !monitor_turned_off_explicitely {
+        set_options.monitor = true;
+    }
 
     Ok(ShellArgs {
         set_options,
@@ -318,7 +329,13 @@ mod tests {
         assert_eq!(parsed_args.execution_mode, ExecutionMode::Interactive);
         assert_eq!(parsed_args.program_name, "sh");
         assert!(parsed_args.arguments.is_empty());
-        assert_eq!(parsed_args.set_options, SetOptions::default());
+        assert_eq!(
+            parsed_args.set_options,
+            SetOptions {
+                monitor: true,
+                ..Default::default()
+            }
+        );
     }
 
     #[test]
@@ -346,6 +363,7 @@ mod tests {
         assert_eq!(
             parsed_args.set_options,
             SetOptions {
+                monitor: true,
                 errexit: false,
                 notify: false,
                 ..Default::default()
@@ -389,7 +407,13 @@ mod tests {
         assert_eq!(parsed_args.execution_mode, ExecutionMode::Interactive);
         assert_eq!(parsed_args.program_name, "sh");
         assert!(parsed_args.arguments.is_empty());
-        assert_eq!(parsed_args.set_options, SetOptions::default());
+        assert_eq!(
+            parsed_args.set_options,
+            SetOptions {
+                monitor: true,
+                ..Default::default()
+            }
+        );
     }
 
     #[test]
@@ -398,7 +422,13 @@ mod tests {
         assert_eq!(parsed_args.execution_mode, ExecutionMode::Interactive);
         assert_eq!(parsed_args.program_name, "sh");
         assert_eq!(parsed_args.arguments, vec!["arg1", "arg2"]);
-        assert_eq!(parsed_args.set_options, SetOptions::default());
+        assert_eq!(
+            parsed_args.set_options,
+            SetOptions {
+                monitor: true,
+                ..Default::default()
+            }
+        );
     }
 
     #[test]
@@ -410,6 +440,7 @@ mod tests {
         assert_eq!(
             parsed_args.set_options,
             SetOptions {
+                monitor: true,
                 xtrace: false,
                 ignoreeof: true,
                 ..SetOptions::default()
@@ -426,9 +457,37 @@ mod tests {
         assert_eq!(
             parsed_args.set_options,
             SetOptions {
+                monitor: true,
                 noexec: true,
                 allexport: true,
                 ..SetOptions::default()
+            }
+        );
+    }
+
+    #[test]
+    fn explicitly_disable_monitor_for_interactive_shell() {
+        let parsed_args = parse_args(vec!["sh", "+m"], true);
+        assert_eq!(parsed_args.execution_mode, ExecutionMode::Interactive);
+        assert_eq!(parsed_args.program_name, "sh");
+        assert!(parsed_args.arguments.is_empty());
+        assert_eq!(
+            parsed_args.set_options,
+            SetOptions {
+                monitor: false,
+                ..Default::default()
+            }
+        );
+
+        let parsed_args = parse_args(vec!["sh", "+o", "monitor"], true);
+        assert_eq!(parsed_args.execution_mode, ExecutionMode::Interactive);
+        assert_eq!(parsed_args.program_name, "sh");
+        assert!(parsed_args.arguments.is_empty());
+        assert_eq!(
+            parsed_args.set_options,
+            SetOptions {
+                monitor: false,
+                ..Default::default()
             }
         );
     }

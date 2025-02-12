@@ -1,3 +1,4 @@
+use crate::interpreter::set::{SetOptions, SetSpecialBuiltin};
 use crate::interpreter::wordexp::{expand_word, expand_word_to_string};
 use crate::program::{
     Assignment, Command, CompleteCommand, CompoundCommand, Conjunction, IORedirectionKind,
@@ -16,11 +17,12 @@ pub mod set;
 mod wordexp;
 
 trait BuiltinUtility {
-    fn exec(&self);
+    fn exec(&self, args: &[String], interpreter: &mut Interpreter) -> i32;
 }
 
 fn get_special_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
     match name {
+        "set" => Some(&SetSpecialBuiltin),
         _ => None,
     }
 }
@@ -78,6 +80,7 @@ pub struct Interpreter {
     shell_pid: i32,
     most_recent_background_command_pid: i32,
     current_directory: OsString,
+    set_options: SetOptions,
 }
 
 impl Interpreter {
@@ -200,10 +203,9 @@ impl Interpreter {
                 .collect::<Vec<String>>();
             command_environment.exec(&command, &arguments)
         } else {
-            if let Some(_special_builtin_utility) = get_special_builtin_utility(&expanded_words[0])
-            {
+            if let Some(special_builtin_utility) = get_special_builtin_utility(&expanded_words[0]) {
                 self.perform_assignments(&simple_command.assignments);
-                todo!()
+                return special_builtin_utility.exec(&expanded_words[1..], self);
             }
 
             if let Some(_function_body) = self.functions.get(expanded_words[0].as_str()) {
@@ -330,7 +332,11 @@ impl Interpreter {
         }
     }
 
-    pub fn initialize_from_system(program_name: String, args: Vec<String>) -> Interpreter {
+    pub fn initialize_from_system(
+        program_name: String,
+        args: Vec<String>,
+        set_options: SetOptions,
+    ) -> Interpreter {
         // > If a variable is initialized from the environment, it shall be marked for
         // > export immediately
         let variables = std::env::vars()
@@ -344,6 +350,7 @@ impl Interpreter {
             shell_pid: getpid().as_raw(),
             // TODO: handle error
             current_directory: std::env::current_dir().unwrap().into_os_string(),
+            set_options,
             ..Default::default()
         }
     }
@@ -362,6 +369,7 @@ impl Default for Interpreter {
             shell_pid: 0,
             most_recent_background_command_pid: 0,
             current_directory: OsString::from("/"),
+            set_options: SetOptions::default(),
         }
     }
 }

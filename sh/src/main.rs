@@ -18,14 +18,18 @@ mod interpreter;
 mod lexer;
 mod parser;
 mod program;
+mod utils;
 
 fn main() {
     let is_attached_to_terminal = atty::is(Stream::Stdin) && atty::is(Stream::Stdout);
     let args = parse_args(std::env::args().collect(), is_attached_to_terminal).unwrap();
     match args.execution_mode {
         ExecutionMode::Interactive | ExecutionMode::ReadCommandsFromStdin => {
-            let mut interpreter =
-                Interpreter::initialize_from_system(args.program_name, args.arguments);
+            let mut interpreter = Interpreter::initialize_from_system(
+                args.program_name,
+                args.arguments,
+                args.set_options,
+            );
             let mut buffer = String::new();
             let stdin = io::stdin();
             while stdin.read_line(&mut buffer).is_ok_and(|n| n > 0) {
@@ -42,8 +46,11 @@ fn main() {
             }
         }
         ExecutionMode::ReadCommandsFromString(command_string) => {
-            let mut interpreter =
-                Interpreter::initialize_from_system(args.program_name, args.arguments);
+            let mut interpreter = Interpreter::initialize_from_system(
+                args.program_name,
+                args.arguments,
+                args.set_options,
+            );
             // TODO: impl proper error reporting
             let program = parse(&command_string).expect("parsing error");
             interpreter.interpret(program);

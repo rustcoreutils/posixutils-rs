@@ -1,6 +1,55 @@
+use crate::interpreter::{BuiltinUtility, Interpreter};
+use crate::utils::strcoll;
+use nix::libc;
+use std::ffi::CString;
 use std::fmt::Write;
 
-#[derive(Default, Debug, PartialEq, Eq)]
+pub struct SetSpecialBuiltin;
+
+impl BuiltinUtility for SetSpecialBuiltin {
+    fn exec(&self, args: &[String], interpreter: &mut Interpreter) -> i32 {
+        match interpreter.set_options.parse_args_and_update(args) {
+            Err(err) => {
+                eprintln!("set: {}", err);
+                // the standard specifies >0, both bash and dash return 2
+                2
+            }
+            Ok(parsed_args) => {
+                match parsed_args {
+                    ParsedArgs::PrintSettingsHumanReadable => {
+                        print!("{}", interpreter.set_options.to_string_human_readable());
+                    }
+                    ParsedArgs::PrintSettingsShellReadable => {
+                        print!("{}", interpreter.set_options.to_string_shell_readable());
+                    }
+                    ParsedArgs::ResetPositionalParameters => {
+                        interpreter.positional_parameters.clear();
+                    }
+                    ParsedArgs::PrintVars => {
+                        let mut sorted_vars = interpreter
+                            .environment
+                            .iter()
+                            .map(|(var, val)| {
+                                (CString::new(var.as_str()).unwrap(), val.value.as_str())
+                            })
+                            .collect::<Vec<_>>();
+                        sorted_vars.sort_by(|(k1, _), (k2, _)| strcoll(k1, k2));
+                        for (key, value) in sorted_vars {
+                            // key should only contain valid ascii
+                            println!("{}='{}'", key.to_str().unwrap(), value);
+                        }
+                    }
+                    ParsedArgs::ArgsStart(i) => {
+                        interpreter.positional_parameters = args[i..].to_vec();
+                    }
+                }
+                0
+            }
+        }
+    }
+}
+
+#[derive(Default, Debug, PartialEq, Eq, Clone)]
 pub struct SetOptions {
     /// -a
     pub allexport: bool,

@@ -1,6 +1,7 @@
 use crate::interpreter::wordexp::pattern::FilenamePattern;
+use crate::utils::strcoll;
 use std::ffi::{CString, OsStr, OsString};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -122,9 +123,20 @@ fn list_files(
             &mut result,
         );
     }
-    // TODO: sort properly taking into account LC_COLLATE
-    result.sort();
-    result
+    if result.len() == 1 {
+        // common case
+        result
+    } else {
+        let mut cstr_result = result
+            .into_iter()
+            .map(|s| CString::new(s.into_vec()).unwrap())
+            .collect::<Vec<_>>();
+        cstr_result.sort_by(|lhs, rhs| strcoll(lhs, rhs));
+        cstr_result
+            .into_iter()
+            .map(|s| OsString::from_vec(s.into_bytes()))
+            .collect()
+    }
 }
 
 /// # Panics

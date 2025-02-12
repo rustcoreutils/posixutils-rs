@@ -45,18 +45,26 @@ fn main() {
                 }
             }
         }
-        ExecutionMode::ReadCommandsFromString(command_string) => {
+        other => {
             let mut interpreter = Interpreter::initialize_from_system(
                 args.program_name,
                 args.arguments,
                 args.set_options,
             );
-            // TODO: impl proper error reporting
-            let program = parse(&command_string).expect("parsing error");
-            interpreter.interpret(program);
-        }
-        ExecutionMode::ReadFromFile(_) => {
-            todo!()
+            match other {
+                ExecutionMode::ReadCommandsFromString(command_string) => {
+                    // TODO: impl proper error reporting
+                    let program = parse(&command_string).expect("parsing error");
+                    interpreter.interpret(program);
+                }
+                ExecutionMode::ReadFromFile(file) => {
+                    // TODO: impl proper error reporting
+                    let file_contents = std::fs::read_to_string(file).expect("could not read file");
+                    let program = parse(&file_contents).expect("parsing error");
+                    interpreter.interpret(program);
+                }
+                _ => unreachable!(),
+            }
         }
     }
 }

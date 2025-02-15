@@ -20,9 +20,7 @@ fn expand_simple_parameter(parameter: &Parameter, interpreter: &mut Interpreter)
             SpecialParameter::Asterisk => {
                 todo!()
             }
-            SpecialParameter::Hash => {
-                todo!()
-            }
+            SpecialParameter::Hash => Some(interpreter.positional_parameters.len().to_string()),
             SpecialParameter::QuestionMark => {
                 Some(interpreter.most_recent_pipeline_status.to_string())
             }

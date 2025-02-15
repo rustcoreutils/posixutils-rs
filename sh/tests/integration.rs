@@ -143,6 +143,11 @@ set +o vi
 }
 
 #[test]
+fn expand_arg_count() {
+    test_cli(vec!["-c", "echo $#", "sh", "1", "2", "3"], "", "3\n");
+}
+
+#[test]
 fn read_from_file() {
     test_cli(
         vec!["tests/sh/hello_world.sh"],

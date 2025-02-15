@@ -63,6 +63,9 @@ impl Pattern {
     }
 
     pub fn remove_largest_suffix(&self, s: String) -> String {
+        if s.is_empty() {
+            return s;
+        }
         let cstring = CString::new(s).expect("trying to match a string containing null");
         let len = cstring.as_bytes().len();
         let mut suffix_start = len - 1;
@@ -78,6 +81,9 @@ impl Pattern {
     }
 
     pub fn remove_shortest_suffix(&self, s: String) -> String {
+        if s.is_empty() {
+            return s;
+        }
         assert!(
             !s.as_bytes().contains(&b'\0'),
             "trying to match a string containing null"
@@ -85,7 +91,7 @@ impl Pattern {
         let mut bytes = s.into_bytes();
         bytes.push(b'\0');
         let mut suffix_start = bytes.len();
-        for i in (1..bytes.len() - 2).rev() {
+        for i in (1..bytes.len() - 1).rev() {
             // we know there is a null, so this unwrap will never fail
             if self
                 .regex
@@ -191,6 +197,38 @@ pub mod tests {
 
     fn cstring_from_str(s: &str) -> CString {
         CString::new(s).unwrap()
+    }
+
+    #[test]
+    fn remove_largest_prefix_from_empty_string() {
+        assert_eq!(
+            pattern_from_str("abcd").remove_largest_prefix("".to_string()),
+            ""
+        )
+    }
+
+    #[test]
+    fn remove_smallest_prefix_from_empty_string() {
+        assert_eq!(
+            pattern_from_str("abcd").remove_shortest_prefix("".to_string()),
+            ""
+        )
+    }
+
+    #[test]
+    fn remove_largest_suffix_from_empty_string() {
+        assert_eq!(
+            pattern_from_str("abcd").remove_largest_suffix("".to_string()),
+            ""
+        )
+    }
+
+    #[test]
+    fn remove_smallest_suffix_from_empty_string() {
+        assert_eq!(
+            pattern_from_str("abcd").remove_shortest_suffix("".to_string()),
+            ""
+        )
     }
 
     #[test]

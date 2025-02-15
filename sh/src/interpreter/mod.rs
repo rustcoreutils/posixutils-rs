@@ -6,7 +6,7 @@ use crate::program::{
 };
 use nix::libc;
 use nix::sys::wait::{waitpid, WaitStatus};
-use nix::unistd::{close, dup2, execve, fork, getpid, pipe, ForkResult, Pid};
+use nix::unistd::{close, dup2, execve, fork, getpid, getppid, pipe, ForkResult, Pid};
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
 use std::os::fd::{AsRawFd, IntoRawFd};
@@ -339,10 +339,11 @@ impl Interpreter {
     ) -> Interpreter {
         // > If a variable is initialized from the environment, it shall be marked for
         // > export immediately
-        let variables = std::env::vars()
+        let mut variables: Environment = std::env::vars()
             .into_iter()
             .map(|(k, v)| (k, Variable::new_exported(v)))
             .collect();
+        variables.insert("PPID".to_string(), Variable::new(getppid().to_string()));
         Interpreter {
             environment: variables,
             program_name,

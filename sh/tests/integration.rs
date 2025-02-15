@@ -163,3 +163,11 @@ fn expand_shell_pid() {
         assert!(is_pid(output));
     })
 }
+
+#[test]
+fn shell_ppid() {
+    run_successfully_and("echo $PPID", |output| {
+        assert!(!output.is_empty());
+        assert!(is_pid(output));
+    })
+}

@@ -90,6 +90,7 @@ pub fn parse_args(args: Vec<String>, is_attached_to_terminal: bool) -> Result<Sh
                 }
             } else {
                 let command_file = arguments.drain(0..1).next().unwrap();
+                program_name = command_file.clone();
                 ExecutionMode::ReadFromFile(command_file)
             }
         }
@@ -345,7 +346,7 @@ mod tests {
             parsed_args.execution_mode,
             ExecutionMode::ReadFromFile("file.sh".to_string())
         );
-        assert_eq!(parsed_args.program_name, "sh");
+        assert_eq!(parsed_args.program_name, "file.sh");
         assert_eq!(parsed_args.arguments, vec!["arg2"]);
         assert_eq!(parsed_args.set_options, SetOptions::default());
         assert_eq!(
@@ -378,7 +379,7 @@ mod tests {
             parsed_args.execution_mode,
             ExecutionMode::ReadFromFile("file.sh".to_string())
         );
-        assert_eq!(parsed_args.program_name, "sh");
+        assert_eq!(parsed_args.program_name, "file.sh");
         assert_eq!(parsed_args.arguments, vec!["arg2"]);
         assert_eq!(
             parsed_args.set_options,

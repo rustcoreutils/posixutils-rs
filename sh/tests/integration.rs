@@ -278,6 +278,16 @@ fn expand_bang() {
 }
 
 #[test]
+fn expand_zero() {
+    test_cli(vec!["-c", "echo $0", "sh", "1", "2", "3"], "", "sh\n");
+    test_cli(
+        vec!["tests/sh/script_name.sh"],
+        "",
+        include_str!("sh/script_name.out"),
+    );
+}
+
+#[test]
 fn read_from_file() {
     test_cli(
         vec!["tests/sh/hello_world.sh"],

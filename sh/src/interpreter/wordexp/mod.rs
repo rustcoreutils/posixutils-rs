@@ -1,4 +1,4 @@
-use crate::interpreter::wordexp::parameter::expand_parameter;
+use crate::interpreter::wordexp::parameter::expand_parameter_into;
 use crate::interpreter::wordexp::pathname::glob;
 use crate::interpreter::wordexp::pattern::FilenamePattern;
 use crate::interpreter::wordexp::tilde::tilde_expansion;
@@ -16,6 +16,20 @@ pub enum ExpandedWordPart {
     QuotedLiteral(String),
     UnquotedLiteral(String),
     GeneratedUnquotedLiteral(String),
+    // terminates a field
+    FieldEnd,
+}
+
+impl ExpandedWordPart {
+    fn new(value: String, quoted: bool, generated: bool) -> Self {
+        if quoted {
+            ExpandedWordPart::QuotedLiteral(value)
+        } else if generated {
+            ExpandedWordPart::GeneratedUnquotedLiteral(value)
+        } else {
+            ExpandedWordPart::UnquotedLiteral(value)
+        }
+    }
 }
 
 /// Word that has undergone:
@@ -23,7 +37,7 @@ pub enum ExpandedWordPart {
 /// - parameter expansion
 /// - command substitution
 /// - arithmetic expansion
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct ExpandedWord {
     parts: Vec<ExpandedWordPart>,
 }
@@ -42,6 +56,7 @@ impl ToString for ExpandedWord {
                 ExpandedWordPart::UnquotedLiteral(s) => s.as_str(),
                 ExpandedWordPart::QuotedLiteral(s) => s.as_str(),
                 ExpandedWordPart::GeneratedUnquotedLiteral(s) => s.as_str(),
+                ExpandedWordPart::FieldEnd => "",
             })
             .collect()
     }
@@ -74,6 +89,59 @@ impl ExpandedWord {
         Self {
             parts: merged_parts,
         }
+    }
+
+    fn append<S: AsRef<str> + Into<String>>(&mut self, value: S, quoted: bool, generated: bool) {
+        if let Some(last) = self.parts.last_mut() {
+            match last {
+                ExpandedWordPart::GeneratedUnquotedLiteral(last) if generated && !quoted => {
+                    last.push_str(value.as_ref());
+                }
+                ExpandedWordPart::UnquotedLiteral(last) if !generated && !quoted => {
+                    last.push_str(value.as_ref())
+                }
+                ExpandedWordPart::QuotedLiteral(last) if quoted => {
+                    last.push_str(value.as_ref());
+                }
+                _ => self
+                    .parts
+                    .push(ExpandedWordPart::new(value.into(), quoted, generated)),
+            }
+        } else {
+            self.parts
+                .push(ExpandedWordPart::new(value.into(), quoted, generated));
+        }
+    }
+
+    fn end_field(&mut self) {
+        self.parts.push(ExpandedWordPart::FieldEnd);
+    }
+
+    fn extend(&mut self, mut other: Self) {
+        self.parts.reserve(other.parts.len());
+        let mut iter = other.parts.into_iter();
+        if let Some(first) = iter.next() {
+            if self.parts.is_empty() {
+                self.parts.push(first);
+            } else {
+                match (first, self.parts.last_mut().unwrap()) {
+                    (
+                        ExpandedWordPart::UnquotedLiteral(lit),
+                        ExpandedWordPart::UnquotedLiteral(dest),
+                    ) => dest.push_str(&lit),
+                    (
+                        ExpandedWordPart::GeneratedUnquotedLiteral(lit),
+                        ExpandedWordPart::GeneratedUnquotedLiteral(dest),
+                    ) => dest.push_str(&lit),
+                    (
+                        ExpandedWordPart::QuotedLiteral(lit),
+                        ExpandedWordPart::QuotedLiteral(dest),
+                    ) => dest.push_str(&lit),
+                    (part, _) => self.parts.push(part),
+                }
+            }
+        }
+        self.parts.extend(iter);
     }
 }
 
@@ -110,6 +178,15 @@ fn split_fields(expanded_word: ExpandedWord, ifs: Option<&str>) -> Vec<ExpandedW
             }
             ExpandedWordPart::QuotedLiteral(lit) => {
                 parts_for_last_word.push(ExpandedWordPart::QuotedLiteral(lit));
+            }
+            ExpandedWordPart::FieldEnd => {
+                result.push(
+                    ExpandedWord {
+                        parts: parts_for_last_word,
+                    }
+                    .normalize(),
+                );
+                parts_for_last_word = Vec::new();
             }
             ExpandedWordPart::GeneratedUnquotedLiteral(lit) => {
                 if lit.is_empty() {
@@ -183,36 +260,23 @@ fn split_fields(expanded_word: ExpandedWord, ifs: Option<&str>) -> Vec<ExpandedW
 /// - parameter expansion
 /// - command substitution
 /// - arithmetic expansion
-fn expand_word_simple(
+fn simple_word_expansion_into(
+    result: &mut ExpandedWord,
     word: &Word,
     is_assignment: bool,
     interpreter: &mut Interpreter,
-) -> ExpandedWord {
+) {
     let mut word = word.clone();
     tilde_expansion(&mut word, is_assignment, &interpreter.environment);
-    let mut result = Vec::new();
     for part in word.parts.into_iter() {
         match part {
-            WordPart::UnquotedLiteral(lit) => result.push(ExpandedWordPart::UnquotedLiteral(lit)),
-            WordPart::QuotedLiteral(lit) => result.push(ExpandedWordPart::QuotedLiteral(lit)),
+            WordPart::UnquotedLiteral(lit) => result.append(lit, false, false),
+            WordPart::QuotedLiteral(lit) => result.append(lit, true, false),
             WordPart::ParameterExpansion {
                 expansion,
                 inside_double_quotes,
             } => {
-                // > If a parameter expansion occurs inside double-quotes:
-                // > - Pathname expansion shall not be performed on the results of the
-                // >   expansion.
-                // > - Field splitting shall not be performed on the results of the expansion.
-                if inside_double_quotes {
-                    result.push(ExpandedWordPart::QuotedLiteral(expand_parameter(
-                        &expansion,
-                        interpreter,
-                    )))
-                } else {
-                    result.push(ExpandedWordPart::GeneratedUnquotedLiteral(
-                        expand_parameter(&expansion, interpreter),
-                    ))
-                }
+                expand_parameter_into(result, &expansion, inside_double_quotes, true, interpreter);
             }
             WordPart::ArithmeticExpansion(_) => {
                 todo!()
@@ -232,7 +296,6 @@ fn expand_word_simple(
             }
         }
     }
-    ExpandedWord { parts: result }
 }
 
 /// performs:
@@ -245,12 +308,15 @@ pub fn expand_word_to_string(
     is_assignment: bool,
     interpreter: &mut Interpreter,
 ) -> String {
-    expand_word_simple(word, is_assignment, interpreter).to_string()
+    let mut expanded_word = ExpandedWord::default();
+    simple_word_expansion_into(&mut expanded_word, word, is_assignment, interpreter);
+    expanded_word.to_string()
 }
 
 /// performs general word expansion (similar to `wordexp` from libc)
 pub fn expand_word(word: &Word, is_assignment: bool, interpreter: &mut Interpreter) -> Vec<String> {
-    let expanded_word = expand_word_simple(word, is_assignment, interpreter);
+    let mut expanded_word = ExpandedWord::default();
+    simple_word_expansion_into(&mut expanded_word, word, is_assignment, interpreter);
     let ifs = interpreter.environment.get("IFS").map(|v| v.value.as_str());
     let mut result = Vec::new();
     for field in split_fields(expanded_word, ifs) {
@@ -268,12 +334,30 @@ pub fn expand_word(word: &Word, is_assignment: bool, interpreter: &mut Interpret
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
-    fn expanded_word_from_str(s: &str) -> ExpandedWord {
-        ExpandedWord {
-            parts: vec![ExpandedWordPart::UnquotedLiteral(s.to_string())],
+    impl ExpandedWord {
+        pub fn unquoted_literal(s: &str) -> Self {
+            Self {
+                parts: vec![ExpandedWordPart::UnquotedLiteral(s.to_string())],
+            }
+        }
+
+        pub fn quoted_literal(s: &str) -> Self {
+            Self {
+                parts: vec![ExpandedWordPart::QuotedLiteral(s.to_string())],
+            }
+        }
+
+        pub fn generated_unquoted_literal(s: &str) -> Self {
+            Self {
+                parts: vec![ExpandedWordPart::GeneratedUnquotedLiteral(s.to_string())],
+            }
+        }
+
+        pub fn from_parts(parts: Vec<ExpandedWordPart>) -> Self {
+            Self { parts }
         }
     }
 
@@ -302,9 +386,9 @@ mod tests {
                 Some(":")
             ),
             vec![
-                expanded_word_from_str("a"),
-                expanded_word_from_str("b"),
-                expanded_word_from_str("c")
+                ExpandedWord::unquoted_literal("a"),
+                ExpandedWord::unquoted_literal("b"),
+                ExpandedWord::unquoted_literal("c")
             ]
         );
     }
@@ -321,11 +405,11 @@ mod tests {
                 Some(":/-")
             ),
             vec![
-                expanded_word_from_str("a"),
-                expanded_word_from_str("b"),
-                expanded_word_from_str("c"),
-                expanded_word_from_str("d"),
-                expanded_word_from_str("x y")
+                ExpandedWord::unquoted_literal("a"),
+                ExpandedWord::unquoted_literal("b"),
+                ExpandedWord::unquoted_literal("c"),
+                ExpandedWord::unquoted_literal("d"),
+                ExpandedWord::unquoted_literal("x y")
             ]
         );
     }
@@ -342,9 +426,9 @@ mod tests {
                 Some(" ")
             ),
             vec![
-                expanded_word_from_str("a"),
-                expanded_word_from_str("b"),
-                expanded_word_from_str("c"),
+                ExpandedWord::unquoted_literal("a"),
+                ExpandedWord::unquoted_literal("b"),
+                ExpandedWord::unquoted_literal("c"),
             ]
         );
     }
@@ -361,10 +445,10 @@ mod tests {
                 Some("\t\n")
             ),
             vec![
-                expanded_word_from_str("  a"),
-                expanded_word_from_str("b  "),
-                expanded_word_from_str("c"),
-                expanded_word_from_str("d  e f"),
+                ExpandedWord::unquoted_literal("  a"),
+                ExpandedWord::unquoted_literal("b  "),
+                ExpandedWord::unquoted_literal("c"),
+                ExpandedWord::unquoted_literal("d  e f"),
             ]
         )
     }
@@ -381,9 +465,9 @@ mod tests {
                 None
             ),
             vec![
-                expanded_word_from_str("a"),
-                expanded_word_from_str("word,and"),
-                expanded_word_from_str("c")
+                ExpandedWord::unquoted_literal("a"),
+                ExpandedWord::unquoted_literal("word,and"),
+                ExpandedWord::unquoted_literal("c")
             ]
         );
     }
@@ -400,12 +484,12 @@ mod tests {
                 Some(",.:  \n")
             ),
             vec![
-                expanded_word_from_str("a"),
-                expanded_word_from_str("b"),
-                expanded_word_from_str("c"),
-                expanded_word_from_str("d"),
-                expanded_word_from_str("e"),
-                expanded_word_from_str("f")
+                ExpandedWord::unquoted_literal("a"),
+                ExpandedWord::unquoted_literal("b"),
+                ExpandedWord::unquoted_literal("c"),
+                ExpandedWord::unquoted_literal("d"),
+                ExpandedWord::unquoted_literal("e"),
+                ExpandedWord::unquoted_literal("f")
             ]
         );
     }
@@ -419,7 +503,7 @@ mod tests {
                 },
                 Some(":")
             ),
-            vec![expanded_word_from_str("a:b:c")]
+            vec![ExpandedWord::unquoted_literal("a:b:c")]
         );
         assert_eq!(
             split_fields(
@@ -432,7 +516,10 @@ mod tests {
                 },
                 Some(":")
             ),
-            vec![expanded_word_from_str("a:b"), expanded_word_from_str("c:d")]
+            vec![
+                ExpandedWord::unquoted_literal("a:b"),
+                ExpandedWord::unquoted_literal("c:d")
+            ]
         );
     }
 }

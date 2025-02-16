@@ -148,6 +148,106 @@ fn expand_arg_count() {
 }
 
 #[test]
+fn expand_at() {
+    test_cli(vec!["-c", "echo $@", "sh", "1", "2", "3"], "", "1 2 3\n");
+    test_cli(
+        vec!["-c", "for x in $@; do echo $x; done", "sh", "1 2", "3", "4"],
+        "",
+        "1\n2\n3\n4\n",
+    );
+    test_cli(
+        vec![
+            "-c",
+            "for x in a$@b; do echo $x; done",
+            "sh",
+            "1 2",
+            "3",
+            "4",
+        ],
+        "",
+        "a1\n2\n3\n4b\n",
+    );
+    test_cli(
+        vec![
+            "-c",
+            "for x in \"$@\"; do echo $x; done",
+            "sh",
+            "1 2",
+            "3",
+            "4",
+        ],
+        "",
+        "1 2\n3\n4\n",
+    );
+    test_cli(
+        vec![
+            "-c",
+            "for x in a\"$@\"b; do echo $x; done",
+            "sh",
+            "a1 2",
+            "3",
+            "4b",
+        ],
+        "",
+        "1 2\n3\n4\n",
+    );
+    test_cli(
+        vec![
+            "-c",
+            "for x in ${unset-\"$@\"}; do echo $x; done",
+            "sh",
+            "1 2",
+            "3",
+            "4",
+        ],
+        "",
+        "1 2\n3\n4\n",
+    );
+    test_cli(
+        vec![
+            "-c",
+            "for x in ${PPID\"$@\"}; do echo $x; done",
+            "sh",
+            "1 2",
+            "3",
+            "4",
+        ],
+        "",
+        "1 2\n3\n4\n",
+    );
+}
+
+#[test]
+fn expand_asterisk() {
+    test_cli(vec!["-c", "echo $*", "sh", "1", "2", "3"], "", "1 2 3\n");
+    test_cli(
+        vec!["-c", "echo \"$*\"", "sh", "1", "2", "3"],
+        "",
+        "1 2 3\n",
+    );
+    test_cli(
+        vec!["-c", "for x in $*; do echo $x; done", "sh", "1 2", "3", "4"],
+        "",
+        "1\n2\n3\n4\n",
+    );
+    test_cli(
+        vec!["-c", "IFS=,; echo \"$*\"", "sh", "1", "2", "3"],
+        "",
+        "1,2,3\n",
+    );
+    test_cli(
+        vec!["-c", "IFS=; echo \"$*\"", "sh", "1", "2", "3"],
+        "",
+        "123\n",
+    );
+    test_cli(
+        vec!["-c", "unset IFS; echo \"$*\"", "sh", "1", "2", "3"],
+        "",
+        "1 2 3\n",
+    );
+}
+
+#[test]
 fn read_from_file() {
     test_cli(
         vec!["tests/sh/hello_world.sh"],

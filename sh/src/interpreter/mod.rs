@@ -344,6 +344,7 @@ impl Interpreter {
             .map(|(k, v)| (k, Variable::new_exported(v)))
             .collect();
         variables.insert("PPID".to_string(), Variable::new(getppid().to_string()));
+        variables.insert("IFS".to_string(), Variable::new(" \t\n".to_string()));
         Interpreter {
             environment: variables,
             program_name,
@@ -360,7 +361,10 @@ impl Interpreter {
 impl Default for Interpreter {
     fn default() -> Self {
         Interpreter {
-            environment: Environment::default(),
+            environment: Environment::from([(
+                "IFS".to_string(),
+                Variable::new(" \t\n".to_string()),
+            )]),
             program_name: "sh".to_string(),
             positional_parameters: Vec::default(),
             opened_files: HashMap::default(),

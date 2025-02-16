@@ -27,6 +27,17 @@ fn test_cli(args: Vec<&str>, stdin: &str, expected_output: &str) {
     });
 }
 
+fn test_script(script: &str, expected_output: &str) {
+    run_test(TestPlan {
+        cmd: "sh".to_string(),
+        args: vec![],
+        stdin_data: script.to_string(),
+        expected_out: expected_output.to_string(),
+        expected_err: String::default(),
+        expected_exit_code: 0,
+    });
+}
+
 fn is_pid(s: &str) -> bool {
     s.trim_end_matches('\n').chars().all(|c| c.is_ascii_digit())
 }
@@ -139,6 +150,15 @@ set +o vi
         vec!["-c", "-aef", "+vx", "-o", "nounset", "set +o"],
         "",
         output_shell_readable,
+    );
+}
+
+#[test]
+fn read_from_file() {
+    test_cli(
+        vec!["tests/sh/hello_world.sh"],
+        "",
+        include_str!("sh/hello_world.out"),
     );
 }
 
@@ -288,18 +308,17 @@ fn expand_zero() {
 }
 
 #[test]
-fn read_from_file() {
-    test_cli(
-        vec!["tests/sh/hello_world.sh"],
-        "",
-        include_str!("sh/hello_world.out"),
-    );
-}
-
-#[test]
 fn shell_ppid() {
     run_successfully_and("echo $PPID", |output| {
         assert!(!output.is_empty());
         assert!(is_pid(output));
     })
+}
+
+#[test]
+fn tilde_expansion() {
+    test_script(
+        include_str!("sh/tilde_expansion.sh"),
+        include_str!("sh/tilde_expansion.out"),
+    );
 }

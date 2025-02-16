@@ -143,11 +143,6 @@ set +o vi
 }
 
 #[test]
-fn expand_arg_count() {
-    test_cli(vec!["-c", "echo $#", "sh", "1", "2", "3"], "", "3\n");
-}
-
-#[test]
 fn expand_at() {
     test_cli(vec!["-c", "echo $@", "sh", "1", "2", "3"], "", "1 2 3\n");
     test_cli(
@@ -245,6 +240,18 @@ fn expand_asterisk() {
         "",
         "1 2 3\n",
     );
+}
+
+#[test]
+fn expand_arg_count() {
+    test_cli(vec!["-c", "echo $#", "sh", "1", "2", "3"], "", "3\n");
+}
+
+#[test]
+fn expand_question_mark() {
+    test_cli(vec!["-c", "echo $?", "sh"], "", "0\n");
+    test_cli(vec!["-c", "true; echo $?", "sh"], "", "0\n");
+    test_cli(vec!["-c", "false; echo $?", "sh"], "", "1\n");
 }
 
 #[test]

@@ -129,7 +129,7 @@ fn expand_simple_parameter_into(
                 }
                 SpecialParameter::QuestionMark => {
                     expanded_word.append(
-                        interpreter.most_recent_pipeline_status.to_string(),
+                        interpreter.most_recent_pipeline_exit_status.to_string(),
                         inside_double_quotes,
                         true,
                     );

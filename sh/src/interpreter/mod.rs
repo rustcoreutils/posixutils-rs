@@ -75,7 +75,7 @@ pub struct Interpreter {
     positional_parameters: Vec<String>,
     opened_files: HashMap<u32, Rc<std::fs::File>>,
     functions: HashMap<Name, Rc<CompoundCommand>>,
-    most_recent_pipeline_status: i32,
+    most_recent_pipeline_exit_status: i32,
     last_command_substitution_status: i32,
     shell_pid: i32,
     most_recent_background_command_pid: i32,
@@ -300,11 +300,12 @@ impl Interpreter {
                 }
             }
         }
-        if pipeline.negate_status {
+        self.most_recent_pipeline_exit_status = if pipeline.negate_status {
             (pipeline_exit_status == 0) as i32
         } else {
             pipeline_exit_status
-        }
+        };
+        self.most_recent_pipeline_exit_status
     }
 
     fn interpret_conjunction(&mut self, conjunction: &Conjunction) -> i32 {
@@ -369,7 +370,7 @@ impl Default for Interpreter {
             positional_parameters: Vec::default(),
             opened_files: HashMap::default(),
             functions: HashMap::default(),
-            most_recent_pipeline_status: 0,
+            most_recent_pipeline_exit_status: 0,
             last_command_substitution_status: 0,
             shell_pid: 0,
             most_recent_background_command_pid: 0,

@@ -182,17 +182,12 @@ pub mod tests {
     use crate::interpreter::wordexp::ExpandedWordPart;
 
     pub fn pattern_from_str(pat: &str) -> Pattern {
-        Pattern::new(&ExpandedWord {
-            parts: vec![ExpandedWordPart::UnquotedLiteral(pat.to_string())],
-        })
-        .expect("failed to create pattern")
+        Pattern::new(&ExpandedWord::unquoted_literal(pat)).expect("failed to create pattern")
     }
 
     pub fn filename_pattern_from_str(pat: &str) -> FilenamePattern {
-        FilenamePattern::new(&ExpandedWord {
-            parts: vec![ExpandedWordPart::UnquotedLiteral(pat.to_string())],
-        })
-        .expect("failed to create filename pattern")
+        FilenamePattern::new(&ExpandedWord::unquoted_literal(pat))
+            .expect("failed to create filename pattern")
     }
 
     fn cstring_from_str(s: &str) -> CString {

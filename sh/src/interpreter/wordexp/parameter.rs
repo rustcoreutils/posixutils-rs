@@ -5,13 +5,37 @@ use crate::interpreter::wordexp::{
 use crate::interpreter::{Interpreter, Variable};
 use crate::program::{Parameter, ParameterExpansion, SpecialParameter};
 
+#[derive(PartialEq, Eq)]
+enum ParameterExpansionResult {
+    Unset,
+    Set,
+    Null,
+}
+
+impl ParameterExpansionResult {
+    fn is_null(&self) -> bool {
+        self == &ParameterExpansionResult::Null
+    }
+
+    fn is_unset(&self) -> bool {
+        self == &ParameterExpansionResult::Unset
+    }
+}
+
 fn add_option_to_expanded_word(
     word: &mut ExpandedWord,
     str: Option<&String>,
     inside_double_quotes: bool,
-) {
+) -> ParameterExpansionResult {
     if let Some(s) = str {
         word.append(s, inside_double_quotes, true);
+        if s.is_empty() {
+            ParameterExpansionResult::Null
+        } else {
+            ParameterExpansionResult::Set
+        }
+    } else {
+        ParameterExpansionResult::Unset
     }
 }
 
@@ -32,40 +56,19 @@ fn add_split_parameters_to_expanded_word(
     word.append(&parameters[i], quoted, true);
 }
 
-fn is_null(word: &ExpandedWord) -> bool {
-    if let Some(part) = word.parts.first() {
-        match part {
-            ExpandedWordPart::QuotedLiteral(val) => val.is_empty(),
-            ExpandedWordPart::UnquotedLiteral(val) => val.is_empty(),
-            ExpandedWordPart::GeneratedUnquotedLiteral(val) => val.is_empty(),
-            ExpandedWordPart::FieldEnd => {
-                panic!("an expanded word cannot start with a field terminator")
-            }
-        }
-    } else {
-        false
-    }
-}
-
-fn is_unset(word: &ExpandedWord) -> bool {
-    word.parts.is_empty()
-}
-
 fn expand_simple_parameter_into(
     expanded_word: &mut ExpandedWord,
     parameter: &Parameter,
     inside_double_quotes: bool,
     field_splitting_will_be_performed: bool,
     interpreter: &mut Interpreter,
-) {
+) -> ParameterExpansionResult {
     match parameter {
-        Parameter::Number(n) => {
-            add_option_to_expanded_word(
-                expanded_word,
-                interpreter.positional_parameters.get(*n as usize - 1),
-                inside_double_quotes,
-            );
-        }
+        Parameter::Number(n) => add_option_to_expanded_word(
+            expanded_word,
+            interpreter.positional_parameters.get(*n as usize - 1),
+            inside_double_quotes,
+        ),
         Parameter::Variable(var_name) => add_option_to_expanded_word(
             expanded_word,
             interpreter
@@ -74,81 +77,89 @@ fn expand_simple_parameter_into(
                 .map(|v| &v.value),
             inside_double_quotes,
         ),
-        Parameter::Special(special_parameter) => match special_parameter {
-            SpecialParameter::At => {
-                if !field_splitting_will_be_performed {
+        Parameter::Special(special_parameter) => {
+            match special_parameter {
+                SpecialParameter::At => {
+                    if !field_splitting_will_be_performed {
+                        expanded_word.append(
+                            interpreter.positional_parameters.join(" "),
+                            inside_double_quotes,
+                            true,
+                        );
+                    } else {
+                        add_split_parameters_to_expanded_word(
+                            expanded_word,
+                            &interpreter.positional_parameters,
+                            inside_double_quotes,
+                        );
+                    }
+                }
+                SpecialParameter::Asterisk => {
+                    if field_splitting_will_be_performed && !inside_double_quotes {
+                        add_split_parameters_to_expanded_word(
+                            expanded_word,
+                            &interpreter.positional_parameters,
+                            false,
+                        );
+                    } else {
+                        let separator = interpreter
+                            .environment
+                            .get("IFS")
+                            .map(|var| {
+                                if var.value.is_empty() {
+                                    ""
+                                } else {
+                                    &var.value[..1]
+                                }
+                            })
+                            .unwrap_or(" ");
+                        expanded_word.append(
+                            interpreter.positional_parameters.join(separator),
+                            inside_double_quotes,
+                            true,
+                        );
+                    }
+                }
+                SpecialParameter::Hash => {
                     expanded_word.append(
-                        interpreter.positional_parameters.join(" "),
+                        interpreter.positional_parameters.len().to_string(),
                         inside_double_quotes,
                         true,
                     );
-                } else {
-                    add_split_parameters_to_expanded_word(
-                        expanded_word,
-                        &interpreter.positional_parameters,
-                        inside_double_quotes,
-                    )
                 }
-            }
-            SpecialParameter::Asterisk => {
-                if field_splitting_will_be_performed && !inside_double_quotes {
-                    add_split_parameters_to_expanded_word(
-                        expanded_word,
-                        &interpreter.positional_parameters,
-                        false,
-                    );
-                } else {
-                    let separator = interpreter
-                        .environment
-                        .get("IFS")
-                        .map(|var| {
-                            if var.value.is_empty() {
-                                ""
-                            } else {
-                                &var.value[..1]
-                            }
-                        })
-                        .unwrap_or(" ");
+                SpecialParameter::QuestionMark => {
                     expanded_word.append(
-                        interpreter.positional_parameters.join(separator),
+                        interpreter.most_recent_pipeline_status.to_string(),
+                        inside_double_quotes,
+                        true,
+                    );
+                }
+                SpecialParameter::Minus => {
+                    todo!()
+                }
+                SpecialParameter::Dollar => {
+                    expanded_word.append(
+                        interpreter.shell_pid.to_string(),
+                        inside_double_quotes,
+                        true,
+                    );
+                }
+                SpecialParameter::Bang => expanded_word.append(
+                    interpreter.most_recent_background_command_pid.to_string(),
+                    inside_double_quotes,
+                    true,
+                ),
+                SpecialParameter::Zero => {
+                    expanded_word.append(
+                        interpreter.program_name.clone(),
                         inside_double_quotes,
                         true,
                     );
                 }
             }
-            SpecialParameter::Hash => {
-                expanded_word.append(
-                    interpreter.positional_parameters.len().to_string(),
-                    inside_double_quotes,
-                    true,
-                );
-            }
-            SpecialParameter::QuestionMark => {
-                expanded_word.append(
-                    interpreter.most_recent_pipeline_status.to_string(),
-                    inside_double_quotes,
-                    true,
-                );
-            }
-            SpecialParameter::Minus => {
-                todo!()
-            }
-            SpecialParameter::Dollar => {
-                expanded_word.append(
-                    interpreter.shell_pid.to_string(),
-                    inside_double_quotes,
-                    true,
-                );
-            }
-            SpecialParameter::Bang => expanded_word.append(
-                interpreter.most_recent_background_command_pid.to_string(),
-                inside_double_quotes,
-                true,
-            ),
-            SpecialParameter::Zero => {
-                expanded_word.append(interpreter.program_name.clone(), inside_double_quotes, true);
-            }
-        },
+            // special parameters are always set
+            ParameterExpansionResult::Set
+        }
     }
 }
 
@@ -160,27 +171,29 @@ pub fn expand_parameter_into(
     interpreter: &mut Interpreter,
 ) {
     match parameter_expansion {
-        ParameterExpansion::Simple(parameter) => expand_simple_parameter_into(
-            expanded_word,
-            parameter,
-            inside_double_quotes,
-            field_splitting_will_be_performed,
-            interpreter,
-        ),
+        ParameterExpansion::Simple(parameter) => {
+            expand_simple_parameter_into(
+                expanded_word,
+                parameter,
+                inside_double_quotes,
+                field_splitting_will_be_performed,
+                interpreter,
+            );
+        }
         ParameterExpansion::UnsetUseDefault {
             parameter,
             word: default,
             default_on_null,
         } => {
             let mut expanded_parameter = ExpandedWord::default();
-            expand_simple_parameter_into(
+            let parameter_type = expand_simple_parameter_into(
                 &mut expanded_parameter,
                 parameter,
                 inside_double_quotes,
                 field_splitting_will_be_performed,
                 interpreter,
             );
-            if is_unset(&expanded_parameter) || (*default_on_null && is_null(&expanded_parameter)) {
+            if parameter_type.is_unset() || (*default_on_null && parameter_type.is_null()) {
                 if let Some(default) = default {
                     simple_word_expansion_into(expanded_word, default, false, interpreter);
                 }
@@ -224,14 +237,14 @@ pub fn expand_parameter_into(
             error_on_null,
         } => {
             let mut expanded_parameter = ExpandedWord::default();
-            expand_simple_parameter_into(
+            let parameter_type = expand_simple_parameter_into(
                 &mut expanded_parameter,
                 parameter,
                 inside_double_quotes,
                 field_splitting_will_be_performed,
                 interpreter,
             );
-            if is_unset(&expanded_parameter) || (*error_on_null && is_null(&expanded_parameter)) {
+            if parameter_type.is_unset() || (*error_on_null && parameter_type.is_null()) {
                 if let Some(word) = word {
                     eprintln!("{}", expand_word_to_string(word, false, interpreter));
                 } else if *error_on_null {
@@ -249,15 +262,15 @@ pub fn expand_parameter_into(
             substitute_null_with_word,
         } => {
             let mut expanded_parameter = ExpandedWord::default();
-            expand_simple_parameter_into(
+            let parameter_type = expand_simple_parameter_into(
                 &mut expanded_parameter,
                 parameter,
                 inside_double_quotes,
                 field_splitting_will_be_performed,
                 interpreter,
             );
-            if !is_unset(&expanded_parameter)
-                && (!is_null(&expanded_parameter) || *substitute_null_with_word)
+            if !parameter_type.is_unset()
+                && (!parameter_type.is_null() || *substitute_null_with_word)
             {
                 if let Some(word) = word {
                     simple_word_expansion_into(expanded_word, word, false, interpreter)
@@ -273,14 +286,14 @@ pub fn expand_parameter_into(
                 todo!("error: length of '*' or '@' is unspecified")
             }
             let mut expanded_parameter = ExpandedWord::default();
-            expand_simple_parameter_into(
+            let parameter_type = expand_simple_parameter_into(
                 &mut expanded_parameter,
                 parameter,
                 false,
                 false,
                 interpreter,
             );
-            if is_unset(&expanded_parameter) && interpreter.set_options.nounset {
+            if parameter_type.is_unset() && interpreter.set_options.nounset {
                 todo!("error: unset parameter")
             }
             expanded_word.append(

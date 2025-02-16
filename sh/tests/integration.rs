@@ -248,6 +248,12 @@ fn expand_asterisk() {
 }
 
 #[test]
+fn expand_minus() {
+    test_cli(vec!["-c", "echo $-", "sh"], "", "\n");
+    test_cli(vec!["-c", "-aeh", "echo $-", "sh"], "", "aeh\n");
+}
+
+#[test]
 fn read_from_file() {
     test_cli(
         vec!["tests/sh/hello_world.sh"],

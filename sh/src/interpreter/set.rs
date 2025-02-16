@@ -165,6 +165,46 @@ impl SetOptions {
         result
     }
 
+    /// # Returns
+    /// Returns active short options concatenated into a string
+    pub fn to_string_short(&self) -> String {
+        let mut result = String::new();
+        if self.allexport {
+            result.push('a');
+        }
+        if self.notify {
+            result.push('b');
+        }
+        if self.noclobber {
+            result.push('C');
+        }
+        if self.errexit {
+            result.push('e');
+        }
+        if self.noglob {
+            result.push('f');
+        }
+        if self.hashall {
+            result.push('h');
+        }
+        if self.monitor {
+            result.push('m');
+        }
+        if self.noexec {
+            result.push('n');
+        }
+        if self.nounset {
+            result.push('u');
+        }
+        if self.verbose {
+            result.push('v');
+        }
+        if self.xtrace {
+            result.push('x');
+        }
+        result
+    }
+
     pub fn parse_args_and_update(&mut self, args: &[String]) -> Result<ParsedArgs, String> {
         if args.len() == 0 {
             return Ok(ParsedArgs::PrintVars);

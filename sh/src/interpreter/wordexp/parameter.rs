@@ -135,7 +135,11 @@ fn expand_simple_parameter_into(
                     );
                 }
                 SpecialParameter::Minus => {
-                    todo!()
+                    expanded_word.append(
+                        interpreter.set_options.to_string_short(),
+                        inside_double_quotes,
+                        true,
+                    );
                 }
                 SpecialParameter::Dollar => {
                     expanded_word.append(

@@ -78,7 +78,7 @@ pub struct Interpreter {
     most_recent_pipeline_exit_status: i32,
     last_command_substitution_status: i32,
     shell_pid: i32,
-    most_recent_background_command_pid: i32,
+    most_recent_background_command_pid: Option<i32>,
     current_directory: OsString,
     set_options: SetOptions,
 }
@@ -373,7 +373,7 @@ impl Default for Interpreter {
             most_recent_pipeline_exit_status: 0,
             last_command_substitution_status: 0,
             shell_pid: 0,
-            most_recent_background_command_pid: 0,
+            most_recent_background_command_pid: None,
             current_directory: OsString::from("/"),
             set_options: SetOptions::default(),
         }

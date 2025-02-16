@@ -261,20 +261,29 @@ fn expand_minus() {
 }
 
 #[test]
+fn expand_shell_pid() {
+    run_successfully_and("echo $$", |output| {
+        assert!(!output.is_empty());
+        assert!(is_pid(output));
+    })
+}
+
+#[test]
+fn expand_bang() {
+    test_cli(vec!["-c", "echo $!"], "", "\n");
+    run_successfully_and("sleep 1 & echo $!", |output| {
+        assert!(!output.is_empty());
+        assert!(is_pid(output));
+    })
+}
+
+#[test]
 fn read_from_file() {
     test_cli(
         vec!["tests/sh/hello_world.sh"],
         "",
         include_str!("sh/hello_world.out"),
     );
-}
-
-#[test]
-fn expand_shell_pid() {
-    run_successfully_and("echo $$", |output| {
-        assert!(!output.is_empty());
-        assert!(is_pid(output));
-    })
 }
 
 #[test]

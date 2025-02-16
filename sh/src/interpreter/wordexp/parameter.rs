@@ -149,7 +149,10 @@ fn expand_simple_parameter_into(
                     );
                 }
                 SpecialParameter::Bang => expanded_word.append(
-                    interpreter.most_recent_background_command_pid.to_string(),
+                    interpreter
+                        .most_recent_background_command_pid
+                        .map(|pid| pid.to_string())
+                        .unwrap_or_default(),
                     inside_double_quotes,
                     true,
                 ),
@@ -413,10 +416,9 @@ mod tests {
     }
 
     #[test]
-    fn expand_special_parameters() {
+    fn expand_dollar() {
         let mut interpreter = Interpreter::default();
         interpreter.shell_pid = 123;
-        interpreter.most_recent_background_command_pid = 456;
         assert_eq!(
             expand_parameter_to_string(
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Dollar)),
@@ -424,12 +426,25 @@ mod tests {
             ),
             "123"
         );
+    }
+
+    #[test]
+    fn expand_bang() {
+        let mut interpreter = Interpreter::default();
         assert_eq!(
             expand_parameter_to_string(
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Bang)),
                 &mut interpreter
             ),
-            "456"
+            "".to_string()
+        );
+        interpreter.most_recent_background_command_pid = Some(123);
+        assert_eq!(
+            expand_parameter_to_string(
+                ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Bang)),
+                &mut interpreter
+            ),
+            "123".to_string()
         );
     }
 

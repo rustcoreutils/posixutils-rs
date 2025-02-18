@@ -291,7 +291,7 @@ fn expand_shell_pid() {
 #[test]
 fn expand_bang() {
     test_cli(vec!["-c", "echo $!"], "", "\n");
-    run_successfully_and("sleep 1 & echo $!", |output| {
+    run_successfully_and("true & echo $!", |output| {
         assert!(!output.is_empty());
         assert!(is_pid(output));
     })
@@ -312,6 +312,13 @@ fn shell_ppid() {
     run_successfully_and("echo $PPID", |output| {
         assert!(!output.is_empty());
         assert!(is_pid(output));
+    });
+    run_successfully_and("echo $PPID; echo $(echo $PPID)", |output| {
+        let mut lines = output.lines();
+        let ppid1 = lines.next().unwrap();
+        let ppid2 = lines.next().unwrap();
+        assert!(is_pid(ppid1));
+        assert_eq!(ppid1, ppid2);
     })
 }
 

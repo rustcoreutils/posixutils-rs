@@ -25,6 +25,12 @@ fn is_valid_name(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+fn is_valid_alias_name(name: &str) -> bool {
+    name.chars().all(|c| {
+        c.is_ascii_alphanumeric() || c == '_' || c == '!' || c == '%' || c == ',' || c == '@'
+    })
+}
+
 fn try_word_to_assignment(word: Word) -> Result<Assignment, Word> {
     if let Some(WordPart::UnquotedLiteral(name)) = word.parts.first() {
         if let Some(eq_pos) = name.find('=') {
@@ -69,19 +75,19 @@ fn try_into_name(word: Word) -> Result<Name, Word> {
 
 #[derive(Debug, Clone)]
 pub struct ParserError {
-    pub location: SourceLocation,
+    pub lineno: u32,
     pub message: String,
     pub could_be_resolved_with_more_input: bool,
 }
 
 impl ParserError {
     fn new<S: Into<String>>(
-        location: SourceLocation,
+        lineno: u32,
         message: S,
         could_be_resolved_with_more_input: bool,
     ) -> Self {
         Self {
-            location,
+            lineno,
             message: message.into(),
             could_be_resolved_with_more_input,
         }
@@ -96,27 +102,27 @@ struct Parser<'src> {
     shell_lookahead_token_id: TokenId,
     word_lookahead: WordToken,
     word_lookahead_token_id: TokenId,
-    lookahead_source_location: SourceLocation,
+    lookahead_lineno: u32,
 }
 
 impl<'src> Parser<'src> {
     /// advances the current shell token and returns the previous shell lookahead
     fn advance_shell(&mut self) -> ShellToken {
-        let (lookahead, source_location, id) = self.lexer.next_shell_token();
+        let token = self.lexer.next_shell_token();
         let prev_lookahead = self.shell_lookahead;
-        self.shell_lookahead = lookahead;
-        self.lookahead_source_location = source_location;
-        self.shell_lookahead_token_id = id;
+        self.shell_lookahead = token.value;
+        self.lookahead_lineno = token.line_no;
+        self.shell_lookahead_token_id = token.id;
         prev_lookahead
     }
 
     /// advances the current word token and returns the previous word lookahead
     fn advance_word(&mut self) -> WordToken {
-        let (lookahead, source_location, id) = self.lexer.next_word_token();
+        let token = self.lexer.next_word_token();
         let prev_lookahead = self.word_lookahead;
-        self.word_lookahead = lookahead;
-        self.lookahead_source_location = source_location;
-        self.word_lookahead_token_id = id;
+        self.word_lookahead = token.value;
+        self.lookahead_lineno = token.line_no;
+        self.word_lookahead_token_id = token.id;
         prev_lookahead
     }
 
@@ -171,7 +177,7 @@ impl<'src> Parser<'src> {
     fn match_shell_token(&mut self, token: ShellToken) -> ParseResult<()> {
         if self.shell_lookahead() != token {
             return Err(ParserError::new(
-                self.lookahead_source_location,
+                self.lookahead_lineno,
                 format!("expected {}, got {}", token, self.shell_lookahead()),
                 self.shell_lookahead() == ShellToken::EOF,
             ));
@@ -189,7 +195,7 @@ impl<'src> Parser<'src> {
     fn match_word_token(&mut self, token: WordToken) -> ParseResult<()> {
         if self.word_lookahead() != token {
             return Err(ParserError::new(
-                self.lookahead_source_location,
+                self.lookahead_lineno,
                 format!("expected {}, got {}", token, self.word_lookahead()),
                 self.word_lookahead() == WordToken::EOF,
             ));
@@ -259,7 +265,7 @@ impl<'src> Parser<'src> {
                 Ok(Parameter::Variable(Rc::from(name)))
             }
             other => Err(ParserError::new(
-                self.lookahead_source_location,
+                self.lookahead_lineno,
                 format!("{} is not the start of a valid parameter", other,),
                 other == WordToken::EOF,
             )),
@@ -283,7 +289,7 @@ impl<'src> Parser<'src> {
             }
             let parameter = self.parse_parameter(false)?;
 
-            let operator_loc = self.lookahead_source_location;
+            let operator_loc = self.lookahead_lineno;
             match self.advance_word() {
                 WordToken::Char('}') => Ok(ParameterExpansion::Simple(parameter)),
                 WordToken::Char('%') => {
@@ -395,14 +401,14 @@ impl<'src> Parser<'src> {
                     if !inside_double_quotes {
                         push_literal(&mut current_literal, &mut word_parts, false);
                         loop {
-                            if let Some((c, _)) = self.lexer.next_char() {
+                            if let Some(c) = self.lexer.next_char() {
                                 if c == '\'' {
                                     break;
                                 }
                                 current_literal.push(c);
                             } else {
                                 return Err(ParserError::new(
-                                    self.lookahead_source_location,
+                                    self.lookahead_lineno,
                                     "unterminated escaped string",
                                     true,
                                 ));
@@ -459,7 +465,7 @@ impl<'src> Parser<'src> {
                         current_literal.push('\\');
                     } else {
                         push_literal(&mut current_literal, &mut word_parts, false);
-                        if let Some((c, _)) = self.lexer.next_char() {
+                        if let Some(c) = self.lexer.next_char() {
                             current_literal.push(c);
                         } else {
                             todo!("error: expected character, got end of file")
@@ -494,7 +500,7 @@ impl<'src> Parser<'src> {
 
         if inside_double_quotes {
             return Err(ParserError::new(
-                self.lookahead_source_location,
+                self.lookahead_lineno,
                 "unterminated quoted string",
                 true,
             ));
@@ -515,16 +521,16 @@ impl<'src> Parser<'src> {
         {
             let remove_leading_tabs = self.shell_lookahead() == ShellToken::DLessDash;
             let mut contents = String::new();
-            let end = self.lexer.next_line().0;
+            let end = self.lexer.next_line();
             loop {
-                let line = self.lexer.next_line().0;
+                let line = self.lexer.next_line();
                 if line == end {
                     break;
                 }
                 if remove_leading_tabs {
                     contents.push_str(line.trim_start_matches('\t'));
                 } else {
-                    contents.push_str(line);
+                    contents.push_str(&line);
                 }
             }
             self.advance_shell();
@@ -548,7 +554,7 @@ impl<'src> Parser<'src> {
             Ok(Some(RedirectionKind::IORedirection { kind, file }))
         } else {
             Err(ParserError::new(
-                self.lookahead_source_location,
+                self.lookahead_lineno,
                 format!("expected word, got {}", self.shell_lookahead()),
                 self.shell_lookahead() == ShellToken::EOF,
             ))
@@ -560,7 +566,7 @@ impl<'src> Parser<'src> {
             if !(0..9).contains(&n) {
                 // TODO: bash supports (0..1023), should look into this
                 return Err(ParserError::new(
-                    self.lookahead_source_location,
+                    self.lookahead_lineno,
                     "invalid file descriptor",
                     false,
                 ));
@@ -574,7 +580,7 @@ impl<'src> Parser<'src> {
                 }))
             } else {
                 Err(ParserError::new(
-                    self.lookahead_source_location,
+                    self.lookahead_lineno,
                     "expected redirection operator after file descriptor",
                     self.shell_lookahead() == ShellToken::EOF,
                 ))
@@ -665,7 +671,7 @@ impl<'src> Parser<'src> {
 
     fn parse_compound_list(&mut self, word_stop: WordToken) -> ParseResult<CompleteCommand> {
         self.skip_linebreak();
-        let list_start = self.lookahead_source_location;
+        let list_start = self.lookahead_lineno;
 
         const END_TOKENS: &[ShellToken] = &[
             ShellToken::RParen,
@@ -738,7 +744,7 @@ impl<'src> Parser<'src> {
         // consume 'for'
         self.advance_shell();
         self.go_to_word_start(true);
-        let word_start_location = self.lookahead_source_location;
+        let word_start_location = self.lookahead_lineno;
         let word_start_token = self.word_lookahead();
         let iter_var = if let Some(name) = self
             .parse_word_until(WordToken::EOF)?
@@ -952,7 +958,7 @@ impl<'src> Parser<'src> {
             return Ok(None);
         }
         while self.shell_lookahead() == ShellToken::Pipe {
-            let pipe_location = self.lookahead_source_location;
+            let pipe_location = self.lookahead_lineno;
             self.advance_shell();
             self.skip_linebreak();
             if let Some(command) = self.parse_command(word_stop)? {
@@ -986,7 +992,7 @@ impl<'src> Parser<'src> {
                 ShellToken::OrIf => LogicalOp::Or,
                 _ => unreachable!(),
             };
-            let operator_location = self.lookahead_source_location;
+            let operator_location = self.lookahead_lineno;
             self.skip_linebreak();
             let next = if let Some(next) = self.parse_pipeline(word_stop)? {
                 next
@@ -1014,7 +1020,7 @@ impl<'src> Parser<'src> {
         while self.shell_lookahead() != ShellToken::Newline
             || self.shell_lookahead() != ShellToken::EOF
         {
-            let command_start = self.lookahead_source_location;
+            let command_start = self.lookahead_lineno;
             let mut and_or = if let Some(and_or) = self.parse_and_or(word_stop)? {
                 and_or
             } else {
@@ -1062,7 +1068,7 @@ impl<'src> Parser<'src> {
             shell_lookahead_token_id: TokenId::default(),
             word_lookahead: WordToken::EOF,
             word_lookahead_token_id: TokenId::default(),
-            lookahead_source_location: SourceLocation::default(),
+            lookahead_lineno: 0,
         }
     }
 }

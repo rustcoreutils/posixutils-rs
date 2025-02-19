@@ -880,7 +880,14 @@ mod tests {
 
     #[test]
     fn lex_single_quoted_word() {
-        lex_word("'test ${$($(('")
+        lex_word("'test ${$($(('");
+        lex_word("'\"abc\"'");
+    }
+
+    #[test]
+    fn lex_double_quoted_word() {
+        lex_word("\"abc\"");
+        lex_word("\"'abc'\"");
     }
 
     #[test]

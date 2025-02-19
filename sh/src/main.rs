@@ -9,14 +9,13 @@
 
 use crate::cli::{parse_args, ExecutionMode};
 use crate::interpreter::Interpreter;
-use crate::parser::parse;
+use crate::parse::parse;
 use atty::Stream;
 use std::io;
 
 mod cli;
 mod interpreter;
-mod lexer;
-mod parser;
+mod parse;
 mod program;
 mod utils;
 

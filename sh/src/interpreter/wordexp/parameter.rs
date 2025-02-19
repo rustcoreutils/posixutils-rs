@@ -3,7 +3,7 @@ use crate::interpreter::wordexp::{
     expand_word_to_string, simple_word_expansion_into, ExpandedWord, ExpandedWordPart,
 };
 use crate::interpreter::{Interpreter, Variable};
-use crate::program::{Parameter, ParameterExpansion, SpecialParameter};
+use crate::parse::word::{Parameter, ParameterExpansion, SpecialParameter};
 
 #[derive(PartialEq, Eq)]
 enum ParameterExpansionResult {
@@ -353,7 +353,7 @@ pub fn expand_parameter_into(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::program::test_utils::unquoted_literal;
+    use crate::parse::word::test_utils::unquoted_literal;
 
     fn interpreter_with_env(env: &[(&str, &str)]) -> Interpreter {
         let mut interpreter = Interpreter::default();

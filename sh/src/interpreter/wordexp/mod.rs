@@ -4,7 +4,7 @@ use crate::interpreter::wordexp::pathname::glob;
 use crate::interpreter::wordexp::pattern::FilenamePattern;
 use crate::interpreter::wordexp::tilde::tilde_expansion;
 use crate::interpreter::Interpreter;
-use crate::program::{Word, WordPart};
+use crate::parse::word::{Word, WordPart};
 use std::path::Path;
 
 pub mod expanded_word;
@@ -132,7 +132,7 @@ fn simple_word_expansion_into(
                 todo!()
             }
             WordPart::CommandSubstitution {
-                command,
+                commands,
                 inside_double_quotes,
             } => {
                 // > If a command substitution occurs inside double-quotes, field splitting

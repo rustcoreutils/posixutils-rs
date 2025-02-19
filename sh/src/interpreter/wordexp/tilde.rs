@@ -1,5 +1,5 @@
 use crate::interpreter::Environment;
-use crate::program::{Word, WordPart};
+use crate::parse::word::{Word, WordPart};
 use nix::libc;
 use std::ffi::{c_char, CStr, CString};
 use std::os::unix::ffi::OsStringExt;
@@ -140,7 +140,7 @@ pub fn tilde_expansion(word: &mut Word, is_assignment: bool, env: &Environment) 
 mod tests {
     use super::*;
     use crate::interpreter::{Interpreter, Variable};
-    use crate::program::test_utils::{quoted_literal, unquoted_literal};
+    use crate::parse::word::test_utils::{quoted_literal, unquoted_literal};
     use std::collections::HashMap;
 
     #[derive(Default)]

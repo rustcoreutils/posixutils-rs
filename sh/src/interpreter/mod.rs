@@ -1,6 +1,6 @@
 use crate::interpreter::set::{SetOptions, SetSpecialBuiltin};
 use crate::interpreter::wordexp::{expand_word, expand_word_to_string};
-use crate::program::{
+use crate::parse::command::{
     Assignment, Command, CompleteCommand, CompoundCommand, Conjunction, IORedirectionKind,
     LogicalOp, Name, Pipeline, Program, Redirection, RedirectionKind, SimpleCommand,
 };

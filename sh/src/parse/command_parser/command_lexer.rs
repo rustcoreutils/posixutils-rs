@@ -332,7 +332,6 @@ fn advance_and_return<Tok>(lex: &mut CommandLexer, complete_token: Tok) -> Tok {
 
 pub struct CommandLexer<'src> {
     source: SourceString<'src>,
-    last_token_id: u64,
 }
 
 impl<'src> CommandLexer<'src> {
@@ -769,7 +768,6 @@ impl<'src> CommandLexer<'src> {
     pub fn new(source: &'src str) -> Self {
         Self {
             source: SourceString::new(source),
-            last_token_id: 0,
         }
     }
 }

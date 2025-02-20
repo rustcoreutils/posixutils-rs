@@ -154,7 +154,9 @@ impl<'src> CommandParser<'src> {
     fn parse_redirection_kind(&mut self) -> ParseResult<Option<RedirectionKind>> {
         if let CommandToken::HereDocument(_) = &self.lookahead {
             let contents = self.advance()?.unwrap_here_document_contents();
-            return Ok(Some(RedirectionKind::HereDocument { contents }));
+            return Ok(Some(RedirectionKind::HereDocument {
+                contents: contents.into(),
+            }));
         }
         let kind = match self.lookahead {
             CommandToken::Greater => IORedirectionKind::RedirectOutput,

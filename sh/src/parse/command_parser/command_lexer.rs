@@ -81,16 +81,33 @@ impl<'s> SourceString<'s> {
         }
         self.read_state.current_part_char_index = index + char.len_utf8();
         if self.read_state.current_part_char_iter.peek().is_none() {
-            self.read_state.current_part += 1;
-            if self.read_state.current_part == self.parts.len() {
+            if self.read_state.current_part == self.parts.len() - 1 {
                 self.read_state.reached_eof = true;
                 return;
             }
+            self.read_state.current_part += 1;
             self.read_state.current_part_char_index = 0;
             self.read_state.current_part_char_iter = self.parts[self.read_state.current_part]
                 .text
                 .char_indices()
                 .peekable();
+        }
+    }
+
+    fn substr(&self, start: &SourceReadState, end: &SourceReadState) -> Cow<'s, str> {
+        assert!(start.current_part <= end.current_part);
+        if start.current_part == end.current_part {
+            self.parts[start.current_part].text
+                [start.current_part_char_index..end.current_part_char_index]
+                .into()
+        } else {
+            let mut result = String::new();
+            result.push_str(&self.parts[start.current_part].text[start.current_part_char_index..]);
+            for part_idx in start.current_part + 1..end.current_part {
+                result.push_str(self.parts[part_idx].text);
+            }
+            result.push_str(&self.parts[end.current_part].text[..end.current_part_char_index]);
+            result.into()
         }
     }
 
@@ -130,6 +147,311 @@ impl<'s> SourceString<'s> {
             .copied()
             .map(|(_, c)| c)
             .unwrap_or_default()
+    }
+}
+
+pub trait Lexer {
+    fn advance(&mut self);
+
+    fn reached_eof(&self) -> bool;
+
+    fn lookahead(&mut self) -> char;
+
+    fn line_no(&self) -> u32;
+
+    fn next_line(&mut self) -> Cow<str>;
+
+    fn skip_comment(&mut self) {
+        if self.lookahead() == '#' {
+            while self.lookahead() != '\n' {
+                self.advance();
+            }
+        }
+    }
+
+    fn skip_double_quoted_string(&mut self) -> ParseResult<()> {
+        let quote_start_lineno = self.line_no();
+        self.advance();
+        self.skip_word_token(Some('"'), true)?;
+        if self.lookahead() != '"' {
+            return Err(ParserError::new(
+                quote_start_lineno,
+                "missing closing '\"'",
+                self.reached_eof(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn skip_here_document(&mut self) -> ParseResult<()> {
+        let start_lineno = self.line_no();
+        let end = self.next_line().into_owned();
+        loop {
+            if self.reached_eof() {
+                return Err(ParserError::new(
+                    start_lineno,
+                    "unterminated here-document",
+                    true,
+                ));
+            }
+            let line = self.next_line();
+            if line == end {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn skip_single_quoted_string(&mut self) -> ParseResult<()> {
+        let start_lineno = self.line_no();
+        self.advance();
+        loop {
+            if self.reached_eof() {
+                return Err(ParserError::new(
+                    start_lineno,
+                    "unterminated single quoted string",
+                    true,
+                ));
+            }
+            if self.lookahead() == '\'' {
+                break;
+            }
+            self.advance();
+        }
+        Ok(())
+    }
+
+    fn skip_parameter_expansion(&mut self) -> ParseResult<()> {
+        self.skip_word_token(Some('}'), false)?;
+        if self.lookahead() != '}' {
+            return Err(ParserError::new(
+                self.line_no(),
+                "missing closing '}' in parameter expansion",
+                self.reached_eof(),
+            ));
+        }
+        self.advance();
+        Ok(())
+    }
+
+    fn skip_command_substitution(&mut self) -> ParseResult<()> {
+        let start_lineno = self.line_no();
+        let mut open_parens = 0;
+        self.skip_comment();
+        loop {
+            if self.reached_eof() {
+                return Err(ParserError::new(
+                    start_lineno,
+                    "missing terminating ')' in command expansion",
+                    true,
+                ));
+            }
+            match self.lookahead() {
+                '"' => {
+                    self.skip_double_quoted_string()?;
+                }
+                '\'' => {
+                    self.skip_single_quoted_string()?;
+                }
+                '(' => {
+                    open_parens += 1;
+                }
+                ')' if open_parens == 0 => {
+                    self.advance();
+                    break;
+                }
+                ')' => {
+                    open_parens -= 1;
+                }
+                '\\' => {
+                    self.advance();
+                    if self.reached_eof() {
+                        return Err(ParserError::new(
+                            self.line_no(),
+                            "missing character after '\\'",
+                            true,
+                        ));
+                    }
+                }
+                '<' => {
+                    self.advance();
+                    if self.lookahead() == '<' {
+                        self.advance();
+                        if self.lookahead() == '-' {
+                            self.advance();
+                            self.skip_here_document()?;
+                        } else {
+                            self.skip_here_document()?;
+                        }
+                    }
+                    // don't advance char
+                    continue;
+                }
+                other if is_blank(other) || is_operator(other) => {
+                    // unquoted blanks and operators are word delimiters
+                    // when '#' is not inside a word it is a comment.
+                    self.advance();
+                    self.skip_comment();
+                    // don't advance char
+                    continue;
+                }
+                _ => {}
+            }
+            self.advance();
+        }
+        Ok(())
+    }
+
+    fn skip_backquoted_command_substitution(&mut self) -> ParseResult<()> {
+        loop {
+            if self.reached_eof() {
+                return Err(ParserError::new(
+                    self.line_no(),
+                    "missing closing '`' in command substitution",
+                    true,
+                ));
+            }
+            match self.lookahead() {
+                '\\' => {
+                    self.advance();
+                    if self.lookahead() == '`' {
+                        self.advance();
+                    }
+                }
+                '`' => {
+                    self.advance();
+                    break;
+                }
+                _ => self.advance(),
+            }
+        }
+        Ok(())
+    }
+
+    fn skip_arithmetic_expansion(&mut self) -> ParseResult<()> {
+        let start_lineno = self.line_no();
+        let mut open_parens = 0;
+        loop {
+            if self.reached_eof() {
+                return Err(ParserError::new(
+                    start_lineno,
+                    "missing closing '))' in arithmetic expansion",
+                    true,
+                ));
+            }
+            match self.lookahead() {
+                '"' => {
+                    self.skip_double_quoted_string()?;
+                }
+                '\'' => {
+                    self.skip_single_quoted_string()?;
+                }
+                '\\' => {
+                    self.advance();
+                }
+                '(' => open_parens += 1,
+                ')' if open_parens == 0 => {
+                    self.advance();
+                    if self.lookahead() == ')' {
+                        self.advance();
+                        break;
+                    } else {
+                        return Err(ParserError::new(
+                            start_lineno,
+                            "missing closing '))' in arithmetic expansion",
+                            true,
+                        ));
+                    }
+                }
+                ')' => open_parens -= 1,
+                _ => {}
+            }
+            self.advance();
+        }
+        Ok(())
+    }
+
+    fn skip_word_token(
+        &mut self,
+        end: Option<char>,
+        include_spaces_and_operators: bool,
+    ) -> ParseResult<()> {
+        let word_start_lineno = self.line_no();
+        let mut inside_double_quotes = false;
+        while !self.reached_eof() {
+            if !inside_double_quotes && end.is_some_and(|c| self.lookahead() == c) {
+                break;
+            }
+
+            match self.lookahead() {
+                '"' => {
+                    inside_double_quotes = !inside_double_quotes;
+                    self.advance();
+                }
+                '\'' if !inside_double_quotes => {
+                    self.skip_single_quoted_string()?;
+                    self.advance();
+                }
+                '$' => {
+                    self.advance();
+                    match self.lookahead() {
+                        '(' => {
+                            self.advance();
+                            if self.lookahead() == '(' {
+                                self.advance();
+                                self.skip_arithmetic_expansion()?;
+                            } else {
+                                self.skip_command_substitution()?;
+                            }
+                        }
+                        '{' => {
+                            self.skip_parameter_expansion()?;
+                        }
+                        _ => {}
+                    }
+                }
+                '`' => {
+                    self.advance();
+                    self.skip_backquoted_command_substitution()?;
+                }
+                '\\' => {
+                    self.advance();
+                    self.advance();
+                }
+                other => {
+                    if !include_spaces_and_operators
+                        && !inside_double_quotes
+                        && (is_operator(other) || is_blank(other))
+                    {
+                        break;
+                    }
+                    self.advance();
+                }
+            }
+        }
+        if inside_double_quotes {
+            return Err(ParserError::new(
+                word_start_lineno,
+                "missing closing '\"'",
+                self.reached_eof(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn remove_delimiter_from_here_document(here_document: Cow<str>) -> Cow<str> {
+    match here_document {
+        Cow::Borrowed(str) => {
+            let str = &str.trim_start_matches(|c| c != '\n')[1..];
+            let str = str[0..str.len() - 1].trim_end_matches(|c| c != '\n');
+            str.into()
+        }
+        Cow::Owned(str) => {
+            let str = &str.trim_start_matches(|c| c != '\n')[1..];
+            let str = str[0..str.len() - 1].trim_end_matches(|c| c != '\n');
+            str.to_string().into()
+        }
     }
 }
 
@@ -178,7 +500,7 @@ pub enum CommandToken<'src> {
     IoNumber(u32),
 
     Word(Cow<'src, str>),
-    HereDocument(String),
+    HereDocument(Cow<'src, str>),
 
     EOF,
 }
@@ -273,7 +595,7 @@ impl<'src> CommandToken<'src> {
         }
     }
 
-    pub fn unwrap_here_document_contents(self) -> String {
+    pub fn unwrap_here_document_contents(self) -> Cow<'src, str> {
         match self {
             CommandToken::HereDocument(contents) => contents,
             _ => unreachable!(),
@@ -334,348 +656,67 @@ pub struct CommandLexer<'src> {
     source: SourceString<'src>,
 }
 
-impl<'src> CommandLexer<'src> {
-    fn reached_eof(&mut self) -> bool {
+impl Lexer for CommandLexer<'_> {
+    fn advance(&mut self) {
+        self.source.advance_char()
+    }
+
+    fn reached_eof(&self) -> bool {
         self.source.reached_eof()
     }
 
+    fn lookahead(&mut self) -> char {
+        self.source.lookahead()
+    }
+
+    fn line_no(&self) -> u32 {
+        self.source.line_no()
+    }
+
+    fn next_line(&mut self) -> Cow<str> {
+        let start = self.source.read_state.clone();
+        while !self.reached_eof() {
+            let lookahead = self.lookahead();
+            self.advance();
+            if lookahead == '\n' {
+                break;
+            }
+        }
+        self.source.substr(&start, &self.source.read_state)
+    }
+}
+
+impl<'src> CommandLexer<'src> {
     fn skip_blanks(&mut self) {
         while is_blank(self.source.lookahead()) {
             self.source.advance_char();
         }
     }
 
-    fn skip_comment(&mut self) {
-        if self.source.lookahead() == '#' {
-            while self.source.lookahead() != '\n' {
-                self.source.advance_char();
-            }
-        }
-    }
-
-    fn next_line(&mut self) -> String {
-        let mut result = String::new();
-        while !self.reached_eof() {
-            let lookahead = self.source.lookahead();
-            result.push(lookahead);
-            self.source.advance_char();
-            if lookahead == '\n' {
-                break;
-            }
-        }
-        result
-    }
-
-    fn read_double_quoted_string_into(&mut self, result: &mut String) -> ParseResult<()> {
-        let quote_start_lineno = self.source.line_no();
-        self.source.advance_char();
-        self.read_word_token_into(result, Some('"'), true)?;
-        if self.source.lookahead() != '"' {
-            return Err(ParserError::new(
-                quote_start_lineno,
-                "missing closing '\"'",
-                self.reached_eof(),
-            ));
-        }
-        result.push('"');
-        Ok(())
-    }
-
-    fn read_here_document_into(
-        &mut self,
-        result: &mut String,
-        remove_leading_tabs: bool,
-        include_delimiters: bool,
-    ) -> ParseResult<()> {
-        let start_lineno = self.source.line_no();
-        let end = self.next_line();
-        if include_delimiters {
-            result.push_str(&end);
-        }
-        loop {
-            if self.reached_eof() {
-                return Err(ParserError::new(
-                    start_lineno,
-                    "unterminated here-document",
-                    true,
-                ));
-            }
-            let line = self.next_line();
-            if line == end {
-                if include_delimiters {
-                    result.push_str(&line);
-                }
-                break;
-            }
-            if remove_leading_tabs {
-                result.push_str(line.trim_start_matches('\t'));
-            } else {
-                result.push_str(&line);
-            }
-        }
-        Ok(())
-    }
-
-    fn read_single_quoted_string_into(&mut self, result: &mut String) -> ParseResult<()> {
-        let start_lineno = self.source.line_no();
-        self.source.advance_char();
-        loop {
-            if self.source.reached_eof() {
-                return Err(ParserError::new(
-                    start_lineno,
-                    "unterminated single quoted string",
-                    true,
-                ));
-            }
-            result.push(self.source.lookahead());
-            if self.source.lookahead() == '\'' {
-                break;
-            }
-            self.source.advance_char();
-        }
-        Ok(())
-    }
-
-    fn read_parameter_expansion_into(&mut self, result: &mut String) -> ParseResult<()> {
-        self.read_word_token_into(result, Some('}'), false)?;
-        if self.source.lookahead() != '}' {
-            return Err(ParserError::new(
-                self.source.line_no(),
-                "missing closing '}' in parameter expansion",
-                self.reached_eof(),
-            ));
-        }
-        result.push('}');
-        self.source.advance_char();
-        Ok(())
-    }
-
-    fn read_command_substitution_into(&mut self, result: &mut String) -> ParseResult<()> {
-        let start_lineno = self.source.line_no();
-        let mut open_parens = 0;
-        self.skip_comment();
-        loop {
-            if self.reached_eof() {
-                return Err(ParserError::new(
-                    start_lineno,
-                    "missing terminating ')' in command expansion",
-                    true,
-                ));
-            }
-            result.push(self.source.lookahead());
-            match self.source.lookahead() {
-                '"' => {
-                    self.read_double_quoted_string_into(result)?;
-                }
-                '\'' => {
-                    self.read_single_quoted_string_into(result)?;
-                }
-                '(' => {
-                    open_parens += 1;
-                }
-                ')' if open_parens == 0 => {
-                    self.source.advance_char();
-                    break;
-                }
-                ')' => {
-                    open_parens -= 1;
-                }
-                '\\' => {
-                    self.source.advance_char();
-                    if self.reached_eof() {
-                        return Err(ParserError::new(
-                            self.source.line_no(),
-                            "missing character after '\\'",
-                            true,
-                        ));
-                    }
-                    result.push(self.source.lookahead());
-                }
-                '<' => {
-                    self.source.advance_char();
-                    if self.source.lookahead() == '<' {
-                        result.push('<');
-                        self.source.advance_char();
-                        if self.source.lookahead() == '-' {
-                            result.push('-');
-                            self.source.advance_char();
-                            self.read_here_document_into(result, true, true)?;
-                        } else {
-                            self.read_here_document_into(result, false, true)?;
-                        }
-                    }
-                    // don't advance char
-                    continue;
-                }
-                other if is_blank(other) || is_operator(other) => {
-                    // unquoted blanks and operators are word delimiters
-                    // when '#' is not inside a word it is a comment.
-                    self.source.advance_char();
-                    self.skip_comment();
-                    // don't advance char
-                    continue;
-                }
-                _ => {}
-            }
-            self.source.advance_char();
-        }
-        Ok(())
-    }
-
-    fn read_backquoted_command_substitution_into(
-        &mut self,
-        result: &mut String,
-    ) -> ParseResult<()> {
-        loop {
-            if self.reached_eof() {
-                return Err(ParserError::new(
-                    self.source.line_no(),
-                    "missing closing '`' in command substitution",
-                    true,
-                ));
-            }
-            result.push(self.source.lookahead());
-            match self.source.lookahead() {
-                '\\' => {
-                    self.source.advance_char();
-                    if self.source.lookahead() == '`' {
-                        result.push('`');
-                        self.source.advance_char();
-                    }
-                }
-                '`' => {
-                    self.source.advance_char();
-                    break;
-                }
-                _ => self.source.advance_char(),
-            }
-        }
-        Ok(())
-    }
-
-    fn read_arithmetic_expansion_into(&mut self, result: &mut String) -> ParseResult<()> {
-        let start_lineno = self.source.line_no();
-        let mut open_parens = 0;
-        loop {
-            if self.reached_eof() {
-                return Err(ParserError::new(
-                    start_lineno,
-                    "missing closing '))' in arithmetic expansion",
-                    true,
-                ));
-            }
-            result.push(self.source.lookahead());
-            match self.source.lookahead() {
-                '"' => {
-                    self.read_double_quoted_string_into(result)?;
-                }
-                '\'' => {
-                    self.read_single_quoted_string_into(result)?;
-                }
-                '\\' => {
-                    self.source.advance_char();
-                    result.push(self.source.lookahead());
-                }
-                '(' => open_parens += 1,
-                ')' if open_parens == 0 => {
-                    self.source.advance_char();
-                    if self.source.lookahead() == ')' {
-                        result.push(')');
-                        self.source.advance_char();
-                        break;
-                    } else {
-                        return Err(ParserError::new(
-                            start_lineno,
-                            "missing closing '))' in arithmetic expansion",
-                            true,
-                        ));
-                    }
-                }
-                ')' => open_parens -= 1,
-                _ => {}
-            }
-            self.source.advance_char();
-        }
-        Ok(())
-    }
-
-    fn read_word_token_into(
-        &mut self,
-        result: &mut String,
-        end: Option<char>,
-        include_spaces_and_operators: bool,
-    ) -> ParseResult<()> {
-        let word_start_lineno = self.source.line_no();
-        let mut inside_double_quotes = false;
-        while !self.source.reached_eof() {
-            if !inside_double_quotes && end.is_some_and(|c| self.source.lookahead() == c) {
-                break;
-            }
-            result.push(self.source.lookahead());
-            match self.source.lookahead() {
-                '"' => {
-                    inside_double_quotes = !inside_double_quotes;
-                    self.source.advance_char();
-                }
-                '\'' if !inside_double_quotes => {
-                    self.read_single_quoted_string_into(result)?;
-                    self.source.advance_char();
-                }
-                '$' => {
-                    self.source.advance_char();
-                    match self.source.lookahead() {
-                        '(' => {
-                            result.push('(');
-                            self.source.advance_char();
-                            if self.source.lookahead() == '(' {
-                                result.push('(');
-                                self.source.advance_char();
-                                self.read_arithmetic_expansion_into(result)?;
-                            } else {
-                                self.read_command_substitution_into(result)?;
-                            }
-                        }
-                        '{' => {
-                            self.read_parameter_expansion_into(result)?;
-                        }
-                        _ => {}
-                    }
-                }
-                '`' => {
-                    self.source.advance_char();
-                    self.read_backquoted_command_substitution_into(result)?;
-                }
-                '\\' => {
-                    self.source.advance_char();
-                    result.push(self.source.lookahead());
-                    self.source.advance_char();
-                }
-                other => {
-                    if !include_spaces_and_operators
-                        && !inside_double_quotes
-                        && (is_operator(other) || is_blank(other))
-                    {
-                        result.pop();
-                        break;
-                    }
-                    self.source.advance_char();
-                }
-            }
-        }
-        if inside_double_quotes {
-            return Err(ParserError::new(
-                word_start_lineno,
-                "missing closing '\"'",
-                self.reached_eof(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn read_word_token(&mut self) -> ParseResult<String> {
-        let mut result = String::new();
-        self.read_word_token_into(&mut result, None, false)?;
+    fn read_word_token(&mut self) -> ParseResult<Cow<'src, str>> {
+        let start = self.source.read_state.clone();
+        self.skip_word_token(None, false)?;
+        let result = self.source.substr(&start, &self.source.read_state);
         Ok(result)
+    }
+
+    fn read_here_document(&mut self, remove_leading_tabs: bool) -> ParseResult<Cow<'src, str>> {
+        let start = self.source.read_state.clone();
+        self.skip_here_document()?;
+        let here_document = remove_delimiter_from_here_document(
+            self.source.substr(&start, &self.source.read_state),
+        );
+
+        if remove_leading_tabs {
+            let mut result = String::new();
+            for line in here_document.lines() {
+                result.push_str(line.trim_start_matches('\t'));
+                result.push('\n');
+            }
+            Ok(result.into())
+        } else {
+            Ok(here_document)
+        }
     }
 
     pub fn next_token(&mut self) -> ParseResult<(CommandToken<'src>, u32)> {
@@ -711,18 +752,14 @@ impl<'src> CommandLexer<'src> {
                     '>' => advance_and_return(self, CommandToken::LessGreat),
                     '<' => {
                         self.source.advance_char();
-                        let mut here_document_contents = String::new();
                         if self.source.lookahead() == '-' {
                             self.source.advance_char();
-                            self.read_here_document_into(&mut here_document_contents, true, false)?;
+                            self.read_here_document(true)
+                                .map(CommandToken::HereDocument)?
                         } else {
-                            self.read_here_document_into(
-                                &mut here_document_contents,
-                                false,
-                                false,
-                            )?;
+                            self.read_here_document(false)
+                                .map(CommandToken::HereDocument)?
                         }
-                        CommandToken::HereDocument(here_document_contents)
                     }
                     _ => CommandToken::Less,
                 },
@@ -899,19 +936,13 @@ mod tests {
 
     #[test]
     fn comment_in_command_substitution() {
-        assert_eq!(
-            lex_token("$(#comment\necho a &#)'\")2\n)"),
-            CommandToken::Word("$(\necho a &\n)".into())
-        );
+        lex_word("$(#comment\necho a &#)'\")2\n)");
     }
 
     #[test]
     fn here_document_inside_command_substitution() {
         lex_word("$(echo <<end\nthis\nis\n\ta\ntest\nend\n)");
-        assert_eq!(
-            lex_token("$(echo <<-end\nthis)(\nis\n\ta))\n\t\t\t\ttest\nend\n)"),
-            CommandToken::Word("$(echo <<-end\nthis)(\nis\na))\ntest\nend\n)".into())
-        );
+        lex_word("$(echo <<-end\nthis)(\nis\n\ta))\n\t\t\t\ttest\nend\n)");
     }
 
     #[test]
@@ -940,11 +971,11 @@ mod tests {
     fn here_document() {
         assert_eq!(
             lex_token("<<end\nthis\nis\n\ta\ntest\nend\n"),
-            CommandToken::HereDocument("this\nis\n\ta\ntest\n".to_string())
+            CommandToken::HereDocument("this\nis\n\ta\ntest\n".into())
         );
         assert_eq!(
             lex_token("<<-end\nthis\nis\n\ta\n\t\t\t\ttest\nend\n"),
-            CommandToken::HereDocument("this\nis\na\ntest\n".to_string())
+            CommandToken::HereDocument("this\nis\na\ntest\n".into())
         )
     }
 

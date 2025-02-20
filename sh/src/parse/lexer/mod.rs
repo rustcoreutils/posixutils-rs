@@ -91,6 +91,7 @@ trait Lexer {
             }
             self.advance();
         }
+        self.advance();
         Ok(())
     }
 
@@ -107,6 +108,7 @@ trait Lexer {
         Ok(())
     }
 
+    /// does not skip the terminating )
     fn skip_command_substitution(&mut self) -> ParseResult<()> {
         let start_lineno = self.line_no();
         let mut open_parens = 0;
@@ -125,12 +127,12 @@ trait Lexer {
                 }
                 '\'' => {
                     self.skip_single_quoted_string()?;
+                    continue;
                 }
                 '(' => {
                     open_parens += 1;
                 }
                 ')' if open_parens == 0 => {
-                    self.advance();
                     break;
                 }
                 ')' => {
@@ -175,6 +177,7 @@ trait Lexer {
         Ok(())
     }
 
+    /// does not skip terminating `
     fn skip_backquoted_command_substitution(&mut self) -> ParseResult<()> {
         loop {
             if self.reached_eof() {
@@ -192,7 +195,6 @@ trait Lexer {
                     }
                 }
                 '`' => {
-                    self.advance();
                     break;
                 }
                 _ => self.advance(),
@@ -218,6 +220,7 @@ trait Lexer {
                 }
                 '\'' => {
                     self.skip_single_quoted_string()?;
+                    continue;
                 }
                 '\\' => {
                     self.advance();
@@ -263,7 +266,6 @@ trait Lexer {
                 }
                 '\'' if !inside_double_quotes => {
                     self.skip_single_quoted_string()?;
-                    self.advance();
                 }
                 '$' => {
                     self.advance();
@@ -275,6 +277,7 @@ trait Lexer {
                                 self.skip_arithmetic_expansion()?;
                             } else {
                                 self.skip_command_substitution()?;
+                                self.advance();
                             }
                         }
                         '{' => {
@@ -286,6 +289,7 @@ trait Lexer {
                 '`' => {
                     self.advance();
                     self.skip_backquoted_command_substitution()?;
+                    self.advance();
                 }
                 '\\' => {
                     self.advance();

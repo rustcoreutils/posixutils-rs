@@ -367,6 +367,21 @@ impl<'src> CommandLexer<'src> {
         result
     }
 
+    fn read_double_quoted_string_into(&mut self, result: &mut String) -> ParseResult<()> {
+        let quote_start_lineno = self.source.line_no();
+        self.source.advance_char();
+        self.read_word_token_into(result, Some('"'), true)?;
+        if self.source.lookahead() != '"' {
+            return Err(ParserError::new(
+                quote_start_lineno,
+                "missing closing '\"'",
+                self.reached_eof(),
+            ));
+        }
+        result.push('"');
+        Ok(())
+    }
+
     fn read_here_document_into(
         &mut self,
         result: &mut String,
@@ -451,17 +466,7 @@ impl<'src> CommandLexer<'src> {
             result.push(self.source.lookahead());
             match self.source.lookahead() {
                 '"' => {
-                    let quote_start_lineno = self.source.line_no();
-                    self.source.advance_char();
-                    self.read_word_token_into(result, Some('"'), true)?;
-                    if self.source.lookahead() != '"' {
-                        return Err(ParserError::new(
-                            quote_start_lineno,
-                            "missing closing '\"'",
-                            self.reached_eof(),
-                        ));
-                    }
-                    result.push('"');
+                    self.read_double_quoted_string_into(result)?;
                 }
                 '\'' => {
                     self.read_single_quoted_string_into(result)?;
@@ -563,17 +568,7 @@ impl<'src> CommandLexer<'src> {
             result.push(self.source.lookahead());
             match self.source.lookahead() {
                 '"' => {
-                    let quote_start_lineno = self.source.line_no();
-                    self.source.advance_char();
-                    self.read_word_token_into(result, Some('"'), true)?;
-                    if self.source.lookahead() != '"' {
-                        return Err(ParserError::new(
-                            quote_start_lineno,
-                            "missing closing '\"'",
-                            self.reached_eof(),
-                        ));
-                    }
-                    result.push('"');
+                    self.read_double_quoted_string_into(result)?;
                 }
                 '\'' => {
                     self.read_single_quoted_string_into(result)?;

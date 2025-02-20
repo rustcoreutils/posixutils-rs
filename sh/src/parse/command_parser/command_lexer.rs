@@ -11,6 +11,7 @@ use crate::parse::{ParseResult, ParserError};
 use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
 use std::iter::Peekable;
+use std::ops::Range;
 use std::str::CharIndices;
 
 #[derive(Clone, Debug)]
@@ -331,7 +332,6 @@ fn advance_and_return<Tok>(lex: &mut CommandLexer, complete_token: Tok) -> Tok {
 
 pub struct CommandLexer<'src> {
     source: SourceString<'src>,
-    prev_read_state: SourceReadState<'src>,
     last_token_id: u64,
 }
 
@@ -772,11 +772,8 @@ impl<'src> CommandLexer<'src> {
     }
 
     pub fn new(source: &'src str) -> Self {
-        let source = SourceString::new(source);
-        let initial_read_state = source.read_state.clone();
         Self {
-            source,
-            prev_read_state: initial_read_state,
+            source: SourceString::new(source),
             last_token_id: 0,
         }
     }

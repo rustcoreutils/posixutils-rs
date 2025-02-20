@@ -1,5 +1,6 @@
 pub mod command;
 mod command_parser;
+mod lexer;
 pub mod word;
 mod word_parser;
 

@@ -218,7 +218,7 @@ impl<'src> CommandParser<'src> {
 
     fn alias_substitution(
         &mut self,
-        word: String,
+        word: Cow<'src, str>,
         apply_alias_substitution_to_next_word: &mut bool,
         alias_table: &'src AliasTable,
     ) -> ParseResult<Option<Word>> {
@@ -226,18 +226,17 @@ impl<'src> CommandParser<'src> {
         substitution_stack.push(word);
         loop {
             let top = substitution_stack.last().unwrap();
-            if let Some(alias) = alias_table.get(top) {
+            if let Some(alias) = alias_table.get(top.as_ref()) {
                 self.lexer.insert_text_at_current_position(alias);
                 self.advance()?;
-                // TODO: cleanup allocations
                 if let CommandToken::Word(word) = &self.lookahead {
-                    if substitution_stack.contains(&word.to_string()) {
+                    if substitution_stack.contains(word) {
                         if !alias.ends_with(|c| is_blank(c)) {
                             *apply_alias_substitution_to_next_word = false
                         }
                         return parse_word(word, 0, true).map(Some);
                     } else {
-                        substitution_stack.push(word.to_string());
+                        substitution_stack.push(word.clone());
                     }
                 } else {
                     return Ok(None);
@@ -268,9 +267,8 @@ impl<'src> CommandParser<'src> {
                         Ok(assignment) => command.assignments.push(assignment),
                         Err(word) => {
                             if continue_to_apply_alias_substitution {
-                                let word = word.to_string();
                                 let next_word = self.alias_substitution(
-                                    word,
+                                    word.to_string().into(),
                                     &mut continue_to_apply_alias_substitution,
                                     alias_table,
                                 )?;
@@ -300,9 +298,8 @@ impl<'src> CommandParser<'src> {
             match self.lookahead.as_word_str() {
                 Some(word) => {
                     if continue_to_apply_alias_substitution {
-                        let word = word.to_string();
                         let next_word = self.alias_substitution(
-                            word,
+                            word.to_string().into(),
                             &mut continue_to_apply_alias_substitution,
                             alias_table,
                         )?;

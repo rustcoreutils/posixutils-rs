@@ -7,7 +7,6 @@ struct WordParser<'src> {
     lexer: WordLexer<'src>,
     lookahead: WordToken<'src>,
     line_no: u32,
-    last_command_token: bool,
 }
 
 impl<'src> WordParser<'src> {
@@ -30,11 +29,8 @@ impl<'src> WordParser<'src> {
         if self.matches_token(token) {
             Ok(())
         } else {
-            Err(ParserError::new(
-                self.line_no,
-                format!("expected {}, got {}", token, self.lookahead),
-                token == WordToken::EOF && self.last_command_token,
-            ))
+            // word should be valid
+            panic!("invalid word")
         }
     }
 
@@ -81,7 +77,7 @@ impl<'src> WordParser<'src> {
             other => Err(ParserError::new(
                 self.line_no,
                 format!("{} is not the start of a valid parameter", other,),
-                self.last_command_token && other == WordToken::EOF,
+                false,
             )),
         }
     }
@@ -158,10 +154,10 @@ impl<'src> WordParser<'src> {
                             word,
                             substitute_null_with_word: !alternative_version,
                         }),
-                        other => Err(ParserError::new(
+                        _ => Err(ParserError::new(
                             operator_loc,
                             "invalid format in parameter expansion",
-                            self.last_command_token && other == WordToken::EOF,
+                            false,
                         )),
                     }
                 }
@@ -288,20 +284,21 @@ impl<'src> WordParser<'src> {
         }
     }
 
-    fn new(text: &'src str, line_no: u32, last_command_token: bool) -> Self {
+    fn new(text: &'src str, line_no: u32) -> Self {
         let mut lexer = WordLexer::new(text);
         let lookahead = lexer.next_token();
         Self {
             lexer,
             lookahead,
-            last_command_token,
             line_no,
         }
     }
 }
 
-pub fn parse_word(text: &str, line_no: u32, last_command_token: bool) -> ParseResult<Word> {
-    let mut parser = WordParser::new(text, line_no, last_command_token);
+/// # Panics
+/// Panics if word is not valid (unclosed quotes, unclosed command substitution, etc.)
+pub fn parse_word(text: &str, line_no: u32) -> ParseResult<Word> {
+    let mut parser = WordParser::new(text, line_no);
     parser
         .parse_word_until(WordToken::EOF)
         .map(|word| word.unwrap())
@@ -313,7 +310,7 @@ mod tests {
     use crate::parse::word::test_utils::{quoted_literal, unquoted_literal};
 
     fn parse_word(word: &str) -> Word {
-        super::parse_word(word, 0, true).expect("parsing error")
+        super::parse_word(word, 0).expect("parsing error")
     }
 
     fn parse_unquoted_parameter_expansion(word: &str) -> ParameterExpansion {

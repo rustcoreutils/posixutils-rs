@@ -31,11 +31,7 @@ fn is_valid_alias_name(name: &str) -> bool {
     })
 }
 
-fn try_into_assignment(
-    word: &str,
-    line_no: u32,
-    reached_eof: bool,
-) -> ParseResult<Result<Assignment, &str>> {
+fn try_into_assignment(word: &str, line_no: u32) -> ParseResult<Result<Assignment, &str>> {
     if !word.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
         return Ok(Err(word));
     }
@@ -46,8 +42,7 @@ fn try_into_assignment(
         if c == '=' {
             let (name, value) = word.split_at(pos);
             let name = Rc::from(name);
-            parse_word(&value[1..], line_no, reached_eof)
-                .map(|value| Ok(Assignment { name, value }))
+            parse_word(&value[1..], line_no).map(|value| Ok(Assignment { name, value }))
         } else {
             Ok(Err(word))
         }
@@ -126,7 +121,7 @@ impl<'src> CommandParser<'src> {
         let line_no = self.lookahead_lineno;
         let token = self.advance()?;
         if let Some(word) = token.as_word_str() {
-            parse_word(&word, line_no, self.reached_eof())
+            parse_word(&word, line_no)
         } else {
             Err(ParserError::new(
                 line_no,
@@ -173,7 +168,7 @@ impl<'src> CommandParser<'src> {
         self.advance()?;
         match self.advance()? {
             CommandToken::Word(word) => {
-                let file = parse_word(&word, line_no, self.reached_eof())?;
+                let file = parse_word(&word, line_no)?;
                 Ok(Some(RedirectionKind::IORedirection { kind, file }))
             }
             other => Err(ParserError::new(
@@ -234,7 +229,7 @@ impl<'src> CommandParser<'src> {
                         if !alias.ends_with(|c| is_blank(c)) {
                             *apply_alias_substitution_to_next_word = false
                         }
-                        return parse_word(word, 0, true).map(Some);
+                        return parse_word(&word, self.lookahead_lineno).map(Some);
                     } else {
                         substitution_stack.push(word.clone());
                     }
@@ -242,7 +237,7 @@ impl<'src> CommandParser<'src> {
                     return Ok(None);
                 }
             } else {
-                return parse_word(top, 0, true).map(Some);
+                return parse_word(top, self.lookahead_lineno).map(Some);
             }
         }
     }
@@ -263,7 +258,7 @@ impl<'src> CommandParser<'src> {
             }
             match self.lookahead.as_word_str() {
                 Some(word) => {
-                    match try_into_assignment(&word, self.lookahead_lineno, self.reached_eof())? {
+                    match try_into_assignment(&word, self.lookahead_lineno)? {
                         Ok(assignment) => command.assignments.push(assignment),
                         Err(word) => {
                             if continue_to_apply_alias_substitution {
@@ -274,14 +269,10 @@ impl<'src> CommandParser<'src> {
                                 )?;
                                 command.words.extend(next_word.into_iter());
                             } else {
-                                command.words.push(parse_word(
-                                    word,
-                                    self.lookahead_lineno,
-                                    self.reached_eof(),
-                                )?);
+                                command.words.push(parse_word(word, self.lookahead_lineno)?);
                             }
                         }
-                    }
+                    };
                     self.advance()?;
                 }
                 None => match self.parse_redirection_opt()? {
@@ -305,11 +296,7 @@ impl<'src> CommandParser<'src> {
                         )?;
                         command.words.extend(next_word.into_iter());
                     } else {
-                        command.words.push(parse_word(
-                            word,
-                            self.lookahead_lineno,
-                            self.reached_eof(),
-                        )?);
+                        command.words.push(parse_word(word, self.lookahead_lineno)?);
                     }
                     self.advance()?;
                 }
@@ -408,11 +395,7 @@ impl<'src> CommandParser<'src> {
             self.advance()?;
             while self.lookahead.as_word_str().is_some() {
                 let word = self.advance()?.into_word_cow().unwrap();
-                words.push(parse_word(
-                    &word,
-                    self.lookahead_lineno,
-                    self.lookahead == CommandToken::EOF,
-                )?);
+                words.push(parse_word(&word, self.lookahead_lineno)?);
             }
         }
         match self.lookahead {

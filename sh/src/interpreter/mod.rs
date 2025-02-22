@@ -340,6 +340,9 @@ impl Interpreter {
             .collect();
         variables.insert("PPID".to_string(), Variable::new(getppid().to_string()));
         variables.insert("IFS".to_string(), Variable::new(" \t\n".to_string()));
+        variables.insert("PS1".to_string(), Variable::new("$ ".to_string()));
+        variables.insert("PS2".to_string(), Variable::new("> ".to_string()));
+        variables.insert("PS4".to_string(), Variable::new("+ ".to_string()));
         Interpreter {
             environment: variables,
             program_name,

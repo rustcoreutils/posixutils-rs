@@ -16,10 +16,8 @@ use crate::parse::lexer::command_lexer::{CommandLexer, CommandToken};
 use crate::parse::lexer::is_blank;
 use crate::parse::word::Word;
 use crate::parse::word_parser::parse_word;
-use crate::parse::{ParseResult, ParserError};
+use crate::parse::{AliasTable, ParseResult, ParserError};
 use std::borrow::Cow;
-use std::collections::HashMap;
-use std::hash::Hash;
 use std::rc::Rc;
 
 fn is_valid_name(name: &str) -> bool {
@@ -58,11 +56,11 @@ fn try_into_assignment(
     }
 }
 
-struct CommandParser<'src> {
+pub struct CommandParser<'src> {
     lexer: CommandLexer<'src>,
     lookahead: CommandToken<'src>,
-    alias_table: &'src HashMap<String, String>,
     lookahead_lineno: u32,
+    parsed_one_command: bool,
 }
 
 impl<'src> CommandParser<'src> {
@@ -222,12 +220,13 @@ impl<'src> CommandParser<'src> {
         &mut self,
         word: String,
         apply_alias_substitution_to_next_word: &mut bool,
+        alias_table: &'src AliasTable,
     ) -> ParseResult<Option<Word>> {
         let mut substitution_stack = Vec::new();
         substitution_stack.push(word);
         loop {
             let top = substitution_stack.last().unwrap();
-            if let Some(alias) = self.alias_table.get(top) {
+            if let Some(alias) = alias_table.get(top) {
                 self.lexer.insert_text_at_current_position(alias);
                 self.advance()?;
                 // TODO: cleanup allocations
@@ -249,7 +248,11 @@ impl<'src> CommandParser<'src> {
         }
     }
 
-    fn parse_simple_command(&mut self, end: CommandToken) -> ParseResult<Option<SimpleCommand>> {
+    fn parse_simple_command(
+        &mut self,
+        end: CommandToken,
+        alias_table: &'src AliasTable,
+    ) -> ParseResult<Option<SimpleCommand>> {
         // simple_command = (io_redirect | assignment_word)* word? (io_redirect | word)*
 
         let mut command = SimpleCommand::default();
@@ -269,6 +272,7 @@ impl<'src> CommandParser<'src> {
                                 let next_word = self.alias_substitution(
                                     word,
                                     &mut continue_to_apply_alias_substitution,
+                                    alias_table,
                                 )?;
                                 command.words.extend(next_word.into_iter());
                             } else {
@@ -297,8 +301,11 @@ impl<'src> CommandParser<'src> {
                 Some(word) => {
                     if continue_to_apply_alias_substitution {
                         let word = word.to_string();
-                        let next_word = self
-                            .alias_substitution(word, &mut continue_to_apply_alias_substitution)?;
+                        let next_word = self.alias_substitution(
+                            word,
+                            &mut continue_to_apply_alias_substitution,
+                            alias_table,
+                        )?;
                         command.words.extend(next_word.into_iter());
                     } else {
                         command.words.push(parse_word(
@@ -319,7 +326,11 @@ impl<'src> CommandParser<'src> {
         Ok(command.none_if_empty())
     }
 
-    fn parse_compound_list(&mut self, end: CommandToken) -> ParseResult<CompleteCommand> {
+    fn parse_compound_list(
+        &mut self,
+        end: CommandToken,
+        alias_table: &'src AliasTable,
+    ) -> ParseResult<CompleteCommand> {
         self.skip_linebreak()?;
         let list_start = self.lookahead_lineno;
 
@@ -335,7 +346,7 @@ impl<'src> CommandParser<'src> {
             CommandToken::Then,
         ];
 
-        let mut last_conjunction = self.parse_and_or(end.clone())?;
+        let mut last_conjunction = self.parse_and_or(end.clone(), alias_table)?;
         let mut commands = Vec::new();
         while let Some(mut conjunction) = last_conjunction {
             match self.lookahead {
@@ -355,7 +366,7 @@ impl<'src> CommandParser<'src> {
                 break;
             }
             commands.push(conjunction);
-            last_conjunction = self.parse_and_or(end.clone())?;
+            last_conjunction = self.parse_and_or(end.clone(), alias_table)?;
         }
         if commands.is_empty() {
             return Err(ParserError::new(
@@ -367,30 +378,30 @@ impl<'src> CommandParser<'src> {
         Ok(CompleteCommand { commands })
     }
 
-    fn parse_brace_group(&mut self) -> ParseResult<CompoundCommand> {
+    fn parse_brace_group(&mut self, alias_table: &'src AliasTable) -> ParseResult<CompoundCommand> {
         // consume '{'
         self.advance()?;
-        let inner = self.parse_compound_list(CommandToken::RBrace)?;
+        let inner = self.parse_compound_list(CommandToken::RBrace, alias_table)?;
         self.match_token(CommandToken::RBrace)?;
         Ok(CompoundCommand::BraceGroup(inner))
     }
 
-    fn parse_subshell(&mut self) -> ParseResult<CompoundCommand> {
+    fn parse_subshell(&mut self, alias_table: &'src AliasTable) -> ParseResult<CompoundCommand> {
         // consume '('
         self.advance()?;
-        let inner = self.parse_compound_list(CommandToken::RParen)?;
+        let inner = self.parse_compound_list(CommandToken::RParen, alias_table)?;
         self.match_token(CommandToken::RParen)?;
         Ok(CompoundCommand::Subshell(inner))
     }
 
-    fn parse_do_group(&mut self) -> ParseResult<CompleteCommand> {
+    fn parse_do_group(&mut self, alias_table: &'src AliasTable) -> ParseResult<CompleteCommand> {
         self.match_token(CommandToken::Do)?;
-        let inner = self.parse_compound_list(CommandToken::Done)?;
+        let inner = self.parse_compound_list(CommandToken::Done, alias_table)?;
         self.match_token(CommandToken::Done)?;
         Ok(inner)
     }
 
-    fn parse_for_clause(&mut self) -> ParseResult<CompoundCommand> {
+    fn parse_for_clause(&mut self, alias_table: &'src AliasTable) -> ParseResult<CompoundCommand> {
         // consume 'for'
         self.advance()?;
         let iter_var = self.match_name()?;
@@ -414,7 +425,7 @@ impl<'src> CommandParser<'src> {
             }
             _ => {}
         }
-        let body = self.parse_do_group()?;
+        let body = self.parse_do_group(alias_table)?;
         Ok(CompoundCommand::ForClause {
             iter_var,
             words,
@@ -422,8 +433,8 @@ impl<'src> CommandParser<'src> {
         })
     }
 
-    fn parse_case_item(&mut self) -> ParseResult<CaseItem> {
-        self.match_shell_token_opt(CommandToken::LParen);
+    fn parse_case_item(&mut self, alias_table: &'src AliasTable) -> ParseResult<CaseItem> {
+        self.match_shell_token_opt(CommandToken::LParen)?;
         let mut pattern = Vec::new();
         while self.lookahead != CommandToken::RParen {
             pattern.push(self.parse_word()?);
@@ -434,7 +445,7 @@ impl<'src> CommandParser<'src> {
         }
         self.match_token(CommandToken::RParen)?;
 
-        let body = self.parse_compound_list(CommandToken::EOF)?;
+        let body = self.parse_compound_list(CommandToken::EOF, alias_table)?;
 
         if self.lookahead == CommandToken::DSemi {
             self.advance()?;
@@ -450,7 +461,7 @@ impl<'src> CommandParser<'src> {
         Ok(CaseItem { body, pattern })
     }
 
-    fn parse_case_clause(&mut self) -> ParseResult<CompoundCommand> {
+    fn parse_case_clause(&mut self, alias_table: &'src AliasTable) -> ParseResult<CompoundCommand> {
         // consume 'case'
         self.advance()?;
         let arg = self.parse_word()?;
@@ -462,7 +473,7 @@ impl<'src> CommandParser<'src> {
             match self.lookahead {
                 CommandToken::Esac => break,
                 _ => {
-                    cases.push(self.parse_case_item()?);
+                    cases.push(self.parse_case_item(alias_table)?);
                 }
             }
         }
@@ -470,14 +481,14 @@ impl<'src> CommandParser<'src> {
         Ok(CompoundCommand::CaseClause { arg, cases })
     }
 
-    fn parse_if_clause(&mut self) -> ParseResult<CompoundCommand> {
+    fn parse_if_clause(&mut self, alias_table: &'src AliasTable) -> ParseResult<CompoundCommand> {
         // consume 'if'
         self.advance()?;
         let mut if_chain = Vec::new();
         // there is a terminator after the condition, we don't need to terminate on CommandToken::Then
-        let condition = self.parse_compound_list(CommandToken::EOF)?;
+        let condition = self.parse_compound_list(CommandToken::EOF, alias_table)?;
         self.match_token(CommandToken::Then)?;
-        let then_part = self.parse_compound_list(CommandToken::EOF)?;
+        let then_part = self.parse_compound_list(CommandToken::EOF, alias_table)?;
         if_chain.push(If {
             condition,
             body: then_part,
@@ -485,9 +496,9 @@ impl<'src> CommandParser<'src> {
         while self.lookahead == CommandToken::Elif {
             // consume 'elif'
             self.advance()?;
-            let condition = self.parse_compound_list(CommandToken::EOF)?;
+            let condition = self.parse_compound_list(CommandToken::EOF, alias_table)?;
             self.match_token(CommandToken::Then)?;
-            let then_part = self.parse_compound_list(CommandToken::EOF)?;
+            let then_part = self.parse_compound_list(CommandToken::EOF, alias_table)?;
             if_chain.push(If {
                 condition,
                 body: then_part,
@@ -495,7 +506,7 @@ impl<'src> CommandParser<'src> {
         }
         if self.lookahead == CommandToken::Else {
             self.advance()?;
-            let else_part = self.parse_compound_list(CommandToken::EOF)?;
+            let else_part = self.parse_compound_list(CommandToken::EOF, alias_table)?;
             if_chain.push(If {
                 condition: CompleteCommand {
                     commands: Vec::new(),
@@ -507,52 +518,69 @@ impl<'src> CommandParser<'src> {
         Ok(CompoundCommand::IfClause { if_chain })
     }
 
-    fn parse_while_clause(&mut self) -> ParseResult<CompoundCommand> {
+    fn parse_while_clause(
+        &mut self,
+        alias_table: &'src AliasTable,
+    ) -> ParseResult<CompoundCommand> {
         // consume 'while'
         self.advance()?;
-        let condition = self.parse_compound_list(CommandToken::EOF)?;
-        let body = self.parse_do_group()?;
+        let condition = self.parse_compound_list(CommandToken::EOF, alias_table)?;
+        let body = self.parse_do_group(alias_table)?;
         Ok(CompoundCommand::WhileClause { condition, body })
     }
 
-    fn parse_until_clause(&mut self) -> ParseResult<CompoundCommand> {
+    fn parse_until_clause(
+        &mut self,
+        alias_table: &'src AliasTable,
+    ) -> ParseResult<CompoundCommand> {
         // consume 'until'
         self.advance()?;
-        let condition = self.parse_compound_list(CommandToken::EOF)?;
-        let body = self.parse_do_group()?;
+        let condition = self.parse_compound_list(CommandToken::EOF, alias_table)?;
+        let body = self.parse_do_group(alias_table)?;
         Ok(CompoundCommand::UntilClause { condition, body })
     }
 
-    fn parse_compound_command(&mut self) -> ParseResult<Option<CompoundCommand>> {
+    fn parse_compound_command(
+        &mut self,
+        alias_table: &'src AliasTable,
+    ) -> ParseResult<Option<CompoundCommand>> {
         match &self.lookahead {
-            CommandToken::LParen => self.parse_subshell().map(Some),
-            CommandToken::LBrace => self.parse_brace_group().map(Some),
-            CommandToken::For => self.parse_for_clause().map(Some),
-            CommandToken::Case => self.parse_case_clause().map(Some),
-            CommandToken::If => self.parse_if_clause().map(Some),
-            CommandToken::While => self.parse_while_clause().map(Some),
-            CommandToken::Until => self.parse_until_clause().map(Some),
+            CommandToken::LParen => self.parse_subshell(alias_table).map(Some),
+            CommandToken::LBrace => self.parse_brace_group(alias_table).map(Some),
+            CommandToken::For => self.parse_for_clause(alias_table).map(Some),
+            CommandToken::Case => self.parse_case_clause(alias_table).map(Some),
+            CommandToken::If => self.parse_if_clause(alias_table).map(Some),
+            CommandToken::While => self.parse_while_clause(alias_table).map(Some),
+            CommandToken::Until => self.parse_until_clause(alias_table).map(Some),
             _ => Ok(None),
         }
     }
 
-    fn parse_function_definition(&mut self, name: Name) -> ParseResult<FunctionDefinition> {
+    fn parse_function_definition(
+        &mut self,
+        name: Name,
+        alias_table: &'src AliasTable,
+    ) -> ParseResult<FunctionDefinition> {
         // consume '('
         self.advance()?;
         self.match_token(CommandToken::RParen)?;
-        if let Some(body) = self.parse_compound_command()? {
+        if let Some(body) = self.parse_compound_command(alias_table)? {
             Ok(FunctionDefinition { name, body })
         } else {
             todo!("error: expected compound command")
         }
     }
 
-    fn parse_command(&mut self, end: CommandToken) -> ParseResult<Option<Command>> {
+    fn parse_command(
+        &mut self,
+        end: CommandToken,
+        alias_table: &'src AliasTable,
+    ) -> ParseResult<Option<Command>> {
         // command =
         // 			| compound_command redirect_list?
         // 			| simple_command
         // 			| function_definition
-        if let Some(compound_command) = self.parse_compound_command()? {
+        if let Some(compound_command) = self.parse_compound_command(alias_table)? {
             let mut redirections = Vec::new();
             while let Some(redirection) = self.parse_redirection_opt()? {
                 redirections.push(redirection);
@@ -566,26 +594,34 @@ impl<'src> CommandParser<'src> {
                 CommandToken::Word(word) if is_valid_name(word) => {
                     let word = self.advance()?.into_word_cow().unwrap();
                     if self.lookahead == CommandToken::LParen {
-                        self.parse_function_definition(word.into_owned().into())
+                        self.parse_function_definition(word.into_owned().into(), alias_table)
                             .map(Command::FunctionDefinition)
                             .map(Some)
                     } else {
                         // not a function, rollback the lookahead
                         self.lexer.rollback_last_token();
                         self.lookahead = CommandToken::Word(word);
-                        Ok(self.parse_simple_command(end)?.map(Command::SimpleCommand))
+                        Ok(self
+                            .parse_simple_command(end, alias_table)?
+                            .map(Command::SimpleCommand))
                     }
                 }
-                _ => Ok(self.parse_simple_command(end)?.map(Command::SimpleCommand)),
+                _ => Ok(self
+                    .parse_simple_command(end, alias_table)?
+                    .map(Command::SimpleCommand)),
             }
         }
     }
 
-    fn parse_pipeline(&mut self, end: CommandToken) -> ParseResult<Option<Pipeline>> {
+    fn parse_pipeline(
+        &mut self,
+        end: CommandToken,
+        alias_table: &'src AliasTable,
+    ) -> ParseResult<Option<Pipeline>> {
         // pipeline = "!" command ("|" linebreak command)*
         let negate_status = self.match_alternatives(&[CommandToken::Bang])?.is_some();
         let mut commands = Vec::new();
-        if let Some(command) = self.parse_command(end.clone())? {
+        if let Some(command) = self.parse_command(end.clone(), alias_table)? {
             commands.push(command);
         } else {
             return Ok(None);
@@ -594,7 +630,7 @@ impl<'src> CommandParser<'src> {
             let pipe_location = self.lookahead_lineno;
             self.advance()?;
             self.skip_linebreak()?;
-            if let Some(command) = self.parse_command(end.clone())? {
+            if let Some(command) = self.parse_command(end.clone(), alias_table)? {
                 commands.push(command);
             } else {
                 return Err(ParserError::new(
@@ -610,9 +646,13 @@ impl<'src> CommandParser<'src> {
         }))
     }
 
-    fn parse_and_or(&mut self, end: CommandToken) -> ParseResult<Option<Conjunction>> {
+    fn parse_and_or(
+        &mut self,
+        end: CommandToken,
+        alias_table: &'src AliasTable,
+    ) -> ParseResult<Option<Conjunction>> {
         // and_or = pipeline (("&&" | "||") linebreak pipeline)*
-        let mut last = if let Some(pipeline) = self.parse_pipeline(end.clone())? {
+        let mut last = if let Some(pipeline) = self.parse_pipeline(end.clone(), alias_table)? {
             pipeline
         } else {
             return Ok(None);
@@ -626,7 +666,7 @@ impl<'src> CommandParser<'src> {
             };
             let operator_location = self.lookahead_lineno;
             self.skip_linebreak()?;
-            let next = if let Some(next) = self.parse_pipeline(end.clone())? {
+            let next = if let Some(next) = self.parse_pipeline(end.clone(), alias_table)? {
                 next
             } else {
                 return Err(ParserError::new(
@@ -646,16 +686,20 @@ impl<'src> CommandParser<'src> {
         }))
     }
 
-    fn parse_complete_command(&mut self) -> ParseResult<CompleteCommand> {
+    fn parse_complete_command(
+        &mut self,
+        alias_table: &'src AliasTable,
+    ) -> ParseResult<CompleteCommand> {
         // complete_command = and_or (separator_op and_or)* separator_op?
         let mut commands = Vec::new();
         while self.lookahead != CommandToken::Newline || self.lookahead != CommandToken::EOF {
             let command_start = self.lookahead_lineno;
-            let mut and_or = if let Some(and_or) = self.parse_and_or(CommandToken::EOF)? {
-                and_or
-            } else {
-                return Err(ParserError::new(command_start, "expected command", false));
-            };
+            let mut and_or =
+                if let Some(and_or) = self.parse_and_or(CommandToken::EOF, alias_table)? {
+                    and_or
+                } else {
+                    return Err(ParserError::new(command_start, "expected command", false));
+                };
             if self.lookahead == CommandToken::And {
                 and_or.is_async = true;
             }
@@ -669,40 +713,37 @@ impl<'src> CommandParser<'src> {
         Ok(CompleteCommand { commands })
     }
 
-    fn parse_program(mut self) -> ParseResult<Program> {
-        // program = linebreak (complete_command (complete_command  newline_list)*)? linebreak
-        self.skip_linebreak()?;
-        let mut commands = Vec::new();
-        while self.lookahead != CommandToken::EOF {
-            if commands.len() > 0 {
-                self.match_token(CommandToken::Newline)?;
-                self.skip_linebreak()?;
-            }
-            if self.lookahead == CommandToken::EOF {
-                break;
-            }
-            commands.push(self.parse_complete_command()?);
+    pub fn parse_next_command(
+        &mut self,
+        alias_table: &'src AliasTable,
+    ) -> ParseResult<Option<CompleteCommand>> {
+        if self.lookahead == CommandToken::EOF {
+            return Ok(None);
         }
-
-        Ok(Program { commands })
+        if self.parsed_one_command {
+            self.match_token(CommandToken::Newline)?;
+            self.skip_linebreak()?;
+            if self.lookahead == CommandToken::EOF {
+                return Ok(None);
+            }
+        }
+        let command = self.parse_complete_command(alias_table)?;
+        self.parsed_one_command = true;
+        Ok(Some(command))
     }
 
-    fn new(source: &'src str, alias_table: &'src AliasTable) -> ParseResult<Self> {
+    pub fn new(source: &'src str) -> ParseResult<Self> {
         let mut lexer = CommandLexer::new(source);
         let (lookahead, lookahead_lineno) = lexer.next_token()?;
-        Ok(Self {
+        let mut parser = Self {
             lexer,
-            alias_table,
             lookahead,
             lookahead_lineno,
-        })
+            parsed_one_command: false,
+        };
+        parser.skip_linebreak()?;
+        Ok(parser)
     }
-}
-
-pub type AliasTable = HashMap<String, String>;
-
-pub fn parse(text: &str, alias_table: &AliasTable) -> ParseResult<Program> {
-    CommandParser::new(text, alias_table)?.parse_program()
 }
 
 #[cfg(test)]
@@ -710,6 +751,21 @@ mod tests {
     use crate::parse::word::test_utils::{quoted_literal, unquoted_literal};
 
     use super::*;
+
+    fn parse_complete_command(
+        text: &str,
+        alias_table: AliasTable,
+    ) -> ParseResult<Option<CompleteCommand>> {
+        let mut parser = CommandParser::new(text)?;
+        parser.parse_next_command(&alias_table)
+    }
+
+    fn parse_correct_complete_command(
+        text: &str,
+        alias_table: AliasTable,
+    ) -> Option<CompleteCommand> {
+        parse_complete_command(text, alias_table).expect("parsing failed")
+    }
 
     fn pipeline_from_word(word: Word) -> Pipeline {
         Pipeline {
@@ -734,32 +790,26 @@ mod tests {
         }
     }
 
-    fn unwrap_complete_command(program: Program) -> CompleteCommand {
-        assert_eq!(program.commands.len(), 1);
-        program.commands.into_iter().next().unwrap()
+    fn unwrap_conjunction(cmd: CompleteCommand) -> Conjunction {
+        assert_eq!(cmd.commands.len(), 1);
+        cmd.commands.into_iter().next().unwrap()
     }
 
-    fn unwrap_conjunction(program: Program) -> Conjunction {
-        let complete_command = unwrap_complete_command(program);
-        assert_eq!(complete_command.commands.len(), 1);
-        complete_command.commands.into_iter().next().unwrap()
-    }
-
-    fn unwrap_pipeline(program: Program) -> Pipeline {
-        let conjunction = unwrap_conjunction(program);
+    fn unwrap_pipeline(cmd: CompleteCommand) -> Pipeline {
+        let conjunction = unwrap_conjunction(cmd);
         assert_eq!(conjunction.elements.len(), 1);
         let (pipeline, _) = conjunction.elements.into_iter().next().unwrap();
         pipeline
     }
 
-    fn unwrap_command(program: Program) -> Command {
-        let pipeline = unwrap_pipeline(program);
+    fn unwrap_command(cmd: CompleteCommand) -> Command {
+        let pipeline = unwrap_pipeline(cmd);
         assert_eq!(pipeline.commands.len(), 1);
         pipeline.commands.into_iter().next().unwrap()
     }
 
-    fn unwrap_simple_command(program: Program) -> SimpleCommand {
-        let command = unwrap_command(program);
+    fn unwrap_simple_command(cmd: CompleteCommand) -> SimpleCommand {
+        let command = unwrap_command(cmd);
         if let Command::SimpleCommand(command) = command {
             command
         } else {
@@ -768,7 +818,9 @@ mod tests {
     }
 
     fn parse_simple_command_with_alias_table(text: &str, alias_table: AliasTable) -> SimpleCommand {
-        unwrap_simple_command(parse(text, &alias_table).expect("parsing failed"))
+        unwrap_simple_command(
+            parse_correct_complete_command(text, alias_table).expect("no commands"),
+        )
     }
 
     fn parse_simple_command(text: &str) -> SimpleCommand {
@@ -784,7 +836,9 @@ mod tests {
     }
 
     fn parse_compound_command(text: &str) -> (CompoundCommand, Vec<Redirection>) {
-        let command = unwrap_command(parse(text, &AliasTable::default()).expect("parsing failed"));
+        let command = unwrap_command(
+            parse_correct_complete_command(text, AliasTable::default()).expect("no commands"),
+        );
         if let Command::CompoundCommand {
             command,
             redirections,
@@ -797,19 +851,21 @@ mod tests {
     }
 
     fn parse_command(text: &str) -> Command {
-        unwrap_command(parse(text, &AliasTable::default()).expect("parsing failed"))
+        unwrap_command(
+            parse_correct_complete_command(text, AliasTable::default()).expect("no commands"),
+        )
     }
 
     fn parse_pipeline(text: &str) -> Pipeline {
-        unwrap_pipeline(parse(text, &AliasTable::default()).expect("parsing failed"))
+        unwrap_pipeline(
+            parse_correct_complete_command(text, AliasTable::default()).expect("no commands"),
+        )
     }
 
     fn parse_conjunction(text: &str) -> Conjunction {
-        unwrap_conjunction(parse(text, &AliasTable::default()).expect("parsing failed"))
-    }
-
-    fn parse_complete_command(text: &str) -> CompleteCommand {
-        unwrap_complete_command(parse(text, &AliasTable::default()).expect("parsing failed"))
+        unwrap_conjunction(
+            parse_correct_complete_command(text, AliasTable::default()).expect("no commands"),
+        )
     }
 
     #[test]
@@ -1124,7 +1180,8 @@ mod tests {
 
     #[test]
     fn parse_commands_separated_by_semicolon() {
-        let command = parse_complete_command("a; b");
+        let command =
+            parse_correct_complete_command("a; b", AliasTable::default()).expect("no commands");
         assert_eq!(command.commands.len(), 2);
         assert_eq!(
             command.commands[0],
@@ -1545,54 +1602,64 @@ mod tests {
 
     #[test]
     fn invalid_parameter_is_error() {
-        assert!(parse("$.", &AliasTable::default())
+        assert!(parse_complete_command("$.", AliasTable::default())
             .is_err_and(|err| !err.could_be_resolved_with_more_input));
-        assert!(parse("$\n0", &AliasTable::default())
+        assert!(parse_complete_command("$\n0", AliasTable::default())
             .is_err_and(|err| !err.could_be_resolved_with_more_input));
-        assert!(parse("$", &AliasTable::default())
+        assert!(parse_complete_command("$", AliasTable::default())
             .is_err_and(|err| err.could_be_resolved_with_more_input))
     }
 
     #[test]
     fn invalid_format_specifier_in_parameter_expansion_is_error() {
-        assert!(parse("${word:.other_word}", &AliasTable::default())
+        assert!(
+            parse_complete_command("${word:.other_word}", AliasTable::default())
+                .is_err_and(|err| !err.could_be_resolved_with_more_input)
+        );
+        assert!(parse_complete_command("${word:\n-}", AliasTable::default())
             .is_err_and(|err| !err.could_be_resolved_with_more_input));
-        assert!(parse("${word:\n-}", &AliasTable::default())
-            .is_err_and(|err| !err.could_be_resolved_with_more_input));
-        assert!(parse("${word:", &AliasTable::default())
+        assert!(parse_complete_command("${word:", AliasTable::default())
             .is_err_and(|err| err.could_be_resolved_with_more_input));
 
-        assert!(parse("${word;word}", &AliasTable::default())
-            .is_err_and(|err| !err.could_be_resolved_with_more_input));
-        assert!(parse("${word", &AliasTable::default())
+        assert!(
+            parse_complete_command("${word;word}", AliasTable::default())
+                .is_err_and(|err| !err.could_be_resolved_with_more_input)
+        );
+        assert!(parse_complete_command("${word", AliasTable::default())
             .is_err_and(|err| err.could_be_resolved_with_more_input));
     }
 
     #[test]
     fn unclosed_quotes_are_error() {
-        assert!(parse("\"unclosed string", &AliasTable::default())
-            .is_err_and(|err| err.could_be_resolved_with_more_input));
-        assert!(parse("'unclosed string", &AliasTable::default())
-            .is_err_and(|err| err.could_be_resolved_with_more_input));
+        assert!(
+            parse_complete_command("\"unclosed string", AliasTable::default())
+                .is_err_and(|err| err.could_be_resolved_with_more_input)
+        );
+        assert!(
+            parse_complete_command("'unclosed string", AliasTable::default())
+                .is_err_and(|err| err.could_be_resolved_with_more_input)
+        );
     }
 
     #[test]
     fn out_of_range_file_descriptor_is_error() {
-        assert!(parse("2000> file.txt", &AliasTable::default())
-            .is_err_and(|err| !err.could_be_resolved_with_more_input));
+        assert!(
+            parse_complete_command("2000> file.txt", AliasTable::default())
+                .is_err_and(|err| !err.could_be_resolved_with_more_input)
+        );
     }
 
     #[test]
     fn pipe_with_no_following_command_is_error() {
-        assert!(parse("command |", &AliasTable::default())
+        assert!(parse_complete_command("command |", AliasTable::default())
             .is_err_and(|err| err.could_be_resolved_with_more_input));
     }
 
     #[test]
     fn logical_op_with_no_following_command_is_error() {
-        assert!(parse("command &&", &AliasTable::default())
+        assert!(parse_complete_command("command &&", AliasTable::default())
             .is_err_and(|err| err.could_be_resolved_with_more_input));
-        assert!(parse("command ||", &AliasTable::default())
+        assert!(parse_complete_command("command ||", AliasTable::default())
             .is_err_and(|err| err.could_be_resolved_with_more_input));
     }
 

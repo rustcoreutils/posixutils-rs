@@ -1,5 +1,7 @@
+use std::collections::HashMap;
+
 pub mod command;
-mod command_parser;
+pub mod command_parser;
 mod lexer;
 pub mod word;
 mod word_parser;
@@ -25,6 +27,6 @@ impl ParserError {
     }
 }
 
-type ParseResult<T> = Result<T, ParserError>;
+pub type ParseResult<T> = Result<T, ParserError>;
 
-pub use command_parser::parse;
+pub type AliasTable = HashMap<String, String>;

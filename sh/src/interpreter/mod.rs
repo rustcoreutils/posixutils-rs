@@ -321,15 +321,9 @@ impl Interpreter {
         status
     }
 
-    fn interpret_complete_command(&mut self, command: &CompleteCommand) {
+    pub fn interpret(&mut self, command: &CompleteCommand) {
         for conjunction in &command.commands {
             self.interpret_conjunction(conjunction);
-        }
-    }
-
-    pub fn interpret(&mut self, program: Program) {
-        for command in &program.commands {
-            self.interpret_complete_command(command);
         }
     }
 

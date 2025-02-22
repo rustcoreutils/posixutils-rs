@@ -9,9 +9,9 @@
 
 use crate::cli::{parse_args, ExecutionMode};
 use crate::interpreter::Interpreter;
-use crate::parse::parse;
+use crate::parse::command_parser::CommandParser;
+use crate::parse::{AliasTable, ParseResult};
 use atty::Stream;
-use std::collections::HashMap;
 use std::io;
 
 mod cli;
@@ -19,6 +19,20 @@ mod interpreter;
 mod parse;
 mod program;
 mod utils;
+
+fn execute_program(program: &str, interpreter: &mut Interpreter) -> ParseResult<()> {
+    let mut parser = CommandParser::new(program)?;
+    let alias_table = AliasTable::default();
+    loop {
+        match parser.parse_next_command(&alias_table)? {
+            Some(command) => {
+                interpreter.interpret(&command);
+            }
+            None => break,
+        }
+    }
+    Ok(())
+}
 
 fn main() {
     let is_attached_to_terminal = atty::is(Stream::Stdin) && atty::is(Stream::Stdout);
@@ -33,9 +47,8 @@ fn main() {
             let mut buffer = String::new();
             let stdin = io::stdin();
             while stdin.read_line(&mut buffer).is_ok_and(|n| n > 0) {
-                match parse(&buffer, &HashMap::default()) {
-                    Ok(program) => {
-                        interpreter.interpret(program);
+                match execute_program(&buffer, &mut interpreter) {
+                    Ok(_) => {
                         buffer.clear();
                     }
                     Err(err) if !err.could_be_resolved_with_more_input => {
@@ -54,16 +67,12 @@ fn main() {
             match other {
                 ExecutionMode::ReadCommandsFromString(command_string) => {
                     // TODO: impl proper error reporting
-                    let program =
-                        parse(&command_string, &HashMap::default()).expect("parsing error");
-                    interpreter.interpret(program);
+                    execute_program(&command_string, &mut interpreter).expect("parsing error");
                 }
                 ExecutionMode::ReadFromFile(file) => {
                     // TODO: impl proper error reporting
                     let file_contents = std::fs::read_to_string(file).expect("could not read file");
-                    let program =
-                        parse(&file_contents, &HashMap::default()).expect("parsing error");
-                    interpreter.interpret(program);
+                    execute_program(&file_contents, &mut interpreter).expect("parsing error");
                 }
                 _ => unreachable!(),
             }

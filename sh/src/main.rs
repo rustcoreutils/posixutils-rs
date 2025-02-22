@@ -37,13 +37,10 @@ fn execute_program(program: &str, interpreter: &mut Interpreter) -> ParseResult<
 fn main() {
     let is_attached_to_terminal = atty::is(Stream::Stdin) && atty::is(Stream::Stdout);
     let args = parse_args(std::env::args().collect(), is_attached_to_terminal).unwrap();
+    let mut interpreter =
+        Interpreter::initialize_from_system(args.program_name, args.arguments, args.set_options);
     match args.execution_mode {
         ExecutionMode::Interactive | ExecutionMode::ReadCommandsFromStdin => {
-            let mut interpreter = Interpreter::initialize_from_system(
-                args.program_name,
-                args.arguments,
-                args.set_options,
-            );
             let mut buffer = String::new();
             let stdin = io::stdin();
             while stdin.read_line(&mut buffer).is_ok_and(|n| n > 0) {
@@ -59,11 +56,6 @@ fn main() {
             }
         }
         other => {
-            let mut interpreter = Interpreter::initialize_from_system(
-                args.program_name,
-                args.arguments,
-                args.set_options,
-            );
             match other {
                 ExecutionMode::ReadCommandsFromString(command_string) => {
                     // TODO: impl proper error reporting

@@ -11,6 +11,7 @@ use crate::cli::{parse_args, ExecutionMode};
 use crate::interpreter::Interpreter;
 use crate::parse::parse;
 use atty::Stream;
+use std::collections::HashMap;
 use std::io;
 
 mod cli;
@@ -32,7 +33,7 @@ fn main() {
             let mut buffer = String::new();
             let stdin = io::stdin();
             while stdin.read_line(&mut buffer).is_ok_and(|n| n > 0) {
-                match parse(&buffer) {
+                match parse(&buffer, &HashMap::default()) {
                     Ok(program) => {
                         interpreter.interpret(program);
                         buffer.clear();
@@ -53,13 +54,15 @@ fn main() {
             match other {
                 ExecutionMode::ReadCommandsFromString(command_string) => {
                     // TODO: impl proper error reporting
-                    let program = parse(&command_string).expect("parsing error");
+                    let program =
+                        parse(&command_string, &HashMap::default()).expect("parsing error");
                     interpreter.interpret(program);
                 }
                 ExecutionMode::ReadFromFile(file) => {
                     // TODO: impl proper error reporting
                     let file_contents = std::fs::read_to_string(file).expect("could not read file");
-                    let program = parse(&file_contents).expect("parsing error");
+                    let program =
+                        parse(&file_contents, &HashMap::default()).expect("parsing error");
                     interpreter.interpret(program);
                 }
                 _ => unreachable!(),

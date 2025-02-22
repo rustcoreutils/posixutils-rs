@@ -13,10 +13,13 @@ use crate::parse::command::{
     RedirectionKind, SimpleCommand,
 };
 use crate::parse::lexer::command_lexer::{CommandLexer, CommandToken};
+use crate::parse::lexer::is_blank;
 use crate::parse::word::Word;
 use crate::parse::word_parser::parse_word;
 use crate::parse::{ParseResult, ParserError};
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::rc::Rc;
 
 fn is_valid_name(name: &str) -> bool {
@@ -34,9 +37,9 @@ fn try_into_assignment(
     word: &str,
     line_no: u32,
     reached_eof: bool,
-) -> ParseResult<Result<Assignment, Word>> {
+) -> ParseResult<Result<Assignment, &str>> {
     if !word.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
-        return parse_word(word, line_no, reached_eof).map(Err);
+        return Ok(Err(word));
     }
     if let Some((pos, c)) = word
         .char_indices()
@@ -48,16 +51,17 @@ fn try_into_assignment(
             parse_word(&value[1..], line_no, reached_eof)
                 .map(|value| Ok(Assignment { name, value }))
         } else {
-            parse_word(word, line_no, reached_eof).map(Err)
+            Ok(Err(word))
         }
     } else {
-        parse_word(word, line_no, reached_eof).map(Err)
+        Ok(Err(word))
     }
 }
 
 struct CommandParser<'src> {
     lexer: CommandLexer<'src>,
     lookahead: CommandToken<'src>,
+    alias_table: &'src HashMap<String, String>,
     lookahead_lineno: u32,
 }
 
@@ -214,32 +218,69 @@ impl<'src> CommandParser<'src> {
         }
     }
 
-    fn parse_simple_command(
+    fn alias_substitution(
         &mut self,
-        start: Option<&str>,
-        end: CommandToken,
-    ) -> ParseResult<Option<SimpleCommand>> {
+        word: String,
+        apply_alias_substitution_to_next_word: &mut bool,
+    ) -> ParseResult<Option<Word>> {
+        let mut substitution_stack = Vec::new();
+        substitution_stack.push(word);
+        loop {
+            let top = substitution_stack.last().unwrap();
+            if let Some(alias) = self.alias_table.get(top) {
+                self.lexer.insert_text_at_current_position(alias);
+                self.advance()?;
+                // TODO: cleanup allocations
+                if let CommandToken::Word(word) = &self.lookahead {
+                    if substitution_stack.contains(&word.to_string()) {
+                        if !alias.ends_with(|c| is_blank(c)) {
+                            *apply_alias_substitution_to_next_word = false
+                        }
+                        return parse_word(word, 0, true).map(Some);
+                    } else {
+                        substitution_stack.push(word.to_string());
+                    }
+                } else {
+                    return Ok(None);
+                }
+            } else {
+                return parse_word(top, 0, true).map(Some);
+            }
+        }
+    }
+
+    fn parse_simple_command(&mut self, end: CommandToken) -> ParseResult<Option<SimpleCommand>> {
         // simple_command = (io_redirect | assignment_word)* word? (io_redirect | word)*
 
         let mut command = SimpleCommand::default();
-
-        if let Some(word) = start {
-            match try_into_assignment(&word, self.lookahead_lineno, self.reached_eof())? {
-                Ok(assignment) => command.assignments.push(assignment),
-                Err(word) => command.words.push(word),
-            }
-        }
+        let mut continue_to_apply_alias_substitution = true;
 
         while command.words.is_empty() {
             if self.lookahead == end {
                 return Ok(command.none_if_empty());
             }
-            match self.advance_if_word()? {
+            match self.lookahead.as_word_str() {
                 Some(word) => {
                     match try_into_assignment(&word, self.lookahead_lineno, self.reached_eof())? {
                         Ok(assignment) => command.assignments.push(assignment),
-                        Err(word) => command.words.push(word),
+                        Err(word) => {
+                            if continue_to_apply_alias_substitution {
+                                let word = word.to_string();
+                                let next_word = self.alias_substitution(
+                                    word,
+                                    &mut continue_to_apply_alias_substitution,
+                                )?;
+                                command.words.extend(next_word.into_iter());
+                            } else {
+                                command.words.push(parse_word(
+                                    word,
+                                    self.lookahead_lineno,
+                                    self.reached_eof(),
+                                )?);
+                            }
+                        }
                     }
+                    self.advance()?;
                 }
                 None => match self.parse_redirection_opt()? {
                     Some(redirection) => command.redirections.push(redirection),
@@ -250,14 +291,24 @@ impl<'src> CommandParser<'src> {
 
         loop {
             if self.lookahead == end {
-                // at this point command cannot be empty, it has at least one word
                 return Ok(command.none_if_empty());
             }
-            let line_no = self.lookahead_lineno;
-            match self.advance_if_word()? {
-                Some(word) => command
-                    .words
-                    .push(parse_word(&word, line_no, self.reached_eof())?),
+            match self.lookahead.as_word_str() {
+                Some(word) => {
+                    if continue_to_apply_alias_substitution {
+                        let word = word.to_string();
+                        let next_word = self
+                            .alias_substitution(word, &mut continue_to_apply_alias_substitution)?;
+                        command.words.extend(next_word.into_iter());
+                    } else {
+                        command.words.push(parse_word(
+                            word,
+                            self.lookahead_lineno,
+                            self.reached_eof(),
+                        )?);
+                    }
+                    self.advance()?;
+                }
                 None => match self.parse_redirection_opt()? {
                     Some(redirection) => command.redirections.push(redirection),
                     None => break,
@@ -519,14 +570,13 @@ impl<'src> CommandParser<'src> {
                             .map(Command::FunctionDefinition)
                             .map(Some)
                     } else {
-                        Ok(self
-                            .parse_simple_command(Some(&word), end)?
-                            .map(Command::SimpleCommand))
+                        // not a function, rollback the lookahead
+                        self.lexer.rollback_last_token();
+                        self.lookahead = CommandToken::Word(word);
+                        Ok(self.parse_simple_command(end)?.map(Command::SimpleCommand))
                     }
                 }
-                _ => Ok(self
-                    .parse_simple_command(None, end)?
-                    .map(Command::SimpleCommand)),
+                _ => Ok(self.parse_simple_command(end)?.map(Command::SimpleCommand)),
             }
         }
     }
@@ -637,19 +687,22 @@ impl<'src> CommandParser<'src> {
         Ok(Program { commands })
     }
 
-    fn new(source: &'src str) -> ParseResult<Self> {
+    fn new(source: &'src str, alias_table: &'src AliasTable) -> ParseResult<Self> {
         let mut lexer = CommandLexer::new(source);
         let (lookahead, lookahead_lineno) = lexer.next_token()?;
         Ok(Self {
             lexer,
+            alias_table,
             lookahead,
             lookahead_lineno,
         })
     }
 }
 
-pub fn parse(text: &str) -> ParseResult<Program> {
-    CommandParser::new(text)?.parse_program()
+pub type AliasTable = HashMap<String, String>;
+
+pub fn parse(text: &str, alias_table: &AliasTable) -> ParseResult<Program> {
+    CommandParser::new(text, alias_table)?.parse_program()
 }
 
 #[cfg(test)]
@@ -714,8 +767,12 @@ mod tests {
         }
     }
 
+    fn parse_simple_command_with_alias_table(text: &str, alias_table: AliasTable) -> SimpleCommand {
+        unwrap_simple_command(parse(text, &alias_table).expect("parsing failed"))
+    }
+
     fn parse_simple_command(text: &str) -> SimpleCommand {
-        unwrap_simple_command(parse(text).expect("parsing failed"))
+        parse_simple_command_with_alias_table(text, AliasTable::default())
     }
 
     fn parse_single_redirection(text: &str) -> Redirection {
@@ -727,7 +784,7 @@ mod tests {
     }
 
     fn parse_compound_command(text: &str) -> (CompoundCommand, Vec<Redirection>) {
-        let command = unwrap_command(parse(text).expect("parsing failed"));
+        let command = unwrap_command(parse(text, &AliasTable::default()).expect("parsing failed"));
         if let Command::CompoundCommand {
             command,
             redirections,
@@ -740,19 +797,19 @@ mod tests {
     }
 
     fn parse_command(text: &str) -> Command {
-        unwrap_command(parse(text).expect("parsing failed"))
+        unwrap_command(parse(text, &AliasTable::default()).expect("parsing failed"))
     }
 
     fn parse_pipeline(text: &str) -> Pipeline {
-        unwrap_pipeline(parse(text).expect("parsing failed"))
+        unwrap_pipeline(parse(text, &AliasTable::default()).expect("parsing failed"))
     }
 
     fn parse_conjunction(text: &str) -> Conjunction {
-        unwrap_conjunction(parse(text).expect("parsing failed"))
+        unwrap_conjunction(parse(text, &AliasTable::default()).expect("parsing failed"))
     }
 
     fn parse_complete_command(text: &str) -> CompleteCommand {
-        unwrap_complete_command(parse(text).expect("parsing failed"))
+        unwrap_complete_command(parse(text, &AliasTable::default()).expect("parsing failed"))
     }
 
     #[test]
@@ -1488,42 +1545,351 @@ mod tests {
 
     #[test]
     fn invalid_parameter_is_error() {
-        assert!(parse("$.").is_err_and(|err| !err.could_be_resolved_with_more_input));
-        assert!(parse("$\n0").is_err_and(|err| !err.could_be_resolved_with_more_input));
-        assert!(parse("$").is_err_and(|err| err.could_be_resolved_with_more_input))
+        assert!(parse("$.", &AliasTable::default())
+            .is_err_and(|err| !err.could_be_resolved_with_more_input));
+        assert!(parse("$\n0", &AliasTable::default())
+            .is_err_and(|err| !err.could_be_resolved_with_more_input));
+        assert!(parse("$", &AliasTable::default())
+            .is_err_and(|err| err.could_be_resolved_with_more_input))
     }
 
     #[test]
     fn invalid_format_specifier_in_parameter_expansion_is_error() {
-        assert!(
-            parse("${word:.other_word}").is_err_and(|err| !err.could_be_resolved_with_more_input)
-        );
-        assert!(parse("${word:\n-}").is_err_and(|err| !err.could_be_resolved_with_more_input));
-        assert!(parse("${word:").is_err_and(|err| err.could_be_resolved_with_more_input));
+        assert!(parse("${word:.other_word}", &AliasTable::default())
+            .is_err_and(|err| !err.could_be_resolved_with_more_input));
+        assert!(parse("${word:\n-}", &AliasTable::default())
+            .is_err_and(|err| !err.could_be_resolved_with_more_input));
+        assert!(parse("${word:", &AliasTable::default())
+            .is_err_and(|err| err.could_be_resolved_with_more_input));
 
-        assert!(parse("${word;word}").is_err_and(|err| !err.could_be_resolved_with_more_input));
-        assert!(parse("${word").is_err_and(|err| err.could_be_resolved_with_more_input));
+        assert!(parse("${word;word}", &AliasTable::default())
+            .is_err_and(|err| !err.could_be_resolved_with_more_input));
+        assert!(parse("${word", &AliasTable::default())
+            .is_err_and(|err| err.could_be_resolved_with_more_input));
     }
 
     #[test]
     fn unclosed_quotes_are_error() {
-        assert!(parse("\"unclosed string").is_err_and(|err| err.could_be_resolved_with_more_input));
-        assert!(parse("'unclosed string").is_err_and(|err| err.could_be_resolved_with_more_input));
+        assert!(parse("\"unclosed string", &AliasTable::default())
+            .is_err_and(|err| err.could_be_resolved_with_more_input));
+        assert!(parse("'unclosed string", &AliasTable::default())
+            .is_err_and(|err| err.could_be_resolved_with_more_input));
     }
 
     #[test]
     fn out_of_range_file_descriptor_is_error() {
-        assert!(parse("2000> file.txt").is_err_and(|err| !err.could_be_resolved_with_more_input));
+        assert!(parse("2000> file.txt", &AliasTable::default())
+            .is_err_and(|err| !err.could_be_resolved_with_more_input));
     }
 
     #[test]
     fn pipe_with_no_following_command_is_error() {
-        assert!(parse("command |").is_err_and(|err| err.could_be_resolved_with_more_input));
+        assert!(parse("command |", &AliasTable::default())
+            .is_err_and(|err| err.could_be_resolved_with_more_input));
     }
 
     #[test]
     fn logical_op_with_no_following_command_is_error() {
-        assert!(parse("command &&").is_err_and(|err| err.could_be_resolved_with_more_input));
-        assert!(parse("command ||").is_err_and(|err| err.could_be_resolved_with_more_input));
+        assert!(parse("command &&", &AliasTable::default())
+            .is_err_and(|err| err.could_be_resolved_with_more_input));
+        assert!(parse("command ||", &AliasTable::default())
+            .is_err_and(|err| err.could_be_resolved_with_more_input));
+    }
+
+    #[test]
+    fn alias_substitution_word_to_word() {
+        assert_eq!(
+            parse_simple_command_with_alias_table(
+                "cmd_x",
+                AliasTable::from([("cmd_x".to_string(), "cmd_y".to_string())])
+            ),
+            SimpleCommand {
+                words: vec![unquoted_literal("cmd_y")],
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            parse_simple_command_with_alias_table(
+                "cmd_x arg1 arg2",
+                AliasTable::from([("cmd_x".to_string(), "cmd_y".to_string())])
+            ),
+            SimpleCommand {
+                words: vec![
+                    unquoted_literal("cmd_y"),
+                    unquoted_literal("arg1"),
+                    unquoted_literal("arg2")
+                ],
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn alias_substitution_word_to_words() {
+        assert_eq!(
+            parse_simple_command_with_alias_table(
+                "cmd_x",
+                AliasTable::from([("cmd_x".to_string(), "cmd_y arg1 arg2".to_string())])
+            ),
+            SimpleCommand {
+                words: vec![
+                    unquoted_literal("cmd_y"),
+                    unquoted_literal("arg1"),
+                    unquoted_literal("arg2")
+                ],
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            parse_simple_command_with_alias_table(
+                "cmd_x arg3 arg4",
+                AliasTable::from([("cmd_x".to_string(), "cmd_y arg1 arg2".to_string())])
+            ),
+            SimpleCommand {
+                words: vec![
+                    unquoted_literal("cmd_y"),
+                    unquoted_literal("arg1"),
+                    unquoted_literal("arg2"),
+                    unquoted_literal("arg3"),
+                    unquoted_literal("arg4"),
+                ],
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn recursive_alias_substitution_word_to_word() {
+        assert_eq!(
+            parse_simple_command_with_alias_table(
+                "cmd_x",
+                AliasTable::from([
+                    ("cmd_x".to_string(), "cmd_y".to_string()),
+                    ("cmd_y".to_string(), "cmd_z".to_string())
+                ])
+            ),
+            SimpleCommand {
+                words: vec![unquoted_literal("cmd_z")],
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            parse_simple_command_with_alias_table(
+                "cmd_x",
+                AliasTable::from([
+                    ("cmd_x".to_string(), "cmd_y".to_string()),
+                    ("cmd_y".to_string(), "cmd_z".to_string()),
+                    ("cmd_z".to_string(), "cmd_w".to_string())
+                ])
+            ),
+            SimpleCommand {
+                words: vec![unquoted_literal("cmd_w")],
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            parse_simple_command_with_alias_table(
+                "cmd_x arg1 arg2",
+                AliasTable::from([
+                    ("cmd_x".to_string(), "cmd_y".to_string()),
+                    ("cmd_y".to_string(), "cmd_z".to_string()),
+                    ("cmd_z".to_string(), "cmd_w".to_string())
+                ])
+            ),
+            SimpleCommand {
+                words: vec![
+                    unquoted_literal("cmd_w"),
+                    unquoted_literal("arg1"),
+                    unquoted_literal("arg2")
+                ],
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn recursive_alias_substitution_word_to_words() {
+        assert_eq!(
+            parse_simple_command_with_alias_table(
+                "cmd_x",
+                AliasTable::from([
+                    ("cmd_x".to_string(), "cmd_y arg1 arg2".to_string()),
+                    ("cmd_y".to_string(), "cmd_z arg3".to_string())
+                ])
+            ),
+            SimpleCommand {
+                words: vec![
+                    unquoted_literal("cmd_z"),
+                    unquoted_literal("arg3"),
+                    unquoted_literal("arg1"),
+                    unquoted_literal("arg2")
+                ],
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            parse_simple_command_with_alias_table(
+                "cmd_x arg4 arg5",
+                AliasTable::from([
+                    ("cmd_x".to_string(), "cmd_y arg2 arg3".to_string()),
+                    ("cmd_y".to_string(), "cmd_z arg1".to_string())
+                ])
+            ),
+            SimpleCommand {
+                words: vec![
+                    unquoted_literal("cmd_z"),
+                    unquoted_literal("arg1"),
+                    unquoted_literal("arg2"),
+                    unquoted_literal("arg3"),
+                    unquoted_literal("arg4"),
+                    unquoted_literal("arg5"),
+                ],
+                ..Default::default()
+            }
+        )
+    }
+
+    #[test]
+    fn recursive_alias_substitution_word_to_word_with_cycle() {
+        assert_eq!(
+            parse_simple_command_with_alias_table(
+                "cmd_x",
+                AliasTable::from([
+                    ("cmd_x".to_string(), "cmd_y".to_string()),
+                    ("cmd_y".to_string(), "cmd_x".to_string())
+                ])
+            ),
+            SimpleCommand {
+                words: vec![unquoted_literal("cmd_x")],
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            parse_simple_command_with_alias_table(
+                "cmd_x arg1 arg2",
+                AliasTable::from([
+                    ("cmd_x".to_string(), "cmd_y".to_string()),
+                    ("cmd_y".to_string(), "cmd_x".to_string())
+                ])
+            ),
+            SimpleCommand {
+                words: vec![
+                    unquoted_literal("cmd_x"),
+                    unquoted_literal("arg1"),
+                    unquoted_literal("arg2")
+                ],
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            parse_simple_command_with_alias_table(
+                "cmd1",
+                AliasTable::from([
+                    ("cmd1".to_string(), "cmd2".to_string()),
+                    ("cmd2".to_string(), "cmd3".to_string()),
+                    ("cmd3".to_string(), "cmd2".to_string())
+                ])
+            ),
+            SimpleCommand {
+                words: vec![unquoted_literal("cmd2")],
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn recursive_alias_substitution_word_to_words_with_cycle() {
+        assert_eq!(
+            parse_simple_command_with_alias_table(
+                "cmd_x",
+                AliasTable::from([
+                    ("cmd_x".to_string(), "cmd_y arg2".to_string()),
+                    ("cmd_y".to_string(), "cmd_x arg1".to_string())
+                ])
+            ),
+            SimpleCommand {
+                words: vec![
+                    unquoted_literal("cmd_x"),
+                    unquoted_literal("arg1"),
+                    unquoted_literal("arg2")
+                ],
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            parse_simple_command_with_alias_table(
+                "cmd_x arg3 arg4",
+                AliasTable::from([
+                    ("cmd_x".to_string(), "cmd_y arg2".to_string()),
+                    ("cmd_y".to_string(), "cmd_x arg1".to_string())
+                ])
+            ),
+            SimpleCommand {
+                words: vec![
+                    unquoted_literal("cmd_x"),
+                    unquoted_literal("arg1"),
+                    unquoted_literal("arg2"),
+                    unquoted_literal("arg3"),
+                    unquoted_literal("arg4"),
+                ],
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            parse_simple_command_with_alias_table(
+                "cmd1 arg4 arg5",
+                AliasTable::from([
+                    ("cmd1".to_string(), "cmd2 arg3".to_string()),
+                    ("cmd2".to_string(), "cmd3 arg2".to_string()),
+                    ("cmd3".to_string(), "cmd2 arg1".to_string())
+                ])
+            ),
+            SimpleCommand {
+                words: vec![
+                    unquoted_literal("cmd2"),
+                    unquoted_literal("arg1"),
+                    unquoted_literal("arg2"),
+                    unquoted_literal("arg3"),
+                    unquoted_literal("arg4"),
+                    unquoted_literal("arg5"),
+                ],
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn continued_alias_substitution() {
+        assert_eq!(
+            parse_simple_command_with_alias_table(
+                "cmd_x arg1",
+                AliasTable::from([
+                    ("cmd_x".to_string(), "cmd_y ".to_string()),
+                    ("arg1".to_string(), "arg2".to_string())
+                ])
+            ),
+            SimpleCommand {
+                words: vec![unquoted_literal("cmd_y"), unquoted_literal("arg2")],
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            parse_simple_command_with_alias_table(
+                "cmd_x arg1 arg2",
+                AliasTable::from([
+                    ("cmd_x".to_string(), "cmd_y ".to_string()),
+                    ("arg1".to_string(), "arg_x ".to_string()),
+                    ("arg2".to_string(), "arg_y ".to_string())
+                ])
+            ),
+            SimpleCommand {
+                words: vec![
+                    unquoted_literal("cmd_y"),
+                    unquoted_literal("arg_x"),
+                    unquoted_literal("arg_y")
+                ],
+                ..Default::default()
+            }
+        );
     }
 }

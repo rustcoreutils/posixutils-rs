@@ -123,8 +123,14 @@ impl<'s> SourceString<'s> {
             text: string,
             in_original_string: false,
         });
-        self.parts.push(p2);
-        self.parts[self.read_state.current_part + 1..].rotate_right(2);
+        if p2.text.is_empty() {
+            self.parts[self.read_state.current_part + 1..].rotate_right(1);
+        } else {
+            self.parts.push(p2);
+            self.parts[self.read_state.current_part + 1..].rotate_right(2);
+        }
+
+        self.read_state.reached_eof = false;
         self.read_state.current_part_char_index = 0;
         self.read_state.current_part += 1;
         self.read_state.current_part_char_iter = self.parts[self.read_state.current_part]
@@ -342,6 +348,7 @@ fn char_to_operator_token(c: char) -> Option<CommandToken<'static>> {
 
 pub struct CommandLexer<'src> {
     source: SourceString<'src>,
+    prev_read_state: SourceReadState<'src>,
 }
 
 impl Lexer for CommandLexer<'_> {
@@ -408,6 +415,7 @@ impl<'src> CommandLexer<'src> {
     }
 
     pub fn next_token(&mut self) -> ParseResult<(CommandToken<'src>, u32)> {
+        self.prev_read_state = self.source.read_state.clone();
         self.skip_blanks();
         self.skip_comment();
 
@@ -490,9 +498,16 @@ impl<'src> CommandLexer<'src> {
         self.source.insert_string_after_last_char(text);
     }
 
+    pub fn rollback_last_token(&mut self) {
+        self.source.read_state = self.prev_read_state.clone();
+    }
+
     pub fn new(source: &'src str) -> Self {
+        let source = SourceString::new(source);
+        let initial_read_state = source.read_state.clone();
         Self {
-            source: SourceString::new(source),
+            source,
+            prev_read_state: initial_read_state,
         }
     }
 }
@@ -676,5 +691,18 @@ mod tests {
             lex.next_token().unwrap().0,
             CommandToken::Word("123".into())
         );
+    }
+
+    #[test]
+    fn insert_text() {
+        let mut lex = CommandLexer::new("a b c");
+        assert_eq!(lex.next_token().unwrap().0, CommandToken::Word("a".into()));
+        lex.insert_text_at_current_position("x");
+        assert_eq!(lex.next_token().unwrap().0, CommandToken::Word("x".into()));
+        assert_eq!(lex.next_token().unwrap().0, CommandToken::Word("b".into()));
+        assert_eq!(lex.next_token().unwrap().0, CommandToken::Word("c".into()));
+        lex.insert_text_at_current_position("y");
+        assert_eq!(lex.next_token().unwrap().0, CommandToken::Word("y".into()));
+        assert_eq!(lex.next_token().unwrap().0, CommandToken::EOF);
     }
 }

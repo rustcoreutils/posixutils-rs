@@ -5,7 +5,7 @@ use std::borrow::Cow;
 pub mod command_lexer;
 pub mod word_lexer;
 
-fn is_blank(c: char) -> bool {
+pub fn is_blank(c: char) -> bool {
     c == ' ' || c == '\t'
 }
 

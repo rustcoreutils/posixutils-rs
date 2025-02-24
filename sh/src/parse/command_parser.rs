@@ -25,12 +25,6 @@ fn is_valid_name(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-fn is_valid_alias_name(name: &str) -> bool {
-    name.chars().all(|c| {
-        c.is_ascii_alphanumeric() || c == '_' || c == '!' || c == '%' || c == ',' || c == '@'
-    })
-}
-
 fn try_into_assignment(word: &str, line_no: u32) -> ParseResult<Result<Assignment, &str>> {
     if !word.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
         return Ok(Err(word));

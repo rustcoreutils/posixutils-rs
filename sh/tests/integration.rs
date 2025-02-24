@@ -208,6 +208,38 @@ mod quoting {
             include_str!("sh/quoting/backslash_inside_double_quotes.out"),
         )
     }
+
+    #[test]
+    fn parameter_expansion_inside_double_quotes() {
+        test_script(
+            include_str!("sh/quoting/parameter_expansion_inside_double_quotes.sh"),
+            include_str!("sh/quoting/parameter_expansion_inside_double_quotes.out"),
+        )
+    }
+
+    #[test]
+    fn command_substitution_inside_double_quotes() {
+        test_script(
+            include_str!("sh/quoting/command_substitution_inside_double_quotes.sh"),
+            include_str!("sh/quoting/command_substitution_inside_double_quotes.out"),
+        )
+    }
+
+    #[test]
+    fn arithmetic_expansion_inside_double_quotes() {
+        test_script(
+            include_str!("sh/quoting/arithmetic_expansion_inside_double_quotes.sh"),
+            include_str!("sh/quoting/arithmetic_expansion_inside_double_quotes.out"),
+        )
+    }
+
+    #[test]
+    fn backtick_command_substitution_inside_double_quotes() {
+        test_script(
+            include_str!("sh/quoting/backtick_command_substitution_inside_double_quotes.sh"),
+            include_str!("sh/quoting/backtick_command_substitution_inside_double_quotes.out"),
+        )
+    }
 }
 
 #[test]

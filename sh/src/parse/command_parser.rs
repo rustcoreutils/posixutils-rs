@@ -205,34 +205,38 @@ impl<'src> CommandParser<'src> {
         }
     }
 
+    fn is_currently_processing_substitution(&self, word: &str) -> bool {
+        self.lexer.is_currently_processing_tag(word)
+    }
+
     fn alias_substitution(
         &mut self,
         word: Cow<'src, str>,
         apply_alias_substitution_to_next_word: &mut bool,
         alias_table: &AliasTable,
     ) -> ParseResult<Option<Word>> {
-        let mut substitution_stack = Vec::new();
-        substitution_stack.push(word);
+        let mut next_substitution = word;
         loop {
-            let top = substitution_stack.last().unwrap();
-            if let Some(alias) = alias_table.get(top.as_ref()) {
-                self.lexer
-                    .insert_text_at_current_position(alias.to_string().into());
+            if self.is_currently_processing_substitution(next_substitution.as_ref()) {
+                return parse_word(&next_substitution, self.lookahead_lineno).map(Some);
+            }
+            if let Some(alias) = alias_table.get(next_substitution.as_ref()) {
+                if !alias.ends_with(|c| is_blank(c)) {
+                    *apply_alias_substitution_to_next_word = false
+                }
+                self.lexer.insert_text_at_current_position(
+                    alias.to_string().into(),
+                    next_substitution.as_ref(),
+                );
                 self.advance()?;
                 if let CommandToken::Word(word) = &self.lookahead {
-                    if substitution_stack.contains(word) {
-                        if !alias.ends_with(|c| is_blank(c)) {
-                            *apply_alias_substitution_to_next_word = false
-                        }
-                        return parse_word(&word, self.lookahead_lineno).map(Some);
-                    } else {
-                        substitution_stack.push(word.clone());
-                    }
+                    next_substitution = word.clone();
                 } else {
                     return Ok(None);
                 }
             } else {
-                return parse_word(top, self.lookahead_lineno).map(Some);
+                *apply_alias_substitution_to_next_word = false;
+                return parse_word(next_substitution.as_ref(), self.lookahead_lineno).map(Some);
             }
         }
     }
@@ -1922,6 +1926,84 @@ mod tests {
                     unquoted_literal("arg_y")
                 ],
                 ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn alias_substitution_word_to_conjunction() {
+        let command = parse_correct_complete_command(
+            "cmd_x",
+            AliasTable::from([("cmd_x".to_string(), "cmd_y && cmd_z".to_string())]),
+        )
+        .expect("no commands");
+        assert_eq!(
+            command,
+            CompleteCommand {
+                commands: vec![Conjunction {
+                    elements: vec![
+                        (
+                            Pipeline {
+                                commands: vec![Command::SimpleCommand(SimpleCommand {
+                                    words: vec![unquoted_literal("cmd_y")],
+                                    ..Default::default()
+                                })],
+                                negate_status: false
+                            },
+                            LogicalOp::And
+                        ),
+                        (
+                            Pipeline {
+                                commands: vec![Command::SimpleCommand(SimpleCommand {
+                                    words: vec![unquoted_literal("cmd_z")],
+                                    ..Default::default()
+                                })],
+                                negate_status: false
+                            },
+                            LogicalOp::None
+                        )
+                    ],
+                    is_async: false
+                }]
+            }
+        );
+    }
+
+    #[test]
+    fn recursive_alias_substitution_word_to_conjunction() {
+        let command = parse_correct_complete_command(
+            "cmd_x",
+            AliasTable::from([("cmd_x".to_string(), "cmd_y && cmd_x".to_string())]),
+        )
+        .expect("no commands");
+        assert_eq!(
+            command,
+            CompleteCommand {
+                commands: vec![Conjunction {
+                    elements: vec![
+                        (
+                            Pipeline {
+                                commands: vec![Command::SimpleCommand(SimpleCommand {
+                                    words: vec![unquoted_literal("cmd_y")],
+                                    ..Default::default()
+                                })],
+                                negate_status: false
+                            },
+                            LogicalOp::And
+                        ),
+                        (
+                            Pipeline {
+                                commands: vec![Command::SimpleCommand(SimpleCommand {
+                                    words: vec![unquoted_literal("cmd_x")],
+                                    ..Default::default()
+                                })],
+                                negate_status: false
+                            },
+                            LogicalOp::None
+                        )
+                    ],
+                    is_async: false
+                }]
             }
         );
     }

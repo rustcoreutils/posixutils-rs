@@ -215,14 +215,15 @@ impl<'src> CommandParser<'src> {
         &mut self,
         word: Cow<'src, str>,
         apply_alias_substitution_to_next_word: &mut bool,
-        alias_table: &'src AliasTable,
+        alias_table: &AliasTable,
     ) -> ParseResult<Option<Word>> {
         let mut substitution_stack = Vec::new();
         substitution_stack.push(word);
         loop {
             let top = substitution_stack.last().unwrap();
             if let Some(alias) = alias_table.get(top.as_ref()) {
-                self.lexer.insert_text_at_current_position(alias);
+                self.lexer
+                    .insert_text_at_current_position(alias.to_string().into());
                 self.advance()?;
                 if let CommandToken::Word(word) = &self.lookahead {
                     if substitution_stack.contains(word) {
@@ -245,7 +246,7 @@ impl<'src> CommandParser<'src> {
     fn parse_simple_command(
         &mut self,
         end: CommandToken,
-        alias_table: &'src AliasTable,
+        alias_table: &AliasTable,
     ) -> ParseResult<Option<SimpleCommand>> {
         // simple_command = (io_redirect | assignment_word)* word? (io_redirect | word)*
 
@@ -313,7 +314,7 @@ impl<'src> CommandParser<'src> {
     fn parse_compound_list(
         &mut self,
         end: CommandToken,
-        alias_table: &'src AliasTable,
+        alias_table: &AliasTable,
     ) -> ParseResult<CompleteCommand> {
         self.skip_linebreak()?;
         let list_start = self.lookahead_lineno;
@@ -362,7 +363,7 @@ impl<'src> CommandParser<'src> {
         Ok(CompleteCommand { commands })
     }
 
-    fn parse_brace_group(&mut self, alias_table: &'src AliasTable) -> ParseResult<CompoundCommand> {
+    fn parse_brace_group(&mut self, alias_table: &AliasTable) -> ParseResult<CompoundCommand> {
         // consume '{'
         self.advance()?;
         let inner = self.parse_compound_list(CommandToken::RBrace, alias_table)?;
@@ -370,7 +371,7 @@ impl<'src> CommandParser<'src> {
         Ok(CompoundCommand::BraceGroup(inner))
     }
 
-    fn parse_subshell(&mut self, alias_table: &'src AliasTable) -> ParseResult<CompoundCommand> {
+    fn parse_subshell(&mut self, alias_table: &AliasTable) -> ParseResult<CompoundCommand> {
         // consume '('
         self.advance()?;
         let inner = self.parse_compound_list(CommandToken::RParen, alias_table)?;
@@ -378,14 +379,14 @@ impl<'src> CommandParser<'src> {
         Ok(CompoundCommand::Subshell(inner))
     }
 
-    fn parse_do_group(&mut self, alias_table: &'src AliasTable) -> ParseResult<CompleteCommand> {
+    fn parse_do_group(&mut self, alias_table: &AliasTable) -> ParseResult<CompleteCommand> {
         self.match_token(CommandToken::Do)?;
         let inner = self.parse_compound_list(CommandToken::Done, alias_table)?;
         self.match_token(CommandToken::Done)?;
         Ok(inner)
     }
 
-    fn parse_for_clause(&mut self, alias_table: &'src AliasTable) -> ParseResult<CompoundCommand> {
+    fn parse_for_clause(&mut self, alias_table: &AliasTable) -> ParseResult<CompoundCommand> {
         // consume 'for'
         self.advance()?;
         let iter_var = self.match_name()?;
@@ -413,7 +414,7 @@ impl<'src> CommandParser<'src> {
         })
     }
 
-    fn parse_case_item(&mut self, alias_table: &'src AliasTable) -> ParseResult<CaseItem> {
+    fn parse_case_item(&mut self, alias_table: &AliasTable) -> ParseResult<CaseItem> {
         self.match_shell_token_opt(CommandToken::LParen)?;
         let mut pattern = Vec::new();
         while self.lookahead != CommandToken::RParen {
@@ -441,7 +442,7 @@ impl<'src> CommandParser<'src> {
         Ok(CaseItem { body, pattern })
     }
 
-    fn parse_case_clause(&mut self, alias_table: &'src AliasTable) -> ParseResult<CompoundCommand> {
+    fn parse_case_clause(&mut self, alias_table: &AliasTable) -> ParseResult<CompoundCommand> {
         // consume 'case'
         self.advance()?;
         let arg = self.parse_word()?;
@@ -461,7 +462,7 @@ impl<'src> CommandParser<'src> {
         Ok(CompoundCommand::CaseClause { arg, cases })
     }
 
-    fn parse_if_clause(&mut self, alias_table: &'src AliasTable) -> ParseResult<CompoundCommand> {
+    fn parse_if_clause(&mut self, alias_table: &AliasTable) -> ParseResult<CompoundCommand> {
         // consume 'if'
         self.advance()?;
         let mut if_chain = Vec::new();
@@ -498,10 +499,7 @@ impl<'src> CommandParser<'src> {
         Ok(CompoundCommand::IfClause { if_chain })
     }
 
-    fn parse_while_clause(
-        &mut self,
-        alias_table: &'src AliasTable,
-    ) -> ParseResult<CompoundCommand> {
+    fn parse_while_clause(&mut self, alias_table: &AliasTable) -> ParseResult<CompoundCommand> {
         // consume 'while'
         self.advance()?;
         let condition = self.parse_compound_list(CommandToken::EOF, alias_table)?;
@@ -509,10 +507,7 @@ impl<'src> CommandParser<'src> {
         Ok(CompoundCommand::WhileClause { condition, body })
     }
 
-    fn parse_until_clause(
-        &mut self,
-        alias_table: &'src AliasTable,
-    ) -> ParseResult<CompoundCommand> {
+    fn parse_until_clause(&mut self, alias_table: &AliasTable) -> ParseResult<CompoundCommand> {
         // consume 'until'
         self.advance()?;
         let condition = self.parse_compound_list(CommandToken::EOF, alias_table)?;
@@ -522,7 +517,7 @@ impl<'src> CommandParser<'src> {
 
     fn parse_compound_command(
         &mut self,
-        alias_table: &'src AliasTable,
+        alias_table: &AliasTable,
     ) -> ParseResult<Option<CompoundCommand>> {
         match &self.lookahead {
             CommandToken::LParen => self.parse_subshell(alias_table).map(Some),
@@ -539,7 +534,7 @@ impl<'src> CommandParser<'src> {
     fn parse_function_definition(
         &mut self,
         name: Name,
-        alias_table: &'src AliasTable,
+        alias_table: &AliasTable,
     ) -> ParseResult<FunctionDefinition> {
         // consume '('
         self.advance()?;
@@ -554,7 +549,7 @@ impl<'src> CommandParser<'src> {
     fn parse_command(
         &mut self,
         end: CommandToken,
-        alias_table: &'src AliasTable,
+        alias_table: &AliasTable,
     ) -> ParseResult<Option<Command>> {
         // command =
         // 			| compound_command redirect_list?
@@ -596,7 +591,7 @@ impl<'src> CommandParser<'src> {
     fn parse_pipeline(
         &mut self,
         end: CommandToken,
-        alias_table: &'src AliasTable,
+        alias_table: &AliasTable,
     ) -> ParseResult<Option<Pipeline>> {
         // pipeline = "!" command ("|" linebreak command)*
         let negate_status = self.match_alternatives(&[CommandToken::Bang])?.is_some();
@@ -629,7 +624,7 @@ impl<'src> CommandParser<'src> {
     fn parse_and_or(
         &mut self,
         end: CommandToken,
-        alias_table: &'src AliasTable,
+        alias_table: &AliasTable,
     ) -> ParseResult<Option<Conjunction>> {
         // and_or = pipeline (("&&" | "||") linebreak pipeline)*
         let mut last = if let Some(pipeline) = self.parse_pipeline(end.clone(), alias_table)? {
@@ -666,10 +661,7 @@ impl<'src> CommandParser<'src> {
         }))
     }
 
-    fn parse_complete_command(
-        &mut self,
-        alias_table: &'src AliasTable,
-    ) -> ParseResult<CompleteCommand> {
+    fn parse_complete_command(&mut self, alias_table: &AliasTable) -> ParseResult<CompleteCommand> {
         // complete_command = and_or (separator_op and_or)* separator_op?
         let mut commands = Vec::new();
         while self.lookahead != CommandToken::Newline || self.lookahead != CommandToken::EOF {
@@ -695,7 +687,7 @@ impl<'src> CommandParser<'src> {
 
     pub fn parse_next_command(
         &mut self,
-        alias_table: &'src AliasTable,
+        alias_table: &AliasTable,
     ) -> ParseResult<Option<CompleteCommand>> {
         if self.lookahead == CommandToken::EOF {
             return Ok(None);

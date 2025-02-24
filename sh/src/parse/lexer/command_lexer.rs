@@ -15,33 +15,73 @@ use std::iter::Peekable;
 use std::ops::Range;
 use std::str::CharIndices;
 
+#[derive(Clone, Debug, Default)]
+struct IndexIter {
+    pos: usize,
+}
+
+impl IndexIter {
+    fn next(&mut self, string: &str) -> Option<(usize, char)> {
+        if let Some((idx, c)) = self.peek(string) {
+            self.pos += c.len_utf8();
+            Some((idx, c))
+        } else {
+            None
+        }
+    }
+
+    fn peek(&self, string: &str) -> Option<(usize, char)> {
+        string[self.pos..]
+            .char_indices()
+            .map(|(_, c)| (self.pos, c))
+            .next()
+    }
+}
+
 #[derive(Clone, Debug)]
-struct SourceReadState<'s> {
+struct SourceReadState {
     current_part: usize,
-    current_part_char_iter: Peekable<CharIndices<'s>>,
+    current_part_char_iter: IndexIter,
     current_part_char_index: usize,
     line_no: u32,
     reached_eof: bool,
 }
 
 struct SourcePart<'s> {
-    text: &'s str,
+    text: Cow<'s, str>,
     in_original_string: bool,
 }
 
 impl SourcePart<'_> {
     fn split_at(&self, mid: usize) -> (Self, Self) {
-        let (p1, p2) = self.text.split_at(mid);
-        (
-            Self {
-                text: p1,
-                in_original_string: self.in_original_string,
-            },
-            Self {
-                text: p2,
-                in_original_string: self.in_original_string,
-            },
-        )
+        match &self.text {
+            Cow::Borrowed(s) => {
+                let (p1, p2) = s.split_at(mid);
+                (
+                    Self {
+                        text: p1.into(),
+                        in_original_string: self.in_original_string,
+                    },
+                    Self {
+                        text: p2.into(),
+                        in_original_string: self.in_original_string,
+                    },
+                )
+            }
+            Cow::Owned(s) => {
+                let (p1, p2) = s.split_at(mid);
+                (
+                    Self {
+                        text: p1.to_owned().into(),
+                        in_original_string: self.in_original_string,
+                    },
+                    Self {
+                        text: p2.to_owned().into(),
+                        in_original_string: self.in_original_string,
+                    },
+                )
+            }
+        }
     }
 }
 
@@ -50,24 +90,28 @@ struct SourceString<'s> {
     // The first part is an exception, but if its empty, `read_state.reached_eof`
     // should be set
     parts: Vec<SourcePart<'s>>,
-    read_state: SourceReadState<'s>,
+    read_state: SourceReadState,
 }
 
 impl<'s> SourceString<'s> {
     fn new(s: &'s str) -> Self {
         Self {
             parts: vec![SourcePart {
-                text: s,
+                text: s.into(),
                 in_original_string: true,
             }],
             read_state: SourceReadState {
                 current_part: 0,
-                current_part_char_iter: s.char_indices().peekable(),
+                current_part_char_iter: IndexIter::default(),
                 current_part_char_index: 0,
                 reached_eof: s.is_empty(),
                 line_no: 1,
             },
         }
+    }
+
+    fn current_str(&self) -> &str {
+        self.parts[self.read_state.current_part].text.as_ref()
     }
 
     fn advance_char(&mut self) {
@@ -76,43 +120,54 @@ impl<'s> SourceString<'s> {
         }
 
         // since `self.read_state.reached_eof` is false, unwrap is safe
-        let (index, char) = self.read_state.current_part_char_iter.next().unwrap();
+        let (index, char) = self
+            .read_state
+            .current_part_char_iter
+            .next(self.parts[self.read_state.current_part].text.as_ref())
+            .unwrap();
         if char == '\n' && self.parts[self.read_state.current_part].in_original_string {
             self.read_state.line_no += 1;
         }
         self.read_state.current_part_char_index = index + char.len_utf8();
-        if self.read_state.current_part_char_iter.peek().is_none() {
+        if self
+            .read_state
+            .current_part_char_iter
+            .peek(self.current_str())
+            .is_none()
+        {
             if self.read_state.current_part == self.parts.len() - 1 {
                 self.read_state.reached_eof = true;
                 return;
             }
             self.read_state.current_part += 1;
             self.read_state.current_part_char_index = 0;
-            self.read_state.current_part_char_iter = self.parts[self.read_state.current_part]
-                .text
-                .char_indices()
-                .peekable();
+            self.read_state.current_part_char_iter = IndexIter::default();
         }
     }
 
     fn substr(&self, start: &SourceReadState, end: &SourceReadState) -> Cow<'s, str> {
         assert!(start.current_part <= end.current_part);
         if start.current_part == end.current_part {
-            self.parts[start.current_part].text
-                [start.current_part_char_index..end.current_part_char_index]
-                .into()
+            match self.parts[start.current_part].text {
+                Cow::Owned(ref s) => s[start.current_part_char_index..end.current_part_char_index]
+                    .to_owned()
+                    .into(),
+                Cow::Borrowed(s) => {
+                    s[start.current_part_char_index..end.current_part_char_index].into()
+                }
+            }
         } else {
             let mut result = String::new();
             result.push_str(&self.parts[start.current_part].text[start.current_part_char_index..]);
             for part_idx in start.current_part + 1..end.current_part {
-                result.push_str(self.parts[part_idx].text);
+                result.push_str(self.parts[part_idx].text.as_ref());
             }
             result.push_str(&self.parts[end.current_part].text[..end.current_part_char_index]);
             result.into()
         }
     }
 
-    fn insert_string_after_last_char(&mut self, string: &'s str) {
+    fn insert_string_after_last_char(&mut self, string: Cow<'s, str>) {
         if string.is_empty() {
             return;
         }
@@ -133,10 +188,7 @@ impl<'s> SourceString<'s> {
         self.read_state.reached_eof = false;
         self.read_state.current_part_char_index = 0;
         self.read_state.current_part += 1;
-        self.read_state.current_part_char_iter = self.parts[self.read_state.current_part]
-            .text
-            .char_indices()
-            .peekable();
+        self.read_state.current_part_char_iter = IndexIter::default();
     }
 
     fn reached_eof(&self) -> bool {
@@ -147,11 +199,10 @@ impl<'s> SourceString<'s> {
         self.read_state.line_no
     }
 
-    fn lookahead(&mut self) -> char {
+    fn lookahead(&self) -> char {
         self.read_state
             .current_part_char_iter
-            .peek()
-            .copied()
+            .peek(self.current_str())
             .map(|(_, c)| c)
             .unwrap_or_default()
     }
@@ -348,7 +399,7 @@ fn char_to_operator_token(c: char) -> Option<CommandToken<'static>> {
 
 pub struct CommandLexer<'src> {
     source: SourceString<'src>,
-    prev_read_state: SourceReadState<'src>,
+    prev_read_state: SourceReadState,
 }
 
 impl Lexer for CommandLexer<'_> {
@@ -494,7 +545,7 @@ impl<'src> CommandLexer<'src> {
     }
 
     /// Inserts text after the last returned token
-    pub fn insert_text_at_current_position(&mut self, text: &'src str) {
+    pub fn insert_text_at_current_position(&mut self, text: Cow<'src, str>) {
         self.source.insert_string_after_last_char(text);
     }
 
@@ -697,11 +748,11 @@ mod tests {
     fn insert_text() {
         let mut lex = CommandLexer::new("a b c");
         assert_eq!(lex.next_token().unwrap().0, CommandToken::Word("a".into()));
-        lex.insert_text_at_current_position("x");
+        lex.insert_text_at_current_position("x".into());
         assert_eq!(lex.next_token().unwrap().0, CommandToken::Word("x".into()));
         assert_eq!(lex.next_token().unwrap().0, CommandToken::Word("b".into()));
         assert_eq!(lex.next_token().unwrap().0, CommandToken::Word("c".into()));
-        lex.insert_text_at_current_position("y");
+        lex.insert_text_at_current_position("y".into());
         assert_eq!(lex.next_token().unwrap().0, CommandToken::Word("y".into()));
         assert_eq!(lex.next_token().unwrap().0, CommandToken::EOF);
     }

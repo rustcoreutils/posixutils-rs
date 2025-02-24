@@ -308,7 +308,7 @@ fn expand_zero() {
 }
 
 #[test]
-fn shell_ppid() {
+fn expand_ppid() {
     run_successfully_and("echo $PPID", |output| {
         assert!(!output.is_empty());
         assert!(is_pid(output));
@@ -320,6 +320,26 @@ fn shell_ppid() {
         assert!(is_pid(ppid1));
         assert_eq!(ppid1, ppid2);
     })
+}
+
+#[test]
+fn expand_default_ifs() {
+    test_cli(vec!["-c", "echo \"$IFS\""], "", " \t\n\n");
+}
+
+#[test]
+fn expand_default_ps1() {
+    test_cli(vec!["-c", "echo \"$PS1\""], "", "$ \n");
+}
+
+#[test]
+fn expand_default_ps2() {
+    test_cli(vec!["-c", "echo \"$PS2\""], "", "> \n");
+}
+
+#[test]
+fn expand_default_ps4() {
+    test_cli(vec!["-c", "echo \"$PS4\""], "", "+ \n");
 }
 
 #[test]

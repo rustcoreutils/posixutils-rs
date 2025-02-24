@@ -216,6 +216,7 @@ impl<'src> CommandParser<'src> {
         alias_table: &AliasTable,
     ) -> ParseResult<Option<Word>> {
         let mut next_substitution = word;
+        let mut performed_one_substitution = false;
         loop {
             if self.is_currently_processing_substitution(next_substitution.as_ref()) {
                 return parse_word(&next_substitution, self.lookahead_lineno).map(Some);
@@ -223,11 +224,14 @@ impl<'src> CommandParser<'src> {
             if let Some(alias) = alias_table.get(next_substitution.as_ref()) {
                 if !alias.ends_with(|c| is_blank(c)) {
                     *apply_alias_substitution_to_next_word = false
+                } else {
+                    *apply_alias_substitution_to_next_word = true;
                 }
                 self.lexer.insert_text_at_current_position(
                     alias.to_string().into(),
                     next_substitution.as_ref(),
                 );
+                performed_one_substitution = true;
                 self.advance()?;
                 if let CommandToken::Word(word) = &self.lookahead {
                     next_substitution = word.clone();
@@ -235,7 +239,9 @@ impl<'src> CommandParser<'src> {
                     return Ok(None);
                 }
             } else {
-                *apply_alias_substitution_to_next_word = false;
+                if !performed_one_substitution {
+                    *apply_alias_substitution_to_next_word = false;
+                }
                 return parse_word(next_substitution.as_ref(), self.lookahead_lineno).map(Some);
             }
         }

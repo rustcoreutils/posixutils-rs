@@ -1,9 +1,11 @@
-use crate::interpreter::set::{SetOptions, SetSpecialBuiltin};
+use crate::interpreter::builtin::alias::AliasBuiltin;
+use crate::interpreter::builtin::set::{SetOptions, SetSpecialBuiltin};
 use crate::interpreter::wordexp::{expand_word, expand_word_to_string};
 use crate::parse::command::{
     Assignment, Command, CompleteCommand, CompoundCommand, Conjunction, IORedirectionKind,
     LogicalOp, Name, Pipeline, Program, Redirection, RedirectionKind, SimpleCommand,
 };
+use crate::parse::AliasTable;
 use nix::libc;
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{close, dup2, execve, fork, getpid, getppid, pipe, ForkResult, Pid};
@@ -13,7 +15,7 @@ use std::os::fd::{AsRawFd, IntoRawFd};
 use std::path::PathBuf;
 use std::rc::Rc;
 
-pub mod set;
+pub mod builtin;
 mod wordexp;
 
 trait BuiltinUtility {
@@ -29,6 +31,7 @@ fn get_special_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
 
 fn get_bultin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
     match name {
+        "alias" => Some(&AliasBuiltin),
         _ => None,
     }
 }
@@ -81,6 +84,7 @@ pub struct Interpreter {
     most_recent_background_command_pid: Option<i32>,
     current_directory: OsString,
     set_options: SetOptions,
+    pub alias_table: AliasTable,
 }
 
 impl Interpreter {
@@ -214,7 +218,7 @@ impl Interpreter {
             }
 
             if let Some(_builtin_utility) = get_bultin_utility(&expanded_words[0]) {
-                todo!()
+                return _builtin_utility.exec(&expanded_words[1..], self);
             }
 
             let mut command_environment = self.clone();
@@ -373,6 +377,7 @@ impl Default for Interpreter {
             most_recent_background_command_pid: None,
             current_directory: OsString::from("/"),
             set_options: SetOptions::default(),
+            alias_table: AliasTable::default(),
         }
     }
 }

@@ -1,4 +1,4 @@
-use crate::interpreter::set::SetOptions;
+use crate::interpreter::builtin::set::SetOptions;
 use clap::command;
 
 #[derive(Debug, PartialEq, Eq)]

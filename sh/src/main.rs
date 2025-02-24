@@ -22,13 +22,12 @@ mod utils;
 
 fn execute_program(program: &str, interpreter: &mut Interpreter) -> ParseResult<()> {
     let mut parser = CommandParser::new(program)?;
-    let alias_table = AliasTable::default();
     loop {
-        match parser.parse_next_command(&alias_table)? {
-            Some(command) => {
-                interpreter.interpret(&command);
-            }
-            None => break,
+        let command = parser.parse_next_command(&interpreter.alias_table)?;
+        if let Some(command) = command {
+            interpreter.interpret(&command);
+        } else {
+            break;
         }
     }
     Ok(())

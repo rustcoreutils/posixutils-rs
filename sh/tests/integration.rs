@@ -27,6 +27,8 @@ pub fn test_cli(args: Vec<&str>, stdin: &str, expected_output: &str) {
     });
 }
 
+pub fn test_cli_with_env(args: Vec<&str>, stdin: &str, expected_output: &str) {}
+
 pub fn test_script(script: &str, expected_output: &str) {
     run_test(TestPlan {
         cmd: "sh".to_string(),
@@ -306,184 +308,243 @@ mod token_recognition {
     }
 }
 
-#[test]
-fn expand_at() {
-    test_cli(vec!["-c", "echo $@", "sh", "1", "2", "3"], "", "1 2 3\n");
-    test_cli(
-        vec!["-c", "for x in $@; do echo $x; done", "sh", "1 2", "3", "4"],
-        "",
-        "1\n2\n3\n4\n",
-    );
-    test_cli(
-        vec![
-            "-c",
-            "for x in a$@b; do echo $x; done",
-            "sh",
-            "1 2",
-            "3",
-            "4",
-        ],
-        "",
-        "a1\n2\n3\n4b\n",
-    );
-    test_cli(
-        vec![
-            "-c",
-            "for x in \"$@\"; do echo $x; done",
-            "sh",
-            "1 2",
-            "3",
-            "4",
-        ],
-        "",
-        "1 2\n3\n4\n",
-    );
-    test_cli(
-        vec![
-            "-c",
-            "for x in a\"$@\"b; do echo $x; done",
-            "sh",
-            "a1 2",
-            "3",
-            "4b",
-        ],
-        "",
-        "1 2\n3\n4\n",
-    );
-    test_cli(
-        vec![
-            "-c",
-            "for x in ${unset-\"$@\"}; do echo $x; done",
-            "sh",
-            "1 2",
-            "3",
-            "4",
-        ],
-        "",
-        "1 2\n3\n4\n",
-    );
-    test_cli(
-        vec![
-            "-c",
-            "for x in ${PPID\"$@\"}; do echo $x; done",
-            "sh",
-            "1 2",
-            "3",
-            "4",
-        ],
-        "",
-        "1 2\n3\n4\n",
-    );
+mod special_parameters {
+    use super::*;
+
+    #[test]
+    fn expand_at() {
+        test_cli(vec!["-c", "echo $@", "sh", "1", "2", "3"], "", "1 2 3\n");
+        test_cli(
+            vec!["-c", "for x in $@; do echo $x; done", "sh", "1 2", "3", "4"],
+            "",
+            "1\n2\n3\n4\n",
+        );
+        test_cli(
+            vec![
+                "-c",
+                "for x in a$@b; do echo $x; done",
+                "sh",
+                "1 2",
+                "3",
+                "4",
+            ],
+            "",
+            "a1\n2\n3\n4b\n",
+        );
+        test_cli(
+            vec![
+                "-c",
+                "for x in \"$@\"; do echo $x; done",
+                "sh",
+                "1 2",
+                "3",
+                "4",
+            ],
+            "",
+            "1 2\n3\n4\n",
+        );
+        test_cli(
+            vec![
+                "-c",
+                "for x in a\"$@\"b; do echo $x; done",
+                "sh",
+                "a1 2",
+                "3",
+                "4b",
+            ],
+            "",
+            "1 2\n3\n4\n",
+        );
+        test_cli(
+            vec![
+                "-c",
+                "for x in ${unset-\"$@\"}; do echo $x; done",
+                "sh",
+                "1 2",
+                "3",
+                "4",
+            ],
+            "",
+            "1 2\n3\n4\n",
+        );
+        test_cli(
+            vec![
+                "-c",
+                "for x in ${PPID\"$@\"}; do echo $x; done",
+                "sh",
+                "1 2",
+                "3",
+                "4",
+            ],
+            "",
+            "1 2\n3\n4\n",
+        );
+    }
+
+    #[test]
+    fn expand_asterisk() {
+        test_cli(vec!["-c", "echo $*", "sh", "1", "2", "3"], "", "1 2 3\n");
+        test_cli(
+            vec!["-c", "echo \"$*\"", "sh", "1", "2", "3"],
+            "",
+            "1 2 3\n",
+        );
+        test_cli(
+            vec!["-c", "for x in $*; do echo $x; done", "sh", "1 2", "3", "4"],
+            "",
+            "1\n2\n3\n4\n",
+        );
+        test_cli(
+            vec!["-c", "IFS=,; echo \"$*\"", "sh", "1", "2", "3"],
+            "",
+            "1,2,3\n",
+        );
+        test_cli(
+            vec!["-c", "IFS=; echo \"$*\"", "sh", "1", "2", "3"],
+            "",
+            "123\n",
+        );
+        test_cli(
+            vec!["-c", "unset IFS; echo \"$*\"", "sh", "1", "2", "3"],
+            "",
+            "1 2 3\n",
+        );
+    }
+
+    #[test]
+    fn expand_arg_count() {
+        test_cli(vec!["-c", "echo $#"], "", "0\n");
+        test_cli(vec!["-c", "echo $#", "sh"], "", "0\n");
+        test_cli(vec!["-c", "echo $#", "sh", "1", "2", "3"], "", "3\n");
+    }
+
+    #[test]
+    fn expand_question_mark() {
+        test_cli(vec!["-c", "echo $?", "sh"], "", "0\n");
+        test_cli(vec!["-c", "true; echo $?", "sh"], "", "0\n");
+        test_cli(vec!["-c", "false; echo $?", "sh"], "", "1\n");
+    }
+
+    #[test]
+    fn expand_minus() {
+        test_cli(vec!["-c", "echo $-", "sh"], "", "\n");
+        test_cli(vec!["-c", "-aeh", "echo $-", "sh"], "", "aeh\n");
+    }
+
+    #[test]
+    fn expand_shell_pid() {
+        run_successfully_and("echo $$", |output| {
+            assert!(!output.is_empty());
+            assert!(is_pid(output));
+        })
+    }
+
+    #[test]
+    fn expand_bang() {
+        test_cli(vec!["-c", "echo $!"], "", "\n");
+        run_successfully_and("true & echo $!", |output| {
+            assert!(!output.is_empty());
+            assert!(is_pid(output));
+        })
+    }
+
+    #[test]
+    fn expand_zero() {
+        test_cli(vec!["-c", "echo $0", "sh", "1", "2", "3"], "", "sh\n");
+        test_cli(
+            vec!["tests/sh/script_name.sh"],
+            "",
+            include_str!("sh/script_name.out"),
+        );
+    }
 }
 
-#[test]
-fn expand_asterisk() {
-    test_cli(vec!["-c", "echo $*", "sh", "1", "2", "3"], "", "1 2 3\n");
-    test_cli(
-        vec!["-c", "echo \"$*\"", "sh", "1", "2", "3"],
-        "",
-        "1 2 3\n",
-    );
-    test_cli(
-        vec!["-c", "for x in $*; do echo $x; done", "sh", "1 2", "3", "4"],
-        "",
-        "1\n2\n3\n4\n",
-    );
-    test_cli(
-        vec!["-c", "IFS=,; echo \"$*\"", "sh", "1", "2", "3"],
-        "",
-        "1,2,3\n",
-    );
-    test_cli(
-        vec!["-c", "IFS=; echo \"$*\"", "sh", "1", "2", "3"],
-        "",
-        "123\n",
-    );
-    test_cli(
-        vec!["-c", "unset IFS; echo \"$*\"", "sh", "1", "2", "3"],
-        "",
-        "1 2 3\n",
-    );
-}
+mod special_variables {
+    use super::*;
 
-#[test]
-fn expand_arg_count() {
-    test_cli(vec!["-c", "echo $#", "sh", "1", "2", "3"], "", "3\n");
-}
+    #[test]
+    fn expand_home() {
+        run_successfully_and("echo $HOME", |output| {
+            assert!(!output.is_empty());
+            assert!(output.starts_with('/'));
+        })
+    }
 
-#[test]
-fn expand_question_mark() {
-    test_cli(vec!["-c", "echo $?", "sh"], "", "0\n");
-    test_cli(vec!["-c", "true; echo $?", "sh"], "", "0\n");
-    test_cli(vec!["-c", "false; echo $?", "sh"], "", "1\n");
-}
+    #[test]
+    fn expand_default_ifs() {
+        test_cli(vec!["-c", "echo \"$IFS\""], "", " \t\n\n");
+    }
 
-#[test]
-fn expand_minus() {
-    test_cli(vec!["-c", "echo $-", "sh"], "", "\n");
-    test_cli(vec!["-c", "-aeh", "echo $-", "sh"], "", "aeh\n");
-}
+    #[test]
+    fn expand_lineno() {
+        test_script(
+            include_str!("sh/special_variables/expand_lineno.sh"),
+            include_str!("sh/special_variables/expand_lineno.out"),
+        )
+    }
 
-#[test]
-fn expand_shell_pid() {
-    run_successfully_and("echo $$", |output| {
-        assert!(!output.is_empty());
-        assert!(is_pid(output));
-    })
-}
+    #[test]
+    fn expand_lineno_inside_function() {
+        test_script(
+            include_str!("sh/special_variables/expand_lineno_inside_function.sh"),
+            include_str!("sh/special_variables/expand_lineno_inside_function.out"),
+        )
+    }
 
-#[test]
-fn expand_bang() {
-    test_cli(vec!["-c", "echo $!"], "", "\n");
-    run_successfully_and("true & echo $!", |output| {
-        assert!(!output.is_empty());
-        assert!(is_pid(output));
-    })
-}
+    #[test]
+    fn expand_lineno_inside_subshell() {
+        test_script(
+            include_str!("sh/special_variables/expand_lineno_inside_subshell.sh"),
+            include_str!("sh/special_variables/expand_lineno_inside_subshell.out"),
+        )
+    }
 
-#[test]
-fn expand_zero() {
-    test_cli(vec!["-c", "echo $0", "sh", "1", "2", "3"], "", "sh\n");
-    test_cli(
-        vec!["tests/sh/script_name.sh"],
-        "",
-        include_str!("sh/script_name.out"),
-    );
-}
+    #[test]
+    fn expand_lineno_with_alias_substitution() {
+        test_script(
+            include_str!("sh/special_variables/expand_lineno_with_alias_substitution.sh"),
+            include_str!("sh/special_variables/expand_lineno_with_alias_substitution.out"),
+        );
+    }
 
-#[test]
-fn expand_ppid() {
-    run_successfully_and("echo $PPID", |output| {
-        assert!(!output.is_empty());
-        assert!(is_pid(output));
-    });
-    run_successfully_and("echo $PPID; echo $(echo $PPID)", |output| {
-        let mut lines = output.lines();
-        let ppid1 = lines.next().unwrap();
-        let ppid2 = lines.next().unwrap();
-        assert!(is_pid(ppid1));
-        assert_eq!(ppid1, ppid2);
-    })
-}
+    #[test]
+    fn expand_ppid() {
+        run_successfully_and("echo $PPID", |output| {
+            assert!(!output.is_empty());
+            assert!(is_pid(output));
+        });
+        run_successfully_and("echo $PPID; echo $(echo $PPID)", |output| {
+            let mut lines = output.lines();
+            let ppid1 = lines.next().unwrap();
+            let ppid2 = lines.next().unwrap();
+            assert!(is_pid(ppid1));
+            assert_eq!(ppid1, ppid2);
+        })
+    }
 
-#[test]
-fn expand_default_ifs() {
-    test_cli(vec!["-c", "echo \"$IFS\""], "", " \t\n\n");
-}
+    #[test]
+    fn expand_default_ps1() {
+        test_cli(vec!["-c", "echo \"$PS1\""], "", "$ \n");
+    }
 
-#[test]
-fn expand_default_ps1() {
-    test_cli(vec!["-c", "echo \"$PS1\""], "", "$ \n");
-}
+    #[test]
+    fn expand_default_ps2() {
+        test_cli(vec!["-c", "echo \"$PS2\""], "", "> \n");
+    }
 
-#[test]
-fn expand_default_ps2() {
-    test_cli(vec!["-c", "echo \"$PS2\""], "", "> \n");
-}
+    #[test]
+    fn expand_default_ps4() {
+        test_cli(vec!["-c", "echo \"$PS4\""], "", "+ \n");
+    }
 
-#[test]
-fn expand_default_ps4() {
-    test_cli(vec!["-c", "echo \"$PS4\""], "", "+ \n");
+    #[test]
+    fn expand_pwd() {
+        run_successfully_and("echo $PWD", |output| {
+            assert!(!output.is_empty());
+            assert!(output.starts_with('/'));
+            assert!(output.ends_with("/sh/tests"));
+        })
+    }
 }
 
 #[test]

@@ -242,6 +242,70 @@ mod quoting {
     }
 }
 
+mod token_recognition {
+    use crate::test_script;
+
+    #[test]
+    fn alias_command_to_command() {
+        test_script(
+            include_str!("sh/token_recognition/alias_command_to_command.sh"),
+            include_str!("sh/token_recognition/alias_command_to_command.out"),
+        )
+    }
+
+    #[test]
+    fn alias_command_to_command_with_args() {
+        test_script(
+            include_str!("sh/token_recognition/alias_command_to_command_with_args.sh"),
+            include_str!("sh/token_recognition/alias_command_to_command_with_args.out"),
+        )
+    }
+
+    #[test]
+    fn alias_command_to_conjunction() {
+        test_script(
+            include_str!("sh/token_recognition/alias_command_to_conjunction.sh"),
+            include_str!("sh/token_recognition/alias_command_to_conjunction.out"),
+        )
+    }
+
+    #[test]
+    fn arg_alias() {
+        test_script(
+            include_str!("sh/token_recognition/arg_alias.sh"),
+            include_str!("sh/token_recognition/arg_alias.out"),
+        )
+    }
+
+    #[test]
+    fn discard_comments() {
+        test_script(
+            include_str!("sh/token_recognition/discard_comments.sh"),
+            include_str!("sh/token_recognition/discard_comments.out"),
+        )
+    }
+
+    #[test]
+    fn recursive_alias_with_cycle_command_to_command() {
+        test_script(
+            include_str!("sh/token_recognition/recursive_alias_with_cycle_command_to_command.sh"),
+            include_str!("sh/token_recognition/recursive_alias_with_cycle_command_to_command.out"),
+        )
+    }
+
+    #[test]
+    fn recursive_alias_with_cycle_command_to_conjunction() {
+        test_script(
+            include_str!(
+                "sh/token_recognition/recursive_alias_with_cycle_command_to_conjunction.sh"
+            ),
+            include_str!(
+                "sh/token_recognition/recursive_alias_with_cycle_command_to_conjunction.out"
+            ),
+        )
+    }
+}
+
 #[test]
 fn expand_at() {
     test_cli(vec!["-c", "echo $@", "sh", "1", "2", "3"], "", "1 2 3\n");

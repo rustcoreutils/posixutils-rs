@@ -627,6 +627,17 @@ mod tests {
         let mut lex = CommandLexer::new("# this is a comment\n");
         assert_eq!(lex.next_token().unwrap().0, CommandToken::Newline);
         assert_eq!(lex.next_token().unwrap().0, CommandToken::EOF);
+
+        let mut lex = CommandLexer::new("cmd arg #comment");
+        assert_eq!(
+            lex.next_token().unwrap().0,
+            CommandToken::Word("cmd".into())
+        );
+        assert_eq!(
+            lex.next_token().unwrap().0,
+            CommandToken::Word("arg".into())
+        );
+        assert_eq!(lex.next_token().unwrap().0, CommandToken::EOF);
     }
 
     #[test]

@@ -36,7 +36,7 @@ trait Lexer {
 
     fn skip_comment(&mut self) {
         if self.lookahead() == '#' {
-            while self.lookahead() != '\n' {
+            while self.lookahead() != '\n' && !self.reached_eof() {
                 self.advance();
             }
         }

@@ -547,10 +547,136 @@ mod special_variables {
     }
 }
 
-#[test]
-fn tilde_expansion() {
-    test_script(
-        include_str!("sh/tilde_expansion.sh"),
-        include_str!("sh/tilde_expansion.out"),
-    );
+mod word_expansion {
+    use super::*;
+
+    #[test]
+    fn variable_expansion() {}
+
+    #[test]
+    fn parameter_expansion_indicate_error_if_null_or_unset() {
+        todo!()
+    }
+
+    #[test]
+    fn string_operations_on_unset_parameters_fail_with_no_unset() {
+        todo!()
+    }
+
+    #[test]
+    fn arithmetic_expansion_basic_operations() {
+        test_script(
+            include_str!("sh/word_expansion/arithmetic_expansion_basic_operations.sh"),
+            include_str!("sh/word_expansion/arithmetic_expansion_basic_operations.out"),
+        );
+    }
+    #[test]
+    fn arithmetic_expansion_constants() {
+        test_script(
+            include_str!("sh/word_expansion/arithmetic_expansion_constants.sh"),
+            include_str!("sh/word_expansion/arithmetic_expansion_constants.out"),
+        );
+    }
+    #[test]
+    fn arithmetic_expansion_expand_words() {
+        test_script(
+            include_str!("sh/word_expansion/arithmetic_expansion_expand_words.sh"),
+            include_str!("sh/word_expansion/arithmetic_expansion_expand_words.out"),
+        );
+    }
+    #[test]
+    fn arithmetic_expansion_precedence() {
+        test_script(
+            include_str!("sh/word_expansion/arithmetic_expansion_precedence.sh"),
+            include_str!("sh/word_expansion/arithmetic_expansion_precedence.out"),
+        );
+    }
+    #[test]
+    fn command_substitution() {
+        test_script(
+            include_str!("sh/word_expansion/command_substitution.sh"),
+            include_str!("sh/word_expansion/command_substitution.out"),
+        );
+    }
+    #[test]
+    fn command_substitution_inside_double_quotes_does_not_perform_field_splitting_or_pathname_expansion(
+    ) {
+        test_script(include_str!("sh/word_expansion/command_substitution_inside_double_quotes_does_not_perform_field_splitting_or_pathname_expansion.sh"), include_str!("sh/word_expansion/command_substitution_inside_double_quotes_does_not_perform_field_splitting_or_pathname_expansion.out"));
+    }
+    #[test]
+    fn nested_command_substitution() {
+        test_script(
+            include_str!("sh/word_expansion/nested_command_substitution.sh"),
+            include_str!("sh/word_expansion/nested_command_substitution.out"),
+        );
+    }
+    #[test]
+    fn parameter_expansion_assign_default_values() {
+        test_script(
+            include_str!("sh/word_expansion/parameter_expansion_assign_default_values.sh"),
+            include_str!("sh/word_expansion/parameter_expansion_assign_default_values.out"),
+        );
+    }
+    #[test]
+    fn parameter_expansion_inside_double_quotes_does_not_perform_pathname_expansion_and_field_splitting(
+    ) {
+        test_script(include_str!("sh/word_expansion/parameter_expansion_inside_double_quotes_does_not_perform_pathname_expansion_and_field_splitting.sh"), include_str!("sh/word_expansion/parameter_expansion_inside_double_quotes_does_not_perform_pathname_expansion_and_field_splitting.out"));
+    }
+    #[test]
+    fn parameter_expansion_string_operations() {
+        test_script(
+            include_str!("sh/word_expansion/parameter_expansion_string_operations.sh"),
+            include_str!("sh/word_expansion/parameter_expansion_string_operations.out"),
+        );
+    }
+    #[test]
+    fn parameter_expansion_use_alternative() {
+        test_script(
+            include_str!("sh/word_expansion/parameter_expansion_use_alternative.sh"),
+            include_str!("sh/word_expansion/parameter_expansion_use_alternative.out"),
+        );
+    }
+    #[test]
+    fn parameter_expansion_use_default_values() {
+        test_script(
+            include_str!("sh/word_expansion/parameter_expansion_use_default_values.sh"),
+            include_str!("sh/word_expansion/parameter_expansion_use_default_values.out"),
+        );
+    }
+    #[test]
+    fn split_fields() {
+        test_script(
+            include_str!("sh/word_expansion/split_fields.sh"),
+            include_str!("sh/word_expansion/split_fields.out"),
+        );
+    }
+    #[test]
+    fn split_fields_default_ifs() {
+        test_script(
+            include_str!("sh/word_expansion/split_fields_default_ifs.sh"),
+            include_str!("sh/word_expansion/split_fields_default_ifs.out"),
+        );
+    }
+    #[test]
+    fn split_fields_null_ifs() {
+        test_script(
+            include_str!("sh/word_expansion/split_fields_null_ifs.sh"),
+            include_str!("sh/word_expansion/split_fields_null_ifs.out"),
+        );
+    }
+    #[test]
+    fn split_fields_unset_ifs() {
+        test_script(
+            include_str!("sh/word_expansion/split_fields_unset_ifs.sh"),
+            include_str!("sh/word_expansion/split_fields_unset_ifs.out"),
+        );
+    }
+
+    #[test]
+    fn tilde_expansion() {
+        test_script(
+            include_str!("sh/word_expansion/tilde_expansion.sh"),
+            include_str!("sh/word_expansion/tilde_expansion.out"),
+        );
+    }
 }

@@ -6,7 +6,7 @@ pub mod alias;
 pub mod set;
 
 pub trait BuiltinUtility {
-    fn exec(&self, args: &[String], interpreter: &mut Shell) -> i32;
+    fn exec(&self, args: &[String], shell: &mut Shell) -> i32;
 }
 
 pub fn get_special_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {

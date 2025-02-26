@@ -1,5 +1,5 @@
-use crate::interpreter::wordexp::pattern::FilenamePattern;
 use crate::utils::strcoll;
+use crate::wordexp::pattern::FilenamePattern;
 use std::ffi::{CString, OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
@@ -153,7 +153,7 @@ pub fn glob(pattern: &FilenamePattern, starting_directory: &Path) -> Vec<OsStrin
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::interpreter::wordexp::pattern::tests::filename_pattern_from_str;
+    use crate::wordexp::pattern::tests::filename_pattern_from_str;
     use std::collections::hash_map::Entry;
     use std::collections::HashMap;
 

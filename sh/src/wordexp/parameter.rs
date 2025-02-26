@@ -1,9 +1,9 @@
-use crate::interpreter::wordexp::pattern::Pattern;
-use crate::interpreter::wordexp::{
+use crate::parse::word::{Parameter, ParameterExpansion, SpecialParameter};
+use crate::shell::{Shell, Variable};
+use crate::wordexp::pattern::Pattern;
+use crate::wordexp::{
     expand_word_to_string, simple_word_expansion_into, ExpandedWord, ExpandedWordPart,
 };
-use crate::interpreter::{Interpreter, Variable};
-use crate::parse::word::{Parameter, ParameterExpansion, SpecialParameter};
 
 #[derive(PartialEq, Eq)]
 enum ParameterExpansionResult {
@@ -61,20 +61,17 @@ fn expand_simple_parameter_into(
     parameter: &Parameter,
     inside_double_quotes: bool,
     field_splitting_will_be_performed: bool,
-    interpreter: &mut Interpreter,
+    shell: &mut Shell,
 ) -> ParameterExpansionResult {
     match parameter {
         Parameter::Number(n) => add_option_to_expanded_word(
             expanded_word,
-            interpreter.positional_parameters.get(*n as usize - 1),
+            shell.positional_parameters.get(*n as usize - 1),
             inside_double_quotes,
         ),
         Parameter::Variable(var_name) => add_option_to_expanded_word(
             expanded_word,
-            interpreter
-                .environment
-                .get(var_name.as_ref())
-                .map(|v| &v.value),
+            shell.environment.get(var_name.as_ref()).map(|v| &v.value),
             inside_double_quotes,
         ),
         Parameter::Special(special_parameter) => {
@@ -82,14 +79,14 @@ fn expand_simple_parameter_into(
                 SpecialParameter::At => {
                     if !field_splitting_will_be_performed {
                         expanded_word.append(
-                            interpreter.positional_parameters.join(" "),
+                            shell.positional_parameters.join(" "),
                             inside_double_quotes,
                             true,
                         );
                     } else {
                         add_split_parameters_to_expanded_word(
                             expanded_word,
-                            &interpreter.positional_parameters,
+                            &shell.positional_parameters,
                             inside_double_quotes,
                         );
                     }
@@ -98,11 +95,11 @@ fn expand_simple_parameter_into(
                     if field_splitting_will_be_performed && !inside_double_quotes {
                         add_split_parameters_to_expanded_word(
                             expanded_word,
-                            &interpreter.positional_parameters,
+                            &shell.positional_parameters,
                             false,
                         );
                     } else {
-                        let separator = interpreter
+                        let separator = shell
                             .environment
                             .get("IFS")
                             .map(|var| {
@@ -114,7 +111,7 @@ fn expand_simple_parameter_into(
                             })
                             .unwrap_or(" ");
                         expanded_word.append(
-                            interpreter.positional_parameters.join(separator),
+                            shell.positional_parameters.join(separator),
                             inside_double_quotes,
                             true,
                         );
@@ -122,34 +119,30 @@ fn expand_simple_parameter_into(
                 }
                 SpecialParameter::Hash => {
                     expanded_word.append(
-                        interpreter.positional_parameters.len().to_string(),
+                        shell.positional_parameters.len().to_string(),
                         inside_double_quotes,
                         true,
                     );
                 }
                 SpecialParameter::QuestionMark => {
                     expanded_word.append(
-                        interpreter.most_recent_pipeline_exit_status.to_string(),
+                        shell.most_recent_pipeline_exit_status.to_string(),
                         inside_double_quotes,
                         true,
                     );
                 }
                 SpecialParameter::Minus => {
                     expanded_word.append(
-                        interpreter.set_options.to_string_short(),
+                        shell.set_options.to_string_short(),
                         inside_double_quotes,
                         true,
                     );
                 }
                 SpecialParameter::Dollar => {
-                    expanded_word.append(
-                        interpreter.shell_pid.to_string(),
-                        inside_double_quotes,
-                        true,
-                    );
+                    expanded_word.append(shell.shell_pid.to_string(), inside_double_quotes, true);
                 }
                 SpecialParameter::Bang => expanded_word.append(
-                    interpreter
+                    shell
                         .most_recent_background_command_pid
                         .map(|pid| pid.to_string())
                         .unwrap_or_default(),
@@ -157,11 +150,7 @@ fn expand_simple_parameter_into(
                     true,
                 ),
                 SpecialParameter::Zero => {
-                    expanded_word.append(
-                        interpreter.program_name.clone(),
-                        inside_double_quotes,
-                        true,
-                    );
+                    expanded_word.append(shell.program_name.clone(), inside_double_quotes, true);
                 }
             }
             // special parameters are always set
@@ -175,7 +164,7 @@ pub fn expand_parameter_into(
     parameter_expansion: &ParameterExpansion,
     inside_double_quotes: bool,
     field_splitting_will_be_performed: bool,
-    interpreter: &mut Interpreter,
+    shell: &mut Shell,
 ) {
     match parameter_expansion {
         ParameterExpansion::Simple(parameter) => {
@@ -184,7 +173,7 @@ pub fn expand_parameter_into(
                 parameter,
                 inside_double_quotes,
                 field_splitting_will_be_performed,
-                interpreter,
+                shell,
             );
         }
         ParameterExpansion::UnsetUseDefault {
@@ -198,11 +187,11 @@ pub fn expand_parameter_into(
                 parameter,
                 inside_double_quotes,
                 field_splitting_will_be_performed,
-                interpreter,
+                shell,
             );
             if parameter_type.is_unset() || (*default_on_null && parameter_type.is_null()) {
                 if let Some(default) = default {
-                    simple_word_expansion_into(expanded_word, default, false, interpreter);
+                    simple_word_expansion_into(expanded_word, default, false, shell);
                 }
             }
             expanded_word.extend(expanded_parameter);
@@ -219,14 +208,14 @@ pub fn expand_parameter_into(
                 Parameter::Variable(variable_name) => {
                     let value = word
                         .as_ref()
-                        .map(|w| expand_word_to_string(w, false, interpreter))
+                        .map(|w| expand_word_to_string(w, false, shell))
                         .unwrap_or_default();
-                    match interpreter.environment.get_mut(variable_name.as_ref()) {
+                    match shell.environment.get_mut(variable_name.as_ref()) {
                         Some(variable) if *assign_on_null && variable.value.is_empty() => {
                             variable.value = value.clone();
                         }
                         None => {
-                            interpreter
+                            shell
                                 .environment
                                 .insert(variable_name.to_string(), Variable::new(value.clone()));
                         }
@@ -249,11 +238,11 @@ pub fn expand_parameter_into(
                 parameter,
                 inside_double_quotes,
                 field_splitting_will_be_performed,
-                interpreter,
+                shell,
             );
             if parameter_type.is_unset() || (*error_on_null && parameter_type.is_null()) {
                 if let Some(word) = word {
-                    eprintln!("{}", expand_word_to_string(word, false, interpreter));
+                    eprintln!("{}", expand_word_to_string(word, false, shell));
                 } else if *error_on_null {
                     eprintln!("parameter is unset or null");
                 } else {
@@ -274,13 +263,13 @@ pub fn expand_parameter_into(
                 parameter,
                 inside_double_quotes,
                 field_splitting_will_be_performed,
-                interpreter,
+                shell,
             );
             if !parameter_type.is_unset()
                 && (!parameter_type.is_null() || *substitute_null_with_word)
             {
                 if let Some(word) = word {
-                    simple_word_expansion_into(expanded_word, word, false, interpreter)
+                    simple_word_expansion_into(expanded_word, word, false, shell)
                 }
             }
         }
@@ -298,9 +287,9 @@ pub fn expand_parameter_into(
                 parameter,
                 false,
                 false,
-                interpreter,
+                shell,
             );
-            if parameter_type.is_unset() && interpreter.set_options.nounset {
+            if parameter_type.is_unset() && shell.set_options.nounset {
                 todo!("error: unset parameter")
             }
             expanded_word.append(
@@ -321,12 +310,12 @@ pub fn expand_parameter_into(
                 parameter,
                 inside_double_quotes,
                 field_splitting_will_be_performed,
-                interpreter,
+                shell,
             );
             let param_str = expanded_parameter.to_string();
             if let Some(word) = pattern {
                 let mut expanded_pattern = ExpandedWord::default();
-                simple_word_expansion_into(&mut expanded_pattern, word, false, interpreter);
+                simple_word_expansion_into(&mut expanded_pattern, word, false, shell);
                 // TODO: fix unwrap
                 let pattern = Pattern::new(&expanded_pattern).unwrap();
                 let result = if *remove_prefix {
@@ -355,25 +344,25 @@ mod tests {
     use super::*;
     use crate::parse::word::test_utils::unquoted_literal;
 
-    fn interpreter_with_env(env: &[(&str, &str)]) -> Interpreter {
-        let mut interpreter = Interpreter::default();
+    fn shell_with_env(env: &[(&str, &str)]) -> Shell {
+        let mut shell = Shell::default();
         for (k, v) in env {
-            interpreter
+            shell
                 .environment
                 .insert(k.to_string(), Variable::new(v.to_string()));
         }
-        interpreter
+        shell
     }
 
-    fn interpreter_with_positional_arguments(args: Vec<&str>) -> Interpreter {
-        let mut interpreter = Interpreter::default();
-        interpreter.positional_parameters = args.iter().map(|s| s.to_string()).collect();
-        interpreter
+    fn shell_with_positional_arguments(args: Vec<&str>) -> Shell {
+        let mut shell = Shell::default();
+        shell.positional_parameters = args.iter().map(|s| s.to_string()).collect();
+        shell
     }
 
     fn expand_parameter_to_string(
         parameter_expansion: ParameterExpansion,
-        interpreter: &mut Interpreter,
+        shell: &mut Shell,
     ) -> String {
         let mut expanded_word = ExpandedWord::default();
         expand_parameter_into(
@@ -381,7 +370,7 @@ mod tests {
             &parameter_expansion,
             false,
             false,
-            interpreter,
+            shell,
         );
         expanded_word.to_string()
     }
@@ -390,7 +379,7 @@ mod tests {
         parameter_expansion: ParameterExpansion,
         inside_double_quotes: bool,
         field_splitting_will_be_performed: bool,
-        interpreter: &mut Interpreter,
+        shell: &mut Shell,
     ) -> ExpandedWord {
         let mut expanded_word = ExpandedWord::default();
         expand_parameter_into(
@@ -398,18 +387,18 @@ mod tests {
             &parameter_expansion,
             inside_double_quotes,
             field_splitting_will_be_performed,
-            interpreter,
+            shell,
         );
         expanded_word
     }
 
     #[test]
     fn expand_simple_named_parameter() {
-        let mut interpreter = interpreter_with_env(&[("HOME", "/home/test_user")]);
+        let mut shell = shell_with_env(&[("HOME", "/home/test_user")]);
         assert_eq!(
             expand_parameter_to_string(
                 ParameterExpansion::Simple(Parameter::Variable("HOME".into())),
-                &mut interpreter
+                &mut shell
             ),
             "/home/test_user"
         );
@@ -417,12 +406,12 @@ mod tests {
 
     #[test]
     fn expand_dollar() {
-        let mut interpreter = Interpreter::default();
-        interpreter.shell_pid = 123;
+        let mut shell = Shell::default();
+        shell.shell_pid = 123;
         assert_eq!(
             expand_parameter_to_string(
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Dollar)),
-                &mut interpreter
+                &mut shell
             ),
             "123"
         );
@@ -430,19 +419,19 @@ mod tests {
 
     #[test]
     fn expand_bang() {
-        let mut interpreter = Interpreter::default();
+        let mut shell = Shell::default();
         assert_eq!(
             expand_parameter_to_string(
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Bang)),
-                &mut interpreter
+                &mut shell
             ),
             "".to_string()
         );
-        interpreter.most_recent_background_command_pid = Some(123);
+        shell.most_recent_background_command_pid = Some(123);
         assert_eq!(
             expand_parameter_to_string(
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Bang)),
-                &mut interpreter
+                &mut shell
             ),
             "123".to_string()
         );
@@ -450,7 +439,7 @@ mod tests {
 
     #[test]
     fn unset_use_default_parameter_expansion() {
-        let mut interpreter = interpreter_with_env(&[("HOME", "/home/test_user"), ("NULL", "")]);
+        let mut shell = shell_with_env(&[("HOME", "/home/test_user"), ("NULL", "")]);
         assert_eq!(
             expand_parameter_to_string(
                 ParameterExpansion::UnsetUseDefault {
@@ -458,7 +447,7 @@ mod tests {
                     word: None,
                     default_on_null: false,
                 },
-                &mut interpreter
+                &mut shell
             ),
             "/home/test_user"
         );
@@ -469,7 +458,7 @@ mod tests {
                     word: Some(unquoted_literal("default")),
                     default_on_null: false,
                 },
-                &mut interpreter
+                &mut shell
             ),
             "default"
         );
@@ -480,7 +469,7 @@ mod tests {
                     word: Some(unquoted_literal("default")),
                     default_on_null: false,
                 },
-                &mut interpreter
+                &mut shell
             ),
             ""
         );
@@ -491,7 +480,7 @@ mod tests {
                     word: Some(unquoted_literal("default")),
                     default_on_null: true,
                 },
-                &mut interpreter
+                &mut shell
             ),
             "default"
         );
@@ -499,7 +488,7 @@ mod tests {
 
     #[test]
     fn unset_assign_default_parameter_expansion() {
-        let mut interpreter = interpreter_with_env(&[("NULL", "")]);
+        let mut shell = shell_with_env(&[("NULL", "")]);
         assert_eq!(
             expand_parameter_to_string(
                 ParameterExpansion::UnsetAssignDefault {
@@ -507,14 +496,14 @@ mod tests {
                     word: Some(unquoted_literal("value")),
                     assign_on_null: false,
                 },
-                &mut interpreter
+                &mut shell
             ),
             "value"
         );
         assert_eq!(
             expand_parameter_to_string(
                 ParameterExpansion::Simple(Parameter::Variable("unset_var".into())),
-                &mut interpreter
+                &mut shell
             ),
             "value"
         );
@@ -525,14 +514,14 @@ mod tests {
                     word: None,
                     assign_on_null: false,
                 },
-                &mut interpreter
+                &mut shell
             ),
             ""
         );
         assert_eq!(
             expand_parameter_to_string(
                 ParameterExpansion::Simple(Parameter::Variable("unset_var".into())),
-                &mut interpreter
+                &mut shell
             ),
             "value".to_string()
         );
@@ -543,14 +532,14 @@ mod tests {
                     word: Some(unquoted_literal("default")),
                     assign_on_null: false,
                 },
-                &mut interpreter
+                &mut shell
             ),
             "default".to_string()
         );
         assert_eq!(
             expand_parameter_to_string(
                 ParameterExpansion::Simple(Parameter::Variable("NULL".into())),
-                &mut interpreter
+                &mut shell
             ),
             "".to_string()
         );
@@ -561,14 +550,14 @@ mod tests {
                     word: Some(unquoted_literal("default")),
                     assign_on_null: true,
                 },
-                &mut interpreter
+                &mut shell
             ),
             "default".to_string()
         );
         assert_eq!(
             expand_parameter_to_string(
                 ParameterExpansion::Simple(Parameter::Variable("NULL".into())),
-                &mut interpreter
+                &mut shell
             ),
             "default".to_string()
         );
@@ -576,7 +565,7 @@ mod tests {
 
     #[test]
     fn set_use_alternative_parameter_expansion() {
-        let mut interpreter = interpreter_with_env(&[("HOME", "/home/test"), ("NULL", "")]);
+        let mut shell = shell_with_env(&[("HOME", "/home/test"), ("NULL", "")]);
         assert_eq!(
             expand_parameter_to_string(
                 ParameterExpansion::SetUseAlternative {
@@ -584,7 +573,7 @@ mod tests {
                     word: Some(unquoted_literal("word")),
                     substitute_null_with_word: false,
                 },
-                &mut interpreter
+                &mut shell
             ),
             "word".to_string()
         );
@@ -595,7 +584,7 @@ mod tests {
                     word: Some(unquoted_literal("word")),
                     substitute_null_with_word: false,
                 },
-                &mut interpreter
+                &mut shell
             ),
             "".to_string()
         );
@@ -606,7 +595,7 @@ mod tests {
                     word: Some(unquoted_literal("word")),
                     substitute_null_with_word: false,
                 },
-                &mut interpreter
+                &mut shell
             ),
             "".to_string()
         );
@@ -617,7 +606,7 @@ mod tests {
                     word: Some(unquoted_literal("word")),
                     substitute_null_with_word: true,
                 },
-                &mut interpreter
+                &mut shell
             ),
             "word".to_string()
         );
@@ -625,11 +614,11 @@ mod tests {
 
     #[test]
     fn string_length_parameter_expansion() {
-        let mut interpreter = interpreter_with_env(&[("HOME", "/home/test_user")]);
+        let mut shell = shell_with_env(&[("HOME", "/home/test_user")]);
         assert_eq!(
             expand_parameter_to_string(
                 ParameterExpansion::StrLen(Parameter::Variable("HOME".into())),
-                &mut interpreter
+                &mut shell
             ),
             "15".to_string()
         );
@@ -637,7 +626,7 @@ mod tests {
 
     #[test]
     fn remove_smallest_suffix() {
-        let mut interpreter = interpreter_with_env(&[
+        let mut shell = shell_with_env(&[
             ("HOME", "/home/test_user"),
             ("TEST", "aabbcc"),
             ("NULL", ""),
@@ -650,7 +639,7 @@ mod tests {
                     remove_largest: false,
                     remove_prefix: false,
                 },
-                &mut interpreter
+                &mut shell
             ),
             "/home/".to_string()
         );
@@ -662,7 +651,7 @@ mod tests {
                     remove_largest: false,
                     remove_prefix: false,
                 },
-                &mut interpreter
+                &mut shell
             ),
             "a".to_string()
         );
@@ -674,7 +663,7 @@ mod tests {
                     remove_largest: false,
                     remove_prefix: false,
                 },
-                &mut interpreter
+                &mut shell
             ),
             "".to_string()
         );
@@ -686,7 +675,7 @@ mod tests {
                     remove_largest: false,
                     remove_prefix: false,
                 },
-                &mut interpreter
+                &mut shell
             ),
             "".to_string()
         );
@@ -698,7 +687,7 @@ mod tests {
                     remove_largest: false,
                     remove_prefix: false,
                 },
-                &mut interpreter
+                &mut shell
             ),
             "/home/test_user".to_string()
         );
@@ -706,7 +695,7 @@ mod tests {
 
     #[test]
     fn remove_largest_suffix() {
-        let mut interpreter = interpreter_with_env(&[
+        let mut shell = shell_with_env(&[
             ("HOME", "/home/test_user"),
             ("TEST", "aabbcc"),
             ("NULL", ""),
@@ -719,7 +708,7 @@ mod tests {
                     remove_largest: true,
                     remove_prefix: false,
                 },
-                &mut interpreter
+                &mut shell
             ),
             "/home/".to_string()
         );
@@ -731,7 +720,7 @@ mod tests {
                     remove_largest: true,
                     remove_prefix: false,
                 },
-                &mut interpreter
+                &mut shell
             ),
             "".to_string()
         );
@@ -743,7 +732,7 @@ mod tests {
                     remove_largest: true,
                     remove_prefix: false,
                 },
-                &mut interpreter
+                &mut shell
             ),
             "".to_string()
         );
@@ -755,7 +744,7 @@ mod tests {
                     remove_largest: true,
                     remove_prefix: false,
                 },
-                &mut interpreter
+                &mut shell
             ),
             "".to_string()
         );
@@ -767,7 +756,7 @@ mod tests {
                     remove_largest: true,
                     remove_prefix: false,
                 },
-                &mut interpreter
+                &mut shell
             ),
             "/home/test_user".to_string()
         );
@@ -775,7 +764,7 @@ mod tests {
 
     #[test]
     fn remove_smallest_prefix() {
-        let mut interpreter = interpreter_with_env(&[
+        let mut shell = shell_with_env(&[
             ("HOME", "/home/test_user"),
             ("TEST", "aabbcc"),
             ("NULL", ""),
@@ -788,7 +777,7 @@ mod tests {
                     remove_largest: false,
                     remove_prefix: true,
                 },
-                &mut interpreter
+                &mut shell
             ),
             "test_user".to_string()
         );
@@ -800,7 +789,7 @@ mod tests {
                     remove_largest: false,
                     remove_prefix: true,
                 },
-                &mut interpreter
+                &mut shell
             ),
             "c".to_string()
         );
@@ -812,7 +801,7 @@ mod tests {
                     remove_largest: false,
                     remove_prefix: true,
                 },
-                &mut interpreter
+                &mut shell
             ),
             "".to_string()
         );
@@ -824,7 +813,7 @@ mod tests {
                     remove_largest: false,
                     remove_prefix: true,
                 },
-                &mut interpreter
+                &mut shell
             ),
             "".to_string()
         );
@@ -836,7 +825,7 @@ mod tests {
                     remove_largest: false,
                     remove_prefix: true,
                 },
-                &mut interpreter
+                &mut shell
             ),
             "/home/test_user".to_string()
         );
@@ -844,8 +833,8 @@ mod tests {
 
     #[test]
     fn remove_largest_prefix() {
-        let mut interpreter =
-            interpreter_with_env(&[("HOME", "/home/test_user"), ("TEST", "aabbc"), ("NULL", "")]);
+        let mut shell =
+            shell_with_env(&[("HOME", "/home/test_user"), ("TEST", "aabbc"), ("NULL", "")]);
         assert_eq!(
             expand_parameter_to_string(
                 ParameterExpansion::RemovePattern {
@@ -854,7 +843,7 @@ mod tests {
                     remove_largest: true,
                     remove_prefix: true,
                 },
-                &mut interpreter
+                &mut shell
             ),
             "test_user"
         );
@@ -866,7 +855,7 @@ mod tests {
                     remove_largest: true,
                     remove_prefix: true,
                 },
-                &mut interpreter
+                &mut shell
             ),
             "".to_string()
         );
@@ -878,7 +867,7 @@ mod tests {
                     remove_largest: true,
                     remove_prefix: true,
                 },
-                &mut interpreter
+                &mut shell
             ),
             "".to_string()
         );
@@ -890,7 +879,7 @@ mod tests {
                     remove_largest: true,
                     remove_prefix: true,
                 },
-                &mut interpreter
+                &mut shell
             ),
             "".to_string()
         );
@@ -902,7 +891,7 @@ mod tests {
                     remove_largest: true,
                     remove_prefix: true,
                 },
-                &mut interpreter
+                &mut shell
             ),
             "/home/test_user".to_string()
         );
@@ -910,13 +899,13 @@ mod tests {
 
     #[test]
     fn expand_at() {
-        let mut interpreter = interpreter_with_positional_arguments(vec!["arg1", "arg2", "arg3"]);
+        let mut shell = shell_with_positional_arguments(vec!["arg1", "arg2", "arg3"]);
         assert_eq!(
             expand_parameter(
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::At)),
                 false,
                 false,
-                &mut interpreter
+                &mut shell
             ),
             ExpandedWord::generated_unquoted_literal("arg1 arg2 arg3")
         );
@@ -925,7 +914,7 @@ mod tests {
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::At)),
                 false,
                 true,
-                &mut interpreter
+                &mut shell
             ),
             ExpandedWord::from_parts(vec![
                 ExpandedWordPart::GeneratedUnquotedLiteral("arg1".to_string()),
@@ -940,7 +929,7 @@ mod tests {
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::At)),
                 true,
                 true,
-                &mut interpreter
+                &mut shell
             ),
             ExpandedWord::from_parts(vec![
                 ExpandedWordPart::QuotedLiteral("arg1".to_string()),
@@ -954,13 +943,13 @@ mod tests {
 
     #[test]
     fn expand_asterisk_with_default_ifs() {
-        let mut interpreter = interpreter_with_positional_arguments(vec!["arg1", "arg2", "arg3"]);
+        let mut shell = shell_with_positional_arguments(vec!["arg1", "arg2", "arg3"]);
         assert_eq!(
             expand_parameter(
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Asterisk)),
                 false,
                 false,
-                &mut interpreter
+                &mut shell
             ),
             ExpandedWord::generated_unquoted_literal("arg1 arg2 arg3")
         );
@@ -969,7 +958,7 @@ mod tests {
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Asterisk)),
                 false,
                 true,
-                &mut interpreter
+                &mut shell
             ),
             ExpandedWord::from_parts(vec![
                 ExpandedWordPart::GeneratedUnquotedLiteral("arg1".to_string()),
@@ -984,7 +973,7 @@ mod tests {
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Asterisk)),
                 true,
                 true,
-                &mut interpreter
+                &mut shell
             ),
             ExpandedWord::quoted_literal("arg1 arg2 arg3")
         );
@@ -992,8 +981,8 @@ mod tests {
 
     #[test]
     fn expand_asterisk_with_null_ifs() {
-        let mut interpreter = interpreter_with_positional_arguments(vec!["arg1", "arg2", "arg3"]);
-        interpreter
+        let mut shell = shell_with_positional_arguments(vec!["arg1", "arg2", "arg3"]);
+        shell
             .environment
             .insert("IFS".to_string(), Variable::new("".to_string()));
         assert_eq!(
@@ -1001,7 +990,7 @@ mod tests {
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Asterisk)),
                 false,
                 false,
-                &mut interpreter
+                &mut shell
             ),
             ExpandedWord::generated_unquoted_literal("arg1arg2arg3")
         );
@@ -1010,7 +999,7 @@ mod tests {
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Asterisk)),
                 false,
                 true,
-                &mut interpreter
+                &mut shell
             ),
             ExpandedWord::from_parts(vec![
                 ExpandedWordPart::GeneratedUnquotedLiteral("arg1".to_string()),
@@ -1025,7 +1014,7 @@ mod tests {
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Asterisk)),
                 true,
                 true,
-                &mut interpreter
+                &mut shell
             ),
             ExpandedWord::quoted_literal("arg1arg2arg3")
         );
@@ -1033,14 +1022,14 @@ mod tests {
 
     #[test]
     fn expand_asterisk_with_unset_ifs() {
-        let mut interpreter = interpreter_with_positional_arguments(vec!["arg1", "arg2", "arg3"]);
-        interpreter.environment.remove("IFS");
+        let mut shell = shell_with_positional_arguments(vec!["arg1", "arg2", "arg3"]);
+        shell.environment.remove("IFS");
         assert_eq!(
             expand_parameter(
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Asterisk)),
                 false,
                 false,
-                &mut interpreter
+                &mut shell
             ),
             ExpandedWord::generated_unquoted_literal("arg1 arg2 arg3")
         );
@@ -1049,7 +1038,7 @@ mod tests {
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Asterisk)),
                 false,
                 true,
-                &mut interpreter
+                &mut shell
             ),
             ExpandedWord::from_parts(vec![
                 ExpandedWordPart::GeneratedUnquotedLiteral("arg1".to_string()),
@@ -1064,7 +1053,7 @@ mod tests {
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Asterisk)),
                 true,
                 true,
-                &mut interpreter
+                &mut shell
             ),
             ExpandedWord::quoted_literal("arg1 arg2 arg3")
         );
@@ -1072,8 +1061,8 @@ mod tests {
 
     #[test]
     fn expand_asterisk_with_custom_ifs() {
-        let mut interpreter = interpreter_with_positional_arguments(vec!["arg1", "arg2", "arg3"]);
-        interpreter
+        let mut shell = shell_with_positional_arguments(vec!["arg1", "arg2", "arg3"]);
+        shell
             .environment
             .insert("IFS".to_string(), Variable::new(",:".to_string()));
         assert_eq!(
@@ -1081,7 +1070,7 @@ mod tests {
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Asterisk)),
                 false,
                 false,
-                &mut interpreter
+                &mut shell
             ),
             ExpandedWord::generated_unquoted_literal("arg1,arg2,arg3")
         );
@@ -1090,7 +1079,7 @@ mod tests {
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Asterisk)),
                 false,
                 true,
-                &mut interpreter
+                &mut shell
             ),
             ExpandedWord::from_parts(vec![
                 ExpandedWordPart::GeneratedUnquotedLiteral("arg1".to_string()),
@@ -1105,7 +1094,7 @@ mod tests {
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Asterisk)),
                 true,
                 true,
-                &mut interpreter
+                &mut shell
             ),
             ExpandedWord::quoted_literal("arg1,arg2,arg3")
         );

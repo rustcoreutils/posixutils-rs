@@ -1,10 +1,10 @@
-use crate::interpreter::wordexp::expanded_word::{ExpandedWord, ExpandedWordPart};
-use crate::interpreter::wordexp::parameter::expand_parameter_into;
-use crate::interpreter::wordexp::pathname::glob;
-use crate::interpreter::wordexp::pattern::FilenamePattern;
-use crate::interpreter::wordexp::tilde::tilde_expansion;
-use crate::interpreter::Interpreter;
 use crate::parse::word::{Word, WordPart};
+use crate::shell::Shell;
+use crate::wordexp::expanded_word::{ExpandedWord, ExpandedWordPart};
+use crate::wordexp::parameter::expand_parameter_into;
+use crate::wordexp::pathname::glob;
+use crate::wordexp::pattern::FilenamePattern;
+use crate::wordexp::tilde::tilde_expansion;
 use std::path::Path;
 
 pub mod expanded_word;
@@ -114,10 +114,10 @@ fn simple_word_expansion_into(
     result: &mut ExpandedWord,
     word: &Word,
     is_assignment: bool,
-    interpreter: &mut Interpreter,
+    shell: &mut Shell,
 ) {
     let mut word = word.clone();
-    tilde_expansion(&mut word, is_assignment, &interpreter.environment);
+    tilde_expansion(&mut word, is_assignment, &shell.environment);
     for part in word.parts.into_iter() {
         match part {
             WordPart::UnquotedLiteral(lit) => result.append(lit, false, false),
@@ -126,7 +126,7 @@ fn simple_word_expansion_into(
                 expansion,
                 inside_double_quotes,
             } => {
-                expand_parameter_into(result, &expansion, inside_double_quotes, true, interpreter);
+                expand_parameter_into(result, &expansion, inside_double_quotes, true, shell);
             }
             WordPart::ArithmeticExpansion(_) => {
                 todo!()
@@ -153,26 +153,22 @@ fn simple_word_expansion_into(
 /// - parameter expansion
 /// - command substitution
 /// - arithmetic expansion
-pub fn expand_word_to_string(
-    word: &Word,
-    is_assignment: bool,
-    interpreter: &mut Interpreter,
-) -> String {
+pub fn expand_word_to_string(word: &Word, is_assignment: bool, shell: &mut Shell) -> String {
     let mut expanded_word = ExpandedWord::default();
-    simple_word_expansion_into(&mut expanded_word, word, is_assignment, interpreter);
+    simple_word_expansion_into(&mut expanded_word, word, is_assignment, shell);
     expanded_word.to_string()
 }
 
 /// performs general word expansion (similar to `wordexp` from libc)
-pub fn expand_word(word: &Word, is_assignment: bool, interpreter: &mut Interpreter) -> Vec<String> {
+pub fn expand_word(word: &Word, is_assignment: bool, shell: &mut Shell) -> Vec<String> {
     let mut expanded_word = ExpandedWord::default();
-    simple_word_expansion_into(&mut expanded_word, word, is_assignment, interpreter);
-    let ifs = interpreter.environment.get("IFS").map(|v| v.value.as_str());
+    simple_word_expansion_into(&mut expanded_word, word, is_assignment, shell);
+    let ifs = shell.environment.get("IFS").map(|v| v.value.as_str());
     let mut result = Vec::new();
     for field in split_fields(expanded_word, ifs) {
         // TODO: handle error
         let pattern = FilenamePattern::new(&field).unwrap();
-        let files = glob(&pattern, Path::new(&interpreter.current_directory));
+        let files = glob(&pattern, Path::new(&shell.current_directory));
         if files.is_empty() {
             result.push(pattern.into())
         } else {

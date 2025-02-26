@@ -8,46 +8,35 @@
 //
 
 use crate::cli::{parse_args, ExecutionMode};
-use crate::interpreter::Interpreter;
-use crate::parse::command_parser::CommandParser;
-use crate::parse::{AliasTable, ParseResult};
+use crate::shell::{ExecutionError, Shell};
 use atty::Stream;
 use std::io;
 
+mod builtin;
 mod cli;
-mod interpreter;
 mod parse;
 mod program;
+mod shell;
 mod utils;
-
-fn execute_program(program: &str, interpreter: &mut Interpreter) -> ParseResult<()> {
-    let mut parser = CommandParser::new(program)?;
-    loop {
-        let command = parser.parse_next_command(&interpreter.alias_table)?;
-        if let Some(command) = command {
-            interpreter.interpret(&command);
-        } else {
-            break;
-        }
-    }
-    Ok(())
-}
+mod wordexp;
 
 fn main() {
     let is_attached_to_terminal = atty::is(Stream::Stdin) && atty::is(Stream::Stdout);
     let args = parse_args(std::env::args().collect(), is_attached_to_terminal).unwrap();
-    let mut interpreter =
-        Interpreter::initialize_from_system(args.program_name, args.arguments, args.set_options);
+    let mut shell =
+        Shell::initialize_from_system(args.program_name, args.arguments, args.set_options);
     match args.execution_mode {
         ExecutionMode::Interactive | ExecutionMode::ReadCommandsFromStdin => {
             let mut buffer = String::new();
             let stdin = io::stdin();
             while stdin.read_line(&mut buffer).is_ok_and(|n| n > 0) {
-                match execute_program(&buffer, &mut interpreter) {
+                match shell.execute_program(&buffer) {
                     Ok(_) => {
                         buffer.clear();
                     }
-                    Err(err) if !err.could_be_resolved_with_more_input => {
+                    Err(ExecutionError::ParserError(err))
+                        if !err.could_be_resolved_with_more_input =>
+                    {
                         println!("{}", err.message);
                     }
                     Err(_) => {}
@@ -58,12 +47,16 @@ fn main() {
             match other {
                 ExecutionMode::ReadCommandsFromString(command_string) => {
                     // TODO: impl proper error reporting
-                    execute_program(&command_string, &mut interpreter).expect("parsing error");
+                    shell
+                        .execute_program(&command_string)
+                        .expect("parsing error");
                 }
                 ExecutionMode::ReadFromFile(file) => {
                     // TODO: impl proper error reporting
                     let file_contents = std::fs::read_to_string(file).expect("could not read file");
-                    execute_program(&file_contents, &mut interpreter).expect("parsing error");
+                    shell
+                        .execute_program(&file_contents)
+                        .expect("parsing error");
                 }
                 _ => unreachable!(),
             }

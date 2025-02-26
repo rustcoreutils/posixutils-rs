@@ -1,14 +1,14 @@
-use crate::interpreter::{BuiltinUtility, Interpreter};
+use crate::builtin::BuiltinUtility;
+use crate::shell::Shell;
 use crate::utils::strcoll;
-use nix::libc;
 use std::ffi::CString;
 use std::fmt::Write;
 
 pub struct SetSpecialBuiltin;
 
 impl BuiltinUtility for SetSpecialBuiltin {
-    fn exec(&self, args: &[String], interpreter: &mut Interpreter) -> i32 {
-        match interpreter.set_options.parse_args_and_update(args) {
+    fn exec(&self, args: &[String], shell: &mut Shell) -> i32 {
+        match shell.set_options.parse_args_and_update(args) {
             Err(err) => {
                 eprintln!("set: {}", err);
                 // the standard specifies >0, both bash and dash return 2
@@ -17,16 +17,16 @@ impl BuiltinUtility for SetSpecialBuiltin {
             Ok(parsed_args) => {
                 match parsed_args {
                     ParsedArgs::PrintSettingsHumanReadable => {
-                        print!("{}", interpreter.set_options.to_string_human_readable());
+                        print!("{}", shell.set_options.to_string_human_readable());
                     }
                     ParsedArgs::PrintSettingsShellReadable => {
-                        print!("{}", interpreter.set_options.to_string_shell_readable());
+                        print!("{}", shell.set_options.to_string_shell_readable());
                     }
                     ParsedArgs::ResetPositionalParameters => {
-                        interpreter.positional_parameters.clear();
+                        shell.positional_parameters.clear();
                     }
                     ParsedArgs::PrintVars => {
-                        let mut sorted_vars = interpreter
+                        let mut sorted_vars = shell
                             .environment
                             .iter()
                             .map(|(var, val)| {
@@ -40,7 +40,7 @@ impl BuiltinUtility for SetSpecialBuiltin {
                         }
                     }
                     ParsedArgs::ArgsStart(i) => {
-                        interpreter.positional_parameters = args[i..].to_vec();
+                        shell.positional_parameters = args[i..].to_vec();
                     }
                 }
                 0

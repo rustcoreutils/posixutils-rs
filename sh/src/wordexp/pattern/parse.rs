@@ -1,4 +1,4 @@
-use crate::interpreter::wordexp::{ExpandedWord, ExpandedWordPart};
+use crate::wordexp::{ExpandedWord, ExpandedWordPart};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RangeEndpoint {

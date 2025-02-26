@@ -1,9 +1,10 @@
-use crate::interpreter::{BuiltinUtility, Interpreter};
+use crate::builtin::BuiltinUtility;
+use crate::shell::Shell;
 
 pub struct AliasBuiltin;
 
 impl BuiltinUtility for AliasBuiltin {
-    fn exec(&self, args: &[String], interpreter: &mut Interpreter) -> i32 {
+    fn exec(&self, args: &[String], interpreter: &mut Shell) -> i32 {
         if args.is_empty() {
             for (alias, command) in &interpreter.alias_table {
                 println!("alias {}='{}'", alias, command);

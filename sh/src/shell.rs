@@ -1,56 +1,35 @@
-use crate::interpreter::builtin::alias::AliasBuiltin;
-use crate::interpreter::builtin::set::{SetOptions, SetSpecialBuiltin};
-use crate::interpreter::wordexp::{expand_word, expand_word_to_string};
+use crate::builtin::set::SetOptions;
+use crate::builtin::{get_bultin_utility, get_special_builtin_utility};
 use crate::parse::command::{
     Assignment, Command, CompleteCommand, CompoundCommand, Conjunction, IORedirectionKind,
-    LogicalOp, Name, Pipeline, Program, Redirection, RedirectionKind, SimpleCommand,
+    LogicalOp, Name, Pipeline, Redirection, RedirectionKind, SimpleCommand,
 };
-use crate::parse::AliasTable;
+use crate::parse::command_parser::CommandParser;
+use crate::parse::{AliasTable, ParseResult, ParserError};
 use nix::libc;
 use nix::sys::wait::{waitpid, WaitStatus};
-use nix::unistd::{close, dup2, execve, fork, getpid, getppid, pipe, ForkResult, Pid};
+use nix::unistd::{close, dup2, execve, fork, getpid, getppid, pipe, ForkResult};
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
 use std::os::fd::{AsRawFd, IntoRawFd};
 use std::path::PathBuf;
 use std::rc::Rc;
 
-pub mod builtin;
-mod wordexp;
-
-trait BuiltinUtility {
-    fn exec(&self, args: &[String], interpreter: &mut Interpreter) -> i32;
-}
-
-fn get_special_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
-    match name {
-        "set" => Some(&SetSpecialBuiltin),
-        _ => None,
-    }
-}
-
-fn get_bultin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
-    match name {
-        "alias" => Some(&AliasBuiltin),
-        _ => None,
-    }
-}
-
 #[derive(Clone)]
-struct Variable {
-    value: String,
-    export: bool,
+pub struct Variable {
+    pub value: String,
+    pub export: bool,
 }
 
 impl Variable {
-    fn new_exported(value: String) -> Self {
+    pub fn new_exported(value: String) -> Self {
         Variable {
             value,
             export: true,
         }
     }
 
-    fn new(value: String) -> Self {
+    pub fn new(value: String) -> Self {
         Variable {
             value,
             export: false,
@@ -71,23 +50,34 @@ fn find_in_path(command: &str, env_path: &str) -> Option<String> {
 
 pub type Environment = HashMap<String, Variable>;
 
+#[derive(Clone, Debug)]
+pub enum ExecutionError {
+    ParserError(ParserError),
+}
+
+impl From<ParserError> for ExecutionError {
+    fn from(value: ParserError) -> Self {
+        Self::ParserError(value)
+    }
+}
+
 #[derive(Clone)]
-pub struct Interpreter {
-    environment: Environment,
-    program_name: String,
-    positional_parameters: Vec<String>,
-    opened_files: HashMap<u32, Rc<std::fs::File>>,
-    functions: HashMap<Name, Rc<CompoundCommand>>,
-    most_recent_pipeline_exit_status: i32,
-    last_command_substitution_status: i32,
-    shell_pid: i32,
-    most_recent_background_command_pid: Option<i32>,
-    current_directory: OsString,
-    set_options: SetOptions,
+pub struct Shell {
+    pub environment: Environment,
+    pub program_name: String,
+    pub positional_parameters: Vec<String>,
+    pub opened_files: HashMap<u32, Rc<std::fs::File>>,
+    pub functions: HashMap<Name, Rc<CompoundCommand>>,
+    pub most_recent_pipeline_exit_status: i32,
+    pub last_command_substitution_status: i32,
+    pub shell_pid: i32,
+    pub most_recent_background_command_pid: Option<i32>,
+    pub current_directory: OsString,
+    pub set_options: SetOptions,
     pub alias_table: AliasTable,
 }
 
-impl Interpreter {
+impl Shell {
     fn exec(&self, command: &str, args: &[String]) -> i32 {
         match unsafe { fork() } {
             Ok(ForkResult::Child) => {
@@ -137,7 +127,7 @@ impl Interpreter {
                     // > the word that follows the redirection operator shall be subjected to tilde
                     // > expansion, parameter expansion, command substitution, arithmetic expansion,
                     // > and quote removal.
-                    let path = expand_word_to_string(file, false, self);
+                    let path = crate::wordexp::expand_word_to_string(file, false, self);
                     // TODO: pathname expansion is not allowed if the shell is non-interactive,
                     // optional otherwise. Bash does implement this, maybe we should too.
                     match kind {
@@ -173,7 +163,7 @@ impl Interpreter {
 
     fn perform_assignments(&mut self, assignments: &[Assignment]) {
         for assignment in assignments {
-            let word_str = expand_word_to_string(&assignment.value, true, self);
+            let word_str = crate::wordexp::expand_word_to_string(&assignment.value, true, self);
             self.environment
                 .insert(assignment.name.to_string(), Variable::new(word_str));
         }
@@ -184,7 +174,7 @@ impl Interpreter {
         // reset
         self.last_command_substitution_status = 0;
         for word in &simple_command.words {
-            expanded_words.extend(expand_word(word, false, self));
+            expanded_words.extend(crate::wordexp::expand_word(word, false, self));
         }
         if expanded_words.is_empty() {
             // no commands to execute, perform assignments and redirections
@@ -325,17 +315,30 @@ impl Interpreter {
         status
     }
 
-    pub fn interpret(&mut self, command: &CompleteCommand) {
+    fn interpret(&mut self, command: &CompleteCommand) {
         for conjunction in &command.commands {
             self.interpret_conjunction(conjunction);
         }
+    }
+
+    pub fn execute_program(&mut self, program: &str) -> Result<(), ExecutionError> {
+        let mut parser = CommandParser::new(program)?;
+        loop {
+            let command = parser.parse_next_command(&self.alias_table)?;
+            if let Some(command) = command {
+                self.interpret(&command);
+            } else {
+                break;
+            }
+        }
+        Ok(())
     }
 
     pub fn initialize_from_system(
         program_name: String,
         args: Vec<String>,
         set_options: SetOptions,
-    ) -> Interpreter {
+    ) -> Shell {
         // > If a variable is initialized from the environment, it shall be marked for
         // > export immediately
         let mut variables: Environment = std::env::vars()
@@ -347,7 +350,7 @@ impl Interpreter {
         variables.insert("PS1".to_string(), Variable::new("$ ".to_string()));
         variables.insert("PS2".to_string(), Variable::new("> ".to_string()));
         variables.insert("PS4".to_string(), Variable::new("+ ".to_string()));
-        Interpreter {
+        Shell {
             environment: variables,
             program_name,
             positional_parameters: args,
@@ -360,9 +363,9 @@ impl Interpreter {
     }
 }
 
-impl Default for Interpreter {
+impl Default for Shell {
     fn default() -> Self {
-        Interpreter {
+        Shell {
             environment: Environment::from([(
                 "IFS".to_string(),
                 Variable::new(" \t\n".to_string()),

@@ -1,6 +1,6 @@
-use crate::interpreter::wordexp::pattern::parse::{parse_pattern, PatternItem};
-use crate::interpreter::wordexp::pattern::regex::{parsed_pattern_to_regex, Regex};
-use crate::interpreter::wordexp::ExpandedWord;
+use crate::wordexp::pattern::parse::{parse_pattern, PatternItem};
+use crate::wordexp::pattern::regex::{parsed_pattern_to_regex, Regex};
+use crate::wordexp::ExpandedWord;
 use std::ffi::{CStr, CString};
 
 mod parse;
@@ -179,7 +179,7 @@ impl From<FilenamePattern> for String {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::interpreter::wordexp::ExpandedWordPart;
+    use crate::wordexp::ExpandedWordPart;
 
     pub fn pattern_from_str(pat: &str) -> Pattern {
         Pattern::new(&ExpandedWord::unquoted_literal(pat)).expect("failed to create pattern")

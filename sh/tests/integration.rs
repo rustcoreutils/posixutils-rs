@@ -551,9 +551,6 @@ mod word_expansion {
     use super::*;
 
     #[test]
-    fn variable_expansion() {}
-
-    #[test]
     fn parameter_expansion_indicate_error_if_null_or_unset() {
         todo!()
     }
@@ -611,6 +608,17 @@ mod word_expansion {
         );
     }
     #[test]
+    fn only_the_results_of_expansion_and_substitution_are_split() {
+        test_script(
+            include_str!(
+                "sh/word_expansion/only_the_results_of_expansion_and_substitution_are_split.sh"
+            ),
+            include_str!(
+                "sh/word_expansion/only_the_results_of_expansion_and_substitution_are_split.out"
+            ),
+        );
+    }
+    #[test]
     fn parameter_expansion_assign_default_values() {
         test_script(
             include_str!("sh/word_expansion/parameter_expansion_assign_default_values.sh"),
@@ -643,6 +651,14 @@ mod word_expansion {
             include_str!("sh/word_expansion/parameter_expansion_use_default_values.out"),
         );
     }
+
+    #[test]
+    fn pathname_expansion() {
+        test_script(
+            include_str!("sh/word_expansion/pathname_expansion.sh"),
+            include_str!("sh/word_expansion/pathname_expansion.out"),
+        );
+    }
     #[test]
     fn split_fields() {
         test_script(
@@ -671,12 +687,18 @@ mod word_expansion {
             include_str!("sh/word_expansion/split_fields_unset_ifs.out"),
         );
     }
-
     #[test]
     fn tilde_expansion() {
         test_script(
             include_str!("sh/word_expansion/tilde_expansion.sh"),
             include_str!("sh/word_expansion/tilde_expansion.out"),
+        );
+    }
+    #[test]
+    fn variable_expansion() {
+        test_script(
+            include_str!("sh/word_expansion/variable_expansion.sh"),
+            include_str!("sh/word_expansion/variable_expansion.out"),
         );
     }
 }

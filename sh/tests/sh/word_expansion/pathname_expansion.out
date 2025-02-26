@@ -1,0 +1,15 @@
+dir/inner_dir/data1
+dir/inner_dir/data1 dir/inner_dir/data2 dir/inner_dir/data3
+dir?inner_dir?data1
+dir[x/y]inner_dir[x/y]data1
+dir[[:graph:]]inner_dir[[:graph:]]data1
+dir/inner_dir/data1 dir/inner_dir/data2 dir/inner_dir/data3
+dir file1.txt file2.txt filea.txt filea.xyz fileb.txt filec.txt
+?hidden
+*hidden
+[!a]hidden
+[[:punct:]]hidden
+. .. .hidden
+file1.txt file2.txt filea.txt fileb.txt filec.txt
+file1.txt file2.txt filea.txt filea.xyz fileb.txt filec.txt
+file1.txt file2.txt

@@ -1583,7 +1583,7 @@ mod tests {
         assert!(parse_complete_command("$\n0", AliasTable::default())
             .is_err_and(|err| !err.could_be_resolved_with_more_input));
         assert!(parse_complete_command("$", AliasTable::default())
-            .is_err_and(|err| err.could_be_resolved_with_more_input))
+            .is_err_and(|err| !err.could_be_resolved_with_more_input))
     }
 
     #[test]

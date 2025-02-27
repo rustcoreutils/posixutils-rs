@@ -882,3 +882,174 @@ mod errors {
         expect_exit_code("tests/read_dir/file1.txt", 126);
     }
 }
+
+mod commands {
+    use super::*;
+
+    #[test]
+    fn assigning_to_readonly_var_is_error() {
+        expect_err_and_message("readonly x=1; x=2", None);
+    }
+
+    #[test]
+    fn for_loop_without_iterable_iterates_over_shell_args() {
+        test_cli(
+            vec!["-c", "for x; do echo $x; done", "sh", "1", "2", "3"],
+            "",
+            "1\n2\n3\n",
+        );
+    }
+
+    #[test]
+    fn and_or_list() {
+        test_script(
+            include_str!("sh/commands/and_or_list.sh"),
+            include_str!("sh/commands/and_or_list.out"),
+        );
+    }
+    #[test]
+    fn assignments_before_command_are_exported_to_command_env() {
+        test_script(
+            include_str!("sh/commands/assignments_before_command_are_exported_to_command_env.sh"),
+            include_str!("sh/commands/assignments_before_command_are_exported_to_command_env.out"),
+        );
+    }
+    #[test]
+    fn assignments_before_function_call_affect_the_current_environment_during_function_execution() {
+        test_script(include_str!("sh/commands/assignments_before_function_call_affect_the_current_environment_during_function_execution.sh"), include_str!("sh/commands/assignments_before_function_call_affect_the_current_environment_during_function_execution.out"));
+    }
+    #[test]
+    fn assignments_before_special_builtin_affect_the_current_env() {
+        test_script(
+            include_str!(
+                "sh/commands/assignments_before_special_builtin_affect_the_current_env.sh"
+            ),
+            include_str!(
+                "sh/commands/assignments_before_special_builtin_affect_the_current_env.out"
+            ),
+        );
+    }
+    #[test]
+    fn assignments_with_no_command_affect_the_current_env() {
+        test_script(
+            include_str!("sh/commands/assignments_with_no_command_affect_the_current_env.sh"),
+            include_str!("sh/commands/assignments_with_no_command_affect_the_current_env.out"),
+        );
+    }
+    #[test]
+    fn braced_grouping() {
+        test_script(
+            include_str!("sh/commands/braced_grouping.sh"),
+            include_str!("sh/commands/braced_grouping.out"),
+        );
+    }
+    #[test]
+    fn case_construct() {
+        test_script(
+            include_str!("sh/commands/case_construct.sh"),
+            include_str!("sh/commands/case_construct.out"),
+        );
+    }
+    #[test]
+    fn command_precedence() {
+        test_script(
+            include_str!("sh/commands/command_precedence.sh"),
+            include_str!("sh/commands/command_precedence.out"),
+        );
+    }
+    #[test]
+    fn exit_status_of_for_loop_is_exit_status_of_last_command() {
+        test_script(
+            include_str!("sh/commands/exit_status_of_for_loop_is_exit_status_of_last_command.sh"),
+            include_str!("sh/commands/exit_status_of_for_loop_is_exit_status_of_last_command.out"),
+        );
+    }
+    #[test]
+    fn exit_status_of_if_construct_is_the_exit_status_of_last_executed_command() {
+        test_script(include_str!("sh/commands/exit_status_of_if_construct_is_the_exit_status_of_last_executed_command.sh"), include_str!("sh/commands/exit_status_of_if_construct_is_the_exit_status_of_last_executed_command.out"));
+    }
+    #[test]
+    fn for_loop() {
+        test_script(
+            include_str!("sh/commands/for_loop.sh"),
+            include_str!("sh/commands/for_loop.out"),
+        );
+    }
+    #[test]
+    fn functions() {
+        test_script(
+            include_str!("sh/commands/functions.sh"),
+            include_str!("sh/commands/functions.out"),
+        );
+    }
+    #[test]
+    fn if_construct() {
+        test_script(
+            include_str!("sh/commands/if_construct.sh"),
+            include_str!("sh/commands/if_construct.out"),
+        );
+    }
+    #[test]
+    fn invert_pipeline_exit_status() {
+        test_script(
+            include_str!("sh/commands/invert_pipeline_exit_status.sh"),
+            include_str!("sh/commands/invert_pipeline_exit_status.out"),
+        );
+    }
+    #[test]
+    fn pass_arguments_to_command() {
+        test_script(
+            include_str!("sh/commands/pass_arguments_to_command.sh"),
+            include_str!("sh/commands/pass_arguments_to_command.out"),
+        );
+    }
+    #[test]
+    fn pipeline() {
+        test_script(
+            include_str!("sh/commands/pipeline.sh"),
+            include_str!("sh/commands/pipeline.out"),
+        );
+    }
+    #[test]
+    fn pipeline_exit_status_is_determined_by_the_last_command() {
+        test_script(
+            include_str!("sh/commands/pipeline_exit_status_is_determined_by_the_last_command.sh"),
+            include_str!("sh/commands/pipeline_exit_status_is_determined_by_the_last_command.out"),
+        );
+    }
+    #[test]
+    fn sequential_list() {
+        test_script(
+            include_str!("sh/commands/sequential_list.sh"),
+            include_str!("sh/commands/sequential_list.out"),
+        );
+    }
+    #[test]
+    fn subshell_grouping_command() {
+        test_script(
+            include_str!("sh/commands/subshell_grouping_command.sh"),
+            include_str!("sh/commands/subshell_grouping_command.out"),
+        );
+    }
+    #[test]
+    fn until_loop() {
+        test_script(
+            include_str!("sh/commands/until_loop.sh"),
+            include_str!("sh/commands/until_loop.out"),
+        );
+    }
+    #[test]
+    fn values_in_variable_assignment_are_expanded() {
+        test_script(
+            include_str!("sh/commands/values_in_variable_assignment_are_expanded.sh"),
+            include_str!("sh/commands/values_in_variable_assignment_are_expanded.out"),
+        );
+    }
+    #[test]
+    fn while_loop() {
+        test_script(
+            include_str!("sh/commands/while_loop.sh"),
+            include_str!("sh/commands/while_loop.out"),
+        );
+    }
+}

@@ -1,0 +1,1 @@
+awk 'BEGIN { print ARGV[0], ARGV[1], ARGV[2], ARGV[3] }' arg1 arg2 arg3

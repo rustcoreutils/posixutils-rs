@@ -1,4 +1,5 @@
 use plib::{run_test, run_test_with_checker, TestPlan};
+use std::os::unix::process::ExitStatusExt;
 use std::process::Output;
 
 fn run_script<F: Fn(&Output)>(script: &str, checker: F) {
@@ -45,7 +46,7 @@ pub fn test_script(script: &str, expected_output: &str) {
     });
 }
 
-fn expect_err(script: &str) {
+fn expect_err_and_message(script: &str, stdout: Option<&str>) {
     run_test_with_checker(
         TestPlan {
             cmd: "sh".to_string(),
@@ -56,8 +57,27 @@ fn expect_err(script: &str) {
             expected_exit_code: 0,
         },
         |_, output| {
+            if let Some(stdout) = stdout {
+                assert_eq!(String::from_utf8_lossy(&output.stdout), stdout);
+            }
             assert!(!output.status.success());
             assert!(!output.stderr.is_empty());
+        },
+    )
+}
+
+fn expect_exit_code(script: &str, exit_code: i32) {
+    run_test_with_checker(
+        TestPlan {
+            cmd: "sh".to_string(),
+            args: vec!["-s".to_string()],
+            stdin_data: script.to_string(),
+            expected_out: "".to_string(),
+            expected_err: "".to_string(),
+            expected_exit_code: 0,
+        },
+        |_, output| {
+            assert_eq!(output.status.into_raw(), exit_code);
         },
     )
 }
@@ -826,5 +846,39 @@ mod redirection {
             include_str!("sh/redirection/output_redirection.sh"),
             include_str!("sh/redirection/output_redirection.out"),
         );
+    }
+}
+
+mod errors {
+    use super::*;
+
+    #[test]
+    fn exit_on_syntax_error() {
+        expect_err_and_message("echo &&; echo wrong", None);
+    }
+
+    #[test]
+    fn exit_on_special_builtin_error() {
+        expect_err_and_message("set -o abc; echo wrong", None);
+    }
+
+    #[test]
+    fn builtin_error_does_not_exit() {
+        expect_err_and_message("cd nonexistent; echo correct", Some("correct"));
+    }
+
+    #[test]
+    fn expansion_error_shall_exit() {
+        expect_err_and_message("${x!y}", None);
+    }
+
+    #[test]
+    fn exit_code_127_if_command_is_not_found() {
+        expect_exit_code("./nonexistent", 127);
+    }
+
+    #[test]
+    fn exit_code_126_if_command_is_found_but_not_executable() {
+        expect_exit_code("tests/read_dir/file1.txt", 126);
     }
 }

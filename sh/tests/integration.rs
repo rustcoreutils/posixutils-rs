@@ -1,19 +1,26 @@
 use plib::{run_test, run_test_with_checker, TestPlan};
+use std::process::Output;
 
-pub fn run_successfully_and<F: Fn(&str)>(program: &str, checker: F) {
+fn run_script<F: Fn(&Output)>(script: &str, checker: F) {
     run_test_with_checker(
         TestPlan {
             cmd: "sh".to_string(),
             args: vec!["-s".to_string()],
-            stdin_data: program.to_string(),
+            stdin_data: script.to_string(),
             expected_out: "".to_string(),
             expected_err: "".to_string(),
             expected_exit_code: 0,
         },
-        |_, output| {
-            checker(&String::from_utf8_lossy(&output.stdout));
-        },
+        |_, output| checker(output),
     )
+}
+
+pub fn run_successfully_and<F: Fn(&str)>(program: &str, checker: F) {
+    run_script(program, |output| {
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        checker(stdout.as_ref());
+    })
 }
 
 pub fn test_cli(args: Vec<&str>, stdin: &str, expected_output: &str) {
@@ -27,8 +34,6 @@ pub fn test_cli(args: Vec<&str>, stdin: &str, expected_output: &str) {
     });
 }
 
-pub fn test_cli_with_env(args: Vec<&str>, stdin: &str, expected_output: &str) {}
-
 pub fn test_script(script: &str, expected_output: &str) {
     run_test(TestPlan {
         cmd: "sh".to_string(),
@@ -38,6 +43,23 @@ pub fn test_script(script: &str, expected_output: &str) {
         expected_err: String::default(),
         expected_exit_code: 0,
     });
+}
+
+fn expect_err(script: &str) {
+    run_test_with_checker(
+        TestPlan {
+            cmd: "sh".to_string(),
+            args: vec!["-s".to_string()],
+            stdin_data: script.to_string(),
+            expected_out: "".to_string(),
+            expected_err: "".to_string(),
+            expected_exit_code: 0,
+        },
+        |_, output| {
+            assert!(!output.status.success());
+            assert!(!output.stderr.is_empty());
+        },
+    )
 }
 
 pub fn is_pid(s: &str) -> bool {
@@ -699,6 +721,109 @@ mod word_expansion {
         test_script(
             include_str!("sh/word_expansion/variable_expansion.sh"),
             include_str!("sh/word_expansion/variable_expansion.out"),
+        );
+    }
+}
+
+mod redirection {
+    use super::*;
+
+    #[test]
+    fn standard_output_redirection_fails_with_noclobber_set() {
+        run_script(
+            r#"
+            set -o noclobber
+            cd tests/write_dir
+            echo test1 > standard_output_redirection_fails_with_noclobber_set.txt
+            echo test2 > standard_output_redirection_fails_with_noclobber_set.txt
+            cat standard_output_redirection_fails_with_noclobber_set.txt
+            echo test3 >| standard_output_redirection_fails_with_noclobber_set.txt
+            cat standard_output_redirection_fails_with_noclobber_set.txt
+            rm standard_output_redirection_fails_with_noclobber_set.txt
+            "#,
+            |output| {
+                assert!(output.status.success());
+                assert!(!output.stderr.is_empty());
+                assert_eq!(String::from_utf8_lossy(&output.stdout), "test1\ntest3\n");
+            },
+        );
+    }
+
+    #[test]
+    fn duplicate_stderr_to_stdout() {
+        run_script("echo test 1>&2", |output| {
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "test\n");
+            assert_eq!(String::from_utf8_lossy(&output.stderr), "test\n");
+        });
+    }
+
+    #[test]
+    fn append_redirected_output() {
+        test_script(
+            include_str!("sh/redirection/append_redirected_output.sh"),
+            include_str!("sh/redirection/append_redirected_output.out"),
+        );
+    }
+
+    #[test]
+    fn contents_of_here_document_are_expanded() {
+        test_script(
+            include_str!("sh/redirection/contents_of_here_document_are_expanded.sh"),
+            include_str!("sh/redirection/contents_of_here_document_are_expanded.out"),
+        );
+    }
+
+    #[test]
+    fn contents_of_here_document_are_not_expanded_if_delimiter_is_quoted() {
+        test_script(include_str!("sh/redirection/contents_of_here_document_are_not_expanded_if_delimiter_is_quoted.sh"), include_str!("sh/redirection/contents_of_here_document_are_not_expanded_if_delimiter_is_quoted.out"));
+    }
+
+    #[test]
+    fn duplicate_input_file_descriptor() {
+        test_script(
+            include_str!("sh/redirection/duplicate_input_file_descriptor.sh"),
+            include_str!("sh/redirection/duplicate_input_file_descriptor.out"),
+        );
+    }
+
+    #[test]
+    fn duplicate_output_file_descriptor() {
+        test_script(
+            include_str!("sh/redirection/duplicate_output_file_descriptor.sh"),
+            include_str!("sh/redirection/duplicate_output_file_descriptor.out"),
+        );
+    }
+
+    #[test]
+    fn here_document() {
+        test_script(
+            include_str!("sh/redirection/here_document.sh"),
+            include_str!("sh/redirection/here_document.out"),
+        );
+    }
+
+    #[test]
+    fn input_redirection() {
+        test_script(
+            include_str!("sh/redirection/input_redirection.sh"),
+            include_str!("sh/redirection/input_redirection.out"),
+        );
+    }
+
+    #[test]
+    fn open_file_descriptor_for_read_and_write() {
+        test_script(
+            include_str!("sh/redirection/open_file_descriptor_for_read_and_write.sh"),
+            include_str!("sh/redirection/open_file_descriptor_for_read_and_write.out"),
+        );
+    }
+
+    #[test]
+    fn output_redirection() {
+        test_script(
+            include_str!("sh/redirection/output_redirection.sh"),
+            include_str!("sh/redirection/output_redirection.out"),
         );
     }
 }

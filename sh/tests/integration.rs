@@ -733,6 +733,7 @@ mod redirection {
         run_script(
             r#"
             set -o noclobber
+            mkdir -p tests/write_dir
             cd tests/write_dir
             echo test1 > standard_output_redirection_fails_with_noclobber_set.txt
             echo test2 > standard_output_redirection_fails_with_noclobber_set.txt

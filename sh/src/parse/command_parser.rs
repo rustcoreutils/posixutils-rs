@@ -1220,10 +1220,10 @@ mod tests {
 
     #[test]
     fn parse_subshell() {
-        // assert_eq!(
-        //     parse_compound_command("(word)").0,
-        //     CompoundCommand::Subshell(complete_command_from_word(unquoted_literal("word"), false))
-        // );
+        assert_eq!(
+            parse_compound_command("( word )").0,
+            CompoundCommand::Subshell(complete_command_from_word(unquoted_literal("word"), false))
+        );
         assert_eq!(
             parse_compound_command("(\ncmd1; cmd2 & cmd3;\n\n\ncmd4 &\n)").0,
             CompoundCommand::Subshell(CompleteCommand {

@@ -19,7 +19,7 @@ pub fn get_special_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
     }
 }
 
-pub fn get_bultin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
+pub fn get_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
     match name {
         "alias" => Some(&AliasBuiltin),
         _ => None,

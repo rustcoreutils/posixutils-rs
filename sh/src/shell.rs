@@ -1,5 +1,5 @@
 use crate::builtin::set::SetOptions;
-use crate::builtin::{get_bultin_utility, get_special_builtin_utility};
+use crate::builtin::{get_builtin_utility, get_special_builtin_utility};
 use crate::parse::command::{
     Assignment, Command, CompleteCommand, CompoundCommand, Conjunction, IORedirectionKind,
     LogicalOp, Name, Pipeline, Redirection, RedirectionKind, SimpleCommand,
@@ -233,7 +233,7 @@ impl Shell {
 
             if let Some(_function_body) = self.functions.get(expanded_words[0].as_str()) {}
 
-            if let Some(builtin_utility) = get_bultin_utility(&expanded_words[0]) {
+            if let Some(builtin_utility) = get_builtin_utility(&expanded_words[0]) {
                 return builtin_utility.exec(&expanded_words[1..], self);
             }
 

@@ -304,13 +304,18 @@ impl Shell {
 
     fn interpret_conjunction(&mut self, conjunction: &Conjunction) -> i32 {
         let mut status = 0;
-        for (pipeline, op) in &conjunction.elements {
+        let mut i = 0;
+        while i < conjunction.elements.len() {
+            let (pipeline, op) = &conjunction.elements[i];
             status = self.interpret_pipeline(pipeline);
             if status != 0 && *op == LogicalOp::And {
-                break;
+                // false && other ... -> skip other
+                i += 1;
             } else if status == 0 && *op == LogicalOp::Or {
-                break;
+                // true || other ... -> skip other
+                i += 1;
             }
+            i += 1;
         }
         status
     }

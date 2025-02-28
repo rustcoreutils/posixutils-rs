@@ -21,6 +21,10 @@ impl Pattern {
         })
     }
 
+    pub fn matches(&self, s: &CStr) -> bool {
+        self.regex.matches(s)
+    }
+
     pub fn remove_largest_prefix(&self, s: String) -> String {
         let cstring = CString::new(s).expect("trying to match a string containing null");
         let mut prefix_end = 0;

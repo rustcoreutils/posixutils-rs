@@ -1,12 +1,14 @@
 use crate::builtin::set::SetOptions;
 use crate::builtin::{get_builtin_utility, get_special_builtin_utility};
 use crate::parse::command::{
-    Assignment, Command, CompleteCommand, CompoundCommand, Conjunction, FunctionDefinition,
-    IORedirectionKind, LogicalOp, Name, Pipeline, Redirection, RedirectionKind, SimpleCommand,
+    Assignment, CaseItem, Command, CompleteCommand, CompoundCommand, Conjunction,
+    FunctionDefinition, IORedirectionKind, LogicalOp, Name, Pipeline, Redirection, RedirectionKind,
+    SimpleCommand,
 };
 use crate::parse::command_parser::CommandParser;
+use crate::parse::word::Word;
 use crate::parse::{AliasTable, ParseResult, ParserError};
-use crate::wordexp::{expand_word, expand_word_to_string};
+use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{close, dup2, execve, fork, getpid, getppid, pipe, ForkResult};
 use nix::{libc, NixPath};
@@ -262,6 +264,21 @@ impl Shell {
         }
     }
 
+    fn interpret_case_clause(&mut self, arg: &Word, cases: &[CaseItem]) -> i32 {
+        let arg = expand_word_to_string(arg, false, self);
+        let arg_cstr = CString::new(arg).expect("invalid pattern");
+        for case in cases {
+            for pattern in &case.pattern {
+                // TODO: deal with error
+                let pattern = word_to_pattern(pattern, self).unwrap();
+                if pattern.matches(&arg_cstr) {
+                    return self.interpret(&case.body);
+                }
+            }
+        }
+        0
+    }
+
     fn interpret_compound_command(
         &mut self,
         compound_command: &CompoundCommand,
@@ -275,9 +292,7 @@ impl Shell {
             CompoundCommand::ForClause { .. } => {
                 todo!()
             }
-            CompoundCommand::CaseClause { .. } => {
-                todo!()
-            }
+            CompoundCommand::CaseClause { arg, cases } => self.interpret_case_clause(arg, cases),
             CompoundCommand::IfClause { .. } => {
                 todo!()
             }

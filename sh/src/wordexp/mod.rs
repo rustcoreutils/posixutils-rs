@@ -3,7 +3,7 @@ use crate::shell::Shell;
 use crate::wordexp::expanded_word::{ExpandedWord, ExpandedWordPart};
 use crate::wordexp::parameter::expand_parameter_into;
 use crate::wordexp::pathname::glob;
-use crate::wordexp::pattern::FilenamePattern;
+use crate::wordexp::pattern::{FilenamePattern, Pattern};
 use crate::wordexp::tilde::tilde_expansion;
 use std::path::Path;
 
@@ -177,6 +177,12 @@ pub fn expand_word(word: &Word, is_assignment: bool, shell: &mut Shell) -> Vec<S
         }
     }
     result
+}
+
+pub fn word_to_pattern(word: &Word, shell: &mut Shell) -> Result<Pattern, String> {
+    let mut expanded_word = ExpandedWord::default();
+    simple_word_expansion_into(&mut expanded_word, &word, false, shell);
+    Pattern::new(&expanded_word)
 }
 
 #[cfg(test)]

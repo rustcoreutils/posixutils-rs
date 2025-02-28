@@ -363,6 +363,43 @@ impl Shell {
         }
     }
 
+    fn interpret_loop_clause(
+        &mut self,
+        condition: &CompleteCommand,
+        body: &CompleteCommand,
+        continue_if_zero: bool,
+    ) -> i32 {
+        let status = 0;
+        loop {
+            let condition = self.interpret(condition);
+            if (condition == 0 && !continue_if_zero) || (condition != 0 && continue_if_zero) {
+                break;
+            }
+            self.loop_depth += 1;
+            self.interpret(body);
+            self.loop_depth -= 1;
+            match self.control_flow_state {
+                ControlFlowState::Break(_) => {
+                    self.control_flow_state.go_to_outer_loop();
+                    break;
+                }
+                ControlFlowState::Continue(n) => {
+                    self.control_flow_state.go_to_outer_loop();
+                    if n > 1 {
+                        break;
+                    } else {
+                        continue;
+                    }
+                }
+                ControlFlowState::Return => {
+                    break;
+                }
+                _ => {}
+            }
+        }
+        status
+    }
+
     fn interpret_compound_command(
         &mut self,
         compound_command: &CompoundCommand,
@@ -383,11 +420,11 @@ impl Shell {
                 if_chain,
                 else_body,
             } => self.interpret_if_clause(if_chain, else_body),
-            CompoundCommand::WhileClause { .. } => {
-                todo!()
+            CompoundCommand::WhileClause { condition, body } => {
+                self.interpret_loop_clause(condition, body, true)
             }
-            CompoundCommand::UntilClause { .. } => {
-                todo!()
+            CompoundCommand::UntilClause { condition, body } => {
+                self.interpret_loop_clause(condition, body, false)
             }
         }
     }

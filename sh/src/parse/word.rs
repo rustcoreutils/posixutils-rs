@@ -146,4 +146,13 @@ pub mod test_utils {
             parts: vec![WordPart::UnquotedLiteral(contents.to_string())],
         }
     }
+
+    pub fn special_parameter(param: SpecialParameter) -> Word {
+        Word {
+            parts: vec![WordPart::ParameterExpansion {
+                expansion: ParameterExpansion::Simple(Parameter::Special(param)),
+                inside_double_quotes: false,
+            }],
+        }
+    }
 }

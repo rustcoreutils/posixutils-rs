@@ -14,7 +14,7 @@ use crate::parse::command::{
 };
 use crate::parse::lexer::command_lexer::{CommandLexer, CommandToken};
 use crate::parse::lexer::is_blank;
-use crate::parse::word::Word;
+use crate::parse::word::{Parameter, ParameterExpansion, SpecialParameter, Word, WordPart};
 use crate::parse::word_parser::parse_word;
 use crate::parse::{AliasTable, ParseResult, ParserError};
 use std::borrow::Cow;
@@ -402,6 +402,13 @@ impl<'src> CommandParser<'src> {
                 let word = self.advance()?.into_word_cow().unwrap();
                 words.push(parse_word(&word, self.lookahead_lineno)?);
             }
+        } else {
+            words.push(Word {
+                parts: vec![WordPart::ParameterExpansion {
+                    expansion: ParameterExpansion::Simple(Parameter::Special(SpecialParameter::At)),
+                    inside_double_quotes: false,
+                }],
+            })
         }
         match self.lookahead {
             CommandToken::SemiColon | CommandToken::Newline => {
@@ -727,9 +734,9 @@ impl<'src> CommandParser<'src> {
 
 #[cfg(test)]
 mod tests {
-    use crate::parse::word::test_utils::{quoted_literal, unquoted_literal};
-
     use super::*;
+    use crate::parse::word::test_utils::{quoted_literal, special_parameter, unquoted_literal};
+    use crate::parse::word::{SpecialParameter, WordPart};
 
     fn parse_complete_command(
         text: &str,
@@ -1248,6 +1255,20 @@ mod tests {
                     unquoted_literal("2"),
                     unquoted_literal("3")
                 ],
+                body: CompleteCommand {
+                    commands: vec![conjunction_from_word(unquoted_literal("cmd"), false)]
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn parse_for_clause_with_no_words() {
+        assert_eq!(
+            parse_compound_command("for i; do\ncmd\ndone").0,
+            CompoundCommand::ForClause {
+                iter_var: Rc::from("i"),
+                words: vec![special_parameter(SpecialParameter::At)],
                 body: CompleteCommand {
                     commands: vec![conjunction_from_word(unquoted_literal("cmd"), false)]
                 }

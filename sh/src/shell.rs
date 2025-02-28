@@ -176,25 +176,30 @@ impl Shell {
         }
     }
 
+    fn assign(&mut self, var_name: String, value: String, export: bool) {
+        match self.environment.entry(var_name) {
+            Entry::Occupied(mut e) => {
+                if e.get().readonly {
+                    todo!("error")
+                }
+                e.get_mut().value = Some(value);
+                e.get_mut().export = e.get_mut().export || export;
+            }
+            Entry::Vacant(e) => {
+                e.insert(VariableValue {
+                    value: Some(value),
+                    export,
+                    readonly: false,
+                });
+            }
+        }
+    }
+
     fn perform_assignments(&mut self, assignments: &[Assignment], export: bool) {
         for assignment in assignments {
             let word_str = expand_word_to_string(&assignment.value, true, self);
-            match self.environment.entry(assignment.name.to_string()) {
-                Entry::Occupied(mut e) => {
-                    if e.get().readonly {
-                        todo!("error")
-                    }
-                    e.get_mut().value = Some(word_str);
-                    e.get_mut().export = e.get_mut().export || export;
-                }
-                Entry::Vacant(e) => {
-                    e.insert(VariableValue {
-                        value: Some(word_str),
-                        export,
-                        readonly: false,
-                    });
-                }
-            }
+            // TODO: should look into using Rc for Environment
+            self.assign(assignment.name.to_string(), word_str, export);
         }
     }
 
@@ -264,6 +269,23 @@ impl Shell {
         }
     }
 
+    fn interpret_for_clause(
+        &mut self,
+        iter_var: Name,
+        iter_words: &[Word],
+        body: &CompleteCommand,
+    ) -> i32 {
+        let mut result = 0;
+        for word in iter_words {
+            let items = expand_word(word, false, self);
+            for item in items {
+                self.assign(iter_var.to_string(), item, false);
+                result = self.interpret(body);
+            }
+        }
+        result
+    }
+
     fn interpret_case_clause(&mut self, arg: &Word, cases: &[CaseItem]) -> i32 {
         let arg = expand_word_to_string(arg, false, self);
         let arg_cstr = CString::new(arg).expect("invalid pattern");
@@ -289,9 +311,11 @@ impl Shell {
             CompoundCommand::Subshell(_) => {
                 todo!()
             }
-            CompoundCommand::ForClause { .. } => {
-                todo!()
-            }
+            CompoundCommand::ForClause {
+                iter_var,
+                words,
+                body,
+            } => self.interpret_for_clause(iter_var.clone(), words, body),
             CompoundCommand::CaseClause { arg, cases } => self.interpret_case_clause(arg, cases),
             CompoundCommand::IfClause { .. } => {
                 todo!()

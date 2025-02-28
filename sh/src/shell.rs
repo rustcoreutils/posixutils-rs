@@ -2,8 +2,8 @@ use crate::builtin::set::SetOptions;
 use crate::builtin::{get_builtin_utility, get_special_builtin_utility};
 use crate::parse::command::{
     Assignment, CaseItem, Command, CompleteCommand, CompoundCommand, Conjunction,
-    FunctionDefinition, IORedirectionKind, LogicalOp, Name, Pipeline, Redirection, RedirectionKind,
-    SimpleCommand,
+    FunctionDefinition, IORedirectionKind, If, LogicalOp, Name, Pipeline, Redirection,
+    RedirectionKind, SimpleCommand,
 };
 use crate::parse::command_parser::CommandParser;
 use crate::parse::word::Word;
@@ -301,6 +301,20 @@ impl Shell {
         0
     }
 
+    fn interpret_if_clause(&mut self, if_chain: &[If], else_body: &Option<CompleteCommand>) -> i32 {
+        assert!(!if_chain.is_empty(), "parsed if without else");
+        for if_ in if_chain {
+            if self.interpret(&if_.condition) == 0 {
+                return self.interpret(&if_.body);
+            }
+        }
+        if let Some(else_body) = else_body {
+            self.interpret(else_body)
+        } else {
+            0
+        }
+    }
+
     fn interpret_compound_command(
         &mut self,
         compound_command: &CompoundCommand,
@@ -317,9 +331,10 @@ impl Shell {
                 body,
             } => self.interpret_for_clause(iter_var.clone(), words, body),
             CompoundCommand::CaseClause { arg, cases } => self.interpret_case_clause(arg, cases),
-            CompoundCommand::IfClause { .. } => {
-                todo!()
-            }
+            CompoundCommand::IfClause {
+                if_chain,
+                else_body,
+            } => self.interpret_if_clause(if_chain, else_body),
             CompoundCommand::WhileClause { .. } => {
                 todo!()
             }

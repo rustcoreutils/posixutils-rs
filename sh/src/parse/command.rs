@@ -109,6 +109,7 @@ pub enum CompoundCommand {
     },
     IfClause {
         if_chain: Vec<If>,
+        else_body: Option<CompleteCommand>,
     },
     WhileClause {
         condition: CompleteCommand,

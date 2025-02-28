@@ -496,18 +496,16 @@ impl<'src> CommandParser<'src> {
                 body: then_part,
             });
         }
+        let mut else_body = None;
         if self.lookahead == CommandToken::Else {
             self.advance()?;
-            let else_part = self.parse_compound_list(CommandToken::EOF, alias_table)?;
-            if_chain.push(If {
-                condition: CompleteCommand {
-                    commands: Vec::new(),
-                },
-                body: else_part,
-            });
+            else_body = Some(self.parse_compound_list(CommandToken::EOF, alias_table)?);
         }
         self.match_token(CommandToken::Fi)?;
-        Ok(CompoundCommand::IfClause { if_chain })
+        Ok(CompoundCommand::IfClause {
+            if_chain,
+            else_body,
+        })
     }
 
     fn parse_while_clause(&mut self, alias_table: &AliasTable) -> ParseResult<CompoundCommand> {
@@ -1363,7 +1361,8 @@ mod tests {
                     body: CompleteCommand {
                         commands: vec![conjunction_from_word(unquoted_literal("cmd"), false)]
                     }
-                }]
+                }],
+                else_body: None
             }
         );
     }
@@ -1373,27 +1372,17 @@ mod tests {
         assert_eq!(
             parse_compound_command("if condition; then cmd; else cmd2; fi").0,
             CompoundCommand::IfClause {
-                if_chain: vec![
-                    If {
-                        condition: CompleteCommand {
-                            commands: vec![conjunction_from_word(
-                                unquoted_literal("condition"),
-                                false
-                            )]
-                        },
-                        body: CompleteCommand {
-                            commands: vec![conjunction_from_word(unquoted_literal("cmd"), false)]
-                        }
+                if_chain: vec![If {
+                    condition: CompleteCommand {
+                        commands: vec![conjunction_from_word(unquoted_literal("condition"), false)]
                     },
-                    If {
-                        condition: CompleteCommand {
-                            commands: Vec::new()
-                        },
-                        body: CompleteCommand {
-                            commands: vec![conjunction_from_word(unquoted_literal("cmd2"), false)]
-                        }
+                    body: CompleteCommand {
+                        commands: vec![conjunction_from_word(unquoted_literal("cmd"), false)]
                     }
-                ]
+                },],
+                else_body: Some(CompleteCommand {
+                    commands: vec![conjunction_from_word(unquoted_literal("cmd2"), false)]
+                })
             }
         );
     }
@@ -1437,15 +1426,10 @@ mod tests {
                             commands: vec![conjunction_from_word(unquoted_literal("cmd3"), false)]
                         }
                     },
-                    If {
-                        condition: CompleteCommand {
-                            commands: Vec::new()
-                        },
-                        body: CompleteCommand {
+                ],
+                else_body: Some(CompleteCommand {
                             commands: vec![conjunction_from_word(unquoted_literal("cmd4"), false)]
-                        }
-                    }
-                ]
+                        })
             }
         );
     }
@@ -1493,7 +1477,8 @@ mod tests {
                     body: CompleteCommand {
                         commands: vec![conjunction_from_word(unquoted_literal("b"), false)]
                     }
-                }]
+                }],
+                else_body: None
             }
         );
         assert_eq!(

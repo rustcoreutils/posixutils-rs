@@ -24,7 +24,7 @@ impl ParameterExpansionResult {
 
 fn add_option_to_expanded_word(
     word: &mut ExpandedWord,
-    str: Option<&String>,
+    str: Option<&str>,
     inside_double_quotes: bool,
 ) -> ParameterExpansionResult {
     if let Some(s) = str {
@@ -66,12 +66,15 @@ fn expand_simple_parameter_into(
     match parameter {
         Parameter::Number(n) => add_option_to_expanded_word(
             expanded_word,
-            shell.positional_parameters.get(*n as usize - 1),
+            shell
+                .positional_parameters
+                .get(*n as usize - 1)
+                .map(|s| s.as_str()),
             inside_double_quotes,
         ),
         Parameter::Variable(var_name) => add_option_to_expanded_word(
             expanded_word,
-            shell.environment.get(var_name.as_ref()).map(|v| &v.value),
+            shell.get_variable_value(var_name.as_ref()),
             inside_double_quotes,
         ),
         Parameter::Special(special_parameter) => {
@@ -100,15 +103,8 @@ fn expand_simple_parameter_into(
                         );
                     } else {
                         let separator = shell
-                            .environment
-                            .get("IFS")
-                            .map(|var| {
-                                if var.value.is_empty() {
-                                    ""
-                                } else {
-                                    &var.value[..1]
-                                }
-                            })
+                            .get_variable_value("IFS")
+                            .map(|v| if v.is_empty() { "" } else { &v[..1] })
                             .unwrap_or(" ");
                         expanded_word.append(
                             shell.positional_parameters.join(separator),
@@ -211,8 +207,8 @@ pub fn expand_parameter_into(
                         .map(|w| expand_word_to_string(w, false, shell))
                         .unwrap_or_default();
                     match shell.environment.get_mut(variable_name.as_ref()) {
-                        Some(variable) if *assign_on_null && variable.value.is_empty() => {
-                            variable.value = value.clone();
+                        Some(variable) if *assign_on_null && variable.is_null() => {
+                            variable.value = Some(value.clone());
                         }
                         None => {
                             shell

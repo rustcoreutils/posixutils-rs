@@ -6,9 +6,9 @@ use crate::parse::command::{
 };
 use crate::parse::command_parser::CommandParser;
 use crate::parse::{AliasTable, ParseResult, ParserError};
-use nix::libc;
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{close, dup2, execve, fork, getpid, getppid, pipe, ForkResult};
+use nix::{libc, NixPath};
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
 use std::os::fd::{AsRawFd, IntoRawFd};
@@ -17,23 +17,28 @@ use std::rc::Rc;
 
 #[derive(Clone)]
 pub struct Variable {
-    pub value: String,
+    /// `None` if `Variable` is unset
+    pub value: Option<String>,
     pub export: bool,
 }
 
 impl Variable {
     pub fn new_exported(value: String) -> Self {
         Variable {
-            value,
+            value: Some(value),
             export: true,
         }
     }
 
     pub fn new(value: String) -> Self {
         Variable {
-            value,
+            value: Some(value),
             export: false,
         }
+    }
+
+    pub fn is_null(&self) -> bool {
+        self.value.as_ref().is_some_and(|v| v.is_empty())
     }
 }
 
@@ -97,7 +102,10 @@ impl Shell {
                     .filter_map(|(name, value)| {
                         if value.export {
                             // TODO: look into this unwrap
-                            Some(CString::new(format!("{name}={}", value.value)).unwrap())
+                            value
+                                .value
+                                .as_ref()
+                                .map(|v| CString::new(format!("{name}={}", v)).unwrap())
                         } else {
                             None
                         }
@@ -214,10 +222,9 @@ impl Shell {
             let mut command_environment = self.clone();
             command_environment.perform_assignments(&simple_command.assignments);
             command_environment.perform_redirections(&simple_command.redirections);
-            if let Some(command) = find_in_path(
-                &expanded_words[0],
-                &self.environment.get("PATH").unwrap().value,
-            ) {
+            // TODO: fix unwrap with proper error
+            let path = self.get_variable_value("PATH").unwrap();
+            if let Some(command) = find_in_path(&expanded_words[0], path) {
                 let arguments = expanded_words
                     .iter()
                     .map(|w| w.clone())
@@ -324,6 +331,13 @@ impl Shell {
         for conjunction in &command.commands {
             self.interpret_conjunction(conjunction);
         }
+    }
+
+    pub fn get_variable_value(&self, name: &str) -> Option<&str> {
+        self.environment
+            .get(name)
+            .map(|var| var.value.as_ref().map(|v| v.as_str()))
+            .flatten()
     }
 
     pub fn execute_program(&mut self, program: &str) -> Result<(), ExecutionError> {

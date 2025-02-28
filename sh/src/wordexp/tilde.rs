@@ -35,7 +35,8 @@ fn expand_home(login_name: &str, env: &Environment, user_home: &dyn UsersHomeDir
         // > If the login name is null (that is, the tilde-prefix contains only the tilde),
         // > the tilde-prefix is replaced by the value of the variable HOME
         env.get("HOME")
-            .map(|v| v.value.clone())
+            .map(|v| v.value.as_ref().cloned())
+            .flatten()
             .unwrap_or_else(|| todo!("error: HOME not set"))
     } else {
         if !login_name.chars().all(is_portable_filename_character) {

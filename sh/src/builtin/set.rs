@@ -29,8 +29,10 @@ impl BuiltinUtility for SetSpecialBuiltin {
                         let mut sorted_vars = shell
                             .environment
                             .iter()
-                            .map(|(var, val)| {
-                                (CString::new(var.as_str()).unwrap(), val.value.as_str())
+                            .filter_map(|(var, val)| {
+                                val.value
+                                    .as_ref()
+                                    .map(|v| (CString::new(var.as_str()).unwrap(), v.as_str()))
                             })
                             .collect::<Vec<_>>();
                         sorted_vars.sort_by(|(k1, _), (k2, _)| strcoll(k1, k2));

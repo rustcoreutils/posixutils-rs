@@ -4,8 +4,8 @@ echo $?
 ! false
 echo $?
 
-! echo test | cat | false
+! echo test | cat >/dev/null | false
 echo $?
 
-! echo test | cat | true
+! echo test | cat >/dev/null | true
 echo $?

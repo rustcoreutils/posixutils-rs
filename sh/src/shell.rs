@@ -73,6 +73,32 @@ impl From<ParserError> for ExecutionError {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ControlFlowState {
+    Break(u32),
+    Continue(u32),
+    Return,
+    None,
+}
+
+impl ControlFlowState {
+    fn go_to_outer_loop(&mut self) {
+        match *self {
+            ControlFlowState::Break(1) => *self = ControlFlowState::None,
+            ControlFlowState::Break(n) => {
+                assert_ne!(n, 0);
+                *self = ControlFlowState::Break(n - 1)
+            }
+            ControlFlowState::Continue(1) => *self = ControlFlowState::None,
+            ControlFlowState::Continue(n) => {
+                assert_ne!(n, 0);
+                *self = ControlFlowState::Continue(n - 1);
+            }
+            _ => {}
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Shell {
     pub environment: Environment,
@@ -87,6 +113,8 @@ pub struct Shell {
     pub current_directory: OsString,
     pub set_options: SetOptions,
     pub alias_table: AliasTable,
+    pub control_flow_state: ControlFlowState,
+    pub loop_depth: u32,
 }
 
 impl Shell {
@@ -276,13 +304,33 @@ impl Shell {
         body: &CompleteCommand,
     ) -> i32 {
         let mut result = 0;
-        for word in iter_words {
+        self.loop_depth += 1;
+        'outer: for word in iter_words {
             let items = expand_word(word, false, self);
             for item in items {
                 self.assign(iter_var.to_string(), item, false);
                 result = self.interpret(body);
+                match self.control_flow_state {
+                    ControlFlowState::Break(_) => {
+                        self.control_flow_state.go_to_outer_loop();
+                        break 'outer;
+                    }
+                    ControlFlowState::Continue(n) => {
+                        self.control_flow_state.go_to_outer_loop();
+                        if n > 1 {
+                            break 'outer;
+                        } else {
+                            continue 'outer;
+                        }
+                    }
+                    ControlFlowState::Return => {
+                        break 'outer;
+                    }
+                    _ => {}
+                }
             }
         }
+        self.loop_depth -= 1;
         result
     }
 
@@ -429,6 +477,9 @@ impl Shell {
         while i < conjunction.elements.len() {
             let (pipeline, op) = &conjunction.elements[i];
             status = self.interpret_pipeline(pipeline);
+            if self.control_flow_state != ControlFlowState::None {
+                return status;
+            }
             if status != 0 && *op == LogicalOp::And {
                 // false && other ... -> skip other
                 i += 1;
@@ -442,11 +493,14 @@ impl Shell {
     }
 
     fn interpret(&mut self, command: &CompleteCommand) -> i32 {
-        let mut result = 0;
+        let mut status = 0;
         for conjunction in &command.commands {
-            result = self.interpret_conjunction(conjunction)
+            status = self.interpret_conjunction(conjunction);
+            if self.control_flow_state != ControlFlowState::None {
+                return status;
+            }
         }
-        result
+        status
     }
 
     pub fn get_variable_value(&self, name: &str) -> Option<&str> {
@@ -519,6 +573,8 @@ impl Default for Shell {
             current_directory: OsString::from("/"),
             set_options: SetOptions::default(),
             alias_table: AliasTable::default(),
+            control_flow_state: ControlFlowState::None,
+            loop_depth: 0,
         }
     }
 }

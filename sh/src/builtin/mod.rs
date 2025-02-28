@@ -1,9 +1,11 @@
 use crate::builtin::alias::AliasBuiltin;
+use crate::builtin::control_flow::Break;
 use crate::builtin::readonly::ReadOnly;
 use crate::builtin::set::SetSpecialBuiltin;
 use crate::shell::Shell;
 
 pub mod alias;
+mod control_flow;
 mod readonly;
 pub mod set;
 
@@ -15,6 +17,7 @@ pub fn get_special_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
     match name {
         "set" => Some(&SetSpecialBuiltin),
         "readonly" => Some(&ReadOnly),
+        "break" => Some(&Break),
         _ => None,
     }
 }

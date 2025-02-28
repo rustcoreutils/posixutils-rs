@@ -1052,4 +1052,12 @@ mod builtin {
             include_str!("sh/builtin/readonly.out"),
         );
     }
+
+    #[test]
+    fn break_stmt() {
+        test_script(
+            include_str!("sh/builtin/break.sh"),
+            include_str!("sh/builtin/break.out"),
+        )
+    }
 }

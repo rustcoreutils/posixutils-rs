@@ -544,7 +544,10 @@ impl<'src> CommandParser<'src> {
         self.advance()?;
         self.match_token(CommandToken::RParen)?;
         if let Some(body) = self.parse_compound_command(alias_table)? {
-            Ok(FunctionDefinition { name, body })
+            Ok(FunctionDefinition {
+                name,
+                body: Rc::from(body),
+            })
         } else {
             todo!("error: expected compound command")
         }
@@ -1490,10 +1493,10 @@ mod tests {
             parse_command("function_name() { cmd; }"),
             Command::FunctionDefinition(FunctionDefinition {
                 name: Rc::from("function_name"),
-                body: CompoundCommand::BraceGroup(complete_command_from_word(
+                body: Rc::from(CompoundCommand::BraceGroup(complete_command_from_word(
                     unquoted_literal("cmd"),
                     false
-                ))
+                )))
             })
         );
 
@@ -1501,9 +1504,9 @@ mod tests {
             parse_command("function_name() ( cmd1 )"),
             Command::FunctionDefinition(FunctionDefinition {
                 name: Rc::from("function_name"),
-                body: CompoundCommand::Subshell(CompleteCommand {
+                body: Rc::from(CompoundCommand::Subshell(CompleteCommand {
                     commands: vec![conjunction_from_word(unquoted_literal("cmd1"), false),]
-                })
+                }))
             })
         );
     }

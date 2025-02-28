@@ -123,7 +123,7 @@ pub enum CompoundCommand {
 #[derive(Debug, PartialEq, Clone)]
 pub struct FunctionDefinition {
     pub name: Name,
-    pub body: CompoundCommand,
+    pub body: Rc<CompoundCommand>,
 }
 
 #[derive(Debug, PartialEq, Clone)]

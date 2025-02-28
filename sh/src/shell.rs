@@ -1,8 +1,8 @@
 use crate::builtin::set::SetOptions;
 use crate::builtin::{get_builtin_utility, get_special_builtin_utility};
 use crate::parse::command::{
-    Assignment, Command, CompleteCommand, CompoundCommand, Conjunction, IORedirectionKind,
-    LogicalOp, Name, Pipeline, Redirection, RedirectionKind, SimpleCommand,
+    Assignment, Command, CompleteCommand, CompoundCommand, Conjunction, FunctionDefinition,
+    IORedirectionKind, LogicalOp, Name, Pipeline, Redirection, RedirectionKind, SimpleCommand,
 };
 use crate::parse::command_parser::CommandParser;
 use crate::parse::{AliasTable, ParseResult, ParserError};
@@ -231,7 +231,14 @@ impl Shell {
                 return special_builtin_utility.exec(&expanded_words[1..], self);
             }
 
-            if let Some(_function_body) = self.functions.get(expanded_words[0].as_str()) {}
+            if let Some(function_body) = self.functions.get(expanded_words[0].as_str()).cloned() {
+                let mut args = expanded_words[1..].to_vec();
+                std::mem::swap(&mut args, &mut self.positional_parameters);
+                let result =
+                    self.interpret_compound_command(&function_body, &simple_command.redirections);
+                std::mem::swap(&mut args, &mut self.positional_parameters);
+                return result;
+            }
 
             if let Some(builtin_utility) = get_builtin_utility(&expanded_words[0]) {
                 return builtin_utility.exec(&expanded_words[1..], self);
@@ -255,13 +262,48 @@ impl Shell {
         }
     }
 
+    fn interpret_compound_command(
+        &mut self,
+        compound_command: &CompoundCommand,
+        redirections: &[Redirection],
+    ) -> i32 {
+        match compound_command {
+            CompoundCommand::BraceGroup(command) => self.interpret(command),
+            CompoundCommand::Subshell(_) => {
+                todo!()
+            }
+            CompoundCommand::ForClause { .. } => {
+                todo!()
+            }
+            CompoundCommand::CaseClause { .. } => {
+                todo!()
+            }
+            CompoundCommand::IfClause { .. } => {
+                todo!()
+            }
+            CompoundCommand::WhileClause { .. } => {
+                todo!()
+            }
+            CompoundCommand::UntilClause { .. } => {
+                todo!()
+            }
+        }
+    }
+
+    fn define_function(&mut self, definition: &FunctionDefinition) -> i32 {
+        self.functions
+            .insert(definition.name.clone(), definition.body.clone());
+        0
+    }
+
     fn interpret_command(&mut self, command: &Command) -> i32 {
         match command {
             Command::SimpleCommand(simple_command) => self.interpret_simple_command(simple_command),
-            Command::CompoundCommand { .. } => {
-                todo!()
-            }
-            _ => todo!("not implemented"),
+            Command::CompoundCommand {
+                command,
+                redirections,
+            } => self.interpret_compound_command(command, redirections),
+            Command::FunctionDefinition(function) => self.define_function(function),
         }
     }
 
@@ -345,10 +387,12 @@ impl Shell {
         status
     }
 
-    fn interpret(&mut self, command: &CompleteCommand) {
+    fn interpret(&mut self, command: &CompleteCommand) -> i32 {
+        let mut result = 0;
         for conjunction in &command.commands {
-            self.interpret_conjunction(conjunction);
+            result = self.interpret_conjunction(conjunction)
         }
+        result
     }
 
     pub fn get_variable_value(&self, name: &str) -> Option<&str> {

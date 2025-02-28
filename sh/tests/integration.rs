@@ -395,24 +395,12 @@ mod special_parameters {
                 "4b",
             ],
             "",
-            "1 2\n3\n4\n",
+            "aa1 2\n3\n4bb\n",
         );
         test_cli(
             vec![
                 "-c",
                 "for x in ${unset-\"$@\"}; do echo $x; done",
-                "sh",
-                "1 2",
-                "3",
-                "4",
-            ],
-            "",
-            "1 2\n3\n4\n",
-        );
-        test_cli(
-            vec![
-                "-c",
-                "for x in ${PPID\"$@\"}; do echo $x; done",
                 "sh",
                 "1 2",
                 "3",

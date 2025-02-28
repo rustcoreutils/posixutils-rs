@@ -174,7 +174,7 @@ impl Shell {
         }
     }
 
-    fn perform_assignments(&mut self, assignments: &[Assignment]) {
+    fn perform_assignments(&mut self, assignments: &[Assignment], export: bool) {
         for assignment in assignments {
             let word_str = expand_word_to_string(&assignment.value, true, self);
             match self.environment.entry(assignment.name.to_string()) {
@@ -183,9 +183,14 @@ impl Shell {
                         todo!("error")
                     }
                     e.get_mut().value = Some(word_str);
+                    e.get_mut().export = e.get_mut().export || export;
                 }
                 Entry::Vacant(e) => {
-                    e.insert(VariableValue::new(word_str));
+                    e.insert(VariableValue {
+                        value: Some(word_str),
+                        export,
+                        readonly: false,
+                    });
                 }
             }
         }
@@ -200,7 +205,7 @@ impl Shell {
         }
         if expanded_words.is_empty() {
             // no commands to execute, perform assignments and redirections
-            self.perform_assignments(&simple_command.assignments);
+            self.perform_assignments(&simple_command.assignments, false);
             if !simple_command.redirections.is_empty() {
                 let mut subshell = self.clone();
                 subshell.perform_redirections(&simple_command.redirections);
@@ -210,7 +215,7 @@ impl Shell {
 
         if expanded_words[0].contains('/') {
             let mut command_environment = self.clone();
-            command_environment.perform_assignments(&simple_command.assignments);
+            command_environment.perform_assignments(&simple_command.assignments, true);
             command_environment.perform_redirections(&simple_command.redirections);
             let command = &expanded_words[0];
             let arguments = expanded_words
@@ -220,21 +225,20 @@ impl Shell {
             command_environment.exec(&command, &arguments)
         } else {
             if let Some(special_builtin_utility) = get_special_builtin_utility(&expanded_words[0]) {
-                self.perform_assignments(&simple_command.assignments);
+                // the standard does not specify if the variables should have the export attribute.
+                // Bash exports them, we do the same here (neither sh, nor zsh do it though)
+                self.perform_assignments(&simple_command.assignments, true);
                 return special_builtin_utility.exec(&expanded_words[1..], self);
             }
 
-            if let Some(_function_body) = self.functions.get(expanded_words[0].as_str()) {
-                self.perform_assignments(&simple_command.assignments);
-                todo!()
-            }
+            if let Some(_function_body) = self.functions.get(expanded_words[0].as_str()) {}
 
-            if let Some(_builtin_utility) = get_bultin_utility(&expanded_words[0]) {
-                return _builtin_utility.exec(&expanded_words[1..], self);
+            if let Some(builtin_utility) = get_bultin_utility(&expanded_words[0]) {
+                return builtin_utility.exec(&expanded_words[1..], self);
             }
 
             let mut command_environment = self.clone();
-            command_environment.perform_assignments(&simple_command.assignments);
+            command_environment.perform_assignments(&simple_command.assignments, true);
             command_environment.perform_redirections(&simple_command.redirections);
             // TODO: fix unwrap with proper error
             let path = self.get_variable_value("PATH").unwrap();

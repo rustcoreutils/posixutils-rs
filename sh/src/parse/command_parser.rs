@@ -20,7 +20,7 @@ use crate::parse::{AliasTable, ParseResult, ParserError};
 use std::borrow::Cow;
 use std::rc::Rc;
 
-fn is_valid_name(name: &str) -> bool {
+pub fn is_valid_name(name: &str) -> bool {
     name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
         && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }

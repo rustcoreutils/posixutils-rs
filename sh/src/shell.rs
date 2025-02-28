@@ -6,9 +6,11 @@ use crate::parse::command::{
 };
 use crate::parse::command_parser::CommandParser;
 use crate::parse::{AliasTable, ParseResult, ParserError};
+use crate::wordexp::{expand_word, expand_word_to_string};
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{close, dup2, execve, fork, getpid, getppid, pipe, ForkResult};
 use nix::{libc, NixPath};
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
 use std::os::fd::{AsRawFd, IntoRawFd};
@@ -20,6 +22,7 @@ pub struct VariableValue {
     /// `None` if `Variable` is unset
     pub value: Option<String>,
     pub export: bool,
+    pub readonly: bool,
 }
 
 impl VariableValue {
@@ -27,6 +30,7 @@ impl VariableValue {
         VariableValue {
             value: Some(value),
             export: true,
+            readonly: false,
         }
     }
 
@@ -34,6 +38,7 @@ impl VariableValue {
         VariableValue {
             value: Some(value),
             export: false,
+            readonly: false,
         }
     }
 
@@ -135,7 +140,7 @@ impl Shell {
                     // > the word that follows the redirection operator shall be subjected to tilde
                     // > expansion, parameter expansion, command substitution, arithmetic expansion,
                     // > and quote removal.
-                    let path = crate::wordexp::expand_word_to_string(file, false, self);
+                    let path = expand_word_to_string(file, false, self);
                     // TODO: pathname expansion is not allowed if the shell is non-interactive,
                     // optional otherwise. Bash does implement this, maybe we should too.
                     match kind {
@@ -171,9 +176,18 @@ impl Shell {
 
     fn perform_assignments(&mut self, assignments: &[Assignment]) {
         for assignment in assignments {
-            let word_str = crate::wordexp::expand_word_to_string(&assignment.value, true, self);
-            self.environment
-                .insert(assignment.name.to_string(), VariableValue::new(word_str));
+            let word_str = expand_word_to_string(&assignment.value, true, self);
+            match self.environment.entry(assignment.name.to_string()) {
+                Entry::Occupied(mut e) => {
+                    if e.get().readonly {
+                        todo!("error")
+                    }
+                    e.get_mut().value = Some(word_str);
+                }
+                Entry::Vacant(e) => {
+                    e.insert(VariableValue::new(word_str));
+                }
+            }
         }
     }
 
@@ -182,7 +196,7 @@ impl Shell {
         // reset
         self.last_command_substitution_status = 0;
         for word in &simple_command.words {
-            expanded_words.extend(crate::wordexp::expand_word(word, false, self));
+            expanded_words.extend(expand_word(word, false, self));
         }
         if expanded_words.is_empty() {
             // no commands to execute, perform assignments and redirections

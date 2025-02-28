@@ -1053,3 +1053,15 @@ mod commands {
         );
     }
 }
+
+mod builtin {
+    use super::*;
+
+    #[test]
+    fn readonly() {
+        test_script(
+            include_str!("sh/builtin/readonly.sh"),
+            include_str!("sh/builtin/readonly.out"),
+        );
+    }
+}

@@ -1060,4 +1060,12 @@ mod builtin {
             include_str!("sh/builtin/break.out"),
         )
     }
+
+    #[test]
+    fn continue_builtin() {
+        test_script(
+            include_str!("sh/builtin/continue.sh"),
+            include_str!("sh/builtin/continue.out"),
+        );
+    }
 }

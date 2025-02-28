@@ -1,5 +1,5 @@
 use crate::builtin::alias::AliasBuiltin;
-use crate::builtin::control_flow::Break;
+use crate::builtin::control_flow::{Break, Continue};
 use crate::builtin::readonly::ReadOnly;
 use crate::builtin::set::SetSpecialBuiltin;
 use crate::shell::Shell;
@@ -18,6 +18,7 @@ pub fn get_special_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
         "set" => Some(&SetSpecialBuiltin),
         "readonly" => Some(&ReadOnly),
         "break" => Some(&Break),
+        "continue" => Some(&Continue),
         _ => None,
     }
 }

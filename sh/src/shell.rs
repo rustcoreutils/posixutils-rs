@@ -16,22 +16,22 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 #[derive(Clone)]
-pub struct Variable {
+pub struct VariableValue {
     /// `None` if `Variable` is unset
     pub value: Option<String>,
     pub export: bool,
 }
 
-impl Variable {
+impl VariableValue {
     pub fn new_exported(value: String) -> Self {
-        Variable {
+        VariableValue {
             value: Some(value),
             export: true,
         }
     }
 
     pub fn new(value: String) -> Self {
-        Variable {
+        VariableValue {
             value: Some(value),
             export: false,
         }
@@ -53,7 +53,7 @@ fn find_in_path(command: &str, env_path: &str) -> Option<String> {
     None
 }
 
-pub type Environment = HashMap<String, Variable>;
+pub type Environment = HashMap<String, VariableValue>;
 
 #[derive(Clone, Debug)]
 pub enum ExecutionError {
@@ -173,7 +173,7 @@ impl Shell {
         for assignment in assignments {
             let word_str = crate::wordexp::expand_word_to_string(&assignment.value, true, self);
             self.environment
-                .insert(assignment.name.to_string(), Variable::new(word_str));
+                .insert(assignment.name.to_string(), VariableValue::new(word_str));
         }
     }
 
@@ -362,13 +362,16 @@ impl Shell {
         // > export immediately
         let mut variables: Environment = std::env::vars()
             .into_iter()
-            .map(|(k, v)| (k, Variable::new_exported(v)))
+            .map(|(k, v)| (k, VariableValue::new_exported(v)))
             .collect();
-        variables.insert("PPID".to_string(), Variable::new(getppid().to_string()));
-        variables.insert("IFS".to_string(), Variable::new(" \t\n".to_string()));
-        variables.insert("PS1".to_string(), Variable::new("$ ".to_string()));
-        variables.insert("PS2".to_string(), Variable::new("> ".to_string()));
-        variables.insert("PS4".to_string(), Variable::new("+ ".to_string()));
+        variables.insert(
+            "PPID".to_string(),
+            VariableValue::new(getppid().to_string()),
+        );
+        variables.insert("IFS".to_string(), VariableValue::new(" \t\n".to_string()));
+        variables.insert("PS1".to_string(), VariableValue::new("$ ".to_string()));
+        variables.insert("PS2".to_string(), VariableValue::new("> ".to_string()));
+        variables.insert("PS4".to_string(), VariableValue::new("+ ".to_string()));
         Shell {
             environment: variables,
             program_name,
@@ -387,7 +390,7 @@ impl Default for Shell {
         Shell {
             environment: Environment::from([(
                 "IFS".to_string(),
-                Variable::new(" \t\n".to_string()),
+                VariableValue::new(" \t\n".to_string()),
             )]),
             program_name: "sh".to_string(),
             positional_parameters: Vec::default(),

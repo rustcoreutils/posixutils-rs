@@ -1,5 +1,5 @@
 use crate::parse::word::{Parameter, ParameterExpansion, SpecialParameter};
-use crate::shell::{Shell, Variable};
+use crate::shell::{Shell, VariableValue};
 use crate::wordexp::pattern::Pattern;
 use crate::wordexp::{
     expand_word_to_string, simple_word_expansion_into, ExpandedWord, ExpandedWordPart,
@@ -211,9 +211,10 @@ pub fn expand_parameter_into(
                             variable.value = Some(value.clone());
                         }
                         None => {
-                            shell
-                                .environment
-                                .insert(variable_name.to_string(), Variable::new(value.clone()));
+                            shell.environment.insert(
+                                variable_name.to_string(),
+                                VariableValue::new(value.clone()),
+                            );
                         }
                         _ => {
                             // variable is set and not null
@@ -345,7 +346,7 @@ mod tests {
         for (k, v) in env {
             shell
                 .environment
-                .insert(k.to_string(), Variable::new(v.to_string()));
+                .insert(k.to_string(), VariableValue::new(v.to_string()));
         }
         shell
     }
@@ -980,7 +981,7 @@ mod tests {
         let mut shell = shell_with_positional_arguments(vec!["arg1", "arg2", "arg3"]);
         shell
             .environment
-            .insert("IFS".to_string(), Variable::new("".to_string()));
+            .insert("IFS".to_string(), VariableValue::new("".to_string()));
         assert_eq!(
             expand_parameter(
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Asterisk)),
@@ -1060,7 +1061,7 @@ mod tests {
         let mut shell = shell_with_positional_arguments(vec!["arg1", "arg2", "arg3"]);
         shell
             .environment
-            .insert("IFS".to_string(), Variable::new(",:".to_string()));
+            .insert("IFS".to_string(), VariableValue::new(",:".to_string()));
         assert_eq!(
             expand_parameter(
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Asterisk)),

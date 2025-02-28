@@ -141,7 +141,7 @@ pub fn tilde_expansion(word: &mut Word, is_assignment: bool, env: &Environment) 
 mod tests {
     use super::*;
     use crate::parse::word::test_utils::{quoted_literal, unquoted_literal};
-    use crate::shell::Variable;
+    use crate::shell::VariableValue;
     use std::collections::HashMap;
 
     #[derive(Default)]
@@ -162,7 +162,8 @@ mod tests {
         env_home: &str,
         users_home_dirs: TestUsersHomeDirs,
     ) -> Word {
-        let env = Environment::from([("HOME".to_string(), Variable::new(env_home.to_string()))]);
+        let env =
+            Environment::from([("HOME".to_string(), VariableValue::new(env_home.to_string()))]);
         let mut word = unquoted_literal(word_str);
         expand_tilde_with_custom_users_home_dirs(&mut word, is_assignment, &env, &users_home_dirs);
         word

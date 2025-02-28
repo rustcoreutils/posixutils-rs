@@ -1054,7 +1054,7 @@ mod builtin {
     }
 
     #[test]
-    fn break_stmt() {
+    fn break_builtin() {
         test_script(
             include_str!("sh/builtin/break.sh"),
             include_str!("sh/builtin/break.out"),

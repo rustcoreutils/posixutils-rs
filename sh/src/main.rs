@@ -35,7 +35,7 @@ fn main() {
     let is_attached_to_terminal = atty::is(Stream::Stdin) && atty::is(Stream::Stdout);
     let args = parse_args(std::env::args().collect(), is_attached_to_terminal).unwrap();
     let mut shell =
-        Shell::initialize_from_system(args.program_name, args.arguments, args.set_options);
+        Shell::initialize_from_system(args.program_name, args.arguments, args.set_options, args.execution_mode == ExecutionMode::Interactive);
     match args.execution_mode {
         ExecutionMode::Interactive | ExecutionMode::ReadCommandsFromStdin => {
             let mut buffer = String::new();

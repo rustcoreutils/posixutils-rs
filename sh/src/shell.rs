@@ -116,6 +116,7 @@ pub struct Shell {
     pub alias_table: AliasTable,
     pub control_flow_state: ControlFlowState,
     pub loop_depth: u32,
+    pub is_interactive: bool,
 }
 
 impl Shell {
@@ -273,7 +274,11 @@ impl Shell {
                 // the standard does not specify if the variables should have the export attribute.
                 // Bash exports them, we do the same here (neither sh, nor zsh do it though)
                 self.perform_assignments(&simple_command.assignments, true);
-                return special_builtin_utility.exec(&expanded_words[1..], self);
+                let status = special_builtin_utility.exec(&expanded_words[1..], self);
+                if status != 0 && !self.is_interactive {
+                    std::process::exit(status);
+                }
+                return status;
             }
 
             if let Some(function_body) = self.functions.get(expanded_words[0].as_str()).cloned() {
@@ -574,6 +579,7 @@ impl Shell {
         program_name: String,
         args: Vec<String>,
         set_options: SetOptions,
+        is_interactive: bool,
     ) -> Shell {
         // > If a variable is initialized from the environment, it shall be marked for
         // > export immediately
@@ -622,6 +628,7 @@ impl Default for Shell {
             alias_table: AliasTable::default(),
             control_flow_state: ControlFlowState::None,
             loop_depth: 0,
+            is_interactive: false,
         }
     }
 }

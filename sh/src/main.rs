@@ -64,4 +64,5 @@ fn main() {
             }
         }
     }
+    std::process::exit(shell.most_recent_pipeline_exit_status);
 }

@@ -48,6 +48,10 @@ impl VariableValue {
     pub fn is_null(&self) -> bool {
         self.value.as_ref().is_some_and(|v| v.is_empty())
     }
+
+    pub fn is_set(&self) -> bool {
+        self.value.is_some()
+    }
 }
 
 fn find_in_path(command: &str, env_path: &str) -> Option<String> {

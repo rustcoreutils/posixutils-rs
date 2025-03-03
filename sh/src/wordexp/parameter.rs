@@ -201,20 +201,25 @@ pub fn expand_parameter_into(
                     let value =
                         expand_word_to_string(word, false, shell);
                     match shell.environment.get_mut(variable_name.as_ref()) {
-                        Some(variable) if *assign_on_null && variable.is_null() => {
-                            variable.value = Some(value.clone());
+                        Some(variable) => {
+                            if !variable.is_set() || (variable.is_null() && *assign_on_null) {
+                                if variable.readonly {
+                                    todo!("cannot assign to readonly variable");
+                                }
+                                variable.value = Some(value.clone());
+                                expanded_word.append(value, inside_double_quotes, true);
+                            } else {
+                                expanded_word.append(variable.value.clone().unwrap(), inside_double_quotes, true);
+                            }
                         }
                         None => {
                             shell.environment.insert(
                                 variable_name.to_string(),
                                 VariableValue::new(value.clone()),
                             );
-                        }
-                        _ => {
-                            // variable is set and not null
+                            expanded_word.append(value, inside_double_quotes, true);
                         }
                     }
-                    expanded_word.append(value, inside_double_quotes, true);
                 }
             }
         }
@@ -501,7 +506,7 @@ mod tests {
                 },
                 &mut shell
             ),
-            ""
+            "value"
         );
         assert_eq!(
             expand_parameter_to_string(
@@ -519,7 +524,7 @@ mod tests {
                 },
                 &mut shell
             ),
-            "default".to_string()
+            "".to_string()
         );
         assert_eq!(
             expand_parameter_to_string(

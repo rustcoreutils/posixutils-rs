@@ -13,12 +13,21 @@ pub trait BuiltinUtility {
     fn exec(&self, args: &[String], shell: &mut Shell) -> i32;
 }
 
+struct BuiltinNull;
+
+impl BuiltinUtility for BuiltinNull {
+    fn exec(&self, _: &[String], _: &mut Shell) -> i32 {
+        0
+    }
+}
+
 pub fn get_special_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
     match name {
         "set" => Some(&SetSpecialBuiltin),
         "readonly" => Some(&ReadOnly),
         "break" => Some(&Break),
         "continue" => Some(&Continue),
+        ":" => Some(&BuiltinNull),
         _ => None,
     }
 }

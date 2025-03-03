@@ -37,12 +37,11 @@ fn main() {
                     Ok(_) => {
                         buffer.clear();
                     }
-                    Err(ExecutionError::ParserError(err))
-                    if !err.could_be_resolved_with_more_input =>
-                        {
+                    Err(ExecutionError::ParserError(err)) => {
+                        if !err.could_be_resolved_with_more_input {
                             println!("{}", err.message);
                         }
-                    Err(_) => {}
+                    }
                 }
             }
         }

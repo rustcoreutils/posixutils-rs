@@ -2,18 +2,27 @@ for x in a b c
 do
   echo $x
   break
+  echo wrong
+done
+
+for x in a b c
+do
+  echo $x
+  echo correct && break && echo wrong
 done
 
 for x in a b c
 do
   echo $x
   break 1
+  echo wrong
 done
 
 for x in a b c
 do
   echo $x
   break 10
+  echo wrong
 done
 
 for x in a b c
@@ -23,6 +32,7 @@ do
   do
     echo $y
     break
+    echo wrong
   done
 done
 

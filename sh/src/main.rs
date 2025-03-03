@@ -20,6 +20,17 @@ mod shell;
 mod utils;
 mod wordexp;
 
+fn execute_string(string: &str, shell: &mut Shell) {
+    match shell.execute_program(string) {
+        Ok(_) => {}
+        Err(ExecutionError::ParserError(err)) => {
+            eprintln!("{}", err.message);
+            // both bash and sh use 2 as the exit code for a syntax error
+            std::process::exit(2);
+        }
+    }
+}
+
 fn main() {
     let is_attached_to_terminal = atty::is(Stream::Stdin) && atty::is(Stream::Stdout);
     let args = parse_args(std::env::args().collect(), is_attached_to_terminal).unwrap();
@@ -39,7 +50,10 @@ fn main() {
                     }
                     Err(ExecutionError::ParserError(err)) => {
                         if !err.could_be_resolved_with_more_input {
-                            println!("{}", err.message);
+                            eprintln!("{}", err.message);
+                            if args.execution_mode != ExecutionMode::Interactive {
+                                std::process::exit(2);
+                            }
                         }
                     }
                 }
@@ -48,17 +62,11 @@ fn main() {
         other => {
             match other {
                 ExecutionMode::ReadCommandsFromString(command_string) => {
-                    // TODO: impl proper error reporting
-                    shell
-                        .execute_program(&command_string)
-                        .expect("parsing error");
+                    execute_string(&command_string, &mut shell);
                 }
                 ExecutionMode::ReadFromFile(file) => {
-                    // TODO: impl proper error reporting
                     let file_contents = std::fs::read_to_string(file).expect("could not read file");
-                    shell
-                        .execute_program(&file_contents)
-                        .expect("parsing error");
+                    execute_string(&file_contents, &mut shell);
                 }
                 _ => unreachable!(),
             }

@@ -92,7 +92,7 @@ fn expect_exit_code(script: &str, exit_code: i32) {
             expected_exit_code: 0,
         },
         |_, output| {
-            assert_eq!(output.status.into_raw(), exit_code);
+            assert_eq!(output.status.code().unwrap(), exit_code);
         },
     )
 }

@@ -76,7 +76,7 @@ impl<'src> WordParser<'src> {
             }
             other => Err(ParserError::new(
                 self.line_no,
-                format!("{} is not the start of a valid parameter", other,),
+                format!("{} is not the start of a valid parameter", other, ),
                 false,
             )),
         }
@@ -167,7 +167,7 @@ impl<'src> WordParser<'src> {
         }
     }
 
-    fn parse_word_until(&mut self, end: WordToken) -> ParseResult<Option<Word>> {
+    fn parse_word_until(&mut self, end: WordToken) -> ParseResult<Word> {
         fn push_literal(literal: &mut String, parts: &mut Vec<WordPart>, quoted: bool) {
             let mut temp = String::new();
             std::mem::swap(&mut temp, literal);
@@ -277,11 +277,7 @@ impl<'src> WordParser<'src> {
 
         push_literal(&mut current_literal, &mut word_parts, false);
 
-        if word_parts.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(Word { parts: word_parts }))
-        }
+        Ok(Word { parts: word_parts })
     }
 
     fn new(text: &'src str, line_no: u32) -> Self {
@@ -301,7 +297,6 @@ pub fn parse_word(text: &str, line_no: u32) -> ParseResult<Word> {
     let mut parser = WordParser::new(text, line_no);
     parser
         .parse_word_until(WordToken::EOF)
-        .map(|word| word.unwrap())
 }
 
 #[cfg(test)]
@@ -431,7 +426,7 @@ mod tests {
             parse_unquoted_parameter_expansion("${test:-default}"),
             ParameterExpansion::UnsetUseDefault {
                 parameter: Parameter::Variable(Rc::from("test")),
-                word: Some(unquoted_literal("default")),
+                word: unquoted_literal("default"),
                 default_on_null: true,
             }
         );
@@ -439,7 +434,7 @@ mod tests {
             parse_unquoted_parameter_expansion("${test-default}"),
             ParameterExpansion::UnsetUseDefault {
                 parameter: Parameter::Variable(Rc::from("test")),
-                word: Some(unquoted_literal("default")),
+                word: unquoted_literal("default"),
                 default_on_null: false,
             }
         );
@@ -447,7 +442,7 @@ mod tests {
             parse_unquoted_parameter_expansion("${test:=default}"),
             ParameterExpansion::UnsetAssignDefault {
                 parameter: Parameter::Variable(Rc::from("test")),
-                word: Some(unquoted_literal("default")),
+                word: unquoted_literal("default"),
                 assign_on_null: true,
             }
         );
@@ -455,7 +450,7 @@ mod tests {
             parse_unquoted_parameter_expansion("${test=default}"),
             ParameterExpansion::UnsetAssignDefault {
                 parameter: Parameter::Variable(Rc::from("test")),
-                word: Some(unquoted_literal("default")),
+                word: unquoted_literal("default"),
                 assign_on_null: false,
             }
         );
@@ -463,7 +458,7 @@ mod tests {
             parse_unquoted_parameter_expansion("${test:?default}"),
             ParameterExpansion::UnsetError {
                 parameter: Parameter::Variable(Rc::from("test")),
-                word: Some(unquoted_literal("default")),
+                word: unquoted_literal("default"),
                 error_on_null: true,
             }
         );
@@ -471,7 +466,7 @@ mod tests {
             parse_unquoted_parameter_expansion("${test?default}"),
             ParameterExpansion::UnsetError {
                 parameter: Parameter::Variable(Rc::from("test")),
-                word: Some(unquoted_literal("default")),
+                word: unquoted_literal("default"),
                 error_on_null: false,
             }
         );
@@ -479,7 +474,7 @@ mod tests {
             parse_unquoted_parameter_expansion("${test:+default}"),
             ParameterExpansion::SetUseAlternative {
                 parameter: Parameter::Variable(Rc::from("test")),
-                word: Some(unquoted_literal("default")),
+                word: unquoted_literal("default"),
                 substitute_null_with_word: false,
             }
         );
@@ -487,7 +482,7 @@ mod tests {
             parse_unquoted_parameter_expansion("${test+default}"),
             ParameterExpansion::SetUseAlternative {
                 parameter: Parameter::Variable(Rc::from("test")),
-                word: Some(unquoted_literal("default")),
+                word: unquoted_literal("default"),
                 substitute_null_with_word: true,
             }
         );
@@ -499,7 +494,7 @@ mod tests {
             parse_unquoted_parameter_expansion("${test:-}"),
             ParameterExpansion::UnsetUseDefault {
                 parameter: Parameter::Variable(Rc::from("test")),
-                word: None,
+                word: Word::default(),
                 default_on_null: true
             }
         );
@@ -507,7 +502,7 @@ mod tests {
             parse_unquoted_parameter_expansion("${test-}"),
             ParameterExpansion::UnsetUseDefault {
                 parameter: Parameter::Variable(Rc::from("test")),
-                word: None,
+                word: Word::default(),
                 default_on_null: false
             }
         );
@@ -515,7 +510,7 @@ mod tests {
             parse_unquoted_parameter_expansion("${test:=}"),
             ParameterExpansion::UnsetAssignDefault {
                 parameter: Parameter::Variable(Rc::from("test")),
-                word: None,
+                word: Word::default(),
                 assign_on_null: true
             }
         );
@@ -523,7 +518,7 @@ mod tests {
             parse_unquoted_parameter_expansion("${test=}"),
             ParameterExpansion::UnsetAssignDefault {
                 parameter: Parameter::Variable(Rc::from("test")),
-                word: None,
+                word: Word::default(),
                 assign_on_null: false,
             }
         );
@@ -531,7 +526,7 @@ mod tests {
             parse_unquoted_parameter_expansion("${test:?}"),
             ParameterExpansion::UnsetError {
                 parameter: Parameter::Variable(Rc::from("test")),
-                word: None,
+                word: Word::default(),
                 error_on_null: true
             }
         );
@@ -539,7 +534,7 @@ mod tests {
             parse_unquoted_parameter_expansion("${test?}"),
             ParameterExpansion::UnsetError {
                 parameter: Parameter::Variable(Rc::from("test")),
-                word: None,
+                word: Word::default(),
                 error_on_null: false
             }
         );
@@ -547,7 +542,7 @@ mod tests {
             parse_unquoted_parameter_expansion("${test:+}"),
             ParameterExpansion::SetUseAlternative {
                 parameter: Parameter::Variable(Rc::from("test")),
-                word: None,
+                word: Word::default(),
                 substitute_null_with_word: false
             }
         );
@@ -555,7 +550,7 @@ mod tests {
             parse_unquoted_parameter_expansion("${test+}"),
             ParameterExpansion::SetUseAlternative {
                 parameter: Parameter::Variable(Rc::from("test")),
-                word: None,
+                word: Word::default(),
                 substitute_null_with_word: true
             }
         );
@@ -571,7 +566,7 @@ mod tests {
             parse_unquoted_parameter_expansion("${test%pattern}"),
             ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable(Rc::from("test")),
-                pattern: Some(unquoted_literal("pattern")),
+                pattern: unquoted_literal("pattern"),
                 remove_prefix: false,
                 remove_largest: false,
             }
@@ -580,7 +575,7 @@ mod tests {
             parse_unquoted_parameter_expansion("${test%%pattern}"),
             ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable(Rc::from("test")),
-                pattern: Some(unquoted_literal("pattern")),
+                pattern: unquoted_literal("pattern"),
                 remove_prefix: false,
                 remove_largest: true,
             }
@@ -589,7 +584,7 @@ mod tests {
             parse_unquoted_parameter_expansion("${test#pattern}"),
             ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable(Rc::from("test")),
-                pattern: Some(unquoted_literal("pattern")),
+                pattern: unquoted_literal("pattern"),
                 remove_prefix: true,
                 remove_largest: false,
             }
@@ -598,7 +593,7 @@ mod tests {
             parse_unquoted_parameter_expansion("${test##pattern}"),
             ParameterExpansion::RemovePattern {
                 parameter: Parameter::Variable(Rc::from("test")),
-                pattern: Some(unquoted_literal("pattern")),
+                pattern: unquoted_literal("pattern"),
                 remove_prefix: true,
                 remove_largest: true,
             }

@@ -2,6 +2,7 @@ use crate::wordexp::pattern::parse::{parse_pattern, PatternItem};
 use crate::wordexp::pattern::regex::{parsed_pattern_to_regex, Regex};
 use crate::wordexp::ExpandedWord;
 use std::ffi::{CStr, CString};
+use nix::NixPath;
 
 mod parse;
 mod regex;
@@ -26,6 +27,9 @@ impl Pattern {
     }
 
     pub fn remove_largest_prefix(&self, s: String) -> String {
+        if self.pattern_string.is_empty() || s.is_empty() {
+            return s;
+        }
         let cstring = CString::new(s).expect("trying to match a string containing null");
         let mut prefix_end = 0;
         if let Some(regex_match) = self.regex.match_locations(&cstring).next() {
@@ -39,6 +43,9 @@ impl Pattern {
     }
 
     pub fn remove_shortest_prefix(&self, s: String) -> String {
+        if self.pattern_string.is_empty() || s.is_empty() {
+            return s;
+        }
         assert!(
             !s.as_bytes().contains(&b'\0'),
             "trying to match a string containing null"
@@ -67,7 +74,7 @@ impl Pattern {
     }
 
     pub fn remove_largest_suffix(&self, s: String) -> String {
-        if s.is_empty() {
+        if self.pattern_string.is_empty() || s.is_empty() {
             return s;
         }
         let cstring = CString::new(s).expect("trying to match a string containing null");
@@ -85,7 +92,7 @@ impl Pattern {
     }
 
     pub fn remove_shortest_suffix(&self, s: String) -> String {
-        if s.is_empty() {
+        if self.pattern_string.is_empty() || s.is_empty() {
             return s;
         }
         assert!(

@@ -35,25 +35,25 @@ pub enum ParameterExpansion {
     // ${parameter[:]-[word]}
     UnsetUseDefault {
         parameter: Parameter,
-        word: Option<Word>,
+        word: Word,
         default_on_null: bool,
     },
     // ${parameter[:]=[word]}
     UnsetAssignDefault {
         parameter: Parameter,
-        word: Option<Word>,
+        word: Word,
         assign_on_null: bool,
     },
     // ${parameter[:]?[word]}
     UnsetError {
         parameter: Parameter,
-        word: Option<Word>,
+        word: Word,
         error_on_null: bool,
     },
     // ${parameter[:]+[word]}
     SetUseAlternative {
         parameter: Parameter,
-        word: Option<Word>,
+        word: Word,
         substitute_null_with_word: bool,
     },
     // ${#parameter}
@@ -61,7 +61,7 @@ pub enum ParameterExpansion {
     // ${parameter(%[%]|#[#])[word]}
     RemovePattern {
         parameter: Parameter,
-        pattern: Option<Word>,
+        pattern: Word,
         /// otherwise remove smallest
         remove_largest: bool,
         /// otherwise remove suffix

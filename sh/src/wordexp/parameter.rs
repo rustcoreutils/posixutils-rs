@@ -1,9 +1,7 @@
 use crate::parse::word::{Parameter, ParameterExpansion, SpecialParameter};
 use crate::shell::{Shell, VariableValue};
 use crate::wordexp::pattern::Pattern;
-use crate::wordexp::{
-    expand_word_to_string, simple_word_expansion_into, ExpandedWord, ExpandedWordPart,
-};
+use crate::wordexp::{expand_word_to_string, simple_word_expansion_into, word_to_pattern, ExpandedWord, ExpandedWordPart};
 
 #[derive(PartialEq, Eq)]
 enum ParameterExpansionResult {
@@ -186,9 +184,7 @@ pub fn expand_parameter_into(
                 shell,
             );
             if parameter_type.is_unset() || (*default_on_null && parameter_type.is_null()) {
-                if let Some(default) = default {
-                    simple_word_expansion_into(expanded_word, default, false, shell);
-                }
+                simple_word_expansion_into(expanded_word, default, false, shell);
             }
             expanded_word.extend(expanded_parameter);
         }
@@ -202,10 +198,8 @@ pub fn expand_parameter_into(
                     todo!("error: cannot assign to positional argument or special parameter")
                 }
                 Parameter::Variable(variable_name) => {
-                    let value = word
-                        .as_ref()
-                        .map(|w| expand_word_to_string(w, false, shell))
-                        .unwrap_or_default();
+                    let value =
+                        expand_word_to_string(word, false, shell);
                     match shell.environment.get_mut(variable_name.as_ref()) {
                         Some(variable) if *assign_on_null && variable.is_null() => {
                             variable.value = Some(value.clone());
@@ -238,7 +232,7 @@ pub fn expand_parameter_into(
                 shell,
             );
             if parameter_type.is_unset() || (*error_on_null && parameter_type.is_null()) {
-                if let Some(word) = word {
+                if word.parts.is_empty() {
                     eprintln!("{}", expand_word_to_string(word, false, shell));
                 } else if *error_on_null {
                     eprintln!("parameter is unset or null");
@@ -265,9 +259,7 @@ pub fn expand_parameter_into(
             if !parameter_type.is_unset()
                 && (!parameter_type.is_null() || *substitute_null_with_word)
             {
-                if let Some(word) = word {
-                    simple_word_expansion_into(expanded_word, word, false, shell)
-                }
+                simple_word_expansion_into(expanded_word, word, false, shell)
             }
         }
         ParameterExpansion::StrLen(parameter) => {
@@ -310,28 +302,23 @@ pub fn expand_parameter_into(
                 shell,
             );
             let param_str = expanded_parameter.to_string();
-            if let Some(word) = pattern {
-                let mut expanded_pattern = ExpandedWord::default();
-                simple_word_expansion_into(&mut expanded_pattern, word, false, shell);
-                // TODO: fix unwrap
-                let pattern = Pattern::new(&expanded_pattern).unwrap();
-                let result = if *remove_prefix {
-                    if *remove_largest {
-                        pattern.remove_largest_prefix(param_str)
-                    } else {
-                        pattern.remove_shortest_prefix(param_str)
-                    }
+
+            // TODO: fix unwrap
+            let pattern = word_to_pattern(pattern, shell).unwrap();
+            let result = if *remove_prefix {
+                if *remove_largest {
+                    pattern.remove_largest_prefix(param_str)
                 } else {
-                    if *remove_largest {
-                        pattern.remove_largest_suffix(param_str)
-                    } else {
-                        pattern.remove_shortest_suffix(param_str)
-                    }
-                };
-                expanded_word.append(result, inside_double_quotes, true);
+                    pattern.remove_shortest_prefix(param_str)
+                }
             } else {
-                expanded_word.append(param_str, inside_double_quotes, true);
-            }
+                if *remove_largest {
+                    pattern.remove_largest_suffix(param_str)
+                } else {
+                    pattern.remove_shortest_suffix(param_str)
+                }
+            };
+            expanded_word.append(result, inside_double_quotes, true);
         }
     }
 }
@@ -340,6 +327,7 @@ pub fn expand_parameter_into(
 mod tests {
     use super::*;
     use crate::parse::word::test_utils::unquoted_literal;
+    use crate::parse::word::Word;
 
     fn shell_with_env(env: &[(&str, &str)]) -> Shell {
         let mut shell = Shell::default();
@@ -441,7 +429,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::UnsetUseDefault {
                     parameter: Parameter::Variable("HOME".into()),
-                    word: None,
+                    word: Word::default(),
                     default_on_null: false,
                 },
                 &mut shell
@@ -452,7 +440,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::UnsetUseDefault {
                     parameter: Parameter::Variable("unset_var".into()),
-                    word: Some(unquoted_literal("default")),
+                    word: unquoted_literal("default"),
                     default_on_null: false,
                 },
                 &mut shell
@@ -463,7 +451,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::UnsetUseDefault {
                     parameter: Parameter::Variable("NULL".into()),
-                    word: Some(unquoted_literal("default")),
+                    word: unquoted_literal("default"),
                     default_on_null: false,
                 },
                 &mut shell
@@ -474,7 +462,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::UnsetUseDefault {
                     parameter: Parameter::Variable("NULL".into()),
-                    word: Some(unquoted_literal("default")),
+                    word: unquoted_literal("default"),
                     default_on_null: true,
                 },
                 &mut shell
@@ -490,7 +478,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::UnsetAssignDefault {
                     parameter: Parameter::Variable("unset_var".into()),
-                    word: Some(unquoted_literal("value")),
+                    word: unquoted_literal("value"),
                     assign_on_null: false,
                 },
                 &mut shell
@@ -508,7 +496,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::UnsetAssignDefault {
                     parameter: Parameter::Variable("unset_var".into()),
-                    word: None,
+                    word: Word::default(),
                     assign_on_null: false,
                 },
                 &mut shell
@@ -526,7 +514,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::UnsetAssignDefault {
                     parameter: Parameter::Variable("NULL".into()),
-                    word: Some(unquoted_literal("default")),
+                    word: unquoted_literal("default"),
                     assign_on_null: false,
                 },
                 &mut shell
@@ -544,7 +532,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::UnsetAssignDefault {
                     parameter: Parameter::Variable("NULL".into()),
-                    word: Some(unquoted_literal("default")),
+                    word: unquoted_literal("default"),
                     assign_on_null: true,
                 },
                 &mut shell
@@ -567,7 +555,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::SetUseAlternative {
                     parameter: Parameter::Variable("HOME".into()),
-                    word: Some(unquoted_literal("word")),
+                    word: unquoted_literal("word"),
                     substitute_null_with_word: false,
                 },
                 &mut shell
@@ -578,7 +566,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::SetUseAlternative {
                     parameter: Parameter::Variable("unset_var".into()),
-                    word: Some(unquoted_literal("word")),
+                    word: unquoted_literal("word"),
                     substitute_null_with_word: false,
                 },
                 &mut shell
@@ -589,7 +577,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::SetUseAlternative {
                     parameter: Parameter::Variable("NULL".into()),
-                    word: Some(unquoted_literal("word")),
+                    word: unquoted_literal("word"),
                     substitute_null_with_word: false,
                 },
                 &mut shell
@@ -600,7 +588,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::SetUseAlternative {
                     parameter: Parameter::Variable("NULL".into()),
-                    word: Some(unquoted_literal("word")),
+                    word: unquoted_literal("word"),
                     substitute_null_with_word: true,
                 },
                 &mut shell
@@ -632,7 +620,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::RemovePattern {
                     parameter: Parameter::Variable("HOME".into()),
-                    pattern: Some(unquoted_literal("test_user")),
+                    pattern: unquoted_literal("test_user"),
                     remove_largest: false,
                     remove_prefix: false,
                 },
@@ -644,7 +632,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::RemovePattern {
                     parameter: Parameter::Variable("TEST".into()),
-                    pattern: Some(unquoted_literal("a*c")),
+                    pattern: unquoted_literal("a*c"),
                     remove_largest: false,
                     remove_prefix: false,
                 },
@@ -656,7 +644,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::RemovePattern {
                     parameter: Parameter::Variable("NULL".into()),
-                    pattern: Some(unquoted_literal("anything")),
+                    pattern: unquoted_literal("anything"),
                     remove_largest: false,
                     remove_prefix: false,
                 },
@@ -668,7 +656,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::RemovePattern {
                     parameter: Parameter::Variable("UNDEFINED".into()),
-                    pattern: Some(unquoted_literal("anything")),
+                    pattern: unquoted_literal("anything"),
                     remove_largest: false,
                     remove_prefix: false,
                 },
@@ -680,7 +668,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::RemovePattern {
                     parameter: Parameter::Variable("HOME".into()),
-                    pattern: None,
+                    pattern: Word::default(),
                     remove_largest: false,
                     remove_prefix: false,
                 },
@@ -701,7 +689,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::RemovePattern {
                     parameter: Parameter::Variable("HOME".into()),
-                    pattern: Some(unquoted_literal("test_user")),
+                    pattern: unquoted_literal("test_user"),
                     remove_largest: true,
                     remove_prefix: false,
                 },
@@ -713,7 +701,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::RemovePattern {
                     parameter: Parameter::Variable("TEST".into()),
-                    pattern: Some(unquoted_literal("a*c")),
+                    pattern: unquoted_literal("a*c"),
                     remove_largest: true,
                     remove_prefix: false,
                 },
@@ -725,7 +713,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::RemovePattern {
                     parameter: Parameter::Variable("NULL".into()),
-                    pattern: Some(unquoted_literal("anything")),
+                    pattern: unquoted_literal("anything"),
                     remove_largest: true,
                     remove_prefix: false,
                 },
@@ -737,7 +725,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::RemovePattern {
                     parameter: Parameter::Variable("UNDEFINED".into()),
-                    pattern: Some(unquoted_literal("anything")),
+                    pattern: unquoted_literal("anything"),
                     remove_largest: true,
                     remove_prefix: false,
                 },
@@ -749,7 +737,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::RemovePattern {
                     parameter: Parameter::Variable("HOME".into()),
-                    pattern: None,
+                    pattern: Word::default(),
                     remove_largest: true,
                     remove_prefix: false,
                 },
@@ -770,7 +758,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::RemovePattern {
                     parameter: Parameter::Variable("HOME".into()),
-                    pattern: Some(unquoted_literal("/home/")),
+                    pattern: unquoted_literal("/home/"),
                     remove_largest: false,
                     remove_prefix: true,
                 },
@@ -782,7 +770,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::RemovePattern {
                     parameter: Parameter::Variable("TEST".into()),
-                    pattern: Some(unquoted_literal("a*c")),
+                    pattern: unquoted_literal("a*c"),
                     remove_largest: false,
                     remove_prefix: true,
                 },
@@ -794,7 +782,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::RemovePattern {
                     parameter: Parameter::Variable("NULL".into()),
-                    pattern: Some(unquoted_literal("anything")),
+                    pattern: unquoted_literal("anything"),
                     remove_largest: false,
                     remove_prefix: true,
                 },
@@ -806,7 +794,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::RemovePattern {
                     parameter: Parameter::Variable("UNDEFINED".into()),
-                    pattern: Some(unquoted_literal("anything")),
+                    pattern: unquoted_literal("anything"),
                     remove_largest: false,
                     remove_prefix: true,
                 },
@@ -818,7 +806,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::RemovePattern {
                     parameter: Parameter::Variable("HOME".into()),
-                    pattern: None,
+                    pattern: Word::default(),
                     remove_largest: false,
                     remove_prefix: true,
                 },
@@ -836,7 +824,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::RemovePattern {
                     parameter: Parameter::Variable("HOME".into()),
-                    pattern: Some(unquoted_literal("/home/")),
+                    pattern: unquoted_literal("/home/"),
                     remove_largest: true,
                     remove_prefix: true,
                 },
@@ -848,7 +836,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::RemovePattern {
                     parameter: Parameter::Variable("TEST".into()),
-                    pattern: Some(unquoted_literal("a*c")),
+                    pattern: unquoted_literal("a*c"),
                     remove_largest: true,
                     remove_prefix: true,
                 },
@@ -860,7 +848,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::RemovePattern {
                     parameter: Parameter::Variable("NULL".into()),
-                    pattern: Some(unquoted_literal("anything")),
+                    pattern: unquoted_literal("anything"),
                     remove_largest: true,
                     remove_prefix: true,
                 },
@@ -872,7 +860,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::RemovePattern {
                     parameter: Parameter::Variable("UNDEFINED".into()),
-                    pattern: Some(unquoted_literal("anything")),
+                    pattern: unquoted_literal("anything"),
                     remove_largest: true,
                     remove_prefix: true,
                 },
@@ -884,7 +872,7 @@ mod tests {
             expand_parameter_to_string(
                 ParameterExpansion::RemovePattern {
                     parameter: Parameter::Variable("HOME".into()),
-                    pattern: None,
+                    pattern: Word::default(),
                     remove_largest: true,
                     remove_prefix: true,
                 },

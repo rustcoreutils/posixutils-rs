@@ -6,6 +6,12 @@ done
 
 for x in a b c
 do
+  echo correct && continue && echo wrong
+  echo $x
+done
+
+for x in a b c
+do
   continue 1
   echo $x
 done

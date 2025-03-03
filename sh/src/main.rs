@@ -30,15 +30,18 @@ fn main() {
             let mut buffer = String::new();
             let stdin = io::stdin();
             while stdin.read_line(&mut buffer).is_ok_and(|n| n > 0) {
+                if buffer.ends_with("\\\n") {
+                    continue;
+                }
                 match shell.execute_program(&buffer) {
                     Ok(_) => {
                         buffer.clear();
                     }
                     Err(ExecutionError::ParserError(err))
-                        if !err.could_be_resolved_with_more_input =>
-                    {
-                        println!("{}", err.message);
-                    }
+                    if !err.could_be_resolved_with_more_input =>
+                        {
+                            println!("{}", err.message);
+                        }
                     Err(_) => {}
                 }
             }

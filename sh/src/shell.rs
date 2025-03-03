@@ -18,6 +18,7 @@ use std::ffi::{CString, OsString};
 use std::os::fd::{AsRawFd, IntoRawFd};
 use std::path::PathBuf;
 use std::rc::Rc;
+use nix::errno::Errno;
 
 #[derive(Clone)]
 pub struct VariableValue {
@@ -146,9 +147,13 @@ impl Shell {
                         }
                     })
                     .collect::<Vec<CString>>();
-                // can never fail
-                execve(&command, &args, &env).unwrap();
-                unreachable!();
+                // unwrap is safe here, because execve will only return if it fails
+                let err = execve(&command, &args, &env).unwrap_err();
+                if err == Errno::ENOEXEC {
+                    std::process::exit(126);
+                } else {
+                    std::process::exit(127);
+                }
             }
             Ok(ForkResult::Parent { child }) => match waitpid(child, None) {
                 Ok(WaitStatus::Exited(_, status)) => status,

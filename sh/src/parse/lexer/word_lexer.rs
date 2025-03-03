@@ -18,6 +18,7 @@ pub enum WordToken<'src> {
     SingleQuote,
     Dollar,
     Backslash,
+    QuotedBacktick, // \`
     CommandSubstitution(&'src str),
     ArithmeticExpansion(&'src str),
 
@@ -33,6 +34,7 @@ impl Display for WordToken<'_> {
             WordToken::SingleQuote => write!(f, "'"),
             WordToken::Dollar => write!(f, "'$'"),
             WordToken::Backslash => write!(f, "'\\'"),
+            WordToken::QuotedBacktick => write!(f, "'\\`'"),
             WordToken::CommandSubstitution(str) => write!(f, "'$({str})'"),
             WordToken::ArithmeticExpansion(str) => write!(f, "'$(({str}))'"),
             WordToken::Char(c) => write!(f, "'{}'", c),
@@ -103,7 +105,17 @@ impl<'src> WordLexer<'src> {
                 self.advance();
                 WordToken::CommandSubstitution(&self.source[start..end])
             }
-            '\\' => advance_and_return(self, WordToken::Backslash),
+            '\\' => {
+                self.advance();
+                match self.lookahead {
+                    '`' => advance_and_return(self, WordToken::QuotedBacktick),
+                    '\n' => {
+                        self.advance();
+                        self.next_token()
+                    }
+                    _ => WordToken::Backslash,
+                }
+            }
             '$' => {
                 self.advance();
                 if self.lookahead == '(' {

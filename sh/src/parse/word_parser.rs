@@ -241,14 +241,43 @@ impl<'src> WordParser<'src> {
                 }
                 WordToken::Backslash => {
                     if inside_double_quotes {
-                        current_literal.push('\\');
                         self.advance();
+                        match self.lookahead {
+                            WordToken::Dollar => {
+                                current_literal.push('$');
+                                self.advance();
+                            }
+                            WordToken::DoubleQuote => {
+                                current_literal.push('"');
+                                self.advance();
+                            }
+                            WordToken::Backslash => {
+                                current_literal.push('\\');
+                                self.advance();
+                            }
+                            _ => {
+                                current_literal.push('\\');
+                            }
+                        }
                     } else {
                         push_literal(&mut current_literal, &mut word_parts, false);
                         current_literal.push(self.lexer.next_char().unwrap());
                         push_literal(&mut current_literal, &mut word_parts, true);
                         self.advance();
                     }
+                }
+                WordToken::QuotedBacktick => {
+                    if inside_double_quotes {
+                        current_literal.push('`');
+                    } else {
+                        push_literal_and_insert(
+                            &mut current_literal,
+                            &mut word_parts,
+                            WordPart::QuotedLiteral("`".to_string()),
+                            false,
+                        );
+                    }
+                    self.advance();
                 }
                 WordToken::CommandSubstitution(commands) => {
                     push_literal_and_insert(
@@ -703,7 +732,15 @@ mod tests {
             }
         );
         assert_eq!(parse_word("\\$"), quoted_literal("$"));
-        assert_eq!(parse_word("\"\\\""), quoted_literal("\\"));
         assert_eq!(parse_word("'\\'"), quoted_literal("\\"));
+    }
+
+    #[test]
+    fn parse_backslash_inside_double_quotes() {
+        assert_eq!(parse_word("\"\\$\""), quoted_literal("$"));
+        assert_eq!(parse_word("\"\\`\""), quoted_literal("`"));
+        assert_eq!(parse_word("\"\\\"\""), quoted_literal("\""));
+        assert_eq!(parse_word("\"\\\\\""), quoted_literal("\\"));
+        assert_eq!(parse_word("\"\\a\""), quoted_literal("\\a"));
     }
 }

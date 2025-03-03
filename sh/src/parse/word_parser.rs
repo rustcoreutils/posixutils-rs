@@ -139,11 +139,24 @@ impl<'src> WordParser<'src> {
                             word,
                             default_on_null: alternative_version,
                         }),
-                        WordToken::Char('=') => Ok(ParameterExpansion::UnsetAssignDefault {
-                            parameter,
-                            word,
-                            assign_on_null: alternative_version,
-                        }),
+                        WordToken::Char('=') => {
+                            match parameter {
+                                Parameter::Variable(variable) => {
+                                    Ok(ParameterExpansion::UnsetAssignDefault {
+                                        variable,
+                                        word,
+                                        assign_on_null: alternative_version,
+                                    })
+                                }
+                                _ => {
+                                    Err(ParserError::new(
+                                        operator_loc,
+                                        "cannot assign to positional argument or special parameter",
+                                        false,
+                                    ))
+                                }
+                            }
+                        }
                         WordToken::Char('?') => Ok(ParameterExpansion::UnsetError {
                             parameter,
                             word,
@@ -470,7 +483,7 @@ mod tests {
         assert_eq!(
             parse_unquoted_parameter_expansion("${test:=default}"),
             ParameterExpansion::UnsetAssignDefault {
-                parameter: Parameter::Variable(Rc::from("test")),
+                variable: Rc::from("test"),
                 word: unquoted_literal("default"),
                 assign_on_null: true,
             }
@@ -478,7 +491,7 @@ mod tests {
         assert_eq!(
             parse_unquoted_parameter_expansion("${test=default}"),
             ParameterExpansion::UnsetAssignDefault {
-                parameter: Parameter::Variable(Rc::from("test")),
+                variable: Rc::from("test"),
                 word: unquoted_literal("default"),
                 assign_on_null: false,
             }
@@ -538,7 +551,7 @@ mod tests {
         assert_eq!(
             parse_unquoted_parameter_expansion("${test:=}"),
             ParameterExpansion::UnsetAssignDefault {
-                parameter: Parameter::Variable(Rc::from("test")),
+                variable: Rc::from("test"),
                 word: Word::default(),
                 assign_on_null: true
             }
@@ -546,7 +559,7 @@ mod tests {
         assert_eq!(
             parse_unquoted_parameter_expansion("${test=}"),
             ParameterExpansion::UnsetAssignDefault {
-                parameter: Parameter::Variable(Rc::from("test")),
+                variable: Rc::from("test"),
                 word: Word::default(),
                 assign_on_null: false,
             }

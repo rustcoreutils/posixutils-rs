@@ -189,37 +189,30 @@ pub fn expand_parameter_into(
             expanded_word.extend(expanded_parameter);
         }
         ParameterExpansion::UnsetAssignDefault {
-            parameter,
+            variable,
             word,
             assign_on_null,
         } => {
-            match parameter {
-                Parameter::Number(_) | Parameter::Special(_) => {
-                    todo!("error: cannot assign to positional argument or special parameter")
-                }
-                Parameter::Variable(variable_name) => {
-                    let value =
-                        expand_word_to_string(word, false, shell);
-                    match shell.environment.get_mut(variable_name.as_ref()) {
-                        Some(variable) => {
-                            if !variable.is_set() || (variable.is_null() && *assign_on_null) {
-                                if variable.readonly {
-                                    todo!("cannot assign to readonly variable");
-                                }
-                                variable.value = Some(value.clone());
-                                expanded_word.append(value, inside_double_quotes, true);
-                            } else {
-                                expanded_word.append(variable.value.clone().unwrap(), inside_double_quotes, true);
-                            }
+            let value =
+                expand_word_to_string(word, false, shell);
+            match shell.environment.get_mut(variable.as_ref()) {
+                Some(variable) => {
+                    if !variable.is_set() || (variable.is_null() && *assign_on_null) {
+                        if variable.readonly {
+                            todo!("cannot assign to readonly variable");
                         }
-                        None => {
-                            shell.environment.insert(
-                                variable_name.to_string(),
-                                VariableValue::new(value.clone()),
-                            );
-                            expanded_word.append(value, inside_double_quotes, true);
-                        }
+                        variable.value = Some(value.clone());
+                        expanded_word.append(value, inside_double_quotes, true);
+                    } else {
+                        expanded_word.append(variable.value.clone().unwrap(), inside_double_quotes, true);
                     }
+                }
+                None => {
+                    shell.environment.insert(
+                        variable.to_string(),
+                        VariableValue::new(value.clone()),
+                    );
+                    expanded_word.append(value, inside_double_quotes, true);
                 }
             }
         }
@@ -482,7 +475,7 @@ mod tests {
         assert_eq!(
             expand_parameter_to_string(
                 ParameterExpansion::UnsetAssignDefault {
-                    parameter: Parameter::Variable("unset_var".into()),
+                    variable: "unset_var".into(),
                     word: unquoted_literal("value"),
                     assign_on_null: false,
                 },
@@ -500,7 +493,7 @@ mod tests {
         assert_eq!(
             expand_parameter_to_string(
                 ParameterExpansion::UnsetAssignDefault {
-                    parameter: Parameter::Variable("unset_var".into()),
+                    variable: "unset_var".into(),
                     word: Word::default(),
                     assign_on_null: false,
                 },
@@ -518,7 +511,7 @@ mod tests {
         assert_eq!(
             expand_parameter_to_string(
                 ParameterExpansion::UnsetAssignDefault {
-                    parameter: Parameter::Variable("NULL".into()),
+                    variable: "NULL".into(),
                     word: unquoted_literal("default"),
                     assign_on_null: false,
                 },
@@ -536,7 +529,7 @@ mod tests {
         assert_eq!(
             expand_parameter_to_string(
                 ParameterExpansion::UnsetAssignDefault {
-                    parameter: Parameter::Variable("NULL".into()),
+                    variable: "NULL".into(),
                     word: unquoted_literal("default"),
                     assign_on_null: true,
                 },

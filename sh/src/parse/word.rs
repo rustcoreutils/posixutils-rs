@@ -40,7 +40,7 @@ pub enum ParameterExpansion {
     },
     // ${parameter[:]=[word]}
     UnsetAssignDefault {
-        parameter: Parameter,
+        variable: Name,
         word: Word,
         assign_on_null: bool,
     },

@@ -16,7 +16,7 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
 use std::os::fd::{AsRawFd, IntoRawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use nix::errno::Errno;
 
@@ -255,6 +255,10 @@ impl Shell {
         }
 
         if expanded_words[0].contains('/') {
+            if !Path::new(&expanded_words[0]).exists() {
+                eprintln!("{}: command not found", expanded_words[0]);
+                return 127;
+            }
             let mut command_environment = self.clone();
             command_environment.perform_assignments(&simple_command.assignments, true);
             command_environment.perform_redirections(&simple_command.redirections);

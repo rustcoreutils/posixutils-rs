@@ -1,2 +1,2 @@
-var=value eval
+var=value :
 echo $var

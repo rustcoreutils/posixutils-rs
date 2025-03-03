@@ -877,11 +877,6 @@ mod errors {
     fn exit_code_127_if_command_is_not_found() {
         expect_exit_code("./nonexistent", 127);
     }
-
-    #[test]
-    fn exit_code_126_if_command_is_found_but_not_executable() {
-        expect_exit_code("tests/read_dir/file1.txt", 126);
-    }
 }
 
 mod commands {

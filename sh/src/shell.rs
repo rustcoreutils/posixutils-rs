@@ -150,10 +150,11 @@ impl Shell {
                 // unwrap is safe here, because execve will only return if it fails
                 let err = execve(&command, &args, &env).unwrap_err();
                 if err == Errno::ENOEXEC {
-                    std::process::exit(126);
-                } else {
-                    std::process::exit(127);
+                    // TODO: the spec says that we should try to execute the file as a shell script
+                    // before returning error
+                    todo!()
                 }
+                std::process::exit(126);
             }
             Ok(ForkResult::Parent { child }) => match waitpid(child, None) {
                 Ok(WaitStatus::Exited(_, status)) => status,

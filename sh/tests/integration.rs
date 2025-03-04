@@ -597,7 +597,12 @@ mod word_expansion {
 
     #[test]
     fn parameter_expansion_indicate_error_if_null_or_unset() {
-        todo!()
+        test_script("x=val; echo ${x?error}", "val\n");
+        test_script("x=val; echo ${x:?error}", "val\n");
+        test_script_expect_err("echo ${x?error}", "");
+        test_script_expect_err("echo ${x:?error}", "");
+        test_script("x=; echo ${x?error}", "\n");
+        test_script_expect_err("x=; echo ${x:?error}", "");
     }
 
     #[test]

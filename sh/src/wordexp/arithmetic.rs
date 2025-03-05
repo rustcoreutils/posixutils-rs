@@ -182,16 +182,16 @@ const ASSIGNMENT_TOKENS: &[ExprToken<'static>] = &[
 ];
 
 const BINARY_OPERATORS: &[&[ExprToken<'static>]] = &[
-    &[ExprToken::Mul, ExprToken::Div, ExprToken::Mod],
-    &[ExprToken::Plus, ExprToken::Minus],
-    &[ExprToken::ShiftLeft, ExprToken::ShiftRight],
-    &[ExprToken::Le, ExprToken::Leq, ExprToken::Ge, ExprToken::Geq],
-    &[ExprToken::Eq, ExprToken::Neq],
-    &[ExprToken::BitwiseAnd],
-    &[ExprToken::BitwiseXor],
-    &[ExprToken::BitwiseOr],
-    &[ExprToken::LogicalAnd],
     &[ExprToken::LogicalOr],
+    &[ExprToken::LogicalAnd],
+    &[ExprToken::BitwiseOr],
+    &[ExprToken::BitwiseXor],
+    &[ExprToken::BitwiseAnd],
+    &[ExprToken::Eq, ExprToken::Neq],
+    &[ExprToken::Le, ExprToken::Leq, ExprToken::Ge, ExprToken::Geq],
+    &[ExprToken::ShiftLeft, ExprToken::ShiftRight],
+    &[ExprToken::Plus, ExprToken::Minus],
+    &[ExprToken::Mul, ExprToken::Div, ExprToken::Mod],
 ];
 
 const UNARY_OPERATORS: &[ExprToken<'static>] = &[

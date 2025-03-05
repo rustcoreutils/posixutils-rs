@@ -121,9 +121,10 @@ impl<'src> WordLexer<'src> {
                 if self.lookahead == '(' {
                     self.advance();
                     if self.lookahead == '(' {
+                        self.advance();
                         let start = self.position;
                         self.skip_arithmetic_expansion().expect("invalid word");
-                        WordToken::ArithmeticExpansion(&self.source[start..self.position])
+                        WordToken::ArithmeticExpansion(&self.source[start..self.position - 1])
                     } else {
                         let start = self.position;
                         self.skip_command_substitution().expect("invalid word");
@@ -215,6 +216,19 @@ mod tests {
         assert_eq!(
             lex_token("`cmd $(cmd2)`"),
             WordToken::CommandSubstitution("cmd $(cmd2)")
+        );
+    }
+
+    #[test]
+    fn lex_arithmetic_expansion() {
+        assert_eq!(lex_token("$((1))"), WordToken::ArithmeticExpansion("1"));
+        assert_eq!(
+            lex_token("$((1 + 1))"),
+            WordToken::ArithmeticExpansion("1 + 1")
+        );
+        assert_eq!(
+            lex_token("$(((1) + (1)))"),
+            WordToken::ArithmeticExpansion("(1) + (1)")
         );
     }
 }

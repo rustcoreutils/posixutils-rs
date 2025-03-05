@@ -657,6 +657,11 @@ mod tests {
 
     #[test]
     fn precedence() {
-        assert_eq!(execute_expr("1 + 2 * 3"), "7");
+        assert_eq!(
+            execute_expr(
+                "(2 + 3 * 4 - 5 / 2 % 3 << 1 >> 1 & 4 | 5 ^ 1) && (2 < 3 || 4 >= 5) ? ~2 + !3 : -4"
+            ),
+            "-3"
+        );
     }
 }

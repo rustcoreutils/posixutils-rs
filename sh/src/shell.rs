@@ -575,7 +575,10 @@ impl Shell {
                 match waitpid(child, None) {
                     Ok(WaitStatus::Exited(_, _)) => {
                         let read_file = File::from(read_pipe);
-                        read_to_string(&read_file).unwrap()
+                        let mut output = read_to_string(&read_file).unwrap();
+                        let new_len = output.trim_end_matches('\n').len();
+                        output.truncate(new_len);
+                        output
                     }
                     Err(_) => {
                         todo!("failed to wait for child process");

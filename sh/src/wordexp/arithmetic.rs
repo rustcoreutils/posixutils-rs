@@ -1,9 +1,9 @@
-use std::iter::Peekable;
-use std::str::{CharIndices};
-use crate::parse::word::{Word};
+use crate::parse::word::Word;
 use crate::shell::Shell;
 use crate::wordexp::expand_word_to_string;
 use crate::wordexp::expanded_word::ExpandedWord;
+use std::iter::Peekable;
+use std::str::CharIndices;
 
 enum UnaryOperator {
     Plus,
@@ -173,12 +173,17 @@ impl From<ExprToken<'_>> for UnaryOperator {
 }
 
 const ASSIGNMENT_TOKENS: &[ExprToken<'static>] = &[
-    ExprToken::Assign, ExprToken::MulAssign,
-    ExprToken::DivAssign, ExprToken::ModAssign,
-    ExprToken::AddAssign, ExprToken::SubAssign,
-    ExprToken::ShiftLeftAssign, ExprToken::ShiftRightAssign,
-    ExprToken::AndAssign, ExprToken::XorAssign,
-    ExprToken::OrAssign
+    ExprToken::Assign,
+    ExprToken::MulAssign,
+    ExprToken::DivAssign,
+    ExprToken::ModAssign,
+    ExprToken::AddAssign,
+    ExprToken::SubAssign,
+    ExprToken::ShiftLeftAssign,
+    ExprToken::ShiftRightAssign,
+    ExprToken::AndAssign,
+    ExprToken::XorAssign,
+    ExprToken::OrAssign,
 ];
 
 const BINARY_OPERATORS: &[&[ExprToken<'static>]] = &[
@@ -195,7 +200,10 @@ const BINARY_OPERATORS: &[&[ExprToken<'static>]] = &[
 ];
 
 const UNARY_OPERATORS: &[ExprToken<'static>] = &[
-    ExprToken::Plus, ExprToken::Minus, ExprToken::Not, ExprToken::BitwiseNot
+    ExprToken::Plus,
+    ExprToken::Minus,
+    ExprToken::Not,
+    ExprToken::BitwiseNot,
 ];
 
 type ExprParseResult<T> = Result<T, String>;
@@ -222,7 +230,11 @@ impl<'src> ExpressionParser<'src> {
         self.source_iter.peek().map(|(_, c)| *c)
     }
 
-    fn multichar_token(&mut self, start: ExprToken<'static>, choices: &[(char, ExprToken<'static>)]) -> ExprToken<'static> {
+    fn multichar_token(
+        &mut self,
+        start: ExprToken<'static>,
+        choices: &[(char, ExprToken<'static>)],
+    ) -> ExprToken<'static> {
         let mut token = start;
         for (c, t) in choices {
             if self.peek() == Some(*c) {
@@ -245,7 +257,9 @@ impl<'src> ExpressionParser<'src> {
         while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
             self.advance_char();
         }
-        self.source[start_pos..=self.source_position].parse::<i64>().map_err(|_| todo!())
+        self.source[start_pos..=self.source_position]
+            .parse::<i64>()
+            .map_err(|_| todo!())
     }
 
     fn lex_variable(&mut self, start_pos: usize) -> &'src str {
@@ -259,70 +273,64 @@ impl<'src> ExpressionParser<'src> {
         self.skip_whitespace();
         let start_pos = self.source_position;
         match self.advance_char() {
-            Some('+') => {
-                Ok(self.multichar_token(ExprToken::Plus, &[('=', ExprToken::AddAssign)]))
-            }
-            Some('-') => {
-                Ok(self.multichar_token(ExprToken::Minus, &[('=', ExprToken::SubAssign)]))
-            }
+            Some('+') => Ok(self.multichar_token(ExprToken::Plus, &[('=', ExprToken::AddAssign)])),
+            Some('-') => Ok(self.multichar_token(ExprToken::Minus, &[('=', ExprToken::SubAssign)])),
             Some('~') => Ok(ExprToken::BitwiseNot),
             Some('!') => Ok(self.multichar_token(ExprToken::Not, &[('=', ExprToken::Neq)])),
-            Some('*') => {
-                Ok(self.multichar_token(ExprToken::Mul, &[('=', ExprToken::MulAssign)]))
-            }
-            Some('/') => {
-                Ok(self.multichar_token(ExprToken::Div, &[('=', ExprToken::DivAssign)]))
-            }
-            Some('%') => {
-                Ok(self.multichar_token(ExprToken::Mod, &[('=', ExprToken::ModAssign)]))
-            }
-            Some('<') => {
-                match self.peek() {
-                    Some('<') => {
-                        self.advance_char();
-                        Ok(self.multichar_token(ExprToken::ShiftLeft, &[('=', ExprToken::ShiftLeftAssign)]))
-                    }
-                    Some('=') => {
-                        self.advance_char();
-                        Ok(ExprToken::Leq)
-                    }
-                    _ => Ok(ExprToken::Le),
+            Some('*') => Ok(self.multichar_token(ExprToken::Mul, &[('=', ExprToken::MulAssign)])),
+            Some('/') => Ok(self.multichar_token(ExprToken::Div, &[('=', ExprToken::DivAssign)])),
+            Some('%') => Ok(self.multichar_token(ExprToken::Mod, &[('=', ExprToken::ModAssign)])),
+            Some('<') => match self.peek() {
+                Some('<') => {
+                    self.advance_char();
+                    Ok(self.multichar_token(
+                        ExprToken::ShiftLeft,
+                        &[('=', ExprToken::ShiftLeftAssign)],
+                    ))
                 }
-            }
-            Some('>') => {
-                match self.peek() {
-                    Some('>') => {
-                        self.advance_char();
-                        Ok(self.multichar_token(ExprToken::ShiftRight, &[('=', ExprToken::ShiftRightAssign)]))
-                    }
-                    Some('=') => {
-                        self.advance_char();
-                        Ok(ExprToken::Geq)
-                    }
-                    _ => Ok(ExprToken::Ge),
+                Some('=') => {
+                    self.advance_char();
+                    Ok(ExprToken::Leq)
                 }
-            }
-            Some('=') => {
-                Ok(self.multichar_token(ExprToken::Assign, &[('=', ExprToken::Eq)]))
-            }
-            Some('&') => {
-                Ok(self.multichar_token(ExprToken::BitwiseAnd, &[('=', ExprToken::AndAssign), ('&', ExprToken::LogicalAnd)]))
-            }
+                _ => Ok(ExprToken::Le),
+            },
+            Some('>') => match self.peek() {
+                Some('>') => {
+                    self.advance_char();
+                    Ok(self.multichar_token(
+                        ExprToken::ShiftRight,
+                        &[('=', ExprToken::ShiftRightAssign)],
+                    ))
+                }
+                Some('=') => {
+                    self.advance_char();
+                    Ok(ExprToken::Geq)
+                }
+                _ => Ok(ExprToken::Ge),
+            },
+            Some('=') => Ok(self.multichar_token(ExprToken::Assign, &[('=', ExprToken::Eq)])),
+            Some('&') => Ok(self.multichar_token(
+                ExprToken::BitwiseAnd,
+                &[('=', ExprToken::AndAssign), ('&', ExprToken::LogicalAnd)],
+            )),
             Some('^') => {
                 Ok(self.multichar_token(ExprToken::BitwiseXor, &[('=', ExprToken::XorAssign)]))
             }
-            Some('|') => {
-                Ok(self.multichar_token(ExprToken::BitwiseOr, &[('=', ExprToken::OrAssign), ('|', ExprToken::LogicalOr)]))
-            }
+            Some('|') => Ok(self.multichar_token(
+                ExprToken::BitwiseOr,
+                &[('=', ExprToken::OrAssign), ('|', ExprToken::LogicalOr)],
+            )),
             Some('?') => Ok(ExprToken::QuestionMark),
             Some(':') => Ok(ExprToken::Colon),
             Some('(') => Ok(ExprToken::LParen),
             Some(')') => Ok(ExprToken::RParen),
             Some(c) if c.is_ascii_digit() => self.lex_number(start_pos).map(ExprToken::Number),
-            Some(c) if c.is_ascii_alphabetic() || c == '_' => Ok(ExprToken::Variable(self.lex_variable(start_pos))),
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+                Ok(ExprToken::Variable(self.lex_variable(start_pos)))
+            }
             None => Ok(ExprToken::EOF),
             // TODO: improve error output by properly implementing debug for token
-            Some(other) => Err(format!("unexpected character '{other}"))
+            Some(other) => Err(format!("unexpected character '{other}")),
         }
     }
 
@@ -345,7 +353,10 @@ impl<'src> ExpressionParser<'src> {
         self.lookahead == token
     }
 
-    fn matches_alternatives(&mut self, tokens: &[ExprToken<'static>]) -> Option<ExprToken<'static>> {
+    fn matches_alternatives(
+        &mut self,
+        tokens: &[ExprToken<'static>],
+    ) -> Option<ExprToken<'static>> {
         tokens.iter().find(|t| self.matches(**t)).copied()
     }
 
@@ -358,7 +369,7 @@ impl<'src> ExpressionParser<'src> {
                 self.match_token(ExprToken::RParen)?;
                 Ok(expr)
             }
-            other => Err(format!("unexpected token {other:?}"))
+            other => Err(format!("unexpected token {other:?}")),
         }
     }
 
@@ -463,9 +474,7 @@ fn interpret_expression(expr: &Expr, shell: &mut Shell) -> i64 {
             let value = shell.get_variable_value(var).unwrap_or_default();
             value.parse().unwrap_or(0)
         }
-        Expr::Number(num) => {
-            *num
-        }
+        Expr::Number(num) => *num,
         Expr::UnaryOp { operator, operand } => {
             let value = interpret_expression(operand, shell);
             match operator {
@@ -497,7 +506,11 @@ fn interpret_expression(expr: &Expr, shell: &mut Shell) -> i64 {
             let rhs_value = interpret_expression(rhs, shell);
             binary_operation(operator, lhs_value, rhs_value)
         }
-        Expr::Conditional { condition, true_expr, false_expr } => {
+        Expr::Conditional {
+            condition,
+            true_expr,
+            false_expr,
+        } => {
             if interpret_expression(condition, shell) != 0 {
                 interpret_expression(true_expr, shell)
             } else {
@@ -509,9 +522,16 @@ fn interpret_expression(expr: &Expr, shell: &mut Shell) -> i64 {
             shell.assign(variable.to_string(), value.to_string(), false);
             value
         }
-        Expr::CompoundAssignment { variable, operator, value } => {
+        Expr::CompoundAssignment {
+            variable,
+            operator,
+            value,
+        } => {
             let value = interpret_expression(value, shell);
-            let current_value = shell.get_variable_value(variable).map(|val| val.parse().unwrap_or(0)).unwrap_or(0);
+            let current_value = shell
+                .get_variable_value(variable)
+                .map(|val| val.parse().unwrap_or(0))
+                .unwrap_or(0);
             let new_value = binary_operation(operator, current_value, value);
             shell.assign(variable.to_string(), new_value.to_string(), false);
             new_value
@@ -519,7 +539,12 @@ fn interpret_expression(expr: &Expr, shell: &mut Shell) -> i64 {
     }
 }
 
-pub fn expand_arithmetic_expression_into(expanded_word: &mut ExpandedWord, expr: &Word, inside_double_quotes: bool, shell: &mut Shell) {
+pub fn expand_arithmetic_expression_into(
+    expanded_word: &mut ExpandedWord,
+    expr: &Word,
+    inside_double_quotes: bool,
+    shell: &mut Shell,
+) {
     let expr = expand_word_to_string(expr, false, shell);
     let expr = parse_expression(&expr).unwrap();
     let value = interpret_expression(&expr, shell);
@@ -528,9 +553,9 @@ pub fn expand_arithmetic_expression_into(expanded_word: &mut ExpandedWord, expr:
 
 #[cfg(test)]
 mod tests {
-    use crate::parse::word::test_utils::{quoted_literal};
-    use crate::shell::Environment;
     use super::*;
+    use crate::parse::word::test_utils::quoted_literal;
+    use crate::shell::Environment;
 
     fn execute_expr(s: &str) -> String {
         let mut shell = Shell::default();
@@ -614,10 +639,24 @@ mod tests {
         assert_eq!(test_assignment_with_initial_value("x %= 2", "x", "3"), "1");
         assert_eq!(test_assignment_with_initial_value("x += 2", "x", "4"), "6");
         assert_eq!(test_assignment_with_initial_value("x -= 2", "x", "2"), "0");
-        assert_eq!(test_assignment_with_initial_value("x <<= 4", "x", "2"), "32");
-        assert_eq!(test_assignment_with_initial_value("x >>= 4", "x", "32"), "2");
+        assert_eq!(
+            test_assignment_with_initial_value("x <<= 4", "x", "2"),
+            "32"
+        );
+        assert_eq!(
+            test_assignment_with_initial_value("x >>= 4", "x", "32"),
+            "2"
+        );
         assert_eq!(test_assignment_with_initial_value("x &= 3", "x", "2"), "2");
         assert_eq!(test_assignment_with_initial_value("x ^= 1", "x", "2"), "3");
-        assert_eq!(test_assignment_with_initial_value("x |= 1", "x", "10"), "11");
+        assert_eq!(
+            test_assignment_with_initial_value("x |= 1", "x", "10"),
+            "11"
+        );
+    }
+
+    #[test]
+    fn precedence() {
+        assert_eq!(execute_expr("1 + 2 * 3"), "7");
     }
 }

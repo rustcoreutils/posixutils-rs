@@ -18,7 +18,9 @@ pub enum WordToken<'src> {
     SingleQuote,
     Dollar,
     Backslash,
-    QuotedBacktick, // \`
+    // this needs to be a standalone token, otherwise we would get
+    // `Backslash` and then we would try to lex `BackTickCommandSubstitution`
+    QuotedBacktick,
     CommandSubstitution(&'src str),
     BackTickCommandSubstitution(&'src str),
     ArithmeticExpansion(&'src str),

@@ -138,14 +138,8 @@ fn simple_word_expansion_into(
                 commands,
                 inside_double_quotes,
             } => {
-                // > If a command substitution occurs inside double-quotes, field splitting
-                // > and pathname expansion shall not be performed on the results of
-                // > the substitution.
-                if inside_double_quotes {
-                    todo!()
-                } else {
-                    todo!()
-                }
+                let output = shell.execute_in_subshell(&commands);
+                result.append(output, inside_double_quotes, true);
             }
         }
     }

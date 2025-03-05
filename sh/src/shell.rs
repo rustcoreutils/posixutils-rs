@@ -9,16 +9,18 @@ use crate::parse::command_parser::CommandParser;
 use crate::parse::word::Word;
 use crate::parse::{AliasTable, ParseResult, ParserError};
 use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
+use nix::errno::Errno;
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{close, dup2, execve, fork, getpid, getppid, pipe, ForkResult};
 use nix::{libc, NixPath};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
+use std::fs::File;
+use std::io::read_to_string;
 use std::os::fd::{AsRawFd, IntoRawFd};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use nix::errno::Errno;
 
 #[derive(Clone)]
 pub struct VariableValue {
@@ -557,6 +559,34 @@ impl Shell {
             }
         }
         status
+    }
+
+    pub fn execute_in_subshell(&mut self, program: &str) -> String {
+        let (read_pipe, write_pipe) = pipe().unwrap();
+        match unsafe { fork() } {
+            Ok(ForkResult::Child) => {
+                drop(read_pipe);
+                dup2(write_pipe.as_raw_fd(), libc::STDOUT_FILENO).unwrap();
+                self.execute_program(program).unwrap();
+                std::process::exit(self.most_recent_pipeline_exit_status);
+            }
+            Ok(ForkResult::Parent { child }) => {
+                drop(write_pipe);
+                match waitpid(child, None) {
+                    Ok(WaitStatus::Exited(_, _)) => {
+                        let read_file = File::from(read_pipe);
+                        read_to_string(&read_file).unwrap()
+                    }
+                    Err(_) => {
+                        todo!("failed to wait for child process");
+                    }
+                    _ => todo!(),
+                }
+            }
+            Err(_) => {
+                todo!()
+            }
+        }
     }
 
     pub fn get_variable_value(&self, name: &str) -> Option<&str> {

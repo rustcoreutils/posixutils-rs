@@ -245,7 +245,6 @@ impl<'src> ExpressionParser<'src> {
         while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
             self.advance_char();
         }
-        println!("{}", &self.source[start_pos..self.source_position]);
         self.source[start_pos..=self.source_position].parse::<i64>().map_err(|_| todo!())
     }
 

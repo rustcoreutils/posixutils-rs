@@ -305,7 +305,7 @@ impl<'src> WordParser<'src> {
                         &mut current_literal,
                         &mut word_parts,
                         WordPart::ArithmeticExpansion {
-                            expr: parse_word(expr, self.line_no)?,
+                            expr: parse_word(expr, self.line_no, true)?,
                             inside_double_quotes,
                         },
                         inside_double_quotes,
@@ -338,11 +338,31 @@ impl<'src> WordParser<'src> {
     }
 }
 
+fn quote_literals(word: Word) -> Result<Word, ParserError> {
+    let mut quoted_word_parts = Vec::with_capacity(word.parts.len());
+    for part in word.parts.into_iter() {
+        match part {
+            WordPart::UnquotedLiteral(literal) => {
+                quoted_word_parts.push(WordPart::QuotedLiteral(literal));
+            }
+            other => quoted_word_parts.push(other),
+        }
+    }
+    Ok(Word {
+        parts: quoted_word_parts,
+    })
+}
+
 /// # Panics
 /// Panics if word is not valid (unclosed quotes, unclosed command substitution, etc.)
-pub fn parse_word(text: &str, line_no: u32) -> ParseResult<Word> {
+pub fn parse_word(text: &str, line_no: u32, contents_are_quoted: bool) -> ParseResult<Word> {
     let mut parser = WordParser::new(text, line_no);
-    parser.parse_word_until(WordToken::EOF)
+    let word = parser.parse_word_until(WordToken::EOF)?;
+    if contents_are_quoted {
+        quote_literals(word)
+    } else {
+        Ok(word)
+    }
 }
 
 #[cfg(test)]
@@ -351,7 +371,7 @@ mod tests {
     use crate::parse::word::test_utils::{quoted_literal, unquoted_literal};
 
     fn parse_word(word: &str) -> Word {
-        super::parse_word(word, 0).expect("parsing error")
+        super::parse_word(word, 0, false).expect("parsing error")
     }
 
     fn parse_unquoted_parameter_expansion(word: &str) -> ParameterExpansion {

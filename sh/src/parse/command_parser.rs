@@ -36,7 +36,7 @@ fn try_into_assignment(word: &str, line_no: u32) -> ParseResult<Result<Assignmen
         if c == '=' {
             let (name, value) = word.split_at(pos);
             let name = Rc::from(name);
-            parse_word(&value[1..], line_no).map(|value| Ok(Assignment { name, value }))
+            parse_word(&value[1..], line_no, false).map(|value| Ok(Assignment { name, value }))
         } else {
             Ok(Err(word))
         }
@@ -115,7 +115,7 @@ impl<'src> CommandParser<'src> {
         let line_no = self.lookahead_lineno;
         let token = self.advance()?;
         if let Some(word) = token.as_word_str() {
-            parse_word(&word, line_no)
+            parse_word(&word, line_no, false)
         } else {
             Err(ParserError::new(
                 line_no,
@@ -162,7 +162,7 @@ impl<'src> CommandParser<'src> {
         self.advance()?;
         match self.advance()? {
             CommandToken::Word(word) => {
-                let file = parse_word(&word, line_no)?;
+                let file = parse_word(&word, line_no, false)?;
                 Ok(Some(RedirectionKind::IORedirection { kind, file }))
             }
             other => Err(ParserError::new(
@@ -219,7 +219,7 @@ impl<'src> CommandParser<'src> {
         let mut performed_one_substitution = false;
         loop {
             if self.is_currently_processing_substitution(next_substitution.as_ref()) {
-                return parse_word(&next_substitution, self.lookahead_lineno).map(Some);
+                return parse_word(&next_substitution, self.lookahead_lineno, false).map(Some);
             }
             if let Some(alias) = alias_table.get(next_substitution.as_ref()) {
                 if !alias.ends_with(|c| is_blank(c)) {
@@ -242,7 +242,8 @@ impl<'src> CommandParser<'src> {
                 if !performed_one_substitution {
                     *apply_alias_substitution_to_next_word = false;
                 }
-                return parse_word(next_substitution.as_ref(), self.lookahead_lineno).map(Some);
+                return parse_word(next_substitution.as_ref(), self.lookahead_lineno, false)
+                    .map(Some);
             }
         }
     }
@@ -274,7 +275,9 @@ impl<'src> CommandParser<'src> {
                                 )?;
                                 command.words.extend(next_word.into_iter());
                             } else {
-                                command.words.push(parse_word(word, self.lookahead_lineno)?);
+                                command
+                                    .words
+                                    .push(parse_word(word, self.lookahead_lineno, false)?);
                             }
                         }
                     };
@@ -301,7 +304,9 @@ impl<'src> CommandParser<'src> {
                         )?;
                         command.words.extend(next_word.into_iter());
                     } else {
-                        command.words.push(parse_word(word, self.lookahead_lineno)?);
+                        command
+                            .words
+                            .push(parse_word(word, self.lookahead_lineno, false)?);
                     }
                     self.advance()?;
                 }
@@ -400,7 +405,7 @@ impl<'src> CommandParser<'src> {
             self.advance()?;
             while self.lookahead.as_word_str().is_some() {
                 let word = self.advance()?.into_word_cow().unwrap();
-                words.push(parse_word(&word, self.lookahead_lineno)?);
+                words.push(parse_word(&word, self.lookahead_lineno, false)?);
             }
         } else {
             words.push(Word {

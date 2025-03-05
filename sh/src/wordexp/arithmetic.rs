@@ -253,13 +253,25 @@ impl<'src> ExpressionParser<'src> {
         })
     }
 
-    fn lex_number(&mut self, start_pos: usize) -> ExprParseResult<i64> {
+    fn lex_decimal_number(&mut self, start_pos: usize) -> ExprParseResult<i64> {
         while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
             self.advance_char();
         }
-        self.source[start_pos..=self.source_position]
-            .parse::<i64>()
-            .map_err(|_| todo!())
+        i64::from_str_radix(&self.source[start_pos..=self.source_position], 10).map_err(|_| todo!())
+    }
+
+    fn lex_octal_number(&mut self, start_pos: usize) -> ExprParseResult<i64> {
+        while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+            self.advance_char();
+        }
+        i64::from_str_radix(&self.source[start_pos..=self.source_position], 8).map_err(|_| todo!())
+    }
+
+    fn lex_hex_number(&mut self, start_pos: usize) -> ExprParseResult<i64> {
+        while matches!(self.peek(), Some(c) if c.is_ascii_hexdigit()) {
+            self.advance_char();
+        }
+        i64::from_str_radix(&self.source[start_pos..=self.source_position], 16).map_err(|_| todo!())
     }
 
     fn lex_variable(&mut self, start_pos: usize) -> &'src str {
@@ -324,7 +336,19 @@ impl<'src> ExpressionParser<'src> {
             Some(':') => Ok(ExprToken::Colon),
             Some('(') => Ok(ExprToken::LParen),
             Some(')') => Ok(ExprToken::RParen),
-            Some(c) if c.is_ascii_digit() => self.lex_number(start_pos).map(ExprToken::Number),
+            Some(c) if c.is_ascii_digit() => {
+                if c == '0' {
+                    if self.peek() == Some('x') {
+                        self.advance_char();
+                        self.lex_hex_number(self.source_position + 1)
+                            .map(ExprToken::Number)
+                    } else {
+                        self.lex_octal_number(start_pos).map(ExprToken::Number)
+                    }
+                } else {
+                    self.lex_decimal_number(start_pos).map(ExprToken::Number)
+                }
+            }
             Some(c) if c.is_ascii_alphabetic() || c == '_' => {
                 Ok(ExprToken::Variable(self.lex_variable(start_pos)))
             }
@@ -584,6 +608,8 @@ mod tests {
     #[test]
     fn literal_number() {
         assert_eq!(execute_expr("1"), "1");
+        assert_eq!(execute_expr("0123"), "83");
+        assert_eq!(execute_expr("0x123"), "291");
     }
 
     #[test]

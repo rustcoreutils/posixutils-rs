@@ -215,7 +215,7 @@ impl Shell {
         }
     }
 
-    fn assign(&mut self, var_name: String, value: String, export: bool) {
+    pub fn assign(&mut self, var_name: String, value: String, export: bool) {
         match self.environment.entry(var_name) {
             Entry::Occupied(mut e) => {
                 if e.get().readonly {

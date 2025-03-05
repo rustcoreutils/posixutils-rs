@@ -76,7 +76,7 @@ impl<'src> WordParser<'src> {
             }
             other => Err(ParserError::new(
                 self.line_no,
-                format!("{} is not the start of a valid parameter", other, ),
+                format!("{} is not the start of a valid parameter", other,),
                 false,
             )),
         }
@@ -139,24 +139,20 @@ impl<'src> WordParser<'src> {
                             word,
                             default_on_null: alternative_version,
                         }),
-                        WordToken::Char('=') => {
-                            match parameter {
-                                Parameter::Variable(variable) => {
-                                    Ok(ParameterExpansion::UnsetAssignDefault {
-                                        variable,
-                                        word,
-                                        assign_on_null: alternative_version,
-                                    })
-                                }
-                                _ => {
-                                    Err(ParserError::new(
-                                        operator_loc,
-                                        "cannot assign to positional argument or special parameter",
-                                        false,
-                                    ))
-                                }
+                        WordToken::Char('=') => match parameter {
+                            Parameter::Variable(variable) => {
+                                Ok(ParameterExpansion::UnsetAssignDefault {
+                                    variable,
+                                    word,
+                                    assign_on_null: alternative_version,
+                                })
                             }
-                        }
+                            _ => Err(ParserError::new(
+                                operator_loc,
+                                "cannot assign to positional argument or special parameter",
+                                false,
+                            )),
+                        },
                         WordToken::Char('?') => Ok(ParameterExpansion::UnsetError {
                             parameter,
                             word,
@@ -304,8 +300,16 @@ impl<'src> WordParser<'src> {
                     );
                     self.advance();
                 }
-                WordToken::ArithmeticExpansion(str) => {
-                    todo!();
+                WordToken::ArithmeticExpansion(expr) => {
+                    push_literal_and_insert(
+                        &mut current_literal,
+                        &mut word_parts,
+                        WordPart::ArithmeticExpansion {
+                            expr: parse_word(expr, self.line_no)?,
+                            inside_double_quotes,
+                        },
+                        inside_double_quotes,
+                    );
                 }
                 WordToken::Char(c) => {
                     current_literal.push(c);
@@ -337,8 +341,7 @@ impl<'src> WordParser<'src> {
 /// Panics if word is not valid (unclosed quotes, unclosed command substitution, etc.)
 pub fn parse_word(text: &str, line_no: u32) -> ParseResult<Word> {
     let mut parser = WordParser::new(text, line_no);
-    parser
-        .parse_word_until(WordToken::EOF)
+    parser.parse_word_until(WordToken::EOF)
 }
 
 #[cfg(test)]

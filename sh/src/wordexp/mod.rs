@@ -1,5 +1,6 @@
 use crate::parse::word::{Word, WordPart};
 use crate::shell::Shell;
+use crate::wordexp::arithmetic::expand_arithmetic_expression_into;
 use crate::wordexp::expanded_word::{ExpandedWord, ExpandedWordPart};
 use crate::wordexp::parameter::expand_parameter_into;
 use crate::wordexp::pathname::glob;
@@ -7,6 +8,7 @@ use crate::wordexp::pattern::{FilenamePattern, Pattern};
 use crate::wordexp::tilde::tilde_expansion;
 use std::path::Path;
 
+mod arithmetic;
 pub mod expanded_word;
 mod parameter;
 pub mod pathname;
@@ -128,9 +130,10 @@ fn simple_word_expansion_into(
             } => {
                 expand_parameter_into(result, &expansion, inside_double_quotes, true, shell);
             }
-            WordPart::ArithmeticExpansion(_) => {
-                todo!()
-            }
+            WordPart::ArithmeticExpansion {
+                expr,
+                inside_double_quotes,
+            } => expand_arithmetic_expression_into(result, &expr, inside_double_quotes, shell),
             WordPart::CommandSubstitution {
                 commands,
                 inside_double_quotes,

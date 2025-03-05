@@ -70,48 +70,6 @@ pub enum ParameterExpansion {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum ArithmeticExpr {
-    // arithmetic operations
-    Add(Box<ArithmeticExpr>, Box<ArithmeticExpr>),
-    Sub(Box<ArithmeticExpr>, Box<ArithmeticExpr>),
-    Div(Box<ArithmeticExpr>, Box<ArithmeticExpr>),
-    Mul(Box<ArithmeticExpr>, Box<ArithmeticExpr>),
-    Mod(Box<ArithmeticExpr>, Box<ArithmeticExpr>),
-    Negate(Box<ArithmeticExpr>),
-    PreInc(Name),
-    PostInc(Name),
-    PreDec(Name),
-    PostDec(Name),
-
-    // compairison operations
-    Eq(Box<ArithmeticExpr>, Box<ArithmeticExpr>),
-    Neq(Box<ArithmeticExpr>, Box<ArithmeticExpr>),
-    Ge(Box<ArithmeticExpr>, Box<ArithmeticExpr>),
-    Le(Box<ArithmeticExpr>, Box<ArithmeticExpr>),
-    Geq(Box<ArithmeticExpr>, Box<ArithmeticExpr>),
-    Leq(Box<ArithmeticExpr>, Box<ArithmeticExpr>),
-
-    // logical operations
-    Not(Box<ArithmeticExpr>, Box<ArithmeticExpr>),
-    And(Box<ArithmeticExpr>, Box<ArithmeticExpr>),
-    Or(Box<ArithmeticExpr>, Box<ArithmeticExpr>),
-
-    // bitwise operations
-    BNot(Box<ArithmeticExpr>),
-    BAnd(Box<ArithmeticExpr>),
-    BOr(Box<ArithmeticExpr>),
-    Xor(Box<ArithmeticExpr>),
-    Shl(Box<ArithmeticExpr>),
-    Shr(Box<ArithmeticExpr>),
-
-    ConditionalOperator {
-        condition: Box<ArithmeticExpr>,
-        true_expr: Box<ArithmeticExpr>,
-        false_expr: Box<ArithmeticExpr>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub enum WordPart {
     UnquotedLiteral(String),
     QuotedLiteral(String),
@@ -119,7 +77,10 @@ pub enum WordPart {
         expansion: ParameterExpansion,
         inside_double_quotes: bool,
     },
-    ArithmeticExpansion(ArithmeticExpr),
+    ArithmeticExpansion {
+        expr: Word,
+        inside_double_quotes: bool,
+    },
     CommandSubstitution {
         commands: String,
         inside_double_quotes: bool,

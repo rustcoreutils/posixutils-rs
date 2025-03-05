@@ -300,7 +300,7 @@ impl<'src> WordParser<'src> {
                     );
                     self.advance();
                 }
-                WordToken::BackTickCommandSubstitution(commands) => {
+                WordToken::BacktickCommandSubstitution(commands) => {
                     push_literal_and_insert(
                         &mut current_literal,
                         &mut word_parts,

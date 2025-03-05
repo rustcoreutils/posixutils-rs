@@ -19,10 +19,10 @@ pub enum WordToken<'src> {
     Dollar,
     Backslash,
     // this needs to be a standalone token, otherwise we would get
-    // `Backslash` and then we would try to lex `BackTickCommandSubstitution`
+    // `Backslash` and then we would try to lex `BacktickCommandSubstitution`
     QuotedBacktick,
     CommandSubstitution(&'src str),
-    BackTickCommandSubstitution(&'src str),
+    BacktickCommandSubstitution(&'src str),
     ArithmeticExpansion(&'src str),
 
     Char(char),
@@ -39,7 +39,7 @@ impl Display for WordToken<'_> {
             WordToken::Backslash => write!(f, "'\\'"),
             WordToken::QuotedBacktick => write!(f, "'\\`'"),
             WordToken::CommandSubstitution(str) => write!(f, "'$({str})'"),
-            WordToken::BackTickCommandSubstitution(str) => write!(f, "`{str}`"),
+            WordToken::BacktickCommandSubstitution(str) => write!(f, "`{str}`"),
             WordToken::ArithmeticExpansion(str) => write!(f, "'$(({str}))'"),
             WordToken::Char(c) => write!(f, "'{}'", c),
             WordToken::EOF => write!(f, "'EOF'"),
@@ -107,7 +107,7 @@ impl<'src> WordLexer<'src> {
                     .expect("invalid word");
                 let end = self.position;
                 self.advance();
-                WordToken::BackTickCommandSubstitution(&self.source[start..end])
+                WordToken::BacktickCommandSubstitution(&self.source[start..end])
             }
             '\\' => {
                 self.advance();
@@ -203,26 +203,26 @@ mod tests {
 
     #[test]
     fn lex_backtick_command_substitution() {
-        assert_eq!(lex_token("``"), WordToken::BackTickCommandSubstitution(""));
+        assert_eq!(lex_token("``"), WordToken::BacktickCommandSubstitution(""));
         assert_eq!(
             lex_token("`cmd`"),
-            WordToken::BackTickCommandSubstitution("cmd")
+            WordToken::BacktickCommandSubstitution("cmd")
         );
         assert_eq!(
             lex_token("`cmd arg1 arg2`"),
-            WordToken::BackTickCommandSubstitution("cmd arg1 arg2")
+            WordToken::BacktickCommandSubstitution("cmd arg1 arg2")
         );
         assert_eq!(
             lex_token("`\ncmd1\ncmd2\ncmd3\n`"),
-            WordToken::BackTickCommandSubstitution("\ncmd1\ncmd2\ncmd3\n")
+            WordToken::BacktickCommandSubstitution("\ncmd1\ncmd2\ncmd3\n")
         );
         assert_eq!(
             lex_token("`#comment\ncmd`"),
-            WordToken::BackTickCommandSubstitution("#comment\ncmd")
+            WordToken::BacktickCommandSubstitution("#comment\ncmd")
         );
         assert_eq!(
             lex_token("`cmd $(cmd2)`"),
-            WordToken::BackTickCommandSubstitution("cmd $(cmd2)")
+            WordToken::BacktickCommandSubstitution("cmd $(cmd2)")
         );
     }
 

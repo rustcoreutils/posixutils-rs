@@ -607,6 +607,7 @@ impl Shell {
             // TODO: handle error
             current_directory: std::env::current_dir().unwrap().into_os_string(),
             set_options,
+            is_interactive,
             ..Default::default()
         }
     }

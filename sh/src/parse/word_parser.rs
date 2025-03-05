@@ -300,6 +300,18 @@ impl<'src> WordParser<'src> {
                     );
                     self.advance();
                 }
+                WordToken::BackTickCommandSubstitution(commands) => {
+                    push_literal_and_insert(
+                        &mut current_literal,
+                        &mut word_parts,
+                        WordPart::CommandSubstitution {
+                            commands: commands.replace("\\`", "`"),
+                            inside_double_quotes,
+                        },
+                        inside_double_quotes,
+                    );
+                    self.advance();
+                }
                 WordToken::ArithmeticExpansion(expr) => {
                     push_literal_and_insert(
                         &mut current_literal,
@@ -701,6 +713,10 @@ mod tests {
         assert_eq!(
             parse_unquoted_command_substitution("$(echo $(echo hello))"),
             "echo $(echo hello)"
+        );
+        assert_eq!(
+            parse_unquoted_command_substitution("`echo \\`echo nested\\``"),
+            "echo `echo nested`"
         );
     }
 

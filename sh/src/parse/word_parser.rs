@@ -310,6 +310,7 @@ impl<'src> WordParser<'src> {
                         },
                         inside_double_quotes,
                     );
+                    self.advance();
                 }
                 WordToken::Char(c) => {
                     current_literal.push(c);

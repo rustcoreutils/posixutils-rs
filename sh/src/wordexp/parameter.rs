@@ -1,7 +1,10 @@
 use crate::parse::word::{Parameter, ParameterExpansion, SpecialParameter};
 use crate::shell::{Shell, VariableValue};
 use crate::wordexp::pattern::Pattern;
-use crate::wordexp::{expand_word_to_string, simple_word_expansion_into, word_to_pattern, ExpandedWord, ExpandedWordPart};
+use crate::wordexp::{
+    expand_word_to_string, simple_word_expansion_into, word_to_pattern, ExpandedWord,
+    ExpandedWordPart,
+};
 
 #[derive(PartialEq, Eq)]
 enum ParameterExpansionResult {
@@ -193,8 +196,7 @@ pub fn expand_parameter_into(
             word,
             assign_on_null,
         } => {
-            let value =
-                expand_word_to_string(word, false, shell);
+            let value = expand_word_to_string(word, false, shell);
             match shell.environment.get_mut(variable.as_ref()) {
                 Some(variable) => {
                     if !variable.is_set() || (variable.is_null() && *assign_on_null) {
@@ -204,14 +206,17 @@ pub fn expand_parameter_into(
                         variable.value = Some(value.clone());
                         expanded_word.append(value, inside_double_quotes, true);
                     } else {
-                        expanded_word.append(variable.value.clone().unwrap(), inside_double_quotes, true);
+                        expanded_word.append(
+                            variable.value.clone().unwrap(),
+                            inside_double_quotes,
+                            true,
+                        );
                     }
                 }
                 None => {
-                    shell.environment.insert(
-                        variable.to_string(),
-                        VariableValue::new(value.clone()),
-                    );
+                    shell
+                        .environment
+                        .insert(variable.to_string(), VariableValue::new(value.clone()));
                     expanded_word.append(value, inside_double_quotes, true);
                 }
             }

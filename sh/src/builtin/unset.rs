@@ -20,7 +20,9 @@ impl BuiltinUtility for BuiltinUnset {
                 eprintln!("unset: cannot simultaneously unset a function and a variable");
                 return 1;
             }
-            _ => { start_index = 0; }
+            _ => {
+                start_index = 0;
+            }
         }
 
         for name in &args[start_index..] {

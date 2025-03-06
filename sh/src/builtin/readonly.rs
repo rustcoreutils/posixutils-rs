@@ -1,7 +1,7 @@
-use crate::builtin::{BuiltinUtility, SpecialBuiltinUtility};
+use crate::builtin::SpecialBuiltinUtility;
 use crate::parse::command_parser::is_valid_name;
 use crate::shell::opened_files::OpenedFiles;
-use crate::shell::{Shell, VariableValue};
+use crate::shell::Shell;
 use std::collections::hash_map::Entry;
 
 pub struct ReadOnly;
@@ -18,6 +18,7 @@ impl SpecialBuiltinUtility for ReadOnly {
         if args[0] == "-p" {
             let mut pairs = shell
                 .environment
+                .variables
                 .iter()
                 .filter(|(_, val)| val.readonly)
                 .collect::<Vec<_>>();
@@ -55,21 +56,7 @@ impl SpecialBuiltinUtility for ReadOnly {
                 }
                 (arg.clone(), None)
             };
-            match shell.environment.entry(name) {
-                Entry::Occupied(mut e) => {
-                    e.get_mut().readonly = true;
-                    if value.is_some() {
-                        e.get_mut().value = value;
-                    }
-                }
-                Entry::Vacant(e) => {
-                    e.insert(VariableValue {
-                        value,
-                        export: false,
-                        readonly: true,
-                    });
-                }
-            }
+            shell.environment.set_readonly(&name, value);
         }
         0
     }

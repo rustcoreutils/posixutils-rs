@@ -1,6 +1,6 @@
 use crate::parse::word::{Parameter, ParameterExpansion, SpecialParameter};
-use crate::shell::{Shell, VariableValue};
-use crate::wordexp::pattern::Pattern;
+use crate::shell::environment::Value;
+use crate::shell::Shell;
 use crate::wordexp::{
     expand_word_to_string, simple_word_expansion_into, word_to_pattern, ExpandedWord,
     ExpandedWordPart,
@@ -75,7 +75,7 @@ fn expand_simple_parameter_into(
         ),
         Parameter::Variable(var_name) => add_option_to_expanded_word(
             expanded_word,
-            shell.get_variable_value(var_name.as_ref()),
+            shell.environment.get_str_value(var_name.as_ref()),
             inside_double_quotes,
         ),
         Parameter::Special(special_parameter) => {
@@ -104,7 +104,8 @@ fn expand_simple_parameter_into(
                         );
                     } else {
                         let separator = shell
-                            .get_variable_value("IFS")
+                            .environment
+                            .get_str_value("IFS")
                             .map(|v| if v.is_empty() { "" } else { &v[..1] })
                             .unwrap_or(" ");
                         expanded_word.append(
@@ -197,7 +198,7 @@ pub fn expand_parameter_into(
             assign_on_null,
         } => {
             let value = expand_word_to_string(word, false, shell);
-            match shell.environment.get_mut(variable.as_ref()) {
+            match shell.environment.get_var_mut(variable.as_ref()) {
                 Some(variable) => {
                     if !variable.is_set() || (variable.is_null() && *assign_on_null) {
                         if variable.readonly {
@@ -214,9 +215,11 @@ pub fn expand_parameter_into(
                     }
                 }
                 None => {
+                    // cannot be readonly, unwrap is safe
                     shell
                         .environment
-                        .insert(variable.to_string(), VariableValue::new(value.clone()));
+                        .set(variable.to_string(), value.clone(), false)
+                        .unwrap();
                     expanded_word.append(value, inside_double_quotes, true);
                 }
             }
@@ -335,9 +338,7 @@ mod tests {
     fn shell_with_env(env: &[(&str, &str)]) -> Shell {
         let mut shell = Shell::default();
         for (k, v) in env {
-            shell
-                .environment
-                .insert(k.to_string(), VariableValue::new(v.to_string()));
+            shell.environment.set(k.to_string(), v.to_string(), false);
         }
         shell
     }
@@ -972,7 +973,7 @@ mod tests {
         let mut shell = shell_with_positional_arguments(vec!["arg1", "arg2", "arg3"]);
         shell
             .environment
-            .insert("IFS".to_string(), VariableValue::new("".to_string()));
+            .set("IFS".to_string(), "".to_string(), false);
         assert_eq!(
             expand_parameter(
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Asterisk)),
@@ -1011,7 +1012,7 @@ mod tests {
     #[test]
     fn expand_asterisk_with_unset_ifs() {
         let mut shell = shell_with_positional_arguments(vec!["arg1", "arg2", "arg3"]);
-        shell.environment.remove("IFS");
+        shell.environment.unset("IFS").expect("cannot unset IFS");
         assert_eq!(
             expand_parameter(
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Asterisk)),
@@ -1052,7 +1053,7 @@ mod tests {
         let mut shell = shell_with_positional_arguments(vec!["arg1", "arg2", "arg3"]);
         shell
             .environment
-            .insert("IFS".to_string(), VariableValue::new(",:".to_string()));
+            .set("IFS".to_string(), ",:".to_string(), false);
         assert_eq!(
             expand_parameter(
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Asterisk)),

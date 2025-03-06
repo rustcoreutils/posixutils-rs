@@ -30,15 +30,12 @@ impl SpecialBuiltinUtility for BuiltinUnset {
 
         for name in &args[start_index..] {
             if unset_var {
-                if let Some(var) = shell.environment.get_mut(name) {
-                    if var.readonly {
-                        opened_files.stderr().write_str(format!(
-                            "unset: cannot unset readonly variable '{}'\n",
-                            name
-                        ));
-                        return 1;
-                    }
-                    var.value = None;
+                if shell.environment.unset(name).is_err() {
+                    opened_files.stderr().write_str(format!(
+                        "unset: cannot unset readonly variable '{}'\n",
+                        name
+                    ));
+                    return 1;
                 }
             } else {
                 shell.functions.remove(name.as_str());

@@ -160,7 +160,7 @@ pub fn expand_word_to_string(word: &Word, is_assignment: bool, shell: &mut Shell
 pub fn expand_word(word: &Word, is_assignment: bool, shell: &mut Shell) -> Vec<String> {
     let mut expanded_word = ExpandedWord::default();
     simple_word_expansion_into(&mut expanded_word, word, is_assignment, shell);
-    let ifs = shell.get_variable_value("IFS");
+    let ifs = shell.environment.get_str_value("IFS");
     let mut result = Vec::new();
     for field in split_fields(expanded_word, ifs) {
         // TODO: handle error

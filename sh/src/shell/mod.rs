@@ -7,6 +7,7 @@ use crate::parse::command::{
 use crate::parse::command_parser::CommandParser;
 use crate::parse::word::Word;
 use crate::parse::{AliasTable, ParserError};
+use crate::shell::environment::{Environment, Value};
 use crate::shell::opened_files::{OpenedFile, OpenedFiles};
 use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
 use nix::errno::Errno;
@@ -22,41 +23,8 @@ use std::os::fd::{AsRawFd, IntoRawFd};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+pub mod environment;
 pub mod opened_files;
-
-#[derive(Clone)]
-pub struct VariableValue {
-    /// `None` if `Variable` is unset
-    pub value: Option<String>,
-    pub export: bool,
-    pub readonly: bool,
-}
-
-impl VariableValue {
-    pub fn new_exported(value: String) -> Self {
-        VariableValue {
-            value: Some(value),
-            export: true,
-            readonly: false,
-        }
-    }
-
-    pub fn new(value: String) -> Self {
-        VariableValue {
-            value: Some(value),
-            export: false,
-            readonly: false,
-        }
-    }
-
-    pub fn is_null(&self) -> bool {
-        self.value.as_ref().is_some_and(|v| v.is_empty())
-    }
-
-    pub fn is_set(&self) -> bool {
-        self.value.is_some()
-    }
-}
 
 fn find_in_path(command: &str, env_path: &str) -> Option<String> {
     for path in env_path.split(':') {
@@ -68,8 +36,6 @@ fn find_in_path(command: &str, env_path: &str) -> Option<String> {
     }
     None
 }
-
-pub type Environment = HashMap<String, VariableValue>;
 
 #[derive(Clone, Debug)]
 pub enum ExecutionError {
@@ -128,6 +94,17 @@ pub struct Shell {
 }
 
 impl Shell {
+    fn assign(&mut self, name: String, value: String, export: bool) {
+        if self.environment.set(name, value, export).is_err() {
+            self.opened_files
+                .stderr()
+                .write_str("sh: cannot assign to readonly variable\n");
+            if !self.is_interactive {
+                std::process::exit(2)
+            }
+        }
+    }
+
     fn exec(&self, command: &str, args: &[String]) -> i32 {
         match unsafe { fork() } {
             Ok(ForkResult::Child) => {
@@ -148,6 +125,7 @@ impl Shell {
                     .collect::<Vec<_>>();
                 let env = self
                     .environment
+                    .variables
                     .iter()
                     .filter_map(|(name, value)| {
                         if value.export {
@@ -179,25 +157,6 @@ impl Shell {
             },
             Err(_) => {
                 todo!("error: fork failed");
-            }
-        }
-    }
-
-    pub fn assign(&mut self, var_name: String, value: String, export: bool) {
-        match self.environment.entry(var_name) {
-            Entry::Occupied(mut e) => {
-                if e.get().readonly {
-                    todo!("error")
-                }
-                e.get_mut().value = Some(value);
-                e.get_mut().export = e.get_mut().export || export;
-            }
-            Entry::Vacant(e) => {
-                e.insert(VariableValue {
-                    value: Some(value),
-                    export,
-                    readonly: false,
-                });
             }
         }
     }
@@ -279,7 +238,7 @@ impl Shell {
                 .opened_files
                 .redirect(&simple_command.redirections, self);
             // TODO: fix unwrap with proper error
-            let path = self.get_variable_value("PATH").unwrap();
+            let path = self.environment.get_str_value("PATH").unwrap();
             if let Some(command) = find_in_path(&expanded_words[0], path) {
                 let arguments = expanded_words
                     .iter()
@@ -567,13 +526,6 @@ impl Shell {
         }
     }
 
-    pub fn get_variable_value(&self, name: &str) -> Option<&str> {
-        self.environment
-            .get(name)
-            .map(|var| var.value.as_ref().map(|v| v.as_str()))
-            .flatten()
-    }
-
     pub fn execute_program(&mut self, program: &str) -> Result<(), ExecutionError> {
         let mut parser = CommandParser::new(program)?;
         loop {
@@ -595,20 +547,14 @@ impl Shell {
     ) -> Shell {
         // > If a variable is initialized from the environment, it shall be marked for
         // > export immediately
-        let mut variables: Environment = std::env::vars()
-            .into_iter()
-            .map(|(k, v)| (k, VariableValue::new_exported(v)))
-            .collect();
-        variables.insert(
-            "PPID".to_string(),
-            VariableValue::new(getppid().to_string()),
+        let environment = Environment::from(
+            std::env::vars()
+                .into_iter()
+                .map(|(k, v)| (k, Value::new_exported(v))),
         );
-        variables.insert("IFS".to_string(), VariableValue::new(" \t\n".to_string()));
-        variables.insert("PS1".to_string(), VariableValue::new("$ ".to_string()));
-        variables.insert("PS2".to_string(), VariableValue::new("> ".to_string()));
-        variables.insert("PS4".to_string(), VariableValue::new("+ ".to_string()));
-        Shell {
-            environment: variables,
+
+        let mut shell = Shell {
+            environment,
             program_name,
             positional_parameters: args,
             shell_pid: getpid().as_raw(),
@@ -617,17 +563,20 @@ impl Shell {
             set_options,
             is_interactive,
             ..Default::default()
-        }
+        };
+        shell.assign("PPID".to_string(), getppid().to_string(), false);
+        shell.assign("IFS".to_string(), " \t\n".to_string(), false);
+        shell.assign("PS1".to_string(), "$ ".to_string(), false);
+        shell.assign("PS2".to_string(), "> ".to_string(), false);
+        shell.assign("PS4".to_string(), "+ ".to_string(), false);
+        shell
     }
 }
 
 impl Default for Shell {
     fn default() -> Self {
         Shell {
-            environment: Environment::from([(
-                "IFS".to_string(),
-                VariableValue::new(" \t\n".to_string()),
-            )]),
+            environment: Environment::from([("IFS".to_string(), Value::new(" \t\n".to_string()))]),
             program_name: "sh".to_string(),
             positional_parameters: Vec::default(),
             opened_files: OpenedFiles::default(),

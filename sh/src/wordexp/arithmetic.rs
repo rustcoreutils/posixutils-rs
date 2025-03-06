@@ -1,4 +1,5 @@
 use crate::parse::word::Word;
+use crate::shell::environment::Environment;
 use crate::shell::Shell;
 use crate::wordexp::expand_word_to_string;
 use crate::wordexp::expanded_word::ExpandedWord;
@@ -492,15 +493,15 @@ fn binary_operation(operator: &BinaryOperator, lhs_value: i64, rhs_value: i64) -
     }
 }
 
-fn interpret_expression(expr: &Expr, shell: &mut Shell) -> i64 {
+fn interpret_expression(expr: &Expr, env: &mut Environment) -> i64 {
     match expr {
         Expr::Variable(var) => {
-            let value = shell.get_variable_value(var).unwrap_or_default();
+            let value = env.get_str_value(var).unwrap_or_default();
             value.parse().unwrap_or(0)
         }
         Expr::Number(num) => *num,
         Expr::UnaryOp { operator, operand } => {
-            let value = interpret_expression(operand, shell);
+            let value = interpret_expression(operand, env);
             match operator {
                 UnaryOperator::Plus => value,
                 UnaryOperator::Minus => -value,
@@ -509,25 +510,25 @@ fn interpret_expression(expr: &Expr, shell: &mut Shell) -> i64 {
             }
         }
         Expr::BinaryOp { lhs, operator, rhs } => {
-            let lhs_value = interpret_expression(lhs, shell);
+            let lhs_value = interpret_expression(lhs, env);
             match operator {
                 BinaryOperator::LogicalAnd => {
                     return if lhs_value != 0 {
-                        (interpret_expression(rhs, shell) != 0) as i64
+                        (interpret_expression(rhs, env) != 0) as i64
                     } else {
                         0
                     }
                 }
                 BinaryOperator::LogicalOr => {
                     return if lhs_value == 0 {
-                        (interpret_expression(rhs, shell) != 0) as i64
+                        (interpret_expression(rhs, env) != 0) as i64
                     } else {
                         1
                     }
                 }
                 _ => {}
             }
-            let rhs_value = interpret_expression(rhs, shell);
+            let rhs_value = interpret_expression(rhs, env);
             binary_operation(operator, lhs_value, rhs_value)
         }
         Expr::Conditional {
@@ -535,15 +536,16 @@ fn interpret_expression(expr: &Expr, shell: &mut Shell) -> i64 {
             true_expr,
             false_expr,
         } => {
-            if interpret_expression(condition, shell) != 0 {
-                interpret_expression(true_expr, shell)
+            if interpret_expression(condition, env) != 0 {
+                interpret_expression(true_expr, env)
             } else {
-                interpret_expression(false_expr, shell)
+                interpret_expression(false_expr, env)
             }
         }
         Expr::Assignment { variable, value } => {
-            let value = interpret_expression(value, shell);
-            shell.assign(variable.to_string(), value.to_string(), false);
+            let value = interpret_expression(value, env);
+            // TODO: handle error
+            env.set(variable.to_string(), value.to_string(), false);
             value
         }
         Expr::CompoundAssignment {
@@ -551,13 +553,14 @@ fn interpret_expression(expr: &Expr, shell: &mut Shell) -> i64 {
             operator,
             value,
         } => {
-            let value = interpret_expression(value, shell);
-            let current_value = shell
-                .get_variable_value(variable)
+            let value = interpret_expression(value, env);
+            let current_value = env
+                .get_str_value(variable)
                 .map(|val| val.parse().unwrap_or(0))
                 .unwrap_or(0);
             let new_value = binary_operation(operator, current_value, value);
-            shell.assign(variable.to_string(), new_value.to_string(), false);
+            // TODO: handle error
+            env.set(variable.to_string(), new_value.to_string(), false);
             new_value
         }
     }
@@ -571,7 +574,7 @@ pub fn expand_arithmetic_expression_into(
 ) {
     let expr = expand_word_to_string(expr, false, shell);
     let expr = parse_expression(&expr).unwrap();
-    let value = interpret_expression(&expr, shell);
+    let value = interpret_expression(&expr, &mut shell.environment);
     expanded_word.append(value.to_string(), inside_double_quotes, true);
 }
 
@@ -579,7 +582,6 @@ pub fn expand_arithmetic_expression_into(
 mod tests {
     use super::*;
     use crate::parse::word::test_utils::quoted_literal;
-    use crate::shell::Environment;
 
     fn execute_expr(s: &str) -> String {
         let mut shell = Shell::default();
@@ -590,19 +592,22 @@ mod tests {
 
     fn test_assignment_with_initial_value(expr: &str, var: &str, initial_value: &str) -> String {
         let mut shell = Shell::default();
-        shell.assign(var.to_string(), initial_value.to_string(), false);
+        shell
+            .environment
+            .set(var.to_string(), initial_value.to_string(), false)
+            .expect("variable is readonly");
         let mut result = ExpandedWord::default();
         expand_arithmetic_expression_into(&mut result, &quoted_literal(expr), false, &mut shell);
         let result = result.to_string();
-        assert_eq!(shell.get_variable_value(var), Some(result.as_str()));
+        assert_eq!(shell.environment.get_str_value(var), Some(result.as_str()));
         result
     }
 
-    fn test_assignment(expr: &str) -> (String, Shell) {
+    fn test_assignment(expr: &str) -> (String, Environment) {
         let mut shell = Shell::default();
         let mut result = ExpandedWord::default();
         expand_arithmetic_expression_into(&mut result, &quoted_literal(expr), false, &mut shell);
-        (result.to_string(), shell)
+        (result.to_string(), shell.environment)
     }
 
     #[test]
@@ -653,9 +658,9 @@ mod tests {
 
     #[test]
     fn simple_assignment() {
-        let (result, shell) = test_assignment("x = 1");
+        let (result, env) = test_assignment("x = 1");
         assert_eq!(result, "1");
-        assert_eq!(shell.get_variable_value("x"), Some("1"));
+        assert_eq!(env.get_str_value("x"), Some("1"));
     }
 
     #[test]

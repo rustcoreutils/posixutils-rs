@@ -1,5 +1,5 @@
 use crate::parse::word::{Word, WordPart};
-use crate::shell::Environment;
+use crate::shell::environment::Environment;
 use nix::libc;
 use std::ffi::{c_char, CStr, CString};
 use std::os::unix::ffi::OsStringExt;
@@ -34,9 +34,8 @@ fn expand_home(login_name: &str, env: &Environment, user_home: &dyn UsersHomeDir
     if login_name.is_empty() {
         // > If the login name is null (that is, the tilde-prefix contains only the tilde),
         // > the tilde-prefix is replaced by the value of the variable HOME
-        env.get("HOME")
-            .map(|v| v.value.as_ref().cloned())
-            .flatten()
+        env.get_str_value("HOME")
+            .map(|s| s.to_string())
             .unwrap_or_else(|| todo!("error: HOME not set"))
     } else {
         if !login_name.chars().all(is_portable_filename_character) {
@@ -141,7 +140,7 @@ pub fn tilde_expansion(word: &mut Word, is_assignment: bool, env: &Environment) 
 mod tests {
     use super::*;
     use crate::parse::word::test_utils::{quoted_literal, unquoted_literal};
-    use crate::shell::VariableValue;
+    use crate::shell::environment::Value;
     use std::collections::HashMap;
 
     #[derive(Default)]
@@ -162,8 +161,7 @@ mod tests {
         env_home: &str,
         users_home_dirs: TestUsersHomeDirs,
     ) -> Word {
-        let env =
-            Environment::from([("HOME".to_string(), VariableValue::new(env_home.to_string()))]);
+        let env = Environment::from([("HOME".to_string(), Value::new(env_home.to_string()))]);
         let mut word = unquoted_literal(word_str);
         expand_tilde_with_custom_users_home_dirs(&mut word, is_assignment, &env, &users_home_dirs);
         word

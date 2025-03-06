@@ -1,14 +1,17 @@
-use crate::builtin::BuiltinUtility;
+use crate::builtin::{BuiltinUtility, SpecialBuiltinUtility};
 use crate::parse::command_parser::is_valid_name;
+use crate::shell::opened_files::OpenedFiles;
 use crate::shell::{Shell, VariableValue};
 use std::collections::hash_map::Entry;
 
 pub struct ReadOnly;
 
-impl BuiltinUtility for ReadOnly {
-    fn exec(&self, args: &[String], shell: &mut Shell) -> i32 {
+impl SpecialBuiltinUtility for ReadOnly {
+    fn exec(&self, args: &[String], shell: &mut Shell, opened_files: OpenedFiles) -> i32 {
         if args.is_empty() {
-            eprintln!("readonly: too few arguments");
+            opened_files
+                .stderr()
+                .write_str("readonly: too few arguments\n");
             return 1;
         }
 
@@ -21,9 +24,13 @@ impl BuiltinUtility for ReadOnly {
             pairs.sort_by_key(|(k, _)| k.as_str());
             for (var, var_value) in pairs {
                 if let Some(val) = &var_value.value {
-                    println!("readonly {}='{}'", var, val);
+                    opened_files
+                        .stdout()
+                        .write_str(format!("readonly {}='{}'\n", var, val));
                 } else {
-                    println!("readonly {}", var)
+                    opened_files
+                        .stdout()
+                        .write_str(format!("readonly {}\n", var));
                 }
             }
             return 0;
@@ -33,13 +40,17 @@ impl BuiltinUtility for ReadOnly {
             let (name, value) = if let Some(pos) = arg.find('=') {
                 let (name, value) = arg.split_at(pos);
                 if !is_valid_name(name) {
-                    eprintln!("readonly: '{}' is not a valid name", name);
+                    opened_files
+                        .stderr()
+                        .write_str(format!("readonly: '{}' is not a valid name\n", name));
                     return 1;
                 }
                 (name.to_string(), Some(value[1..].to_string()))
             } else {
                 if !is_valid_name(&arg) {
-                    eprintln!("readonly: '{}' is not a valid name", arg);
+                    opened_files
+                        .stderr()
+                        .write_str(format!("readonly: '{}' is not a valid name\n", arg));
                     return 1;
                 }
                 (arg.clone(), None)

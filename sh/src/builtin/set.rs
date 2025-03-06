@@ -1,26 +1,30 @@
-use crate::builtin::BuiltinUtility;
+use crate::builtin::{BuiltinUtility, SpecialBuiltinUtility};
+use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 use crate::utils::strcoll;
 use std::ffi::CString;
-use std::fmt::Write;
+use std::io::Write;
 
 pub struct SetSpecialBuiltin;
 
-impl BuiltinUtility for SetSpecialBuiltin {
-    fn exec(&self, args: &[String], shell: &mut Shell) -> i32 {
+impl SpecialBuiltinUtility for SetSpecialBuiltin {
+    fn exec(&self, args: &[String], shell: &mut Shell, opened_files: OpenedFiles) -> i32 {
         match shell.set_options.parse_args_and_update(args) {
             Err(err) => {
-                eprintln!("set: {}", err);
-                // the standard specifies >0, both bash and dash return 2
+                opened_files.stderr().write_str(format!("set: {}\n", err));
                 2
             }
             Ok(parsed_args) => {
                 match parsed_args {
                     ParsedArgs::PrintSettingsHumanReadable => {
-                        print!("{}", shell.set_options.to_string_human_readable());
+                        opened_files
+                            .stdout()
+                            .write_str(shell.set_options.to_string_human_readable());
                     }
                     ParsedArgs::PrintSettingsShellReadable => {
-                        print!("{}", shell.set_options.to_string_shell_readable());
+                        opened_files
+                            .stdout()
+                            .write_str(shell.set_options.to_string_shell_readable());
                     }
                     ParsedArgs::ResetPositionalParameters => {
                         shell.positional_parameters.clear();
@@ -38,7 +42,11 @@ impl BuiltinUtility for SetSpecialBuiltin {
                         sorted_vars.sort_by(|(k1, _), (k2, _)| strcoll(k1, k2));
                         for (key, value) in sorted_vars {
                             // key should only contain valid ascii
-                            println!("{}='{}'", key.to_str().unwrap(), value);
+                            opened_files.stdout().write_str(format!(
+                                "{}='{}'\n",
+                                key.to_str().unwrap(),
+                                value
+                            ));
                         }
                     }
                     ParsedArgs::ArgsStart(i) => {
@@ -128,6 +136,8 @@ impl SetOptions {
     }
 
     pub fn to_string_human_readable(&self) -> String {
+        use std::fmt::Write;
+
         let option = |v: bool| if v { "on" } else { "off" };
         let mut result = String::new();
         writeln!(&mut result, "allexport {}", option(self.allexport)).unwrap();
@@ -148,6 +158,8 @@ impl SetOptions {
     }
 
     pub fn to_string_shell_readable(&self) -> String {
+        use std::fmt::Write;
+
         let option = |v: bool| if v { "-" } else { "+" };
         let mut result = String::new();
         writeln!(&mut result, "set {}o allexport", option(self.allexport)).unwrap();

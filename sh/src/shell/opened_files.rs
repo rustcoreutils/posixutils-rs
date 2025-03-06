@@ -60,6 +60,17 @@ impl Write for WriteFile {
     }
 }
 
+impl WriteFile {
+    pub fn write_str<S: AsRef<str>>(&mut self, s: S) {
+        match self.write_all(s.as_ref().as_bytes()) {
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!("sh: {}", err);
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct OpenedFiles {
     pub opened_files: HashMap<u32, OpenedFile>,

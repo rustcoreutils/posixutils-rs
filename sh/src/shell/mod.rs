@@ -251,7 +251,9 @@ impl Shell {
                 // the standard does not specify if the variables should have the export attribute.
                 // Bash exports them, we do the same here (neither sh, nor zsh do it though)
                 self.perform_assignments(&simple_command.assignments, true);
-                let status = special_builtin_utility.exec(&expanded_words[1..], self);
+                let mut opened_files = self.opened_files.clone();
+                opened_files.redirect(&simple_command.redirections, self);
+                let status = special_builtin_utility.exec(&expanded_words[1..], self, opened_files);
                 if status != 0 && !self.is_interactive {
                     std::process::exit(status);
                 }

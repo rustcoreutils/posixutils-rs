@@ -1,10 +1,11 @@
-use crate::builtin::BuiltinUtility;
+use crate::builtin::{BuiltinUtility, SpecialBuiltinUtility};
+use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 
 pub struct BuiltinUnset;
 
-impl BuiltinUtility for BuiltinUnset {
-    fn exec(&self, args: &[String], shell: &mut Shell) -> i32 {
+impl SpecialBuiltinUtility for BuiltinUnset {
+    fn exec(&self, args: &[String], shell: &mut Shell, opened_files: OpenedFiles) -> i32 {
         if args.is_empty() {
             return 0;
         }
@@ -17,7 +18,9 @@ impl BuiltinUtility for BuiltinUnset {
             }
             "-v" => {}
             "-fv" | "-vf" => {
-                eprintln!("unset: cannot simultaneously unset a function and a variable");
+                opened_files
+                    .stderr()
+                    .write_str("unset: cannot simultaneously unset a function and a variable\n");
                 return 1;
             }
             _ => {
@@ -29,7 +32,10 @@ impl BuiltinUtility for BuiltinUnset {
             if unset_var {
                 if let Some(var) = shell.environment.get_mut(name) {
                     if var.readonly {
-                        eprintln!("unset: cannot unset readonly variable '{}'", name);
+                        opened_files.stderr().write_str(format!(
+                            "unset: cannot unset readonly variable '{}'\n",
+                            name
+                        ));
                         return 1;
                     }
                     var.value = None;

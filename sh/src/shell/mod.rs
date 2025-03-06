@@ -229,7 +229,12 @@ impl Shell {
             }
 
             if let Some(builtin_utility) = get_builtin_utility(&expanded_words[0]) {
-                return builtin_utility.exec(&expanded_words[1..], self);
+                let mut opened_files = self.opened_files.clone();
+                opened_files.redirect(&simple_command.redirections, self);
+                let mut command_env = self.environment.clone();
+                self.perform_assignments(&simple_command.assignments, false);
+                std::mem::swap(&mut self.environment, &mut command_env);
+                return builtin_utility.exec(&expanded_words[1..], self, opened_files, command_env);
             }
 
             let mut command_environment = self.clone();

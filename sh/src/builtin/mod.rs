@@ -3,9 +3,9 @@ use crate::builtin::control_flow::{Break, Continue};
 use crate::builtin::readonly::ReadOnly;
 use crate::builtin::set::SetSpecialBuiltin;
 use crate::builtin::unset::BuiltinUnset;
+use crate::shell::environment::Environment;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
-use std::io::Write;
 
 pub mod alias;
 mod control_flow;
@@ -38,7 +38,13 @@ pub fn get_special_builtin_utility(name: &str) -> Option<&dyn SpecialBuiltinUtil
 }
 
 pub trait BuiltinUtility {
-    fn exec(&self, args: &[String], shell: &mut Shell) -> i32;
+    fn exec(
+        &self,
+        args: &[String],
+        shell: &mut Shell,
+        opened_files: OpenedFiles,
+        environment: Environment,
+    ) -> i32;
 }
 
 pub fn get_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {

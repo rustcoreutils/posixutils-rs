@@ -47,18 +47,21 @@ pub fn test_script(script: &str, expected_output: &str) {
 }
 
 fn test_script_expect_err(script: &str, expected_output: &str) {
-    run_test_with_checker(TestPlan {
-        cmd: "sh".to_string(),
-        args: vec![],
-        stdin_data: script.to_string(),
-        expected_out: expected_output.to_string(),
-        expected_err: String::default(),
-        expected_exit_code: 0,
-    }, |_, output| {
-        assert!(!output.stderr.is_empty());
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert_eq!(stdout, expected_output)
-    });
+    run_test_with_checker(
+        TestPlan {
+            cmd: "sh".to_string(),
+            args: vec![],
+            stdin_data: script.to_string(),
+            expected_out: expected_output.to_string(),
+            expected_err: String::default(),
+            expected_exit_code: 0,
+        },
+        |_, output| {
+            assert!(!output.stderr.is_empty());
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert_eq!(stdout, expected_output)
+        },
+    );
 }
 
 fn expect_err_and_message(script: &str, stdout: Option<&str>) {
@@ -646,7 +649,8 @@ mod word_expansion {
         );
     }
     #[test]
-    fn command_substitution_inside_double_quotes_does_not_perform_field_splitting_or_pathname_expansion() {
+    fn command_substitution_inside_double_quotes_does_not_perform_field_splitting_or_pathname_expansion(
+    ) {
         test_script(include_str!("sh/word_expansion/command_substitution_inside_double_quotes_does_not_perform_field_splitting_or_pathname_expansion.sh"), include_str!("sh/word_expansion/command_substitution_inside_double_quotes_does_not_perform_field_splitting_or_pathname_expansion.out"));
     }
     #[test]
@@ -675,7 +679,8 @@ mod word_expansion {
         );
     }
     #[test]
-    fn parameter_expansion_inside_double_quotes_does_not_perform_pathname_expansion_and_field_splitting() {
+    fn parameter_expansion_inside_double_quotes_does_not_perform_pathname_expansion_and_field_splitting(
+    ) {
         test_script(include_str!("sh/word_expansion/parameter_expansion_inside_double_quotes_does_not_perform_pathname_expansion_and_field_splitting.sh"), include_str!("sh/word_expansion/parameter_expansion_inside_double_quotes_does_not_perform_pathname_expansion_and_field_splitting.out"));
     }
     #[test]
@@ -852,6 +857,14 @@ mod redirection {
             include_str!("sh/redirection/output_redirection.sh"),
             include_str!("sh/redirection/output_redirection.out"),
         );
+    }
+
+    #[test]
+    fn redirect_output_of_special_builtin_commands() {
+        test_script(
+            include_str!("sh/redirection/redirect_output_of_special_builtin_commands.sh"),
+            include_str!("sh/redirection/redirect_output_of_special_builtin_commands.out"),
+        )
     }
 }
 
@@ -1084,12 +1097,18 @@ mod builtin {
 
     #[test]
     fn unset_variable() {
-        test_script(include_str!("sh/builtin/unset_variable.sh"), include_str!("sh/builtin/unset_variable.out"));
+        test_script(
+            include_str!("sh/builtin/unset_variable.sh"),
+            include_str!("sh/builtin/unset_variable.out"),
+        );
     }
 
     #[test]
     fn unset_function() {
-        test_script_expect_err(include_str!("sh/builtin/unset_function.sh"), include_str!("sh/builtin/unset_function.out"));
+        test_script_expect_err(
+            include_str!("sh/builtin/unset_function.sh"),
+            include_str!("sh/builtin/unset_function.out"),
+        );
     }
 
     #[test]

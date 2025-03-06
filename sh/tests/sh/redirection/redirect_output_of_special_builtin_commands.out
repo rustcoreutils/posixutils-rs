@@ -1,0 +1,14 @@
+allexport off
+notify    off
+noclobber off
+errexit   off
+noglob    off
+hashall   off
+monitor   off
+noexec    off
+nounset   off
+verbose   off
+xtrace    off
+ignoreeof off
+nolog     off
+vi        off

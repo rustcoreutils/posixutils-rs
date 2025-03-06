@@ -2,12 +2,12 @@ use crate::builtin::set::SetOptions;
 use crate::builtin::{get_builtin_utility, get_special_builtin_utility};
 use crate::parse::command::{
     Assignment, CaseItem, Command, CompleteCommand, CompoundCommand, Conjunction,
-    FunctionDefinition, IORedirectionKind, If, LogicalOp, Name, Pipeline, Redirection,
-    RedirectionKind, SimpleCommand,
+    FunctionDefinition, If, LogicalOp, Name, Pipeline, Redirection, SimpleCommand,
 };
 use crate::parse::command_parser::CommandParser;
 use crate::parse::word::Word;
-use crate::parse::{AliasTable, ParseResult, ParserError};
+use crate::parse::{AliasTable, ParserError};
+use crate::shell::opened_files::{OpenedFile, OpenedFiles};
 use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
 use nix::errno::Errno;
 use nix::sys::wait::{waitpid, WaitStatus};
@@ -17,10 +17,12 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
 use std::fs::File;
-use std::io::read_to_string;
+use std::io::{read_to_string, Read, Write};
 use std::os::fd::{AsRawFd, IntoRawFd};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+
+pub mod opened_files;
 
 #[derive(Clone)]
 pub struct VariableValue {
@@ -111,7 +113,7 @@ pub struct Shell {
     pub environment: Environment,
     pub program_name: String,
     pub positional_parameters: Vec<String>,
-    pub opened_files: HashMap<u32, Rc<std::fs::File>>,
+    pub opened_files: OpenedFiles,
     pub functions: HashMap<Name, Rc<CompoundCommand>>,
     pub most_recent_pipeline_exit_status: i32,
     pub last_command_substitution_status: i32,
@@ -129,9 +131,14 @@ impl Shell {
     fn exec(&self, command: &str, args: &[String]) -> i32 {
         match unsafe { fork() } {
             Ok(ForkResult::Child) => {
-                for (id, file) in &self.opened_files {
+                for (id, file) in &self.opened_files.opened_files {
                     let dest = *id as i32;
-                    let src = file.as_raw_fd();
+                    let src = match file {
+                        OpenedFile::Stdin => libc::STDIN_FILENO,
+                        OpenedFile::Stdout => libc::STDOUT_FILENO,
+                        OpenedFile::Stderr => libc::STDERR_FILENO,
+                        OpenedFile::File(file) => file.as_raw_fd(),
+                    };
                     dup2(src, dest).expect("TODO: handle dup2 error");
                 }
                 let command = CString::new(command).unwrap();
@@ -176,47 +183,6 @@ impl Shell {
         }
     }
 
-    fn perform_redirections(&mut self, redirections: &[Redirection]) {
-        for redir in redirections {
-            match &redir.kind {
-                RedirectionKind::IORedirection { kind, file } => {
-                    // > the word that follows the redirection operator shall be subjected to tilde
-                    // > expansion, parameter expansion, command substitution, arithmetic expansion,
-                    // > and quote removal.
-                    let path = expand_word_to_string(file, false, self);
-                    // TODO: pathname expansion is not allowed if the shell is non-interactive,
-                    // optional otherwise. Bash does implement this, maybe we should too.
-                    match kind {
-                        IORedirectionKind::RedirectOutput
-                        | IORedirectionKind::RedirectOutputClobber
-                        | IORedirectionKind::RedirectOuputAppend => {
-                            // TODO: fail if noclobber is set and file exists and is a regular file
-
-                            // TODO: fix unwrap
-                            let file = if *kind == IORedirectionKind::RedirectOuputAppend {
-                                std::fs::OpenOptions::new()
-                                    .append(true)
-                                    .create(true)
-                                    .open(path)
-                                    .unwrap()
-                            } else {
-                                std::fs::File::create(path).unwrap()
-                            };
-                            let source_fd =
-                                redir.file_descriptor.unwrap_or(libc::STDOUT_FILENO as u32);
-                            self.opened_files.insert(source_fd, Rc::new(file));
-                        }
-                        IORedirectionKind::DuplicateOutput => {}
-                        IORedirectionKind::RedirectInput => {}
-                        IORedirectionKind::DuplicateInput => {}
-                        IORedirectionKind::OpenRW => {}
-                    }
-                }
-                RedirectionKind::HereDocument { contents } => {}
-            }
-        }
-    }
-
     pub fn assign(&mut self, var_name: String, value: String, export: bool) {
         match self.environment.entry(var_name) {
             Entry::Occupied(mut e) => {
@@ -256,7 +222,10 @@ impl Shell {
             self.perform_assignments(&simple_command.assignments, false);
             if !simple_command.redirections.is_empty() {
                 let mut subshell = self.clone();
-                subshell.perform_redirections(&simple_command.redirections);
+                subshell
+                    .opened_files
+                    .redirect(&simple_command.redirections, self);
+                (&simple_command.redirections, &mut subshell);
             }
             return self.last_command_substitution_status;
         }
@@ -268,7 +237,9 @@ impl Shell {
             }
             let mut command_environment = self.clone();
             command_environment.perform_assignments(&simple_command.assignments, true);
-            command_environment.perform_redirections(&simple_command.redirections);
+            command_environment
+                .opened_files
+                .redirect(&simple_command.redirections, self);
             let command = &expanded_words[0];
             let arguments = expanded_words
                 .iter()
@@ -302,7 +273,9 @@ impl Shell {
 
             let mut command_environment = self.clone();
             command_environment.perform_assignments(&simple_command.assignments, true);
-            command_environment.perform_redirections(&simple_command.redirections);
+            command_environment
+                .opened_files
+                .redirect(&simple_command.redirections, self);
             // TODO: fix unwrap with proper error
             let path = self.get_variable_value("PATH").unwrap();
             if let Some(command) = find_in_path(&expanded_words[0], path) {
@@ -655,7 +628,7 @@ impl Default for Shell {
             )]),
             program_name: "sh".to_string(),
             positional_parameters: Vec::default(),
-            opened_files: HashMap::default(),
+            opened_files: OpenedFiles::default(),
             functions: HashMap::default(),
             most_recent_pipeline_exit_status: 0,
             last_command_substitution_status: 0,

@@ -5,6 +5,7 @@ use nix::libc;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::rc::Rc;
 
 const STDIN_FILENO: u32 = libc::STDIN_FILENO as u32;
@@ -20,31 +21,41 @@ pub enum OpenedFile {
 }
 
 pub enum ReadFile {
-    Stdin(std::io::StdinLock<'static>),
+    Stdin,
     File(Rc<File>),
 }
 
-impl AsRef<dyn Read> for ReadFile {
-    fn as_ref(&self) -> &(dyn Read + 'static) {
+impl Read for ReadFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
-            ReadFile::Stdin(stdin) => stdin,
-            ReadFile::File(file) => file.as_ref(),
+            ReadFile::Stdin => std::io::stdin().lock().read(buf),
+            ReadFile::File(file) => {
+                nix::unistd::read(file.as_raw_fd(), buf).map_err(|err| err.into())
+            }
         }
     }
 }
 
 pub enum WriteFile {
-    Stdout(std::io::StdoutLock<'static>),
-    Stderr(std::io::StderrLock<'static>),
+    Stdout,
+    Stderr,
     File(Rc<File>),
 }
 
-impl AsRef<dyn Write> for WriteFile {
-    fn as_ref(&self) -> &(dyn Write + 'static) {
+impl Write for WriteFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
-            WriteFile::Stdout(stdout) => stdout,
-            WriteFile::Stderr(stderr) => stderr,
-            WriteFile::File(file) => file.as_ref(),
+            WriteFile::Stdout => std::io::stdout().lock().write(buf),
+            WriteFile::Stderr => std::io::stderr().lock().write(buf),
+            WriteFile::File(file) => nix::unistd::write(file, buf).map_err(|err| err.into()),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            WriteFile::Stdout => std::io::stdout().lock().flush(),
+            WriteFile::Stderr => std::io::stderr().lock().flush(),
+            WriteFile::File(_) => Ok(()),
         }
     }
 }
@@ -99,7 +110,7 @@ impl OpenedFiles {
 
     pub fn stdin(&self) -> ReadFile {
         match self.opened_files.get(&STDIN_FILENO) {
-            Some(OpenedFile::Stdin) => ReadFile::Stdin(std::io::stdin().lock()),
+            Some(OpenedFile::Stdin) => ReadFile::Stdin,
             Some(OpenedFile::File(file)) => ReadFile::File(file.clone()),
             _ => todo!(),
         }
@@ -107,8 +118,8 @@ impl OpenedFiles {
 
     fn write_file(&self, fileno: u32) -> WriteFile {
         match self.opened_files.get(&fileno) {
-            Some(OpenedFile::Stdout) => WriteFile::Stdout(std::io::stdout().lock()),
-            Some(OpenedFile::Stderr) => WriteFile::Stderr(std::io::stderr().lock()),
+            Some(OpenedFile::Stdout) => WriteFile::Stdout,
+            Some(OpenedFile::Stderr) => WriteFile::Stderr,
             Some(OpenedFile::File(file)) => WriteFile::File(file.clone()),
             _ => todo!(),
         }

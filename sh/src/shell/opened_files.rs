@@ -125,7 +125,17 @@ impl OpenedFiles {
                             self.opened_files
                                 .insert(source_fd, OpenedFile::File(Rc::new(file)));
                         }
-                        IORedirectionKind::OpenRW => {}
+                        IORedirectionKind::OpenRW => {
+                            let file = File::options()
+                                .read(true)
+                                .write(true)
+                                .create(true)
+                                .open(target)
+                                .unwrap();
+                            let source_fd = redir.file_descriptor.unwrap_or(STDIN_FILENO);
+                            self.opened_files
+                                .insert(source_fd, OpenedFile::File(Rc::from(file)));
+                        }
                     }
                 }
                 RedirectionKind::HereDocument {

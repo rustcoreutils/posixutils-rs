@@ -128,7 +128,10 @@ impl OpenedFiles {
                         IORedirectionKind::OpenRW => {}
                     }
                 }
-                RedirectionKind::HereDocument { contents } => {}
+                RedirectionKind::HereDocument {
+                    contents,
+                    should_be_expanded,
+                } => {}
             }
         }
     }

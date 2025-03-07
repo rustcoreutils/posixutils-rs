@@ -142,9 +142,11 @@ impl<'src> CommandParser<'src> {
 
     fn parse_redirection_kind(&mut self) -> ParseResult<Option<RedirectionKind>> {
         if let CommandToken::HereDocument(_) = &self.lookahead {
+            let line_no = self.lookahead_lineno;
             let contents = self.advance()?.unwrap_here_document_contents();
             return Ok(Some(RedirectionKind::HereDocument {
-                contents: contents.into(),
+                contents: parse_word(contents.as_ref(), line_no, true)?,
+                should_be_expanded: true,
             }));
         }
         let kind = match self.lookahead {
@@ -1095,7 +1097,8 @@ mod tests {
             Redirection {
                 file_descriptor: None,
                 kind: RedirectionKind::HereDocument {
-                    contents: "this\nis\n\ta\ntest\n".to_string()
+                    contents: quoted_literal("this\nis\n\ta\ntest\n"),
+                    should_be_expanded: true
                 }
             }
         )
@@ -1108,7 +1111,8 @@ mod tests {
             Redirection {
                 file_descriptor: None,
                 kind: RedirectionKind::HereDocument {
-                    contents: "this\nis\na\ntest\n".to_string()
+                    contents: quoted_literal("this\nis\na\ntest\n"),
+                    should_be_expanded: true,
                 }
             }
         )

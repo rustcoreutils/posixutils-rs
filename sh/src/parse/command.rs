@@ -33,8 +33,14 @@ pub enum IORedirectionKind {
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum RedirectionKind {
-    IORedirection { kind: IORedirectionKind, file: Word },
-    HereDocument { contents: String },
+    IORedirection {
+        kind: IORedirectionKind,
+        file: Word,
+    },
+    HereDocument {
+        contents: Word,
+        should_be_expanded: bool,
+    },
 }
 
 #[derive(Debug, PartialEq, Clone)]

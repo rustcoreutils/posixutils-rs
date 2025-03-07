@@ -104,15 +104,18 @@ impl OpenedFiles {
                             self.opened_files
                                 .insert(source_fd, OpenedFile::File(Rc::new(file)));
                         }
-                        IORedirectionKind::DuplicateOutput => {
+                        IORedirectionKind::DuplicateOutput | IORedirectionKind::DuplicateInput => {
+                            let dest_fd = if *kind == IORedirectionKind::DuplicateOutput {
+                                redir.file_descriptor.unwrap_or(STDOUT_FILENO)
+                            } else {
+                                redir.file_descriptor.unwrap_or(STDIN_FILENO)
+                            };
                             if target == "-" {
-                                self.opened_files
-                                    .remove(&redir.file_descriptor.unwrap_or(STDOUT_FILENO));
+                                self.opened_files.remove(&dest_fd);
                             } else {
                                 // TODO: handle errors
                                 let source_fd = target.parse::<u32>().unwrap();
                                 let file = self.opened_files.get(&source_fd).unwrap().clone();
-                                let dest_fd = redir.file_descriptor.unwrap_or(STDOUT_FILENO);
                                 self.opened_files.insert(dest_fd, file);
                             }
                         }
@@ -122,7 +125,6 @@ impl OpenedFiles {
                             self.opened_files
                                 .insert(source_fd, OpenedFile::File(Rc::new(file)));
                         }
-                        IORedirectionKind::DuplicateInput => {}
                         IORedirectionKind::OpenRW => {}
                     }
                 }

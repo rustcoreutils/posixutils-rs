@@ -221,8 +221,9 @@ impl Shell {
 
             if let Some(function_body) = self.functions.get(expanded_words[0].as_str()).cloned() {
                 let mut args = expanded_words[1..].to_vec();
+                // assignments affect the current environment and are marked for export,
+                // same as special builtin utilities
                 self.perform_assignments(&simple_command.assignments, true);
-
                 let mut previous_opened_files = self.opened_files.clone();
                 previous_opened_files.redirect(&simple_command.redirections, self);
                 std::mem::swap(&mut self.opened_files, &mut previous_opened_files);

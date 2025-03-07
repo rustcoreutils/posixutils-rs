@@ -6,6 +6,7 @@ g () {
 
 f () {
   echo $a
+  awk 'BEGIN {print ENVIRON["a"]}'
   b=2 g
   c=3
 }

@@ -221,10 +221,18 @@ impl Shell {
 
             if let Some(function_body) = self.functions.get(expanded_words[0].as_str()).cloned() {
                 let mut args = expanded_words[1..].to_vec();
+                self.perform_assignments(&simple_command.assignments, true);
+
+                let mut previous_opened_files = self.opened_files.clone();
+                previous_opened_files.redirect(&simple_command.redirections, self);
+                std::mem::swap(&mut self.opened_files, &mut previous_opened_files);
                 std::mem::swap(&mut args, &mut self.positional_parameters);
+
                 let result =
                     self.interpret_compound_command(&function_body, &simple_command.redirections);
+
                 std::mem::swap(&mut args, &mut self.positional_parameters);
+                std::mem::swap(&mut self.opened_files, &mut previous_opened_files);
                 return result;
             }
 

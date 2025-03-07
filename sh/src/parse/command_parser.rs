@@ -1992,8 +1992,12 @@ mod tests {
     #[test]
     fn recursive_alias_substitution_word_to_conjunction() {
         let command = parse_correct_complete_command(
-            "cmd_x",
-            AliasTable::from([("cmd_x".to_string(), "cmd_y && cmd_x".to_string())]),
+            "a",
+            AliasTable::from([
+                ("a".to_string(), "b && c".to_string()),
+                ("b".to_string(), "cmd_x".to_string()),
+                ("c".to_string(), "cmd_y".to_string()),
+            ]),
         )
         .expect("no commands");
         assert_eq!(
@@ -2004,7 +2008,7 @@ mod tests {
                         (
                             Pipeline {
                                 commands: vec![Command::SimpleCommand(SimpleCommand {
-                                    words: vec![unquoted_literal("cmd_y")],
+                                    words: vec![unquoted_literal("cmd_x")],
                                     ..Default::default()
                                 })],
                                 negate_status: false
@@ -2014,7 +2018,7 @@ mod tests {
                         (
                             Pipeline {
                                 commands: vec![Command::SimpleCommand(SimpleCommand {
-                                    words: vec![unquoted_literal("cmd_x")],
+                                    words: vec![unquoted_literal("cmd_y")],
                                     ..Default::default()
                                 })],
                                 negate_status: false

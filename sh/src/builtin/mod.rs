@@ -1,4 +1,5 @@
 use crate::builtin::alias::AliasBuiltin;
+use crate::builtin::cd::Cd;
 use crate::builtin::control_flow::{Break, Continue};
 use crate::builtin::readonly::ReadOnly;
 use crate::builtin::set::SetSpecialBuiltin;
@@ -8,6 +9,7 @@ use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 
 pub mod alias;
+mod cd;
 mod control_flow;
 mod readonly;
 pub mod set;
@@ -50,6 +52,7 @@ pub trait BuiltinUtility {
 pub fn get_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
     match name {
         "alias" => Some(&AliasBuiltin),
+        "cd" => Some(&Cd),
         _ => None,
     }
 }

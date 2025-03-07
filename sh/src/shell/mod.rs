@@ -94,7 +94,7 @@ pub struct Shell {
 }
 
 impl Shell {
-    fn assign(&mut self, name: String, value: String, export: bool) {
+    pub fn assign(&mut self, name: String, value: String, export: bool) {
         if self.environment.set(name, value, export).is_err() {
             self.opened_files
                 .stderr()

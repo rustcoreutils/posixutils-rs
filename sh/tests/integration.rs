@@ -785,7 +785,7 @@ mod redirection {
     fn duplicate_stderr_to_stdout() {
         run_script("echo test 1>&2", |output| {
             assert!(output.status.success());
-            assert_eq!(String::from_utf8_lossy(&output.stdout), "test\n");
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "");
             assert_eq!(String::from_utf8_lossy(&output.stderr), "test\n");
         });
     }

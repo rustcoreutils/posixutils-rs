@@ -374,7 +374,10 @@ impl Shell {
         compound_command: &CompoundCommand,
         redirections: &[Redirection],
     ) -> i32 {
-        match compound_command {
+        let mut prev_opened_files = self.opened_files.clone();
+        prev_opened_files.redirect(redirections, self);
+        std::mem::swap(&mut self.opened_files, &mut prev_opened_files);
+        let result = match compound_command {
             CompoundCommand::BraceGroup(command) => self.interpret(command),
             CompoundCommand::Subshell(_) => {
                 todo!()
@@ -395,7 +398,9 @@ impl Shell {
             CompoundCommand::UntilClause { condition, body } => {
                 self.interpret_loop_clause(condition, body, false)
             }
-        }
+        };
+        std::mem::swap(&mut self.opened_files, &mut prev_opened_files);
+        result
     }
 
     fn define_function(&mut self, definition: &FunctionDefinition) -> i32 {

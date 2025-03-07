@@ -232,7 +232,8 @@ impl<'s> SourceString<'s> {
     fn currently_processing_tag(&self, tag: &str) -> bool {
         self.parts[self.read_state.current_part]
             .provenance
-            .contains(tag)
+            .split(':')
+            .any(|part| part == tag)
     }
 }
 

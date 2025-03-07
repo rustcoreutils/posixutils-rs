@@ -379,8 +379,9 @@ impl Shell {
         std::mem::swap(&mut self.opened_files, &mut prev_opened_files);
         let result = match compound_command {
             CompoundCommand::BraceGroup(command) => self.interpret(command),
-            CompoundCommand::Subshell(_) => {
-                todo!()
+            CompoundCommand::Subshell(commands) => {
+                let mut subshell = self.clone();
+                subshell.interpret(commands)
             }
             CompoundCommand::ForClause {
                 iter_var,

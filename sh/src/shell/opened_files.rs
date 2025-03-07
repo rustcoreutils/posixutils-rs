@@ -81,9 +81,6 @@ impl OpenedFiles {
         for redir in redirections {
             match &redir.kind {
                 RedirectionKind::IORedirection { kind, file } => {
-                    // > the word that follows the redirection operator shall be subjected to tilde
-                    // > expansion, parameter expansion, command substitution, arithmetic expansion,
-                    // > and quote removal.
                     let path = expand_word_to_string(file, false, shell);
                     // TODO: pathname expansion is not allowed if the shell is non-interactive,
                     // optional otherwise. Bash does implement this, maybe we should too.
@@ -95,7 +92,7 @@ impl OpenedFiles {
 
                             // TODO: fix unwrap
                             let file = if *kind == IORedirectionKind::RedirectOuputAppend {
-                                std::fs::OpenOptions::new()
+                                File::options()
                                     .append(true)
                                     .create(true)
                                     .open(path)
@@ -103,13 +100,17 @@ impl OpenedFiles {
                             } else {
                                 File::create(path).unwrap()
                             };
-                            let source_fd =
-                                redir.file_descriptor.unwrap_or(libc::STDOUT_FILENO as u32);
+                            let source_fd = redir.file_descriptor.unwrap_or(STDOUT_FILENO);
                             self.opened_files
                                 .insert(source_fd, OpenedFile::File(Rc::new(file)));
                         }
                         IORedirectionKind::DuplicateOutput => {}
-                        IORedirectionKind::RedirectInput => {}
+                        IORedirectionKind::RedirectInput => {
+                            let file = File::options().read(true).open(path).unwrap();
+                            let source_fd = redir.file_descriptor.unwrap_or(STDIN_FILENO);
+                            self.opened_files
+                                .insert(source_fd, OpenedFile::File(Rc::new(file)));
+                        }
                         IORedirectionKind::DuplicateInput => {}
                         IORedirectionKind::OpenRW => {}
                     }

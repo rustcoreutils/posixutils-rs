@@ -81,7 +81,7 @@ impl OpenedFiles {
         for redir in redirections {
             match &redir.kind {
                 RedirectionKind::IORedirection { kind, file } => {
-                    let path = expand_word_to_string(file, false, shell);
+                    let target = expand_word_to_string(file, false, shell);
                     // TODO: pathname expansion is not allowed if the shell is non-interactive,
                     // optional otherwise. Bash does implement this, maybe we should too.
                     match kind {
@@ -95,18 +95,29 @@ impl OpenedFiles {
                                 File::options()
                                     .append(true)
                                     .create(true)
-                                    .open(path)
+                                    .open(target)
                                     .unwrap()
                             } else {
-                                File::create(path).unwrap()
+                                File::create(target).unwrap()
                             };
                             let source_fd = redir.file_descriptor.unwrap_or(STDOUT_FILENO);
                             self.opened_files
                                 .insert(source_fd, OpenedFile::File(Rc::new(file)));
                         }
-                        IORedirectionKind::DuplicateOutput => {}
+                        IORedirectionKind::DuplicateOutput => {
+                            if target == "-" {
+                                self.opened_files
+                                    .remove(&redir.file_descriptor.unwrap_or(STDOUT_FILENO));
+                            } else {
+                                // TODO: handle errors
+                                let source_fd = target.parse::<u32>().unwrap();
+                                let file = self.opened_files.get(&source_fd).unwrap().clone();
+                                let dest_fd = redir.file_descriptor.unwrap_or(STDOUT_FILENO);
+                                self.opened_files.insert(dest_fd, file);
+                            }
+                        }
                         IORedirectionKind::RedirectInput => {
-                            let file = File::options().read(true).open(path).unwrap();
+                            let file = File::options().read(true).open(target).unwrap();
                             let source_fd = redir.file_descriptor.unwrap_or(STDIN_FILENO);
                             self.opened_files
                                 .insert(source_fd, OpenedFile::File(Rc::new(file)));

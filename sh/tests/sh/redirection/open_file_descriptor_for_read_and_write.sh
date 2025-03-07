@@ -3,7 +3,7 @@ cd tests/read_dir
 cat <>file1.txt
 cat 0<>file1.txt
 
-cd -
+cd ../../
 mkdir -p tests/write_dir
 cd tests/write_dir
 

@@ -341,7 +341,7 @@ impl<'src> WordParser<'src> {
             }
         }
 
-        if !inside_double_quotes {
+        if inside_double_quotes {
             return Err(ParserError::new(
                 self.line_no,
                 "unterminated double quotes",

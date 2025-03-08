@@ -139,14 +139,17 @@ impl OpenedFiles {
                         }
                     }
                 }
-                RedirectionKind::HereDocument {
-                    contents,
-                    should_be_expanded,
-                } => {
+                RedirectionKind::HereDocument(contents) => {
                     let contents = expand_word_to_string(contents, false, shell);
                     self.opened_files.insert(
                         redir.file_descriptor.unwrap_or(STDIN_FILENO),
                         OpenedFile::HereDocument(contents),
+                    );
+                }
+                RedirectionKind::QuotedHereDocument(contents) => {
+                    self.opened_files.insert(
+                        redir.file_descriptor.unwrap_or(STDIN_FILENO),
+                        OpenedFile::HereDocument(contents.clone()),
                     );
                 }
             }

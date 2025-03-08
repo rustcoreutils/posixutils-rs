@@ -203,6 +203,7 @@ pub fn remove_quotes(word: &str) -> (bool, String) {
             }
             WordToken::Dollar => result.push('$'),
             WordToken::Backslash => {
+                is_quoted = true;
                 if inside_double_quotes {
                     match lex.next_token() {
                         WordToken::Dollar => {

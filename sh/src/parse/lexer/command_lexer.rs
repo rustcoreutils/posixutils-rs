@@ -283,6 +283,7 @@ pub enum CommandToken<'src> {
 
     Word(Cow<'src, str>),
     HereDocument(Cow<'src, str>),
+    QuotedHereDocument(Cow<'src, str>),
 
     EOF,
 }
@@ -324,7 +325,9 @@ impl Display for CommandToken<'_> {
             CommandToken::While => write!(f, "while"),
             CommandToken::IoNumber(_) => write!(f, "number"),
             CommandToken::Word(_) => write!(f, "word"),
-            CommandToken::HereDocument(_) => write!(f, "here-document"),
+            CommandToken::HereDocument(_) | CommandToken::QuotedHereDocument(_) => {
+                write!(f, "here-document")
+            }
             CommandToken::EOF => write!(f, "EOF"),
         }
     }
@@ -479,22 +482,27 @@ impl<'src> CommandLexer<'src> {
         Ok(result)
     }
 
-    fn read_here_document(&mut self, remove_leading_tabs: bool) -> ParseResult<Cow<'src, str>> {
+    fn read_here_document(&mut self, remove_leading_tabs: bool) -> ParseResult<CommandToken<'src>> {
         let start = self.source.read_state.clone();
-        self.skip_here_document()?;
+        let is_quoted = self.skip_here_document()?;
         let here_document = remove_delimiter_from_here_document(
             self.source.substr(&start, &self.source.read_state),
         );
 
-        if remove_leading_tabs {
+        let contents = if remove_leading_tabs {
             let mut result = String::new();
             for line in here_document.lines() {
                 result.push_str(line.trim_start_matches('\t'));
                 result.push('\n');
             }
-            Ok(result.into())
+            result.into()
         } else {
-            Ok(here_document)
+            here_document
+        };
+        if is_quoted {
+            Ok(CommandToken::QuotedHereDocument(contents))
+        } else {
+            Ok(CommandToken::HereDocument(contents))
         }
     }
 
@@ -534,11 +542,9 @@ impl<'src> CommandLexer<'src> {
                         self.source.advance_char();
                         if self.source.lookahead() == '-' {
                             self.source.advance_char();
-                            self.read_here_document(true)
-                                .map(CommandToken::HereDocument)?
+                            self.read_here_document(true)?
                         } else {
-                            self.read_here_document(false)
-                                .map(CommandToken::HereDocument)?
+                            self.read_here_document(false)?
                         }
                     }
                     _ => CommandToken::Less,
@@ -778,6 +784,18 @@ mod tests {
         assert_eq!(
             lex_token("<<-end\nthis\nis\n\ta\n\t\t\t\ttest\nend\n"),
             CommandToken::HereDocument("this\nis\na\ntest\n".into())
+        )
+    }
+
+    #[test]
+    fn quoted_here_document() {
+        assert_eq!(
+            lex_token("<<\\end\nthis\nis\n\ta\ntest\nend\n"),
+            CommandToken::QuotedHereDocument("this\nis\n\ta\ntest\n".into())
+        );
+        assert_eq!(
+            lex_token("<<-\\end\nthis\nis\n\ta\n\t\t\t\ttest\nend\n"),
+            CommandToken::QuotedHereDocument("this\nis\na\ntest\n".into())
         )
     }
 

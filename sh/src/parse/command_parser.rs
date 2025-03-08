@@ -141,15 +141,7 @@ impl<'src> CommandParser<'src> {
     }
 
     fn parse_redirection_kind(&mut self) -> ParseResult<Option<RedirectionKind>> {
-        if let CommandToken::HereDocument(_) = &self.lookahead {
-            let line_no = self.lookahead_lineno;
-            let contents = self.advance()?.unwrap_here_document_contents();
-            return Ok(Some(RedirectionKind::HereDocument {
-                contents: parse_word(contents.as_ref(), line_no, true)?,
-                should_be_expanded: true,
-            }));
-        }
-        let kind = match self.lookahead {
+        let kind = match &self.lookahead {
             CommandToken::Greater => IORedirectionKind::RedirectOutput,
             CommandToken::Clobber => IORedirectionKind::RedirectOutputClobber,
             CommandToken::DGreat => IORedirectionKind::RedirectOuputAppend,
@@ -157,6 +149,20 @@ impl<'src> CommandParser<'src> {
             CommandToken::Less => IORedirectionKind::RedirectInput,
             CommandToken::LessAnd => IORedirectionKind::DuplicateInput,
             CommandToken::LessGreat => IORedirectionKind::OpenRW,
+            CommandToken::HereDocument(contents) => {
+                let contents = parse_word(contents.as_ref(), self.lookahead_lineno, true)?;
+                self.advance()?;
+                return Ok(Some(RedirectionKind::HereDocument(contents)));
+            }
+            CommandToken::QuotedHereDocument(_) => {
+                if let CommandToken::QuotedHereDocument(contents) = self.advance()? {
+                    return Ok(Some(RedirectionKind::QuotedHereDocument(
+                        contents.into_owned(),
+                    )));
+                } else {
+                    unreachable!()
+                }
+            }
             _ => return Ok(None),
         };
         let line_no = self.lookahead_lineno;
@@ -1096,10 +1102,7 @@ mod tests {
             parse_single_redirection("<<end\nthis\nis\n\ta\ntest\nend\n"),
             Redirection {
                 file_descriptor: None,
-                kind: RedirectionKind::HereDocument {
-                    contents: quoted_literal("this\nis\n\ta\ntest\n"),
-                    should_be_expanded: true
-                }
+                kind: RedirectionKind::HereDocument(quoted_literal("this\nis\n\ta\ntest\n"))
             }
         )
     }
@@ -1110,10 +1113,7 @@ mod tests {
             parse_single_redirection("<<-end\nthis\nis\n\ta\n\t\t\t\ttest\nend\n"),
             Redirection {
                 file_descriptor: None,
-                kind: RedirectionKind::HereDocument {
-                    contents: quoted_literal("this\nis\na\ntest\n"),
-                    should_be_expanded: true,
-                }
+                kind: RedirectionKind::HereDocument(quoted_literal("this\nis\na\ntest\n"))
             }
         )
     }

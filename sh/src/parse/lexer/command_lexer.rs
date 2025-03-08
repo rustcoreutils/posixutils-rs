@@ -459,6 +459,10 @@ impl Lexer for CommandLexer<'_> {
         }
         self.source.substr(&start, &self.source.read_state)
     }
+
+    fn next_word(&mut self) -> ParseResult<Cow<str>> {
+        self.read_word_token()
+    }
 }
 
 impl<'src> CommandLexer<'src> {

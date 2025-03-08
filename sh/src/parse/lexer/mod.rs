@@ -1,4 +1,4 @@
-use crate::parse::lexer::command_lexer::CommandToken;
+use crate::parse::lexer::word_lexer::remove_quotes;
 use crate::parse::{ParseResult, ParserError};
 use std::borrow::Cow;
 
@@ -34,6 +34,8 @@ trait Lexer {
 
     fn next_line(&mut self) -> Cow<str>;
 
+    fn next_word(&mut self) -> ParseResult<Cow<str>>;
+
     fn skip_comment(&mut self) {
         if self.lookahead() == '#' {
             while self.lookahead() != '\n' && !self.reached_eof() {
@@ -56,9 +58,9 @@ trait Lexer {
         Ok(())
     }
 
-    fn skip_here_document(&mut self) -> ParseResult<()> {
+    fn skip_here_document(&mut self) -> ParseResult<bool> {
         let start_lineno = self.line_no();
-        let end = self.next_line().into_owned();
+        let (quoted_terminator, end) = remove_quotes(self.next_word()?.as_ref());
         loop {
             if self.reached_eof() {
                 return Err(ParserError::new(
@@ -68,11 +70,11 @@ trait Lexer {
                 ));
             }
             let line = self.next_line();
-            if line == end {
+            if line.trim_end_matches('\n') == end {
                 break;
             }
         }
-        Ok(())
+        Ok(quoted_terminator)
     }
 
     fn skip_single_quoted_string(&mut self) -> ParseResult<()> {

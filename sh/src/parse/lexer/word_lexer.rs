@@ -8,6 +8,7 @@
 //
 
 use crate::parse::lexer::Lexer;
+use crate::parse::ParseResult;
 use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
 use std::str::CharIndices;
@@ -90,6 +91,12 @@ impl Lexer for WordLexer<'_> {
         }
         self.source[start..self.position].into()
     }
+
+    fn next_word(&mut self) -> ParseResult<Cow<str>> {
+        let start = self.position;
+        self.skip_word_token(None, false)?;
+        Ok(Cow::from(&self.source[start..self.position]))
+    }
 }
 
 impl<'src> WordLexer<'src> {
@@ -166,6 +173,77 @@ impl<'src> WordLexer<'src> {
         lexer.advance();
         lexer
     }
+}
+
+pub fn remove_quotes(word: &str) -> (bool, String) {
+    let mut lex = WordLexer::new(word);
+    let mut result = String::with_capacity(word.len());
+    let mut is_quoted = false;
+    let mut inside_double_quotes = false;
+    let mut next = lex.next_token();
+    loop {
+        match next {
+            WordToken::DoubleQuote => {
+                is_quoted = true;
+                inside_double_quotes = !inside_double_quotes;
+            }
+            WordToken::SingleQuote => {
+                is_quoted = true;
+                if inside_double_quotes {
+                    result.push('\'')
+                } else {
+                    while let Some(c) = lex.next_char() {
+                        if c == '\'' {
+                            break;
+                        } else {
+                            result.push(c);
+                        }
+                    }
+                }
+            }
+            WordToken::Dollar => result.push('$'),
+            WordToken::Backslash => {
+                if inside_double_quotes {
+                    match lex.next_token() {
+                        WordToken::Dollar => {
+                            result.push('$');
+                        }
+                        WordToken::DoubleQuote => {
+                            result.push('"');
+                        }
+                        WordToken::Backslash => {
+                            result.push('\\');
+                        }
+                        _ => result.push('\\'),
+                    }
+                } else {
+                    if let Some(c) = lex.next_char() {
+                        result.push(c)
+                    }
+                }
+            }
+            WordToken::QuotedBacktick => result.push('`'),
+            WordToken::CommandSubstitution(commands) => {
+                result.push_str("$(");
+                result.push_str(commands);
+                result.push(')');
+            }
+            WordToken::BacktickCommandSubstitution(commands) => {
+                result.push_str("`");
+                result.push_str(commands);
+                result.push('`');
+            }
+            WordToken::ArithmeticExpansion(expr) => {
+                result.push_str("$((");
+                result.push_str(expr);
+                result.push_str("))");
+            }
+            WordToken::Char(c) => result.push(c),
+            WordToken::EOF => break,
+        }
+        next = lex.next_token()
+    }
+    (is_quoted, result)
 }
 
 #[cfg(test)]

@@ -29,8 +29,11 @@ impl<'src> WordParser<'src> {
         if self.matches_token(token) {
             Ok(())
         } else {
-            // word should be valid
-            panic!("invalid word")
+            Err(ParserError::new(
+                self.line_no,
+                format!("expected {}, got {}", token, self.lookahead),
+                false,
+            ))
         }
     }
 
@@ -230,7 +233,13 @@ impl<'src> WordParser<'src> {
                                         current_literal.push(c)
                                     }
                                 }
-                                None => unreachable!("invalid word"),
+                                None => {
+                                    return Err(ParserError::new(
+                                        self.line_no,
+                                        "unclosed single quotes",
+                                        false,
+                                    ))
+                                }
                             }
                         }
                         push_literal(&mut current_literal, &mut word_parts, true);
@@ -332,7 +341,13 @@ impl<'src> WordParser<'src> {
             }
         }
 
-        assert!(!inside_double_quotes);
+        if !inside_double_quotes {
+            return Err(ParserError::new(
+                self.line_no,
+                "unterminated double quotes",
+                false,
+            ));
+        }
 
         push_literal(&mut current_literal, &mut word_parts, false);
 
@@ -365,8 +380,6 @@ fn quote_literals(word: Word) -> Result<Word, ParserError> {
     })
 }
 
-/// # Panics
-/// Panics if word is not valid (unclosed quotes, unclosed command substitution, etc.)
 pub fn parse_word(text: &str, line_no: u32, contents_are_quoted: bool) -> ParseResult<Word> {
     let mut parser = WordParser::new(text, line_no);
     let word = parser.parse_word_until(WordToken::EOF)?;

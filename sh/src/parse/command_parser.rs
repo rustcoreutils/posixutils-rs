@@ -592,15 +592,13 @@ impl<'src> CommandParser<'src> {
         } else {
             match &self.lookahead {
                 CommandToken::Word(word) if is_valid_name(word) => {
-                    let word = self.advance()?.into_word_cow().unwrap();
-                    if self.lookahead == CommandToken::LParen {
+                    if self.lexer.is_next_lparen() {
+                        let word = self.advance()?.into_word_cow().unwrap();
+                        assert_eq!(self.lookahead, CommandToken::LParen);
                         self.parse_function_definition(word.into_owned().into(), alias_table)
                             .map(Command::FunctionDefinition)
                             .map(Some)
                     } else {
-                        // not a function, rollback the lookahead
-                        self.lexer.rollback_last_token();
-                        self.lookahead = CommandToken::Word(word);
                         Ok(self
                             .parse_simple_command(end, alias_table)?
                             .map(Command::SimpleCommand))

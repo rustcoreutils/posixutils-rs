@@ -589,8 +589,12 @@ impl<'src> CommandLexer<'src> {
         self.source.currently_processing_tag(tag)
     }
 
-    pub fn rollback_last_token(&mut self) {
-        self.source.read_state = self.prev_read_state.clone();
+    pub fn is_next_lparen(&mut self) -> bool {
+        let rollback = self.source.read_state.clone();
+        self.skip_blanks();
+        let result = self.source.lookahead() == '(';
+        self.source.read_state = rollback;
+        result
     }
 
     pub fn new(source: &'src str) -> Self {

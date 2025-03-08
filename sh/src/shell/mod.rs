@@ -14,7 +14,6 @@ use nix::errno::Errno;
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{close, dup2, execve, fork, getpid, getppid, pipe, ForkResult};
 use nix::{libc, NixPath};
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
 use std::fs::File;
@@ -115,6 +114,12 @@ impl Shell {
                         OpenedFile::Stdout => libc::STDOUT_FILENO,
                         OpenedFile::Stderr => libc::STDERR_FILENO,
                         OpenedFile::File(file) => file.as_raw_fd(),
+                        OpenedFile::HereDocument(contents) => {
+                            let (read_pipe, write_pipe) = pipe().unwrap();
+                            nix::unistd::write(write_pipe, contents.as_bytes()).unwrap();
+                            dup2(read_pipe.as_raw_fd(), dest).unwrap();
+                            continue;
+                        }
                     };
                     dup2(src, dest).expect("TODO: handle dup2 error");
                 }

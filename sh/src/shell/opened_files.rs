@@ -18,6 +18,7 @@ pub enum OpenedFile {
     Stdout,
     Stderr,
     File(Rc<File>),
+    HereDocument(String),
 }
 
 pub enum ReadFile {
@@ -141,7 +142,13 @@ impl OpenedFiles {
                 RedirectionKind::HereDocument {
                     contents,
                     should_be_expanded,
-                } => {}
+                } => {
+                    let contents = expand_word_to_string(contents, false, shell);
+                    self.opened_files.insert(
+                        redir.file_descriptor.unwrap_or(STDIN_FILENO),
+                        OpenedFile::HereDocument(contents),
+                    );
+                }
             }
         }
     }

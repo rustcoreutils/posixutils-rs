@@ -43,7 +43,6 @@ impl IndexIter {
 struct SourceReadState {
     current_part: usize,
     current_part_char_iter: IndexIter,
-    current_part_char_index: usize,
     line_no: u32,
     reached_eof: bool,
 }
@@ -110,7 +109,6 @@ impl<'s> SourceString<'s> {
             read_state: SourceReadState {
                 current_part: 0,
                 current_part_char_iter: IndexIter::default(),
-                current_part_char_index: 0,
                 reached_eof: s.is_empty(),
                 line_no: 1,
             },
@@ -141,13 +139,11 @@ impl<'s> SourceString<'s> {
             if char == '\n' && self.parts[self.read_state.current_part].in_original_string {
                 self.read_state.line_no += 1;
             }
-            self.read_state.current_part_char_index = index + char.len_utf8();
             if self.read_state.current_part == self.parts.len() - 1 && self.peek().is_none() {
                 self.read_state.reached_eof = true;
             }
         } else {
             self.read_state.current_part += 1;
-            self.read_state.current_part_char_index = 0;
             self.read_state.current_part_char_iter = IndexIter::default();
         }
     }
@@ -156,20 +152,22 @@ impl<'s> SourceString<'s> {
         assert!(start.current_part <= end.current_part);
         if start.current_part == end.current_part {
             match self.parts[start.current_part].text {
-                Cow::Owned(ref s) => s[start.current_part_char_index..end.current_part_char_index]
+                Cow::Owned(ref s) => s
+                    [start.current_part_char_iter.pos..end.current_part_char_iter.pos]
                     .to_owned()
                     .into(),
                 Cow::Borrowed(s) => {
-                    s[start.current_part_char_index..end.current_part_char_index].into()
+                    s[start.current_part_char_iter.pos..end.current_part_char_iter.pos].into()
                 }
             }
         } else {
             let mut result = String::new();
-            result.push_str(&self.parts[start.current_part].text[start.current_part_char_index..]);
+            result
+                .push_str(&self.parts[start.current_part].text[start.current_part_char_iter.pos..]);
             for part_idx in start.current_part + 1..end.current_part {
                 result.push_str(self.parts[part_idx].text.as_ref());
             }
-            result.push_str(&self.parts[end.current_part].text[..end.current_part_char_index]);
+            result.push_str(&self.parts[end.current_part].text[..end.current_part_char_iter.pos]);
             result.into()
         }
     }
@@ -185,7 +183,7 @@ impl<'s> SourceString<'s> {
         provenance.push_str(tag);
 
         let (p1, p2) = self.parts[self.read_state.current_part]
-            .split_at(self.read_state.current_part_char_index);
+            .split_at(self.read_state.current_part_char_iter.pos);
         self.parts[self.read_state.current_part] = p1;
         self.parts.push(SourcePart {
             text: string,
@@ -200,7 +198,6 @@ impl<'s> SourceString<'s> {
         }
 
         self.read_state.reached_eof = false;
-        self.read_state.current_part_char_index = 0;
         self.read_state.current_part += 1;
         self.read_state.current_part_char_iter = IndexIter::default();
     }

@@ -8,8 +8,8 @@
 //
 
 use crate::parse::command::{
-    Assignment, CaseItem, Command, CompleteCommand, CompoundCommand, Conjunction,
-    FunctionDefinition, IORedirectionKind, If, LogicalOp, Name, Pipeline, Program, Redirection,
+    Assignment, CaseItem, Command, CommandType, CompleteCommand, CompoundCommand, Conjunction,
+    FunctionDefinition, IORedirectionKind, If, LogicalOp, Name, Pipeline, Redirection,
     RedirectionKind, SimpleCommand,
 };
 use crate::parse::lexer::command_lexer::{CommandLexer, CommandToken};
@@ -49,12 +49,17 @@ pub struct CommandParser<'src> {
     lexer: CommandLexer<'src>,
     lookahead: CommandToken<'src>,
     lookahead_lineno: u32,
+    start_lineno: u32,
     parsed_one_command: bool,
 }
 
 impl<'src> CommandParser<'src> {
     fn reached_eof(&self) -> bool {
         self.lookahead == CommandToken::EOF
+    }
+
+    pub fn lineno(&self) -> u32 {
+        self.lookahead_lineno + self.start_lineno
     }
 
     /// advances the current shell token and returns the previous shell lookahead
@@ -580,34 +585,39 @@ impl<'src> CommandParser<'src> {
         // 			| compound_command redirect_list?
         // 			| simple_command
         // 			| function_definition
+        let start_lineno = self.lineno();
         if let Some(compound_command) = self.parse_compound_command(alias_table)? {
             let mut redirections = Vec::new();
             while let Some(redirection) = self.parse_redirection_opt()? {
                 redirections.push(redirection);
             }
-            Ok(Some(Command::CompoundCommand {
-                command: compound_command,
-                redirections,
-            }))
+            Ok(Some(Command::new(
+                CommandType::CompoundCommand {
+                    command: compound_command,
+                    redirections,
+                },
+                start_lineno,
+            )))
         } else {
-            match &self.lookahead {
+            let command_type = match &self.lookahead {
                 CommandToken::Word(word) if is_valid_name(word) => {
                     if self.lexer.is_next_lparen() {
                         let word = self.advance()?.into_word_cow().unwrap();
                         assert_eq!(self.lookahead, CommandToken::LParen);
-                        self.parse_function_definition(word.into_owned().into(), alias_table)
-                            .map(Command::FunctionDefinition)
-                            .map(Some)
+                        Some(
+                            self.parse_function_definition(word.into_owned().into(), alias_table)
+                                .map(CommandType::FunctionDefinition)?,
+                        )
                     } else {
-                        Ok(self
-                            .parse_simple_command(end, alias_table)?
-                            .map(Command::SimpleCommand))
+                        self.parse_simple_command(end, alias_table)?
+                            .map(CommandType::SimpleCommand)
                     }
                 }
-                _ => Ok(self
+                _ => self
                     .parse_simple_command(end, alias_table)?
-                    .map(Command::SimpleCommand)),
-            }
+                    .map(CommandType::SimpleCommand),
+            };
+            Ok(command_type.map(|type_| Command::new(type_, self.lineno())))
         }
     }
 
@@ -727,7 +737,7 @@ impl<'src> CommandParser<'src> {
         Ok(Some(command))
     }
 
-    pub fn new(source: &'src str) -> ParseResult<Self> {
+    pub fn new(source: &'src str, start_lineno: u32) -> ParseResult<Self> {
         let mut lexer = CommandLexer::new(source);
         let (lookahead, lookahead_lineno) = lexer.next_token()?;
         let mut parser = Self {
@@ -735,6 +745,7 @@ impl<'src> CommandParser<'src> {
             lookahead,
             lookahead_lineno,
             parsed_one_command: false,
+            start_lineno,
         };
         parser.skip_linebreak()?;
         Ok(parser)
@@ -745,13 +756,13 @@ impl<'src> CommandParser<'src> {
 mod tests {
     use super::*;
     use crate::parse::word::test_utils::{quoted_literal, special_parameter, unquoted_literal};
-    use crate::parse::word::{SpecialParameter, WordPart};
+    use crate::parse::word::SpecialParameter;
 
     fn parse_complete_command(
         text: &str,
         alias_table: AliasTable,
     ) -> ParseResult<Option<CompleteCommand>> {
-        let mut parser = CommandParser::new(text)?;
+        let mut parser = CommandParser::new(text, 1)?;
         parser.parse_next_command(&alias_table)
     }
 
@@ -764,10 +775,11 @@ mod tests {
 
     fn pipeline_from_word(word: Word) -> Pipeline {
         Pipeline {
-            commands: vec![Command::SimpleCommand(SimpleCommand {
+            commands: vec![CommandType::SimpleCommand(SimpleCommand {
                 words: vec![word],
                 ..Default::default()
-            })],
+            })
+            .into()],
             negate_status: false,
         }
     }
@@ -797,15 +809,15 @@ mod tests {
         pipeline
     }
 
-    fn unwrap_command(cmd: CompleteCommand) -> Command {
+    fn unwrap_command(cmd: CompleteCommand) -> CommandType {
         let pipeline = unwrap_pipeline(cmd);
         assert_eq!(pipeline.commands.len(), 1);
-        pipeline.commands.into_iter().next().unwrap()
+        pipeline.commands.into_iter().next().unwrap().type_
     }
 
     fn unwrap_simple_command(cmd: CompleteCommand) -> SimpleCommand {
         let command = unwrap_command(cmd);
-        if let Command::SimpleCommand(command) = command {
+        if let CommandType::SimpleCommand(command) = command {
             command
         } else {
             panic!("expected simple command")
@@ -834,7 +846,7 @@ mod tests {
         let command = unwrap_command(
             parse_correct_complete_command(text, AliasTable::default()).expect("no commands"),
         );
-        if let Command::CompoundCommand {
+        if let CommandType::CompoundCommand {
             command,
             redirections,
         } = command
@@ -845,7 +857,7 @@ mod tests {
         }
     }
 
-    fn parse_command(text: &str) -> Command {
+    fn parse_command(text: &str) -> CommandType {
         unwrap_command(
             parse_correct_complete_command(text, AliasTable::default()).expect("no commands"),
         )
@@ -1121,15 +1133,15 @@ mod tests {
         let pipeline = parse_pipeline("echo hello | wc -l");
         assert_eq!(pipeline.commands.len(), 2);
         assert_eq!(
-            pipeline.commands[0],
-            Command::SimpleCommand(SimpleCommand {
+            pipeline.commands[0].type_,
+            CommandType::SimpleCommand(SimpleCommand {
                 words: vec![unquoted_literal("echo"), unquoted_literal("hello")],
                 ..Default::default()
             })
         );
         assert_eq!(
-            pipeline.commands[1],
-            Command::SimpleCommand(SimpleCommand {
+            pipeline.commands[1].type_,
+            CommandType::SimpleCommand(SimpleCommand {
                 words: vec![unquoted_literal("wc"), unquoted_literal("-l")],
                 ..Default::default()
             })
@@ -1145,10 +1157,11 @@ mod tests {
             conjunction.elements[0],
             (
                 Pipeline {
-                    commands: vec![Command::SimpleCommand(SimpleCommand {
+                    commands: vec![CommandType::SimpleCommand(SimpleCommand {
                         words: vec![unquoted_literal("a")],
                         ..Default::default()
-                    })],
+                    })
+                    .into()],
                     negate_status: false
                 },
                 LogicalOp::And
@@ -1158,10 +1171,11 @@ mod tests {
             conjunction.elements[1],
             (
                 Pipeline {
-                    commands: vec![Command::SimpleCommand(SimpleCommand {
+                    commands: vec![CommandType::SimpleCommand(SimpleCommand {
                         words: vec![unquoted_literal("b")],
                         ..Default::default()
-                    })],
+                    })
+                    .into()],
                     negate_status: false
                 },
                 LogicalOp::None
@@ -1179,10 +1193,11 @@ mod tests {
             Conjunction {
                 elements: vec![(
                     Pipeline {
-                        commands: vec![Command::SimpleCommand(SimpleCommand {
+                        commands: vec![CommandType::SimpleCommand(SimpleCommand {
                             words: vec![unquoted_literal("a")],
                             ..Default::default()
-                        })],
+                        })
+                        .into()],
                         negate_status: false
                     },
                     LogicalOp::None
@@ -1195,10 +1210,11 @@ mod tests {
             Conjunction {
                 elements: vec![(
                     Pipeline {
-                        commands: vec![Command::SimpleCommand(SimpleCommand {
+                        commands: vec![CommandType::SimpleCommand(SimpleCommand {
                             words: vec![unquoted_literal("b")],
                             ..Default::default()
-                        })],
+                        })
+                        .into()],
                         negate_status: false
                     },
                     LogicalOp::None
@@ -1504,7 +1520,7 @@ mod tests {
     fn parse_function_definition() {
         assert_eq!(
             parse_command("function_name() { cmd; }"),
-            Command::FunctionDefinition(FunctionDefinition {
+            CommandType::FunctionDefinition(FunctionDefinition {
                 name: Rc::from("function_name"),
                 body: Rc::from(CompoundCommand::BraceGroup(complete_command_from_word(
                     unquoted_literal("cmd"),
@@ -1515,7 +1531,7 @@ mod tests {
 
         assert_eq!(
             parse_command("function_name() ( cmd1 )"),
-            Command::FunctionDefinition(FunctionDefinition {
+            CommandType::FunctionDefinition(FunctionDefinition {
                 name: Rc::from("function_name"),
                 body: Rc::from(CompoundCommand::Subshell(CompleteCommand {
                     commands: vec![conjunction_from_word(unquoted_literal("cmd1"), false),]
@@ -1529,10 +1545,11 @@ mod tests {
         assert_eq!(
             parse_pipeline("! cmd"),
             Pipeline {
-                commands: vec![Command::SimpleCommand(SimpleCommand {
+                commands: vec![CommandType::SimpleCommand(SimpleCommand {
                     words: vec![unquoted_literal("cmd")],
                     ..Default::default()
-                })],
+                })
+                .into()],
                 negate_status: true
             }
         );
@@ -1966,20 +1983,22 @@ mod tests {
                     elements: vec![
                         (
                             Pipeline {
-                                commands: vec![Command::SimpleCommand(SimpleCommand {
+                                commands: vec![CommandType::SimpleCommand(SimpleCommand {
                                     words: vec![unquoted_literal("cmd_y")],
                                     ..Default::default()
-                                })],
+                                })
+                                .into()],
                                 negate_status: false
                             },
                             LogicalOp::And
                         ),
                         (
                             Pipeline {
-                                commands: vec![Command::SimpleCommand(SimpleCommand {
+                                commands: vec![CommandType::SimpleCommand(SimpleCommand {
                                     words: vec![unquoted_literal("cmd_z")],
                                     ..Default::default()
-                                })],
+                                })
+                                .into()],
                                 negate_status: false
                             },
                             LogicalOp::None
@@ -2009,20 +2028,22 @@ mod tests {
                     elements: vec![
                         (
                             Pipeline {
-                                commands: vec![Command::SimpleCommand(SimpleCommand {
+                                commands: vec![CommandType::SimpleCommand(SimpleCommand {
                                     words: vec![unquoted_literal("cmd_x")],
                                     ..Default::default()
-                                })],
+                                })
+                                .into()],
                                 negate_status: false
                             },
                             LogicalOp::And
                         ),
                         (
                             Pipeline {
-                                commands: vec![Command::SimpleCommand(SimpleCommand {
+                                commands: vec![CommandType::SimpleCommand(SimpleCommand {
                                     words: vec![unquoted_literal("cmd_y")],
                                     ..Default::default()
-                                })],
+                                })
+                                .into()],
                                 negate_status: false
                             },
                             LogicalOp::None

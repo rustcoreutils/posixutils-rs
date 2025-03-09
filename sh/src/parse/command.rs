@@ -83,19 +83,22 @@ impl SimpleCommand {
     }
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct CaseItem {
     pub pattern: Vec<Word>,
     pub body: CompleteCommand,
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct If {
     pub condition: CompleteCommand,
     pub body: CompleteCommand,
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq))]
 pub enum CompoundCommand {
     BraceGroup(CompleteCommand),
     Subshell(CompleteCommand),
@@ -122,14 +125,16 @@ pub enum CompoundCommand {
     },
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct FunctionDefinition {
     pub name: Name,
     pub body: Rc<CompoundCommand>,
 }
 
-#[derive(Debug, PartialEq, Clone)]
-pub enum Command {
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq))]
+pub enum CommandType {
     FunctionDefinition(FunctionDefinition),
     SimpleCommand(SimpleCommand),
     CompoundCommand {
@@ -138,7 +143,20 @@ pub enum Command {
     },
 }
 
-#[derive(PartialEq, Clone)]
+#[derive(Debug, Clone)]
+pub struct Command {
+    pub type_: CommandType,
+    pub lineno: u32,
+}
+
+impl Command {
+    pub fn new(type_: CommandType, lineno: u32) -> Self {
+        Self { type_, lineno }
+    }
+}
+
+#[derive(Clone)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct Pipeline {
     pub commands: Vec<Command>,
     pub negate_status: bool,
@@ -161,7 +179,8 @@ pub enum LogicalOp {
     None,
 }
 
-#[derive(PartialEq, Clone)]
+#[derive(Clone)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct Conjunction {
     pub elements: Vec<(Pipeline, LogicalOp)>,
     pub is_async: bool,
@@ -184,7 +203,8 @@ impl std::fmt::Debug for Conjunction {
     }
 }
 
-#[derive(PartialEq, Clone)]
+#[derive(Clone)]
+#[cfg_attr(test, derive(PartialEq))]
 pub struct CompleteCommand {
     pub commands: Vec<Conjunction>,
 }
@@ -199,25 +219,27 @@ impl std::fmt::Debug for CompleteCommand {
     }
 }
 
-#[derive(PartialEq)]
-pub struct Program {
-    pub commands: CompleteCommandList,
-}
-
-impl std::fmt::Debug for Program {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "Program:")?;
-        for command in &self.commands {
-            writeln!(f, "{:?}", command)?;
-        }
-        Ok(())
-    }
-}
-
 fn indent<D: std::fmt::Debug>(val: &D) -> String {
     format!("{:?}", val)
         .lines()
         .map(|line| format!("    {}", line))
         .collect::<Vec<String>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    impl From<CommandType> for Command {
+        fn from(value: CommandType) -> Self {
+            Command::new(value, 0)
+        }
+    }
+
+    impl PartialEq for Command {
+        fn eq(&self, other: &Self) -> bool {
+            self.type_ == other.type_
+        }
+    }
 }

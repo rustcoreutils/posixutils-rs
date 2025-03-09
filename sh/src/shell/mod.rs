@@ -1,7 +1,7 @@
 use crate::builtin::set::SetOptions;
 use crate::builtin::{get_builtin_utility, get_special_builtin_utility};
 use crate::parse::command::{
-    Assignment, CaseItem, Command, CompleteCommand, CompoundCommand, Conjunction,
+    Assignment, CaseItem, Command, CommandType, CompleteCommand, CompoundCommand, Conjunction,
     FunctionDefinition, If, LogicalOp, Name, Pipeline, Redirection, SimpleCommand,
 };
 use crate::parse::command_parser::CommandParser;
@@ -90,6 +90,7 @@ pub struct Shell {
     pub control_flow_state: ControlFlowState,
     pub loop_depth: u32,
     pub is_interactive: bool,
+    pub last_lineno: u32,
 }
 
 impl Shell {
@@ -416,13 +417,16 @@ impl Shell {
     }
 
     fn interpret_command(&mut self, command: &Command) -> i32 {
-        match command {
-            Command::SimpleCommand(simple_command) => self.interpret_simple_command(simple_command),
-            Command::CompoundCommand {
+        self.assign("LINENO".to_string(), command.lineno.to_string(), false);
+        match &command.type_ {
+            CommandType::SimpleCommand(simple_command) => {
+                self.interpret_simple_command(simple_command)
+            }
+            CommandType::CompoundCommand {
                 command,
                 redirections,
             } => self.interpret_compound_command(command, redirections),
-            Command::FunctionDefinition(function) => self.define_function(function),
+            CommandType::FunctionDefinition(function) => self.define_function(function),
         }
     }
 
@@ -552,7 +556,7 @@ impl Shell {
     }
 
     pub fn execute_program(&mut self, program: &str) -> Result<(), ExecutionError> {
-        let mut parser = CommandParser::new(program)?;
+        let mut parser = CommandParser::new(program, self.last_lineno)?;
         loop {
             let command = parser.parse_next_command(&self.alias_table)?;
             if let Some(command) = command {
@@ -561,6 +565,7 @@ impl Shell {
                 break;
             }
         }
+        self.last_lineno = parser.lineno() - 1;
         Ok(())
     }
 
@@ -616,6 +621,7 @@ impl Default for Shell {
             control_flow_state: ControlFlowState::None,
             loop_depth: 0,
             is_interactive: false,
+            last_lineno: 0,
         }
     }
 }

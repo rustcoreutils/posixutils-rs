@@ -299,13 +299,18 @@ pub fn expand_parameter_into(
             remove_largest,
         } => {
             let mut expanded_parameter = ExpandedWord::default();
-            expand_simple_parameter_into(
+            let parameter_type = expand_simple_parameter_into(
                 &mut expanded_parameter,
                 parameter,
                 inside_double_quotes,
                 field_splitting_will_be_performed,
                 shell,
             );
+            if parameter_type.is_unset() && shell.set_options.nounset {
+                return Err(CommandExecutionError::ExpansionError(
+                    "sh: parameter is unset".to_string(),
+                ));
+            }
             let param_str = expanded_parameter.to_string();
 
             let pattern = word_to_pattern(pattern, shell)?;

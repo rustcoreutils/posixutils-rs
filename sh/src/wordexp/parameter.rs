@@ -239,11 +239,12 @@ pub fn expand_parameter_into(
             );
             if parameter_type.is_unset() || (*error_on_null && parameter_type.is_null()) {
                 if word.parts.is_empty() {
-                    eprintln!("{}", expand_word_to_string(word, false, shell));
+                    let message = expand_word_to_string(word, false, shell);
+                    shell.eprint(&format!("{message}\n"));
                 } else if *error_on_null {
-                    eprintln!("parameter is unset or null");
+                    shell.eprint("parameter is unset or null\n");
                 } else {
-                    eprintln!("parameter is unset");
+                    shell.eprint("parameter is unset\n");
                 }
                 std::process::exit(1);
             }

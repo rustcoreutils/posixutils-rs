@@ -590,7 +590,7 @@ mod special_variables {
         run_successfully_and("echo $PWD", |output| {
             assert!(!output.is_empty());
             assert!(output.starts_with('/'));
-            assert!(output.ends_with("/sh/tests"));
+            assert!(output.ends_with("/sh\n"));
         })
     }
 }

@@ -133,7 +133,7 @@ fn simple_word_expansion_into(
                 expansion,
                 inside_double_quotes,
             } => {
-                expand_parameter_into(result, &expansion, inside_double_quotes, true, shell);
+                expand_parameter_into(result, &expansion, inside_double_quotes, true, shell)?;
             }
             WordPart::ArithmeticExpansion {
                 expr,

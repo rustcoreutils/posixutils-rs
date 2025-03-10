@@ -24,7 +24,10 @@ fn execute_string(string: &str, shell: &mut Shell) {
     match shell.execute_program(string) {
         Ok(_) => {}
         Err(syntax_err) => {
-            eprintln!("{}", syntax_err.message);
+            eprintln!(
+                "sh({}): syntax error: {}",
+                syntax_err.lineno, syntax_err.message
+            );
             // both bash and sh use 2 as the exit code for a syntax error
             std::process::exit(2);
         }
@@ -55,10 +58,11 @@ fn main() {
                     }
                     Err(syntax_err) => {
                         if !syntax_err.could_be_resolved_with_more_input {
-                            eprint!("{}", syntax_err.message);
-                            if args.execution_mode != ExecutionMode::Interactive {
-                                std::process::exit(2);
-                            }
+                            eprintln!(
+                                "sh({}): syntax error: {}",
+                                syntax_err.lineno, syntax_err.message
+                            );
+                            buffer.clear()
                         } else {
                             eprint!("{}", shell.get_ps2());
                         }
@@ -78,7 +82,10 @@ fn main() {
                     }
                     Err(syntax_err) => {
                         if !syntax_err.could_be_resolved_with_more_input {
-                            eprint!("{}", syntax_err.message);
+                            eprintln!(
+                                "sh({}): syntax error: {}",
+                                syntax_err.lineno, syntax_err.message
+                            );
                             std::process::exit(2);
                         }
                     }

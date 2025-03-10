@@ -51,6 +51,7 @@ fn cd(
         if let Some(oldpwd) = environment.get_str_value("OLDPWD") {
             let old_working_dir = std::env::current_dir().unwrap();
             nix::unistd::chdir(oldpwd).map_err(io_err_to_string)?;
+            shell.current_directory = OsString::from_vec(oldpwd.as_bytes().to_vec());
             shell.assign("PWD".to_string(), oldpwd.to_string(), false);
             shell.assign(
                 "OLDPWD".to_string(),
@@ -128,6 +129,7 @@ fn cd(
 
     let old_working_dir = std::env::current_dir().map_err(io_err_to_string)?;
     nix::unistd::chdir(AsRef::<OsStr>::as_ref(&curr_path)).map_err(io_err_to_string)?;
+    shell.current_directory = curr_path.clone();
 
     shell.assign(
         "PWD".to_string(),

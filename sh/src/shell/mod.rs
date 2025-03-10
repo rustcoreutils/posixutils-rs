@@ -111,6 +111,10 @@ pub struct Shell {
 }
 
 impl Shell {
+    pub fn eprint(&self, message: &str) {
+        self.opened_files.stderr().write_str(message);
+    }
+
     pub fn assign(&mut self, name: String, value: String, export: bool) {
         if self.environment.set(name, value, export).is_err() {
             self.opened_files
@@ -469,26 +473,26 @@ impl Shell {
             }
             Err(CommandExecutionError::BuiltinError) => 1,
             Err(CommandExecutionError::SpecialBuiltinRedirectionError(err)) => {
-                self.opened_files.stderr().write_str(format!("{err}\n"));
+                self.eprint(&format!("{err}\n"));
                 if !self.is_interactive {
                     std::process::exit(1)
                 }
                 1
             }
             Err(CommandExecutionError::RedirectionError(err)) => {
-                self.opened_files.stderr().write_str(format!("{err}\n"));
+                self.eprint(&format!("{err}\n"));
                 1
             }
             Err(CommandExecutionError::VariableAssignmentError) => 1,
             Err(CommandExecutionError::CommandNotFound(command_name)) => {
-                self.opened_files.stderr().write_str(format!(
+                self.eprint(&format!(
                     "sh({}): '{command_name}' not found\n",
                     command.lineno
                 ));
                 127
             }
             Err(CommandExecutionError::OsError(err)) => {
-                self.opened_files.stderr().write_str(format!("{err}\n"));
+                self.eprint(&format!("{err}\n"));
                 std::process::exit(1)
             }
         }
@@ -555,7 +559,7 @@ impl Shell {
             status = match self.interpret_pipeline(pipeline) {
                 Ok(status) => status,
                 Err(err) => {
-                    self.opened_files.stderr().write_str(format!("{err}\n"));
+                    self.eprint(&format!("{err}\n"));
                     std::process::exit(1)
                 }
             };

@@ -138,7 +138,8 @@ fn simple_word_expansion_into(
                 commands,
                 inside_double_quotes,
             } => {
-                let output = shell.execute_in_subshell(&commands);
+                // TODO: properly handle error
+                let output = shell.execute_in_subshell(&commands).unwrap();
                 result.append(output, inside_double_quotes, true);
             }
         }

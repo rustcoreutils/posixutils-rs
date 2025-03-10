@@ -10,16 +10,18 @@ use crate::parse::word_parser::parse_word;
 use crate::parse::{AliasTable, ParserError};
 use crate::shell::environment::{Environment, Value};
 use crate::shell::opened_files::{OpenedFile, OpenedFiles, RedirectionError};
+use crate::utils::{close, dup2, fork, pipe, waitpid, OsError, OsResult};
 use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
 use nix::errno::Errno;
-use nix::sys::wait::{waitpid, WaitStatus};
-use nix::unistd::{close, dup2, execve, fork, getpid, getppid, pipe, ForkResult};
+use nix::sys::wait::WaitStatus;
+use nix::unistd::{execve, getpid, getppid, ForkResult, Pid};
 use nix::{libc, NixPath};
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
+use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::{read_to_string, Read, Write};
-use std::os::fd::{AsRawFd, IntoRawFd};
+use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -45,11 +47,18 @@ enum CommandExecutionError {
     RedirectionError(RedirectionError),
     VariableAssignmentError,
     CommandNotFound(String),
+    OsError(OsError),
 }
 
 impl From<RedirectionError> for CommandExecutionError {
     fn from(value: RedirectionError) -> Self {
         CommandExecutionError::RedirectionError(value)
+    }
+}
+
+impl From<OsError> for CommandExecutionError {
+    fn from(value: OsError) -> Self {
+        Self::OsError(value)
     }
 }
 
@@ -113,9 +122,9 @@ impl Shell {
         }
     }
 
-    fn exec(&self, command: &str, args: &[String]) -> i32 {
-        match unsafe { fork() } {
-            Ok(ForkResult::Child) => {
+    fn exec(&self, command: &str, args: &[String]) -> OsResult<i32> {
+        match fork()? {
+            ForkResult::Child => {
                 for (id, file) in &self.opened_files.opened_files {
                     let dest = *id as i32;
                     let src = match file {
@@ -126,13 +135,15 @@ impl Shell {
                         | OpenedFile::WriteFile(file)
                         | OpenedFile::ReadWriteFile(file) => file.as_raw_fd(),
                         OpenedFile::HereDocument(contents) => {
-                            let (read_pipe, write_pipe) = pipe().unwrap();
-                            nix::unistd::write(write_pipe, contents.as_bytes()).unwrap();
-                            dup2(read_pipe.as_raw_fd(), dest).unwrap();
+                            let (read_pipe, write_pipe) = pipe()?;
+                            nix::unistd::write(write_pipe, contents.as_bytes()).map_err(|err| {
+                                OsError::from(format!("sh: internal call to write failed ({err})"))
+                            })?;
+                            dup2(read_pipe.as_raw_fd(), dest)?;
                             continue;
                         }
                     };
-                    dup2(src, dest).expect("TODO: handle dup2 error");
+                    dup2(src, dest)?;
                 }
                 let command = CString::new(command).unwrap();
                 let args = args
@@ -164,16 +175,10 @@ impl Shell {
                 }
                 std::process::exit(126);
             }
-            Ok(ForkResult::Parent { child }) => match waitpid(child, None) {
-                Ok(WaitStatus::Exited(_, status)) => status,
-                Err(_) => {
-                    todo!("failed to wait for child process");
-                }
+            ForkResult::Parent { child } => match waitpid(child)? {
+                WaitStatus::Exited(_, status) => Ok(status),
                 _ => todo!(),
             },
-            Err(_) => {
-                todo!("error: fork failed");
-            }
         }
     }
 
@@ -224,7 +229,9 @@ impl Shell {
                 .iter()
                 .map(|w| w.clone())
                 .collect::<Vec<String>>();
-            Ok(command_environment.exec(&command, &arguments))
+            command_environment
+                .exec(&command, &arguments)
+                .map_err(|err| err.into())
         } else {
             if let Some(special_builtin_utility) = get_special_builtin_utility(&expanded_words[0]) {
                 // the standard does not specify if the variables should have the export attribute.
@@ -282,7 +289,9 @@ impl Shell {
                     .iter()
                     .map(|w| w.clone())
                     .collect::<Vec<String>>();
-                Ok(command_environment.exec(&command, &arguments))
+                command_environment
+                    .exec(&command, &arguments)
+                    .map_err(|err| err.into())
             } else {
                 Err(CommandExecutionError::CommandNotFound(
                     expanded_words[0].clone(),
@@ -478,10 +487,14 @@ impl Shell {
                 ));
                 127
             }
+            Err(CommandExecutionError::OsError(err)) => {
+                self.opened_files.stderr().write_str(format!("{err}\n"));
+                std::process::exit(1)
+            }
         }
     }
 
-    fn interpret_pipeline(&mut self, pipeline: &Pipeline) -> i32 {
+    fn interpret_pipeline(&mut self, pipeline: &Pipeline) -> OsResult<i32> {
         let pipeline_exit_status;
         if pipeline.commands.len() == 1 {
             let command = &pipeline.commands[0];
@@ -489,49 +502,40 @@ impl Shell {
         } else {
             let mut current_stdin = libc::STDIN_FILENO;
             for command in pipeline.commands.iter().take(pipeline.commands.len() - 1) {
-                let (read_pipe, write_pipe) = pipe().unwrap();
-                match unsafe { fork() } {
-                    Ok(ForkResult::Child) => {
+                let (read_pipe, write_pipe) = pipe()?;
+                match fork()? {
+                    ForkResult::Child => {
                         drop(read_pipe);
-                        dup2(current_stdin, libc::STDIN_FILENO);
-                        dup2(write_pipe.as_raw_fd(), libc::STDOUT_FILENO);
+                        dup2(current_stdin, libc::STDIN_FILENO)?;
+                        dup2(write_pipe.as_raw_fd(), libc::STDOUT_FILENO)?;
                         let return_status = self.interpret_command(command);
                         if current_stdin != libc::STDIN_FILENO {
-                            close(current_stdin);
+                            close(current_stdin)?;
                         }
                         std::process::exit(return_status);
                     }
-                    Ok(ForkResult::Parent { .. }) => {
+                    ForkResult::Parent { .. } => {
                         if current_stdin != libc::STDIN_FILENO {
-                            close(current_stdin);
+                            close(current_stdin)?;
                         }
                         current_stdin = read_pipe.into_raw_fd();
-                    }
-                    Err(_) => {
-                        todo!("failed to fork")
                     }
                 }
             }
 
-            match unsafe { fork() } {
-                Ok(ForkResult::Child) => {
-                    dup2(current_stdin, libc::STDIN_FILENO).unwrap();
+            match fork()? {
+                ForkResult::Child => {
+                    dup2(current_stdin, libc::STDIN_FILENO)?;
                     let return_status = self.interpret_command(pipeline.commands.last().unwrap());
-                    close(current_stdin);
+                    close(current_stdin)?;
                     std::process::exit(return_status);
                 }
-                Ok(ForkResult::Parent { child }) => {
-                    close(current_stdin);
-                    match waitpid(child, None) {
-                        Ok(WaitStatus::Exited(_, status)) => pipeline_exit_status = status,
-                        Err(_) => {
-                            todo!("failed to wait for child process");
-                        }
+                ForkResult::Parent { child } => {
+                    close(current_stdin)?;
+                    match waitpid(child)? {
+                        WaitStatus::Exited(_, status) => pipeline_exit_status = status,
                         _ => todo!(),
                     }
-                }
-                Err(_) => {
-                    todo!("handle fork error")
                 }
             }
         }
@@ -540,7 +544,7 @@ impl Shell {
         } else {
             pipeline_exit_status
         };
-        self.most_recent_pipeline_exit_status
+        Ok(self.most_recent_pipeline_exit_status)
     }
 
     fn interpret_conjunction(&mut self, conjunction: &Conjunction) -> i32 {
@@ -548,7 +552,13 @@ impl Shell {
         let mut i = 0;
         while i < conjunction.elements.len() {
             let (pipeline, op) = &conjunction.elements[i];
-            status = self.interpret_pipeline(pipeline);
+            status = match self.interpret_pipeline(pipeline) {
+                Ok(status) => status,
+                Err(err) => {
+                    self.opened_files.stderr().write_str(format!("{err}\n"));
+                    std::process::exit(1)
+                }
+            };
             if self.control_flow_state != ControlFlowState::None {
                 return status;
             }
@@ -575,33 +585,27 @@ impl Shell {
         status
     }
 
-    pub fn execute_in_subshell(&mut self, program: &str) -> String {
-        let (read_pipe, write_pipe) = pipe().unwrap();
-        match unsafe { fork() } {
-            Ok(ForkResult::Child) => {
+    pub fn execute_in_subshell(&mut self, program: &str) -> OsResult<String> {
+        let (read_pipe, write_pipe) = pipe()?;
+        match fork()? {
+            ForkResult::Child => {
                 drop(read_pipe);
-                dup2(write_pipe.as_raw_fd(), libc::STDOUT_FILENO).unwrap();
+                dup2(write_pipe.as_raw_fd(), libc::STDOUT_FILENO)?;
                 self.execute_program(program).unwrap();
                 std::process::exit(self.most_recent_pipeline_exit_status);
             }
-            Ok(ForkResult::Parent { child }) => {
+            ForkResult::Parent { child } => {
                 drop(write_pipe);
-                match waitpid(child, None) {
-                    Ok(WaitStatus::Exited(_, _)) => {
+                match waitpid(child)? {
+                    WaitStatus::Exited(_, _) => {
                         let read_file = File::from(read_pipe);
                         let mut output = read_to_string(&read_file).unwrap();
                         let new_len = output.trim_end_matches('\n').len();
                         output.truncate(new_len);
-                        output
-                    }
-                    Err(_) => {
-                        todo!("failed to wait for child process");
+                        Ok(output)
                     }
                     _ => todo!(),
                 }
-            }
-            Err(_) => {
-                todo!()
             }
         }
     }

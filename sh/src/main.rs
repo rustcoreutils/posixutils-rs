@@ -58,11 +58,9 @@ fn main() {
                     }
                     Err(syntax_err) => {
                         if !syntax_err.could_be_resolved_with_more_input {
-                            eprintln!(
-                                "sh({}): syntax error: {}",
-                                syntax_err.lineno, syntax_err.message
-                            );
-                            buffer.clear()
+                            eprintln!("sh: syntax error: {}", syntax_err.message);
+                            buffer.clear();
+                            eprint!("{}", shell.get_ps1());
                         } else {
                             eprint!("{}", shell.get_ps2());
                         }

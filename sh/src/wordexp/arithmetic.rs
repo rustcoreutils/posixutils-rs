@@ -1,8 +1,8 @@
 use crate::parse::word::Word;
 use crate::shell::environment::Environment;
-use crate::shell::Shell;
-use crate::wordexp::expand_word_to_string;
+use crate::shell::{CommandExecutionError, Shell};
 use crate::wordexp::expanded_word::ExpandedWord;
+use crate::wordexp::{expand_word_to_string, ExpansionResult};
 use std::iter::Peekable;
 use std::str::CharIndices;
 
@@ -493,75 +493,73 @@ fn binary_operation(operator: &BinaryOperator, lhs_value: i64, rhs_value: i64) -
     }
 }
 
-fn interpret_expression(expr: &Expr, env: &mut Environment) -> i64 {
+fn interpret_expression(expr: &Expr, env: &mut Environment) -> ExpansionResult<i64> {
     match expr {
         Expr::Variable(var) => {
             let value = env.get_str_value(var).unwrap_or_default();
-            value.parse().unwrap_or(0)
+            Ok(value.parse().unwrap_or(0))
         }
-        Expr::Number(num) => *num,
+        Expr::Number(num) => Ok(*num),
         Expr::UnaryOp { operator, operand } => {
-            let value = interpret_expression(operand, env);
+            let value = interpret_expression(operand, env)?;
             match operator {
-                UnaryOperator::Plus => value,
-                UnaryOperator::Minus => -value,
-                UnaryOperator::Not => !(value != 0) as i64,
-                UnaryOperator::BitwiseNot => !value,
+                UnaryOperator::Plus => Ok(value),
+                UnaryOperator::Minus => Ok(-value),
+                UnaryOperator::Not => Ok(!(value != 0) as i64),
+                UnaryOperator::BitwiseNot => Ok(!value),
             }
         }
         Expr::BinaryOp { lhs, operator, rhs } => {
-            let lhs_value = interpret_expression(lhs, env);
+            let lhs_value = interpret_expression(lhs, env)?;
             match operator {
                 BinaryOperator::LogicalAnd => {
                     return if lhs_value != 0 {
-                        (interpret_expression(rhs, env) != 0) as i64
+                        Ok((interpret_expression(rhs, env)? != 0) as i64)
                     } else {
-                        0
+                        Ok(0)
                     }
                 }
                 BinaryOperator::LogicalOr => {
                     return if lhs_value == 0 {
-                        (interpret_expression(rhs, env) != 0) as i64
+                        Ok((interpret_expression(rhs, env)? != 0) as i64)
                     } else {
-                        1
+                        Ok(1)
                     }
                 }
                 _ => {}
             }
-            let rhs_value = interpret_expression(rhs, env);
-            binary_operation(operator, lhs_value, rhs_value)
+            let rhs_value = interpret_expression(rhs, env)?;
+            Ok(binary_operation(operator, lhs_value, rhs_value))
         }
         Expr::Conditional {
             condition,
             true_expr,
             false_expr,
         } => {
-            if interpret_expression(condition, env) != 0 {
+            if interpret_expression(condition, env)? != 0 {
                 interpret_expression(true_expr, env)
             } else {
                 interpret_expression(false_expr, env)
             }
         }
         Expr::Assignment { variable, value } => {
-            let value = interpret_expression(value, env);
-            // TODO: handle error
-            env.set(variable.to_string(), value.to_string(), false);
-            value
+            let value = interpret_expression(value, env)?;
+            env.set(variable.to_string(), value.to_string(), false)?;
+            Ok(value)
         }
         Expr::CompoundAssignment {
             variable,
             operator,
             value,
         } => {
-            let value = interpret_expression(value, env);
+            let value = interpret_expression(value, env)?;
             let current_value = env
                 .get_str_value(variable)
                 .map(|val| val.parse().unwrap_or(0))
                 .unwrap_or(0);
             let new_value = binary_operation(operator, current_value, value);
-            // TODO: handle error
-            env.set(variable.to_string(), new_value.to_string(), false);
-            new_value
+            env.set(variable.to_string(), new_value.to_string(), false)?;
+            Ok(new_value)
         }
     }
 }
@@ -571,11 +569,12 @@ pub fn expand_arithmetic_expression_into(
     expr: &Word,
     inside_double_quotes: bool,
     shell: &mut Shell,
-) {
-    let expr = expand_word_to_string(expr, false, shell);
-    let expr = parse_expression(&expr).unwrap();
-    let value = interpret_expression(&expr, &mut shell.environment);
+) -> ExpansionResult<()> {
+    let expr = expand_word_to_string(expr, false, shell)?;
+    let expr = parse_expression(&expr).map_err(CommandExecutionError::ExpansionError)?;
+    let value = interpret_expression(&expr, &mut shell.environment)?;
     expanded_word.append(value.to_string(), inside_double_quotes, true);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -586,7 +585,8 @@ mod tests {
     fn execute_expr(s: &str) -> String {
         let mut shell = Shell::default();
         let mut result = ExpandedWord::default();
-        expand_arithmetic_expression_into(&mut result, &quoted_literal(s), false, &mut shell);
+        expand_arithmetic_expression_into(&mut result, &quoted_literal(s), false, &mut shell)
+            .expect("invalid expression");
         result.to_string()
     }
 
@@ -597,7 +597,8 @@ mod tests {
             .set(var.to_string(), initial_value.to_string(), false)
             .expect("variable is readonly");
         let mut result = ExpandedWord::default();
-        expand_arithmetic_expression_into(&mut result, &quoted_literal(expr), false, &mut shell);
+        expand_arithmetic_expression_into(&mut result, &quoted_literal(expr), false, &mut shell)
+            .expect("invalid expression");
         let result = result.to_string();
         assert_eq!(shell.environment.get_str_value(var), Some(result.as_str()));
         result
@@ -606,7 +607,8 @@ mod tests {
     fn test_assignment(expr: &str) -> (String, Environment) {
         let mut shell = Shell::default();
         let mut result = ExpandedWord::default();
-        expand_arithmetic_expression_into(&mut result, &quoted_literal(expr), false, &mut shell);
+        expand_arithmetic_expression_into(&mut result, &quoted_literal(expr), false, &mut shell)
+            .expect("invalid expression");
         (result.to_string(), shell.environment)
     }
 

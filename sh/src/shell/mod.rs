@@ -8,8 +8,8 @@ use crate::parse::command_parser::CommandParser;
 use crate::parse::word::Word;
 use crate::parse::word_parser::parse_word;
 use crate::parse::{AliasTable, ParserError};
-use crate::shell::environment::{Environment, Value};
-use crate::shell::opened_files::{OpenedFile, OpenedFiles, RedirectionError};
+use crate::shell::environment::{CannotModifyReadonly, Environment, Value};
+use crate::shell::opened_files::{OpenedFile, OpenedFiles};
 use crate::utils::{close, dup2, fork, pipe, waitpid, OsError, OsResult};
 use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
 use nix::errno::Errno;
@@ -40,20 +40,15 @@ fn find_in_path(command: &str, env_path: &str) -> Option<String> {
 }
 
 #[derive(Clone, Debug)]
-enum CommandExecutionError {
+pub enum CommandExecutionError {
     SpecialBuiltinError,
     BuiltinError,
-    SpecialBuiltinRedirectionError(RedirectionError),
-    RedirectionError(RedirectionError),
-    VariableAssignmentError,
+    SpecialBuiltinRedirectionError(String),
+    RedirectionError(String),
+    VariableAssignmentError(CannotModifyReadonly),
+    ExpansionError(String),
     CommandNotFound(String),
     OsError(OsError),
-}
-
-impl From<RedirectionError> for CommandExecutionError {
-    fn from(value: RedirectionError) -> Self {
-        CommandExecutionError::RedirectionError(value)
-    }
 }
 
 impl From<OsError> for CommandExecutionError {
@@ -62,7 +57,13 @@ impl From<OsError> for CommandExecutionError {
     }
 }
 
-type CommandExecutionResult = Result<i32, CommandExecutionError>;
+impl From<CannotModifyReadonly> for CommandExecutionError {
+    fn from(value: CannotModifyReadonly) -> Self {
+        CommandExecutionError::VariableAssignmentError(value)
+    }
+}
+
+type CommandExecutionResult<T> = Result<T, CommandExecutionError>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ControlFlowState {
@@ -122,6 +123,45 @@ impl Shell {
                 .write_str("sh: cannot assign to readonly variable\n");
             if !self.is_interactive {
                 std::process::exit(2)
+            }
+        }
+    }
+
+    fn handle_error(&self, err: CommandExecutionError) -> i32 {
+        match err {
+            CommandExecutionError::SpecialBuiltinError => {
+                if !self.is_interactive {
+                    std::process::exit(1)
+                }
+                1
+            }
+            CommandExecutionError::BuiltinError => 1,
+            CommandExecutionError::SpecialBuiltinRedirectionError(err) => {
+                self.eprint(&format!("{err}\n"));
+                if !self.is_interactive {
+                    std::process::exit(1)
+                }
+                1
+            }
+            CommandExecutionError::RedirectionError(err) => {
+                self.eprint(&format!("{err}\n"));
+                1
+            }
+            CommandExecutionError::VariableAssignmentError(err) => {
+                self.eprint(&format!("{err}\n"));
+                1
+            }
+            CommandExecutionError::ExpansionError(err) => {
+                self.eprint(&format!("{err}\n"));
+                1
+            }
+            CommandExecutionError::CommandNotFound(command_name) => {
+                self.eprint(&format!("sh: '{command_name}' not found\n"));
+                127
+            }
+            CommandExecutionError::OsError(err) => {
+                self.eprint(&format!("{err}\n"));
+                std::process::exit(1)
             }
         }
     }
@@ -186,27 +226,32 @@ impl Shell {
         }
     }
 
-    fn perform_assignments(&mut self, assignments: &[Assignment], export: bool) {
+    fn perform_assignments(
+        &mut self,
+        assignments: &[Assignment],
+        export: bool,
+    ) -> CommandExecutionResult<()> {
         for assignment in assignments {
-            let word_str = expand_word_to_string(&assignment.value, true, self);
+            let word_str = expand_word_to_string(&assignment.value, true, self)?;
             // TODO: should look into using Rc for Environment
             self.assign(assignment.name.to_string(), word_str, export);
         }
+        Ok(())
     }
 
     fn interpret_simple_command(
         &mut self,
         simple_command: &SimpleCommand,
-    ) -> CommandExecutionResult {
+    ) -> CommandExecutionResult<i32> {
         let mut expanded_words = Vec::new();
         // reset
         self.last_command_substitution_status = 0;
         for word in &simple_command.words {
-            expanded_words.extend(expand_word(word, false, self));
+            expanded_words.extend(expand_word(word, false, self)?);
         }
         if expanded_words.is_empty() {
             // no commands to execute, perform assignments and redirections
-            self.perform_assignments(&simple_command.assignments, false);
+            self.perform_assignments(&simple_command.assignments, false)?;
             if !simple_command.redirections.is_empty() {
                 let mut subshell = self.clone();
                 subshell
@@ -224,7 +269,7 @@ impl Shell {
                 ));
             }
             let mut command_environment = self.clone();
-            command_environment.perform_assignments(&simple_command.assignments, true);
+            command_environment.perform_assignments(&simple_command.assignments, true)?;
             command_environment
                 .opened_files
                 .redirect(&simple_command.redirections, self)?;
@@ -240,11 +285,17 @@ impl Shell {
             if let Some(special_builtin_utility) = get_special_builtin_utility(&expanded_words[0]) {
                 // the standard does not specify if the variables should have the export attribute.
                 // Bash exports them, we do the same here (neither sh, nor zsh do it though)
-                self.perform_assignments(&simple_command.assignments, true);
+                self.perform_assignments(&simple_command.assignments, true)?;
                 let mut opened_files = self.opened_files.clone();
                 opened_files
                     .redirect(&simple_command.redirections, self)
-                    .map_err(CommandExecutionError::SpecialBuiltinRedirectionError)?;
+                    .map_err(|err| {
+                        if let CommandExecutionError::RedirectionError(err) = err {
+                            CommandExecutionError::SpecialBuiltinRedirectionError(err)
+                        } else {
+                            err
+                        }
+                    })?;
                 let status = special_builtin_utility.exec(&expanded_words[1..], self, opened_files);
                 return Ok(status);
             }
@@ -253,7 +304,7 @@ impl Shell {
                 let mut args = expanded_words[1..].to_vec();
                 // assignments affect the current environment and are marked for export,
                 // same as special builtin utilities
-                self.perform_assignments(&simple_command.assignments, true);
+                self.perform_assignments(&simple_command.assignments, true)?;
                 let mut previous_opened_files = self.opened_files.clone();
                 previous_opened_files.redirect(&simple_command.redirections, self)?;
                 std::mem::swap(&mut self.opened_files, &mut previous_opened_files);
@@ -271,7 +322,7 @@ impl Shell {
                 let mut opened_files = self.opened_files.clone();
                 opened_files.redirect(&simple_command.redirections, self)?;
                 let mut command_env = self.environment.clone();
-                self.perform_assignments(&simple_command.assignments, false);
+                self.perform_assignments(&simple_command.assignments, false)?;
                 std::mem::swap(&mut self.environment, &mut command_env);
                 return Ok(builtin_utility.exec(
                     &expanded_words[1..],
@@ -282,7 +333,7 @@ impl Shell {
             }
 
             let mut command_environment = self.clone();
-            command_environment.perform_assignments(&simple_command.assignments, true);
+            command_environment.perform_assignments(&simple_command.assignments, true)?;
             command_environment
                 .opened_files
                 .redirect(&simple_command.redirections, self)?;
@@ -309,11 +360,11 @@ impl Shell {
         iter_var: Name,
         iter_words: &[Word],
         body: &CompleteCommand,
-    ) -> i32 {
+    ) -> CommandExecutionResult<i32> {
         let mut result = 0;
         self.loop_depth += 1;
         'outer: for word in iter_words {
-            let items = expand_word(word, false, self);
+            let items = expand_word(word, false, self)?;
             for item in items {
                 self.assign(iter_var.to_string(), item, false);
                 result = self.interpret(body);
@@ -338,22 +389,25 @@ impl Shell {
             }
         }
         self.loop_depth -= 1;
-        result
+        Ok(result)
     }
 
-    fn interpret_case_clause(&mut self, arg: &Word, cases: &[CaseItem]) -> i32 {
-        let arg = expand_word_to_string(arg, false, self);
+    fn interpret_case_clause(
+        &mut self,
+        arg: &Word,
+        cases: &[CaseItem],
+    ) -> CommandExecutionResult<i32> {
+        let arg = expand_word_to_string(arg, false, self)?;
         let arg_cstr = CString::new(arg).expect("invalid pattern");
         for case in cases {
             for pattern in &case.pattern {
-                // TODO: deal with error
-                let pattern = word_to_pattern(pattern, self).unwrap();
+                let pattern = word_to_pattern(pattern, self)?;
                 if pattern.matches(&arg_cstr) {
-                    return self.interpret(&case.body);
+                    return Ok(self.interpret(&case.body));
                 }
             }
         }
-        0
+        Ok(0)
     }
 
     fn interpret_if_clause(&mut self, if_chain: &[If], else_body: &Option<CompleteCommand>) -> i32 {
@@ -411,15 +465,15 @@ impl Shell {
         &mut self,
         compound_command: &CompoundCommand,
         redirections: &[Redirection],
-    ) -> CommandExecutionResult {
+    ) -> CommandExecutionResult<i32> {
         let mut prev_opened_files = self.opened_files.clone();
         prev_opened_files.redirect(redirections, self)?;
         std::mem::swap(&mut self.opened_files, &mut prev_opened_files);
         let result = match compound_command {
-            CompoundCommand::BraceGroup(command) => self.interpret(command),
+            CompoundCommand::BraceGroup(command) => Ok(self.interpret(command)),
             CompoundCommand::Subshell(commands) => {
                 let mut subshell = self.clone();
-                subshell.interpret(commands)
+                Ok(subshell.interpret(commands))
             }
             CompoundCommand::ForClause {
                 iter_var,
@@ -430,16 +484,16 @@ impl Shell {
             CompoundCommand::IfClause {
                 if_chain,
                 else_body,
-            } => self.interpret_if_clause(if_chain, else_body),
+            } => Ok(self.interpret_if_clause(if_chain, else_body)),
             CompoundCommand::WhileClause { condition, body } => {
-                self.interpret_loop_clause(condition, body, true)
+                Ok(self.interpret_loop_clause(condition, body, true))
             }
             CompoundCommand::UntilClause { condition, body } => {
-                self.interpret_loop_clause(condition, body, false)
+                Ok(self.interpret_loop_clause(condition, body, false))
             }
         };
         std::mem::swap(&mut self.opened_files, &mut prev_opened_files);
-        Ok(result)
+        result
     }
 
     fn define_function(&mut self, definition: &FunctionDefinition) {
@@ -465,36 +519,7 @@ impl Shell {
 
         match execution_result {
             Ok(result) => result,
-            Err(CommandExecutionError::SpecialBuiltinError) => {
-                if !self.is_interactive {
-                    std::process::exit(1)
-                }
-                1
-            }
-            Err(CommandExecutionError::BuiltinError) => 1,
-            Err(CommandExecutionError::SpecialBuiltinRedirectionError(err)) => {
-                self.eprint(&format!("{err}\n"));
-                if !self.is_interactive {
-                    std::process::exit(1)
-                }
-                1
-            }
-            Err(CommandExecutionError::RedirectionError(err)) => {
-                self.eprint(&format!("{err}\n"));
-                1
-            }
-            Err(CommandExecutionError::VariableAssignmentError) => 1,
-            Err(CommandExecutionError::CommandNotFound(command_name)) => {
-                self.eprint(&format!(
-                    "sh({}): '{command_name}' not found\n",
-                    command.lineno
-                ));
-                127
-            }
-            Err(CommandExecutionError::OsError(err)) => {
-                self.eprint(&format!("{err}\n"));
-                std::process::exit(1)
-            }
+            Err(err) => self.handle_error(err),
         }
     }
 
@@ -664,13 +689,18 @@ impl Shell {
     fn get_var_and_expand(&mut self, var: &str, default_if_err: &str) -> String {
         let var = self.environment.get_str_value(var).unwrap_or_default();
         match parse_word(var, 0, false) {
-            Ok(word) => expand_word_to_string(&word, false, self),
+            Ok(word) => match expand_word_to_string(&word, false, self) {
+                Ok(str) => str,
+                Err(err) => {
+                    self.handle_error(err);
+                    default_if_err.to_string()
+                }
+            },
             Err(err) => {
                 eprintln!("sh: error parsing contents of {var}: {}", err.message);
                 if !self.is_interactive {
                     std::process::exit(1)
                 }
-                self.assign(var.to_string(), default_if_err.to_string(), false);
                 default_if_err.to_string()
             }
         }

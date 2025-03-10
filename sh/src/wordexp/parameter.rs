@@ -1,9 +1,8 @@
 use crate::parse::word::{Parameter, ParameterExpansion, SpecialParameter};
-use crate::shell::environment::Value;
-use crate::shell::Shell;
+use crate::shell::{CommandExecutionError, Shell};
 use crate::wordexp::{
     expand_word_to_string, simple_word_expansion_into, word_to_pattern, ExpandedWord,
-    ExpandedWordPart,
+    ExpansionResult,
 };
 
 #[derive(PartialEq, Eq)]
@@ -163,7 +162,7 @@ pub fn expand_parameter_into(
     inside_double_quotes: bool,
     field_splitting_will_be_performed: bool,
     shell: &mut Shell,
-) {
+) -> ExpansionResult<()> {
     match parameter_expansion {
         ParameterExpansion::Simple(parameter) => {
             expand_simple_parameter_into(
@@ -188,21 +187,23 @@ pub fn expand_parameter_into(
                 shell,
             );
             if parameter_type.is_unset() || (*default_on_null && parameter_type.is_null()) {
-                simple_word_expansion_into(expanded_word, default, false, shell);
+                simple_word_expansion_into(expanded_word, default, false, shell)?;
             }
             expanded_word.extend(expanded_parameter);
         }
         ParameterExpansion::UnsetAssignDefault {
-            variable,
+            variable: variable_name,
             word,
             assign_on_null,
         } => {
-            let value = expand_word_to_string(word, false, shell);
-            match shell.environment.get_var_mut(variable.as_ref()) {
+            let value = expand_word_to_string(word, false, shell)?;
+            match shell.environment.get_var_mut(variable_name.as_ref()) {
                 Some(variable) => {
                     if !variable.is_set() || (variable.is_null() && *assign_on_null) {
                         if variable.readonly {
-                            todo!("cannot assign to readonly variable");
+                            return Err(CommandExecutionError::ExpansionError(format!(
+                                "sh: cannot set readonly variable {variable_name}"
+                            )));
                         }
                         variable.value = Some(value.clone());
                         expanded_word.append(value, inside_double_quotes, true);
@@ -215,11 +216,10 @@ pub fn expand_parameter_into(
                     }
                 }
                 None => {
-                    // cannot be readonly, unwrap is safe
-                    shell
+                    // cannot fail since var is not in the environment
+                    let _ = shell
                         .environment
-                        .set(variable.to_string(), value.clone(), false)
-                        .unwrap();
+                        .set(variable_name.to_string(), value.clone(), false);
                     expanded_word.append(value, inside_double_quotes, true);
                 }
             }
@@ -238,15 +238,18 @@ pub fn expand_parameter_into(
                 shell,
             );
             if parameter_type.is_unset() || (*error_on_null && parameter_type.is_null()) {
-                if word.parts.is_empty() {
-                    let message = expand_word_to_string(word, false, shell);
-                    shell.eprint(&format!("{message}\n"));
+                return if word.parts.is_empty() {
+                    let message = expand_word_to_string(word, false, shell)?;
+                    Err(CommandExecutionError::ExpansionError(message))
                 } else if *error_on_null {
-                    shell.eprint("parameter is unset or null\n");
+                    Err(CommandExecutionError::ExpansionError(
+                        "parameter is unset or null".to_string(),
+                    ))
                 } else {
-                    shell.eprint("parameter is unset\n");
-                }
-                std::process::exit(1);
+                    Err(CommandExecutionError::ExpansionError(
+                        "parameter is unset".to_string(),
+                    ))
+                };
             }
             expanded_word.extend(expanded_parameter);
         }
@@ -266,7 +269,7 @@ pub fn expand_parameter_into(
             if !parameter_type.is_unset()
                 && (!parameter_type.is_null() || *substitute_null_with_word)
             {
-                simple_word_expansion_into(expanded_word, word, false, shell)
+                simple_word_expansion_into(expanded_word, word, false, shell)?
             }
         }
         ParameterExpansion::StrLen(parameter) => {
@@ -286,7 +289,9 @@ pub fn expand_parameter_into(
                 shell,
             );
             if parameter_type.is_unset() && shell.set_options.nounset {
-                todo!("error: unset parameter")
+                return Err(CommandExecutionError::ExpansionError(
+                    "sh: parameter is unset".to_string(),
+                ));
             }
             expanded_word.append(
                 expanded_parameter.to_string().len().to_string(),
@@ -310,8 +315,7 @@ pub fn expand_parameter_into(
             );
             let param_str = expanded_parameter.to_string();
 
-            // TODO: fix unwrap
-            let pattern = word_to_pattern(pattern, shell).unwrap();
+            let pattern = word_to_pattern(pattern, shell)?;
             let result = if *remove_prefix {
                 if *remove_largest {
                     pattern.remove_largest_prefix(param_str)
@@ -328,6 +332,7 @@ pub fn expand_parameter_into(
             expanded_word.append(result, inside_double_quotes, true);
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -335,11 +340,15 @@ mod tests {
     use super::*;
     use crate::parse::word::test_utils::unquoted_literal;
     use crate::parse::word::Word;
+    use crate::wordexp::expanded_word::ExpandedWordPart;
 
     fn shell_with_env(env: &[(&str, &str)]) -> Shell {
         let mut shell = Shell::default();
         for (k, v) in env {
-            shell.environment.set(k.to_string(), v.to_string(), false);
+            shell
+                .environment
+                .set(k.to_string(), v.to_string(), false)
+                .expect("failed to set var");
         }
         shell
     }

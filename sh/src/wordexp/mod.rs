@@ -1,5 +1,7 @@
 use crate::parse::word::{Word, WordPart};
-use crate::shell::Shell;
+use crate::shell::environment::CannotModifyReadonly;
+use crate::shell::{CommandExecutionError, Shell};
+use crate::utils::OsError;
 use crate::wordexp::arithmetic::expand_arithmetic_expression_into;
 use crate::wordexp::expanded_word::{ExpandedWord, ExpandedWordPart};
 use crate::wordexp::parameter::expand_parameter_into;
@@ -14,6 +16,8 @@ mod parameter;
 pub mod pathname;
 pub mod pattern;
 mod tilde;
+
+pub type ExpansionResult<T> = Result<T, CommandExecutionError>;
 
 fn is_ifs_whitespace(c: char) -> bool {
     c == ' ' || c == '\t' || c == '\n'
@@ -117,9 +121,10 @@ fn simple_word_expansion_into(
     word: &Word,
     is_assignment: bool,
     shell: &mut Shell,
-) {
+) -> ExpansionResult<()> {
     let mut word = word.clone();
-    tilde_expansion(&mut word, is_assignment, &shell.environment);
+    tilde_expansion(&mut word, is_assignment, &shell.environment)
+        .map_err(CommandExecutionError::ExpansionError)?;
     for part in word.parts.into_iter() {
         match part {
             WordPart::UnquotedLiteral(lit) => result.append(lit, false, false),
@@ -133,17 +138,17 @@ fn simple_word_expansion_into(
             WordPart::ArithmeticExpansion {
                 expr,
                 inside_double_quotes,
-            } => expand_arithmetic_expression_into(result, &expr, inside_double_quotes, shell),
+            } => expand_arithmetic_expression_into(result, &expr, inside_double_quotes, shell)?,
             WordPart::CommandSubstitution {
                 commands,
                 inside_double_quotes,
             } => {
-                // TODO: properly handle error
-                let output = shell.execute_in_subshell(&commands).unwrap();
+                let output = shell.execute_in_subshell(&commands)?;
                 result.append(output, inside_double_quotes, true);
             }
         }
     }
+    Ok(())
 }
 
 /// performs:
@@ -151,21 +156,29 @@ fn simple_word_expansion_into(
 /// - parameter expansion
 /// - command substitution
 /// - arithmetic expansion
-pub fn expand_word_to_string(word: &Word, is_assignment: bool, shell: &mut Shell) -> String {
+pub fn expand_word_to_string(
+    word: &Word,
+    is_assignment: bool,
+    shell: &mut Shell,
+) -> ExpansionResult<String> {
     let mut expanded_word = ExpandedWord::default();
-    simple_word_expansion_into(&mut expanded_word, word, is_assignment, shell);
-    expanded_word.to_string()
+    simple_word_expansion_into(&mut expanded_word, word, is_assignment, shell)?;
+    Ok(expanded_word.to_string())
 }
 
 /// performs general word expansion (similar to `wordexp` from libc)
-pub fn expand_word(word: &Word, is_assignment: bool, shell: &mut Shell) -> Vec<String> {
+pub fn expand_word(
+    word: &Word,
+    is_assignment: bool,
+    shell: &mut Shell,
+) -> ExpansionResult<Vec<String>> {
     let mut expanded_word = ExpandedWord::default();
-    simple_word_expansion_into(&mut expanded_word, word, is_assignment, shell);
+    simple_word_expansion_into(&mut expanded_word, word, is_assignment, shell)?;
     let ifs = shell.environment.get_str_value("IFS");
     let mut result = Vec::new();
     for field in split_fields(expanded_word, ifs) {
-        // TODO: handle error
-        let pattern = FilenamePattern::new(&field).unwrap();
+        let pattern =
+            FilenamePattern::new(&field).map_err(CommandExecutionError::ExpansionError)?;
         let files = glob(&pattern, Path::new(&shell.current_directory));
         if files.is_empty() {
             result.push(pattern.into())
@@ -174,13 +187,13 @@ pub fn expand_word(word: &Word, is_assignment: bool, shell: &mut Shell) -> Vec<S
             result.extend(files.into_iter().map(|s| s.into_string().unwrap()))
         }
     }
-    result
+    Ok(result)
 }
 
-pub fn word_to_pattern(word: &Word, shell: &mut Shell) -> Result<Pattern, String> {
+pub fn word_to_pattern(word: &Word, shell: &mut Shell) -> ExpansionResult<Pattern> {
     let mut expanded_word = ExpandedWord::default();
-    simple_word_expansion_into(&mut expanded_word, &word, false, shell);
-    Pattern::new(&expanded_word)
+    simple_word_expansion_into(&mut expanded_word, &word, false, shell)?;
+    Pattern::new(&expanded_word).map_err(CommandExecutionError::ExpansionError)
 }
 
 #[cfg(test)]

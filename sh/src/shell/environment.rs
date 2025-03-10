@@ -1,5 +1,7 @@
+use crate::shell::Display;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::fmt::Formatter;
 
 #[derive(Clone)]
 pub struct Value {
@@ -40,8 +42,14 @@ pub struct Environment {
     pub variables: HashMap<String, Value>,
 }
 
-#[derive(Debug)]
-pub struct CannotModifyReadonly;
+#[derive(Debug, Clone)]
+pub struct CannotModifyReadonly(String);
+
+impl Display for CannotModifyReadonly {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "sh: cannot set readonly variable {}", self.0)
+    }
+}
 
 impl Environment {
     pub fn set(
@@ -53,7 +61,7 @@ impl Environment {
         match self.variables.entry(name) {
             Entry::Occupied(mut e) => {
                 if e.get().readonly {
-                    return Err(CannotModifyReadonly);
+                    return Err(CannotModifyReadonly(e.key().clone()));
                 }
                 e.get_mut().value = Some(value);
                 e.get_mut().export = e.get_mut().export || export;
@@ -105,7 +113,7 @@ impl Environment {
     pub fn unset(&mut self, name: &str) -> Result<(), CannotModifyReadonly> {
         if let Some(var) = self.variables.get_mut(name) {
             if var.readonly {
-                return Err(CannotModifyReadonly);
+                return Err(CannotModifyReadonly(name.to_string()));
             }
             var.value = None;
         }

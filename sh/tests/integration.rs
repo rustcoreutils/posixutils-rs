@@ -572,7 +572,7 @@ mod special_variables {
 
     #[test]
     fn expand_default_ps1() {
-        test_cli(vec!["-c", "echo \"$PS1\""], "", "$ \n");
+        test_cli(vec!["-c", "echo \"$PS1\""], "", "\\$ \n");
     }
 
     #[test]

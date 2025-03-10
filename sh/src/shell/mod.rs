@@ -6,6 +6,7 @@ use crate::parse::command::{
 };
 use crate::parse::command_parser::CommandParser;
 use crate::parse::word::Word;
+use crate::parse::word_parser::parse_word;
 use crate::parse::{AliasTable, ParserError};
 use crate::shell::environment::{Environment, Value};
 use crate::shell::opened_files::{OpenedFile, OpenedFiles, RedirectionError};
@@ -459,20 +460,20 @@ impl Shell {
             }
             Err(CommandExecutionError::BuiltinError) => 1,
             Err(CommandExecutionError::SpecialBuiltinRedirectionError(err)) => {
-                self.opened_files.stderr().write_str(err.to_string());
+                self.opened_files.stderr().write_str(format!("{err}\n"));
                 if !self.is_interactive {
                     std::process::exit(1)
                 }
                 1
             }
             Err(CommandExecutionError::RedirectionError(err)) => {
-                self.opened_files.stderr().write_str(err.to_string());
+                self.opened_files.stderr().write_str(format!("{err}\n"));
                 1
             }
             Err(CommandExecutionError::VariableAssignmentError) => 1,
             Err(CommandExecutionError::CommandNotFound(command_name)) => {
                 self.opened_files.stderr().write_str(format!(
-                    "sh({}): '{command_name}' not found",
+                    "sh({}): '{command_name}' not found\n",
                     command.lineno
                 ));
                 127
@@ -646,10 +647,33 @@ impl Shell {
         };
         shell.assign("PPID".to_string(), getppid().to_string(), false);
         shell.assign("IFS".to_string(), " \t\n".to_string(), false);
-        shell.assign("PS1".to_string(), "$ ".to_string(), false);
+        shell.assign("PS1".to_string(), "\\$ ".to_string(), false);
         shell.assign("PS2".to_string(), "> ".to_string(), false);
         shell.assign("PS4".to_string(), "+ ".to_string(), false);
         shell
+    }
+
+    fn get_var_and_expand(&mut self, var: &str, default_if_err: &str) -> String {
+        let var = self.environment.get_str_value(var).unwrap_or_default();
+        match parse_word(var, 0, false) {
+            Ok(word) => expand_word_to_string(&word, false, self),
+            Err(err) => {
+                eprintln!("sh: error parsing contents of {var}: {}", err.message);
+                if !self.is_interactive {
+                    std::process::exit(1)
+                }
+                self.assign(var.to_string(), default_if_err.to_string(), false);
+                default_if_err.to_string()
+            }
+        }
+    }
+
+    pub fn get_ps1(&mut self) -> String {
+        self.get_var_and_expand("PS1", "\\$ ")
+    }
+
+    pub fn get_ps2(&mut self) -> String {
+        self.get_var_and_expand("PS2", "> ")
     }
 }
 

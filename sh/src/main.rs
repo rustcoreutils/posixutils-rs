@@ -41,10 +41,34 @@ fn main() {
         args.execution_mode == ExecutionMode::Interactive,
     );
     match args.execution_mode {
-        ExecutionMode::Interactive | ExecutionMode::ReadCommandsFromStdin => {
+        ExecutionMode::Interactive => {
             let mut buffer = String::new();
-            let stdin = io::stdin();
-            while stdin.read_line(&mut buffer).is_ok_and(|n| n > 0) {
+            eprint!("{}", shell.get_ps1());
+            while io::stdin().read_line(&mut buffer).is_ok_and(|n| n > 0) {
+                if buffer.ends_with("\\\n") {
+                    continue;
+                }
+                match shell.execute_program(&buffer) {
+                    Ok(_) => {
+                        buffer.clear();
+                        eprint!("{}", shell.get_ps1());
+                    }
+                    Err(syntax_err) => {
+                        if !syntax_err.could_be_resolved_with_more_input {
+                            eprint!("{}", syntax_err.message);
+                            if args.execution_mode != ExecutionMode::Interactive {
+                                std::process::exit(2);
+                            }
+                        } else {
+                            eprint!("{}", shell.get_ps2());
+                        }
+                    }
+                }
+            }
+        }
+        ExecutionMode::ReadCommandsFromStdin => {
+            let mut buffer = String::new();
+            while io::stdin().read_line(&mut buffer).is_ok_and(|n| n > 0) {
                 if buffer.ends_with("\\\n") {
                     continue;
                 }
@@ -54,10 +78,8 @@ fn main() {
                     }
                     Err(syntax_err) => {
                         if !syntax_err.could_be_resolved_with_more_input {
-                            eprintln!("{}", syntax_err.message);
-                            if args.execution_mode != ExecutionMode::Interactive {
-                                std::process::exit(2);
-                            }
+                            eprint!("{}", syntax_err.message);
+                            std::process::exit(2);
                         }
                     }
                 }

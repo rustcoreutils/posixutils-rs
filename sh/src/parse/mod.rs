@@ -4,7 +4,7 @@ pub mod command;
 pub mod command_parser;
 mod lexer;
 pub mod word;
-mod word_parser;
+pub mod word_parser;
 
 #[derive(Debug, Clone)]
 pub struct ParserError {

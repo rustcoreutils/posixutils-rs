@@ -428,6 +428,11 @@ mod tests {
     }
 
     #[test]
+    fn parse_empty_word() {
+        assert_eq!(parse_word(""), Word::default())
+    }
+
+    #[test]
     fn parse_simple_word() {
         assert_eq!(parse_word("hello"), unquoted_literal("hello"));
     }

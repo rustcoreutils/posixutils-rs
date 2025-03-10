@@ -610,7 +610,8 @@ mod word_expansion {
 
     #[test]
     fn string_operations_on_unset_parameters_fail_with_no_unset() {
-        todo!()
+        test_script_expect_err("set -u; echo ${#UNSET}", "");
+        test_script_expect_err("set -u; echo ${UNSET%test}", "");
     }
 
     #[test]

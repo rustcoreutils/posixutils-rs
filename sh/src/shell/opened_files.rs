@@ -3,21 +3,48 @@ use crate::shell::Shell;
 use crate::wordexp::expand_word_to_string;
 use nix::libc;
 use std::collections::HashMap;
+use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
+use std::path::Path;
 use std::rc::Rc;
 
 const STDIN_FILENO: u32 = libc::STDIN_FILENO as u32;
 const STDOUT_FILENO: u32 = libc::STDOUT_FILENO as u32;
 const STDERR_FILENO: u32 = libc::STDERR_FILENO as u32;
 
+#[derive(Clone, Debug)]
+pub struct RedirectionError(String);
+
+impl From<String> for RedirectionError {
+    fn from(value: String) -> Self {
+        Self(value.into())
+    }
+}
+
+impl From<std::io::Error> for RedirectionError {
+    fn from(value: std::io::Error) -> Self {
+        format!("sh: io error: {value}").into()
+    }
+}
+
+impl Display for RedirectionError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.as_str())
+    }
+}
+
+pub type RedirectionResult = Result<(), RedirectionError>;
+
 #[derive(Clone)]
 pub enum OpenedFile {
     Stdin,
     Stdout,
     Stderr,
-    File(Rc<File>),
+    ReadFile(Rc<File>),
+    WriteFile(Rc<File>),
+    ReadWriteFile(Rc<File>),
     HereDocument(String),
 }
 
@@ -78,66 +105,104 @@ pub struct OpenedFiles {
 }
 
 impl OpenedFiles {
-    pub fn redirect(&mut self, redirections: &[Redirection], shell: &mut Shell) {
+    fn io_redirect(
+        &mut self,
+        kind: &IORedirectionKind,
+        target: &str,
+        file_descriptor: Option<u32>,
+        shell: &Shell,
+    ) -> RedirectionResult {
+        match kind {
+            IORedirectionKind::RedirectOutput
+            | IORedirectionKind::RedirectOutputClobber
+            | IORedirectionKind::RedirectOuputAppend => {
+                if *kind != IORedirectionKind::RedirectOutputClobber
+                    && shell.set_options.noclobber
+                    && Path::new(target).exists()
+                {
+                    Err(format!(
+                        "sh: redirection would overwrite existing file {target}",
+                    ))?;
+                }
+
+                let append = *kind == IORedirectionKind::RedirectOuputAppend;
+                let file = File::options()
+                    .write(true)
+                    .append(append)
+                    .create(true)
+                    .open(target)?;
+
+                let source_fd = file_descriptor.unwrap_or(STDOUT_FILENO);
+                self.opened_files
+                    .insert(source_fd, OpenedFile::WriteFile(Rc::new(file)));
+            }
+            IORedirectionKind::DuplicateOutput | IORedirectionKind::DuplicateInput => {
+                let dest_fd = if *kind == IORedirectionKind::DuplicateOutput {
+                    file_descriptor.unwrap_or(STDOUT_FILENO)
+                } else {
+                    file_descriptor.unwrap_or(STDIN_FILENO)
+                };
+                if target == "-" {
+                    self.opened_files.remove(&dest_fd);
+                } else {
+                    let duplicate_input = *kind == IORedirectionKind::DuplicateInput;
+                    let source_fd = target
+                        .parse::<u32>()
+                        .map_err(|_| format!("sh: invalid file descriptor {target}"))?;
+                    match self.opened_files.get(&source_fd) {
+                        Some(OpenedFile::WriteFile(_))
+                        | Some(OpenedFile::Stdout)
+                        | Some(OpenedFile::Stderr)
+                            if duplicate_input =>
+                        {
+                            Err(format!("sh: '{source_fd}' is not opened for reading"))?
+                        }
+                        Some(OpenedFile::ReadFile(_))
+                        | Some(OpenedFile::Stdin)
+                        | Some(OpenedFile::HereDocument(_))
+                            if !duplicate_input =>
+                        {
+                            Err(format!("sh: '{source_fd}' is not opened for writing"))?
+                        }
+                        None => Err(format!(
+                            "sh: cannot duplicate unopened file descriptor '{source_fd}'"
+                        ))?,
+                        Some(other) => {
+                            self.opened_files.insert(dest_fd, other.clone());
+                        }
+                    }
+                }
+            }
+            IORedirectionKind::RedirectInput => {
+                let file = File::options().read(true).open(target)?;
+                let source_fd = file_descriptor.unwrap_or(STDIN_FILENO);
+                self.opened_files
+                    .insert(source_fd, OpenedFile::ReadFile(Rc::new(file)));
+            }
+            IORedirectionKind::OpenRW => {
+                let file = File::options()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .open(target)?;
+                let source_fd = file_descriptor.unwrap_or(STDIN_FILENO);
+                self.opened_files
+                    .insert(source_fd, OpenedFile::ReadWriteFile(Rc::from(file)));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn redirect(
+        &mut self,
+        redirections: &[Redirection],
+        shell: &mut Shell,
+    ) -> Result<(), RedirectionError> {
         for redir in redirections {
             match &redir.kind {
                 RedirectionKind::IORedirection { kind, file } => {
-                    let target = expand_word_to_string(file, false, shell);
-                    // TODO: pathname expansion is not allowed if the shell is non-interactive,
-                    // optional otherwise. Bash does implement this, maybe we should too.
-                    match kind {
-                        IORedirectionKind::RedirectOutput
-                        | IORedirectionKind::RedirectOutputClobber
-                        | IORedirectionKind::RedirectOuputAppend => {
-                            // TODO: fail if noclobber is set and file exists and is a regular file
-
-                            // TODO: fix unwrap
-                            let file = if *kind == IORedirectionKind::RedirectOuputAppend {
-                                File::options()
-                                    .append(true)
-                                    .create(true)
-                                    .open(target)
-                                    .unwrap()
-                            } else {
-                                File::create(target).unwrap()
-                            };
-                            let source_fd = redir.file_descriptor.unwrap_or(STDOUT_FILENO);
-                            self.opened_files
-                                .insert(source_fd, OpenedFile::File(Rc::new(file)));
-                        }
-                        IORedirectionKind::DuplicateOutput | IORedirectionKind::DuplicateInput => {
-                            let dest_fd = if *kind == IORedirectionKind::DuplicateOutput {
-                                redir.file_descriptor.unwrap_or(STDOUT_FILENO)
-                            } else {
-                                redir.file_descriptor.unwrap_or(STDIN_FILENO)
-                            };
-                            if target == "-" {
-                                self.opened_files.remove(&dest_fd);
-                            } else {
-                                // TODO: handle errors
-                                let source_fd = target.parse::<u32>().unwrap();
-                                let file = self.opened_files.get(&source_fd).unwrap().clone();
-                                self.opened_files.insert(dest_fd, file);
-                            }
-                        }
-                        IORedirectionKind::RedirectInput => {
-                            let file = File::options().read(true).open(target).unwrap();
-                            let source_fd = redir.file_descriptor.unwrap_or(STDIN_FILENO);
-                            self.opened_files
-                                .insert(source_fd, OpenedFile::File(Rc::new(file)));
-                        }
-                        IORedirectionKind::OpenRW => {
-                            let file = File::options()
-                                .read(true)
-                                .write(true)
-                                .create(true)
-                                .open(target)
-                                .unwrap();
-                            let source_fd = redir.file_descriptor.unwrap_or(STDIN_FILENO);
-                            self.opened_files
-                                .insert(source_fd, OpenedFile::File(Rc::from(file)));
-                        }
-                    }
+                    let file = expand_word_to_string(file, false, shell);
+                    self.io_redirect(kind, &file, redir.file_descriptor, shell)?;
                 }
                 RedirectionKind::HereDocument(contents) => {
                     let contents = expand_word_to_string(contents, false, shell);
@@ -154,22 +219,17 @@ impl OpenedFiles {
                 }
             }
         }
-    }
-
-    pub fn stdin(&self) -> ReadFile {
-        match self.opened_files.get(&STDIN_FILENO) {
-            Some(OpenedFile::Stdin) => ReadFile::Stdin,
-            Some(OpenedFile::File(file)) => ReadFile::File(file.clone()),
-            _ => todo!(),
-        }
+        Ok(())
     }
 
     fn write_file(&self, fileno: u32) -> WriteFile {
         match self.opened_files.get(&fileno) {
             Some(OpenedFile::Stdout) => WriteFile::Stdout,
             Some(OpenedFile::Stderr) => WriteFile::Stderr,
-            Some(OpenedFile::File(file)) => WriteFile::File(file.clone()),
-            _ => todo!(),
+            Some(OpenedFile::WriteFile(file)) | Some(OpenedFile::ReadWriteFile(file)) => {
+                WriteFile::File(file.clone())
+            }
+            _ => unreachable!(),
         }
     }
 
@@ -184,7 +244,7 @@ impl OpenedFiles {
 
 impl Default for OpenedFiles {
     fn default() -> Self {
-        let mut opened_files = HashMap::from([
+        let opened_files = HashMap::from([
             (STDIN_FILENO, OpenedFile::Stdin),
             (STDOUT_FILENO, OpenedFile::Stdout),
             (STDERR_FILENO, OpenedFile::Stderr),

@@ -8,7 +8,7 @@ use crate::parse::command_parser::CommandParser;
 use crate::parse::word::Word;
 use crate::parse::{AliasTable, ParserError};
 use crate::shell::environment::{Environment, Value};
-use crate::shell::opened_files::{OpenedFile, OpenedFiles};
+use crate::shell::opened_files::{OpenedFile, OpenedFiles, RedirectionError};
 use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
 use nix::errno::Errno;
 use nix::sys::wait::{waitpid, WaitStatus};
@@ -37,15 +37,22 @@ fn find_in_path(command: &str, env_path: &str) -> Option<String> {
 }
 
 #[derive(Clone, Debug)]
-pub enum ExecutionError {
-    ParserError(ParserError),
+enum CommandExecutionError {
+    SpecialBuiltinError,
+    BuiltinError,
+    SpecialBuiltinRedirectionError(RedirectionError),
+    RedirectionError(RedirectionError),
+    VariableAssignmentError,
+    CommandNotFound(String),
 }
 
-impl From<ParserError> for ExecutionError {
-    fn from(value: ParserError) -> Self {
-        Self::ParserError(value)
+impl From<RedirectionError> for CommandExecutionError {
+    fn from(value: RedirectionError) -> Self {
+        CommandExecutionError::RedirectionError(value)
     }
 }
+
+type CommandExecutionResult = Result<i32, CommandExecutionError>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ControlFlowState {
@@ -114,7 +121,9 @@ impl Shell {
                         OpenedFile::Stdin => libc::STDIN_FILENO,
                         OpenedFile::Stdout => libc::STDOUT_FILENO,
                         OpenedFile::Stderr => libc::STDERR_FILENO,
-                        OpenedFile::File(file) => file.as_raw_fd(),
+                        OpenedFile::ReadFile(file)
+                        | OpenedFile::WriteFile(file)
+                        | OpenedFile::ReadWriteFile(file) => file.as_raw_fd(),
                         OpenedFile::HereDocument(contents) => {
                             let (read_pipe, write_pipe) = pipe().unwrap();
                             nix::unistd::write(write_pipe, contents.as_bytes()).unwrap();
@@ -175,7 +184,10 @@ impl Shell {
         }
     }
 
-    fn interpret_simple_command(&mut self, simple_command: &SimpleCommand) -> i32 {
+    fn interpret_simple_command(
+        &mut self,
+        simple_command: &SimpleCommand,
+    ) -> CommandExecutionResult {
         let mut expanded_words = Vec::new();
         // reset
         self.last_command_substitution_status = 0;
@@ -189,40 +201,40 @@ impl Shell {
                 let mut subshell = self.clone();
                 subshell
                     .opened_files
-                    .redirect(&simple_command.redirections, self);
+                    .redirect(&simple_command.redirections, self)?;
                 (&simple_command.redirections, &mut subshell);
             }
-            return self.last_command_substitution_status;
+            return Ok(self.last_command_substitution_status);
         }
 
         if expanded_words[0].contains('/') {
             if !Path::new(&expanded_words[0]).exists() {
-                eprintln!("{}: command not found", expanded_words[0]);
-                return 127;
+                return Err(CommandExecutionError::CommandNotFound(
+                    expanded_words[0].clone(),
+                ));
             }
             let mut command_environment = self.clone();
             command_environment.perform_assignments(&simple_command.assignments, true);
             command_environment
                 .opened_files
-                .redirect(&simple_command.redirections, self);
+                .redirect(&simple_command.redirections, self)?;
             let command = &expanded_words[0];
             let arguments = expanded_words
                 .iter()
                 .map(|w| w.clone())
                 .collect::<Vec<String>>();
-            command_environment.exec(&command, &arguments)
+            Ok(command_environment.exec(&command, &arguments))
         } else {
             if let Some(special_builtin_utility) = get_special_builtin_utility(&expanded_words[0]) {
                 // the standard does not specify if the variables should have the export attribute.
                 // Bash exports them, we do the same here (neither sh, nor zsh do it though)
                 self.perform_assignments(&simple_command.assignments, true);
                 let mut opened_files = self.opened_files.clone();
-                opened_files.redirect(&simple_command.redirections, self);
+                opened_files
+                    .redirect(&simple_command.redirections, self)
+                    .map_err(CommandExecutionError::SpecialBuiltinRedirectionError)?;
                 let status = special_builtin_utility.exec(&expanded_words[1..], self, opened_files);
-                if status != 0 && !self.is_interactive {
-                    std::process::exit(status);
-                }
-                return status;
+                return Ok(status);
             }
 
             if let Some(function_body) = self.functions.get(expanded_words[0].as_str()).cloned() {
@@ -231,7 +243,7 @@ impl Shell {
                 // same as special builtin utilities
                 self.perform_assignments(&simple_command.assignments, true);
                 let mut previous_opened_files = self.opened_files.clone();
-                previous_opened_files.redirect(&simple_command.redirections, self);
+                previous_opened_files.redirect(&simple_command.redirections, self)?;
                 std::mem::swap(&mut self.opened_files, &mut previous_opened_files);
                 std::mem::swap(&mut args, &mut self.positional_parameters);
 
@@ -245,18 +257,23 @@ impl Shell {
 
             if let Some(builtin_utility) = get_builtin_utility(&expanded_words[0]) {
                 let mut opened_files = self.opened_files.clone();
-                opened_files.redirect(&simple_command.redirections, self);
+                opened_files.redirect(&simple_command.redirections, self)?;
                 let mut command_env = self.environment.clone();
                 self.perform_assignments(&simple_command.assignments, false);
                 std::mem::swap(&mut self.environment, &mut command_env);
-                return builtin_utility.exec(&expanded_words[1..], self, opened_files, command_env);
+                return Ok(builtin_utility.exec(
+                    &expanded_words[1..],
+                    self,
+                    opened_files,
+                    command_env,
+                ));
             }
 
             let mut command_environment = self.clone();
             command_environment.perform_assignments(&simple_command.assignments, true);
             command_environment
                 .opened_files
-                .redirect(&simple_command.redirections, self);
+                .redirect(&simple_command.redirections, self)?;
             // TODO: fix unwrap with proper error
             let path = self.environment.get_str_value("PATH").unwrap();
             if let Some(command) = find_in_path(&expanded_words[0], path) {
@@ -264,10 +281,11 @@ impl Shell {
                     .iter()
                     .map(|w| w.clone())
                     .collect::<Vec<String>>();
-                command_environment.exec(&command, &arguments)
+                Ok(command_environment.exec(&command, &arguments))
             } else {
-                eprintln!("{}: command not found", expanded_words[0]);
-                127
+                Err(CommandExecutionError::CommandNotFound(
+                    expanded_words[0].clone(),
+                ))
             }
         }
     }
@@ -379,9 +397,9 @@ impl Shell {
         &mut self,
         compound_command: &CompoundCommand,
         redirections: &[Redirection],
-    ) -> i32 {
+    ) -> CommandExecutionResult {
         let mut prev_opened_files = self.opened_files.clone();
-        prev_opened_files.redirect(redirections, self);
+        prev_opened_files.redirect(redirections, self)?;
         std::mem::swap(&mut self.opened_files, &mut prev_opened_files);
         let result = match compound_command {
             CompoundCommand::BraceGroup(command) => self.interpret(command),
@@ -407,18 +425,17 @@ impl Shell {
             }
         };
         std::mem::swap(&mut self.opened_files, &mut prev_opened_files);
-        result
+        Ok(result)
     }
 
-    fn define_function(&mut self, definition: &FunctionDefinition) -> i32 {
+    fn define_function(&mut self, definition: &FunctionDefinition) {
         self.functions
             .insert(definition.name.clone(), definition.body.clone());
-        0
     }
 
     fn interpret_command(&mut self, command: &Command) -> i32 {
         self.assign("LINENO".to_string(), command.lineno.to_string(), false);
-        match &command.type_ {
+        let execution_result = match &command.type_ {
             CommandType::SimpleCommand(simple_command) => {
                 self.interpret_simple_command(simple_command)
             }
@@ -426,7 +443,40 @@ impl Shell {
                 command,
                 redirections,
             } => self.interpret_compound_command(command, redirections),
-            CommandType::FunctionDefinition(function) => self.define_function(function),
+            CommandType::FunctionDefinition(function) => {
+                self.define_function(function);
+                Ok(0)
+            }
+        };
+
+        match execution_result {
+            Ok(result) => result,
+            Err(CommandExecutionError::SpecialBuiltinError) => {
+                if !self.is_interactive {
+                    std::process::exit(1)
+                }
+                1
+            }
+            Err(CommandExecutionError::BuiltinError) => 1,
+            Err(CommandExecutionError::SpecialBuiltinRedirectionError(err)) => {
+                self.opened_files.stderr().write_str(err.to_string());
+                if !self.is_interactive {
+                    std::process::exit(1)
+                }
+                1
+            }
+            Err(CommandExecutionError::RedirectionError(err)) => {
+                self.opened_files.stderr().write_str(err.to_string());
+                1
+            }
+            Err(CommandExecutionError::VariableAssignmentError) => 1,
+            Err(CommandExecutionError::CommandNotFound(command_name)) => {
+                self.opened_files.stderr().write_str(format!(
+                    "sh({}): '{command_name}' not found",
+                    command.lineno
+                ));
+                127
+            }
         }
     }
 
@@ -555,7 +605,7 @@ impl Shell {
         }
     }
 
-    pub fn execute_program(&mut self, program: &str) -> Result<(), ExecutionError> {
+    pub fn execute_program(&mut self, program: &str) -> Result<(), ParserError> {
         let mut parser = CommandParser::new(program, self.last_lineno)?;
         loop {
             let command = parser.parse_next_command(&self.alias_table)?;

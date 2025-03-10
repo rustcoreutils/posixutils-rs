@@ -8,7 +8,7 @@
 //
 
 use crate::cli::{parse_args, ExecutionMode};
-use crate::shell::{ExecutionError, Shell};
+use crate::shell::Shell;
 use atty::Stream;
 use std::io;
 
@@ -23,8 +23,8 @@ mod wordexp;
 fn execute_string(string: &str, shell: &mut Shell) {
     match shell.execute_program(string) {
         Ok(_) => {}
-        Err(ExecutionError::ParserError(err)) => {
-            eprintln!("{}", err.message);
+        Err(syntax_err) => {
+            eprintln!("{}", syntax_err.message);
             // both bash and sh use 2 as the exit code for a syntax error
             std::process::exit(2);
         }
@@ -34,8 +34,12 @@ fn execute_string(string: &str, shell: &mut Shell) {
 fn main() {
     let is_attached_to_terminal = atty::is(Stream::Stdin) && atty::is(Stream::Stdout);
     let args = parse_args(std::env::args().collect(), is_attached_to_terminal).unwrap();
-    let mut shell =
-        Shell::initialize_from_system(args.program_name, args.arguments, args.set_options, args.execution_mode == ExecutionMode::Interactive);
+    let mut shell = Shell::initialize_from_system(
+        args.program_name,
+        args.arguments,
+        args.set_options,
+        args.execution_mode == ExecutionMode::Interactive,
+    );
     match args.execution_mode {
         ExecutionMode::Interactive | ExecutionMode::ReadCommandsFromStdin => {
             let mut buffer = String::new();
@@ -48,9 +52,9 @@ fn main() {
                     Ok(_) => {
                         buffer.clear();
                     }
-                    Err(ExecutionError::ParserError(err)) => {
-                        if !err.could_be_resolved_with_more_input {
-                            eprintln!("{}", err.message);
+                    Err(syntax_err) => {
+                        if !syntax_err.could_be_resolved_with_more_input {
+                            eprintln!("{}", syntax_err.message);
                             if args.execution_mode != ExecutionMode::Interactive {
                                 std::process::exit(2);
                             }
@@ -59,18 +63,16 @@ fn main() {
                 }
             }
         }
-        other => {
-            match other {
-                ExecutionMode::ReadCommandsFromString(command_string) => {
-                    execute_string(&command_string, &mut shell);
-                }
-                ExecutionMode::ReadFromFile(file) => {
-                    let file_contents = std::fs::read_to_string(file).expect("could not read file");
-                    execute_string(&file_contents, &mut shell);
-                }
-                _ => unreachable!(),
+        other => match other {
+            ExecutionMode::ReadCommandsFromString(command_string) => {
+                execute_string(&command_string, &mut shell);
             }
-        }
+            ExecutionMode::ReadFromFile(file) => {
+                let file_contents = std::fs::read_to_string(file).expect("could not read file");
+                execute_string(&file_contents, &mut shell);
+            }
+            _ => unreachable!(),
+        },
     }
     std::process::exit(shell.most_recent_pipeline_exit_status);
 }

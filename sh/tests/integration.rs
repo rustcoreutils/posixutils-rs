@@ -884,7 +884,7 @@ mod errors {
 
     #[test]
     fn builtin_error_does_not_exit() {
-        expect_err_and_message("cd nonexistent; echo correct", Some("correct\n"));
+        test_script_expect_err("cd nonexistent; echo $?; echo correct", "1\ncorrect\n");
     }
 
     #[test]

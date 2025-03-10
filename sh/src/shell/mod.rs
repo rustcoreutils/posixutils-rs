@@ -41,8 +41,6 @@ fn find_in_path(command: &str, env_path: &str) -> Option<String> {
 
 #[derive(Clone, Debug)]
 pub enum CommandExecutionError {
-    SpecialBuiltinError,
-    BuiltinError,
     SpecialBuiltinRedirectionError(String),
     RedirectionError(String),
     VariableAssignmentError(CannotModifyReadonly),
@@ -129,13 +127,6 @@ impl Shell {
 
     fn handle_error(&self, err: CommandExecutionError) -> i32 {
         match err {
-            CommandExecutionError::SpecialBuiltinError => {
-                if !self.is_interactive {
-                    std::process::exit(1)
-                }
-                1
-            }
-            CommandExecutionError::BuiltinError => 1,
             CommandExecutionError::SpecialBuiltinRedirectionError(err) => {
                 self.eprint(&format!("{err}\n"));
                 if !self.is_interactive {
@@ -297,6 +288,9 @@ impl Shell {
                         }
                     })?;
                 let status = special_builtin_utility.exec(&expanded_words[1..], self, opened_files);
+                if status != 0 && !self.is_interactive {
+                    std::process::exit(status);
+                }
                 return Ok(status);
             }
 

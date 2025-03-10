@@ -16,6 +16,7 @@ trait UsersHomeDirs {
 struct DefaultUsersHomeDirs;
 
 impl UsersHomeDirs for DefaultUsersHomeDirs {
+    /// `login_name` has to be a valid login name
     fn get_user_home(&self, login_name: &str) -> Option<String> {
         // it cannot contain a null char as part of the method's contract
         let login_name = CString::new(login_name).unwrap();
@@ -30,20 +31,22 @@ impl UsersHomeDirs for DefaultUsersHomeDirs {
     }
 }
 
-fn expand_home(login_name: &str, env: &Environment, user_home: &dyn UsersHomeDirs) -> String {
+fn expand_home(
+    login_name: &str,
+    env: &Environment,
+    user_home: &dyn UsersHomeDirs,
+) -> Result<String, String> {
     if login_name.is_empty() {
-        // > If the login name is null (that is, the tilde-prefix contains only the tilde),
-        // > the tilde-prefix is replaced by the value of the variable HOME
         env.get_str_value("HOME")
             .map(|s| s.to_string())
-            .unwrap_or_else(|| todo!("error: HOME not set"))
+            .ok_or("sh: failed to expand ~, variable HOME is unset".to_string())
     } else {
         if !login_name.chars().all(is_portable_filename_character) {
-            todo!("error: invalid character in login name")
+            return Err(format!("sh: invalid user '{login_name}'"));
         }
         user_home
             .get_user_home(login_name)
-            .unwrap_or_else(|| todo!("error: login name not found"))
+            .ok_or(format!("sh: invalid user '{login_name}'"))
     }
 }
 
@@ -54,14 +57,14 @@ fn tilde_expansion_simple(
     is_assignment: bool,
     env: &Environment,
     user_home: &dyn UsersHomeDirs,
-) -> String {
+) -> Result<String, String> {
     if is_assignment {
         let mut result = String::with_capacity(unquoted_start.len());
         for sub in unquoted_start.split(':') {
             if sub.starts_with('~') {
                 let prefix_end = sub.find('/').unwrap_or(sub.len());
                 let login_name = &sub[1..prefix_end];
-                result += &expand_home(login_name, env, user_home);
+                result += &expand_home(login_name, env, user_home)?;
                 result += &sub[prefix_end..];
             } else {
                 result += sub
@@ -70,13 +73,13 @@ fn tilde_expansion_simple(
         }
         // removes last ':'
         result.pop();
-        result
+        Ok(result)
     } else {
         let prefix_end = unquoted_start.find('/').unwrap_or(unquoted_start.len());
         let login_name = &unquoted_start[1..prefix_end];
-        let mut result = expand_home(login_name, env, user_home);
+        let mut result = expand_home(login_name, env, user_home)?;
         result += &unquoted_start[prefix_end..];
-        result
+        Ok(result)
     }
 }
 
@@ -85,25 +88,21 @@ fn expand_tilde_with_custom_users_home_dirs(
     is_assignment: bool,
     env: &Environment,
     user_home: &dyn UsersHomeDirs,
-) {
+) -> Result<(), String> {
     let unquoted_start = if let Some(WordPart::UnquotedLiteral(start)) = word.parts.first() {
         start.as_str()
     } else {
-        return;
+        return Ok(());
     };
 
     if is_assignment {
-        // > In an assignment (see XBD Variable Assignment), multiple tilde-prefixes can be
-        // > used: at the beginning of the word (that is, following the <equals-sign> of the
-        // > assignment), following any unquoted <colon>, or both
-
         if unquoted_start.starts_with('~') {
             word.parts[0] = WordPart::QuotedLiteral(tilde_expansion_simple(
                 unquoted_start,
                 true,
                 env,
                 user_home,
-            ));
+            )?);
         }
         for i in 1..word.parts.len() {
             if let WordPart::UnquotedLiteral(lit) = &word.parts[i] {
@@ -113,13 +112,13 @@ fn expand_tilde_with_custom_users_home_dirs(
                         true,
                         env,
                         user_home,
-                    ))
+                    )?)
                 }
             }
         }
     } else {
         if !unquoted_start.starts_with('~') {
-            return;
+            return Ok(());
         }
         // > The pathname resulting from tilde expansion shall be treated as if
         // > quoted to prevent it being altered by field splitting and pathname expansion.
@@ -128,12 +127,17 @@ fn expand_tilde_with_custom_users_home_dirs(
             false,
             env,
             user_home,
-        ));
+        )?);
     }
+    Ok(())
 }
 
-pub fn tilde_expansion(word: &mut Word, is_assignment: bool, env: &Environment) {
-    expand_tilde_with_custom_users_home_dirs(word, is_assignment, env, &DefaultUsersHomeDirs);
+pub fn tilde_expansion(
+    word: &mut Word,
+    is_assignment: bool,
+    env: &Environment,
+) -> Result<(), String> {
+    expand_tilde_with_custom_users_home_dirs(word, is_assignment, env, &DefaultUsersHomeDirs)
 }
 
 #[cfg(test)]
@@ -163,7 +167,8 @@ mod tests {
     ) -> Word {
         let env = Environment::from([("HOME".to_string(), Value::new(env_home.to_string()))]);
         let mut word = unquoted_literal(word_str);
-        expand_tilde_with_custom_users_home_dirs(&mut word, is_assignment, &env, &users_home_dirs);
+        expand_tilde_with_custom_users_home_dirs(&mut word, is_assignment, &env, &users_home_dirs)
+            .expect("expansion failure");
         word
     }
 

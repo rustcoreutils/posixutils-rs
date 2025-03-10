@@ -188,8 +188,7 @@ impl<'src> CommandParser<'src> {
 
     fn parse_redirection_opt(&mut self) -> ParseResult<Option<Redirection>> {
         if let CommandToken::IoNumber(n) = self.lookahead {
-            if !(0..9).contains(&n) {
-                // TODO: bash supports (0..1023), should look into this
+            if !(0..1023).contains(&n) {
                 return Err(ParserError::new(
                     self.lookahead_lineno,
                     "invalid file descriptor",

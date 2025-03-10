@@ -111,6 +111,7 @@ impl OpenedFiles {
                 let append = *kind == IORedirectionKind::RedirectOuputAppend;
                 let file = File::options()
                     .write(true)
+                    .truncate(!append)
                     .append(append)
                     .create(true)
                     .open(target)

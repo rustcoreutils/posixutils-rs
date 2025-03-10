@@ -273,13 +273,6 @@ pub fn expand_parameter_into(
             }
         }
         ParameterExpansion::StrLen(parameter) => {
-            if matches!(
-                parameter,
-                Parameter::Special(SpecialParameter::Asterisk)
-                    | Parameter::Special(SpecialParameter::At)
-            ) {
-                todo!("error: length of '*' or '@' is unspecified")
-            }
             let mut expanded_parameter = ExpandedWord::default();
             let parameter_type = expand_simple_parameter_into(
                 &mut expanded_parameter,

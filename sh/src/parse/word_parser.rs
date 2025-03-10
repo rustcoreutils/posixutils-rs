@@ -94,9 +94,18 @@ impl<'src> WordParser<'src> {
 
             if self.lookahead == WordToken::Char('#') {
                 self.advance();
-                let expansion = self
-                    .parse_parameter(false)
-                    .map(ParameterExpansion::StrLen)?;
+                let parameter = self.parse_parameter(false)?;
+                let expansion = match parameter {
+                    Parameter::Special(SpecialParameter::Asterisk)
+                    | Parameter::Special(SpecialParameter::At) => {
+                        return Err(ParserError::new(
+                            self.line_no,
+                            "length of '*' or '@' is unspecified",
+                            false,
+                        ))
+                    }
+                    other => ParameterExpansion::StrLen(other),
+                };
                 self.match_token(WordToken::Char('}'))?;
                 return Ok(expansion);
             }

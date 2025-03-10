@@ -3,6 +3,7 @@ use crate::shell::environment::Environment;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 use std::ffi::{OsStr, OsString};
+use std::fmt::Display;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
@@ -36,6 +37,112 @@ impl<'a> CdArgs<'a> {
     }
 }
 
+fn io_err_to_string<Err: Display>(err: Err) -> String {
+    format!("cd: io error ({err})\n")
+}
+
+fn cd(
+    args: &[String],
+    shell: &mut Shell,
+    opened_files: &OpenedFiles,
+    environment: Environment,
+) -> Result<(), String> {
+    if args.len() == 1 && args[0] == "-" {
+        if let Some(oldpwd) = environment.get_str_value("OLDPWD") {
+            let old_working_dir = std::env::current_dir().unwrap();
+            nix::unistd::chdir(oldpwd).map_err(io_err_to_string)?;
+            shell.assign("PWD".to_string(), oldpwd.to_string(), false);
+            shell.assign(
+                "OLDPWD".to_string(),
+                old_working_dir.to_string_lossy().into_owned(),
+                false,
+            );
+            opened_files.stdout().write_str(format!("{}\n", oldpwd));
+            return Ok(());
+        }
+        return Err("cd: OLDPWD not set\n".to_string());
+    }
+
+    let args = match CdArgs::parse(args) {
+        Ok(args) => args,
+        Err(err) => {
+            return Err(format!("sh: {}\n", err));
+        }
+    };
+
+    let dir = if let Some(dir) = args.directory {
+        dir
+    } else {
+        if let Some(home_dir) = environment.get_str_value("HOME") {
+            home_dir
+        } else {
+            // behaviour is implementation defined, bash just returns 0
+            // and doesn't change directory
+            return Ok(());
+        }
+    };
+    let mut curr_path = OsString::new();
+
+    if !dir.starts_with('/') {
+        if !dir.starts_with('.') && !dir.starts_with("..") {
+            if let Some(cdpath) = environment.get_str_value("CDPATH") {
+                for component in cdpath.split(':') {
+                    let mut path = PathBuf::from(component);
+                    path.push(dir);
+                    if path.exists() {
+                        curr_path = path.into_os_string();
+                    }
+                }
+            } else {
+                let path = PathBuf::from(dir);
+                if path.exists() {
+                    curr_path = path.into_os_string();
+                }
+            }
+        }
+        if curr_path.is_empty() {
+            curr_path = OsString::from_vec(dir.as_bytes().to_vec());
+        }
+    } else {
+        curr_path = OsString::from_vec(dir.as_bytes().to_vec());
+    }
+
+    if !args.handle_dot_dot_physically {
+        if !curr_path.as_bytes().get(0).is_some_and(|c| *c == b'/') {
+            let mut new_curr_path = environment
+                .get_str_value("PWD")
+                .unwrap_or_default()
+                .as_bytes()
+                .to_vec();
+            if new_curr_path.last().is_some_and(|c| *c != b'/') {
+                new_curr_path.push(b'/');
+            }
+            new_curr_path.extend(curr_path.as_bytes());
+            curr_path = OsString::from_vec(new_curr_path)
+        }
+        curr_path = PathBuf::from(curr_path)
+            .canonicalize()
+            .map_err(io_err_to_string)?
+            .into_os_string();
+    }
+
+    let old_working_dir = std::env::current_dir().map_err(io_err_to_string)?;
+    nix::unistd::chdir(AsRef::<OsStr>::as_ref(&curr_path)).map_err(io_err_to_string)?;
+
+    shell.assign(
+        "PWD".to_string(),
+        curr_path.to_string_lossy().into_owned(),
+        false,
+    );
+    shell.assign(
+        "OLDPWD".to_string(),
+        old_working_dir.to_string_lossy().into_owned(),
+        false,
+    );
+
+    Ok(())
+}
+
 pub struct Cd;
 
 impl BuiltinUtility for Cd {
@@ -46,104 +153,12 @@ impl BuiltinUtility for Cd {
         opened_files: OpenedFiles,
         environment: Environment,
     ) -> i32 {
-        if args.len() == 1 && args[0] == "-" {
-            if let Some(oldpwd) = environment.get_str_value("OLDPWD") {
-                let old_working_dir = std::env::current_dir().unwrap();
-                // TODO: handle errors
-                nix::unistd::chdir(oldpwd).unwrap();
-                shell.assign("PWD".to_string(), oldpwd.to_string(), false);
-                shell.assign(
-                    "OLDPWD".to_string(),
-                    old_working_dir.to_string_lossy().into_owned(),
-                    false,
-                );
-                opened_files.stdout().write_str(format!("{}\n", oldpwd));
-                return 0;
+        match cd(args, shell, &opened_files, environment) {
+            Ok(_) => 0,
+            Err(message) => {
+                opened_files.stderr().write_str(message);
+                1
             }
-            opened_files.stderr().write_str("cd: OLDPWD not set");
-            return 1;
         }
-
-        let args = match CdArgs::parse(args) {
-            Ok(args) => args,
-            Err(err) => {
-                opened_files.stderr().write_str(format!("sh: {}", err));
-                return 2;
-            }
-        };
-
-        let dir = if let Some(dir) = args.directory {
-            dir
-        } else {
-            if let Some(home_dir) = environment.get_str_value("HOME") {
-                home_dir
-            } else {
-                // behaviour is implementation defined, bash just returns 0
-                // and doesn't change directory
-                return 0;
-            }
-        };
-        let mut curr_path = OsString::new();
-
-        if !dir.starts_with('/') {
-            if !dir.starts_with('.') && !dir.starts_with("..") {
-                if let Some(cdpath) = environment.get_str_value("CDPATH") {
-                    for component in cdpath.split(':') {
-                        let mut path = PathBuf::from(component);
-                        path.push(dir);
-                        if path.exists() {
-                            curr_path = path.into_os_string();
-                        }
-                    }
-                } else {
-                    let path = PathBuf::from(dir);
-                    if path.exists() {
-                        curr_path = path.into_os_string();
-                    }
-                }
-            }
-            if curr_path.is_empty() {
-                curr_path = OsString::from_vec(dir.as_bytes().to_vec());
-            }
-        } else {
-            curr_path = OsString::from_vec(dir.as_bytes().to_vec());
-        }
-
-        if !args.handle_dot_dot_physically {
-            if !curr_path.as_bytes().get(0).is_some_and(|c| *c == b'/') {
-                let mut new_curr_path = environment
-                    .get_str_value("PWD")
-                    .unwrap_or_default()
-                    .as_bytes()
-                    .to_vec();
-                if new_curr_path.last().is_some_and(|c| *c != b'/') {
-                    new_curr_path.push(b'/');
-                }
-                new_curr_path.extend(curr_path.as_bytes());
-                curr_path = OsString::from_vec(new_curr_path)
-            }
-            // TODO: handle error
-            curr_path = PathBuf::from(curr_path)
-                .canonicalize()
-                .unwrap()
-                .into_os_string();
-        }
-
-        // TODO: handle errors
-        let old_working_dir = std::env::current_dir().unwrap();
-        nix::unistd::chdir(AsRef::<OsStr>::as_ref(&curr_path)).unwrap();
-
-        shell.assign(
-            "PWD".to_string(),
-            curr_path.to_string_lossy().into_owned(),
-            false,
-        );
-        shell.assign(
-            "OLDPWD".to_string(),
-            old_working_dir.to_string_lossy().into_owned(),
-            false,
-        );
-
-        0
     }
 }

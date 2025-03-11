@@ -1,6 +1,7 @@
 use crate::builtin::alias::AliasBuiltin;
 use crate::builtin::cd::Cd;
 use crate::builtin::control_flow::{Break, Continue};
+use crate::builtin::dot::Dot;
 use crate::builtin::readonly::ReadOnly;
 use crate::builtin::set::SetSpecialBuiltin;
 use crate::builtin::unset::BuiltinUnset;
@@ -11,6 +12,7 @@ use crate::shell::Shell;
 pub mod alias;
 mod cd;
 mod control_flow;
+mod dot;
 mod readonly;
 pub mod set;
 mod unset;
@@ -36,11 +38,12 @@ impl SpecialBuiltinUtility for BuiltinNull {
 
 pub fn get_special_builtin_utility(name: &str) -> Option<&dyn SpecialBuiltinUtility> {
     match name {
+        "break" => Some(&Break),
+        ":" => Some(&BuiltinNull),
+        "continue" => Some(&Continue),
+        "." => Some(&Dot),
         "set" => Some(&SetSpecialBuiltin),
         "readonly" => Some(&ReadOnly),
-        "break" => Some(&Break),
-        "continue" => Some(&Continue),
-        ":" => Some(&BuiltinNull),
         "unset" => Some(&BuiltinUnset),
         _ => None,
     }

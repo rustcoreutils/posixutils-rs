@@ -1116,4 +1116,12 @@ mod builtin {
     fn unset_on_readonly_variable_is_error() {
         expect_err_and_message("readonly var=value; unset var", None);
     }
+
+    #[test]
+    fn dot() {
+        test_script(
+            include_str!("sh/builtin/dot.sh"),
+            include_str!("sh/builtin/dot.out"),
+        )
+    }
 }

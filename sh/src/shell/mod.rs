@@ -31,7 +31,6 @@ pub mod opened_files;
 
 #[derive(Clone, Debug)]
 pub enum CommandExecutionError {
-    SpecialBuiltinRedirectionError(String),
     RedirectionError(String),
     VariableAssignmentError(CannotModifyReadonly),
     ExpansionError(String),
@@ -48,6 +47,28 @@ impl From<OsError> for CommandExecutionError {
 impl From<CannotModifyReadonly> for CommandExecutionError {
     fn from(value: CannotModifyReadonly) -> Self {
         CommandExecutionError::VariableAssignmentError(value)
+    }
+}
+
+impl Display for CommandExecutionError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CommandExecutionError::RedirectionError(err) => {
+                writeln!(f, "{err}")
+            }
+            CommandExecutionError::VariableAssignmentError(err) => {
+                writeln!(f, "{err}")
+            }
+            CommandExecutionError::ExpansionError(err) => {
+                writeln!(f, "{err}\n")
+            }
+            CommandExecutionError::CommandNotFound(command_name) => {
+                writeln!(f, "sh: '{command_name}' not found\n")
+            }
+            CommandExecutionError::OsError(err) => {
+                writeln!(f, "{err}")
+            }
+        }
     }
 }
 
@@ -116,34 +137,11 @@ impl Shell {
     }
 
     fn handle_error(&self, err: CommandExecutionError) -> i32 {
+        self.eprint(&err.to_string());
         match err {
-            CommandExecutionError::SpecialBuiltinRedirectionError(err) => {
-                self.eprint(&format!("{err}\n"));
-                if !self.is_interactive {
-                    std::process::exit(1)
-                }
-                1
-            }
-            CommandExecutionError::RedirectionError(err) => {
-                self.eprint(&format!("{err}\n"));
-                1
-            }
-            CommandExecutionError::VariableAssignmentError(err) => {
-                self.eprint(&format!("{err}\n"));
-                1
-            }
-            CommandExecutionError::ExpansionError(err) => {
-                self.eprint(&format!("{err}\n"));
-                1
-            }
-            CommandExecutionError::CommandNotFound(command_name) => {
-                self.eprint(&format!("sh: '{command_name}' not found\n"));
-                127
-            }
-            CommandExecutionError::OsError(err) => {
-                self.eprint(&format!("{err}\n"));
-                std::process::exit(1)
-            }
+            CommandExecutionError::CommandNotFound(_) => 127,
+            CommandExecutionError::OsError(_) => std::process::exit(1),
+            _ => 1,
         }
     }
 
@@ -268,15 +266,13 @@ impl Shell {
                 // Bash exports them, we do the same here (neither sh, nor zsh do it though)
                 self.perform_assignments(&simple_command.assignments, true)?;
                 let mut opened_files = self.opened_files.clone();
-                opened_files
-                    .redirect(&simple_command.redirections, self)
-                    .map_err(|err| {
-                        if let CommandExecutionError::RedirectionError(err) = err {
-                            CommandExecutionError::SpecialBuiltinRedirectionError(err)
-                        } else {
-                            err
-                        }
-                    })?;
+                if let Err(err) = opened_files.redirect(&simple_command.redirections, self) {
+                    self.eprint(&err.to_string());
+                    if !self.is_interactive {
+                        std::process::exit(1)
+                    }
+                    return Ok(1);
+                }
                 let status = special_builtin_utility.exec(&expanded_words[1..], self, opened_files);
                 if status != 0 && !self.is_interactive {
                     std::process::exit(status);

@@ -1,4 +1,4 @@
-use crate::builtin::SpecialBuiltinUtility;
+use crate::builtin::{SpecialBuiltinResult, SpecialBuiltinUtility};
 use crate::parse::command_parser::is_valid_name;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
@@ -7,12 +7,14 @@ use std::collections::hash_map::Entry;
 pub struct ReadOnly;
 
 impl SpecialBuiltinUtility for ReadOnly {
-    fn exec(&self, args: &[String], shell: &mut Shell, opened_files: OpenedFiles) -> i32 {
+    fn exec(
+        &self,
+        args: &[String],
+        shell: &mut Shell,
+        opened_files: &OpenedFiles,
+    ) -> SpecialBuiltinResult {
         if args.is_empty() {
-            opened_files
-                .stderr()
-                .write_str("readonly: too few arguments\n");
-            return 1;
+            return Err("readonly: too few arguments".to_string());
         }
 
         if args[0] == "-p" {
@@ -34,30 +36,24 @@ impl SpecialBuiltinUtility for ReadOnly {
                         .write_str(format!("readonly {}\n", var));
                 }
             }
-            return 0;
+            return Ok(0);
         }
 
         for arg in args {
             let (name, value) = if let Some(pos) = arg.find('=') {
                 let (name, value) = arg.split_at(pos);
                 if !is_valid_name(name) {
-                    opened_files
-                        .stderr()
-                        .write_str(format!("readonly: '{}' is not a valid name\n", name));
-                    return 1;
+                    return Err(format!("readonly: '{name}' is not a valid name"));
                 }
                 (name.to_string(), Some(value[1..].to_string()))
             } else {
                 if !is_valid_name(&arg) {
-                    opened_files
-                        .stderr()
-                        .write_str(format!("readonly: '{}' is not a valid name\n", arg));
-                    return 1;
+                    return Err(format!("readonly: '{arg}' is not a valid name\n"));
                 }
                 (arg.clone(), None)
             };
             shell.environment.set_readonly(&name, value);
         }
-        0
+        Ok(0)
     }
 }

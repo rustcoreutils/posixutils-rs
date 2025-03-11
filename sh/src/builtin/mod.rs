@@ -15,15 +15,22 @@ mod readonly;
 pub mod set;
 mod unset;
 
+pub type SpecialBuiltinResult = Result<i32, String>;
+
 pub trait SpecialBuiltinUtility {
-    fn exec(&self, args: &[String], shell: &mut Shell, opened_files: OpenedFiles) -> i32;
+    fn exec(
+        &self,
+        args: &[String],
+        shell: &mut Shell,
+        opened_files: &OpenedFiles,
+    ) -> SpecialBuiltinResult;
 }
 
 struct BuiltinNull;
 
 impl SpecialBuiltinUtility for BuiltinNull {
-    fn exec(&self, _: &[String], _: &mut Shell, _: OpenedFiles) -> i32 {
-        0
+    fn exec(&self, _: &[String], _: &mut Shell, _: &OpenedFiles) -> SpecialBuiltinResult {
+        Ok(0)
     }
 }
 

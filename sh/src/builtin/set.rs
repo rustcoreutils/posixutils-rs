@@ -1,4 +1,4 @@
-use crate::builtin::{BuiltinUtility, SpecialBuiltinUtility};
+use crate::builtin::{BuiltinUtility, SpecialBuiltinResult, SpecialBuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 use crate::utils::strcoll;
@@ -8,12 +8,14 @@ use std::io::Write;
 pub struct SetSpecialBuiltin;
 
 impl SpecialBuiltinUtility for SetSpecialBuiltin {
-    fn exec(&self, args: &[String], shell: &mut Shell, opened_files: OpenedFiles) -> i32 {
+    fn exec(
+        &self,
+        args: &[String],
+        shell: &mut Shell,
+        opened_files: &OpenedFiles,
+    ) -> SpecialBuiltinResult {
         match shell.set_options.parse_args_and_update(args) {
-            Err(err) => {
-                opened_files.stderr().write_str(format!("set: {}\n", err));
-                2
-            }
+            Err(err) => Err(format!("set: {}\n", err)),
             Ok(parsed_args) => {
                 match parsed_args {
                     ParsedArgs::PrintSettingsHumanReadable => {
@@ -54,7 +56,7 @@ impl SpecialBuiltinUtility for SetSpecialBuiltin {
                         shell.positional_parameters = args[i..].to_vec();
                     }
                 }
-                0
+                Ok(0)
             }
         }
     }

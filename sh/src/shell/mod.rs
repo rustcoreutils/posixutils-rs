@@ -273,11 +273,16 @@ impl Shell {
                     }
                     return Ok(1);
                 }
-                let status = special_builtin_utility.exec(&expanded_words[1..], self, opened_files);
-                if status != 0 && !self.is_interactive {
-                    std::process::exit(status);
+                match special_builtin_utility.exec(&expanded_words[1..], self, &opened_files) {
+                    Ok(status) => return Ok(status),
+                    Err(err) => {
+                        opened_files.stderr().write_str(&format!("{err}\n"));
+                        if !self.is_interactive {
+                            std::process::exit(1)
+                        }
+                        return Ok(1);
+                    }
                 }
-                return Ok(status);
             }
 
             if let Some(function_body) = self.functions.get(expanded_words[0].as_str()).cloned() {

@@ -1,8 +1,8 @@
 use crate::wordexp::pattern::parse::{parse_pattern, PatternItem};
 use crate::wordexp::pattern::regex::{parsed_pattern_to_regex, Regex};
 use crate::wordexp::ExpandedWord;
-use std::ffi::{CStr, CString};
 use nix::NixPath;
+use std::ffi::{CStr, CString};
 
 mod parse;
 mod regex;
@@ -125,13 +125,19 @@ impl From<Pattern> for String {
     }
 }
 
+struct FilenamePatternPart {
+    regex: Regex,
+    starts_with_dot: bool,
+}
+
 pub struct FilenamePattern {
-    path_parts: Vec<Regex>,
+    path_parts: Vec<FilenamePatternPart>,
     pattern_string: String,
 }
 
 impl FilenamePattern {
     pub fn new(word: &ExpandedWord) -> Result<Self, String> {
+        let pattern_string = word.to_string();
         let parsed_pattern = parse_pattern(word, true)?;
         let mut path_parts = Vec::new();
 
@@ -139,13 +145,18 @@ impl FilenamePattern {
             .split(|item| *item == PatternItem::Char('/'))
             .filter(|items| !items.is_empty())
             .try_for_each(|items| {
-                path_parts.push(parsed_pattern_to_regex(items)?);
+                let starts_with_dot = items.starts_with(&[PatternItem::Char('.')]);
+                let regex = parsed_pattern_to_regex(items)?;
+                path_parts.push(FilenamePatternPart {
+                    regex,
+                    starts_with_dot,
+                });
                 Ok::<(), String>(())
             })?;
 
         Ok(Self {
             path_parts,
-            pattern_string: word.to_string(),
+            pattern_string,
         })
     }
 
@@ -157,12 +168,15 @@ impl FilenamePattern {
             "invalid depth"
         );
         let component_index = depth - 1;
-        if component_index == 0 && s.to_bytes()[0] == b'.' && !self.pattern_string.starts_with('.')
-        {
+        if s.to_bytes()[0] == b'.' && !self.path_parts[component_index].starts_with_dot {
             // dot at the start is only matched explicitly
             return false;
         }
-        if let Some(loc) = self.path_parts[component_index].match_locations(s).next() {
+        if let Some(loc) = self.path_parts[component_index]
+            .regex
+            .match_locations(s)
+            .next()
+        {
             loc.start == 0 && loc.end == s.count_bytes()
         } else {
             false
@@ -190,7 +204,6 @@ impl From<FilenamePattern> for String {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::wordexp::ExpandedWordPart;
 
     pub fn pattern_from_str(pat: &str) -> Pattern {
         Pattern::new(&ExpandedWord::unquoted_literal(pat)).expect("failed to create pattern")

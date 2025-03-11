@@ -32,14 +32,9 @@ impl SpecialBuiltinUtility for Dot {
 
         let lineno = shell.last_lineno;
         shell.last_lineno = 1;
-        let parse_result = shell.execute_program(&source);
+        let execution_result = shell.execute_program(&source);
         shell.last_lineno = lineno;
-        if let Err(err) = parse_result {
-            return Err(format!(
-                "dot: parsing error({}): {}\n",
-                err.lineno, err.message
-            ));
-        }
-        Ok(shell.last_command_substitution_status)
+        execution_result
+            .map_err(|err| format!("dot: parsing error({}): {}\n", err.lineno, err.message))
     }
 }

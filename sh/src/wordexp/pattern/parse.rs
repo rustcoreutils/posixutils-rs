@@ -363,7 +363,10 @@ impl Parser<'_> {
                     '*' => items.push(PatternItem::Asterisk),
                     '[' => match self.try_parse_bracket_expression() {
                         Ok(bracket_expression) => {
-                            items.push(PatternItem::BracketExpression(bracket_expression))
+                            items.push(PatternItem::BracketExpression(bracket_expression));
+                            // the above already skips the closing ']' so we don't need to do it at the
+                            // end of the loop
+                            continue;
                         }
                         Err(pattern_items) => {
                             items.extend(pattern_items);
@@ -684,6 +687,22 @@ mod tests {
                 PatternItem::Char('c'),
                 PatternItem::Char(']'),
                 PatternItem::Char('d')
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_character_after_bracket_expression() {
+        let parsed_pattern = parse_pattern(&ExpandedWord::unquoted_literal("[[:digit:]]a"), true)
+            .expect("parsing failed");
+        assert_eq!(
+            parsed_pattern,
+            vec![
+                PatternItem::BracketExpression(BracketExpression {
+                    items: vec![BracketItem::CharacterClass("digit".to_string())],
+                    matching: true,
+                }),
+                PatternItem::Char('a'),
             ]
         );
     }

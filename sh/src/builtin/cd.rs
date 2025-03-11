@@ -67,7 +67,7 @@ fn cd(
     let args = match CdArgs::parse(args) {
         Ok(args) => args,
         Err(err) => {
-            return Err(format!("sh: {}\n", err));
+            return Err(format!("cd: {}\n", err));
         }
     };
 

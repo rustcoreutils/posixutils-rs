@@ -37,7 +37,9 @@ impl SpecialBuiltinUtility for Dot {
 
         let lineno = shell.last_lineno;
         shell.last_lineno = 1;
+        std::mem::swap(&mut shell.opened_files, opened_files);
         let execution_result = shell.execute_program(&source);
+        std::mem::swap(&mut shell.opened_files, opened_files);
         shell.last_lineno = lineno;
         execution_result
             .map_err(|err| format!("dot: parsing error({}): {}\n", err.lineno, err.message))

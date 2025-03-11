@@ -67,13 +67,15 @@ fn list_files_rec(
                 }
             }
             DirEntry::Dir(dir_name) => {
-                prefix.push(&dir_name);
-                current_directory.push(&dir_name);
-                let dir_name_cstring = CString::new(dir_name.into_encoded_bytes()).unwrap();
+                let dir_name_cstring = CString::new(dir_name.clone().into_encoded_bytes()).unwrap();
                 if pattern.matches_all(component_index, &dir_name_cstring) {
+                    let prev_prefix = prefix.clone();
+                    prefix.push(&dir_name);
                     if add_to_result {
                         result.push(prefix.clone().into_os_string())
                     } else {
+                        let prev_current_dir = current_directory.clone();
+                        current_directory.push(&dir_name);
                         list_files_rec(
                             filesystem,
                             pattern,
@@ -82,10 +84,10 @@ fn list_files_rec(
                             prefix,
                             result,
                         );
+                        *current_directory = prev_current_dir;
                     }
+                    *prefix = prev_prefix;
                 }
-                prefix.pop();
-                current_directory.pop();
             }
             _ => {}
         }

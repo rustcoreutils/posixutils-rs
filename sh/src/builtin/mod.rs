@@ -24,14 +24,19 @@ pub trait SpecialBuiltinUtility {
         &self,
         args: &[String],
         shell: &mut Shell,
-        opened_files: &OpenedFiles,
+        opened_files: &mut OpenedFiles,
     ) -> SpecialBuiltinResult;
 }
 
 struct BuiltinNull;
 
 impl SpecialBuiltinUtility for BuiltinNull {
-    fn exec(&self, _: &[String], _: &mut Shell, _: &OpenedFiles) -> SpecialBuiltinResult {
+    fn exec(
+        &self,
+        args: &[String],
+        shell: &mut Shell,
+        _: &mut OpenedFiles,
+    ) -> SpecialBuiltinResult {
         Ok(0)
     }
 }

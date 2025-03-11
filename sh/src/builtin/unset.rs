@@ -5,7 +5,12 @@ use crate::shell::Shell;
 pub struct BuiltinUnset;
 
 impl SpecialBuiltinUtility for BuiltinUnset {
-    fn exec(&self, args: &[String], shell: &mut Shell, _: &OpenedFiles) -> SpecialBuiltinResult {
+    fn exec(
+        &self,
+        args: &[String],
+        shell: &mut Shell,
+        opened_files: &mut OpenedFiles,
+    ) -> SpecialBuiltinResult {
         if args.is_empty() {
             return Ok(0);
         }

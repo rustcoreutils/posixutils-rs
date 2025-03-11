@@ -12,7 +12,7 @@ impl SpecialBuiltinUtility for SetSpecialBuiltin {
         &self,
         args: &[String],
         shell: &mut Shell,
-        opened_files: &OpenedFiles,
+        opened_files: &mut OpenedFiles,
     ) -> SpecialBuiltinResult {
         match shell.set_options.parse_args_and_update(args) {
             Err(err) => Err(format!("set: {}\n", err)),

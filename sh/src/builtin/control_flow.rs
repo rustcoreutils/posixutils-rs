@@ -38,7 +38,12 @@ fn loop_control_flow(
 pub struct Break;
 
 impl SpecialBuiltinUtility for Break {
-    fn exec(&self, args: &[String], shell: &mut Shell, _: &OpenedFiles) -> SpecialBuiltinResult {
+    fn exec(
+        &self,
+        args: &[String],
+        shell: &mut Shell,
+        opened_files: &mut OpenedFiles,
+    ) -> SpecialBuiltinResult {
         loop_control_flow(args, shell, "break", ControlFlowState::Break)
     }
 }
@@ -46,7 +51,12 @@ impl SpecialBuiltinUtility for Break {
 pub struct Continue;
 
 impl SpecialBuiltinUtility for Continue {
-    fn exec(&self, args: &[String], shell: &mut Shell, _: &OpenedFiles) -> SpecialBuiltinResult {
+    fn exec(
+        &self,
+        args: &[String],
+        shell: &mut Shell,
+        opened_files: &mut OpenedFiles,
+    ) -> SpecialBuiltinResult {
         loop_control_flow(args, shell, "break", ControlFlowState::Continue)
     }
 }

@@ -273,7 +273,7 @@ impl Shell {
                     }
                     return Ok(1);
                 }
-                match special_builtin_utility.exec(&expanded_words[1..], self, &opened_files) {
+                match special_builtin_utility.exec(&expanded_words[1..], self, &mut opened_files) {
                     Ok(status) => return Ok(status),
                     Err(err) => {
                         opened_files.stderr().write_str(&format!("{err}\n"));

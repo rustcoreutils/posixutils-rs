@@ -11,7 +11,7 @@ impl SpecialBuiltinUtility for ReadOnly {
         &self,
         args: &[String],
         shell: &mut Shell,
-        opened_files: &OpenedFiles,
+        opened_files: &mut OpenedFiles,
     ) -> SpecialBuiltinResult {
         if args.is_empty() {
             return Err("readonly: too few arguments".to_string());

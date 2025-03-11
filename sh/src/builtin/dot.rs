@@ -7,7 +7,12 @@ use std::ffi::OsString;
 pub struct Dot;
 
 impl SpecialBuiltinUtility for Dot {
-    fn exec(&self, args: &[String], shell: &mut Shell, _: &OpenedFiles) -> SpecialBuiltinResult {
+    fn exec(
+        &self,
+        args: &[String],
+        shell: &mut Shell,
+        opened_files: &mut OpenedFiles,
+    ) -> SpecialBuiltinResult {
         if args.len() != 1 {
             return Err("dot: incorrect number of arguments".to_string());
         }

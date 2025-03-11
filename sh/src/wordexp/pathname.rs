@@ -22,7 +22,7 @@ struct DefaultFileSystem;
 
 impl FileSystem for DefaultFileSystem {
     fn read_dir(&self, path: &Path) -> DirContent {
-        let mut result = DirContent::default();
+        let mut result = vec![DirEntry::Dir(".".into()), DirEntry::Dir("..".into())];
         let dir_iter = if let Ok(iter) = std::fs::read_dir(path) {
             iter
         } else {

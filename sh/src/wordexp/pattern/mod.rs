@@ -296,6 +296,9 @@ pub mod tests {
         assert!(!pattern.matches_all(1, &cstring_from_str(".test")));
         assert!(pattern.matches_all(1, &cstring_from_str("atest")));
 
+        let pattern = filename_pattern_from_str("/dir/*file");
+        assert!(!pattern.matches_all(2, &cstring_from_str(".file")));
+
         let pattern = filename_pattern_from_str(".test");
         assert!(pattern.matches_all(1, &cstring_from_str(".test")));
     }

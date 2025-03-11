@@ -107,7 +107,7 @@ pub struct Shell {
     pub positional_parameters: Vec<String>,
     pub opened_files: OpenedFiles,
     pub functions: HashMap<Name, Rc<CompoundCommand>>,
-    pub most_recent_pipeline_exit_status: i32,
+    pub last_pipeline_exit_status: i32,
     pub last_command_substitution_status: i32,
     pub shell_pid: i32,
     pub most_recent_background_command_pid: Option<i32>,
@@ -553,12 +553,12 @@ impl Shell {
                 }
             }
         }
-        self.most_recent_pipeline_exit_status = if pipeline.negate_status {
+        self.last_pipeline_exit_status = if pipeline.negate_status {
             (pipeline_exit_status == 0) as i32
         } else {
             pipeline_exit_status
         };
-        Ok(self.most_recent_pipeline_exit_status)
+        Ok(self.last_pipeline_exit_status)
     }
 
     fn interpret_conjunction(&mut self, conjunction: &Conjunction) -> i32 {
@@ -606,7 +606,7 @@ impl Shell {
                 drop(read_pipe);
                 dup2(write_pipe.as_raw_fd(), libc::STDOUT_FILENO)?;
                 self.execute_program(program).unwrap();
-                std::process::exit(self.most_recent_pipeline_exit_status);
+                std::process::exit(self.last_pipeline_exit_status);
             }
             ForkResult::Parent { child } => {
                 drop(write_pipe);
@@ -624,18 +624,19 @@ impl Shell {
         }
     }
 
-    pub fn execute_program(&mut self, program: &str) -> Result<(), ParserError> {
+    pub fn execute_program(&mut self, program: &str) -> Result<i32, ParserError> {
         let mut parser = CommandParser::new(program, self.last_lineno)?;
+        let mut result = 0;
         loop {
             let command = parser.parse_next_command(&self.alias_table)?;
             if let Some(command) = command {
-                self.interpret(&command);
+                result = self.interpret(&command);
             } else {
                 break;
             }
         }
         self.last_lineno = parser.lineno() - 1;
-        Ok(())
+        Ok(result)
     }
 
     pub fn initialize_from_system(
@@ -708,7 +709,7 @@ impl Default for Shell {
             positional_parameters: Vec::default(),
             opened_files: OpenedFiles::default(),
             functions: HashMap::default(),
-            most_recent_pipeline_exit_status: 0,
+            last_pipeline_exit_status: 0,
             last_command_substitution_status: 0,
             shell_pid: 0,
             most_recent_background_command_pid: None,

@@ -101,5 +101,5 @@ fn main() {
             _ => unreachable!(),
         },
     }
-    std::process::exit(shell.most_recent_pipeline_exit_status);
+    std::process::exit(shell.last_pipeline_exit_status);
 }

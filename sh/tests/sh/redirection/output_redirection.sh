@@ -1,5 +1,5 @@
 mkdir -p tests/write_dir
-cd tests/write_dir
+cd $TEST_WRITE_DIR
 
 echo test >ouput_redirection.txt
 cat ouput_redirection.txt

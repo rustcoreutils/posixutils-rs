@@ -1,4 +1,4 @@
-cd tests/read_dir
+cd $TEST_READ_DIR
 
 echo dir/inner_dir/data1
 echo dir/inner_dir/*

@@ -1,8 +1,26 @@
 use plib::{run_test, run_test_with_checker, TestPlan};
 use std::os::unix::process::ExitStatusExt;
 use std::process::Output;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static SET_TEST_VARS: AtomicBool = AtomicBool::new(true);
+
+fn set_env_vars() {
+    if SET_TEST_VARS.load(Ordering::SeqCst) {
+        let current_dir = std::env::current_dir().unwrap();
+        let base_dir = if current_dir.ends_with("sh") {
+            current_dir.join("tests")
+        } else {
+            current_dir.join("sh/tests")
+        };
+        std::env::set_var("TEST_READ_DIR", base_dir.join("read_dir"));
+        std::env::set_var("TEST_WRITE_DIR", base_dir.join("write_dir"));
+        SET_TEST_VARS.store(false, Ordering::SeqCst);
+    }
+}
 
 fn run_script_with_checker<F: Fn(&Output)>(script: &str, checker: F) {
+    set_env_vars();
     run_test_with_checker(
         TestPlan {
             cmd: "sh".to_string(),
@@ -17,6 +35,7 @@ fn run_script_with_checker<F: Fn(&Output)>(script: &str, checker: F) {
 }
 
 pub fn run_successfully_and<F: Fn(&str)>(program: &str, checker: F) {
+    set_env_vars();
     run_script_with_checker(program, |output| {
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -25,6 +44,7 @@ pub fn run_successfully_and<F: Fn(&str)>(program: &str, checker: F) {
 }
 
 pub fn test_cli(args: Vec<&str>, stdin: &str, expected_output: &str) {
+    set_env_vars();
     run_test(TestPlan {
         cmd: "sh".to_string(),
         args: args.iter().map(|s| s.to_string()).collect(),
@@ -36,6 +56,7 @@ pub fn test_cli(args: Vec<&str>, stdin: &str, expected_output: &str) {
 }
 
 pub fn test_script(script: &str, expected_output: &str) {
+    set_env_vars();
     run_test(TestPlan {
         cmd: "sh".to_string(),
         args: vec![],
@@ -47,6 +68,7 @@ pub fn test_script(script: &str, expected_output: &str) {
 }
 
 fn test_script_expect_stderr_and_stdout(script: &str, expected_output: &str) {
+    set_env_vars();
     run_test_with_checker(
         TestPlan {
             cmd: "sh".to_string(),
@@ -65,6 +87,7 @@ fn test_script_expect_stderr_and_stdout(script: &str, expected_output: &str) {
 }
 
 fn test_script_expect_error_status_stderr_and_stdout(script: &str, stdout: Option<&str>) {
+    set_env_vars();
     run_test_with_checker(
         TestPlan {
             cmd: "sh".to_string(),
@@ -85,6 +108,7 @@ fn test_script_expect_error_status_stderr_and_stdout(script: &str, stdout: Optio
 }
 
 fn expect_exit_code(script: &str, exit_code: i32) {
+    set_env_vars();
     run_test_with_checker(
         TestPlan {
             cmd: "sh".to_string(),
@@ -590,7 +614,6 @@ mod special_variables {
         run_successfully_and("echo $PWD", |output| {
             assert!(!output.is_empty());
             assert!(output.starts_with('/'));
-            assert!(output.ends_with("/sh\n"));
         })
     }
 }
@@ -766,7 +789,7 @@ mod redirection {
             r#"
             set -o noclobber
             mkdir -p tests/write_dir
-            cd tests/write_dir
+            cd $TEST_WRITE_DIR
             echo test1 > standard_output_redirection_fails_with_noclobber_set.txt
             echo test2 > standard_output_redirection_fails_with_noclobber_set.txt
             cat standard_output_redirection_fails_with_noclobber_set.txt

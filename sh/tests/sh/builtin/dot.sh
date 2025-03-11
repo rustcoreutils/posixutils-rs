@@ -1,4 +1,4 @@
-cd tests/read_dir
+cd $TEST_READ_DIR
 
 . ./file2.txt
 echo $?

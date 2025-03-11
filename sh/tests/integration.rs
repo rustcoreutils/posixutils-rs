@@ -2,7 +2,7 @@ use plib::{run_test, run_test_with_checker, TestPlan};
 use std::os::unix::process::ExitStatusExt;
 use std::process::Output;
 
-fn run_script<F: Fn(&Output)>(script: &str, checker: F) {
+fn run_script_with_checker<F: Fn(&Output)>(script: &str, checker: F) {
     run_test_with_checker(
         TestPlan {
             cmd: "sh".to_string(),
@@ -17,7 +17,7 @@ fn run_script<F: Fn(&Output)>(script: &str, checker: F) {
 }
 
 pub fn run_successfully_and<F: Fn(&str)>(program: &str, checker: F) {
-    run_script(program, |output| {
+    run_script_with_checker(program, |output| {
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
         checker(stdout.as_ref());
@@ -46,7 +46,7 @@ pub fn test_script(script: &str, expected_output: &str) {
     });
 }
 
-fn test_script_expect_err(script: &str, expected_output: &str) {
+fn test_script_expect_stderr_and_stdout(script: &str, expected_output: &str) {
     run_test_with_checker(
         TestPlan {
             cmd: "sh".to_string(),
@@ -64,7 +64,7 @@ fn test_script_expect_err(script: &str, expected_output: &str) {
     );
 }
 
-fn expect_err_and_message(script: &str, stdout: Option<&str>) {
+fn test_script_expect_error_status_stderr_and_stdout(script: &str, stdout: Option<&str>) {
     run_test_with_checker(
         TestPlan {
             cmd: "sh".to_string(),
@@ -602,16 +602,16 @@ mod word_expansion {
     fn parameter_expansion_indicate_error_if_null_or_unset() {
         test_script("x=val; echo ${x?error}", "val\n");
         test_script("x=val; echo ${x:?error}", "val\n");
-        test_script_expect_err("echo ${x?error}", "");
-        test_script_expect_err("echo ${x:?error}", "");
+        test_script_expect_stderr_and_stdout("echo ${x?error}", "");
+        test_script_expect_stderr_and_stdout("echo ${x:?error}", "");
         test_script("x=; echo ${x?error}", "\n");
-        test_script_expect_err("x=; echo ${x:?error}", "");
+        test_script_expect_stderr_and_stdout("x=; echo ${x:?error}", "");
     }
 
     #[test]
     fn string_operations_on_unset_parameters_fail_with_no_unset() {
-        test_script_expect_err("set -u; echo ${#UNSET}", "");
-        test_script_expect_err("set -u; echo ${UNSET%test}", "");
+        test_script_expect_stderr_and_stdout("set -u; echo ${#UNSET}", "");
+        test_script_expect_stderr_and_stdout("set -u; echo ${UNSET%test}", "");
     }
 
     #[test]
@@ -762,7 +762,7 @@ mod redirection {
 
     #[test]
     fn standard_output_redirection_fails_with_noclobber_set() {
-        run_script(
+        run_script_with_checker(
             r#"
             set -o noclobber
             mkdir -p tests/write_dir
@@ -784,7 +784,7 @@ mod redirection {
 
     #[test]
     fn duplicate_stderr_to_stdout() {
-        run_script("echo test 1>&2", |output| {
+        run_script_with_checker("echo test 1>&2", |output| {
             assert!(output.status.success());
             assert_eq!(String::from_utf8_lossy(&output.stdout), "");
             assert_eq!(String::from_utf8_lossy(&output.stderr), "test\n");
@@ -874,22 +874,25 @@ mod errors {
 
     #[test]
     fn exit_on_syntax_error() {
-        expect_err_and_message("echo &&; echo wrong", None);
+        test_script_expect_error_status_stderr_and_stdout("echo &&; echo wrong", None);
     }
 
     #[test]
     fn exit_on_special_builtin_error() {
-        expect_err_and_message("set -o abc; echo wrong", None);
+        test_script_expect_error_status_stderr_and_stdout("set -o abc; echo wrong", None);
     }
 
     #[test]
     fn builtin_error_does_not_exit() {
-        test_script_expect_err("cd nonexistent; echo $?; echo correct", "1\ncorrect\n");
+        test_script_expect_stderr_and_stdout(
+            "cd nonexistent; echo $?; echo correct",
+            "1\ncorrect\n",
+        );
     }
 
     #[test]
     fn expansion_error_shall_exit() {
-        expect_err_and_message("${x!y}", None);
+        test_script_expect_error_status_stderr_and_stdout("${x!y}", None);
     }
 
     #[test]
@@ -903,7 +906,7 @@ mod commands {
 
     #[test]
     fn assigning_to_readonly_var_is_error() {
-        expect_err_and_message("readonly x=1; x=2", None);
+        test_script_expect_error_status_stderr_and_stdout("readonly x=1; x=2", None);
     }
 
     #[test]
@@ -1106,7 +1109,7 @@ mod builtin {
 
     #[test]
     fn unset_function() {
-        test_script_expect_err(
+        test_script_expect_stderr_and_stdout(
             include_str!("sh/builtin/unset_function.sh"),
             include_str!("sh/builtin/unset_function.out"),
         );
@@ -1114,7 +1117,7 @@ mod builtin {
 
     #[test]
     fn unset_on_readonly_variable_is_error() {
-        expect_err_and_message("readonly var=value; unset var", None);
+        test_script_expect_error_status_stderr_and_stdout("readonly var=value; unset var", None);
     }
 
     #[test]

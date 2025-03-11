@@ -1,9 +1,10 @@
 use nix::libc;
 use nix::sys::wait::WaitStatus;
 use nix::unistd::{ForkResult, Pid};
-use std::ffi::CStr;
+use std::ffi::{CStr, OsString};
 use std::fmt::{Display, Formatter};
 use std::os::fd::{OwnedFd, RawFd};
+use std::path::PathBuf;
 
 pub fn strcoll(lhs: &CStr, rhs: &CStr) -> std::cmp::Ordering {
     // strings are valid, this is safe
@@ -60,4 +61,15 @@ pub fn waitpid(pid: Pid) -> OsResult<WaitStatus> {
 pub fn close(fd: RawFd) -> OsResult<()> {
     nix::unistd::close(fd)
         .map_err(|err| format!("sh: internal call to close failed ({err})").into())
+}
+
+pub fn find_in_path(command: &str, env_path: &str) -> Option<OsString> {
+    for path in env_path.split(':') {
+        let mut command_path = PathBuf::from(path);
+        command_path.push(command);
+        if command_path.is_file() {
+            return Some(command_path.into_os_string());
+        }
+    }
+    None
 }

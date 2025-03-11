@@ -10,7 +10,7 @@ use crate::parse::word_parser::parse_word;
 use crate::parse::{AliasTable, ParserError};
 use crate::shell::environment::{CannotModifyReadonly, Environment, Value};
 use crate::shell::opened_files::{OpenedFile, OpenedFiles};
-use crate::utils::{close, dup2, fork, pipe, waitpid, OsError, OsResult};
+use crate::utils::{close, dup2, find_in_path, fork, pipe, waitpid, OsError, OsResult};
 use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
 use nix::errno::Errno;
 use nix::sys::wait::WaitStatus;
@@ -22,22 +22,12 @@ use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::{read_to_string, Read, Write};
 use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 pub mod environment;
 pub mod opened_files;
-
-fn find_in_path(command: &str, env_path: &str) -> Option<String> {
-    for path in env_path.split(':') {
-        let mut command_path = PathBuf::from(path);
-        command_path.push(command);
-        if command_path.is_file() {
-            return Some(command_path.into_os_string().to_string_lossy().into());
-        }
-    }
-    None
-}
 
 #[derive(Clone, Debug)]
 pub enum CommandExecutionError {
@@ -157,7 +147,7 @@ impl Shell {
         }
     }
 
-    fn exec(&self, command: &str, args: &[String]) -> OsResult<i32> {
+    fn exec(&self, command: OsString, args: &[String]) -> OsResult<i32> {
         match fork()? {
             ForkResult::Child => {
                 for (id, file) in &self.opened_files.opened_files {
@@ -180,7 +170,7 @@ impl Shell {
                     };
                     dup2(src, dest)?;
                 }
-                let command = CString::new(command).unwrap();
+                let command = CString::new(command.into_vec()).unwrap();
                 let args = args
                     .iter()
                     .map(|s| CString::new(s.as_str()).unwrap())
@@ -264,13 +254,13 @@ impl Shell {
             command_environment
                 .opened_files
                 .redirect(&simple_command.redirections, self)?;
-            let command = &expanded_words[0];
+            let command = OsString::from(&expanded_words[0]);
             let arguments = expanded_words
                 .iter()
                 .map(|w| w.clone())
                 .collect::<Vec<String>>();
             command_environment
-                .exec(&command, &arguments)
+                .exec(command, &arguments)
                 .map_err(|err| err.into())
         } else {
             if let Some(special_builtin_utility) = get_special_builtin_utility(&expanded_words[0]) {
@@ -339,7 +329,7 @@ impl Shell {
                     .map(|w| w.clone())
                     .collect::<Vec<String>>();
                 command_environment
-                    .exec(&command, &arguments)
+                    .exec(command, &arguments)
                     .map_err(|err| err.into())
             } else {
                 Err(CommandExecutionError::CommandNotFound(

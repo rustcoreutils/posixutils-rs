@@ -60,10 +60,10 @@ impl Display for CommandExecutionError {
                 writeln!(f, "{err}")
             }
             CommandExecutionError::ExpansionError(err) => {
-                writeln!(f, "{err}\n")
+                writeln!(f, "{err}")
             }
             CommandExecutionError::CommandNotFound(command_name) => {
-                writeln!(f, "sh: '{command_name}' not found\n")
+                writeln!(f, "sh: '{command_name}' not found")
             }
             CommandExecutionError::OsError(err) => {
                 writeln!(f, "{err}")

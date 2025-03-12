@@ -36,7 +36,7 @@ impl SpecialBuiltinUtility for Dot {
         };
 
         let lineno = shell.last_lineno;
-        shell.last_lineno = 1;
+        shell.last_lineno = 0;
         std::mem::swap(&mut shell.opened_files, opened_files);
         let execution_result = shell.execute_program(&source);
         std::mem::swap(&mut shell.opened_files, opened_files);

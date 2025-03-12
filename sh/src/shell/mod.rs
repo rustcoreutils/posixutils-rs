@@ -381,6 +381,18 @@ impl Shell {
         status
     }
 
+    fn interpret_subshell(&mut self, commands: &CompleteCommand) -> CommandExecutionResult<i32> {
+        match fork()? {
+            ForkResult::Child => {
+                std::process::exit(self.interpret(commands));
+            }
+            ForkResult::Parent { child } => match waitpid(child)? {
+                WaitStatus::Exited(_, status) => Ok(status),
+                _ => todo!(),
+            },
+        }
+    }
+
     fn interpret_compound_command(
         &mut self,
         compound_command: &CompoundCommand,
@@ -391,10 +403,7 @@ impl Shell {
         std::mem::swap(&mut self.opened_files, &mut prev_opened_files);
         let result = match compound_command {
             CompoundCommand::BraceGroup(command) => Ok(self.interpret(command)),
-            CompoundCommand::Subshell(commands) => {
-                let mut subshell = self.clone();
-                Ok(subshell.interpret(commands))
-            }
+            CompoundCommand::Subshell(commands) => self.interpret_subshell(commands),
             CompoundCommand::ForClause {
                 iter_var,
                 words,

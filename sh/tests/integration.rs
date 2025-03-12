@@ -1166,4 +1166,12 @@ mod builtin {
             include_str!("sh/builtin/exec.out"),
         )
     }
+
+    #[test]
+    fn exit() {
+        test_script(
+            include_str!("sh/builtin/exit.sh"),
+            include_str!("sh/builtin/exit.out"),
+        )
+    }
 }

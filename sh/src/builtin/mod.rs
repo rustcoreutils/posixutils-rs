@@ -4,6 +4,7 @@ use crate::builtin::control_flow::{Break, Continue};
 use crate::builtin::dot::Dot;
 use crate::builtin::eval::Eval;
 use crate::builtin::exec::Exec;
+use crate::builtin::exit::Exit;
 use crate::builtin::readonly::ReadOnly;
 use crate::builtin::set::SetSpecialBuiltin;
 use crate::builtin::unset::BuiltinUnset;
@@ -17,6 +18,7 @@ mod control_flow;
 mod dot;
 mod eval;
 mod exec;
+mod exit;
 mod readonly;
 pub mod set;
 mod unset;
@@ -53,6 +55,7 @@ pub fn get_special_builtin_utility(name: &str) -> Option<&dyn SpecialBuiltinUtil
         "." => Some(&Dot),
         "eval" => Some(&Eval),
         "exec" => Some(&Exec),
+        "exit" => Some(&Exit),
         "set" => Some(&SetSpecialBuiltin),
         "readonly" => Some(&ReadOnly),
         "unset" => Some(&BuiltinUnset),

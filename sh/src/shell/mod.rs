@@ -10,7 +10,9 @@ use crate::parse::word_parser::parse_word;
 use crate::parse::{AliasTable, ParserError};
 use crate::shell::environment::{CannotModifyReadonly, Environment, Value};
 use crate::shell::opened_files::{OpenedFile, OpenedFiles};
-use crate::utils::{close, dup2, find_in_path, fork, pipe, waitpid, OsError, OsResult};
+use crate::utils::{
+    close, dup2, exec, find_in_path, fork, pipe, waitpid, ExecError, OsError, OsResult,
+};
 use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
 use nix::errno::Errno;
 use nix::sys::wait::WaitStatus;
@@ -147,57 +149,14 @@ impl Shell {
 
     fn exec(&self, command: OsString, args: &[String]) -> OsResult<i32> {
         match fork()? {
-            ForkResult::Child => {
-                for (id, file) in &self.opened_files.opened_files {
-                    let dest = *id as i32;
-                    let src = match file {
-                        OpenedFile::Stdin => libc::STDIN_FILENO,
-                        OpenedFile::Stdout => libc::STDOUT_FILENO,
-                        OpenedFile::Stderr => libc::STDERR_FILENO,
-                        OpenedFile::ReadFile(file)
-                        | OpenedFile::WriteFile(file)
-                        | OpenedFile::ReadWriteFile(file) => file.as_raw_fd(),
-                        OpenedFile::HereDocument(contents) => {
-                            let (read_pipe, write_pipe) = pipe()?;
-                            nix::unistd::write(write_pipe, contents.as_bytes()).map_err(|err| {
-                                OsError::from(format!("sh: internal call to write failed ({err})"))
-                            })?;
-                            dup2(read_pipe.as_raw_fd(), dest)?;
-                            continue;
-                        }
-                    };
-                    dup2(src, dest)?;
+            ForkResult::Child => match exec(command, args, &self.opened_files, &self.environment) {
+                Err(ExecError::OsError(err)) => {
+                    self.eprint(&format!("{err}\n"));
+                    std::process::exit(1)
                 }
-                let command = CString::new(command.into_vec()).unwrap();
-                let args = args
-                    .iter()
-                    .map(|s| CString::new(s.as_str()).unwrap())
-                    .collect::<Vec<_>>();
-                let env = self
-                    .environment
-                    .variables
-                    .iter()
-                    .filter_map(|(name, value)| {
-                        if value.export {
-                            // TODO: look into this unwrap
-                            value
-                                .value
-                                .as_ref()
-                                .map(|v| CString::new(format!("{name}={}", v)).unwrap())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<CString>>();
-                // unwrap is safe here, because execve will only return if it fails
-                let err = execve(&command, &args, &env).unwrap_err();
-                if err == Errno::ENOEXEC {
-                    // TODO: the spec says that we should try to execute the file as a shell script
-                    // before returning error
-                    todo!()
-                }
-                std::process::exit(126);
-            }
+                Err(ExecError::CannotExecute(_)) => std::process::exit(126),
+                Ok(_) => unreachable!(),
+            },
             ForkResult::Parent { child } => match waitpid(child)? {
                 WaitStatus::Exited(_, status) => Ok(status),
                 _ => todo!(),

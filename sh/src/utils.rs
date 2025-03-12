@@ -1,9 +1,14 @@
+use crate::shell::environment::Environment;
+use crate::shell::opened_files::{OpenedFile, OpenedFiles};
+use nix::errno::Errno;
 use nix::libc;
 use nix::sys::wait::WaitStatus;
-use nix::unistd::{ForkResult, Pid};
-use std::ffi::{CStr, OsString};
+use nix::unistd::{execve, ForkResult, Pid};
+use std::convert::Infallible;
+use std::ffi::{CStr, CString, OsString};
 use std::fmt::{Display, Formatter};
-use std::os::fd::{OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 
 pub fn strcoll(lhs: &CStr, rhs: &CStr) -> std::cmp::Ordering {
@@ -72,4 +77,71 @@ pub fn find_in_path(command: &str, env_path: &str) -> Option<OsString> {
         }
     }
     None
+}
+
+pub enum ExecError {
+    OsError(String),
+    CannotExecute(Errno),
+}
+
+impl From<OsError> for ExecError {
+    fn from(value: OsError) -> Self {
+        Self::OsError(value.0)
+    }
+}
+
+pub fn exec(
+    command: OsString,
+    args: &[String],
+    opened_files: &OpenedFiles,
+    env: &Environment,
+) -> Result<Infallible, ExecError> {
+    for (id, file) in &opened_files.opened_files {
+        let dest = *id as i32;
+        let src = match file {
+            OpenedFile::Stdin => libc::STDIN_FILENO,
+            OpenedFile::Stdout => libc::STDOUT_FILENO,
+            OpenedFile::Stderr => libc::STDERR_FILENO,
+            OpenedFile::ReadFile(file)
+            | OpenedFile::WriteFile(file)
+            | OpenedFile::ReadWriteFile(file) => file.as_raw_fd(),
+            OpenedFile::HereDocument(contents) => {
+                let (read_pipe, write_pipe) = pipe()?;
+                nix::unistd::write(write_pipe, contents.as_bytes()).map_err(|err| {
+                    OsError::from(format!("sh: internal call to write failed ({err})"))
+                })?;
+                dup2(read_pipe.as_raw_fd(), dest)?;
+                continue;
+            }
+        };
+        dup2(src, dest)?;
+    }
+    let command = CString::new(command.into_vec()).unwrap();
+    let args = args
+        .iter()
+        .map(|s| CString::new(s.as_str()).unwrap())
+        .collect::<Vec<_>>();
+    let env = env
+        .variables
+        .iter()
+        .filter_map(|(name, value)| {
+            if value.export {
+                // TODO: look into this unwrap
+                value
+                    .value
+                    .as_ref()
+                    .map(|v| CString::new(format!("{name}={}", v)).unwrap())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<CString>>();
+    // unwrap is safe here, because execve will only return if it fails
+    let err = execve(&command, &args, &env).unwrap_err();
+    if err == Errno::ENOEXEC {
+        // TODO: the spec says that we should try to execute the file as a shell script
+        // before returning error
+        todo!()
+    }
+    Err(ExecError::CannotExecute(err))
 }

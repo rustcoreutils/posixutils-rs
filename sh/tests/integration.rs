@@ -1150,4 +1150,12 @@ mod builtin {
             include_str!("sh/builtin/dot.out"),
         )
     }
+
+    #[test]
+    fn eval() {
+        test_script(
+            include_str!("sh/builtin/eval.sh"),
+            include_str!("sh/builtin/eval.out"),
+        )
+    }
 }

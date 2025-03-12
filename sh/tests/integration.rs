@@ -1158,4 +1158,12 @@ mod builtin {
             include_str!("sh/builtin/eval.out"),
         )
     }
+
+    #[test]
+    fn exec() {
+        test_script(
+            include_str!("sh/builtin/exec.sh"),
+            include_str!("sh/builtin/exec.out"),
+        )
+    }
 }

@@ -1,7 +1,7 @@
 use crate::builtin::{SpecialBuiltinResult, SpecialBuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
-use crate::utils::find_in_path;
+use crate::utils::{find_command, find_in_path};
 use std::ffi::OsString;
 
 pub struct Dot;
@@ -17,18 +17,14 @@ impl SpecialBuiltinUtility for Dot {
             return Err("dot: incorrect number of arguments".to_string());
         }
 
-        let path = if args[0].contains('/') {
-            OsString::from(&args[0])
-        } else if let Some(path) = find_in_path(
-            &args[0],
-            shell.environment.get_str_value("PATH").unwrap_or_default(),
-        ) {
-            path
+        let path = shell.environment.get_str_value("PATH").unwrap_or_default();
+        let file_path = if let Some(file_path) = find_command(&args[0], path) {
+            file_path
         } else {
             return Err(format!("dot: {}, no such file or directory\n", &args[0]));
         };
 
-        let source = match std::fs::read_to_string(path) {
+        let source = match std::fs::read_to_string(file_path) {
             Ok(source) => source,
             Err(err) => {
                 return Err(format!("dot: error opening file ({})\n", err));

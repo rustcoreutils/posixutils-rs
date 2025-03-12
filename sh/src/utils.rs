@@ -79,6 +79,19 @@ pub fn find_in_path(command: &str, env_path: &str) -> Option<OsString> {
     None
 }
 
+pub fn find_command(command: &str, env_path: &str) -> Option<OsString> {
+    if command.contains('/') {
+        let path = PathBuf::from(command);
+        if path.exists() {
+            Some(path.into_os_string())
+        } else {
+            None
+        }
+    } else {
+        find_in_path(command, env_path)
+    }
+}
+
 pub enum ExecError {
     OsError(String),
     CannotExecute(Errno),

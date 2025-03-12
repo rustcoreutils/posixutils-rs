@@ -11,7 +11,8 @@ use crate::parse::{AliasTable, ParserError};
 use crate::shell::environment::{CannotModifyReadonly, Environment, Value};
 use crate::shell::opened_files::{OpenedFile, OpenedFiles};
 use crate::utils::{
-    close, dup2, exec, find_in_path, fork, pipe, waitpid, ExecError, OsError, OsResult,
+    close, dup2, exec, find_command, find_in_path, fork, pipe, waitpid, ExecError, OsError,
+    OsResult,
 };
 use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
 use nix::errno::Errno;
@@ -200,103 +201,78 @@ impl Shell {
             return Ok(self.last_command_substitution_status);
         }
 
-        if expanded_words[0].contains('/') {
-            if !Path::new(&expanded_words[0]).exists() {
-                return Err(CommandExecutionError::CommandNotFound(
-                    expanded_words[0].clone(),
-                ));
+        if let Some(special_builtin_utility) = get_special_builtin_utility(&expanded_words[0]) {
+            // the standard does not specify if the variables should have the export attribute.
+            // Bash exports them, we do the same here (neither sh, nor zsh do it though)
+            self.perform_assignments(&simple_command.assignments, true)?;
+            let mut opened_files = self.opened_files.clone();
+            if let Err(err) = opened_files.redirect(&simple_command.redirections, self) {
+                self.eprint(&err.to_string());
+                if !self.is_interactive {
+                    std::process::exit(1)
+                }
+                return Ok(1);
             }
-            let mut command_environment = self.clone();
-            command_environment.perform_assignments(&simple_command.assignments, true)?;
-            command_environment
-                .opened_files
-                .redirect(&simple_command.redirections, self)?;
-            let command = OsString::from(&expanded_words[0]);
-            let arguments = expanded_words
-                .iter()
-                .map(|w| w.clone())
-                .collect::<Vec<String>>();
-            command_environment
-                .exec(command, &arguments)
-                .map_err(|err| err.into())
-        } else {
-            if let Some(special_builtin_utility) = get_special_builtin_utility(&expanded_words[0]) {
-                // the standard does not specify if the variables should have the export attribute.
-                // Bash exports them, we do the same here (neither sh, nor zsh do it though)
-                self.perform_assignments(&simple_command.assignments, true)?;
-                let mut opened_files = self.opened_files.clone();
-                if let Err(err) = opened_files.redirect(&simple_command.redirections, self) {
-                    self.eprint(&err.to_string());
+            match special_builtin_utility.exec(&expanded_words[1..], self, &mut opened_files) {
+                Ok(status) => return Ok(status),
+                Err(err) => {
+                    opened_files.stderr().write_str(&format!("{err}\n"));
                     if !self.is_interactive {
                         std::process::exit(1)
                     }
                     return Ok(1);
                 }
-                match special_builtin_utility.exec(&expanded_words[1..], self, &mut opened_files) {
-                    Ok(status) => return Ok(status),
-                    Err(err) => {
-                        opened_files.stderr().write_str(&format!("{err}\n"));
-                        if !self.is_interactive {
-                            std::process::exit(1)
-                        }
-                        return Ok(1);
-                    }
-                }
-            }
-
-            if let Some(function_body) = self.functions.get(expanded_words[0].as_str()).cloned() {
-                let mut args = expanded_words[1..].to_vec();
-                // assignments affect the current environment and are marked for export,
-                // same as special builtin utilities
-                self.perform_assignments(&simple_command.assignments, true)?;
-                let mut previous_opened_files = self.opened_files.clone();
-                previous_opened_files.redirect(&simple_command.redirections, self)?;
-                std::mem::swap(&mut self.opened_files, &mut previous_opened_files);
-                std::mem::swap(&mut args, &mut self.positional_parameters);
-
-                let result =
-                    self.interpret_compound_command(&function_body, &simple_command.redirections);
-
-                std::mem::swap(&mut args, &mut self.positional_parameters);
-                std::mem::swap(&mut self.opened_files, &mut previous_opened_files);
-                return result;
-            }
-
-            if let Some(builtin_utility) = get_builtin_utility(&expanded_words[0]) {
-                let mut opened_files = self.opened_files.clone();
-                opened_files.redirect(&simple_command.redirections, self)?;
-                let mut command_env = self.environment.clone();
-                self.perform_assignments(&simple_command.assignments, false)?;
-                std::mem::swap(&mut self.environment, &mut command_env);
-                return Ok(builtin_utility.exec(
-                    &expanded_words[1..],
-                    self,
-                    opened_files,
-                    command_env,
-                ));
-            }
-
-            let mut command_environment = self.clone();
-            command_environment.perform_assignments(&simple_command.assignments, true)?;
-            command_environment
-                .opened_files
-                .redirect(&simple_command.redirections, self)?;
-            // TODO: fix unwrap with proper error
-            let path = self.environment.get_str_value("PATH").unwrap();
-            if let Some(command) = find_in_path(&expanded_words[0], path) {
-                let arguments = expanded_words
-                    .iter()
-                    .map(|w| w.clone())
-                    .collect::<Vec<String>>();
-                command_environment
-                    .exec(command, &arguments)
-                    .map_err(|err| err.into())
-            } else {
-                Err(CommandExecutionError::CommandNotFound(
-                    expanded_words[0].clone(),
-                ))
             }
         }
+
+        if let Some(function_body) = self.functions.get(expanded_words[0].as_str()).cloned() {
+            let mut args = expanded_words[1..].to_vec();
+            // assignments affect the current environment and are marked for export,
+            // same as special builtin utilities
+            self.perform_assignments(&simple_command.assignments, true)?;
+            let mut previous_opened_files = self.opened_files.clone();
+            previous_opened_files.redirect(&simple_command.redirections, self)?;
+            std::mem::swap(&mut self.opened_files, &mut previous_opened_files);
+            std::mem::swap(&mut args, &mut self.positional_parameters);
+
+            let result =
+                self.interpret_compound_command(&function_body, &simple_command.redirections);
+
+            std::mem::swap(&mut args, &mut self.positional_parameters);
+            std::mem::swap(&mut self.opened_files, &mut previous_opened_files);
+            return result;
+        }
+
+        if let Some(builtin_utility) = get_builtin_utility(&expanded_words[0]) {
+            let mut opened_files = self.opened_files.clone();
+            opened_files.redirect(&simple_command.redirections, self)?;
+            let mut command_env = self.environment.clone();
+            self.perform_assignments(&simple_command.assignments, false)?;
+            std::mem::swap(&mut self.environment, &mut command_env);
+            return Ok(builtin_utility.exec(&expanded_words[1..], self, opened_files, command_env));
+        }
+
+        let path = self.environment.get_str_value("PATH").unwrap_or_default();
+        let command = if let Some(command) = find_command(&expanded_words[0], path) {
+            command
+        } else {
+            return Err(CommandExecutionError::CommandNotFound(
+                expanded_words[0].to_string(),
+            ));
+        };
+
+        let mut command_environment = self.clone();
+        command_environment.perform_assignments(&simple_command.assignments, true)?;
+        command_environment
+            .opened_files
+            .redirect(&simple_command.redirections, self)?;
+        let arguments = expanded_words
+            .iter()
+            .map(|w| w.clone())
+            .collect::<Vec<String>>();
+        command_environment
+            .exec(command, &arguments)
+            .map_err(|err| err.into())
     }
 
     fn interpret_for_clause(

@@ -21,14 +21,14 @@ fn loop_control_flow(
         match n.parse::<i32>() {
             Ok(n) => n,
             Err(_) => {
-                return Err(format!("{name}: expected numeric argument\n"));
+                return Err(format!("{name}: expected numeric argument"));
             }
         }
     } else {
         1
     };
     if n < 1 {
-        return Err(format!("{name}: argument has to be bigger than 0\n"));
+        return Err(format!("{name}: argument has to be bigger than 0"));
     }
 
     shell.control_flow_state = state(shell.loop_depth.min(n as u32));

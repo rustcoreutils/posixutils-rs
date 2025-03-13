@@ -1,6 +1,6 @@
 use crate::builtin::{SpecialBuiltinResult, SpecialBuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
-use crate::shell::Shell;
+use crate::shell::{ControlFlowState, Shell};
 use crate::utils::{find_command, find_in_path};
 use std::ffi::OsString;
 
@@ -34,7 +34,9 @@ impl SpecialBuiltinUtility for Dot {
         let lineno = shell.last_lineno;
         shell.last_lineno = 0;
         std::mem::swap(&mut shell.opened_files, opened_files);
+        shell.dot_script_depth += 1;
         let execution_result = shell.execute_program(&source);
+        shell.dot_script_depth -= 1;
         std::mem::swap(&mut shell.opened_files, opened_files);
         shell.last_lineno = lineno;
         execution_result

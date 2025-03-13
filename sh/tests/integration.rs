@@ -1187,4 +1187,12 @@ mod builtin {
             include_str!("sh/builtin/export.out"),
         )
     }
+
+    #[test]
+    fn return_builtin() {
+        test_script(
+            include_str!("sh/builtin/return.sh"),
+            include_str!("sh/builtin/return.out"),
+        )
+    }
 }

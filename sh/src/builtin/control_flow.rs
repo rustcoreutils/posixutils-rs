@@ -60,3 +60,35 @@ impl SpecialBuiltinUtility for Continue {
         loop_control_flow(args, shell, "break", ControlFlowState::Continue)
     }
 }
+
+pub struct Return;
+
+impl SpecialBuiltinUtility for Return {
+    fn exec(
+        &self,
+        args: &[String],
+        shell: &mut Shell,
+        _: &mut OpenedFiles,
+    ) -> SpecialBuiltinResult {
+        if shell.function_call_depth == 0 && shell.dot_script_depth == 0 {
+            return Err(
+                "return: 'return' can only be used inside function or dot script".to_string(),
+            );
+        }
+        if args.len() > 1 {
+            return Err("return: too many arguments".to_string());
+        }
+        let n = if let Some(n) = args.get(0) {
+            match n.parse::<i32>() {
+                Ok(n) => n,
+                Err(_) => {
+                    return Err("return: expected numeric argument".to_string());
+                }
+            }
+        } else {
+            0
+        };
+        shell.control_flow_state = ControlFlowState::Return;
+        Ok(n)
+    }
+}

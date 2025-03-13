@@ -1,6 +1,6 @@
 use crate::builtin::alias::AliasBuiltin;
 use crate::builtin::cd::Cd;
-use crate::builtin::control_flow::{Break, Continue};
+use crate::builtin::control_flow::{Break, Continue, Return};
 use crate::builtin::dot::Dot;
 use crate::builtin::eval::Eval;
 use crate::builtin::exec::Exec;
@@ -63,6 +63,7 @@ pub fn get_special_builtin_utility(name: &str) -> Option<&dyn SpecialBuiltinUtil
         "export" => Some(&Export),
         "set" => Some(&SetSpecialBuiltin),
         "readonly" => Some(&ReadOnly),
+        "return" => Some(&Return),
         "times" => Some(&Times),
         "unset" => Some(&BuiltinUnset),
         _ => None,

@@ -119,6 +119,8 @@ pub struct Shell {
     pub alias_table: AliasTable,
     pub control_flow_state: ControlFlowState,
     pub loop_depth: u32,
+    pub function_call_depth: u32,
+    pub dot_script_depth: u32,
     pub is_interactive: bool,
     pub last_lineno: u32,
 }
@@ -238,10 +240,13 @@ impl Shell {
             previous_opened_files.redirect(&simple_command.redirections, self)?;
             std::mem::swap(&mut self.opened_files, &mut previous_opened_files);
             std::mem::swap(&mut args, &mut self.positional_parameters);
-
+            self.function_call_depth += 1;
             let result =
                 self.interpret_compound_command(&function_body, &simple_command.redirections);
-
+            if self.control_flow_state == ControlFlowState::Return {
+                self.control_flow_state = ControlFlowState::None;
+            }
+            self.function_call_depth -= 1;
             std::mem::swap(&mut args, &mut self.positional_parameters);
             std::mem::swap(&mut self.opened_files, &mut previous_opened_files);
             return result;
@@ -579,6 +584,10 @@ impl Shell {
             let command = parser.parse_next_command(&self.alias_table)?;
             if let Some(command) = command {
                 result = self.interpret(&command);
+                if self.control_flow_state == ControlFlowState::Return {
+                    self.control_flow_state = ControlFlowState::None;
+                    return Ok(result);
+                }
             } else {
                 break;
             }
@@ -666,6 +675,8 @@ impl Default for Shell {
             alias_table: AliasTable::default(),
             control_flow_state: ControlFlowState::None,
             loop_depth: 0,
+            function_call_depth: 0,
+            dot_script_depth: 0,
             is_interactive: false,
             last_lineno: 0,
         }

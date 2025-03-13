@@ -1239,4 +1239,12 @@ mod builtin {
             include_str!("sh/builtin/set_noglob.out"),
         )
     }
+
+    #[test]
+    fn set_noexec() {
+        test_script(
+            include_str!("sh/builtin/set_noexec.sh"),
+            include_str!("sh/builtin/set_noexec.out"),
+        )
+    }
 }

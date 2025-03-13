@@ -649,6 +649,9 @@ impl Shell {
         let mut result = 0;
         loop {
             let command = parser.parse_next_command(&self.alias_table)?;
+            if !self.is_interactive && self.set_options.noexec {
+                return Ok(result);
+            }
             if let Some(command) = command {
                 result = self.interpret(&command, false);
                 if self.control_flow_state == ControlFlowState::Return {

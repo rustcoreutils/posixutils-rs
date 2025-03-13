@@ -7,6 +7,7 @@ use crate::builtin::exec::Exec;
 use crate::builtin::exit::Exit;
 use crate::builtin::readonly::ReadOnly;
 use crate::builtin::set::SetSpecialBuiltin;
+use crate::builtin::times::Times;
 use crate::builtin::unset::BuiltinUnset;
 use crate::shell::environment::Environment;
 use crate::shell::opened_files::OpenedFiles;
@@ -21,6 +22,7 @@ mod exec;
 mod exit;
 mod readonly;
 pub mod set;
+mod times;
 mod unset;
 
 pub type SpecialBuiltinResult = Result<i32, String>;
@@ -58,6 +60,7 @@ pub fn get_special_builtin_utility(name: &str) -> Option<&dyn SpecialBuiltinUtil
         "exit" => Some(&Exit),
         "set" => Some(&SetSpecialBuiltin),
         "readonly" => Some(&ReadOnly),
+        "times" => Some(&Times),
         "unset" => Some(&BuiltinUnset),
         _ => None,
     }

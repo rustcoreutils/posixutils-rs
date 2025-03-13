@@ -217,9 +217,12 @@ pub fn expand_parameter_into(
                 }
                 None => {
                     // cannot fail since var is not in the environment
-                    let _ = shell
-                        .environment
-                        .set(variable_name.to_string(), value.clone(), false);
+                    let _ = shell.environment.set(
+                        variable_name.to_string(),
+                        Some(value.clone()),
+                        false,
+                        false,
+                    );
                     expanded_word.append(value, inside_double_quotes, true);
                 }
             }
@@ -345,7 +348,7 @@ mod tests {
         for (k, v) in env {
             shell
                 .environment
-                .set(k.to_string(), v.to_string(), false)
+                .set(k.to_string(), Some(v.to_string()), false, false)
                 .expect("failed to set var");
         }
         shell
@@ -981,7 +984,8 @@ mod tests {
         let mut shell = shell_with_positional_arguments(vec!["arg1", "arg2", "arg3"]);
         shell
             .environment
-            .set("IFS".to_string(), "".to_string(), false);
+            .set("IFS".to_string(), Some("".to_string()), false, false)
+            .unwrap();
         assert_eq!(
             expand_parameter(
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Asterisk)),
@@ -1061,7 +1065,8 @@ mod tests {
         let mut shell = shell_with_positional_arguments(vec!["arg1", "arg2", "arg3"]);
         shell
             .environment
-            .set("IFS".to_string(), ",:".to_string(), false);
+            .set("IFS".to_string(), Some(",:".to_string()), false, false)
+            .unwrap();
         assert_eq!(
             expand_parameter(
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Asterisk)),

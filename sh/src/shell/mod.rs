@@ -129,7 +129,11 @@ impl Shell {
     }
 
     pub fn assign(&mut self, name: String, value: String, export: bool) {
-        if self.environment.set(name, value, export).is_err() {
+        if self
+            .environment
+            .set(name, Some(value), export, false)
+            .is_err()
+        {
             self.opened_files
                 .stderr()
                 .write_str("sh: cannot assign to readonly variable\n");

@@ -1107,6 +1107,11 @@ mod builtin {
     }
 
     #[test]
+    fn assign_to_readonly_var_through_readonly_is_err() {
+        test_script_expect_error_status_stderr_and_stdout("readonly x=1; readonly x=1", None);
+    }
+
+    #[test]
     fn break_builtin() {
         test_script(
             include_str!("sh/builtin/break.sh"),

@@ -45,6 +45,12 @@ pub struct Environment {
 #[derive(Debug, Clone)]
 pub struct CannotModifyReadonly(String);
 
+impl CannotModifyReadonly {
+    pub fn var_name(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
 impl Display for CannotModifyReadonly {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "sh: cannot set readonly variable {}", self.0)
@@ -55,44 +61,30 @@ impl Environment {
     pub fn set(
         &mut self,
         name: String,
-        value: String,
-        export: bool,
+        value: Option<String>,
+        add_export: bool,
+        add_readonly: bool,
     ) -> Result<(), CannotModifyReadonly> {
         match self.variables.entry(name) {
             Entry::Occupied(mut e) => {
-                if e.get().readonly {
-                    return Err(CannotModifyReadonly(e.key().clone()));
+                if let Some(value) = value {
+                    if e.get().readonly {
+                        return Err(CannotModifyReadonly(e.key().clone()));
+                    }
+                    e.get_mut().value = Some(value);
                 }
-                e.get_mut().value = Some(value);
-                e.get_mut().export = e.get_mut().export || export;
+                e.get_mut().export = e.get_mut().export || add_export;
+                e.get_mut().readonly = e.get_mut().readonly || add_readonly;
             }
             Entry::Vacant(e) => {
                 e.insert(Value {
-                    value: Some(value),
-                    export,
-                    readonly: false,
+                    value,
+                    export: add_export,
+                    readonly: add_readonly,
                 });
             }
         }
         Ok(())
-    }
-
-    pub fn set_readonly(&mut self, name: &str, new_value: Option<String>) {
-        if let Some(value) = self.variables.get_mut(name) {
-            value.readonly = true;
-            if let Some(new_value) = new_value {
-                value.value = Some(new_value)
-            }
-        } else {
-            self.variables.insert(
-                name.to_string(),
-                Value {
-                    value: new_value,
-                    export: false,
-                    readonly: true,
-                },
-            );
-        }
     }
 
     pub fn get_str_value(&self, name: &str) -> Option<&str> {

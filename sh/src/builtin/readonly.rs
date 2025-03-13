@@ -52,7 +52,15 @@ impl SpecialBuiltinUtility for ReadOnly {
                 }
                 (arg.clone(), None)
             };
-            shell.environment.set_readonly(&name, value);
+            shell
+                .environment
+                .set(name, value, false, true)
+                .map_err(|err| {
+                    format!(
+                        "readonly: cannot assign to readonly var '{}'",
+                        err.var_name()
+                    )
+                })?;
         }
         Ok(0)
     }

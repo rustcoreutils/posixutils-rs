@@ -544,7 +544,7 @@ fn interpret_expression(expr: &Expr, env: &mut Environment) -> ExpansionResult<i
         }
         Expr::Assignment { variable, value } => {
             let value = interpret_expression(value, env)?;
-            env.set(variable.to_string(), value.to_string(), false)?;
+            env.set(variable.to_string(), Some(value.to_string()), false, false)?;
             Ok(value)
         }
         Expr::CompoundAssignment {
@@ -558,7 +558,12 @@ fn interpret_expression(expr: &Expr, env: &mut Environment) -> ExpansionResult<i
                 .map(|val| val.parse().unwrap_or(0))
                 .unwrap_or(0);
             let new_value = binary_operation(operator, current_value, value);
-            env.set(variable.to_string(), new_value.to_string(), false)?;
+            env.set(
+                variable.to_string(),
+                Some(new_value.to_string()),
+                false,
+                false,
+            )?;
             Ok(new_value)
         }
     }
@@ -594,7 +599,12 @@ mod tests {
         let mut shell = Shell::default();
         shell
             .environment
-            .set(var.to_string(), initial_value.to_string(), false)
+            .set(
+                var.to_string(),
+                Some(initial_value.to_string()),
+                false,
+                false,
+            )
             .expect("variable is readonly");
         let mut result = ExpandedWord::default();
         expand_arithmetic_expression_into(&mut result, &quoted_literal(expr), false, &mut shell)

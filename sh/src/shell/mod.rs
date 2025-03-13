@@ -192,11 +192,11 @@ impl Shell {
         self.perform_assignments(&simple_command.assignments, true)?;
         let mut opened_files = self.opened_files.clone();
         if let Err(err) = opened_files.redirect(&simple_command.redirections, self) {
-            self.eprint(&err.to_string());
             if !self.is_interactive {
+                self.eprint(&err.to_string());
                 std::process::exit(1)
             }
-            return Ok(1);
+            return Err(err);
         }
         match special_builtin_utility.exec(args, self, &mut opened_files) {
             Ok(status) => Ok(status),
@@ -215,6 +215,7 @@ impl Shell {
         simple_command: &SimpleCommand,
         expanded_words: &[String],
         function_body: &CompoundCommand,
+        ignore_errexit: bool,
     ) -> CommandExecutionResult<i32> {
         let mut args = expanded_words[1..].to_vec();
         // assignments affect the current environment and are marked for export,
@@ -225,7 +226,11 @@ impl Shell {
         std::mem::swap(&mut self.opened_files, &mut previous_opened_files);
         std::mem::swap(&mut args, &mut self.positional_parameters);
         self.function_call_depth += 1;
-        let result = self.interpret_compound_command(&function_body, &simple_command.redirections);
+        let result = self.interpret_compound_command(
+            &function_body,
+            &simple_command.redirections,
+            ignore_errexit,
+        );
         if self.control_flow_state == ControlFlowState::Return {
             self.control_flow_state = ControlFlowState::None;
         }
@@ -258,6 +263,7 @@ impl Shell {
     fn interpret_simple_command(
         &mut self,
         simple_command: &SimpleCommand,
+        ignore_errexit: bool,
     ) -> CommandExecutionResult<i32> {
         let mut expanded_words = Vec::new();
         // reset
@@ -286,7 +292,12 @@ impl Shell {
             )
         } else if let Some(function_body) = self.functions.get(expanded_words[0].as_str()).cloned()
         {
-            self.exec_function(&simple_command, &mut expanded_words, &function_body)
+            self.exec_function(
+                &simple_command,
+                &mut expanded_words,
+                &function_body,
+                ignore_errexit,
+            )
         } else if let Some(builtin_utility) = get_builtin_utility(&expanded_words[0]) {
             self.exec_builtin_utility(&simple_command, &expanded_words[1..], builtin_utility)
         } else {
@@ -319,6 +330,7 @@ impl Shell {
         iter_var: Name,
         iter_words: &[Word],
         body: &CompleteCommand,
+        ignore_errexit: bool,
     ) -> CommandExecutionResult<i32> {
         let mut result = 0;
         self.loop_depth += 1;
@@ -326,7 +338,7 @@ impl Shell {
             let items = expand_word(word, false, self)?;
             for item in items {
                 self.assign(iter_var.to_string(), Some(item), false, false)?;
-                result = self.interpret(body);
+                result = self.interpret(body, ignore_errexit);
                 match self.control_flow_state {
                     ControlFlowState::Break(_) => {
                         self.control_flow_state.go_to_outer_loop();
@@ -355,6 +367,7 @@ impl Shell {
         &mut self,
         arg: &Word,
         cases: &[CaseItem],
+        ignore_errexit: bool,
     ) -> CommandExecutionResult<i32> {
         let arg = expand_word_to_string(arg, false, self)?;
         let arg_cstr = CString::new(arg).expect("invalid pattern");
@@ -362,22 +375,27 @@ impl Shell {
             for pattern in &case.pattern {
                 let pattern = word_to_pattern(pattern, self)?;
                 if pattern.matches(&arg_cstr) {
-                    return Ok(self.interpret(&case.body));
+                    return Ok(self.interpret(&case.body, ignore_errexit));
                 }
             }
         }
         Ok(0)
     }
 
-    fn interpret_if_clause(&mut self, if_chain: &[If], else_body: &Option<CompleteCommand>) -> i32 {
+    fn interpret_if_clause(
+        &mut self,
+        if_chain: &[If],
+        else_body: &Option<CompleteCommand>,
+        ignore_errexit: bool,
+    ) -> i32 {
         assert!(!if_chain.is_empty(), "parsed if without else");
         for if_ in if_chain {
-            if self.interpret(&if_.condition) == 0 {
-                return self.interpret(&if_.body);
+            if self.interpret(&if_.condition, true) == 0 {
+                return self.interpret(&if_.body, ignore_errexit);
             }
         }
         if let Some(else_body) = else_body {
-            self.interpret(else_body)
+            self.interpret(else_body, ignore_errexit)
         } else {
             0
         }
@@ -388,15 +406,16 @@ impl Shell {
         condition: &CompleteCommand,
         body: &CompleteCommand,
         continue_if_zero: bool,
+        ignore_errexit: bool,
     ) -> i32 {
         let status = 0;
         loop {
-            let condition = self.interpret(condition);
+            let condition = self.interpret(condition, true);
             if (condition == 0 && !continue_if_zero) || (condition != 0 && continue_if_zero) {
                 break;
             }
             self.loop_depth += 1;
-            self.interpret(body);
+            self.interpret(body, ignore_errexit);
             self.loop_depth -= 1;
             match self.control_flow_state {
                 ControlFlowState::Break(_) => {
@@ -423,7 +442,7 @@ impl Shell {
     fn interpret_subshell(&mut self, commands: &CompleteCommand) -> CommandExecutionResult<i32> {
         match fork()? {
             ForkResult::Child => {
-                std::process::exit(self.interpret(commands));
+                std::process::exit(self.interpret(commands, false));
             }
             ForkResult::Parent { child } => match waitpid(child)? {
                 WaitStatus::Exited(_, status) => Ok(status),
@@ -436,28 +455,31 @@ impl Shell {
         &mut self,
         compound_command: &CompoundCommand,
         redirections: &[Redirection],
+        ignore_errexit: bool,
     ) -> CommandExecutionResult<i32> {
         let mut prev_opened_files = self.opened_files.clone();
         prev_opened_files.redirect(redirections, self)?;
         std::mem::swap(&mut self.opened_files, &mut prev_opened_files);
         let result = match compound_command {
-            CompoundCommand::BraceGroup(command) => Ok(self.interpret(command)),
+            CompoundCommand::BraceGroup(command) => Ok(self.interpret(command, ignore_errexit)),
             CompoundCommand::Subshell(commands) => self.interpret_subshell(commands),
             CompoundCommand::ForClause {
                 iter_var,
                 words,
                 body,
-            } => self.interpret_for_clause(iter_var.clone(), words, body),
-            CompoundCommand::CaseClause { arg, cases } => self.interpret_case_clause(arg, cases),
+            } => self.interpret_for_clause(iter_var.clone(), words, body, ignore_errexit),
+            CompoundCommand::CaseClause { arg, cases } => {
+                self.interpret_case_clause(arg, cases, ignore_errexit)
+            }
             CompoundCommand::IfClause {
                 if_chain,
                 else_body,
-            } => Ok(self.interpret_if_clause(if_chain, else_body)),
+            } => Ok(self.interpret_if_clause(if_chain, else_body, ignore_errexit)),
             CompoundCommand::WhileClause { condition, body } => {
-                Ok(self.interpret_loop_clause(condition, body, true))
+                Ok(self.interpret_loop_clause(condition, body, true, ignore_errexit))
             }
             CompoundCommand::UntilClause { condition, body } => {
-                Ok(self.interpret_loop_clause(condition, body, false))
+                Ok(self.interpret_loop_clause(condition, body, false, ignore_errexit))
             }
         };
         std::mem::swap(&mut self.opened_files, &mut prev_opened_files);
@@ -469,17 +491,17 @@ impl Shell {
             .insert(definition.name.clone(), definition.body.clone());
     }
 
-    fn interpret_command(&mut self, command: &Command) -> i32 {
+    fn interpret_command(&mut self, command: &Command, ignore_errexit: bool) -> i32 {
         self.environment
             .set_forced("LINENO", command.lineno.to_string());
         let execution_result = match &command.type_ {
             CommandType::SimpleCommand(simple_command) => {
-                self.interpret_simple_command(simple_command)
+                self.interpret_simple_command(simple_command, ignore_errexit)
             }
             CommandType::CompoundCommand {
                 command,
                 redirections,
-            } => self.interpret_compound_command(command, redirections),
+            } => self.interpret_compound_command(command, redirections, ignore_errexit),
             CommandType::FunctionDefinition(function) => {
                 self.define_function(function);
                 Ok(0)
@@ -492,11 +514,11 @@ impl Shell {
         }
     }
 
-    fn interpret_pipeline(&mut self, pipeline: &Pipeline) -> OsResult<i32> {
+    fn interpret_pipeline(&mut self, pipeline: &Pipeline, ignore_errexit: bool) -> OsResult<i32> {
         let pipeline_exit_status;
         if pipeline.commands.len() == 1 {
             let command = &pipeline.commands[0];
-            pipeline_exit_status = self.interpret_command(command);
+            pipeline_exit_status = self.interpret_command(command, ignore_errexit);
         } else {
             let mut current_stdin = libc::STDIN_FILENO;
             for command in pipeline.commands.iter().take(pipeline.commands.len() - 1) {
@@ -506,7 +528,7 @@ impl Shell {
                         drop(read_pipe);
                         dup2(current_stdin, libc::STDIN_FILENO)?;
                         dup2(write_pipe.as_raw_fd(), libc::STDOUT_FILENO)?;
-                        let return_status = self.interpret_command(command);
+                        let return_status = self.interpret_command(command, false);
                         if current_stdin != libc::STDIN_FILENO {
                             close(current_stdin)?;
                         }
@@ -524,7 +546,8 @@ impl Shell {
             match fork()? {
                 ForkResult::Child => {
                     dup2(current_stdin, libc::STDIN_FILENO)?;
-                    let return_status = self.interpret_command(pipeline.commands.last().unwrap());
+                    let return_status =
+                        self.interpret_command(pipeline.commands.last().unwrap(), false);
                     close(current_stdin)?;
                     std::process::exit(return_status);
                 }
@@ -540,17 +563,21 @@ impl Shell {
         self.last_pipeline_exit_status = if pipeline.negate_status {
             (pipeline_exit_status == 0) as i32
         } else {
+            if pipeline_exit_status != 0 && !ignore_errexit && self.set_options.errexit {
+                std::process::exit(pipeline_exit_status)
+            }
             pipeline_exit_status
         };
         Ok(self.last_pipeline_exit_status)
     }
 
-    fn interpret_conjunction(&mut self, conjunction: &Conjunction) -> i32 {
+    fn interpret_conjunction(&mut self, conjunction: &Conjunction, ignore_errexit: bool) -> i32 {
         let mut status = 0;
         let mut i = 0;
         while i < conjunction.elements.len() {
             let (pipeline, op) = &conjunction.elements[i];
-            status = match self.interpret_pipeline(pipeline) {
+            let ignore_errexit = i == conjunction.elements.len() - 1 && ignore_errexit;
+            status = match self.interpret_pipeline(pipeline, ignore_errexit) {
                 Ok(status) => status,
                 Err(err) => {
                     self.eprint(&format!("{err}\n"));
@@ -572,10 +599,10 @@ impl Shell {
         status
     }
 
-    fn interpret(&mut self, command: &CompleteCommand) -> i32 {
+    fn interpret(&mut self, command: &CompleteCommand, ignore_errexit: bool) -> i32 {
         let mut status = 0;
         for conjunction in &command.commands {
-            status = self.interpret_conjunction(conjunction);
+            status = self.interpret_conjunction(conjunction, ignore_errexit);
             if self.control_flow_state != ControlFlowState::None {
                 return status;
             }
@@ -614,7 +641,7 @@ impl Shell {
         loop {
             let command = parser.parse_next_command(&self.alias_table)?;
             if let Some(command) = command {
-                result = self.interpret(&command);
+                result = self.interpret(&command, false);
                 if self.control_flow_state == ControlFlowState::Return {
                     self.control_flow_state = ControlFlowState::None;
                     return Ok(result);

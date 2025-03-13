@@ -107,6 +107,26 @@ fn test_script_expect_error_status_stderr_and_stdout(script: &str, stdout: Optio
     )
 }
 
+fn test_script_expect_error_status_and_stdout(script: &str, stdout: Option<&str>) {
+    set_env_vars();
+    run_test_with_checker(
+        TestPlan {
+            cmd: "sh".to_string(),
+            args: vec!["-s".to_string()],
+            stdin_data: script.to_string(),
+            expected_out: "".to_string(),
+            expected_err: "".to_string(),
+            expected_exit_code: 0,
+        },
+        |_, output| {
+            if let Some(stdout) = stdout {
+                assert_eq!(String::from_utf8_lossy(&output.stdout), stdout);
+            }
+            assert!(!output.status.success());
+        },
+    )
+}
+
 fn expect_exit_code(script: &str, exit_code: i32) {
     set_env_vars();
     run_test_with_checker(
@@ -1202,5 +1222,13 @@ mod builtin {
             include_str!("sh/builtin/set_allexport.sh"),
             include_str!("sh/builtin/set_allexport.out"),
         )
+    }
+
+    #[test]
+    fn set_errexit() {
+        test_script_expect_error_status_and_stdout(
+            include_str!("sh/builtin/set_errexit.sh"),
+            Some(include_str!("sh/builtin/set_errexit.out")),
+        );
     }
 }

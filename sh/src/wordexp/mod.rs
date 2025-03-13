@@ -177,14 +177,18 @@ pub fn expand_word(
     let ifs = shell.environment.get_str_value("IFS");
     let mut result = Vec::new();
     for field in split_fields(expanded_word, ifs) {
-        let pattern =
-            FilenamePattern::new(&field).map_err(CommandExecutionError::ExpansionError)?;
-        let files = glob(&pattern, Path::new(&shell.current_directory));
-        if files.is_empty() {
-            result.push(pattern.into())
+        if shell.set_options.noglob {
+            result.push(field.to_string())
         } else {
-            // TODO: handle error
-            result.extend(files.into_iter().map(|s| s.into_string().unwrap()))
+            let pattern =
+                FilenamePattern::new(&field).map_err(CommandExecutionError::ExpansionError)?;
+            let files = glob(&pattern, Path::new(&shell.current_directory));
+            if files.is_empty() {
+                result.push(pattern.into())
+            } else {
+                // TODO: handle error
+                result.extend(files.into_iter().map(|s| s.into_string().unwrap()))
+            }
         }
     }
     Ok(result)

@@ -1231,4 +1231,12 @@ mod builtin {
             Some(include_str!("sh/builtin/set_errexit.out")),
         );
     }
+
+    #[test]
+    fn set_noglob() {
+        test_script(
+            include_str!("sh/builtin/set_noglob.sh"),
+            include_str!("sh/builtin/set_noglob.out"),
+        )
+    }
 }

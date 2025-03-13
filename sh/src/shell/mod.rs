@@ -41,6 +41,7 @@ pub enum CommandExecutionError {
     ExpansionError(String),
     CommandNotFound(String),
     OsError(OsError),
+    ParseError(ParserError),
 }
 
 impl From<OsError> for CommandExecutionError {
@@ -72,6 +73,13 @@ impl Display for CommandExecutionError {
             }
             CommandExecutionError::OsError(err) => {
                 writeln!(f, "{err}")
+            }
+            CommandExecutionError::ParseError(err) => {
+                writeln!(
+                    f,
+                    "sh: parsing error at line {}: {}",
+                    err.lineno, err.message
+                )
             }
         }
     }
@@ -610,13 +618,14 @@ impl Shell {
         status
     }
 
-    pub fn execute_in_subshell(&mut self, program: &str) -> OsResult<String> {
+    pub fn execute_in_subshell(&mut self, program: &str) -> CommandExecutionResult<String> {
         let (read_pipe, write_pipe) = pipe()?;
         match fork()? {
             ForkResult::Child => {
                 drop(read_pipe);
                 dup2(write_pipe.as_raw_fd(), libc::STDOUT_FILENO)?;
-                self.execute_program(program).unwrap();
+                self.execute_program(program)
+                    .map_err(CommandExecutionError::ParseError)?;
                 std::process::exit(self.last_pipeline_exit_status);
             }
             ForkResult::Parent { child } => {

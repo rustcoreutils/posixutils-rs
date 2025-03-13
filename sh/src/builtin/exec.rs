@@ -1,4 +1,4 @@
-use crate::builtin::{SpecialBuiltinResult, SpecialBuiltinUtility};
+use crate::builtin::{BuiltinResult, SpecialBuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 use crate::utils::{exec, find_command, ExecError};
@@ -11,7 +11,7 @@ impl SpecialBuiltinUtility for Exec {
         args: &[String],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
-    ) -> SpecialBuiltinResult {
+    ) -> BuiltinResult {
         if args.is_empty() {
             shell.opened_files = opened_files.clone();
             return Ok(0);
@@ -21,13 +21,13 @@ impl SpecialBuiltinUtility for Exec {
         let command = if let Some(command) = find_command(&args[0], path) {
             command
         } else {
-            return Err(format!("exec: '{}' command not found", args[0]));
+            return Err(format!("exec: '{}' command not found", args[0]).into());
         };
 
         match exec(command, &args, opened_files, &shell.environment) {
-            Err(ExecError::OsError(err)) => Err(err.to_string()),
+            Err(ExecError::OsError(err)) => Err(err.into()),
             Err(ExecError::CannotExecute(err)) => {
-                Err(format!("exec: could not execute '{}' ({})", args[0], err))
+                Err(format!("exec: could not execute '{}' ({})", args[0], err).into())
             }
             Ok(_) => unreachable!(),
         }

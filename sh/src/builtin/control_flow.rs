@@ -1,4 +1,4 @@
-use crate::builtin::{BuiltinUtility, SpecialBuiltinResult, SpecialBuiltinUtility};
+use crate::builtin::{BuiltinResult, BuiltinUtility, SpecialBuiltinUtility};
 use crate::shell::opened_files::{OpenedFiles, WriteFile};
 use crate::shell::ControlFlowState;
 use crate::shell::Shell;
@@ -8,27 +8,28 @@ fn loop_control_flow(
     shell: &mut Shell,
     name: &str,
     state: fn(u32) -> ControlFlowState,
-) -> SpecialBuiltinResult {
+) -> BuiltinResult {
     if shell.loop_depth == 0 {
         return Err(format!(
             "{name}: '{name}' can only be used inside 'for', 'while' and 'until' loops"
-        ));
+        )
+        .into());
     }
     if args.len() > 1 {
-        return Err(format!("{name}: too many arguments"));
+        return Err(format!("{name}: too many arguments").into());
     }
     let n = if let Some(n) = args.get(0) {
         match n.parse::<i32>() {
             Ok(n) => n,
             Err(_) => {
-                return Err(format!("{name}: expected numeric argument"));
+                return Err(format!("{name}: expected numeric argument").into());
             }
         }
     } else {
         1
     };
     if n < 1 {
-        return Err(format!("{name}: argument has to be bigger than 0"));
+        return Err(format!("{name}: argument has to be bigger than 0").into());
     }
 
     shell.control_flow_state = state(shell.loop_depth.min(n as u32));
@@ -43,7 +44,7 @@ impl SpecialBuiltinUtility for Break {
         args: &[String],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
-    ) -> SpecialBuiltinResult {
+    ) -> BuiltinResult {
         loop_control_flow(args, shell, "break", ControlFlowState::Break)
     }
 }
@@ -56,7 +57,7 @@ impl SpecialBuiltinUtility for Continue {
         args: &[String],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
-    ) -> SpecialBuiltinResult {
+    ) -> BuiltinResult {
         loop_control_flow(args, shell, "break", ControlFlowState::Continue)
     }
 }
@@ -64,25 +65,18 @@ impl SpecialBuiltinUtility for Continue {
 pub struct Return;
 
 impl SpecialBuiltinUtility for Return {
-    fn exec(
-        &self,
-        args: &[String],
-        shell: &mut Shell,
-        _: &mut OpenedFiles,
-    ) -> SpecialBuiltinResult {
+    fn exec(&self, args: &[String], shell: &mut Shell, _: &mut OpenedFiles) -> BuiltinResult {
         if shell.function_call_depth == 0 && shell.dot_script_depth == 0 {
-            return Err(
-                "return: 'return' can only be used inside function or dot script".to_string(),
-            );
+            return Err("return: 'return' can only be used inside function or dot script".into());
         }
         if args.len() > 1 {
-            return Err("return: too many arguments".to_string());
+            return Err("return: too many arguments".into());
         }
         let n = if let Some(n) = args.get(0) {
             match n.parse::<i32>() {
                 Ok(n) => n,
                 Err(_) => {
-                    return Err("return: expected numeric argument".to_string());
+                    return Err("return: expected numeric argument".into());
                 }
             }
         } else {

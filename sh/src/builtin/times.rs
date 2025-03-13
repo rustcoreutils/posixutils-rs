@@ -1,4 +1,4 @@
-use crate::builtin::{SpecialBuiltinResult, SpecialBuiltinUtility};
+use crate::builtin::{BuiltinResult, SpecialBuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 use nix::libc::{suseconds_t, time_t};
@@ -19,7 +19,7 @@ impl SpecialBuiltinUtility for Times {
         _: &[String],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
-    ) -> SpecialBuiltinResult {
+    ) -> BuiltinResult {
         let shell_times = getrusage(UsageWho::RUSAGE_SELF)
             .map_err(|err| format!("times: failed to read user times ({err})"))?;
         let children_times = getrusage(UsageWho::RUSAGE_CHILDREN)

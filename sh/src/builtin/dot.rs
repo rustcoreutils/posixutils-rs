@@ -1,4 +1,4 @@
-use crate::builtin::{SpecialBuiltinResult, SpecialBuiltinUtility};
+use crate::builtin::{BuiltinResult, SpecialBuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::{ControlFlowState, Shell};
 use crate::utils::{find_command, find_in_path};
@@ -12,22 +12,22 @@ impl SpecialBuiltinUtility for Dot {
         args: &[String],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
-    ) -> SpecialBuiltinResult {
+    ) -> BuiltinResult {
         if args.len() != 1 {
-            return Err("dot: incorrect number of arguments".to_string());
+            return Err("dot: incorrect number of arguments".into());
         }
 
         let path = shell.environment.get_str_value("PATH").unwrap_or_default();
         let file_path = if let Some(file_path) = find_command(&args[0], path) {
             file_path
         } else {
-            return Err(format!("dot: {}, no such file or directory\n", &args[0]));
+            return Err(format!("dot: {}, no such file or directory\n", &args[0]).into());
         };
 
         let source = match std::fs::read_to_string(file_path) {
             Ok(source) => source,
             Err(err) => {
-                return Err(format!("dot: error opening file ({})\n", err));
+                return Err(format!("dot: error opening file ({})\n", err).into());
             }
         };
 
@@ -40,6 +40,6 @@ impl SpecialBuiltinUtility for Dot {
         std::mem::swap(&mut shell.opened_files, opened_files);
         shell.last_lineno = lineno;
         execution_result
-            .map_err(|err| format!("dot: parsing error({}): {}\n", err.lineno, err.message))
+            .map_err(|err| format!("dot: parsing error({}): {}\n", err.lineno, err.message).into())
     }
 }

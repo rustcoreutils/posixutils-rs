@@ -1,4 +1,4 @@
-use crate::builtin::{BuiltinUtility, SpecialBuiltinResult, SpecialBuiltinUtility};
+use crate::builtin::{BuiltinResult, BuiltinUtility, SpecialBuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 use crate::utils::strcoll;
@@ -13,9 +13,9 @@ impl SpecialBuiltinUtility for SetSpecialBuiltin {
         args: &[String],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
-    ) -> SpecialBuiltinResult {
+    ) -> BuiltinResult {
         match shell.set_options.parse_args_and_update(args) {
-            Err(err) => Err(format!("set: {}\n", err)),
+            Err(err) => Err(format!("set: {}\n", err).into()),
             Ok(parsed_args) => {
                 match parsed_args {
                     ParsedArgs::PrintSettingsHumanReadable => {

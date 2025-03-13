@@ -14,6 +14,7 @@ use crate::shell::environment::{CannotModifyReadonly, Environment};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 use crate::utils::OsError;
+use std::fmt::{Display, Formatter};
 
 pub mod alias;
 mod cd;
@@ -28,31 +29,51 @@ pub mod set;
 mod times;
 mod unset;
 
-pub enum SpecialBuiltinError {
+pub enum BuiltinError {
     CustomError(String),
     AssignmentError(CannotModifyReadonly),
     OsError(OsError),
 }
 
-impl From<CannotModifyReadonly> for SpecialBuiltinError {
+impl From<CannotModifyReadonly> for BuiltinError {
     fn from(value: CannotModifyReadonly) -> Self {
         Self::AssignmentError(value)
     }
 }
 
-impl From<String> for SpecialBuiltinError {
+impl From<String> for BuiltinError {
     fn from(value: String) -> Self {
         Self::CustomError(value)
     }
 }
 
-impl From<OsError> for SpecialBuiltinError {
+impl From<&str> for BuiltinError {
+    fn from(value: &str) -> Self {
+        value.to_string().into()
+    }
+}
+
+impl From<OsError> for BuiltinError {
     fn from(value: OsError) -> Self {
         Self::OsError(value)
     }
 }
 
-pub type SpecialBuiltinResult = Result<i32, String>;
+impl Display for BuiltinError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BuiltinError::CustomError(err) => f.write_str(err),
+            BuiltinError::AssignmentError(err) => {
+                write!(f, "{}", err)
+            }
+            BuiltinError::OsError(err) => {
+                write!(f, "{}", err)
+            }
+        }
+    }
+}
+
+pub type BuiltinResult = Result<i32, BuiltinError>;
 
 pub trait SpecialBuiltinUtility {
     fn exec(
@@ -60,18 +81,13 @@ pub trait SpecialBuiltinUtility {
         args: &[String],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
-    ) -> SpecialBuiltinResult;
+    ) -> BuiltinResult;
 }
 
 struct BuiltinNull;
 
 impl SpecialBuiltinUtility for BuiltinNull {
-    fn exec(
-        &self,
-        args: &[String],
-        shell: &mut Shell,
-        _: &mut OpenedFiles,
-    ) -> SpecialBuiltinResult {
+    fn exec(&self, args: &[String], shell: &mut Shell, _: &mut OpenedFiles) -> BuiltinResult {
         Ok(0)
     }
 }

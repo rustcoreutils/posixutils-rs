@@ -1,4 +1,4 @@
-use crate::builtin::{SpecialBuiltinResult, SpecialBuiltinUtility};
+use crate::builtin::{BuiltinResult, SpecialBuiltinUtility};
 use crate::parse::command_parser::is_valid_name;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
@@ -11,9 +11,9 @@ impl SpecialBuiltinUtility for Export {
         args: &[String],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
-    ) -> SpecialBuiltinResult {
+    ) -> BuiltinResult {
         if args.is_empty() {
-            return Err("export: too few arguments".to_string());
+            return Err("export: too few arguments".into());
         }
 
         if args[0] == "-p" {
@@ -40,12 +40,12 @@ impl SpecialBuiltinUtility for Export {
             let (name, value) = if let Some(pos) = arg.find('=') {
                 let (name, value) = arg.split_at(pos);
                 if !is_valid_name(name) {
-                    return Err(format!("export: '{name}' is not a valid name"));
+                    return Err(format!("export: '{name}' is not a valid name").into());
                 }
                 (name.to_string(), Some(value[1..].to_string()))
             } else {
                 if !is_valid_name(&arg) {
-                    return Err(format!("export: '{arg}' is not a valid name\n"));
+                    return Err(format!("export: '{arg}' is not a valid name\n").into());
                 }
                 (arg.clone(), None)
             };

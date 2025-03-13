@@ -87,6 +87,21 @@ impl Environment {
         Ok(())
     }
 
+    pub fn set_forced(&mut self, name: &str, value: String) {
+        if let Some(var) = self.get_var_mut(name) {
+            var.value = Some(value)
+        } else {
+            self.variables.insert(
+                name.to_string(),
+                Value {
+                    value: Some(value),
+                    export: false,
+                    readonly: false,
+                },
+            );
+        }
+    }
+
     pub fn get_str_value(&self, name: &str) -> Option<&str> {
         self.variables
             .get(name)

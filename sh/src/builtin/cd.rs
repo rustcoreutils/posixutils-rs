@@ -52,10 +52,11 @@ fn cd(
             let old_working_dir = std::env::current_dir().unwrap();
             nix::unistd::chdir(oldpwd).map_err(io_err_to_string)?;
             shell.current_directory = OsString::from_vec(oldpwd.as_bytes().to_vec());
-            shell.assign("PWD".to_string(), oldpwd.to_string(), false);
+            shell.assign("PWD".to_string(), Some(oldpwd.to_string()), false, false);
             shell.assign(
                 "OLDPWD".to_string(),
-                old_working_dir.to_string_lossy().into_owned(),
+                Some(old_working_dir.to_string_lossy().into_owned()),
+                false,
                 false,
             );
             opened_files.stdout().write_str(format!("{}\n", oldpwd));
@@ -133,12 +134,14 @@ fn cd(
 
     shell.assign(
         "PWD".to_string(),
-        curr_path.to_string_lossy().into_owned(),
+        Some(curr_path.to_string_lossy().into_owned()),
+        false,
         false,
     );
     shell.assign(
         "OLDPWD".to_string(),
-        old_working_dir.to_string_lossy().into_owned(),
+        Some(old_working_dir.to_string_lossy().into_owned()),
+        false,
         false,
     );
 

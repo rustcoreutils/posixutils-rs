@@ -130,19 +130,15 @@ impl Shell {
         self.opened_files.stderr().write_str(message);
     }
 
-    pub fn assign(&mut self, name: String, value: String, export: bool) {
-        if self
-            .environment
-            .set(name, Some(value), export, false)
-            .is_err()
-        {
-            self.opened_files
-                .stderr()
-                .write_str("sh: cannot assign to readonly variable\n");
-            if !self.is_interactive {
-                std::process::exit(2)
-            }
-        }
+    pub fn assign(
+        &mut self,
+        name: String,
+        value: Option<String>,
+        add_export: bool,
+        add_readonly: bool,
+    ) -> Result<(), CannotModifyReadonly> {
+        let export = self.set_options.allexport || add_export;
+        self.environment.set(name, value, export, add_readonly)
     }
 
     fn handle_error(&self, err: CommandExecutionError) -> i32 {
@@ -178,8 +174,7 @@ impl Shell {
     ) -> CommandExecutionResult<()> {
         for assignment in assignments {
             let word_str = expand_word_to_string(&assignment.value, true, self)?;
-            // TODO: should look into using Rc for Environment
-            self.assign(assignment.name.to_string(), word_str, export);
+            self.assign(assignment.name.to_string(), Some(word_str), export, false)?;
         }
         Ok(())
     }
@@ -295,7 +290,7 @@ impl Shell {
         'outer: for word in iter_words {
             let items = expand_word(word, false, self)?;
             for item in items {
-                self.assign(iter_var.to_string(), item, false);
+                self.assign(iter_var.to_string(), Some(item), false, false)?;
                 result = self.interpret(body);
                 match self.control_flow_state {
                     ControlFlowState::Break(_) => {
@@ -440,7 +435,8 @@ impl Shell {
     }
 
     fn interpret_command(&mut self, command: &Command) -> i32 {
-        self.assign("LINENO".to_string(), command.lineno.to_string(), false);
+        self.environment
+            .set_forced("LINENO", command.lineno.to_string());
         let execution_result = match &command.type_ {
             CommandType::SimpleCommand(simple_command) => {
                 self.interpret_simple_command(simple_command)
@@ -621,11 +617,26 @@ impl Shell {
             is_interactive,
             ..Default::default()
         };
-        shell.assign("PPID".to_string(), getppid().to_string(), false);
-        shell.assign("IFS".to_string(), " \t\n".to_string(), false);
-        shell.assign("PS1".to_string(), "\\$ ".to_string(), false);
-        shell.assign("PS2".to_string(), "> ".to_string(), false);
-        shell.assign("PS4".to_string(), "+ ".to_string(), false);
+        shell
+            .assign(
+                "PPID".to_string(),
+                Some(getppid().to_string()),
+                false,
+                false,
+            )
+            .unwrap();
+        shell
+            .assign("IFS".to_string(), Some(" \t\n".to_string()), false, false)
+            .unwrap();
+        shell
+            .assign("PS1".to_string(), Some("\\$ ".to_string()), false, false)
+            .unwrap();
+        shell
+            .assign("PS2".to_string(), Some("> ".to_string()), false, false)
+            .unwrap();
+        shell
+            .assign("PS4".to_string(), Some("+ ".to_string()), false, false)
+            .unwrap();
         shell
     }
 

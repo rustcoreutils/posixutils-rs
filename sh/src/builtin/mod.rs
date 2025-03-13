@@ -10,9 +10,10 @@ use crate::builtin::readonly::ReadOnly;
 use crate::builtin::set::SetSpecialBuiltin;
 use crate::builtin::times::Times;
 use crate::builtin::unset::BuiltinUnset;
-use crate::shell::environment::Environment;
+use crate::shell::environment::{CannotModifyReadonly, Environment};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
+use crate::utils::OsError;
 
 pub mod alias;
 mod cd;
@@ -26,6 +27,30 @@ mod readonly;
 pub mod set;
 mod times;
 mod unset;
+
+pub enum SpecialBuiltinError {
+    CustomError(String),
+    AssignmentError(CannotModifyReadonly),
+    OsError(OsError),
+}
+
+impl From<CannotModifyReadonly> for SpecialBuiltinError {
+    fn from(value: CannotModifyReadonly) -> Self {
+        Self::AssignmentError(value)
+    }
+}
+
+impl From<String> for SpecialBuiltinError {
+    fn from(value: String) -> Self {
+        Self::CustomError(value)
+    }
+}
+
+impl From<OsError> for SpecialBuiltinError {
+    fn from(value: OsError) -> Self {
+        Self::OsError(value)
+    }
+}
 
 pub type SpecialBuiltinResult = Result<i32, String>;
 

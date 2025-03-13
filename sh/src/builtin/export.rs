@@ -49,12 +49,7 @@ impl SpecialBuiltinUtility for Export {
                 }
                 (arg.clone(), None)
             };
-            shell
-                .environment
-                .set(name, value, true, false)
-                .map_err(|err| {
-                    format!("export: cannot assign to readonly var '{}'", err.var_name())
-                })?;
+            shell.assign(name, value, true, false)?;
         }
         Ok(0)
     }

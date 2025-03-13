@@ -493,15 +493,15 @@ fn binary_operation(operator: &BinaryOperator, lhs_value: i64, rhs_value: i64) -
     }
 }
 
-fn interpret_expression(expr: &Expr, env: &mut Environment) -> ExpansionResult<i64> {
+fn interpret_expression(expr: &Expr, shell: &mut Shell) -> ExpansionResult<i64> {
     match expr {
         Expr::Variable(var) => {
-            let value = env.get_str_value(var).unwrap_or_default();
+            let value = shell.environment.get_str_value(var).unwrap_or_default();
             Ok(value.parse().unwrap_or(0))
         }
         Expr::Number(num) => Ok(*num),
         Expr::UnaryOp { operator, operand } => {
-            let value = interpret_expression(operand, env)?;
+            let value = interpret_expression(operand, shell)?;
             match operator {
                 UnaryOperator::Plus => Ok(value),
                 UnaryOperator::Minus => Ok(-value),
@@ -510,25 +510,25 @@ fn interpret_expression(expr: &Expr, env: &mut Environment) -> ExpansionResult<i
             }
         }
         Expr::BinaryOp { lhs, operator, rhs } => {
-            let lhs_value = interpret_expression(lhs, env)?;
+            let lhs_value = interpret_expression(lhs, shell)?;
             match operator {
                 BinaryOperator::LogicalAnd => {
                     return if lhs_value != 0 {
-                        Ok((interpret_expression(rhs, env)? != 0) as i64)
+                        Ok((interpret_expression(rhs, shell)? != 0) as i64)
                     } else {
                         Ok(0)
                     }
                 }
                 BinaryOperator::LogicalOr => {
                     return if lhs_value == 0 {
-                        Ok((interpret_expression(rhs, env)? != 0) as i64)
+                        Ok((interpret_expression(rhs, shell)? != 0) as i64)
                     } else {
                         Ok(1)
                     }
                 }
                 _ => {}
             }
-            let rhs_value = interpret_expression(rhs, env)?;
+            let rhs_value = interpret_expression(rhs, shell)?;
             Ok(binary_operation(operator, lhs_value, rhs_value))
         }
         Expr::Conditional {
@@ -536,15 +536,15 @@ fn interpret_expression(expr: &Expr, env: &mut Environment) -> ExpansionResult<i
             true_expr,
             false_expr,
         } => {
-            if interpret_expression(condition, env)? != 0 {
-                interpret_expression(true_expr, env)
+            if interpret_expression(condition, shell)? != 0 {
+                interpret_expression(true_expr, shell)
             } else {
-                interpret_expression(false_expr, env)
+                interpret_expression(false_expr, shell)
             }
         }
         Expr::Assignment { variable, value } => {
-            let value = interpret_expression(value, env)?;
-            env.set(variable.to_string(), Some(value.to_string()), false, false)?;
+            let value = interpret_expression(value, shell)?;
+            shell.assign(variable.to_string(), Some(value.to_string()), false, false)?;
             Ok(value)
         }
         Expr::CompoundAssignment {
@@ -552,13 +552,14 @@ fn interpret_expression(expr: &Expr, env: &mut Environment) -> ExpansionResult<i
             operator,
             value,
         } => {
-            let value = interpret_expression(value, env)?;
-            let current_value = env
+            let value = interpret_expression(value, shell)?;
+            let current_value = shell
+                .environment
                 .get_str_value(variable)
                 .map(|val| val.parse().unwrap_or(0))
                 .unwrap_or(0);
             let new_value = binary_operation(operator, current_value, value);
-            env.set(
+            shell.assign(
                 variable.to_string(),
                 Some(new_value.to_string()),
                 false,
@@ -577,7 +578,7 @@ pub fn expand_arithmetic_expression_into(
 ) -> ExpansionResult<()> {
     let expr = expand_word_to_string(expr, false, shell)?;
     let expr = parse_expression(&expr).map_err(CommandExecutionError::ExpansionError)?;
-    let value = interpret_expression(&expr, &mut shell.environment)?;
+    let value = interpret_expression(&expr, shell)?;
     expanded_word.append(value.to_string(), inside_double_quotes, true);
     Ok(())
 }

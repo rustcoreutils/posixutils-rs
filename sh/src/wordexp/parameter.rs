@@ -217,12 +217,8 @@ pub fn expand_parameter_into(
                 }
                 None => {
                     // cannot fail since var is not in the environment
-                    let _ = shell.environment.set(
-                        variable_name.to_string(),
-                        Some(value.clone()),
-                        false,
-                        false,
-                    );
+                    let _ =
+                        shell.assign(variable_name.to_string(), Some(value.clone()), false, false);
                     expanded_word.append(value, inside_double_quotes, true);
                 }
             }

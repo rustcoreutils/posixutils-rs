@@ -645,6 +645,9 @@ impl Shell {
     }
 
     pub fn execute_program(&mut self, program: &str) -> Result<i32, ParserError> {
+        if self.set_options.verbose {
+            self.eprint(program)
+        }
         let mut parser = CommandParser::new(program, self.last_lineno)?;
         let mut result = 0;
         loop {

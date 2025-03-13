@@ -1,4 +1,4 @@
-use crate::builtin::BuiltinUtility;
+use crate::builtin::{BuiltinResult, BuiltinUtility};
 use crate::shell::environment::Environment;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
@@ -10,16 +10,16 @@ impl BuiltinUtility for AliasBuiltin {
         &self,
         args: &[String],
         shell: &mut Shell,
-        opened_files: OpenedFiles,
+        opened_files: &mut OpenedFiles,
         _: Environment,
-    ) -> i32 {
+    ) -> BuiltinResult {
         if args.is_empty() {
             for (alias, command) in &shell.alias_table {
                 opened_files
                     .stdout()
                     .write_str(format!("alias {}='{}'", alias, command));
             }
-            return 0;
+            return Ok(0);
         }
 
         for arg in args {
@@ -35,13 +35,10 @@ impl BuiltinUtility for AliasBuiltin {
                         .stdout()
                         .write_str(format!("alias {}='{}'", arg, command));
                 } else {
-                    opened_files
-                        .stderr()
-                        .write_str(format!("alias: {}: not found", arg));
-                    return 1;
+                    return Err(format!("alias: {}: not found", arg).into());
                 }
             }
         }
-        0
+        Ok(0)
     }
 }

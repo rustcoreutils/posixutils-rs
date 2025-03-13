@@ -116,9 +116,9 @@ pub trait BuiltinUtility {
         &self,
         args: &[String],
         shell: &mut Shell,
-        opened_files: OpenedFiles,
+        opened_files: &mut OpenedFiles,
         environment: Environment,
-    ) -> i32;
+    ) -> BuiltinResult;
 }
 
 pub fn get_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {

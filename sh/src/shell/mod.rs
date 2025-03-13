@@ -246,7 +246,13 @@ impl Shell {
         let mut command_env = self.environment.clone();
         self.perform_assignments(&simple_command.assignments, false)?;
         std::mem::swap(&mut self.environment, &mut command_env);
-        Ok(builtin_utility.exec(args, self, opened_files, command_env))
+        match builtin_utility.exec(args, self, &mut opened_files, command_env) {
+            Ok(status) => Ok(status),
+            Err(err) => {
+                opened_files.stderr().write_str(format!("{err}\n"));
+                Ok(1)
+            }
+        }
     }
 
     fn interpret_simple_command(

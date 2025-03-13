@@ -268,6 +268,19 @@ impl Shell {
         }
     }
 
+    fn trace(&mut self, expanded_words: &[String]) {
+        let ps4 = self.get_ps4();
+        self.eprint(&ps4);
+        for expanded_word in &expanded_words[..expanded_words.len() - 1] {
+            self.eprint(expanded_word);
+            self.eprint(" ");
+        }
+        if let Some(expanded_word) = expanded_words.last() {
+            self.eprint(expanded_word);
+        }
+        self.eprint("\n");
+    }
+
     fn interpret_simple_command(
         &mut self,
         simple_command: &SimpleCommand,
@@ -278,6 +291,9 @@ impl Shell {
         self.last_command_substitution_status = 0;
         for word in &simple_command.words {
             expanded_words.extend(expand_word(word, false, self)?);
+        }
+        if self.set_options.xtrace {
+            self.trace(&expanded_words);
         }
         if expanded_words.is_empty() {
             // no commands to execute, perform assignments and redirections
@@ -743,6 +759,10 @@ impl Shell {
 
     pub fn get_ps2(&mut self) -> String {
         self.get_var_and_expand("PS2", "> ")
+    }
+
+    pub fn get_ps4(&mut self) -> String {
+        self.get_var_and_expand("PS4", "+ ")
     }
 }
 

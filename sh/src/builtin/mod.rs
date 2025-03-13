@@ -5,6 +5,7 @@ use crate::builtin::dot::Dot;
 use crate::builtin::eval::Eval;
 use crate::builtin::exec::Exec;
 use crate::builtin::exit::Exit;
+use crate::builtin::export::Export;
 use crate::builtin::readonly::ReadOnly;
 use crate::builtin::set::SetSpecialBuiltin;
 use crate::builtin::times::Times;
@@ -20,6 +21,7 @@ mod dot;
 mod eval;
 mod exec;
 mod exit;
+mod export;
 mod readonly;
 pub mod set;
 mod times;
@@ -58,6 +60,7 @@ pub fn get_special_builtin_utility(name: &str) -> Option<&dyn SpecialBuiltinUtil
         "eval" => Some(&Eval),
         "exec" => Some(&Exec),
         "exit" => Some(&Exit),
+        "export" => Some(&Export),
         "set" => Some(&SetSpecialBuiltin),
         "readonly" => Some(&ReadOnly),
         "times" => Some(&Times),

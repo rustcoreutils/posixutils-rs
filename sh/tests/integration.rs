@@ -1195,4 +1195,12 @@ mod builtin {
             include_str!("sh/builtin/return.out"),
         )
     }
+
+    #[test]
+    fn set_allexport() {
+        test_script(
+            include_str!("sh/builtin/set_allexport.sh"),
+            include_str!("sh/builtin/set_allexport.out"),
+        )
+    }
 }

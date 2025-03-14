@@ -31,12 +31,14 @@ fn get_global_shell() -> &'static mut Shell {
 
 fn execute_action(condition: TrapCondition) {
     if let TrapAction::Commands(commands) = &get_global_shell().trap_actions[condition as usize] {
+        let last_pipeline_exit_status_before_trap = get_global_shell().last_pipeline_exit_status;
         match get_global_shell().execute_program(commands) {
             Err(err) => {
                 eprintln!("sh: error parsing action: {}", err.message);
             }
             Ok(_) => {}
         }
+        get_global_shell().last_pipeline_exit_status = last_pipeline_exit_status_before_trap;
     }
 }
 

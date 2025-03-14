@@ -1,4 +1,5 @@
 use crate::builtin::set::SetOptions;
+use crate::builtin::trap::{TrapAction, TrapCondition};
 use crate::builtin::{
     get_builtin_utility, get_special_builtin_utility, BuiltinUtility, SpecialBuiltinUtility,
 };
@@ -133,6 +134,7 @@ pub struct Shell {
     pub dot_script_depth: u32,
     pub is_interactive: bool,
     pub last_lineno: u32,
+    pub trap_actions: [TrapAction; TrapCondition::Count as usize],
 }
 
 impl Shell {
@@ -787,6 +789,7 @@ impl Default for Shell {
             dot_script_depth: 0,
             is_interactive: false,
             last_lineno: 0,
+            trap_actions: [const { TrapAction::Default }; TrapCondition::Count as usize],
         }
     }
 }

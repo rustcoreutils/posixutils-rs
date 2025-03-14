@@ -7,7 +7,7 @@ edition = "2021"
 plib = { path = "../plib" }
 gettext-rs.workspace = true
 clap.workspace = true
-nix = { version = "0.29", features = ["process", "fs", "resource"] }
+nix = { version = "0.29", features = ["process", "fs", "resource", "signal"] }
 atty.workspace = true
 
 [[bin]]

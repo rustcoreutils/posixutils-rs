@@ -1247,4 +1247,12 @@ mod builtin {
             include_str!("sh/builtin/set_noexec.out"),
         )
     }
+
+    #[test]
+    fn shift() {
+        test_script(
+            include_str!("sh/builtin/shift.sh"),
+            include_str!("sh/builtin/shift.out"),
+        )
+    }
 }

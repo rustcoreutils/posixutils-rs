@@ -8,6 +8,7 @@ use crate::builtin::exit::Exit;
 use crate::builtin::export::Export;
 use crate::builtin::readonly::ReadOnly;
 use crate::builtin::set::SetSpecialBuiltin;
+use crate::builtin::shift::Shift;
 use crate::builtin::times::Times;
 use crate::builtin::unset::BuiltinUnset;
 use crate::shell::environment::{CannotModifyReadonly, Environment};
@@ -26,6 +27,7 @@ mod exit;
 mod export;
 mod readonly;
 pub mod set;
+mod shift;
 mod times;
 mod unset;
 
@@ -102,9 +104,10 @@ pub fn get_special_builtin_utility(name: &str) -> Option<&dyn SpecialBuiltinUtil
         "exec" => Some(&Exec),
         "exit" => Some(&Exit),
         "export" => Some(&Export),
-        "set" => Some(&SetSpecialBuiltin),
         "readonly" => Some(&ReadOnly),
         "return" => Some(&Return),
+        "set" => Some(&SetSpecialBuiltin),
+        "shift" => Some(&Shift),
         "times" => Some(&Times),
         "unset" => Some(&BuiltinUnset),
         _ => None,

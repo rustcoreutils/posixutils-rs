@@ -120,26 +120,33 @@ fn ignore_action(shell: &mut Shell, condition: TrapCondition) {
 }
 
 fn print_commands(shell: &mut Shell, opened_files: &mut OpenedFiles, print_default: bool) {
+    const CONDITIONS: &[TrapCondition] = &[
+        TrapCondition::Exit,
+        TrapCondition::SigHup,
+        TrapCondition::SigInt,
+        TrapCondition::SigQuit,
+        TrapCondition::SigAbrt,
+        TrapCondition::SigAlrm,
+        TrapCondition::SigTerm,
+    ];
     for (condition, action) in shell.trap_actions.iter().enumerate() {
+        let condition = CONDITIONS[condition];
         match action {
             TrapAction::Default if print_default => {
-                opened_files.stdout().write_str(format!(
-                    "trap -- - {}\n",
-                    TrapCondition::try_from(condition as i32).unwrap()
-                ));
+                opened_files
+                    .stdout()
+                    .write_str(format!("trap -- - {}\n", condition));
             }
             TrapAction::Default => {}
             TrapAction::Ignore => {
-                opened_files.stdout().write_str(format!(
-                    "trap -- '' {}\n",
-                    TrapCondition::try_from(condition as i32).unwrap()
-                ));
+                opened_files
+                    .stdout()
+                    .write_str(format!("trap -- '' {}\n", condition));
             }
             TrapAction::Commands(cmd) => {
-                opened_files.stdout().write_str(format!(
-                    "trap -- '{cmd}' {}\n",
-                    TrapCondition::try_from(condition as i32).unwrap()
-                ));
+                opened_files
+                    .stdout()
+                    .write_str(format!("trap -- '{cmd}' {}\n", condition));
             }
         }
     }

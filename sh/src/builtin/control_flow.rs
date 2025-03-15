@@ -15,6 +15,13 @@ fn loop_control_flow(
         )
         .into());
     }
+
+    let args = if args.get(0).is_some_and(|arg| arg == "--") {
+        &args[1..]
+    } else {
+        &args
+    };
+
     if args.len() > 1 {
         return Err(format!("{name}: too many arguments").into());
     }

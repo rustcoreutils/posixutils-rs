@@ -67,3 +67,13 @@ do
   echo 'inside until'
   break
 done
+
+while true
+do
+  break --
+done
+
+while true
+do
+  break -- 1
+done

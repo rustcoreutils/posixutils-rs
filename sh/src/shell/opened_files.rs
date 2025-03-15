@@ -27,57 +27,6 @@ pub enum OpenedFile {
     HereDocument(String),
 }
 
-pub enum ReadFile {
-    Stdin,
-    File(Rc<File>),
-}
-
-impl Read for ReadFile {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            ReadFile::Stdin => std::io::stdin().lock().read(buf),
-            ReadFile::File(file) => {
-                nix::unistd::read(file.as_raw_fd(), buf).map_err(|err| err.into())
-            }
-        }
-    }
-}
-
-pub enum WriteFile {
-    Stdout,
-    Stderr,
-    File(Rc<File>),
-}
-
-impl Write for WriteFile {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
-            WriteFile::Stdout => std::io::stdout().lock().write(buf),
-            WriteFile::Stderr => std::io::stderr().lock().write(buf),
-            WriteFile::File(file) => nix::unistd::write(file, buf).map_err(|err| err.into()),
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            WriteFile::Stdout => std::io::stdout().lock().flush(),
-            WriteFile::Stderr => std::io::stderr().lock().flush(),
-            WriteFile::File(_) => Ok(()),
-        }
-    }
-}
-
-impl WriteFile {
-    pub fn write_str<S: AsRef<str>>(&mut self, s: S) {
-        match self.write_all(s.as_ref().as_bytes()) {
-            Ok(_) => {}
-            Err(err) => {
-                eprintln!("sh: {}", err);
-            }
-        }
-    }
-}
-
 fn io_err_to_redirection_err(err: std::io::Error) -> CommandExecutionError {
     CommandExecutionError::RedirectionError(format!("sh: io error ({})", err))
 }
@@ -219,23 +168,31 @@ impl OpenedFiles {
         Ok(())
     }
 
-    fn write_file(&self, fileno: u32) -> WriteFile {
-        match self.opened_files.get(&fileno) {
-            Some(OpenedFile::Stdout) => WriteFile::Stdout,
-            Some(OpenedFile::Stderr) => WriteFile::Stderr,
+    fn write_file(&self, fileno: u32, contents: &str) {
+        let result = match self.opened_files.get(&fileno) {
+            Some(OpenedFile::Stdout) => std::io::stdout().write_all(contents.as_bytes()),
+            Some(OpenedFile::Stderr) => std::io::stderr().write_all(contents.as_bytes()),
             Some(OpenedFile::WriteFile(file)) | Some(OpenedFile::ReadWriteFile(file)) => {
-                WriteFile::File(file.clone())
+                nix::unistd::write(file, contents.as_bytes())
+                    .map_err(|err| std::io::Error::from(err))
+                    .map(|_| ())
             }
             _ => unreachable!(),
+        };
+        match result {
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!("sh: io error ({})", err);
+            }
         }
     }
 
-    pub fn stdout(&self) -> WriteFile {
-        self.write_file(STDOUT_FILENO)
+    pub fn write_out<S: AsRef<str>>(&self, string: S) {
+        self.write_file(STDOUT_FILENO, string.as_ref());
     }
 
-    pub fn stderr(&self) -> WriteFile {
-        self.write_file(STDERR_FILENO)
+    pub fn write_err<S: AsRef<str>>(&self, string: S) {
+        self.write_file(STDERR_FILENO, string.as_ref());
     }
 }
 

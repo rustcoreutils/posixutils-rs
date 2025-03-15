@@ -170,7 +170,7 @@ impl BuiltinUtility for Cd {
                         false,
                         false,
                     )?;
-                    opened_files.stdout().write_str(format!("{}\n", oldpwd));
+                    opened_files.write_out(format!("{}\n", oldpwd));
                     return Ok(0);
                 }
                 return Err("cd: OLDPWD not set\n".into());

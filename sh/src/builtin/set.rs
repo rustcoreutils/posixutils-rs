@@ -19,14 +19,10 @@ impl SpecialBuiltinUtility for SetSpecialBuiltin {
             Ok(parsed_args) => {
                 match parsed_args {
                     ParsedArgs::PrintSettingsHumanReadable => {
-                        opened_files
-                            .stdout()
-                            .write_str(shell.set_options.to_string_human_readable());
+                        opened_files.write_out(shell.set_options.to_string_human_readable());
                     }
                     ParsedArgs::PrintSettingsShellReadable => {
-                        opened_files
-                            .stdout()
-                            .write_str(shell.set_options.to_string_shell_readable());
+                        opened_files.write_out(shell.set_options.to_string_shell_readable());
                     }
                     ParsedArgs::ResetPositionalParameters => {
                         shell.positional_parameters.clear();
@@ -45,7 +41,7 @@ impl SpecialBuiltinUtility for SetSpecialBuiltin {
                         sorted_vars.sort_by(|(k1, _), (k2, _)| strcoll(k1, k2));
                         for (key, value) in sorted_vars {
                             // key should only contain valid ascii
-                            opened_files.stdout().write_str(format!(
+                            opened_files.write_out(format!(
                                 "{}='{}'\n",
                                 key.to_str().unwrap(),
                                 value

@@ -35,7 +35,7 @@ impl SpecialBuiltinUtility for Times {
         let children_user_s = microseconds_to_seconds(children_times.user_time().tv_usec());
         let children_system_s = microseconds_to_seconds(children_times.system_time().tv_usec());
 
-        opened_files.stdout().write_str(format!(
+        opened_files.write_out(format!(
             "{}m{}s {}m{}s\n{}m{}s {}m{}s\n",
             seconds_to_minutes(shell_user_s),
             shell_user_s,

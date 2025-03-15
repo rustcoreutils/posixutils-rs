@@ -15,9 +15,7 @@ impl BuiltinUtility for AliasBuiltin {
     ) -> BuiltinResult {
         if args.is_empty() {
             for (alias, command) in &shell.alias_table {
-                opened_files
-                    .stdout()
-                    .write_str(format!("alias {}='{}'", alias, command));
+                opened_files.write_out(format!("alias {}='{}'", alias, command));
             }
             return Ok(0);
         }
@@ -31,9 +29,7 @@ impl BuiltinUtility for AliasBuiltin {
                     .insert(alias.to_string(), command.to_string());
             } else {
                 if let Some(command) = shell.alias_table.get(arg) {
-                    opened_files
-                        .stdout()
-                        .write_str(format!("alias {}='{}'", arg, command));
+                    opened_files.write_out(format!("alias {}='{}'", arg, command));
                 } else {
                     return Err(format!("alias: {}: not found", arg).into());
                 }

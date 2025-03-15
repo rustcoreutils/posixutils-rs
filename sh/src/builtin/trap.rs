@@ -229,20 +229,14 @@ fn print_commands(shell: &mut Shell, opened_files: &mut OpenedFiles, print_defau
         let condition = CONDITIONS[condition];
         match action {
             TrapAction::Default if print_default => {
-                opened_files
-                    .stdout()
-                    .write_str(format!("trap -- - {}\n", condition));
+                opened_files.write_out(format!("trap -- - {}\n", condition));
             }
             TrapAction::Default => {}
             TrapAction::Ignore => {
-                opened_files
-                    .stdout()
-                    .write_str(format!("trap -- '' {}\n", condition));
+                opened_files.write_out(format!("trap -- '' {}\n", condition));
             }
             TrapAction::Commands(cmd) => {
-                opened_files
-                    .stdout()
-                    .write_str(format!("trap -- '{cmd}' {}\n", condition));
+                opened_files.write_out(format!("trap -- '{cmd}' {}\n", condition));
             }
         }
     }

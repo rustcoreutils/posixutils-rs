@@ -26,13 +26,9 @@ impl SpecialBuiltinUtility for ReadOnly {
             pairs.sort_by_key(|(k, _)| k.as_str());
             for (var, var_value) in pairs {
                 if let Some(val) = &var_value.value {
-                    opened_files
-                        .stdout()
-                        .write_str(format!("readonly {}='{}'\n", var, val));
+                    opened_files.write_out(format!("readonly {}='{}'\n", var, val));
                 } else {
-                    opened_files
-                        .stdout()
-                        .write_str(format!("readonly {}\n", var));
+                    opened_files.write_out(format!("readonly {}\n", var));
                 }
             }
             return Ok(0);

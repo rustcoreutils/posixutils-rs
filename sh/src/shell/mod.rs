@@ -139,7 +139,7 @@ pub struct Shell {
 
 impl Shell {
     pub fn eprint(&self, message: &str) {
-        self.opened_files.stderr().write_str(message);
+        self.opened_files.write_err(message);
     }
 
     pub fn assign(
@@ -211,7 +211,7 @@ impl Shell {
         match special_builtin_utility.exec(args, self, &mut opened_files) {
             Ok(status) => Ok(status),
             Err(err) => {
-                opened_files.stderr().write_str(&format!("{err}\n"));
+                opened_files.write_err(format!("{err}\n"));
                 if !self.is_interactive {
                     std::process::exit(1)
                 }
@@ -264,7 +264,7 @@ impl Shell {
         match builtin_utility.exec(args, self, &mut opened_files, command_env) {
             Ok(status) => Ok(status),
             Err(err) => {
-                opened_files.stderr().write_str(format!("{err}\n"));
+                opened_files.write_err(format!("{err}\n"));
                 Ok(1)
             }
         }

@@ -1255,4 +1255,12 @@ mod builtin {
             include_str!("sh/builtin/shift.out"),
         )
     }
+
+    #[test]
+    fn trap() {
+        test_script(
+            include_str!("sh/builtin/trap.sh"),
+            include_str!("sh/builtin/trap.out"),
+        )
+    }
 }

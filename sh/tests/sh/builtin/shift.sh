@@ -8,3 +8,6 @@ shift 2
 echo $?
 echo $*
 
+shift -- 1
+echo $?
+echo $*

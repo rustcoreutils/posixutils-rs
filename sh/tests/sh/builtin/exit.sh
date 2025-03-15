@@ -1,4 +1,13 @@
+(exit)
+echo $?
+
+(exit --)
+echo $?
+
 (exit 0)
+echo $?
+
+(exit -- 0)
 echo $?
 
 (false; exit)

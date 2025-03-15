@@ -1,4 +1,4 @@
-use crate::builtin::{BuiltinResult, SpecialBuiltinUtility};
+use crate::builtin::{skip_option_terminator, BuiltinResult, SpecialBuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 use crate::utils::{exec, find_command, ExecError};
@@ -12,6 +12,7 @@ impl SpecialBuiltinUtility for Exec {
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
+        let args = skip_option_terminator(args);
         if args.is_empty() {
             shell.opened_files = opened_files.clone();
             return Ok(0);

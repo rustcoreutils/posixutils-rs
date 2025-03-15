@@ -1,4 +1,6 @@
-use crate::builtin::{BuiltinResult, BuiltinUtility, SpecialBuiltinUtility};
+use crate::builtin::{
+    skip_option_terminator, BuiltinResult, BuiltinUtility, SpecialBuiltinUtility,
+};
 use crate::shell::opened_files::{OpenedFiles, WriteFile};
 use crate::shell::ControlFlowState;
 use crate::shell::Shell;
@@ -16,11 +18,7 @@ fn loop_control_flow(
         .into());
     }
 
-    let args = if args.get(0).is_some_and(|arg| arg == "--") {
-        &args[1..]
-    } else {
-        &args
-    };
+    let args = skip_option_terminator(args);
 
     if args.len() > 1 {
         return Err(format!("{name}: too many arguments").into());

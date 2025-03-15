@@ -1,4 +1,4 @@
-use crate::builtin::{BuiltinResult, SpecialBuiltinUtility};
+use crate::builtin::{skip_option_terminator, BuiltinResult, SpecialBuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 
@@ -11,6 +11,7 @@ impl SpecialBuiltinUtility for Eval {
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
+        let args = skip_option_terminator(args);
         let program = args.join(" ");
 
         std::mem::swap(&mut shell.opened_files, opened_files);

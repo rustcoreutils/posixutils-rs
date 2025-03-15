@@ -1,4 +1,5 @@
 (exec echo hello)
+(exec -- echo hello)
 
 (exec 1> $TEST_WRITE_DIR/exec.txt; echo $?; echo hello)
 

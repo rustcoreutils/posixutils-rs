@@ -1,4 +1,4 @@
-use crate::builtin::{BuiltinResult, SpecialBuiltinUtility};
+use crate::builtin::{skip_option_terminator, BuiltinResult, SpecialBuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 use nix::libc::{suseconds_t, time_t};
@@ -16,10 +16,15 @@ pub struct Times;
 impl SpecialBuiltinUtility for Times {
     fn exec(
         &self,
-        _: &[String],
+        args: &[String],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
+        let args = skip_option_terminator(args);
+        if !args.is_empty() {
+            return Err("times: too many arguments".into());
+        }
+
         let shell_times = getrusage(UsageWho::RUSAGE_SELF)
             .map_err(|err| format!("times: failed to read user times ({err})"))?;
         let children_times = getrusage(UsageWho::RUSAGE_CHILDREN)

@@ -1,4 +1,4 @@
-use crate::builtin::{BuiltinResult, SpecialBuiltinUtility};
+use crate::builtin::{skip_option_terminator, BuiltinResult, SpecialBuiltinUtility};
 use crate::parse::command_parser::is_valid_name;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
@@ -13,11 +13,10 @@ impl SpecialBuiltinUtility for ReadOnly {
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
-        if args.is_empty() {
-            return Err("readonly: too few arguments".to_string().into());
-        }
-
-        if args[0] == "-p" {
+        if args.get(0).is_some_and(|arg| arg == "-p") {
+            if args.len() > 1 && !(args.len() == 2 && args[1] == "--") {
+                return Err("export: too many arguments".into());
+            }
             let mut pairs = shell
                 .environment
                 .variables
@@ -37,6 +36,11 @@ impl SpecialBuiltinUtility for ReadOnly {
                 }
             }
             return Ok(0);
+        }
+
+        let args = skip_option_terminator(args);
+        if args.is_empty() {
+            return Err("readonly: too few arguments".to_string().into());
         }
 
         for arg in args {

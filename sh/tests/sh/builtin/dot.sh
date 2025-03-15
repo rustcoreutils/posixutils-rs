@@ -2,6 +2,10 @@ echo 'echo hello' > $TEST_WRITE_DIR/dot.txt
 . $TEST_WRITE_DIR/dot.txt
 echo $?
 
+echo 'echo hello' > $TEST_WRITE_DIR/dot.txt
+. -- $TEST_WRITE_DIR/dot.txt
+echo $?
+
 echo 'echo $LINENO
 echo $LINENO' > $TEST_WRITE_DIR/dot.txt
 . $TEST_WRITE_DIR/dot.txt

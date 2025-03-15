@@ -1,4 +1,4 @@
-use crate::builtin::{BuiltinResult, SpecialBuiltinUtility};
+use crate::builtin::{skip_option_terminator, BuiltinResult, SpecialBuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::{ControlFlowState, Shell};
 use crate::utils::{find_command, find_in_path};
@@ -13,6 +13,8 @@ impl SpecialBuiltinUtility for Dot {
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
+        let args = skip_option_terminator(args);
+
         if args.len() != 1 {
             return Err("dot: incorrect number of arguments".into());
         }

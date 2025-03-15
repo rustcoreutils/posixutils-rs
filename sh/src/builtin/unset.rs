@@ -1,4 +1,6 @@
-use crate::builtin::{BuiltinResult, BuiltinUtility, SpecialBuiltinUtility};
+use crate::builtin::{
+    skip_option_terminator, BuiltinResult, BuiltinUtility, SpecialBuiltinUtility,
+};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 
@@ -11,6 +13,7 @@ impl SpecialBuiltinUtility for BuiltinUnset {
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
+        let args = skip_option_terminator(args);
         if args.is_empty() {
             return Ok(0);
         }

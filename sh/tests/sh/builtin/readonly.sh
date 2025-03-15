@@ -8,6 +8,11 @@ echo $?
 echo $b $c
 readonly -p
 
+readonly -- d=value3
+echo $?
+echo $d
+readonly -p --
+
 var=value
 echo $var
 readonly var

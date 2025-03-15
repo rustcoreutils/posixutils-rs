@@ -1,7 +1,13 @@
 eval
 echo $?
 
+eval --
+echo $?
+
 eval echo hello
+echo $?
+
+eval -- echo hello
 echo $?
 
 eval echo hello \; echo world

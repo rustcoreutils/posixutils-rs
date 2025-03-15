@@ -7,32 +7,54 @@ use std::fmt::Display;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
-struct CdArgs<'a> {
-    directory: Option<&'a str>,
-    handle_dot_dot_physically: bool,
+#[derive(Debug, PartialEq, Eq)]
+enum CdArgs<'a> {
+    ChangeDir {
+        directory: Option<&'a str>,
+        handle_dot_dot_physically: bool,
+    },
+    GoBack,
 }
 
 impl<'a> CdArgs<'a> {
-    fn parse(args: &'a [String]) -> Result<Self, &'static str> {
+    fn parse(args: &'a [String]) -> Result<Self, String> {
         let mut handle_dot_dot_physically = false;
+        let mut parsing_options = true;
         for (i, arg) in args.iter().enumerate() {
             match arg.as_str() {
-                "-L" => handle_dot_dot_physically = false,
-                "-P" => handle_dot_dot_physically = true,
+                "--" if parsing_options => {
+                    parsing_options = false;
+                }
+                option if parsing_options && option.starts_with('-') => {
+                    if option.len() == 1 {
+                        if i != args.len() - 1 {
+                            return Err("too many arguments".into());
+                        }
+                        return Ok(Self::GoBack);
+                    }
+                    if let Some(c) = arg[1..].chars().find(|c| *c != 'L' && *c != 'P') {
+                        return Err(format!("invalid argument -{c}"));
+                    }
+                    let last = option.chars().last().unwrap();
+                    handle_dot_dot_physically = last == 'P';
+                }
                 directory => {
                     if i != args.len() - 1 {
-                        return Err("too many arguments");
+                        return Err("too many arguments".into());
                     }
-                    return Ok(Self {
+                    if directory == "-" {
+                        return Ok(Self::GoBack);
+                    }
+                    return Ok(Self::ChangeDir {
                         directory: Some(directory),
                         handle_dot_dot_physically,
                     });
                 }
             }
         }
-        Ok(Self {
+        Ok(Self::ChangeDir {
             directory: None,
-            handle_dot_dot_physically: true,
+            handle_dot_dot_physically,
         })
     }
 }
@@ -51,24 +73,6 @@ impl BuiltinUtility for Cd {
         opened_files: &mut OpenedFiles,
         environment: Environment,
     ) -> BuiltinResult {
-        if args.len() == 1 && args[0] == "-" {
-            if let Some(oldpwd) = environment.get_str_value("OLDPWD") {
-                let old_working_dir = std::env::current_dir().unwrap();
-                nix::unistd::chdir(oldpwd).map_err(io_err_to_string)?;
-                shell.current_directory = OsString::from_vec(oldpwd.as_bytes().to_vec());
-                shell.assign("PWD".to_string(), Some(oldpwd.to_string()), false, false)?;
-                shell.assign(
-                    "OLDPWD".to_string(),
-                    Some(old_working_dir.to_string_lossy().into_owned()),
-                    false,
-                    false,
-                )?;
-                opened_files.stdout().write_str(format!("{}\n", oldpwd));
-                return Ok(0);
-            }
-            return Err("cd: OLDPWD not set\n".into());
-        }
-
         let args = match CdArgs::parse(args) {
             Ok(args) => args,
             Err(err) => {
@@ -76,79 +80,224 @@ impl BuiltinUtility for Cd {
             }
         };
 
-        let dir = if let Some(dir) = args.directory {
-            dir
-        } else {
-            if let Some(home_dir) = environment.get_str_value("HOME") {
-                home_dir
-            } else {
-                // behaviour is implementation defined, bash just returns 0
-                // and doesn't change directory
-                return Ok(0);
-            }
-        };
-        let mut curr_path = OsString::new();
+        match args {
+            CdArgs::ChangeDir {
+                directory,
+                handle_dot_dot_physically,
+            } => {
+                let dir = if let Some(dir) = directory {
+                    dir
+                } else {
+                    if let Some(home_dir) = environment.get_str_value("HOME") {
+                        home_dir
+                    } else {
+                        // behaviour is implementation defined, bash just returns 0
+                        // and doesn't change directory
+                        return Ok(0);
+                    }
+                };
+                let mut curr_path = OsString::new();
 
-        if !dir.starts_with('/') {
-            if !dir.starts_with('.') && !dir.starts_with("..") {
-                if let Some(cdpath) = environment.get_str_value("CDPATH") {
-                    for component in cdpath.split(':') {
-                        let mut path = PathBuf::from(component);
-                        path.push(dir);
-                        if path.exists() {
-                            curr_path = path.into_os_string();
+                if !dir.starts_with('/') {
+                    if !dir.starts_with('.') && !dir.starts_with("..") {
+                        if let Some(cdpath) = environment.get_str_value("CDPATH") {
+                            for component in cdpath.split(':') {
+                                let mut path = PathBuf::from(component);
+                                path.push(dir);
+                                if path.exists() {
+                                    curr_path = path.into_os_string();
+                                }
+                            }
+                        } else {
+                            let path = PathBuf::from(dir);
+                            if path.exists() {
+                                curr_path = path.into_os_string();
+                            }
                         }
                     }
-                } else {
-                    let path = PathBuf::from(dir);
-                    if path.exists() {
-                        curr_path = path.into_os_string();
+                    if curr_path.is_empty() {
+                        curr_path = OsString::from_vec(dir.as_bytes().to_vec());
                     }
+                } else {
+                    curr_path = OsString::from_vec(dir.as_bytes().to_vec());
                 }
-            }
-            if curr_path.is_empty() {
-                curr_path = OsString::from_vec(dir.as_bytes().to_vec());
-            }
-        } else {
-            curr_path = OsString::from_vec(dir.as_bytes().to_vec());
-        }
 
-        if !args.handle_dot_dot_physically {
-            if !curr_path.as_bytes().get(0).is_some_and(|c| *c == b'/') {
-                let mut new_curr_path = environment
-                    .get_str_value("PWD")
-                    .unwrap_or_default()
-                    .as_bytes()
-                    .to_vec();
-                if new_curr_path.last().is_some_and(|c| *c != b'/') {
-                    new_curr_path.push(b'/');
+                if !handle_dot_dot_physically {
+                    if !curr_path.as_bytes().get(0).is_some_and(|c| *c == b'/') {
+                        let mut new_curr_path = environment
+                            .get_str_value("PWD")
+                            .unwrap_or_default()
+                            .as_bytes()
+                            .to_vec();
+                        if new_curr_path.last().is_some_and(|c| *c != b'/') {
+                            new_curr_path.push(b'/');
+                        }
+                        new_curr_path.extend(curr_path.as_bytes());
+                        curr_path = OsString::from_vec(new_curr_path)
+                    }
+                    curr_path = PathBuf::from(curr_path)
+                        .canonicalize()
+                        .map_err(io_err_to_string)?
+                        .into_os_string();
                 }
-                new_curr_path.extend(curr_path.as_bytes());
-                curr_path = OsString::from_vec(new_curr_path)
+
+                let old_working_dir = std::env::current_dir().map_err(io_err_to_string)?;
+                nix::unistd::chdir(AsRef::<OsStr>::as_ref(&curr_path)).map_err(io_err_to_string)?;
+                shell.current_directory = curr_path.clone();
+
+                shell.assign(
+                    "PWD".to_string(),
+                    Some(curr_path.to_string_lossy().into_owned()),
+                    false,
+                    false,
+                )?;
+                shell.assign(
+                    "OLDPWD".to_string(),
+                    Some(old_working_dir.to_string_lossy().into_owned()),
+                    false,
+                    false,
+                )?;
             }
-            curr_path = PathBuf::from(curr_path)
-                .canonicalize()
-                .map_err(io_err_to_string)?
-                .into_os_string();
+            CdArgs::GoBack => {
+                if let Some(oldpwd) = environment.get_str_value("OLDPWD") {
+                    let old_working_dir = std::env::current_dir().unwrap();
+                    nix::unistd::chdir(oldpwd).map_err(io_err_to_string)?;
+                    shell.current_directory = OsString::from_vec(oldpwd.as_bytes().to_vec());
+                    shell.assign("PWD".to_string(), Some(oldpwd.to_string()), false, false)?;
+                    shell.assign(
+                        "OLDPWD".to_string(),
+                        Some(old_working_dir.to_string_lossy().into_owned()),
+                        false,
+                        false,
+                    )?;
+                    opened_files.stdout().write_str(format!("{}\n", oldpwd));
+                    return Ok(0);
+                }
+                return Err("cd: OLDPWD not set\n".into());
+            }
         }
-
-        let old_working_dir = std::env::current_dir().map_err(io_err_to_string)?;
-        nix::unistd::chdir(AsRef::<OsStr>::as_ref(&curr_path)).map_err(io_err_to_string)?;
-        shell.current_directory = curr_path.clone();
-
-        shell.assign(
-            "PWD".to_string(),
-            Some(curr_path.to_string_lossy().into_owned()),
-            false,
-            false,
-        )?;
-        shell.assign(
-            "OLDPWD".to_string(),
-            Some(old_working_dir.to_string_lossy().into_owned()),
-            false,
-            false,
-        )?;
 
         Ok(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_and_check_eq(args: Vec<&str>, correct: CdArgs<'static>) {
+        let args = args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let parsed_args = CdArgs::parse(&args).expect("invalid args");
+        assert_eq!(parsed_args, correct);
+    }
+
+    #[test]
+    fn parse_empty_args() {
+        parse_and_check_eq(
+            vec![],
+            CdArgs::ChangeDir {
+                directory: None,
+                handle_dot_dot_physically: false,
+            },
+        )
+    }
+
+    #[test]
+    fn parse_change_directory_no_args() {
+        parse_and_check_eq(
+            vec!["some_dir/some_other_dir"],
+            CdArgs::ChangeDir {
+                directory: Some("some_dir/some_other_dir"),
+                handle_dot_dot_physically: false,
+            },
+        )
+    }
+
+    #[test]
+    fn parse_change_directory_single_arg() {
+        parse_and_check_eq(
+            vec!["-L", "some_dir/some_other_dir"],
+            CdArgs::ChangeDir {
+                directory: Some("some_dir/some_other_dir"),
+                handle_dot_dot_physically: false,
+            },
+        );
+        parse_and_check_eq(
+            vec!["-P", "some_dir/some_other_dir"],
+            CdArgs::ChangeDir {
+                directory: Some("some_dir/some_other_dir"),
+                handle_dot_dot_physically: true,
+            },
+        )
+    }
+
+    #[test]
+    fn parse_change_directory_multiple_args() {
+        parse_and_check_eq(
+            vec!["-L", "-P", "some_dir/some_other_dir"],
+            CdArgs::ChangeDir {
+                directory: Some("some_dir/some_other_dir"),
+                handle_dot_dot_physically: true,
+            },
+        );
+        parse_and_check_eq(
+            vec!["-P", "-L", "some_dir/some_other_dir"],
+            CdArgs::ChangeDir {
+                directory: Some("some_dir/some_other_dir"),
+                handle_dot_dot_physically: false,
+            },
+        );
+        parse_and_check_eq(
+            vec!["-PL", "some_dir/some_other_dir"],
+            CdArgs::ChangeDir {
+                directory: Some("some_dir/some_other_dir"),
+                handle_dot_dot_physically: false,
+            },
+        );
+        parse_and_check_eq(
+            vec!["-PLPPLLP", "some_dir/some_other_dir"],
+            CdArgs::ChangeDir {
+                directory: Some("some_dir/some_other_dir"),
+                handle_dot_dot_physically: true,
+            },
+        )
+    }
+
+    #[test]
+    fn parse_go_back_no_args() {
+        parse_and_check_eq(vec!["-"], CdArgs::GoBack);
+    }
+
+    #[test]
+    fn correctly_handle_options_terminator() {
+        parse_and_check_eq(
+            vec!["--"],
+            CdArgs::ChangeDir {
+                directory: None,
+                handle_dot_dot_physically: false,
+            },
+        );
+        parse_and_check_eq(
+            vec!["--", "-L"],
+            CdArgs::ChangeDir {
+                directory: Some("-L"),
+                handle_dot_dot_physically: false,
+            },
+        );
+        parse_and_check_eq(
+            vec!["--", "-L"],
+            CdArgs::ChangeDir {
+                directory: Some("-L"),
+                handle_dot_dot_physically: false,
+            },
+        );
+        parse_and_check_eq(vec!["--", "-"], CdArgs::GoBack);
+        parse_and_check_eq(
+            vec!["-P", "--", "some_dir"],
+            CdArgs::ChangeDir {
+                directory: Some("some_dir"),
+                handle_dot_dot_physically: true,
+            },
+        );
     }
 }

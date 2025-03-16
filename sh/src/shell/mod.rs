@@ -751,6 +751,9 @@ impl Shell {
             .assign_global("PS4".to_string(), "+ ".to_string())
             .unwrap();
         shell
+            .assign_global("OPTIND".to_string(), "1".to_string())
+            .unwrap();
+        shell
     }
 
     fn get_var_and_expand(&mut self, var: &str, default_if_err: &str) -> String {

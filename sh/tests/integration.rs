@@ -1290,4 +1290,19 @@ mod builtin {
             include_str!("sh/builtin/unalias.out"),
         )
     }
+
+    #[test]
+    fn getopts() {
+        test_script(include_str!("sh/builtin/getopts.sh"), include_str!("sh/builtin/getopts.out"));
+    }
+
+    #[test]
+    fn getopts_with_invalid_option_prints_err() {
+        test_script_expect_stderr_and_stdout("while getopts a opt -d; do echo $opt $OPTARG; done; echo $OPTIND", "?\n2\n");
+    }
+
+    #[test]
+    fn getopts_option_with_missing_argument_prints_error() {
+        test_script_expect_stderr_and_stdout("while getopts a: opt -a; do echo $opt $OPTARG; done; echo $OPTIND", "?\n2\n");
+    }
 }

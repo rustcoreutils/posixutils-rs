@@ -7,6 +7,7 @@ use crate::builtin::eval::Eval;
 use crate::builtin::exec::Exec;
 use crate::builtin::exit::Exit;
 use crate::builtin::export::Export;
+use crate::builtin::getopts::GetOpts;
 use crate::builtin::readonly::ReadOnly;
 use crate::builtin::set::SetSpecialBuiltin;
 use crate::builtin::shift::Shift;
@@ -30,6 +31,7 @@ mod eval;
 mod exec;
 mod exit;
 mod export;
+mod getopts;
 mod readonly;
 pub mod set;
 mod shift;
@@ -136,6 +138,7 @@ pub fn get_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
     match name {
         "alias" => Some(&AliasBuiltin),
         "command" => Some(&Command),
+        "getopts" => Some(&GetOpts),
         "cd" => Some(&Cd),
         "type" => Some(&Type_),
         "unalias" => Some(&Unalias),

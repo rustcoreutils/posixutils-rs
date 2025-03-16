@@ -1,0 +1,5 @@
+a is aliased to 'echo hello'
+f is a function
+set is a special shell builtin
+exit is a special shell builtin
+type is a shell builtin

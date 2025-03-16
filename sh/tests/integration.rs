@@ -1274,4 +1274,12 @@ mod builtin {
             include_str!("sh/builtin/command.out"),
         )
     }
+
+    #[test]
+    fn type_builtin() {
+        test_script(
+            include_str!("sh/builtin/type.sh"),
+            include_str!("sh/builtin/type.out"),
+        )
+    }
 }

@@ -136,6 +136,7 @@ impl Environment {
     }
 
     pub fn unset(&mut self, name: &str) -> Result<(), CannotModifyReadonly> {
+        self.remove_from_local_scope(name);
         if let Some(var) = self.global_scope.get_mut(name) {
             if var.readonly {
                 return Err(CannotModifyReadonly(name.to_string()));

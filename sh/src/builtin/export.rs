@@ -18,7 +18,7 @@ impl SpecialBuiltinUtility for Export {
             }
             let mut pairs = shell
                 .environment
-                .variables
+                .global_scope()
                 .iter()
                 .filter(|(_, val)| val.export)
                 .collect::<Vec<_>>();
@@ -51,7 +51,11 @@ impl SpecialBuiltinUtility for Export {
                 }
                 (arg.clone(), None)
             };
-            shell.assign(name, value, true, false)?;
+            if let Some(value) = value {
+                shell.assign_global(name, value)?.export = true;
+            } else {
+                shell.environment.promote_local_or_get_global(name).export = true;
+            }
         }
         Ok(0)
     }

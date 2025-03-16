@@ -145,17 +145,10 @@ impl BuiltinUtility for Cd {
                 nix::unistd::chdir(AsRef::<OsStr>::as_ref(&curr_path)).map_err(io_err_to_string)?;
                 shell.current_directory = curr_path.clone();
 
-                shell.assign(
-                    "PWD".to_string(),
-                    Some(curr_path.to_string_lossy().into_owned()),
-                    false,
-                    false,
-                )?;
-                shell.assign(
+                shell.assign_global("PWD".to_string(), curr_path.to_string_lossy().into_owned())?;
+                shell.assign_global(
                     "OLDPWD".to_string(),
-                    Some(old_working_dir.to_string_lossy().into_owned()),
-                    false,
-                    false,
+                    old_working_dir.to_string_lossy().into_owned(),
                 )?;
             }
             CdArgs::GoBack => {
@@ -163,12 +156,10 @@ impl BuiltinUtility for Cd {
                     let old_working_dir = std::env::current_dir().unwrap();
                     nix::unistd::chdir(oldpwd).map_err(io_err_to_string)?;
                     shell.current_directory = OsString::from_vec(oldpwd.as_bytes().to_vec());
-                    shell.assign("PWD".to_string(), Some(oldpwd.to_string()), false, false)?;
-                    shell.assign(
+                    shell.assign_global("PWD".to_string(), oldpwd.to_string())?;
+                    shell.assign_global(
                         "OLDPWD".to_string(),
-                        Some(old_working_dir.to_string_lossy().into_owned()),
-                        false,
-                        false,
+                        old_working_dir.to_string_lossy().into_owned(),
                     )?;
                     opened_files.write_out(format!("{}\n", oldpwd));
                     return Ok(0);

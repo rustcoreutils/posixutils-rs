@@ -19,7 +19,7 @@ impl SpecialBuiltinUtility for ReadOnly {
             }
             let mut pairs = shell
                 .environment
-                .variables
+                .global_scope()
                 .iter()
                 .filter(|(_, val)| val.readonly)
                 .collect::<Vec<_>>();
@@ -52,7 +52,11 @@ impl SpecialBuiltinUtility for ReadOnly {
                 }
                 (arg.clone(), None)
             };
-            shell.assign(name, value, false, true)?;
+            if let Some(value) = value {
+                shell.assign_global(name, value)?.readonly = true;
+            } else {
+                shell.environment.promote_local_or_get_global(name).readonly = true;
+            }
         }
         Ok(0)
     }

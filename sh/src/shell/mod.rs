@@ -142,15 +142,15 @@ impl Shell {
         self.opened_files.write_err(message);
     }
 
-    pub fn assign(
+    pub fn assign_global(
         &mut self,
         name: String,
-        value: Option<String>,
-        add_export: bool,
-        add_readonly: bool,
-    ) -> Result<(), CannotModifyReadonly> {
-        let export = self.set_options.allexport || add_export;
-        self.environment.set(name, value, export, add_readonly)
+        value: String,
+    ) -> Result<&mut Value, CannotModifyReadonly> {
+        self.environment.set_global(name, value).map(|val| {
+            val.export_or(self.set_options.allexport);
+            val
+        })
     }
 
     fn handle_error(&self, err: CommandExecutionError) -> i32 {
@@ -186,7 +186,8 @@ impl Shell {
     ) -> CommandExecutionResult<()> {
         for assignment in assignments {
             let word_str = expand_word_to_string(&assignment.value, true, self)?;
-            self.assign(assignment.name.to_string(), Some(word_str), export, false)?;
+            self.assign_global(assignment.name.to_string(), word_str)?
+                .export_or(export);
         }
         Ok(())
     }
@@ -363,7 +364,7 @@ impl Shell {
         'outer: for word in iter_words {
             let items = expand_word(word, false, self)?;
             for item in items {
-                self.assign(iter_var.to_string(), Some(item), false, false)?;
+                self.assign_global(iter_var.to_string(), item)?;
                 result = self.interpret(body, ignore_errexit);
                 match self.control_flow_state {
                     ControlFlowState::Break(_) => {
@@ -518,8 +519,14 @@ impl Shell {
     }
 
     fn interpret_command(&mut self, command: &Command, ignore_errexit: bool) -> i32 {
-        self.environment
-            .set_forced("LINENO", command.lineno.to_string());
+        let lineno_var = self
+            .environment
+            .set_global_forced("LINENO".to_string(), command.lineno.to_string());
+        if lineno_var.readonly {
+            self.opened_files
+                .write_err("sh: setting LINENO to readonly has no effect");
+            lineno_var.readonly = false;
+        }
         let execution_result = match &command.type_ {
             CommandType::SimpleCommand(simple_command) => {
                 self.interpret_simple_command(simple_command, ignore_errexit)
@@ -713,24 +720,19 @@ impl Shell {
             ..Default::default()
         };
         shell
-            .assign(
-                "PPID".to_string(),
-                Some(getppid().to_string()),
-                false,
-                false,
-            )
+            .assign_global("PPID".to_string(), getppid().to_string())
             .unwrap();
         shell
-            .assign("IFS".to_string(), Some(" \t\n".to_string()), false, false)
+            .assign_global("IFS".to_string(), " \t\n".to_string())
             .unwrap();
         shell
-            .assign("PS1".to_string(), Some("\\$ ".to_string()), false, false)
+            .assign_global("PS1".to_string(), "\\$ ".to_string())
             .unwrap();
         shell
-            .assign("PS2".to_string(), Some("> ".to_string()), false, false)
+            .assign_global("PS2".to_string(), "> ".to_string())
             .unwrap();
         shell
-            .assign("PS4".to_string(), Some("+ ".to_string()), false, false)
+            .assign_global("PS4".to_string(), "+ ".to_string())
             .unwrap();
         shell
     }

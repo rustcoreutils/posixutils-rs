@@ -197,30 +197,17 @@ pub fn expand_parameter_into(
             assign_on_null,
         } => {
             let value = expand_word_to_string(word, false, shell)?;
-            match shell.environment.get_var_mut(variable_name.as_ref()) {
-                Some(variable) => {
-                    if !variable.is_set() || (variable.is_null() && *assign_on_null) {
-                        if variable.readonly {
-                            return Err(CommandExecutionError::ExpansionError(format!(
-                                "sh: cannot set readonly variable {variable_name}"
-                            )));
-                        }
-                        variable.value = Some(value.clone());
-                        expanded_word.append(value, inside_double_quotes, true);
-                    } else {
-                        expanded_word.append(
-                            variable.value.clone().unwrap(),
-                            inside_double_quotes,
-                            true,
-                        );
-                    }
-                }
-                None => {
-                    // cannot fail since var is not in the environment
-                    let _ =
-                        shell.assign(variable_name.to_string(), Some(value.clone()), false, false);
+
+            if let Some(current_value) = shell.environment.get_str_value(&variable_name) {
+                if current_value.is_empty() && *assign_on_null {
+                    shell.assign_global(variable_name.to_string(), value.clone())?;
                     expanded_word.append(value, inside_double_quotes, true);
+                } else {
+                    expanded_word.append(current_value.to_string(), inside_double_quotes, true);
                 }
+            } else {
+                shell.assign_global(variable_name.to_string(), value.clone())?;
+                expanded_word.append(value, inside_double_quotes, true);
             }
         }
         ParameterExpansion::UnsetError {
@@ -344,7 +331,7 @@ mod tests {
         for (k, v) in env {
             shell
                 .environment
-                .set(k.to_string(), Some(v.to_string()), false, false)
+                .set_global(k.to_string(), v.to_string())
                 .expect("failed to set var");
         }
         shell
@@ -980,7 +967,7 @@ mod tests {
         let mut shell = shell_with_positional_arguments(vec!["arg1", "arg2", "arg3"]);
         shell
             .environment
-            .set("IFS".to_string(), Some("".to_string()), false, false)
+            .set_global("IFS".to_string(), "".to_string())
             .unwrap();
         assert_eq!(
             expand_parameter(
@@ -1061,7 +1048,7 @@ mod tests {
         let mut shell = shell_with_positional_arguments(vec!["arg1", "arg2", "arg3"]);
         shell
             .environment
-            .set("IFS".to_string(), Some(",:".to_string()), false, false)
+            .set_global("IFS".to_string(), ",:".to_string())
             .unwrap();
         assert_eq!(
             expand_parameter(

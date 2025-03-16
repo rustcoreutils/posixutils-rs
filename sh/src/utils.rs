@@ -135,7 +135,7 @@ pub fn exec(
         .map(|s| CString::new(s.as_str()).unwrap())
         .collect::<Vec<_>>();
     let env = env
-        .variables
+        .global_scope()
         .iter()
         .filter_map(|(name, value)| {
             if value.export {

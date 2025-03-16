@@ -3,7 +3,7 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fmt::Formatter;
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Value {
     /// `None` if `Value` is unset
     pub value: Option<String>,
@@ -28,18 +28,18 @@ impl Value {
         }
     }
 
-    pub fn is_null(&self) -> bool {
-        self.value.as_ref().is_some_and(|v| v.is_empty())
-    }
-
-    pub fn is_set(&self) -> bool {
-        self.value.is_some()
+    pub fn export_or(&mut self, value: bool) {
+        self.export = self.export || value;
     }
 }
 
+pub type GlobalScope = HashMap<String, Value>;
+pub type LocalScope = HashMap<String, String>;
+
 #[derive(Default, Clone)]
 pub struct Environment {
-    pub variables: HashMap<String, Value>,
+    global_scope: HashMap<String, Value>,
+    local_scopes: Vec<LocalScope>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,67 +58,78 @@ impl Display for CannotModifyReadonly {
 }
 
 impl Environment {
-    pub fn set(
+    pub fn set_global(
         &mut self,
         name: String,
-        value: Option<String>,
-        add_export: bool,
-        add_readonly: bool,
-    ) -> Result<(), CannotModifyReadonly> {
-        match self.variables.entry(name) {
+        value: String,
+    ) -> Result<&mut Value, CannotModifyReadonly> {
+        self.remove_from_local_scope(&name);
+        match self.global_scope.entry(name) {
             Entry::Occupied(mut e) => {
-                if let Some(value) = value {
-                    if e.get().readonly {
-                        return Err(CannotModifyReadonly(e.key().clone()));
-                    }
-                    e.get_mut().value = Some(value);
+                if e.get().readonly {
+                    return Err(CannotModifyReadonly(e.key().clone()));
                 }
-                e.get_mut().export = e.get_mut().export || add_export;
-                e.get_mut().readonly = e.get_mut().readonly || add_readonly;
+                e.get_mut().value = Some(value);
+                Ok(e.into_mut())
             }
-            Entry::Vacant(e) => {
-                e.insert(Value {
-                    value,
-                    export: add_export,
-                    readonly: add_readonly,
-                });
+            Entry::Vacant(e) => Ok(e.insert(Value {
+                value: Some(value),
+                export: false,
+                readonly: false,
+            })),
+        }
+    }
+
+    pub fn set_global_forced(&mut self, name: String, value: String) -> &mut Value {
+        self.remove_from_local_scope(&name);
+        match self.global_scope.entry(name) {
+            Entry::Occupied(mut e) => {
+                e.get_mut().value = Some(value);
+                e.into_mut()
             }
+            Entry::Vacant(e) => e.insert(Value {
+                value: Some(value),
+                export: false,
+                readonly: false,
+            }),
+        }
+    }
+
+    pub fn set(&mut self, name: String, value: String) -> Result<(), CannotModifyReadonly> {
+        if let Some(innermost_scope) = self.local_scopes.last_mut() {
+            innermost_scope.insert(name, value);
+        } else {
+            self.set_global(name, value)?;
         }
         Ok(())
     }
 
-    pub fn set_forced(&mut self, name: &str, value: String) {
-        if let Some(var) = self.get_var_mut(name) {
-            var.value = Some(value)
-        } else {
-            self.variables.insert(
-                name.to_string(),
-                Value {
-                    value: Some(value),
-                    export: false,
-                    readonly: false,
-                },
-            );
-        }
-    }
-
     pub fn get_str_value(&self, name: &str) -> Option<&str> {
-        self.variables
+        for local_scope in self.local_scopes.iter().rev() {
+            if let Some(value) = local_scope.get(name).map(|val| val.as_str()) {
+                return Some(value);
+            }
+        }
+        self.global_scope
             .get(name)
             .map(|val| val.value.as_deref())
             .flatten()
     }
 
-    pub fn get_var(&self, name: &str) -> Option<&Value> {
-        self.variables.get(name)
-    }
-
-    pub fn get_var_mut(&mut self, name: &str) -> Option<&mut Value> {
-        self.variables.get_mut(name)
+    pub fn promote_local_or_get_global(&mut self, name: String) -> &mut Value {
+        for local_scope in self.local_scopes.iter_mut().rev() {
+            if let Some((k, v)) = local_scope.remove_entry(&name) {
+                return self.set_global(k, v).unwrap();
+            }
+        }
+        match self.global_scope.entry(name) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => e.insert(Value::default()),
+        }
     }
 
     pub fn unset(&mut self, name: &str) -> Result<(), CannotModifyReadonly> {
-        if let Some(var) = self.variables.get_mut(name) {
+        if let Some(var) = self.global_scope.get_mut(name) {
             if var.readonly {
                 return Err(CannotModifyReadonly(name.to_string()));
             }
@@ -126,12 +137,31 @@ impl Environment {
         }
         Ok(())
     }
+
+    fn remove_from_local_scope(&mut self, var: &str) {
+        for local_scope in &mut self.local_scopes {
+            local_scope.remove(var);
+        }
+    }
+
+    pub fn push_scope(&mut self) {
+        self.local_scopes.push(LocalScope::new());
+    }
+
+    pub fn pop_scope(&mut self) {
+        self.local_scopes.pop();
+    }
+
+    pub fn global_scope(&self) -> &GlobalScope {
+        &self.global_scope
+    }
 }
 
 impl<I: IntoIterator<Item = (String, Value)>> From<I> for Environment {
     fn from(value: I) -> Self {
         Self {
-            variables: value.into_iter().collect(),
+            global_scope: value.into_iter().collect(),
+            local_scopes: Vec::default(),
         }
     }
 }

@@ -1282,4 +1282,12 @@ mod builtin {
             include_str!("sh/builtin/type.out"),
         )
     }
+
+    #[test]
+    fn unalias() {
+        test_script(
+            include_str!("sh/builtin/unalias.sh"),
+            include_str!("sh/builtin/unalias.out"),
+        )
+    }
 }

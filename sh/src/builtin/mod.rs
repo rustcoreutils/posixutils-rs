@@ -13,6 +13,7 @@ use crate::builtin::shift::Shift;
 use crate::builtin::times::Times;
 use crate::builtin::trap::Trap;
 use crate::builtin::type_::Type_;
+use crate::builtin::unalias::Unalias;
 use crate::builtin::unset::BuiltinUnset;
 use crate::shell::environment::{CannotModifyReadonly, Environment};
 use crate::shell::opened_files::OpenedFiles;
@@ -35,6 +36,7 @@ mod shift;
 mod times;
 pub mod trap;
 mod type_;
+mod unalias;
 mod unset;
 
 pub enum BuiltinError {
@@ -136,6 +138,7 @@ pub fn get_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
         "command" => Some(&Command),
         "cd" => Some(&Cd),
         "type" => Some(&Type_),
+        "unalias" => Some(&Unalias),
         _ => None,
     }
 }

@@ -123,7 +123,6 @@ pub trait BuiltinUtility {
         args: &[String],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
-        environment: Environment,
     ) -> BuiltinResult;
 }
 

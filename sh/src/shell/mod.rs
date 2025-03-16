@@ -273,16 +273,18 @@ impl Shell {
     ) -> CommandExecutionResult<i32> {
         let mut opened_files = self.opened_files.clone();
         opened_files.redirect(&simple_command.redirections, self)?;
-        let mut command_env = self.environment.clone();
-        self.assign_globals(&simple_command.assignments, false)?;
-        std::mem::swap(&mut self.environment, &mut command_env);
-        match builtin_utility.exec(args, self, &mut opened_files, command_env) {
-            Ok(status) => Ok(status),
+
+        self.environment.push_scope();
+        self.assign_locals(&simple_command.assignments)?;
+        let status = match builtin_utility.exec(args, self, &mut opened_files) {
+            Ok(status) => status,
             Err(err) => {
                 opened_files.write_err(format!("{err}\n"));
-                Ok(1)
+                1
             }
-        }
+        };
+        self.environment.pop_scope();
+        Ok(status)
     }
 
     fn trace(&mut self, expanded_words: &[String]) {

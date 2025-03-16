@@ -11,7 +11,6 @@ impl BuiltinUtility for AliasBuiltin {
         args: &[String],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
-        _: Environment,
     ) -> BuiltinResult {
         if args.is_empty() {
             for (alias, command) in &shell.alias_table {

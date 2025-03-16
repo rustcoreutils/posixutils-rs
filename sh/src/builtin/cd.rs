@@ -71,7 +71,6 @@ impl BuiltinUtility for Cd {
         args: &[String],
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
-        environment: Environment,
     ) -> BuiltinResult {
         let args = match CdArgs::parse(args) {
             Ok(args) => args,
@@ -88,7 +87,7 @@ impl BuiltinUtility for Cd {
                 let dir = if let Some(dir) = directory {
                     dir
                 } else {
-                    if let Some(home_dir) = environment.get_str_value("HOME") {
+                    if let Some(home_dir) = shell.environment.get_str_value("HOME") {
                         home_dir
                     } else {
                         // behaviour is implementation defined, bash just returns 0
@@ -100,7 +99,7 @@ impl BuiltinUtility for Cd {
 
                 if !dir.starts_with('/') {
                     if !dir.starts_with('.') && !dir.starts_with("..") {
-                        if let Some(cdpath) = environment.get_str_value("CDPATH") {
+                        if let Some(cdpath) = shell.environment.get_str_value("CDPATH") {
                             for component in cdpath.split(':') {
                                 let mut path = PathBuf::from(component);
                                 path.push(dir);
@@ -124,7 +123,8 @@ impl BuiltinUtility for Cd {
 
                 if !handle_dot_dot_physically {
                     if !curr_path.as_bytes().get(0).is_some_and(|c| *c == b'/') {
-                        let mut new_curr_path = environment
+                        let mut new_curr_path = shell
+                            .environment
                             .get_str_value("PWD")
                             .unwrap_or_default()
                             .as_bytes()
@@ -152,11 +152,15 @@ impl BuiltinUtility for Cd {
                 )?;
             }
             CdArgs::GoBack => {
-                if let Some(oldpwd) = environment.get_str_value("OLDPWD") {
+                if let Some(oldpwd) = shell
+                    .environment
+                    .get_str_value("OLDPWD")
+                    .map(|s| s.to_string())
+                {
                     let old_working_dir = std::env::current_dir().unwrap();
-                    nix::unistd::chdir(oldpwd).map_err(io_err_to_string)?;
+                    nix::unistd::chdir(oldpwd.as_str()).map_err(io_err_to_string)?;
                     shell.current_directory = OsString::from_vec(oldpwd.as_bytes().to_vec());
-                    shell.assign_global("PWD".to_string(), oldpwd.to_string())?;
+                    shell.assign_global("PWD".to_string(), oldpwd.clone())?;
                     shell.assign_global(
                         "OLDPWD".to_string(),
                         old_working_dir.to_string_lossy().into_owned(),

@@ -175,7 +175,7 @@ impl Environment {
         }
         for local_scope in &self.local_scopes {
             for (name, value) in local_scope {
-                exported.insert((name, value));
+                exported.replace((name, value));
             }
         }
         exported.into_iter()

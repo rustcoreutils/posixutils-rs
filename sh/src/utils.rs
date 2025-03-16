@@ -135,19 +135,8 @@ pub fn exec(
         .map(|s| CString::new(s.as_str()).unwrap())
         .collect::<Vec<_>>();
     let env = env
-        .global_scope()
-        .iter()
-        .filter_map(|(name, value)| {
-            if value.export {
-                // TODO: look into this unwrap
-                value
-                    .value
-                    .as_ref()
-                    .map(|v| CString::new(format!("{name}={}", v)).unwrap())
-            } else {
-                None
-            }
-        })
+        .exported()
+        .map(|(name, value)| CString::new(format!("{name}={value}")).unwrap())
         .collect::<Vec<CString>>();
     // unwrap is safe here, because execve will only return if it fails
     let err = execve(&command, &args, &env).unwrap_err();

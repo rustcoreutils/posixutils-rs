@@ -1,6 +1,6 @@
 use crate::shell::Display;
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Formatter;
 
 #[derive(Clone, Default)]
@@ -39,6 +39,13 @@ pub type LocalScope = HashMap<String, String>;
 #[derive(Default, Clone)]
 pub struct Environment {
     global_scope: HashMap<String, Value>,
+    /// variables in the local scope are implicitly export.
+    /// For example, if `f` is a function and we execute:
+    /// ```sh
+    /// var=value f
+    /// ```
+    /// `var` will be available to all commands called from `f`.
+    /// (This is also true in other shells)
     local_scopes: Vec<LocalScope>,
 }
 
@@ -154,6 +161,23 @@ impl Environment {
 
     pub fn global_scope(&self) -> &GlobalScope {
         &self.global_scope
+    }
+
+    pub fn exported(&self) -> impl Iterator<Item = (&String, &String)> {
+        let mut exported = HashSet::new();
+        for (name, var) in &self.global_scope {
+            if var.export {
+                if let Some(value) = &var.value {
+                    exported.insert((name, value));
+                }
+            }
+        }
+        for local_scope in &self.local_scopes {
+            for (name, value) in local_scope {
+                exported.insert((name, value));
+            }
+        }
+        exported.into_iter()
     }
 }
 

@@ -976,8 +976,11 @@ mod commands {
         );
     }
     #[test]
-    fn assignments_before_function_call_affect_the_current_environment_during_function_execution() {
-        test_script(include_str!("sh/commands/assignments_before_function_call_affect_the_current_environment_during_function_execution.sh"), include_str!("sh/commands/assignments_before_function_call_affect_the_current_environment_during_function_execution.out"));
+    fn assignments_before_function_call_are_local_to_function() {
+        test_script(
+            include_str!("sh/commands/assignments_before_function_call_are_local_to_function.sh"),
+            include_str!("sh/commands/assignments_before_function_call_are_local_to_function.out"),
+        );
     }
     #[test]
     fn assignments_before_special_builtin_affect_the_current_env() {

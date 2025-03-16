@@ -179,7 +179,7 @@ impl Shell {
         }
     }
 
-    fn perform_assignments(
+    fn assign_globals(
         &mut self,
         assignments: &[Assignment],
         export: bool,
@@ -192,6 +192,15 @@ impl Shell {
         Ok(())
     }
 
+    fn assign_locals(&mut self, assignments: &[Assignment]) -> CommandExecutionResult<()> {
+        for assignment in assignments {
+            let word_str = expand_word_to_string(&assignment.value, true, self)?;
+            self.environment
+                .set(assignment.name.to_string(), word_str)?;
+        }
+        Ok(())
+    }
+
     fn exec_special_builtin(
         &mut self,
         simple_command: &SimpleCommand,
@@ -200,7 +209,7 @@ impl Shell {
     ) -> CommandExecutionResult<i32> {
         // the standard does not specify if the variables should have the export attribute.
         // Bash exports them, we do the same here (neither sh, nor zsh do it though)
-        self.perform_assignments(&simple_command.assignments, true)?;
+        self.assign_globals(&simple_command.assignments, true)?;
         let mut opened_files = self.opened_files.clone();
         if let Err(err) = opened_files.redirect(&simple_command.redirections, self) {
             if !self.is_interactive {
@@ -228,26 +237,31 @@ impl Shell {
         function_body: &CompoundCommand,
         ignore_errexit: bool,
     ) -> CommandExecutionResult<i32> {
-        let mut args = expanded_words[1..].to_vec();
-        // assignments affect the current environment and are marked for export,
-        // same as special builtin utilities
-        self.perform_assignments(&simple_command.assignments, true)?;
+        self.environment.push_scope();
+
+        self.assign_locals(&simple_command.assignments)?;
+
         let mut previous_opened_files = self.opened_files.clone();
         previous_opened_files.redirect(&simple_command.redirections, self)?;
         std::mem::swap(&mut self.opened_files, &mut previous_opened_files);
+
+        let mut args = expanded_words[1..].to_vec();
         std::mem::swap(&mut args, &mut self.positional_parameters);
+
         self.function_call_depth += 1;
         let result = self.interpret_compound_command(
             &function_body,
             &simple_command.redirections,
             ignore_errexit,
         );
+
         if self.control_flow_state == ControlFlowState::Return {
             self.control_flow_state = ControlFlowState::None;
         }
         self.function_call_depth -= 1;
         std::mem::swap(&mut args, &mut self.positional_parameters);
         std::mem::swap(&mut self.opened_files, &mut previous_opened_files);
+        self.environment.pop_scope();
         result
     }
 
@@ -260,7 +274,7 @@ impl Shell {
         let mut opened_files = self.opened_files.clone();
         opened_files.redirect(&simple_command.redirections, self)?;
         let mut command_env = self.environment.clone();
-        self.perform_assignments(&simple_command.assignments, false)?;
+        self.assign_globals(&simple_command.assignments, false)?;
         std::mem::swap(&mut self.environment, &mut command_env);
         match builtin_utility.exec(args, self, &mut opened_files, command_env) {
             Ok(status) => Ok(status),
@@ -300,7 +314,7 @@ impl Shell {
         }
         if expanded_words.is_empty() {
             // no commands to execute, perform assignments and redirections
-            self.perform_assignments(&simple_command.assignments, false)?;
+            self.assign_globals(&simple_command.assignments, false)?;
             if !simple_command.redirections.is_empty() {
                 let mut subshell = self.clone();
                 subshell
@@ -338,7 +352,7 @@ impl Shell {
             };
 
             let mut command_environment = self.clone();
-            command_environment.perform_assignments(&simple_command.assignments, true)?;
+            command_environment.assign_globals(&simple_command.assignments, true)?;
             command_environment
                 .opened_files
                 .redirect(&simple_command.redirections, self)?;

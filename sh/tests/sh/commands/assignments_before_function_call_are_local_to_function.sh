@@ -1,14 +1,18 @@
 g () {
   echo $a
+  awk 'BEGIN {print ENVIRON["a"]}'
   echo $b
-  d=4
+  d=5
 }
 
 f () {
   echo $a
   awk 'BEGIN {print ENVIRON["a"]}'
-  b=2 g
-  c=3
+  a=2 b=3 g
+  echo $a
+  echo $b
+  echo $d
+  c=4
 }
 
 a=1 f

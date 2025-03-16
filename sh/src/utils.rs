@@ -11,6 +11,8 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 
+pub const DEFAULT_PATH: &str = "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:.";
+
 pub fn strcoll(lhs: &CStr, rhs: &CStr) -> std::cmp::Ordering {
     // strings are valid, this is safe
     let ordering = unsafe { libc::strcoll(lhs.as_ptr(), rhs.as_ptr()) };

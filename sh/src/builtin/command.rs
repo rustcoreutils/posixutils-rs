@@ -4,7 +4,7 @@ use crate::builtin::{
 use crate::shell::environment::Environment;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::{CommandExecutionError, ControlFlowState, Shell};
-use crate::utils::find_command;
+use crate::utils::{find_command, DEFAULT_PATH};
 
 #[derive(PartialEq, Eq)]
 enum Action {
@@ -143,7 +143,7 @@ impl BuiltinUtility for Command {
             }
         } else {
             let path = if args.use_default_path {
-                todo!()
+                DEFAULT_PATH
             } else {
                 shell.environment.get_str_value("PATH").unwrap_or_default()
             };

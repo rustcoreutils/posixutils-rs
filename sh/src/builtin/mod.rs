@@ -1,5 +1,6 @@
 use crate::builtin::alias::AliasBuiltin;
 use crate::builtin::cd::Cd;
+use crate::builtin::command::Command;
 use crate::builtin::control_flow::{Break, Continue, Return};
 use crate::builtin::dot::Dot;
 use crate::builtin::eval::Eval;
@@ -20,6 +21,7 @@ use std::fmt::{Display, Formatter};
 
 pub mod alias;
 mod cd;
+mod command;
 mod control_flow;
 mod dot;
 mod eval;
@@ -129,6 +131,7 @@ pub trait BuiltinUtility {
 pub fn get_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
     match name {
         "alias" => Some(&AliasBuiltin),
+        "command" => Some(&Command),
         "cd" => Some(&Cd),
         _ => None,
     }

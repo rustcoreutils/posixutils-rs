@@ -162,7 +162,7 @@ impl Shell {
         }
     }
 
-    fn exec(&self, command: OsString, args: &[String]) -> OsResult<i32> {
+    pub fn exec(&self, command: OsString, args: &[String]) -> OsResult<i32> {
         match fork()? {
             ForkResult::Child => match exec(command, args, &self.opened_files, &self.environment) {
                 Err(ExecError::OsError(err)) => {
@@ -494,7 +494,7 @@ impl Shell {
         }
     }
 
-    fn interpret_compound_command(
+    pub fn interpret_compound_command(
         &mut self,
         compound_command: &CompoundCommand,
         redirections: &[Redirection],

@@ -1266,4 +1266,12 @@ mod builtin {
             include_str!("sh/builtin/trap.out"),
         )
     }
+
+    #[test]
+    fn command() {
+        test_script(
+            include_str!("sh/builtin/command.sh"),
+            include_str!("sh/builtin/command.out"),
+        )
+    }
 }

@@ -1,5 +1,4 @@
 use crate::builtin::set::SetOptions;
-use clap::command;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ExecutionMode {

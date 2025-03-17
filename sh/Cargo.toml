@@ -6,7 +6,6 @@ edition = "2021"
 [dependencies]
 plib = { path = "../plib" }
 gettext-rs.workspace = true
-clap.workspace = true
 nix = { version = "0.29", features = ["process", "fs", "resource", "signal"] }
 atty.workspace = true
 

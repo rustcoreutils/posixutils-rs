@@ -7,12 +7,12 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::builtin::trap::{TrapAction, TrapCondition};
+use crate::builtin::trap::TrapAction;
 use crate::cli::{parse_args, ExecutionMode};
 use crate::shell::Shell;
+use crate::signals::Signal;
 use atty::Stream;
 use nix::libc;
-use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal};
 use std::io;
 
 mod builtin;
@@ -20,6 +20,7 @@ mod cli;
 mod parse;
 mod program;
 mod shell;
+mod signals;
 mod utils;
 mod wordexp;
 
@@ -29,10 +30,10 @@ fn get_global_shell() -> &'static mut Shell {
     unsafe { GLOBAL_SHELL.as_mut().unwrap() }
 }
 
-fn execute_action(condition: TrapCondition) {
+fn execute_action(condition: Signal) {
     if let TrapAction::Commands(commands) = &get_global_shell().trap_actions[condition as usize] {
         let last_pipeline_exit_status_before_trap = get_global_shell().last_pipeline_exit_status;
-        match get_global_shell().execute_program(commands) {
+        match get_global_shell().execute_program(&commands) {
             Err(err) => {
                 eprintln!("sh: error parsing action: {}", err.message);
             }
@@ -43,7 +44,7 @@ fn execute_action(condition: TrapCondition) {
 }
 
 extern "C" fn on_exit() {
-    execute_action(TrapCondition::Exit);
+    execute_action(Signal::Exit);
 }
 
 pub extern "C" fn global_shell_signal_handler(signal: libc::c_int) {

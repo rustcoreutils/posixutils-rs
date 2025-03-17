@@ -1,5 +1,5 @@
 use crate::builtin::set::SetOptions;
-use crate::builtin::trap::{TrapAction, TrapCondition};
+use crate::builtin::trap::TrapAction;
 use crate::builtin::{
     get_builtin_utility, get_special_builtin_utility, BuiltinUtility, SpecialBuiltinUtility,
 };
@@ -13,23 +13,22 @@ use crate::parse::word_parser::parse_word;
 use crate::parse::{AliasTable, ParserError};
 use crate::shell::environment::{CannotModifyReadonly, Environment, Value};
 use crate::shell::opened_files::{OpenedFile, OpenedFiles};
+use crate::signals::Signal;
 use crate::utils::{
     close, dup2, exec, find_command, find_in_path, fork, pipe, waitpid, ExecError, OsError,
     OsResult,
 };
 use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
-use nix::errno::Errno;
 use nix::sys::wait::WaitStatus;
-use nix::unistd::{execve, getpid, getppid, ForkResult, Pid};
+use nix::unistd::{getpid, getppid, ForkResult};
 use nix::{libc, NixPath};
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::{read_to_string, Read, Write};
-use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, IntoRawFd};
 use std::os::unix::ffi::OsStringExt;
-use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 pub mod environment;
@@ -134,7 +133,7 @@ pub struct Shell {
     pub dot_script_depth: u32,
     pub is_interactive: bool,
     pub last_lineno: u32,
-    pub trap_actions: [TrapAction; TrapCondition::Count as usize],
+    pub trap_actions: [TrapAction; Signal::Count as usize],
 }
 
 impl Shell {
@@ -810,7 +809,7 @@ impl Default for Shell {
             dot_script_depth: 0,
             is_interactive: false,
             last_lineno: 0,
-            trap_actions: [const { TrapAction::Default }; TrapCondition::Count as usize],
+            trap_actions: [const { TrapAction::Default }; Signal::Count as usize],
         }
     }
 }

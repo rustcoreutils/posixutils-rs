@@ -13,7 +13,8 @@ enum KillArgs<'a> {
         signal: Option<Signal>,
         pids: &'a [String],
     },
-    ListSignals,
+    ListAllSignals,
+    NumberToSignal(&'a str),
 }
 
 fn get_pids(args: &[String]) -> Result<&[String], String> {
@@ -30,8 +31,15 @@ impl<'a> KillArgs<'a> {
             return Err("kill: missing operand".to_string());
         }
 
-        if args.len() == 1 && args[0] == "-l" {
-            return Ok(Self::ListSignals);
+        if args[0] == "-l" {
+            let args = skip_option_terminator(&args[1..]);
+            if args.len() > 1 {
+                return Err("kill: too many arguments".to_string());
+            }
+            if args.len() == 1 {
+                return Ok(Self::NumberToSignal(&args[0]));
+            }
+            return Ok(Self::ListAllSignals);
         }
 
         if args[0] == "-s" && args.len() > 2 {
@@ -75,7 +83,6 @@ impl BuiltinUtility for Kill {
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
         // TODO: handle job ids
-        // TODO: handle -l with op
         let args = KillArgs::parse(args)?;
 
         match args {
@@ -88,9 +95,20 @@ impl BuiltinUtility for Kill {
                         .map_err(|err| format!("kill: failed to send signal ({})", err))?;
                 }
             }
-            KillArgs::ListSignals => {
+            KillArgs::ListAllSignals => {
                 for signal in SIGNALS {
                     opened_files.write_out(format!("{}\n", signal));
+                }
+            }
+            KillArgs::NumberToSignal(signal) => {
+                let mut signal = signal.parse::<i32>().map_err(|_| "kill: invalid signal")?;
+                if signal > 128 {
+                    signal -= 128;
+                }
+                if let Ok(signal) = Signal::try_from(signal) {
+                    opened_files.write_out(format!("{}\n", signal));
+                } else {
+                    return Err(format!("kill: invalid signal '{}'", signal).into());
                 }
             }
         }

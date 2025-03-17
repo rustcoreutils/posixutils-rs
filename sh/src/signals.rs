@@ -1,3 +1,4 @@
+use nix::libc;
 use nix::sys::signal::Signal as NixSignal;
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
@@ -136,6 +137,43 @@ impl From<Signal> for NixSignal {
             Signal::SigProf => NixSignal::SIGPROF,
             Signal::SigSys => NixSignal::SIGSYS,
             Signal::Count => unreachable!("invalid trap condition"),
+        }
+    }
+}
+
+impl TryFrom<i32> for Signal {
+    type Error = ();
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            libc::SIGHUP => Ok(Signal::SigHup),
+            libc::SIGINT => Ok(Signal::SigInt),
+            libc::SIGQUIT => Ok(Signal::SigQuit),
+            libc::SIGILL => Ok(Signal::SigIll),
+            libc::SIGTRAP => Ok(Signal::SigTrap),
+            libc::SIGABRT => Ok(Signal::SigAbrt),
+            libc::SIGBUS => Ok(Signal::SigBus),
+            libc::SIGFPE => Ok(Signal::SigFpe),
+            libc::SIGKILL => Ok(Signal::SigKill),
+            libc::SIGUSR1 => Ok(Signal::SigUsr1),
+            libc::SIGSEGV => Ok(Signal::SigSegv),
+            libc::SIGUSR2 => Ok(Signal::SigUsr2),
+            libc::SIGPIPE => Ok(Signal::SigPipe),
+            libc::SIGALRM => Ok(Signal::SigAlrm),
+            libc::SIGTERM => Ok(Signal::SigTerm),
+            libc::SIGCHLD => Ok(Signal::SigChld),
+            libc::SIGCONT => Ok(Signal::SigCont),
+            libc::SIGSTOP => Ok(Signal::SigStop),
+            libc::SIGTSTP => Ok(Signal::SigTstp),
+            libc::SIGTTIN => Ok(Signal::SigTtin),
+            libc::SIGTTOU => Ok(Signal::SigTtou),
+            libc::SIGURG => Ok(Signal::SigUrg),
+            libc::SIGXCPU => Ok(Signal::SigXcpu),
+            libc::SIGXFSZ => Ok(Signal::SigXfsz),
+            libc::SIGVTALRM => Ok(Signal::SigVtalrm),
+            libc::SIGPROF => Ok(Signal::SigProf),
+            libc::SIGSYS => Ok(Signal::SigSys),
+            _ => Err(()),
         }
     }
 }

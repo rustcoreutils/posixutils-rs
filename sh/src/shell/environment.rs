@@ -165,17 +165,17 @@ impl Environment {
     }
 
     pub fn exported(&self) -> impl Iterator<Item = (&String, &String)> {
-        let mut exported = HashSet::new();
+        let mut exported = HashMap::new();
         for (name, var) in &self.global_scope {
             if var.export {
                 if let Some(value) = &var.value {
-                    exported.insert((name, value));
+                    exported.insert(name, value);
                 }
             }
         }
         for local_scope in &self.local_scopes {
             for (name, value) in local_scope {
-                exported.replace((name, value));
+                exported.insert(name, value);
             }
         }
         exported.into_iter()

@@ -14,6 +14,7 @@ use crate::builtin::shift::Shift;
 use crate::builtin::times::Times;
 use crate::builtin::trap::Trap;
 use crate::builtin::type_::Type_;
+use crate::builtin::ulimit::Ulimit;
 use crate::builtin::unalias::Unalias;
 use crate::builtin::unset::BuiltinUnset;
 use crate::shell::environment::{CannotModifyReadonly, Environment};
@@ -38,6 +39,7 @@ mod shift;
 mod times;
 pub mod trap;
 mod type_;
+mod ulimit;
 mod unalias;
 mod unset;
 
@@ -139,6 +141,7 @@ pub fn get_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
         "alias" => Some(&AliasBuiltin),
         "command" => Some(&Command),
         "getopts" => Some(&GetOpts),
+        "ulimit" => Some(&Ulimit),
         "cd" => Some(&Cd),
         "type" => Some(&Type_),
         "unalias" => Some(&Unalias),

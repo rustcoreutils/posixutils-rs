@@ -689,6 +689,7 @@ impl<'src> CommandParser<'src> {
         elements.push((last, LogicalOp::None));
         Ok(Some(Conjunction {
             elements,
+            // temporary value, will be set by the caller
             is_async: false,
         }))
     }
@@ -705,6 +706,7 @@ impl<'src> CommandParser<'src> {
                     return Err(ParserError::new(command_start, "expected command", false));
                 };
             if self.lookahead == CommandToken::And {
+                self.advance()?;
                 and_or.is_async = true;
             }
             commands.push(and_or);
@@ -1221,6 +1223,36 @@ mod tests {
                 is_async: false,
             }
         )
+    }
+
+    #[test]
+    fn parse_async_conjunction_with_single_command() {
+        let conjunction = parse_conjunction("cmd &");
+        assert_eq!(conjunction.elements.len(), 1);
+        assert!(conjunction.is_async);
+        assert_eq!(
+            conjunction.elements[0].0,
+            pipeline_from_word(unquoted_literal("cmd"))
+        )
+    }
+
+    #[test]
+    fn parse_async_conjunction_with_multiple_commands() {
+        let conjunction = parse_conjunction("x && y || z &");
+        assert_eq!(conjunction.elements.len(), 3);
+        assert!(conjunction.is_async);
+        assert_eq!(
+            conjunction.elements[0],
+            (pipeline_from_word(unquoted_literal("x")), LogicalOp::And)
+        );
+        assert_eq!(
+            conjunction.elements[1],
+            (pipeline_from_word(unquoted_literal("y")), LogicalOp::Or)
+        );
+        assert_eq!(
+            conjunction.elements[2],
+            (pipeline_from_word(unquoted_literal("z")), LogicalOp::None)
+        );
     }
 
     #[test]

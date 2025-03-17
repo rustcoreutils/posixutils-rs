@@ -20,7 +20,7 @@ use crate::utils::{
 };
 use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
 use nix::sys::wait::WaitStatus;
-use nix::unistd::{getpid, getppid, ForkResult};
+use nix::unistd::{getpid, getppid, ForkResult, Pid};
 use nix::{libc, NixPath};
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
@@ -113,6 +113,8 @@ impl ControlFlowState {
     }
 }
 
+type JobId = u64;
+
 #[derive(Clone)]
 pub struct Shell {
     pub environment: Environment,
@@ -123,7 +125,7 @@ pub struct Shell {
     pub last_pipeline_exit_status: i32,
     pub last_command_substitution_status: i32,
     pub shell_pid: i32,
-    pub most_recent_background_command_pid: Option<i32>,
+    pub most_recent_background_command_pid: Option<Pid>,
     pub current_directory: OsString,
     pub set_options: SetOptions,
     pub alias_table: AliasTable,
@@ -135,6 +137,8 @@ pub struct Shell {
     pub last_lineno: u32,
     pub exit_action: TrapAction,
     pub trap_actions: [TrapAction; Signal::Count as usize],
+    pub background_jobs: HashMap<JobId, Pid>,
+    pub last_job_id: JobId,
 }
 
 impl Shell {
@@ -620,12 +624,16 @@ impl Shell {
         Ok(self.last_pipeline_exit_status)
     }
 
-    fn interpret_conjunction(&mut self, conjunction: &Conjunction, ignore_errexit: bool) -> i32 {
+    fn interpret_and_or_list(
+        &mut self,
+        list: &[(Pipeline, LogicalOp)],
+        ignore_errexit: bool,
+    ) -> i32 {
         let mut status = 0;
         let mut i = 0;
-        while i < conjunction.elements.len() {
-            let (pipeline, op) = &conjunction.elements[i];
-            let ignore_errexit = i == conjunction.elements.len() - 1 && ignore_errexit;
+        while i < list.len() {
+            let (pipeline, op) = &list[i];
+            let ignore_errexit = i == list.len() - 1 && ignore_errexit;
             status = match self.interpret_pipeline(pipeline, ignore_errexit) {
                 Ok(status) => status,
                 Err(err) => {
@@ -646,6 +654,32 @@ impl Shell {
             i += 1;
         }
         status
+    }
+
+    fn interpret_conjunction(&mut self, conjunction: &Conjunction, ignore_errexit: bool) -> i32 {
+        if conjunction.is_async {
+            match fork() {
+                Ok(ForkResult::Child) => {
+                    std::process::exit(self.interpret_and_or_list(&conjunction.elements, false));
+                }
+                Ok(ForkResult::Parent { child }) => {
+                    self.background_jobs.insert(self.last_job_id, child);
+                    self.most_recent_background_command_pid = Some(child);
+                    self.last_job_id += 1;
+                    0
+                }
+                Err(_) => {
+                    self.eprint("sh: failed to create background job\n");
+                    if !self.is_interactive {
+                        std::process::exit(1);
+                    } else {
+                        1
+                    }
+                }
+            }
+        } else {
+            self.interpret_and_or_list(&conjunction.elements, ignore_errexit)
+        }
     }
 
     fn interpret(&mut self, command: &CompleteCommand, ignore_errexit: bool) -> i32 {
@@ -812,6 +846,8 @@ impl Default for Shell {
             last_lineno: 0,
             exit_action: TrapAction::Default,
             trap_actions: [const { TrapAction::Default }; Signal::Count as usize],
+            background_jobs: HashMap::default(),
+            last_job_id: 0,
         }
     }
 }

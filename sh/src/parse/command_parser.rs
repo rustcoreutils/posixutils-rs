@@ -699,22 +699,22 @@ impl<'src> CommandParser<'src> {
         let mut commands = Vec::new();
         while self.lookahead != CommandToken::Newline || self.lookahead != CommandToken::EOF {
             let command_start = self.lookahead_lineno;
-            let mut and_or =
-                if let Some(and_or) = self.parse_and_or(CommandToken::EOF, alias_table)? {
-                    and_or
+            if let Some(mut and_or) = self.parse_and_or(CommandToken::EOF, alias_table)? {
+                if self.lookahead == CommandToken::And {
+                    and_or.is_async = true;
+                }
+                commands.push(and_or);
+                if self.lookahead == CommandToken::And || self.lookahead == CommandToken::SemiColon
+                {
+                    self.advance()?;
                 } else {
-                    return Err(ParserError::new(command_start, "expected command", false));
-                };
-            if self.lookahead == CommandToken::And {
-                self.advance()?;
-                and_or.is_async = true;
-            }
-            commands.push(and_or);
-            if self.lookahead == CommandToken::And || self.lookahead == CommandToken::SemiColon {
-                self.advance()?;
+                    break;
+                }
+            } else if commands.is_empty() {
+                return Err(ParserError::new(command_start, "expected command", false));
             } else {
                 break;
-            }
+            };
         }
         Ok(CompleteCommand { commands })
     }
@@ -1253,6 +1253,14 @@ mod tests {
             conjunction.elements[2],
             (pipeline_from_word(unquoted_literal("z")), LogicalOp::None)
         );
+    }
+
+    #[test]
+    fn ampersand_terminates_current_and_or_list() {
+        let complete_command =
+            parse_correct_complete_command("a & b", AliasTable::default()).expect("no commands");
+        assert_eq!(complete_command.commands.len(), 2);
+        assert!(complete_command.commands[0].is_async);
     }
 
     #[test]

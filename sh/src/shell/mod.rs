@@ -19,6 +19,7 @@ use crate::utils::{
     OsResult,
 };
 use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
+use nix::sys::signal::Signal as NixSignal;
 use nix::sys::wait::WaitStatus;
 use nix::unistd::{getpid, getppid, ForkResult, Pid};
 use nix::{libc, NixPath};
@@ -113,6 +114,10 @@ impl ControlFlowState {
     }
 }
 
+fn signal_exit_status(signal: NixSignal) -> i32 {
+    128 + signal as i32
+}
+
 type JobId = u64;
 
 #[derive(Clone)]
@@ -178,7 +183,8 @@ impl Shell {
             },
             ForkResult::Parent { child } => match waitpid(child, None)? {
                 WaitStatus::Exited(_, status) => Ok(status),
-                _ => todo!(),
+                WaitStatus::Signaled(_, signal, _) => Ok(signal_exit_status(signal)),
+                _ => unreachable!(),
             },
         }
     }
@@ -493,7 +499,8 @@ impl Shell {
             }
             ForkResult::Parent { child } => match waitpid(child, None)? {
                 WaitStatus::Exited(_, status) => Ok(status),
-                _ => todo!(),
+                WaitStatus::Signaled(_, signal, _) => Ok(signal_exit_status(signal)),
+                _ => unreachable!(),
             },
         }
     }
@@ -608,6 +615,9 @@ impl Shell {
                     close(current_stdin)?;
                     match waitpid(child, None)? {
                         WaitStatus::Exited(_, status) => pipeline_exit_status = status,
+                        WaitStatus::Signaled(_, signal, _) => {
+                            pipeline_exit_status = signal_exit_status(signal)
+                        }
                         _ => todo!(),
                     }
                 }
@@ -706,7 +716,7 @@ impl Shell {
             ForkResult::Parent { child } => {
                 drop(write_pipe);
                 match waitpid(child, None)? {
-                    WaitStatus::Exited(_, _) => {
+                    WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _) => {
                         let read_file = File::from(read_pipe);
                         let mut output = read_to_string(&read_file).unwrap();
                         let new_len = output.trim_end_matches('\n').len();

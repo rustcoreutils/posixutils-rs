@@ -133,6 +133,7 @@ pub struct Shell {
     pub dot_script_depth: u32,
     pub is_interactive: bool,
     pub last_lineno: u32,
+    pub exit_action: TrapAction,
     pub trap_actions: [TrapAction; Signal::Count as usize],
 }
 
@@ -809,6 +810,7 @@ impl Default for Shell {
             dot_script_depth: 0,
             is_interactive: false,
             last_lineno: 0,
+            exit_action: TrapAction::Default,
             trap_actions: [const { TrapAction::Default }; Signal::Count as usize],
         }
     }

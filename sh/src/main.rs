@@ -30,8 +30,8 @@ fn get_global_shell() -> &'static mut Shell {
     unsafe { GLOBAL_SHELL.as_mut().unwrap() }
 }
 
-fn execute_action(condition: Signal) {
-    if let TrapAction::Commands(commands) = &get_global_shell().trap_actions[condition as usize] {
+fn execute_action(action: TrapAction) {
+    if let TrapAction::Commands(commands) = action {
         let last_pipeline_exit_status_before_trap = get_global_shell().last_pipeline_exit_status;
         match get_global_shell().execute_program(&commands) {
             Err(err) => {
@@ -44,11 +44,13 @@ fn execute_action(condition: Signal) {
 }
 
 extern "C" fn on_exit() {
-    execute_action(Signal::Exit);
+    execute_action(get_global_shell().exit_action.clone());
 }
 
 pub extern "C" fn global_shell_signal_handler(signal: libc::c_int) {
-    execute_action(signal.try_into().expect("invalid signal"));
+    let nix_signal = nix::sys::signal::Signal::try_from(signal).unwrap();
+    let action = get_global_shell().trap_actions[Signal::from(nix_signal) as usize].clone();
+    execute_action(action);
 }
 
 fn execute_string(string: &str, shell: &mut Shell) {

@@ -4,7 +4,6 @@ use std::str::FromStr;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
-    Exit,
     SigHup,
     SigInt,
     SigQuit,
@@ -39,7 +38,6 @@ pub enum Signal {
 impl Display for Signal {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Signal::Exit => write!(f, "EXIT"),
             Signal::SigHup => write!(f, "HUP"),
             Signal::SigInt => write!(f, "INT"),
             Signal::SigQuit => write!(f, "QUIT"),
@@ -77,7 +75,6 @@ impl FromStr for Signal {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "EXIT" | "exit" | "0" => Ok(Signal::Exit),
             "HUP" | "hup" | "1" => Ok(Signal::SigHup),
             "INT" | "int" | "2" => Ok(Signal::SigInt),
             "QUIT" | "quit" | "3" => Ok(Signal::SigQuit),
@@ -108,61 +105,77 @@ impl FromStr for Signal {
     }
 }
 
-impl TryFrom<i32> for Signal {
-    type Error = ();
-
-    fn try_from(value: i32) -> Result<Self, Self::Error> {
+impl From<Signal> for NixSignal {
+    fn from(value: Signal) -> Self {
         match value {
-            0 => Ok(Signal::Exit),
-            1 => Ok(Signal::SigHup),
-            2 => Ok(Signal::SigInt),
-            3 => Ok(Signal::SigQuit),
-            6 => Ok(Signal::SigAbrt),
-            14 => Ok(Signal::SigAlrm),
-            15 => Ok(Signal::SigTerm),
-            _ => Err(()),
-        }
-    }
-}
-
-impl Signal {
-    pub fn to_nix_signal(self) -> Option<NixSignal> {
-        match self {
-            Signal::Exit => None,
-            Signal::SigHup => Some(NixSignal::SIGHUP),
-            Signal::SigInt => Some(NixSignal::SIGINT),
-            Signal::SigQuit => Some(NixSignal::SIGQUIT),
-            Signal::SigIll => Some(NixSignal::SIGILL),
-            Signal::SigTrap => Some(NixSignal::SIGTRAP),
-            Signal::SigAbrt => Some(NixSignal::SIGABRT),
-            Signal::SigBus => Some(NixSignal::SIGBUS),
-            Signal::SigFpe => Some(NixSignal::SIGFPE),
-            Signal::SigKill => Some(NixSignal::SIGKILL),
-            Signal::SigUsr1 => Some(NixSignal::SIGUSR1),
-            Signal::SigSegv => Some(NixSignal::SIGSEGV),
-            Signal::SigUsr2 => Some(NixSignal::SIGUSR2),
-            Signal::SigPipe => Some(NixSignal::SIGPIPE),
-            Signal::SigAlrm => Some(NixSignal::SIGALRM),
-            Signal::SigTerm => Some(NixSignal::SIGTERM),
-            Signal::SigChld => Some(NixSignal::SIGCHLD),
-            Signal::SigCont => Some(NixSignal::SIGCONT),
-            Signal::SigStop => Some(NixSignal::SIGSTOP),
-            Signal::SigTstp => Some(NixSignal::SIGTSTP),
-            Signal::SigTtin => Some(NixSignal::SIGTTIN),
-            Signal::SigTtou => Some(NixSignal::SIGTTOU),
-            Signal::SigUrg => Some(NixSignal::SIGURG),
-            Signal::SigXcpu => Some(NixSignal::SIGXCPU),
-            Signal::SigXfsz => Some(NixSignal::SIGXFSZ),
-            Signal::SigVtalrm => Some(NixSignal::SIGVTALRM),
-            Signal::SigProf => Some(NixSignal::SIGPROF),
-            Signal::SigSys => Some(NixSignal::SIGSYS),
+            Signal::SigHup => NixSignal::SIGHUP,
+            Signal::SigInt => NixSignal::SIGINT,
+            Signal::SigQuit => NixSignal::SIGQUIT,
+            Signal::SigIll => NixSignal::SIGILL,
+            Signal::SigTrap => NixSignal::SIGTRAP,
+            Signal::SigAbrt => NixSignal::SIGABRT,
+            Signal::SigBus => NixSignal::SIGBUS,
+            Signal::SigFpe => NixSignal::SIGFPE,
+            Signal::SigKill => NixSignal::SIGKILL,
+            Signal::SigUsr1 => NixSignal::SIGUSR1,
+            Signal::SigSegv => NixSignal::SIGSEGV,
+            Signal::SigUsr2 => NixSignal::SIGUSR2,
+            Signal::SigPipe => NixSignal::SIGPIPE,
+            Signal::SigAlrm => NixSignal::SIGALRM,
+            Signal::SigTerm => NixSignal::SIGTERM,
+            Signal::SigChld => NixSignal::SIGCHLD,
+            Signal::SigCont => NixSignal::SIGCONT,
+            Signal::SigStop => NixSignal::SIGSTOP,
+            Signal::SigTstp => NixSignal::SIGTSTP,
+            Signal::SigTtin => NixSignal::SIGTTIN,
+            Signal::SigTtou => NixSignal::SIGTTOU,
+            Signal::SigUrg => NixSignal::SIGURG,
+            Signal::SigXcpu => NixSignal::SIGXCPU,
+            Signal::SigXfsz => NixSignal::SIGXFSZ,
+            Signal::SigVtalrm => NixSignal::SIGVTALRM,
+            Signal::SigProf => NixSignal::SIGPROF,
+            Signal::SigSys => NixSignal::SIGSYS,
             Signal::Count => unreachable!("invalid trap condition"),
         }
     }
 }
 
+impl From<NixSignal> for Signal {
+    fn from(value: NixSignal) -> Self {
+        match value {
+            NixSignal::SIGHUP => Signal::SigHup,
+            NixSignal::SIGINT => Signal::SigInt,
+            NixSignal::SIGQUIT => Signal::SigQuit,
+            NixSignal::SIGILL => Signal::SigIll,
+            NixSignal::SIGTRAP => Signal::SigTrap,
+            NixSignal::SIGABRT => Signal::SigAbrt,
+            NixSignal::SIGBUS => Signal::SigBus,
+            NixSignal::SIGFPE => Signal::SigFpe,
+            NixSignal::SIGKILL => Signal::SigKill,
+            NixSignal::SIGUSR1 => Signal::SigUsr1,
+            NixSignal::SIGSEGV => Signal::SigSegv,
+            NixSignal::SIGUSR2 => Signal::SigUsr2,
+            NixSignal::SIGPIPE => Signal::SigPipe,
+            NixSignal::SIGALRM => Signal::SigAlrm,
+            NixSignal::SIGTERM => Signal::SigTerm,
+            NixSignal::SIGCHLD => Signal::SigChld,
+            NixSignal::SIGCONT => Signal::SigCont,
+            NixSignal::SIGSTOP => Signal::SigStop,
+            NixSignal::SIGTSTP => Signal::SigTstp,
+            NixSignal::SIGTTIN => Signal::SigTtin,
+            NixSignal::SIGTTOU => Signal::SigTtou,
+            NixSignal::SIGURG => Signal::SigUrg,
+            NixSignal::SIGXCPU => Signal::SigXcpu,
+            NixSignal::SIGXFSZ => Signal::SigXfsz,
+            NixSignal::SIGVTALRM => Signal::SigVtalrm,
+            NixSignal::SIGPROF => Signal::SigProf,
+            NixSignal::SIGSYS => Signal::SigSys,
+            _ => unreachable!("invalid signal"),
+        }
+    }
+}
+
 pub const SIGNALS: &[Signal] = &[
-    Signal::Exit,
     Signal::SigHup,
     Signal::SigInt,
     Signal::SigQuit,

@@ -176,7 +176,7 @@ impl Shell {
                 Err(ExecError::CannotExecute(_)) => std::process::exit(126),
                 Ok(_) => unreachable!(),
             },
-            ForkResult::Parent { child } => match waitpid(child)? {
+            ForkResult::Parent { child } => match waitpid(child, None)? {
                 WaitStatus::Exited(_, status) => Ok(status),
                 _ => todo!(),
             },
@@ -491,7 +491,7 @@ impl Shell {
             ForkResult::Child => {
                 std::process::exit(self.interpret(commands, false));
             }
-            ForkResult::Parent { child } => match waitpid(child)? {
+            ForkResult::Parent { child } => match waitpid(child, None)? {
                 WaitStatus::Exited(_, status) => Ok(status),
                 _ => todo!(),
             },
@@ -606,7 +606,7 @@ impl Shell {
                 }
                 ForkResult::Parent { child } => {
                     close(current_stdin)?;
-                    match waitpid(child)? {
+                    match waitpid(child, None)? {
                         WaitStatus::Exited(_, status) => pipeline_exit_status = status,
                         _ => todo!(),
                     }
@@ -705,7 +705,7 @@ impl Shell {
             }
             ForkResult::Parent { child } => {
                 drop(write_pipe);
-                match waitpid(child)? {
+                match waitpid(child, None)? {
                     WaitStatus::Exited(_, _) => {
                         let read_file = File::from(read_pipe);
                         let mut output = read_to_string(&read_file).unwrap();
@@ -719,10 +719,38 @@ impl Shell {
         }
     }
 
+    pub fn update_background_jobs(&mut self) {
+        for (job_id, job_pid) in &mut self.background_jobs {
+            let status = match waitpid(*job_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+                Ok(status) => status,
+                Err(err) => {
+                    self.opened_files
+                        .write_err(&format!("sh: error waiting for background job: {err}\n"));
+                    continue;
+                }
+            };
+            match status {
+                WaitStatus::Exited(_, status) => {
+                    if self.set_options.monitor {
+                        self.opened_files
+                            .write_err(&format!("[{}] Done({})\n", job_id, status));
+                    }
+                    *job_pid = Pid::from_raw(0);
+                }
+                WaitStatus::StillAlive => {}
+                _ => {
+                    todo!()
+                }
+            }
+        }
+        self.background_jobs.retain(|_, pid| pid.as_raw() != 0);
+    }
+
     pub fn execute_program(&mut self, program: &str) -> Result<i32, ParserError> {
         if self.set_options.verbose {
             self.eprint(program)
         }
+        self.update_background_jobs();
         let mut parser = CommandParser::new(program, self.last_lineno)?;
         let mut result = 0;
         loop {

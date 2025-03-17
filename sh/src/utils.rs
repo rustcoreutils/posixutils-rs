@@ -2,7 +2,7 @@ use crate::shell::environment::Environment;
 use crate::shell::opened_files::{OpenedFile, OpenedFiles};
 use nix::errno::Errno;
 use nix::libc;
-use nix::sys::wait::WaitStatus;
+use nix::sys::wait::{WaitPidFlag, WaitStatus};
 use nix::unistd::{execve, ForkResult, Pid};
 use std::convert::Infallible;
 use std::ffi::{CStr, CString, OsString};
@@ -60,8 +60,8 @@ pub fn dup2(old_fd: RawFd, new_fd: RawFd) -> OsResult<RawFd> {
         .map_err(|err| format!("sh: internal call to dup2 failed ({err})").into())
 }
 
-pub fn waitpid(pid: Pid) -> OsResult<WaitStatus> {
-    nix::sys::wait::waitpid(pid, None)
+pub fn waitpid(pid: Pid, options: Option<WaitPidFlag>) -> OsResult<WaitStatus> {
+    nix::sys::wait::waitpid(pid, options)
         .map_err(|err| format!("sh: internal call to waitpid failed ({err})").into())
 }
 

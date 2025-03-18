@@ -1,6 +1,9 @@
+use nix::errno::Errno;
 use nix::libc;
 use nix::sys::signal::Signal as NixSignal;
+use nix::unistd::{read, write};
 use std::fmt::{Display, Formatter};
+use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd, RawFd};
 use std::str::FromStr;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -242,3 +245,50 @@ pub const SIGNALS: &[Signal] = &[
     Signal::SigProf,
     Signal::SigSys,
 ];
+
+static mut SIGNAL_WRITE: Option<RawFd> = None;
+static mut SIGNAL_READ: Option<RawFd> = None;
+
+pub extern "C" fn handle_signals(signal: libc::c_int) {
+    // SIGNAL_WRITE is never modified after the initial
+    // setup, and is a valid file descriptor, so this is safe
+    let fd = unsafe { BorrowedFd::borrow_raw(SIGNAL_WRITE.unwrap()) };
+    write(fd, &signal.to_ne_bytes()).expect("failed to write to signal buffer");
+}
+
+/// # Safety
+/// cannot be called by multiple threads
+pub unsafe fn setup_signal_handling() {
+    let (read_pipe, write_pipe) = nix::unistd::pipe().expect("could not create signal buffer pipe");
+    nix::fcntl::fcntl(
+        read_pipe.as_raw_fd(),
+        nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+    )
+    .expect("signal buffer pipe could not be set as non-blocking");
+    SIGNAL_WRITE = Some(write_pipe.into_raw_fd());
+    SIGNAL_READ = Some(read_pipe.into_raw_fd());
+}
+
+pub fn get_pending_signal() -> Option<Signal> {
+    // SIGNAL_READ is never modified after the initial
+    // setup, so this is safe
+    let fd = unsafe { SIGNAL_READ.unwrap() };
+    let mut buf = [0u8; size_of::<libc::c_int>()];
+    match read(fd, &mut buf) {
+        Err(err) => {
+            if err == Errno::EAGAIN {
+                None
+            } else {
+                panic!("failed to write to signal pipe ({err})");
+            }
+        }
+        Ok(size) => {
+            if size == 0 {
+                None
+            } else {
+                let signal = libc::c_int::from_ne_bytes(buf);
+                Some(Signal::try_from(signal).unwrap())
+            }
+        }
+    }
+}

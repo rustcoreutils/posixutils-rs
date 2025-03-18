@@ -3,6 +3,7 @@ use crate::builtin::trap::TrapAction;
 use crate::builtin::{
     get_builtin_utility, get_special_builtin_utility, BuiltinUtility, SpecialBuiltinUtility,
 };
+use crate::get_global_shell;
 use crate::nonempty::NonEmpty;
 use crate::parse::command::{
     Assignment, CaseItem, Command, CommandType, CompleteCommand, CompoundCommand, Conjunction,
@@ -14,14 +15,14 @@ use crate::parse::word_parser::parse_word;
 use crate::parse::{AliasTable, ParserError};
 use crate::shell::environment::{CannotModifyReadonly, Environment, Value};
 use crate::shell::opened_files::{OpenedFile, OpenedFiles};
-use crate::signals::Signal;
+use crate::signals::{get_pending_signal, Signal};
 use crate::utils::{
     close, dup2, exec, find_command, find_in_path, fork, pipe, waitpid, ExecError, OsError,
     OsResult,
 };
 use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
 use nix::sys::signal::Signal as NixSignal;
-use nix::sys::wait::WaitStatus;
+use nix::sys::wait::{WaitPidFlag, WaitStatus};
 use nix::unistd::{getpid, getppid, ForkResult, Pid};
 use nix::{libc, NixPath};
 use std::collections::HashMap;
@@ -32,6 +33,7 @@ use std::io::{read_to_string, Read, Write};
 use std::os::fd::{AsRawFd, IntoRawFd};
 use std::os::unix::ffi::OsStringExt;
 use std::rc::Rc;
+use std::time::Duration;
 
 pub mod environment;
 pub mod opened_files;
@@ -160,11 +162,17 @@ impl Shell {
         self.opened_files.write_err(message);
     }
 
-    fn wait_child_process(&self, child_pid: Pid) -> OsResult<i32> {
-        match waitpid(child_pid, None)? {
-            WaitStatus::Exited(_, status) => Ok(status),
-            WaitStatus::Signaled(_, signal, _) => Ok(signal_exit_status(signal)),
-            _ => unreachable!(),
+    fn wait_child_process(&mut self, child_pid: Pid) -> OsResult<i32> {
+        loop {
+            match waitpid(child_pid, Some(WaitPidFlag::WNOHANG))? {
+                WaitStatus::Exited(_, status) => return Ok(status),
+                WaitStatus::Signaled(_, signal, _) => return Ok(signal_exit_status(signal)),
+                WaitStatus::StillAlive => {
+                    self.process_signals();
+                    std::thread::sleep(Duration::from_millis(16));
+                }
+                _ => unreachable!(),
+            }
         }
     }
 
@@ -179,6 +187,26 @@ impl Shell {
         })
     }
 
+    pub fn execute_action(&mut self, action: TrapAction) {
+        if let TrapAction::Commands(commands) = action {
+            let last_pipeline_exit_status_before_trap = self.last_pipeline_exit_status;
+            match self.execute_program(&commands) {
+                Err(err) => {
+                    eprintln!("sh: error parsing action: {}", err.message);
+                }
+                Ok(_) => {}
+            }
+            self.last_pipeline_exit_status = last_pipeline_exit_status_before_trap;
+        }
+    }
+
+    pub fn process_signals(&mut self) {
+        while let Some(signal) = get_pending_signal() {
+            let action = self.trap_actions[signal as usize].clone();
+            self.execute_action(action)
+        }
+    }
+
     fn handle_error(&self, err: CommandExecutionError) -> i32 {
         self.eprint(&err.to_string());
         match err {
@@ -188,7 +216,7 @@ impl Shell {
         }
     }
 
-    pub fn exec(&self, command: OsString, args: &[String]) -> OsResult<i32> {
+    pub fn exec(&mut self, command: OsString, args: &[String]) -> OsResult<i32> {
         match fork()? {
             ForkResult::Child => match exec(command, args, &self.opened_files, &self.environment) {
                 Err(ExecError::OsError(err)) => {
@@ -739,7 +767,7 @@ impl Shell {
 
     pub fn update_background_jobs(&mut self) {
         for job in &mut self.background_jobs {
-            let status = match waitpid(job.pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+            let status = match waitpid(job.pid, Some(WaitPidFlag::WNOHANG)) {
                 Ok(status) => status,
                 Err(err) => {
                     self.opened_files
@@ -771,6 +799,7 @@ impl Shell {
             self.eprint(program)
         }
         self.update_background_jobs();
+        self.process_signals();
         let mut parser = CommandParser::new(program, self.last_lineno)?;
         let mut result = 0;
         loop {

@@ -10,10 +10,12 @@
 use crate::builtin::trap::TrapAction;
 use crate::cli::{parse_args, ExecutionMode};
 use crate::shell::Shell;
-use crate::signals::Signal;
+use crate::signals::{setup_signal_handling, Signal};
 use atty::Stream;
 use nix::libc;
 use std::io;
+use std::os::fd::RawFd;
+use std::time::Duration;
 
 mod builtin;
 mod cli;
@@ -31,27 +33,9 @@ fn get_global_shell() -> &'static mut Shell {
     unsafe { GLOBAL_SHELL.as_mut().unwrap() }
 }
 
-fn execute_action(action: TrapAction) {
-    if let TrapAction::Commands(commands) = action {
-        let last_pipeline_exit_status_before_trap = get_global_shell().last_pipeline_exit_status;
-        match get_global_shell().execute_program(&commands) {
-            Err(err) => {
-                eprintln!("sh: error parsing action: {}", err.message);
-            }
-            Ok(_) => {}
-        }
-        get_global_shell().last_pipeline_exit_status = last_pipeline_exit_status_before_trap;
-    }
-}
-
 extern "C" fn on_exit() {
-    execute_action(get_global_shell().exit_action.clone());
-}
-
-pub extern "C" fn global_shell_signal_handler(signal: libc::c_int) {
-    let nix_signal = nix::sys::signal::Signal::try_from(signal).unwrap();
-    let action = get_global_shell().trap_actions[Signal::from(nix_signal) as usize].clone();
-    execute_action(action);
+    let action = get_global_shell().exit_action.clone();
+    get_global_shell().execute_action(action);
 }
 
 fn execute_string(string: &str, shell: &mut Shell) {
@@ -80,29 +64,39 @@ fn main() {
         ))
     };
     unsafe { libc::atexit(on_exit) };
+    unsafe { setup_signal_handling() };
     match args.execution_mode {
         ExecutionMode::Interactive => {
+            nix::fcntl::fcntl(
+                libc::STDIN_FILENO,
+                nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+            )
+            .unwrap();
             let mut buffer = String::new();
             eprint!("{}", get_global_shell().get_ps1());
-            while io::stdin().read_line(&mut buffer).is_ok_and(|n| n > 0) {
-                if buffer.ends_with("\\\n") {
-                    continue;
-                }
-                match get_global_shell().execute_program(&buffer) {
-                    Ok(_) => {
-                        buffer.clear();
-                        eprint!("{}", get_global_shell().get_ps1());
+            loop {
+                while io::stdin().read_line(&mut buffer).is_ok_and(|n| n > 0) {
+                    if buffer.ends_with("\\\n") {
+                        continue;
                     }
-                    Err(syntax_err) => {
-                        if !syntax_err.could_be_resolved_with_more_input {
-                            eprintln!("sh: syntax error: {}", syntax_err.message);
+                    match get_global_shell().execute_program(&buffer) {
+                        Ok(_) => {
                             buffer.clear();
                             eprint!("{}", get_global_shell().get_ps1());
-                        } else {
-                            eprint!("{}", get_global_shell().get_ps2());
+                        }
+                        Err(syntax_err) => {
+                            if !syntax_err.could_be_resolved_with_more_input {
+                                eprintln!("sh: syntax error: {}", syntax_err.message);
+                                buffer.clear();
+                                eprint!("{}", get_global_shell().get_ps1());
+                            } else {
+                                eprint!("{}", get_global_shell().get_ps2());
+                            }
                         }
                     }
                 }
+                std::thread::sleep(Duration::from_millis(16));
+                get_global_shell().process_signals();
             }
         }
         ExecutionMode::ReadCommandsFromStdin => {

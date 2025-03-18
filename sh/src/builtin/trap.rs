@@ -1,8 +1,7 @@
 use crate::builtin::{BuiltinError, BuiltinResult, SpecialBuiltinUtility};
-use crate::global_shell_signal_handler;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
-use crate::signals::{Signal, SIGNALS};
+use crate::signals::{handle_signals, Signal, SIGNALS};
 use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet};
 use std::fmt::Display;
 use std::str::FromStr;
@@ -152,7 +151,7 @@ impl SpecialBuiltinUtility for Trap {
                         shell,
                         condition,
                         TrapAction::Commands(cmd.to_string()),
-                        SigHandler::Handler(global_shell_signal_handler),
+                        SigHandler::Handler(handle_signals),
                     );
                 }
             }

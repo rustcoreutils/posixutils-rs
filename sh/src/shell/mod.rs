@@ -160,6 +160,14 @@ impl Shell {
         self.opened_files.write_err(message);
     }
 
+    fn wait_child_process(&self, child_pid: Pid) -> OsResult<i32> {
+        match waitpid(child_pid, None)? {
+            WaitStatus::Exited(_, status) => Ok(status),
+            WaitStatus::Signaled(_, signal, _) => Ok(signal_exit_status(signal)),
+            _ => unreachable!(),
+        }
+    }
+
     pub fn assign_global(
         &mut self,
         name: String,
@@ -190,11 +198,7 @@ impl Shell {
                 Err(ExecError::CannotExecute(_)) => std::process::exit(126),
                 Ok(_) => unreachable!(),
             },
-            ForkResult::Parent { child } => match waitpid(child, None)? {
-                WaitStatus::Exited(_, status) => Ok(status),
-                WaitStatus::Signaled(_, signal, _) => Ok(signal_exit_status(signal)),
-                _ => unreachable!(),
-            },
+            ForkResult::Parent { child } => self.wait_child_process(child),
         }
     }
 
@@ -505,11 +509,9 @@ impl Shell {
             ForkResult::Child => {
                 std::process::exit(self.interpret(commands, false));
             }
-            ForkResult::Parent { child } => match waitpid(child, None)? {
-                WaitStatus::Exited(_, status) => Ok(status),
-                WaitStatus::Signaled(_, signal, _) => Ok(signal_exit_status(signal)),
-                _ => unreachable!(),
-            },
+            ForkResult::Parent { child } => {
+                self.wait_child_process(child).map_err(|err| err.into())
+            }
         }
     }
 
@@ -620,13 +622,7 @@ impl Shell {
                 }
                 ForkResult::Parent { child } => {
                     close(current_stdin)?;
-                    match waitpid(child, None)? {
-                        WaitStatus::Exited(_, status) => pipeline_exit_status = status,
-                        WaitStatus::Signaled(_, signal, _) => {
-                            pipeline_exit_status = signal_exit_status(signal)
-                        }
-                        _ => todo!(),
-                    }
+                    pipeline_exit_status = self.wait_child_process(child)?;
                 }
             }
         }

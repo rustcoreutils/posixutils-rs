@@ -153,7 +153,7 @@ impl Shell {
         self.opened_files.write_err(message);
     }
 
-    fn wait_child_process(&mut self, child_pid: Pid) -> OsResult<i32> {
+    pub fn wait_child_process(&mut self, child_pid: Pid) -> OsResult<i32> {
         loop {
             match waitpid(child_pid, Some(WaitPidFlag::WNOHANG))? {
                 WaitStatus::Exited(_, status) => return Ok(status),

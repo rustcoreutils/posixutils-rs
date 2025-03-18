@@ -26,17 +26,24 @@ pub fn strcoll(lhs: &CStr, rhs: &CStr) -> std::cmp::Ordering {
 }
 
 #[derive(Clone, Debug)]
-pub struct OsError(String);
+pub struct OsError {
+    pub command: &'static str,
+    pub errno: Errno,
+}
 
-impl From<String> for OsError {
-    fn from(value: String) -> Self {
-        Self(value)
+impl OsError {
+    pub fn new(command: &'static str, errno: Errno) -> Self {
+        Self { command, errno }
     }
 }
 
 impl Display for OsError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0.as_str())
+        write!(
+            f,
+            "sh: internal call to {} failed ({})",
+            self.command, self.errno
+        )
     }
 }
 
@@ -45,29 +52,23 @@ pub type OsResult<T> = Result<T, OsError>;
 pub fn fork() -> OsResult<ForkResult> {
     // fork in general is not safe for multithreaded programs, but all code in this module is single
     // threaded, so this is safe
-    unsafe {
-        nix::unistd::fork()
-            .map_err(|err| format!("sh: internal call to fork failed ({err})").into())
-    }
+    unsafe { nix::unistd::fork().map_err(|err| OsError::new("fork", err)) }
 }
 
 pub fn pipe() -> OsResult<(OwnedFd, OwnedFd)> {
-    nix::unistd::pipe().map_err(|err| format!("sh: internal call to pipe failed ({err})").into())
+    nix::unistd::pipe().map_err(|err| OsError::new("pipe", err))
 }
 
 pub fn dup2(old_fd: RawFd, new_fd: RawFd) -> OsResult<RawFd> {
-    nix::unistd::dup2(old_fd, new_fd)
-        .map_err(|err| format!("sh: internal call to dup2 failed ({err})").into())
+    nix::unistd::dup2(old_fd, new_fd).map_err(|err| OsError::new("dup2", err))
 }
 
 pub fn waitpid(pid: Pid, options: Option<WaitPidFlag>) -> OsResult<WaitStatus> {
-    nix::sys::wait::waitpid(pid, options)
-        .map_err(|err| format!("sh: internal call to waitpid failed ({err})").into())
+    nix::sys::wait::waitpid(pid, options).map_err(|err| OsError::new("waitpid", err))
 }
 
 pub fn close(fd: RawFd) -> OsResult<()> {
-    nix::unistd::close(fd)
-        .map_err(|err| format!("sh: internal call to close failed ({err})").into())
+    nix::unistd::close(fd).map_err(|err| OsError::new("close", err))
 }
 
 pub fn find_in_path(command: &str, env_path: &str) -> Option<OsString> {
@@ -95,13 +96,13 @@ pub fn find_command(command: &str, env_path: &str) -> Option<OsString> {
 }
 
 pub enum ExecError {
-    OsError(String),
+    OsError(OsError),
     CannotExecute(Errno),
 }
 
 impl From<OsError> for ExecError {
     fn from(value: OsError) -> Self {
-        Self::OsError(value.0)
+        Self::OsError(value)
     }
 }
 
@@ -122,9 +123,8 @@ pub fn exec(
             | OpenedFile::ReadWriteFile(file) => file.as_raw_fd(),
             OpenedFile::HereDocument(contents) => {
                 let (read_pipe, write_pipe) = pipe()?;
-                nix::unistd::write(write_pipe, contents.as_bytes()).map_err(|err| {
-                    OsError::from(format!("sh: internal call to write failed ({err})"))
-                })?;
+                nix::unistd::write(write_pipe, contents.as_bytes())
+                    .map_err(|err| OsError::new("write", err))?;
                 dup2(read_pipe.as_raw_fd(), dest)?;
                 continue;
             }

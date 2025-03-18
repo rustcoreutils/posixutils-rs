@@ -352,18 +352,20 @@ pub struct Conjunction {
 }
 
 impl Conjunction {
-    fn write_into_string(&self, string: &mut String, print_semicolon: bool) {
+    fn format_into(&self, f: &mut Formatter<'_>, print_semicolon: bool) -> std::fmt::Result {
         for (pipeline, op) in &self.elements {
             match op {
-                LogicalOp::And => write!(string, "{} && ", pipeline).unwrap(),
-                LogicalOp::Or => write!(string, "{} || ", pipeline).unwrap(),
-                LogicalOp::None => write!(string, "{}", pipeline).unwrap(),
+                LogicalOp::And => write!(f, "{} && ", pipeline)?,
+                LogicalOp::Or => write!(f, "{} || ", pipeline)?,
+                LogicalOp::None => write!(f, "{}", pipeline)?,
             }
         }
         if self.is_async {
-            string.push('&');
+            f.write_char('&')
         } else if print_semicolon {
-            string.push(';');
+            f.write_char(';')
+        } else {
+            Ok(())
         }
     }
 }
@@ -375,18 +377,20 @@ pub struct CompleteCommand {
 }
 
 impl CompleteCommand {
-    pub fn to_string(&self) -> String {
-        let mut result = String::new();
-        for conjunction in &self.commands {
-            conjunction.write_into_string(&mut result, true);
+    fn format_into(&self, f: &mut Formatter<'_>, print_final_semicolon: bool) -> std::fmt::Result {
+        for conjunction in self.commands.head() {
+            conjunction.format_into(f, true)?;
+            f.write_char(' ')?
         }
-        result
+        self.commands.last().format_into(f, print_final_semicolon)?;
+
+        Ok(())
     }
 }
 
 impl Display for CompleteCommand {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.to_string())
+        self.format_into(f, false)
     }
 }
 

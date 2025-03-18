@@ -17,6 +17,7 @@ use std::io;
 
 mod builtin;
 mod cli;
+mod nonempty;
 mod parse;
 mod program;
 mod shell;

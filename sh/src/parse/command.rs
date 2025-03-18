@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+use crate::nonempty::NonEmpty;
 use crate::parse::word::{Word, WordPair};
 use std::fmt::{Debug, Display, Formatter, Write};
 use std::rc::Rc;
@@ -120,14 +121,14 @@ impl SimpleCommand {
 #[derive(Debug, Clone)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct CaseItem {
-    pub pattern: Vec<WordPair>,
+    pub pattern: NonEmpty<WordPair>,
     pub body: CompleteCommand,
 }
 
 impl Display for CaseItem {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "({}", self.pattern[0].as_string)?;
-        for pattern in &self.pattern[1..] {
+        write!(f, "({}", self.pattern.first().as_string)?;
+        for pattern in self.pattern.tail() {
             write!(f, " | {}", pattern.as_string)?;
         }
         write!(f, ")")?;
@@ -158,7 +159,7 @@ pub enum CompoundCommand {
         cases: Vec<CaseItem>,
     },
     IfClause {
-        if_chain: Vec<If>,
+        if_chain: NonEmpty<If>,
         else_body: Option<CompleteCommand>,
     },
     WhileClause {
@@ -185,8 +186,8 @@ impl Display for CompoundCommand {
                 words,
                 body,
             } => {
-                write!(f, "for {} in {}", iter_var, words[0].as_string)?;
-                for word in &words[1..] {
+                write!(f, "for {} in", iter_var)?;
+                for word in words {
                     write!(f, " {}", word.as_string)?;
                 }
                 write!(f, "; do {body} done")?;
@@ -204,8 +205,13 @@ impl Display for CompoundCommand {
                 if_chain,
                 else_body,
             } => {
-                write!(f, "if {} then {}", if_chain[0].condition, if_chain[0].body)?;
-                for if_ in if_chain {
+                write!(
+                    f,
+                    "if {} then {}",
+                    if_chain.first().condition,
+                    if_chain.first().body
+                )?;
+                for if_ in if_chain.tail() {
                     write!(f, "else if {} then {}", if_.condition, if_.body)?;
                 }
                 if let Some(else_body) = else_body {
@@ -290,14 +296,14 @@ impl Command {
 #[derive(Debug, Clone)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct Pipeline {
-    pub commands: Vec<Command>,
+    pub commands: NonEmpty<Command>,
     pub negate_status: bool,
 }
 
 impl Display for Pipeline {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.commands[0])?;
-        for command in &self.commands[1..] {
+        write!(f, "{}", self.commands.first())?;
+        for command in self.commands.tail() {
             write!(f, " | {}", command)?;
         }
         Ok(())
@@ -314,7 +320,7 @@ pub enum LogicalOp {
 #[derive(Debug, Clone)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct Conjunction {
-    pub elements: Vec<(Pipeline, LogicalOp)>,
+    pub elements: NonEmpty<(Pipeline, LogicalOp)>,
     pub is_async: bool,
 }
 
@@ -338,7 +344,7 @@ impl Conjunction {
 #[derive(Debug, Clone)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct CompleteCommand {
-    pub commands: Vec<Conjunction>,
+    pub commands: NonEmpty<Conjunction>,
 }
 
 impl CompleteCommand {

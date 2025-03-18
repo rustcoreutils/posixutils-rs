@@ -3,6 +3,7 @@ use crate::builtin::trap::TrapAction;
 use crate::builtin::{
     get_builtin_utility, get_special_builtin_utility, BuiltinUtility, SpecialBuiltinUtility,
 };
+use crate::nonempty::NonEmpty;
 use crate::parse::command::{
     Assignment, CaseItem, Command, CommandType, CompleteCommand, CompoundCommand, Conjunction,
     FunctionDefinition, If, LogicalOp, Name, Pipeline, Redirection, SimpleCommand,
@@ -437,11 +438,10 @@ impl Shell {
 
     fn interpret_if_clause(
         &mut self,
-        if_chain: &[If],
+        if_chain: &NonEmpty<If>,
         else_body: &Option<CompleteCommand>,
         ignore_errexit: bool,
     ) -> i32 {
-        assert!(!if_chain.is_empty(), "parsed if without else");
         for if_ in if_chain {
             if self.interpret(&if_.condition, true) == 0 {
                 return self.interpret(&if_.body, ignore_errexit);
@@ -577,11 +577,11 @@ impl Shell {
     fn interpret_pipeline(&mut self, pipeline: &Pipeline, ignore_errexit: bool) -> OsResult<i32> {
         let pipeline_exit_status;
         if pipeline.commands.len() == 1 {
-            let command = &pipeline.commands[0];
+            let command = pipeline.commands.first();
             pipeline_exit_status = self.interpret_command(command, ignore_errexit);
         } else {
             let mut current_stdin = libc::STDIN_FILENO;
-            for command in pipeline.commands.iter().take(pipeline.commands.len() - 1) {
+            for command in pipeline.commands.head() {
                 let (read_pipe, write_pipe) = pipe()?;
                 match fork()? {
                     ForkResult::Child => {
@@ -606,8 +606,7 @@ impl Shell {
             match fork()? {
                 ForkResult::Child => {
                     dup2(current_stdin, libc::STDIN_FILENO)?;
-                    let return_status =
-                        self.interpret_command(pipeline.commands.last().unwrap(), false);
+                    let return_status = self.interpret_command(pipeline.commands.last(), false);
                     close(current_stdin)?;
                     std::process::exit(return_status);
                 }
@@ -636,7 +635,7 @@ impl Shell {
 
     fn interpret_and_or_list(
         &mut self,
-        list: &[(Pipeline, LogicalOp)],
+        list: &NonEmpty<(Pipeline, LogicalOp)>,
         ignore_errexit: bool,
     ) -> i32 {
         let mut status = 0;

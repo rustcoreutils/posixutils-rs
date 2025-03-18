@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+use crate::nonempty::NonEmpty;
 use crate::parse::command::{
     Assignment, CaseItem, Command, CommandType, CompleteCommand, CompoundCommand, Conjunction,
     FunctionDefinition, IORedirectionKind, If, LogicalOp, Name, Pipeline, Redirection,
@@ -378,14 +379,15 @@ impl<'src> CommandParser<'src> {
             commands.push(conjunction);
             last_conjunction = self.parse_and_or(end.clone(), alias_table)?;
         }
-        if commands.is_empty() {
-            return Err(ParserError::new(
+        if let Ok(commands) = commands.try_into() {
+            Ok(CompleteCommand { commands })
+        } else {
+            Err(ParserError::new(
                 list_start,
                 "expected command",
                 self.lookahead == CommandToken::EOF,
-            ));
+            ))
         }
-        Ok(CompleteCommand { commands })
     }
 
     fn parse_brace_group(&mut self, alias_table: &AliasTable) -> ParseResult<CompoundCommand> {
@@ -458,6 +460,13 @@ impl<'src> CommandParser<'src> {
             self.advance()?;
         }
         self.match_token(CommandToken::RParen)?;
+        let pattern = pattern.try_into().map_err(|_| {
+            ParserError::new(
+                self.lookahead_lineno,
+                "expected pattern",
+                self.lookahead == CommandToken::EOF,
+            )
+        })?;
 
         let body = self.parse_compound_list(CommandToken::EOF, alias_table)?;
 
@@ -498,12 +507,11 @@ impl<'src> CommandParser<'src> {
     fn parse_if_clause(&mut self, alias_table: &AliasTable) -> ParseResult<CompoundCommand> {
         // consume 'if'
         self.advance()?;
-        let mut if_chain = Vec::new();
         // there is a terminator after the condition, we don't need to terminate on CommandToken::Then
         let condition = self.parse_compound_list(CommandToken::EOF, alias_table)?;
         self.match_token(CommandToken::Then)?;
         let then_part = self.parse_compound_list(CommandToken::EOF, alias_table)?;
-        if_chain.push(If {
+        let mut if_chain = NonEmpty::new(If {
             condition,
             body: then_part,
         });
@@ -632,12 +640,11 @@ impl<'src> CommandParser<'src> {
     ) -> ParseResult<Option<Pipeline>> {
         // pipeline = "!" command ("|" linebreak command)*
         let negate_status = self.match_alternatives(&[CommandToken::Bang])?.is_some();
-        let mut commands = Vec::new();
-        if let Some(command) = self.parse_command(end.clone(), alias_table)? {
-            commands.push(command);
+        let mut commands = if let Some(command) = self.parse_command(end.clone(), alias_table)? {
+            NonEmpty::new(command)
         } else {
             return Ok(None);
-        }
+        };
         while self.lookahead == CommandToken::Pipe {
             let pipe_location = self.lookahead_lineno;
             self.advance()?;
@@ -693,7 +700,7 @@ impl<'src> CommandParser<'src> {
         }
         elements.push((last, LogicalOp::None));
         Ok(Some(Conjunction {
-            elements,
+            elements: elements.try_into().unwrap(),
             // temporary value, will be set by the caller
             is_async: false,
         }))
@@ -721,7 +728,9 @@ impl<'src> CommandParser<'src> {
                 break;
             };
         }
-        Ok(CompleteCommand { commands })
+        Ok(CompleteCommand {
+            commands: commands.try_into().unwrap(),
+        })
     }
 
     pub fn parse_next_command(
@@ -783,25 +792,27 @@ mod tests {
 
     fn pipeline_from_word_pair(word: WordPair) -> Pipeline {
         Pipeline {
-            commands: vec![CommandType::SimpleCommand(SimpleCommand {
-                words: vec![word],
-                ..Default::default()
-            })
-            .into()],
+            commands: NonEmpty::new(
+                CommandType::SimpleCommand(SimpleCommand {
+                    words: vec![word],
+                    ..Default::default()
+                })
+                .into(),
+            ),
             negate_status: false,
         }
     }
 
     fn conjunction_from_word_pair(word: WordPair, is_async: bool) -> Conjunction {
         Conjunction {
-            elements: vec![(pipeline_from_word_pair(word), LogicalOp::None)],
+            elements: NonEmpty::new((pipeline_from_word_pair(word), LogicalOp::None)),
             is_async,
         }
     }
 
-    fn complete_command_from_word(word: WordPair, is_async: bool) -> CompleteCommand {
+    fn complete_command_from_word_pair(word: WordPair, is_async: bool) -> CompleteCommand {
         CompleteCommand {
-            commands: vec![conjunction_from_word_pair(word, is_async)],
+            commands: NonEmpty::new(conjunction_from_word_pair(word, is_async)),
         }
     }
 
@@ -1173,28 +1184,15 @@ mod tests {
         assert_eq!(
             conjunction.elements[0],
             (
-                Pipeline {
-                    commands: vec![CommandType::SimpleCommand(SimpleCommand {
-                        words: vec![unquoted_literal_pair("a")],
-                        ..Default::default()
-                    })
-                    .into()],
-                    negate_status: false
-                },
+                pipeline_from_word_pair(unquoted_literal_pair("a")),
                 LogicalOp::And
             )
         );
+
         assert_eq!(
             conjunction.elements[1],
             (
-                Pipeline {
-                    commands: vec![CommandType::SimpleCommand(SimpleCommand {
-                        words: vec![unquoted_literal_pair("b")],
-                        ..Default::default()
-                    })
-                    .into()],
-                    negate_status: false
-                },
+                pipeline_from_word_pair(unquoted_literal_pair("b")),
                 LogicalOp::None
             )
         );
@@ -1207,37 +1205,12 @@ mod tests {
         assert_eq!(command.commands.len(), 2);
         assert_eq!(
             command.commands[0],
-            Conjunction {
-                elements: vec![(
-                    Pipeline {
-                        commands: vec![CommandType::SimpleCommand(SimpleCommand {
-                            words: vec![unquoted_literal_pair("a")],
-                            ..Default::default()
-                        })
-                        .into()],
-                        negate_status: false
-                    },
-                    LogicalOp::None
-                )],
-                is_async: false,
-            }
+            conjunction_from_word_pair(unquoted_literal_pair("a"), false)
         );
+
         assert_eq!(
             command.commands[1],
-            Conjunction {
-                elements: vec![(
-                    Pipeline {
-                        commands: vec![CommandType::SimpleCommand(SimpleCommand {
-                            words: vec![unquoted_literal_pair("b")],
-                            ..Default::default()
-                        })
-                        .into()],
-                        negate_status: false
-                    },
-                    LogicalOp::None
-                )],
-                is_async: false,
-            }
+            conjunction_from_word_pair(unquoted_literal_pair("b"), false)
         )
     }
 
@@ -1292,7 +1265,7 @@ mod tests {
     fn parse_brace_group() {
         assert_eq!(
             parse_compound_command("{ word }").0,
-            CompoundCommand::BraceGroup(complete_command_from_word(
+            CompoundCommand::BraceGroup(complete_command_from_word_pair(
                 unquoted_literal_pair("word"),
                 false
             ))
@@ -1306,6 +1279,8 @@ mod tests {
                     conjunction_from_word_pair(unquoted_literal_pair("cmd3"), false),
                     conjunction_from_word_pair(unquoted_literal_pair("cmd4"), true)
                 ]
+                .try_into()
+                .unwrap()
             })
         )
     }
@@ -1314,7 +1289,7 @@ mod tests {
     fn parse_subshell() {
         assert_eq!(
             parse_compound_command("( word )").0,
-            CompoundCommand::Subshell(complete_command_from_word(
+            CompoundCommand::Subshell(complete_command_from_word_pair(
                 unquoted_literal_pair("word"),
                 false
             ))
@@ -1328,6 +1303,8 @@ mod tests {
                     conjunction_from_word_pair(unquoted_literal_pair("cmd3"), false),
                     conjunction_from_word_pair(unquoted_literal_pair("cmd4"), true)
                 ]
+                .try_into()
+                .unwrap()
             })
         )
     }
@@ -1343,12 +1320,7 @@ mod tests {
                     unquoted_literal_pair("2"),
                     unquoted_literal_pair("3")
                 ],
-                body: CompleteCommand {
-                    commands: vec![conjunction_from_word_pair(
-                        unquoted_literal_pair("cmd"),
-                        false
-                    )]
-                }
+                body: complete_command_from_word_pair(unquoted_literal_pair("cmd"), false)
             }
         );
     }
@@ -1360,12 +1332,7 @@ mod tests {
             CompoundCommand::ForClause {
                 iter_var: Rc::from("i"),
                 words: vec![WordPair::new(special_parameter(SpecialParameter::At), "$@")],
-                body: CompleteCommand {
-                    commands: vec![conjunction_from_word_pair(
-                        unquoted_literal_pair("cmd"),
-                        false
-                    )]
-                }
+                body: complete_command_from_word_pair(unquoted_literal_pair("cmd"), false)
             }
         );
     }
@@ -1395,8 +1362,8 @@ mod tests {
             CompoundCommand::CaseClause {
                 arg: unquoted_literal_pair("word"),
                 cases: vec![CaseItem {
-                    pattern: vec![unquoted_literal_pair("pattern")],
-                    body: complete_command_from_word(unquoted_literal_pair("cmd"), false)
+                    pattern: NonEmpty::new(unquoted_literal_pair("pattern")),
+                    body: complete_command_from_word_pair(unquoted_literal_pair("cmd"), false)
                 }]
             }
         );
@@ -1421,16 +1388,16 @@ mod tests {
                 arg: unquoted_literal_pair("word"),
                 cases: vec![
                     CaseItem {
-                        pattern: vec![unquoted_literal_pair("pattern1")],
-                        body: complete_command_from_word(unquoted_literal_pair("cmd1"), false)
+                        pattern: NonEmpty::new(unquoted_literal_pair("pattern1")),
+                        body: complete_command_from_word_pair(unquoted_literal_pair("cmd1"), false)
                     },
                     CaseItem {
-                        pattern: vec![unquoted_literal_pair("pattern2")],
-                        body: complete_command_from_word(unquoted_literal_pair("cmd2"), false)
+                        pattern: NonEmpty::new(unquoted_literal_pair("pattern2")),
+                        body: complete_command_from_word_pair(unquoted_literal_pair("cmd2"), false)
                     },
                     CaseItem {
-                        pattern: vec![unquoted_literal_pair("pattern3")],
-                        body: complete_command_from_word(unquoted_literal_pair("cmd3"), false)
+                        pattern: NonEmpty::new(unquoted_literal_pair("pattern3")),
+                        body: complete_command_from_word_pair(unquoted_literal_pair("cmd3"), false)
                     }
                 ]
             }
@@ -1450,20 +1417,13 @@ mod tests {
         assert_eq!(
             parse_compound_command("if condition; then cmd; fi").0,
             CompoundCommand::IfClause {
-                if_chain: vec![If {
-                    condition: CompleteCommand {
-                        commands: vec![conjunction_from_word_pair(
-                            unquoted_literal_pair("condition"),
-                            false
-                        )]
-                    },
-                    body: CompleteCommand {
-                        commands: vec![conjunction_from_word_pair(
-                            unquoted_literal_pair("cmd"),
-                            false
-                        )]
-                    }
-                }],
+                if_chain: NonEmpty::new(If {
+                    condition: complete_command_from_word_pair(
+                        unquoted_literal_pair("condition"),
+                        false
+                    ),
+                    body: complete_command_from_word_pair(unquoted_literal_pair("cmd"), false)
+                }),
                 else_body: None
             }
         );
@@ -1474,26 +1434,17 @@ mod tests {
         assert_eq!(
             parse_compound_command("if condition; then cmd; else cmd2; fi").0,
             CompoundCommand::IfClause {
-                if_chain: vec![If {
-                    condition: CompleteCommand {
-                        commands: vec![conjunction_from_word_pair(
-                            unquoted_literal_pair("condition"),
-                            false
-                        )]
-                    },
-                    body: CompleteCommand {
-                        commands: vec![conjunction_from_word_pair(
-                            unquoted_literal_pair("cmd"),
-                            false
-                        )]
-                    }
-                },],
-                else_body: Some(CompleteCommand {
-                    commands: vec![conjunction_from_word_pair(
-                        unquoted_literal_pair("cmd2"),
+                if_chain: NonEmpty::new(If {
+                    condition: complete_command_from_word_pair(
+                        unquoted_literal_pair("condition"),
                         false
-                    )]
-                })
+                    ),
+                    body: complete_command_from_word_pair(unquoted_literal_pair("cmd"), false)
+                },),
+                else_body: Some(complete_command_from_word_pair(
+                    unquoted_literal_pair("cmd2"),
+                    false
+                ))
             }
         );
     }
@@ -1505,42 +1456,28 @@ mod tests {
             CompoundCommand::IfClause {
                 if_chain: vec![
                     If {
-                        condition: CompleteCommand {
-                            commands: vec![conjunction_from_word_pair(
+                        condition: complete_command_from_word_pair(
                                 unquoted_literal_pair("condition1"),
                                 false
-                            )]
-                        },
-                        body: CompleteCommand {
-                            commands: vec![conjunction_from_word_pair(unquoted_literal_pair("cmd1"), false)]
-                        }
+                            ),
+                        body: complete_command_from_word_pair(unquoted_literal_pair("cmd1"), false)
                     },
                     If {
-                        condition: CompleteCommand {
-                            commands: vec![conjunction_from_word_pair(
+                        condition: complete_command_from_word_pair(
                                 unquoted_literal_pair("condition2"),
                                 false
-                            )]
-                        },
-                        body: CompleteCommand {
-                            commands: vec![conjunction_from_word_pair(unquoted_literal_pair("cmd2"), false)]
-                        }
+                            ),
+                        body: complete_command_from_word_pair(unquoted_literal_pair("cmd2"), false)
                     },
                     If {
-                        condition: CompleteCommand {
-                            commands: vec![conjunction_from_word_pair(
+                        condition: complete_command_from_word_pair(
                                 unquoted_literal_pair("condition3"),
                                 false
-                            )]
-                        },
-                        body: CompleteCommand {
-                            commands: vec![conjunction_from_word_pair(unquoted_literal_pair("cmd3"), false)]
-                        }
+                            ),
+                        body: complete_command_from_word_pair(unquoted_literal_pair("cmd3"), false)
                     },
-                ],
-                else_body: Some(CompleteCommand {
-                            commands: vec![conjunction_from_word_pair(unquoted_literal_pair("cmd4"), false)]
-                        })
+                ].try_into().unwrap(),
+                else_body: Some(complete_command_from_word_pair(unquoted_literal_pair("cmd4"), false))
             }
         );
     }
@@ -1550,18 +1487,11 @@ mod tests {
         assert_eq!(
             parse_compound_command("while condition; do cmd; done").0,
             CompoundCommand::WhileClause {
-                condition: CompleteCommand {
-                    commands: vec![conjunction_from_word_pair(
-                        unquoted_literal_pair("condition"),
-                        false
-                    )]
-                },
-                body: CompleteCommand {
-                    commands: vec![conjunction_from_word_pair(
-                        unquoted_literal_pair("cmd"),
-                        false
-                    )]
-                }
+                condition: complete_command_from_word_pair(
+                    unquoted_literal_pair("condition"),
+                    false
+                ),
+                body: complete_command_from_word_pair(unquoted_literal_pair("cmd"), false)
             }
         );
     }
@@ -1571,18 +1501,11 @@ mod tests {
         assert_eq!(
             parse_compound_command("until condition; do cmd; done").0,
             CompoundCommand::UntilClause {
-                condition: CompleteCommand {
-                    commands: vec![conjunction_from_word_pair(
-                        unquoted_literal_pair("condition"),
-                        false
-                    )]
-                },
-                body: CompleteCommand {
-                    commands: vec![conjunction_from_word_pair(
-                        unquoted_literal_pair("cmd"),
-                        false
-                    )]
-                }
+                condition: complete_command_from_word_pair(
+                    unquoted_literal_pair("condition"),
+                    false
+                ),
+                body: complete_command_from_word_pair(unquoted_literal_pair("cmd"), false)
             }
         );
     }
@@ -1593,20 +1516,10 @@ mod tests {
         assert_eq!(
             command,
             CompoundCommand::IfClause {
-                if_chain: vec![If {
-                    condition: CompleteCommand {
-                        commands: vec![conjunction_from_word_pair(
-                            unquoted_literal_pair("a"),
-                            false
-                        )]
-                    },
-                    body: CompleteCommand {
-                        commands: vec![conjunction_from_word_pair(
-                            unquoted_literal_pair("b"),
-                            false
-                        )]
-                    }
-                }],
+                if_chain: NonEmpty::new(If {
+                    condition: complete_command_from_word_pair(unquoted_literal_pair("a"), false),
+                    body: complete_command_from_word_pair(unquoted_literal_pair("b"), false)
+                }),
                 else_body: None
             }
         );
@@ -1628,10 +1541,9 @@ mod tests {
             parse_command("function_name() { cmd; }"),
             CommandType::FunctionDefinition(FunctionDefinition {
                 name: Rc::from("function_name"),
-                body: Rc::from(CompoundCommand::BraceGroup(complete_command_from_word(
-                    unquoted_literal_pair("cmd"),
-                    false
-                )))
+                body: Rc::from(CompoundCommand::BraceGroup(
+                    complete_command_from_word_pair(unquoted_literal_pair("cmd"), false)
+                ))
             })
         );
 
@@ -1640,10 +1552,10 @@ mod tests {
             CommandType::FunctionDefinition(FunctionDefinition {
                 name: Rc::from("function_name"),
                 body: Rc::from(CompoundCommand::Subshell(CompleteCommand {
-                    commands: vec![conjunction_from_word_pair(
+                    commands: NonEmpty::new(conjunction_from_word_pair(
                         unquoted_literal_pair("cmd1"),
                         false
-                    ),]
+                    ))
                 }))
             })
         );
@@ -1654,11 +1566,13 @@ mod tests {
         assert_eq!(
             parse_pipeline("! cmd"),
             Pipeline {
-                commands: vec![CommandType::SimpleCommand(SimpleCommand {
-                    words: vec![unquoted_literal_pair("cmd")],
-                    ..Default::default()
-                })
-                .into()],
+                commands: NonEmpty::new(
+                    CommandType::SimpleCommand(SimpleCommand {
+                        words: vec![unquoted_literal_pair("cmd")],
+                        ..Default::default()
+                    })
+                    .into()
+                ),
                 negate_status: true
             }
         );
@@ -1686,12 +1600,7 @@ mod tests {
                     unquoted_literal_pair("2"),
                     unquoted_literal_pair("3")
                 ],
-                body: CompleteCommand {
-                    commands: vec![conjunction_from_word_pair(
-                        unquoted_literal_pair("cmd"),
-                        false
-                    )]
-                }
+                body: complete_command_from_word_pair(unquoted_literal_pair("cmd"), false)
             }
         );
     }
@@ -1714,12 +1623,7 @@ mod tests {
             CompoundCommand::ForClause {
                 iter_var: Rc::from("word"),
                 words: vec![unquoted_literal_pair("in")],
-                body: CompleteCommand {
-                    commands: vec![conjunction_from_word_pair(
-                        unquoted_literal_pair("cmd"),
-                        false
-                    )]
-                }
+                body: complete_command_from_word_pair(unquoted_literal_pair("cmd"), false)
             }
         );
     }
@@ -2097,33 +2001,21 @@ mod tests {
         assert_eq!(
             command,
             CompleteCommand {
-                commands: vec![Conjunction {
+                commands: NonEmpty::new(Conjunction {
                     elements: vec![
                         (
-                            Pipeline {
-                                commands: vec![CommandType::SimpleCommand(SimpleCommand {
-                                    words: vec![unquoted_literal_pair("cmd_y")],
-                                    ..Default::default()
-                                })
-                                .into()],
-                                negate_status: false
-                            },
+                            pipeline_from_word_pair(unquoted_literal_pair("cmd_y")),
                             LogicalOp::And
                         ),
                         (
-                            Pipeline {
-                                commands: vec![CommandType::SimpleCommand(SimpleCommand {
-                                    words: vec![unquoted_literal_pair("cmd_z")],
-                                    ..Default::default()
-                                })
-                                .into()],
-                                negate_status: false
-                            },
+                            pipeline_from_word_pair(unquoted_literal_pair("cmd_z")),
                             LogicalOp::None
                         )
-                    ],
+                    ]
+                    .try_into()
+                    .unwrap(),
                     is_async: false
-                }]
+                })
             }
         );
     }
@@ -2142,33 +2034,21 @@ mod tests {
         assert_eq!(
             command,
             CompleteCommand {
-                commands: vec![Conjunction {
+                commands: NonEmpty::new(Conjunction {
                     elements: vec![
                         (
-                            Pipeline {
-                                commands: vec![CommandType::SimpleCommand(SimpleCommand {
-                                    words: vec![unquoted_literal_pair("cmd_x")],
-                                    ..Default::default()
-                                })
-                                .into()],
-                                negate_status: false
-                            },
+                            pipeline_from_word_pair(unquoted_literal_pair("cmd_x")),
                             LogicalOp::And
                         ),
                         (
-                            Pipeline {
-                                commands: vec![CommandType::SimpleCommand(SimpleCommand {
-                                    words: vec![unquoted_literal_pair("cmd_y")],
-                                    ..Default::default()
-                                })
-                                .into()],
-                                negate_status: false
-                            },
+                            pipeline_from_word_pair(unquoted_literal_pair("cmd_y")),
                             LogicalOp::None
                         )
-                    ],
+                    ]
+                    .try_into()
+                    .unwrap(),
                     is_async: false
-                }]
+                })
             }
         );
     }

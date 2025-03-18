@@ -18,10 +18,14 @@ use crate::builtin::type_::Type_;
 use crate::builtin::ulimit::Ulimit;
 use crate::builtin::unalias::Unalias;
 use crate::builtin::unset::BuiltinUnset;
+use crate::builtin::wait::Wait;
+use crate::jobs::parse_job_id;
 use crate::shell::environment::{CannotModifyReadonly, Environment};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 use crate::utils::OsError;
+use nix::libc::pid_t;
+use nix::unistd::Pid;
 use std::fmt::{Display, Formatter};
 
 pub mod alias;
@@ -44,6 +48,7 @@ mod type_;
 mod ulimit;
 mod unalias;
 mod unset;
+mod wait;
 
 pub enum BuiltinError {
     CustomError(String),
@@ -145,6 +150,7 @@ pub fn get_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
         "getopts" => Some(&GetOpts),
         "kill" => Some(&Kill),
         "ulimit" => Some(&Ulimit),
+        "wait" => Some(&Wait),
         "cd" => Some(&Cd),
         "type" => Some(&Type_),
         "unalias" => Some(&Unalias),
@@ -157,5 +163,20 @@ fn skip_option_terminator(args: &[String]) -> &[String] {
         &args[1..]
     } else {
         &args
+    }
+}
+
+fn parse_pid(pid: &str, shell: &Shell) -> Result<Pid, String> {
+    if pid.starts_with('%') {
+        let job_id = parse_job_id(pid).map_err(|_| format!("'{pid}' is not a valid job id"))?;
+        let job = shell
+            .get_job(job_id)
+            .ok_or(format!("'{pid}' no such job"))?;
+        Ok(job.pid)
+    } else {
+        let raw_pid = pid
+            .parse::<pid_t>()
+            .map_err(|_| format!("'{pid}' is not a valid pid"))?;
+        Ok(Pid::from_raw(raw_pid))
     }
 }

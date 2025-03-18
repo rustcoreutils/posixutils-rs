@@ -1,4 +1,4 @@
-use crate::builtin::{skip_option_terminator, BuiltinResult, BuiltinUtility};
+use crate::builtin::{parse_pid, skip_option_terminator, BuiltinResult, BuiltinUtility};
 use crate::jobs::parse_job_id;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
@@ -88,19 +88,7 @@ impl BuiltinUtility for Kill {
         match args {
             KillArgs::SendSignal { signal, pids } => {
                 for pid in pids {
-                    let pid = if pid.starts_with('%') {
-                        let job_id = parse_job_id(pid)
-                            .map_err(|_| format!("kill: '{pid}' is not a valid job id"))?;
-                        let job = shell
-                            .get_job(job_id)
-                            .ok_or(format!("kill: '{pid}' no such job"))?;
-                        job.pid
-                    } else {
-                        let raw_pid = pid
-                            .parse::<pid_t>()
-                            .map_err(|_| format!("kill: '{pid}' is not a valid pid"))?;
-                        Pid::from_raw(raw_pid)
-                    };
+                    let pid = parse_pid(pid, shell).map_err(|err| format!("kill: {err}"))?;
                     kill(pid, signal.map(|s| NixSignal::from(s)))
                         .map_err(|err| format!("kill: failed to send signal ({})", err))?;
                 }

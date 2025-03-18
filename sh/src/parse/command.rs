@@ -217,9 +217,9 @@ impl Display for CompoundCommand {
                 for word in words {
                     write!(f, " {}", word.as_string)?;
                 }
-                write!(f, "; do {body} done")?;
-                write!(f, "{}", body)?;
-                writeln!(f, "; done")
+                write!(f, "; do ")?;
+                body.format_into(f, true)?;
+                write!(f, " done")
             }
             CompoundCommand::CaseClause { arg, cases } => {
                 write!(f, "case {} in", arg.as_string)?;
@@ -232,30 +232,35 @@ impl Display for CompoundCommand {
                 if_chain,
                 else_body,
             } => {
-                write!(
-                    f,
-                    "if {} then {}",
-                    if_chain.first().condition,
-                    if_chain.first().body
-                )?;
+                write!(f, "if ",)?;
+                if_chain.first().condition.format_into(f, true)?;
+                write!(f, " then ")?;
+                if_chain.first().body.format_into(f, true)?;
                 for if_ in if_chain.tail() {
-                    write!(f, "else if {} then {}", if_.condition, if_.body)?;
+                    write!(f, " elif ",)?;
+                    if_.condition.format_into(f, true)?;
+                    write!(f, " then ")?;
+                    if_.body.format_into(f, true)?;
                 }
                 if let Some(else_body) = else_body {
                     write!(f, "else")?;
-                    write!(f, "{}", else_body)?;
+                    else_body.format_into(f, true)?;
                 }
-                write!(f, "fi")
+                write!(f, " fi")
             }
             CompoundCommand::WhileClause { condition, body } => {
-                write!(f, "while {} do {}", condition, body)?;
-                write!(f, "{}", body)?;
-                write!(f, "done")
+                write!(f, "while ")?;
+                condition.format_into(f, true)?;
+                write!(f, " do ")?;
+                body.format_into(f, true)?;
+                write!(f, " done")
             }
             CompoundCommand::UntilClause { condition, body } => {
-                write!(f, "until {} do {}", condition, body)?;
-                write!(f, "{}", body)?;
-                write!(f, "done")
+                write!(f, "until ")?;
+                condition.format_into(f, true)?;
+                write!(f, " do ")?;
+                body.format_into(f, true)?;
+                write!(f, " done")
             }
         }
     }

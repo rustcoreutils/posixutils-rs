@@ -147,7 +147,7 @@ impl OpenedFiles {
         for redir in redirections {
             match &redir.kind {
                 RedirectionKind::IORedirection { kind, file } => {
-                    let file = expand_word_to_string(file, false, shell)?;
+                    let file = expand_word_to_string(&file.word, false, shell)?;
                     self.io_redirect(kind, &file, redir.file_descriptor, shell)?;
                 }
                 RedirectionKind::HereDocument(contents) => {

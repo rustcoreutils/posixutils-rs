@@ -8,7 +8,7 @@ use crate::parse::command::{
     FunctionDefinition, If, LogicalOp, Name, Pipeline, Redirection, SimpleCommand,
 };
 use crate::parse::command_parser::CommandParser;
-use crate::parse::word::Word;
+use crate::parse::word::{Word, WordPair};
 use crate::parse::word_parser::parse_word;
 use crate::parse::{AliasTable, ParserError};
 use crate::shell::environment::{CannotModifyReadonly, Environment, Value};
@@ -195,7 +195,7 @@ impl Shell {
         export: bool,
     ) -> CommandExecutionResult<()> {
         for assignment in assignments {
-            let word_str = expand_word_to_string(&assignment.value, true, self)?;
+            let word_str = expand_word_to_string(&assignment.value.word, true, self)?;
             self.assign_global(assignment.name.to_string(), word_str)?
                 .export_or(export);
         }
@@ -204,7 +204,7 @@ impl Shell {
 
     fn assign_locals(&mut self, assignments: &[Assignment]) -> CommandExecutionResult<()> {
         for assignment in assignments {
-            let word_str = expand_word_to_string(&assignment.value, true, self)?;
+            let word_str = expand_word_to_string(&assignment.value.word, true, self)?;
             self.environment
                 .set(assignment.name.to_string(), word_str)?;
         }
@@ -318,8 +318,8 @@ impl Shell {
         let mut expanded_words = Vec::new();
         // reset
         self.last_command_substitution_status = 0;
-        for word in &simple_command.words {
-            expanded_words.extend(expand_word(word, false, self)?);
+        for word_pair in &simple_command.words {
+            expanded_words.extend(expand_word(&word_pair.word, false, self)?);
         }
         if self.set_options.xtrace {
             self.trace(&expanded_words);
@@ -381,14 +381,14 @@ impl Shell {
     fn interpret_for_clause(
         &mut self,
         iter_var: Name,
-        iter_words: &[Word],
+        iter_words: &[WordPair],
         body: &CompleteCommand,
         ignore_errexit: bool,
     ) -> CommandExecutionResult<i32> {
         let mut result = 0;
         self.loop_depth += 1;
-        'outer: for word in iter_words {
-            let items = expand_word(word, false, self)?;
+        'outer: for word_pair in iter_words {
+            let items = expand_word(&word_pair.word, false, self)?;
             for item in items {
                 self.assign_global(iter_var.to_string(), item)?;
                 result = self.interpret(body, ignore_errexit);
@@ -418,15 +418,15 @@ impl Shell {
 
     fn interpret_case_clause(
         &mut self,
-        arg: &Word,
+        arg: &WordPair,
         cases: &[CaseItem],
         ignore_errexit: bool,
     ) -> CommandExecutionResult<i32> {
-        let arg = expand_word_to_string(arg, false, self)?;
+        let arg = expand_word_to_string(&arg.word, false, self)?;
         let arg_cstr = CString::new(arg).expect("invalid pattern");
         for case in cases {
             for pattern in &case.pattern {
-                let pattern = word_to_pattern(pattern, self)?;
+                let pattern = word_to_pattern(&pattern.word, self)?;
                 if pattern.matches(&arg_cstr) {
                     return Ok(self.interpret(&case.body, ignore_errexit));
                 }

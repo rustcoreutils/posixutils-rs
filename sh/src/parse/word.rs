@@ -92,6 +92,21 @@ pub struct Word {
     pub parts: Vec<WordPart>,
 }
 
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct WordPair {
+    pub word: Word,
+    pub as_string: String,
+}
+
+impl WordPair {
+    pub fn new<S: Into<String>>(word: Word, contents: S) -> Self {
+        WordPair {
+            word,
+            as_string: contents.into(),
+        }
+    }
+}
+
 #[cfg(test)]
 pub mod test_utils {
     use super::*;
@@ -108,12 +123,31 @@ pub mod test_utils {
         }
     }
 
+    pub fn unquoted_literal_pair(contents: &str) -> WordPair {
+        WordPair {
+            word: unquoted_literal(contents),
+            as_string: contents.to_string(),
+        }
+    }
+
     pub fn special_parameter(param: SpecialParameter) -> Word {
         Word {
             parts: vec![WordPart::ParameterExpansion {
                 expansion: ParameterExpansion::Simple(Parameter::Special(param)),
                 inside_double_quotes: false,
             }],
+        }
+    }
+
+    impl PartialEq<Word> for WordPair {
+        fn eq(&self, other: &Word) -> bool {
+            self.word.eq(other)
+        }
+    }
+
+    impl PartialEq<WordPair> for Word {
+        fn eq(&self, other: &WordPair) -> bool {
+            self.eq(&other.word)
         }
     }
 }

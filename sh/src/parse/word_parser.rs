@@ -1,5 +1,7 @@
 use crate::parse::lexer::word_lexer::{WordLexer, WordToken};
-use crate::parse::word::{Parameter, ParameterExpansion, SpecialParameter, Word, WordPart};
+use crate::parse::word::{
+    Parameter, ParameterExpansion, SpecialParameter, Word, WordPair, WordPart,
+};
 use crate::parse::{ParseResult, ParserError};
 use std::rc::Rc;
 
@@ -397,6 +399,14 @@ pub fn parse_word(text: &str, line_no: u32, contents_are_quoted: bool) -> ParseR
     } else {
         Ok(word)
     }
+}
+
+pub fn parse_word_pair(
+    text: &str,
+    line_no: u32,
+    contents_are_quoted: bool,
+) -> ParseResult<WordPair> {
+    parse_word(text, line_no, contents_are_quoted).map(|w| WordPair::new(w, text))
 }
 
 #[cfg(test)]

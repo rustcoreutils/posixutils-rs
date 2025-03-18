@@ -7,7 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::parse::word::Word;
+use crate::parse::word::{Word, WordPair};
+use std::fmt::{Debug, Display, Formatter, Write};
 use std::rc::Rc;
 
 pub type CompleteCommandList = Vec<CompleteCommand>;
@@ -31,11 +32,39 @@ pub enum IORedirectionKind {
     OpenRW,
 }
 
+impl Display for IORedirectionKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IORedirectionKind::RedirectOutput => write!(f, ">"),
+            IORedirectionKind::RedirectOutputClobber => write!(f, ">|"),
+            IORedirectionKind::RedirectOuputAppend => write!(f, ">>"),
+            IORedirectionKind::DuplicateOutput => write!(f, ">&"),
+            IORedirectionKind::RedirectInput => write!(f, "<"),
+            IORedirectionKind::DuplicateInput => write!(f, "<&"),
+            IORedirectionKind::OpenRW => write!(f, "<>"),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub enum RedirectionKind {
-    IORedirection { kind: IORedirectionKind, file: Word },
+    IORedirection {
+        kind: IORedirectionKind,
+        file: WordPair,
+    },
     HereDocument(Word),
     QuotedHereDocument(String),
+}
+
+impl Display for RedirectionKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RedirectionKind::IORedirection { kind, file } => {
+                write!(f, "{} {}", kind, file.as_string)
+            }
+            _ => todo!(),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -44,31 +73,36 @@ pub struct Redirection {
     pub kind: RedirectionKind,
 }
 
-#[derive(PartialEq, Clone)]
+#[derive(PartialEq, Clone, Debug)]
 pub struct Assignment {
     pub name: Name,
-    pub value: Word,
+    pub value: WordPair,
 }
 
-impl std::fmt::Debug for Assignment {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "{}={:?}", self.name, self.value)
+impl Display for Assignment {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "{}={}", self.name, self.value.as_string)
     }
 }
 
-#[derive(PartialEq, Default, Clone)]
+#[derive(PartialEq, Default, Clone, Debug)]
 pub struct SimpleCommand {
     pub assignments: Vec<Assignment>,
     pub redirections: Vec<Redirection>,
-    pub words: Vec<Word>,
+    pub words: Vec<WordPair>,
 }
 
-impl std::fmt::Debug for SimpleCommand {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "SimpleCommand:")?;
-        writeln!(f, "  assignments: {:?}", self.assignments)?;
-        writeln!(f, "  words: {:?}", self.words)?;
-        writeln!(f, "  redirections: {:?}", self.redirections)?;
+impl Display for SimpleCommand {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        for assignment in &self.assignments {
+            write!(f, "{} ", assignment)?;
+        }
+        for word in &self.words {
+            write!(f, "{} ", word.as_string)?;
+        }
+        for redirection in &self.redirections {
+            write!(f, "{} ", redirection.kind)?;
+        }
         Ok(())
     }
 }
@@ -86,8 +120,20 @@ impl SimpleCommand {
 #[derive(Debug, Clone)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct CaseItem {
-    pub pattern: Vec<Word>,
+    pub pattern: Vec<WordPair>,
     pub body: CompleteCommand,
+}
+
+impl Display for CaseItem {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "({}", self.pattern[0].as_string)?;
+        for pattern in &self.pattern[1..] {
+            write!(f, " | {}", pattern.as_string)?;
+        }
+        write!(f, ")")?;
+        write!(f, " {}", &self.body)?;
+        write!(f, ";;")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -104,11 +150,11 @@ pub enum CompoundCommand {
     Subshell(CompleteCommand),
     ForClause {
         iter_var: Name,
-        words: Vec<Word>,
+        words: Vec<WordPair>,
         body: CompleteCommand,
     },
     CaseClause {
-        arg: Word,
+        arg: WordPair,
         cases: Vec<CaseItem>,
     },
     IfClause {
@@ -123,6 +169,63 @@ pub enum CompoundCommand {
         condition: CompleteCommand,
         body: CompleteCommand,
     },
+}
+
+impl Display for CompoundCommand {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CompoundCommand::BraceGroup(commands) => {
+                write!(f, "{{ {} }}", commands)
+            }
+            CompoundCommand::Subshell(commands) => {
+                write!(f, "({})", commands)
+            }
+            CompoundCommand::ForClause {
+                iter_var,
+                words,
+                body,
+            } => {
+                write!(f, "for {} in {}", iter_var, words[0].as_string)?;
+                for word in &words[1..] {
+                    write!(f, " {}", word.as_string)?;
+                }
+                write!(f, "; do {body} done")?;
+                write!(f, "{}", body)?;
+                writeln!(f, "; done")
+            }
+            CompoundCommand::CaseClause { arg, cases } => {
+                write!(f, "case {} in", arg.as_string)?;
+                for case in cases {
+                    write!(f, " {}", case)?;
+                }
+                write!(f, " esac")
+            }
+            CompoundCommand::IfClause {
+                if_chain,
+                else_body,
+            } => {
+                write!(f, "if {} then {}", if_chain[0].condition, if_chain[0].body)?;
+                for if_ in if_chain {
+                    write!(f, "else if {} then {}", if_.condition, if_.body)?;
+                }
+                if let Some(else_body) = else_body {
+                    write!(f, "else")?;
+                    write!(f, "{}", else_body)?;
+                }
+                write!(f, "fi")
+            }
+            CompoundCommand::WhileClause { condition, body } => {
+                write!(f, "while {} do {}", condition, body)?;
+                write!(f, "{}", body)?;
+                write!(f, "done")
+            }
+            CompoundCommand::UntilClause { condition, body } => {
+                write!(f, "until {} do {}", condition, body)?;
+                write!(f, "{}", body)?;
+                write!(f, "done")
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -143,10 +246,39 @@ pub enum CommandType {
     },
 }
 
+impl Display for CommandType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CommandType::FunctionDefinition(func) => {
+                write!(f, "{} () {}", func.name, func.body)
+            }
+            CommandType::SimpleCommand(cmd) => {
+                write!(f, "{}", cmd)
+            }
+            CommandType::CompoundCommand {
+                command,
+                redirections,
+            } => {
+                write!(f, "{}", command)?;
+                for redirection in redirections {
+                    write!(f, "{}", redirection.kind)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Command {
     pub type_: CommandType,
     pub lineno: u32,
+}
+
+impl Display for Command {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.type_)
+    }
 }
 
 impl Command {
@@ -155,18 +287,18 @@ impl Command {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct Pipeline {
     pub commands: Vec<Command>,
     pub negate_status: bool,
 }
 
-impl std::fmt::Debug for Pipeline {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "Pipeline:")?;
-        for command in &self.commands {
-            writeln!(f, "{}", indent(command))?;
+impl Display for Pipeline {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.commands[0])?;
+        for command in &self.commands[1..] {
+            write!(f, " | {}", command)?;
         }
         Ok(())
     }
@@ -179,52 +311,50 @@ pub enum LogicalOp {
     None,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct Conjunction {
     pub elements: Vec<(Pipeline, LogicalOp)>,
     pub is_async: bool,
 }
 
-impl std::fmt::Debug for Conjunction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(
-            f,
-            "Conjunction{}:",
-            if self.is_async { " (async)" } else { "" }
-        )?;
-        for (pipeline, logical_op) in &self.elements {
-            writeln!(f, "{}", indent(pipeline))?;
-            if *logical_op != LogicalOp::None {
-                writeln!(f, "{:?}", logical_op)?;
+impl Conjunction {
+    fn write_into_string(&self, string: &mut String, print_semicolon: bool) {
+        for (pipeline, op) in &self.elements {
+            match op {
+                LogicalOp::And => write!(string, "{} && ", pipeline).unwrap(),
+                LogicalOp::Or => write!(string, "{} || ", pipeline).unwrap(),
+                LogicalOp::None => write!(string, "{}", pipeline).unwrap(),
             }
         }
-        Ok(())
+        if self.is_async {
+            string.push('&');
+        } else if print_semicolon {
+            string.push(';');
+        }
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct CompleteCommand {
     pub commands: Vec<Conjunction>,
 }
 
-impl std::fmt::Debug for CompleteCommand {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "CompleteCommand:")?;
+impl CompleteCommand {
+    pub fn to_string(&self) -> String {
+        let mut result = String::new();
         for conjunction in &self.commands {
-            writeln!(f, "{}", indent(conjunction))?;
+            conjunction.write_into_string(&mut result, true);
         }
-        Ok(())
+        result
     }
 }
 
-fn indent<D: std::fmt::Debug>(val: &D) -> String {
-    format!("{:?}", val)
-        .lines()
-        .map(|line| format!("    {}", line))
-        .collect::<Vec<String>>()
-        .join("\n")
+impl Display for CompleteCommand {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_string())
+    }
 }
 
 #[cfg(test)]

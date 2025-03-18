@@ -13,7 +13,6 @@ impl SpecialBuiltinUtility for BuiltinUnset {
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
-        let args = skip_option_terminator(args);
         if args.is_empty() {
             return Ok(0);
         }
@@ -31,6 +30,9 @@ impl SpecialBuiltinUtility for BuiltinUnset {
             _ => {
                 start_index = 0;
             }
+        }
+        if args[start_index] == "--" {
+            start_index += 1;
         }
 
         for name in &args[start_index..] {

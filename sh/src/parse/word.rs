@@ -8,6 +8,7 @@
 //
 
 use crate::parse::command::{CompleteCommand, Name};
+use std::fmt::{Display, Formatter};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SpecialParameter {
@@ -104,6 +105,12 @@ impl WordPair {
             word,
             as_string: contents.into(),
         }
+    }
+}
+
+impl Display for WordPair {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_string)
     }
 }
 

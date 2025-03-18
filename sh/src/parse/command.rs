@@ -61,7 +61,7 @@ impl Display for RedirectionKind {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             RedirectionKind::IORedirection { kind, file } => {
-                write!(f, "{} {}", kind, file.as_string)
+                write!(f, "{}{}", kind, file.as_string)
             }
             _ => todo!(),
         }
@@ -74,6 +74,15 @@ pub struct Redirection {
     pub kind: RedirectionKind,
 }
 
+impl Display for Redirection {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if let Some(fd) = self.file_descriptor {
+            write!(f, "{}", fd)?;
+        }
+        write!(f, "{}", self.kind)
+    }
+}
+
 #[derive(PartialEq, Clone, Debug)]
 pub struct Assignment {
     pub name: Name,
@@ -82,7 +91,7 @@ pub struct Assignment {
 
 impl Display for Assignment {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "{}={}", self.name, self.value.as_string)
+        write!(f, "{}={}", self.name, self.value.as_string)
     }
 }
 
@@ -93,18 +102,36 @@ pub struct SimpleCommand {
     pub words: Vec<WordPair>,
 }
 
+fn tail<T>(items: &[T]) -> &[T] {
+    if items.is_empty() {
+        items
+    } else {
+        &items[1..]
+    }
+}
+
+fn write_command_parts<P: Display>(
+    parts: &[P],
+    f: &mut Formatter<'_>,
+    start_with_space: bool,
+) -> std::fmt::Result {
+    if let Some(part) = parts.first() {
+        if start_with_space {
+            write!(f, " ")?;
+        }
+        write!(f, "{}", part)?;
+    }
+    for part in tail(parts) {
+        write!(f, " {}", part)?;
+    }
+    Ok(())
+}
+
 impl Display for SimpleCommand {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        for assignment in &self.assignments {
-            write!(f, "{} ", assignment)?;
-        }
-        for word in &self.words {
-            write!(f, "{} ", word.as_string)?;
-        }
-        for redirection in &self.redirections {
-            write!(f, "{} ", redirection.kind)?;
-        }
-        Ok(())
+        write_command_parts(&self.assignments, f, false)?;
+        write_command_parts(&self.words, f, !self.assignments.is_empty())?;
+        write_command_parts(&self.redirections, f, !self.redirections.is_empty())
     }
 }
 

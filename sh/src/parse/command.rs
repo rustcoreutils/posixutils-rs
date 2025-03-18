@@ -374,6 +374,12 @@ impl Conjunction {
     }
 }
 
+impl Display for Conjunction {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.format_into(f, false)
+    }
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(test, derive(PartialEq))]
 pub struct CompleteCommand {

@@ -4,6 +4,7 @@ use crate::builtin::{
     get_builtin_utility, get_special_builtin_utility, BuiltinUtility, SpecialBuiltinUtility,
 };
 use crate::get_global_shell;
+use crate::jobs::{Job, JobId};
 use crate::nonempty::NonEmpty;
 use crate::parse::command::{
     Assignment, CaseItem, Command, CommandType, CompleteCommand, CompoundCommand, Conjunction,
@@ -121,16 +122,6 @@ fn signal_exit_status(signal: NixSignal) -> i32 {
     128 + signal as i32
 }
 
-type JobId = u64;
-
-#[derive(Clone)]
-pub struct Job {
-    command: String,
-    pid: Pid,
-    id: JobId,
-    terminated: bool,
-}
-
 #[derive(Clone)]
 pub struct Shell {
     pub environment: Environment,
@@ -154,7 +145,7 @@ pub struct Shell {
     pub exit_action: TrapAction,
     pub trap_actions: [TrapAction; Signal::Count as usize],
     pub background_jobs: Vec<Job>,
-    pub last_job_id: JobId,
+    pub last_job_number: u64,
 }
 
 impl Shell {
@@ -197,6 +188,19 @@ impl Shell {
                 Ok(_) => {}
             }
             self.last_pipeline_exit_status = last_pipeline_exit_status_before_trap;
+        }
+    }
+
+    pub fn get_job(&self, id: JobId) -> Option<&Job> {
+        match id {
+            JobId::CurrentJob => self.background_jobs.last(),
+            JobId::PreviousJob => self.background_jobs.get(self.background_jobs.len() - 2),
+            JobId::JobNumber(n) => self.background_jobs.iter().find(|j| j.number == n),
+            JobId::BeginsWith(s) => self
+                .background_jobs
+                .iter()
+                .find(|j| j.command.starts_with(s)),
+            JobId::Contains(s) => self.background_jobs.iter().find(|j| j.command.contains(s)),
         }
     }
 
@@ -707,11 +711,11 @@ impl Shell {
                     self.background_jobs.push(Job {
                         command: conjunction.to_string(),
                         pid: child,
-                        id: self.last_job_id,
+                        number: self.last_job_number,
                         terminated: false,
                     });
                     self.most_recent_background_command_pid = Some(child);
-                    self.last_job_id += 1;
+                    self.last_job_number += 1;
                     0
                 }
                 Err(_) => {
@@ -780,7 +784,7 @@ impl Shell {
                     if self.set_options.monitor {
                         self.opened_files.write_err(&format!(
                             "[{}] Done({})  {}\n",
-                            job.id, status, job.command
+                            job.number, status, job.command
                         ));
                     }
                     job.terminated = true;
@@ -792,6 +796,7 @@ impl Shell {
             }
         }
         self.background_jobs.retain(|j| !j.terminated);
+        self.background_jobs.sort_by_key(|j| j.number)
     }
 
     pub fn execute_program(&mut self, program: &str) -> Result<i32, ParserError> {
@@ -924,7 +929,7 @@ impl Default for Shell {
             exit_action: TrapAction::Default,
             trap_actions: [const { TrapAction::Default }; Signal::Count as usize],
             background_jobs: Vec::new(),
-            last_job_id: 0,
+            last_job_number: 0,
         }
     }
 }

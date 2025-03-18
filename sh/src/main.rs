@@ -19,6 +19,7 @@ use std::time::Duration;
 
 mod builtin;
 mod cli;
+mod jobs;
 mod nonempty;
 mod parse;
 mod program;

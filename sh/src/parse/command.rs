@@ -310,7 +310,7 @@ pub struct Command {
 
 impl Display for Command {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.type_)
+        Display::fmt(&self.type_, f)
     }
 }
 

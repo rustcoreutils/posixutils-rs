@@ -122,6 +122,14 @@ fn signal_exit_status(signal: NixSignal) -> i32 {
 type JobId = u64;
 
 #[derive(Clone)]
+pub struct Job {
+    command: String,
+    pid: Pid,
+    id: JobId,
+    terminated: bool,
+}
+
+#[derive(Clone)]
 pub struct Shell {
     pub environment: Environment,
     pub program_name: String,
@@ -143,7 +151,7 @@ pub struct Shell {
     pub last_lineno: u32,
     pub exit_action: TrapAction,
     pub trap_actions: [TrapAction; Signal::Count as usize],
-    pub background_jobs: HashMap<JobId, Pid>,
+    pub background_jobs: Vec<Job>,
     pub last_job_id: JobId,
 }
 
@@ -672,7 +680,12 @@ impl Shell {
                     std::process::exit(self.interpret_and_or_list(&conjunction.elements, false));
                 }
                 Ok(ForkResult::Parent { child }) => {
-                    self.background_jobs.insert(self.last_job_id, child);
+                    self.background_jobs.push(Job {
+                        command: conjunction.to_string(),
+                        pid: child,
+                        id: self.last_job_id,
+                        terminated: false,
+                    });
                     self.most_recent_background_command_pid = Some(child);
                     self.last_job_id += 1;
                     0
@@ -729,8 +742,8 @@ impl Shell {
     }
 
     pub fn update_background_jobs(&mut self) {
-        for (job_id, job_pid) in &mut self.background_jobs {
-            let status = match waitpid(*job_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
+        for job in &mut self.background_jobs {
+            let status = match waitpid(job.pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)) {
                 Ok(status) => status,
                 Err(err) => {
                     self.opened_files
@@ -741,10 +754,12 @@ impl Shell {
             match status {
                 WaitStatus::Exited(_, status) => {
                     if self.set_options.monitor {
-                        self.opened_files
-                            .write_err(&format!("[{}] Done({})\n", job_id, status));
+                        self.opened_files.write_err(&format!(
+                            "[{}] Done({})  {}\n",
+                            job.id, status, job.command
+                        ));
                     }
-                    *job_pid = Pid::from_raw(0);
+                    job.terminated = true;
                 }
                 WaitStatus::StillAlive => {}
                 _ => {
@@ -752,7 +767,7 @@ impl Shell {
                 }
             }
         }
-        self.background_jobs.retain(|_, pid| pid.as_raw() != 0);
+        self.background_jobs.retain(|j| !j.terminated);
     }
 
     pub fn execute_program(&mut self, program: &str) -> Result<i32, ParserError> {
@@ -883,7 +898,7 @@ impl Default for Shell {
             last_lineno: 0,
             exit_action: TrapAction::Default,
             trap_actions: [const { TrapAction::Default }; Signal::Count as usize],
-            background_jobs: HashMap::default(),
+            background_jobs: Vec::new(),
             last_job_id: 0,
         }
     }

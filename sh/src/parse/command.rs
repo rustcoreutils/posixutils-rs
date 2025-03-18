@@ -12,7 +12,6 @@ use crate::parse::word::{Word, WordPair};
 use std::fmt::{Debug, Display, Formatter, Write};
 use std::rc::Rc;
 
-pub type CompleteCommandList = Vec<CompleteCommand>;
 pub type Name = Rc<str>;
 
 #[derive(Debug, PartialEq, Clone, Copy)]

@@ -16,6 +16,7 @@ pub struct Job {
     pub state: JobState,
 }
 
+#[derive(Debug, Clone, Copy)]
 pub enum JobId<'s> {
     CurrentJob,
     PreviousJob,
@@ -35,11 +36,11 @@ pub fn parse_job_id(text: &str) -> Result<JobId, ()> {
             Ok(JobId::JobNumber(n))
         }
         "-" => Ok(JobId::PreviousJob),
-        "%?" => {
-            if text.len() < 4 {
+        other if other.starts_with('?') => {
+            if text.len() < 3 {
                 Err(())
             } else {
-                Ok(JobId::Contains(&text[3..]))
+                Ok(JobId::Contains(&text[2..]))
             }
         }
         other => {

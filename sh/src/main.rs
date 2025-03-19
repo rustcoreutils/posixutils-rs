@@ -21,6 +21,7 @@ mod builtin;
 mod cli;
 mod jobs;
 mod nonempty;
+mod option_parser;
 mod parse;
 mod program;
 mod shell;

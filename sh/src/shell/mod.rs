@@ -4,7 +4,7 @@ use crate::builtin::{
     get_builtin_utility, get_special_builtin_utility, BuiltinUtility, SpecialBuiltinUtility,
 };
 use crate::get_global_shell;
-use crate::jobs::{Job, JobId};
+use crate::jobs::{Job, JobId, JobState};
 use crate::nonempty::NonEmpty;
 use crate::parse::command::{
     Assignment, CaseItem, Command, CommandType, CompleteCommand, CompoundCommand, Conjunction,
@@ -194,7 +194,13 @@ impl Shell {
     pub fn get_job(&self, id: JobId) -> Option<&Job> {
         match id {
             JobId::CurrentJob => self.background_jobs.last(),
-            JobId::PreviousJob => self.background_jobs.get(self.background_jobs.len() - 2),
+            JobId::PreviousJob => {
+                if self.background_jobs.len() > 1 {
+                    Some(&self.background_jobs[self.background_jobs.len() - 2])
+                } else {
+                    None
+                }
+            }
             JobId::JobNumber(n) => self.background_jobs.iter().find(|j| j.number == n),
             JobId::BeginsWith(s) => self
                 .background_jobs
@@ -708,11 +714,14 @@ impl Shell {
                     std::process::exit(self.interpret_and_or_list(&conjunction.elements, false));
                 }
                 Ok(ForkResult::Parent { child }) => {
+                    self.background_jobs
+                        .last_mut()
+                        .map(|j| j.state = JobState::Previous);
                     self.background_jobs.push(Job {
                         command: conjunction.to_string(),
                         pid: child,
                         number: self.last_job_number,
-                        terminated: false,
+                        state: JobState::Current,
                     });
                     self.most_recent_background_command_pid = Some(child);
                     self.last_job_number += 1;
@@ -787,7 +796,7 @@ impl Shell {
                             job.number, status, job.command
                         ));
                     }
-                    job.terminated = true;
+                    job.state = JobState::Terminated;
                 }
                 WaitStatus::StillAlive => {}
                 _ => {
@@ -795,8 +804,16 @@ impl Shell {
                 }
             }
         }
-        self.background_jobs.retain(|j| !j.terminated);
-        self.background_jobs.sort_by_key(|j| j.number)
+        self.background_jobs
+            .retain(|j| j.state != JobState::Terminated);
+        self.background_jobs.sort_by_key(|j| j.number);
+        self.background_jobs
+            .last_mut()
+            .map(|j| j.state = JobState::Current);
+        if self.background_jobs.len() > 1 {
+            let len = self.background_jobs.len();
+            self.background_jobs[len - 2].state = JobState::Previous;
+        }
     }
 
     pub fn execute_program(&mut self, program: &str) -> Result<i32, ParserError> {
@@ -929,7 +946,7 @@ impl Default for Shell {
             exit_action: TrapAction::Default,
             trap_actions: [const { TrapAction::Default }; Signal::Count as usize],
             background_jobs: Vec::new(),
-            last_job_number: 0,
+            last_job_number: 1,
         }
     }
 }

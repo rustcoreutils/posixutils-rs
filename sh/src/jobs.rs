@@ -1,11 +1,19 @@
 use nix::unistd::Pid;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum JobState {
+    Current,
+    Previous,
+    Default,
+    Terminated,
+}
+
 #[derive(Clone)]
 pub struct Job {
     pub command: String,
     pub pid: Pid,
     pub number: u64,
-    pub terminated: bool,
+    pub state: JobState,
 }
 
 pub enum JobId<'s> {

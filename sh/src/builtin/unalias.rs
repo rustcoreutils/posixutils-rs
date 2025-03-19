@@ -12,6 +12,9 @@ impl BuiltinUtility for Unalias {
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
         if args.first().is_some_and(|arg| arg == "-a") {
+            if args.len() > 1 {
+                return Err("unalias: too many arguments".into());
+            }
             shell.alias_table.clear();
             return Ok(0);
         }

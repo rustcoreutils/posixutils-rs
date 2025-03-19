@@ -40,16 +40,35 @@ impl<'a> OptionParser<'a> {
         Ok(None)
     }
 
+    pub fn next_option_argument(&mut self) -> Option<&'a str> {
+        if self.arg_pos < self.args.len() {
+            let arg = &self.args[self.arg_pos];
+            if self.option_pos == arg.len() {
+                self.option_pos = 0;
+                let result = self.args.get(self.arg_pos + 1).map(|s| s.as_str());
+                self.arg_pos += 2;
+                result
+            } else {
+                let result = Some(&self.args[self.arg_pos][self.option_pos..]);
+                self.arg_pos += 1;
+                self.option_pos = 0;
+                result
+            }
+        } else {
+            None
+        }
+    }
+
     pub fn next_argument(&self) -> usize {
         self.arg_pos
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
-    fn to_args(args: Vec<&str>) -> Vec<String> {
+    pub fn to_args(args: Vec<&str>) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
     }
 
@@ -82,5 +101,17 @@ mod tests {
         assert_eq!(parser.next_option(), Ok(Some('a')));
         assert_eq!(parser.next_option(), Ok(None));
         assert_eq!(parser.next_argument(), 2);
+    }
+
+    #[test]
+    fn parse_option_argument() {
+        let args = to_args(vec!["-a", "arg", "-barg2", "-c"]);
+        let mut parser = OptionParser::new(&args);
+        assert_eq!(parser.next_option(), Ok(Some('a')));
+        assert_eq!(parser.next_option_argument(), Some("arg"));
+        assert_eq!(parser.next_option(), Ok(Some('b')));
+        assert_eq!(parser.next_option_argument(), Some("arg2"));
+        assert_eq!(parser.next_option(), Ok(Some('c')));
+        assert_eq!(parser.next_option_argument(), None);
     }
 }

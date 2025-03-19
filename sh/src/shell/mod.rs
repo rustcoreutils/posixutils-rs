@@ -717,6 +717,10 @@ impl Shell {
                     self.background_jobs
                         .last_mut()
                         .map(|j| j.state = JobState::Previous);
+                    if self.background_jobs.len() > 1 {
+                        let len = self.background_jobs.len();
+                        self.background_jobs[len - 2].state = JobState::Default;
+                    }
                     self.background_jobs.push(Job {
                         command: conjunction.to_string(),
                         pid: child,

@@ -1,4 +1,5 @@
 use crate::builtin::{BuiltinError, BuiltinResult, BuiltinUtility};
+use crate::option_parser::OptionParser;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 use nix::libc::{rlim_t, RLIM_INFINITY};
@@ -89,45 +90,36 @@ impl UlimitArgs {
         if args.is_empty() {
             return Err("ulimit: missing argument".to_string());
         }
+        let mut option_parser = OptionParser::new(args);
         let mut limit = None;
-        let mut arg_index = 0;
         let mut resource_limit = None;
-        while arg_index < args.len() {
-            match args[arg_index].as_str() {
-                "--" => {
-                    arg_index += 1;
-                    break;
-                }
-                option if option.starts_with("-") => {
-                    for c in option.chars().skip(1) {
-                        match c {
-                            'H' => limit = Some(LimitType::Hard),
-                            'S' => limit = Some(LimitType::Soft),
-                            other => {
-                                if resource_limit.is_some() {
-                                    return Err("ulimit: too many arguments".to_string());
-                                }
-                                match other {
-                                    'a' => resource_limit = Some(ResourceLimit::All),
-                                    'c' => resource_limit = Some(ResourceLimit::Core),
-                                    'd' => resource_limit = Some(ResourceLimit::Data),
-                                    'f' => resource_limit = Some(ResourceLimit::FSize),
-                                    'n' => resource_limit = Some(ResourceLimit::NoFile),
-                                    's' => resource_limit = Some(ResourceLimit::Stack),
-                                    't' => resource_limit = Some(ResourceLimit::Cpu),
-                                    'v' => resource_limit = Some(ResourceLimit::As),
-                                    _ => return Err(format!("ulimit: invalid option {}", c)),
-                                }
-                            }
-                        }
+        while let Some(option) = option_parser
+            .next_option()
+            .map_err(|opt| format!("ulimit: invalid option {opt}"))?
+        {
+            match option {
+                'H' => limit = Some(LimitType::Hard),
+                'S' => limit = Some(LimitType::Soft),
+                other => {
+                    if resource_limit.is_some() {
+                        return Err("ulimit: too many arguments".to_string());
+                    }
+                    match other {
+                        'a' => resource_limit = Some(ResourceLimit::All),
+                        'c' => resource_limit = Some(ResourceLimit::Core),
+                        'd' => resource_limit = Some(ResourceLimit::Data),
+                        'f' => resource_limit = Some(ResourceLimit::FSize),
+                        'n' => resource_limit = Some(ResourceLimit::NoFile),
+                        's' => resource_limit = Some(ResourceLimit::Stack),
+                        't' => resource_limit = Some(ResourceLimit::Cpu),
+                        'v' => resource_limit = Some(ResourceLimit::As),
+                        _ => return Err(format!("ulimit: invalid option {}", option)),
                     }
                 }
-                _ => break,
             }
-            arg_index += 1;
         }
-
-        let newlimit = if let Some(arg) = args.get(arg_index) {
+        let first_operant = option_parser.next_argument();
+        let newlimit = if let Some(arg) = args.get(first_operant) {
             Some(
                 LimitQuantity::parse(arg)
                     .map_err(|_| format!("ulimit: '{arg}' is not a valid limit"))?,
@@ -136,7 +128,7 @@ impl UlimitArgs {
             None
         };
 
-        if arg_index < args.len() - 1 {
+        if first_operant < args.len() - 1 {
             return Err("ulimit: too many arguments".to_string());
         }
 

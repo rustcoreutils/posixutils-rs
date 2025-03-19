@@ -1,6 +1,7 @@
 use crate::builtin::{
     get_builtin_utility, get_special_builtin_utility, BuiltinError, BuiltinResult, BuiltinUtility,
 };
+use crate::option_parser::OptionParser;
 use crate::shell::environment::Environment;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::{CommandExecutionError, ControlFlowState, Shell};
@@ -25,51 +26,46 @@ impl CommandArgs<'_> {
     fn parse(args: &[String]) -> Result<CommandArgs, String> {
         let mut use_default_path = false;
         let mut action = Action::Execute;
-        let mut i = 0;
-        while i < args.len() {
-            match args[i].as_str() {
-                "--" => {
-                    i += 1;
-                    break;
+
+        let mut option_parser = OptionParser::new(args);
+
+        while let Some(option) = option_parser
+            .next_option()
+            .map_err(|opt| format!("command: invalid option ({opt})"))?
+        {
+            match option {
+                'p' => {
+                    if use_default_path {
+                        return Err("command: cannot specify -p multiple times".into());
+                    }
+                    use_default_path = true;
                 }
-                options if options.starts_with("-") => {
-                    for option in options[1..].chars() {
-                        match option {
-                            'p' => {
-                                if use_default_path {
-                                    return Err("command: cannot specify -p multiple times".into());
-                                }
-                                use_default_path = true;
-                            }
-                            'v' | 'V' => {
-                                if action != Action::Execute {
-                                    return Err("command: cannot specify both -v and -V".into());
-                                }
-                                if option == 'v' {
-                                    action = Action::PrintShort;
-                                } else {
-                                    action = Action::PrintLong;
-                                }
-                            }
-                            other => return Err(format!("command: invalid option -{other}")),
-                        }
+                'v' | 'V' => {
+                    if action != Action::Execute {
+                        return Err("command: cannot specify both -v and -V".into());
+                    }
+                    if option == 'v' {
+                        action = Action::PrintShort;
+                    } else {
+                        action = Action::PrintLong;
                     }
                 }
-                _ => break,
+                other => return Err(format!("command: invalid option -{other}")),
             }
-            i += 1;
         }
-        if i >= args.len() {
+
+        let first_operand = option_parser.next_argument();
+        if first_operand >= args.len() {
             return Err("command: missing command name".into());
         }
-        if action != Action::Execute && i != args.len() - 1 {
+        if action != Action::Execute && first_operand != args.len() - 1 {
             return Err("command: too many arguments".into());
         }
         Ok(CommandArgs {
             use_default_path,
             action,
-            command_name: &args[i],
-            args: &args[i..],
+            command_name: &args[first_operand],
+            args: &args[first_operand..],
         })
     }
 }

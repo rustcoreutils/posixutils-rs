@@ -1,5 +1,5 @@
 use crate::builtin::{BuiltinResult, BuiltinUtility};
-use crate::shell::environment::Environment;
+use crate::option_parser::OptionParser;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 use std::ffi::{OsStr, OsString};
@@ -19,41 +19,32 @@ enum CdArgs<'a> {
 impl<'a> CdArgs<'a> {
     fn parse(args: &'a [String]) -> Result<Self, String> {
         let mut handle_dot_dot_physically = false;
-        let mut parsing_options = true;
-        for (i, arg) in args.iter().enumerate() {
-            match arg.as_str() {
-                "--" if parsing_options => {
-                    parsing_options = false;
+
+        let mut option_parser = OptionParser::new(args);
+
+        while let Some(option) = option_parser
+            .next_option()
+            .map_err(|err| format!("cd: invalid option ({err})"))?
+        {
+            match option {
+                'L' => {
+                    handle_dot_dot_physically = false;
                 }
-                option if parsing_options && option.starts_with('-') => {
-                    if option.len() == 1 {
-                        if i != args.len() - 1 {
-                            return Err("too many arguments".into());
-                        }
-                        return Ok(Self::GoBack);
-                    }
-                    if let Some(c) = arg[1..].chars().find(|c| *c != 'L' && *c != 'P') {
-                        return Err(format!("invalid argument -{c}"));
-                    }
-                    let last = option.chars().last().unwrap();
-                    handle_dot_dot_physically = last == 'P';
+                'P' => {
+                    handle_dot_dot_physically = true;
                 }
-                directory => {
-                    if i != args.len() - 1 {
-                        return Err("too many arguments".into());
-                    }
-                    if directory == "-" {
-                        return Ok(Self::GoBack);
-                    }
-                    return Ok(Self::ChangeDir {
-                        directory: Some(directory),
-                        handle_dot_dot_physically,
-                    });
+                _ => {
+                    return Err(format!("cd: invalid option -{option}"));
                 }
             }
         }
+
+        let directory = args.get(option_parser.next_argument()).map(|s| s.as_str());
+        if directory.is_some_and(|op| op == "-") {
+            return Ok(Self::GoBack);
+        }
         Ok(Self::ChangeDir {
-            directory: None,
+            directory,
             handle_dot_dot_physically,
         })
     }

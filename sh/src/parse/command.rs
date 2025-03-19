@@ -365,7 +365,7 @@ impl Conjunction {
             }
         }
         if self.is_async {
-            f.write_char('&')
+            f.write_str(" &")
         } else if print_semicolon {
             f.write_char(';')
         } else {

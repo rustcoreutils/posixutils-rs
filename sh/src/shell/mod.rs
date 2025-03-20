@@ -14,9 +14,9 @@ use crate::parse::command_parser::CommandParser;
 use crate::parse::word::{Word, WordPair};
 use crate::parse::word_parser::parse_word;
 use crate::parse::{AliasTable, ParserError};
-use crate::shell::variables::{CannotModifyReadonly, Variables, Value};
 use crate::shell::history::{initialize_history_from_system, History};
 use crate::shell::opened_files::{OpenedFile, OpenedFiles};
+use crate::shell::variables::{CannotModifyReadonly, Value, Variables};
 use crate::signals::{get_pending_signal, Signal};
 use crate::utils::{
     close, dup2, exec, find_command, find_in_path, fork, pipe, waitpid, ExecError, OsError,
@@ -37,9 +37,9 @@ use std::os::unix::ffi::OsStringExt;
 use std::rc::Rc;
 use std::time::Duration;
 
-pub mod variables;
 pub mod history;
 pub mod opened_files;
+pub mod variables;
 
 #[derive(Clone, Debug)]
 pub enum CommandExecutionError {
@@ -149,6 +149,7 @@ pub struct Shell {
     pub background_jobs: Vec<Job>,
     pub last_job_number: u64,
     pub history: History,
+    pub umask: u32,
 }
 
 impl Shell {
@@ -269,8 +270,7 @@ impl Shell {
     fn assign_locals(&mut self, assignments: &[Assignment]) -> CommandExecutionResult<()> {
         for assignment in assignments {
             let word_str = expand_word_to_string(&assignment.value.word, true, self)?;
-            self.variables
-                .set(assignment.name.to_string(), word_str)?;
+            self.variables.set(assignment.name.to_string(), word_str)?;
         }
         Ok(())
     }
@@ -375,10 +375,7 @@ impl Shell {
     }
 
     pub fn find_command(&self, command: &str, default_path: &str) -> Option<OsString> {
-        let path = self
-            .variables
-            .get_str_value("PATH")
-            .unwrap_or(default_path);
+        let path = self.variables.get_str_value("PATH").unwrap_or(default_path);
         if let Some(command) = find_command(command, path) {
             Some(command)
         } else {
@@ -972,6 +969,7 @@ impl Default for Shell {
             background_jobs: Vec::new(),
             last_job_number: 1,
             history: History::new(32767),
+            umask: !0o022 & 0o777,
         }
     }
 }

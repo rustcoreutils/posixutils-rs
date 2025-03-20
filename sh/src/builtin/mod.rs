@@ -18,12 +18,13 @@ use crate::builtin::times::Times;
 use crate::builtin::trap::Trap;
 use crate::builtin::type_::Type_;
 use crate::builtin::ulimit::Ulimit;
+use crate::builtin::umask::Umask;
 use crate::builtin::unalias::Unalias;
 use crate::builtin::unset::BuiltinUnset;
 use crate::builtin::wait::Wait;
 use crate::jobs::parse_job_id;
-use crate::shell::variables::{CannotModifyReadonly, Variables};
 use crate::shell::opened_files::OpenedFiles;
+use crate::shell::variables::{CannotModifyReadonly, Variables};
 use crate::shell::Shell;
 use crate::utils::OsError;
 use nix::libc::pid_t;
@@ -50,6 +51,7 @@ mod times;
 pub mod trap;
 mod type_;
 mod ulimit;
+mod umask;
 mod unalias;
 mod unset;
 mod wait;
@@ -156,6 +158,7 @@ pub fn get_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
         "ulimit" => Some(&Ulimit),
         "wait" => Some(&Wait),
         "fc" => Some(&Fc),
+        "umask" => Some(&Umask),
         "cd" => Some(&Cd),
         "jobs" => Some(&Jobs),
         "type" => Some(&Type_),

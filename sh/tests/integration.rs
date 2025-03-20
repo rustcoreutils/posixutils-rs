@@ -1322,4 +1322,12 @@ mod builtin {
             include_str!("sh/builtin/kill.out"),
         )
     }
+
+    #[test]
+    fn umask() {
+        test_script(
+            include_str!("sh/builtin/umask.sh"),
+            include_str!("sh/builtin/umask.out"),
+        )
+    }
 }

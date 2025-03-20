@@ -7,6 +7,7 @@ use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::rc::Rc;
 
@@ -59,6 +60,7 @@ impl OpenedFiles {
 
                 let append = *kind == IORedirectionKind::RedirectOuputAppend;
                 let file = File::options()
+                    .mode(shell.umask)
                     .write(true)
                     .truncate(!append)
                     .append(append)
@@ -117,6 +119,7 @@ impl OpenedFiles {
             }
             IORedirectionKind::RedirectInput => {
                 let file = File::options()
+                    .mode(shell.umask)
                     .read(true)
                     .open(target)
                     .map_err(io_err_to_redirection_err)?;
@@ -126,6 +129,7 @@ impl OpenedFiles {
             }
             IORedirectionKind::OpenRW => {
                 let file = File::options()
+                    .mode(shell.umask)
                     .read(true)
                     .write(true)
                     .create(true)

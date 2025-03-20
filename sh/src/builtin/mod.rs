@@ -7,6 +7,7 @@ use crate::builtin::eval::Eval;
 use crate::builtin::exec::Exec;
 use crate::builtin::exit::Exit;
 use crate::builtin::export::Export;
+use crate::builtin::fc::Fc;
 use crate::builtin::getopts::GetOpts;
 use crate::builtin::jobs::Jobs;
 use crate::builtin::kill::Kill;
@@ -38,6 +39,7 @@ mod eval;
 mod exec;
 mod exit;
 mod export;
+mod fc;
 mod getopts;
 mod jobs;
 mod kill;
@@ -153,6 +155,7 @@ pub fn get_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
         "kill" => Some(&Kill),
         "ulimit" => Some(&Ulimit),
         "wait" => Some(&Wait),
+        "fc" => Some(&Fc),
         "cd" => Some(&Cd),
         "jobs" => Some(&Jobs),
         "type" => Some(&Type_),

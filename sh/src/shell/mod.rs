@@ -231,14 +231,24 @@ impl Shell {
 
     pub fn exec(&mut self, command: OsString, args: &[String]) -> OsResult<i32> {
         match fork()? {
-            ForkResult::Child => match exec(command, args, &self.opened_files, &self.environment) {
-                Err(ExecError::OsError(err)) => {
-                    self.eprint(&format!("{err}\n"));
-                    std::process::exit(1)
+            ForkResult::Child => {
+                let flags =
+                    nix::fcntl::fcntl(libc::STDIN_FILENO, nix::fcntl::FcntlArg::F_GETFL).unwrap();
+                let new_flags = flags & !nix::fcntl::OFlag::O_NONBLOCK.bits();
+                nix::fcntl::fcntl(
+                    libc::STDIN_FILENO,
+                    nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::from_bits_truncate(new_flags)),
+                )
+                .unwrap();
+                match exec(command, args, &self.opened_files, &self.environment) {
+                    Err(ExecError::OsError(err)) => {
+                        self.eprint(&format!("{err}\n"));
+                        std::process::exit(1)
+                    }
+                    Err(ExecError::CannotExecute(_)) => std::process::exit(126),
+                    Ok(_) => unreachable!(),
                 }
-                Err(ExecError::CannotExecute(_)) => std::process::exit(126),
-                Ok(_) => unreachable!(),
-            },
+            }
             ForkResult::Parent { child } => self.wait_child_process(child),
         }
     }

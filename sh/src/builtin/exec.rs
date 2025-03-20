@@ -18,14 +18,14 @@ impl SpecialBuiltinUtility for Exec {
             return Ok(0);
         }
 
-        let path = shell.environment.get_str_value("PATH").unwrap_or_default();
+        let path = shell.variables.get_str_value("PATH").unwrap_or_default();
         let command = if let Some(command) = find_command(&args[0], path) {
             command
         } else {
             return Err(format!("exec: '{}' command not found", args[0]).into());
         };
 
-        match exec(command, &args, opened_files, &shell.environment) {
+        match exec(command, &args, opened_files, &shell.variables) {
             Err(ExecError::OsError(err)) => Err(err.into()),
             Err(ExecError::CannotExecute(err)) => {
                 Err(format!("exec: could not execute '{}' ({})", args[0], err).into())

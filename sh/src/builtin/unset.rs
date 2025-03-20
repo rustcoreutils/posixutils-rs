@@ -38,7 +38,7 @@ impl SpecialBuiltinUtility for BuiltinUnset {
 
         for name in &args[parser.next_argument()..] {
             if unset_var {
-                if shell.environment.unset(name).is_err() {
+                if shell.variables.unset(name).is_err() {
                     return Err(
                         format!("unset: cannot unset readonly variable '{}'\n", name).into(),
                     );

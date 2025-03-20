@@ -209,7 +209,7 @@ fn edit(
     nix::unistd::write(&fd, history.as_bytes())
         .map_err(|err| format!("fc: failed to write to temporary file ({err})"))?;
     let editor = editor
-        .unwrap_or_else(|| shell.environment.get_str_value("FCEDIT").unwrap_or("ed"))
+        .unwrap_or_else(|| shell.variables.get_str_value("FCEDIT").unwrap_or("ed"))
         .to_string();
     let result = open_editor_with_file(&editor, path, shell)?;
     if result != 0 {

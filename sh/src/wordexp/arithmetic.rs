@@ -1,5 +1,5 @@
 use crate::parse::word::Word;
-use crate::shell::environment::Environment;
+use crate::shell::variables::Variables;
 use crate::shell::{CommandExecutionError, Shell};
 use crate::wordexp::expanded_word::ExpandedWord;
 use crate::wordexp::{expand_word_to_string, ExpansionResult};
@@ -496,7 +496,7 @@ fn binary_operation(operator: &BinaryOperator, lhs_value: i64, rhs_value: i64) -
 fn interpret_expression(expr: &Expr, shell: &mut Shell) -> ExpansionResult<i64> {
     match expr {
         Expr::Variable(var) => {
-            let value = shell.environment.get_str_value(var).unwrap_or_default();
+            let value = shell.variables.get_str_value(var).unwrap_or_default();
             Ok(value.parse().unwrap_or(0))
         }
         Expr::Number(num) => Ok(*num),
@@ -554,7 +554,7 @@ fn interpret_expression(expr: &Expr, shell: &mut Shell) -> ExpansionResult<i64> 
         } => {
             let value = interpret_expression(value, shell)?;
             let current_value = shell
-                .environment
+                .variables
                 .get_str_value(variable)
                 .map(|val| val.parse().unwrap_or(0))
                 .unwrap_or(0);
@@ -594,23 +594,23 @@ mod tests {
     fn test_assignment_with_initial_value(expr: &str, var: &str, initial_value: &str) -> String {
         let mut shell = Shell::default();
         shell
-            .environment
+            .variables
             .set_global(var.to_string(), initial_value.to_string())
             .expect("variable is readonly");
         let mut result = ExpandedWord::default();
         expand_arithmetic_expression_into(&mut result, &quoted_literal(expr), false, &mut shell)
             .expect("invalid expression");
         let result = result.to_string();
-        assert_eq!(shell.environment.get_str_value(var), Some(result.as_str()));
+        assert_eq!(shell.variables.get_str_value(var), Some(result.as_str()));
         result
     }
 
-    fn test_assignment(expr: &str) -> (String, Environment) {
+    fn test_assignment(expr: &str) -> (String, Variables) {
         let mut shell = Shell::default();
         let mut result = ExpandedWord::default();
         expand_arithmetic_expression_into(&mut result, &quoted_literal(expr), false, &mut shell)
             .expect("invalid expression");
-        (result.to_string(), shell.environment)
+        (result.to_string(), shell.variables)
     }
 
     #[test]

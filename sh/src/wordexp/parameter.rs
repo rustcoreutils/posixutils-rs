@@ -74,7 +74,7 @@ fn expand_simple_parameter_into(
         ),
         Parameter::Variable(var_name) => add_option_to_expanded_word(
             expanded_word,
-            shell.environment.get_str_value(var_name.as_ref()),
+            shell.variables.get_str_value(var_name.as_ref()),
             inside_double_quotes,
         ),
         Parameter::Special(special_parameter) => {
@@ -103,7 +103,7 @@ fn expand_simple_parameter_into(
                         );
                     } else {
                         let separator = shell
-                            .environment
+                            .variables
                             .get_str_value("IFS")
                             .map(|v| if v.is_empty() { "" } else { &v[..1] })
                             .unwrap_or(" ");
@@ -198,7 +198,7 @@ pub fn expand_parameter_into(
         } => {
             let value = expand_word_to_string(word, false, shell)?;
 
-            if let Some(current_value) = shell.environment.get_str_value(&variable_name) {
+            if let Some(current_value) = shell.variables.get_str_value(&variable_name) {
                 if current_value.is_empty() && *assign_on_null {
                     shell.assign_global(variable_name.to_string(), value.clone())?;
                     expanded_word.append(value, inside_double_quotes, true);
@@ -331,7 +331,7 @@ mod tests {
         let mut shell = Shell::default();
         for (k, v) in env {
             shell
-                .environment
+                .variables
                 .set_global(k.to_string(), v.to_string())
                 .expect("failed to set var");
         }
@@ -967,7 +967,7 @@ mod tests {
     fn expand_asterisk_with_null_ifs() {
         let mut shell = shell_with_positional_arguments(vec!["arg1", "arg2", "arg3"]);
         shell
-            .environment
+            .variables
             .set_global("IFS".to_string(), "".to_string())
             .unwrap();
         assert_eq!(
@@ -1008,7 +1008,7 @@ mod tests {
     #[test]
     fn expand_asterisk_with_unset_ifs() {
         let mut shell = shell_with_positional_arguments(vec!["arg1", "arg2", "arg3"]);
-        shell.environment.unset("IFS").expect("cannot unset IFS");
+        shell.variables.unset("IFS").expect("cannot unset IFS");
         assert_eq!(
             expand_parameter(
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Asterisk)),
@@ -1048,7 +1048,7 @@ mod tests {
     fn expand_asterisk_with_custom_ifs() {
         let mut shell = shell_with_positional_arguments(vec!["arg1", "arg2", "arg3"]);
         shell
-            .environment
+            .variables
             .set_global("IFS".to_string(), ",:".to_string())
             .unwrap();
         assert_eq!(

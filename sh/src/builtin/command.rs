@@ -2,7 +2,7 @@ use crate::builtin::{
     get_builtin_utility, get_special_builtin_utility, BuiltinError, BuiltinResult, BuiltinUtility,
 };
 use crate::option_parser::OptionParser;
-use crate::shell::environment::Environment;
+use crate::shell::variables::Variables;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::{CommandExecutionError, ControlFlowState, Shell};
 use crate::utils::{find_command, DEFAULT_PATH};
@@ -141,7 +141,7 @@ impl BuiltinUtility for Command {
             let path = if args.use_default_path {
                 DEFAULT_PATH
             } else {
-                shell.environment.get_str_value("PATH").unwrap_or_default()
+                shell.variables.get_str_value("PATH").unwrap_or_default()
             };
             let command = if let Some(command) = find_command(args.command_name, path) {
                 command

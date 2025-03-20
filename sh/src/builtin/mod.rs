@@ -22,7 +22,7 @@ use crate::builtin::unalias::Unalias;
 use crate::builtin::unset::BuiltinUnset;
 use crate::builtin::wait::Wait;
 use crate::jobs::parse_job_id;
-use crate::shell::environment::{CannotModifyReadonly, Environment};
+use crate::shell::variables::{CannotModifyReadonly, Variables};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 use crate::utils::OsError;

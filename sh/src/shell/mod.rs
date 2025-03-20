@@ -15,6 +15,7 @@ use crate::parse::word::{Word, WordPair};
 use crate::parse::word_parser::parse_word;
 use crate::parse::{AliasTable, ParserError};
 use crate::shell::environment::{CannotModifyReadonly, Environment, Value};
+use crate::shell::history::{initialize_history_from_system, History};
 use crate::shell::opened_files::{OpenedFile, OpenedFiles};
 use crate::signals::{get_pending_signal, Signal};
 use crate::utils::{
@@ -37,6 +38,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 pub mod environment;
+pub mod history;
 pub mod opened_files;
 
 #[derive(Clone, Debug)]
@@ -146,6 +148,7 @@ pub struct Shell {
     pub trap_actions: [TrapAction; Signal::Count as usize],
     pub background_jobs: Vec<Job>,
     pub last_job_number: u64,
+    pub history: History,
 }
 
 impl Shell {
@@ -834,6 +837,9 @@ impl Shell {
                 return Ok(result);
             }
             if let Some(command) = command {
+                if self.is_interactive {
+                    self.history.add_entry(command.to_string());
+                }
                 result = self.interpret(&command, false);
                 if self.control_flow_state == ControlFlowState::Return {
                     self.control_flow_state = ControlFlowState::None;
@@ -860,7 +866,7 @@ impl Shell {
                 .into_iter()
                 .map(|(k, v)| (k, Value::new_exported(v))),
         );
-
+        let history = initialize_history_from_system(&environment);
         let mut shell = Shell {
             environment,
             program_name,
@@ -868,6 +874,7 @@ impl Shell {
             shell_pid: getpid().as_raw(),
             // TODO: handle error
             current_directory: std::env::current_dir().unwrap().into_os_string(),
+            history,
             set_options,
             is_interactive,
             ..Default::default()
@@ -951,6 +958,7 @@ impl Default for Shell {
             trap_actions: [const { TrapAction::Default }; Signal::Count as usize],
             background_jobs: Vec::new(),
             last_job_number: 1,
+            history: History::new(32767),
         }
     }
 }

@@ -364,6 +364,18 @@ impl Shell {
         self.eprint("\n");
     }
 
+    pub fn find_command(&self, command: &str, default_path: &str) -> Option<OsString> {
+        let path = self
+            .environment
+            .get_str_value("PATH")
+            .unwrap_or(default_path);
+        if let Some(command) = find_command(command, path) {
+            Some(command)
+        } else {
+            None
+        }
+    }
+
     fn interpret_simple_command(
         &mut self,
         simple_command: &SimpleCommand,
@@ -408,26 +420,17 @@ impl Shell {
         } else if let Some(builtin_utility) = get_builtin_utility(&expanded_words[0]) {
             self.exec_builtin_utility(&simple_command, &expanded_words[1..], builtin_utility)
         } else {
-            let path = self.environment.get_str_value("PATH").unwrap_or_default();
-            let command = if let Some(command) = find_command(&expanded_words[0], path) {
-                command
-            } else {
-                return Err(CommandExecutionError::CommandNotFound(
-                    expanded_words[0].to_string(),
-                ));
-            };
+            let command = self.find_command(&expanded_words[0], "").ok_or(
+                CommandExecutionError::CommandNotFound(expanded_words[0].to_string()),
+            )?;
 
             let mut command_environment = self.clone();
             command_environment.assign_globals(&simple_command.assignments, true)?;
             command_environment
                 .opened_files
                 .redirect(&simple_command.redirections, self)?;
-            let arguments = expanded_words
-                .iter()
-                .map(|w| w.clone())
-                .collect::<Vec<String>>();
             command_environment
-                .exec(command, &arguments)
+                .exec(command, &expanded_words)
                 .map_err(|err| err.into())
         }
     }

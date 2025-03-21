@@ -35,7 +35,7 @@ pub fn parse_args(args: Vec<String>, is_attached_to_terminal: bool) -> Result<Sh
     let mut iter = args.into_iter();
     let mut program_name = iter.next().unwrap();
     let mut arguments = Vec::new();
-    let mut monitor_turned_off_explicitely = false;
+    let mut monitor_turned_off_explicitly = false;
 
     while let Some(next) = iter.next() {
         match next.as_str() {
@@ -44,7 +44,7 @@ pub fn parse_args(args: Vec<String>, is_attached_to_terminal: bool) -> Result<Sh
                     .next()
                     .ok_or_else(|| format!("{} requires an option name", next))?;
                 if option == "monitor" && next == "+o" {
-                    monitor_turned_off_explicitely = true;
+                    monitor_turned_off_explicitly = true;
                 }
                 set_options.set_long(&option, next == "-o")?;
             }
@@ -65,7 +65,7 @@ pub fn parse_args(args: Vec<String>, is_attached_to_terminal: bool) -> Result<Sh
             s if s.starts_with('+') => {
                 for c in s.chars().skip(1) {
                     if c == 'm' {
-                        monitor_turned_off_explicitely = true;
+                        monitor_turned_off_explicitly = true;
                     }
                     set_options.set_short(c, false)?;
                 }
@@ -112,7 +112,7 @@ pub fn parse_args(args: Vec<String>, is_attached_to_terminal: bool) -> Result<Sh
         _ => unreachable!(),
     };
 
-    if execution_mode == ExecutionMode::Interactive && !monitor_turned_off_explicitely {
+    if execution_mode == ExecutionMode::Interactive && !monitor_turned_off_explicitly {
         set_options.monitor = true;
     }
 

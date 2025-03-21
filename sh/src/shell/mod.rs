@@ -150,6 +150,7 @@ pub struct Shell {
     pub last_job_number: u64,
     pub history: History,
     pub umask: u32,
+    pub saved_command_locations: HashMap<String, OsString>,
 }
 
 impl Shell {
@@ -374,9 +375,16 @@ impl Shell {
         self.eprint("\n");
     }
 
-    pub fn find_command(&self, command: &str, default_path: &str) -> Option<OsString> {
+    pub fn find_command(&mut self, command_name: &str, default_path: &str) -> Option<OsString> {
+        if let Some(command) = self.saved_command_locations.get(command_name) {
+            return Some(command.clone());
+        }
         let path = self.variables.get_str_value("PATH").unwrap_or(default_path);
-        if let Some(command) = find_command(command, path) {
+        if let Some(command) = find_command(command_name, path) {
+            if self.set_options.hashall {
+                self.saved_command_locations
+                    .insert(command_name.to_string(), command.clone());
+            }
             Some(command)
         } else {
             None
@@ -957,6 +965,7 @@ impl Default for Shell {
             last_job_number: 1,
             history: History::new(32767),
             umask: !0o022 & 0o777,
+            saved_command_locations: HashMap::new(),
         }
     }
 }

@@ -1,4 +1,6 @@
-use crate::wordexp::pattern::parse::{BracketExpression, BracketItem, ParsedPattern, PatternItem};
+use crate::wordexp::pattern::parse::{
+    BracketExpression, BracketItem, ParsedPattern, PatternItem, RangeEndpoint,
+};
 use core::fmt;
 use nix::libc;
 use std::ffi::{CStr, CString};
@@ -19,11 +21,9 @@ fn regex_compilation_result(
                 128,
             )
         };
-        let error = CString::from_vec_with_nul(error_buffer)
+        let error = CStr::from_bytes_until_nul(&error_buffer)
             .expect("error message returned from `libc::regerror` is an invalid CString");
-        Err(error
-            .into_string()
-            .expect("error message from `libc::regerror' contains invalid utf-8"))
+        Err(error.to_string_lossy().into_owned())
     } else {
         Ok(())
     }
@@ -141,6 +141,23 @@ fn push_char_literal(c: char, string: &mut String) {
     }
 }
 
+fn push_collating_symbol(symbol: &str, string: &mut String) {
+    string.push_str("[.");
+    string.push_str(symbol);
+    string.push_str(".]")
+}
+
+fn push_range_endpoint(endpoint: &RangeEndpoint, string: &mut String) {
+    match endpoint {
+        RangeEndpoint::Char(c) => {
+            string.push(*c);
+        }
+        RangeEndpoint::CollatingSymbol(symbol) => {
+            push_collating_symbol(symbol, string);
+        }
+    }
+}
+
 fn push_bracket_expression(expr: &BracketExpression, string: &mut String) {
     string.push('[');
     if !expr.matching {
@@ -154,7 +171,17 @@ fn push_bracket_expression(expr: &BracketExpression, string: &mut String) {
                 string.push_str(class);
                 string.push_str(":]");
             }
-            _ => todo!(),
+            BracketItem::CollatingSymbol(symbol) => push_collating_symbol(symbol, string),
+            BracketItem::EquivalenceClass(class) => {
+                string.push_str("[=");
+                string.push_str(class);
+                string.push_str("=]");
+            }
+            BracketItem::RangeExpression(start, end) => {
+                push_range_endpoint(start, string);
+                string.push('-');
+                push_range_endpoint(end, string);
+            }
         }
     }
     string.push(']');
@@ -255,6 +282,27 @@ mod tests {
             items: vec![BracketItem::CharacterClass("digit".to_string())],
         })]);
         assert_eq!(regex, "[[:digit:]]");
+    }
+
+    #[test]
+    fn convert_bracket_expression_with_collating_symbol() {
+        let regex = pattern_to_regex_string(&[PatternItem::BracketExpression(BracketExpression {
+            matching: true,
+            items: vec![BracketItem::CollatingSymbol("a".to_string())],
+        })]);
+        assert_eq!(regex, "[[.a.]]");
+    }
+
+    #[test]
+    fn convert_bracket_expression_with_range() {
+        let regex = pattern_to_regex_string(&[PatternItem::BracketExpression(BracketExpression {
+            matching: true,
+            items: vec![BracketItem::RangeExpression(
+                RangeEndpoint::Char('a'),
+                RangeEndpoint::Char('z'),
+            )],
+        })]);
+        assert_eq!(regex, "[a-z]");
     }
 
     #[test]

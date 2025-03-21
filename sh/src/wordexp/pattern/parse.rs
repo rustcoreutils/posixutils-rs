@@ -3,7 +3,6 @@ use crate::wordexp::{ExpandedWord, ExpandedWordPart};
 #[derive(Debug, PartialEq, Eq)]
 pub enum RangeEndpoint {
     Char(char),
-    CollatingElement(String),
     CollatingSymbol(String),
 }
 

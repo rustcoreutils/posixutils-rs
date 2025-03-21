@@ -3,6 +3,7 @@ use crate::shell::variables::Variables;
 use crate::shell::{CommandExecutionError, Shell};
 use crate::wordexp::expanded_word::ExpandedWord;
 use crate::wordexp::{expand_word_to_string, ExpansionResult};
+use std::fmt::{Display, Formatter};
 use std::iter::Peekable;
 use std::str::CharIndices;
 
@@ -135,6 +136,51 @@ enum ExprToken<'src> {
     EOF,
 }
 
+impl Display for ExprToken<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExprToken::Variable(var) => write!(f, "{var}"),
+            ExprToken::Number(num) => write!(f, "{num}"),
+            ExprToken::Plus => write!(f, "+"),
+            ExprToken::Minus => write!(f, "-"),
+            ExprToken::BitwiseNot => write!(f, "~"),
+            ExprToken::Not => write!(f, "!"),
+            ExprToken::Mul => write!(f, "*"),
+            ExprToken::Div => write!(f, "/"),
+            ExprToken::Mod => write!(f, "%"),
+            ExprToken::ShiftLeft => write!(f, "<<"),
+            ExprToken::ShiftRight => write!(f, ">>"),
+            ExprToken::Le => write!(f, "<"),
+            ExprToken::Leq => write!(f, "<="),
+            ExprToken::Ge => write!(f, ">"),
+            ExprToken::Geq => write!(f, ">="),
+            ExprToken::Eq => write!(f, "=="),
+            ExprToken::Neq => write!(f, "!="),
+            ExprToken::BitwiseAnd => write!(f, "&"),
+            ExprToken::BitwiseXor => write!(f, "^"),
+            ExprToken::BitwiseOr => write!(f, "|"),
+            ExprToken::LogicalAnd => write!(f, "&&"),
+            ExprToken::LogicalOr => write!(f, "||"),
+            ExprToken::QuestionMark => write!(f, "?"),
+            ExprToken::Colon => write!(f, ":"),
+            ExprToken::Assign => write!(f, "="),
+            ExprToken::MulAssign => write!(f, "*="),
+            ExprToken::DivAssign => write!(f, "/="),
+            ExprToken::ModAssign => write!(f, "%="),
+            ExprToken::AddAssign => write!(f, "+="),
+            ExprToken::SubAssign => write!(f, "-="),
+            ExprToken::ShiftLeftAssign => write!(f, "<<="),
+            ExprToken::ShiftRightAssign => write!(f, ">>="),
+            ExprToken::AndAssign => write!(f, "&="),
+            ExprToken::XorAssign => write!(f, "^="),
+            ExprToken::OrAssign => write!(f, "|="),
+            ExprToken::LParen => write!(f, "("),
+            ExprToken::RParen => write!(f, ")"),
+            ExprToken::EOF => write!(f, "<EOF>"),
+        }
+    }
+}
+
 impl From<ExprToken<'_>> for BinaryOperator {
     fn from(value: ExprToken<'_>) -> Self {
         match value {
@@ -258,21 +304,24 @@ impl<'src> ExpressionParser<'src> {
         while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
             self.advance_char();
         }
-        i64::from_str_radix(&self.source[start_pos..=self.source_position], 10).map_err(|_| todo!())
+        i64::from_str_radix(&self.source[start_pos..=self.source_position], 10)
+            .map_err(|_| "invalid number".to_string())
     }
 
     fn lex_octal_number(&mut self, start_pos: usize) -> ExprParseResult<i64> {
         while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
             self.advance_char();
         }
-        i64::from_str_radix(&self.source[start_pos..=self.source_position], 8).map_err(|_| todo!())
+        i64::from_str_radix(&self.source[start_pos..=self.source_position], 8)
+            .map_err(|_| "invalid octal number".to_string())
     }
 
     fn lex_hex_number(&mut self, start_pos: usize) -> ExprParseResult<i64> {
         while matches!(self.peek(), Some(c) if c.is_ascii_hexdigit()) {
             self.advance_char();
         }
-        i64::from_str_radix(&self.source[start_pos..=self.source_position], 16).map_err(|_| todo!())
+        i64::from_str_radix(&self.source[start_pos..=self.source_position], 16)
+            .map_err(|_| "invalid hexadecimal number".to_string())
     }
 
     fn lex_variable(&mut self, start_pos: usize) -> &'src str {
@@ -354,7 +403,6 @@ impl<'src> ExpressionParser<'src> {
                 Ok(ExprToken::Variable(self.lex_variable(start_pos)))
             }
             None => Ok(ExprToken::EOF),
-            // TODO: improve error output by properly implementing debug for token
             Some(other) => Err(format!("unexpected character '{other}")),
         }
     }
@@ -370,7 +418,7 @@ impl<'src> ExpressionParser<'src> {
             self.advance_token()?;
             Ok(())
         } else {
-            Err(format!("expected {:?}, got {:?}", token, self.lookahead))
+            Err(format!("expected {}, got {}", token, self.lookahead))
         }
     }
 
@@ -394,7 +442,7 @@ impl<'src> ExpressionParser<'src> {
                 self.match_token(ExprToken::RParen)?;
                 Ok(expr)
             }
-            other => Err(format!("unexpected token {other:?}")),
+            other => Err(format!("unexpected token {other}")),
         }
     }
 

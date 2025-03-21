@@ -1,5 +1,5 @@
 use crate::builtin::{BuiltinResult, BuiltinUtility};
-use crate::shell::variables::Variables;
+use crate::shell::environment::Environment;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 

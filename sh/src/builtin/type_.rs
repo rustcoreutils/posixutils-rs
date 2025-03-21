@@ -27,7 +27,7 @@ impl BuiltinUtility for Type_ {
             } else if get_builtin_utility(command_name).is_some() {
                 opened_files.write_out(format!("{} is a shell builtin\n", command_name));
             } else {
-                let path = shell.variables.get_str_value("PATH").unwrap_or_default();
+                let path = shell.environment.get_str_value("PATH").unwrap_or_default();
                 if let Some(command) = find_command(command_name, path) {
                     opened_files.write_out(format!(
                         "{} is {}\n",

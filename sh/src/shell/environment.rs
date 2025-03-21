@@ -37,7 +37,7 @@ pub type GlobalScope = HashMap<String, Value>;
 pub type LocalScope = HashMap<String, String>;
 
 #[derive(Default, Clone)]
-pub struct Variables {
+pub struct Environment {
     global_scope: HashMap<String, Value>,
     /// variables in the local scope are implicitly export.
     /// For example, if `f` is a function and we execute:
@@ -64,7 +64,7 @@ impl Display for CannotModifyReadonly {
     }
 }
 
-impl Variables {
+impl Environment {
     pub fn set_global(
         &mut self,
         name: String,
@@ -189,7 +189,7 @@ impl Variables {
     }
 }
 
-impl<I: IntoIterator<Item = (String, Value)>> From<I> for Variables {
+impl<I: IntoIterator<Item = (String, Value)>> From<I> for Environment {
     fn from(value: I) -> Self {
         Self {
             global_scope: value.into_iter().collect(),

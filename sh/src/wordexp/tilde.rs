@@ -1,5 +1,5 @@
 use crate::parse::word::{Word, WordPart};
-use crate::shell::variables::Variables;
+use crate::shell::environment::Environment;
 use nix::libc;
 use std::ffi::{c_char, CStr, CString};
 use std::os::unix::ffi::OsStringExt;
@@ -33,7 +33,7 @@ impl UsersHomeDirs for DefaultUsersHomeDirs {
 
 fn expand_home(
     login_name: &str,
-    env: &Variables,
+    env: &Environment,
     user_home: &dyn UsersHomeDirs,
 ) -> Result<String, String> {
     if login_name.is_empty() {
@@ -55,7 +55,7 @@ fn expand_home(
 fn tilde_expansion_simple(
     unquoted_start: &str,
     is_assignment: bool,
-    env: &Variables,
+    env: &Environment,
     user_home: &dyn UsersHomeDirs,
 ) -> Result<String, String> {
     if is_assignment {
@@ -86,7 +86,7 @@ fn tilde_expansion_simple(
 fn expand_tilde_with_custom_users_home_dirs(
     word: &mut Word,
     is_assignment: bool,
-    env: &Variables,
+    env: &Environment,
     user_home: &dyn UsersHomeDirs,
 ) -> Result<(), String> {
     let unquoted_start = if let Some(WordPart::UnquotedLiteral(start)) = word.parts.first() {
@@ -135,16 +135,16 @@ fn expand_tilde_with_custom_users_home_dirs(
 pub fn tilde_expansion(
     word: &mut Word,
     is_assignment: bool,
-    variables: &Variables,
+    env: &Environment,
 ) -> Result<(), String> {
-    expand_tilde_with_custom_users_home_dirs(word, is_assignment, variables, &DefaultUsersHomeDirs)
+    expand_tilde_with_custom_users_home_dirs(word, is_assignment, env, &DefaultUsersHomeDirs)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::parse::word::test_utils::{quoted_literal, unquoted_literal};
-    use crate::shell::variables::Value;
+    use crate::shell::environment::Value;
     use std::collections::HashMap;
 
     #[derive(Default)]
@@ -165,7 +165,7 @@ mod tests {
         env_home: &str,
         users_home_dirs: TestUsersHomeDirs,
     ) -> Word {
-        let env = Variables::from([("HOME".to_string(), Value::new(env_home.to_string()))]);
+        let env = Environment::from([("HOME".to_string(), Value::new(env_home.to_string()))]);
         let mut word = unquoted_literal(word_str);
         expand_tilde_with_custom_users_home_dirs(&mut word, is_assignment, &env, &users_home_dirs)
             .expect("expansion failure");

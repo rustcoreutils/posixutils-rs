@@ -141,7 +141,7 @@ impl BuiltinUtility for GetOpts {
 
         let quiet_errs = args[0].starts_with(':');
         let parser = OptsParser::new(&args[0][quiet_errs as usize..])?;
-        let optind = shell.variables.get_str_value("OPTIND").unwrap_or("1");
+        let optind = shell.environment.get_str_value("OPTIND").unwrap_or("1");
         let (mut parameter_index, mut option_index) = parse_optind(optind)?;
 
         let var_name = args[1].as_str();
@@ -158,7 +158,7 @@ impl BuiltinUtility for GetOpts {
         let status = match parser.parse(parameters, &mut parameter_index, &mut option_index) {
             ParseResult::SimpleOption(opt) => {
                 shell.assign_global(var_name.to_string(), opt.to_string())?;
-                shell.variables.unset("OPTARG")?;
+                shell.environment.unset("OPTARG")?;
                 0
             }
             ParseResult::OptionWithArg { option, arg } => {
@@ -172,7 +172,7 @@ impl BuiltinUtility for GetOpts {
                 if quiet_errs {
                     shell.assign_global("OPTARG".to_string(), opt.to_string())?;
                 } else {
-                    shell.variables.unset("OPTARG")?;
+                    shell.environment.unset("OPTARG")?;
                     opened_files.write_err(format!("getopts: illegal option {opt}\n"));
                 }
                 0
@@ -183,7 +183,7 @@ impl BuiltinUtility for GetOpts {
                     shell.assign_global("OPTARG".to_string(), opt.to_string())?;
                 } else {
                     shell.assign_global(var_name.to_string(), "?".to_string())?;
-                    shell.variables.unset("OPTARG")?;
+                    shell.environment.unset("OPTARG")?;
                     opened_files.write_err(format!("getopts: option {opt} requires an argument\n"));
                 }
                 0

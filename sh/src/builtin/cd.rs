@@ -78,7 +78,7 @@ impl BuiltinUtility for Cd {
                 let dir = if let Some(dir) = directory {
                     dir
                 } else {
-                    if let Some(home_dir) = shell.variables.get_str_value("HOME") {
+                    if let Some(home_dir) = shell.environment.get_str_value("HOME") {
                         home_dir
                     } else {
                         // behaviour is implementation defined, bash just returns 0
@@ -90,7 +90,7 @@ impl BuiltinUtility for Cd {
 
                 if !dir.starts_with('/') {
                     if !dir.starts_with('.') && !dir.starts_with("..") {
-                        if let Some(cdpath) = shell.variables.get_str_value("CDPATH") {
+                        if let Some(cdpath) = shell.environment.get_str_value("CDPATH") {
                             for component in cdpath.split(':') {
                                 let mut path = PathBuf::from(component);
                                 path.push(dir);
@@ -115,7 +115,7 @@ impl BuiltinUtility for Cd {
                 if !handle_dot_dot_physically {
                     if !curr_path.as_bytes().get(0).is_some_and(|c| *c == b'/') {
                         let mut new_curr_path = shell
-                            .variables
+                            .environment
                             .get_str_value("PWD")
                             .unwrap_or_default()
                             .as_bytes()
@@ -144,7 +144,7 @@ impl BuiltinUtility for Cd {
             }
             CdArgs::GoBack => {
                 if let Some(oldpwd) = shell
-                    .variables
+                    .environment
                     .get_str_value("OLDPWD")
                     .map(|s| s.to_string())
                 {

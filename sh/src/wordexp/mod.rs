@@ -1,5 +1,5 @@
 use crate::parse::word::{Word, WordPart};
-use crate::shell::variables::CannotModifyReadonly;
+use crate::shell::environment::CannotModifyReadonly;
 use crate::shell::{CommandExecutionError, Shell};
 use crate::utils::OsError;
 use crate::wordexp::arithmetic::expand_arithmetic_expression_into;
@@ -123,7 +123,7 @@ fn simple_word_expansion_into(
     shell: &mut Shell,
 ) -> ExpansionResult<()> {
     let mut word = word.clone();
-    tilde_expansion(&mut word, is_assignment, &shell.variables)
+    tilde_expansion(&mut word, is_assignment, &shell.environment)
         .map_err(CommandExecutionError::ExpansionError)?;
     for part in word.parts.into_iter() {
         match part {
@@ -174,7 +174,7 @@ pub fn expand_word(
 ) -> ExpansionResult<Vec<String>> {
     let mut expanded_word = ExpandedWord::default();
     simple_word_expansion_into(&mut expanded_word, word, is_assignment, shell)?;
-    let ifs = shell.variables.get_str_value("IFS");
+    let ifs = shell.environment.get_str_value("IFS");
     let mut result = Vec::new();
     for field in split_fields(expanded_word, ifs) {
         if shell.set_options.noglob {

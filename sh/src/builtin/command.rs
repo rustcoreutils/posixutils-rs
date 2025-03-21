@@ -2,8 +2,8 @@ use crate::builtin::{
     get_builtin_utility, get_special_builtin_utility, BuiltinError, BuiltinResult, BuiltinUtility,
 };
 use crate::option_parser::OptionParser;
+use crate::shell::environment::Environment;
 use crate::shell::opened_files::OpenedFiles;
-use crate::shell::variables::Variables;
 use crate::shell::{CommandExecutionError, ControlFlowState, Shell};
 use crate::utils::{find_command, DEFAULT_PATH};
 

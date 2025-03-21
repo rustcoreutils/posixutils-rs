@@ -14,9 +14,9 @@ use crate::parse::command_parser::CommandParser;
 use crate::parse::word::{Word, WordPair};
 use crate::parse::word_parser::parse_word;
 use crate::parse::{AliasTable, ParserError};
+use crate::shell::environment::{CannotModifyReadonly, Environment, Value};
 use crate::shell::history::{initialize_history_from_system, History};
 use crate::shell::opened_files::{OpenedFile, OpenedFiles};
-use crate::shell::variables::{CannotModifyReadonly, Value, Variables};
 use crate::signals::{get_pending_signal, Signal};
 use crate::utils::{
     close, dup2, exec, find_command, find_in_path, fork, pipe, waitpid, ExecError, OsError,
@@ -37,9 +37,9 @@ use std::os::unix::ffi::OsStringExt;
 use std::rc::Rc;
 use std::time::Duration;
 
+pub mod environment;
 pub mod history;
 pub mod opened_files;
-pub mod variables;
 
 #[derive(Clone, Debug)]
 pub enum CommandExecutionError {
@@ -126,7 +126,7 @@ fn signal_exit_status(signal: NixSignal) -> i32 {
 
 #[derive(Clone)]
 pub struct Shell {
-    pub variables: Variables,
+    pub environment: Environment,
     pub program_name: String,
     pub positional_parameters: Vec<String>,
     pub opened_files: OpenedFiles,
@@ -177,7 +177,7 @@ impl Shell {
         name: String,
         value: String,
     ) -> Result<&mut Value, CannotModifyReadonly> {
-        self.variables.set_global(name, value).map(|val| {
+        self.environment.set_global(name, value).map(|val| {
             val.export_or(self.set_options.allexport);
             val
         })
@@ -242,7 +242,7 @@ impl Shell {
                     nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::from_bits_truncate(new_flags)),
                 )
                 .unwrap();
-                match exec(command, args, &self.opened_files, &self.variables) {
+                match exec(command, args, &self.opened_files, &self.environment) {
                     Err(ExecError::OsError(err)) => {
                         self.eprint(&format!("{err}\n"));
                         std::process::exit(1)
@@ -271,7 +271,8 @@ impl Shell {
     fn assign_locals(&mut self, assignments: &[Assignment]) -> CommandExecutionResult<()> {
         for assignment in assignments {
             let word_str = expand_word_to_string(&assignment.value.word, true, self)?;
-            self.variables.set(assignment.name.to_string(), word_str)?;
+            self.environment
+                .set(assignment.name.to_string(), word_str)?;
         }
         Ok(())
     }
@@ -312,7 +313,7 @@ impl Shell {
         function_body: &CompoundCommand,
         ignore_errexit: bool,
     ) -> CommandExecutionResult<i32> {
-        self.variables.push_scope();
+        self.environment.push_scope();
 
         self.assign_locals(&simple_command.assignments)?;
 
@@ -336,7 +337,7 @@ impl Shell {
         self.function_call_depth -= 1;
         std::mem::swap(&mut args, &mut self.positional_parameters);
         std::mem::swap(&mut self.opened_files, &mut previous_opened_files);
-        self.variables.pop_scope();
+        self.environment.pop_scope();
         result
     }
 
@@ -349,7 +350,7 @@ impl Shell {
         let mut opened_files = self.opened_files.clone();
         opened_files.redirect(&simple_command.redirections, self)?;
 
-        self.variables.push_scope();
+        self.environment.push_scope();
         self.assign_locals(&simple_command.assignments)?;
         let status = match builtin_utility.exec(args, self, &mut opened_files) {
             Ok(status) => status,
@@ -358,7 +359,7 @@ impl Shell {
                 1
             }
         };
-        self.variables.pop_scope();
+        self.environment.pop_scope();
         Ok(status)
     }
 
@@ -384,7 +385,10 @@ impl Shell {
         if let Some(command) = self.saved_command_locations.get(command_name) {
             return Some(command.clone());
         }
-        let path = self.variables.get_str_value("PATH").unwrap_or(default_path);
+        let path = self
+            .environment
+            .get_str_value("PATH")
+            .unwrap_or(default_path);
         if let Some(command) = find_command(command_name, path) {
             if remember_location {
                 self.saved_command_locations
@@ -623,7 +627,7 @@ impl Shell {
 
     fn interpret_command(&mut self, command: &Command, ignore_errexit: bool) -> i32 {
         let lineno_var = self
-            .variables
+            .environment
             .set_global_forced("LINENO".to_string(), command.lineno.to_string());
         if lineno_var.readonly {
             self.opened_files
@@ -886,20 +890,20 @@ impl Shell {
     ) -> Shell {
         // > If a variable is initialized from the environment, it shall be marked for
         // > export immediately
-        let mut variables = Variables::from(
+        let mut environment = Environment::from(
             std::env::vars()
                 .into_iter()
                 .map(|(k, v)| (k, Value::new_exported(v))),
         );
-        variables.set_global_forced("PPID".to_string(), getppid().to_string());
-        variables.set_global_if_unset("IFS", " \t\n");
-        variables.set_global_if_unset("PS1", "\\$ ");
-        variables.set_global_if_unset("PS2", "> ");
-        variables.set_global_if_unset("PS4", "+ ");
-        variables.set_global_if_unset("OPTIND", "1");
-        let history = initialize_history_from_system(&variables);
+        environment.set_global_forced("PPID".to_string(), getppid().to_string());
+        environment.set_global_if_unset("IFS", " \t\n");
+        environment.set_global_if_unset("PS1", "\\$ ");
+        environment.set_global_if_unset("PS2", "> ");
+        environment.set_global_if_unset("PS4", "+ ");
+        environment.set_global_if_unset("OPTIND", "1");
+        let history = initialize_history_from_system(&environment);
         Shell {
-            variables,
+            environment,
             program_name,
             positional_parameters: args,
             shell_pid: getpid().as_raw(),
@@ -913,7 +917,7 @@ impl Shell {
     }
 
     fn get_var_and_expand(&mut self, var: &str, default_if_err: &str) -> String {
-        let var = self.variables.get_str_value(var).unwrap_or_default();
+        let var = self.environment.get_str_value(var).unwrap_or_default();
         match parse_word(var, 0, false) {
             Ok(word) => match expand_word_to_string(&word, false, self) {
                 Ok(str) => str,
@@ -948,7 +952,7 @@ impl Shell {
 impl Default for Shell {
     fn default() -> Self {
         Shell {
-            variables: Variables::from([("IFS".to_string(), Value::new(" \t\n".to_string()))]),
+            environment: Environment::from([("IFS".to_string(), Value::new(" \t\n".to_string()))]),
             program_name: "sh".to_string(),
             positional_parameters: Vec::default(),
             opened_files: OpenedFiles::default(),

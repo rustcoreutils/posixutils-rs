@@ -29,7 +29,7 @@ impl SpecialBuiltinUtility for SetSpecialBuiltin {
                     }
                     ParsedArgs::PrintVars => {
                         let mut sorted_vars = shell
-                            .variables
+                            .environment
                             .global_scope()
                             .iter()
                             .filter_map(|(var, val)| {

@@ -19,7 +19,7 @@ impl SpecialBuiltinUtility for Dot {
             return Err("dot: incorrect number of arguments".into());
         }
 
-        let path = shell.variables.get_str_value("PATH").unwrap_or_default();
+        let path = shell.environment.get_str_value("PATH").unwrap_or_default();
         let file_path = if let Some(file_path) = find_command(&args[0], path) {
             file_path
         } else {

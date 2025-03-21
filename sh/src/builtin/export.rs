@@ -17,7 +17,7 @@ impl SpecialBuiltinUtility for Export {
                 return Err("export: too many arguments".into());
             }
             let mut pairs = shell
-                .variables
+                .environment
                 .global_scope()
                 .iter()
                 .filter(|(_, val)| val.export)
@@ -54,7 +54,7 @@ impl SpecialBuiltinUtility for Export {
             if let Some(value) = value {
                 shell.assign_global(name, value)?.export = true;
             } else {
-                shell.variables.promote_local_or_get_global(name).export = true;
+                shell.environment.promote_local_or_get_global(name).export = true;
             }
         }
         Ok(0)

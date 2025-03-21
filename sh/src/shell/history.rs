@@ -1,4 +1,4 @@
-use crate::shell::variables::Variables;
+use crate::shell::environment::Environment;
 use std::cmp::max;
 use std::collections::VecDeque;
 use std::io::Read;
@@ -178,7 +178,7 @@ fn read_history_from_file(path: &Path, max_entries: u32) -> History {
     }
 }
 
-pub fn initialize_history_from_system(env: &Variables) -> History {
+pub fn initialize_history_from_system(env: &Environment) -> History {
     let histsize = if let Some(histsize) = env.get_str_value("HISTSIZE") {
         histsize.parse().unwrap_or_else(|_| {
             eprintln!("sh: invalid HISTSIZE value, using default value 32767");

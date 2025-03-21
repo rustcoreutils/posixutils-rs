@@ -1,4 +1,4 @@
-use crate::shell::variables::Variables;
+use crate::shell::environment::Environment;
 use crate::shell::opened_files::{OpenedFile, OpenedFiles};
 use nix::errno::Errno;
 use nix::libc;
@@ -110,7 +110,7 @@ pub fn exec(
     command: OsString,
     args: &[String],
     opened_files: &OpenedFiles,
-    env: &Variables,
+    env: &Environment,
 ) -> Result<Infallible, ExecError> {
     for (id, file) in &opened_files.opened_files {
         let dest = *id as i32;

@@ -18,7 +18,7 @@ impl SpecialBuiltinUtility for ReadOnly {
                 return Err("export: too many arguments".into());
             }
             let mut pairs = shell
-                .variables
+                .environment
                 .global_scope()
                 .iter()
                 .filter(|(_, val)| val.readonly)
@@ -55,7 +55,7 @@ impl SpecialBuiltinUtility for ReadOnly {
             if let Some(value) = value {
                 shell.assign_global(name, value)?.readonly = true;
             } else {
-                shell.variables.promote_local_or_get_global(name).readonly = true;
+                shell.environment.promote_local_or_get_global(name).readonly = true;
             }
         }
         Ok(0)

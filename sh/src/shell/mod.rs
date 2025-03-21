@@ -3,7 +3,6 @@ use crate::builtin::trap::TrapAction;
 use crate::builtin::{
     get_builtin_utility, get_special_builtin_utility, BuiltinUtility, SpecialBuiltinUtility,
 };
-use crate::get_global_shell;
 use crate::jobs::{Job, JobId, JobState};
 use crate::nonempty::NonEmpty;
 use crate::parse::command::{
@@ -11,21 +10,21 @@ use crate::parse::command::{
     FunctionDefinition, If, LogicalOp, Name, Pipeline, Redirection, SimpleCommand,
 };
 use crate::parse::command_parser::CommandParser;
-use crate::parse::word::{Word, WordPair};
+use crate::parse::word::WordPair;
 use crate::parse::word_parser::parse_word;
 use crate::parse::{AliasTable, ParserError};
 use crate::shell::environment::{CannotModifyReadonly, Environment, Value};
 use crate::shell::history::{initialize_history_from_system, History};
-use crate::shell::opened_files::{OpenedFile, OpenedFiles};
+use crate::shell::opened_files::OpenedFiles;
 use crate::signals::{get_pending_signal, Signal};
 use crate::utils::{
-    close, dup2, exec, find_command, find_in_path, fork, pipe, waitpid, ExecError, OsError,
-    OsResult,
+    close, dup2, exec, find_command, fork, pipe, waitpid, ExecError, OsError, OsResult,
 };
 use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
+use nix::errno::Errno;
 use nix::sys::signal::Signal as NixSignal;
 use nix::sys::wait::{WaitPidFlag, WaitStatus};
-use nix::unistd::{getpid, getppid, ForkResult, Pid};
+use nix::unistd::{getgid, getpid, getppid, getuid, ForkResult, Pid};
 use nix::{libc, NixPath};
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
@@ -34,6 +33,8 @@ use std::fs::File;
 use std::io::{read_to_string, Read, Write};
 use std::os::fd::{AsRawFd, IntoRawFd};
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -122,6 +123,28 @@ impl ControlFlowState {
 
 fn signal_exit_status(signal: NixSignal) -> i32 {
     128 + signal as i32
+}
+
+pub enum ScriptExecutionError {
+    ParsingError(ParserError),
+    IoError(std::io::Error),
+}
+
+pub fn execute_file_as_script(shell: &mut Shell, path: &Path) -> Result<i32, ScriptExecutionError> {
+    let mut file = File::options()
+        .read(true)
+        .open(path)
+        .map_err(ScriptExecutionError::IoError)?;
+
+    let mut source = String::new();
+    file.read_to_string(&mut source)
+        .map_err(ScriptExecutionError::IoError)?;
+
+    let lineno = shell.last_lineno;
+    shell.last_lineno = 0;
+    let execution_result = shell.execute_program(&source);
+    shell.last_lineno = lineno;
+    execution_result.map_err(ScriptExecutionError::ParsingError)
 }
 
 #[derive(Clone)]
@@ -242,13 +265,35 @@ impl Shell {
                     nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::from_bits_truncate(new_flags)),
                 )
                 .unwrap();
-                match exec(command, args, &self.opened_files, &self.environment) {
-                    Err(ExecError::OsError(err)) => {
+                match exec(command.clone(), args, &self.opened_files, &self.environment)
+                    .unwrap_err()
+                {
+                    ExecError::OsError(err) => {
                         self.eprint(&format!("{err}\n"));
                         std::process::exit(1)
                     }
-                    Err(ExecError::CannotExecute(_)) => std::process::exit(126),
-                    Ok(_) => unreachable!(),
+                    ExecError::CannotExecute(errno) => {
+                        if errno == Errno::ENOEXEC {
+                            match execute_file_as_script(self, Path::new(&command)) {
+                                Ok(status) => std::process::exit(status),
+                                Err(ScriptExecutionError::ParsingError(err)) => {
+                                    self.eprint(&format!(
+                                        "sh: parsing error ({}): {}\n",
+                                        err.lineno, err.message
+                                    ));
+                                    std::process::exit(2)
+                                }
+                                Err(ScriptExecutionError::IoError(_)) => {
+                                    // fallthrough to the default error
+                                }
+                            }
+                        }
+                        self.eprint(&format!(
+                            "sh: failed to execute {}\n",
+                            command.to_string_lossy()
+                        ));
+                        std::process::exit(126);
+                    }
                 }
             }
             ForkResult::Parent { child } => self.wait_child_process(child),

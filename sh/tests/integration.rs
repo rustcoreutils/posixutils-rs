@@ -1116,6 +1116,14 @@ mod commands {
             include_str!("sh/commands/while_loop.out"),
         );
     }
+
+    #[test]
+    fn if_command_could_not_be_executed_run_as_a_shell_script() {
+        test_script(
+            include_str!("sh/commands/if_command_could_not_be_executed_run_as_a_shell_script.sh"),
+            include_str!("sh/commands/if_command_could_not_be_executed_run_as_a_shell_script.out"),
+        )
+    }
 }
 
 mod builtin {

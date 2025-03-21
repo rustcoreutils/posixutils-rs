@@ -1,8 +1,8 @@
 use crate::builtin::{skip_option_terminator, BuiltinResult, SpecialBuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
-use crate::shell::{ControlFlowState, Shell};
-use crate::utils::{find_command, find_in_path};
-use std::ffi::OsString;
+use crate::shell::{execute_file_as_script, ScriptExecutionError, Shell};
+use crate::utils::find_command;
+use std::path::Path;
 
 pub struct Dot;
 
@@ -26,22 +26,24 @@ impl SpecialBuiltinUtility for Dot {
             return Err(format!("dot: {}, no such file or directory\n", &args[0]).into());
         };
 
-        let source = match std::fs::read_to_string(file_path) {
-            Ok(source) => source,
-            Err(err) => {
-                return Err(format!("dot: error opening file ({})\n", err).into());
-            }
-        };
-
-        let lineno = shell.last_lineno;
-        shell.last_lineno = 0;
         std::mem::swap(&mut shell.opened_files, opened_files);
         shell.dot_script_depth += 1;
-        let execution_result = shell.execute_program(&source);
+
+        let result = execute_file_as_script(shell, Path::new(&file_path));
+
         shell.dot_script_depth -= 1;
         std::mem::swap(&mut shell.opened_files, opened_files);
-        shell.last_lineno = lineno;
-        execution_result
-            .map_err(|err| format!("dot: parsing error({}): {}\n", err.lineno, err.message).into())
+
+        match result {
+            Ok(status) => Ok(status),
+            Err(ScriptExecutionError::IoError(io_err)) => {
+                Err(format!("dot: io error: {}\n", io_err).into())
+            }
+            Err(ScriptExecutionError::ParsingError(parser_err)) => Err(format!(
+                "dot: parsing error ({}): {}\n",
+                parser_err.lineno, parser_err.message
+            )
+            .into()),
+        }
     }
 }

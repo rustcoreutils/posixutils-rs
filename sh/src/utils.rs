@@ -142,10 +142,5 @@ pub fn exec(
         .collect::<Vec<CString>>();
     // unwrap is safe here, because execve will only return if it fails
     let err = execve(&command, &args, &env).unwrap_err();
-    if err == Errno::ENOEXEC {
-        // TODO: the spec says that we should try to execute the file as a shell script
-        // before returning error
-        todo!()
-    }
     Err(ExecError::CannotExecute(err))
 }

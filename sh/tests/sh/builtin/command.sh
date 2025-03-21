@@ -16,3 +16,9 @@ command -V command
 command echo test
 var=value command :
 echo $var
+echo () {
+  :
+}
+
+echo test
+command echo test

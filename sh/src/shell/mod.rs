@@ -871,13 +871,19 @@ impl Shell {
     ) -> Shell {
         // > If a variable is initialized from the environment, it shall be marked for
         // > export immediately
-        let variables = Variables::from(
+        let mut variables = Variables::from(
             std::env::vars()
                 .into_iter()
                 .map(|(k, v)| (k, Value::new_exported(v))),
         );
+        variables.set_global_forced("PPID".to_string(), getppid().to_string());
+        variables.set_global_if_unset("IFS", " \t\n");
+        variables.set_global_if_unset("PS1", "\\$ ");
+        variables.set_global_if_unset("PS2", "> ");
+        variables.set_global_if_unset("PS4", "+ ");
+        variables.set_global_if_unset("OPTIND", "1");
         let history = initialize_history_from_system(&variables);
-        let mut shell = Shell {
+        Shell {
             variables,
             program_name,
             positional_parameters: args,
@@ -888,26 +894,7 @@ impl Shell {
             set_options,
             is_interactive,
             ..Default::default()
-        };
-        shell
-            .assign_global("PPID".to_string(), getppid().to_string())
-            .unwrap();
-        shell
-            .assign_global("IFS".to_string(), " \t\n".to_string())
-            .unwrap();
-        shell
-            .assign_global("PS1".to_string(), "\\$ ".to_string())
-            .unwrap();
-        shell
-            .assign_global("PS2".to_string(), "> ".to_string())
-            .unwrap();
-        shell
-            .assign_global("PS4".to_string(), "+ ".to_string())
-            .unwrap();
-        shell
-            .assign_global("OPTIND".to_string(), "1".to_string())
-            .unwrap();
-        shell
+        }
     }
 
     fn get_var_and_expand(&mut self, var: &str, default_if_err: &str) -> String {

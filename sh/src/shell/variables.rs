@@ -102,6 +102,13 @@ impl Variables {
         }
     }
 
+    pub fn set_global_if_unset(&mut self, name: &str, value: &str) {
+        if !self.global_scope.contains_key(name) {
+            self.global_scope
+                .insert(name.to_string(), Value::new(value.to_string()));
+        }
+    }
+
     pub fn set(&mut self, name: String, value: String) -> Result<(), CannotModifyReadonly> {
         if let Some(innermost_scope) = self.local_scopes.last_mut() {
             innermost_scope.insert(name, value);

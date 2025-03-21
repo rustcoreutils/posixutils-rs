@@ -177,7 +177,7 @@ pub struct Shell {
 }
 
 impl Shell {
-    pub fn eprint(&self, message: &str) {
+    fn eprint(&self, message: &str) {
         self.opened_files.write_err(message);
     }
 

@@ -9,6 +9,7 @@ use crate::builtin::exit::Exit;
 use crate::builtin::export::Export;
 use crate::builtin::fc::Fc;
 use crate::builtin::getopts::GetOpts;
+use crate::builtin::hash::Hash;
 use crate::builtin::jobs::Jobs;
 use crate::builtin::kill::Kill;
 use crate::builtin::readonly::ReadOnly;
@@ -42,6 +43,7 @@ mod exit;
 mod export;
 mod fc;
 mod getopts;
+mod hash;
 mod jobs;
 mod kill;
 mod readonly;
@@ -158,6 +160,7 @@ pub fn get_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
         "ulimit" => Some(&Ulimit),
         "wait" => Some(&Wait),
         "fc" => Some(&Fc),
+        "hash" => Some(&Hash),
         "umask" => Some(&Umask),
         "cd" => Some(&Cd),
         "jobs" => Some(&Jobs),

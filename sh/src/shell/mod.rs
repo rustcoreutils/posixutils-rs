@@ -375,13 +375,18 @@ impl Shell {
         self.eprint("\n");
     }
 
-    pub fn find_command(&mut self, command_name: &str, default_path: &str) -> Option<OsString> {
+    pub fn find_command(
+        &mut self,
+        command_name: &str,
+        default_path: &str,
+        remember_location: bool,
+    ) -> Option<OsString> {
         if let Some(command) = self.saved_command_locations.get(command_name) {
             return Some(command.clone());
         }
         let path = self.variables.get_str_value("PATH").unwrap_or(default_path);
         if let Some(command) = find_command(command_name, path) {
-            if self.set_options.hashall {
+            if remember_location {
                 self.saved_command_locations
                     .insert(command_name.to_string(), command.clone());
             }
@@ -435,9 +440,11 @@ impl Shell {
         } else if let Some(builtin_utility) = get_builtin_utility(&expanded_words[0]) {
             self.exec_builtin_utility(&simple_command, &expanded_words[1..], builtin_utility)
         } else {
-            let command = self.find_command(&expanded_words[0], "").ok_or(
-                CommandExecutionError::CommandNotFound(expanded_words[0].to_string()),
-            )?;
+            let command = self
+                .find_command(&expanded_words[0], "", self.set_options.hashall)
+                .ok_or(CommandExecutionError::CommandNotFound(
+                    expanded_words[0].to_string(),
+                ))?;
 
             let mut command_environment = self.clone();
             command_environment.assign_globals(&simple_command.assignments, true)?;

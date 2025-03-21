@@ -172,7 +172,7 @@ fn open_editor_with_file(
     shell: &mut Shell,
 ) -> Result<i32, BuiltinError> {
     let command_path = shell
-        .find_command(editor, "")
+        .find_command(editor, "", shell.set_options.hashall)
         .ok_or("fc: editor not found")?;
     let args = vec![editor.to_string(), file_path.to_string_lossy().to_string()];
     Ok(shell.exec(command_path, &args)?)

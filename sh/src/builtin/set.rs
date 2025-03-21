@@ -58,7 +58,7 @@ impl SpecialBuiltinUtility for SetSpecialBuiltin {
     }
 }
 
-#[derive(Default, Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct SetOptions {
     /// -a
     pub allexport: bool,
@@ -85,6 +85,27 @@ pub struct SetOptions {
     pub ignoreeof: bool,
     pub nolog: bool,
     pub vi: bool,
+}
+
+impl Default for SetOptions {
+    fn default() -> Self {
+        Self {
+            allexport: false,
+            notify: false,
+            noclobber: false,
+            errexit: false,
+            noglob: false,
+            hashall: true,
+            monitor: false,
+            noexec: false,
+            nounset: false,
+            verbose: false,
+            xtrace: false,
+            ignoreeof: false,
+            nolog: false,
+            vi: false,
+        }
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]

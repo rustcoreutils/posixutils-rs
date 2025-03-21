@@ -3,7 +3,7 @@ notify    off
 noclobber off
 errexit   off
 noglob    off
-hashall   off
+hashall   on
 monitor   off
 noexec    off
 nounset   off

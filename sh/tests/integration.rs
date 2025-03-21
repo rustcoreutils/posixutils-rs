@@ -183,7 +183,7 @@ notify    off
 noclobber off
 errexit   off
 noglob    off
-hashall   off
+hashall   on
 monitor   off
 noexec    off
 nounset   off
@@ -204,7 +204,7 @@ set +o notify
 set +o noclobber
 set +o errexit
 set +o noglob
-set +h
+set -h
 set +o monitor
 set +o noexec
 set +o nounset
@@ -225,7 +225,7 @@ notify    off
 noclobber off
 errexit   on
 noglob    on
-hashall   off
+hashall   on
 monitor   off
 noexec    off
 nounset   on
@@ -245,7 +245,7 @@ set +o notify
 set +o noclobber
 set -o errexit
 set -o noglob
-set +h
+set -h
 set +o monitor
 set +o noexec
 set -o nounset
@@ -519,7 +519,7 @@ mod special_parameters {
 
     #[test]
     fn expand_minus() {
-        test_cli(vec!["-c", "echo $-", "sh"], "", "\n");
+        test_cli(vec!["-c", "echo $-", "sh"], "", "h\n");
         test_cli(vec!["-c", "-aeh", "echo $-", "sh"], "", "aeh\n");
     }
 

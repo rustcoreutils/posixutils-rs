@@ -16,7 +16,7 @@ use crate::parse::{AliasTable, ParserError};
 use crate::shell::environment::{CannotModifyReadonly, Environment, Value};
 use crate::shell::history::{initialize_history_from_system, History};
 use crate::shell::opened_files::OpenedFiles;
-use crate::signals::{get_pending_signal, Signal};
+use crate::signals::SignalManager;
 use crate::utils::{
     close, dup2, exec, find_command, fork, is_process_in_foreground, pipe, waitpid, ExecError,
     OsError, OsResult,
@@ -168,7 +168,7 @@ pub struct Shell {
     pub is_interactive: bool,
     pub last_lineno: u32,
     pub exit_action: TrapAction,
-    pub trap_actions: [TrapAction; Signal::Count as usize],
+    pub signal_manager: SignalManager,
     pub background_jobs: JobManager,
     pub history: History,
     pub umask: u32,
@@ -219,9 +219,8 @@ impl Shell {
     }
 
     pub fn process_signals(&mut self) {
-        while let Some(signal) = get_pending_signal() {
-            let action = self.trap_actions[signal as usize].clone();
-            self.execute_action(action)
+        while let Some(action) = self.signal_manager.get_pending_action() {
+            self.execute_action(action.clone())
         }
     }
 
@@ -965,7 +964,7 @@ impl Default for Shell {
             is_interactive: false,
             last_lineno: 0,
             exit_action: TrapAction::Default,
-            trap_actions: [const { TrapAction::Default }; Signal::Count as usize],
+            signal_manager: SignalManager::default(),
             background_jobs: JobManager::default(),
             history: History::new(32767),
             umask: !0o022 & 0o777,

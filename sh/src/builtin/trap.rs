@@ -1,8 +1,7 @@
 use crate::builtin::{BuiltinError, BuiltinResult, SpecialBuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
-use crate::signals::{handle_signals, Signal, SIGNALS};
-use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet};
+use crate::signals::Signal;
 use std::fmt::Display;
 use std::str::FromStr;
 
@@ -11,26 +10,6 @@ pub enum TrapAction {
     Default,
     Ignore,
     Commands(String),
-}
-
-fn set_action(shell: &mut Shell, condition: Signal, action: TrapAction, handler: SigHandler) {
-    shell.trap_actions[condition as usize] = action;
-    // we know signal is neither Kill nor Stop, so the unwraps are safe
-    unsafe {
-        sigaction(
-            condition.into(),
-            &SigAction::new(handler, SaFlags::empty(), SigSet::empty()),
-        )
-        .unwrap();
-    }
-}
-
-fn default_action(shell: &mut Shell, condition: Signal) {
-    set_action(shell, condition, TrapAction::Default, SigHandler::SigDfl)
-}
-
-fn ignore_action(shell: &mut Shell, condition: Signal) {
-    set_action(shell, condition, TrapAction::Ignore, SigHandler::SigIgn)
 }
 
 fn print_action<C: Display>(
@@ -57,8 +36,7 @@ fn print_action<C: Display>(
 
 fn print_commands(shell: &mut Shell, opened_files: &mut OpenedFiles, print_default: bool) {
     print_action("EXIT", &shell.exit_action, opened_files, print_default);
-    for (condition, action) in shell.trap_actions.iter().enumerate() {
-        let condition = SIGNALS[condition];
+    for (condition, action) in shell.signal_manager.iter() {
         if condition == Signal::SigKill || condition == Signal::SigStop {
             // since we decided that calling trap with KILL or STOP is an error, we don't list them
             continue;
@@ -113,7 +91,9 @@ impl SpecialBuiltinUtility for Trap {
                 shell.exit_action = TrapAction::Default;
                 TrapArg::Reset
             } else if let Ok(condition) = Signal::from_str(&args[first_index]) {
-                default_action(shell, condition);
+                shell
+                    .signal_manager
+                    .set_action(condition, TrapAction::Default);
                 TrapArg::Reset
             } else {
                 return Err(format!("trap: '{}' is not a valid signal", args[first_index]).into());
@@ -141,18 +121,19 @@ impl SpecialBuiltinUtility for Trap {
             }
             match action {
                 TrapArg::Reset => {
-                    default_action(shell, condition);
+                    shell
+                        .signal_manager
+                        .set_action(condition, TrapAction::Default);
                 }
                 TrapArg::Ignore => {
-                    ignore_action(shell, condition);
+                    shell
+                        .signal_manager
+                        .set_action(condition, TrapAction::Ignore);
                 }
                 TrapArg::Command(cmd) => {
-                    set_action(
-                        shell,
-                        condition,
-                        TrapAction::Commands(cmd.to_string()),
-                        SigHandler::Handler(handle_signals),
-                    );
+                    shell
+                        .signal_manager
+                        .set_action(condition, TrapAction::Commands(cmd.to_string()));
                 }
             }
         }

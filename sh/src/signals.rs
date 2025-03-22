@@ -1,7 +1,10 @@
+use crate::builtin::trap::TrapAction;
+use crate::shell::Shell;
 use nix::errno::Errno;
 use nix::libc;
-use nix::sys::signal::Signal as NixSignal;
+use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal as NixSignal};
 use nix::unistd::{read, write};
+use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd, RawFd};
 use std::str::FromStr;
@@ -250,7 +253,7 @@ pub const SIGNALS: &[Signal] = &[
 static mut SIGNAL_WRITE: Option<RawFd> = None;
 static mut SIGNAL_READ: Option<RawFd> = None;
 
-pub extern "C" fn handle_signals(signal: libc::c_int) {
+extern "C" fn handle_signals(signal: libc::c_int) {
     // SIGNAL_WRITE is never modified after the initial
     // setup, and is a valid file descriptor, so this is safe
     let fd = unsafe { BorrowedFd::borrow_raw(SIGNAL_WRITE.unwrap()) };
@@ -270,7 +273,7 @@ pub unsafe fn setup_signal_handling() {
     SIGNAL_READ = Some(read_pipe.into_raw_fd());
 }
 
-pub fn get_pending_signal() -> Option<Signal> {
+fn get_pending_signal() -> Option<Signal> {
     // SIGNAL_READ is never modified after the initial
     // setup, so this is safe
     let fd = unsafe { SIGNAL_READ.unwrap() };
@@ -290,6 +293,96 @@ pub fn get_pending_signal() -> Option<Signal> {
                 let signal = libc::c_int::from_ne_bytes(buf);
                 Some(Signal::try_from(signal).unwrap())
             }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct SignalManager {
+    actions: [TrapAction; Signal::Count as usize],
+}
+
+impl SignalManager {
+    pub fn reset(&mut self) {
+        for signal in SIGNALS {
+            let signal = *signal;
+            if signal == Signal::SigKill || signal == Signal::SigStop {
+                continue;
+            }
+            let action = &mut self.actions[signal as usize];
+            match action {
+                TrapAction::Commands(_) | TrapAction::Ignore => unsafe {
+                    sigaction(
+                        signal.into(),
+                        &SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty()),
+                    )
+                    .unwrap();
+                    *action = TrapAction::Default;
+                },
+                TrapAction::Default => {
+                    // already default, nothing to do
+                }
+            }
+        }
+    }
+
+    pub fn set_action(&mut self, signal: Signal, action: TrapAction) {
+        assert!(signal != Signal::SigKill && signal != Signal::SigStop);
+        match action {
+            TrapAction::Default => {
+                unsafe {
+                    sigaction(
+                        signal.into(),
+                        &SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty()),
+                    )
+                    .unwrap()
+                };
+            }
+            TrapAction::Ignore => {
+                unsafe {
+                    sigaction(
+                        signal.into(),
+                        &SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty()),
+                    )
+                    .unwrap()
+                };
+            }
+            TrapAction::Commands(_) => {
+                unsafe {
+                    sigaction(
+                        signal.into(),
+                        &SigAction::new(
+                            SigHandler::Handler(handle_signals),
+                            SaFlags::empty(),
+                            SigSet::empty(),
+                        ),
+                    )
+                    .unwrap()
+                };
+            }
+        }
+        self.actions[signal as usize] = action;
+    }
+
+    pub fn get_pending_action(&self) -> Option<&TrapAction> {
+        if let Some(signal) = get_pending_signal() {
+            Some(&self.actions[signal as usize])
+        } else {
+            None
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (Signal, &TrapAction)> {
+        SIGNALS
+            .iter()
+            .map(move |&signal| (signal, &self.actions[signal as usize]))
+    }
+}
+
+impl Default for SignalManager {
+    fn default() -> Self {
+        Self {
+            actions: [const { TrapAction::Default }; Signal::Count as usize],
         }
     }
 }

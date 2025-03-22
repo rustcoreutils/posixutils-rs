@@ -24,7 +24,7 @@ use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
 use nix::errno::Errno;
 use nix::sys::signal::Signal as NixSignal;
 use nix::sys::wait::{WaitPidFlag, WaitStatus};
-use nix::unistd::{getgid, getpid, getppid, getuid, ForkResult, Pid};
+use nix::unistd::{getgid, getpid, getppid, getuid, setpgid, ForkResult, Pid};
 use nix::{libc, NixPath};
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
@@ -767,6 +767,9 @@ impl Shell {
         if conjunction.is_async {
             match fork() {
                 Ok(ForkResult::Child) => {
+                    // should never fail
+                    setpgid(Pid::from_raw(0), Pid::from_raw(0))
+                        .expect("failed to create process group for background job");
                     std::process::exit(self.interpret_and_or_list(&conjunction.elements, false));
                 }
                 Ok(ForkResult::Parent { child }) => {

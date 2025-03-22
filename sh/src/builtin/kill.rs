@@ -59,7 +59,7 @@ impl<'a> KillArgs<'a> {
             } else {
                 Some(
                     Signal::from_str(&args[0][1..])
-                        .map_err(|_| format!("kill: invalid signal '{}'", args[1]))?,
+                        .map_err(|_| format!("kill: invalid signal '{}'", args[0]))?,
                 )
             };
             let pids = get_pids(&args[1..])?;

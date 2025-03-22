@@ -173,9 +173,15 @@ pub struct Shell {
     pub history: History,
     pub umask: u32,
     pub saved_command_locations: HashMap<String, OsString>,
+    pub is_subshell: bool,
 }
 
 impl Shell {
+    fn become_subshell(&mut self) {
+        self.signal_manager.reset();
+        self.is_subshell = true;
+    }
+
     fn eprint(&self, message: &str) {
         self.opened_files.write_err(message);
     }
@@ -601,6 +607,7 @@ impl Shell {
     fn interpret_subshell(&mut self, commands: &CompleteCommand) -> CommandExecutionResult<i32> {
         match fork()? {
             ForkResult::Child => {
+                self.become_subshell();
                 std::process::exit(self.interpret(commands, false));
             }
             ForkResult::Parent { child } => {
@@ -690,6 +697,7 @@ impl Shell {
                 let (read_pipe, write_pipe) = pipe()?;
                 match fork()? {
                     ForkResult::Child => {
+                        self.become_subshell();
                         if is_process_in_foreground() {
                             if let Some(pgid) = pipeline_pgid {
                                 setpgid(Pid::from_raw(0), pgid)
@@ -719,6 +727,7 @@ impl Shell {
 
             match fork()? {
                 ForkResult::Child => {
+                    self.become_subshell();
                     if is_process_in_foreground() {
                         // pipeline_pgid is Some since this is the last command of the pipeline
                         // which has more than one command
@@ -783,6 +792,7 @@ impl Shell {
         if conjunction.is_async {
             match fork() {
                 Ok(ForkResult::Child) => {
+                    self.become_subshell();
                     // should never fail
                     setpgid(Pid::from_raw(0), Pid::from_raw(0))
                         .expect("failed to create process group for background job");
@@ -821,6 +831,7 @@ impl Shell {
         let (read_pipe, write_pipe) = pipe()?;
         match fork()? {
             ForkResult::Child => {
+                self.become_subshell();
                 drop(read_pipe);
                 dup2(write_pipe.as_raw_fd(), libc::STDOUT_FILENO)?;
                 self.execute_program(program)
@@ -969,6 +980,7 @@ impl Default for Shell {
             history: History::new(32767),
             umask: !0o022 & 0o777,
             saved_command_locations: HashMap::new(),
+            is_subshell: false,
         }
     }
 }

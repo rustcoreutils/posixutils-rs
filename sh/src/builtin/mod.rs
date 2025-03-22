@@ -1,4 +1,5 @@
 use crate::builtin::alias::AliasBuiltin;
+use crate::builtin::bg::Bg;
 use crate::builtin::cd::Cd;
 use crate::builtin::command::Command;
 use crate::builtin::control_flow::{Break, Continue, Return};
@@ -8,6 +9,7 @@ use crate::builtin::exec::Exec;
 use crate::builtin::exit::Exit;
 use crate::builtin::export::Export;
 use crate::builtin::fc::Fc;
+use crate::builtin::fg::Fg;
 use crate::builtin::getopts::GetOpts;
 use crate::builtin::hash::Hash;
 use crate::builtin::jobs::Jobs;
@@ -33,6 +35,7 @@ use nix::unistd::Pid;
 use std::fmt::{Display, Formatter};
 
 pub mod alias;
+mod bg;
 mod cd;
 mod command;
 mod control_flow;
@@ -42,6 +45,7 @@ mod exec;
 mod exit;
 mod export;
 mod fc;
+mod fg;
 mod getopts;
 mod hash;
 mod jobs;
@@ -159,10 +163,12 @@ pub fn get_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
         "kill" => Some(&Kill),
         "ulimit" => Some(&Ulimit),
         "wait" => Some(&Wait),
+        "bg" => Some(&Bg),
         "fc" => Some(&Fc),
         "hash" => Some(&Hash),
         "umask" => Some(&Umask),
         "cd" => Some(&Cd),
+        "fg" => Some(&Fg),
         "jobs" => Some(&Jobs),
         "type" => Some(&Type_),
         "unalias" => Some(&Unalias),

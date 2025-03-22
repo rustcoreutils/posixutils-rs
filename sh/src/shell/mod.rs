@@ -25,14 +25,15 @@ use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
 use nix::errno::Errno;
 use nix::sys::signal::Signal as NixSignal;
 use nix::sys::wait::{WaitPidFlag, WaitStatus};
-use nix::unistd::{getpid, getppid, setpgid, ForkResult, Pid};
+use nix::unistd::{getpgid, getpgrp, getpid, getppid, setpgid, ForkResult, Pid};
 use nix::{libc, NixPath};
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
 use std::fmt::{Display, Formatter};
 use std::fs::File;
+use std::io;
 use std::io::{read_to_string, Read, Write};
-use std::os::fd::{AsRawFd, IntoRawFd};
+use std::os::fd::{AsFd, AsRawFd, IntoRawFd};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
@@ -705,48 +706,40 @@ impl Shell {
             let command = pipeline.commands.first();
             pipeline_exit_status = self.interpret_command(command, ignore_errexit);
         } else {
-            let mut current_stdin = libc::STDIN_FILENO;
-            let mut pipeline_pgid = None;
-            for command in pipeline.commands.head() {
-                let (read_pipe, write_pipe) = pipe()?;
-                match fork()? {
-                    ForkResult::Child => {
-                        self.become_subshell();
-                        if is_process_in_foreground() {
-                            if let Some(pgid) = pipeline_pgid {
-                                setpgid(Pid::from_raw(0), pgid)
-                                    .expect("failed to set pipeline pgid");
-                            } else {
-                                setpgid(Pid::from_raw(0), Pid::from_raw(0))
-                                    .expect("failed to create new process group for pipeline");
-                            }
-                        }
-                        drop(read_pipe);
-                        dup2(current_stdin, libc::STDIN_FILENO)?;
-                        dup2(write_pipe.as_raw_fd(), libc::STDOUT_FILENO)?;
-                        let return_status = self.interpret_command(command, false);
-                        if current_stdin != libc::STDIN_FILENO {
-                            close(current_stdin)?;
-                        }
-                        std::process::exit(return_status);
-                    }
-                    ForkResult::Parent { .. } => {
-                        if current_stdin != libc::STDIN_FILENO {
-                            close(current_stdin)?;
-                        }
-                        current_stdin = read_pipe.into_raw_fd();
-                    }
-                }
-            }
-
             match fork()? {
                 ForkResult::Child => {
                     self.become_subshell();
-                    if is_process_in_foreground() {
-                        // pipeline_pgid is Some since this is the last command of the pipeline
-                        // which has more than one command
-                        setpgid(Pid::from_raw(0), pipeline_pgid.unwrap())
-                            .expect("failed to set pipeline pgid");
+                    setpgid(Pid::from_raw(0), Pid::from_raw(0))
+                        .expect("failed to create new process group for pipeline");
+                    // cannot fail
+                    let pipeline_pgid = getpgrp();
+
+                    let mut current_stdin = libc::STDIN_FILENO;
+                    for command in pipeline.commands.head() {
+                        let (read_pipe, write_pipe) = pipe()?;
+                        match fork()? {
+                            ForkResult::Child => {
+                                self.become_subshell();
+                                if is_process_in_foreground() {
+                                    setpgid(Pid::from_raw(0), pipeline_pgid)
+                                        .expect("failed to set pipeline pgid");
+                                }
+                                drop(read_pipe);
+                                dup2(current_stdin, libc::STDIN_FILENO)?;
+                                dup2(write_pipe.as_raw_fd(), libc::STDOUT_FILENO)?;
+                                let return_status = self.interpret_command(command, false);
+                                if current_stdin != libc::STDIN_FILENO {
+                                    close(current_stdin)?;
+                                }
+                                std::process::exit(return_status);
+                            }
+                            ForkResult::Parent { .. } => {
+                                if current_stdin != libc::STDIN_FILENO {
+                                    close(current_stdin)?;
+                                }
+                                current_stdin = read_pipe.into_raw_fd();
+                            }
+                        }
                     }
                     dup2(current_stdin, libc::STDIN_FILENO)?;
                     let return_status = self.interpret_command(pipeline.commands.last(), false);
@@ -754,8 +747,13 @@ impl Shell {
                     std::process::exit(return_status);
                 }
                 ForkResult::Parent { child } => {
-                    close(current_stdin)?;
-                    pipeline_exit_status = self.wait_child_process(child)?;
+                    if is_process_in_foreground() {
+                        nix::unistd::tcsetpgrp(io::stdin().as_fd(), child).unwrap();
+                        pipeline_exit_status = self.wait_child_process(child)?;
+                        nix::unistd::tcsetpgrp(io::stdin().as_fd(), getpgrp()).unwrap();
+                    } else {
+                        pipeline_exit_status = self.wait_child_process(child)?;
+                    }
                 }
             }
         }

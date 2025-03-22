@@ -3,11 +3,12 @@ use crate::shell::opened_files::{OpenedFile, OpenedFiles};
 use nix::errno::Errno;
 use nix::libc;
 use nix::sys::wait::{WaitPidFlag, WaitStatus};
-use nix::unistd::{execve, ForkResult, Pid};
+use nix::unistd::{execve, tcgetpgrp, ForkResult, Pid};
 use std::convert::Infallible;
 use std::ffi::{CStr, CString, OsString};
 use std::fmt::{Display, Formatter};
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::io;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 
@@ -143,4 +144,12 @@ pub fn exec(
     // unwrap is safe here, because execve will only return if it fails
     let err = execve(&command, &args, &env).unwrap_err();
     Err(ExecError::CannotExecute(err))
+}
+
+pub fn is_process_in_foreground() -> bool {
+    if let Ok(pgid) = tcgetpgrp(io::stdin().as_fd()) {
+        pgid == nix::unistd::getpgrp()
+    } else {
+        false
+    }
 }

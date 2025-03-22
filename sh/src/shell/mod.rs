@@ -18,13 +18,14 @@ use crate::shell::history::{initialize_history_from_system, History};
 use crate::shell::opened_files::OpenedFiles;
 use crate::signals::{get_pending_signal, Signal};
 use crate::utils::{
-    close, dup2, exec, find_command, fork, pipe, waitpid, ExecError, OsError, OsResult,
+    close, dup2, exec, find_command, fork, is_process_in_foreground, pipe, waitpid, ExecError,
+    OsError, OsResult,
 };
 use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
 use nix::errno::Errno;
 use nix::sys::signal::Signal as NixSignal;
 use nix::sys::wait::{WaitPidFlag, WaitStatus};
-use nix::unistd::{getgid, getpid, getppid, getuid, setpgid, ForkResult, Pid};
+use nix::unistd::{getpid, getppid, setpgid, ForkResult, Pid};
 use nix::{libc, NixPath};
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
@@ -685,10 +686,20 @@ impl Shell {
             pipeline_exit_status = self.interpret_command(command, ignore_errexit);
         } else {
             let mut current_stdin = libc::STDIN_FILENO;
+            let mut pipeline_pgid = None;
             for command in pipeline.commands.head() {
                 let (read_pipe, write_pipe) = pipe()?;
                 match fork()? {
                     ForkResult::Child => {
+                        if is_process_in_foreground() {
+                            if let Some(pgid) = pipeline_pgid {
+                                setpgid(Pid::from_raw(0), pgid)
+                                    .expect("failed to set pipeline pgid");
+                            } else {
+                                setpgid(Pid::from_raw(0), Pid::from_raw(0))
+                                    .expect("failed to create new process group for pipeline");
+                            }
+                        }
                         drop(read_pipe);
                         dup2(current_stdin, libc::STDIN_FILENO)?;
                         dup2(write_pipe.as_raw_fd(), libc::STDOUT_FILENO)?;
@@ -709,6 +720,12 @@ impl Shell {
 
             match fork()? {
                 ForkResult::Child => {
+                    if is_process_in_foreground() {
+                        // pipeline_pgid is Some since this is the last command of the pipeline
+                        // which has more than one command
+                        setpgid(Pid::from_raw(0), pipeline_pgid.unwrap())
+                            .expect("failed to set pipeline pgid");
+                    }
                     dup2(current_stdin, libc::STDIN_FILENO)?;
                     let return_status = self.interpret_command(pipeline.commands.last(), false);
                     close(current_stdin)?;

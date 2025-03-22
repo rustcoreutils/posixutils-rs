@@ -27,6 +27,9 @@ impl BuiltinUtility for Bg {
         if !shell.set_options.monitor {
             return Err("bg: job control is disabled".into());
         }
+        if !shell.is_interactive {
+            return Err("bg: shell is not interactive".into());
+        }
 
         let mut status = 0;
         let args = skip_option_terminator(args);

@@ -311,7 +311,10 @@ impl SignalManager {
             }
             let action = &mut self.actions[signal as usize];
             match action {
-                TrapAction::Commands(_) => unsafe {
+                // we also reset default actions because ignore could have been
+                // set at startup for an interactive shell, but its not registered
+                // as a trap action
+                TrapAction::Commands(_) | TrapAction::Default => unsafe {
                     sigaction(
                         signal.into(),
                         &SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty()),
@@ -319,11 +322,7 @@ impl SignalManager {
                     .unwrap();
                     *action = TrapAction::Default;
                 },
-                TrapAction::Ignore => {
-                }
-                TrapAction::Default => {
-                    // already default, nothing to do
-                }
+                TrapAction::Ignore => {}
             }
         }
     }

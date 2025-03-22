@@ -152,6 +152,16 @@ impl JobManager {
         self.jobs.last()
     }
 
+    pub fn remove_job(&mut self, id: JobId) -> Option<Job> {
+        if let Some(i) = self.job_index(id) {
+            let job = self.jobs.remove(i);
+            self.update_positions();
+            Some(job)
+        } else {
+            None
+        }
+    }
+
     pub fn drain(&mut self) -> Vec<Job> {
         let mut jobs = Vec::new();
         std::mem::swap(&mut jobs, &mut self.jobs);

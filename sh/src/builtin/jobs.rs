@@ -47,12 +47,12 @@ fn print_job(
             let state = job_state(job.pid)?;
             if print_option == PrintOptions::Long {
                 opened_files.write_out(format!(
-                    "[{}]{} {} {} {:>20}\n",
+                    "[{}]{} {} {} {}\n",
                     job.number, current, job.pid, state, job.command
                 ));
             } else {
                 opened_files.write_out(format!(
-                    "[{}]{} {} {:>20}\n",
+                    "[{}]{} {} {}\n",
                     job.number, current, state, job.command
                 ));
             }

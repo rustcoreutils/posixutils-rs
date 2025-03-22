@@ -100,6 +100,14 @@ impl JobManager {
         Ok(())
     }
 
+    pub fn cleanup_terminated_jobs(&mut self) {
+        self.jobs.retain(|j| match j.state {
+            JobState::Done(_) => false,
+            _ => true,
+        });
+        self.update_positions();
+    }
+
     pub fn add_job(&mut self, pid: Pid, command: String) {
         self.jobs.push(Job {
             position: JobPosition::Current,

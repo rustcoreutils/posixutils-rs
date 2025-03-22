@@ -852,6 +852,7 @@ impl Shell {
                 break;
             }
         }
+        self.background_jobs.cleanup_terminated_jobs();
         self.last_lineno = parser.lineno() - 1;
         Ok(result)
     }

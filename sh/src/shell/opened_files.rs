@@ -154,14 +154,14 @@ impl OpenedFiles {
                     let file = expand_word_to_string(&file.word, false, shell)?;
                     self.io_redirect(kind, &file, redir.file_descriptor, shell)?;
                 }
-                RedirectionKind::HereDocument(contents) => {
-                    let contents = expand_word_to_string(contents, false, shell)?;
+                RedirectionKind::HereDocument { contents, .. } => {
+                    let contents = expand_word_to_string(&contents.word, false, shell)?;
                     self.opened_files.insert(
                         redir.file_descriptor.unwrap_or(STDIN_FILENO),
                         OpenedFile::HereDocument(contents),
                     );
                 }
-                RedirectionKind::QuotedHereDocument(contents) => {
+                RedirectionKind::QuotedHereDocument { contents, .. } => {
                     self.opened_files.insert(
                         redir.file_descriptor.unwrap_or(STDIN_FILENO),
                         OpenedFile::HereDocument(contents.clone()),

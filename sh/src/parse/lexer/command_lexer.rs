@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::parse::lexer::{is_blank, remove_delimiter_from_here_document, Lexer};
+use crate::parse::lexer::{is_blank, remove_delimiter_from_here_document, HereDocument, Lexer};
 use crate::parse::{ParseResult, ParserError};
 use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
@@ -279,8 +279,15 @@ pub enum CommandToken<'src> {
     IoNumber(u32),
 
     Word(Cow<'src, str>),
-    HereDocument(Cow<'src, str>),
-    QuotedHereDocument(Cow<'src, str>),
+    HereDocument {
+        delimiter: Cow<'src, str>,
+        contents: Cow<'src, str>,
+    },
+    QuotedHereDocument {
+        start_delimiter: Cow<'src, str>,
+        end_delimiter: Cow<'src, str>,
+        contents: Cow<'src, str>,
+    },
 
     EOF,
 }
@@ -322,7 +329,7 @@ impl Display for CommandToken<'_> {
             CommandToken::While => write!(f, "while"),
             CommandToken::IoNumber(_) => write!(f, "number"),
             CommandToken::Word(_) => write!(f, "word"),
-            CommandToken::HereDocument(_) | CommandToken::QuotedHereDocument(_) => {
+            CommandToken::HereDocument { .. } | CommandToken::QuotedHereDocument { .. } => {
                 write!(f, "here-document")
             }
             CommandToken::EOF => write!(f, "EOF"),
@@ -374,13 +381,6 @@ impl<'src> CommandToken<'src> {
             CommandToken::While => Some("while".into()),
             CommandToken::Word(word) => Some(word.into()),
             _ => None,
-        }
-    }
-
-    pub fn unwrap_here_document_contents(self) -> Cow<'src, str> {
-        match self {
-            CommandToken::HereDocument(contents) => contents,
-            _ => unreachable!(),
         }
     }
 
@@ -486,20 +486,32 @@ impl<'src> CommandLexer<'src> {
             self.source.substr(&start, &self.source.read_state),
         );
 
-        let contents = if remove_leading_tabs {
-            let mut result = String::new();
-            for line in here_document.lines() {
-                result.push_str(line.trim_start_matches('\t'));
-                result.push('\n');
+        let here_document = if remove_leading_tabs {
+            let mut contents = String::new();
+            for line in here_document.contents.lines() {
+                contents.push_str(line.trim_start_matches('\t'));
+                contents.push('\n');
             }
-            result.into()
+            HereDocument {
+                contents: contents.into(),
+                start_delimiter: here_document.start_delimiter,
+                end_delimiter: here_document.end_delimiter,
+            }
         } else {
             here_document
         };
         if is_quoted {
-            Ok(CommandToken::QuotedHereDocument(contents))
+            Ok(CommandToken::QuotedHereDocument {
+                start_delimiter: here_document.start_delimiter,
+                end_delimiter: here_document.end_delimiter,
+                contents: here_document.contents,
+            })
         } else {
-            Ok(CommandToken::HereDocument(contents))
+            assert_eq!(here_document.start_delimiter, here_document.end_delimiter);
+            Ok(CommandToken::HereDocument {
+                delimiter: here_document.start_delimiter,
+                contents: here_document.contents,
+            })
         }
     }
 
@@ -780,11 +792,17 @@ mod tests {
     fn here_document() {
         assert_eq!(
             lex_token("<<end\nthis\nis\n\ta\ntest\nend\n"),
-            CommandToken::HereDocument("this\nis\n\ta\ntest\n".into())
+            CommandToken::HereDocument {
+                delimiter: "end".into(),
+                contents: "this\nis\n\ta\ntest\n".into()
+            }
         );
         assert_eq!(
             lex_token("<<-end\nthis\nis\n\ta\n\t\t\t\ttest\nend\n"),
-            CommandToken::HereDocument("this\nis\na\ntest\n".into())
+            CommandToken::HereDocument {
+                delimiter: "end".into(),
+                contents: "this\nis\na\ntest\n".into()
+            }
         )
     }
 
@@ -792,11 +810,19 @@ mod tests {
     fn quoted_here_document() {
         assert_eq!(
             lex_token("<<\\end\nthis\nis\n\ta\ntest\nend\n"),
-            CommandToken::QuotedHereDocument("this\nis\n\ta\ntest\n".into())
+            CommandToken::QuotedHereDocument {
+                start_delimiter: "\\end".into(),
+                end_delimiter: "end".into(),
+                contents: "this\nis\n\ta\ntest\n".into()
+            }
         );
         assert_eq!(
             lex_token("<<-\\end\nthis\nis\n\ta\n\t\t\t\ttest\nend\n"),
-            CommandToken::QuotedHereDocument("this\nis\na\ntest\n".into())
+            CommandToken::QuotedHereDocument {
+                start_delimiter: "\\end".into(),
+                end_delimiter: "end".into(),
+                contents: "this\nis\na\ntest\n".into()
+            }
         )
     }
 

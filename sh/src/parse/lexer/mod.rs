@@ -319,17 +319,27 @@ trait Lexer {
     }
 }
 
-fn remove_delimiter_from_here_document(here_document: Cow<str>) -> Cow<str> {
+struct HereDocument<'src> {
+    start_delimiter: Cow<'src, str>,
+    end_delimiter: Cow<'src, str>,
+    contents: Cow<'src, str>,
+}
+
+fn remove_delimiter_from_here_document(here_document: Cow<str>) -> HereDocument {
+    let start_delimiter_end = here_document.find('\n').unwrap();
+    let end_delimiter_start = here_document.trim_end_matches('\n').rfind('\n').unwrap();
     match here_document {
-        Cow::Borrowed(str) => {
-            let str = &str.trim_start_matches(|c| c != '\n')[1..];
-            let str = str[0..str.len() - 1].trim_end_matches(|c| c != '\n');
-            str.into()
-        }
-        Cow::Owned(str) => {
-            let str = &str.trim_start_matches(|c| c != '\n')[1..];
-            let str = str[0..str.len() - 1].trim_end_matches(|c| c != '\n');
-            str.to_string().into()
-        }
+        Cow::Borrowed(str) => HereDocument {
+            start_delimiter: str[0..start_delimiter_end].into(),
+            end_delimiter: str[end_delimiter_start + 1..].trim_end_matches('\n').into(),
+            contents: str[start_delimiter_end + 1..=end_delimiter_start].into(),
+        },
+        Cow::Owned(str) => HereDocument {
+            start_delimiter: str[0..start_delimiter_end].to_owned().into(),
+            end_delimiter: str[end_delimiter_start + 1..].to_owned().into(),
+            contents: str[start_delimiter_end + 1..=end_delimiter_start]
+                .to_owned()
+                .into(),
+        },
     }
 }

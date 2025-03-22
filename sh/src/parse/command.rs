@@ -9,6 +9,7 @@
 
 use crate::nonempty::NonEmpty;
 use crate::parse::word::{Word, WordPair};
+use nix::libc::dlinfo;
 use std::fmt::{Debug, Display, Formatter, Write};
 use std::rc::Rc;
 
@@ -52,8 +53,15 @@ pub enum RedirectionKind {
         kind: IORedirectionKind,
         file: WordPair,
     },
-    HereDocument(Word),
-    QuotedHereDocument(String),
+    HereDocument {
+        delimiter: String,
+        contents: WordPair,
+    },
+    QuotedHereDocument {
+        start_delimiter: String,
+        end_delimiter: String,
+        contents: String,
+    },
 }
 
 impl Display for RedirectionKind {
@@ -62,7 +70,19 @@ impl Display for RedirectionKind {
             RedirectionKind::IORedirection { kind, file } => {
                 write!(f, "{}{}", kind, file.as_string)
             }
-            _ => todo!(),
+            RedirectionKind::HereDocument {
+                delimiter,
+                contents,
+            } => {
+                write!(f, "<<{}\n{}{}", delimiter, contents.as_string, delimiter)
+            }
+            RedirectionKind::QuotedHereDocument {
+                start_delimiter,
+                end_delimiter,
+                contents,
+            } => {
+                write!(f, "<<{}\n{}{}", start_delimiter, contents, end_delimiter)
+            }
         }
     }
 }

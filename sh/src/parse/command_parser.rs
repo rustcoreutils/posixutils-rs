@@ -157,16 +157,30 @@ impl<'src> CommandParser<'src> {
             CommandToken::Less => IORedirectionKind::RedirectInput,
             CommandToken::LessAnd => IORedirectionKind::DuplicateInput,
             CommandToken::LessGreat => IORedirectionKind::OpenRW,
-            CommandToken::HereDocument(contents) => {
-                let contents = parse_word(contents.as_ref(), self.lookahead_lineno, true)?;
+            CommandToken::HereDocument {
+                delimiter,
+                contents,
+            } => {
+                let contents = parse_word_pair(contents.as_ref(), self.lookahead_lineno, true)?;
+                let delimiter = delimiter.to_string();
                 self.advance()?;
-                return Ok(Some(RedirectionKind::HereDocument(contents)));
+                return Ok(Some(RedirectionKind::HereDocument {
+                    delimiter,
+                    contents,
+                }));
             }
-            CommandToken::QuotedHereDocument(_) => {
-                if let CommandToken::QuotedHereDocument(contents) = self.advance()? {
-                    return Ok(Some(RedirectionKind::QuotedHereDocument(
-                        contents.into_owned(),
-                    )));
+            CommandToken::QuotedHereDocument { .. } => {
+                if let CommandToken::QuotedHereDocument {
+                    start_delimiter,
+                    end_delimiter,
+                    contents,
+                } = self.advance()?
+                {
+                    return Ok(Some(RedirectionKind::QuotedHereDocument {
+                        start_delimiter: start_delimiter.into_owned(),
+                        end_delimiter: end_delimiter.into_owned(),
+                        contents: contents.into_owned(),
+                    }));
                 } else {
                     unreachable!()
                 }
@@ -1137,7 +1151,13 @@ mod tests {
             parse_single_redirection("<<end\nthis\nis\n\ta\ntest\nend\n"),
             Redirection {
                 file_descriptor: None,
-                kind: RedirectionKind::HereDocument(quoted_literal("this\nis\n\ta\ntest\n"))
+                kind: RedirectionKind::HereDocument {
+                    delimiter: "end".to_string(),
+                    contents: WordPair {
+                        word: quoted_literal("this\nis\n\ta\ntest\n"),
+                        as_string: "this\nis\n\ta\ntest\n".to_string()
+                    }
+                }
             }
         )
     }
@@ -1148,7 +1168,13 @@ mod tests {
             parse_single_redirection("<<-end\nthis\nis\n\ta\n\t\t\t\ttest\nend\n"),
             Redirection {
                 file_descriptor: None,
-                kind: RedirectionKind::HereDocument(quoted_literal("this\nis\na\ntest\n"))
+                kind: RedirectionKind::HereDocument {
+                    delimiter: "end".to_string(),
+                    contents: WordPair {
+                        word: quoted_literal("this\nis\na\ntest\n"),
+                        as_string: "this\nis\na\ntest\n".to_string()
+                    }
+                }
             }
         )
     }

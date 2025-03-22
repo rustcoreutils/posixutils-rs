@@ -64,7 +64,7 @@ pub fn parse_job_id(text: &str) -> Result<JobId, ()> {
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct JobManager {
     jobs: Vec<Job>,
     last_job_number: u64,
@@ -72,6 +72,14 @@ pub struct JobManager {
 
 impl JobManager {
     fn update_positions(&mut self) {
+        for job in self.jobs.iter_mut().rev() {
+            // `jobs` is always ordered, so we only have to check until
+            // `position` is not `Current` or `Previous`
+            if job.position == JobPosition::Other {
+                break;
+            }
+            job.position = JobPosition::Other;
+        }
         self.jobs
             .last_mut()
             .map(|j| j.position = JobPosition::Current);
@@ -152,5 +160,14 @@ impl JobManager {
 
     pub fn iter(&self) -> impl Iterator<Item = &Job> {
         self.jobs.iter()
+    }
+}
+
+impl Default for JobManager {
+    fn default() -> Self {
+        Self {
+            jobs: Vec::new(),
+            last_job_number: 1,
+        }
     }
 }

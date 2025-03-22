@@ -25,10 +25,13 @@ impl BuiltinUtility for Bg {
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
         if !shell.set_options.monitor {
-            return Err("bg: job control is disabled".into());
+            return Err("bg: cannot use bg when job control is disabled".into());
         }
         if !shell.is_interactive {
-            return Err("bg: shell is not interactive".into());
+            return Err("bg: cannot use bg in a non-interactive shell".into());
+        }
+        if shell.is_subshell {
+            return Err("bg: cannot use bg in a subshell environment".into());
         }
 
         let mut status = 0;

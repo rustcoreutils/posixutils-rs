@@ -38,10 +38,13 @@ impl BuiltinUtility for Fg {
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
         if !shell.set_options.monitor {
-            return Err("fg: job control is disabled".into());
+            return Err("fg: cannot use fg when job control is disabled".into());
         }
         if !shell.is_interactive {
-            return Err("fg: shell is not interactive".into());
+            return Err("fg: cannot use fg in a non-interactive shell".into());
+        }
+        if shell.is_subshell {
+            return Err("fg: cannot use fg in a subshell environment".into());
         }
 
         let mut status = 0;

@@ -95,6 +95,7 @@ impl FromStr for Signal {
             "TERM" | "term" | "15" => Ok(Signal::SigTerm),
             "CHLD" | "chld" => Ok(Signal::SigChld),
             "CONT" | "cont" => Ok(Signal::SigCont),
+            "STOP" | "stop" => Ok(Signal::SigStop),
             "TSTP" | "tstp" => Ok(Signal::SigTstp),
             "TTIN" | "ttin" => Ok(Signal::SigTtin),
             "TTOU" | "ttou" => Ok(Signal::SigTtou),

@@ -91,6 +91,9 @@ impl JobManager {
 
     pub fn update_jobs(&mut self) -> OsResult<()> {
         for job in &mut self.jobs {
+            if let JobState::Done(_) = job.state {
+                continue;
+            }
             match waitpid(job.pid, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED))? {
                 WaitStatus::Exited(_, status) => {
                     job.state = JobState::Done(status);

@@ -20,9 +20,7 @@ impl BuiltinUtility for Wait {
 
         let mut status = 0;
         if pids.is_empty() {
-            let mut jobs = Vec::default();
-            std::mem::swap(&mut shell.background_jobs, &mut jobs);
-            for job in jobs {
+            for job in shell.background_jobs.drain() {
                 wait_for_pid(job.pid, shell);
             }
         } else {

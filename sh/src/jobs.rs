@@ -1,11 +1,21 @@
+use crate::utils::{waitpid, OsResult};
+use nix::sys::wait::{WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
+use std::slice::Iter;
+use std::vec::Drain;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum JobPosition {
+    Current,
+    Previous,
+    Other,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum JobState {
-    Current,
-    Previous,
-    Default,
-    Terminated,
+    Done(i32),
+    Running,
+    Stopped,
 }
 
 #[derive(Clone)]
@@ -13,6 +23,7 @@ pub struct Job {
     pub command: String,
     pub pid: Pid,
     pub number: u64,
+    pub position: JobPosition,
     pub state: JobState,
 }
 
@@ -50,5 +61,88 @@ pub fn parse_job_id(text: &str) -> Result<JobId, ()> {
                 Ok(JobId::BeginsWith(other))
             }
         }
+    }
+}
+
+#[derive(Default, Clone)]
+pub struct JobManager {
+    jobs: Vec<Job>,
+    last_job_number: u64,
+}
+
+impl JobManager {
+    fn update_positions(&mut self) {
+        self.jobs
+            .last_mut()
+            .map(|j| j.position = JobPosition::Current);
+        if self.jobs.len() > 1 {
+            let len = self.jobs.len();
+            self.jobs[len - 2].position = JobPosition::Previous;
+        }
+    }
+
+    pub fn update_jobs(&mut self) -> OsResult<()> {
+        for job in &mut self.jobs {
+            match waitpid(job.pid, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED))? {
+                WaitStatus::Exited(_, status) => {
+                    job.state = JobState::Done(status);
+                }
+                WaitStatus::Signaled(_, _, _) => todo!(),
+                WaitStatus::StillAlive => {}
+                WaitStatus::Stopped(_, _) => {
+                    job.state = JobState::Stopped;
+                }
+                _ => {
+                    todo!()
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn add_job(&mut self, pid: Pid, command: String) {
+        self.jobs.push(Job {
+            position: JobPosition::Current,
+            pid,
+            command,
+            state: JobState::Running,
+            number: self.last_job_number,
+        });
+        self.last_job_number += 1;
+        self.update_positions();
+    }
+
+    fn job_index(&self, id: JobId) -> Option<usize> {
+        match id {
+            JobId::CurrentJob => self.jobs.last().map(|_| self.jobs.len() - 1),
+            JobId::PreviousJob => {
+                if self.jobs.len() > 1 {
+                    Some(self.jobs.len() - 2)
+                } else {
+                    None
+                }
+            }
+            JobId::JobNumber(n) => self.jobs.iter().position(|j| j.number == n),
+            JobId::BeginsWith(s) => self.jobs.iter().position(|j| j.command.starts_with(s)),
+            JobId::Contains(s) => self.jobs.iter().position(|j| j.command.contains(s)),
+        }
+    }
+
+    pub fn get_job(&self, id: JobId) -> Option<&Job> {
+        self.job_index(id).map(|i| &self.jobs[i])
+    }
+
+    pub fn current(&self) -> Option<&Job> {
+        self.jobs.last()
+    }
+
+    pub fn drain(&mut self) -> Vec<Job> {
+        let mut jobs = Vec::new();
+        std::mem::swap(&mut jobs, &mut self.jobs);
+        jobs
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Job> {
+        self.jobs.iter()
     }
 }

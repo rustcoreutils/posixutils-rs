@@ -140,8 +140,9 @@ fn expand_simple_parameter_into(
                 }
                 SpecialParameter::Bang => expanded_word.append(
                     shell
-                        .most_recent_background_command_pid
-                        .map(|pid| pid.to_string())
+                        .background_jobs
+                        .current()
+                        .map(|job| job.pid.to_string())
                         .unwrap_or_default(),
                     inside_double_quotes,
                     true,
@@ -411,7 +412,9 @@ mod tests {
             ),
             "".to_string()
         );
-        shell.most_recent_background_command_pid = Some(Pid::from_raw(123));
+        shell
+            .background_jobs
+            .add_job(Pid::from_raw(123), "cmd".to_string());
         assert_eq!(
             expand_parameter_to_string(
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Bang)),

@@ -188,6 +188,7 @@ fn parse_pid(pid: &str, shell: &Shell) -> Result<Pid, String> {
     if pid.starts_with('%') {
         let job_id = parse_job_id(pid).map_err(|_| format!("'{pid}' is not a valid job id"))?;
         let job = shell
+            .background_jobs
             .get_job(job_id)
             .ok_or(format!("'{pid}' no such job"))?;
         Ok(job.pid)

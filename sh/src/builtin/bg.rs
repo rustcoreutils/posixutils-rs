@@ -25,7 +25,7 @@ impl BuiltinUtility for Bg {
         let mut status = 0;
         let args = skip_option_terminator(args);
         if args.is_empty() {
-            if let Some(job) = shell.background_jobs.last() {
+            if let Some(job) = shell.background_jobs.current() {
                 run_background_job("current", job)?;
             } else {
                 opened_files.write_err("bg: no background jobs".to_string());
@@ -35,7 +35,7 @@ impl BuiltinUtility for Bg {
             for arg in args {
                 match parse_job_id(arg) {
                     Ok(job_id) => {
-                        if let Some(job) = shell.get_job(job_id) {
+                        if let Some(job) = shell.background_jobs.get_job(job_id) {
                             run_background_job(arg, job)?;
                         } else {
                             opened_files.write_err(format!("bg: '{arg}' no such job"));

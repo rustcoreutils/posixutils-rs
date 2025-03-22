@@ -1,5 +1,5 @@
 use crate::builtin::{BuiltinError, BuiltinResult, BuiltinUtility};
-use crate::jobs::{parse_job_id, Job, JobState};
+use crate::jobs::{parse_job_id, Job, JobPosition, JobState};
 use crate::option_parser::OptionParser;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
@@ -14,19 +14,17 @@ enum PrintOptions {
     Short,
 }
 
-fn job_state(pid: Pid) -> Result<String, OsError> {
-    match waitpid(pid, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED))? {
-        WaitStatus::Exited(_, status) => {
-            if status == 0 {
-                Ok("Done".to_string())
+fn job_state_to_string(state: JobState) -> String {
+    match state {
+        JobState::Done(code) => {
+            if code == 0 {
+                "Done".to_string()
             } else {
-                Ok(format!("Done({status})"))
+                format!("Done({})", code)
             }
         }
-        WaitStatus::Signaled(_, _, _) => todo!(),
-        WaitStatus::Stopped(_, _) => Ok("Stopped".to_string()),
-        WaitStatus::StillAlive => Ok("Running".to_string()),
-        _ => unreachable!(),
+        JobState::Running => "Running".to_string(),
+        JobState::Stopped => "Stopped".to_string(),
     }
 }
 
@@ -37,14 +35,14 @@ fn print_job(
 ) -> Result<(), BuiltinError> {
     match print_option {
         PrintOptions::Default | PrintOptions::Long => {
-            let current = if job.state == JobState::Current {
+            let current = if job.position == JobPosition::Current {
                 "+"
-            } else if job.state == JobState::Previous {
+            } else if job.position == JobPosition::Previous {
                 "-"
             } else {
                 " "
             };
-            let state = job_state(job.pid)?;
+            let state = job_state_to_string(job.state);
             if print_option == PrintOptions::Long {
                 opened_files.write_out(format!(
                     "[{}]{} {} {} {}\n",
@@ -94,14 +92,14 @@ impl BuiltinUtility for Jobs {
         }
 
         if options_parser.next_argument() == args.len() {
-            for job in &shell.background_jobs {
+            for job in shell.background_jobs.iter() {
                 print_job(job, print_option, opened_files)?;
             }
         } else {
             for operand in &args[options_parser.next_argument()..] {
                 let job_id = parse_job_id(operand)
                     .map_err(|_| format!("jobs: invalid job id '{operand}'"))?;
-                if let Some(job) = shell.get_job(job_id) {
+                if let Some(job) = shell.background_jobs.get_job(job_id) {
                     print_job(job, print_option, opened_files)?;
                 } else {
                     return Err(format!("jobs: '{operand}' no such job").into());

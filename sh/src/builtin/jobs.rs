@@ -15,7 +15,7 @@ enum PrintOptions {
 }
 
 fn job_state(pid: Pid) -> Result<String, OsError> {
-    match waitpid(pid, Some(WaitPidFlag::WNOHANG))? {
+    match waitpid(pid, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED))? {
         WaitStatus::Exited(_, status) => {
             if status == 0 {
                 Ok("Done".to_string())
@@ -23,12 +23,8 @@ fn job_state(pid: Pid) -> Result<String, OsError> {
                 Ok(format!("Done({status})"))
             }
         }
-        WaitStatus::Signaled(_, _, _) => {
-            todo!()
-        }
-        WaitStatus::Stopped(_, _) => {
-            todo!()
-        }
+        WaitStatus::Signaled(_, _, _) => todo!(),
+        WaitStatus::Stopped(_, _) => Ok("Stopped".to_string()),
         WaitStatus::StillAlive => Ok("Running".to_string()),
         _ => unreachable!(),
     }

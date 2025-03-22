@@ -2,6 +2,7 @@ use crate::shell::environment::Environment;
 use crate::shell::opened_files::{OpenedFile, OpenedFiles};
 use nix::errno::Errno;
 use nix::libc;
+use nix::sys::signal::Signal as NixSignal;
 use nix::sys::wait::{WaitPidFlag, WaitStatus};
 use nix::unistd::{execve, tcgetpgrp, ForkResult, Pid};
 use std::convert::Infallible;
@@ -152,4 +153,8 @@ pub fn is_process_in_foreground() -> bool {
     } else {
         false
     }
+}
+
+pub fn signal_to_exit_status(signal: NixSignal) -> i32 {
+    128 + signal as i32
 }

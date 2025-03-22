@@ -1,4 +1,4 @@
-use crate::utils::{waitpid, OsResult};
+use crate::utils::{signal_to_exit_status, waitpid, OsResult};
 use nix::sys::wait::{WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
 use std::slice::Iter;
@@ -98,7 +98,13 @@ impl JobManager {
                 WaitStatus::Exited(_, status) => {
                     job.state = JobState::Done(status);
                 }
-                WaitStatus::Signaled(_, _, _) => todo!(),
+                WaitStatus::Signaled(_, signal, _) => {
+                    if signal == nix::sys::signal::SIGTSTP {
+                        job.state = JobState::Stopped;
+                    } else {
+                        job.state = JobState::Done(signal_to_exit_status(signal));
+                    }
+                }
                 WaitStatus::StillAlive => {}
                 WaitStatus::Stopped(_, _) => {
                     job.state = JobState::Stopped;
@@ -119,12 +125,12 @@ impl JobManager {
         self.update_positions();
     }
 
-    pub fn add_job(&mut self, pid: Pid, command: String) {
+    pub fn add_job(&mut self, pid: Pid, command: String, initial_state: JobState) {
         self.jobs.push(Job {
             position: JobPosition::Current,
             pid,
             command,
-            state: JobState::Running,
+            state: initial_state,
             number: self.last_job_number,
         });
         self.last_job_number += 1;
@@ -151,8 +157,16 @@ impl JobManager {
         self.job_index(id).map(|i| &self.jobs[i])
     }
 
+    pub fn get_job_mut(&mut self, id: JobId) -> Option<&mut Job> {
+        self.job_index(id).map(|i| &mut self.jobs[i])
+    }
+
     pub fn current(&self) -> Option<&Job> {
         self.jobs.last()
+    }
+
+    pub fn current_mut(&mut self) -> Option<&mut Job> {
+        self.jobs.last_mut()
     }
 
     pub fn remove_job(&mut self, id: JobId) -> Option<Job> {

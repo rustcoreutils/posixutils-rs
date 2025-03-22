@@ -170,12 +170,13 @@ fn open_editor_with_file(
     editor: &str,
     file_path: PathBuf,
     shell: &mut Shell,
+    opened_files: &OpenedFiles,
 ) -> Result<i32, BuiltinError> {
     let command_path = shell
         .find_command(editor, "", shell.set_options.hashall)
         .ok_or("fc: editor not found")?;
     let args = vec![editor.to_string(), file_path.to_string_lossy().to_string()];
-    Ok(shell.exec(command_path, &args)?)
+    Ok(shell.exec(command_path, &args, opened_files)?)
 }
 
 fn edit(
@@ -211,7 +212,7 @@ fn edit(
     let editor = editor
         .unwrap_or_else(|| shell.environment.get_str_value("FCEDIT").unwrap_or("ed"))
         .to_string();
-    let result = open_editor_with_file(&editor, path, shell)?;
+    let result = open_editor_with_file(&editor, path, shell, opened_files)?;
     if result != 0 {
         return Ok(());
     }

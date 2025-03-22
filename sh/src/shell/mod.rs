@@ -18,8 +18,8 @@ use crate::shell::history::{initialize_history_from_system, History};
 use crate::shell::opened_files::OpenedFiles;
 use crate::signals::SignalManager;
 use crate::utils::{
-    close, dup2, exec, find_command, fork, is_process_in_foreground, pipe, waitpid, ExecError,
-    OsError, OsResult,
+    close, dup2, exec, find_command, fork, is_process_in_foreground, pipe, signal_to_exit_status,
+    waitpid, ExecError, OsError, OsResult,
 };
 use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
 use nix::errno::Errno;
@@ -122,10 +122,6 @@ impl ControlFlowState {
     }
 }
 
-fn signal_exit_status(signal: NixSignal) -> i32 {
-    128 + signal as i32
-}
-
 pub enum ScriptExecutionError {
     ParsingError(ParserError),
     IoError(std::io::Error),
@@ -174,6 +170,7 @@ pub struct Shell {
     pub umask: u32,
     pub saved_command_locations: HashMap<String, OsString>,
     pub is_subshell: bool,
+    pub last_pipeline_command: String,
 }
 
 impl Shell {
@@ -188,9 +185,20 @@ impl Shell {
 
     pub fn wait_child_process(&mut self, child_pid: Pid) -> OsResult<i32> {
         loop {
-            match waitpid(child_pid, Some(WaitPidFlag::WNOHANG))? {
+            match waitpid(
+                child_pid,
+                Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED),
+            )? {
                 WaitStatus::Exited(_, status) => return Ok(status),
-                WaitStatus::Signaled(_, signal, _) => return Ok(signal_exit_status(signal)),
+                WaitStatus::Signaled(_, signal, _) => return Ok(signal_to_exit_status(signal)),
+                WaitStatus::Stopped(_, signal) => {
+                    self.background_jobs.add_job(
+                        child_pid,
+                        self.last_pipeline_command.clone(),
+                        JobState::Stopped,
+                    );
+                    return Ok(signal_to_exit_status(signal));
+                }
                 WaitStatus::StillAlive => {
                     self.process_signals();
                     std::thread::sleep(Duration::from_millis(16));
@@ -239,9 +247,15 @@ impl Shell {
         }
     }
 
-    pub fn exec(&mut self, command: OsString, args: &[String]) -> OsResult<i32> {
+    pub fn exec(
+        &mut self,
+        command: OsString,
+        args: &[String],
+        opened_files: &OpenedFiles,
+    ) -> OsResult<i32> {
         match fork()? {
             ForkResult::Child => {
+                self.signal_manager.reset();
                 let flags =
                     nix::fcntl::fcntl(libc::STDIN_FILENO, nix::fcntl::FcntlArg::F_GETFL).unwrap();
                 let new_flags = flags & !nix::fcntl::OFlag::O_NONBLOCK.bits();
@@ -250,9 +264,7 @@ impl Shell {
                     nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::from_bits_truncate(new_flags)),
                 )
                 .unwrap();
-                match exec(command.clone(), args, &self.opened_files, &self.environment)
-                    .unwrap_err()
-                {
+                match exec(command.clone(), args, &opened_files, &self.environment).unwrap_err() {
                     ExecError::OsError(err) => {
                         self.eprint(&format!("{err}\n"));
                         std::process::exit(1)
@@ -480,14 +492,15 @@ impl Shell {
                     expanded_words[0].to_string(),
                 ))?;
 
-            let mut command_environment = self.clone();
-            command_environment.assign_globals(&simple_command.assignments, true)?;
-            command_environment
-                .opened_files
-                .redirect(&simple_command.redirections, self)?;
-            command_environment
-                .exec(command, &expanded_words)
-                .map_err(|err| err.into())
+            self.environment.push_scope();
+            self.assign_locals(&simple_command.assignments)?;
+            let mut opened_files = self.opened_files.clone();
+            opened_files.redirect(&simple_command.redirections, self)?;
+            let result = self
+                .exec(command, &expanded_words, &opened_files)
+                .map_err(|err| err.into());
+            self.environment.pop_scope();
+            result
         }
     }
 
@@ -686,6 +699,7 @@ impl Shell {
     }
 
     fn interpret_pipeline(&mut self, pipeline: &Pipeline, ignore_errexit: bool) -> OsResult<i32> {
+        self.last_pipeline_command = pipeline.to_string();
         let pipeline_exit_status;
         if pipeline.commands.len() == 1 {
             let command = pipeline.commands.first();
@@ -799,7 +813,8 @@ impl Shell {
                     std::process::exit(self.interpret_and_or_list(&conjunction.elements, false));
                 }
                 Ok(ForkResult::Parent { child }) => {
-                    self.background_jobs.add_job(child, conjunction.to_string());
+                    self.background_jobs
+                        .add_job(child, conjunction.to_string(), JobState::Running);
                     0
                 }
                 Err(_) => {
@@ -981,6 +996,7 @@ impl Default for Shell {
             umask: !0o022 & 0o777,
             saved_command_locations: HashMap::new(),
             is_subshell: false,
+            last_pipeline_command: String::new(),
         }
     }
 }

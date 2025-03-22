@@ -323,6 +323,7 @@ pub fn expand_parameter_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jobs::JobState;
     use crate::parse::word::test_utils::unquoted_literal;
     use crate::parse::word::Word;
     use crate::wordexp::expanded_word::ExpandedWordPart;
@@ -414,7 +415,7 @@ mod tests {
         );
         shell
             .background_jobs
-            .add_job(Pid::from_raw(123), "cmd".to_string());
+            .add_job(Pid::from_raw(123), "cmd".to_string(), JobState::Running);
         assert_eq!(
             expand_parameter_to_string(
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Bang)),

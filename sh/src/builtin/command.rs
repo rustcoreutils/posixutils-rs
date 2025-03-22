@@ -107,10 +107,8 @@ impl BuiltinUtility for Command {
                 return builtin_utility.exec(&args.args[1..], shell, opened_files);
             } else if let Some(command) = shell.find_command(args.command_name, default_path, true)
             {
-                let mut command_environment = shell.clone();
-                command_environment.opened_files = opened_files.clone();
-                return command_environment
-                    .exec(command, args.args)
+                return shell
+                    .exec(command, args.args, opened_files)
                     .map_err(BuiltinError::OsError);
             }
             return Err(format!("command: {} not found", args.command_name).into());

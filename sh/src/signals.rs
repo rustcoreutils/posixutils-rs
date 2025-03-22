@@ -311,7 +311,7 @@ impl SignalManager {
             }
             let action = &mut self.actions[signal as usize];
             match action {
-                TrapAction::Commands(_) | TrapAction::Ignore => unsafe {
+                TrapAction::Commands(_) => unsafe {
                     sigaction(
                         signal.into(),
                         &SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty()),
@@ -319,6 +319,8 @@ impl SignalManager {
                     .unwrap();
                     *action = TrapAction::Default;
                 },
+                TrapAction::Ignore => {
+                }
                 TrapAction::Default => {
                     // already default, nothing to do
                 }

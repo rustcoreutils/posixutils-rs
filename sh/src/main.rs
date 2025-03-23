@@ -10,6 +10,7 @@
 use crate::cli::{parse_args, ExecutionMode};
 use crate::shell::Shell;
 use crate::signals::setup_signal_handling;
+use crate::utils::is_process_in_foreground;
 use atty::Stream;
 use nix::libc;
 use nix::sys::signal::{sigaction, SaFlags, SigAction, SigSet};
@@ -56,8 +57,10 @@ fn execute_string(string: &str, shell: &mut Shell) {
 }
 
 fn interactive_shell() {
-    let pgid = nix::unistd::getpgrp();
-    nix::unistd::tcsetpgrp(io::stdin().as_fd(), pgid).unwrap();
+    if is_process_in_foreground() {
+        let pgid = nix::unistd::getpgrp();
+        nix::unistd::tcsetpgrp(io::stdin().as_fd(), pgid).unwrap();
+    }
     nix::fcntl::fcntl(
         libc::STDIN_FILENO,
         nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),

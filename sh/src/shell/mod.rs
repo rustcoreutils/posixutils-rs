@@ -955,6 +955,9 @@ impl Shell {
     }
 
     pub fn get_ps1(&mut self) -> String {
+        // The standard specifies that only parameter expansion should be performed,
+        // but other shells also do all the other forms of substitution. Since its easier
+        // and basically an extension to the standard, we do the same here.
         self.get_var_and_expand("PS1", "\\$ ")
     }
 

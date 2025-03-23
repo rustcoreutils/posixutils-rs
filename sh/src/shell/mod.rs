@@ -718,11 +718,8 @@ impl Shell {
                         let (read_pipe, write_pipe) = pipe()?;
                         match fork()? {
                             ForkResult::Child => {
-                                self.become_subshell();
-                                if is_process_in_foreground() {
-                                    setpgid(Pid::from_raw(0), pipeline_pgid)
-                                        .expect("failed to set pipeline pgid");
-                                }
+                                setpgid(Pid::from_raw(0), pipeline_pgid)
+                                    .expect("failed to set pipeline pgid");
                                 drop(read_pipe);
                                 dup2(current_stdin, libc::STDIN_FILENO)?;
                                 dup2(write_pipe.as_raw_fd(), libc::STDOUT_FILENO)?;

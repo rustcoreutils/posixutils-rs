@@ -3,7 +3,6 @@ use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 use crate::utils::strcoll;
 use std::ffi::CString;
-use std::io::Write;
 
 pub struct SetSpecialBuiltin;
 

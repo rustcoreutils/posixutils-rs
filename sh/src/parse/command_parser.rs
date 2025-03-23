@@ -73,15 +73,6 @@ impl<'src> CommandParser<'src> {
         Ok(next_token)
     }
 
-    fn advance_if_word(&mut self) -> ParseResult<Option<Cow<'src, str>>> {
-        if self.lookahead.as_word_str().is_some() {
-            self.advance()
-                .map(|word| Some(word.into_word_cow().unwrap()))
-        } else {
-            Ok(None)
-        }
-    }
-
     fn match_alternatives(
         &mut self,
         tokens: &[CommandToken],

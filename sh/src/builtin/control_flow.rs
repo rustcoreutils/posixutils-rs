@@ -1,6 +1,4 @@
-use crate::builtin::{
-    skip_option_terminator, BuiltinResult, SpecialBuiltinUtility,
-};
+use crate::builtin::{skip_option_terminator, BuiltinResult, SpecialBuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::ControlFlowState;
 use crate::shell::Shell;
@@ -44,12 +42,7 @@ fn loop_control_flow(
 pub struct Break;
 
 impl SpecialBuiltinUtility for Break {
-    fn exec(
-        &self,
-        args: &[String],
-        shell: &mut Shell,
-        opened_files: &mut OpenedFiles,
-    ) -> BuiltinResult {
+    fn exec(&self, args: &[String], shell: &mut Shell, _: &mut OpenedFiles) -> BuiltinResult {
         loop_control_flow(args, shell, "break", ControlFlowState::Break)
     }
 }
@@ -57,12 +50,7 @@ impl SpecialBuiltinUtility for Break {
 pub struct Continue;
 
 impl SpecialBuiltinUtility for Continue {
-    fn exec(
-        &self,
-        args: &[String],
-        shell: &mut Shell,
-        opened_files: &mut OpenedFiles,
-    ) -> BuiltinResult {
+    fn exec(&self, args: &[String], shell: &mut Shell, _: &mut OpenedFiles) -> BuiltinResult {
         loop_control_flow(args, shell, "break", ControlFlowState::Continue)
     }
 }

@@ -17,7 +17,7 @@ impl SpecialBuiltinUtility for Times {
     fn exec(
         &self,
         args: &[String],
-        shell: &mut Shell,
+        _: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
         let args = skip_option_terminator(args);

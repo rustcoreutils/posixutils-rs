@@ -52,12 +52,6 @@ pub struct Environment {
 #[derive(Debug, Clone)]
 pub struct CannotModifyReadonly(String);
 
-impl CannotModifyReadonly {
-    pub fn var_name(&self) -> &str {
-        self.0.as_str()
-    }
-}
-
 impl Display for CannotModifyReadonly {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "sh: cannot set readonly variable {}", self.0)

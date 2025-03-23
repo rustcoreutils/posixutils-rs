@@ -4,7 +4,7 @@ use crate::wordexp::expand_word_to_string;
 use nix::libc;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::rc::Rc;

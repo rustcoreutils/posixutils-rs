@@ -120,7 +120,7 @@ pub trait SpecialBuiltinUtility {
 struct BuiltinNull;
 
 impl SpecialBuiltinUtility for BuiltinNull {
-    fn exec(&self, args: &[String], shell: &mut Shell, _: &mut OpenedFiles) -> BuiltinResult {
+    fn exec(&self, _: &[String], _: &mut Shell, _: &mut OpenedFiles) -> BuiltinResult {
         Ok(0)
     }
 }

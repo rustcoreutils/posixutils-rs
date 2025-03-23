@@ -1,7 +1,6 @@
 use crate::wordexp::pattern::parse::{parse_pattern, PatternItem};
 use crate::wordexp::pattern::regex::{parsed_pattern_to_regex, Regex};
 use crate::wordexp::ExpandedWord;
-use nix::NixPath;
 use std::ffi::{CStr, CString};
 
 mod parse;

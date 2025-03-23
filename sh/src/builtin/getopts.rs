@@ -59,7 +59,6 @@ impl<'s> OptsParser<'s> {
                                             arg: &options[1 + pos + c.len_utf8()..],
                                         };
                                     }
-                                    i += 1;
                                     break;
                                 } else {
                                     *option_index = 0;

@@ -23,15 +23,15 @@ use crate::utils::{
 };
 use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
 use nix::errno::Errno;
+use nix::libc;
 use nix::sys::wait::{WaitPidFlag, WaitStatus};
 use nix::unistd::{getpgrp, getpid, getppid, setpgid, ForkResult, Pid};
-use nix::{libc, NixPath};
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io;
-use std::io::{read_to_string, Read, Write};
+use std::io::{read_to_string, Read};
 use std::os::fd::{AsFd, AsRawFd, IntoRawFd};
 use std::path::Path;
 use std::rc::Rc;

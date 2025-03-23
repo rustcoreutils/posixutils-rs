@@ -5,12 +5,7 @@ use crate::shell::Shell;
 pub struct Shift;
 
 impl SpecialBuiltinUtility for Shift {
-    fn exec(
-        &self,
-        args: &[String],
-        shell: &mut Shell,
-        opened_files: &mut OpenedFiles,
-    ) -> BuiltinResult {
+    fn exec(&self, args: &[String], shell: &mut Shell, _: &mut OpenedFiles) -> BuiltinResult {
         let args = skip_option_terminator(args);
         if args.len() > 1 {
             return Err("shift: too many arguments".into());

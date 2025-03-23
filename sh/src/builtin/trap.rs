@@ -98,6 +98,8 @@ impl SpecialBuiltinUtility for Trap {
             } else {
                 return Err(format!("trap: '{}' is not a valid signal", args[first_index]).into());
             }
+        } else if args[first_index].is_empty() {
+            TrapArg::Ignore
         } else {
             TrapArg::Command(&args[first_index])
         };

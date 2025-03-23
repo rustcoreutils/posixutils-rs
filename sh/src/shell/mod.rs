@@ -711,7 +711,6 @@ impl Shell {
                     self.become_subshell();
                     setpgid(Pid::from_raw(0), Pid::from_raw(0))
                         .expect("failed to create new process group for pipeline");
-                    // cannot fail
                     let pipeline_pgid = getpgrp();
 
                     let mut current_stdin = libc::STDIN_FILENO;

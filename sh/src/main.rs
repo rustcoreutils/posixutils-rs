@@ -28,6 +28,7 @@ mod parse;
 mod shell;
 mod signals;
 mod utils;
+mod vi;
 mod wordexp;
 
 fn execute_string(string: &str, shell: &mut Shell) {

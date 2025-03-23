@@ -1,11 +1,8 @@
 use crate::builtin::{BuiltinError, BuiltinResult, BuiltinUtility};
-use crate::jobs::{parse_job_id, Job, JobPosition, JobState};
+use crate::jobs::{parse_job_id, Job};
 use crate::option_parser::OptionParser;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
-use crate::utils::{waitpid, OsError};
-use nix::sys::wait::{WaitPidFlag, WaitStatus};
-use nix::unistd::Pid;
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum PrintOptions {

@@ -1,5 +1,4 @@
 use crate::parse::word::Word;
-use crate::shell::environment::Environment;
 use crate::shell::{CommandExecutionError, Shell};
 use crate::wordexp::expanded_word::ExpandedWord;
 use crate::wordexp::{expand_word_to_string, ExpansionResult};
@@ -630,6 +629,7 @@ pub fn expand_arithmetic_expression_into(
 mod tests {
     use super::*;
     use crate::parse::word::test_utils::quoted_literal;
+    use crate::shell::environment::Environment;
 
     fn execute_expr(s: &str) -> String {
         let mut shell = Shell::default();

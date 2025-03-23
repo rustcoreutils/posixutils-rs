@@ -2,7 +2,6 @@ use crate::builtin::{skip_option_terminator, BuiltinResult, SpecialBuiltinUtilit
 use crate::parse::command_parser::is_valid_name;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
-use std::collections::hash_map::Entry;
 
 pub struct ReadOnly;
 

@@ -1,6 +1,6 @@
 use crate::shell::Display;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Formatter;
 
 #[derive(Clone, Default)]

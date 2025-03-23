@@ -1,10 +1,8 @@
 use crate::builtin::trap::TrapAction;
-use crate::shell::Shell;
 use nix::errno::Errno;
 use nix::libc;
 use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal as NixSignal};
 use nix::unistd::{read, write};
-use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd, RawFd};
 use std::str::FromStr;

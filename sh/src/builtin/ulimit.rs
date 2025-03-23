@@ -1,4 +1,4 @@
-use crate::builtin::{BuiltinError, BuiltinResult, BuiltinUtility};
+use crate::builtin::{BuiltinResult, BuiltinUtility};
 use crate::option_parser::OptionParser;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;

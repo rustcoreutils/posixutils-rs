@@ -1,5 +1,5 @@
 use crate::builtin::{
-    skip_option_terminator, BuiltinResult, BuiltinUtility, SpecialBuiltinUtility,
+    skip_option_terminator, BuiltinResult, SpecialBuiltinUtility,
 };
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::ControlFlowState;

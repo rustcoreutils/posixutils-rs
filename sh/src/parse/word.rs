@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::parse::command::{CompleteCommand, Name};
+use crate::parse::command::Name;
 use std::fmt::{Display, Formatter};
 
 #[derive(Debug, Clone, PartialEq)]

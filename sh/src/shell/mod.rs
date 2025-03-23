@@ -3,7 +3,7 @@ use crate::builtin::trap::TrapAction;
 use crate::builtin::{
     get_builtin_utility, get_special_builtin_utility, BuiltinUtility, SpecialBuiltinUtility,
 };
-use crate::jobs::{Job, JobId, JobManager, JobState};
+use crate::jobs::{JobManager, JobState};
 use crate::nonempty::NonEmpty;
 use crate::parse::command::{
     Assignment, CaseItem, Command, CommandType, CompleteCommand, CompoundCommand, Conjunction,
@@ -23,9 +23,8 @@ use crate::utils::{
 };
 use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
 use nix::errno::Errno;
-use nix::sys::signal::Signal as NixSignal;
 use nix::sys::wait::{WaitPidFlag, WaitStatus};
-use nix::unistd::{getpgid, getpgrp, getpid, getppid, setpgid, ForkResult, Pid};
+use nix::unistd::{getpgrp, getpid, getppid, setpgid, ForkResult, Pid};
 use nix::{libc, NixPath};
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
@@ -34,8 +33,6 @@ use std::fs::File;
 use std::io;
 use std::io::{read_to_string, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, IntoRawFd};
-use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;

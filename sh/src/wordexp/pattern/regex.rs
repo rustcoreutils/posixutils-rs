@@ -1,5 +1,5 @@
 use crate::wordexp::pattern::parse::{
-    BracketExpression, BracketItem, ParsedPattern, PatternItem, RangeEndpoint,
+    BracketExpression, BracketItem, PatternItem, RangeEndpoint,
 };
 use core::fmt;
 use nix::libc;

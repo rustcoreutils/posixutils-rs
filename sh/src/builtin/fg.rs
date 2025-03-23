@@ -3,9 +3,6 @@ use crate::jobs::{parse_job_id, Job, JobId, JobState};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 use nix::sys::signal::kill;
-use nix::unistd::Pid;
-use std::io;
-use std::os::fd::AsFd;
 
 fn run_foreground_job(
     shell: &mut Shell,

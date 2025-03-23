@@ -1,5 +1,4 @@
 use plib::{run_test, run_test_with_checker, TestPlan};
-use std::os::unix::process::ExitStatusExt;
 use std::process::Output;
 use std::sync::atomic::{AtomicBool, Ordering};
 

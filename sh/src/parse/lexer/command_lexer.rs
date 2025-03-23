@@ -8,13 +8,9 @@
 //
 
 use crate::parse::lexer::{is_blank, remove_delimiter_from_here_document, HereDocument, Lexer};
-use crate::parse::{ParseResult, ParserError};
+use crate::parse::ParseResult;
 use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
-use std::iter::Peekable;
-use std::ops::Range;
-use std::rc::Rc;
-use std::str::CharIndices;
 
 #[derive(Clone, Debug, Default)]
 struct IndexIter {

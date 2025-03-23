@@ -1,5 +1,4 @@
 use crate::shell::environment::Environment;
-use std::cmp::max;
 use std::collections::VecDeque;
 use std::io::Read;
 use std::path::Path;

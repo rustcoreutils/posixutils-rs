@@ -8,8 +8,7 @@
 //
 
 use crate::nonempty::NonEmpty;
-use crate::parse::word::{Word, WordPair};
-use nix::libc::dlinfo;
+use crate::parse::word::WordPair;
 use std::fmt::{Debug, Display, Formatter, Write};
 use std::rc::Rc;
 

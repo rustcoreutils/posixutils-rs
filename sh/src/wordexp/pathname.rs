@@ -1,7 +1,7 @@
 use crate::utils::strcoll;
 use crate::wordexp::pattern::FilenamePattern;
 use std::ffi::{CString, OsStr, OsString};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, PartialEq, Eq)]

@@ -1,5 +1,5 @@
 use crate::builtin::{
-    skip_option_terminator, BuiltinResult, BuiltinUtility, SpecialBuiltinUtility,
+    BuiltinResult, SpecialBuiltinUtility,
 };
 use crate::option_parser::OptionParser;
 use crate::shell::opened_files::OpenedFiles;

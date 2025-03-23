@@ -1,4 +1,4 @@
-use crate::builtin::{BuiltinResult, BuiltinUtility, SpecialBuiltinUtility};
+use crate::builtin::{BuiltinResult, SpecialBuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 use crate::utils::strcoll;

@@ -1,12 +1,9 @@
 use crate::builtin::{parse_pid, skip_option_terminator, BuiltinResult, BuiltinUtility};
-use crate::jobs::parse_job_id;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 use crate::signals::{Signal, SIGNALS};
-use nix::libc::pid_t;
 use nix::sys::signal::kill;
 use nix::sys::signal::Signal as NixSignal;
-use nix::unistd::Pid;
 use std::str::FromStr;
 
 enum KillArgs<'a> {

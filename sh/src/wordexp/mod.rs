@@ -1,7 +1,5 @@
 use crate::parse::word::{Word, WordPart};
-use crate::shell::environment::CannotModifyReadonly;
 use crate::shell::{CommandExecutionError, Shell};
-use crate::utils::OsError;
 use crate::wordexp::arithmetic::expand_arithmetic_expression_into;
 use crate::wordexp::expanded_word::{ExpandedWord, ExpandedWordPart};
 use crate::wordexp::parameter::expand_parameter_into;

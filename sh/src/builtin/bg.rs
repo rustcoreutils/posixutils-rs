@@ -1,4 +1,4 @@
-use crate::builtin::{skip_option_terminator, BuiltinError, BuiltinResult, BuiltinUtility};
+use crate::builtin::{skip_option_terminator, BuiltinResult, BuiltinUtility};
 use crate::jobs::{parse_job_id, Job, JobState};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;

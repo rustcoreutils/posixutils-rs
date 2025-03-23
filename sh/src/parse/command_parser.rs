@@ -18,7 +18,7 @@ use crate::parse::lexer::is_blank;
 use crate::parse::word::{
     Parameter, ParameterExpansion, SpecialParameter, Word, WordPair, WordPart,
 };
-use crate::parse::word_parser::{parse_word, parse_word_pair};
+use crate::parse::word_parser::parse_word_pair;
 use crate::parse::{AliasTable, ParseResult, ParserError};
 use std::borrow::Cow;
 use std::rc::Rc;

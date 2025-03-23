@@ -18,20 +18,17 @@ struct IndexIter {
 }
 
 impl IndexIter {
-    fn next(&mut self, string: &str) -> Option<(usize, char)> {
-        if let Some((idx, c)) = self.peek(string) {
+    fn next(&mut self, string: &str) -> Option<char> {
+        if let Some(c) = self.peek(string) {
             self.pos += c.len_utf8();
-            Some((idx, c))
+            Some(c)
         } else {
             None
         }
     }
 
-    fn peek(&self, string: &str) -> Option<(usize, char)> {
-        string[self.pos..]
-            .char_indices()
-            .map(|(_, c)| (self.pos, c))
-            .next()
+    fn peek(&self, string: &str) -> Option<char> {
+        string[self.pos..].chars().next()
     }
 }
 
@@ -119,7 +116,6 @@ impl<'s> SourceString<'s> {
         self.read_state
             .current_part_char_iter
             .peek(self.current_str())
-            .map(|(_, c)| c)
     }
 
     fn advance_char(&mut self) {
@@ -127,7 +123,7 @@ impl<'s> SourceString<'s> {
             return;
         }
 
-        if let Some((index, char)) = self
+        if let Some(char) = self
             .read_state
             .current_part_char_iter
             .next(self.parts[self.read_state.current_part].text.as_ref())

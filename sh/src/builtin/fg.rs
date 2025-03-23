@@ -21,11 +21,14 @@ fn run_foreground_job(
             .map_err(|err| format!("fg: failed to resume {arg} ({err})"))?;
     }
     opened_files.write_out(&format!("{}\n", job.command));
+    let mut temp = job.command.clone();
+    std::mem::swap(&mut shell.last_pipeline_command, &mut temp);
     nix::unistd::tcsetpgrp(io::stdin().as_fd(), job.pid).unwrap();
     shell
         .wait_child_process(job.pid)
         .map_err(|err| err.to_string())?;
     nix::unistd::tcsetpgrp(io::stdin().as_fd(), Pid::from_raw(shell.shell_pid)).unwrap();
+    std::mem::swap(&mut shell.last_pipeline_command, &mut temp);
     Ok(())
 }
 pub struct Fg;

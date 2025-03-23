@@ -184,6 +184,11 @@ impl Shell {
         self.opened_files.write_err(message);
     }
 
+    pub fn exit(&mut self, code: i32) -> ! {
+        self.execute_action(self.exit_action.clone());
+        std::process::exit(code);
+    }
+
     pub fn wait_child_process(&mut self, child_pid: Pid) -> OsResult<i32> {
         loop {
             match waitpid(
@@ -252,11 +257,11 @@ impl Shell {
         }
     }
 
-    fn handle_error(&self, err: CommandExecutionError) -> i32 {
+    fn handle_error(&mut self, err: CommandExecutionError) -> i32 {
         self.eprint(&err.to_string());
         match err {
             CommandExecutionError::CommandNotFound(_) => 127,
-            CommandExecutionError::OsError(_) => std::process::exit(1),
+            CommandExecutionError::OsError(_) => self.exit(1),
             _ => 1,
         }
     }
@@ -281,18 +286,18 @@ impl Shell {
                 match exec(command.clone(), args, &opened_files, &self.environment).unwrap_err() {
                     ExecError::OsError(err) => {
                         self.eprint(&format!("{err}\n"));
-                        std::process::exit(1)
+                        self.exit(1)
                     }
                     ExecError::CannotExecute(errno) => {
                         if errno == Errno::ENOEXEC {
                             match execute_file_as_script(self, Path::new(&command)) {
-                                Ok(status) => std::process::exit(status),
+                                Ok(status) => self.exit(status),
                                 Err(ScriptExecutionError::ParsingError(err)) => {
                                     self.eprint(&format!(
                                         "sh: parsing error ({}): {}\n",
                                         err.lineno, err.message
                                     ));
-                                    std::process::exit(2)
+                                    self.exit(2)
                                 }
                                 Err(ScriptExecutionError::IoError(_)) => {
                                     // fallthrough to the default error
@@ -303,7 +308,7 @@ impl Shell {
                             "sh: failed to execute {}\n",
                             command.to_string_lossy()
                         ));
-                        std::process::exit(126);
+                        self.exit(126);
                     }
                 }
             }
@@ -346,7 +351,7 @@ impl Shell {
         if let Err(err) = opened_files.redirect(&simple_command.redirections, self) {
             if !self.is_interactive {
                 self.eprint(&err.to_string());
-                std::process::exit(1)
+                self.exit(1)
             }
             return Err(err);
         }
@@ -355,7 +360,7 @@ impl Shell {
             Err(err) => {
                 opened_files.write_err(format!("{err}\n"));
                 if !self.is_interactive {
-                    std::process::exit(1)
+                    self.exit(1)
                 }
                 Ok(1)
             }
@@ -635,7 +640,8 @@ impl Shell {
         match fork()? {
             ForkResult::Child => {
                 self.become_subshell();
-                std::process::exit(self.interpret(commands, false));
+                let status = self.interpret(commands, false);
+                self.exit(status);
             }
             ForkResult::Parent { child } => {
                 self.wait_child_process(child).map_err(|err| err.into())
@@ -740,7 +746,7 @@ impl Shell {
                                 if current_stdin != libc::STDIN_FILENO {
                                     close(current_stdin)?;
                                 }
-                                std::process::exit(return_status);
+                                self.exit(return_status);
                             }
                             ForkResult::Parent { .. } => {
                                 if current_stdin != libc::STDIN_FILENO {
@@ -753,7 +759,7 @@ impl Shell {
                     dup2(current_stdin, libc::STDIN_FILENO)?;
                     let return_status = self.interpret_command(pipeline.commands.last(), false);
                     close(current_stdin)?;
-                    std::process::exit(return_status);
+                    self.exit(return_status);
                 }
                 ForkResult::Parent { child } => {
                     if is_process_in_foreground() {
@@ -770,7 +776,7 @@ impl Shell {
             (pipeline_exit_status == 0) as i32
         } else {
             if pipeline_exit_status != 0 && !ignore_errexit && self.set_options.errexit {
-                std::process::exit(pipeline_exit_status)
+                self.exit(pipeline_exit_status)
             }
             pipeline_exit_status
         };
@@ -791,7 +797,7 @@ impl Shell {
                 Ok(status) => status,
                 Err(err) => {
                     self.eprint(&format!("{err}\n"));
-                    std::process::exit(1)
+                    self.exit(1)
                 }
             };
             if self.control_flow_state != ControlFlowState::None {
@@ -817,7 +823,8 @@ impl Shell {
                     // should never fail
                     setpgid(Pid::from_raw(0), Pid::from_raw(0))
                         .expect("failed to create process group for background job");
-                    std::process::exit(self.interpret_and_or_list(&conjunction.elements, false));
+                    let status = self.interpret_and_or_list(&conjunction.elements, false);
+                    self.exit(status);
                 }
                 Ok(ForkResult::Parent { child }) => {
                     self.background_jobs
@@ -827,7 +834,7 @@ impl Shell {
                 Err(_) => {
                     self.eprint("sh: failed to create background job\n");
                     if !self.is_interactive {
-                        std::process::exit(1);
+                        self.exit(1);
                     } else {
                         1
                     }
@@ -858,7 +865,7 @@ impl Shell {
                 dup2(write_pipe.as_raw_fd(), libc::STDOUT_FILENO)?;
                 self.execute_program(program)
                     .map_err(CommandExecutionError::ParseError)?;
-                std::process::exit(self.last_pipeline_exit_status);
+                self.exit(self.last_pipeline_exit_status);
             }
             ForkResult::Parent { child } => {
                 drop(write_pipe);
@@ -960,7 +967,7 @@ impl Shell {
             Err(err) => {
                 eprintln!("sh: error parsing contents of {var}: {}", err.message);
                 if !self.is_interactive {
-                    std::process::exit(1)
+                    self.exit(1)
                 }
                 default_if_err.to_string()
             }

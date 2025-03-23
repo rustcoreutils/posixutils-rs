@@ -13,12 +13,12 @@ impl SpecialBuiltinUtility for Exit {
 
         if let Some(arg) = args.get(0) {
             if let Ok(n) = arg.parse::<i32>() {
-                std::process::exit(n);
+                shell.exit(n);
             } else {
                 Err(format!("exit: '{arg}' is not a valid number").into())
             }
         } else {
-            std::process::exit(shell.last_pipeline_exit_status)
+            shell.exit(shell.last_pipeline_exit_status)
         }
     }
 }

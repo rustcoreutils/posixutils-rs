@@ -25,7 +25,6 @@ mod jobs;
 mod nonempty;
 mod option_parser;
 mod parse;
-mod program;
 mod shell;
 mod signals;
 mod utils;

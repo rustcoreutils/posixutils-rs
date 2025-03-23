@@ -14,20 +14,6 @@ enum PrintOptions {
     Short,
 }
 
-fn job_state_to_string(state: JobState) -> String {
-    match state {
-        JobState::Done(code) => {
-            if code == 0 {
-                "Done".to_string()
-            } else {
-                format!("Done({})", code)
-            }
-        }
-        JobState::Running => "Running".to_string(),
-        JobState::Stopped => "Stopped".to_string(),
-    }
-}
-
 fn print_job(
     job: &Job,
     print_option: PrintOptions,
@@ -35,24 +21,10 @@ fn print_job(
 ) -> Result<(), BuiltinError> {
     match print_option {
         PrintOptions::Default | PrintOptions::Long => {
-            let current = if job.position == JobPosition::Current {
-                "+"
-            } else if job.position == JobPosition::Previous {
-                "-"
-            } else {
-                " "
-            };
-            let state = job_state_to_string(job.state);
             if print_option == PrintOptions::Long {
-                opened_files.write_out(format!(
-                    "[{}]{} {} {}    {}\n",
-                    job.number, current, job.pid, state, job.command
-                ));
+                opened_files.write_out(job.to_string_long());
             } else {
-                opened_files.write_out(format!(
-                    "[{}]{} {}    {}\n",
-                    job.number, current, state, job.command
-                ));
+                opened_files.write_out(job.to_string_short());
             }
         }
         PrintOptions::Short => {

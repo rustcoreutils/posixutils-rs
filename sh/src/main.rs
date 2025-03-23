@@ -108,7 +108,7 @@ fn interactive_shell() {
             }
         }
         std::thread::sleep(Duration::from_millis(16));
-        get_global_shell().process_signals();
+        get_global_shell().update_global_state();
     }
 }
 

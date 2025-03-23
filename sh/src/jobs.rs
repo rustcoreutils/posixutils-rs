@@ -1,14 +1,23 @@
 use crate::utils::{signal_to_exit_status, waitpid, OsResult};
 use nix::sys::wait::{WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
-use std::slice::Iter;
-use std::vec::Drain;
+use std::fmt::{Display, Formatter, Write};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum JobPosition {
     Current,
     Previous,
     Other,
+}
+
+impl Display for JobPosition {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JobPosition::Current => f.write_char('+'),
+            JobPosition::Previous => f.write_char('-'),
+            JobPosition::Other => f.write_char(' '),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -18,6 +27,22 @@ pub enum JobState {
     Stopped,
 }
 
+impl Display for JobState {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JobState::Done(code) => {
+                if *code == 0 {
+                    f.write_str("Done")
+                } else {
+                    write!(f, "Done({})", code)
+                }
+            }
+            JobState::Running => f.write_str("Running"),
+            JobState::Stopped => f.write_str("Stopped"),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Job {
     pub command: String,
@@ -25,6 +50,23 @@ pub struct Job {
     pub number: u64,
     pub position: JobPosition,
     pub state: JobState,
+    pub state_should_be_reported: bool,
+}
+
+impl Job {
+    pub fn to_string_long(&self) -> String {
+        format!(
+            "[{}]{} {} {}    {}\n",
+            self.number, self.position, self.pid, self.state, self.command
+        )
+    }
+
+    pub fn to_string_short(&self) -> String {
+        format!(
+            "[{}]{} {}    {}\n",
+            self.number, self.position, self.state, self.command
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -97,6 +139,7 @@ impl JobManager {
             match waitpid(job.pid, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED))? {
                 WaitStatus::Exited(_, status) => {
                     job.state = JobState::Done(status);
+                    job.state_should_be_reported = true;
                 }
                 WaitStatus::Signaled(_, signal, _) => {
                     if signal == nix::sys::signal::SIGTSTP {
@@ -104,10 +147,12 @@ impl JobManager {
                     } else {
                         job.state = JobState::Done(signal_to_exit_status(signal));
                     }
+                    job.state_should_be_reported = true;
                 }
                 WaitStatus::StillAlive => {}
                 WaitStatus::Stopped(_, _) => {
                     job.state = JobState::Stopped;
+                    job.state_should_be_reported = true;
                 }
                 _ => {
                     todo!()
@@ -132,6 +177,7 @@ impl JobManager {
             command,
             state: initial_state,
             number: self.last_job_number,
+            state_should_be_reported: initial_state != JobState::Running,
         });
         self.last_job_number += 1;
         self.update_positions();
@@ -187,6 +233,15 @@ impl JobManager {
 
     pub fn iter(&self) -> impl Iterator<Item = &Job> {
         self.jobs.iter()
+    }
+
+    pub fn write_report<W: FnMut(&Job)>(&mut self, mut writer: W) {
+        for job in self.jobs.iter_mut() {
+            if job.state_should_be_reported {
+                writer(job)
+            }
+            job.state_should_be_reported = false;
+        }
     }
 }
 

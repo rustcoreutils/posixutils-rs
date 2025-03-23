@@ -201,10 +201,23 @@ impl Shell {
                     return Ok(signal_to_exit_status(signal));
                 }
                 WaitStatus::StillAlive => {
-                    self.process_signals();
+                    self.update_global_state();
                     std::thread::sleep(Duration::from_millis(16));
                 }
                 _ => unreachable!(),
+            }
+        }
+    }
+
+    pub fn update_global_state(&mut self) {
+        self.process_signals();
+        if self.set_options.monitor {
+            if let Err(err) = self.background_jobs.update_jobs() {
+                self.eprint(&format!("sh: error updating background jobs ({err})\n"));
+            }
+            if self.set_options.notify {
+                self.background_jobs
+                    .write_report(|job| self.opened_files.write_err(job.to_string_short()));
             }
         }
     }
@@ -890,6 +903,10 @@ impl Shell {
             } else {
                 break;
             }
+        }
+        if self.set_options.monitor {
+            self.background_jobs
+                .write_report(|job| self.opened_files.write_err(job.to_string_short()));
         }
         self.background_jobs.cleanup_terminated_jobs();
         self.last_lineno = parser.lineno() - 1;

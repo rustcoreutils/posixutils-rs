@@ -1,3 +1,8 @@
+mod word;
+
+use word::{next_bigword_start, next_word_start};
+
+use crate::vi::word::{current_bigword_end, current_word_end, WordIter};
 use crate::wordexp::pattern::Pattern;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -247,6 +252,8 @@ enum EditorMode {
     Command,
 }
 
+pub struct CommandError;
+
 pub struct ViEditor {
     input_buffer: Vec<u8>,
     edit_line: Vec<u8>,
@@ -255,37 +262,99 @@ pub struct ViEditor {
 }
 
 impl ViEditor {
-    fn new_cursor_position(&self, motion_command: MotionCommand, count: u32) -> usize {
+    fn new_cursor_position(
+        &self,
+        motion_command: MotionCommand,
+        count: u32,
+    ) -> Result<usize, CommandError> {
         match motion_command {
-            MotionCommand::MoveRight => self
-                .edit_line
-                .len()
-                .min(self.cursor_position + count as usize),
-            MotionCommand::MoveLeft => self.cursor_position.saturating_sub(count as usize),
+            MotionCommand::MoveRight => {
+                let len = self.edit_line.len();
+                if self.cursor_position == len {
+                    Err(CommandError)
+                } else {
+                    Ok(len.min(self.cursor_position + count as usize))
+                }
+            }
+            MotionCommand::MoveLeft => {
+                if self.cursor_position == 0 {
+                    Err(CommandError)
+                } else {
+                    Ok(self.cursor_position.saturating_sub(count as usize))
+                }
+            }
             MotionCommand::NextWordStart => {
-                todo!()
+                if self.cursor_position == self.edit_line.len() {
+                    Err(CommandError)
+                } else {
+                    Ok(
+                        next_word_start(&self.edit_line[self.cursor_position..], count as usize)
+                            + self.cursor_position,
+                    )
+                }
             }
             MotionCommand::NextBigwordStart => {
-                todo!()
+                if self.cursor_position == self.edit_line.len() {
+                    Err(CommandError)
+                } else {
+                    Ok(
+                        next_bigword_start(&self.edit_line[self.cursor_position..], count as usize)
+                            + self.cursor_position,
+                    )
+                }
             }
             MotionCommand::CurrentWordEnd => {
-                todo!()
+                if self.cursor_position == self.edit_line.len() {
+                    Err(CommandError)
+                } else {
+                    Ok(current_word_end(
+                        &self.edit_line[self.cursor_position..],
+                        count as usize,
+                        false,
+                    ) + self.cursor_position)
+                }
             }
             MotionCommand::CurrentBigwordEnd => {
-                todo!()
+                if self.cursor_position == self.edit_line.len() {
+                    Err(CommandError)
+                } else {
+                    Ok(current_bigword_end(
+                        &self.edit_line[self.cursor_position..],
+                        count as usize,
+                        false,
+                    ) + self.cursor_position)
+                }
             }
             MotionCommand::CurrentWordBegin => {
-                todo!()
+                if self.cursor_position == 0 {
+                    Err(CommandError)
+                } else {
+                    Ok(self.cursor_position
+                        - current_word_end(
+                            &self.edit_line[..self.cursor_position],
+                            count as usize,
+                            true,
+                        ))
+                }
             }
             MotionCommand::CurrentBigwordBegin => {
-                todo!()
+                if self.cursor_position == 0 {
+                    Err(CommandError)
+                } else {
+                    Ok(self.cursor_position
+                        - current_bigword_end(
+                            &self.edit_line[..self.cursor_position],
+                            count as usize,
+                            true,
+                        ))
+                }
             }
-            MotionCommand::GotoFirstCharOnLine => {
-                todo!()
-            }
-            MotionCommand::GotoLastCharOnLine => {
-                todo!()
-            }
+            MotionCommand::GotoFirstCharOnLine => Ok(self
+                .edit_line
+                .iter()
+                .position(|c| !c.is_ascii_whitespace())
+                .unwrap_or(0)),
+            MotionCommand::GotoLastCharOnLine => Ok(self.edit_line.len()),
             MotionCommand::GotoFirstCharPosition => {
                 todo!()
             }
@@ -323,48 +392,51 @@ impl ViEditor {
         result
     }
 
-    pub fn process_new_input(&mut self, c: u8) {
+    pub fn process_new_input(&mut self, c: u8) -> Result<(), CommandError> {
         match self.mode {
-            EditorMode::Insert => match c {
-                b'\n' => {}
-                b'\x1B' => {
-                    // escape
-                    self.mode = EditorMode::Command;
-                }
-                b'\x7F' => {
-                    // delete
-                    if !self.edit_line.is_empty() {
-                        if self.cursor_position != 0 {
-                            self.edit_line.remove(self.cursor_position - 1);
-                            self.cursor_position -= 1;
+            EditorMode::Insert => {
+                match c {
+                    b'\n' => {}
+                    b'\x1B' => {
+                        // escape
+                        self.mode = EditorMode::Command;
+                    }
+                    b'\x7F' => {
+                        // delete
+                        if !self.edit_line.is_empty() {
+                            if self.cursor_position != 0 {
+                                self.edit_line.remove(self.cursor_position - 1);
+                                self.cursor_position -= 1;
+                            }
                         }
                     }
-                }
-                b'\x04' => {
-                    // TODO: EOF
-                    println!("EOF")
-                }
-                b'\x16' => {
-                    // ^V
-                }
-                b'\x17' => {}
-                other if !other.is_ascii_control() => {
-                    if self.cursor_position < self.edit_line.len() {
-                        self.edit_line.insert(self.cursor_position, other);
-                    } else {
-                        self.edit_line.push(other);
+                    b'\x04' => {
+                        // TODO: EOF
+                        println!("EOF")
                     }
-                    self.cursor_position += 1;
+                    b'\x16' => {
+                        // ^V
+                    }
+                    b'\x17' => {}
+                    other if !other.is_ascii_control() => {
+                        if self.cursor_position < self.edit_line.len() {
+                            self.edit_line.insert(self.cursor_position, other);
+                        } else {
+                            self.edit_line.push(other);
+                        }
+                        self.cursor_position += 1;
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             EditorMode::Command => {
                 self.input_buffer.push(c);
                 if let Some(command) = Command::try_from_bytes(&self.input_buffer) {
                     self.input_buffer.clear();
                     match command.op {
                         CommandOp::Move(motion) => {
-                            self.cursor_position = self.new_cursor_position(motion, command.count);
+                            self.cursor_position =
+                                self.new_cursor_position(motion, command.count)?;
                         }
                         CommandOp::Execute => {}
                         CommandOp::Redraw => {}
@@ -410,6 +482,7 @@ impl ViEditor {
                 }
             }
         }
+        Ok(())
     }
 }
 

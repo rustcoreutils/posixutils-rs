@@ -1,4 +1,5 @@
 use crate::vi::word::{current_bigword_end, current_word_end, next_bigword_start, next_word_start};
+use crate::vi::CommandParseError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MotionCommand {
@@ -41,28 +42,32 @@ pub enum MotionCommand {
 }
 
 impl MotionCommand {
-    pub fn try_from_bytes(bytes: &[u8]) -> Option<Self> {
+    pub fn parse(bytes: &[u8]) -> Result<Self, CommandParseError> {
         assert!(!bytes.is_empty());
         match bytes[0] {
-            b'l' | b' ' => Some(Self::MoveRight),
-            b'h' => Some(Self::MoveLeft),
-            b'w' => Some(Self::NextWordStart),
-            b'W' => Some(Self::NextBigwordStart),
-            b'e' => Some(Self::CurrentWordEnd),
-            b'E' => Some(Self::CurrentBigwordEnd),
-            b'b' => Some(Self::CurrentWordBegin),
-            b'B' => Some(Self::CurrentBigwordBegin),
-            b'^' => Some(Self::GotoFirstCharOnLine),
-            b'$' => Some(Self::GotoLineEnd),
-            b'0' => Some(Self::GotoLineStart),
-            b'|' => Some(Self::GotoCharPosition),
-            b'f' if bytes.len() > 1 => Some(Self::MoveToBeforeFirstChar(bytes[1])),
-            b'F' if bytes.len() > 1 => Some(Self::MoveToBeforeFirstCharReverse(bytes[1])),
-            b't' if bytes.len() > 1 => Some(Self::MoveToAfterFirstChar(bytes[1])),
-            b'T' if bytes.len() > 1 => Some(Self::MoveToAfterFirstCharReverse(bytes[1])),
-            b';' => Some(Self::RepeatLastMoveToChar),
-            b',' => Some(Self::RepeatLastMoveToCharReverse),
-            _ => None,
+            b'l' | b' ' => Ok(Self::MoveRight),
+            b'h' => Ok(Self::MoveLeft),
+            b'w' => Ok(Self::NextWordStart),
+            b'W' => Ok(Self::NextBigwordStart),
+            b'e' => Ok(Self::CurrentWordEnd),
+            b'E' => Ok(Self::CurrentBigwordEnd),
+            b'b' => Ok(Self::CurrentWordBegin),
+            b'B' => Ok(Self::CurrentBigwordBegin),
+            b'^' => Ok(Self::GotoFirstCharOnLine),
+            b'$' => Ok(Self::GotoLineEnd),
+            b'0' => Ok(Self::GotoLineStart),
+            b'|' => Ok(Self::GotoCharPosition),
+            b'f' if bytes.len() > 1 => Ok(Self::MoveToBeforeFirstChar(bytes[1])),
+            b'f' => Err(CommandParseError::IncompleteCommand),
+            b'F' if bytes.len() > 1 => Ok(Self::MoveToBeforeFirstCharReverse(bytes[1])),
+            b'F' => Err(CommandParseError::IncompleteCommand),
+            b't' if bytes.len() > 1 => Ok(Self::MoveToAfterFirstChar(bytes[1])),
+            b't' => Err(CommandParseError::IncompleteCommand),
+            b'T' if bytes.len() > 1 => Ok(Self::MoveToAfterFirstCharReverse(bytes[1])),
+            b'T' => Err(CommandParseError::IncompleteCommand),
+            b';' => Ok(Self::RepeatLastMoveToChar),
+            b',' => Ok(Self::RepeatLastMoveToCharReverse),
+            _ => Err(CommandParseError::InvalidCommand),
         }
     }
 }
@@ -78,7 +83,11 @@ fn reverse_goto_char_motion(motion: MotionCommand) -> MotionCommand {
 }
 
 #[derive(Debug)]
-pub struct MotionError;
+pub enum MotionError {
+    BeforeStart,
+    AfterEnd,
+    CharNotFound,
+}
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Cursor {
@@ -98,19 +107,19 @@ impl Cursor {
         match motion {
             MotionCommand::MoveRight => {
                 if self.position == line_end {
-                    return Err(MotionError);
+                    return Err(MotionError::AfterEnd);
                 }
                 result.position = line_end.min(self.position + count.unwrap_or(0) + 1);
             }
             MotionCommand::MoveLeft => {
                 if self.position == 0 {
-                    return Err(MotionError);
+                    return Err(MotionError::BeforeStart);
                 }
                 result.position = self.position.saturating_sub(count.unwrap_or(0) + 1);
             }
             MotionCommand::NextWordStart => {
                 if self.position == line_end {
-                    return Err(MotionError);
+                    return Err(MotionError::AfterEnd);
                 }
                 result.position = line_end.min(
                     next_word_start(&line[self.position..], count.unwrap_or(0)) + self.position,
@@ -118,7 +127,7 @@ impl Cursor {
             }
             MotionCommand::NextBigwordStart => {
                 if self.position == line_end {
-                    return Err(MotionError);
+                    return Err(MotionError::AfterEnd);
                 }
                 result.position = line_end.min(
                     next_bigword_start(&line[self.position..], count.unwrap_or(0)) + self.position,
@@ -126,7 +135,7 @@ impl Cursor {
             }
             MotionCommand::CurrentWordEnd => {
                 if self.position == line_end {
-                    return Err(MotionError);
+                    return Err(MotionError::AfterEnd);
                 }
                 result.position =
                     current_word_end(&line[self.position..], count.unwrap_or(0), false)
@@ -135,7 +144,7 @@ impl Cursor {
             }
             MotionCommand::CurrentBigwordEnd => {
                 if self.position == line_end {
-                    return Err(MotionError);
+                    return Err(MotionError::AfterEnd);
                 }
                 result.position =
                     current_bigword_end(&line[self.position..], count.unwrap_or(0), false)
@@ -144,14 +153,14 @@ impl Cursor {
             }
             MotionCommand::CurrentWordBegin => {
                 if self.position == 0 {
-                    return Err(MotionError);
+                    return Err(MotionError::BeforeStart);
                 }
                 result.position = self.position
                     - current_word_end(&line[..self.position], count.unwrap_or(0), true);
             }
             MotionCommand::CurrentBigwordBegin => {
                 if self.position == 0 {
-                    return Err(MotionError);
+                    return Err(MotionError::BeforeStart);
                 }
                 result.position = self.position
                     - current_bigword_end(&line[..self.position], count.unwrap_or(0), true);
@@ -167,7 +176,7 @@ impl Cursor {
             MotionCommand::GotoCharPosition => result.position = line_end.min(count.unwrap_or(0)),
             MotionCommand::MoveToBeforeFirstChar(char) => {
                 if self.position == line_end {
-                    return Err(MotionError);
+                    return Err(MotionError::AfterEnd);
                 }
                 result.last_move_to_char = Some(motion);
                 result.position = line[self.position + 1..]
@@ -176,11 +185,11 @@ impl Cursor {
                     .filter(|(_, c)| **c == char)
                     .nth(count.unwrap_or(0))
                     .map(|(p, _)| p + self.position + 1)
-                    .ok_or(MotionError)?;
+                    .ok_or(MotionError::CharNotFound)?;
             }
             MotionCommand::MoveToBeforeFirstCharReverse(char) => {
                 if self.position == 0 {
-                    return Err(MotionError);
+                    return Err(MotionError::BeforeStart);
                 }
                 result.last_move_to_char = Some(motion);
                 result.position = line[..self.position]
@@ -190,11 +199,11 @@ impl Cursor {
                     .filter(|(_, c)| **c == char)
                     .nth(count.unwrap_or(0))
                     .map(|(p, _)| self.position - p - 1)
-                    .ok_or(MotionError)?;
+                    .ok_or(MotionError::CharNotFound)?;
             }
             MotionCommand::MoveToAfterFirstChar(char) => {
                 if self.position == line_end {
-                    return Err(MotionError);
+                    return Err(MotionError::AfterEnd);
                 }
                 result.last_move_to_char = Some(motion);
                 result.position = line[self.position + 1..]
@@ -203,11 +212,11 @@ impl Cursor {
                     .filter(|(_, c)| **c == char)
                     .nth(count.unwrap_or(0))
                     .map(|(p, _)| p + self.position)
-                    .ok_or(MotionError)?;
+                    .ok_or(MotionError::CharNotFound)?;
             }
             MotionCommand::MoveToAfterFirstCharReverse(char) => {
                 if self.position == 0 {
-                    return Err(MotionError);
+                    return Err(MotionError::BeforeStart);
                 }
                 result.last_move_to_char = Some(motion);
                 result.position = line[..self.position]
@@ -217,7 +226,7 @@ impl Cursor {
                     .filter(|(_, c)| **c == char)
                     .nth(count.unwrap_or(0))
                     .map(|(p, _)| self.position - p)
-                    .ok_or(MotionError)?;
+                    .ok_or(MotionError::CharNotFound)?;
             }
             MotionCommand::RepeatLastMoveToChar => {
                 if let Some(last) = self.last_move_to_char {

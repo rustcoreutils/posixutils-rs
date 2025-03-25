@@ -6,7 +6,6 @@ use crate::shell::Shell;
 use crate::vi::cursor::{Cursor, MotionCommand, MotionError};
 use crate::vi::word::{current_bigword, BigWordIter};
 use crate::wordexp::expand_word;
-use crate::wordexp::expanded_word::ExpandedWord;
 use crate::wordexp::pathname::glob;
 use crate::wordexp::pattern::FilenamePattern;
 use std::borrow::Cow;
@@ -326,6 +325,8 @@ impl ViEditor {
                         word_range.start..word_range.end,
                         replacement.as_bytes().iter().copied(),
                     );
+                    self.cursor.position = word_range.start + replacement.len();
+                    self.mode = EditorMode::Insert;
                 }
             }
             CommandOp::ExpandAll => {
@@ -349,6 +350,8 @@ impl ViEditor {
                         word_range.start..word_range.end,
                         replacement.as_bytes().iter().copied(),
                     );
+                    self.cursor.position = word_range.start + replacement.len();
+                    self.mode = EditorMode::Insert;
                 }
             }
             CommandOp::Alias(_) => {

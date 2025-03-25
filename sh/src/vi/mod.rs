@@ -1,7 +1,17 @@
 mod cursor;
 mod word;
 
+use crate::parse::word_parser::parse_word;
+use crate::shell::Shell;
 use crate::vi::cursor::{Cursor, MotionCommand, MotionError};
+use crate::vi::word::current_bigword;
+use crate::wordexp::expand_word;
+use crate::wordexp::expanded_word::ExpandedWord;
+use crate::wordexp::pathname::glob;
+use crate::wordexp::pattern::FilenamePattern;
+use std::borrow::Cow;
+use std::ffi::OsString;
+use std::path::Path;
 
 #[derive(Clone)]
 enum CommandOp {
@@ -223,6 +233,34 @@ pub enum Action {
     None,
 }
 
+fn into_expansion_word(word: &[u8]) -> Result<Cow<str>, CommandError> {
+    let word = std::str::from_utf8(word).map_err(|_| CommandError)?;
+    if word.chars().any(|c| c == '?' || c == '*' || c == '[') {
+        Ok(Cow::Borrowed(word))
+    } else {
+        Ok(Cow::Owned(format!("{word}*")))
+    }
+}
+
+fn add_terminating_slash_if_directory(mut s: String) -> String {
+    if Path::new(&s).is_dir() {
+        s.push('/');
+    }
+    s
+}
+
+fn select_longest_pathname_with_longest_common_prefix(pathnames: Vec<OsString>) -> String {
+    assert!(!pathnames.is_empty());
+    let mut longest = pathnames[0].to_string_lossy().into_owned();
+    for pathname in pathnames.iter().skip(1) {
+        let pathname = pathname.to_string_lossy();
+        while !pathname.starts_with(&longest) {
+            longest.pop();
+        }
+    }
+    add_terminating_slash_if_directory(longest)
+}
+
 pub struct ViEditor {
     input_buffer: Vec<u8>,
     edit_line: Vec<u8>,
@@ -233,7 +271,11 @@ pub struct ViEditor {
 }
 
 impl ViEditor {
-    fn execute_command(&mut self, command: Command) -> Result<Action, CommandError> {
+    fn execute_command(
+        &mut self,
+        command: Command,
+        shell: &mut Shell,
+    ) -> Result<Action, CommandError> {
         if let CommandOp::Move(motion) = command.op {
             self.cursor = self
                 .cursor
@@ -252,9 +294,63 @@ impl ViEditor {
             CommandOp::CommentLine => {
                 self.edit_line.insert(0, b'#');
             }
-            CommandOp::DisplayExpansions => {}
-            CommandOp::ExpandUnique => {}
-            CommandOp::ExpandAll => {}
+            CommandOp::DisplayExpansions => {
+                if let Some(word_range) = current_bigword(&self.edit_line, self.cursor.position) {
+                    let word =
+                        into_expansion_word(&self.edit_line[word_range.start..word_range.end])?;
+                    let parsed_word = parse_word(&word, 0, false).map_err(|_| CommandError)?;
+                    let expansions =
+                        expand_word(&parsed_word, false, shell).map_err(|_| CommandError)?;
+                    if expansions.is_empty() {
+                        return Err(CommandError);
+                    }
+                    print!("\n");
+                    for (i, e) in expansions.into_iter().enumerate() {
+                        println!("{i}) {}", add_terminating_slash_if_directory(e));
+                    }
+                }
+            }
+            CommandOp::ExpandUnique => {
+                if let Some(word_range) = current_bigword(&self.edit_line, self.cursor.position) {
+                    let word =
+                        into_expansion_word(&self.edit_line[word_range.start..word_range.end])?;
+                    let pattern =
+                        FilenamePattern::try_from(word.into_owned()).map_err(|_| CommandError)?;
+                    let expansions = glob(&pattern, Path::new(&shell.current_directory));
+                    if expansions.is_empty() {
+                        return Err(CommandError);
+                    }
+                    let replacement =
+                        select_longest_pathname_with_longest_common_prefix(expansions);
+                    self.edit_line.splice(
+                        word_range.start..word_range.end,
+                        replacement.as_bytes().iter().copied(),
+                    );
+                }
+            }
+            CommandOp::ExpandAll => {
+                if let Some(word_range) = current_bigword(&self.edit_line, self.cursor.position) {
+                    let word =
+                        into_expansion_word(&self.edit_line[word_range.start..word_range.end])?;
+                    let pattern =
+                        FilenamePattern::try_from(word.into_owned()).map_err(|_| CommandError)?;
+                    let expansions = glob(&pattern, Path::new(&shell.current_directory));
+                    if expansions.is_empty() {
+                        return Err(CommandError);
+                    }
+                    let replacement = expansions
+                        .iter()
+                        .map(|e| {
+                            add_terminating_slash_if_directory(e.to_string_lossy().into_owned())
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    self.edit_line.splice(
+                        word_range.start..word_range.end,
+                        replacement.as_bytes().iter().copied(),
+                    );
+                }
+            }
             CommandOp::Alias(_) => {
                 // I don't know what they mean by alias since it's not
                 // a shell alias, and no other types of alias are mentioned
@@ -272,7 +368,7 @@ impl ViEditor {
             }
             CommandOp::RepeatLast => {
                 if let Some(last_command) = &self.most_recent_nonmotion_command {
-                    return self.execute_command(last_command.clone());
+                    return self.execute_command(last_command.clone(), shell);
                 }
             }
             CommandOp::EditCommand => {}
@@ -458,7 +554,7 @@ impl ViEditor {
         result
     }
 
-    pub fn process_new_input(&mut self, c: u8) -> Result<Action, CommandError> {
+    pub fn process_new_input(&mut self, c: u8, shell: &mut Shell) -> Result<Action, CommandError> {
         match self.mode {
             EditorMode::Insert | EditorMode::Replace => {
                 match c {
@@ -508,7 +604,7 @@ impl ViEditor {
                 match Command::parse(&self.input_buffer) {
                     Ok(command) => {
                         self.input_buffer.clear();
-                        return self.execute_command(command);
+                        return self.execute_command(command, shell);
                     }
                     Err(CommandParseError::IncompleteCommand) => {
                         // we need more input, nothing to do here

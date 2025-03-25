@@ -70,6 +70,12 @@ impl<'a> IntoIterator for &'a ExpandedWord {
 }
 
 impl ExpandedWord {
+    pub fn unquoted_literal<S: Into<String>>(s: S) -> Self {
+        Self {
+            parts: vec![ExpandedWordPart::UnquotedLiteral(s.into())],
+        }
+    }
+
     pub fn append<S: AsRef<str> + Into<String>>(
         &mut self,
         value: S,
@@ -146,12 +152,6 @@ pub mod tests {
     use super::*;
 
     impl ExpandedWord {
-        pub fn unquoted_literal(s: &str) -> Self {
-            Self {
-                parts: vec![ExpandedWordPart::UnquotedLiteral(s.to_string())],
-            }
-        }
-
         pub fn quoted_literal(s: &str) -> Self {
             Self {
                 parts: vec![ExpandedWordPart::QuotedLiteral(s.to_string())],

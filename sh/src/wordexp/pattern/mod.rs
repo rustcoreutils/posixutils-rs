@@ -200,6 +200,15 @@ impl From<FilenamePattern> for String {
     }
 }
 
+impl TryFrom<String> for FilenamePattern {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let value = ExpandedWord::unquoted_literal(value);
+        FilenamePattern::new(&value)
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;

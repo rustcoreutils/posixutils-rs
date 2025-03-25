@@ -196,6 +196,15 @@ pub fn current_bigword_end(line: &[u8], count: usize, reverse: bool) -> usize {
     }
 }
 
+pub fn current_bigword(line: &[u8], position: usize) -> Option<Range> {
+    for range in BigWordIter::new(line.iter().copied()) {
+        if range.start <= position && position <= range.end {
+            return Some(range);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

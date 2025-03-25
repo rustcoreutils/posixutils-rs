@@ -143,6 +143,12 @@ impl History {
             Ok(list_entries(entries, include_command_number))
         }
     }
+
+    pub fn get_reverse(&self, index: usize) -> Option<&str> {
+        self.entries
+            .get(self.entries.len() - index - 1)
+            .map(|e| e.command.as_str())
+    }
 }
 
 fn read_history_from_file(path: &Path, max_entries: u32) -> History {

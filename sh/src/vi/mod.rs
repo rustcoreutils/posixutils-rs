@@ -4,7 +4,7 @@ mod word;
 use crate::parse::word_parser::parse_word;
 use crate::shell::Shell;
 use crate::vi::cursor::{Cursor, MotionCommand, MotionError};
-use crate::vi::word::current_bigword;
+use crate::vi::word::{current_bigword, BigWordIter};
 use crate::wordexp::expand_word;
 use crate::wordexp::expanded_word::ExpandedWord;
 use crate::wordexp::pathname::glob;
@@ -432,7 +432,27 @@ impl ViEditor {
                 }
             }
             CommandOp::AppendLastBigWord => {
-                todo!()
+                let last_command = if let Some(cmd) = shell.history.get_reverse(0) {
+                    cmd
+                } else {
+                    return Err(CommandError);
+                };
+                let mut words = BigWordIter::new(last_command.as_bytes().iter().copied());
+                let word_range = if let Some(count) = command.count {
+                    words.nth(count)
+                } else {
+                    words.last()
+                };
+                if let Some(word_range) = word_range {
+                    let word = last_command[word_range.start..word_range.end].as_bytes();
+                    self.edit_line.splice(
+                        self.cursor.position..self.cursor.position,
+                        word.iter().copied(),
+                    );
+                    self.cursor.position += word_range.end - word_range.start;
+                } else {
+                    return Err(CommandError);
+                }
             }
             CommandOp::CutCurrentChars => {
                 let end = self

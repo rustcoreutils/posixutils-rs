@@ -448,11 +448,14 @@ impl ViEditor {
                 };
                 if let Some(word_range) = word_range {
                     let word = last_command[word_range.start..word_range.end].as_bytes();
+                    // we are in command mode, so cursor is always less than self.edit_line.len()
+                    self.edit_line.insert(self.cursor.position, b' ');
                     self.edit_line.splice(
                         self.cursor.position..self.cursor.position,
                         word.iter().copied(),
                     );
                     self.cursor.position += word_range.end - word_range.start;
+                    self.mode = EditorMode::Insert;
                 } else {
                     return Err(CommandError);
                 }

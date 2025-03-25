@@ -1,76 +1,8 @@
+mod cursor;
 mod word;
 
-use word::{next_bigword_start, next_word_start};
-
-use crate::vi::word::{current_bigword_end, current_word_end, WordIter};
+use crate::vi::cursor::{Cursor, MotionCommand};
 use crate::wordexp::pattern::Pattern;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MotionCommand {
-    /// l | <space>
-    MoveRight,
-    /// h
-    MoveLeft,
-    /// w
-    NextWordStart,
-    /// W
-    NextBigwordStart,
-    /// e
-    CurrentWordEnd,
-    /// E
-    CurrentBigwordEnd,
-    /// b
-    CurrentWordBegin,
-    /// B
-    CurrentBigwordBegin,
-    /// ^
-    GotoFirstCharOnLine,
-    /// $
-    GotoLastCharOnLine,
-    /// 0
-    GotoFirstCharPosition,
-    /// |
-    GotoCharPosition,
-    /// fc
-    MoveToBeforeFirstChar(char),
-    /// Fc
-    MoveToBeforeFirstCharReverse(char),
-    /// tc
-    MoveToAfterFirstChar(char),
-    /// Tc
-    MoveToAfterFirstCharReverse(char),
-    /// ;
-    RepeatLastMoveToChar,
-    /// ,
-    RepeatLastMoveToCharReverse,
-}
-
-impl MotionCommand {
-    fn try_from_bytes(bytes: &[u8]) -> Option<Self> {
-        assert!(!bytes.is_empty());
-        match bytes[0] {
-            b'l' | b' ' => Some(Self::MoveRight),
-            b'h' => Some(Self::MoveLeft),
-            b'w' => Some(Self::NextWordStart),
-            b'W' => Some(Self::NextBigwordStart),
-            b'e' => Some(Self::CurrentWordEnd),
-            b'E' => Some(Self::CurrentBigwordEnd),
-            b'b' => Some(Self::CurrentWordBegin),
-            b'B' => Some(Self::CurrentBigwordBegin),
-            b'^' => Some(Self::GotoFirstCharOnLine),
-            b'$' => Some(Self::GotoLastCharOnLine),
-            b'0' => Some(Self::GotoFirstCharPosition),
-            b'|' => Some(Self::GotoCharPosition),
-            b'f' if bytes.len() > 1 => Some(Self::MoveToBeforeFirstChar(bytes[1] as char)),
-            b'F' if bytes.len() > 1 => Some(Self::MoveToBeforeFirstCharReverse(bytes[1] as char)),
-            b't' if bytes.len() > 1 => Some(Self::MoveToAfterFirstChar(bytes[1] as char)),
-            b'T' if bytes.len() > 1 => Some(Self::MoveToAfterFirstCharReverse(bytes[1] as char)),
-            b';' => Some(Self::RepeatLastMoveToChar),
-            b',' => Some(Self::RepeatLastMoveToCharReverse),
-            _ => None,
-        }
-    }
-}
 
 enum CommandOp {
     /// *motion*
@@ -154,7 +86,7 @@ enum CommandOp {
 }
 
 struct Command {
-    count: u32,
+    count: Option<usize>,
     op: CommandOp,
 }
 
@@ -170,14 +102,15 @@ impl Command {
         if last_digit == bytes.len() {
             return None;
         }
-        let count = if last_digit != 0 {
+        let count = if last_digit != 0 && bytes[last_digit] != b'0' {
             // TODO: handle count too big
-            std::str::from_utf8(&bytes[..last_digit])
+            let count = std::str::from_utf8(&bytes[..last_digit])
                 .unwrap()
-                .parse()
-                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            Some(count - 1)
         } else {
-            1
+            None
         };
         let remaining_bytes = &bytes[last_digit..];
         let op = match remaining_bytes[0] {
@@ -257,137 +190,17 @@ pub struct CommandError;
 pub struct ViEditor {
     input_buffer: Vec<u8>,
     edit_line: Vec<u8>,
-    cursor_position: usize,
+    cursor: Cursor,
     mode: EditorMode,
 }
 
 impl ViEditor {
-    fn new_cursor_position(
-        &self,
-        motion_command: MotionCommand,
-        count: u32,
-    ) -> Result<usize, CommandError> {
-        match motion_command {
-            MotionCommand::MoveRight => {
-                let len = self.edit_line.len();
-                if self.cursor_position == len {
-                    Err(CommandError)
-                } else {
-                    Ok(len.min(self.cursor_position + count as usize))
-                }
-            }
-            MotionCommand::MoveLeft => {
-                if self.cursor_position == 0 {
-                    Err(CommandError)
-                } else {
-                    Ok(self.cursor_position.saturating_sub(count as usize))
-                }
-            }
-            MotionCommand::NextWordStart => {
-                if self.cursor_position == self.edit_line.len() {
-                    Err(CommandError)
-                } else {
-                    Ok(
-                        next_word_start(&self.edit_line[self.cursor_position..], count as usize)
-                            + self.cursor_position,
-                    )
-                }
-            }
-            MotionCommand::NextBigwordStart => {
-                if self.cursor_position == self.edit_line.len() {
-                    Err(CommandError)
-                } else {
-                    Ok(
-                        next_bigword_start(&self.edit_line[self.cursor_position..], count as usize)
-                            + self.cursor_position,
-                    )
-                }
-            }
-            MotionCommand::CurrentWordEnd => {
-                if self.cursor_position == self.edit_line.len() {
-                    Err(CommandError)
-                } else {
-                    Ok(current_word_end(
-                        &self.edit_line[self.cursor_position..],
-                        count as usize,
-                        false,
-                    ) + self.cursor_position)
-                }
-            }
-            MotionCommand::CurrentBigwordEnd => {
-                if self.cursor_position == self.edit_line.len() {
-                    Err(CommandError)
-                } else {
-                    Ok(current_bigword_end(
-                        &self.edit_line[self.cursor_position..],
-                        count as usize,
-                        false,
-                    ) + self.cursor_position)
-                }
-            }
-            MotionCommand::CurrentWordBegin => {
-                if self.cursor_position == 0 {
-                    Err(CommandError)
-                } else {
-                    Ok(self.cursor_position
-                        - current_word_end(
-                            &self.edit_line[..self.cursor_position],
-                            count as usize,
-                            true,
-                        ))
-                }
-            }
-            MotionCommand::CurrentBigwordBegin => {
-                if self.cursor_position == 0 {
-                    Err(CommandError)
-                } else {
-                    Ok(self.cursor_position
-                        - current_bigword_end(
-                            &self.edit_line[..self.cursor_position],
-                            count as usize,
-                            true,
-                        ))
-                }
-            }
-            MotionCommand::GotoFirstCharOnLine => Ok(self
-                .edit_line
-                .iter()
-                .position(|c| !c.is_ascii_whitespace())
-                .unwrap_or(0)),
-            MotionCommand::GotoLastCharOnLine => Ok(self.edit_line.len()),
-            MotionCommand::GotoFirstCharPosition => {
-                todo!()
-            }
-            MotionCommand::GotoCharPosition => {
-                todo!()
-            }
-            MotionCommand::MoveToBeforeFirstChar(_) => {
-                todo!()
-            }
-            MotionCommand::MoveToBeforeFirstCharReverse(_) => {
-                todo!()
-            }
-            MotionCommand::MoveToAfterFirstChar(_) => {
-                todo!()
-            }
-            MotionCommand::MoveToAfterFirstCharReverse(_) => {
-                todo!()
-            }
-            MotionCommand::RepeatLastMoveToChar => {
-                todo!()
-            }
-            MotionCommand::RepeatLastMoveToCharReverse => {
-                todo!()
-            }
-        }
-    }
-
     pub fn current_line(&self) -> Vec<u8> {
         let mut result = Vec::new();
         result.extend_from_slice(b"\r\x1b[K");
         result.extend_from_slice(&self.edit_line);
         result.extend_from_slice(b"\x1b[");
-        result.extend_from_slice((self.cursor_position + 1).to_string().as_bytes());
+        result.extend_from_slice((self.cursor.position + 1).to_string().as_bytes());
         result.push(b'G');
         result
     }
@@ -400,13 +213,14 @@ impl ViEditor {
                     b'\x1B' => {
                         // escape
                         self.mode = EditorMode::Command;
+                        self.cursor.position = self.cursor.position.min(self.edit_line.len() - 1);
                     }
                     b'\x7F' => {
                         // delete
                         if !self.edit_line.is_empty() {
-                            if self.cursor_position != 0 {
-                                self.edit_line.remove(self.cursor_position - 1);
-                                self.cursor_position -= 1;
+                            if self.cursor.position != 0 {
+                                self.edit_line.remove(self.cursor.position - 1);
+                                self.cursor.position -= 1;
                             }
                         }
                     }
@@ -419,12 +233,12 @@ impl ViEditor {
                     }
                     b'\x17' => {}
                     other if !other.is_ascii_control() => {
-                        if self.cursor_position < self.edit_line.len() {
-                            self.edit_line.insert(self.cursor_position, other);
+                        if self.cursor.position < self.edit_line.len() {
+                            self.edit_line.insert(self.cursor.position, other);
                         } else {
                             self.edit_line.push(other);
                         }
-                        self.cursor_position += 1;
+                        self.cursor.position += 1;
                     }
                     _ => {}
                 }
@@ -435,8 +249,10 @@ impl ViEditor {
                     self.input_buffer.clear();
                     match command.op {
                         CommandOp::Move(motion) => {
-                            self.cursor_position =
-                                self.new_cursor_position(motion, command.count)?;
+                            self.cursor = self
+                                .cursor
+                                .moved(&self.edit_line, motion, command.count)
+                                .map_err(|_| CommandError)?;
                         }
                         CommandOp::Execute => {}
                         CommandOp::Redraw => {}
@@ -491,7 +307,7 @@ impl Default for ViEditor {
         Self {
             mode: EditorMode::Insert,
             input_buffer: Vec::new(),
-            cursor_position: 0,
+            cursor: Cursor::default(),
             edit_line: Vec::new(),
         }
     }

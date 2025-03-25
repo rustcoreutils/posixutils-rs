@@ -51,7 +51,7 @@ impl<I: Iterator<Item = u8>> BaseIter<I> {
 }
 
 fn next_start<I: Iterator<Item = Range>>(mut iter: I, len: usize, count: usize) -> usize {
-    if let Some(word_span) = iter.nth(count - 1) {
+    if let Some(word_span) = iter.nth(count) {
         if word_span.start == 0 {
             iter.next().map(|span| span.start).unwrap_or(len)
         } else {
@@ -63,7 +63,7 @@ fn next_start<I: Iterator<Item = Range>>(mut iter: I, len: usize, count: usize) 
 }
 
 fn current_end<I: Iterator<Item = Range>>(mut iter: I, len: usize, count: usize) -> usize {
-    if let Some(word_span) = iter.nth(count - 1) {
+    if let Some(word_span) = iter.nth(count) {
         word_span.end
     } else {
         len
@@ -232,9 +232,9 @@ mod tests {
 
     #[test]
     fn get_next_word_start() {
-        assert_eq!(next_word_start(b"  test", 1), 2);
-        assert_eq!(next_word_start(b"this is", 1), 5);
-        assert_eq!(next_word_start(b"this(&& a test", 3), 8);
+        assert_eq!(next_word_start(b"  test", 0), 2);
+        assert_eq!(next_word_start(b"this is", 0), 5);
+        assert_eq!(next_word_start(b"this(&& a test", 2), 8);
     }
 
     #[test]
@@ -249,8 +249,8 @@ mod tests {
 
     #[test]
     fn get_next_bigword_start() {
-        assert_eq!(next_bigword_start(b"  test", 1), 2);
-        assert_eq!(next_bigword_start(b"this&& is", 1), 7);
-        assert_eq!(next_bigword_start(b"this(&& a test", 3), 10);
+        assert_eq!(next_bigword_start(b"  test", 0), 2);
+        assert_eq!(next_bigword_start(b"this&& is", 0), 7);
+        assert_eq!(next_bigword_start(b"this(&& a test", 2), 10);
     }
 }

@@ -287,6 +287,9 @@ impl ViEditor {
             CommandOp::Execute => {
                 let mut result = Vec::new();
                 std::mem::swap(&mut result, &mut self.edit_line);
+                result.push(b'\n');
+                self.mode = EditorMode::Insert;
+                self.cursor.position = 0;
                 return Ok(Action::Execute(result));
             }
             CommandOp::Redraw => return Ok(Action::Redraw),
@@ -570,21 +573,25 @@ impl ViEditor {
         Ok(Action::None)
     }
 
-    pub fn current_line(&self) -> Vec<u8> {
-        let mut result = Vec::new();
-        result.extend_from_slice(b"\r\x1b[K");
-        result.extend_from_slice(&self.edit_line);
-        result.extend_from_slice(b"\x1b[");
-        result.extend_from_slice((self.cursor.position + 1).to_string().as_bytes());
-        result.push(b'G');
-        result
+    pub fn current_line(&self) -> &[u8] {
+        &self.edit_line
+    }
+
+    pub fn cursor_position(&self) -> usize {
+        self.cursor.position
     }
 
     pub fn process_new_input(&mut self, c: u8, shell: &mut Shell) -> Result<Action, CommandError> {
         match self.mode {
             EditorMode::Insert | EditorMode::Replace => {
                 match c {
-                    b'\n' => {}
+                    b'\x0D' => {
+                        let mut result = Vec::new();
+                        std::mem::swap(&mut result, &mut self.edit_line);
+                        result.push(b'\n');
+                        self.cursor.position = 0;
+                        return Ok(Action::Execute(result));
+                    }
                     b'\x1B' => {
                         // escape
                         self.mode = EditorMode::Command;

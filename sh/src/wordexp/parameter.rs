@@ -366,7 +366,8 @@ mod tests {
             false,
             false,
             shell,
-        );
+        )
+        .unwrap();
         expanded_word.to_string()
     }
 
@@ -383,7 +384,8 @@ mod tests {
             inside_double_quotes,
             field_splitting_will_be_performed,
             shell,
-        );
+        )
+        .unwrap();
         expanded_word
     }
 

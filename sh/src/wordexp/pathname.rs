@@ -186,12 +186,12 @@ pub mod tests {
     }
 
     #[derive(Default)]
-    pub struct TestFileSystem {
+    struct TestFileSystem {
         root: Directory,
     }
 
     impl TestFileSystem {
-        pub fn get_dir(&self, path: &Path) -> Option<&Directory> {
+        fn get_dir(&self, path: &Path) -> Option<&Directory> {
             let mut current_dir = &self.root;
             for entry in path.into_iter() {
                 let next_dir_name = entry.to_str().unwrap();
@@ -205,7 +205,7 @@ pub mod tests {
             Some(current_dir)
         }
 
-        pub fn add_file(mut self, path: &str) -> Self {
+        fn add_file(mut self, path: &str) -> Self {
             let path = PathBuf::from(path);
             let mut current_dir = &mut self.root;
             if let Some(file_path) = path.parent() {

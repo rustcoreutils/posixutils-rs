@@ -274,14 +274,7 @@ impl Shell {
         match fork()? {
             ForkResult::Child => {
                 self.signal_manager.reset();
-                let flags =
-                    nix::fcntl::fcntl(libc::STDIN_FILENO, nix::fcntl::FcntlArg::F_GETFL).unwrap();
-                let new_flags = flags & !nix::fcntl::OFlag::O_NONBLOCK.bits();
-                nix::fcntl::fcntl(
-                    libc::STDIN_FILENO,
-                    nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::from_bits_truncate(new_flags)),
-                )
-                .unwrap();
+                self.terminal.reset();
                 match exec(command.clone(), args, &opened_files, &self.environment).unwrap_err() {
                     ExecError::OsError(err) => {
                         self.eprint(&format!("{err}\n"));

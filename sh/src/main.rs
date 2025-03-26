@@ -47,20 +47,19 @@ fn execute_string(string: &str, shell: &mut Shell) {
     }
 }
 
-fn print_line(line: &[u8], shell: &mut Shell, print_ps2: bool) {
+fn print_line(line: &[u8], mut cursor_position: usize, shell: &mut Shell, print_ps2: bool) {
     clear_line();
-    let mut cursor_pos = line.len();
     if print_ps2 {
         let ps2 = shell.get_ps2();
         print!("{}", ps2);
-        cursor_pos += ps2.len();
+        cursor_position += ps2.len();
     } else {
         let ps1 = shell.get_ps1();
         print!("{}", ps1);
-        cursor_pos += ps1.len();
+        cursor_position += ps1.len();
     }
     std::io::stdout().write(&line).unwrap();
-    set_cursor_pos(cursor_pos);
+    set_cursor_pos(cursor_position);
     io::stdout().flush().unwrap();
 }
 
@@ -117,7 +116,7 @@ fn standard_repl(shell: &mut Shell) {
                 }
                 _ => {}
             }
-            print_line(&buffer, shell, print_ps2);
+            print_line(&buffer, buffer.len(), shell, print_ps2);
         }
         std::thread::sleep(Duration::from_millis(16));
         shell.update_global_state();
@@ -173,7 +172,12 @@ fn vi_repl(shell: &mut Shell) {
                 Ok(Action::None) => {}
                 Err(_) => {}
             }
-            print_line(&buffer, shell, print_ps2);
+            print_line(
+                &editor.current_line(),
+                editor.cursor_position(),
+                shell,
+                print_ps2,
+            );
         }
         std::thread::sleep(Duration::from_millis(16));
         shell.update_global_state();

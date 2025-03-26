@@ -8,11 +8,11 @@
 //
 
 use crate::cli::args::{parse_args, ExecutionMode};
+use crate::cli::terminal::is_attached_to_terminal;
 use crate::cli::{clear_line, set_cursor_pos};
 use crate::shell::Shell;
 use crate::signals::setup_signal_handling;
 use crate::utils::is_process_in_foreground;
-use atty::Stream;
 use cli::terminal::read_nonblocking_char;
 use cli::vi::{Action, ViEditor};
 use nix::sys::signal::{sigaction, SaFlags, SigAction, SigSet};
@@ -222,8 +222,7 @@ fn interactive_shell(shell: &mut Shell) {
 }
 
 fn main() {
-    let is_attached_to_terminal = atty::is(Stream::Stdin) && atty::is(Stream::Stdout);
-    let args = parse_args(std::env::args().collect(), is_attached_to_terminal).unwrap();
+    let args = parse_args(std::env::args().collect(), is_attached_to_terminal()).unwrap();
     let mut shell = Shell::initialize_from_system(
         args.program_name,
         args.arguments,

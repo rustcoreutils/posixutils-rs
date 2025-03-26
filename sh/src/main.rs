@@ -95,6 +95,7 @@ fn standard_repl(shell: &mut Shell) {
                         }
                     };
                     print!("\n");
+                    shell.terminal.reset();
                     match shell.execute_program(program_string) {
                         Ok(_) => {
                             buffer.clear();
@@ -110,6 +111,7 @@ fn standard_repl(shell: &mut Shell) {
                             }
                         }
                     }
+                    shell.terminal.set_nonblocking_no_echo();
                 }
                 other if !other.is_ascii_control() => {
                     buffer.push(other);
@@ -150,6 +152,7 @@ fn vi_repl(shell: &mut Shell) {
                         }
                     };
                     print!("\n");
+                    shell.terminal.reset();
                     match shell.execute_program(program_string) {
                         Ok(_) => {
                             buffer.clear();
@@ -164,6 +167,7 @@ fn vi_repl(shell: &mut Shell) {
                             }
                         }
                     }
+                    shell.terminal.set_nonblocking_no_echo();
                 }
                 Ok(Action::Eof) => shell.exit(shell.last_pipeline_exit_status),
                 Ok(Action::Redraw) => {

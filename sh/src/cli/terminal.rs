@@ -23,7 +23,8 @@ impl Terminal {
     }
 
     /// Doesn't do anything if the current process is not attached to a terminal.
-    pub fn reset(&self) {
+    pub fn reset(&self) -> Termios {
+        let current = termios::tcgetattr(io::stdin().as_fd()).unwrap();
         if let Some(base_settings) = &self.base_settings {
             termios::tcsetattr(
                 io::stdin().as_fd(),
@@ -32,6 +33,11 @@ impl Terminal {
             )
             .unwrap();
         }
+        current
+    }
+
+    pub fn set(&self, settings: Termios) {
+        termios::tcsetattr(io::stdin().as_fd(), termios::SetArg::TCSANOW, &settings).unwrap();
     }
 }
 

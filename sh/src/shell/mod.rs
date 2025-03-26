@@ -267,7 +267,6 @@ impl Shell {
 
     pub fn exec(&mut self, command: OsString, args: &[String], opened_files: &OpenedFiles) -> ! {
         self.signal_manager.reset();
-        self.terminal.reset();
         match exec(command.clone(), args, &opened_files, &self.environment).unwrap_err() {
             ExecError::OsError(err) => {
                 self.eprint(&format!("{err}\n"));

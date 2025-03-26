@@ -1,5 +1,5 @@
-use crate::wordexp::pattern::parse::{parse_pattern, PatternItem};
-use crate::wordexp::pattern::regex::{parsed_pattern_to_regex, Regex};
+use crate::pattern::parse::{parse_pattern, PatternItem};
+use crate::pattern::regex::{parsed_pattern_to_regex, Regex};
 use crate::wordexp::ExpandedWord;
 use std::ffi::{CStr, CString};
 

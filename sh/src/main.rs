@@ -28,6 +28,7 @@ mod jobs;
 mod nonempty;
 mod option_parser;
 mod parse;
+pub mod pattern;
 mod shell;
 mod signals;
 mod utils;

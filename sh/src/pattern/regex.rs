@@ -1,6 +1,4 @@
-use crate::wordexp::pattern::parse::{
-    BracketExpression, BracketItem, PatternItem, RangeEndpoint,
-};
+use crate::pattern::parse::{BracketExpression, BracketItem, PatternItem, RangeEndpoint};
 use core::fmt;
 use nix::libc;
 use std::ffi::{CStr, CString};

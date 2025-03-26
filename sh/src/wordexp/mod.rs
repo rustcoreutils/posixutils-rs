@@ -1,10 +1,10 @@
 use crate::parse::word::{Word, WordPart};
+use crate::pattern::{FilenamePattern, Pattern};
 use crate::shell::{CommandExecutionError, Shell};
 use crate::wordexp::arithmetic::expand_arithmetic_expression_into;
-use crate::wordexp::expanded_word::{ExpandedWord, ExpandedWordPart};
+pub(crate) use crate::wordexp::expanded_word::{ExpandedWord, ExpandedWordPart};
 use crate::wordexp::parameter::expand_parameter_into;
 use crate::wordexp::pathname::glob;
-use crate::wordexp::pattern::{FilenamePattern, Pattern};
 use crate::wordexp::tilde::tilde_expansion;
 use std::path::Path;
 
@@ -12,7 +12,6 @@ mod arithmetic;
 pub mod expanded_word;
 mod parameter;
 pub mod pathname;
-pub mod pattern;
 mod tilde;
 
 pub type ExpansionResult<T> = Result<T, CommandExecutionError>;

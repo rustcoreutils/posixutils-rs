@@ -2,20 +2,30 @@ use plib::testing::{run_test, run_test_with_checker, TestPlan};
 use std::process::Output;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-static SET_TEST_VARS: AtomicBool = AtomicBool::new(true);
+static SETTING_TEST_VARS: AtomicBool = AtomicBool::new(false);
+static TEST_VARS_ARE_SET: AtomicBool = AtomicBool::new(false);
 
 fn set_env_vars() {
-    if SET_TEST_VARS.load(Ordering::SeqCst) {
+    if SETTING_TEST_VARS
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
         let current_dir = std::env::current_dir().unwrap();
         let base_dir = if current_dir.ends_with("sh") {
             current_dir.join("tests")
         } else {
             current_dir.join("sh/tests")
         };
-        std::env::set_var("TEST_READ_DIR", base_dir.join("read_dir"));
-        std::env::set_var("TEST_WRITE_DIR", base_dir.join("write_dir"));
-        SET_TEST_VARS.store(false, Ordering::SeqCst);
+        let read_dir = base_dir.join("read_dir");
+        let write_dir = base_dir.join("write_dir");
+        if !write_dir.exists() {
+            std::fs::create_dir(&write_dir).expect("failed to create write_dir");
+        }
+        std::env::set_var("TEST_READ_DIR", read_dir);
+        std::env::set_var("TEST_WRITE_DIR", write_dir);
+        TEST_VARS_ARE_SET.store(true, Ordering::SeqCst);
     }
+    while !TEST_VARS_ARE_SET.load(Ordering::SeqCst) {}
 }
 
 fn run_script_with_checker<F: Fn(&Output)>(script: &str, checker: F) {
@@ -807,7 +817,6 @@ mod redirection {
         run_script_with_checker(
             r#"
             set -o noclobber
-            mkdir -p tests/write_dir
             cd $TEST_WRITE_DIR
             echo test1 > standard_output_redirection_fails_with_noclobber_set.txt
             echo test2 > standard_output_redirection_fails_with_noclobber_set.txt

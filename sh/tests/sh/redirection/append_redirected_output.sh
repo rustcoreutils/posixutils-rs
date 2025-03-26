@@ -1,4 +1,3 @@
-mkdir -p tests/write_dir
 cd $TEST_WRITE_DIR
 
 echo test >>append_redirected_output.txt

@@ -7,14 +7,14 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::cli::{parse_args, ExecutionMode};
+use crate::cli::args::{parse_args, ExecutionMode};
+use crate::cli::{clear_line, set_cursor_pos};
 use crate::shell::Shell;
 use crate::signals::setup_signal_handling;
-use crate::terminal::{clear_line, read_nonblocking_char, set_cursor_pos, set_terminal_raw_mode};
 use crate::utils::is_process_in_foreground;
-use crate::vi::{Action, ViEditor};
 use atty::Stream;
-use nix::libc;
+use cli::terminal::read_nonblocking_char;
+use cli::vi::{Action, ViEditor};
 use nix::sys::signal::{sigaction, SaFlags, SigAction, SigSet};
 use nix::sys::signal::{SigHandler, Signal as NixSignal};
 use std::io;
@@ -30,9 +30,7 @@ mod option_parser;
 mod parse;
 mod shell;
 mod signals;
-mod terminal;
 mod utils;
-mod vi;
 mod wordexp;
 
 fn execute_string(string: &str, shell: &mut Shell) {
@@ -50,30 +48,67 @@ fn execute_string(string: &str, shell: &mut Shell) {
 }
 
 fn standard_repl(shell: &mut Shell) {
-    let mut buffer = String::new();
+    let mut buffer = Vec::new();
+    let mut print_ps2 = false;
     clear_line();
     io::stdout().flush().unwrap();
     eprint!("{}", shell.get_ps1());
     loop {
-        while io::stdin().read_line(&mut buffer).is_ok_and(|n| n > 0) {
-            if buffer.ends_with("\\\n") {
-                continue;
-            }
-            match shell.execute_program(&buffer) {
-                Ok(_) => {
-                    buffer.clear();
-                    eprint!("{}", shell.get_ps1());
-                }
-                Err(syntax_err) => {
-                    if !syntax_err.could_be_resolved_with_more_input {
-                        eprintln!("sh: syntax error: {}", syntax_err.message);
-                        buffer.clear();
-                        eprint!("{}", shell.get_ps1());
-                    } else {
-                        eprint!("{}", shell.get_ps2());
+        while let Some(c) = read_nonblocking_char() {
+            let ps1 = shell.get_ps1();
+            let ps2 = shell.get_ps2();
+            match c {
+                b'\x7F' => {
+                    if !buffer.is_empty() {
+                        buffer.pop();
                     }
                 }
+                b'\n' => {
+                    buffer.push(b'\n');
+                    if buffer.ends_with(b"\\\n") {
+                        continue;
+                    }
+                    let program_string = match std::str::from_utf8(&buffer) {
+                        Ok(buf) => buf,
+                        Err(_) => {
+                            eprintln!("sh: invalid utf-8 sequence");
+                            buffer.clear();
+                            continue;
+                        }
+                    };
+                    print!("\n");
+                    match shell.execute_program(program_string) {
+                        Ok(_) => {
+                            buffer.clear();
+                            print_ps2 = false;
+                        }
+                        Err(syntax_err) => {
+                            if !syntax_err.could_be_resolved_with_more_input {
+                                eprintln!("sh: syntax error: {}", syntax_err.message);
+                                buffer.clear();
+                                print_ps2 = false;
+                            } else {
+                                print_ps2 = true;
+                            }
+                        }
+                    }
+                }
+                other => {
+                    buffer.push(other);
+                }
             }
+            clear_line();
+            let mut cursor_pos = buffer.len();
+            if print_ps2 {
+                print!("{}", ps2);
+                cursor_pos += ps2.len();
+            } else {
+                print!("{}", ps1);
+                cursor_pos += ps1.len();
+            }
+            std::io::stdout().write(&buffer).unwrap();
+            set_cursor_pos(cursor_pos);
+            io::stdout().flush().unwrap();
         }
         std::thread::sleep(Duration::from_millis(16));
         shell.update_global_state();
@@ -85,7 +120,6 @@ fn standard_repl(shell: &mut Shell) {
 
 fn vi_repl(shell: &mut Shell) {
     let mut editor = ViEditor::default();
-    set_terminal_raw_mode();
     let mut buffer = Vec::new();
     let mut print_ps2 = false;
     clear_line();
@@ -158,11 +192,7 @@ fn interactive_shell(shell: &mut Shell) {
         let pgid = nix::unistd::getpgrp();
         nix::unistd::tcsetpgrp(io::stdin().as_fd(), pgid).unwrap();
     }
-    nix::fcntl::fcntl(
-        libc::STDIN_FILENO,
-        nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
-    )
-    .unwrap();
+    shell.terminal.set_nonblocking_no_echo();
     let ignore_action = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
     unsafe {
         sigaction(NixSignal::SIGQUIT, &ignore_action).unwrap();

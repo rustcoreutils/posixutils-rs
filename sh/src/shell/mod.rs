@@ -3,6 +3,7 @@ use crate::builtin::trap::TrapAction;
 use crate::builtin::{
     get_builtin_utility, get_special_builtin_utility, BuiltinUtility, SpecialBuiltinUtility,
 };
+use crate::cli::terminal::Terminal;
 use crate::jobs::{JobManager, JobState};
 use crate::nonempty::NonEmpty;
 use crate::parse::command::{
@@ -169,6 +170,7 @@ pub struct Shell {
     pub saved_command_locations: HashMap<String, OsString>,
     pub is_subshell: bool,
     pub last_pipeline_command: String,
+    pub terminal: Terminal,
 }
 
 impl Shell {
@@ -1015,6 +1017,7 @@ impl Default for Shell {
             saved_command_locations: HashMap::new(),
             is_subshell: false,
             last_pipeline_command: String::new(),
+            terminal: Terminal::default(),
         }
     }
 }

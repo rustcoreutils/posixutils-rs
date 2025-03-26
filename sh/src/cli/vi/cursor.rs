@@ -1,5 +1,7 @@
-use crate::vi::word::{current_bigword_end, current_word_end, next_bigword_start, next_word_start};
-use crate::vi::CommandParseError;
+use crate::cli::vi::word::{
+    current_bigword_end, current_word_end, next_bigword_start, next_word_start,
+};
+use crate::cli::vi::CommandParseError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MotionCommand {

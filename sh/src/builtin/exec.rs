@@ -1,7 +1,6 @@
 use crate::builtin::{skip_option_terminator, BuiltinResult, SpecialBuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
-use crate::utils::{exec, find_command, ExecError};
 
 pub struct Exec;
 

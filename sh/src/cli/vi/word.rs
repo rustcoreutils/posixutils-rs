@@ -1,4 +1,3 @@
-use std::iter::Copied;
 
 fn is_name_char(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_'

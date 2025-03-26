@@ -29,7 +29,7 @@ enum CommandOp {
     /// *
     ExpandAll,
     /// @c
-    Alias(char),
+    Alias(()),
     /// ~
     ChangeCase,
     /// .
@@ -137,7 +137,7 @@ impl Command {
             b'=' => CommandOp::DisplayExpansions,
             b'\\' => CommandOp::ExpandUnique,
             b'*' => CommandOp::ExpandAll,
-            b'@' if remaining_bytes.len() > 1 => CommandOp::Alias(remaining_bytes[1] as char),
+            b'@' if remaining_bytes.len() > 1 => CommandOp::Alias(()),
             b'@' => return Err(CommandParseError::IncompleteCommand),
             b'~' => CommandOp::ChangeCase,
             b'.' => CommandOp::RepeatLast,

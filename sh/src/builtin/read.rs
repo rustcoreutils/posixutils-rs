@@ -6,7 +6,6 @@ use crate::wordexp::expanded_word::ExpandedWord;
 use crate::wordexp::split_fields;
 use atty::Stream;
 use nix::errno::Errno;
-use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::Duration;
 

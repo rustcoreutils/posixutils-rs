@@ -209,6 +209,46 @@ impl TryFrom<String> for FilenamePattern {
     }
 }
 
+pub struct HistoryPattern {
+    regex: Regex,
+    match_only_at_line_start: bool,
+}
+
+impl HistoryPattern {
+    pub fn new(pattern: String) -> Result<Option<Self>, ()> {
+        let parsed_pattern =
+            parse_pattern(&ExpandedWord::unquoted_literal(pattern), false).map_err(|_| ())?;
+        if parsed_pattern.is_empty() {
+            return Ok(None);
+        }
+        if parsed_pattern[0] == PatternItem::Char('^') {
+            let regex = parsed_pattern_to_regex(&parsed_pattern[1..]).map_err(|_| ())?;
+            Ok(Some(Self {
+                regex,
+                match_only_at_line_start: true,
+            }))
+        } else {
+            let regex = parsed_pattern_to_regex(&parsed_pattern).map_err(|_| ())?;
+            Ok(Some(Self {
+                regex,
+                match_only_at_line_start: false,
+            }))
+        }
+    }
+
+    pub fn matches(&self, s: &str) -> bool {
+        if let Ok(s_cstr) = CString::new(s) {
+            if let Some(first_match) = self.regex.match_locations(&s_cstr).next() {
+                if self.match_only_at_line_start && first_match.start != 0 {
+                    return false;
+                }
+                return true;
+            }
+        }
+        false
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -316,5 +356,17 @@ pub mod tests {
         // the standard leaves this case to the implementation, here we follow what bash does
         let pattern = filename_pattern_from_str("[.abc]*");
         assert!(!pattern.matches_all(1, &cstring_from_str(".a")));
+    }
+
+    #[test]
+    fn match_history_pattern() {
+        let pattern = HistoryPattern::new("arg".to_string()).unwrap().unwrap();
+        assert!(pattern.matches("cmd arg"));
+
+        let pattern = HistoryPattern::new("^cmd".to_string()).unwrap().unwrap();
+        assert!(pattern.matches("cmd arg"));
+
+        let pattern = HistoryPattern::new("^arg".to_string()).unwrap().unwrap();
+        assert!(!pattern.matches("cmd arg"));
     }
 }

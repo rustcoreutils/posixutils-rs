@@ -1,3 +1,4 @@
+use crate::pattern::HistoryPattern;
 use crate::shell::environment::Environment;
 use std::collections::VecDeque;
 use std::io::Read;
@@ -151,6 +152,27 @@ impl History {
         self.entries
             .get(self.entries.len() - 1 - index)
             .map(|e| e.command.as_str())
+    }
+
+    pub fn find_pattern(
+        &self,
+        pattern: &HistoryPattern,
+        reverse_start: usize,
+        reverse: bool,
+    ) -> Option<usize> {
+        if reverse {
+            self.entries
+                .iter()
+                .rev()
+                .take(reverse_start)
+                .position(|e| pattern.matches(&e.command))
+        } else {
+            self.entries
+                .iter()
+                .rev()
+                .skip(reverse_start)
+                .position(|e| pattern.matches(&e.command))
+        }
     }
 
     pub fn entries_count(&self) -> usize {

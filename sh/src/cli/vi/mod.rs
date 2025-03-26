@@ -4,7 +4,7 @@ mod word;
 use crate::cli::vi::cursor::{Cursor, MotionCommand, MotionError};
 use crate::cli::vi::word::{current_bigword, BigWordIter};
 use crate::parse::word_parser::parse_word;
-use crate::pattern::FilenamePattern;
+use crate::pattern::{FilenamePattern, HistoryPattern};
 use crate::shell::Shell;
 use crate::wordexp::expand_word;
 use crate::wordexp::pathname::glob;
@@ -88,10 +88,8 @@ enum CommandOp {
     NextShellCommand,
     /// G
     OldestShellCommand,
-    /// /*pattern*
-    SearchPattern(()),
-    /// ?*pattern*
-    SearchPatternAfter(()),
+    /// /*pattern* | ?*pattern*
+    SearchPattern { pattern: String, reverse: bool },
     /// n
     RepeatLastSearch,
     /// N
@@ -201,12 +199,23 @@ impl Command {
             b'k' | b'-' => CommandOp::PreviousShellCommand,
             b'j' | b'+' => CommandOp::NextShellCommand,
             b'G' => CommandOp::OldestShellCommand,
-            b'/' if remaining_bytes.len() > 1 => {
-                todo!()
+            b'/' | b'?' if remaining_bytes.len() > 1 => {
+                if *remaining_bytes.last().unwrap() != b'\n' {
+                    return Err(CommandParseError::IncompleteCommand);
+                }
+                let pattern =
+                    String::from_utf8(remaining_bytes[1..remaining_bytes.len() - 1].to_vec())
+                        .map_err(|_| CommandParseError::InvalidCommand)?;
+                if pattern.is_empty() {
+                    CommandOp::RepeatLastSearch
+                } else {
+                    CommandOp::SearchPattern {
+                        pattern,
+                        reverse: remaining_bytes[0] == b'?',
+                    }
+                }
             }
-            b'?' if remaining_bytes.len() > 1 => {
-                todo!()
-            }
+            b'?' | b'/' => return Err(CommandParseError::IncompleteCommand),
             b'n' => CommandOp::RepeatLastSearch,
             b'N' => CommandOp::RepeatLastSearchReverse,
             _ => CommandOp::Move(MotionCommand::parse(remaining_bytes)?),
@@ -260,13 +269,19 @@ fn select_longest_pathname_with_longest_common_prefix(pathnames: Vec<OsString>) 
     add_terminating_slash_if_directory(longest)
 }
 
+struct LastSearch {
+    pattern: HistoryPattern,
+    reverse: bool,
+}
+
 pub struct ViEditor {
     input_buffer: Vec<u8>,
     edit_line: Vec<u8>,
     cursor: Cursor,
     saved_edit_line_position: usize,
     mode: EditorMode,
-    most_recent_nonmotion_command: Option<Command>,
+    last_nonmotion_command: Option<Command>,
+    last_search: Option<LastSearch>,
     save_buffer: Vec<u8>,
     current_command_in_history: usize,
 }
@@ -297,7 +312,7 @@ impl ViEditor {
                 .map_err(|_| CommandError)?;
             return Ok(Action::None);
         }
-        self.most_recent_nonmotion_command = Some(command.clone());
+        self.last_nonmotion_command = Some(command.clone());
         match command.op {
             CommandOp::Execute => {
                 let mut result = self.current_line(shell).to_vec();
@@ -393,7 +408,7 @@ impl ViEditor {
                 }
             }
             CommandOp::RepeatLast => {
-                if let Some(last_command) = &self.most_recent_nonmotion_command {
+                if let Some(last_command) = &self.last_nonmotion_command {
                     return self.execute_command(last_command.clone(), shell);
                 }
             }
@@ -610,6 +625,7 @@ impl ViEditor {
                     return Err(CommandError);
                 }
                 self.current_command_in_history += number;
+                self.cursor.position = 0;
             }
             CommandOp::NextShellCommand => {
                 let number = command.count.unwrap_or(1);
@@ -620,13 +636,68 @@ impl ViEditor {
                 self.current_command_in_history -= number;
                 if self.current_command_in_history == 0 {
                     self.cursor.position = self.saved_edit_line_position;
+                } else {
+                    self.cursor.position = 0;
                 }
             }
-            CommandOp::OldestShellCommand => {}
-            CommandOp::SearchPattern(_) => {}
-            CommandOp::SearchPatternAfter(_) => {}
-            CommandOp::RepeatLastSearch => {}
-            CommandOp::RepeatLastSearchReverse => {}
+            CommandOp::OldestShellCommand => {
+                let number = command.count.unwrap_or(shell.history.entries_count());
+                if self.current_command_in_history == 0 {
+                    self.saved_edit_line_position = self.cursor.position;
+                }
+                if number > self.current_command_in_history {
+                    return Err(CommandError);
+                }
+                self.current_command_in_history = number;
+                self.cursor.position = 0;
+            }
+            CommandOp::SearchPattern { pattern, reverse } => {
+                let history_pattern = HistoryPattern::new(pattern)
+                    .map_err(|_| CommandError)?
+                    .expect("pattern should never be empty");
+                let result = shell.history.find_pattern(
+                    &history_pattern,
+                    self.current_command_in_history,
+                    reverse,
+                );
+                self.last_search = Some(LastSearch {
+                    pattern: history_pattern,
+                    reverse,
+                });
+                if let Some(index) = result {
+                    let index = index + 1;
+                    if self.current_command_in_history == 0 {
+                        self.saved_edit_line_position = self.cursor.position;
+                    }
+                    self.current_command_in_history = index;
+                    self.cursor.position = 0;
+                } else {
+                    return Err(CommandError);
+                }
+            }
+            CommandOp::RepeatLastSearch | CommandOp::RepeatLastSearchReverse => {
+                let last_search = self.last_search.as_ref().ok_or(CommandError)?;
+                let reverse = if let CommandOp::RepeatLastSearchReverse = command.op {
+                    !last_search.reverse
+                } else {
+                    last_search.reverse
+                };
+                let result = shell.history.find_pattern(
+                    &last_search.pattern,
+                    self.current_command_in_history,
+                    reverse,
+                );
+                if let Some(index) = result {
+                    let index = index + 1;
+                    if self.current_command_in_history == 0 {
+                        self.saved_edit_line_position = self.cursor.position;
+                    }
+                    self.current_command_in_history = index;
+                    self.cursor.position = 0;
+                } else {
+                    return Err(CommandError);
+                }
+            }
             CommandOp::Move(_) => unreachable!(),
         }
         Ok(Action::None)
@@ -723,7 +794,8 @@ impl Default for ViEditor {
             edit_line: Vec::new(),
             cursor: Cursor::default(),
             saved_edit_line_position: 0,
-            most_recent_nonmotion_command: None,
+            last_nonmotion_command: None,
+            last_search: None,
             save_buffer: Vec::new(),
             current_command_in_history: 0,
         }

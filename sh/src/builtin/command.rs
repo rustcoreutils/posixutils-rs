@@ -107,7 +107,7 @@ impl BuiltinUtility for Command {
             } else if let Some(command) = shell.find_command(args.command_name, default_path, true)
             {
                 return shell
-                    .exec(command, args.args, opened_files)
+                    .fork_and_exec(command, args.args, opened_files)
                     .map_err(BuiltinError::OsError);
             }
             return Err(format!("command: {} not found", args.command_name).into());

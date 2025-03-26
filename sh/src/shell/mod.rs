@@ -265,45 +265,47 @@ impl Shell {
         }
     }
 
-    pub fn exec(
+    pub fn exec(&mut self, command: OsString, args: &[String], opened_files: &OpenedFiles) -> ! {
+        self.signal_manager.reset();
+        self.terminal.reset();
+        match exec(command.clone(), args, &opened_files, &self.environment).unwrap_err() {
+            ExecError::OsError(err) => {
+                self.eprint(&format!("{err}\n"));
+                self.exit(1)
+            }
+            ExecError::CannotExecute(errno) => {
+                if errno == Errno::ENOEXEC {
+                    match execute_file_as_script(self, Path::new(&command)) {
+                        Ok(status) => self.exit(status),
+                        Err(ScriptExecutionError::ParsingError(err)) => {
+                            self.eprint(&format!(
+                                "sh: parsing error ({}): {}\n",
+                                err.lineno, err.message
+                            ));
+                            self.exit(2)
+                        }
+                        Err(ScriptExecutionError::IoError(_)) => {
+                            // fallthrough to the default error
+                        }
+                    }
+                }
+                self.eprint(&format!(
+                    "sh: failed to execute {}\n",
+                    command.to_string_lossy()
+                ));
+                self.exit(126);
+            }
+        }
+    }
+
+    pub fn fork_and_exec(
         &mut self,
         command: OsString,
         args: &[String],
         opened_files: &OpenedFiles,
     ) -> OsResult<i32> {
         match fork()? {
-            ForkResult::Child => {
-                self.signal_manager.reset();
-                self.terminal.reset();
-                match exec(command.clone(), args, &opened_files, &self.environment).unwrap_err() {
-                    ExecError::OsError(err) => {
-                        self.eprint(&format!("{err}\n"));
-                        self.exit(1)
-                    }
-                    ExecError::CannotExecute(errno) => {
-                        if errno == Errno::ENOEXEC {
-                            match execute_file_as_script(self, Path::new(&command)) {
-                                Ok(status) => self.exit(status),
-                                Err(ScriptExecutionError::ParsingError(err)) => {
-                                    self.eprint(&format!(
-                                        "sh: parsing error ({}): {}\n",
-                                        err.lineno, err.message
-                                    ));
-                                    self.exit(2)
-                                }
-                                Err(ScriptExecutionError::IoError(_)) => {
-                                    // fallthrough to the default error
-                                }
-                            }
-                        }
-                        self.eprint(&format!(
-                            "sh: failed to execute {}\n",
-                            command.to_string_lossy()
-                        ));
-                        self.exit(126);
-                    }
-                }
-            }
+            ForkResult::Child => self.exec(command, args, opened_files),
             ForkResult::Parent { child } => self.wait_child_process(child),
         }
     }
@@ -508,7 +510,7 @@ impl Shell {
             let mut opened_files = self.opened_files.clone();
             opened_files.redirect(&simple_command.redirections, self)?;
             let result = self
-                .exec(command, &expanded_words, &opened_files)
+                .fork_and_exec(command, &expanded_words, &opened_files)
                 .map_err(|err| err.into());
             self.environment.pop_scope();
             result

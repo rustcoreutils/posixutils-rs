@@ -170,7 +170,9 @@ fn vi_repl(shell: &mut Shell) {
                     // nothing, we redraw anyway
                 }
                 Ok(Action::None) => {}
-                Err(_) => {}
+                Err(_) => {
+                    print!("\x07");
+                }
             }
             print_line(
                 &editor.current_line(),

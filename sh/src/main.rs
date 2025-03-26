@@ -47,6 +47,23 @@ fn execute_string(string: &str, shell: &mut Shell) {
     }
 }
 
+fn print_line(line: &[u8], shell: &mut Shell, print_ps2: bool) {
+    clear_line();
+    let mut cursor_pos = line.len();
+    if print_ps2 {
+        let ps2 = shell.get_ps2();
+        print!("{}", ps2);
+        cursor_pos += ps2.len();
+    } else {
+        let ps1 = shell.get_ps1();
+        print!("{}", ps1);
+        cursor_pos += ps1.len();
+    }
+    std::io::stdout().write(&line).unwrap();
+    set_cursor_pos(cursor_pos);
+    io::stdout().flush().unwrap();
+}
+
 fn standard_repl(shell: &mut Shell) {
     let mut buffer = Vec::new();
     let mut print_ps2 = false;
@@ -55,8 +72,6 @@ fn standard_repl(shell: &mut Shell) {
     eprint!("{}", shell.get_ps1());
     loop {
         while let Some(c) = read_nonblocking_char() {
-            let ps1 = shell.get_ps1();
-            let ps2 = shell.get_ps2();
             match c {
                 b'\x7F' => {
                     if !buffer.is_empty() {
@@ -97,18 +112,7 @@ fn standard_repl(shell: &mut Shell) {
                     buffer.push(other);
                 }
             }
-            clear_line();
-            let mut cursor_pos = buffer.len();
-            if print_ps2 {
-                print!("{}", ps2);
-                cursor_pos += ps2.len();
-            } else {
-                print!("{}", ps1);
-                cursor_pos += ps1.len();
-            }
-            std::io::stdout().write(&buffer).unwrap();
-            set_cursor_pos(cursor_pos);
-            io::stdout().flush().unwrap();
+            print_line(&buffer, shell, print_ps2);
         }
         std::thread::sleep(Duration::from_millis(16));
         shell.update_global_state();
@@ -126,8 +130,6 @@ fn vi_repl(shell: &mut Shell) {
     io::stdout().flush().unwrap();
     eprint!("{}", shell.get_ps1());
     'outer: loop {
-        let ps1 = shell.get_ps1();
-        let ps2 = shell.get_ps2();
         while let Some(c) = read_nonblocking_char() {
             match editor.process_new_input(c, shell) {
                 Ok(Action::Execute(command)) => {
@@ -166,18 +168,7 @@ fn vi_repl(shell: &mut Shell) {
                 Ok(Action::None) => {}
                 Err(_) => {}
             }
-            clear_line();
-            let mut cursor_pos = editor.cursor_position();
-            if print_ps2 {
-                print!("{}", ps2);
-                cursor_pos += ps2.len();
-            } else {
-                print!("{}", ps1);
-                cursor_pos += ps1.len();
-            }
-            std::io::stdout().write(&editor.current_line()).unwrap();
-            set_cursor_pos(cursor_pos);
-            io::stdout().flush().unwrap();
+            print_line(&buffer, shell, print_ps2);
         }
         std::thread::sleep(Duration::from_millis(16));
         shell.update_global_state();

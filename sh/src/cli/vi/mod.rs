@@ -300,11 +300,12 @@ impl ViEditor {
         self.most_recent_nonmotion_command = Some(command.clone());
         match command.op {
             CommandOp::Execute => {
-                let mut result = Vec::new();
-                std::mem::swap(&mut result, &mut self.edit_line);
+                let mut result = self.current_line(shell).to_vec();
                 result.push(b'\n');
                 self.mode = EditorMode::Insert;
                 self.cursor.position = 0;
+                self.current_command_in_history = 0;
+                self.edit_line.clear();
                 return Ok(Action::Execute(result));
             }
             CommandOp::Redraw => return Ok(Action::Redraw),

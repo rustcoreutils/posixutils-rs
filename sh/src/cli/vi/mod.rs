@@ -609,10 +609,7 @@ impl ViEditor {
                             }
                         }
                     }
-                    b'\x04' => {
-                        // TODO: EOF
-                        println!("EOF")
-                    }
+                    b'\x04' => return Ok(Action::Eof),
                     b'\x16' => {
                         // ^V
                     }

@@ -78,6 +78,10 @@ fn standard_repl(shell: &mut Shell) {
                         buffer.pop();
                     }
                 }
+                b'\x04' => {
+                    // EOF
+                    shell.exit(shell.last_pipeline_exit_status);
+                }
                 b'\n' => {
                     buffer.push(b'\n');
                     if buffer.ends_with(b"\\\n") {
@@ -129,7 +133,7 @@ fn vi_repl(shell: &mut Shell) {
     clear_line();
     io::stdout().flush().unwrap();
     eprint!("{}", shell.get_ps1());
-    'outer: loop {
+    loop {
         while let Some(c) = read_nonblocking_char() {
             match editor.process_new_input(c, shell) {
                 Ok(Action::Execute(command)) => {
@@ -161,7 +165,7 @@ fn vi_repl(shell: &mut Shell) {
                         }
                     }
                 }
-                Ok(Action::Eof) => break 'outer,
+                Ok(Action::Eof) => shell.exit(shell.last_pipeline_exit_status),
                 Ok(Action::Redraw) => {
                     todo!()
                 }

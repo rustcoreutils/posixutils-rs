@@ -602,11 +602,9 @@ impl ViEditor {
                     }
                     b'\x7F' => {
                         // delete
-                        if !self.edit_line.is_empty() {
-                            if self.cursor.position != 0 {
-                                self.edit_line.remove(self.cursor.position - 1);
-                                self.cursor.position -= 1;
-                            }
+                        if !self.edit_line.is_empty() && self.cursor.position != 0 {
+                            self.edit_line.remove(self.cursor.position - 1);
+                            self.cursor.position -= 1;
                         }
                     }
                     b'\x04' => return Ok(Action::Eof),

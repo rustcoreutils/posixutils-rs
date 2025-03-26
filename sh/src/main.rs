@@ -112,9 +112,10 @@ fn standard_repl(shell: &mut Shell) {
                         }
                     }
                 }
-                other => {
+                other if !other.is_ascii_control() => {
                     buffer.push(other);
                 }
+                _ => {}
             }
             print_line(&buffer, shell, print_ps2);
         }

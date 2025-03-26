@@ -15,8 +15,10 @@ use crate::signals::setup_signal_handling;
 use crate::utils::is_process_in_foreground;
 use cli::terminal::read_nonblocking_char;
 use cli::vi::{Action, ViEditor};
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use nix::sys::signal::{sigaction, SaFlags, SigAction, SigSet};
 use nix::sys::signal::{SigHandler, Signal as NixSignal};
+use std::error::Error;
 use std::io;
 use std::io::Write;
 use std::os::fd::AsFd;
@@ -239,7 +241,11 @@ fn interactive_shell(shell: &mut Shell) {
     }
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn Error>> {
+    setlocale(LocaleCategory::LcAll, "");
+    textdomain("posixutils-rs")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+
     let args = parse_args(std::env::args().collect(), is_attached_to_terminal()).unwrap();
     let mut shell = Shell::initialize_from_system(
         args.program_name,

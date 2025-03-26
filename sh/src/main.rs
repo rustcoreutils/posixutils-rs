@@ -167,7 +167,7 @@ fn vi_repl(shell: &mut Shell) {
                 }
                 Ok(Action::Eof) => shell.exit(shell.last_pipeline_exit_status),
                 Ok(Action::Redraw) => {
-                    todo!()
+                    // nothing, we redraw anyway
                 }
                 Ok(Action::None) => {}
                 Err(_) => {}

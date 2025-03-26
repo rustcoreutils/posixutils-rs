@@ -9,9 +9,9 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::rc::Rc;
 
-const STDIN_FILENO: u32 = libc::STDIN_FILENO as u32;
-const STDOUT_FILENO: u32 = libc::STDOUT_FILENO as u32;
-const STDERR_FILENO: u32 = libc::STDERR_FILENO as u32;
+pub const STDIN_FILENO: u32 = libc::STDIN_FILENO as u32;
+pub const STDOUT_FILENO: u32 = libc::STDOUT_FILENO as u32;
+pub const STDERR_FILENO: u32 = libc::STDERR_FILENO as u32;
 
 pub type RedirectionResult = Result<(), CommandExecutionError>;
 
@@ -195,6 +195,10 @@ impl OpenedFiles {
 
     pub fn write_err<S: AsRef<str>>(&self, string: S) {
         self.write_file(STDERR_FILENO, string.as_ref());
+    }
+
+    pub fn get_file(&self, fileno: u32) -> Option<&OpenedFile> {
+        self.opened_files.get(&fileno)
     }
 }
 

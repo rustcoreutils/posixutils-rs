@@ -1337,4 +1337,12 @@ mod builtin {
             include_str!("sh/builtin/umask.out"),
         )
     }
+
+    #[test]
+    fn read() {
+        test_script(
+            include_str!("sh/builtin/read.sh"),
+            include_str!("sh/builtin/read.out"),
+        );
+    }
 }

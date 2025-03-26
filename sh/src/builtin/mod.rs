@@ -14,6 +14,7 @@ use crate::builtin::getopts::GetOpts;
 use crate::builtin::hash::Hash;
 use crate::builtin::jobs::Jobs;
 use crate::builtin::kill::Kill;
+use crate::builtin::read::BuiltinRead;
 use crate::builtin::readonly::ReadOnly;
 use crate::builtin::set::SetSpecialBuiltin;
 use crate::builtin::shift::Shift;
@@ -50,6 +51,7 @@ mod getopts;
 mod hash;
 mod jobs;
 mod kill;
+mod read;
 mod readonly;
 pub mod set;
 mod shift;
@@ -166,6 +168,7 @@ pub fn get_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
         "bg" => Some(&Bg),
         "fc" => Some(&Fc),
         "hash" => Some(&Hash),
+        "read" => Some(&BuiltinRead),
         "umask" => Some(&Umask),
         "cd" => Some(&Cd),
         "fg" => Some(&Fg),

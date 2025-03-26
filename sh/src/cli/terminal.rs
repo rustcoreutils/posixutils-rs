@@ -22,6 +22,17 @@ impl Terminal {
         termios::tcsetattr(io::stdin().as_fd(), termios::SetArg::TCSANOW, &termios).unwrap();
     }
 
+    /// # Panic
+    /// Panics if the current process is not attached to a terminal.
+    pub fn set_nonblocking(&self) {
+        let mut termios = self.base_settings.clone().unwrap();
+        termios.local_flags &= !LocalFlags::ICANON;
+        termios.control_chars[termios::SpecialCharacterIndices::VMIN as usize] = 0;
+        termios.control_chars[termios::SpecialCharacterIndices::VTIME as usize] = 0;
+
+        termios::tcsetattr(io::stdin().as_fd(), termios::SetArg::TCSANOW, &termios).unwrap();
+    }
+
     /// Doesn't do anything if the current process is not attached to a terminal.
     pub fn reset(&self) -> Termios {
         let current = termios::tcgetattr(io::stdin().as_fd()).unwrap();

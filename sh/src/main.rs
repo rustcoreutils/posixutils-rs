@@ -64,7 +64,8 @@ fn print_line(line: &[u8], mut cursor_position: usize, shell: &mut Shell, print_
 }
 
 fn standard_repl(shell: &mut Shell) {
-    let mut buffer = Vec::new();
+    let mut program_buffer = Vec::new();
+    let mut line_buffer = Vec::new();
     let mut print_ps2 = false;
     clear_line();
     io::stdout().flush().unwrap();
@@ -73,8 +74,8 @@ fn standard_repl(shell: &mut Shell) {
         while let Some(c) = read_nonblocking_char() {
             match c {
                 b'\x7F' => {
-                    if !buffer.is_empty() {
-                        buffer.pop();
+                    if !line_buffer.is_empty() {
+                        line_buffer.pop();
                     }
                 }
                 b'\x04' => {
@@ -82,15 +83,17 @@ fn standard_repl(shell: &mut Shell) {
                     shell.exit(shell.last_pipeline_exit_status);
                 }
                 b'\n' => {
-                    buffer.push(b'\n');
-                    if buffer.ends_with(b"\\\n") {
+                    line_buffer.push(b'\n');
+                    program_buffer.extend(&line_buffer);
+                    line_buffer.clear();
+                    if program_buffer.ends_with(b"\\\n") {
                         continue;
                     }
-                    let program_string = match std::str::from_utf8(&buffer) {
+                    let program_string = match std::str::from_utf8(&program_buffer) {
                         Ok(buf) => buf,
                         Err(_) => {
                             eprintln!("sh: invalid utf-8 sequence");
-                            buffer.clear();
+                            program_buffer.clear();
                             continue;
                         }
                     };
@@ -98,13 +101,13 @@ fn standard_repl(shell: &mut Shell) {
                     shell.terminal.reset();
                     match shell.execute_program(program_string) {
                         Ok(_) => {
-                            buffer.clear();
+                            program_buffer.clear();
                             print_ps2 = false;
                         }
                         Err(syntax_err) => {
                             if !syntax_err.could_be_resolved_with_more_input {
                                 eprintln!("sh: syntax error: {}", syntax_err.message);
-                                buffer.clear();
+                                program_buffer.clear();
                                 print_ps2 = false;
                             } else {
                                 print_ps2 = true;
@@ -114,11 +117,11 @@ fn standard_repl(shell: &mut Shell) {
                     shell.terminal.set_nonblocking_no_echo();
                 }
                 other if !other.is_ascii_control() => {
-                    buffer.push(other);
+                    line_buffer.push(other);
                 }
                 _ => {}
             }
-            print_line(&buffer, buffer.len(), shell, print_ps2);
+            print_line(&line_buffer, line_buffer.len(), shell, print_ps2);
         }
         std::thread::sleep(Duration::from_millis(16));
         shell.update_global_state();

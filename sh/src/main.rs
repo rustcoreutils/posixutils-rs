@@ -178,12 +178,20 @@ fn vi_repl(shell: &mut Shell) {
                     print!("\x07");
                 }
             }
-            print_line(
-                &editor.current_line(),
-                editor.cursor_position(),
-                shell,
-                print_ps2,
-            );
+            let mut cursor_position = editor.cursor_position();
+            clear_line();
+            if print_ps2 {
+                let ps2 = shell.get_ps2();
+                print!("{}", ps2);
+                cursor_position += ps2.len();
+            } else {
+                let ps1 = shell.get_ps1();
+                print!("{}", ps1);
+                cursor_position += ps1.len();
+            }
+            std::io::stdout().write(editor.current_line(shell)).unwrap();
+            set_cursor_pos(cursor_position);
+            io::stdout().flush().unwrap();
         }
         std::thread::sleep(Duration::from_millis(16));
         shell.update_global_state();

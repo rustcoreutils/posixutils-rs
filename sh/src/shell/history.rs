@@ -145,9 +145,16 @@ impl History {
     }
 
     pub fn get_reverse(&self, index: usize) -> Option<&str> {
+        if index >= self.entries.len() {
+            return None;
+        }
         self.entries
-            .get(self.entries.len() - index - 1)
+            .get(self.entries.len() - 1 - index)
             .map(|e| e.command.as_str())
+    }
+
+    pub fn entries_count(&self) -> usize {
+        self.entries.len()
     }
 }
 

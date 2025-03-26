@@ -263,23 +263,56 @@ fn select_longest_pathname_with_longest_common_prefix(pathnames: Vec<OsString>) 
 pub struct ViEditor {
     input_buffer: Vec<u8>,
     edit_line: Vec<u8>,
-    cursor: Cursor,
+    edit_line_cursor: Cursor,
+    history_line_cursor: Cursor,
     mode: EditorMode,
     most_recent_nonmotion_command: Option<Command>,
     save_buffer: Vec<u8>,
+    current_command_in_history: usize,
 }
 
 impl ViEditor {
+    fn edit_current_line(&mut self, shell: &Shell) -> &mut Vec<u8> {
+        if self.current_command_in_history != 0 {
+            self.edit_line = shell
+                .history
+                .get_reverse(self.current_command_in_history - 1)
+                .unwrap()
+                .as_bytes()
+                .to_vec();
+            self.current_command_in_history = 0;
+            self.edit_line_cursor.position = 0;
+        }
+        &mut self.edit_line
+    }
+
+    fn move_current_cursor(
+        &mut self,
+        shell: &Shell,
+        motion: MotionCommand,
+        count: Option<usize>,
+    ) -> Result<(), CommandError> {
+        if self.current_command_in_history != 0 {
+            self.history_line_cursor = self
+                .history_line_cursor
+                .moved(&self.current_line(shell), motion, count)
+                .map_err(|_| CommandError)?;
+        } else {
+            self.edit_line_cursor = self
+                .edit_line_cursor
+                .moved(&self.edit_line, motion, count)
+                .map_err(|_| CommandError)?;
+        }
+        Ok(())
+    }
+
     fn execute_command(
         &mut self,
         command: Command,
         shell: &mut Shell,
     ) -> Result<Action, CommandError> {
         if let CommandOp::Move(motion) = command.op {
-            self.cursor = self
-                .cursor
-                .moved(&self.edit_line, motion, command.count)
-                .map_err(|_| CommandError)?;
+            self.move_current_cursor(shell, motion, command.count)?;
             return Ok(Action::None);
         }
         self.most_recent_nonmotion_command = Some(command.clone());
@@ -289,17 +322,20 @@ impl ViEditor {
                 std::mem::swap(&mut result, &mut self.edit_line);
                 result.push(b'\n');
                 self.mode = EditorMode::Insert;
-                self.cursor.position = 0;
+                self.edit_line_cursor.position = 0;
                 return Ok(Action::Execute(result));
             }
             CommandOp::Redraw => return Ok(Action::Redraw),
             CommandOp::CommentLine => {
-                self.edit_line.insert(0, b'#');
+                self.edit_current_line(shell).insert(0, b'#');
             }
             CommandOp::DisplayExpansions => {
-                if let Some(word_range) = current_bigword(&self.edit_line, self.cursor.position) {
+                let current_line = self.current_line(shell);
+                if let Some(word_range) =
+                    current_bigword(current_line, self.edit_line_cursor.position)
+                {
                     let word =
-                        into_expansion_word(&self.edit_line[word_range.start..word_range.end])?;
+                        into_expansion_word(&current_line[word_range.start..word_range.end])?;
                     let parsed_word = parse_word(&word, 0, false).map_err(|_| CommandError)?;
                     let expansions =
                         expand_word(&parsed_word, false, shell).map_err(|_| CommandError)?;
@@ -313,7 +349,10 @@ impl ViEditor {
                 }
             }
             CommandOp::ExpandUnique => {
-                if let Some(word_range) = current_bigword(&self.edit_line, self.cursor.position) {
+                self.edit_current_line(shell);
+                if let Some(word_range) =
+                    current_bigword(&self.edit_line, self.edit_line_cursor.position)
+                {
                     let word =
                         into_expansion_word(&self.edit_line[word_range.start..word_range.end])?;
                     let pattern =
@@ -328,12 +367,15 @@ impl ViEditor {
                         word_range.start..word_range.end,
                         replacement.as_bytes().iter().copied(),
                     );
-                    self.cursor.position = word_range.start + replacement.len();
+                    self.edit_line_cursor.position = word_range.start + replacement.len();
                     self.mode = EditorMode::Insert;
                 }
             }
             CommandOp::ExpandAll => {
-                if let Some(word_range) = current_bigword(&self.edit_line, self.cursor.position) {
+                self.edit_current_line(shell);
+                if let Some(word_range) =
+                    current_bigword(&self.edit_line, self.edit_line_cursor.position)
+                {
                     let word =
                         into_expansion_word(&self.edit_line[word_range.start..word_range.end])?;
                     let pattern =
@@ -353,7 +395,7 @@ impl ViEditor {
                         word_range.start..word_range.end,
                         replacement.as_bytes().iter().copied(),
                     );
-                    self.cursor.position = word_range.start + replacement.len();
+                    self.edit_line_cursor.position = word_range.start + replacement.len();
                     self.mode = EditorMode::Insert;
                 }
             }
@@ -362,9 +404,10 @@ impl ViEditor {
                 // a shell alias, and no other types of alias are mentioned
             }
             CommandOp::ChangeCase => {
+                self.edit_current_line(shell);
                 let count = self.edit_line.len().min(command.count.unwrap_or(0) + 1);
                 for i in 0..count {
-                    let c = &mut self.edit_line[self.cursor.position + i];
+                    let c = &mut self.edit_line[self.edit_line_cursor.position + i];
                     if c.is_ascii_uppercase() {
                         *c = c.to_ascii_lowercase();
                     } else if c.is_ascii_lowercase() {
@@ -379,36 +422,47 @@ impl ViEditor {
             }
             CommandOp::EditCommand => {}
             CommandOp::InsertAtNextChar => {
-                self.cursor.position += 1;
+                self.edit_line_cursor.position += 1;
                 self.mode = EditorMode::Insert;
+                self.edit_current_line(shell);
             }
             CommandOp::InsertAtLineEnd => {
-                self.cursor.position = self.edit_line.len();
+                self.edit_line_cursor.position = self.edit_line.len();
                 self.mode = EditorMode::Insert;
+                self.edit_current_line(shell);
             }
             CommandOp::InsertAtCurrentPosition => {
                 self.mode = EditorMode::Insert;
+                self.edit_current_line(shell);
             }
             CommandOp::InsertAtLineStart => {
-                self.cursor.position = 0;
+                self.edit_line_cursor.position = 0;
                 self.mode = EditorMode::Insert;
+                self.edit_current_line(shell);
             }
             CommandOp::ReplaceMode => {
                 self.mode = EditorMode::Replace;
+                self.edit_current_line(shell);
             }
             CommandOp::DeleteRange(motion) => {
-                match self.cursor.moved(&self.edit_line, motion, command.count) {
+                self.edit_current_line(shell);
+                match self
+                    .edit_line_cursor
+                    .moved(&self.edit_line, motion, command.count)
+                {
                     Ok(range_end) => {
                         let range_end = range_end.position;
-                        if self.cursor.position < range_end {
-                            self.edit_line.drain(self.cursor.position..range_end);
+                        if self.edit_line_cursor.position < range_end {
+                            self.edit_line
+                                .drain(self.edit_line_cursor.position..range_end);
                         } else {
-                            self.edit_line.drain(range_end..self.cursor.position);
-                            self.cursor.position = range_end;
+                            self.edit_line
+                                .drain(range_end..self.edit_line_cursor.position);
+                            self.edit_line_cursor.position = range_end;
                         }
                     }
                     Err(MotionError::AfterEnd) => {
-                        self.edit_line.truncate(self.cursor.position);
+                        self.edit_line.truncate(self.edit_line_cursor.position);
                     }
                     Err(_) => {
                         return Err(CommandError);
@@ -417,27 +471,30 @@ impl ViEditor {
                 self.mode = EditorMode::Insert;
             }
             CommandOp::ClearLine => {
-                self.edit_line.clear();
-                self.cursor.position = 0;
+                self.edit_current_line(shell).clear();
+                self.edit_line_cursor.position = 0;
                 self.mode = EditorMode::Insert;
             }
             CommandOp::DeleteToEnd => {
-                self.edit_line.truncate(self.cursor.position);
-                self.cursor.position = self.edit_line.len();
+                self.edit_current_line(shell);
+                self.edit_line.truncate(self.edit_line_cursor.position);
+                self.edit_line_cursor.position = self.edit_line.len();
                 self.mode = EditorMode::Insert;
             }
             CommandOp::ClearEditLine => {
-                self.edit_line.clear();
-                self.cursor.position = 0;
+                self.edit_current_line(shell).clear();
+                self.edit_line_cursor.position = 0;
                 self.mode = EditorMode::Insert;
             }
             CommandOp::ReplaceWith(c) => {
+                self.edit_current_line(shell);
                 let count = self.edit_line.len().min(command.count.unwrap_or(0) + 1);
                 for i in 0..count {
-                    self.edit_line[self.cursor.position + i] = c;
+                    self.edit_line[self.edit_line_cursor.position + i] = c;
                 }
             }
             CommandOp::AppendLastBigWord => {
+                self.edit_current_line(shell);
                 let last_command = if let Some(cmd) = shell.history.get_reverse(0) {
                     cmd
                 } else {
@@ -452,56 +509,73 @@ impl ViEditor {
                 if let Some(word_range) = word_range {
                     let word = last_command[word_range.start..word_range.end].as_bytes();
                     // we are in command mode, so cursor is always less than self.edit_line.len()
-                    let position = self.cursor.position + 1;
+                    let position = self.edit_line_cursor.position + 1;
                     self.edit_line
                         .splice(position..position, word.iter().copied());
                     self.edit_line.insert(position, b' ');
-                    self.cursor.position += word_range.end - word_range.start;
+                    self.edit_line_cursor.position += word_range.end - word_range.start;
                     self.mode = EditorMode::Insert;
                 } else {
                     return Err(CommandError);
                 }
             }
             CommandOp::CutCurrentChars => {
+                self.edit_current_line(shell);
                 let end = self
                     .edit_line
                     .len()
-                    .min(self.cursor.position + command.count.unwrap_or(0) + 1);
-                self.save_buffer = self.edit_line.drain(self.cursor.position..end).collect();
-                if self.cursor.position != 0 && self.cursor.position == self.edit_line.len() {
-                    self.cursor.position -= 1;
+                    .min(self.edit_line_cursor.position + command.count.unwrap_or(0) + 1);
+                self.save_buffer = self
+                    .edit_line
+                    .drain(self.edit_line_cursor.position..end)
+                    .collect();
+                if self.edit_line_cursor.position != 0
+                    && self.edit_line_cursor.position == self.edit_line.len()
+                {
+                    self.edit_line_cursor.position -= 1;
                 }
             }
             CommandOp::CutPreviousChars => {
-                if self.cursor.position == 0 {
+                self.edit_current_line(shell);
+                if self.edit_line_cursor.position == 0 {
                     return Err(CommandError);
                 }
                 let end = self
-                    .cursor
+                    .edit_line_cursor
                     .position
                     .saturating_sub(command.count.unwrap_or(0) + 1);
-                self.save_buffer = self.edit_line.drain(end..self.cursor.position).collect();
-                self.cursor.position = end;
+                self.save_buffer = self
+                    .edit_line
+                    .drain(end..self.edit_line_cursor.position)
+                    .collect();
+                self.edit_line_cursor.position = end;
             }
             CommandOp::CutRange(motion) => {
-                match self.cursor.moved(&self.edit_line, motion, command.count) {
+                self.edit_current_line(shell);
+                match self
+                    .edit_line_cursor
+                    .moved(&self.edit_line, motion, command.count)
+                {
                     Ok(range_end) => {
                         let range_end = range_end.position;
-                        if self.cursor.position < range_end {
+                        if self.edit_line_cursor.position < range_end {
                             self.save_buffer = self
                                 .edit_line
-                                .drain(self.cursor.position..range_end)
+                                .drain(self.edit_line_cursor.position..range_end)
                                 .collect();
                         } else {
                             self.save_buffer = self
                                 .edit_line
-                                .drain(range_end..self.cursor.position)
+                                .drain(range_end..self.edit_line_cursor.position)
                                 .collect();
-                            self.cursor.position = range_end;
+                            self.edit_line_cursor.position = range_end;
                         }
                     }
                     Err(MotionError::AfterEnd) => {
-                        self.save_buffer = self.edit_line.drain(self.cursor.position..).collect();
+                        self.save_buffer = self
+                            .edit_line
+                            .drain(self.edit_line_cursor.position..)
+                            .collect();
                     }
                     Err(_) => {
                         return Err(CommandError);
@@ -509,26 +583,37 @@ impl ViEditor {
                 }
             }
             CommandOp::CutLine => {
+                self.edit_current_line(shell);
                 self.save_buffer = self.edit_line.drain(..).collect();
-                self.cursor.position = 0;
+                self.edit_line_cursor.position = 0;
             }
             CommandOp::CutToEnd => {
-                self.save_buffer = self.edit_line.drain(self.cursor.position..).collect();
+                self.edit_current_line(shell);
+                self.save_buffer = self
+                    .edit_line
+                    .drain(self.edit_line_cursor.position..)
+                    .collect();
             }
             CommandOp::YankRange(motion) => {
-                match self.cursor.moved(&self.edit_line, motion, command.count) {
+                match self
+                    .edit_line_cursor
+                    .moved(&self.current_line(shell), motion, command.count)
+                {
                     Ok(range_end) => {
                         let range_end = range_end.position;
-                        if self.cursor.position < range_end {
-                            self.save_buffer =
-                                self.edit_line[self.cursor.position..range_end].to_vec();
+                        if self.edit_line_cursor.position < range_end {
+                            self.save_buffer = self.current_line(shell)
+                                [self.edit_line_cursor.position..range_end]
+                                .to_vec();
                         } else {
-                            self.save_buffer =
-                                self.edit_line[range_end..self.cursor.position].to_vec();
+                            self.save_buffer = self.current_line(shell)
+                                [range_end..self.edit_line_cursor.position]
+                                .to_vec();
                         }
                     }
                     Err(MotionError::AfterEnd) => {
-                        self.save_buffer = self.edit_line[self.cursor.position..].to_vec();
+                        self.save_buffer =
+                            self.current_line(shell)[self.edit_line_cursor.position..].to_vec();
                     }
                     Err(_) => {
                         return Err(CommandError);
@@ -536,32 +621,50 @@ impl ViEditor {
                 }
             }
             CommandOp::YankLine => {
-                self.save_buffer = self.edit_line.clone();
+                self.save_buffer = self.current_line(shell).to_vec();
             }
             CommandOp::YankToEnd => {
-                self.save_buffer = self.edit_line[self.cursor.position..].to_vec();
+                self.save_buffer =
+                    self.current_line(shell)[self.edit_line_cursor.position..].to_vec();
             }
             CommandOp::PasteAfter => {
+                self.edit_current_line(shell);
                 if !self.save_buffer.is_empty() {
                     self.edit_line.splice(
-                        self.cursor.position..self.cursor.position,
+                        self.edit_line_cursor.position..self.edit_line_cursor.position,
                         self.save_buffer.iter().copied(),
                     );
-                    self.cursor.position += 1;
+                    self.edit_line_cursor.position += 1;
                 }
             }
             CommandOp::PasteBefore => {
+                self.edit_current_line(shell);
                 if !self.save_buffer.is_empty() {
                     self.edit_line.splice(
-                        self.cursor.position..self.cursor.position,
+                        self.edit_line_cursor.position..self.edit_line_cursor.position,
                         self.save_buffer.iter().copied(),
                     );
                 }
             }
             CommandOp::UndoLastCommand => {}
             CommandOp::UndoAll => {}
-            CommandOp::PreviousShellCommand => {}
-            CommandOp::NextShellCommand => {}
+            CommandOp::PreviousShellCommand => {
+                let number = command.count.unwrap_or(1);
+                if self.current_command_in_history + number > shell.history.entries_count() {
+                    return Err(CommandError);
+                }
+                self.history_line_cursor = Cursor::default();
+                self.current_command_in_history += number;
+            }
+            CommandOp::NextShellCommand => {
+                let number = command.count.unwrap_or(1);
+                if number > self.current_command_in_history {
+                    self.current_command_in_history = 0;
+                    return Err(CommandError);
+                }
+                self.history_line_cursor = Cursor::default();
+                self.current_command_in_history -= number;
+            }
             CommandOp::OldestShellCommand => {}
             CommandOp::SearchPattern(_) => {}
             CommandOp::SearchPatternAfter(_) => {}
@@ -572,12 +675,24 @@ impl ViEditor {
         Ok(Action::None)
     }
 
-    pub fn current_line(&self) -> &[u8] {
-        &self.edit_line
+    pub fn current_line<'a>(&'a self, shell: &'a Shell) -> &'a [u8] {
+        if self.current_command_in_history == 0 {
+            &self.edit_line
+        } else {
+            shell
+                .history
+                .get_reverse(self.current_command_in_history - 1)
+                .unwrap()
+                .as_bytes()
+        }
     }
 
     pub fn cursor_position(&self) -> usize {
-        self.cursor.position
+        if self.current_command_in_history == 0 {
+            self.edit_line_cursor.position
+        } else {
+            self.history_line_cursor.position
+        }
     }
 
     pub fn process_new_input(&mut self, c: u8, shell: &mut Shell) -> Result<Action, CommandError> {
@@ -588,22 +703,22 @@ impl ViEditor {
                         let mut result = Vec::new();
                         std::mem::swap(&mut result, &mut self.edit_line);
                         result.push(b'\n');
-                        self.cursor.position = 0;
+                        self.edit_line_cursor.position = 0;
                         return Ok(Action::Execute(result));
                     }
                     b'\x1B' => {
                         // escape
                         self.mode = EditorMode::Command;
-                        self.cursor.position = self
-                            .cursor
+                        self.edit_line_cursor.position = self
+                            .edit_line_cursor
                             .position
                             .min(self.edit_line.len().saturating_sub(1));
                     }
                     b'\x7F' => {
                         // delete
-                        if !self.edit_line.is_empty() && self.cursor.position != 0 {
-                            self.edit_line.remove(self.cursor.position - 1);
-                            self.cursor.position -= 1;
+                        if !self.edit_line.is_empty() && self.edit_line_cursor.position != 0 {
+                            self.edit_line.remove(self.edit_line_cursor.position - 1);
+                            self.edit_line_cursor.position -= 1;
                         }
                     }
                     b'\x04' => return Ok(Action::Eof),
@@ -612,16 +727,16 @@ impl ViEditor {
                     }
                     b'\x17' => {}
                     other if !other.is_ascii_control() => {
-                        if self.cursor.position < self.edit_line.len() {
+                        if self.edit_line_cursor.position < self.edit_line.len() {
                             if self.mode == EditorMode::Replace {
-                                self.edit_line[self.cursor.position] = other;
+                                self.edit_line[self.edit_line_cursor.position] = other;
                             } else {
-                                self.edit_line.insert(self.cursor.position, other);
+                                self.edit_line.insert(self.edit_line_cursor.position, other);
                             }
                         } else {
                             self.edit_line.push(other);
                         }
-                        self.cursor.position += 1;
+                        self.edit_line_cursor.position += 1;
                     }
                     _ => {}
                 }
@@ -652,10 +767,12 @@ impl Default for ViEditor {
         Self {
             mode: EditorMode::Insert,
             input_buffer: Vec::new(),
-            cursor: Cursor::default(),
             edit_line: Vec::new(),
+            edit_line_cursor: Cursor::default(),
+            history_line_cursor: Cursor::default(),
             most_recent_nonmotion_command: None,
             save_buffer: Vec::new(),
+            current_command_in_history: 0,
         }
     }
 }

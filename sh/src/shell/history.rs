@@ -7,7 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::pattern::HistoryPattern;
 use crate::shell::environment::Environment;
 use std::collections::VecDeque;
 use std::io::ErrorKind;
@@ -38,8 +37,8 @@ impl<'s> EndPoint<'s> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
-    command: String,
-    command_number: u32,
+    pub command: String,
+    pub command_number: u32,
 }
 
 fn list_entries<'a>(entries: impl Iterator<Item = &'a Entry>, include_numbers: bool) -> String {
@@ -160,25 +159,8 @@ impl History {
             .map(|e| e.command.as_str())
     }
 
-    pub fn find_pattern(
-        &self,
-        pattern: &HistoryPattern,
-        reverse_start: usize,
-        reverse: bool,
-    ) -> Option<usize> {
-        if reverse {
-            self.entries
-                .iter()
-                .rev()
-                .take(reverse_start)
-                .position(|e| pattern.matches(&e.command))
-        } else {
-            self.entries
-                .iter()
-                .rev()
-                .skip(reverse_start)
-                .position(|e| pattern.matches(&e.command))
-        }
+    pub fn entries(&self) -> impl DoubleEndedIterator<Item = &Entry> {
+        self.entries.iter()
     }
 
     pub fn entries_count(&self) -> usize {

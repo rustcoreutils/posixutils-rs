@@ -14,6 +14,7 @@ use crate::cli::vi::cursor::{Cursor, MotionCommand, MotionError};
 use crate::cli::vi::word::{current_bigword, BigWordIter};
 use crate::parse::word_parser::parse_word;
 use crate::pattern::{FilenamePattern, HistoryPattern};
+use crate::shell::history::History;
 use crate::shell::Shell;
 use crate::wordexp::expand_word;
 use crate::wordexp::pathname::glob;
@@ -297,21 +298,55 @@ pub struct ViEditor {
     /// 0 means the `edit_line`, from 1 on
     /// its an index into the history starting
     /// from the most recent command
-    current_command_in_history: usize,
+    current_history_command: usize,
 }
 
 impl ViEditor {
     fn edit_current_line(&mut self, shell: &Shell) -> &mut Vec<u8> {
-        if self.current_command_in_history != 0 {
+        if self.current_history_command != 0 {
             self.edit_line = shell
                 .history
-                .get_reverse(self.current_command_in_history - 1)
+                .get_reverse(self.current_history_command - 1)
                 .unwrap()
                 .as_bytes()
                 .to_vec();
-            self.current_command_in_history = 0;
+            self.current_history_command = 0;
         }
         &mut self.edit_line
+    }
+
+    fn set_current_history_command(&mut self, index: usize) {
+        if self.current_history_command == 0 {
+            self.saved_edit_line_position = self.cursor.position;
+        }
+        self.current_history_command = index;
+        self.cursor.position = 0;
+    }
+
+    fn find_in_history(
+        &self,
+        history: &History,
+        pattern: &HistoryPattern,
+        reverse: bool,
+    ) -> Option<usize> {
+        if reverse {
+            if self.current_history_command == 0 {
+                return None;
+            }
+            let skipped = history.entries_count() - self.current_history_command + 1;
+            history
+                .entries()
+                .skip(skipped)
+                .position(|e| pattern.matches(&e.command))
+                .map(|i| history.entries_count() - i - skipped)
+        } else {
+            history
+                .entries()
+                .rev()
+                .skip(self.current_history_command)
+                .position(|e| pattern.matches(&e.command))
+                .map(|i| self.current_history_command + i + 1)
+        }
     }
 
     fn execute_command(
@@ -333,7 +368,7 @@ impl ViEditor {
                 result.push(b'\n');
                 self.mode = EditorMode::Insert;
                 self.cursor.position = 0;
-                self.current_command_in_history = 0;
+                self.current_history_command = 0;
                 self.edit_line.clear();
                 return Ok(Action::Execute(result));
             }
@@ -630,25 +665,25 @@ impl ViEditor {
             CommandOp::UndoLastCommand => {}
             CommandOp::UndoAll => {}
             CommandOp::PreviousShellCommand => {
-                if self.current_command_in_history == 0 {
+                if self.current_history_command == 0 {
                     self.saved_edit_line_position = self.cursor.position;
                     self.cursor.position = 0;
                 }
                 let number = command.count.unwrap_or(1);
-                if self.current_command_in_history + number > shell.history.entries_count() {
+                if self.current_history_command + number > shell.history.entries_count() {
                     return Err(CommandError);
                 }
-                self.current_command_in_history += number;
+                self.current_history_command += number;
                 self.cursor.position = 0;
             }
             CommandOp::NextShellCommand => {
                 let number = command.count.unwrap_or(1);
-                if number > self.current_command_in_history {
-                    self.current_command_in_history = 0;
+                if number > self.current_history_command {
+                    self.current_history_command = 0;
                     return Err(CommandError);
                 }
-                self.current_command_in_history -= number;
-                if self.current_command_in_history == 0 {
+                self.current_history_command -= number;
+                if self.current_history_command == 0 {
                     self.cursor.position = self.saved_edit_line_position;
                 } else {
                     self.cursor.position = 0;
@@ -656,33 +691,24 @@ impl ViEditor {
             }
             CommandOp::OldestShellCommand => {
                 let number = command.count.unwrap_or(shell.history.entries_count());
-                if self.current_command_in_history == 0 {
+                if self.current_history_command == 0 {
                     self.saved_edit_line_position = self.cursor.position;
                 }
-                if number > self.current_command_in_history {
+                if number > self.current_history_command {
                     return Err(CommandError);
                 }
-                self.current_command_in_history = number;
+                self.current_history_command = number;
                 self.cursor.position = 0;
             }
             CommandOp::SearchPattern { pattern, reverse } => {
                 let history_pattern = HistoryPattern::new(pattern).map_err(|_| CommandError)?;
-                let result = shell.history.find_pattern(
-                    &history_pattern,
-                    self.current_command_in_history,
-                    reverse,
-                );
+                let result = self.find_in_history(&shell.history, &history_pattern, reverse);
                 self.last_search = Some(LastSearch {
                     pattern: history_pattern,
                     reverse,
                 });
                 if let Some(index) = result {
-                    let index = index + 1;
-                    if self.current_command_in_history == 0 {
-                        self.saved_edit_line_position = self.cursor.position;
-                    }
-                    self.current_command_in_history = index;
-                    self.cursor.position = 0;
+                    self.set_current_history_command(index)
                 } else {
                     return Err(CommandError);
                 }
@@ -694,21 +720,10 @@ impl ViEditor {
                 } else {
                     last_search.reverse
                 };
-                let result = shell.history.find_pattern(
-                    &last_search.pattern,
-                    self.current_command_in_history,
-                    reverse,
-                );
-                if let Some(index) = result {
-                    let index = index + 1;
-                    if self.current_command_in_history == 0 {
-                        self.saved_edit_line_position = self.cursor.position;
-                    }
-                    self.current_command_in_history = index;
-                    self.cursor.position = 0;
-                } else {
-                    return Err(CommandError);
-                }
+                let index = self
+                    .find_in_history(&shell.history, &last_search.pattern, reverse)
+                    .ok_or(CommandError)?;
+                self.set_current_history_command(index);
             }
             CommandOp::Move(_) => unreachable!(),
         }
@@ -716,12 +731,12 @@ impl ViEditor {
     }
 
     pub fn current_line<'a>(&'a self, shell: &'a Shell) -> &'a [u8] {
-        if self.current_command_in_history == 0 {
+        if self.current_history_command == 0 {
             &self.edit_line
         } else {
             shell
                 .history
-                .get_reverse(self.current_command_in_history - 1)
+                .get_reverse(self.current_history_command - 1)
                 .unwrap()
                 .as_bytes()
         }
@@ -819,7 +834,7 @@ impl Default for ViEditor {
             last_nonmotion_command: None,
             last_search: None,
             save_buffer: Vec::new(),
-            current_command_in_history: 0,
+            current_history_command: 0,
         }
     }
 }

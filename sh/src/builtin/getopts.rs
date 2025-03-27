@@ -27,7 +27,12 @@ enum ParseResult<'s> {
 
 impl<'s> OptsParser<'s> {
     fn new(optstring: &'s str) -> Result<Self, String> {
-        // TODO: check that optstring is valid
+        if !optstring
+            .chars()
+            .all(|c| c.is_ascii_alphabetic() || c == ':')
+        {
+            return Err("getopts: invalid option string".into());
+        }
         Ok(Self { optstring })
     }
 

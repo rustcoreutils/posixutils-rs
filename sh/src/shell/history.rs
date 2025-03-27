@@ -10,8 +10,7 @@
 use crate::pattern::HistoryPattern;
 use crate::shell::environment::Environment;
 use std::collections::VecDeque;
-use std::io::Read;
-use std::io::Write;
+use std::io::ErrorKind;
 use std::path::Path;
 
 #[derive(Debug, Eq, PartialEq)]
@@ -188,35 +187,22 @@ impl History {
 }
 
 fn read_history_from_file(path: &Path, max_entries: u32) -> History {
-    match std::fs::File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(path)
-    {
-        Ok(mut file) => {
-            let mut history = History::new(max_entries);
-            let mut file_contents = String::new();
-            if let Err(err) = file.read_to_string(&mut file_contents) {
-                eprintln!(
-                    "sh: failed to read history file at {}, details: {err}",
-                    path.to_string_lossy()
-                );
-                return history;
-            }
-            for line in file_contents.lines() {
+    let mut history = History::new(max_entries);
+    match std::fs::read_to_string(path) {
+        Ok(contents) => {
+            for line in contents.lines() {
                 history.add_entry(line.to_string());
             }
-            history
         }
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
         Err(err) => {
             eprintln!(
                 "sh: failed to open history file at {}, details: {err}",
                 path.to_string_lossy()
             );
-            History::new(max_entries)
         }
     }
+    history
 }
 
 pub fn write_history_to_file(history: &History, env: &Environment) {
@@ -231,6 +217,7 @@ pub fn write_history_to_file(history: &History, env: &Environment) {
     let mut content = String::new();
     for entry in &history.entries {
         content.push_str(&entry.command);
+        content.push('\n');
     }
     if let Err(err) = std::fs::write(&path, content) {
         eprintln!("sh: failed to open history file at {} ({err})", path);

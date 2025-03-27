@@ -35,7 +35,7 @@ use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
 use nix::errno::Errno;
 use nix::libc;
 use nix::sys::wait::{WaitPidFlag, WaitStatus};
-use nix::unistd::{getpgrp, getpid, getppid, setpgid, ForkResult, Pid};
+use nix::unistd::{getcwd, getpgrp, getpid, getppid, setpgid, ForkResult, Pid};
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
 use std::fmt::{Display, Formatter};
@@ -942,13 +942,22 @@ impl Shell {
         environment.set_global_if_unset("PS4", "+ ");
         environment.set_global_if_unset("OPTIND", "1");
         let history = initialize_history_from_system(&environment);
+        let current_directory = match getcwd() {
+            Ok(path) => path.into_os_string(),
+            Err(err) => {
+                eprintln!(
+                    "sh: failed to determine the current working directory ({})",
+                    err
+                );
+                std::process::exit(1);
+            }
+        };
         Shell {
             environment,
             program_name,
             positional_parameters: args,
             shell_pid: getpid().as_raw(),
-            // TODO: handle error
-            current_directory: std::env::current_dir().unwrap().into_os_string(),
+            current_directory,
             history,
             set_options,
             is_interactive,

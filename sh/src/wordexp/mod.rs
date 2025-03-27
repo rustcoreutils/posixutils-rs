@@ -229,8 +229,18 @@ pub fn expand_word(
             if files.is_empty() {
                 result.push(pattern.into())
             } else {
-                // TODO: handle error
-                result.extend(files.into_iter().map(|s| s.into_string().unwrap()))
+                result.reserve(files.len());
+                for file in files {
+                    match file.into_string() {
+                        Ok(string) => result.push(string),
+                        Err(os_string) => {
+                            return Err(CommandExecutionError::ExpansionError(format!(
+                                "{} contains invalid utf8",
+                                os_string.to_string_lossy()
+                            )))
+                        }
+                    }
+                }
             }
         }
     }

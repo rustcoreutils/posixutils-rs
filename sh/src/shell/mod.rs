@@ -243,6 +243,8 @@ impl Shell {
         name: String,
         value: String,
     ) -> Result<&mut Value, CannotModifyReadonly> {
+        // inspect does not work in this case
+        #[allow(clippy::manual_inspect)]
         self.environment.set_global(name, value).map(|val| {
             val.export_or(self.set_options.allexport);
             val
@@ -252,11 +254,8 @@ impl Shell {
     pub fn execute_action(&mut self, action: TrapAction) {
         if let TrapAction::Commands(commands) = action {
             let last_pipeline_exit_status_before_trap = self.last_pipeline_exit_status;
-            match self.execute_program(&commands) {
-                Err(err) => {
-                    eprintln!("sh: error parsing action: {}", err.message);
-                }
-                Ok(_) => {}
+            if let Err(err) = self.execute_program(&commands) {
+                eprintln!("sh: error parsing action: {}", err.message);
             }
             self.last_pipeline_exit_status = last_pipeline_exit_status_before_trap;
         }
@@ -279,7 +278,7 @@ impl Shell {
 
     pub fn exec(&mut self, command: OsString, args: &[String], opened_files: &OpenedFiles) -> ! {
         self.signal_manager.reset();
-        match exec(command.clone(), args, &opened_files, &self.environment).unwrap_err() {
+        match exec(command.clone(), args, opened_files, &self.environment).unwrap_err() {
             ExecError::OsError(err) => {
                 self.eprint(&format!("{err}\n"));
                 self.exit(1)
@@ -392,7 +391,7 @@ impl Shell {
 
         self.function_call_depth += 1;
         let result = self.interpret_compound_command(
-            &function_body,
+            function_body,
             &simple_command.redirections,
             ignore_errexit,
         );
@@ -484,31 +483,28 @@ impl Shell {
             // no commands to execute, perform assignments and redirections
             self.assign_globals(&simple_command.assignments, false)?;
             if !simple_command.redirections.is_empty() {
-                let mut subshell = self.clone();
-                subshell
-                    .opened_files
-                    .redirect(&simple_command.redirections, self)?;
-                (&simple_command.redirections, &mut subshell);
+                let mut opened_files = self.opened_files.clone();
+                opened_files.redirect(&simple_command.redirections, self)?;
             }
             return Ok(self.last_command_substitution_status);
         }
 
         if let Some(special_builtin_utility) = get_special_builtin_utility(&expanded_words[0]) {
             self.exec_special_builtin(
-                &simple_command,
+                simple_command,
                 &expanded_words[1..],
                 special_builtin_utility,
             )
         } else if let Some(function_body) = self.functions.get(expanded_words[0].as_str()).cloned()
         {
             self.exec_function(
-                &simple_command,
-                &mut expanded_words,
+                simple_command,
+                &expanded_words,
                 &function_body,
                 ignore_errexit,
             )
         } else if let Some(builtin_utility) = get_builtin_utility(&expanded_words[0]) {
-            self.exec_builtin_utility(&simple_command, &expanded_words[1..], builtin_utility)
+            self.exec_builtin_utility(simple_command, &expanded_words[1..], builtin_utility)
         } else {
             let command = self
                 .find_command(&expanded_words[0], "", self.set_options.hashall)
@@ -934,11 +930,8 @@ impl Shell {
     ) -> Shell {
         // > If a variable is initialized from the environment, it shall be marked for
         // > export immediately
-        let mut environment = Environment::from(
-            std::env::vars()
-                .into_iter()
-                .map(|(k, v)| (k, Value::new_exported(v))),
-        );
+        let mut environment =
+            Environment::from(std::env::vars().map(|(k, v)| (k, Value::new_exported(v))));
         environment.set_global_forced("PPID".to_string(), getppid().to_string());
         environment.set_global_if_unset("IFS", " \t\n");
         environment.set_global_if_unset("PS1", "\\$ ");

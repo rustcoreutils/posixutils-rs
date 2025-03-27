@@ -127,6 +127,9 @@ pub fn split_fields(
     let mut result = Vec::with_capacity(expanded_word.len());
     let mut last_word = ExpandedWord::default();
     let mut iter = expanded_word.into_iter();
+    // we need the iterator later to insert the remaining parts into the last word
+    // so we can't use a for loop
+    #[allow(clippy::while_let_on_iterator)]
     while let Some(part) = iter.next() {
         match part {
             ExpandedWordPart::UnquotedLiteral(lit) => {

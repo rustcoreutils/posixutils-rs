@@ -61,9 +61,7 @@ pub struct MatchIter<'a> {
 impl Iterator for MatchIter<'_> {
     type Item = RegexMatch;
     fn next(&mut self) -> Option<Self::Item> {
-        if self.regex.raw_regex.is_none() {
-            return None;
-        }
+        self.regex.raw_regex?;
         if self.next_start >= self.string.to_bytes().len() {
             return None;
         }

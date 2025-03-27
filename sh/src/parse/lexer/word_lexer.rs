@@ -28,7 +28,7 @@ pub enum WordToken<'src> {
 
     Char(char),
 
-    EOF,
+    Eof,
 }
 
 impl Display for WordToken<'_> {
@@ -43,7 +43,7 @@ impl Display for WordToken<'_> {
             WordToken::BacktickCommandSubstitution(str) => write!(f, "`{str}`"),
             WordToken::ArithmeticExpansion(str) => write!(f, "'$(({str}))'"),
             WordToken::Char(c) => write!(f, "'{}'", c),
-            WordToken::EOF => write!(f, "'EOF'"),
+            WordToken::Eof => write!(f, "'EOF'"),
         }
     }
 }
@@ -102,7 +102,7 @@ impl Lexer for WordLexer<'_> {
 impl<'src> WordLexer<'src> {
     pub fn next_token(&mut self) -> WordToken<'src> {
         if self.reached_eof {
-            return WordToken::EOF;
+            return WordToken::Eof;
         }
         let result = match self.lookahead {
             '"' => advance_and_return(self, WordToken::DoubleQuote),
@@ -217,10 +217,8 @@ pub fn remove_quotes(word: &str) -> (bool, String) {
                         }
                         _ => result.push('\\'),
                     }
-                } else {
-                    if let Some(c) = lex.next_char() {
-                        result.push(c)
-                    }
+                } else if let Some(c) = lex.next_char() {
+                    result.push(c)
                 }
             }
             WordToken::QuotedBacktick => result.push('`'),
@@ -230,7 +228,7 @@ pub fn remove_quotes(word: &str) -> (bool, String) {
                 result.push(')');
             }
             WordToken::BacktickCommandSubstitution(commands) => {
-                result.push_str("`");
+                result.push('`');
                 result.push_str(commands);
                 result.push('`');
             }
@@ -240,7 +238,7 @@ pub fn remove_quotes(word: &str) -> (bool, String) {
                 result.push_str("))");
             }
             WordToken::Char(c) => result.push(c),
-            WordToken::EOF => break,
+            WordToken::Eof => break,
         }
         next = lex.next_token()
     }
@@ -254,7 +252,7 @@ mod tests {
     fn lex_token(s: &str) -> WordToken {
         let mut lex = WordLexer::new(s);
         let token = lex.next_token();
-        assert_eq!(lex.next_token(), WordToken::EOF);
+        assert_eq!(lex.next_token(), WordToken::Eof);
         token
     }
 

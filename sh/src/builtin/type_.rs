@@ -31,7 +31,7 @@ impl BuiltinUtility for Type_ {
                 opened_files.write_out(format!("{} is aliased to '{}'\n", command_name, alias));
             } else if get_special_builtin_utility(command_name).is_some() {
                 opened_files.write_out(format!("{} is a special shell builtin\n", command_name));
-            } else if shell.functions.get(command_name.as_str()).is_some() {
+            } else if shell.functions.contains_key(command_name.as_str()) {
                 opened_files.write_out(format!("{} is a function\n", command_name))
             } else if get_builtin_utility(command_name).is_some() {
                 opened_files.write_out(format!("{} is a shell builtin\n", command_name));

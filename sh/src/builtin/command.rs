@@ -131,7 +131,7 @@ impl BuiltinUtility for Command {
                     args.command_name
                 ))
             }
-        } else if shell.functions.get(args.command_name).is_some() {
+        } else if shell.functions.contains_key(args.command_name) {
             if args.action == Action::PrintShort {
                 opened_files.write_out(format!("{}\n", args.command_name))
             } else {

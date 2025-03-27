@@ -318,7 +318,7 @@ impl ViEditor {
         if let CommandOp::Move(motion) = command.op {
             self.cursor = self
                 .cursor
-                .moved(&self.current_line(shell), motion, command.count)
+                .moved(self.current_line(shell), motion, command.count)
                 .map_err(|_| CommandError)?;
             return Ok(Action::None);
         }
@@ -348,7 +348,7 @@ impl ViEditor {
                     if expansions.is_empty() {
                         return Err(CommandError);
                     }
-                    print!("\n");
+                    println!();
                     for (i, e) in expansions.into_iter().enumerate() {
                         println!("{i}) {}", add_terminating_slash_if_directory(e));
                     }
@@ -577,7 +577,7 @@ impl ViEditor {
             CommandOp::YankRange(motion) => {
                 match self
                     .cursor
-                    .moved(&self.current_line(shell), motion, command.count)
+                    .moved(self.current_line(shell), motion, command.count)
                 {
                     Ok(range_end) => {
                         let range_end = range_end.position;
@@ -662,9 +662,7 @@ impl ViEditor {
                 self.cursor.position = 0;
             }
             CommandOp::SearchPattern { pattern, reverse } => {
-                let history_pattern = HistoryPattern::new(pattern)
-                    .map_err(|_| CommandError)?
-                    .expect("pattern should never be empty");
+                let history_pattern = HistoryPattern::new(pattern).map_err(|_| CommandError)?;
                 let result = shell.history.find_pattern(
                     &history_pattern,
                     self.current_command_in_history,

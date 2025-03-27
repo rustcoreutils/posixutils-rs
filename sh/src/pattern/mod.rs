@@ -224,24 +224,23 @@ pub struct HistoryPattern {
 }
 
 impl HistoryPattern {
-    pub fn new(pattern: String) -> Result<Option<Self>, ()> {
-        let parsed_pattern =
-            parse_pattern(&ExpandedWord::unquoted_literal(pattern), false).map_err(|_| ())?;
-        if parsed_pattern.is_empty() {
-            return Ok(None);
-        }
-        if parsed_pattern[0] == PatternItem::Char('^') {
-            let regex = parsed_pattern_to_regex(&parsed_pattern[1..]).map_err(|_| ())?;
-            Ok(Some(Self {
+    pub fn new(pattern: String) -> Result<Self, String> {
+        let parsed_pattern = parse_pattern(&ExpandedWord::unquoted_literal(pattern), false)?;
+        if parsed_pattern
+            .first()
+            .is_some_and(|p| *p == PatternItem::Char('^'))
+        {
+            let regex = parsed_pattern_to_regex(&parsed_pattern[1..])?;
+            Ok(Self {
                 regex,
                 match_only_at_line_start: true,
-            }))
+            })
         } else {
-            let regex = parsed_pattern_to_regex(&parsed_pattern).map_err(|_| ())?;
-            Ok(Some(Self {
+            let regex = parsed_pattern_to_regex(&parsed_pattern)?;
+            Ok(Self {
                 regex,
                 match_only_at_line_start: false,
-            }))
+            })
         }
     }
 
@@ -369,13 +368,13 @@ pub mod tests {
 
     #[test]
     fn match_history_pattern() {
-        let pattern = HistoryPattern::new("arg".to_string()).unwrap().unwrap();
+        let pattern = HistoryPattern::new("arg".to_string()).unwrap();
         assert!(pattern.matches("cmd arg"));
 
-        let pattern = HistoryPattern::new("^cmd".to_string()).unwrap().unwrap();
+        let pattern = HistoryPattern::new("^cmd".to_string()).unwrap();
         assert!(pattern.matches("cmd arg"));
 
-        let pattern = HistoryPattern::new("^arg".to_string()).unwrap().unwrap();
+        let pattern = HistoryPattern::new("^arg".to_string()).unwrap();
         assert!(!pattern.matches("cmd arg"));
     }
 }

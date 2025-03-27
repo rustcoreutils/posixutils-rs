@@ -131,9 +131,9 @@ impl JobManager {
             }
             job.position = JobPosition::Other;
         }
-        self.jobs
-            .last_mut()
-            .map(|j| j.position = JobPosition::Current);
+        if let Some(job) = self.jobs.last_mut() {
+            job.position = JobPosition::Current;
+        }
         if self.jobs.len() > 1 {
             let len = self.jobs.len();
             self.jobs[len - 2].position = JobPosition::Previous;
@@ -171,10 +171,7 @@ impl JobManager {
     }
 
     pub fn cleanup_terminated_jobs(&mut self) {
-        self.jobs.retain(|j| match j.state {
-            JobState::Done(_) => false,
-            _ => true,
-        });
+        self.jobs.retain(|j| !matches!(j.state, JobState::Done(_)));
         self.update_positions();
     }
 

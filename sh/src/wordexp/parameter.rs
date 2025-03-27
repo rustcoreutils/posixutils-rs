@@ -208,7 +208,7 @@ pub fn expand_parameter_into(
         } => {
             let value = expand_word_to_string(word, false, shell)?;
 
-            if let Some(current_value) = shell.environment.get_str_value(&variable_name) {
+            if let Some(current_value) = shell.environment.get_str_value(variable_name) {
                 if current_value.is_empty() && *assign_on_null {
                     shell.assign_global(variable_name.to_string(), value.clone())?;
                     expanded_word.append(value, inside_double_quotes, true);
@@ -316,12 +316,10 @@ pub fn expand_parameter_into(
                 } else {
                     pattern.remove_shortest_prefix(param_str)
                 }
+            } else if *remove_largest {
+                pattern.remove_largest_suffix(param_str)
             } else {
-                if *remove_largest {
-                    pattern.remove_largest_suffix(param_str)
-                } else {
-                    pattern.remove_shortest_suffix(param_str)
-                }
+                pattern.remove_shortest_suffix(param_str)
             };
             expanded_word.append(result, inside_double_quotes, true);
         }

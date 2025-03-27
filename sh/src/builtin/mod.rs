@@ -189,10 +189,10 @@ pub fn get_builtin_utility(name: &str) -> Option<&dyn BuiltinUtility> {
 }
 
 fn skip_option_terminator(args: &[String]) -> &[String] {
-    if args.get(0).is_some_and(|arg| arg == "--") {
+    if args.first().is_some_and(|arg| arg == "--") {
         &args[1..]
     } else {
-        &args
+        args
     }
 }
 

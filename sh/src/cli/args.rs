@@ -37,7 +37,7 @@ impl Default for ShellArgs {
 }
 
 pub fn parse_args(args: Vec<String>, is_attached_to_terminal: bool) -> Result<ShellArgs, String> {
-    assert!(args.len() > 0, "missing program name");
+    assert!(!args.is_empty(), "missing program name");
     let mut execution_option = None;
     let mut set_options = SetOptions::default();
 
@@ -90,7 +90,7 @@ pub fn parse_args(args: Vec<String>, is_attached_to_terminal: bool) -> Result<Sh
 
     let execution_mode = match execution_option {
         None => {
-            if arguments.len() == 0 {
+            if arguments.is_empty() {
                 if is_attached_to_terminal {
                     ExecutionMode::Interactive
                 } else {

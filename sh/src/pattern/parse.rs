@@ -36,10 +36,7 @@ impl TryInto<RangeEndpoint> for BracketItem {
 }
 
 fn is_valid_range_endpoint(item: &BracketItem) -> bool {
-    match item {
-        BracketItem::Char(_) | BracketItem::CollatingSymbol(_) => true,
-        _ => false,
-    }
+    matches!(item, BracketItem::Char(_) | BracketItem::CollatingSymbol(_))
 }
 
 #[derive(Debug, PartialEq, Eq)]

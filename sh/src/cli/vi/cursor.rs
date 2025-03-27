@@ -246,7 +246,7 @@ impl Cursor {
             }
             MotionCommand::RepeatLastMoveToCharReverse => {
                 if let Some(last) = self.last_move_to_char {
-                    let motion = self.moved(&line, reverse_goto_char_motion(last), count)?;
+                    let motion = self.moved(line, reverse_goto_char_motion(last), count)?;
                     // don't return the reversed motion
                     result.position = motion.position;
                 }

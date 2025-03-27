@@ -185,7 +185,7 @@ impl OpenedFiles {
             Some(OpenedFile::Stderr) => std::io::stderr().write_all(contents.as_bytes()),
             Some(OpenedFile::WriteFile(file)) | Some(OpenedFile::ReadWriteFile(file)) => {
                 nix::unistd::write(file, contents.as_bytes())
-                    .map_err(|err| std::io::Error::from(err))
+                    .map_err(std::io::Error::from)
                     .map(|_| ())
             }
             _ => unreachable!(),

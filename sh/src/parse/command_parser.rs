@@ -58,7 +58,7 @@ pub struct CommandParser<'src> {
 
 impl<'src> CommandParser<'src> {
     fn reached_eof(&self) -> bool {
-        self.lookahead == CommandToken::EOF
+        self.lookahead == CommandToken::Eof
     }
 
     pub fn lineno(&self) -> u32 {
@@ -99,7 +99,7 @@ impl<'src> CommandParser<'src> {
     fn match_name(&mut self) -> ParseResult<Name> {
         let line_no = self.lookahead_lineno;
         match self.lookahead.as_word_str() {
-            Some(word) if is_valid_name(&word) => self
+            Some(word) if is_valid_name(word) => self
                 .advance()
                 .map(|word| word.into_word_cow().unwrap().into_owned().into()),
             _ => Err(ParserError::new(
@@ -114,7 +114,7 @@ impl<'src> CommandParser<'src> {
         let line_no = self.lookahead_lineno;
         let token = self.advance()?;
         if let Some(word) = token.as_word_str() {
-            parse_word_pair(&word, line_no, false)
+            parse_word_pair(word, line_no, false)
         } else {
             Err(ParserError::new(
                 line_no,
@@ -189,7 +189,7 @@ impl<'src> CommandParser<'src> {
             other => Err(ParserError::new(
                 self.lookahead_lineno,
                 format!("expected word, got {}", other),
-                other == CommandToken::EOF,
+                other == CommandToken::Eof,
             )),
         }
     }
@@ -214,7 +214,7 @@ impl<'src> CommandParser<'src> {
                 Err(ParserError::new(
                     self.lookahead_lineno,
                     "expected redirection operator after file descriptor",
-                    self.lookahead == CommandToken::EOF,
+                    self.lookahead == CommandToken::Eof,
                 ))
             }
         } else {
@@ -242,11 +242,7 @@ impl<'src> CommandParser<'src> {
                 return parse_word_pair(&next_substitution, self.lookahead_lineno, false).map(Some);
             }
             if let Some(alias) = alias_table.get(next_substitution.as_ref()) {
-                if !alias.ends_with(|c| is_blank(c)) {
-                    *apply_alias_substitution_to_next_word = false
-                } else {
-                    *apply_alias_substitution_to_next_word = true;
-                }
+                *apply_alias_substitution_to_next_word = alias.ends_with(is_blank);
                 self.lexer.insert_text_at_current_position(
                     alias.to_string().into(),
                     next_substitution.as_ref(),
@@ -284,7 +280,7 @@ impl<'src> CommandParser<'src> {
             }
             match self.lookahead.as_word_str() {
                 Some(word) => {
-                    match try_into_assignment(&word, self.lookahead_lineno)? {
+                    match try_into_assignment(word, self.lookahead_lineno)? {
                         Ok(assignment) => command.assignments.push(assignment),
                         Err(word) => {
                             if continue_to_apply_alias_substitution {
@@ -324,7 +320,7 @@ impl<'src> CommandParser<'src> {
                             &mut continue_to_apply_alias_substitution,
                             alias_table,
                         )?;
-                        command.words.extend(next_word.into_iter());
+                        command.words.extend(next_word);
                     } else {
                         command
                             .words
@@ -390,7 +386,7 @@ impl<'src> CommandParser<'src> {
             Err(ParserError::new(
                 list_start,
                 "expected command",
-                self.lookahead == CommandToken::EOF,
+                self.lookahead == CommandToken::Eof,
             ))
         }
     }
@@ -469,11 +465,11 @@ impl<'src> CommandParser<'src> {
             ParserError::new(
                 self.lookahead_lineno,
                 "expected pattern",
-                self.lookahead == CommandToken::EOF,
+                self.lookahead == CommandToken::Eof,
             )
         })?;
 
-        let body = self.parse_compound_list(CommandToken::EOF, alias_table)?;
+        let body = self.parse_compound_list(CommandToken::Eof, alias_table)?;
 
         if self.lookahead == CommandToken::DSemi {
             self.advance()?;
@@ -482,7 +478,7 @@ impl<'src> CommandParser<'src> {
             return Err(ParserError::new(
                 self.lookahead_lineno,
                 format!("expected ';;', found {}", self.lookahead),
-                self.lookahead == CommandToken::EOF,
+                self.lookahead == CommandToken::Eof,
             ));
         }
 
@@ -513,9 +509,9 @@ impl<'src> CommandParser<'src> {
         // consume 'if'
         self.advance()?;
         // there is a terminator after the condition, we don't need to terminate on CommandToken::Then
-        let condition = self.parse_compound_list(CommandToken::EOF, alias_table)?;
+        let condition = self.parse_compound_list(CommandToken::Eof, alias_table)?;
         self.match_token(CommandToken::Then)?;
-        let then_part = self.parse_compound_list(CommandToken::EOF, alias_table)?;
+        let then_part = self.parse_compound_list(CommandToken::Eof, alias_table)?;
         let mut if_chain = NonEmpty::new(If {
             condition,
             body: then_part,
@@ -523,9 +519,9 @@ impl<'src> CommandParser<'src> {
         while self.lookahead == CommandToken::Elif {
             // consume 'elif'
             self.advance()?;
-            let condition = self.parse_compound_list(CommandToken::EOF, alias_table)?;
+            let condition = self.parse_compound_list(CommandToken::Eof, alias_table)?;
             self.match_token(CommandToken::Then)?;
-            let then_part = self.parse_compound_list(CommandToken::EOF, alias_table)?;
+            let then_part = self.parse_compound_list(CommandToken::Eof, alias_table)?;
             if_chain.push(If {
                 condition,
                 body: then_part,
@@ -534,7 +530,7 @@ impl<'src> CommandParser<'src> {
         let mut else_body = None;
         if self.lookahead == CommandToken::Else {
             self.advance()?;
-            else_body = Some(self.parse_compound_list(CommandToken::EOF, alias_table)?);
+            else_body = Some(self.parse_compound_list(CommandToken::Eof, alias_table)?);
         }
         self.match_token(CommandToken::Fi)?;
         Ok(CompoundCommand::IfClause {
@@ -546,7 +542,7 @@ impl<'src> CommandParser<'src> {
     fn parse_while_clause(&mut self, alias_table: &AliasTable) -> ParseResult<CompoundCommand> {
         // consume 'while'
         self.advance()?;
-        let condition = self.parse_compound_list(CommandToken::EOF, alias_table)?;
+        let condition = self.parse_compound_list(CommandToken::Eof, alias_table)?;
         let body = self.parse_do_group(alias_table)?;
         Ok(CompoundCommand::WhileClause { condition, body })
     }
@@ -554,7 +550,7 @@ impl<'src> CommandParser<'src> {
     fn parse_until_clause(&mut self, alias_table: &AliasTable) -> ParseResult<CompoundCommand> {
         // consume 'until'
         self.advance()?;
-        let condition = self.parse_compound_list(CommandToken::EOF, alias_table)?;
+        let condition = self.parse_compound_list(CommandToken::Eof, alias_table)?;
         let body = self.parse_do_group(alias_table)?;
         Ok(CompoundCommand::UntilClause { condition, body })
     }
@@ -592,7 +588,7 @@ impl<'src> CommandParser<'src> {
             Err(ParserError::new(
                 self.lookahead_lineno,
                 "expected compound command",
-                self.lookahead == CommandToken::EOF,
+                self.lookahead == CommandToken::Eof,
             ))
         }
     }
@@ -664,7 +660,7 @@ impl<'src> CommandParser<'src> {
                 return Err(ParserError::new(
                     pipe_location,
                     "right hand side of pipe operator should be a command",
-                    self.lookahead == CommandToken::EOF,
+                    self.lookahead == CommandToken::Eof,
                 ));
             }
         }
@@ -700,7 +696,7 @@ impl<'src> CommandParser<'src> {
                 return Err(ParserError::new(
                     operator_location,
                     "right hand side of pipe operator should be a command",
-                    self.lookahead == CommandToken::EOF,
+                    self.lookahead == CommandToken::Eof,
                 ));
             };
             let previous = last;
@@ -718,9 +714,9 @@ impl<'src> CommandParser<'src> {
     fn parse_complete_command(&mut self, alias_table: &AliasTable) -> ParseResult<CompleteCommand> {
         // complete_command = and_or (separator_op and_or)* separator_op?
         let mut commands = Vec::new();
-        while self.lookahead != CommandToken::Newline || self.lookahead != CommandToken::EOF {
+        while self.lookahead != CommandToken::Newline || self.lookahead != CommandToken::Eof {
             let command_start = self.lookahead_lineno;
-            if let Some(mut and_or) = self.parse_and_or(CommandToken::EOF, alias_table)? {
+            if let Some(mut and_or) = self.parse_and_or(CommandToken::Eof, alias_table)? {
                 if self.lookahead == CommandToken::And {
                     and_or.is_async = true;
                 }
@@ -746,13 +742,13 @@ impl<'src> CommandParser<'src> {
         &mut self,
         alias_table: &AliasTable,
     ) -> ParseResult<Option<CompleteCommand>> {
-        if self.lookahead == CommandToken::EOF {
+        if self.lookahead == CommandToken::Eof {
             return Ok(None);
         }
         if self.parsed_one_command {
             self.match_token(CommandToken::Newline)?;
             self.skip_linebreak()?;
-            if self.lookahead == CommandToken::EOF {
+            if self.lookahead == CommandToken::Eof {
                 return Ok(None);
             }
         }

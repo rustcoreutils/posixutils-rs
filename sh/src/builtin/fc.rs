@@ -112,10 +112,7 @@ impl<'s> FcArgs<'s> {
             let mut replace = None;
             let mut first = None;
             if let Some(first_op) = args.get(first_operand) {
-                if first_op.contains('=') {
-                    let mut split = first_op.splitn(2, '=');
-                    let old = split.next().unwrap();
-                    let new = split.next().unwrap();
+                if let Some((old, new)) = first_op.split_once('=') {
                     replace = Some(Replace { old, new });
                 } else {
                     first = Some(EndPoint::parse(first_op));

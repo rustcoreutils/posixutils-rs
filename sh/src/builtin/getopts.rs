@@ -87,11 +87,9 @@ impl<'s> OptsParser<'s> {
                                 *option_index += 1;
                                 return ParseResult::SimpleOption(c);
                             }
-                        } else {
-                            if i == *option_index {
-                                *option_index += 1;
-                                return ParseResult::InvalidOption(c);
-                            }
+                        } else if i == *option_index {
+                            *option_index += 1;
+                            return ParseResult::InvalidOption(c);
                         }
                         i += 1;
                     }

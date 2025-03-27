@@ -21,7 +21,7 @@ impl SpecialBuiltinUtility for Export {
         shell: &mut Shell,
         opened_files: &mut OpenedFiles,
     ) -> BuiltinResult {
-        if args.get(0).is_some_and(|arg| arg == "-p") {
+        if args.first().is_some_and(|arg| arg == "-p") {
             if args.len() > 1 && !(args.len() == 2 && args[1] == "--") {
                 return Err("export: too many arguments".into());
             }
@@ -55,7 +55,7 @@ impl SpecialBuiltinUtility for Export {
                 }
                 (name.to_string(), Some(value[1..].to_string()))
             } else {
-                if !is_valid_name(&arg) {
+                if !is_valid_name(arg) {
                     return Err(format!("export: '{arg}' is not a valid name\n").into());
                 }
                 (arg.clone(), None)

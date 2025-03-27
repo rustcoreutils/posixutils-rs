@@ -141,7 +141,7 @@ enum ExprToken<'src> {
     LParen,
     RParen,
 
-    EOF,
+    Eof,
 }
 
 impl Display for ExprToken<'_> {
@@ -184,7 +184,7 @@ impl Display for ExprToken<'_> {
             ExprToken::OrAssign => write!(f, "|="),
             ExprToken::LParen => write!(f, "("),
             ExprToken::RParen => write!(f, ")"),
-            ExprToken::EOF => write!(f, "<EOF>"),
+            ExprToken::Eof => write!(f, "<EOF>"),
         }
     }
 }
@@ -312,7 +312,8 @@ impl<'src> ExpressionParser<'src> {
         while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
             self.advance_char();
         }
-        i64::from_str_radix(&self.source[start_pos..=self.source_position], 10)
+        self.source[start_pos..=self.source_position]
+            .parse()
             .map_err(|_| "invalid number".to_string())
     }
 
@@ -410,7 +411,7 @@ impl<'src> ExpressionParser<'src> {
             Some(c) if c.is_ascii_alphabetic() || c == '_' => {
                 Ok(ExprToken::Variable(self.lex_variable(start_pos)))
             }
-            None => Ok(ExprToken::EOF),
+            None => Ok(ExprToken::Eof),
             Some(other) => Err(format!("unexpected character '{other}")),
         }
     }
@@ -521,7 +522,7 @@ fn parse_expression(expr: &str) -> Result<Expr, String> {
         source: expr,
         source_iter: expr.char_indices().peekable(),
         source_position: 0,
-        lookahead: ExprToken::EOF,
+        lookahead: ExprToken::Eof,
     };
     parser.advance_token()?;
     parser.parse_expr()
@@ -561,7 +562,7 @@ fn interpret_expression(expr: &Expr, shell: &mut Shell) -> ExpansionResult<i64> 
             match operator {
                 UnaryOperator::Plus => Ok(value),
                 UnaryOperator::Minus => Ok(-value),
-                UnaryOperator::Not => Ok(!(value != 0) as i64),
+                UnaryOperator::Not => Ok((value == 0) as i64),
                 UnaryOperator::BitwiseNot => Ok(!value),
             }
         }

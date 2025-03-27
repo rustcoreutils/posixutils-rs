@@ -57,7 +57,7 @@ impl BuiltinUtility for Bg {
                     status = 1;
                 }
             } else {
-                opened_files.write_err("bg: no background jobs".to_string());
+                opened_files.write_err("bg: no background jobs");
                 status = 1;
             }
         } else {

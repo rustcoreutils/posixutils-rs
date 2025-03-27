@@ -248,7 +248,7 @@ impl SetOptions {
     }
 
     pub fn parse_args_and_update(&mut self, args: &[String]) -> Result<ParsedArgs, String> {
-        if args.len() == 0 {
+        if args.is_empty() {
             return Ok(ParsedArgs::PrintVars);
         }
         if args.len() == 1 {

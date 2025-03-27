@@ -129,8 +129,7 @@ impl Environment {
         }
         self.global_scope
             .get(name)
-            .map(|val| val.value.as_deref())
-            .flatten()
+            .and_then(|val| val.value.as_deref())
     }
 
     pub fn promote_local_or_get_global(&mut self, name: String) -> &mut Value {

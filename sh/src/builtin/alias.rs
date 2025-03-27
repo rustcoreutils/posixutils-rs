@@ -34,12 +34,10 @@ impl BuiltinUtility for AliasBuiltin {
                 shell
                     .alias_table
                     .insert(alias.to_string(), command.to_string());
+            } else if let Some(command) = shell.alias_table.get(arg) {
+                opened_files.write_out(format!("alias {}='{}'", arg, command));
             } else {
-                if let Some(command) = shell.alias_table.get(arg) {
-                    opened_files.write_out(format!("alias {}='{}'", arg, command));
-                } else {
-                    return Err(format!("alias: {}: not found", arg).into());
-                }
+                return Err(format!("alias: {}: not found", arg).into());
             }
         }
         Ok(0)

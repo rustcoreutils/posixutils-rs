@@ -26,7 +26,7 @@ fn run_foreground_job(
         kill(job.pid, nix::sys::signal::SIGCONT)
             .map_err(|err| format!("fg: failed to resume {arg} ({err})"))?;
     }
-    opened_files.write_out(&format!("{}\n", job.command));
+    opened_files.write_out(format!("{}\n", job.command));
     let mut temp = job.command.clone();
     std::mem::swap(&mut shell.last_pipeline_command, &mut temp);
     shell
@@ -63,7 +63,7 @@ impl BuiltinUtility for Fg {
                     status = 1;
                 }
             } else {
-                opened_files.write_err("bg: no background jobs".to_string());
+                opened_files.write_err("bg: no background jobs");
                 status = 1;
             }
         } else {

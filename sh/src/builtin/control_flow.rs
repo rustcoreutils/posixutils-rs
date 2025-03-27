@@ -30,7 +30,7 @@ fn loop_control_flow(
     if args.len() > 1 {
         return Err(format!("{name}: too many arguments").into());
     }
-    let n = if let Some(n) = args.get(0) {
+    let n = if let Some(n) = args.first() {
         match n.parse::<i32>() {
             Ok(n) => n,
             Err(_) => {
@@ -74,7 +74,7 @@ impl SpecialBuiltinUtility for Return {
         if args.len() > 1 {
             return Err("return: too many arguments".into());
         }
-        let n = if let Some(n) = args.get(0) {
+        let n = if let Some(n) = args.first() {
             match n.parse::<i32>() {
                 Ok(n) => n,
                 Err(_) => {

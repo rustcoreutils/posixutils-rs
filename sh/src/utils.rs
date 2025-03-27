@@ -27,13 +27,7 @@ pub const DEFAULT_PATH: &str = "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbi
 pub fn strcoll(lhs: &CStr, rhs: &CStr) -> std::cmp::Ordering {
     // strings are valid, this is safe
     let ordering = unsafe { libc::strcoll(lhs.as_ptr(), rhs.as_ptr()) };
-    if ordering < 0 {
-        std::cmp::Ordering::Less
-    } else if ordering == 0 {
-        std::cmp::Ordering::Equal
-    } else {
-        std::cmp::Ordering::Greater
-    }
+    ordering.cmp(&0)
 }
 
 #[derive(Clone, Debug)]

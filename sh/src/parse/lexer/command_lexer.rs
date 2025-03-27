@@ -180,7 +180,7 @@ impl<'s> SourceString<'s> {
         self.parts.push(SourcePart {
             text: string,
             in_original_string: false,
-            provenance: provenance.into(),
+            provenance,
         });
         if p2.text.is_empty() {
             self.parts[self.read_state.current_part + 1..].rotate_right(1);
@@ -281,7 +281,7 @@ pub enum CommandToken<'src> {
         contents: Cow<'src, str>,
     },
 
-    EOF,
+    Eof,
 }
 
 impl Display for CommandToken<'_> {
@@ -324,7 +324,7 @@ impl Display for CommandToken<'_> {
             CommandToken::HereDocument { .. } | CommandToken::QuotedHereDocument { .. } => {
                 write!(f, "here-document")
             }
-            CommandToken::EOF => write!(f, "EOF"),
+            CommandToken::Eof => write!(f, "EOF"),
         }
     }
 }
@@ -371,7 +371,7 @@ impl<'src> CommandToken<'src> {
             CommandToken::Then => Some("then".into()),
             CommandToken::Until => Some("until".into()),
             CommandToken::While => Some("while".into()),
-            CommandToken::Word(word) => Some(word.into()),
+            CommandToken::Word(word) => Some(word),
             _ => None,
         }
     }
@@ -515,7 +515,7 @@ impl<'src> CommandLexer<'src> {
         let line_no = self.source.line_no();
 
         if self.reached_eof() {
-            return Ok((CommandToken::EOF, line_no));
+            return Ok((CommandToken::Eof, line_no));
         }
 
         if let Some(partial_token) = char_to_operator_token(self.source.lookahead()) {
@@ -562,7 +562,7 @@ impl<'src> CommandLexer<'src> {
         }
 
         let token = match self.source.lookahead() {
-            d if d.is_digit(10) => {
+            d if d.is_ascii_digit() => {
                 let prev_read_state = self.source.read_state.clone();
 
                 let mut number = d.to_digit(10).unwrap();
@@ -576,10 +576,10 @@ impl<'src> CommandLexer<'src> {
                     CommandToken::IoNumber(number)
                 } else {
                     self.source.read_state = prev_read_state;
-                    CommandToken::word(self.read_word_token()?.into())
+                    CommandToken::word(self.read_word_token()?)
                 }
             }
-            _ => CommandToken::word(self.read_word_token()?.into()),
+            _ => CommandToken::word(self.read_word_token()?),
         };
         Ok((token, line_no))
     }
@@ -618,7 +618,7 @@ mod tests {
     fn lex_word(text: &str) {
         let mut lex = CommandLexer::new(text);
         if let CommandToken::Word(word) = lex.next_token().unwrap().0 {
-            assert_eq!(lex.next_token().unwrap().0, CommandToken::EOF);
+            assert_eq!(lex.next_token().unwrap().0, CommandToken::Eof);
             assert_eq!(word, text);
         } else {
             panic!("not a word")
@@ -628,21 +628,21 @@ mod tests {
     fn lex_token(token: &str) -> CommandToken {
         let mut lex = CommandLexer::new(token);
         let token = lex.next_token().unwrap().0;
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::EOF);
+        assert_eq!(lex.next_token().unwrap().0, CommandToken::Eof);
         token
     }
 
     #[test]
     fn lex_empty_string() {
         let mut lex = CommandLexer::new("");
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::EOF);
+        assert_eq!(lex.next_token().unwrap().0, CommandToken::Eof);
     }
 
     #[test]
     fn lex_skip_comment() {
         let mut lex = CommandLexer::new("# this is a comment\n");
         assert_eq!(lex.next_token().unwrap().0, CommandToken::Newline);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::EOF);
+        assert_eq!(lex.next_token().unwrap().0, CommandToken::Eof);
 
         let mut lex = CommandLexer::new("cmd arg #comment");
         assert_eq!(
@@ -653,7 +653,7 @@ mod tests {
             lex.next_token().unwrap().0,
             CommandToken::Word("arg".into())
         );
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::EOF);
+        assert_eq!(lex.next_token().unwrap().0, CommandToken::Eof);
     }
 
     #[test]
@@ -675,7 +675,7 @@ mod tests {
         assert_eq!(lex.next_token().unwrap().0, CommandToken::LessAnd);
         assert_eq!(lex.next_token().unwrap().0, CommandToken::GreatAnd);
         assert_eq!(lex.next_token().unwrap().0, CommandToken::LessGreat);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::EOF);
+        assert_eq!(lex.next_token().unwrap().0, CommandToken::Eof);
     }
 
     #[test]
@@ -698,7 +698,7 @@ mod tests {
         assert_eq!(lex.next_token().unwrap().0, CommandToken::Then);
         assert_eq!(lex.next_token().unwrap().0, CommandToken::Until);
         assert_eq!(lex.next_token().unwrap().0, CommandToken::While);
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::EOF);
+        assert_eq!(lex.next_token().unwrap().0, CommandToken::Eof);
     }
 
     #[test]
@@ -839,6 +839,6 @@ mod tests {
         assert_eq!(lex.next_token().unwrap().0, CommandToken::Word("c".into()));
         lex.insert_text_at_current_position("y".into(), "y");
         assert_eq!(lex.next_token().unwrap().0, CommandToken::Word("y".into()));
-        assert_eq!(lex.next_token().unwrap().0, CommandToken::EOF);
+        assert_eq!(lex.next_token().unwrap().0, CommandToken::Eof);
     }
 }

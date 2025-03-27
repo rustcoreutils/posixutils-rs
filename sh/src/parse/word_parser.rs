@@ -357,7 +357,7 @@ impl<'src> WordParser<'src> {
                     current_literal.push(c);
                     self.advance();
                 }
-                WordToken::EOF => break,
+                WordToken::Eof => break,
             }
         }
 
@@ -402,7 +402,7 @@ fn quote_literals(word: Word) -> Result<Word, ParserError> {
 
 pub fn parse_word(text: &str, line_no: u32, contents_are_quoted: bool) -> ParseResult<Word> {
     let mut parser = WordParser::new(text, line_no);
-    let word = parser.parse_word_until(WordToken::EOF)?;
+    let word = parser.parse_word_until(WordToken::Eof)?;
     if contents_are_quoted {
         quote_literals(word)
     } else {

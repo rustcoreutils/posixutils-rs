@@ -20,7 +20,7 @@ impl SpecialBuiltinUtility for Shift {
             return Err("shift: too many arguments".into());
         }
 
-        let n = if let Some(n) = args.get(0) {
+        let n = if let Some(n) = args.first() {
             match n.parse::<usize>() {
                 Ok(n) => {
                     if n > shell.positional_parameters.len() {

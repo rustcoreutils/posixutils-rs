@@ -33,7 +33,7 @@ impl BuiltinUtility for Hash {
 
         let args = skip_option_terminator(args);
 
-        if args.len() == 0 {
+        if args.is_empty() {
             for (command_name, path) in &shell.saved_command_locations {
                 opened_files.write_out(format!("{}: {}\n", command_name, path.to_string_lossy()));
             }
@@ -41,14 +41,13 @@ impl BuiltinUtility for Hash {
         } else {
             let mut status = 0;
             for arg in args {
-                if !get_special_builtin_utility(arg.as_str()).is_some()
-                    && !shell.functions.get(arg.as_str()).is_some()
-                    && !get_builtin_utility(arg.as_str()).is_some()
+                if get_special_builtin_utility(arg.as_str()).is_none()
+                    && !shell.functions.contains_key(arg.as_str())
+                    && get_builtin_utility(arg.as_str()).is_none()
+                    && shell.find_command(arg, "", true).is_none()
                 {
-                    if shell.find_command(arg, "", true).is_none() {
-                        opened_files.write_out(format!("hash: command {} was not found\n", arg));
-                        status = 1;
-                    }
+                    opened_files.write_out(format!("hash: command {} was not found\n", arg));
+                    status = 1;
                 }
             }
             Ok(status)

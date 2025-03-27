@@ -25,7 +25,7 @@ enum KillArgs<'a> {
 }
 
 fn get_pids(args: &[String]) -> Result<&[String], String> {
-    let pids = skip_option_terminator(&args);
+    let pids = skip_option_terminator(args);
     if pids.is_empty() {
         return Err("kill: missing operand".to_string());
     }
@@ -72,7 +72,7 @@ impl<'a> KillArgs<'a> {
             return Ok(KillArgs::SendSignal { pids, signal });
         }
 
-        let pids = get_pids(&args)?;
+        let pids = get_pids(args)?;
         Ok(KillArgs::SendSignal {
             pids,
             signal: Some(Signal::SigTerm),
@@ -95,7 +95,7 @@ impl BuiltinUtility for Kill {
             KillArgs::SendSignal { signal, pids } => {
                 for pid in pids {
                     let pid = parse_pid(pid, shell).map_err(|err| format!("kill: {err}"))?;
-                    kill(pid, signal.map(|s| NixSignal::from(s)))
+                    kill(pid, signal.map(NixSignal::from))
                         .map_err(|err| format!("kill: failed to send signal ({})", err))?;
                 }
             }

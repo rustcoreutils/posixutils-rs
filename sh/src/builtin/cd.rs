@@ -86,14 +86,12 @@ impl BuiltinUtility for Cd {
             } => {
                 let dir = if let Some(dir) = directory {
                     dir
+                } else if let Some(home_dir) = shell.environment.get_str_value("HOME") {
+                    home_dir
                 } else {
-                    if let Some(home_dir) = shell.environment.get_str_value("HOME") {
-                        home_dir
-                    } else {
-                        // behaviour is implementation defined, bash just returns 0
-                        // and doesn't change directory
-                        return Ok(0);
-                    }
+                    // behaviour is implementation defined, bash just returns 0
+                    // and doesn't change directory
+                    return Ok(0);
                 };
                 let mut curr_path = OsString::new();
 
@@ -122,7 +120,7 @@ impl BuiltinUtility for Cd {
                 }
 
                 if !handle_dot_dot_physically {
-                    if !curr_path.as_bytes().get(0).is_some_and(|c| *c == b'/') {
+                    if !curr_path.as_bytes().first().is_some_and(|c| *c == b'/') {
                         let mut new_curr_path = shell
                             .environment
                             .get_str_value("PWD")

@@ -46,12 +46,8 @@ impl Terminal {
     pub fn reset(&self) -> Termios {
         let current = termios::tcgetattr(io::stdin().as_fd()).unwrap();
         if let Some(base_settings) = &self.base_settings {
-            termios::tcsetattr(
-                io::stdin().as_fd(),
-                termios::SetArg::TCSANOW,
-                &base_settings,
-            )
-            .unwrap();
+            termios::tcsetattr(io::stdin().as_fd(), termios::SetArg::TCSANOW, base_settings)
+                .unwrap();
         }
         current
     }

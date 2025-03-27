@@ -20,7 +20,7 @@ impl SpecialBuiltinUtility for Exit {
             return Err("exit: too many arguments".into());
         }
 
-        if let Some(arg) = args.get(0) {
+        if let Some(arg) = args.first() {
             if let Ok(n) = arg.parse::<i32>() {
                 shell.exit(n);
             } else {

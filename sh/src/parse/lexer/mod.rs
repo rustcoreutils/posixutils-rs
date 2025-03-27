@@ -19,17 +19,7 @@ pub fn is_blank(c: char) -> bool {
 }
 
 fn is_operator(c: char) -> bool {
-    match c {
-        '&' => true,
-        '(' => true,
-        ')' => true,
-        ';' => true,
-        '\n' => true,
-        '|' => true,
-        '<' => true,
-        '>' => true,
-        _ => false,
-    }
+    matches!(c, '&' | '(' | ')' | ';' | '\n' | '|' | '<' | '>')
 }
 
 trait Lexer {

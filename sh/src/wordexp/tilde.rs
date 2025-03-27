@@ -29,7 +29,7 @@ impl UsersHomeDirs for DefaultUsersHomeDirs {
         // it cannot contain a null char as part of the method's contract
         let login_name = CString::new(login_name).unwrap();
         let passwd = unsafe { libc::getpwnam(login_name.as_ptr()) };
-        if passwd == std::ptr::null_mut() {
+        if passwd.is_null() {
             return None;
         }
         // this is safe, since the pointer is not null

@@ -163,9 +163,8 @@ impl JobManager {
                     job.state = JobState::Stopped;
                     job.state_should_be_reported = true;
                 }
-                _ => {
-                    todo!()
-                }
+                // no other results possible without specifying flags in waitpid
+                _ => unreachable!(),
             }
         }
         Ok(())

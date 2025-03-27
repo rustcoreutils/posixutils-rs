@@ -882,7 +882,8 @@ impl Shell {
                         output.truncate(new_len);
                         Ok(output)
                     }
-                    _ => todo!(),
+                    // no other results possible without specifying flags in waitpid
+                    _ => unreachable!(),
                 }
             }
         }

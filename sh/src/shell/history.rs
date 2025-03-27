@@ -98,14 +98,11 @@ impl History {
         match end_point {
             EndPoint::CommandNumber(n) => {
                 if let Some(first) = self.entries.front() {
-                    if n <= first.command_number {
-                        // we wrapped around, look for the command from the back
-                        // TODO: I think this can be done in constant time
-                        Ok(self
-                            .entries
-                            .iter()
-                            .rposition(|e| e.command_number == n)
-                            .unwrap_or(self.entries.len() - 1))
+                    if n < first.command_number {
+                        // safe since there is at least one element
+                        let last_command_number = self.entries.back().unwrap().command_number;
+                        let commands_in_between = (last_command_number - n) as usize;
+                        Ok(self.entries.len() - commands_in_between - 1)
                     } else {
                         Ok((n - first.command_number) as usize)
                     }

@@ -129,12 +129,13 @@ impl Command {
             return Err(CommandParseError::IncompleteCommand);
         }
         let count = if last_digit != 0 && bytes[last_digit] != b'0' {
-            // TODO: handle count too big
-            let count = std::str::from_utf8(&bytes[..last_digit])
+            match std::str::from_utf8(&bytes[..last_digit])
                 .unwrap()
                 .parse::<usize>()
-                .unwrap();
-            Some(count - 1)
+            {
+                Ok(count) => Some(count - 1),
+                Err(_) => return Err(CommandParseError::InvalidCommand),
+            }
         } else {
             None
         };

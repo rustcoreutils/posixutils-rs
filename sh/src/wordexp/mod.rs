@@ -62,13 +62,12 @@ fn split_generated_unquoted_literal(
                         None => break 'outer,
                     }
                 }
+            } else if let Some(c) = iter.next() {
+                next_char = c;
             } else {
-                if let Some(c) = iter.next() {
-                    next_char = c;
-                } else {
-                    break;
-                }
+                break;
             }
+
             if !accumulator.is_empty() {
                 last_word.append(accumulator, false, false);
                 accumulator = String::new();

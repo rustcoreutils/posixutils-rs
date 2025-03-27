@@ -589,7 +589,11 @@ impl<'src> CommandParser<'src> {
                 body: Rc::from(body),
             })
         } else {
-            todo!("error: expected compound command")
+            Err(ParserError::new(
+                self.lookahead_lineno,
+                "expected compound command",
+                self.lookahead == CommandToken::EOF,
+            ))
         }
     }
 

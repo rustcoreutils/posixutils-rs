@@ -249,7 +249,7 @@ pub fn expand_word(
 
 pub fn word_to_pattern(word: &Word, shell: &mut Shell) -> ExpansionResult<Pattern> {
     let mut expanded_word = ExpandedWord::default();
-    simple_word_expansion_into(&mut expanded_word, &word, false, shell)?;
+    simple_word_expansion_into(&mut expanded_word, word, false, shell)?;
     Pattern::new(&expanded_word).map_err(CommandExecutionError::ExpansionError)
 }
 

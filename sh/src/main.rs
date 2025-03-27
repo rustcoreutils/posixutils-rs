@@ -61,7 +61,7 @@ fn print_line(line: &[u8], mut cursor_position: usize, shell: &mut Shell, print_
         print!("{}", ps1);
         cursor_position += ps1.len();
     }
-    std::io::stdout().write(&line).unwrap();
+    std::io::stdout().write_all(&line).unwrap();
     set_cursor_pos(cursor_position);
     io::stdout().flush().unwrap();
 }
@@ -100,7 +100,7 @@ fn standard_repl(shell: &mut Shell) {
                             continue;
                         }
                     };
-                    print!("\n");
+                    println!();
                     shell.terminal.reset();
                     match shell.execute_program(program_string) {
                         Ok(_) => {
@@ -157,7 +157,7 @@ fn vi_repl(shell: &mut Shell) {
                             continue;
                         }
                     };
-                    print!("\n");
+                    println!();
                     shell.terminal.reset();
                     match shell.execute_program(program_string) {
                         Ok(_) => {
@@ -195,7 +195,7 @@ fn vi_repl(shell: &mut Shell) {
                 print!("{}", ps1);
                 cursor_position += ps1.len();
             }
-            std::io::stdout().write(editor.current_line(shell)).unwrap();
+            std::io::stdout().write_all(editor.current_line(shell)).unwrap();
             set_cursor_pos(cursor_position);
             io::stdout().flush().unwrap();
         }

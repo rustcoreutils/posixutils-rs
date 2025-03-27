@@ -246,7 +246,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     textdomain("posixutils-rs")?;
     bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
 
-    let args = parse_args(std::env::args().collect(), is_attached_to_terminal()).unwrap();
+    let args = match parse_args(std::env::args().collect(), is_attached_to_terminal()) {
+        Ok(args) => args,
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+    };
     let mut shell = Shell::initialize_from_system(
         args.program_name,
         args.arguments,

@@ -11,6 +11,7 @@ use crate::pattern::HistoryPattern;
 use crate::shell::environment::Environment;
 use std::collections::VecDeque;
 use std::io::Read;
+use std::io::Write;
 use std::path::Path;
 
 #[derive(Debug, Eq, PartialEq)]
@@ -214,6 +215,30 @@ fn read_history_from_file(path: &Path, max_entries: u32) -> History {
                 path.to_string_lossy()
             );
             History::new(max_entries)
+        }
+    }
+}
+
+pub fn write_history_to_file(history: &History, env: &Environment) {
+    let path = if let Some(histfile) = env.get_str_value("HISTFILE") {
+        histfile.to_string()
+    } else if let Some(home) = env.get_str_value("HOME") {
+        format!("{home}/.sh_history")
+    } else {
+        eprintln!("sh: HISTFILE or HOME not set, history not saved");
+        return;
+    };
+    match std::fs::File::options().write(true).open(&path) {
+        Ok(mut file) => {
+            for entry in &history.entries {
+                if let Err(err) = writeln!(file, "{}", entry.command) {
+                    eprintln!("sh: failed to write to history file at {} ({err})", path);
+                    return;
+                }
+            }
+        }
+        Err(err) => {
+            eprintln!("sh: failed to open history file at {} ({err})", path);
         }
     }
 }

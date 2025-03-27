@@ -24,7 +24,7 @@ use crate::parse::word::WordPair;
 use crate::parse::word_parser::parse_word;
 use crate::parse::{AliasTable, ParserError};
 use crate::shell::environment::{CannotModifyReadonly, Environment, Value};
-use crate::shell::history::{initialize_history_from_system, History};
+use crate::shell::history::{initialize_history_from_system, write_history_to_file, History};
 use crate::shell::opened_files::OpenedFiles;
 use crate::signals::SignalManager;
 use crate::utils::{
@@ -194,6 +194,9 @@ impl Shell {
 
     pub fn exit(&mut self, code: i32) -> ! {
         self.execute_action(self.exit_action.clone());
+        if self.is_interactive && !self.is_subshell {
+            write_history_to_file(&self.history, &self.environment);
+        }
         std::process::exit(code);
     }
 

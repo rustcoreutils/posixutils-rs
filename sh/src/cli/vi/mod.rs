@@ -293,6 +293,9 @@ pub struct ViEditor {
     last_nonmotion_command: Option<Command>,
     last_search: Option<LastSearch>,
     save_buffer: Vec<u8>,
+    /// 0 means the `edit_line`, from 1 on
+    /// its an index into the history starting
+    /// from the most recent command
     current_command_in_history: usize,
 }
 

@@ -239,6 +239,7 @@ enum EditorMode {
     Insert,
     Replace,
     Command,
+    InsertNext,
 }
 
 pub struct CommandError;
@@ -759,6 +760,7 @@ impl ViEditor {
                     b'\x04' => return Ok(Action::Eof),
                     b'\x16' => {
                         // ^V
+                        self.mode = EditorMode::InsertNext;
                     }
                     b'\x17' => {}
                     other if !other.is_ascii_control() => {
@@ -791,6 +793,15 @@ impl ViEditor {
                         return Err(CommandError);
                     }
                 }
+            }
+            EditorMode::InsertNext => {
+                if self.cursor.position < self.edit_line.len() {
+                    self.edit_line.insert(self.cursor.position, c);
+                } else {
+                    self.edit_line.push(c);
+                }
+                self.cursor.position += 1;
+                self.mode = EditorMode::Insert;
             }
         }
         Ok(Action::None)

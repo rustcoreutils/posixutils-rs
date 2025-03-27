@@ -50,20 +50,28 @@ fn execute_string(string: &str, shell: &mut Shell) {
     }
 }
 
-fn print_line(line: &[u8], mut cursor_position: usize, shell: &mut Shell, print_ps2: bool) {
-    clear_line();
+fn flush_stdout() {
+    // this is a basic operation, if this doesn't work,
+    // there's nothing else we can do
+    io::stdout().flush().expect("could not flush stdout");
+}
+
+fn write_stdout(bytes: &[u8]) {
+    io::stdout()
+        .write_all(bytes)
+        .expect("failed to write to stdout");
+}
+
+fn print_prompt(shell: &mut Shell, print_ps2: bool) -> usize {
     if print_ps2 {
         let ps2 = shell.get_ps2();
         print!("{}", ps2);
-        cursor_position += ps2.len();
+        ps2.len()
     } else {
         let ps1 = shell.get_ps1();
         print!("{}", ps1);
-        cursor_position += ps1.len();
+        ps1.len()
     }
-    std::io::stdout().write_all(&line).unwrap();
-    set_cursor_pos(cursor_position);
-    io::stdout().flush().unwrap();
 }
 
 fn standard_repl(shell: &mut Shell) {
@@ -71,7 +79,7 @@ fn standard_repl(shell: &mut Shell) {
     let mut line_buffer = Vec::new();
     let mut print_ps2 = false;
     clear_line();
-    io::stdout().flush().unwrap();
+    flush_stdout();
     eprint!("{}", shell.get_ps1());
     loop {
         while let Some(c) = read_nonblocking_char() {
@@ -124,7 +132,12 @@ fn standard_repl(shell: &mut Shell) {
                 }
                 _ => {}
             }
-            print_line(&line_buffer, line_buffer.len(), shell, print_ps2);
+            let mut cursor_position = line_buffer.len();
+            clear_line();
+            cursor_position += print_prompt(shell, print_ps2);
+            write_stdout(&line_buffer);
+            set_cursor_pos(cursor_position);
+            flush_stdout();
         }
         std::thread::sleep(Duration::from_millis(16));
         shell.update_global_state();
@@ -139,7 +152,7 @@ fn vi_repl(shell: &mut Shell) {
     let mut buffer = Vec::new();
     let mut print_ps2 = false;
     clear_line();
-    io::stdout().flush().unwrap();
+    flush_stdout();
     eprint!("{}", shell.get_ps1());
     loop {
         while let Some(c) = read_nonblocking_char() {
@@ -186,18 +199,10 @@ fn vi_repl(shell: &mut Shell) {
             }
             let mut cursor_position = editor.cursor_position();
             clear_line();
-            if print_ps2 {
-                let ps2 = shell.get_ps2();
-                print!("{}", ps2);
-                cursor_position += ps2.len();
-            } else {
-                let ps1 = shell.get_ps1();
-                print!("{}", ps1);
-                cursor_position += ps1.len();
-            }
-            std::io::stdout().write_all(editor.current_line(shell)).unwrap();
+            cursor_position += print_prompt(shell, print_ps2);
+            write_stdout(editor.current_line(shell));
             set_cursor_pos(cursor_position);
-            io::stdout().flush().unwrap();
+            flush_stdout()
         }
         std::thread::sleep(Duration::from_millis(16));
         shell.update_global_state();

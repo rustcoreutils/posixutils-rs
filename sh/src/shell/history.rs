@@ -228,18 +228,12 @@ pub fn write_history_to_file(history: &History, env: &Environment) {
         eprintln!("sh: HISTFILE or HOME not set, history not saved");
         return;
     };
-    match std::fs::File::options().write(true).open(&path) {
-        Ok(mut file) => {
-            for entry in &history.entries {
-                if let Err(err) = writeln!(file, "{}", entry.command) {
-                    eprintln!("sh: failed to write to history file at {} ({err})", path);
-                    return;
-                }
-            }
-        }
-        Err(err) => {
-            eprintln!("sh: failed to open history file at {} ({err})", path);
-        }
+    let mut content = String::new();
+    for entry in &history.entries {
+        content.push_str(&entry.command);
+    }
+    if let Err(err) = std::fs::write(&path, content) {
+        eprintln!("sh: failed to open history file at {} ({err})", path);
     }
 }
 

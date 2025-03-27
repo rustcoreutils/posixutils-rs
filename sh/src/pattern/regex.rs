@@ -38,7 +38,11 @@ fn regex_compilation_result(
 
 // TODO: the implementation is copied from awk, maybe we should consider putting it in a shared crate
 pub struct Regex {
-    raw_regex: libc::regex_t,
+    /// if the regex was initialized with an empty string,
+    /// `raw_regex` will be empty. This is to allow
+    /// empty string regexes on MacOS, which otherwise
+    /// would return a REG_EMPTY on compilation.
+    raw_regex: Option<libc::regex_t>,
     regex_string: CString,
 }
 
@@ -57,6 +61,9 @@ pub struct MatchIter<'a> {
 impl Iterator for MatchIter<'_> {
     type Item = RegexMatch;
     fn next(&mut self) -> Option<Self::Item> {
+        if self.regex.raw_regex.is_none() {
+            return None;
+        }
         if self.next_start >= self.string.to_bytes().len() {
             return None;
         }
@@ -66,7 +73,7 @@ impl Iterator for MatchIter<'_> {
         };
         let exec_status = unsafe {
             libc::regexec(
-                ptr::from_ref(&self.regex.raw_regex),
+                ptr::from_ref(&self.regex.raw_regex.unwrap()),
                 self.string.as_ptr().add(self.next_start),
                 1,
                 ptr::from_mut(&mut match_range),
@@ -87,13 +94,19 @@ impl Iterator for MatchIter<'_> {
 
 impl Regex {
     pub fn new(regex: CString) -> Result<Self, String> {
+        if regex.is_empty() {
+            return Ok(Self {
+                raw_regex: None,
+                regex_string: regex,
+            });
+        }
         let mut raw = unsafe { std::mem::zeroed::<libc::regex_t>() };
         // difference from awk implementation: use 0 instead of REG_EXTENDED
         let compilation_status =
             unsafe { libc::regcomp(ptr::from_mut(&mut raw), regex.as_ptr(), 0) };
         regex_compilation_result(compilation_status, &raw)?;
         Ok(Self {
-            raw_regex: raw,
+            raw_regex: Some(raw),
             regex_string: regex,
         })
     }
@@ -113,8 +126,10 @@ impl Regex {
 
 impl Drop for Regex {
     fn drop(&mut self) {
-        unsafe {
-            libc::regfree(ptr::from_mut(&mut self.raw_regex));
+        if let Some(regex) = &mut self.raw_regex {
+            unsafe {
+                libc::regfree(ptr::from_mut(regex));
+            }
         }
     }
 }

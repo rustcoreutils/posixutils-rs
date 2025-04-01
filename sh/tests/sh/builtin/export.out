@@ -1,0 +1,12 @@
+0
+value
+0
+value2
+0
+value3
+export export_test_var='value'
+export export_test_var2='value2'
+export export_test_var3='value3'
+export export_test_var='value'
+export export_test_var2='value2'
+export export_test_var3='value3'

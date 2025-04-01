@@ -20,6 +20,7 @@ members = [
 	"process",
 	"sccs",
 	"screen",
+	"sh",
 	"sys",
 	"text",
 	"tree",

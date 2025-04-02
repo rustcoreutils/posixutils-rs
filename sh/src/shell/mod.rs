@@ -768,15 +768,18 @@ impl Shell {
                     if is_process_in_foreground() {
                         // unwrap should never fail as child is a valid process id and in the
                         // same session as the shell process
-                        while getpgid(Some(child)).unwrap().as_raw() as u32 == getgid().as_raw() {
-                            // loop until child is process group leader
+                        let mut child_pgid = getpgid(Some(child)).unwrap();
+                        // loop until child is in another group
+                        while child_pgid.as_raw() as u32 == getgid().as_raw() {
                             self.handle_async_events();
                             std::thread::sleep(Duration::from_millis(16));
+                            // cannot fail, same reason as above
+                            child_pgid = getpgid(Some(child)).unwrap();
                         }
                         // should never fail as stdin is a valid file descriptor and
                         // child is a valid group id and is in the same session
                         // as the shell process
-                        tcsetpgrp(io::stdin().as_fd(), child).unwrap();
+                        tcsetpgrp(io::stdin().as_fd(), child_pgid).unwrap();
                         pipeline_exit_status = self.wait_child_process(child)?;
                         // should never fail
                         tcsetpgrp(io::stdin().as_fd(), getpgrp()).unwrap();

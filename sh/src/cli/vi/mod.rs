@@ -821,6 +821,13 @@ impl ViEditor {
         }
         Ok(Action::None)
     }
+
+    pub fn reset_current_line(&mut self) {
+        self.edit_line.clear();
+        self.cursor.position = 0;
+        self.current_history_command = 0;
+        self.mode = EditorMode::Insert;
+    }
 }
 
 impl Default for ViEditor {

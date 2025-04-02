@@ -260,7 +260,7 @@ pub const SIGNALS: &[Signal] = &[
 static mut SIGNAL_WRITE: Option<RawFd> = None;
 static mut SIGNAL_READ: Option<RawFd> = None;
 
-extern "C" fn handle_signals(signal: libc::c_int) {
+extern "C" fn write_signal_to_buffer(signal: libc::c_int) {
     // SIGNAL_WRITE is never modified after the initial
     // setup, and is a valid file descriptor, so this is safe
     let fd = unsafe { BorrowedFd::borrow_raw(SIGNAL_WRITE.unwrap()) };
@@ -304,12 +304,50 @@ fn get_pending_signal() -> Option<Signal> {
     }
 }
 
+pub unsafe fn handle_signal_ignore(signal: Signal) {
+    sigaction(
+        signal.into(),
+        &SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty()),
+    )
+    .unwrap();
+}
+
+pub unsafe fn handle_signal_default(signal: Signal) {
+    sigaction(
+        signal.into(),
+        &SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty()),
+    )
+    .unwrap();
+}
+
+pub unsafe fn handle_signal_write_to_signal_buffer(signal: Signal) {
+    sigaction(
+        signal.into(),
+        &SigAction::new(
+            SigHandler::Handler(write_signal_to_buffer),
+            SaFlags::empty(),
+            SigSet::empty(),
+        ),
+    )
+    .unwrap();
+}
+
 #[derive(Clone)]
 pub struct SignalManager {
     actions: [TrapAction; Signal::Count as usize],
+    is_interactive: bool,
+    sigint_count: u32,
 }
 
 impl SignalManager {
+    pub fn new(is_interactive: bool) -> Self {
+        Self {
+            actions: [const { TrapAction::Default }; Signal::Count as usize],
+            is_interactive,
+            sigint_count: 0,
+        }
+    }
+
     pub fn reset(&mut self) {
         for signal in SIGNALS {
             let signal = *signal;
@@ -336,44 +374,35 @@ impl SignalManager {
 
     pub fn set_action(&mut self, signal: Signal, action: TrapAction) {
         assert!(signal != Signal::SigKill && signal != Signal::SigStop);
+
+        if self.is_interactive
+            && signal == Signal::SigInt
+            && (action == TrapAction::Ignore || action == TrapAction::Default)
+        {
+            // in interactive mode we always want catch sigint
+            unsafe { handle_signal_write_to_signal_buffer(Signal::SigInt) };
+            self.actions[signal as usize] = action;
+            return;
+        }
         match action {
             TrapAction::Default => {
-                unsafe {
-                    sigaction(
-                        signal.into(),
-                        &SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty()),
-                    )
-                    .unwrap()
-                };
+                unsafe { handle_signal_default(signal) };
             }
             TrapAction::Ignore => {
-                unsafe {
-                    sigaction(
-                        signal.into(),
-                        &SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty()),
-                    )
-                    .unwrap()
-                };
+                unsafe { handle_signal_ignore(signal) };
             }
             TrapAction::Commands(_) => {
-                unsafe {
-                    sigaction(
-                        signal.into(),
-                        &SigAction::new(
-                            SigHandler::Handler(handle_signals),
-                            SaFlags::empty(),
-                            SigSet::empty(),
-                        ),
-                    )
-                    .unwrap()
-                };
+                unsafe { handle_signal_write_to_signal_buffer(signal) };
             }
         }
         self.actions[signal as usize] = action;
     }
 
-    pub fn get_pending_action(&self) -> Option<&TrapAction> {
+    pub fn get_pending_action(&mut self) -> Option<&TrapAction> {
         if let Some(signal) = get_pending_signal() {
+            if signal == Signal::SigInt {
+                self.sigint_count += 1;
+            }
             Some(&self.actions[signal as usize])
         } else {
             None
@@ -385,12 +414,12 @@ impl SignalManager {
             .iter()
             .map(move |&signal| (signal, &self.actions[signal as usize]))
     }
-}
 
-impl Default for SignalManager {
-    fn default() -> Self {
-        Self {
-            actions: [const { TrapAction::Default }; Signal::Count as usize],
-        }
+    pub fn reset_sigint_count(&mut self) {
+        self.sigint_count = 0;
+    }
+
+    pub fn get_sigint_count(&self) -> u32 {
+        self.sigint_count
     }
 }

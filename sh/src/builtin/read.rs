@@ -81,7 +81,7 @@ fn read_until_from_non_blocking_fd(
             }
         }
         // might receive signals while reading
-        shell.update_global_state();
+        shell.handle_async_events();
         std::thread::sleep(Duration::from_millis(16));
     }
     if !buffer.is_empty() {

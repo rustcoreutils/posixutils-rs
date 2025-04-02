@@ -34,8 +34,10 @@ use crate::utils::{
 use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
 use nix::errno::Errno;
 use nix::libc;
+use nix::sys::signal::kill;
+use nix::sys::signal::Signal as NixSignal;
 use nix::sys::wait::{WaitPidFlag, WaitStatus};
-use nix::unistd::{getcwd, getpgrp, getpid, getppid, setpgid, ForkResult, Pid};
+use nix::unistd::{getcwd, getpgid, getpgrp, getpid, getppid, setpgid, tcsetpgrp, ForkResult, Pid};
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
 use std::fmt::{Display, Formatter};
@@ -217,7 +219,7 @@ impl Shell {
                     return Ok(signal_to_exit_status(signal));
                 }
                 WaitStatus::StillAlive => {
-                    self.update_global_state();
+                    self.handle_async_events();
                     std::thread::sleep(Duration::from_millis(16));
                 }
                 _ => unreachable!(),
@@ -225,7 +227,7 @@ impl Shell {
         }
     }
 
-    pub fn update_global_state(&mut self) {
+    pub fn handle_async_events(&mut self) {
         self.process_signals();
         if self.set_options.monitor {
             if let Err(err) = self.background_jobs.update_jobs() {
@@ -262,8 +264,8 @@ impl Shell {
     }
 
     pub fn process_signals(&mut self) {
-        while let Some(action) = self.signal_manager.get_pending_action() {
-            self.execute_action(action.clone())
+        while let Some(action) = self.signal_manager.get_pending_action().cloned() {
+            self.execute_action(action)
         }
     }
 
@@ -729,17 +731,22 @@ impl Shell {
             match fork()? {
                 ForkResult::Child => {
                     self.become_subshell();
-                    setpgid(Pid::from_raw(0), Pid::from_raw(0))
-                        .expect("failed to create new process group for pipeline");
+                    // this should never fail as both arguments are valid
+                    setpgid(Pid::from_raw(0), Pid::from_raw(0)).unwrap();
                     let pipeline_pgid = getpgrp();
+                    // wait for the parent process to put the subshell in the foreground
+                    if let Err(err) = kill(Pid::from_raw(0), NixSignal::SIGTSTP) {
+                        self.eprint(&format!("sh: internal call to kill failed ({err})"));
+                        self.exit(1);
+                    }
 
                     let mut current_stdin = libc::STDIN_FILENO;
                     for command in pipeline.commands.head() {
                         let (read_pipe, write_pipe) = pipe()?;
                         match fork()? {
                             ForkResult::Child => {
-                                setpgid(Pid::from_raw(0), pipeline_pgid)
-                                    .expect("failed to set pipeline pgid");
+                                // should never fail as `pipeline_pgid` is a valid process group
+                                setpgid(Pid::from_raw(0), pipeline_pgid).unwrap();
                                 drop(read_pipe);
                                 dup2(current_stdin, libc::STDIN_FILENO)?;
                                 dup2(write_pipe.as_raw_fd(), libc::STDOUT_FILENO)?;
@@ -763,12 +770,46 @@ impl Shell {
                     self.exit(return_status);
                 }
                 ForkResult::Parent { child } => {
-                    if is_process_in_foreground() {
-                        nix::unistd::tcsetpgrp(io::stdin().as_fd(), child).unwrap();
-                        pipeline_exit_status = self.wait_child_process(child)?;
-                        nix::unistd::tcsetpgrp(io::stdin().as_fd(), getpgrp()).unwrap();
-                    } else {
-                        pipeline_exit_status = self.wait_child_process(child)?;
+                    loop {
+                        match waitpid(child, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED))? {
+                            WaitStatus::Exited(_, _) => {
+                                // the only way this happened is if there was an error before going
+                                // the child went to sleep
+                                return Ok(1);
+                            }
+                            WaitStatus::Signaled(_, _, _) => {
+                                self.eprint("sh: unsynchronised pipeline was terminated by another process\n");
+                                return Ok(1);
+                            }
+                            WaitStatus::Continued(_) => {
+                                self.eprint("sh: unsynchronised pipeline was restarted by another process\n");
+                                return Ok(1);
+                            }
+                            WaitStatus::Stopped(_, _) => {
+                                if is_process_in_foreground() {
+                                    // should never fail as child is a valid process id and
+                                    // in the same session as the current shell
+                                    let child_gpid = getpgid(Some(child)).unwrap();
+                                    // should never fail as stdin is a valid file descriptor and
+                                    // child gpid is valid and in the same session
+                                    tcsetpgrp(io::stdin().as_fd(), child_gpid).unwrap();
+                                    kill(child, NixSignal::SIGCONT).unwrap();
+                                    pipeline_exit_status = self.wait_child_process(child)?;
+                                    // should never fail
+                                    tcsetpgrp(io::stdin().as_fd(), getpgrp()).unwrap();
+                                    break;
+                                } else {
+                                    kill(child, NixSignal::SIGCONT).unwrap();
+                                    pipeline_exit_status = self.wait_child_process(child)?;
+                                    break;
+                                }
+                            }
+                            WaitStatus::StillAlive => {
+                                self.handle_async_events();
+                                std::thread::sleep(Duration::from_millis(16));
+                            }
+                            _ => unreachable!(),
+                        }
                     }
                 }
             }
@@ -958,6 +999,7 @@ impl Shell {
             history,
             set_options,
             is_interactive,
+            signal_manager: SignalManager::new(is_interactive),
             ..Default::default()
         }
     }
@@ -1019,7 +1061,7 @@ impl Default for Shell {
             is_interactive: false,
             last_lineno: 0,
             exit_action: TrapAction::Default,
-            signal_manager: SignalManager::default(),
+            signal_manager: SignalManager::new(false),
             background_jobs: JobManager::default(),
             history: History::new(32767),
             umask: !0o022 & 0o777,

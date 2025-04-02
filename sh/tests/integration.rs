@@ -10,14 +10,17 @@ fn set_env_vars() {
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
     {
-        let current_dir = std::env::current_dir().unwrap();
-        let base_dir = if current_dir.ends_with("sh") {
-            current_dir.join("tests")
+        let mut current_dir = std::env::current_dir().unwrap();
+        let read_dir;
+        let write_dir;
+        if current_dir.ends_with("sh") {
+            read_dir = current_dir.join("tests/read_dir");
+            current_dir.pop();
+            write_dir = current_dir.join("target/tmp/sh_test_write_dir");
         } else {
-            current_dir.join("sh/tests")
+            read_dir = current_dir.join("sh/tests/read_dir");
+            write_dir = current_dir.join("target/tmp/sh_test_write_dir")
         };
-        let read_dir = base_dir.join("read_dir");
-        let write_dir = base_dir.join("write_dir");
         if !write_dir.exists() {
             std::fs::create_dir(&write_dir).expect("failed to create write_dir");
         }

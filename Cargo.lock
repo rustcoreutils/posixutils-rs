@@ -1633,6 +1633,7 @@ dependencies = [
  "dirs 5.0.1",
  "gettext-rs",
  "libc",
+ "memchr",
  "notify-debouncer-full",
  "plib",
  "proptest",

@@ -140,7 +140,7 @@ fn standard_repl(shell: &mut Shell) {
             flush_stdout();
         }
         std::thread::sleep(Duration::from_millis(16));
-        shell.update_global_state();
+        shell.handle_async_events();
         if shell.set_options.vi {
             return;
         }
@@ -205,7 +205,7 @@ fn vi_repl(shell: &mut Shell) {
             flush_stdout()
         }
         std::thread::sleep(Duration::from_millis(16));
-        shell.update_global_state();
+        shell.handle_async_events();
         if !shell.set_options.vi {
             return;
         }

@@ -219,7 +219,7 @@ impl Shell {
                     return Ok(signal_to_exit_status(signal));
                 }
                 WaitStatus::StillAlive => {
-                    self.update_global_state();
+                    self.handle_async_events();
                     std::thread::sleep(Duration::from_millis(16));
                 }
                 _ => unreachable!(),
@@ -227,7 +227,7 @@ impl Shell {
         }
     }
 
-    pub fn update_global_state(&mut self) {
+    pub fn handle_async_events(&mut self) {
         self.process_signals();
         if self.set_options.monitor {
             if let Err(err) = self.background_jobs.update_jobs() {
@@ -770,7 +770,7 @@ impl Shell {
                         // same session as the shell process
                         while getpgid(Some(child)).unwrap().as_raw() as u32 == getgid().as_raw() {
                             // loop until child is process group leader
-                            self.update_global_state();
+                            self.handle_async_events();
                             std::thread::sleep(Duration::from_millis(16));
                         }
                         // should never fail as stdin is a valid file descriptor and

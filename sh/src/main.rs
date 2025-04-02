@@ -11,13 +11,14 @@ use crate::cli::args::{parse_args, ExecutionMode};
 use crate::cli::terminal::is_attached_to_terminal;
 use crate::cli::{clear_line, set_cursor_pos};
 use crate::shell::Shell;
-use crate::signals::setup_signal_handling;
+use crate::signals::{
+    handle_signal_ignore, handle_signal_write_to_signal_buffer, setup_signal_handling, Signal,
+};
 use crate::utils::is_process_in_foreground;
 use cli::terminal::read_nonblocking_char;
 use cli::vi::{Action, ViEditor};
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use nix::sys::signal::{sigaction, SaFlags, SigAction, SigSet};
-use nix::sys::signal::{SigHandler, Signal as NixSignal};
+use nix::libc;
 use std::error::Error;
 use std::io;
 use std::io::Write;
@@ -140,7 +141,14 @@ fn standard_repl(shell: &mut Shell) {
             flush_stdout();
         }
         std::thread::sleep(Duration::from_millis(16));
+        shell.signal_manager.reset_sigint_count();
         shell.handle_async_events();
+        if shell.signal_manager.get_sigint_count() > 0 {
+            program_buffer.clear();
+            line_buffer.clear();
+            println!();
+            eprint!("{}", shell.get_ps1());
+        }
         if shell.set_options.vi {
             return;
         }
@@ -149,7 +157,7 @@ fn standard_repl(shell: &mut Shell) {
 
 fn vi_repl(shell: &mut Shell) {
     let mut editor = ViEditor::default();
-    let mut buffer = Vec::new();
+    let mut program_buffer = Vec::new();
     let mut print_ps2 = false;
     clear_line();
     flush_stdout();
@@ -158,15 +166,15 @@ fn vi_repl(shell: &mut Shell) {
         while let Some(c) = read_nonblocking_char() {
             match editor.process_new_input(c, shell) {
                 Ok(Action::Execute(command)) => {
-                    buffer.extend(command.iter());
-                    if buffer.ends_with(b"\\\n") {
+                    program_buffer.extend(command.iter());
+                    if program_buffer.ends_with(b"\\\n") {
                         continue;
                     }
-                    let program_string = match std::str::from_utf8(&buffer) {
+                    let program_string = match std::str::from_utf8(&program_buffer) {
                         Ok(buf) => buf,
                         Err(_) => {
                             eprintln!("sh: invalid utf-8 sequence");
-                            buffer.clear();
+                            program_buffer.clear();
                             continue;
                         }
                     };
@@ -174,13 +182,13 @@ fn vi_repl(shell: &mut Shell) {
                     shell.terminal.reset();
                     match shell.execute_program(program_string) {
                         Ok(_) => {
-                            buffer.clear();
+                            program_buffer.clear();
                             print_ps2 = false;
                         }
                         Err(syntax_err) => {
                             if !syntax_err.could_be_resolved_with_more_input {
                                 eprintln!("sh: syntax error: {}", syntax_err.message);
-                                buffer.clear();
+                                program_buffer.clear();
                             } else {
                                 print_ps2 = true;
                             }
@@ -205,7 +213,14 @@ fn vi_repl(shell: &mut Shell) {
             flush_stdout()
         }
         std::thread::sleep(Duration::from_millis(16));
+        shell.signal_manager.reset_sigint_count();
         shell.handle_async_events();
+        if shell.signal_manager.get_sigint_count() > 0 {
+            program_buffer.clear();
+            editor.reset_current_line();
+            println!();
+            eprint!("{}", shell.get_ps1());
+        }
         if !shell.set_options.vi {
             return;
         }
@@ -218,24 +233,14 @@ fn interactive_shell(shell: &mut Shell) {
         nix::unistd::tcsetpgrp(io::stdin().as_fd(), pgid).unwrap();
     }
     shell.terminal.set_nonblocking_no_echo();
-    let ignore_action = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
-    unsafe {
-        sigaction(NixSignal::SIGQUIT, &ignore_action).unwrap();
-    }
-    unsafe {
-        sigaction(NixSignal::SIGTERM, &ignore_action).unwrap();
-    }
+    unsafe { handle_signal_ignore(Signal::SigQuit) }
+    unsafe { handle_signal_ignore(Signal::SigTerm) }
+    unsafe { handle_signal_write_to_signal_buffer(Signal::SigInt) }
     if shell.set_options.monitor {
         // job control signals
-        unsafe {
-            sigaction(NixSignal::SIGTTIN, &ignore_action).unwrap();
-        }
-        unsafe {
-            sigaction(NixSignal::SIGTTOU, &ignore_action).unwrap();
-        }
-        unsafe {
-            sigaction(NixSignal::SIGTSTP, &ignore_action).unwrap();
-        }
+        unsafe { handle_signal_ignore(Signal::SigTtin) }
+        unsafe { handle_signal_ignore(Signal::SigTtou) }
+        unsafe { handle_signal_ignore(Signal::SigTstp) }
     }
     loop {
         if shell.set_options.vi {

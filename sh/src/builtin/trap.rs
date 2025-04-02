@@ -14,7 +14,7 @@ use crate::signals::Signal;
 use std::fmt::Display;
 use std::str::FromStr;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum TrapAction {
     Default,
     Ignore,

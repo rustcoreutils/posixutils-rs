@@ -264,8 +264,8 @@ impl Shell {
     }
 
     pub fn process_signals(&mut self) {
-        while let Some(action) = self.signal_manager.get_pending_action() {
-            self.execute_action(action.clone())
+        while let Some(action) = self.signal_manager.get_pending_action().cloned() {
+            self.execute_action(action)
         }
     }
 
@@ -971,6 +971,7 @@ impl Shell {
             history,
             set_options,
             is_interactive,
+            signal_manager: SignalManager::new(is_interactive),
             ..Default::default()
         }
     }
@@ -1032,7 +1033,7 @@ impl Default for Shell {
             is_interactive: false,
             last_lineno: 0,
             exit_action: TrapAction::Default,
-            signal_manager: SignalManager::default(),
+            signal_manager: SignalManager::new(false),
             background_jobs: JobManager::default(),
             history: History::new(32767),
             umask: !0o022 & 0o777,

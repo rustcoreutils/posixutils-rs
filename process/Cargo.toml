@@ -12,10 +12,7 @@ plib = { path = "../plib" }
 clap.workspace = true
 gettext-rs.workspace = true
 libc.workspace = true
-chrono.workspace = true
 dirs = "5.0"
-chrono-tz.workspace = true
-tempfile.workspace = true
 
 [build-dependencies]
 bindgen = { version = "0.70.0", features = ["runtime"] }
@@ -25,10 +22,6 @@ workspace = true
 
 [dev-dependencies]
 sysinfo = "0.31"
-
-[[bin]]
-name = "at"
-path = "./at.rs"
 
 [[bin]]
 name = "fuser"

@@ -35,7 +35,9 @@ use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
 use nix::errno::Errno;
 use nix::libc;
 use nix::sys::wait::{WaitPidFlag, WaitStatus};
-use nix::unistd::{getcwd, getpgrp, getpid, getppid, setpgid, ForkResult, Pid};
+use nix::unistd::{
+    getcwd, getgid, getpgid, getpgrp, getpid, getppid, setpgid, tcsetpgrp, ForkResult, Pid,
+};
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
 use std::fmt::{Display, Formatter};
@@ -729,8 +731,8 @@ impl Shell {
             match fork()? {
                 ForkResult::Child => {
                     self.become_subshell();
-                    setpgid(Pid::from_raw(0), Pid::from_raw(0))
-                        .expect("failed to create new process group for pipeline");
+                    // this should never fail as both arguments are valid
+                    setpgid(Pid::from_raw(0), Pid::from_raw(0)).unwrap();
                     let pipeline_pgid = getpgrp();
 
                     let mut current_stdin = libc::STDIN_FILENO;
@@ -738,8 +740,8 @@ impl Shell {
                         let (read_pipe, write_pipe) = pipe()?;
                         match fork()? {
                             ForkResult::Child => {
-                                setpgid(Pid::from_raw(0), pipeline_pgid)
-                                    .expect("failed to set pipeline pgid");
+                                // should never fail as `pipeline_pgid` is a valid process group
+                                setpgid(Pid::from_raw(0), pipeline_pgid).unwrap();
                                 drop(read_pipe);
                                 dup2(current_stdin, libc::STDIN_FILENO)?;
                                 dup2(write_pipe.as_raw_fd(), libc::STDOUT_FILENO)?;
@@ -764,9 +766,20 @@ impl Shell {
                 }
                 ForkResult::Parent { child } => {
                     if is_process_in_foreground() {
-                        nix::unistd::tcsetpgrp(io::stdin().as_fd(), child).unwrap();
+                        // unwrap should never fail as child is a valid process id and in the
+                        // same session as the shell process
+                        while getpgid(Some(child)).unwrap().as_raw() as u32 == getgid().as_raw() {
+                            // loop until child is process group leader
+                            self.update_global_state();
+                            std::thread::sleep(Duration::from_millis(16));
+                        }
+                        // should never fail as stdin is a valid file descriptor and
+                        // child is a valid group id and is in the same session
+                        // as the shell process
+                        tcsetpgrp(io::stdin().as_fd(), child).unwrap();
                         pipeline_exit_status = self.wait_child_process(child)?;
-                        nix::unistd::tcsetpgrp(io::stdin().as_fd(), getpgrp()).unwrap();
+                        // should never fail
+                        tcsetpgrp(io::stdin().as_fd(), getpgrp()).unwrap();
                     } else {
                         pipeline_exit_status = self.wait_child_process(child)?;
                     }

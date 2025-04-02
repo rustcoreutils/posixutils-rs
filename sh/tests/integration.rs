@@ -1,4 +1,5 @@
 use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use std::path::Path;
 use std::process::Output;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -11,17 +12,17 @@ fn set_env_vars() {
         .is_ok()
     {
         let current_dir = std::env::current_dir().unwrap();
-        let base_dir = if current_dir.ends_with("sh") {
-            current_dir.join("tests")
+        let read_dir = if current_dir.ends_with("sh") {
+            current_dir.join("tests/read_dir")
         } else {
-            current_dir.join("sh/tests")
+            current_dir.join("sh/tests/read_dir")
         };
-        let read_dir = base_dir.join("read_dir");
-        let write_dir = base_dir.join("write_dir");
+        std::env::set_var("TEST_READ_DIR", read_dir);
+
+        let write_dir = Path::new(concat!(env!("CARGO_TARGET_TMPDIR"), "/sh_test_write_dir"));
         if !write_dir.exists() {
             std::fs::create_dir(&write_dir).expect("failed to create write_dir");
         }
-        std::env::set_var("TEST_READ_DIR", read_dir);
         std::env::set_var("TEST_WRITE_DIR", write_dir);
         TEST_VARS_ARE_SET.store(true, Ordering::SeqCst);
     }

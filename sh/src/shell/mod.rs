@@ -771,6 +771,8 @@ impl Shell {
                 }
                 ForkResult::Parent { child } => {
                     loop {
+                        // some patterns are only available on linux
+                        #[allow(unreachable_patterns)]
                         match waitpid(child, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED))? {
                             WaitStatus::Exited(_, _) => {
                                 // the only way this happened is if there was an error before going

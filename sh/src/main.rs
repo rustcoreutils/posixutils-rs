@@ -18,7 +18,6 @@ use crate::utils::is_process_in_foreground;
 use cli::terminal::read_nonblocking_char;
 use cli::vi::{Action, ViEditor};
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use nix::libc;
 use std::error::Error;
 use std::io;
 use std::io::Write;

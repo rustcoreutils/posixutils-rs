@@ -1,4 +1,5 @@
 use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use std::path::Path;
 use std::process::Output;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -10,21 +11,18 @@ fn set_env_vars() {
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
     {
-        let mut current_dir = std::env::current_dir().unwrap();
-        let read_dir;
-        let write_dir;
-        if current_dir.ends_with("sh") {
-            read_dir = current_dir.join("tests/read_dir");
-            current_dir.pop();
-            write_dir = current_dir.join("target/tmp/sh_test_write_dir");
+        let current_dir = std::env::current_dir().unwrap();
+        let read_dir = if current_dir.ends_with("sh") {
+            current_dir.join("tests/read_dir")
         } else {
-            read_dir = current_dir.join("sh/tests/read_dir");
-            write_dir = current_dir.join("target/tmp/sh_test_write_dir")
+            current_dir.join("sh/tests/read_dir")
         };
+        std::env::set_var("TEST_READ_DIR", read_dir);
+
+        let write_dir = Path::new(concat!(env!("CARGO_TARGET_TMPDIR"), "/sh_test_write_dir"));
         if !write_dir.exists() {
             std::fs::create_dir(&write_dir).expect("failed to create write_dir");
         }
-        std::env::set_var("TEST_READ_DIR", read_dir);
         std::env::set_var("TEST_WRITE_DIR", write_dir);
         TEST_VARS_ARE_SET.store(true, Ordering::SeqCst);
     }

@@ -34,10 +34,10 @@ use crate::utils::{
 use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
 use nix::errno::Errno;
 use nix::libc;
+use nix::sys::signal::kill;
+use nix::sys::signal::Signal as NixSignal;
 use nix::sys::wait::{WaitPidFlag, WaitStatus};
-use nix::unistd::{
-    getcwd, getgid, getpgid, getpgrp, getpid, getppid, setpgid, tcsetpgrp, ForkResult, Pid,
-};
+use nix::unistd::{getcwd, getpgid, getpgrp, getpid, getppid, setpgid, tcsetpgrp, ForkResult, Pid};
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
 use std::fmt::{Display, Formatter};
@@ -734,6 +734,11 @@ impl Shell {
                     // this should never fail as both arguments are valid
                     setpgid(Pid::from_raw(0), Pid::from_raw(0)).unwrap();
                     let pipeline_pgid = getpgrp();
+                    // wait for the parent process to put the subshell in the foreground
+                    if let Err(err) = kill(Pid::from_raw(0), NixSignal::SIGTSTP) {
+                        self.eprint(&format!("sh: internal call to kill failed ({err})"));
+                        self.exit(1);
+                    }
 
                     let mut current_stdin = libc::STDIN_FILENO;
                     for command in pipeline.commands.head() {
@@ -765,26 +770,46 @@ impl Shell {
                     self.exit(return_status);
                 }
                 ForkResult::Parent { child } => {
-                    if is_process_in_foreground() {
-                        // unwrap should never fail as child is a valid process id and in the
-                        // same session as the shell process
-                        let mut child_pgid = getpgid(Some(child)).unwrap();
-                        // loop until child is in another group
-                        while child_pgid.as_raw() as u32 == getgid().as_raw() {
-                            self.handle_async_events();
-                            std::thread::sleep(Duration::from_millis(16));
-                            // cannot fail, same reason as above
-                            child_pgid = getpgid(Some(child)).unwrap();
+                    loop {
+                        match waitpid(child, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED))? {
+                            WaitStatus::Exited(_, _) => {
+                                // the only way this happened is if there was an error before going
+                                // the child went to sleep
+                                return Ok(1);
+                            }
+                            WaitStatus::Signaled(_, _, _) => {
+                                self.eprint("sh: unsynchronised pipeline was terminated by another process\n");
+                                return Ok(1);
+                            }
+                            WaitStatus::Continued(_) => {
+                                self.eprint("sh: unsynchronised pipeline was restarted by another process\n");
+                                return Ok(1);
+                            }
+                            WaitStatus::Stopped(_, _) => {
+                                if is_process_in_foreground() {
+                                    // should never fail as child is a valid process id and
+                                    // in the same session as the current shell
+                                    let child_gpid = getpgid(Some(child)).unwrap();
+                                    // should never fail as stdin is a valid file descriptor and
+                                    // child gpid is valid and in the same session
+                                    tcsetpgrp(io::stdin().as_fd(), child_gpid).unwrap();
+                                    kill(child, NixSignal::SIGCONT).unwrap();
+                                    pipeline_exit_status = self.wait_child_process(child)?;
+                                    // should never fail
+                                    tcsetpgrp(io::stdin().as_fd(), getpgrp()).unwrap();
+                                    break;
+                                } else {
+                                    kill(child, NixSignal::SIGCONT).unwrap();
+                                    pipeline_exit_status = self.wait_child_process(child)?;
+                                    break;
+                                }
+                            }
+                            WaitStatus::StillAlive => {
+                                self.handle_async_events();
+                                std::thread::sleep(Duration::from_millis(16));
+                            }
+                            _ => unreachable!(),
                         }
-                        // should never fail as stdin is a valid file descriptor and
-                        // child is a valid group id and is in the same session
-                        // as the shell process
-                        tcsetpgrp(io::stdin().as_fd(), child_pgid).unwrap();
-                        pipeline_exit_status = self.wait_child_process(child)?;
-                        // should never fail
-                        tcsetpgrp(io::stdin().as_fd(), getpgrp()).unwrap();
-                    } else {
-                        pipeline_exit_status = self.wait_child_process(child)?;
                     }
                 }
             }

@@ -8,7 +8,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-plib = { path = "../plib" }
+plib.workspace = true
 clap.workspace = true
 gettext-rs.workspace = true
 libc.workspace = true
@@ -18,9 +18,11 @@ libcrypt-rs = "0.1"
 thiserror = "1.0"
 binrw = "0.14"
 
+[dev-dependencies]
+plib-testing.workspace = true
+
 [lints]
 workspace = true
-
 
 [[bin]]
 name = "id"

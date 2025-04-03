@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use plib_testing::{run_test, TestPlan};
 
 fn run_test_join(
     args: &[&str],

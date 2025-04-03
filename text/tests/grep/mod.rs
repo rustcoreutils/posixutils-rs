@@ -8,7 +8,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use plib_testing::{run_test, TestPlan};
 
 const LINES_INPUT: &str =
     "line_{1}\np_line_{2}_s\n  line_{3}  \nLINE_{4}\np_LINE_{5}_s\nl_{6}\nline_{70}\n";

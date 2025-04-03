@@ -1,4 +1,4 @@
-use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use plib_testing::{run_test, run_test_with_checker, TestPlan};
 use std::path::Path;
 use std::process::Output;
 use std::sync::atomic::{AtomicBool, Ordering};

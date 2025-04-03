@@ -1404,6 +1404,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "plib-testing"
+version = "0.2.2"
+
+[[package]]
 name = "portable-atomic"
 version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1428,7 +1432,7 @@ dependencies = [
  "libc",
  "pest",
  "pest_derive",
- "plib",
+ "plib-testing",
  "rand",
 ]
 
@@ -1441,7 +1445,7 @@ dependencies = [
  "gettext-rs",
  "pest",
  "pest_derive",
- "plib",
+ "plib-testing",
  "regex",
  "rustyline",
 ]
@@ -1454,7 +1458,7 @@ dependencies = [
  "clap",
  "gettext-rs",
  "libc",
- "plib",
+ "plib-testing",
 ]
 
 [[package]]
@@ -1466,7 +1470,7 @@ dependencies = [
  "clap",
  "gettext-rs",
  "object",
- "plib",
+ "plib-testing",
 ]
 
 [[package]]
@@ -1476,7 +1480,7 @@ dependencies = [
  "clap",
  "gettext-rs",
  "libc",
- "plib",
+ "plib-testing",
  "termion",
  "thiserror 1.0.69",
 ]
@@ -1489,6 +1493,7 @@ dependencies = [
  "gettext-rs",
  "libc",
  "plib",
+ "plib-testing",
  "regex",
  "users",
  "walkdir",
@@ -1512,6 +1517,7 @@ dependencies = [
  "clap",
  "gettext-rs",
  "plib",
+ "plib-testing",
  "strum",
  "strum_macros",
 ]
@@ -1542,7 +1548,7 @@ dependencies = [
  "const_format",
  "gettext-rs",
  "libc",
- "plib",
+ "plib-testing",
  "rowan",
 ]
 
@@ -1553,7 +1559,7 @@ dependencies = [
  "clap",
  "gettext-rs",
  "libc",
- "plib",
+ "plib-testing",
 ]
 
 [[package]]
@@ -1563,7 +1569,7 @@ dependencies = [
  "clap",
  "gettext-rs",
  "libc",
- "plib",
+ "plib-testing",
 ]
 
 [[package]]
@@ -1578,6 +1584,7 @@ dependencies = [
  "gettext-rs",
  "libc",
  "plib",
+ "plib-testing",
  "sysinfo",
 ]
 
@@ -1587,7 +1594,7 @@ version = "0.2.2"
 dependencies = [
  "clap",
  "gettext-rs",
- "plib",
+ "plib-testing",
 ]
 
 [[package]]
@@ -1608,7 +1615,7 @@ dependencies = [
  "atty",
  "gettext-rs",
  "nix 0.29.0",
- "plib",
+ "plib-testing",
 ]
 
 [[package]]
@@ -1620,6 +1627,7 @@ dependencies = [
  "gettext-rs",
  "libc",
  "plib",
+ "plib-testing",
  "uname",
 ]
 
@@ -1635,6 +1643,7 @@ dependencies = [
  "libc",
  "notify-debouncer-full",
  "plib",
+ "plib-testing",
  "proptest",
  "rand",
  "regex",
@@ -1654,6 +1663,7 @@ dependencies = [
  "gettext-rs",
  "libc",
  "plib",
+ "plib-testing",
  "regex",
  "tempfile",
 ]
@@ -1669,6 +1679,7 @@ dependencies = [
  "libc",
  "libcrypt-rs",
  "plib",
+ "plib-testing",
  "syslog",
  "thiserror 1.0.69",
 ]
@@ -1682,6 +1693,7 @@ dependencies = [
  "gettext-rs",
  "libc",
  "plib",
+ "plib-testing",
 ]
 
 [[package]]

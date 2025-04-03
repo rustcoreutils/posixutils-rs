@@ -15,7 +15,6 @@ pub mod modestr;
 pub mod platform;
 pub mod priority;
 pub mod sccsfile;
-pub mod testing;
 pub mod utmpx;
 
 pub const BUFSZ: usize = 8 * 1024;

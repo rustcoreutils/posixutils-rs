@@ -12,7 +12,7 @@
 mod constants;
 
 use constants::{EXIT_STATUS_DIFFERENCE, EXIT_STATUS_NO_DIFFERENCE};
-use plib::testing::{run_test, TestPlan};
+use plib_testing::{run_test, TestPlan};
 use std::{collections::HashMap, path::PathBuf, process::Stdio, sync::LazyLock};
 
 fn diff_test(args: &[&str], expected_output: &str, expected_diff_exit_status: u8) {

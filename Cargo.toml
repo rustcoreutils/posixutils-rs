@@ -17,6 +17,7 @@ members = [
 	"misc",
 	"pathnames",
 	"plib",
+	"plib-testing",
 	"process",
 	"sccs",
 	"screen",
@@ -43,6 +44,8 @@ regex = "1.10"
 gettext-rs = { path = "./gettext-rs" }
 errno = "0.3"
 chrono-tz = "0.10"
+plib = { path = "./plib" }
+plib-testing = { path = "./plib-testing" }
+ftw = { path = "./ftw" }
 
 [workspace.lints]
-

@@ -8,7 +8,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use plib_testing::{run_test, run_test_with_checker, TestPlan};
 use std::fs;
 use tempfile::tempdir;
 

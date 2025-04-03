@@ -11,4 +11,4 @@ atty = "0.2"
 
 [[bin]]
 name = "sh"
-path = "src/main.rs"
+path = "main.rs"

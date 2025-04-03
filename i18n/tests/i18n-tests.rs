@@ -9,3 +9,4 @@
 
 mod gencat;
 mod iconv;
+mod xgettext;

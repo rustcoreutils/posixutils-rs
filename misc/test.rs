@@ -11,8 +11,14 @@
 // - fix and test unary ops
 //
 
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::{
+    io::IsTerminal,
+    os::{
+        fd::{BorrowedFd, RawFd},
+        unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
+    },
+    path::Path,
+};
 
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 
@@ -132,17 +138,14 @@ fn eval_unary_path(op: &UnaryOp, s: &str) -> bool {
 }
 
 fn eval_terminal(s: &str) -> bool {
-    let fd = match s.parse::<u32>() {
+    let fd = match s.parse::<RawFd>() {
         Ok(f) => f,
         Err(_) => {
             return false;
         }
     };
 
-    // Normally, posixutils would use the atty crate.
-    // Passing an arbitrary fd requires unsafe isatty in this case.
-
-    unsafe { libc::isatty(fd as i32) == 1 }
+    unsafe { BorrowedFd::borrow_raw(fd).is_terminal() }
 }
 
 fn eval_unary(op_str: &str, s: &str) -> bool {

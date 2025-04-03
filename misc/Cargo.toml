@@ -9,7 +9,6 @@ rust-version.workspace = true
 
 [dependencies]
 clap.workspace = true
-libc.workspace = true
 gettext-rs.workspace = true
 
 [dev-dependencies]

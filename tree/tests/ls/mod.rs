@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use plib::testing::{TestPlan, run_test, run_test_with_checker};
 use regex::Regex;
 use std::ffi::CString;
 use std::fs;
@@ -589,7 +589,8 @@ fn test_ls_size_align() {
 #[test]
 fn test_ls_time() {
     // This gets inherited by child processes
-    std::env::set_var("TZ", "UTC0");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("TZ", "UTC0") };
 
     let test_dir = &format!("{}/test_ls_time", env!("CARGO_TARGET_TMPDIR"));
     let a = &format!("{test_dir}/a");

@@ -13,9 +13,9 @@ use std::io::{self, BufRead, Error, ErrorKind, Read, Write};
 use std::path::PathBuf;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::io::{input_reader, input_stream};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use plib::BUFSZ;
+use plib::io::{input_reader, input_stream};
 
 #[derive(Parser)]
 #[command(version, about = gettext("split - split a file into pieces"))]
@@ -164,7 +164,7 @@ impl OutputState {
 
     fn write(&mut self, buf: &[u8]) -> io::Result<()> {
         match &mut self.outf {
-            Some(ref mut f) => f.write_all(buf),
+            Some(f) => f.write_all(buf),
             // TODO:
             None => panic!("unreachable"),
         }

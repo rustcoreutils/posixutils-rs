@@ -12,7 +12,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, setlocale, textdomain};
 use plib::io::input_stream;
 use plib::lzw::UnixLZWReader;
 use std::io::{self, Write};

@@ -9,7 +9,7 @@
 
 mod signal;
 
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, setlocale, textdomain};
 
 use crate::signal::{list_signals, lookup_signum};
 

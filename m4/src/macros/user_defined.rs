@@ -1,8 +1,8 @@
 use std::io::Write;
 
 use crate::{
-    state::{StackFrame, State},
     Result,
+    state::{StackFrame, State},
 };
 
 use super::MacroImplementation;

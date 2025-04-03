@@ -11,7 +11,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, setlocale, textdomain};
 use notify_debouncer_full::new_debouncer;
 use notify_debouncer_full::notify::event::{ModifyKind, RemoveKind};
 use notify_debouncer_full::notify::{EventKind, RecursiveMode, Watcher};
@@ -131,8 +131,8 @@ enum FileOrStdin {
 impl FileOrStdin {
     fn get_buf_read(&mut self) -> &mut dyn BufRead {
         match self {
-            Self::File(_, ref mut bu) => bu,
-            Self::Stdin(ref mut st) => st,
+            Self::File(_, bu) => bu,
+            Self::Stdin(st) => st,
         }
     }
 }

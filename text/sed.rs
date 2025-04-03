@@ -7,11 +7,11 @@
 // SPDX-License-Identifier: MIT
 //
 
-use clap::{command, Parser};
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use clap::{Parser, command};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use libc::{
-    ioctl, regcomp, regex_t, regexec, regmatch_t, winsize, REG_EXTENDED, STDERR_FILENO,
-    STDIN_FILENO, STDOUT_FILENO, TIOCGWINSZ,
+    REG_EXTENDED, STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO, TIOCGWINSZ, ioctl, regcomp, regex_t,
+    regexec, regmatch_t, winsize,
 };
 use std::sync::Mutex;
 use std::{
@@ -222,7 +222,7 @@ impl AddressRange {
                 return Err(SedError::ScriptParse(
                     "address isn't empty, position or range".to_string(),
                     None,
-                ))
+                ));
             }
             2 => Some((false, false)),
             0 => return Ok(None),
@@ -2170,20 +2170,23 @@ impl Sed {
     }
 
     fn execute_r(&mut self, rfile: PathBuf) {
-        if let Ok(file) = File::open(rfile) {
-            let reader = BufReader::new(file);
-            for line in reader.lines() {
-                let Ok(line) = line else {
-                    break;
-                };
-                self.pattern_space += "\n";
-                self.pattern_space += &line;
+        match File::open(rfile) {
+            Ok(file) => {
+                let reader = BufReader::new(file);
+                for line in reader.lines() {
+                    let Ok(line) = line else {
+                        break;
+                    };
+                    self.pattern_space += "\n";
+                    self.pattern_space += &line;
+                }
+                if self.current_end.is_none() {
+                    self.current_end = Some("\n".to_string());
+                }
             }
-            if self.current_end.is_none() {
+            _ => {
                 self.current_end = Some("\n".to_string());
             }
-        } else {
-            self.current_end = Some("\n".to_string());
         }
     }
 

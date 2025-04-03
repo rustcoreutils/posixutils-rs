@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
 
-use plib::testing::{run_test_u8, TestPlanU8};
+use plib::testing::{TestPlanU8, run_test_u8};
 
 fn get_test_file_path(filename: &str) -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

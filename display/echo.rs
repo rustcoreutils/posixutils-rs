@@ -13,7 +13,7 @@
 //	Write an 8-bit value that is the 0, 1, 2 or 3-digit octal number _num_.
 //
 
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, setlocale, textdomain};
 use std::io::{self, Write};
 
 fn translate_str(skip_nl: bool, s: &str) -> String {

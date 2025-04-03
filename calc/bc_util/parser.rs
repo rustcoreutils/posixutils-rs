@@ -552,7 +552,7 @@ fn gather_errors(text: &str, file_path: Option<&str>, first_error: PestError) ->
                 return ParseError {
                     errors,
                     is_incomplete: false,
-                }
+                };
             }
             Err(err) => {
                 byte_index += location_end(&err.location);

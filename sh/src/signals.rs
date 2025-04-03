@@ -270,14 +270,17 @@ extern "C" fn write_signal_to_buffer(signal: libc::c_int) {
 /// # Safety
 /// cannot be called by multiple threads
 pub unsafe fn setup_signal_handling() {
-    let (read_pipe, write_pipe) = nix::unistd::pipe().expect("could not create signal buffer pipe");
-    nix::fcntl::fcntl(
-        read_pipe.as_raw_fd(),
-        nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
-    )
-    .expect("signal buffer pipe could not be set as non-blocking");
-    SIGNAL_WRITE = Some(write_pipe.into_raw_fd());
-    SIGNAL_READ = Some(read_pipe.into_raw_fd());
+    unsafe {
+        let (read_pipe, write_pipe) =
+            nix::unistd::pipe().expect("could not create signal buffer pipe");
+        nix::fcntl::fcntl(
+            read_pipe.as_raw_fd(),
+            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+        )
+        .expect("signal buffer pipe could not be set as non-blocking");
+        SIGNAL_WRITE = Some(write_pipe.into_raw_fd());
+        SIGNAL_READ = Some(read_pipe.into_raw_fd());
+    }
 }
 
 fn get_pending_signal() -> Option<Signal> {
@@ -305,31 +308,37 @@ fn get_pending_signal() -> Option<Signal> {
 }
 
 pub unsafe fn handle_signal_ignore(signal: Signal) {
-    sigaction(
-        signal.into(),
-        &SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty()),
-    )
-    .unwrap();
+    unsafe {
+        sigaction(
+            signal.into(),
+            &SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty()),
+        )
+        .unwrap();
+    }
 }
 
 pub unsafe fn handle_signal_default(signal: Signal) {
-    sigaction(
-        signal.into(),
-        &SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty()),
-    )
-    .unwrap();
+    unsafe {
+        sigaction(
+            signal.into(),
+            &SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty()),
+        )
+        .unwrap();
+    }
 }
 
 pub unsafe fn handle_signal_write_to_signal_buffer(signal: Signal) {
-    sigaction(
-        signal.into(),
-        &SigAction::new(
-            SigHandler::Handler(write_signal_to_buffer),
-            SaFlags::empty(),
-            SigSet::empty(),
-        ),
-    )
-    .unwrap();
+    unsafe {
+        sigaction(
+            signal.into(),
+            &SigAction::new(
+                SigHandler::Handler(write_signal_to_buffer),
+                SaFlags::empty(),
+                SigSet::empty(),
+            ),
+        )
+        .unwrap();
+    }
 }
 
 #[derive(Clone)]

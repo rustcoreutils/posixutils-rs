@@ -9,7 +9,7 @@
 
 use core::panic;
 use std::{
-    collections::{hash_map::Entry, HashMap},
+    collections::{HashMap, hash_map::Entry},
     ffi::CString,
     fs::File,
     io::{BufReader, Bytes, Read, Write},
@@ -43,13 +43,13 @@ impl TryFrom<AwkString> for RecordSeparator {
 type ReadResult = Result<u8, String>;
 
 macro_rules! read_iter_next {
-    ($iter:expr, $ret:expr) => {
+    ($iter:expr_2021, $ret:expr_2021) => {
         match $iter.next() {
             Some(byte_result) => byte_result?,
             None => return $ret,
         }
     };
-    ($iter:expr) => {
+    ($iter:expr_2021) => {
         read_iter_next!($iter, Ok(None))
     };
 }

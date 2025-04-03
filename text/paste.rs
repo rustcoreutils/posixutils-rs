@@ -11,7 +11,7 @@
 // - improve:  don't open all files at once in --serial mode
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, setlocale, textdomain};
 use std::cell::{OnceCell, RefCell};
 use std::error::Error;
 use std::fs::File;
@@ -142,7 +142,7 @@ impl<'a> DelimiterState<'a> {
         match self {
             DelimiterState::MultipleDelimiters {
                 delimiters,
-                ref mut delimiters_iterator,
+                delimiters_iterator,
                 ..
             } => {
                 *delimiters_iterator = delimiters.iter().cycle();

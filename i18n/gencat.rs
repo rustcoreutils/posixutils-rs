@@ -1,6 +1,6 @@
 use byteorder::{BigEndian, ByteOrder, LittleEndian, NativeEndian, WriteBytesExt};
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use plib::io::input_stream;
 use std::{
     cell::RefCell,

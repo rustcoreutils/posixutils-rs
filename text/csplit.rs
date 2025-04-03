@@ -11,7 +11,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, setlocale, textdomain};
 use regex::Regex;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Error, ErrorKind, Read, Write};
@@ -1163,8 +1163,9 @@ mod tests {
         let mut contents = String::new();
         file.read_to_string(&mut contents).unwrap();
 
-        let expected =
-            String::from("    printf(\"This is function 2\\n\");\n}\n\nvoid func3() {\n    printf(\"This is function 3\\n\");\n}\n");
+        let expected = String::from(
+            "    printf(\"This is function 2\\n\");\n}\n\nvoid func3() {\n    printf(\"This is function 3\\n\");\n}\n",
+        );
 
         assert_eq!(contents, expected);
 

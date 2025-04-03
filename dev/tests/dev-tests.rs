@@ -1,5 +1,5 @@
 use object::{Object, ObjectSection, ObjectSymbol};
-use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use plib::testing::{TestPlan, run_test, run_test_with_checker};
 use std::fs;
 
 fn ar_compare_test(
@@ -542,7 +542,8 @@ fn test_strings_print_multiple() {
 
 #[test]
 fn test_strings_utf8_file() {
-    std::env::set_var("LC_CTYPE", "UTF-8");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("LC_CTYPE", "UTF-8") };
     strings_test(
         &["tests/strings/utf8.bin"],
         include_str!("strings/utf8.correct.txt"),

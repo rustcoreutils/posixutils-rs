@@ -8,7 +8,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use plib_testing::{run_test, TestPlan};
 
 fn sort_test(
     args: &[&str],

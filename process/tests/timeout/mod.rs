@@ -7,12 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::{
-    io::Write,
-    process::{Command, Output, Stdio},
-    thread,
-    time::Duration,
-};
+use std::io::Write;
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::Duration;
 
 use sysinfo::System;
 

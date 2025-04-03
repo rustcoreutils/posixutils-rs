@@ -10,12 +10,13 @@
 // - implement -h, -H, -L, -P
 //
 
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use std::ffi::CString;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::{fs, io};
+
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 
 /// chown - change the file ownership
 #[derive(Parser)]

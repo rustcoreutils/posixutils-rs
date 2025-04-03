@@ -7,9 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::{Line, FORM_FEED};
 use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Read};
+
+use crate::{Line, FORM_FEED};
 
 /// Iterator that splits the stream on `\n` or form-feed.
 pub struct LineBreakIterator {

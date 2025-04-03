@@ -1,14 +1,15 @@
 use std::ffi::{OsStr, OsString};
+use std::io::Write;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::process::ExitStatus;
-use std::{io::Write, rc::Rc};
+use std::rc::Rc;
 
-use super::eval::parse_integer;
-use super::{MacroDefinitionImplementation, MacroImplementation};
 use nom::error::{ContextError, FromExternalError};
 use nom::IResult;
 
+use super::eval::parse_integer;
+use super::{MacroDefinitionImplementation, MacroImplementation};
 use crate::error::{Result, ResultExt};
 use crate::input::{Input, InputRead};
 use crate::lexer::{MacroName, MacroParseConfig, DEFAULT_QUOTE_CLOSE_TAG, DEFAULT_QUOTE_OPEN_TAG};

@@ -7,10 +7,12 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::ffi::{c_char, CStr, CString};
+
+use nix::libc;
+
 use crate::parse::word::{Word, WordPart};
 use crate::shell::environment::Environment;
-use nix::libc;
-use std::ffi::{c_char, CStr, CString};
 
 fn is_portable_filename_character(c: char) -> bool {
     // https://pubs.opengroup.org/onlinepubs/9699919799/basedefs/V1_chap03.html#tag_03_282
@@ -150,10 +152,11 @@ pub fn tilde_expansion(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::parse::word::test_utils::{quoted_literal, unquoted_literal};
     use crate::shell::environment::Value;
-    use std::collections::HashMap;
 
     #[derive(Default)]
 

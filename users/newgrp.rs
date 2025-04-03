@@ -7,32 +7,28 @@
 // SPDX-License-Identifier: MIT
 //
 
-use clap::{error::ErrorKind, Parser};
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use libc::{
-    getgid, getgrnam, getgroups, getlogin, getpwnam, getpwuid, getuid, gid_t, passwd, setegid,
-    setgid, setgroups, setuid, uid_t,
-};
-
-#[cfg(target_os = "linux")]
-use libc::{ECHO, ECHONL, TCSANOW};
-#[cfg(target_os = "linux")]
-use libcrypt_rs::Crypt;
-use plib::group::Group;
-
-use std::{
-    env,
-    ffi::{CStr, CString},
-    io,
-    process::{self, Command},
-};
-
+use std::ffi::{CStr, CString};
+use std::process::{self, Command};
+use std::{env, io};
 #[cfg(target_os = "linux")]
 use std::{
     fs::File,
     io::{BufRead, BufReader},
     os::unix::io::AsRawFd,
 };
+
+use clap::error::ErrorKind;
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use libc::{
+    getgid, getgrnam, getgroups, getlogin, getpwnam, getpwuid, getuid, gid_t, passwd, setegid,
+    setgid, setgroups, setuid, uid_t,
+};
+#[cfg(target_os = "linux")]
+use libc::{ECHO, ECHONL, TCSANOW};
+#[cfg(target_os = "linux")]
+use libcrypt_rs::Crypt;
+use plib::group::Group;
 
 #[cfg(target_os = "linux")]
 const GROUPSHADOW_PATH: &str = "/etc/gshadow";

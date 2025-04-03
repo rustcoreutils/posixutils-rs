@@ -1,8 +1,9 @@
+use std::error::Error;
+use std::process;
+
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use setup::{ForRemoval, ForTranslation};
-use std::error::Error;
-use std::process;
 use transformation::delete::DeleteTransformation;
 use transformation::delete_and_squeeze::{DeleteAndSqueezeState, DeleteAndSqueezeTransformation};
 use transformation::squeeze::{SqueezeState, SqueezeTransformation};
@@ -994,8 +995,9 @@ mod parsing {
 }
 
 mod setup {
-    use crate::parsing::{CharOperand, CharRepetition, DataTypeWithData, EquivOperand, Operand};
     use std::error::Error;
+
+    use crate::parsing::{CharOperand, CharRepetition, DataTypeWithData, EquivOperand, Operand};
 
     fn add_normal_char(
         data_type_with_data: DataTypeWithData,

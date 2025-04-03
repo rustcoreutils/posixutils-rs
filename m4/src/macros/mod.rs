@@ -10,11 +10,9 @@ use eval::EvalMacro;
 use trace::{TraceoffMacro, TraceonMacro};
 use user_defined::UserDefinedMacro;
 
-use crate::{
-    lexer::{MacroName, MacroParseConfig},
-    state::{StackFrame, State},
-    Result,
-};
+use crate::lexer::{MacroName, MacroParseConfig};
+use crate::state::{StackFrame, State};
+use crate::Result;
 
 macro_rules! macro_enums {
     (

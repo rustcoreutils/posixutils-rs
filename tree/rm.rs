@@ -9,17 +9,18 @@
 
 mod common;
 
-use self::common::error_string;
+use std::ffi::CString;
+use std::fs;
+use std::io::{self, IsTerminal};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+
 use clap::Parser;
 use ftw::{self, traverse_directory};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use std::{
-    ffi::CString,
-    fs,
-    io::{self, IsTerminal},
-    os::unix::{ffi::OsStrExt, fs::MetadataExt},
-    path::{Path, PathBuf},
-};
+
+use self::common::error_string;
 
 /// rm - remove directory entries
 #[derive(Parser)]

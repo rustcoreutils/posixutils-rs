@@ -7,9 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
 use std::fs;
 use std::path::PathBuf;
+
+use plib::testing::{run_test, TestPlan};
 
 fn get_test_file_path(filename: &str) -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

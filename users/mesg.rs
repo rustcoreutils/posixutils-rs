@@ -11,10 +11,11 @@
 // - set process exit code according to spec
 //
 
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::io::{self, Error, ErrorKind, IsTerminal};
 use std::mem;
+
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 
 /// mesg - permit or deny messages
 #[derive(Parser)]

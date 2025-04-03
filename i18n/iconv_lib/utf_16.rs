@@ -7,11 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::iter::{self};
+use std::process::exit;
+
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
-use std::{
-    iter::{self},
-    process::exit,
-};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UTF16Variant {

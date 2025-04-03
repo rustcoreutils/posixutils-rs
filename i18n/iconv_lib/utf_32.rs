@@ -7,8 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::iter;
+use std::process::exit;
+
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
-use std::{iter, process::exit};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UTF32Variant {

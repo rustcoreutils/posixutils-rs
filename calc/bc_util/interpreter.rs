@@ -7,17 +7,15 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::{fmt::Write, rc::Rc};
+use std::fmt::Write;
+use std::rc::Rc;
 
-use crate::bc_util::instructions::Variable;
-
-use super::{
-    instructions::{
-        BuiltinFunction, ConditionInstruction, ExprInstruction, Function, FunctionArgument,
-        NamedExpr, Program, Register, StmtInstruction,
-    },
-    number::Number,
+use super::instructions::{
+    BuiltinFunction, ConditionInstruction, ExprInstruction, Function, FunctionArgument, NamedExpr,
+    Program, Register, StmtInstruction,
 };
+use super::number::Number;
+use crate::bc_util::instructions::Variable;
 
 #[derive(Debug)]
 struct ErrorCall {

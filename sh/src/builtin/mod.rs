@@ -7,6 +7,11 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::fmt::{Display, Formatter};
+
+use nix::libc::pid_t;
+use nix::unistd::Pid;
+
 use crate::builtin::alias::AliasBuiltin;
 use crate::builtin::bg::Bg;
 use crate::builtin::cd::Cd;
@@ -40,9 +45,6 @@ use crate::shell::environment::CannotModifyReadonly;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 use crate::utils::OsError;
-use nix::libc::pid_t;
-use nix::unistd::Pid;
-use std::fmt::{Display, Formatter};
 
 pub mod alias;
 mod bg;

@@ -9,16 +9,6 @@
 
 #![allow(clippy::result_large_err)]
 
-use crate::program::{
-    Action, AwkRule, BuiltinFunction, Constant, DebugInfo, Function, OpCode, Pattern, Program,
-    SourceLocation, SpecialVar, VarId,
-};
-use crate::regex::Regex;
-
-use pest::error::InputLocation;
-use pest::iterators::{Pair, Pairs};
-use pest::pratt_parser::{Assoc, Op, PrattParser};
-use pest::Parser;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -26,6 +16,17 @@ use std::hash::Hash;
 use std::rc::Rc;
 use std::str::Chars;
 use std::sync::LazyLock;
+
+use pest::error::InputLocation;
+use pest::iterators::{Pair, Pairs};
+use pest::pratt_parser::{Assoc, Op, PrattParser};
+use pest::Parser;
+
+use crate::program::{
+    Action, AwkRule, BuiltinFunction, Constant, DebugInfo, Function, OpCode, Pattern, Program,
+    SourceLocation, SpecialVar, VarId,
+};
+use crate::regex::Regex;
 
 struct BuiltinFunctionInfo {
     function: BuiltinFunction,

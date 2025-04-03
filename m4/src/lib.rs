@@ -1,9 +1,14 @@
+use std::cell::RefCell;
+use std::ffi::OsStr;
+use std::io::Write;
+use std::path::PathBuf;
+use std::rc::Rc;
+
 use error::{Error, ErrorKind, Result};
 use input::{Input, InputRead};
 use lexer::MacroName;
 use macros::MacroDefinition;
 use state::State;
-use std::{cell::RefCell, ffi::OsStr, io::Write, path::PathBuf, rc::Rc};
 
 pub mod error;
 mod input;

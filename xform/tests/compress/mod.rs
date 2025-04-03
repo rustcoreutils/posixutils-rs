@@ -7,11 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::fs::{remove_file, File};
+use std::io::Read;
+
 use plib::testing::{run_test, TestPlan};
-use std::{
-    fs::{remove_file, File},
-    io::Read,
-};
 
 fn compress_test(args: &[&str], expected_output: &str, expected_error: &str) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
@@ -41,9 +40,8 @@ fn uncompress_test(args: &[&str], expected_output: &str, expected_error: &str) {
 
 #[test]
 fn magic_header_compress_file() {
-    use std::env;
-    use std::fs;
     use std::path::PathBuf;
+    use std::{env, fs};
 
     const MAGIC_HEADER: [u8; 2] = [0x1F, 0x9D];
 
@@ -84,9 +82,8 @@ fn magic_header_compress_file() {
 
 #[test]
 fn compression_compress_file() {
-    use std::env;
-    use std::fs;
     use std::path::PathBuf;
+    use std::{env, fs};
 
     // Get the directory of the Cargo project
     let cargo_manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());

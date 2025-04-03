@@ -11,15 +11,14 @@
 // - fix bug:  zero padding does not work for negative numbers
 //
 
+use std::error::Error;
+use std::io::{self, Write};
+use std::iter::Peekable;
+use std::os::unix::ffi::OsStrExt;
+use std::process::ExitCode;
+use std::slice::Iter;
+
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use std::{
-    error::Error,
-    io::{self, Write},
-    iter::Peekable,
-    os::unix::ffi::OsStrExt,
-    process::ExitCode,
-    slice::Iter,
-};
 
 // the following structure is a printf format conversion specifier
 struct ConvSpec {

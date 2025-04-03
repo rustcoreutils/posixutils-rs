@@ -7,7 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::{iter, process::exit};
+use std::iter;
+use std::process::exit;
 
 // Convert ASCII to UCS-4
 pub fn to_ucs4<I: Iterator<Item = u8> + 'static>(

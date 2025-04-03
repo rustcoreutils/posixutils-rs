@@ -7,10 +7,11 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::shell::environment::Environment;
 use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::path::Path;
+
+use crate::shell::environment::Environment;
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum EndPoint<'s> {

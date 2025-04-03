@@ -7,10 +7,11 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::shell::Display;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fmt::Formatter;
+
+use crate::shell::Display;
 
 #[derive(Clone, Default)]
 pub struct Value {

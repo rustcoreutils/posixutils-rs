@@ -7,12 +7,13 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::rc::Rc;
+
 use crate::parse::lexer::word_lexer::{WordLexer, WordToken};
 use crate::parse::word::{
     Parameter, ParameterExpansion, SpecialParameter, Word, WordPair, WordPart,
 };
 use crate::parse::{ParseResult, ParserError};
-use std::rc::Rc;
 
 struct WordParser<'src> {
     lexer: WordLexer<'src>,

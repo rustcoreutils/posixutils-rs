@@ -7,16 +7,18 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::os::fd::{AsRawFd, RawFd};
+use std::time::Duration;
+
+use atty::Stream;
+use nix::errno::Errno;
+
 use crate::builtin::{BuiltinError, BuiltinResult, BuiltinUtility};
 use crate::option_parser::OptionParser;
 use crate::shell::opened_files::{OpenedFile, OpenedFiles, STDIN_FILENO};
 use crate::shell::Shell;
 use crate::wordexp::expanded_word::ExpandedWord;
 use crate::wordexp::split_fields;
-use atty::Stream;
-use nix::errno::Errno;
-use std::os::fd::{AsRawFd, RawFd};
-use std::time::Duration;
 
 fn bytes_to_string(bytes: Vec<u8>) -> Result<String, BuiltinError> {
     String::from_utf8(bytes.to_vec()).map_err(|_| "read: invalid UTF-8".into())

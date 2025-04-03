@@ -7,10 +7,11 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::ffi::{CStr, CString};
+
 use crate::pattern::parse::{parse_pattern, PatternItem};
 use crate::pattern::regex::{parsed_pattern_to_regex, Regex};
 use crate::wordexp::expanded_word::ExpandedWord;
-use std::ffi::{CStr, CString};
 
 mod parse;
 mod regex;

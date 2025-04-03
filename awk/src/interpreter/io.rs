@@ -8,13 +8,12 @@
 //
 
 use core::panic;
-use std::{
-    collections::{hash_map::Entry, HashMap},
-    ffi::CString,
-    fs::File,
-    io::{BufReader, Bytes, Read, Write},
-    rc::Rc,
-};
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
+use std::ffi::CString;
+use std::fs::File;
+use std::io::{BufReader, Bytes, Read, Write};
+use std::rc::Rc;
 
 use super::string::AwkString;
 

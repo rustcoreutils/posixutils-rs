@@ -8,10 +8,11 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test_with_checker, TestPlan};
 use std::fs;
 use std::path::Path;
 use std::process::Output;
+
+use plib::testing::{run_test_with_checker, TestPlan};
 use tempfile::{tempdir, TempDir};
 
 fn setup_test_env() -> (TempDir, String) {

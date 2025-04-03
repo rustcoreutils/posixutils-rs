@@ -7,11 +7,12 @@
 // SPDX-License-Identifier: MIT
 //
 
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::fs;
 use std::io::{self, Error, ErrorKind};
 use std::path::Path;
+
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 
 /// rmdir - remove directories
 #[derive(Parser)]

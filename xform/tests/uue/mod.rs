@@ -7,12 +7,11 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::fs::{File, Permissions};
+use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
+
 use plib::testing::{run_test, TestPlan};
-use std::{
-    fs::{File, Permissions},
-    io::Read,
-    os::unix::fs::PermissionsExt,
-};
 
 const RWX: u32 = 0o7;
 const UUCODE_PERMISSION_PLACEHOLDER: &str = "#PERM#";

@@ -1,5 +1,6 @@
-use plib::testing::{run_test_with_checker, TestPlan};
 use std::process::Output;
+
+use plib::testing::{run_test_with_checker, TestPlan};
 
 mod basic;
 #[cfg(target_os = "linux")]

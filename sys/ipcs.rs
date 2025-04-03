@@ -124,8 +124,9 @@ fn display_message_queues(_args: &Args) {
 }
 
 fn display_shared_memory(_args: &Args) {
-    use libc::{shmctl, shmid_ds, IPC_STAT};
     use std::ffi::CStr;
+
+    use libc::{shmctl, shmid_ds, IPC_STAT};
 
     #[cfg(target_os = "macos")]
     const SHM_INFO: libc::c_int = 14; // SHM_INFO is typically 14 in Linux but this is not standard
@@ -183,8 +184,9 @@ fn display_shared_memory(_args: &Args) {
 }
 
 fn display_semaphores(_args: &Args) {
-    use libc::{semctl, semid_ds, IPC_STAT};
     use std::ffi::CStr;
+
+    use libc::{semctl, semid_ds, IPC_STAT};
 
     let mut semid: i32 = 0;
     let mut sem_ds: semid_ds = unsafe { std::mem::zeroed() };

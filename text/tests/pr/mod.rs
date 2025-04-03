@@ -8,11 +8,12 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::fs;
+use std::io::Read;
+
 use chrono::{DateTime, Local};
 use plib::testing::{run_test, run_test_with_checker, TestPlan};
 use regex::Regex;
-use std::fs;
-use std::io::Read;
 const PR_DATE_TIME_FORMAT: &str = "%b %d %H:%M %Y";
 
 fn pr_test(args: &[&str], test_data: &str, expected_output: &str) {

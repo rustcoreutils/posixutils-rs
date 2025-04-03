@@ -6,11 +6,22 @@
 // SPDX-License-Identifier: MIT
 //
 
-use clap::{error::ErrorKind, Parser};
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use thiserror::Error;
+use std::ffi::{CStr, CString};
+use std::io::{self, Cursor, Error, IsTerminal, Write};
+use std::mem::{size_of, zeroed};
+use std::net::{
+    self, AddrParseError, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener, TcpStream,
+    UdpSocket,
+};
+use std::os::fd::AsRawFd;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
+use std::{char, process, ptr, thread};
 
 use binrw::{binrw, BinReaderExt, BinWrite, Endian};
+use clap::error::ErrorKind;
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 #[cfg(target_os = "linux")]
 use libc::sa_family_t;
 use libc::{
@@ -18,22 +29,7 @@ use libc::{
     sockaddr_in, winsize, AF_INET, AI_CANONNAME, SIGINT, SIGPIPE, SIGQUIT, SOCK_DGRAM,
     STDIN_FILENO, STDOUT_FILENO, TIOCGWINSZ,
 };
-
-use std::{
-    char,
-    ffi::{CStr, CString},
-    io::{self, Cursor, Error, IsTerminal, Write},
-    mem::{size_of, zeroed},
-    net::{
-        self, AddrParseError, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener,
-        TcpStream, UdpSocket,
-    },
-    os::fd::AsRawFd,
-    process, ptr,
-    sync::{Arc, LazyLock, Mutex},
-    thread,
-    time::{Duration, Instant},
-};
+use thiserror::Error;
 
 #[derive(Parser)]
 #[command(version, about=gettext("talk - talk to another user"))]

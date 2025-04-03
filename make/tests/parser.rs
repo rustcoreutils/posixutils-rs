@@ -32,7 +32,8 @@ all:
 }
 
 mod lex {
-    use posixutils_make::parser::{lex::lex, SyntaxKind::*};
+    use posixutils_make::parser::lex::lex;
+    use posixutils_make::parser::SyntaxKind::*;
 
     #[test]
     fn test_empty() {
@@ -256,8 +257,9 @@ endif
 }
 
 mod parse {
+    use posixutils_make::parser::parse::parse;
     use posixutils_make::parser::preprocessor::preprocess;
-    use posixutils_make::parser::{parse::parse, Makefile};
+    use posixutils_make::parser::Makefile;
     use rowan::ast::AstNode;
 
     #[test]

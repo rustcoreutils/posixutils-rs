@@ -7,9 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::io::Read;
+
 use super::LineBreakIterator;
 use crate::{Line, Page};
-use std::io::Read;
 
 /// Iterator over whole pages.
 pub struct PageIterator {

@@ -7,11 +7,12 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::parse::lexer::Lexer;
-use crate::parse::ParseResult;
 use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
 use std::str::CharIndices;
+
+use crate::parse::lexer::Lexer;
+use crate::parse::ParseResult;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WordToken<'src> {

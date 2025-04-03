@@ -7,9 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::{thread, time};
+
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use std::{thread, time};
 
 #[derive(Parser)]
 #[command(version, about = gettext("sleep - suspend execution for an interval"))]

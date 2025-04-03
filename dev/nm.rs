@@ -11,15 +11,15 @@
 // - sort output
 //
 
+use std::collections::HashMap;
+use std::fs;
+
+use clap::{Parser, ValueEnum};
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use object::{
     Object, ObjectSection, ObjectSymbol, SectionIndex, SectionKind, Symbol, SymbolKind,
     SymbolSection,
 };
-
-use clap::{Parser, ValueEnum};
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use std::collections::HashMap;
-use std::fs;
 
 #[derive(ValueEnum, Clone)]
 enum OutputType {

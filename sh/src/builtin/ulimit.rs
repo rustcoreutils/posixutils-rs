@@ -7,13 +7,15 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::fmt::Display;
+
+use nix::libc::{rlim_t, RLIM_INFINITY};
+use nix::sys::resource::Resource;
+
 use crate::builtin::{BuiltinResult, BuiltinUtility};
 use crate::option_parser::OptionParser;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
-use nix::libc::{rlim_t, RLIM_INFINITY};
-use nix::sys::resource::Resource;
-use std::fmt::Display;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum ResourceLimit {

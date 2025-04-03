@@ -10,9 +10,10 @@
 use core::fmt;
 use std::io;
 
+use gettextrs::gettext;
+
 use crate::parser::parse::ParseError;
 use crate::special_target::Error;
-use gettextrs::gettext;
 
 /// Represents the error codes that can be returned by the make utility
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

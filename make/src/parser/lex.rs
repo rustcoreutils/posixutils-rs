@@ -1,9 +1,9 @@
-use super::SyntaxKind;
 use std::collections::HashMap;
 use std::iter::Peekable;
 use std::str::Chars;
 use std::sync::LazyLock;
 
+use super::SyntaxKind;
 use crate::parser::SyntaxKind::{EXPORT, INCLUDE};
 static KEYWORDS: LazyLock<HashMap<&'static str, SyntaxKind>> =
     LazyLock::new(|| HashMap::from_iter([("include", INCLUDE), ("export", EXPORT)]));

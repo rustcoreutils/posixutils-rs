@@ -10,11 +10,10 @@
 use core::fmt;
 use std::collections::BTreeSet;
 
-use crate::{
-    error_code::ErrorCode,
-    rule::{target::Target, Rule},
-    Make,
-};
+use crate::error_code::ErrorCode;
+use crate::rule::target::Target;
+use crate::rule::Rule;
+use crate::Make;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SpecialTarget {
@@ -27,9 +26,10 @@ pub enum SpecialTarget {
     Silent,
     Suffixes,
 }
-use crate::config::Config;
 use gettextrs::gettext;
 use SpecialTarget::*;
+
+use crate::config::Config;
 
 impl SpecialTarget {
     // could be automated with `strum`

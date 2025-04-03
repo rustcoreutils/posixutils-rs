@@ -7,8 +7,9 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::curuser::tty;
 use std::io::{self, IsTerminal};
+
+use plib::curuser::tty;
 
 fn main() {
     let is_tty = io::stdin().is_terminal();

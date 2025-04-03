@@ -7,8 +7,9 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test_with_checker, TestPlan};
 use std::process::Output;
+
+use plib::testing::{run_test_with_checker, TestPlan};
 
 fn run_getconf_test(args: Vec<&str>, expected_exit_code: i32, check_fn: fn(&TestPlan, &Output)) {
     let plan = TestPlan {

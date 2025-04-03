@@ -7,6 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::path::Path;
+
 use crate::parse::word::{Word, WordPart};
 use crate::pattern::{FilenamePattern, Pattern};
 use crate::shell::{CommandExecutionError, Shell};
@@ -15,7 +17,6 @@ use crate::wordexp::expanded_word::{ExpandedWord, ExpandedWordPart};
 use crate::wordexp::parameter::expand_parameter_into;
 use crate::wordexp::pathname::glob;
 use crate::wordexp::tilde::tilde_expansion;
-use std::path::Path;
 
 mod arithmetic;
 pub mod expanded_word;

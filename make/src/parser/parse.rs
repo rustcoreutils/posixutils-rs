@@ -6,11 +6,12 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::parser::lex::lex;
-use rowan::ast::AstNode;
 use std::str::FromStr;
 
+use rowan::ast::AstNode;
+
 use super::SyntaxKind::*;
+use crate::parser::lex::lex;
 
 #[derive(Debug)]
 pub enum Error {
@@ -73,13 +74,13 @@ impl rowan::Language for Lang {
 /// GreenNode is an immutable tree, which is cheap to change,
 /// but doesn't contain offsets and parent pointers.
 use rowan::GreenNode;
-
-use super::SyntaxKind;
-use crate::parser::preprocessor::preprocess;
 /// You can construct GreenNodes by hand, but a builder
 /// is helpful for top-down parsers: it maintains a stack
 /// of currently in-progress nodes
 use rowan::GreenNodeBuilder;
+
+use super::SyntaxKind;
+use crate::parser::preprocessor::preprocess;
 
 /// The parse results are stored as a "green tree".
 /// We'll discuss working with the results later

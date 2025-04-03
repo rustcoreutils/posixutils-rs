@@ -7,12 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::{
-    ffi::OsStr,
-    io::{self, Read},
-    ops::AddAssign,
-    path::PathBuf,
-};
+use std::ffi::OsStr;
+use std::io::{self, Read};
+use std::ops::AddAssign;
+use std::path::PathBuf;
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};

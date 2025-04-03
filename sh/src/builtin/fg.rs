@@ -7,11 +7,12 @@
 // SPDX-License-Identifier: MIT
 //
 
+use nix::sys::signal::kill;
+
 use crate::builtin::{skip_option_terminator, BuiltinResult, BuiltinUtility};
 use crate::jobs::{parse_job_id, Job, JobId, JobState};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
-use nix::sys::signal::kill;
 
 fn run_foreground_job(
     shell: &mut Shell,

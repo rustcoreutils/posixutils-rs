@@ -7,11 +7,11 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::{self};
+
 use plib::testing::{run_test, TestPlan};
-use std::{
-    fs,
-    os::unix::{self, fs::PermissionsExt},
-};
 
 fn chmod_test(args: &[&str], expected_output: &str, expected_error: &str, expected_exit_code: i32) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();

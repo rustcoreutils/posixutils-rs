@@ -10,6 +10,10 @@
 mod cursor;
 mod word;
 
+use std::borrow::Cow;
+use std::ffi::OsString;
+use std::path::Path;
+
 use crate::cli::vi::cursor::{Cursor, MotionCommand, MotionError};
 use crate::cli::vi::word::{current_bigword, BigWordIter};
 use crate::parse::word_parser::parse_word;
@@ -18,9 +22,6 @@ use crate::shell::history::History;
 use crate::shell::Shell;
 use crate::wordexp::expand_word;
 use crate::wordexp::pathname::glob;
-use std::borrow::Cow;
-use std::ffi::OsString;
-use std::path::Path;
 
 #[derive(Clone)]
 enum CommandOp {

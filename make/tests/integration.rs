@@ -13,7 +13,6 @@ use std::io::Write;
 use std::process::{Child, Command, Stdio};
 
 use plib::testing::{run_test, run_test_base, TestPlan};
-
 use posixutils_make::error_code::ErrorCode;
 
 pub fn run_test_not_comparing_error_message(plan: TestPlan) {
@@ -370,10 +369,13 @@ mod macros {
 }
 
 mod target_behavior {
-    use super::*;
+    use std::thread;
+    use std::time::Duration;
+
     use libc::{kill, SIGINT};
     use posixutils_make::parser::parse::ParseError;
-    use std::{thread, time::Duration};
+
+    use super::*;
 
     #[test]
     fn no_targets() {
@@ -575,11 +577,14 @@ mod recipes {
 }
 
 mod special_targets {
-    use super::*;
+    use std::fs::remove_dir;
+    use std::time::Duration;
+    use std::{fs, thread};
+
     use libc::{kill, SIGINT};
     use posixutils_make::special_target;
-    use std::fs::remove_dir;
-    use std::{fs, thread, time::Duration};
+
+    use super::*;
 
     #[test]
     fn default() {

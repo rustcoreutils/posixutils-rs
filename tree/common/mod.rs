@@ -4,20 +4,18 @@
 // module (but is used in `cp` or `mv`).
 #![allow(unused)]
 
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::ffi::{CStr, CString, OsStr};
+use std::mem::MaybeUninit;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::{fs, io};
+
 use ftw::{self, traverse_directory};
 use gettextrs::gettext;
-use std::{
-    cell::RefCell,
-    collections::{HashMap, HashSet},
-    ffi::{CStr, CString, OsStr},
-    fs, io,
-    mem::MaybeUninit,
-    os::{
-        fd::{AsRawFd, FromRawFd},
-        unix::{ffi::OsStrExt, fs::MetadataExt},
-    },
-    path::{Path, PathBuf},
-};
 
 pub type InodeMap = HashMap<(u64, u64), (ftw::FileDescriptor, CString)>;
 

@@ -7,8 +7,9 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::special_target::SpecialTarget;
 use core::fmt;
+
+use crate::special_target::SpecialTarget;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 /// A target for a rule.

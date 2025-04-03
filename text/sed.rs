@@ -7,22 +7,21 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::collections::{HashMap, HashSet};
+use std::ffi::CString;
+use std::fmt::{self, Debug};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Error, ErrorKind, Write};
+use std::mem::MaybeUninit;
+use std::ops::Range;
+use std::path::PathBuf;
+use std::sync::Mutex;
+
 use clap::{command, Parser};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use libc::{
     ioctl, regcomp, regex_t, regexec, regmatch_t, winsize, REG_EXTENDED, STDERR_FILENO,
     STDIN_FILENO, STDOUT_FILENO, TIOCGWINSZ,
-};
-use std::sync::Mutex;
-use std::{
-    collections::{HashMap, HashSet},
-    ffi::CString,
-    fmt::{self, Debug},
-    fs::File,
-    io::{BufRead, BufReader, Error, ErrorKind, Write},
-    mem::MaybeUninit,
-    ops::Range,
-    path::PathBuf,
 };
 
 static ERE: Mutex<bool> = Mutex::new(false);

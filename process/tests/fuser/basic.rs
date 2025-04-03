@@ -1,6 +1,10 @@
 mod basic {
+    use std::fs::File;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::str;
+
     use crate::fuser::fuser_test;
-    use std::{fs::File, path::PathBuf, process::Command, str};
 
     /// Tests the basic functionality of `fuser` by ensuring it can find the PID of a process.
     ///

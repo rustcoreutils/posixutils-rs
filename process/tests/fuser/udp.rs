@@ -1,7 +1,10 @@
 #[cfg(test)]
 mod udp {
+    use std::io;
+    use std::net::UdpSocket;
+    use std::process::Command;
+
     use crate::fuser::fuser_test;
-    use std::{io, net::UdpSocket, process::Command};
 
     /// Waits for a UDP server to become available by sending a dummy message to the specified port.
     ///

@@ -7,13 +7,14 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::fmt::{Display, Formatter};
+use std::iter::Peekable;
+use std::str::CharIndices;
+
 use crate::parse::word::Word;
 use crate::shell::{CommandExecutionError, Shell};
 use crate::wordexp::expanded_word::ExpandedWord;
 use crate::wordexp::{expand_word_to_string, ExpansionResult};
-use std::fmt::{Display, Formatter};
-use std::iter::Peekable;
-use std::str::CharIndices;
 
 enum UnaryOperator {
     Plus,

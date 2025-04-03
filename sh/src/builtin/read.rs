@@ -13,10 +13,12 @@ use crate::shell::opened_files::{OpenedFile, OpenedFiles, STDIN_FILENO};
 use crate::shell::Shell;
 use crate::wordexp::expanded_word::ExpandedWord;
 use crate::wordexp::split_fields;
-use atty::Stream;
 use nix::errno::Errno;
-use std::os::fd::{AsRawFd, RawFd};
-use std::time::Duration;
+use std::{io::stdin, time::Duration};
+use std::{
+    io::IsTerminal,
+    os::fd::{AsRawFd, RawFd},
+};
 
 fn bytes_to_string(bytes: Vec<u8>) -> Result<String, BuiltinError> {
     String::from_utf8(bytes.to_vec()).map_err(|_| "read: invalid UTF-8".into())
@@ -140,13 +142,13 @@ fn read_from_stdin(
     delimiter: u8,
     backslash_escape: bool,
 ) -> Result<ReadResult, BuiltinError> {
-    if atty::is(Stream::Stdin) {
+    if stdin().is_terminal() {
         let original_terminal_settings = shell.terminal.reset();
         shell.terminal.set_nonblocking();
 
         let result = read_until_from_non_blocking_fd(
             shell,
-            std::io::stdin().as_raw_fd(),
+            stdin().as_raw_fd(),
             delimiter,
             backslash_escape,
         );
@@ -155,7 +157,7 @@ fn read_from_stdin(
 
         result
     } else {
-        read_until_from_file(std::io::stdin().as_raw_fd(), delimiter, backslash_escape)
+        read_until_from_file(stdin().as_raw_fd(), delimiter, backslash_escape)
     }
 }
 

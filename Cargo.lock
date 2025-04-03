@@ -1402,7 +1402,7 @@ dependencies = [
  "quote",
  "strum",
  "strum_macros",
- "syn 2.0.82",
+ "syn 2.0.89",
  "tempfile",
 ]
 

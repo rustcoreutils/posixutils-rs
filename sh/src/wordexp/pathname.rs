@@ -32,10 +32,11 @@ struct DefaultFileSystem;
 impl FileSystem for DefaultFileSystem {
     fn read_dir(&self, path: &Path) -> DirContent {
         let mut result = vec![DirEntry::Dir(".".into()), DirEntry::Dir("..".into())];
-        let dir_iter = if let Ok(iter) = std::fs::read_dir(path) {
-            iter
-        } else {
-            return result;
+        let dir_iter = match std::fs::read_dir(path) {
+            Ok(iter) => iter,
+            _ => {
+                return result;
+            }
         };
         for entry in dir_iter {
             let entry = if let Ok(item) = entry { item } else { continue };

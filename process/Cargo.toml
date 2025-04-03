@@ -17,7 +17,7 @@ dirs = "5.0"
 chrono-tz.workspace = true
 
 [build-dependencies]
-bindgen = { version = "0.70.0", features = ["runtime"] }
+bindgen = { version = "0.71", features = ["runtime"] }
 
 [lints]
 workspace = true

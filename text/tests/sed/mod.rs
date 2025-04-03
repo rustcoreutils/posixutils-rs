@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{TestPlan, run_test};
 
 fn sed_test(
     args: &[&str],
@@ -500,18 +500,78 @@ mod tests {
     fn test_address_correct() {
         let test_data = [
             // correct
-            ("1,10 p", "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\n", "a\na\nb\nb\nc\nc\nd\nd\ne\ne\nf\nf\ng\ng\nm\nm\nn\nn\nt\nt\nw\nq\nh\nw\n", ""),                    
-            ("1,10p", "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\n", "a\na\nb\nb\nc\nc\nd\nd\ne\ne\nf\nf\ng\ng\nm\nm\nn\nn\nt\nt\nw\nq\nh\nw\n", ""),
-            ("1,10 p", "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\n", "a\na\nb\nb\nc\nc\nd\nd\ne\ne\nf\nf\ng\ng\nm\nm\nn\nn\nt\nt\nw\nq\nh\nw\n", ""),
-            ("10 p", "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\n", "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nt\nw\nq\nh\nw\n", ""),
-            ("1,$p", "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\n", "a\na\nb\nb\nc\nc\nd\nd\ne\ne\nf\nf\ng\ng\nm\nm\nn\nn\nt\nt\nw\nw\nq\nq\nh\nh\nw\nw\n", ""),                 
-            ("1,$ p", "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\n", "a\na\nb\nb\nc\nc\nd\nd\ne\ne\nf\nf\ng\ng\nm\nm\nn\nn\nt\nt\nw\nw\nq\nq\nh\nh\nw\nw\n", ""),            
-            ("$ p", "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\n", "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\nw\n", ""),
-            ("$ p", "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\n", "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\nw\n", ""),
-            ("$,$p", "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\n", "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\nw\n", ""),
-            ("$,$ p", "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\n", "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\nw\n", ""),                  
-            ("1, 10 p", "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\n", "a\na\nb\nb\nc\nc\nd\nd\ne\ne\nf\nf\ng\ng\nm\nm\nn\nn\nt\nt\nw\nq\nh\nw\n", ""),                
-            ("1 ,10 p", "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\n", "a\na\nb\nb\nc\nc\nd\nd\ne\ne\nf\nf\ng\ng\nm\nm\nn\nn\nt\nt\nw\nq\nh\nw\n", "")        
+            (
+                "1,10 p",
+                "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\n",
+                "a\na\nb\nb\nc\nc\nd\nd\ne\ne\nf\nf\ng\ng\nm\nm\nn\nn\nt\nt\nw\nq\nh\nw\n",
+                "",
+            ),
+            (
+                "1,10p",
+                "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\n",
+                "a\na\nb\nb\nc\nc\nd\nd\ne\ne\nf\nf\ng\ng\nm\nm\nn\nn\nt\nt\nw\nq\nh\nw\n",
+                "",
+            ),
+            (
+                "1,10 p",
+                "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\n",
+                "a\na\nb\nb\nc\nc\nd\nd\ne\ne\nf\nf\ng\ng\nm\nm\nn\nn\nt\nt\nw\nq\nh\nw\n",
+                "",
+            ),
+            (
+                "10 p",
+                "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\n",
+                "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nt\nw\nq\nh\nw\n",
+                "",
+            ),
+            (
+                "1,$p",
+                "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\n",
+                "a\na\nb\nb\nc\nc\nd\nd\ne\ne\nf\nf\ng\ng\nm\nm\nn\nn\nt\nt\nw\nw\nq\nq\nh\nh\nw\nw\n",
+                "",
+            ),
+            (
+                "1,$ p",
+                "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\n",
+                "a\na\nb\nb\nc\nc\nd\nd\ne\ne\nf\nf\ng\ng\nm\nm\nn\nn\nt\nt\nw\nw\nq\nq\nh\nh\nw\nw\n",
+                "",
+            ),
+            (
+                "$ p",
+                "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\n",
+                "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\nw\n",
+                "",
+            ),
+            (
+                "$ p",
+                "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\n",
+                "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\nw\n",
+                "",
+            ),
+            (
+                "$,$p",
+                "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\n",
+                "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\nw\n",
+                "",
+            ),
+            (
+                "$,$ p",
+                "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\n",
+                "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\nw\n",
+                "",
+            ),
+            (
+                "1, 10 p",
+                "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\n",
+                "a\na\nb\nb\nc\nc\nd\nd\ne\ne\nf\nf\ng\ng\nm\nm\nn\nn\nt\nt\nw\nq\nh\nw\n",
+                "",
+            ),
+            (
+                "1 ,10 p",
+                "a\nb\nc\nd\ne\nf\ng\nm\nn\nt\nw\nq\nh\nw\n",
+                "a\na\nb\nb\nc\nc\nd\nd\ne\ne\nf\nf\ng\ng\nm\nm\nn\nn\nt\nt\nw\nq\nh\nw\n",
+                "",
+            ),
         ];
 
         for (script, input, output, err) in test_data {
@@ -1495,9 +1555,24 @@ mod tests {
             ("r aer", "abc\ncdf", "abc\ncdf\n", ""),
             ("r./text/ard/assets/abc", "abc\ncdf", "abc\ncdf\n", ""),
             // wrong
-            ("r", "abc\ncdf", "", "sed: missing filename in r/R/w/W commands (line: 0, col: 1)\n"),
-            ("r #@/?", "abc\ncdf", "", "sed: missing filename in r/R/w/W commands (line: 0, col: 2)\n"),
-            ("r #@/?\nl", "abc\ncdf", "", "sed: missing filename in r/R/w/W commands (line: 0, col: 2)\n")
+            (
+                "r",
+                "abc\ncdf",
+                "",
+                "sed: missing filename in r/R/w/W commands (line: 0, col: 1)\n",
+            ),
+            (
+                "r #@/?",
+                "abc\ncdf",
+                "",
+                "sed: missing filename in r/R/w/W commands (line: 0, col: 2)\n",
+            ),
+            (
+                "r #@/?\nl",
+                "abc\ncdf",
+                "",
+                "sed: missing filename in r/R/w/W commands (line: 0, col: 2)\n",
+            ),
         ];
 
         for (script, input, output, err) in test_data {
@@ -1825,7 +1900,12 @@ mod tests {
     fn test_w() {
         let test_data = [
             // correct
-            ("w ./tests/sed/assets/newfile", "abc\ncdf\n", "abc\ncdf\n", ""),
+            (
+                "w ./tests/sed/assets/newfile",
+                "abc\ncdf\n",
+                "abc\ncdf\n",
+                "",
+            ),
             ("w atyfv", "abc\ncdf\n", "abc\ncdf\n", ""),
             ("w./tests/sed/assets/r", "", "", ""),
             ("w./tests/sed/assets/newfile", "a\n", "a\n", ""),
@@ -1996,18 +2076,62 @@ mod tests {
     fn test_combinations_1() {
         let test_data = [
             // correct
-            (":x ; \\/=$/ { N ; s/=$=//g ; bx }", "abc=$=\ncdf=$=\nret=$=\nget=$=\n", "abc\ncdf\nret\nget\n", ""),
-            ("1,3 { p ; p } ; 1,2 { p ; p } ; {p ; p}", "abc\ncdf\nret\nget\n",
-            "abc\nabc\nabc\nabc\nabc\nabc\nabc\ncdf\ncdf\ncdf\ncdf\ncdf\ncdf\ncdf\nret\nret\nret\nret\nret\nget\nget\nget\n", ""),
+            (
+                ":x ; \\/=$/ { N ; s/=$=//g ; bx }",
+                "abc=$=\ncdf=$=\nret=$=\nget=$=\n",
+                "abc\ncdf\nret\nget\n",
+                "",
+            ),
+            (
+                "1,3 { p ; p } ; 1,2 { p ; p } ; {p ; p}",
+                "abc\ncdf\nret\nget\n",
+                "abc\nabc\nabc\nabc\nabc\nabc\nabc\ncdf\ncdf\ncdf\ncdf\ncdf\ncdf\ncdf\nret\nret\nret\nret\nret\nget\nget\nget\n",
+                "",
+            ),
             ("\\/1/b else ; s/a/z/ ; :else ; y/123/456/", "", "", ""),
-            ("\\/1/s/a/z/ ; y/123/456/", "1aaa\n123aa\n", "4zaa\n456za\n", ""),
-            ("\\/start/,\\/end/p", "a\nb\nc\nstart\nt\n\nu\nend\nert\nqwerty\n", "a\nb\nc\nstart\nstart\nt\nt\n\n\nu\nu\nend\nend\nert\nqwerty\n", ""),
-            ("\\/start/,$p", "a\nb\nc\nstart\nt\n\nu\nend\nert\nqwerty\n", "a\nb\nc\nstart\nstart\nt\nt\n\n\nu\nu\nend\nend\nert\nert\nqwerty\nqwerty\n", ""),
-            ("1,\\/end/p", "a\nb\nc\nstart\nt\n\nu\nend\nert\nqwerty\n", "a\na\nb\nb\nc\nc\nstart\nstart\nt\nt\n\n\nu\nu\nend\nend\nert\nqwerty\n", ""),
-            ("2,4 !p", "a\nb\nc\nstart\nt\n\nu\nend\nert\nqwerty\n", "a\na\nb\nc\nstart\nt\nt\n\n\nu\nu\nend\nend\nert\nert\nqwerty\nqwerty\n", ""),
-            ("2,4 !{p}", "a\nb\nc\nstart\nt\n\nu\nend\nert\nqwerty\n", "a\na\nb\nc\nstart\nt\nt\n\n\nu\nu\nend\nend\nert\nert\nqwerty\nqwerty\n", ""),
+            (
+                "\\/1/s/a/z/ ; y/123/456/",
+                "1aaa\n123aa\n",
+                "4zaa\n456za\n",
+                "",
+            ),
+            (
+                "\\/start/,\\/end/p",
+                "a\nb\nc\nstart\nt\n\nu\nend\nert\nqwerty\n",
+                "a\nb\nc\nstart\nstart\nt\nt\n\n\nu\nu\nend\nend\nert\nqwerty\n",
+                "",
+            ),
+            (
+                "\\/start/,$p",
+                "a\nb\nc\nstart\nt\n\nu\nend\nert\nqwerty\n",
+                "a\nb\nc\nstart\nstart\nt\nt\n\n\nu\nu\nend\nend\nert\nert\nqwerty\nqwerty\n",
+                "",
+            ),
+            (
+                "1,\\/end/p",
+                "a\nb\nc\nstart\nt\n\nu\nend\nert\nqwerty\n",
+                "a\na\nb\nb\nc\nc\nstart\nstart\nt\nt\n\n\nu\nu\nend\nend\nert\nqwerty\n",
+                "",
+            ),
+            (
+                "2,4 !p",
+                "a\nb\nc\nstart\nt\n\nu\nend\nert\nqwerty\n",
+                "a\na\nb\nc\nstart\nt\nt\n\n\nu\nu\nend\nend\nert\nert\nqwerty\nqwerty\n",
+                "",
+            ),
+            (
+                "2,4 !{p}",
+                "a\nb\nc\nstart\nt\n\nu\nend\nert\nqwerty\n",
+                "a\na\nb\nc\nstart\nt\nt\n\n\nu\nu\nend\nend\nert\nert\nqwerty\nqwerty\n",
+                "",
+            ),
             //wrong
-            ("\\/pattern/- p", "a\nb\nc\nstart\nt\n\nu\nend\nert\nqwerty", "", "sed: unknown character '-' (line: 0, col: 11)\n")
+            (
+                "\\/pattern/- p",
+                "a\nb\nc\nstart\nt\n\nu\nend\nert\nqwerty",
+                "",
+                "sed: unknown character '-' (line: 0, col: 11)\n",
+            ),
         ];
 
         for (script, input, output, err) in test_data {
@@ -2019,18 +2143,42 @@ mod tests {
     fn test_combinations_2() {
         let test_data = [
             // correct
-            (r#"s/^[^[:space:]]*[[:space:]]*//"#, "apple pie is sweet\n123abc test123\nhello world\n",
-            "pie is sweet\ntest123\nworld\n", ""),
-            (r#"s/^[[:alnum:]]*[[:space:]]*//"#, "apple pie is sweet\n123abc test123\nhello world\n",
-            "pie is sweet\ntest123\nworld\n", ""),
-            (r#"s/\([[:alnum:]]*\)/\1/1"#, "apple pie is sweet\n123abc test123\nhello world\n",
-            "apple pie is sweet\n123abc test123\nhello world\n", ""),
-            ("\\:start:,\\,stop, p", "a\nb\nc\nstart\nt\n\nu\nend\nert\nqwerty\n",
-            "a\nb\nc\nstart\nstart\nt\nt\n\n\nu\nu\nend\nend\nert\nert\nqwerty\nqwerty\n", ""),
-            ("\\`'$PATTERN'`p", "'$PATTERN'\nabc\n\n'$PATTERN'\nret'$PATTERN'abc\n",
-            "'$PATTERN'\n'$PATTERN'\nabc\n\n'$PATTERN'\n'$PATTERN'\nret'$PATTERN'abc\nret'$PATTERN'abc\n", ""),
-            ("s/param=.*/param=new_value\n/", "param=abc\nparam=\nparam abc\n",
-            "", "sed: unterminated `s' command (line: 0, col: 3)\n"),
+            (
+                r#"s/^[^[:space:]]*[[:space:]]*//"#,
+                "apple pie is sweet\n123abc test123\nhello world\n",
+                "pie is sweet\ntest123\nworld\n",
+                "",
+            ),
+            (
+                r#"s/^[[:alnum:]]*[[:space:]]*//"#,
+                "apple pie is sweet\n123abc test123\nhello world\n",
+                "pie is sweet\ntest123\nworld\n",
+                "",
+            ),
+            (
+                r#"s/\([[:alnum:]]*\)/\1/1"#,
+                "apple pie is sweet\n123abc test123\nhello world\n",
+                "apple pie is sweet\n123abc test123\nhello world\n",
+                "",
+            ),
+            (
+                "\\:start:,\\,stop, p",
+                "a\nb\nc\nstart\nt\n\nu\nend\nert\nqwerty\n",
+                "a\nb\nc\nstart\nstart\nt\nt\n\n\nu\nu\nend\nend\nert\nert\nqwerty\nqwerty\n",
+                "",
+            ),
+            (
+                "\\`'$PATTERN'`p",
+                "'$PATTERN'\nabc\n\n'$PATTERN'\nret'$PATTERN'abc\n",
+                "'$PATTERN'\n'$PATTERN'\nabc\n\n'$PATTERN'\n'$PATTERN'\nret'$PATTERN'abc\nret'$PATTERN'abc\n",
+                "",
+            ),
+            (
+                "s/param=.*/param=new_value\n/",
+                "param=abc\nparam=\nparam abc\n",
+                "",
+                "sed: unterminated `s' command (line: 0, col: 3)\n",
+            ),
         ];
 
         for (script, input, output, err) in test_data {
@@ -2162,24 +2310,61 @@ mod tests {
     fn test_combinations_5() {
         let test_data = [
             // correct
-            ("\\/./,\\/^$/p", "\n\nline1\nline2\n\nline3\n", "\n\nline1\nline1\nline2\nline2\n\n\nline3\nline3\n", ""),
-            ("\\/string [[:digit:]]* /p", "string 123 \nstring abc \nstring 456 \n", 
-            "string 123 \nstring 123 \nstring abc \nstring 456 \nstring 456 \n", ""),
-            ("\\/,.*/ p", "hello, world\nhello world\n\n", "hello, world\nhello, world\nhello world\n\n", ""),
-            ("\\:ac: p", ":ac:\n:bc:\n:ac:\n", ":ac:\n:ac:\n:bc:\n:ac:\n:ac:\n", ""),
-            ("1,\\,stop, p", "first line\nsecond stop\nthird line\n", "first line\nfirst line\nsecond stop\nsecond stop\nthird line\n", ""),
-            ("s/WORD/Hello World/p ; p", "WORD is here\nthis is not word\n",
-            "Hello World is here\nHello World is here\nHello World is here\nthis is not word\nthis is not word\n", ""),
-            ("s/SUBST/program\\/lib\\/module\\/lib.so/", "this is a test SUBST\nwe use SUBST here as well",
-            "this is a test program/lib/module/lib.so\nwe use program/lib/module/lib.so here as well", ""),
-            ("s/.*/[&]/", "This is a test\nAnother test line\n", "[This is a test]\n[Another test line]\n", ""),
+            (
+                "\\/./,\\/^$/p",
+                "\n\nline1\nline2\n\nline3\n",
+                "\n\nline1\nline1\nline2\nline2\n\n\nline3\nline3\n",
+                "",
+            ),
+            (
+                "\\/string [[:digit:]]* /p",
+                "string 123 \nstring abc \nstring 456 \n",
+                "string 123 \nstring 123 \nstring abc \nstring 456 \nstring 456 \n",
+                "",
+            ),
+            (
+                "\\/,.*/ p",
+                "hello, world\nhello world\n\n",
+                "hello, world\nhello, world\nhello world\n\n",
+                "",
+            ),
+            (
+                "\\:ac: p",
+                ":ac:\n:bc:\n:ac:\n",
+                ":ac:\n:ac:\n:bc:\n:ac:\n:ac:\n",
+                "",
+            ),
+            (
+                "1,\\,stop, p",
+                "first line\nsecond stop\nthird line\n",
+                "first line\nfirst line\nsecond stop\nsecond stop\nthird line\n",
+                "",
+            ),
+            (
+                "s/WORD/Hello World/p ; p",
+                "WORD is here\nthis is not word\n",
+                "Hello World is here\nHello World is here\nHello World is here\nthis is not word\nthis is not word\n",
+                "",
+            ),
+            (
+                "s/SUBST/program\\/lib\\/module\\/lib.so/",
+                "this is a test SUBST\nwe use SUBST here as well",
+                "this is a test program/lib/module/lib.so\nwe use program/lib/module/lib.so here as well",
+                "",
+            ),
+            (
+                "s/.*/[&]/",
+                "This is a test\nAnother test line\n",
+                "[This is a test]\n[Another test line]\n",
+                "",
+            ),
             // wrong
             (
-                r#"s/#.*//;s/[[:blank:]]*$//;\/^$/ d;p"#, 
-                "# This is a comment\nLine with trailing spaces     \nAnother line\n", 
-                "Line with trailing spaces\nLine with trailing spaces\nAnother line\nAnother line\n", 
-                ""
-            )
+                r#"s/#.*//;s/[[:blank:]]*$//;\/^$/ d;p"#,
+                "# This is a comment\nLine with trailing spaces     \nAnother line\n",
+                "Line with trailing spaces\nLine with trailing spaces\nAnother line\nAnother line\n",
+                "",
+            ),
         ];
 
         for (script, input, output, err) in test_data {
@@ -2249,23 +2434,54 @@ mod tests {
     #[test]
     fn test_combinations_7() {
         let test_data = [
-            // correct         
-            (r#"\/^Reply-To:/q; \/^From:/h; \/./d;g;q"#, "From: someone\nReply-To: someoneelse\n", "Reply-To: someoneelse\n", ""),
-            ("\\/./{H;$d}; x; 1 s/^/START-->/; $ s/$/<--END/", "Line 1\nLine 2\n\nLine 3",
-            "START-->\nLine 1\nLine 1\nLine 2\nLine 2\n", ""),
-            (r#"1 s/^/ /; $ s/$/ /"#, "line1\nline2", " line1\nline2 ", ""), 
-            (":a; $ q; n; 11,$ D; ba", "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11\nline12\n",
-            "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline12\n", ""),
-            (r#"$ s/[[:alnum:]]*//2"#, "apple pie is sweet\n123abc test123 hello world\none two three four\n",
-            "apple pie is sweet\n123abc test123 hello world\none  three four\n", ""),
-            (r#"s/[[:alnum:]]*//2"#, "apple pie is sweet\n123abc test123 hello world\none two three four\n",
-            "apple  is sweet\n123abc  hello world\none  three four\n", ""),
-            (r#":a;s/^.\{1,13\}$/ &/;ta"#, "12345678\n1234567890123", "      12345678\n 1234567890123", ""),
+            // correct
+            (
+                r#"\/^Reply-To:/q; \/^From:/h; \/./d;g;q"#,
+                "From: someone\nReply-To: someoneelse\n",
+                "Reply-To: someoneelse\n",
+                "",
+            ),
+            (
+                "\\/./{H;$d}; x; 1 s/^/START-->/; $ s/$/<--END/",
+                "Line 1\nLine 2\n\nLine 3",
+                "START-->\nLine 1\nLine 1\nLine 2\nLine 2\n",
+                "",
+            ),
+            (
+                r#"1 s/^/ /; $ s/$/ /"#,
+                "line1\nline2",
+                " line1\nline2 ",
+                "",
+            ),
+            (
+                ":a; $ q; n; 11,$ D; ba",
+                "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11\nline12\n",
+                "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline12\n",
+                "",
+            ),
+            (
+                r#"$ s/[[:alnum:]]*//2"#,
+                "apple pie is sweet\n123abc test123 hello world\none two three four\n",
+                "apple pie is sweet\n123abc test123 hello world\none  three four\n",
+                "",
+            ),
+            (
+                r#"s/[[:alnum:]]*//2"#,
+                "apple pie is sweet\n123abc test123 hello world\none two three four\n",
+                "apple  is sweet\n123abc  hello world\none  three four\n",
+                "",
+            ),
+            (
+                r#":a;s/^.\{1,13\}$/ &/;ta"#,
+                "12345678\n1234567890123",
+                "      12345678\n 1234567890123",
+                "",
+            ),
             (
                 "\\/begin/,\\/end/ {\ns/#.* //;\n\ns/[[:blank:]]*$//;\n\\/^$/ d;\np;\n}",
                 "Some text\nbegin\n# A comment   \nLine with trailing spaces     \nAnother line\n\n     \nend\nSome more text\n",
-                "Some text\nbegin\nbegin\nLine with trailing spaces\nLine with trailing spaces\nAnother line\nAnother line\nend\nend\nSome more text\n", 
-                ""
+                "Some text\nbegin\nbegin\nLine with trailing spaces\nLine with trailing spaces\nAnother line\nAnother line\nend\nend\nSome more text\n",
+                "",
             ),
         ];
         for (script, input, output, err) in test_data {

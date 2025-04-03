@@ -13,7 +13,7 @@
 
 use chrono::{DateTime, Datelike, Local, LocalResult, TimeZone, Utc};
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 
 const DEF_TIMESTR: &str = "%a %b %e %H:%M:%S %Z %Y";
 

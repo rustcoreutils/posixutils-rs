@@ -6,17 +6,17 @@ use std::{io::Write, rc::Rc};
 
 use super::eval::parse_integer;
 use super::{MacroDefinitionImplementation, MacroImplementation};
-use nom::error::{ContextError, FromExternalError};
 use nom::IResult;
+use nom::error::{ContextError, FromExternalError};
 
+use crate::EOF;
 use crate::error::{Result, ResultExt};
 use crate::input::{Input, InputRead};
-use crate::lexer::{MacroName, MacroParseConfig, DEFAULT_QUOTE_CLOSE_TAG, DEFAULT_QUOTE_OPEN_TAG};
-use crate::macros::user_defined::UserDefinedMacro;
+use crate::lexer::{DEFAULT_QUOTE_CLOSE_TAG, DEFAULT_QUOTE_OPEN_TAG, MacroName, MacroParseConfig};
 use crate::macros::MacroDefinition;
+use crate::macros::user_defined::UserDefinedMacro;
 use crate::output::DivertBufferNumber;
 use crate::state::{StackFrame, State};
-use crate::EOF;
 
 const AT_LEAST_ONE_MACRO_DEFINITION_EXPECT: &str =
     "There should always be at least one macro definition";
@@ -55,14 +55,15 @@ impl DefineMacro {
     ) -> Result<(State, Option<MacroDefinition>)> {
         let mut args = frame.args.into_iter();
         let name = if let Some(name_bytes) = args.next() {
-            if let Ok(name) = MacroName::try_from_slice(&name_bytes) {
-                name
-            } else {
-                log::warn!(
-                    "Invalid macro name {:?}, skipping definition",
-                    String::from_utf8_lossy(&name_bytes)
-                );
-                return Ok((state, None));
+            match MacroName::try_from_slice(&name_bytes) {
+                Ok(name) => name,
+                _ => {
+                    log::warn!(
+                        "Invalid macro name {:?}, skipping definition",
+                        String::from_utf8_lossy(&name_bytes)
+                    );
+                    return Ok((state, None));
+                }
             }
         } else {
             log::warn!("No macro name specified, skipping definition");

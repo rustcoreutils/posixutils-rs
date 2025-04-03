@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::{Line, FORM_FEED};
+use crate::{FORM_FEED, Line};
 use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Read};
 

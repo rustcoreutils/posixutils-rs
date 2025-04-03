@@ -23,9 +23,9 @@ use crate::program::{
 };
 use crate::regex::Regex;
 use format::{
-    fmt_write_decimal_float, fmt_write_float_general, fmt_write_hex_float,
+    IntegerFormat, fmt_write_decimal_float, fmt_write_float_general, fmt_write_hex_float,
     fmt_write_scientific_float, fmt_write_signed, fmt_write_string, fmt_write_unsigned,
-    parse_conversion_specifier_args, IntegerFormat,
+    parse_conversion_specifier_args,
 };
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashMap;
@@ -44,11 +44,7 @@ mod string;
 const STACK_SIZE: usize = 2048;
 
 fn bool_to_f64(p: bool) -> f64 {
-    if p {
-        1.0
-    } else {
-        0.0
-    }
+    if p { 1.0 } else { 0.0 }
 }
 
 fn strtod(s: &str) -> f64 {
@@ -410,7 +406,7 @@ fn call_simple_builtin(
             stack.push_value(value.to_uppercase())?;
         }
         BuiltinFunction::Gsub | BuiltinFunction::Sub => {
-            return builtin_gsub(stack, global_env, function == BuiltinFunction::Sub)
+            return builtin_gsub(stack, global_env, function == BuiltinFunction::Sub);
         }
         BuiltinFunction::System => {
             let command: CString = stack
@@ -588,61 +584,65 @@ impl Record {
         last_field: usize,
         truncate_fields: bool,
     ) -> Result<(), String> {
-        let last_field = if truncate_fields {
-            if last_field < *self.last_field.borrow() {
-                for field in self
-                    .fields
-                    .iter()
-                    .skip(last_field + 1)
-                    .take(*self.last_field.borrow() - last_field)
-                {
-                    (*field.get()).value = AwkValueVariant::UninitializedScalar;
+        unsafe {
+            let last_field = if truncate_fields {
+                if last_field < *self.last_field.borrow() {
+                    for field in self
+                        .fields
+                        .iter()
+                        .skip(last_field + 1)
+                        .take(*self.last_field.borrow() - last_field)
+                    {
+                        (*field.get()).value = AwkValueVariant::UninitializedScalar;
+                    }
                 }
+                last_field
+            } else {
+                self.last_field.borrow().max(last_field)
+            };
+            let mut new_record = String::new();
+            for field in self.fields.iter().skip(1).take(last_field - 1) {
+                let field_str = (*field.get())
+                    .clone()
+                    .scalar_to_string(&global_env.convfmt)?;
+                write!(new_record, "{}{}", field_str, &global_env.ofs)
+                    .expect("error writing to string");
             }
-            last_field
-        } else {
-            self.last_field.borrow().max(last_field)
-        };
-        let mut new_record = String::new();
-        for field in self.fields.iter().skip(1).take(last_field - 1) {
-            let field_str = (*field.get())
+            let last_field_str = (*self.fields[last_field].get())
                 .clone()
                 .scalar_to_string(&global_env.convfmt)?;
-            write!(new_record, "{}{}", field_str, &global_env.ofs)
-                .expect("error writing to string");
+            write!(new_record, "{}", last_field_str).expect("error writing to string");
+            // the spec doesn't specify if a recomputed record should be a numeric string.
+            // Most other implementations don't really handle this case. Here we just
+            // mark it as a numeric string if appropriate
+            let record_str = maybe_numeric_string(new_record);
+            *self.fields[0].get() = AwkValue::field_ref(record_str.clone(), 0);
+            *self.record.borrow_mut() = record_str.try_into()?;
+            *self.last_field.borrow_mut() = last_field;
+            Ok(())
         }
-        let last_field_str = (*self.fields[last_field].get())
-            .clone()
-            .scalar_to_string(&global_env.convfmt)?;
-        write!(new_record, "{}", last_field_str).expect("error writing to string");
-        // the spec doesn't specify if a recomputed record should be a numeric string.
-        // Most other implementations don't really handle this case. Here we just
-        // mark it as a numeric string if appropriate
-        let record_str = maybe_numeric_string(new_record);
-        *self.fields[0].get() = AwkValue::field_ref(record_str.clone(), 0);
-        *self.record.borrow_mut() = record_str.try_into()?;
-        *self.last_field.borrow_mut() = last_field;
-        Ok(())
     }
 
     /// # Safety
     /// The caller has to ensure that there are no active references to the fields
     unsafe fn recompute_fields(&self, global_env: &GlobalEnv) -> Result<(), String> {
-        let mut last_field = 0;
-        let record_str = (*self.fields[0].get())
-            .to_owned()
-            .scalar_to_string(&global_env.convfmt)?;
-        split_record(record_str.clone(), &global_env.fs, |i, s| {
-            let field_index = i + 1;
-            last_field += 1;
-            *self.fields[field_index].get() = AwkValue::field_ref(s, field_index as u16);
+        unsafe {
+            let mut last_field = 0;
+            let record_str = (*self.fields[0].get())
+                .to_owned()
+                .scalar_to_string(&global_env.convfmt)?;
+            split_record(record_str.clone(), &global_env.fs, |i, s| {
+                let field_index = i + 1;
+                last_field += 1;
+                *self.fields[field_index].get() = AwkValue::field_ref(s, field_index as u16);
+                Ok(())
+            })
+            .expect("error splitting record");
+            *self.fields[0].get() = AwkValue::field_ref(record_str.clone(), 0);
+            *self.record.borrow_mut() = record_str.try_into()?;
+            *self.last_field.borrow_mut() = last_field;
             Ok(())
-        })
-        .expect("error splitting record");
-        *self.fields[0].get() = AwkValue::field_ref(record_str.clone(), 0);
-        *self.record.borrow_mut() = record_str.try_into()?;
-        *self.last_field.borrow_mut() = last_field;
-        Ok(())
+        }
     }
 
     fn get_last_field(&self) -> usize {
@@ -920,16 +920,18 @@ impl StackValue {
     /// # Safety
     /// the caller has to ensure that the value is valid and dereferencable
     unsafe fn value_ref(&mut self) -> &mut AwkValue {
-        match self {
-            StackValue::Value(val) => val.get_mut(),
-            StackValue::ValueRef(val_ref) => &mut **val_ref,
-            StackValue::UninitializedRef(val_ref) => &mut **val_ref,
-            StackValue::ArrayElementRef(array_element_ref) => (*array_element_ref.array)
-                .as_array()
-                .expect("expected array")
-                .index_to_value(array_element_ref.value_index)
-                .expect("invalid array value index"),
-            _ => unreachable!("invalid stack value"),
+        unsafe {
+            match self {
+                StackValue::Value(val) => val.get_mut(),
+                StackValue::ValueRef(val_ref) => &mut **val_ref,
+                StackValue::UninitializedRef(val_ref) => &mut **val_ref,
+                StackValue::ArrayElementRef(array_element_ref) => (*array_element_ref.array)
+                    .as_array()
+                    .expect("expected array")
+                    .index_to_value(array_element_ref.value_index)
+                    .expect("invalid array value index"),
+                _ => unreachable!("invalid stack value"),
+            }
         }
     }
 
@@ -962,29 +964,33 @@ impl StackValue {
     /// # Safety
     /// pointers inside the `StackValue` have to be valid and dereferencable
     unsafe fn into_owned(self) -> AwkValue {
-        match self {
-            StackValue::Value(val) => val.into_inner(),
-            StackValue::ValueRef(ref_val) => (*ref_val).clone().into_ref(AwkRefType::None),
-            StackValue::UninitializedRef(_) => AwkValue::uninitialized_scalar(),
-            _ => unreachable!("invalid stack value"),
+        unsafe {
+            match self {
+                StackValue::Value(val) => val.into_inner(),
+                StackValue::ValueRef(ref_val) => (*ref_val).clone().into_ref(AwkRefType::None),
+                StackValue::UninitializedRef(_) => AwkValue::uninitialized_scalar(),
+                _ => unreachable!("invalid stack value"),
+            }
         }
     }
 
     /// # Safety
     /// pointers inside the `StackValue` have to be valid and dereferencable
     unsafe fn ensure_value_is_scalar(&mut self) -> Result<(), String> {
-        self.value_ref().ensure_value_is_scalar()
+        unsafe { self.value_ref().ensure_value_is_scalar() }
     }
 
     /// # Safety
     /// `value` has to be a valid pointer at least until the value preceding it
     /// on the stack is popped
     unsafe fn from_var(value: *mut AwkValue) -> Self {
-        let value_ref = &mut *value;
-        match value_ref.value {
-            AwkValueVariant::Array(_) => StackValue::ValueRef(value),
-            AwkValueVariant::Uninitialized => StackValue::UninitializedRef(value),
-            _ => StackValue::Value(UnsafeCell::new(value_ref.clone())),
+        unsafe {
+            let value_ref = &mut *value;
+            match value_ref.value {
+                AwkValueVariant::Array(_) => StackValue::ValueRef(value),
+                AwkValueVariant::Uninitialized => StackValue::UninitializedRef(value),
+                _ => StackValue::Value(UnsafeCell::new(value_ref.clone())),
+            }
         }
     }
 
@@ -1061,12 +1067,14 @@ impl<'i, 's> Stack<'i, 's> {
     /// # Safety
     /// `value` has to be valid at least until the value preceding it is popped
     unsafe fn push(&mut self, value: StackValue) -> Result<(), String> {
-        if self.sp == self.stack_end {
-            Err("stack overflow".to_string())
-        } else {
-            *self.sp = value;
-            self.sp = self.sp.add(1);
-            Ok(())
+        unsafe {
+            if self.sp == self.stack_end {
+                Err("stack overflow".to_string())
+            } else {
+                *self.sp = value;
+                self.sp = self.sp.add(1);
+                Ok(())
+            }
         }
     }
 
@@ -1116,7 +1124,7 @@ impl<'i, 's> Stack<'i, 's> {
     /// `value_ptr` has to be safe to access at least until the value preceding it
     /// on the stack is popped.
     unsafe fn push_ref(&mut self, value_ptr: *mut AwkValue) -> Result<(), String> {
-        self.push(StackValue::ValueRef(value_ptr))
+        unsafe { self.push(StackValue::ValueRef(value_ptr)) }
     }
 
     fn next_instruction(&mut self) -> Option<OpCode> {
@@ -1207,7 +1215,7 @@ struct Interpreter {
 }
 
 macro_rules! numeric_op {
-    ($stack:expr, $op:tt) => {
+    ($stack:expr_2021, $op:tt) => {
         let rhs = $stack.pop_scalar_value()?.scalar_as_f64();
         let lhs = $stack.pop_scalar_value()?.scalar_as_f64();
         $stack.push_value(lhs $op rhs)?;
@@ -1215,7 +1223,7 @@ macro_rules! numeric_op {
 }
 
 macro_rules! compare_op {
-    ($stack:expr, $convfmt:expr, $op:tt) => {
+    ($stack:expr_2021, $convfmt:expr_2021, $op:tt) => {
         let rhs = $stack.pop_scalar_value()?;
         let lhs = $stack.pop_scalar_value()?;
         match (&lhs.value, &rhs.value) {

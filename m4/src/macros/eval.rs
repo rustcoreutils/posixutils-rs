@@ -1,19 +1,19 @@
 use std::io::Write;
 
 use nom::{
+    IResult,
     branch::alt,
     bytes::complete::{tag, take_while},
     combinator::fail,
     error::FromExternalError,
     sequence::{delimited, tuple},
-    IResult,
 };
 
 use crate::{
-    lexer::is_whitespace,
-    precedence::{self, binary_op, unary_op, Assoc, Operation},
-    state::{StackFrame, State},
     Result,
+    lexer::is_whitespace,
+    precedence::{self, Assoc, Operation, binary_op, unary_op},
+    state::{StackFrame, State},
 };
 
 use super::MacroImplementation;

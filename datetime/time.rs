@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use clap::Parser;
 use gettextrs::{
-    bind_textdomain_codeset, bindtextdomain, gettext, setlocale, textdomain, LocaleCategory,
+    LocaleCategory, bind_textdomain_codeset, bindtextdomain, gettext, setlocale, textdomain,
 };
 
 #[derive(Parser)]

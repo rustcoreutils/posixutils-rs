@@ -8,11 +8,11 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, setlocale, textdomain};
 use std::error::Error;
 use std::fs;
 use std::io::Write;
-use std::io::{stderr, stdout, ErrorKind};
+use std::io::{ErrorKind, stderr, stdout};
 use std::path::PathBuf;
 use std::path::{Component, Path};
 

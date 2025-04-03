@@ -1,7 +1,8 @@
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
+
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 
 #[derive(Parser)]
 #[command(version, about)]

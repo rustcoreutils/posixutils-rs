@@ -7,11 +7,12 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::ffi::CString;
+
 use crate::builtin::{BuiltinResult, SpecialBuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 use crate::utils::strcoll;
-use std::ffi::CString;
 
 pub struct SetSpecialBuiltin;
 

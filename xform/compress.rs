@@ -7,13 +7,14 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::fs::{self, File};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::io::input_stream;
 use plib::lzw::UnixLZWWriter;
-use std::fs::{self, File};
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
 
 const NAME_MAX: usize = 255;
 

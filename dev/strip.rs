@@ -7,12 +7,13 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::ffi::{OsStr, OsString};
+use std::io::Read;
+
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use object::build::elf::{Builder, Section, SectionData};
 use object::{archive, elf};
-use std::ffi::{OsStr, OsString};
-use std::io::Read;
 
 #[derive(Parser)]
 #[command(version, about = gettext("strip - remove unnecessary information from strippable files"))]

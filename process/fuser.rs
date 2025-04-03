@@ -141,15 +141,16 @@ impl Names {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::*;
-
-    use libc::fstat;
     use std::env;
     use std::fs::{self, File};
     use std::io::{BufRead, Error, ErrorKind};
     use std::net::{IpAddr, Ipv4Addr, UdpSocket};
     use std::os::unix::io::AsRawFd;
     use std::path::Component;
+
+    use libc::fstat;
+
+    use super::*;
     const PROC_PATH: &str = "/proc";
     const PROC_MOUNTS: &str = "/proc/mounts";
 
@@ -1222,10 +1223,11 @@ mod macos {
     pub mod osx_libproc_bindings {
         include!(concat!(env!("OUT_DIR"), "/osx_libproc_bindings.rs"));
     }
-    use libc::{c_char, c_int, c_void};
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     use std::ptr;
+
+    use libc::{c_char, c_int, c_void};
 
     // similar to list_pids_ret() below, there are two cases when 0 is returned, one when there are
     // no pids, and the other when there is an error

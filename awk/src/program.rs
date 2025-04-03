@@ -7,9 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::regex::Regex;
 use std::collections::HashMap;
 use std::rc::Rc;
+
+use crate::regex::Regex;
 
 pub type VarId = u32;
 

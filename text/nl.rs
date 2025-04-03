@@ -7,14 +7,15 @@
 // SPDX-License-Identifier: MIT
 //
 
-use clap::{Parser, ValueEnum};
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use regex::Regex;
 use std::fs;
 use std::io::{self, BufRead, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::str::FromStr;
+
+use clap::{Parser, ValueEnum};
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use regex::Regex;
 
 /// nl - line numbering filter
 #[derive(Parser)]

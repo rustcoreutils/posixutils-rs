@@ -122,13 +122,14 @@ fn test_head_c() {
 
 /* #region Property-based tests */
 mod property_tests {
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::thread::{self};
+    use std::time::Duration;
+
     use plib::testing::run_test_base;
     use proptest::prelude::TestCaseError;
     use proptest::prop_assert;
     use proptest::test_runner::TestRunner;
-    use std::sync::mpsc::{self, RecvTimeoutError};
-    use std::thread::{self};
-    use std::time::Duration;
 
     fn get_test_runner(cases: u32) -> TestRunner {
         TestRunner::new(proptest::test_runner::Config {

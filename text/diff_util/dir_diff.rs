@@ -3,12 +3,11 @@ use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
 
+use super::common::FormatOptions;
+use super::dir_data::DirData;
 use crate::diff_util::constants::COULD_NOT_UNWRAP_FILENAME;
 use crate::diff_util::diff_exit_status::DiffExitStatus;
 use crate::diff_util::file_diff::FileDiff;
-
-use super::common::FormatOptions;
-use super::dir_data::DirData;
 
 pub struct DirDiff<'a> {
     dir1: &'a mut DirData,

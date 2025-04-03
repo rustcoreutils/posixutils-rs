@@ -7,6 +7,23 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::collections::HashMap;
+use std::ffi::{CString, OsString};
+use std::fmt::{Display, Formatter};
+use std::fs::File;
+use std::io;
+use std::io::{read_to_string, Read};
+use std::os::fd::{AsFd, AsRawFd, IntoRawFd};
+use std::path::Path;
+use std::rc::Rc;
+use std::time::Duration;
+
+use nix::errno::Errno;
+use nix::libc;
+use nix::sys::signal::{kill, Signal as NixSignal};
+use nix::sys::wait::{WaitPidFlag, WaitStatus};
+use nix::unistd::{getcwd, getpgid, getpgrp, getpid, getppid, setpgid, tcsetpgrp, ForkResult, Pid};
+
 use crate::builtin::set::SetOptions;
 use crate::builtin::trap::TrapAction;
 use crate::builtin::{
@@ -32,21 +49,6 @@ use crate::utils::{
     waitpid, ExecError, OsError, OsResult,
 };
 use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
-use nix::errno::Errno;
-use nix::libc;
-use nix::sys::signal::{kill, Signal as NixSignal};
-use nix::sys::wait::{WaitPidFlag, WaitStatus};
-use nix::unistd::{getcwd, getpgid, getpgrp, getpid, getppid, setpgid, tcsetpgrp, ForkResult, Pid};
-use std::collections::HashMap;
-use std::ffi::{CString, OsString};
-use std::fmt::{Display, Formatter};
-use std::fs::File;
-use std::io;
-use std::io::{read_to_string, Read};
-use std::os::fd::{AsFd, AsRawFd, IntoRawFd};
-use std::path::Path;
-use std::rc::Rc;
-use std::time::Duration;
 
 pub mod environment;
 pub mod history;

@@ -7,7 +7,21 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::cell::{RefCell, UnsafeCell};
+use std::collections::HashMap;
+use std::ffi::CString;
+use std::fmt::Write;
+use std::iter;
+use std::marker::PhantomData;
+use std::rc::Rc;
+use std::time::SystemTime;
+
 use array::{Array, KeyIterator, ValueIndex};
+use format::{
+    fmt_write_decimal_float, fmt_write_float_general, fmt_write_hex_float,
+    fmt_write_scientific_float, fmt_write_signed, fmt_write_string, fmt_write_unsigned,
+    parse_conversion_specifier_args, IntegerFormat,
+};
 use io::{
     EmptyRecordReader, FileStream, ReadFiles, ReadPipes, RecordReader, RecordSeparator,
     StdinRecordReader, WriteFiles, WritePipes,
@@ -22,19 +36,6 @@ use crate::program::{
     SpecialVar,
 };
 use crate::regex::Regex;
-use format::{
-    fmt_write_decimal_float, fmt_write_float_general, fmt_write_hex_float,
-    fmt_write_scientific_float, fmt_write_signed, fmt_write_string, fmt_write_unsigned,
-    parse_conversion_specifier_args, IntegerFormat,
-};
-use std::cell::{RefCell, UnsafeCell};
-use std::collections::HashMap;
-use std::ffi::CString;
-use std::fmt::Write;
-use std::iter;
-use std::marker::PhantomData;
-use std::rc::Rc;
-use std::time::SystemTime;
 
 mod array;
 mod format;

@@ -1,6 +1,5 @@
-use crate::diff_util::constants::NO_NEW_LINE_AT_END_OF_FILE;
-
 use super::file_data::FileData;
+use crate::diff_util::constants::NO_NEW_LINE_AT_END_OF_FILE;
 
 #[derive(Clone, Default)]
 pub enum Change {

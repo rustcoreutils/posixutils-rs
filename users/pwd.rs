@@ -10,10 +10,11 @@
 // - compliance:  for -L mode, Rust performs unwanted normalization for "."
 //
 
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use std::ffi::OsStr;
 use std::path::{Component, Path};
+
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 
 const PWD_ENV: &str = "PWD";
 

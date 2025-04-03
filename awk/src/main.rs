@@ -7,14 +7,16 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::compiler::compile_program;
-use crate::interpreter::interpret;
-use clap::Parser;
-use compiler::SourceFile;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::error::Error;
 use std::fmt::Display;
 use std::io::Read;
+
+use clap::Parser;
+use compiler::SourceFile;
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+
+use crate::compiler::compile_program;
+use crate::interpreter::interpret;
 
 mod compiler;
 mod interpreter;

@@ -9,6 +9,12 @@
 
 use std::collections::HashMap;
 
+#[cfg(target_os = "linux")]
+use termios::os::linux::{
+    BS0, BS1, BSDLY, CR0, CR1, CR2, CR3, CRDLY, ECHOCTL, ECHOKE, ECHOPRT, FF0, FF1, FFDLY, FLUSHO,
+    IMAXBEL, IUTF8, NL0, NL1, NLDLY, OFDEL, OFILL, PENDIN, TAB0, TAB1, TAB2, TAB3, TABDLY, VT0,
+    VT1, VTDLY,
+};
 #[cfg(target_os = "macos")]
 use termios::os::macos::{
     ALTWERASE, BS0, BS1, BSDLY, CCAR_OFLOW, CCTS_OFLOW, CDSR_OFLOW, CDTR_IFLOW, CR0, CR1, CR2, CR3,
@@ -16,14 +22,6 @@ use termios::os::macos::{
     NLDLY, NOKERNINFO, OFDEL, OFILL, ONOEOT, OXTABS, PENDIN, TAB0, TAB1, TAB2, TAB3, TABDLY, VT0,
     VT1, VTDLY,
 };
-
-#[cfg(target_os = "linux")]
-use termios::os::linux::{
-    BS0, BS1, BSDLY, CR0, CR1, CR2, CR3, CRDLY, ECHOCTL, ECHOKE, ECHOPRT, FF0, FF1, FFDLY, FLUSHO,
-    IMAXBEL, IUTF8, NL0, NL1, NLDLY, OFDEL, OFILL, PENDIN, TAB0, TAB1, TAB2, TAB3, TABDLY, VT0,
-    VT1, VTDLY,
-};
-
 use termios::*;
 
 pub fn load_speeds() -> HashMap<&'static str, speed_t> {

@@ -18,15 +18,15 @@ use std::collections::HashSet;
 use std::fs::{self};
 use std::time::SystemTime;
 
-use parser::{Makefile, VariableDefinition};
-
-use crate::special_target::InferenceTarget;
 use config::Config;
 use error_code::ErrorCode::{self, *};
+use parser::{Makefile, VariableDefinition};
 use rule::prerequisite::Prerequisite;
 use rule::target::Target;
 use rule::Rule;
 use special_target::SpecialTarget;
+
+use crate::special_target::InferenceTarget;
 
 /// The default shell variable name.
 const DEFAULT_SHELL_VAR: &str = "SHELL";

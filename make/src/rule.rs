@@ -12,15 +12,6 @@ pub mod prerequisite;
 pub mod recipe;
 pub mod target;
 
-use crate::config::Config as GlobalConfig;
-use crate::error_code::ErrorCode::{self, *};
-use crate::parser::{Rule as ParsedRule, VariableDefinition};
-use crate::{signal_handler, DEFAULT_SHELL, DEFAULT_SHELL_VAR};
-use config::Config;
-use gettextrs::gettext;
-use prerequisite::Prerequisite;
-use recipe::config::Config as RecipeConfig;
-use recipe::Recipe;
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::fs::{File, FileTimes};
@@ -29,7 +20,18 @@ use std::path::PathBuf;
 use std::process::{self, Command};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::SystemTime;
+
+use config::Config;
+use gettextrs::gettext;
+use prerequisite::Prerequisite;
+use recipe::config::Config as RecipeConfig;
+use recipe::Recipe;
 use target::Target;
+
+use crate::config::Config as GlobalConfig;
+use crate::error_code::ErrorCode::{self, *};
+use crate::parser::{Rule as ParsedRule, VariableDefinition};
+use crate::{signal_handler, DEFAULT_SHELL, DEFAULT_SHELL_VAR};
 
 type LazyArcMutex<T> = LazyLock<Arc<Mutex<T>>>;
 

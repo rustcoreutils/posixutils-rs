@@ -10,16 +10,17 @@
 #[cfg(target_os = "linux")]
 mod mntent;
 
-#[cfg(target_os = "linux")]
-use crate::mntent::MountTable;
-
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 #[cfg(target_os = "macos")]
 use std::ffi::CStr;
 use std::ffi::CString;
 use std::fmt::Display;
 use std::{cmp, io};
+
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+
+#[cfg(target_os = "linux")]
+use crate::mntent::MountTable;
 
 #[derive(Parser)]
 #[command(version, about = gettext("df - report free storage space"))]

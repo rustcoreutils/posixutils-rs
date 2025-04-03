@@ -1,10 +1,9 @@
 use std::io::Write;
 
+use super::MacroImplementation;
 use crate::lexer::MacroName;
 use crate::state::{StackFrame, State};
 use crate::Result;
-
-use super::MacroImplementation;
 
 pub struct TraceoffMacro;
 

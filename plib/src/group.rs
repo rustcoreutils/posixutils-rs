@@ -7,9 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
-use libc::{endgrent, getgrent, setgrent};
 use std::ffi::CStr;
 use std::ptr;
+
+use libc::{endgrent, getgrent, setgrent};
 
 pub struct Group {
     pub name: String,

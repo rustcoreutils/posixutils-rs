@@ -7,14 +7,15 @@
 // SPDX-License-Identifier: MIT
 //
 
-use chrono::Local;
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::{curuser, platform, utmpx};
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::process::exit;
+
+use chrono::Local;
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use plib::{curuser, platform, utmpx};
 
 const ALERT_CHAR: char = '\u{07}';
 const INTR_CHAR: char = '\u{03}';

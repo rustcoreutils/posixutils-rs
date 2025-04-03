@@ -7,10 +7,11 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::parse::lexer::{is_blank, remove_delimiter_from_here_document, HereDocument, Lexer};
-use crate::parse::ParseResult;
 use std::borrow::Cow;
 use std::fmt::{Display, Formatter};
+
+use crate::parse::lexer::{is_blank, remove_delimiter_from_here_document, HereDocument, Lexer};
+use crate::parse::ParseResult;
 
 #[derive(Clone, Debug, Default)]
 struct IndexIter {

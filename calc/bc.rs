@@ -12,7 +12,6 @@ use std::ffi::OsString;
 use bc_util::interpreter::{ExecutionResult, Interpreter};
 use bc_util::parser::parse_program;
 use clap::Parser;
-
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use rustyline::error::ReadlineError;
 use rustyline::{DefaultEditor, Result};

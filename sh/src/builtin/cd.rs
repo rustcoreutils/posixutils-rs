@@ -7,14 +7,15 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::builtin::{BuiltinResult, BuiltinUtility};
-use crate::option_parser::OptionParser;
-use crate::shell::opened_files::OpenedFiles;
-use crate::shell::Shell;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Display;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
+
+use crate::builtin::{BuiltinResult, BuiltinUtility};
+use crate::option_parser::OptionParser;
+use crate::shell::opened_files::OpenedFiles;
+use crate::shell::Shell;
 
 #[derive(Debug, PartialEq, Eq)]
 enum CdArgs<'a> {

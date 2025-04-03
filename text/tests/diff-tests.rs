@@ -11,12 +11,13 @@
 #[path = "../diff_util/constants.rs"]
 mod constants;
 
-use constants::{EXIT_STATUS_DIFFERENCE, EXIT_STATUS_NO_DIFFERENCE};
-use plib::testing::{run_test, TestPlan};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::LazyLock;
+
+use constants::{EXIT_STATUS_DIFFERENCE, EXIT_STATUS_NO_DIFFERENCE};
+use plib::testing::{run_test, TestPlan};
 
 fn diff_test(args: &[&str], expected_output: &str, expected_diff_exit_status: u8) {
     let str_args = args.iter().cloned().map(str::to_owned).collect();

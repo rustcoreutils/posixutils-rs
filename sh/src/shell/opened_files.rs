@@ -7,16 +7,18 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::parse::command::{IORedirectionKind, Redirection, RedirectionKind};
-use crate::shell::{CommandExecutionError, Shell};
-use crate::wordexp::expand_word_to_string;
-use nix::libc;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::rc::Rc;
+
+use nix::libc;
+
+use crate::parse::command::{IORedirectionKind, Redirection, RedirectionKind};
+use crate::shell::{CommandExecutionError, Shell};
+use crate::wordexp::expand_word_to_string;
 
 pub const STDIN_FILENO: u32 = libc::STDIN_FILENO as u32;
 pub const STDOUT_FILENO: u32 = libc::STDOUT_FILENO as u32;

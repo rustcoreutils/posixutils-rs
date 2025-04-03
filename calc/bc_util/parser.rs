@@ -7,14 +7,15 @@
 // SPDX-License-Identifier: MIT
 //
 
-use super::instructions::*;
+use std::rc::Rc;
+use std::sync::LazyLock;
 
 use pest::error::InputLocation;
 use pest::iterators::Pair;
 use pest::pratt_parser::{Assoc, Op, PrattParser};
 use pest::{Parser, Position};
-use std::rc::Rc;
-use std::sync::LazyLock;
+
+use super::instructions::*;
 
 static PRATT_PARSER: LazyLock<PrattParser<Rule>> = LazyLock::new(|| {
     // Precedence is defined lowest to highest

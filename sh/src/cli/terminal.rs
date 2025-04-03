@@ -7,12 +7,13 @@
 // SPDX-License-Identifier: MIT
 //
 
-use atty::Stream;
-use nix::sys::termios;
-use nix::sys::termios::{LocalFlags, Termios};
 use std::io;
 use std::io::Read;
 use std::os::fd::AsFd;
+
+use atty::Stream;
+use nix::sys::termios;
+use nix::sys::termios::{LocalFlags, Termios};
 
 #[derive(Clone)]
 pub struct Terminal {

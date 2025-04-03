@@ -1,7 +1,8 @@
-use plib::testing::{run_test, run_test_with_checker, TestPlan};
 use std::path::Path;
 use std::process::Output;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use plib::testing::{run_test, run_test_with_checker, TestPlan};
 
 static SETTING_TEST_VARS: AtomicBool = AtomicBool::new(false);
 static TEST_VARS_ARE_SET: AtomicBool = AtomicBool::new(false);

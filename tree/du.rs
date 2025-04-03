@@ -10,11 +10,12 @@
 // - implement -H, -L, -x
 //
 
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::{fs, io};
+
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 
 /// du - estimate file space usage
 #[derive(Parser)]

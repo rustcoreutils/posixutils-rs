@@ -7,6 +7,9 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::borrow::Cow;
+use std::rc::Rc;
+
 use crate::nonempty::NonEmpty;
 use crate::parse::command::{
     Assignment, CaseItem, Command, CommandType, CompleteCommand, CompoundCommand, Conjunction,
@@ -20,8 +23,6 @@ use crate::parse::word::{
 };
 use crate::parse::word_parser::parse_word_pair;
 use crate::parse::{AliasTable, ParseResult, ParserError};
-use std::borrow::Cow;
-use std::rc::Rc;
 
 pub fn is_valid_name(name: &str) -> bool {
     name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')

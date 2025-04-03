@@ -7,14 +7,15 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, run_test_with_checker, TestPlan};
-use regex::Regex;
 use std::ffi::CString;
 use std::io::{self, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::time::Duration;
 use std::{fs, thread};
+
+use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use regex::Regex;
 
 fn get_errno() -> i32 {
     io::Error::last_os_error().raw_os_error().unwrap()

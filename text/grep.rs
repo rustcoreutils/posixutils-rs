@@ -7,14 +7,15 @@
 // SPDX-License-Identifier: MIT
 //
 
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use libc::{regcomp, regex_t, regexec, regfree, REG_EXTENDED, REG_ICASE, REG_NOMATCH};
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::ptr;
+
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use libc::{regcomp, regex_t, regexec, regfree, REG_EXTENDED, REG_ICASE, REG_NOMATCH};
 
 /// grep - search a file for a pattern.
 #[derive(Parser)]

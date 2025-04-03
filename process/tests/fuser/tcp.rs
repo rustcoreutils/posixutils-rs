@@ -1,9 +1,10 @@
 #[cfg(test)]
 mod tcp {
-    use crate::fuser::fuser_test;
     use std::io;
     use std::net::{TcpListener, TcpStream};
     use std::process::Command;
+
+    use crate::fuser::fuser_test;
 
     /// Starts a TCP server on a predefined local address and port.
     ///

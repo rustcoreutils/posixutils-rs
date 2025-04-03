@@ -1,13 +1,14 @@
-use error::{Error, ErrorKind, Result};
-use input::{Input, InputRead};
-use lexer::MacroName;
-use macros::MacroDefinition;
-use state::State;
 use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::io::Write;
 use std::path::PathBuf;
 use std::rc::Rc;
+
+use error::{Error, ErrorKind, Result};
+use input::{Input, InputRead};
+use lexer::MacroName;
+use macros::MacroDefinition;
+use state::State;
 
 pub mod error;
 mod input;

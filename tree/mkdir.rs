@@ -7,13 +7,14 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::ffi::CString;
+use std::io;
+use std::path::PathBuf;
+
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use modestr::ChmodMode;
 use plib::modestr;
-use std::ffi::CString;
-use std::io;
-use std::path::PathBuf;
 
 /// mkdir - make directories
 #[derive(Parser)]

@@ -7,12 +7,14 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::pattern::parse::{BracketExpression, BracketItem, PatternItem, RangeEndpoint};
 use core::fmt;
-use nix::libc;
 use std::ffi::{CStr, CString};
 use std::fmt::{Formatter, Write};
 use std::ptr;
+
+use nix::libc;
+
+use crate::pattern::parse::{BracketExpression, BracketItem, PatternItem, RangeEndpoint};
 
 fn regex_compilation_result(
     status_integer: libc::c_int,

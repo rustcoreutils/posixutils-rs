@@ -7,9 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::borrow::Cow;
+
 use crate::parse::lexer::word_lexer::remove_quotes;
 use crate::parse::{ParseResult, ParserError};
-use std::borrow::Cow;
 
 pub mod command_lexer;
 pub mod word_lexer;

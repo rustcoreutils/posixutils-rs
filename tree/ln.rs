@@ -7,10 +7,11 @@
 // SPDX-License-Identifier: MIT
 //
 
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::path::{Path, PathBuf};
 use std::{fs, io};
+
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 
 /// ln - link files
 #[derive(Parser)]

@@ -7,11 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use libc::{
-    getegid, getgid, getuid, regcomp, regex_t, regexec, setgid, setuid, REG_ICASE, REG_NOMATCH,
-};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::File;
@@ -25,6 +20,12 @@ use std::str::FromStr;
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::Mutex;
 use std::time::Duration;
+
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use libc::{
+    getegid, getgid, getuid, regcomp, regex_t, regexec, setgid, setuid, REG_ICASE, REG_NOMATCH,
+};
 use termion::clear::*;
 use termion::cursor::*;
 use termion::event::*;

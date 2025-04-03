@@ -7,13 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::shell::environment::Environment;
-use crate::shell::opened_files::{OpenedFile, OpenedFiles};
-use nix::errno::Errno;
-use nix::libc;
-use nix::sys::signal::Signal as NixSignal;
-use nix::sys::wait::{WaitPidFlag, WaitStatus};
-use nix::unistd::{execve, tcgetpgrp, ForkResult, Pid};
 use std::convert::Infallible;
 use std::ffi::{CStr, CString, OsString};
 use std::fmt::{Display, Formatter};
@@ -21,6 +14,15 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
+
+use nix::errno::Errno;
+use nix::libc;
+use nix::sys::signal::Signal as NixSignal;
+use nix::sys::wait::{WaitPidFlag, WaitStatus};
+use nix::unistd::{execve, tcgetpgrp, ForkResult, Pid};
+
+use crate::shell::environment::Environment;
+use crate::shell::opened_files::{OpenedFile, OpenedFiles};
 
 pub const DEFAULT_PATH: &str = "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin:.";
 

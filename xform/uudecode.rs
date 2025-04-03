@@ -7,13 +7,14 @@
 // SPDX-License-Identifier: MIT
 //
 
-use base64::prelude::*;
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use std::fs::{remove_file, File};
 use std::io::{self, Error, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+
+use base64::prelude::*;
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 
 macro_rules! reduce {
     ($e : expr) => {

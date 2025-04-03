@@ -7,11 +7,12 @@
 // SPDX-License-Identifier: MIT
 //
 
-use libc::{c_int, c_void, getsid, pid_t, proc_listallpids, proc_pidinfo, proc_pidpath};
 use std::ffi::CStr;
 use std::fs;
 use std::io::Error;
 use std::os::unix::fs::MetadataExt;
+
+use libc::{c_int, c_void, getsid, pid_t, proc_listallpids, proc_pidinfo, proc_pidpath};
 
 const PROC_PIDPATHINFO_MAXSIZE: usize = 4096;
 

@@ -1,6 +1,5 @@
 mod dir;
 
-use dir::{DeferredDir, HybridDir, OwnedDir};
 use std::ffi::{CStr, CString, OsStr};
 use std::mem::MaybeUninit;
 use std::ops::Deref;
@@ -10,6 +9,8 @@ use std::os::unix::{self};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::{fmt, io};
+
+use dir::{DeferredDir, HybridDir, OwnedDir};
 
 /// Type of error to be handled by the `err_reporter` of `traverse_directory`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

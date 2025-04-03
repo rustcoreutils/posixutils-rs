@@ -7,12 +7,13 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::fmt::Display;
+use std::str::FromStr;
+
 use crate::builtin::{BuiltinError, BuiltinResult, SpecialBuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 use crate::signals::Signal;
-use std::fmt::Display;
-use std::str::FromStr;
 
 #[derive(Clone, PartialEq, Eq)]
 pub enum TrapAction {

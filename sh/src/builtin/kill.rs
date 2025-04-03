@@ -7,12 +7,14 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::str::FromStr;
+
+use nix::sys::signal::{kill, Signal as NixSignal};
+
 use crate::builtin::{parse_pid, skip_option_terminator, BuiltinResult, BuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 use crate::signals::{Signal, SIGNALS};
-use nix::sys::signal::{kill, Signal as NixSignal};
-use std::str::FromStr;
 
 enum KillArgs<'a> {
     SendSignal {

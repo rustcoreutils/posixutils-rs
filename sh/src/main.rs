@@ -7,6 +7,16 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::error::Error;
+use std::io;
+use std::io::Write;
+use std::os::fd::AsFd;
+use std::time::Duration;
+
+use cli::terminal::read_nonblocking_char;
+use cli::vi::{Action, ViEditor};
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+
 use crate::cli::args::{parse_args, ExecutionMode};
 use crate::cli::terminal::is_attached_to_terminal;
 use crate::cli::{clear_line, set_cursor_pos};
@@ -15,14 +25,6 @@ use crate::signals::{
     handle_signal_ignore, handle_signal_write_to_signal_buffer, setup_signal_handling, Signal,
 };
 use crate::utils::is_process_in_foreground;
-use cli::terminal::read_nonblocking_char;
-use cli::vi::{Action, ViEditor};
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use std::error::Error;
-use std::io;
-use std::io::Write;
-use std::os::fd::AsFd;
-use std::time::Duration;
 
 mod builtin;
 mod cli;

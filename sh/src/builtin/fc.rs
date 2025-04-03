@@ -7,16 +7,18 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::fs::File;
+use std::io::Read;
+use std::os::fd::{FromRawFd, OwnedFd};
+use std::path::PathBuf;
+
+use nix::unistd::mkstemp;
+
 use crate::builtin::{BuiltinError, BuiltinResult, BuiltinUtility};
 use crate::option_parser::OptionParser;
 use crate::shell::history::EndPoint;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
-use nix::unistd::mkstemp;
-use std::fs::File;
-use std::io::Read;
-use std::os::fd::{FromRawFd, OwnedFd};
-use std::path::PathBuf;
 
 #[derive(Debug, Eq, PartialEq)]
 struct Replace<'s> {

@@ -9,14 +9,16 @@
 
 mod common;
 
-use self::common::error_string;
+use std::cell::RefCell;
+use std::io;
+use std::os::unix::fs::MetadataExt;
+
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use modestr::ChmodMode;
 use plib::modestr;
-use std::cell::RefCell;
-use std::io;
-use std::os::unix::fs::MetadataExt;
+
+use self::common::error_string;
 
 /// chmod - change the file modes
 #[derive(Parser)]

@@ -7,11 +7,12 @@
 // SPDX-License-Identifier: MIT
 //
 
+use nix::libc::suseconds_t;
+use nix::sys::resource::{getrusage, UsageWho};
+
 use crate::builtin::{skip_option_terminator, BuiltinResult, SpecialBuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
-use nix::libc::suseconds_t;
-use nix::sys::resource::{getrusage, UsageWho};
 fn seconds_to_minutes(seconds: f32) -> i32 {
     seconds as i32 / 60
 }

@@ -9,13 +9,15 @@
 
 mod common;
 
-use self::common::error_string;
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::cell::RefCell;
 use std::ffi::CString;
 use std::io;
 use std::os::unix::fs::MetadataExt;
+
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+
+use self::common::error_string;
 
 /// chgrp - change file group ownership
 #[derive(Parser)]

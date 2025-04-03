@@ -11,11 +11,12 @@
 //! in `tree-tests.rs`. They are located here in `tree-tests-umask.rs` so that they can have a
 //! different per-process umask than those in `tree-tests.rs`.
 
-use plib::testing::{run_test, TestPlan};
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Mutex;
+
+use plib::testing::{run_test, TestPlan};
 
 static UMASK_SETTER: Mutex<UmaskSetter> = Mutex::new(UmaskSetter);
 

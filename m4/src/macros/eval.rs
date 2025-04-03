@@ -7,12 +7,11 @@ use nom::error::FromExternalError;
 use nom::sequence::{delimited, tuple};
 use nom::IResult;
 
+use super::MacroImplementation;
 use crate::lexer::is_whitespace;
 use crate::precedence::{self, binary_op, unary_op, Assoc, Operation};
 use crate::state::{StackFrame, State};
 use crate::Result;
-
-use super::MacroImplementation;
 
 pub struct EvalMacro;
 

@@ -7,10 +7,12 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::utils::{signal_to_exit_status, waitpid, OsResult};
+use std::fmt::{Display, Formatter, Write};
+
 use nix::sys::wait::{WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
-use std::fmt::{Display, Formatter, Write};
+
+use crate::utils::{signal_to_exit_status, waitpid, OsResult};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum JobPosition {

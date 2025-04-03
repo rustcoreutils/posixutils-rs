@@ -26,9 +26,10 @@ pub enum SpecialTarget {
     Silent,
     Suffixes,
 }
-use crate::config::Config;
 use gettextrs::gettext;
 use SpecialTarget::*;
+
+use crate::config::Config;
 
 impl SpecialTarget {
     // could be automated with `strum`

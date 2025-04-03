@@ -9,12 +9,14 @@
 
 mod common;
 
-use self::common::{copy_file, copy_files, error_string, CopyConfig};
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::{fs, io};
+
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+
+use self::common::{copy_file, copy_files, error_string, CopyConfig};
 
 /// cp - copy files
 #[derive(Parser)]

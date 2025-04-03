@@ -329,12 +329,13 @@ pub fn expand_parameter_into(
 
 #[cfg(test)]
 mod tests {
+    use nix::unistd::Pid;
+
     use super::*;
     use crate::jobs::JobState;
     use crate::parse::word::test_utils::unquoted_literal;
     use crate::parse::word::Word;
     use crate::wordexp::expanded_word::ExpandedWordPart;
-    use nix::unistd::Pid;
 
     fn shell_with_env(env: &[(&str, &str)]) -> Shell {
         let mut shell = Shell::default();

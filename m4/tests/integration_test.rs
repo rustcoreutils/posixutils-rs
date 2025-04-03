@@ -2,14 +2,15 @@
 //! You can regenerate the tests (which are based on the fixtures in `fixtures/integration_tests/`)
 //! using the following command:
 //! `cargo run -p m4-test-manager update-snapshots`
-use m4_test_manager::TestSnapshot;
-use posixutils_m4::error::GetExitCode;
-use similar_asserts::assert_eq;
 use std::fs::read_to_string;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::ExitStatus;
+
+use m4_test_manager::TestSnapshot;
+use posixutils_m4::error::GetExitCode;
+use similar_asserts::assert_eq;
 
 fn init() {
     let _ = env_logger::builder()

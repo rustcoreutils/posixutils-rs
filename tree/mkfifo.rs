@@ -7,11 +7,12 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::io;
+
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use modestr::ChmodMode;
 use plib::modestr;
-use std::io;
 
 /// mkfifo - make FIFO special files
 #[derive(Parser)]

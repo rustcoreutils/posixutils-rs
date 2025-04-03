@@ -10,8 +10,6 @@
 // TODO:
 // - improve:  don't open all files at once in --serial mode
 
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use std::cell::{OnceCell, RefCell};
 use std::error::Error;
 use std::fs::File;
@@ -19,6 +17,9 @@ use std::io::{self, BufRead, BufReader, Stdin, Write};
 use std::iter::Cycle;
 use std::rc::Rc;
 use std::slice::Iter;
+
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 
 /// paste - merge corresponding or subsequent lines of files
 #[derive(Parser)]

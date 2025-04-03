@@ -7,14 +7,16 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::path::PathBuf;
+use std::str::FromStr;
+
+use clap::Parser;
+use regex::Regex;
+
 use crate::{
     DEFAULT_PAGE_LENGTH, DEFAULT_PAGE_WIDTH, DEFAULT_TAB_WIDTH, NUM_LINES_HEADER_FOOTER,
     PAGE_WIDTH_IF_HAS_SEPARATOR, TAB,
 };
-use clap::Parser;
-use regex::Regex;
-use std::path::PathBuf;
-use std::str::FromStr;
 
 /// pr - print files
 #[derive(Parser)]

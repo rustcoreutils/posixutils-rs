@@ -7,11 +7,12 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test_u8, TestPlanU8};
 use std::env;
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
+
+use plib::testing::{run_test_u8, TestPlanU8};
 
 fn gencat_test(args: &[&str], expected_output: Vec<u8>, expected_error: Vec<u8>) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();

@@ -7,8 +7,9 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::platform::{self, endutxent, getutxent, setutxent};
 use std::ffi::CStr;
+
+use crate::platform::{self, endutxent, getutxent, setutxent};
 
 pub struct Utmpx {
     pub user: String,

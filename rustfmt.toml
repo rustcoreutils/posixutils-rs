@@ -4,3 +4,4 @@
 
 # Module granularity gives better diffs
 imports_granularity = "Module"
+group_imports = "StdExternalCrate"

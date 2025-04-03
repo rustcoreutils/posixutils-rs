@@ -1,12 +1,3 @@
-use super::common::{FormatOptions, OutputFormat};
-use super::constants::COULD_NOT_UNWRAP_FILENAME;
-use super::diff_exit_status::DiffExitStatus;
-use super::file_data::{FileData, LineReader};
-use super::functions::{check_existance, is_binary, system_time_to_rfc2822};
-use super::hunks::Hunks;
-
-use crate::diff_util::constants::NO_NEW_LINE_AT_END_OF_FILE;
-
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -14,6 +5,14 @@ use std::fs::{read_to_string, File};
 use std::io::{self, BufReader, Read};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
+
+use super::common::{FormatOptions, OutputFormat};
+use super::constants::COULD_NOT_UNWRAP_FILENAME;
+use super::diff_exit_status::DiffExitStatus;
+use super::file_data::{FileData, LineReader};
+use super::functions::{check_existance, is_binary, system_time_to_rfc2822};
+use super::hunks::Hunks;
+use crate::diff_util::constants::NO_NEW_LINE_AT_END_OF_FILE;
 
 pub struct FileDiff<'a> {
     file1: &'a mut FileData<'a>,

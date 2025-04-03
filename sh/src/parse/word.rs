@@ -7,8 +7,9 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::parse::command::Name;
 use std::fmt::{Display, Formatter};
+
+use crate::parse::command::Name;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SpecialParameter {

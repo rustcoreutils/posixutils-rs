@@ -1,4 +1,3 @@
-use crate::{open_long_filename, Error, ErrorKind, FileDescriptor};
 use std::cell::{RefCell, RefMut};
 use std::collections::HashSet;
 use std::ffi::{CStr, CString};
@@ -7,6 +6,8 @@ use std::marker::PhantomData;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::PathBuf;
 use std::rc::Rc;
+
+use crate::{open_long_filename, Error, ErrorKind, FileDescriptor};
 
 // Not to be used publically. The public interface for a directory entry is `Entry`.
 pub struct EntryInternal<'a> {

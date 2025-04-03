@@ -8,7 +8,6 @@
 //
 
 use std::cmp::Ordering;
-
 use std::fs::File;
 use std::io::{self, BufRead, BufWriter, Error, ErrorKind, Read, Write};
 use std::path::PathBuf;

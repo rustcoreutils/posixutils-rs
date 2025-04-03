@@ -1,11 +1,12 @@
-use rand::distributions::Standard;
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
 use std::ffi::CString;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::{fs, io};
+
+use rand::distributions::Standard;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 
 static GLOBAL_MUTEX: Mutex<()> = Mutex::new(());
 

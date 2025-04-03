@@ -7,10 +7,11 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::nonempty::NonEmpty;
-use crate::parse::word::WordPair;
 use std::fmt::{Debug, Display, Formatter, Write};
 use std::rc::Rc;
+
+use crate::nonempty::NonEmpty;
+use crate::parse::word::WordPair;
 
 pub type Name = Rc<str>;
 

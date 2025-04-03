@@ -7,11 +7,12 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::pattern::FilenamePattern;
-use crate::utils::strcoll;
 use std::ffi::{CString, OsStr, OsString};
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
+
+use crate::pattern::FilenamePattern;
+use crate::utils::strcoll;
 
 #[derive(Debug, PartialEq, Eq)]
 enum DirEntry {
@@ -163,10 +164,11 @@ pub fn glob(pattern: &FilenamePattern, starting_directory: &Path) -> Vec<OsStrin
 
 #[cfg(test)]
 pub mod tests {
-    use super::*;
-    use crate::pattern::tests::filename_pattern_from_str;
     use std::collections::hash_map::Entry;
     use std::collections::HashMap;
+
+    use super::*;
+    use crate::pattern::tests::filename_pattern_from_str;
 
     type Directory = HashMap<String, FileSystemNode>;
 

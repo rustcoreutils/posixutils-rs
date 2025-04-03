@@ -1,9 +1,8 @@
 use std::io::Write;
 
+use super::MacroImplementation;
 use crate::state::{StackFrame, State};
 use crate::Result;
-
-use super::MacroImplementation;
 
 /// Arguments are positionally defined and referenced. The string "$1" in the defining text shall
 /// be replaced by the first argument. Systems shall support at least nine arguments; only the

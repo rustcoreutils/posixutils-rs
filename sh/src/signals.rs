@@ -7,14 +7,16 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::builtin::trap::TrapAction;
+use std::fmt::{Display, Formatter};
+use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd, RawFd};
+use std::str::FromStr;
+
 use nix::errno::Errno;
 use nix::libc;
 use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal as NixSignal};
 use nix::unistd::{read, write};
-use std::fmt::{Display, Formatter};
-use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd, RawFd};
-use std::str::FromStr;
+
+use crate::builtin::trap::TrapAction;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Signal {

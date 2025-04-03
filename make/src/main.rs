@@ -18,7 +18,6 @@ use std::{env, fs, io, process};
 use clap::Parser;
 use const_format::formatcp;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-
 use posixutils_make::config::Config;
 use posixutils_make::error_code::ErrorCode::{self, *};
 use posixutils_make::parser::preprocessor::ENV_MACROS;

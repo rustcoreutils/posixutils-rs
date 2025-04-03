@@ -7,7 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
 use std::ffi::CString;
 use std::fs::{self, Permissions};
 use std::io::{self, Read, Write};
@@ -15,6 +14,8 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::{self};
 use std::path::Path;
 use std::process::{Command, Stdio};
+
+use plib::testing::{run_test, TestPlan};
 
 fn mv_test(args: &[&str], expected_output: &str, expected_error: &str, expected_exit_code: i32) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();

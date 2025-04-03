@@ -6,20 +6,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-use clap::error::ErrorKind;
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use thiserror::Error;
-
-use binrw::{binrw, BinReaderExt, BinWrite, Endian};
-#[cfg(target_os = "linux")]
-use libc::sa_family_t;
-use libc::{
-    addrinfo, getaddrinfo, gethostname, getpid, getpwuid, getservbyname, getuid, ioctl, signal,
-    sockaddr_in, winsize, AF_INET, AI_CANONNAME, SIGINT, SIGPIPE, SIGQUIT, SOCK_DGRAM,
-    STDIN_FILENO, STDOUT_FILENO, TIOCGWINSZ,
-};
-
 use std::ffi::{CStr, CString};
 use std::io::{self, Cursor, Error, IsTerminal, Write};
 use std::mem::{size_of, zeroed};
@@ -31,6 +17,19 @@ use std::os::fd::AsRawFd;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use std::{char, process, ptr, thread};
+
+use binrw::{binrw, BinReaderExt, BinWrite, Endian};
+use clap::error::ErrorKind;
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+#[cfg(target_os = "linux")]
+use libc::sa_family_t;
+use libc::{
+    addrinfo, getaddrinfo, gethostname, getpid, getpwuid, getservbyname, getuid, ioctl, signal,
+    sockaddr_in, winsize, AF_INET, AI_CANONNAME, SIGINT, SIGPIPE, SIGQUIT, SOCK_DGRAM,
+    STDIN_FILENO, STDOUT_FILENO, TIOCGWINSZ,
+};
+use thiserror::Error;
 
 #[derive(Parser)]
 #[command(version, about=gettext("talk - talk to another user"))]

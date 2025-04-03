@@ -7,12 +7,13 @@
 // SPDX-License-Identifier: MIT
 //
 
-use regex::Regex;
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom};
 use std::path::PathBuf;
+
+use regex::Regex;
 
 #[cfg(target_os = "macos")]
 /// Default raw (text based) magic file

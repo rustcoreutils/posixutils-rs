@@ -11,12 +11,13 @@
 // - support options -f, -v
 //
 
+use std::io::{self, Write};
+use std::path::PathBuf;
+
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use plib::io::input_stream;
 use plib::lzw::UnixLZWReader;
-use std::io::{self, Write};
-use std::path::PathBuf;
 
 /// uncompress - expand compressed data
 #[derive(Parser)]

@@ -7,9 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
 use std::fs::{remove_file, File};
 use std::io::Read;
+
+use plib::testing::{run_test, TestPlan};
 
 fn compress_test(args: &[&str], expected_output: &str, expected_error: &str) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();

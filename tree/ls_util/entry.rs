@@ -7,18 +7,20 @@
 // SPDX-License-Identifier: MIT
 //
 
-use super::ls_from_utf8_lossy;
-use crate::{
-    ClassifyFiles, Config, FileTimeOption, LongFormatOptions, OutputFormat,
-    DATE_TIME_FORMAT_OLD_OR_FUTURE, DATE_TIME_FORMAT_RECENT,
-};
-use chrono::{DateTime, Local};
 use std::cmp::Ordering;
 use std::ffi::{CStr, OsStr, OsString};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::time::{Duration, SystemTime};
+
+use chrono::{DateTime, Local};
+
+use super::ls_from_utf8_lossy;
+use crate::{
+    ClassifyFiles, Config, FileTimeOption, LongFormatOptions, OutputFormat,
+    DATE_TIME_FORMAT_OLD_OR_FUTURE, DATE_TIME_FORMAT_RECENT,
+};
 
 enum FileInfo {
     Size(u64),

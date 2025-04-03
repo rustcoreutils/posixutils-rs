@@ -1,9 +1,10 @@
-use crate::error::Result;
-use crate::input::InputStateRef;
-use crate::state::StackFrame;
 use std::cell::RefCell;
 use std::io::{Seek, Write};
 use std::rc::Rc;
+
+use crate::error::Result;
+use crate::input::InputStateRef;
+use crate::state::StackFrame;
 
 #[derive(Default)]
 pub struct OutputState {

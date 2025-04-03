@@ -1486,6 +1486,7 @@ name = "posixutils-file"
 version = "0.2.2"
 dependencies = [
  "clap",
+ "ftw",
  "gettext-rs",
  "libc",
  "plib",
@@ -1499,6 +1500,7 @@ name = "posixutils-fs"
 version = "0.2.2"
 dependencies = [
  "clap",
+ "ftw",
  "gettext-rs",
  "libc",
 ]

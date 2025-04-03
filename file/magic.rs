@@ -13,7 +13,7 @@ use std::{
     fmt,
     fs::File,
     io::{self, BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 #[cfg(target_os = "macos")]
@@ -24,13 +24,14 @@ pub const DEFAULT_MAGIC_FILE: &str = "/usr/share/file/magic/magic";
 pub const DEFAULT_MAGIC_FILE: &str = "/etc/magic";
 
 /// Get type for the file from the magic file databases (traversed in order of argument)
-pub fn get_type_from_magic_file_dbs(
-    test_file: &PathBuf,
+pub fn get_type_from_magic_file_dbs<P: AsRef<Path>>(
+    test_file: P,
     magic_file_dbs: &[PathBuf],
 ) -> Option<String> {
-    magic_file_dbs.iter().find_map(|magic_file| {
-        parse_magic_file_and_test(&PathBuf::from(magic_file), &PathBuf::from(test_file)).ok()
-    })
+    let test_file = test_file.as_ref();
+    magic_file_dbs
+        .iter()
+        .find_map(|magic_file| parse_magic_file_and_test(test_file, magic_file).ok())
 }
 
 /// Errors that can occur during parsing of a raw magic line.
@@ -478,8 +479,8 @@ impl RawMagicFileLine {
 /// line by line. It parses each line of the magic database file and tests it against
 /// the content of the test file.
 fn parse_magic_file_and_test(
+    test_file: &Path,
     magic_file: &PathBuf,
-    test_file: &PathBuf,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mf_reader = BufReader::new(File::open(magic_file)?);
     let mut tf_reader = BufReader::new(File::open(test_file)?);

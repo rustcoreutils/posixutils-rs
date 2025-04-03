@@ -1,0 +1,5 @@
+#: tests/xgettext/test_pgettext.rs:8
+msgctxt "This is the context"
+msgid "Hello, world!"
+msgstr ""
+

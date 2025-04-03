@@ -1,11 +1,8 @@
 mod unix {
     use crate::fuser::fuser_test;
-    use std::{
-        fs,
-        os::unix::net::{UnixListener, UnixStream},
-        process::Command,
-        thread,
-    };
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::process::Command;
+    use std::{fs, thread};
 
     /// Starts a Unix socket server at the specified socket path.
     ///

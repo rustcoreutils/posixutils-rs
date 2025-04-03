@@ -9,12 +9,9 @@
 
 use std::cmp::Ordering;
 
-use std::io::{ErrorKind, Read};
-use std::{
-    fs::File,
-    io::{self, BufRead, BufWriter, Error, Write},
-    path::PathBuf,
-};
+use std::fs::File;
+use std::io::{self, BufRead, BufWriter, Error, ErrorKind, Read, Write};
+use std::path::PathBuf;
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};

@@ -1,4 +1,5 @@
-use bigdecimal::{num_bigint::BigInt, BigDecimal, Num, One, Signed, ToPrimitive, Zero};
+use bigdecimal::num_bigint::BigInt;
+use bigdecimal::{BigDecimal, Num, One, Signed, ToPrimitive, Zero};
 
 /// Converts a character to a number
 /// # Panics

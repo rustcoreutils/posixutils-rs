@@ -8,7 +8,8 @@
 //
 
 use crate::regex::Regex;
-use std::{collections::HashMap, rc::Rc};
+use std::collections::HashMap;
+use std::rc::Rc;
 
 pub type VarId = u32;
 

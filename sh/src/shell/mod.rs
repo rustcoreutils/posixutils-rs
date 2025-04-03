@@ -34,8 +34,7 @@ use crate::utils::{
 use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
 use nix::errno::Errno;
 use nix::libc;
-use nix::sys::signal::kill;
-use nix::sys::signal::Signal as NixSignal;
+use nix::sys::signal::{kill, Signal as NixSignal};
 use nix::sys::wait::{WaitPidFlag, WaitStatus};
 use nix::unistd::{getcwd, getpgid, getpgrp, getpid, getppid, setpgid, tcsetpgrp, ForkResult, Pid};
 use std::collections::HashMap;

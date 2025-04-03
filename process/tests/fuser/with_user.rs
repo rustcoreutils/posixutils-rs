@@ -1,7 +1,10 @@
 mod with_user {
     use crate::fuser::fuser_test;
     use libc::uid_t;
-    use std::{ffi::CStr, fs::File, io, process::Command, str};
+    use std::ffi::CStr;
+    use std::fs::File;
+    use std::process::Command;
+    use std::{io, str};
 
     /// Retrieves the user name of the process owner by process ID on Linux.
     ///

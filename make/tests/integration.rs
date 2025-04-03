@@ -373,7 +373,8 @@ mod target_behavior {
     use super::*;
     use libc::{kill, SIGINT};
     use posixutils_make::parser::parse::ParseError;
-    use std::{thread, time::Duration};
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn no_targets() {
@@ -579,7 +580,8 @@ mod special_targets {
     use libc::{kill, SIGINT};
     use posixutils_make::special_target;
     use std::fs::remove_dir;
-    use std::{fs, thread, time::Duration};
+    use std::time::Duration;
+    use std::{fs, thread};
 
     #[test]
     fn default() {

@@ -1,18 +1,15 @@
 mod dir;
 
 use dir::{DeferredDir, HybridDir, OwnedDir};
-use std::{
-    ffi::{CStr, CString, OsStr},
-    fmt, io,
-    mem::MaybeUninit,
-    ops::Deref,
-    os::{
-        fd::{AsRawFd, RawFd},
-        unix::{self, ffi::OsStrExt},
-    },
-    path::{Path, PathBuf},
-    rc::Rc,
-};
+use std::ffi::{CStr, CString, OsStr};
+use std::mem::MaybeUninit;
+use std::ops::Deref;
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::{self};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::{fmt, io};
 
 /// Type of error to be handled by the `err_reporter` of `traverse_directory`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

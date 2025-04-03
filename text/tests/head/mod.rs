@@ -9,7 +9,8 @@
 //
 
 use plib::testing::{run_test, TestPlan};
-use rand::{seq::SliceRandom, thread_rng};
+use rand::seq::SliceRandom;
+use rand::thread_rng;
 
 /* #region Normal tests */
 fn head_test(n: Option<&str>, c: Option<&str>, test_data: &str, expected_output: &str) {
@@ -122,12 +123,12 @@ fn test_head_c() {
 /* #region Property-based tests */
 mod property_tests {
     use plib::testing::run_test_base;
-    use proptest::{prelude::TestCaseError, prop_assert, test_runner::TestRunner};
-    use std::{
-        sync::mpsc::{self, RecvTimeoutError},
-        thread::{self},
-        time::Duration,
-    };
+    use proptest::prelude::TestCaseError;
+    use proptest::prop_assert;
+    use proptest::test_runner::TestRunner;
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::thread::{self};
+    use std::time::Duration;
 
     fn get_test_runner(cases: u32) -> TestRunner {
         TestRunner::new(proptest::test_runner::Config {

@@ -11,16 +11,13 @@ use chrono::{DateTime, Local, TimeZone, Utc};
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use libc::{getlogin, getpwnam, passwd};
 
-use std::{
-    collections::HashSet,
-    env,
-    ffi::{CStr, CString},
-    fs::{self},
-    io::{BufRead, Read, Seek, Write},
-    os::unix::fs::PermissionsExt,
-    path::{Path, PathBuf},
-    process,
-};
+use std::collections::HashSet;
+use std::ffi::{CStr, CString};
+use std::fs::{self};
+use std::io::{BufRead, Read, Seek, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::{env, process};
 
 #[cfg(target_os = "linux")]
 const SPOOL_DIRECTORIES: &[&str] = &[

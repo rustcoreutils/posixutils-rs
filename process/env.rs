@@ -8,10 +8,9 @@
 //
 
 use std::collections::HashMap;
-use std::env;
-use std::io;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
+use std::{env, io};
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};

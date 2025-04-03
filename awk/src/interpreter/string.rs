@@ -8,7 +8,9 @@
 //
 
 use core::fmt;
-use std::{ffi::CString, ops::Deref, rc::Rc};
+use std::ffi::CString;
+use std::ops::Deref;
+use std::rc::Rc;
 
 #[cfg_attr(test, derive(Debug))]
 #[derive(Clone, PartialEq)]

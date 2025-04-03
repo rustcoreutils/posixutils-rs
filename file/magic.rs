@@ -8,13 +8,11 @@
 //
 
 use regex::Regex;
-use std::{
-    error::Error,
-    fmt,
-    fs::File,
-    io::{self, BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom},
-    path::PathBuf,
-};
+use std::error::Error;
+use std::fmt;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom};
+use std::path::PathBuf;
 
 #[cfg(target_os = "macos")]
 /// Default raw (text based) magic file

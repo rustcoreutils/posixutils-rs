@@ -2,16 +2,14 @@ use byteorder::{BigEndian, ByteOrder, LittleEndian, NativeEndian, WriteBytesExt}
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::io::input_stream;
-use std::{
-    cell::RefCell,
-    collections::BTreeMap,
-    fmt::Display,
-    fs::File,
-    io::{self, Cursor, Read, Seek, Write},
-    num::ParseIntError,
-    path::PathBuf,
-    rc::Rc,
-};
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::fmt::Display;
+use std::fs::File;
+use std::io::{self, Cursor, Read, Seek, Write};
+use std::num::ParseIntError;
+use std::path::PathBuf;
+use std::rc::Rc;
 
 const NL_SETMAX: u32 = 255; //max set number(the limits.h defines it and is mentioned in POSIX specification)
 const NL_SETD: u32 = 1; // the default set number for the messages that are not in any set

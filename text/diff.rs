@@ -14,16 +14,15 @@
 
 mod diff_util;
 
-use std::{fs, io, path::PathBuf};
+use std::path::PathBuf;
+use std::{fs, io};
 
 use clap::Parser;
-use diff_util::{
-    common::{FormatOptions, OutputFormat},
-    diff_exit_status::DiffExitStatus,
-    dir_diff::DirDiff,
-    file_diff::FileDiff,
-    functions::check_existance,
-};
+use diff_util::common::{FormatOptions, OutputFormat};
+use diff_util::diff_exit_status::DiffExitStatus;
+use diff_util::dir_diff::DirDiff;
+use diff_util::file_diff::FileDiff;
+use diff_util::functions::check_existance;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 
 /// diff - compare two files

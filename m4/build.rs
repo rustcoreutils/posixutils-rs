@@ -1,9 +1,7 @@
-use std::{
-    collections::BTreeMap,
-    fs::read_dir,
-    os::unix::ffi::OsStrExt,
-    path::{Path, PathBuf},
-};
+use std::collections::BTreeMap;
+use std::fs::read_dir;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 
 use m4_test_manager::TestSnapshot;
 

@@ -6,7 +6,8 @@
 // SPDX-License-Identifier: MIT
 //
 
-use clap::{error::ErrorKind, Parser};
+use clap::error::ErrorKind;
+use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use thiserror::Error;
 
@@ -19,21 +20,17 @@ use libc::{
     STDIN_FILENO, STDOUT_FILENO, TIOCGWINSZ,
 };
 
-use std::{
-    char,
-    ffi::{CStr, CString},
-    io::{self, Cursor, Error, IsTerminal, Write},
-    mem::{size_of, zeroed},
-    net::{
-        self, AddrParseError, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener,
-        TcpStream, UdpSocket,
-    },
-    os::fd::AsRawFd,
-    process, ptr,
-    sync::{Arc, LazyLock, Mutex},
-    thread,
-    time::{Duration, Instant},
+use std::ffi::{CStr, CString};
+use std::io::{self, Cursor, Error, IsTerminal, Write};
+use std::mem::{size_of, zeroed};
+use std::net::{
+    self, AddrParseError, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener, TcpStream,
+    UdpSocket,
 };
+use std::os::fd::AsRawFd;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
+use std::{char, process, ptr, thread};
 
 #[derive(Parser)]
 #[command(version, about=gettext("talk - talk to another user"))]

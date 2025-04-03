@@ -1,8 +1,9 @@
 use std::ffi::{OsStr, OsString};
+use std::io::Write;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::process::ExitStatus;
-use std::{io::Write, rc::Rc};
+use std::rc::Rc;
 
 use super::eval::parse_integer;
 use super::{MacroDefinitionImplementation, MacroImplementation};

@@ -7,7 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::{env, path::PathBuf};
+use std::env;
+use std::path::PathBuf;
 
 use plib::testing::{run_test, TestPlan};
 

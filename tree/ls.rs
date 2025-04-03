@@ -13,16 +13,15 @@ use self::ls_util::{ls_from_utf8_lossy, Entry, LongFormatPadding, MultiColumnPad
 use clap::{CommandFactory, FromArgMatches, Parser};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::platform::P_WINSIZE_REQUEST_CODE;
-use std::{
-    collections::HashMap,
-    ffi::{CString, OsStr},
-    io,
-    mem::MaybeUninit,
-    os::unix::{ffi::OsStrExt, fs::MetadataExt},
-    path::{Path, PathBuf},
-    process::ExitCode,
-    sync::atomic::{AtomicU8, Ordering},
-};
+use std::collections::HashMap;
+use std::ffi::{CString, OsStr};
+use std::io;
+use std::mem::MaybeUninit;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// ls - list directory contents
 #[derive(Parser)]

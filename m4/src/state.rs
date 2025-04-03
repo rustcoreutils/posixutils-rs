@@ -1,12 +1,15 @@
-use std::{cell::RefCell, collections::HashMap, io::Write, process::ExitStatus, rc::Rc};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::io::Write;
+use std::process::ExitStatus;
+use std::rc::Rc;
 
-use crate::{
-    input::{Input, InputState, InputStateRef},
-    lexer::{is_alphnumeric, MacroName, ParseConfig},
-    macros::{trace::Trace, BuiltinMacro, MacroDefinition},
-    output::{Output, OutputState},
-    EOF,
-};
+use crate::input::{Input, InputState, InputStateRef};
+use crate::lexer::{is_alphnumeric, MacroName, ParseConfig};
+use crate::macros::trace::Trace;
+use crate::macros::{BuiltinMacro, MacroDefinition};
+use crate::output::{Output, OutputState};
+use crate::EOF;
 
 pub struct State {
     pub macro_definitions: HashMap<MacroName, Vec<Rc<MacroDefinition>>>,

@@ -7,10 +7,9 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::{
-    collections::{hash_map::Entry, HashMap},
-    rc::Rc,
-};
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
+use std::rc::Rc;
 
 use super::AwkValue;
 

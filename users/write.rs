@@ -13,8 +13,7 @@ use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleC
 use plib::{curuser, platform, utmpx};
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, Write};
-use std::os::unix::fs::MetadataExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::process::exit;
 
 const ALERT_CHAR: char = '\u{07}';

@@ -8,17 +8,12 @@
 //
 
 use plib::testing::{run_test, TestPlan};
-use std::{
-    ffi::{CStr, CString},
-    fs, io,
-    os::unix::{
-        self,
-        fs::{MetadataExt, PermissionsExt},
-    },
-    sync::{Once, RwLock},
-    thread,
-    time::Duration,
-};
+use std::ffi::{CStr, CString};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::{self};
+use std::sync::{Once, RwLock};
+use std::time::Duration;
+use std::{fs, io, thread};
 
 fn chgrp_test(args: &[&str], expected_output: &str, expected_error: &str, expected_exit_code: i32) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();

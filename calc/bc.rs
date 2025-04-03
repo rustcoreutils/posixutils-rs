@@ -9,14 +9,13 @@
 
 use std::ffi::OsString;
 
-use bc_util::{
-    interpreter::{ExecutionResult, Interpreter},
-    parser::parse_program,
-};
+use bc_util::interpreter::{ExecutionResult, Interpreter};
+use bc_util::parser::parse_program;
 use clap::Parser;
 
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use rustyline::{error::ReadlineError, DefaultEditor, Result};
+use rustyline::error::ReadlineError;
+use rustyline::{DefaultEditor, Result};
 
 mod bc_util;
 

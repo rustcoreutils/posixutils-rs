@@ -12,12 +12,10 @@
 //! different per-process umask than those in `tree-tests.rs`.
 
 use plib::testing::{run_test, TestPlan};
-use std::{
-    fs,
-    os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
-    path::Path,
-    sync::Mutex,
-};
+use std::fs;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::path::Path;
+use std::sync::Mutex;
 
 static UMASK_SETTER: Mutex<UmaskSetter> = Mutex::new(UmaskSetter);
 

@@ -1,9 +1,7 @@
-use std::{
-    cell::RefCell,
-    io::{Read, Write},
-    path::PathBuf,
-    rc::Rc,
-};
+use std::cell::RefCell;
+use std::io::{Read, Write};
+use std::path::PathBuf;
+use std::rc::Rc;
 
 use crate::EOF;
 

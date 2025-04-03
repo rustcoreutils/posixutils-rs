@@ -1,20 +1,16 @@
 use std::io::Write;
 
-use nom::{
-    branch::alt,
-    bytes::complete::{tag, take_while},
-    combinator::fail,
-    error::FromExternalError,
-    sequence::{delimited, tuple},
-    IResult,
-};
+use nom::branch::alt;
+use nom::bytes::complete::{tag, take_while};
+use nom::combinator::fail;
+use nom::error::FromExternalError;
+use nom::sequence::{delimited, tuple};
+use nom::IResult;
 
-use crate::{
-    lexer::is_whitespace,
-    precedence::{self, binary_op, unary_op, Assoc, Operation},
-    state::{StackFrame, State},
-    Result,
-};
+use crate::lexer::is_whitespace;
+use crate::precedence::{self, binary_op, unary_op, Assoc, Operation};
+use crate::state::{StackFrame, State};
+use crate::Result;
 
 use super::MacroImplementation;
 

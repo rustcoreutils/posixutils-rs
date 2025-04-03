@@ -8,10 +8,8 @@
 //
 
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
-use std::{
-    iter::{self},
-    process::exit,
-};
+use std::iter::{self};
+use std::process::exit;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UTF16Variant {

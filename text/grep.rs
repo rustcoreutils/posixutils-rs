@@ -10,13 +10,11 @@
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use libc::{regcomp, regex_t, regexec, regfree, REG_EXTENDED, REG_ICASE, REG_NOMATCH};
-use std::{
-    ffi::CString,
-    fs::File,
-    io::{self, BufRead, BufReader},
-    path::{Path, PathBuf},
-    ptr,
-};
+use std::ffi::CString;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::ptr;
 
 /// grep - search a file for a pattern.
 #[derive(Parser)]

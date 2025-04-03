@@ -17,7 +17,9 @@ use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 #[cfg(target_os = "macos")]
 use std::ffi::CStr;
-use std::{cmp, ffi::CString, fmt::Display, io};
+use std::ffi::CString;
+use std::fmt::Display;
+use std::{cmp, io};
 
 #[derive(Parser)]
 #[command(version, about = gettext("df - report free storage space"))]

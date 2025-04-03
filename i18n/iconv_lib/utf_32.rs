@@ -8,7 +8,8 @@
 //
 
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
-use std::{iter, process::exit};
+use std::iter;
+use std::process::exit;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UTF32Variant {

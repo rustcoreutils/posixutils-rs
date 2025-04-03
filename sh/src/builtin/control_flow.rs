@@ -9,8 +9,7 @@
 
 use crate::builtin::{skip_option_terminator, BuiltinResult, SpecialBuiltinUtility};
 use crate::shell::opened_files::OpenedFiles;
-use crate::shell::ControlFlowState;
-use crate::shell::Shell;
+use crate::shell::{ControlFlowState, Shell};
 
 fn loop_control_flow(
     args: &[String],

@@ -19,12 +19,11 @@ use clap::Parser;
 use const_format::formatcp;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 
-use posixutils_make::{
-    config::Config,
-    error_code::ErrorCode::{self, *},
-    parser::{preprocessor::ENV_MACROS, Makefile},
-    Make,
-};
+use posixutils_make::config::Config;
+use posixutils_make::error_code::ErrorCode::{self, *};
+use posixutils_make::parser::preprocessor::ENV_MACROS;
+use posixutils_make::parser::Makefile;
+use posixutils_make::Make;
 
 const MAKEFILE_NAME: [&str; 2] = ["makefile", "Makefile"];
 const MAKEFILE_PATH: [&str; 2] = [

@@ -1,10 +1,8 @@
 use chrono::{DateTime, Local};
-use std::{
-    fs::File,
-    io::{self, Read},
-    path::{Path, PathBuf},
-    time::SystemTime,
-};
+use std::fs::File;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use super::constants::UTF8_NOT_ALLOWED_BYTES;
 use crate::diff_util::constants::COULD_NOT_UNWRAP_FILENAME;

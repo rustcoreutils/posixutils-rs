@@ -25,7 +25,14 @@ use std::str::FromStr;
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::Mutex;
 use std::time::Duration;
-use termion::{clear::*, cursor::*, event::*, input::*, raw::*, screen::*, style::*, *};
+use termion::clear::*;
+use termion::cursor::*;
+use termion::event::*;
+use termion::input::*;
+use termion::raw::*;
+use termion::screen::*;
+use termion::style::*;
+use termion::*;
 
 const LINES_PER_PAGE: u16 = 24;
 const NUM_COLUMNS: u16 = 80;

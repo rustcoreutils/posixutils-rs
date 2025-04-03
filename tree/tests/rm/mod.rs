@@ -11,10 +11,8 @@ use plib::testing::{run_test, run_test_with_checker, TestPlan};
 use std::ffi::CString;
 use std::fs;
 use std::io::{self, Write};
-use std::os::unix::{
-    self,
-    fs::{DirBuilderExt, MetadataExt, PermissionsExt},
-};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::{self};
 use std::path::Path;
 use std::process::{Command, Stdio};
 

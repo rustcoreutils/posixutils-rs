@@ -1,10 +1,8 @@
 use std::io::Write;
 
-use crate::{
-    lexer::MacroName,
-    state::{StackFrame, State},
-    Result,
-};
+use crate::lexer::MacroName;
+use crate::state::{StackFrame, State};
+use crate::Result;
 
 use super::MacroImplementation;
 

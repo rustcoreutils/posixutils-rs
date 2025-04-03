@@ -144,14 +144,12 @@ mod linux {
     use super::*;
 
     use libc::fstat;
-    use std::{
-        env,
-        fs::{self, File},
-        io::{BufRead, Error, ErrorKind},
-        net::{IpAddr, Ipv4Addr, UdpSocket},
-        os::unix::io::AsRawFd,
-        path::Component,
-    };
+    use std::env;
+    use std::fs::{self, File};
+    use std::io::{BufRead, Error, ErrorKind};
+    use std::net::{IpAddr, Ipv4Addr, UdpSocket};
+    use std::os::unix::io::AsRawFd;
+    use std::path::Component;
     const PROC_PATH: &str = "/proc";
     const PROC_MOUNTS: &str = "/proc/mounts";
 
@@ -1225,7 +1223,9 @@ mod macos {
         include!(concat!(env!("OUT_DIR"), "/osx_libproc_bindings.rs"));
     }
     use libc::{c_char, c_int, c_void};
-    use std::{ffi::CString, os::unix::ffi::OsStrExt, ptr};
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::ptr;
 
     // similar to list_pids_ret() below, there are two cases when 0 is returned, one when there are
     // no pids, and the other when there is an error

@@ -10,11 +10,10 @@
 use core::fmt;
 use std::collections::BTreeSet;
 
-use crate::{
-    error_code::ErrorCode,
-    rule::{target::Target, Rule},
-    Make,
-};
+use crate::error_code::ErrorCode;
+use crate::rule::target::Target;
+use crate::rule::Rule;
+use crate::Make;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SpecialTarget {

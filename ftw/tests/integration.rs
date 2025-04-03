@@ -1,10 +1,9 @@
-use std::{
-    collections::HashSet,
-    ffi::CString,
-    fs, io,
-    os::{fd::AsRawFd, unix},
-    path::{Path, PathBuf},
-};
+use std::collections::HashSet;
+use std::ffi::CString;
+use std::os::fd::AsRawFd;
+use std::os::unix;
+use std::path::{Path, PathBuf};
+use std::{fs, io};
 
 const DIR_HIERARCHY_DEPTH: usize = 300;
 

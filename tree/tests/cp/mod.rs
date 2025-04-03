@@ -10,11 +10,8 @@
 use plib::testing::{run_test, TestPlan};
 use std::ffi::CString;
 use std::io::{Read, Write};
-use std::os::unix::fs::FileTypeExt;
-use std::os::unix::{
-    self,
-    fs::{MetadataExt, PermissionsExt},
-};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::{self};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::{fs, io};

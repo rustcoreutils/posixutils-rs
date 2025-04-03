@@ -9,22 +9,17 @@
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use iconv_lib::{
-    ascii,
-    utf_16::{self, UTF16Variant},
-    utf_32::{self, UTF32Variant},
-    utf_8,
-};
+use iconv_lib::utf_16::{self, UTF16Variant};
+use iconv_lib::utf_32::{self, UTF32Variant};
+use iconv_lib::{ascii, utf_8};
 use plib::io::input_stream;
-use std::{
-    collections::HashMap,
-    env,
-    fs::File,
-    io::{self, BufRead, BufReader, Read, Write},
-    path::{Path, PathBuf},
-    process::exit,
-    str::FromStr,
-};
+use std::collections::HashMap;
+use std::env;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::exit;
+use std::str::FromStr;
 use strum::IntoEnumIterator;
 use strum_macros::{Display, EnumIter, EnumString};
 

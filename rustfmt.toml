@@ -1,0 +1,6 @@
+# configuration for https://rust-lang.github.io/rustfmt/
+
+## unstable options require running with `cargo +nightly fmt`
+
+# Module granularity gives better diffs
+imports_granularity = "Module"

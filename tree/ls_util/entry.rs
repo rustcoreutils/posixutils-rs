@@ -13,16 +13,12 @@ use crate::{
     DATE_TIME_FORMAT_OLD_OR_FUTURE, DATE_TIME_FORMAT_RECENT,
 };
 use chrono::{DateTime, Local};
-use std::{
-    cmp::Ordering,
-    ffi::{CStr, OsStr, OsString},
-    io,
-    os::unix::{
-        ffi::OsStrExt,
-        fs::{FileTypeExt, MetadataExt},
-    },
-    time::{Duration, SystemTime},
-};
+use std::cmp::Ordering;
+use std::ffi::{CStr, OsStr, OsString};
+use std::io;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::time::{Duration, SystemTime};
 
 enum FileInfo {
     Size(u64),

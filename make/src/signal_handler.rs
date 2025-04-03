@@ -7,7 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::{fs::remove_file, process};
+use std::fs::remove_file;
+use std::process;
 
 use crate::rule::INTERRUPT_FLAG;
 use gettextrs::gettext;

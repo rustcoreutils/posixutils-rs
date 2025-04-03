@@ -1,10 +1,8 @@
-use std::{
-    collections::HashMap,
-    ffi::OsString,
-    fs::{self, DirEntry},
-    io,
-    path::PathBuf,
-};
+use std::collections::HashMap;
+use std::ffi::OsString;
+use std::fs::{self, DirEntry};
+use std::io;
+use std::path::PathBuf;
 
 use super::constants::*;
 

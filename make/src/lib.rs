@@ -14,18 +14,18 @@ pub mod rule;
 pub mod signal_handler;
 pub mod special_target;
 
-use std::{
-    collections::HashSet,
-    fs::{self},
-    time::SystemTime,
-};
+use std::collections::HashSet;
+use std::fs::{self};
+use std::time::SystemTime;
 
 use parser::{Makefile, VariableDefinition};
 
 use crate::special_target::InferenceTarget;
 use config::Config;
 use error_code::ErrorCode::{self, *};
-use rule::{prerequisite::Prerequisite, target::Target, Rule};
+use rule::prerequisite::Prerequisite;
+use rule::target::Target;
+use rule::Rule;
 use special_target::SpecialTarget;
 
 /// The default shell variable name.

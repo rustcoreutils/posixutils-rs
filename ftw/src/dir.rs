@@ -1,14 +1,12 @@
 use crate::{open_long_filename, Error, ErrorKind, FileDescriptor};
-use std::{
-    cell::{RefCell, RefMut},
-    collections::HashSet,
-    ffi::{CStr, CString},
-    io,
-    marker::PhantomData,
-    os::unix::ffi::OsStrExt as _,
-    path::PathBuf,
-    rc::Rc,
-};
+use std::cell::{RefCell, RefMut};
+use std::collections::HashSet;
+use std::ffi::{CStr, CString};
+use std::io;
+use std::marker::PhantomData;
+use std::os::unix::ffi::OsStrExt as _;
+use std::path::PathBuf;
+use std::rc::Rc;
 
 // Not to be used publically. The public interface for a directory entry is `Entry`.
 pub struct EntryInternal<'a> {

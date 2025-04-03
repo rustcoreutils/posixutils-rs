@@ -40,9 +40,10 @@ struct Args {
 
     #[arg(
         short,
-        help = gettext("Name the default output file DEFAULT_DOMAIN.po instead of messages.po")
+        help = gettext("Name the default output file DEFAULT_DOMAIN.po instead of messages.po"),
+        default_value = "messages"
     )]
-    default_domain: Option<String>,
+    default_domain: String,
 
     #[arg(
         short,
@@ -276,11 +277,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let content = read_to_string(&path)?;
                 let path = path.into_os_string().into_string().unwrap();
                 walker.process_rust_file(content, path)?;
-            },
-             _ => {
+            }
+            _ => {
                 eprintln!("xgettext: {}", gettext("unsupported file type"));
                 exit(1);
-            },
+            }
         }
     }
 
@@ -289,11 +290,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output = args
         .pathname
         .unwrap_or_else(|| current_dir().unwrap())
-        .join(format!(
-            "{}.pot",
-            args.default_domain
-                .unwrap_or_else(|| { "messages".to_string() })
-        ));
+        .join(format!("{}.pot", args.default_domain));
 
     let mut output = File::create(output)?;
     write!(output, "{}", walker)?;

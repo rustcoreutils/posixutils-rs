@@ -7,11 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
-use atty::Stream;
 use nix::sys::termios;
 use nix::sys::termios::{LocalFlags, Termios};
-use std::io;
 use std::io::Read;
+use std::io::{self, stdin, stdout, IsTerminal};
 use std::os::fd::AsFd;
 
 #[derive(Clone)]
@@ -81,5 +80,5 @@ pub fn read_nonblocking_char() -> Option<u8> {
 }
 
 pub fn is_attached_to_terminal() -> bool {
-    atty::is(Stream::Stdin) && atty::is(Stream::Stdout)
+    stdin().is_terminal() && stdout().is_terminal()
 }

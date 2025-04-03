@@ -14,7 +14,7 @@ There are several ways to contribute to posixutils-rs:
 3. Test coverage:  Integration tests, positive and negative, are complete, pass 100%
 4. Code coverage:  Automated code coverage data indicates 100%
 5. Translated:  All strings are internationalized, including common OS errors for common error cases.
-6. Audited:  An external party has reviewed and tested for correctness, 
+6. Audited:  An external party has reviewed and tested for correctness,
    POSIX compliance, security, races and similar issues.
 
 ### Coding considerations
@@ -29,12 +29,11 @@ There are several ways to contribute to posixutils-rs:
 ### CLI utility and Rust style guidelines
 
 1. `cargo fmt` is required.
-2. Ideal goal:  **Each utility should look like a standard Rust CLI program.** 
+2. Ideal goal:  **Each utility should look like a standard Rust CLI program.**
    Small, lightweight utility with command line processing,
    core algorithm, and zero external crate dependencies.
 3. "only std"  When an external crate is required, avoid mega-crates.  Prefer
-   std-only, or, tiny crates such as `atty` that perform a single,
-   lightweight function.
+   std-only, or, tiny crates that perform a single, lightweight function.
 4. Correctness, readability, performance, in that order.
    Code should be readable by unfamiliar developers.  Avoid dense,
    uncommented code.
@@ -58,4 +57,3 @@ There are several ways to contribute to posixutils-rs:
 * Provide any input data can that be used to reproduce the bug.
 * Provide any error output from the utility.
 * Describe expected results:  What did you expect to happen, and did not?
-

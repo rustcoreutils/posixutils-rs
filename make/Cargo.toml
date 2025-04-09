@@ -14,7 +14,7 @@ const_format = "0.2"
 rowan = "0.15"
 
 [dev-dependencies]
-plib = { path = "../plib" }
+plib-testing.workspace = true
 
 [[bin]]
 name = "make"

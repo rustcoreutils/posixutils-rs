@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use plib_testing::{run_test, TestPlan};
 
 fn xargs_test(test_data: &str, expected_output: &str, args: Vec<&str>) {
     run_test(TestPlan {

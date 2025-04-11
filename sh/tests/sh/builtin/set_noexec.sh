@@ -1,0 +1,3 @@
+set -n
+
+echo wrong

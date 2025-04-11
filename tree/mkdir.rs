@@ -45,8 +45,8 @@ fn create_dir_with_mode(path: &str, mode: u32) -> io::Result<()> {
 
 fn do_mkdir(dirname: &str, mode: &ChmodMode, parents: bool) -> io::Result<()> {
     let mode_val = match mode {
-        ChmodMode::Absolute(mode) => *mode,
-        ChmodMode::Symbolic(sym) => modestr::mutate(0o777, sym),
+        ChmodMode::Absolute(mode, _) => *mode,
+        ChmodMode::Symbolic(sym) => modestr::mutate(0o777, true, sym),
     };
 
     if parents {
@@ -77,7 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // parse the mode string
     let mode = match args.mode {
         Some(mode) => modestr::parse(&mode)?,
-        None => ChmodMode::Absolute(0o777),
+        None => ChmodMode::Absolute(0o777, 3),
     };
 
     // apply the mode to each file

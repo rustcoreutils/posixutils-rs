@@ -1,0 +1,2 @@
+echo $x
+echo $y

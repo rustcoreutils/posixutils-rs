@@ -1,0 +1,14 @@
+[package]
+name = "posixutils-sh"
+version = "0.1.7"
+edition = "2021"
+
+[dependencies]
+plib = { path = "../plib" }
+gettext-rs.workspace = true
+nix = { version = "0.29", features = ["process", "fs", "resource", "signal", "user", "term"] }
+atty = "0.2"
+
+[[bin]]
+name = "sh"
+path = "main.rs"

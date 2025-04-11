@@ -702,7 +702,7 @@ fn get_file_info(metadata: &ftw::Metadata) -> FileInfo {
 
             // major ID - class of the device
             // minor ID - specific instance of a device
-            let (major, minor) = unsafe {
+            let (major, minor) = {
                 (
                     libc::major(device_id as libc::dev_t),
                     libc::minor(device_id as libc::dev_t),

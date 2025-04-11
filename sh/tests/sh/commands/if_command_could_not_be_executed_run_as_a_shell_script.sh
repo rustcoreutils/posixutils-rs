@@ -1,0 +1,7 @@
+echo 'echo test' > $TEST_WRITE_DIR/if_command_could_not_be_executed_run_it_as_a_shell_script.sh
+chmod +x $TEST_WRITE_DIR/if_command_could_not_be_executed_run_it_as_a_shell_script.sh
+
+PATH="$TEST_WRITE_DIR:$PATH"
+if_command_could_not_be_executed_run_it_as_a_shell_script.sh
+echo $?
+rm $TEST_WRITE_DIR/if_command_could_not_be_executed_run_it_as_a_shell_script.sh

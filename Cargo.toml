@@ -40,10 +40,12 @@ rust-version = "1.84.0"
 [workspace.dependencies]
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "cargo"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+chrono-tz = "0.10.0"
 libc = "0.2"
 regex = "1.10"
 gettext-rs = { path = "./gettext-rs" }
 errno = "0.3"
+tempfile = "3.14"
 chrono-tz = "0.10"
 
 [workspace.lints]

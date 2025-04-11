@@ -7,11 +7,13 @@
 // SPDX-License-Identifier: MIT
 //
 
-use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
-use posixutils_cron::job::Database;
+mod pid;
+
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+use cron::job::Database;
 use std::io::Write;
-use std::ops::Sub;
 use std::process::{Command, Output, Stdio};
+use std::str::FromStr;
 use std::thread;
 use std::time::Duration;
 
@@ -212,4 +214,44 @@ fn test_month() {
             .next_execution(&start_date)
             .unwrap()
     );
+}
+
+#[test]
+fn test_signal() {
+    std::env::set_var("LOGNAME", "root");
+    let logname = std::env::var("LOGNAME").unwrap_or("root".to_string());
+    #[cfg(target_os = "linux")]
+    let file = format!("/var/spool/cron/{logname}");
+    #[cfg(target_os = "macos")]
+    let file = format!("/var/at/tabs/{logname}");
+    let mut tmp_file_created = false;
+    let filepath = std::path::PathBuf::from_str(&file).unwrap();
+    if !filepath.exists() {
+        std::fs::File::create(&file).unwrap();
+        tmp_file_created = true;
+    }
+
+    let output = run_test_base("crond", &vec![], b"");
+    assert_eq!(output.status.code(), Some(0));
+
+    let pids = pid::get_pids("target/debug/crond").unwrap();
+    assert!(!pids.is_empty());
+    for pid in &pids {
+        unsafe {
+            libc::kill(*pid, libc::SIGHUP);
+        }
+    }
+
+    let mut old_pids = pids;
+    let mut pids = pid::get_pids("target/debug/crond").unwrap();
+
+    pids.sort();
+    old_pids.sort();
+    assert!(pids == old_pids || !pids.is_empty());
+
+    let _ = pid::kill("target/debug/crond").unwrap();
+
+    if tmp_file_created && filepath.starts_with("/var/at/tabs") {
+        let _ = std::fs::remove_file(file);
+    }
 }

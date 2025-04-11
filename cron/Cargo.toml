@@ -9,18 +9,25 @@ plib = { path = "../plib" }
 clap = { workspace = true }
 libc = { workspace = true }
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
+tempfile = { workspace = true }
+
+[[bin]]
+name = "at"
+path = "./at.rs"
+
+[[bin]]
+name = "batch"
+path = "./batch.rs"
 
 [[bin]]
 name = "crontab"
-path = "src/bin/crontab.rs"
+path = "./crontab.rs"
 
 [[bin]]
 name = "crond"
-path = "src/bin/crond.rs"
-
-[[bin]]
-name = "main"
-path = "src/main.rs"
+path = "./crond.rs"
 
 [lib]
-path = "./src/lib.rs"
+name = "cron"
+path = "./lib.rs"

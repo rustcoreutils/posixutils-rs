@@ -8,7 +8,7 @@
 //
 
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, Timelike};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::iter::Peekable;
 use std::process::Command;
 use std::str::FromStr;
@@ -54,7 +54,7 @@ macro_rules! time_unit {
 
             fn merge(self, other: Self) -> Self {
                 let mut a = self.to_vec();
-                let b = self.to_vec();
+                let b = other.to_vec();
                 a.extend(b);
                 a.sort();
                 a.dedup();
@@ -118,6 +118,7 @@ pub struct CronJob {
     pub command: String,
 }
 
+#[derive(Clone)]
 pub struct Database(pub Vec<CronJob>);
 
 impl Database {
@@ -131,10 +132,7 @@ impl Database {
         self.0
             .iter()
             .filter(|x| x.next_execution(&now).is_some())
-            .min_by_key(|x| {
-                println!("{x:?}");
-                x.next_execution(&now)
-            })
+            .min_by_key(|x| x.next_execution(&now))
             .cloned()
     }
 }

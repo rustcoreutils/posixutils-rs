@@ -46,7 +46,6 @@ regex = "1.10"
 gettext-rs = { path = "./gettext-rs" }
 errno = "0.3"
 tempfile = "3.14"
-chrono-tz = "0.10"
 
 [workspace.lints]
 

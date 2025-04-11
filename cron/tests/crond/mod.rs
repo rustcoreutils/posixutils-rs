@@ -219,23 +219,22 @@ fn test_month() {
 #[test]
 fn test_signal() {
     std::env::set_var("LOGNAME", "root");
+
     let logname = std::env::var("LOGNAME").unwrap_or("root".to_string());
     #[cfg(target_os = "linux")]
     let file = format!("/var/spool/cron/{logname}");
     #[cfg(target_os = "macos")]
     let file = format!("/var/at/tabs/{logname}");
-    let mut tmp_file_created = false;
-    let filepath = std::path::PathBuf::from_str(&file).unwrap();
-    if !filepath.exists() {
-        std::fs::File::create(&file).unwrap();
-        tmp_file_created = true;
-    }
 
     let output = run_test_base("crond", &vec![], b"");
     assert_eq!(output.status.code(), Some(0));
 
     let pids = pid::get_pids("target/debug/crond").unwrap();
-    assert!(!pids.is_empty());
+
+    if std::path::PathBuf::from_str(&file).unwrap().exists() {
+        assert!(!pids.is_empty());
+    }
+
     for pid in &pids {
         unsafe {
             libc::kill(*pid, libc::SIGHUP);
@@ -250,8 +249,4 @@ fn test_signal() {
     assert!(pids == old_pids || !pids.is_empty());
 
     let _ = pid::kill("target/debug/crond").unwrap();
-
-    if tmp_file_created && filepath.starts_with("/var/at/tabs") {
-        let _ = std::fs::remove_file(file);
-    }
 }

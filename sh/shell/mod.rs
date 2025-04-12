@@ -294,8 +294,9 @@ impl Shell {
                     }
                 }
                 self.eprint(&format!(
-                    "sh: failed to execute {}\n",
-                    command.to_string_lossy()
+                    "sh: failed to execute {} ({})\n",
+                    command.to_string_lossy(),
+                    errno
                 ));
                 self.exit(126);
             }

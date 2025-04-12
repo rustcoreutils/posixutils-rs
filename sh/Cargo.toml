@@ -4,9 +4,11 @@ version = "0.1.7"
 edition = "2021"
 
 [dependencies]
-plib = { path = "../plib" }
 gettext-rs.workspace = true
 libc.workspace = true
+
+[dev-dependencies]
+plib = { path = "../plib" }
 
 [[bin]]
 name = "sh"

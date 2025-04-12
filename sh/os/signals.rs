@@ -273,10 +273,11 @@ unsafe fn handle_signal(signal: Signal, handler: libc::sighandler_t) {
     let mut empty_sigset: libc::sigset_t = std::mem::zeroed::<libc::sigset_t>();
     // never fails
     libc::sigemptyset(&mut empty_sigset);
+
     let action = libc::sigaction {
         sa_sigaction: handler,
         sa_mask: empty_sigset,
-        sa_flags: 0,
+        sa_flags: libc::SA_SIGINFO,
         sa_restorer: None,
     };
     let result = libc::sigaction(signal.into(), &action, std::ptr::null_mut());
@@ -294,7 +295,10 @@ pub unsafe fn handle_signal_default(signal: Signal) {
 }
 
 pub unsafe fn handle_signal_write_to_signal_buffer(signal: Signal) {
-    handle_signal(signal, &write_signal_to_buffer as *const _ as libc::size_t)
+    handle_signal(
+        signal,
+        write_signal_to_buffer as *const extern "C" fn(libc::c_int) as libc::sighandler_t,
+    )
 }
 
 #[derive(Clone)]

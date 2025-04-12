@@ -7,7 +7,6 @@ edition = "2021"
 plib = { path = "../plib" }
 gettext-rs.workspace = true
 libc.workspace = true
-atty = "0.2"
 
 [[bin]]
 name = "sh"

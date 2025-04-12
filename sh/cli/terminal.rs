@@ -8,9 +8,8 @@
 //
 
 use crate::os::errno::get_current_errno_value;
-use atty::Stream;
 use std::io;
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 
 fn get_current_settings() -> libc::termios {
     // using zeroed here because terminos has additional members on some systems
@@ -98,5 +97,5 @@ pub fn read_nonblocking_char() -> Option<u8> {
 }
 
 pub fn is_attached_to_terminal() -> bool {
-    atty::is(Stream::Stdin) && atty::is(Stream::Stdout)
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }

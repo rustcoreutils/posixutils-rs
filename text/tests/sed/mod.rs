@@ -1825,29 +1825,28 @@ mod tests {
     fn test_w() {
         let test_data = [
             // correct
-            ("w ./newfile", "abc\ncdf\n", "abc\ncdf\n", ""),
             ("w atyfv", "abc\ncdf\n", "abc\ncdf\n", ""),
             ("w./tests/sed/assets/r", "", "", ""),
-            ("w./newfile", "a\n", "a\n", ""),
+            ("w newfile", "a\n", "a\n", ""),
             ("w ; h", "abc\ncdf\n", "abc\ncdf\n", ""),
             // wrong
             (
                 "w ./dir/newfile", 
                 "abc\ncdf\n", 
                 "", 
-                "sed: read stdin: can't find '../target/tmp/./dir/newfile': no such file or directory (os error 2)\n",
+                "sed: read stdin: can't find './dir/newfile': no such file or directory (os error 2)\n",
             ),
             (
                 "w./tests/s\x04ed/assets/abc",
                 "a\n",
                 "",
-                "sed: read stdin: can't find '../target/tmp/./tests/s\u{4}ed/assets/abc': no such file or directory (os error 2)\n",
+                "sed: read stdin: can't find './tests/s\u{4}ed/assets/abc': no such file or directory (os error 2)\n",
             ),
             (
                 "w./tests/ard/assets/abc",
                 "a\n",
                 "",
-                "sed: read stdin: can't find '../target/tmp/./tests/ard/assets/abc': no such file or directory (os error 2)\n",
+                "sed: read stdin: can't find './tests/ard/assets/abc': no such file or directory (os error 2)\n",
             ),
         ];
 

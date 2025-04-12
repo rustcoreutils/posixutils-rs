@@ -1834,7 +1834,11 @@ fn execute_replace(
     }) {
         if replace && wfile.components().next().is_some() {
             let mut wfile = wfile.clone();
-            if (cfg!(test) || cfg!(debug_assertions)) && !wfile.exists() {
+            if !(wfile.is_absolute()
+                || wfile.starts_with("./")
+                || wfile.starts_with("../")
+                || wfile.exists())
+            {
                 wfile = get_tmp_path(wfile);
             }
 
@@ -2231,7 +2235,11 @@ impl Sed {
 
     fn execute_w(&mut self, wfile: PathBuf) -> Result<(), SedError> {
         let mut wfile = wfile.clone();
-        if (cfg!(test) || cfg!(debug_assertions)) && !wfile.exists() {
+        if !(wfile.is_absolute()
+            || wfile.starts_with("./")
+            || wfile.starts_with("../")
+            || wfile.exists())
+        {
             wfile = get_tmp_path(wfile);
         }
 

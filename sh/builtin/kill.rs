@@ -93,7 +93,7 @@ impl BuiltinUtility for Kill {
             KillArgs::SendSignal { signal, pids } => {
                 for pid in pids {
                     let pid = parse_pid(pid, shell).map_err(|err| format!("kill: {err}"))?;
-                    kill(pid, signal.map(|s| s.into()))
+                    kill(pid, signal)
                         .map_err(|err| format!("kill: failed to send signal ({})", err))?;
                 }
             }

@@ -9,7 +9,6 @@
 
 use crate::pattern::parse::{BracketExpression, BracketItem, PatternItem, RangeEndpoint};
 use core::fmt;
-use nix::libc;
 use std::ffi::{CStr, CString};
 use std::fmt::{Formatter, Write};
 use std::ptr;

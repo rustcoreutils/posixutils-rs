@@ -7,13 +7,14 @@
 // SPDX-License-Identifier: MIT
 //
 
+use crate::os::write;
 use crate::parse::command::{IORedirectionKind, Redirection, RedirectionKind};
 use crate::shell::{CommandExecutionError, Shell};
 use crate::wordexp::expand_word_to_string;
-use nix::libc;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::rc::Rc;
@@ -184,8 +185,8 @@ impl OpenedFiles {
             Some(OpenedFile::Stdout) => std::io::stdout().write_all(contents.as_bytes()),
             Some(OpenedFile::Stderr) => std::io::stderr().write_all(contents.as_bytes()),
             Some(OpenedFile::WriteFile(file)) | Some(OpenedFile::ReadWriteFile(file)) => {
-                nix::unistd::write(file, contents.as_bytes())
-                    .map_err(std::io::Error::from)
+                write(file.as_raw_fd(), contents.as_bytes())
+                    .map_err(|_| std::io::Error::last_os_error())
                     .map(|_| ())
             }
             _ => unreachable!(),

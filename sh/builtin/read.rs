@@ -9,12 +9,13 @@
 
 use crate::builtin::{BuiltinError, BuiltinResult, BuiltinUtility};
 use crate::option_parser::OptionParser;
+use crate::os::errno::Errno;
+use crate::os::read;
 use crate::shell::opened_files::{OpenedFile, OpenedFiles, STDIN_FILENO};
 use crate::shell::Shell;
 use crate::wordexp::expanded_word::ExpandedWord;
 use crate::wordexp::split_fields;
 use atty::Stream;
-use nix::errno::Errno;
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::Duration;
 
@@ -24,18 +25,18 @@ fn bytes_to_string(bytes: Vec<u8>) -> Result<String, BuiltinError> {
 
 fn read_byte_non_blocking(fd: RawFd) -> Result<Option<u8>, BuiltinError> {
     let mut buffer = [0u8; 1];
-    match nix::unistd::read(fd, &mut buffer) {
+    match read(fd, &mut buffer) {
         Ok(0) => Ok(None),
         Ok(1) => Ok(Some(buffer[0])),
         Ok(_) => unreachable!(),
-        Err(Errno::EAGAIN) => Ok(None),
+        Err(err) if err.errno == Errno::EAGAIN => Ok(None),
         Err(err) => Err(format!("read: failed to read from stdin ({err})").into()),
     }
 }
 
 fn read_byte(fd: RawFd) -> Result<Option<u8>, BuiltinError> {
     let mut buffer = [0u8; 1];
-    match nix::unistd::read(fd, &mut buffer) {
+    match read(fd, &mut buffer) {
         Ok(0) => Ok(None),
         Ok(1) => Ok(Some(buffer[0])),
         Ok(_) => unreachable!(),

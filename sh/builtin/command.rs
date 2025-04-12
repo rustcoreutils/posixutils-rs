@@ -11,9 +11,9 @@ use crate::builtin::{
     get_builtin_utility, get_special_builtin_utility, BuiltinError, BuiltinResult, BuiltinUtility,
 };
 use crate::option_parser::OptionParser;
+use crate::os::DEFAULT_PATH;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
-use crate::utils::DEFAULT_PATH;
 
 #[derive(PartialEq, Eq)]
 enum Action {

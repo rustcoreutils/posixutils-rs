@@ -9,6 +9,7 @@
 
 use crate::builtin::{BuiltinResult, BuiltinUtility};
 use crate::option_parser::OptionParser;
+use crate::os::chdir;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 use std::ffi::{OsStr, OsString};
@@ -140,7 +141,7 @@ impl BuiltinUtility for Cd {
                 }
 
                 let old_working_dir = std::env::current_dir().map_err(io_err_to_string)?;
-                nix::unistd::chdir(AsRef::<OsStr>::as_ref(&curr_path)).map_err(io_err_to_string)?;
+                chdir(AsRef::<OsStr>::as_ref(&curr_path)).map_err(io_err_to_string)?;
                 shell.current_directory = curr_path.clone();
 
                 shell.assign_global("PWD".to_string(), curr_path.to_string_lossy().into_owned())?;
@@ -156,8 +157,9 @@ impl BuiltinUtility for Cd {
                     .map(|s| s.to_string())
                 {
                     let old_working_dir = std::env::current_dir().unwrap();
-                    nix::unistd::chdir(oldpwd.as_str()).map_err(io_err_to_string)?;
-                    shell.current_directory = OsString::from_vec(oldpwd.as_bytes().to_vec());
+                    let oldpwd_ostr = OsString::from(oldpwd.clone());
+                    chdir(&oldpwd_ostr).map_err(io_err_to_string)?;
+                    shell.current_directory = oldpwd_ostr;
                     shell.assign_global("PWD".to_string(), oldpwd.clone())?;
                     shell.assign_global(
                         "OLDPWD".to_string(),

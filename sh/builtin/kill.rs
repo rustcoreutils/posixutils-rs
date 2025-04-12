@@ -8,11 +8,9 @@
 //
 
 use crate::builtin::{parse_pid, skip_option_terminator, BuiltinResult, BuiltinUtility};
+use crate::os::signals::{kill, Signal, SIGNALS};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
-use crate::signals::{Signal, SIGNALS};
-use nix::sys::signal::kill;
-use nix::sys::signal::Signal as NixSignal;
 use std::str::FromStr;
 
 enum KillArgs<'a> {
@@ -95,7 +93,7 @@ impl BuiltinUtility for Kill {
             KillArgs::SendSignal { signal, pids } => {
                 for pid in pids {
                     let pid = parse_pid(pid, shell).map_err(|err| format!("kill: {err}"))?;
-                    kill(pid, signal.map(NixSignal::from))
+                    kill(pid, signal.map(|s| s.into()))
                         .map_err(|err| format!("kill: failed to send signal ({})", err))?;
                 }
             }

@@ -9,10 +9,10 @@
 
 use crate::builtin::{BuiltinError, BuiltinResult, BuiltinUtility};
 use crate::option_parser::OptionParser;
+use crate::os::{mkstemp, write};
 use crate::shell::history::EndPoint;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
-use nix::unistd::mkstemp;
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -210,10 +210,9 @@ fn edit(
     };
     // remove call to fc
     shell.history.remove_last_entry();
-    let (raw_fd, path) = mkstemp("/tmp/sh-fc.XXXXXX")
+    let (fd, path) = mkstemp("/tmp/sh-fc.XXXXXX")
         .map_err(|err| format!("fc: failed to create temporary file: {err}"))?;
-    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-    nix::unistd::write(&fd, history.as_bytes())
+    write(fd, history.as_bytes())
         .map_err(|err| format!("fc: failed to write to temporary file ({err})"))?;
     let editor = editor
         .unwrap_or_else(|| shell.environment.get_str_value("FCEDIT").unwrap_or("ed"))
@@ -222,7 +221,7 @@ fn edit(
     if result != 0 {
         return Ok(());
     }
-    let mut file = File::from(fd);
+    let mut file = unsafe { File::from_raw_fd(fd) };
     let mut edited_contents = String::new();
     file.read_to_string(&mut edited_contents)
         .map_err(|err| format!("fc: failed to read edited commands ({err})"))?;

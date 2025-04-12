@@ -36,12 +36,10 @@ use crate::builtin::unalias::Unalias;
 use crate::builtin::unset::BuiltinUnset;
 use crate::builtin::wait::Wait;
 use crate::jobs::parse_job_id;
+use crate::os::{OsError, Pid};
 use crate::shell::environment::CannotModifyReadonly;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
-use crate::utils::OsError;
-use nix::libc::pid_t;
-use nix::unistd::Pid;
 use std::fmt::{Display, Formatter};
 
 pub mod alias;
@@ -205,9 +203,9 @@ fn parse_pid(pid: &str, shell: &Shell) -> Result<Pid, String> {
             .ok_or(format!("'{pid}' no such job"))?;
         Ok(job.pid)
     } else {
-        let raw_pid = pid
-            .parse::<pid_t>()
+        let pid = pid
+            .parse::<libc::pid_t>()
             .map_err(|_| format!("'{pid}' is not a valid pid"))?;
-        Ok(Pid::from_raw(raw_pid))
+        Ok(pid)
     }
 }

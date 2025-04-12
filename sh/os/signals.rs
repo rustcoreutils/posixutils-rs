@@ -8,12 +8,10 @@
 //
 
 use crate::builtin::trap::TrapAction;
-use nix::errno::Errno;
-use nix::libc;
-use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal as NixSignal};
-use nix::unistd::{read, write};
+use crate::os::errno::{get_current_errno_value, Errno};
+use crate::os::{pipe, read, write, OsError, OsResult, Pid};
 use std::fmt::{Display, Formatter};
-use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd, RawFd};
+use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 use std::str::FromStr;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -120,36 +118,36 @@ impl FromStr for Signal {
     }
 }
 
-impl From<Signal> for NixSignal {
-    fn from(value: Signal) -> Self {
-        match value {
-            Signal::SigHup => NixSignal::SIGHUP,
-            Signal::SigInt => NixSignal::SIGINT,
-            Signal::SigQuit => NixSignal::SIGQUIT,
-            Signal::SigIll => NixSignal::SIGILL,
-            Signal::SigTrap => NixSignal::SIGTRAP,
-            Signal::SigAbrt => NixSignal::SIGABRT,
-            Signal::SigBus => NixSignal::SIGBUS,
-            Signal::SigFpe => NixSignal::SIGFPE,
-            Signal::SigKill => NixSignal::SIGKILL,
-            Signal::SigUsr1 => NixSignal::SIGUSR1,
-            Signal::SigSegv => NixSignal::SIGSEGV,
-            Signal::SigUsr2 => NixSignal::SIGUSR2,
-            Signal::SigPipe => NixSignal::SIGPIPE,
-            Signal::SigAlrm => NixSignal::SIGALRM,
-            Signal::SigTerm => NixSignal::SIGTERM,
-            Signal::SigChld => NixSignal::SIGCHLD,
-            Signal::SigCont => NixSignal::SIGCONT,
-            Signal::SigStop => NixSignal::SIGSTOP,
-            Signal::SigTstp => NixSignal::SIGTSTP,
-            Signal::SigTtin => NixSignal::SIGTTIN,
-            Signal::SigTtou => NixSignal::SIGTTOU,
-            Signal::SigUrg => NixSignal::SIGURG,
-            Signal::SigXcpu => NixSignal::SIGXCPU,
-            Signal::SigXfsz => NixSignal::SIGXFSZ,
-            Signal::SigVtalrm => NixSignal::SIGVTALRM,
-            Signal::SigProf => NixSignal::SIGPROF,
-            Signal::SigSys => NixSignal::SIGSYS,
+impl Into<i32> for Signal {
+    fn into(self) -> i32 {
+        match self {
+            Signal::SigHup => libc::SIGHUP,
+            Signal::SigInt => libc::SIGINT,
+            Signal::SigQuit => libc::SIGQUIT,
+            Signal::SigIll => libc::SIGILL,
+            Signal::SigTrap => libc::SIGTRAP,
+            Signal::SigAbrt => libc::SIGABRT,
+            Signal::SigBus => libc::SIGBUS,
+            Signal::SigFpe => libc::SIGFPE,
+            Signal::SigKill => libc::SIGKILL,
+            Signal::SigUsr1 => libc::SIGUSR1,
+            Signal::SigSegv => libc::SIGSEGV,
+            Signal::SigUsr2 => libc::SIGUSR2,
+            Signal::SigPipe => libc::SIGPIPE,
+            Signal::SigAlrm => libc::SIGALRM,
+            Signal::SigTerm => libc::SIGTERM,
+            Signal::SigChld => libc::SIGCHLD,
+            Signal::SigCont => libc::SIGCONT,
+            Signal::SigStop => libc::SIGSTOP,
+            Signal::SigTstp => libc::SIGTSTP,
+            Signal::SigTtin => libc::SIGTTIN,
+            Signal::SigTtou => libc::SIGTTOU,
+            Signal::SigUrg => libc::SIGURG,
+            Signal::SigXcpu => libc::SIGXCPU,
+            Signal::SigXfsz => libc::SIGXFSZ,
+            Signal::SigVtalrm => libc::SIGVTALRM,
+            Signal::SigProf => libc::SIGPROF,
+            Signal::SigSys => libc::SIGSYS,
             Signal::Count => unreachable!("invalid trap condition"),
         }
     }
@@ -192,41 +190,6 @@ impl TryFrom<i32> for Signal {
     }
 }
 
-impl From<NixSignal> for Signal {
-    fn from(value: NixSignal) -> Self {
-        match value {
-            NixSignal::SIGHUP => Signal::SigHup,
-            NixSignal::SIGINT => Signal::SigInt,
-            NixSignal::SIGQUIT => Signal::SigQuit,
-            NixSignal::SIGILL => Signal::SigIll,
-            NixSignal::SIGTRAP => Signal::SigTrap,
-            NixSignal::SIGABRT => Signal::SigAbrt,
-            NixSignal::SIGBUS => Signal::SigBus,
-            NixSignal::SIGFPE => Signal::SigFpe,
-            NixSignal::SIGKILL => Signal::SigKill,
-            NixSignal::SIGUSR1 => Signal::SigUsr1,
-            NixSignal::SIGSEGV => Signal::SigSegv,
-            NixSignal::SIGUSR2 => Signal::SigUsr2,
-            NixSignal::SIGPIPE => Signal::SigPipe,
-            NixSignal::SIGALRM => Signal::SigAlrm,
-            NixSignal::SIGTERM => Signal::SigTerm,
-            NixSignal::SIGCHLD => Signal::SigChld,
-            NixSignal::SIGCONT => Signal::SigCont,
-            NixSignal::SIGSTOP => Signal::SigStop,
-            NixSignal::SIGTSTP => Signal::SigTstp,
-            NixSignal::SIGTTIN => Signal::SigTtin,
-            NixSignal::SIGTTOU => Signal::SigTtou,
-            NixSignal::SIGURG => Signal::SigUrg,
-            NixSignal::SIGXCPU => Signal::SigXcpu,
-            NixSignal::SIGXFSZ => Signal::SigXfsz,
-            NixSignal::SIGVTALRM => Signal::SigVtalrm,
-            NixSignal::SIGPROF => Signal::SigProf,
-            NixSignal::SIGSYS => Signal::SigSys,
-            _ => unreachable!("invalid signal"),
-        }
-    }
-}
-
 pub const SIGNALS: &[Signal] = &[
     Signal::SigHup,
     Signal::SigInt,
@@ -263,19 +226,21 @@ static mut SIGNAL_READ: Option<RawFd> = None;
 extern "C" fn write_signal_to_buffer(signal: libc::c_int) {
     // SIGNAL_WRITE is never modified after the initial
     // setup, and is a valid file descriptor, so this is safe
-    let fd = unsafe { BorrowedFd::borrow_raw(SIGNAL_WRITE.unwrap()) };
+    let fd = unsafe { SIGNAL_WRITE.unwrap() };
     write(fd, &signal.to_ne_bytes()).expect("failed to write to signal buffer");
 }
 
 /// # Safety
 /// cannot be called by multiple threads
 pub unsafe fn setup_signal_handling() {
-    let (read_pipe, write_pipe) = nix::unistd::pipe().expect("could not create signal buffer pipe");
-    nix::fcntl::fcntl(
-        read_pipe.as_raw_fd(),
-        nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
-    )
-    .expect("signal buffer pipe could not be set as non-blocking");
+    let (read_pipe, write_pipe) = pipe().expect("could not create signal buffer pipe");
+    let result = unsafe { libc::fcntl(read_pipe.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
+    if result < 0 {
+        panic!(
+            "failed initialize async buffer for signal handling ({})",
+            get_current_errno_value()
+        );
+    }
     SIGNAL_WRITE = Some(write_pipe.into_raw_fd());
     SIGNAL_READ = Some(read_pipe.into_raw_fd());
 }
@@ -287,7 +252,7 @@ fn get_pending_signal() -> Option<Signal> {
     let mut buf = [0u8; size_of::<libc::c_int>()];
     match read(fd, &mut buf) {
         Err(err) => {
-            if err == Errno::EAGAIN {
+            if err.errno == Errno::EAGAIN {
                 None
             } else {
                 panic!("failed to write to signal pipe ({err})");
@@ -304,32 +269,32 @@ fn get_pending_signal() -> Option<Signal> {
     }
 }
 
+unsafe fn handle_signal(signal: Signal, handler: libc::sighandler_t) {
+    let mut empty_sigset: libc::sigset_t = std::mem::zeroed::<libc::sigset_t>();
+    // never fails
+    libc::sigemptyset(&mut empty_sigset);
+    let action = libc::sigaction {
+        sa_sigaction: handler,
+        sa_mask: empty_sigset,
+        sa_flags: 0,
+        sa_restorer: None,
+    };
+    let result = libc::sigaction(signal.into(), &action, std::ptr::null_mut());
+    if result < 0 {
+        panic!("failed to set signal handler")
+    }
+}
+
 pub unsafe fn handle_signal_ignore(signal: Signal) {
-    sigaction(
-        signal.into(),
-        &SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty()),
-    )
-    .unwrap();
+    handle_signal(signal, libc::SIG_IGN);
 }
 
 pub unsafe fn handle_signal_default(signal: Signal) {
-    sigaction(
-        signal.into(),
-        &SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty()),
-    )
-    .unwrap();
+    handle_signal(signal, libc::SIG_DFL);
 }
 
 pub unsafe fn handle_signal_write_to_signal_buffer(signal: Signal) {
-    sigaction(
-        signal.into(),
-        &SigAction::new(
-            SigHandler::Handler(write_signal_to_buffer),
-            SaFlags::empty(),
-            SigSet::empty(),
-        ),
-    )
-    .unwrap();
+    handle_signal(signal, &write_signal_to_buffer as *const _ as libc::size_t)
 }
 
 #[derive(Clone)]
@@ -360,11 +325,7 @@ impl SignalManager {
                 // set at startup for an interactive shell, but its not registered
                 // as a trap action
                 TrapAction::Commands(_) | TrapAction::Default => unsafe {
-                    sigaction(
-                        signal.into(),
-                        &SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty()),
-                    )
-                    .unwrap();
+                    unsafe { handle_signal_default(signal) };
                     *action = TrapAction::Default;
                 },
                 TrapAction::Ignore => {}
@@ -422,4 +383,16 @@ impl SignalManager {
     pub fn get_sigint_count(&self) -> u32 {
         self.sigint_count
     }
+}
+
+pub fn signal_to_exit_status(signal: Signal) -> libc::c_int {
+    128 + signal as libc::c_int
+}
+
+pub fn kill(pid: Pid, signal: Option<Signal>) -> OsResult<()> {
+    let result = unsafe { libc::kill(pid, signal.map(|s| s.into()).unwrap_or(0)) };
+    if result < 0 {
+        return Err(OsError::from_current_errno("kill"));
+    }
+    Ok(())
 }

@@ -7,9 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::utils::{signal_to_exit_status, waitpid, OsResult};
-use nix::sys::wait::{WaitPidFlag, WaitStatus};
-use nix::unistd::Pid;
+use crate::os::signals::{signal_to_exit_status, Signal};
+use crate::os::{waitpid, OsResult, Pid, WaitStatus};
 use std::fmt::{Display, Formatter, Write};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -31,7 +30,7 @@ impl Display for JobPosition {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum JobState {
-    Done(i32),
+    Done(libc::c_int),
     Running,
     Stopped,
 }
@@ -145,13 +144,13 @@ impl JobManager {
             if let JobState::Done(_) = job.state {
                 continue;
             }
-            match waitpid(job.pid, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED))? {
-                WaitStatus::Exited(_, status) => {
-                    job.state = JobState::Done(status);
+            match waitpid(job.pid, true, true)? {
+                WaitStatus::Exited { exit_status } => {
+                    job.state = JobState::Done(exit_status);
                     job.state_should_be_reported = true;
                 }
-                WaitStatus::Signaled(_, signal, _) => {
-                    if signal == nix::sys::signal::SIGTSTP {
+                WaitStatus::Signaled { signal, .. } => {
+                    if signal == Signal::SigStop {
                         job.state = JobState::Stopped;
                     } else {
                         job.state = JobState::Done(signal_to_exit_status(signal));
@@ -159,12 +158,10 @@ impl JobManager {
                     job.state_should_be_reported = true;
                 }
                 WaitStatus::StillAlive => {}
-                WaitStatus::Stopped(_, _) => {
+                WaitStatus::Stopped { .. } => {
                     job.state = JobState::Stopped;
                     job.state_should_be_reported = true;
                 }
-                // no other results possible without specifying flags in waitpid
-                _ => unreachable!(),
             }
         }
         Ok(())

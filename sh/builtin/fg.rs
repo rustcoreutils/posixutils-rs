@@ -9,9 +9,9 @@
 
 use crate::builtin::{skip_option_terminator, BuiltinResult, BuiltinUtility};
 use crate::jobs::{parse_job_id, Job, JobId, JobState};
+use crate::os::signals::{kill, Signal};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
-use nix::sys::signal::kill;
 
 fn run_foreground_job(
     shell: &mut Shell,
@@ -23,7 +23,7 @@ fn run_foreground_job(
         return Err(format!("fg: job {arg} already terminated"));
     }
     if job.state == JobState::Stopped {
-        kill(job.pid, nix::sys::signal::SIGCONT)
+        kill(job.pid, Some(Signal::SigCont))
             .map_err(|err| format!("fg: failed to resume {arg} ({err})"))?;
     }
     opened_files.write_out(format!("{}\n", job.command));

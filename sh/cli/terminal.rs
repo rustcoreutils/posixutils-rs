@@ -7,16 +7,37 @@
 // SPDX-License-Identifier: MIT
 //
 
+use crate::os::errno::get_current_errno_value;
 use atty::Stream;
-use nix::sys::termios;
-use nix::sys::termios::{LocalFlags, Termios};
 use std::io;
 use std::io::Read;
-use std::os::fd::AsFd;
+
+fn get_current_settings() -> libc::termios {
+    // using zeroed here because terminos has additional members on some systems
+    let mut settings = unsafe { std::mem::zeroed::<libc::termios>() };
+    let result = unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut settings) };
+    if result < 0 {
+        panic!(
+            "failed to read terminal settings ({})",
+            get_current_errno_value()
+        );
+    }
+    settings
+}
+
+fn set_terminal_settings(settings: &libc::termios) {
+    let result = unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, settings) };
+    if result < 0 {
+        panic!(
+            "failed to set terminal settings {}",
+            get_current_errno_value()
+        );
+    }
+}
 
 #[derive(Clone)]
 pub struct Terminal {
-    base_settings: Option<Termios>,
+    base_settings: Option<libc::termios>,
 }
 
 impl Terminal {
@@ -24,45 +45,41 @@ impl Terminal {
     /// Panics if the current process is not attached to a terminal.
     pub fn set_nonblocking_no_echo(&self) {
         let mut termios = self.base_settings.clone().unwrap();
-        termios.local_flags &= !(LocalFlags::ECHO | LocalFlags::ICANON);
-        termios.control_chars[termios::SpecialCharacterIndices::VMIN as usize] = 0;
-        termios.control_chars[termios::SpecialCharacterIndices::VTIME as usize] = 0;
-
-        termios::tcsetattr(io::stdin().as_fd(), termios::SetArg::TCSANOW, &termios).unwrap();
+        termios.c_lflag &= !(libc::ECHO | libc::ICANON);
+        termios.c_cc[libc::VMIN] = 0;
+        termios.c_cc[libc::VTIME] = 0;
+        set_terminal_settings(&termios);
     }
 
     /// # Panic
     /// Panics if the current process is not attached to a terminal.
     pub fn set_nonblocking(&self) {
         let mut termios = self.base_settings.clone().unwrap();
-        termios.local_flags &= !LocalFlags::ICANON;
-        termios.control_chars[termios::SpecialCharacterIndices::VMIN as usize] = 0;
-        termios.control_chars[termios::SpecialCharacterIndices::VTIME as usize] = 0;
-
-        termios::tcsetattr(io::stdin().as_fd(), termios::SetArg::TCSANOW, &termios).unwrap();
+        termios.c_lflag &= !libc::ICANON;
+        termios.c_cc[libc::VMIN] = 0;
+        termios.c_cc[libc::VTIME] = 0;
+        set_terminal_settings(&termios);
     }
 
     /// Doesn't do anything if the current process is not attached to a terminal.
-    pub fn reset(&self) -> Termios {
-        let current = termios::tcgetattr(io::stdin().as_fd()).unwrap();
+    pub fn reset(&self) -> libc::termios {
+        let current = get_current_settings();
         if let Some(base_settings) = &self.base_settings {
-            termios::tcsetattr(io::stdin().as_fd(), termios::SetArg::TCSANOW, base_settings)
-                .unwrap();
+            set_terminal_settings(base_settings);
         }
         current
     }
 
-    pub fn set(&self, settings: Termios) {
-        termios::tcsetattr(io::stdin().as_fd(), termios::SetArg::TCSANOW, &settings).unwrap();
+    pub fn set(&self, settings: libc::termios) {
+        set_terminal_settings(&settings)
     }
 }
 
 impl Default for Terminal {
     fn default() -> Self {
         if is_attached_to_terminal() {
-            let base_settings = termios::tcgetattr(io::stdin().as_fd()).unwrap();
             Terminal {
-                base_settings: Some(base_settings),
+                base_settings: Some(get_current_settings()),
             }
         } else {
             Terminal {

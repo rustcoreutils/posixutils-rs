@@ -9,7 +9,6 @@
 
 use crate::parse::word::{Word, WordPart};
 use crate::shell::environment::Environment;
-use nix::libc;
 use std::ffi::{c_char, CStr, CString};
 
 fn is_portable_filename_character(c: char) -> bool {

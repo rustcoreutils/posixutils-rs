@@ -9,10 +9,9 @@
 
 use crate::builtin::{BuiltinResult, BuiltinUtility};
 use crate::option_parser::OptionParser;
+use crate::os::errno::{get_current_errno_value, Errno};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
-use nix::libc::{rlim_t, RLIM_INFINITY};
-use nix::sys::resource::Resource;
 use std::fmt::Display;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -37,7 +36,7 @@ enum LimitType {
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum LimitQuantity {
     Unlimited,
-    Number(rlim_t),
+    Number(libc::rlim_t),
 }
 
 impl LimitQuantity {
@@ -46,23 +45,23 @@ impl LimitQuantity {
             Ok(LimitQuantity::Unlimited)
         } else {
             value
-                .parse::<rlim_t>()
+                .parse::<libc::rlim_t>()
                 .map(LimitQuantity::Number)
                 .map_err(|_| ())
         }
     }
 
-    fn new(limit: rlim_t, divisor: rlim_t) -> Self {
-        if limit == RLIM_INFINITY {
+    fn new(limit: libc::rlim_t, divisor: libc::rlim_t) -> Self {
+        if limit == libc::RLIM_INFINITY {
             LimitQuantity::Unlimited
         } else {
             LimitQuantity::Number(limit / divisor)
         }
     }
 
-    fn into_rlim_t(self, multiplier: rlim_t) -> Result<rlim_t, String> {
+    fn into_rlim_t(self, multiplier: libc::rlim_t) -> Result<libc::rlim_t, String> {
         match self {
-            LimitQuantity::Unlimited => Ok(RLIM_INFINITY),
+            LimitQuantity::Unlimited => Ok(libc::RLIM_INFINITY),
             LimitQuantity::Number(value) => value
                 .checked_mul(multiplier)
                 .ok_or("ulimit: value too large".to_string()),
@@ -70,10 +69,10 @@ impl LimitQuantity {
     }
 }
 
-impl From<LimitQuantity> for rlim_t {
+impl From<LimitQuantity> for libc::rlim_t {
     fn from(limit: LimitQuantity) -> Self {
         match limit {
-            LimitQuantity::Unlimited => RLIM_INFINITY,
+            LimitQuantity::Unlimited => libc::RLIM_INFINITY,
             LimitQuantity::Number(value) => value,
         }
     }
@@ -180,39 +179,56 @@ impl UlimitArgs {
     }
 }
 
-fn get_limit(resource: Resource, hard_limit: bool, divisor: rlim_t) -> LimitQuantity {
-    // from what I can tell, this function can never fail, so unwrap is safe
-    let (soft, hard) = nix::sys::resource::getrlimit(resource).unwrap();
+fn get_limits(resource: libc::c_int) -> libc::rlimit {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let result = unsafe { libc::getrlimit(resource as _, &mut limit) };
+    if result < 0 {
+        panic!("invalid call to getrlimit")
+    }
+    limit
+}
+
+fn get_limit(resource: libc::c_int, hard_limit: bool, divisor: libc::rlim_t) -> LimitQuantity {
+    let limits = get_limits(resource);
     if hard_limit {
-        LimitQuantity::new(hard, divisor)
+        LimitQuantity::new(limits.rlim_max, divisor)
     } else {
-        LimitQuantity::new(soft, divisor)
+        LimitQuantity::new(limits.rlim_cur, divisor)
     }
 }
 
 fn set_limit(
-    resource: Resource,
+    resource: libc::c_int,
     newlimit: LimitQuantity,
     limit_type: LimitType,
-    multiplier: rlim_t,
+    multiplier: libc::rlim_t,
 ) -> Result<(), String> {
-    fn map_err(err: nix::Error) -> String {
-        format!("ulimit: cannot modify limit ({err})")
-    }
-
-    let (prev_soft, prev_hard) = nix::sys::resource::getrlimit(resource).unwrap();
+    let mut limits = get_limits(resource);
     let newlimit = newlimit.into_rlim_t(multiplier)?;
     match limit_type {
         LimitType::Soft => {
-            nix::sys::resource::setrlimit(resource, newlimit, prev_hard).map_err(map_err)
+            limits.rlim_cur = newlimit;
+            limits.rlim_max = limits.rlim_max.max(newlimit);
         }
         LimitType::Hard => {
-            nix::sys::resource::setrlimit(resource, prev_soft, newlimit).map_err(map_err)
+            limits.rlim_max = newlimit;
         }
         LimitType::Both => {
-            nix::sys::resource::setrlimit(resource, newlimit, newlimit).map_err(map_err)
+            limits.rlim_cur = newlimit;
+            limits.rlim_max = newlimit;
         }
     }
+    let result = unsafe { libc::setrlimit(resource as _, &limits) };
+    if result < 0 {
+        return Err(format!(
+            "ulimit: cannot modify limit ({})",
+            get_current_errno_value()
+        ));
+    }
+    Ok(())
 }
 
 pub struct Ulimit;
@@ -229,25 +245,30 @@ impl BuiltinUtility for Ulimit {
         if let Some(newlimit) = args.newlimit {
             match args.resource {
                 ResourceLimit::Core => {
-                    set_limit(Resource::RLIMIT_CORE, newlimit, args.limit, 512)?;
+                    set_limit(libc::RLIMIT_CORE as libc::c_int, newlimit, args.limit, 512)?;
                 }
                 ResourceLimit::Data => {
-                    set_limit(Resource::RLIMIT_DATA, newlimit, args.limit, 1024)?;
+                    set_limit(libc::RLIMIT_DATA as libc::c_int, newlimit, args.limit, 1024)?;
                 }
                 ResourceLimit::FSize => {
-                    set_limit(Resource::RLIMIT_FSIZE, newlimit, args.limit, 512)?;
+                    set_limit(libc::RLIMIT_FSIZE as libc::c_int, newlimit, args.limit, 512)?;
                 }
                 ResourceLimit::NoFile => {
-                    set_limit(Resource::RLIMIT_NOFILE, newlimit, args.limit, 1)?;
+                    set_limit(libc::RLIMIT_NOFILE as libc::c_int, newlimit, args.limit, 1)?;
                 }
                 ResourceLimit::Stack => {
-                    set_limit(Resource::RLIMIT_STACK, newlimit, args.limit, 1024)?;
+                    set_limit(
+                        libc::RLIMIT_STACK as libc::c_int,
+                        newlimit,
+                        args.limit,
+                        1024,
+                    )?;
                 }
                 ResourceLimit::Cpu => {
-                    set_limit(Resource::RLIMIT_CPU, newlimit, args.limit, 1)?;
+                    set_limit(libc::RLIMIT_CPU as libc::c_int, newlimit, args.limit, 1)?;
                 }
                 ResourceLimit::As => {
-                    set_limit(Resource::RLIMIT_AS, newlimit, args.limit, 1024)?;
+                    set_limit(libc::RLIMIT_AS as libc::c_int, newlimit, args.limit, 1024)?;
                 }
                 ResourceLimit::All => unreachable!(),
             }
@@ -258,43 +279,43 @@ impl BuiltinUtility for Ulimit {
             if args.resource == ResourceLimit::Core || all {
                 opened_files.write_out(format!(
                     "core file size (-c)             [blocks] {}\n",
-                    get_limit(Resource::RLIMIT_CORE, hard_limit, 512)
+                    get_limit(libc::RLIMIT_CORE as libc::c_int, hard_limit, 512)
                 ));
             }
             if args.resource == ResourceLimit::Data || all {
                 opened_files.write_out(format!(
                     "data seg size (-d)                 [KiB] {}\n",
-                    get_limit(Resource::RLIMIT_DATA, hard_limit, 1024)
+                    get_limit(libc::RLIMIT_DATA as libc::c_int, hard_limit, 1024)
                 ));
             }
             if args.resource == ResourceLimit::FSize || all {
                 opened_files.write_out(format!(
                     "file size (-f)                  [blocks] {}\n",
-                    get_limit(Resource::RLIMIT_FSIZE, hard_limit, 512)
+                    get_limit(libc::RLIMIT_FSIZE as libc::c_int, hard_limit, 512)
                 ));
             }
             if args.resource == ResourceLimit::NoFile || all {
                 opened_files.write_out(format!(
                     "open files (-n)                          {}\n",
-                    get_limit(Resource::RLIMIT_NOFILE, hard_limit, 1)
+                    get_limit(libc::RLIMIT_NOFILE as libc::c_int, hard_limit, 1)
                 ));
             }
             if args.resource == ResourceLimit::Stack || all {
                 opened_files.write_out(format!(
                     "stack size (-s)                    [KiB] {}\n",
-                    get_limit(Resource::RLIMIT_STACK, hard_limit, 1024)
+                    get_limit(libc::RLIMIT_STACK as libc::c_int, hard_limit, 1024)
                 ));
             }
             if args.resource == ResourceLimit::Cpu || all {
                 opened_files.write_out(format!(
                     "cpu time (-t)                  [seconds] {}\n",
-                    get_limit(Resource::RLIMIT_CPU, hard_limit, 1)
+                    get_limit(libc::RLIMIT_CPU as libc::c_int, hard_limit, 1)
                 ));
             }
             if args.resource == ResourceLimit::As || all {
                 opened_files.write_out(format!(
                     "virtual memory (-v)                [KiB] {}\n",
-                    get_limit(Resource::RLIMIT_AS, hard_limit, 1024)
+                    get_limit(libc::RLIMIT_AS as libc::c_int, hard_limit, 1024)
                 ));
             }
         }

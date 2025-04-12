@@ -130,6 +130,8 @@ pub fn waitpid(pid: Pid, no_hang: bool, untraced: bool) -> OsResult<WaitStatus> 
     let wait_result = unsafe { libc::waitpid(pid, &mut status, options) };
     if wait_result < 0 {
         Err(OsError::from_current_errno("waitpid"))
+    } else if wait_result == 0 && no_hang {
+        Ok(WaitStatus::StillAlive)
     } else if libc::WIFEXITED(status) {
         let exit_status = libc::WEXITSTATUS(status);
         Ok(WaitStatus::Exited { exit_status })
@@ -146,7 +148,7 @@ pub fn waitpid(pid: Pid, no_hang: bool, untraced: bool) -> OsResult<WaitStatus> 
             signal: Signal::try_from(raw_stop_signal).expect("invalid signal"),
         })
     } else {
-        Ok(WaitStatus::StillAlive)
+        unreachable!()
     }
 }
 

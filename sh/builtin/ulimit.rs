@@ -9,7 +9,7 @@
 
 use crate::builtin::{BuiltinResult, BuiltinUtility};
 use crate::option_parser::OptionParser;
-use crate::os::errno::{get_current_errno_value, Errno};
+use crate::os::errno::get_current_errno_value;
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 use std::fmt::Display;

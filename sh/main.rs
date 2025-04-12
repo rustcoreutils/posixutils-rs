@@ -21,7 +21,7 @@ use os::signals::{
 use std::error::Error;
 use std::io;
 use std::io::Write;
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::AsRawFd;
 use std::time::Duration;
 
 mod builtin;

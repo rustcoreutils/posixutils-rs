@@ -38,7 +38,7 @@ use std::ffi::{CString, OsString};
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::{read_to_string, Read};
-use std::os::fd::{AsFd, AsRawFd, IntoRawFd};
+use std::os::fd::{AsRawFd, IntoRawFd};
 use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
@@ -214,7 +214,6 @@ impl Shell {
                     self.handle_async_events();
                     std::thread::sleep(Duration::from_millis(16));
                 }
-                _ => unreachable!(),
             }
         }
     }
@@ -765,8 +764,6 @@ impl Shell {
                 }
                 ForkResult::Parent { child } => {
                     loop {
-                        // some patterns are only available on linux
-                        #[allow(unreachable_patterns)]
                         match waitpid(child, true, true)? {
                             WaitStatus::Exited { .. } => {
                                 // the only way this happened is if there was an error before going
@@ -800,7 +797,6 @@ impl Shell {
                                 self.handle_async_events();
                                 std::thread::sleep(Duration::from_millis(16));
                             }
-                            _ => unreachable!(),
                         }
                     }
                 }

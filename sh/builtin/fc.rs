@@ -15,7 +15,7 @@ use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
 use std::fs::File;
 use std::io::Read;
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::FromRawFd;
 use std::path::PathBuf;
 
 #[derive(Debug, Eq, PartialEq)]

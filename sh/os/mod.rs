@@ -110,6 +110,7 @@ pub fn dup2(old_fd: RawFd, new_fd: RawFd) -> OsResult<RawFd> {
     Ok(dup_result)
 }
 
+#[allow(dead_code)]
 pub enum WaitStatus {
     Exited { exit_status: libc::c_int },
     Signaled { signal: Signal, core_dumped: bool },

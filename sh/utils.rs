@@ -8,7 +8,6 @@
 //
 
 use std::ffi::CStr;
-use std::fmt::Display;
 
 pub fn strcoll(lhs: &CStr, rhs: &CStr) -> std::cmp::Ordering {
     // strings are valid, this is safe

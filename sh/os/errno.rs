@@ -208,14 +208,13 @@ impl Errno {
         value: libc::EWOULDBLOCK,
     };
     pub const EXDEV: Self = Self { value: libc::EXDEV };
-
-    pub fn into_raw(self) -> libc::c_int {
-        self.value
-    }
 }
 
 impl Debug for Errno {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        // some variants have the same value, but it's not guaranteed by the
+        // standard
+        #[allow(unreachable_patterns)]
         match self.value {
             libc::E2BIG => write!(f, "E2BIG: argument list too long"),
             libc::EACCES => write!(f, "EACCESS: permission denied"),
@@ -311,6 +310,9 @@ impl Display for Errno {
 impl TryFrom<libc::c_int> for Errno {
     type Error = ();
     fn try_from(value: libc::c_int) -> Result<Self, Self::Error> {
+        // some variants have the same value, but its not guaranteed by the
+        // standard
+        #[allow(unreachable_patterns)]
         match value {
             libc::E2BIG => Ok(Self::E2BIG),
             libc::EACCES => Ok(Self::EACCES),

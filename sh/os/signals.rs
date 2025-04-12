@@ -324,10 +324,10 @@ impl SignalManager {
                 // we also reset default actions because ignore could have been
                 // set at startup for an interactive shell, but its not registered
                 // as a trap action
-                TrapAction::Commands(_) | TrapAction::Default => unsafe {
+                TrapAction::Commands(_) | TrapAction::Default => {
                     unsafe { handle_signal_default(signal) };
                     *action = TrapAction::Default;
-                },
+                }
                 TrapAction::Ignore => {}
             }
         }

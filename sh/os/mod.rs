@@ -197,12 +197,14 @@ pub fn exec(
         .iter()
         .map(|s| CString::new(s.as_str()).unwrap())
         .collect::<Vec<_>>();
-    let args_ptr_vec = args.iter().map(|s| s.as_ptr()).collect::<Vec<_>>();
+    let mut args_ptr_vec = args.iter().map(|s| s.as_ptr()).collect::<Vec<_>>();
+    args_ptr_vec.push(std::ptr::null());
     let env = env
         .exported()
         .map(|(name, value)| CString::new(format!("{name}={value}")).unwrap())
         .collect::<Vec<CString>>();
-    let env_ptr_vec = env.iter().map(|s| s.as_ptr()).collect::<Vec<_>>();
+    let mut env_ptr_vec = env.iter().map(|s| s.as_ptr()).collect::<Vec<_>>();
+    env_ptr_vec.push(std::ptr::null());
     let exit_status = unsafe {
         libc::execve(
             command.as_ptr(),

@@ -778,17 +778,22 @@ impl Shell {
                                 if is_process_in_foreground() {
                                     // should never fail as child is a valid process id and
                                     // in the same session as the current shell
-                                    let child_gpid = getpgid(child).unwrap();
+                                    let child_gpid = getpgid(child)
+                                        .expect("failed to get process id of child process");
                                     // should never fail as stdin is a valid file descriptor and
                                     // child gpid is valid and in the same session
-                                    tcsetpgrp(io::stdin().as_raw_fd(), child_gpid).unwrap();
-                                    kill(child, Some(Signal::SigCont)).unwrap();
+                                    tcsetpgrp(io::stdin().as_raw_fd(), child_gpid)
+                                        .expect("failed to set pipeline in foreground");
+                                    kill(child, Some(Signal::SigCont))
+                                        .expect("failed to start pipeline");
                                     pipeline_exit_status = self.wait_child_process(child)?;
                                     // should never fail
-                                    tcsetpgrp(io::stdin().as_raw_fd(), getpgrp()).unwrap();
+                                    tcsetpgrp(io::stdin().as_raw_fd(), getpgrp())
+                                        .expect("failed to reset foreground process");
                                     break;
                                 } else {
-                                    kill(child, Some(Signal::SigCont)).unwrap();
+                                    kill(child, Some(Signal::SigCont))
+                                        .expect("failed start pipeline");
                                     pipeline_exit_status = self.wait_child_process(child)?;
                                     break;
                                 }

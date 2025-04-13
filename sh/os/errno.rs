@@ -406,6 +406,7 @@ impl TryFrom<libc::c_int> for Errno {
 }
 
 pub fn get_current_errno_value() -> Errno {
-    let errno = unsafe { *libc::__errno_location() };
+    // guaranteed to be some, unwrap is safe
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap();
     errno.try_into().expect("invalid errno value")
 }

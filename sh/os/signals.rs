@@ -270,16 +270,14 @@ fn get_pending_signal() -> Option<Signal> {
 }
 
 unsafe fn handle_signal(signal: Signal, handler: libc::sighandler_t) {
-    let mut empty_sigset: libc::sigset_t = std::mem::zeroed::<libc::sigset_t>();
+    // sigaction contains different field on different systems, we can't
+    // initialize it directly
+    let mut action = std::mem::zeroed::<libc::sigaction>();
+    action.sa_sigaction = handler;
     // never fails
-    libc::sigemptyset(&mut empty_sigset);
+    libc::sigemptyset(&mut action.sa_mask);
+    action.sa_flags = libc::SA_SIGINFO;
 
-    let action = libc::sigaction {
-        sa_sigaction: handler,
-        sa_mask: empty_sigset,
-        sa_flags: libc::SA_SIGINFO,
-        sa_restorer: None,
-    };
     let result = libc::sigaction(signal.into(), &action, std::ptr::null_mut());
     if result < 0 {
         panic!("failed to set signal handler")

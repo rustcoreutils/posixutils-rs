@@ -15,6 +15,12 @@ use crate::builtin::{
 use crate::cli::terminal::Terminal;
 use crate::jobs::{JobManager, JobState};
 use crate::nonempty::NonEmpty;
+use crate::os::errno::Errno;
+use crate::os::signals::{kill, signal_to_exit_status, Signal, SignalManager};
+use crate::os::{
+    close, dup2, exec, find_command, fork, getpgid, getpgrp, is_process_in_foreground, pipe,
+    setpgid, tcsetpgrp, waitpid, ExecError, ForkResult, OsError, OsResult, Pid, WaitStatus,
+};
 use crate::parse::command::{
     Assignment, CaseItem, Command, CommandType, CompleteCommand, CompoundCommand, Conjunction,
     FunctionDefinition, If, LogicalOp, Name, Pipeline, Redirection, SimpleCommand,
@@ -26,28 +32,17 @@ use crate::parse::{AliasTable, ParserError};
 use crate::shell::environment::{CannotModifyReadonly, Environment, Value};
 use crate::shell::history::{initialize_history_from_system, write_history_to_file, History};
 use crate::shell::opened_files::OpenedFiles;
-use crate::signals::SignalManager;
-use crate::utils::{
-    close, dup2, exec, find_command, fork, is_process_in_foreground, pipe, signal_to_exit_status,
-    waitpid, ExecError, OsError, OsResult,
-};
 use crate::wordexp::{expand_word, expand_word_to_string, word_to_pattern};
-use nix::errno::Errno;
-use nix::libc;
-use nix::sys::signal::kill;
-use nix::sys::signal::Signal as NixSignal;
-use nix::sys::wait::{WaitPidFlag, WaitStatus};
-use nix::unistd::{getcwd, getpgid, getpgrp, getpid, getppid, setpgid, tcsetpgrp, ForkResult, Pid};
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
 use std::fmt::{Display, Formatter};
 use std::fs::File;
-use std::io;
 use std::io::{read_to_string, Read};
-use std::os::fd::{AsFd, AsRawFd, IntoRawFd};
+use std::os::fd::{AsRawFd, IntoRawFd};
 use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
+use std::{env, io};
 
 pub mod environment;
 pub mod history;
@@ -204,13 +199,10 @@ impl Shell {
 
     pub fn wait_child_process(&mut self, child_pid: Pid) -> OsResult<i32> {
         loop {
-            match waitpid(
-                child_pid,
-                Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED),
-            )? {
-                WaitStatus::Exited(_, status) => return Ok(status),
-                WaitStatus::Signaled(_, signal, _) => return Ok(signal_to_exit_status(signal)),
-                WaitStatus::Stopped(_, signal) => {
+            match waitpid(child_pid, true, true)? {
+                WaitStatus::Exited { exit_status } => return Ok(exit_status),
+                WaitStatus::Signaled { signal, .. } => return Ok(signal_to_exit_status(signal)),
+                WaitStatus::Stopped { signal } => {
                     self.background_jobs.add_job(
                         child_pid,
                         self.last_pipeline_command.clone(),
@@ -222,7 +214,6 @@ impl Shell {
                     self.handle_async_events();
                     std::thread::sleep(Duration::from_millis(16));
                 }
-                _ => unreachable!(),
             }
         }
     }
@@ -302,8 +293,9 @@ impl Shell {
                     }
                 }
                 self.eprint(&format!(
-                    "sh: failed to execute {}\n",
-                    command.to_string_lossy()
+                    "sh: failed to execute {} ({})\n",
+                    command.to_string_lossy(),
+                    errno
                 ));
                 self.exit(126);
             }
@@ -732,10 +724,10 @@ impl Shell {
                 ForkResult::Child => {
                     self.become_subshell();
                     // this should never fail as both arguments are valid
-                    setpgid(Pid::from_raw(0), Pid::from_raw(0)).unwrap();
+                    setpgid(0, 0).expect("failed to create new process group");
                     let pipeline_pgid = getpgrp();
                     // wait for the parent process to put the subshell in the foreground
-                    if let Err(err) = kill(Pid::from_raw(0), NixSignal::SIGTSTP) {
+                    if let Err(err) = kill(0, Some(Signal::SigStop)) {
                         self.eprint(&format!("sh: internal call to kill failed ({err})"));
                         self.exit(1);
                     }
@@ -746,7 +738,8 @@ impl Shell {
                         match fork()? {
                             ForkResult::Child => {
                                 // should never fail as `pipeline_pgid` is a valid process group
-                                setpgid(Pid::from_raw(0), pipeline_pgid).unwrap();
+                                setpgid(0, pipeline_pgid)
+                                    .expect("failed to set process group for pipeline subcommand");
                                 drop(read_pipe);
                                 dup2(current_stdin, libc::STDIN_FILENO)?;
                                 dup2(write_pipe.as_raw_fd(), libc::STDOUT_FILENO)?;
@@ -771,37 +764,36 @@ impl Shell {
                 }
                 ForkResult::Parent { child } => {
                     loop {
-                        // some patterns are only available on linux
-                        #[allow(unreachable_patterns)]
-                        match waitpid(child, Some(WaitPidFlag::WNOHANG | WaitPidFlag::WUNTRACED))? {
-                            WaitStatus::Exited(_, _) => {
+                        match waitpid(child, true, true)? {
+                            WaitStatus::Exited { .. } => {
                                 // the only way this happened is if there was an error before going
                                 // the child went to sleep
                                 return Ok(1);
                             }
-                            WaitStatus::Signaled(_, _, _) => {
+                            WaitStatus::Signaled { .. } => {
                                 self.eprint("sh: unsynchronised pipeline was terminated by another process\n");
                                 return Ok(1);
                             }
-                            WaitStatus::Continued(_) => {
-                                self.eprint("sh: unsynchronised pipeline was restarted by another process\n");
-                                return Ok(1);
-                            }
-                            WaitStatus::Stopped(_, _) => {
+                            WaitStatus::Stopped { .. } => {
                                 if is_process_in_foreground() {
                                     // should never fail as child is a valid process id and
                                     // in the same session as the current shell
-                                    let child_gpid = getpgid(Some(child)).unwrap();
+                                    let child_gpid = getpgid(child)
+                                        .expect("failed to get process id of child process");
                                     // should never fail as stdin is a valid file descriptor and
                                     // child gpid is valid and in the same session
-                                    tcsetpgrp(io::stdin().as_fd(), child_gpid).unwrap();
-                                    kill(child, NixSignal::SIGCONT).unwrap();
+                                    tcsetpgrp(io::stdin().as_raw_fd(), child_gpid)
+                                        .expect("failed to set pipeline in foreground");
+                                    kill(child, Some(Signal::SigCont))
+                                        .expect("failed to start pipeline");
                                     pipeline_exit_status = self.wait_child_process(child)?;
                                     // should never fail
-                                    tcsetpgrp(io::stdin().as_fd(), getpgrp()).unwrap();
+                                    tcsetpgrp(io::stdin().as_raw_fd(), getpgrp())
+                                        .expect("failed to reset foreground process");
                                     break;
                                 } else {
-                                    kill(child, NixSignal::SIGCONT).unwrap();
+                                    kill(child, Some(Signal::SigCont))
+                                        .expect("failed start pipeline");
                                     pipeline_exit_status = self.wait_child_process(child)?;
                                     break;
                                 }
@@ -810,7 +802,6 @@ impl Shell {
                                 self.handle_async_events();
                                 std::thread::sleep(Duration::from_millis(16));
                             }
-                            _ => unreachable!(),
                         }
                     }
                 }
@@ -865,8 +856,7 @@ impl Shell {
                 Ok(ForkResult::Child) => {
                     self.become_subshell();
                     // should never fail
-                    setpgid(Pid::from_raw(0), Pid::from_raw(0))
-                        .expect("failed to create process group for background job");
+                    setpgid(0, 0).expect("failed to create process group for background job");
                     let status = self.interpret_and_or_list(&conjunction.elements, false);
                     self.exit(status);
                 }
@@ -913,8 +903,8 @@ impl Shell {
             }
             ForkResult::Parent { child } => {
                 drop(write_pipe);
-                match waitpid(child, None)? {
-                    WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _) => {
+                match waitpid(child, false, false)? {
+                    WaitStatus::Exited { .. } | WaitStatus::Signaled { .. } => {
                         let read_file = File::from(read_pipe);
                         let mut output = read_to_string(&read_file).unwrap();
                         let new_len = output.trim_end_matches('\n').len();
@@ -975,14 +965,15 @@ impl Shell {
         // > export immediately
         let mut environment =
             Environment::from(std::env::vars().map(|(k, v)| (k, Value::new_exported(v))));
-        environment.set_global_forced("PPID".to_string(), getppid().to_string());
+        let ppid = unsafe { libc::getppid() };
+        environment.set_global_forced("PPID".to_string(), ppid.to_string());
         environment.set_global_if_unset("IFS", " \t\n");
         environment.set_global_if_unset("PS1", "\\$ ");
         environment.set_global_if_unset("PS2", "> ");
         environment.set_global_if_unset("PS4", "+ ");
         environment.set_global_if_unset("OPTIND", "1");
         let history = initialize_history_from_system(&environment);
-        let current_directory = match getcwd() {
+        let current_directory = match env::current_dir() {
             Ok(path) => path.into_os_string(),
             Err(err) => {
                 eprintln!(
@@ -996,7 +987,7 @@ impl Shell {
             environment,
             program_name,
             positional_parameters: args,
-            shell_pid: getpid().as_raw(),
+            shell_pid: unsafe { libc::getpid() },
             current_directory,
             history,
             set_options,

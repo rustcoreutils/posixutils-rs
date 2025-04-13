@@ -334,7 +334,6 @@ mod tests {
     use crate::parse::word::test_utils::unquoted_literal;
     use crate::parse::word::Word;
     use crate::wordexp::expanded_word::ExpandedWordPart;
-    use nix::unistd::Pid;
 
     fn shell_with_env(env: &[(&str, &str)]) -> Shell {
         let mut shell = Shell::default();
@@ -424,7 +423,7 @@ mod tests {
         );
         shell
             .background_jobs
-            .add_job(Pid::from_raw(123), "cmd".to_string(), JobState::Running);
+            .add_job(123, "cmd".to_string(), JobState::Running);
         assert_eq!(
             expand_parameter_to_string(
                 ParameterExpansion::Simple(Parameter::Special(SpecialParameter::Bang)),

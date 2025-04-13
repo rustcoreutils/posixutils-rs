@@ -10,18 +10,18 @@
 use crate::cli::args::{parse_args, ExecutionMode};
 use crate::cli::terminal::is_attached_to_terminal;
 use crate::cli::{clear_line, set_cursor_pos};
+use crate::os::{getpgrp, is_process_in_foreground, tcsetpgrp};
 use crate::shell::Shell;
-use crate::signals::{
-    handle_signal_ignore, handle_signal_write_to_signal_buffer, setup_signal_handling, Signal,
-};
-use crate::utils::is_process_in_foreground;
 use cli::terminal::read_nonblocking_char;
 use cli::vi::{Action, ViEditor};
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use os::signals::{
+    handle_signal_ignore, handle_signal_write_to_signal_buffer, setup_signal_handling, Signal,
+};
 use std::error::Error;
 use std::io;
 use std::io::Write;
-use std::os::fd::AsFd;
+use std::os::fd::AsRawFd;
 use std::time::Duration;
 
 mod builtin;
@@ -29,10 +29,10 @@ mod cli;
 mod jobs;
 mod nonempty;
 mod option_parser;
+mod os;
 mod parse;
 pub mod pattern;
 mod shell;
-mod signals;
 mod utils;
 mod wordexp;
 
@@ -228,8 +228,8 @@ fn vi_repl(shell: &mut Shell) {
 
 fn interactive_shell(shell: &mut Shell) {
     if is_process_in_foreground() {
-        let pgid = nix::unistd::getpgrp();
-        nix::unistd::tcsetpgrp(io::stdin().as_fd(), pgid).unwrap();
+        let pgid = getpgrp();
+        tcsetpgrp(io::stdin().as_raw_fd(), pgid).unwrap();
     }
     shell.terminal.set_nonblocking_no_echo();
     unsafe { handle_signal_ignore(Signal::SigQuit) }

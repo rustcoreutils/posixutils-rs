@@ -9,9 +9,9 @@
 
 use crate::builtin::{skip_option_terminator, BuiltinResult, BuiltinUtility};
 use crate::jobs::{parse_job_id, Job, JobState};
+use crate::os::signals::{kill, Signal};
 use crate::shell::opened_files::OpenedFiles;
 use crate::shell::Shell;
-use nix::sys::signal::kill;
 
 fn run_background_job(
     arg: &str,
@@ -23,7 +23,7 @@ fn run_background_job(
             "bg: job {arg} is already running in the background"
         ));
     }
-    kill(job.pid, nix::sys::signal::SIGCONT)
+    kill(job.pid, Some(Signal::SigCont))
         .map_err(|err| format!("bg: failed to resume job {arg} ({err})"))?;
     opened_files.write_out(format!("[{}] {}\n", job.number, job.command));
     job.state = JobState::Running;

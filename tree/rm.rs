@@ -9,12 +9,12 @@
 
 mod common;
 
+use ftw::{symlink_metadata, traverse_directory};
+
 use self::common::error_string;
 use clap::Parser;
-use ftw::{self, traverse_directory};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::{
-    ffi::CString,
     fs,
     io::{self, IsTerminal},
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
@@ -72,8 +72,8 @@ fn ask_for_prompt(cfg: &RmConfig, writable: bool) -> bool {
     !cfg.args.force && ((!writable && cfg.is_tty) || cfg.args.interactive)
 }
 
-fn descend_into_directory(cfg: &RmConfig, entry: &ftw::Entry, metadata: &ftw::Metadata) -> bool {
-    let writable = metadata.is_writable();
+fn descend_into_directory(cfg: &RmConfig, entry: &ftw::Entry, meta: &ftw::Metadata) -> bool {
+    let writable = meta.is_writable();
     if ask_for_prompt(cfg, writable) {
         let prompt = if writable {
             gettext!(
@@ -93,8 +93,8 @@ fn descend_into_directory(cfg: &RmConfig, entry: &ftw::Entry, metadata: &ftw::Me
     true
 }
 
-fn should_remove_directory(cfg: &RmConfig, entry: &ftw::Entry, metadata: &ftw::Metadata) -> bool {
-    let writable = metadata.is_writable();
+fn should_remove_directory(cfg: &RmConfig, entry: &ftw::Entry, meta: &ftw::Metadata) -> bool {
+    let writable = meta.is_writable();
     if ask_for_prompt(cfg, writable) {
         let prompt = if writable {
             gettext!(
@@ -116,13 +116,13 @@ fn should_remove_directory(cfg: &RmConfig, entry: &ftw::Entry, metadata: &ftw::M
 
 // The signature of `filename_fn` is to prevent unnecessarily building the filename when a prompt
 // is not required.
-fn should_remove_file<F>(cfg: &RmConfig, metadata: &ftw::Metadata, filename_fn: F) -> bool
+fn should_remove_file<F>(cfg: &RmConfig, meta: &ftw::Metadata, filename_fn: F) -> bool
 where
     F: Fn() -> String,
 {
-    let writable = metadata.is_writable();
+    let writable = meta.is_writable();
     if ask_for_prompt(cfg, writable) {
-        let file_type = metadata.file_type();
+        let file_type = meta.file_type();
         let prompt = match file_type {
             ftw::FileType::Socket => {
                 gettext!("remove socket '{}'?", filename_fn())
@@ -140,7 +140,7 @@ where
                 gettext!("remove fifo '{}'?", filename_fn())
             }
             ftw::FileType::RegularFile => {
-                let is_empty = metadata.size() == 0;
+                let is_empty = meta.size() == 0;
                 if writable {
                     if is_empty {
                         gettext!("remove regular empty file '{}'?", filename_fn())
@@ -179,13 +179,13 @@ enum DirAction {
 fn process_directory(
     cfg: &RmConfig,
     entry: &ftw::Entry,
-    metadata: &ftw::Metadata,
+    meta: &ftw::Metadata,
 ) -> io::Result<DirAction> {
     let dir_is_empty = entry.is_empty_dir();
 
     // If directory is empty or the directory is inaccessible, try to remove it directly
     if (dir_is_empty.is_ok() && dir_is_empty.as_ref().unwrap() == &true) || dir_is_empty.is_err() {
-        if should_remove_directory(cfg, entry, metadata) {
+        if should_remove_directory(cfg, entry, meta) {
             let ret = unsafe {
                 libc::unlinkat(
                     entry.dir_fd(),
@@ -218,7 +218,7 @@ fn process_directory(
 
     // Else, manually traverse the directory to remove the contents one-by-one
     } else {
-        if descend_into_directory(cfg, entry, metadata) {
+        if descend_into_directory(cfg, entry, meta) {
             Ok(DirAction::Entered)
         } else {
             Ok(DirAction::Skipped)
@@ -269,10 +269,10 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
     let success = traverse_directory(
         filepath,
         |entry| {
-            let md = entry.metadata().unwrap();
+            let m = entry.metadata().unwrap();
 
-            if md.file_type() == ftw::FileType::Directory {
-                match process_directory(cfg, &entry, md) {
+            if m.file_type() == ftw::FileType::Directory {
+                match process_directory(cfg, &entry, m) {
                     Ok(dir_action) => match dir_action {
                         DirAction::Entered => Ok(true),
                         DirAction::Removed | DirAction::Skipped => Ok(false),
@@ -283,7 +283,7 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
                     }
                 }
             } else {
-                if should_remove_file(cfg, md, || entry.path().clean_trailing_slashes()) {
+                if should_remove_file(cfg, m, || entry.path().clean_trailing_slashes()) {
                     // Remove the file
                     let ret =
                         unsafe { libc::unlinkat(entry.dir_fd(), entry.file_name().as_ptr(), 0) };
@@ -305,8 +305,8 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
             }
         },
         |entry| {
-            let md = entry.metadata().unwrap();
-            if should_remove_directory(cfg, &entry, md) {
+            let m = entry.metadata().unwrap();
+            if should_remove_directory(cfg, &entry, m) {
                 // Remove the directory
                 let ret = unsafe {
                     libc::unlinkat(
@@ -389,10 +389,9 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
 /// This function returns `Ok(true)` on success. This never returns `Ok(false)` and the function
 /// signature is only to match `rm_directory`.
 fn rm_file(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
-    let filename_cstr = CString::new(filepath.as_os_str().as_bytes())?;
-    let metadata = ftw::Metadata::new(libc::AT_FDCWD, &filename_cstr, false)?;
+    let meta = symlink_metadata(&filepath)?;
 
-    if should_remove_file(cfg, &metadata, || display_cleaned(filepath)) {
+    if should_remove_file(cfg, &meta, || display_cleaned(filepath)) {
         fs::remove_file(filepath).map_err(|e| {
             let err_str = gettext!(
                 "cannot remove '{}': {}",
@@ -407,8 +406,8 @@ fn rm_file(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
 }
 
 fn rm_path(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
-    let metadata = match fs::symlink_metadata(filepath) {
-        Ok(md) => md,
+    let meta = match fs::symlink_metadata(filepath) {
+        Ok(m) => m,
         Err(e) => {
             // Not an error with -f in the case of operands that do not exist
             if e.kind() == io::ErrorKind::NotFound && cfg.args.force {
@@ -424,7 +423,7 @@ fn rm_path(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
         }
     };
 
-    if metadata.is_dir() {
+    if meta.is_dir() {
         rm_directory(cfg, filepath)
     } else {
         rm_file(cfg, filepath)

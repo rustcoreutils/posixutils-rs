@@ -8,6 +8,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+ftw = { path = "../ftw" }
 clap.workspace = true
 gettext-rs.workspace = true
 libc.workspace = true
@@ -18,4 +19,3 @@ workspace = true
 [[bin]]
 name = "df"
 path = "./df.rs"
-

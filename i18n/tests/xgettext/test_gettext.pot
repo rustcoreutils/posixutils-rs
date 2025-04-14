@@ -1,0 +1,4 @@
+#: tests/xgettext/test_gettext.rs:6
+msgid "Hello, world!"
+msgstr ""
+

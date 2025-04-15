@@ -11,7 +11,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, setlocale, textdomain};
 use std::ffi::CString;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;

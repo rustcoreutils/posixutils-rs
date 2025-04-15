@@ -297,7 +297,7 @@ macro_rules! impl_char_and_number {
                                 return Ok(Self {
                                     chr,
                                     ..Default::default()
-                                })
+                                });
                             }
                             Some((start, _)) => {
                                 if let Ok(num) = &s[start..].parse() {

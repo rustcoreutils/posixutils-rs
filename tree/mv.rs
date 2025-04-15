@@ -13,7 +13,7 @@ mod common;
 use self::common::{copy_file, error_string};
 use clap::Parser;
 use common::CopyConfig;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use std::{
     collections::{HashMap, HashSet},
     ffi::CString,

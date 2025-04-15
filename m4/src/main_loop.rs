@@ -1,10 +1,10 @@
 use std::io::Write;
 
+use crate::EOF;
 use crate::error::{Error, ErrorKind};
 use crate::lexer::{is_alpha, is_space};
 use crate::macros::MacroImplementation;
 use crate::state::{StackFrame, State};
-use crate::EOF;
 
 /// The main loop, the most important function in this program.
 pub(crate) fn main_loop(mut state: State, stderr: &mut dyn Write) -> crate::error::Result<State> {

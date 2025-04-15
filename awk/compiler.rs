@@ -15,10 +15,10 @@ use crate::program::{
 };
 use crate::regex::Regex;
 
+use pest::Parser;
 use pest::error::InputLocation;
 use pest::iterators::{Pair, Pairs};
 use pest::pratt_parser::{Assoc, Op, PrattParser};
-use pest::Parser;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -704,13 +704,13 @@ impl Compiler {
                         return Err(pest_error_from_span(
                             span,
                             format!("'{}' is not a function", name),
-                        ))
+                        ));
                     }
                     None => {
                         return Err(pest_error_from_span(
                             span,
                             format!("call to undefined function '{}'", name),
-                        ))
+                        ));
                     }
                 }
                 Ok(Expr::new(ExprKind::Number, instructions))

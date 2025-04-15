@@ -8,11 +8,11 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test_with_checker, TestPlan};
+use plib::testing::{TestPlan, run_test_with_checker};
 use std::fs;
 use std::path::Path;
 use std::process::Output;
-use tempfile::{tempdir, TempDir};
+use tempfile::{TempDir, tempdir};
 
 fn setup_test_env() -> (TempDir, String) {
     let temp_dir = tempdir().expect("Unable to create temporary directory");

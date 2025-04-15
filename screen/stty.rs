@@ -16,11 +16,11 @@ use std::collections::HashMap;
 use std::io::{self, Error, ErrorKind};
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use osdata::{ParamType, PARG, PNEG};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
+use osdata::{PARG, PNEG, ParamType};
 use termios::{
-    cc_t, cfgetispeed, cfgetospeed, cfsetispeed, cfsetospeed, speed_t, tcflag_t, tcsetattr,
-    Termios, TCSANOW,
+    TCSANOW, Termios, cc_t, cfgetispeed, cfgetospeed, cfsetispeed, cfsetospeed, speed_t, tcflag_t,
+    tcsetattr,
 };
 
 const HDR_SAVE: &str = "pfmt1";

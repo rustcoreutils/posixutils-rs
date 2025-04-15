@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, setlocale, textdomain};
 use syslog::{Facility, Formatter3164};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

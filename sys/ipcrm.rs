@@ -12,7 +12,7 @@ use std::io::{self, Error, ErrorKind};
 use std::ptr;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 #[cfg(not(target_os = "macos"))]
 use libc::{msgctl, msgget, msqid_ds};
 use libc::{semctl, semget, shmctl, shmget, shmid_ds};

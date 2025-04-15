@@ -8,7 +8,7 @@
 //
 
 use clap::{Parser, ValueEnum};
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, setlocale, textdomain};
 use regex::Regex;
 use std::fs;
 use std::io::{self, BufRead, Read};

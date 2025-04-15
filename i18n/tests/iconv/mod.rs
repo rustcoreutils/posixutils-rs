@@ -8,7 +8,7 @@
 //
 
 #![allow(non_snake_case)]
-use plib::testing::{run_test_u8, TestPlanU8};
+use plib::testing::{TestPlanU8, run_test_u8};
 use std::env;
 use std::path::PathBuf;
 use std::{fs::File, io::Read};

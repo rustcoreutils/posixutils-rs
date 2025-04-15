@@ -9,7 +9,7 @@
 
 use base64::prelude::*;
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, setlocale, textdomain};
 use std::fs::{File, Permissions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;

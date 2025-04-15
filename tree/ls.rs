@@ -9,9 +9,9 @@
 
 mod ls_util;
 
-use self::ls_util::{ls_from_utf8_lossy, Entry, LongFormatPadding, MultiColumnPadding};
+use self::ls_util::{Entry, LongFormatPadding, MultiColumnPadding, ls_from_utf8_lossy};
 use clap::{CommandFactory, FromArgMatches, Parser};
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use plib::platform::P_WINSIZE_REQUEST_CODE;
 use std::{
     collections::HashMap,

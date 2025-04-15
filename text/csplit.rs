@@ -11,7 +11,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, setlocale, textdomain};
 use regex::Regex;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Error, ErrorKind, Read, Write};

@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::CStr;
-use std::fs::{metadata, Metadata};
+use std::fs::{Metadata, metadata};
 use std::io::{self, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -18,7 +18,7 @@ use std::thread;
 use std::time::Duration;
 
 use clap::{CommandFactory, Parser};
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, setlocale, textdomain};
 
 const NAME_FIELD: usize = 20;
 

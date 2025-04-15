@@ -23,9 +23,9 @@ use crate::program::{
 };
 use crate::regex::Regex;
 use format::{
-    fmt_write_decimal_float, fmt_write_float_general, fmt_write_hex_float,
+    IntegerFormat, fmt_write_decimal_float, fmt_write_float_general, fmt_write_hex_float,
     fmt_write_scientific_float, fmt_write_signed, fmt_write_string, fmt_write_unsigned,
-    parse_conversion_specifier_args, IntegerFormat,
+    parse_conversion_specifier_args,
 };
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashMap;
@@ -44,11 +44,7 @@ mod string;
 const STACK_SIZE: usize = 2048;
 
 fn bool_to_f64(p: bool) -> f64 {
-    if p {
-        1.0
-    } else {
-        0.0
-    }
+    if p { 1.0 } else { 0.0 }
 }
 
 fn strtod(s: &str) -> f64 {

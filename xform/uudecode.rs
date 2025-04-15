@@ -9,8 +9,8 @@
 
 use base64::prelude::*;
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use std::fs::{remove_file, File};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, setlocale, textdomain};
+use std::fs::{File, remove_file};
 use std::io::{self, Error, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;

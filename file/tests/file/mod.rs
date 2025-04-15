@@ -9,7 +9,7 @@
 
 use std::{env, path::PathBuf};
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{TestPlan, run_test};
 
 fn file_test(args: &[&str], expected_output: &str, expected_error: &str) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();

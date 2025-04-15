@@ -224,7 +224,7 @@ where
                                         return Err(Err::Error(E::from_error_kind(
                                             i1,
                                             ErrorKind::Tag,
-                                        )))
+                                        )));
                                     }
                                 },
                             };
@@ -234,7 +234,7 @@ where
                                         i,
                                         ErrorKind::Tag,
                                         e,
-                                    )))
+                                    )));
                                 }
                                 Ok(r) => r,
                             };
@@ -266,7 +266,7 @@ where
                             Operator::Binary(op, _, _) => match operands.pop() {
                                 Some(lhs) => Operation::Binary(lhs, op, value),
                                 None => {
-                                    return Err(Err::Error(E::from_error_kind(i1, ErrorKind::Tag)))
+                                    return Err(Err::Error(E::from_error_kind(i1, ErrorKind::Tag)));
                                 }
                             },
                         };
@@ -276,7 +276,7 @@ where
                                     i,
                                     ErrorKind::Tag,
                                     e,
-                                )))
+                                )));
                             }
                             Ok(r) => r,
                         };

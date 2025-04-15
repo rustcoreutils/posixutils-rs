@@ -9,7 +9,7 @@
 
 use core::panic;
 use std::{
-    collections::{hash_map::Entry, HashMap},
+    collections::{HashMap, hash_map::Entry},
     ffi::CString,
     fs::File,
     io::{BufReader, Bytes, Read, Write},

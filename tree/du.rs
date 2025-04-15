@@ -11,7 +11,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, setlocale, textdomain};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::{fs, io};
@@ -49,11 +49,7 @@ struct Args {
 }
 
 fn calc_size(kilo: bool, size: u64) -> u64 {
-    if kilo {
-        size / 2
-    } else {
-        size
-    }
+    if kilo { size / 2 } else { size }
 }
 
 fn print_pathinfo(args: &Args, filename: &str, size: u64, toplevel: bool) {

@@ -7,11 +7,11 @@
 // SPDX-License-Identifier: MIT
 //
 
-use clap::{command, Parser};
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use clap::{Parser, command};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use libc::{
-    ioctl, regcomp, regex_t, regexec, regmatch_t, winsize, REG_EXTENDED, STDERR_FILENO,
-    STDIN_FILENO, STDOUT_FILENO, TIOCGWINSZ,
+    REG_EXTENDED, STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO, TIOCGWINSZ, ioctl, regcomp, regex_t,
+    regexec, regmatch_t, winsize,
 };
 use std::sync::Mutex;
 use std::{

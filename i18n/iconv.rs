@@ -8,12 +8,11 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use iconv_lib::{
-    ascii,
+    ascii, utf_8,
     utf_16::{self, UTF16Variant},
     utf_32::{self, UTF32Variant},
-    utf_8,
 };
 use plib::io::input_stream;
 use std::{

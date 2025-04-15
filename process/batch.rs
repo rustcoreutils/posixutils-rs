@@ -8,7 +8,7 @@
 //
 
 use chrono::{DateTime, Local, TimeZone, Utc};
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, setlocale, textdomain};
 use libc::{getlogin, getpwnam, passwd};
 
 use std::{

@@ -34,10 +34,10 @@ pub fn gettext<T: Into<String>>(msgid: T) -> String {
 
 #[macro_export]
 macro_rules! gettext {
-    ($fmt:expr) => {
+    ($fmt:expr_2021) => {
         format!($fmt)
     };
-    ($fmt:expr, $($arg:tt)*) => {
+    ($fmt:expr_2021, $($arg:tt)*) => {
         format!($fmt, $($arg)*)
     };
 }

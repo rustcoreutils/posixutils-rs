@@ -164,7 +164,7 @@ impl OutputState {
 
     fn write(&mut self, buf: &[u8]) -> io::Result<()> {
         match &mut self.outf {
-            Some(ref mut f) => f.write_all(buf),
+            Some(f) => f.write_all(buf),
             // TODO:
             None => panic!("unreachable"),
         }

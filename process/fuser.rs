@@ -1220,7 +1220,7 @@ mod linux {
 mod macos {
     use super::*;
 
-    #[allow(warnings, missing_docs)]
+    #[allow(warnings, missing_docs, unsafe_op_in_unsafe_fn)]
     pub mod osx_libproc_bindings {
         include!(concat!(env!("OUT_DIR"), "/osx_libproc_bindings.rs"));
     }

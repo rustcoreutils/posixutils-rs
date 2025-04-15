@@ -2170,20 +2170,23 @@ impl Sed {
     }
 
     fn execute_r(&mut self, rfile: PathBuf) {
-        if let Ok(file) = File::open(rfile) {
-            let reader = BufReader::new(file);
-            for line in reader.lines() {
-                let Ok(line) = line else {
-                    break;
-                };
-                self.pattern_space += "\n";
-                self.pattern_space += &line;
+        match File::open(rfile) {
+            Ok(file) => {
+                let reader = BufReader::new(file);
+                for line in reader.lines() {
+                    let Ok(line) = line else {
+                        break;
+                    };
+                    self.pattern_space += "\n";
+                    self.pattern_space += &line;
+                }
+                if self.current_end.is_none() {
+                    self.current_end = Some("\n".to_string());
+                }
             }
-            if self.current_end.is_none() {
+            _ => {
                 self.current_end = Some("\n".to_string());
             }
-        } else {
-            self.current_end = Some("\n".to_string());
         }
     }
 

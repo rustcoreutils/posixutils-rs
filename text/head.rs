@@ -12,9 +12,9 @@ use std::io::{self, Read, StdoutLock, Write};
 use std::path::PathBuf;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use plib::io::input_stream;
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, setlocale, textdomain};
 use plib::BUFSZ;
+use plib::io::input_stream;
 
 const N_C_GROUP: &str = "N_C_GROUP";
 

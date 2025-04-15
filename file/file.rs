@@ -15,9 +15,9 @@ use std::path::PathBuf;
 use std::{fs, io};
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 
-use crate::magic::{get_type_from_magic_file_dbs, DEFAULT_MAGIC_FILE};
+use crate::magic::{DEFAULT_MAGIC_FILE, get_type_from_magic_file_dbs};
 
 #[derive(Parser)]
 #[command(

@@ -11,7 +11,7 @@
 // - fix bug:  zero padding does not work for negative numbers
 //
 
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use std::{
     error::Error,
     io::{self, Write},

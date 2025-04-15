@@ -24,7 +24,7 @@ use diff_util::{
     file_diff::FileDiff,
     functions::check_existance,
 };
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, setlocale, textdomain};
 
 /// diff - compare two files
 #[derive(Parser, Clone)]

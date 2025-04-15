@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{TestPlan, run_test};
 
 fn cksum_test(test_data: &str, expected_output: &str) {
     run_test(TestPlan {

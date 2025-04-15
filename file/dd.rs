@@ -10,7 +10,7 @@
 use std::fs;
 use std::io::{self, Read, Write};
 
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 
 const DEF_BLOCK_SIZE: usize = 512;
 

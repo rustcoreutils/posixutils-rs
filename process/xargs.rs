@@ -18,7 +18,7 @@ use std::io::{self, Read};
 use std::process::{Command, Stdio};
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use plib::BUFSZ;
 
 const ARG_MAX: i32 = 131072; // arbitrary.  todo: discover actual value

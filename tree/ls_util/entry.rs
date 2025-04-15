@@ -9,8 +9,8 @@
 
 use super::ls_from_utf8_lossy;
 use crate::{
-    ClassifyFiles, Config, FileTimeOption, LongFormatOptions, OutputFormat,
-    DATE_TIME_FORMAT_OLD_OR_FUTURE, DATE_TIME_FORMAT_RECENT,
+    ClassifyFiles, Config, DATE_TIME_FORMAT_OLD_OR_FUTURE, DATE_TIME_FORMAT_RECENT, FileTimeOption,
+    LongFormatOptions, OutputFormat,
 };
 use chrono::{DateTime, Local};
 use std::{
@@ -405,11 +405,7 @@ impl Entry {
     pub fn get_long_format_padding(&self) -> LongFormatPadding {
         // Calculate the length of the resulting string when `v` is converted.
         fn decimal_str_len(v: u64) -> usize {
-            if v == 0 {
-                1
-            } else {
-                v.ilog10() as usize + 1
-            }
+            if v == 0 { 1 } else { v.ilog10() as usize + 1 }
         }
 
         let blocks_str_width = self.multi_column_padding.blocks_str_width;

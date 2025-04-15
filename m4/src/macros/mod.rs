@@ -11,9 +11,9 @@ use trace::{TraceoffMacro, TraceonMacro};
 use user_defined::UserDefinedMacro;
 
 use crate::{
+    Result,
     lexer::{MacroName, MacroParseConfig},
     state::{StackFrame, State},
-    Result,
 };
 
 macro_rules! macro_enums {

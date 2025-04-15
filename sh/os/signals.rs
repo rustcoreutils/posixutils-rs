@@ -233,16 +233,18 @@ extern "C" fn write_signal_to_buffer(signal: libc::c_int) {
 /// # Safety
 /// cannot be called by multiple threads
 pub unsafe fn setup_signal_handling() {
-    let (read_pipe, write_pipe) = pipe().expect("could not create signal buffer pipe");
-    let result = unsafe { libc::fcntl(read_pipe.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) };
-    if result < 0 {
-        panic!(
-            "failed initialize async buffer for signal handling ({})",
-            get_current_errno_value()
-        );
+    unsafe {
+        let (read_pipe, write_pipe) = pipe().expect("could not create signal buffer pipe");
+        let result = libc::fcntl(read_pipe.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
+        if result < 0 {
+            panic!(
+                "failed initialize async buffer for signal handling ({})",
+                get_current_errno_value()
+            );
+        }
+        SIGNAL_WRITE = Some(write_pipe.into_raw_fd());
+        SIGNAL_READ = Some(read_pipe.into_raw_fd());
     }
-    SIGNAL_WRITE = Some(write_pipe.into_raw_fd());
-    SIGNAL_READ = Some(read_pipe.into_raw_fd());
 }
 
 fn get_pending_signal() -> Option<Signal> {
@@ -270,33 +272,41 @@ fn get_pending_signal() -> Option<Signal> {
 }
 
 unsafe fn handle_signal(signal: Signal, handler: libc::sighandler_t) {
-    // sigaction contains different field on different systems, we can't
-    // initialize it directly
-    let mut action = std::mem::zeroed::<libc::sigaction>();
-    action.sa_sigaction = handler;
-    // never fails
-    libc::sigemptyset(&mut action.sa_mask);
-    action.sa_flags = libc::SA_SIGINFO;
+    unsafe {
+        // sigaction contains different field on different systems, we can't
+        // initialize it directly
+        let mut action = std::mem::zeroed::<libc::sigaction>();
+        action.sa_sigaction = handler;
+        // never fails
+        libc::sigemptyset(&mut action.sa_mask);
+        action.sa_flags = libc::SA_SIGINFO;
 
-    let result = libc::sigaction(signal.into(), &action, std::ptr::null_mut());
-    if result < 0 {
-        panic!("failed to set signal handler")
+        let result = libc::sigaction(signal.into(), &action, std::ptr::null_mut());
+        if result < 0 {
+            panic!("failed to set signal handler")
+        }
     }
 }
 
 pub unsafe fn handle_signal_ignore(signal: Signal) {
-    handle_signal(signal, libc::SIG_IGN);
+    unsafe {
+        handle_signal(signal, libc::SIG_IGN);
+    }
 }
 
 pub unsafe fn handle_signal_default(signal: Signal) {
-    handle_signal(signal, libc::SIG_DFL);
+    unsafe {
+        handle_signal(signal, libc::SIG_DFL);
+    }
 }
 
 pub unsafe fn handle_signal_write_to_signal_buffer(signal: Signal) {
-    handle_signal(
-        signal,
-        write_signal_to_buffer as *const extern "C" fn(libc::c_int) as libc::sighandler_t,
-    )
+    unsafe {
+        handle_signal(
+            signal,
+            write_signal_to_buffer as *const extern "C" fn(libc::c_int) as libc::sighandler_t,
+        )
+    }
 }
 
 #[derive(Clone)]

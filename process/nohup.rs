@@ -13,8 +13,8 @@ use std::io::{self, IsTerminal};
 use std::os::unix::io::AsRawFd;
 use std::process::{self, Command};
 
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use libc::{dup, dup2, signal, SIGHUP, SIG_IGN};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, setlocale, textdomain};
+use libc::{SIG_IGN, SIGHUP, dup, dup2, signal};
 
 enum NohupDir {
     Current,

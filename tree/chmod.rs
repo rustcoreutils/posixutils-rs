@@ -11,7 +11,7 @@ mod common;
 
 use self::common::error_string;
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use modestr::ChmodMode;
 use plib::modestr;
 use std::{cell::RefCell, io, os::unix::fs::MetadataExt};

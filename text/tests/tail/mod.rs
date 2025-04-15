@@ -8,7 +8,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, run_test_u8, TestPlan, TestPlanU8};
+use plib::testing::{TestPlan, TestPlanU8, run_test, run_test_u8};
 
 fn tail_test(args: &[&str], test_data: &str, expected_output: &str) {
     let str_args = args.iter().map(|st| (*st).to_owned()).collect::<Vec<_>>();

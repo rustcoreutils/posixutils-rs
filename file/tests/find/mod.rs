@@ -1,7 +1,7 @@
-use std::fs::{remove_file, File};
+use std::fs::{File, remove_file};
 use std::io::Write;
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{TestPlan, run_test};
 
 fn run_test_find(
     args: &[&str],

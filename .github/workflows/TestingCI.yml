@@ -15,7 +15,7 @@ jobs:
       - name: Fetch
         run: cargo fetch
       - name: Build
-        run: cargo build --release --verbose
+        run: RUSTFLAGS='-D warnings' cargo build --release --verbose
       - name: Run tests
         run: cargo test --release --verbose
       - name: Run fmt check
@@ -42,6 +42,6 @@ jobs:
       - name: Fetch
         run: cargo fetch
       - name: Build
-        run: cargo build --release --verbose
+        run: RUSTFLAGS='-D warnings' cargo build --release --verbose
       - name: Run tests
         run: cargo test --release --verbose

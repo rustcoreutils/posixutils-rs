@@ -1,11 +1,11 @@
 use std::{cell::RefCell, collections::HashMap, io::Write, process::ExitStatus, rc::Rc};
 
 use crate::{
-    input::{Input, InputState, InputStateRef},
-    lexer::{is_alphnumeric, MacroName, ParseConfig},
-    macros::{trace::Trace, BuiltinMacro, MacroDefinition},
-    output::{Output, OutputState},
     EOF,
+    input::{Input, InputState, InputStateRef},
+    lexer::{MacroName, ParseConfig, is_alphnumeric},
+    macros::{BuiltinMacro, MacroDefinition, trace::Trace},
+    output::{Output, OutputState},
 };
 
 pub struct State {

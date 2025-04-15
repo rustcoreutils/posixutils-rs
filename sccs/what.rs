@@ -12,7 +12,7 @@ use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 
 #[derive(Parser)]
 #[command(version, about = gettext("what - identify SCCS files"))]
@@ -59,11 +59,14 @@ fn main() -> io::Result<()> {
 
     for file in &args.files {
         let path = Path::new(file);
-        if let Ok(file) = File::open(path) {
-            let reader = BufReader::new(file);
-            process_file(reader, args.single)?;
-        } else {
-            eprintln!("what: {}: {}", gettext("Cannot open file"), file.display());
+        match File::open(path) {
+            Ok(file) => {
+                let reader = BufReader::new(file);
+                process_file(reader, args.single)?;
+            }
+            _ => {
+                eprintln!("what: {}: {}", gettext("Cannot open file"), file.display());
+            }
         }
     }
 

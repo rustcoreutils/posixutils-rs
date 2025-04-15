@@ -11,7 +11,7 @@ use std::ffi::CString;
 use std::path::{Component, Path};
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 
 const _POSIX_PATH_MAX: usize = 255;
 const _POSIX_NAME_MAX: usize = 14;

@@ -1,9 +1,9 @@
 use std::io::Write;
 
 use crate::{
+    Result,
     lexer::MacroName,
     state::{StackFrame, State},
-    Result,
 };
 
 use super::MacroImplementation;

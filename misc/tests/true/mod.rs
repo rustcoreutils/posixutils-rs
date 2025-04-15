@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{TestPlan, run_test};
 
 fn truefalse_test(cmd: &str, expected_exit_code: i32) {
     run_test(TestPlan {

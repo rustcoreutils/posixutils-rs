@@ -9,7 +9,7 @@
 //
 
 use chrono::{DateTime, Local};
-use plib::testing::{run_test, run_test_with_checker, TestPlan};
+use plib::testing::{TestPlan, run_test, run_test_with_checker};
 use regex::Regex;
 use std::fs;
 use std::io::Read;

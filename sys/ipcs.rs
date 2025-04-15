@@ -9,7 +9,7 @@
 
 use chrono::Local;
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 
 /// ipcs - report XSI interprocess communication facilities status
 #[derive(Parser)]
@@ -75,7 +75,7 @@ fn display_message_queues(_args: &Args) {
 
     #[cfg(not(target_os = "macos"))]
     {
-        use libc::{msgctl, msqid_ds, IPC_STAT};
+        use libc::{IPC_STAT, msgctl, msqid_ds};
 
         let mut msqid: i32 = 0;
         let mut msg_ds: msqid_ds = unsafe { std::mem::zeroed() };
@@ -124,7 +124,7 @@ fn display_message_queues(_args: &Args) {
 }
 
 fn display_shared_memory(_args: &Args) {
-    use libc::{shmctl, shmid_ds, IPC_STAT};
+    use libc::{IPC_STAT, shmctl, shmid_ds};
     use std::ffi::CStr;
 
     #[cfg(target_os = "macos")]
@@ -183,7 +183,7 @@ fn display_shared_memory(_args: &Args) {
 }
 
 fn display_semaphores(_args: &Args) {
-    use libc::{semctl, semid_ds, IPC_STAT};
+    use libc::{IPC_STAT, semctl, semid_ds};
     use std::ffi::CStr;
 
     let mut semid: i32 = 0;

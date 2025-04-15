@@ -15,8 +15,8 @@
 use std::io::{self, Error, ErrorKind, Write};
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use terminfo::{capability as cap, Database};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
+use terminfo::{Database, capability as cap};
 
 // arbitrarily chosen.  todo: search if POSIX-ly correct.
 const MAX_STOPS: usize = 100;

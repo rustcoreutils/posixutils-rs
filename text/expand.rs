@@ -11,9 +11,9 @@ use std::io::{self, BufWriter, Read, Write};
 use std::path::PathBuf;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use plib::io::input_stream;
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, setlocale, textdomain};
 use plib::BUFSZ;
+use plib::io::input_stream;
 
 /// expand - convert tabs to spaces
 #[derive(Parser)]

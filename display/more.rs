@@ -8,22 +8,22 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use libc::{
-    getegid, getgid, getuid, regcomp, regex_t, regexec, setgid, setuid, REG_ICASE, REG_NOMATCH,
+    REG_ICASE, REG_NOMATCH, getegid, getgid, getuid, regcomp, regex_t, regexec, setgid, setuid,
 };
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fs::File;
-use std::io::{stdout, BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write, stdout};
 use std::ops::{Not, Range};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
-use std::process::{exit, ExitStatus};
+use std::process::{ExitStatus, exit};
 use std::ptr;
 use std::str::FromStr;
-use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::Mutex;
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::Duration;
 use termion::{clear::*, cursor::*, event::*, input::*, raw::*, screen::*, style::*, *};
 

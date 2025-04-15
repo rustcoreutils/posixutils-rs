@@ -11,7 +11,7 @@ mod common;
 
 use self::common::error_string;
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use std::{cell::RefCell, ffi::CString, io, os::unix::fs::MetadataExt};
 
 /// chgrp - change file group ownership

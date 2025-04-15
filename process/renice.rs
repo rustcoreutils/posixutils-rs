@@ -10,7 +10,7 @@
 use std::ffi::CString;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use gettextrs::{LocaleCategory, bind_textdomain_codeset, gettext, setlocale, textdomain};
 use libc::{getpwnam, passwd};
 use plib::priority::{getpriority, setpriority};
 

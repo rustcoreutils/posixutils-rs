@@ -1,4 +1,4 @@
-use crate::{open_long_filename, Error, ErrorKind, FileDescriptor};
+use crate::{Error, ErrorKind, FileDescriptor, open_long_filename};
 use std::{
     cell::{RefCell, RefMut},
     collections::HashSet,

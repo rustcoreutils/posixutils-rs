@@ -32,8 +32,8 @@ members = [
 [workspace.package]
 repository = "https://github.com/rustcoreutils/posixutils-rs"
 license = "MIT"
-edition = "2021"
-rust-version = "1.84.0"
+edition = "2024"
+rust-version = "1.85.0"
 
 [workspace.dependencies]
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "cargo"] }
@@ -44,5 +44,5 @@ gettext-rs = { path = "./gettext-rs" }
 errno = "0.3"
 chrono-tz = "0.10"
 
-[workspace.lints]
-
+[workspace.lints.rust]
+rust-2024-compatibility = "warn"

@@ -606,10 +606,10 @@ fn test_files_sort_1() {
 #[test]
 fn test_files_sort_2() {
     sort_test(
-            &["-n", "tests/assets/in_seq", "tests/assets/test_file.txt"],
-            "",
-            "1\n1sdfghnm\n2\n2sadsgdhjmf\n3\n3zcxbncvm vbm\n4\n4asdbncv\n5\n5adsbfdgfnfm\n6\n6sdfcvncbmcg\n7zsdgdgfndcgmncg\n8asdbsfdndcgmn\n9sfbdxgfndcgmncgmn\n10dvsd\n11\n12\n13\n14\n15\n16\n17\n",
-            0,
-            "",
-        );
+        &["-n", "tests/assets/in_seq", "tests/assets/test_file.txt"],
+        "",
+        "1\n1sdfghnm\n2\n2sadsgdhjmf\n3\n3zcxbncvm vbm\n4\n4asdbncv\n5\n5adsbfdgfnfm\n6\n6sdfcvncbmcg\n7zsdgdgfndcgmncg\n8asdbsfdndcgmn\n9sfbdxgfndcgmncgmn\n10dvsd\n11\n12\n13\n14\n15\n16\n17\n",
+        0,
+        "",
+    );
 }

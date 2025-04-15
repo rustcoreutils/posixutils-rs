@@ -607,7 +607,9 @@ mod parsing {
         let parse_single_char_result = parse_single_char(&mut peekable)?;
 
         let Some(char) = parse_single_char_result else {
-            return Err(format!("could not parse [x*n] construct: bad input near \"{square_bracket_constructs_buffer_string}\""));
+            return Err(format!(
+                "could not parse [x*n] construct: bad input near \"{square_bracket_constructs_buffer_string}\""
+            ));
         };
 
         // Skip '*'
@@ -733,8 +735,8 @@ mod parsing {
                 match u8::from_str_radix(chars_str, 8_u32) {
                     Ok(ue) => {
                         eprintln!(
-                        "tr: warning: the ambiguous octal escape \\{st} is being interpreted as the 2-byte sequence \\0{chars_str}, {third_octal_digit}"
-                    );
+                            "tr: warning: the ambiguous octal escape \\{st} is being interpreted as the 2-byte sequence \\0{chars_str}, {third_octal_digit}"
+                        );
 
                         ue
                     }
@@ -978,7 +980,7 @@ mod parsing {
             st => {
                 return Err(format!(
                     "input '[:{st}:]' is invalid: invalid character class '{st}'"
-                ))
+                ));
             }
         };
 
@@ -1229,8 +1231,7 @@ mod setup {
 
                         match op {
                             Operand::Char(CharOperand {
-                                ref mut char_repetition,
-                                ..
+                                char_repetition, ..
                             }) => {
                                 *char_repetition = CharRepetition::N(leftover);
                             }
@@ -1244,7 +1245,7 @@ mod setup {
 
                         for op in vec.iter_mut().rev() {
                             if let Operand::Char(CharOperand {
-                                char_repetition: CharRepetition::N(ref mut n),
+                                char_repetition: CharRepetition::N(n),
                                 ..
                             }) = op
                             {

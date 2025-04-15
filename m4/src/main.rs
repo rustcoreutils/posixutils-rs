@@ -8,12 +8,11 @@ fn main() -> ExitCode {
 
     let stdout = std::io::stdout();
     let mut stderr = std::io::stderr();
-    if let Err(error) = posixutils_m4::run(stdout, &mut stderr, args) {
-        ExitCode::from(u8::try_from(error.get_exit_code()).unwrap_or_else(|e| {
+    match posixutils_m4::run(stdout, &mut stderr, args) {
+        Err(error) => ExitCode::from(u8::try_from(error.get_exit_code()).unwrap_or_else(|e| {
             eprintln!("Error casting exit code {e} into platform agnostic u8");
             1
-        }))
-    } else {
-        ExitCode::SUCCESS
+        })),
+        _ => ExitCode::SUCCESS,
     }
 }

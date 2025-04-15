@@ -360,11 +360,13 @@ mod macros {
         );
 
         fn set_env_vars() {
-            env::set_var("MACRO", "echo");
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { env::set_var("MACRO", "echo") };
         }
 
         fn clean_env_vars() {
-            env::remove_var("MACRO");
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { env::remove_var("MACRO") };
         }
     }
 }

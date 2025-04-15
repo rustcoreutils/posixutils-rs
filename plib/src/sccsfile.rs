@@ -313,7 +313,10 @@ E 2
 
         match &sccs_file.edits[0] {
             SccsEdit::Insert(line) => {
-                assert_eq!(line, "I 1\napple\nbanana\ncharlie\ndelta\necho\nfoxtrot\ngolf\nhotel\nindia\njuliet\nkilo\nlima\nmike\nE 1\n");
+                assert_eq!(
+                    line,
+                    "I 1\napple\nbanana\ncharlie\ndelta\necho\nfoxtrot\ngolf\nhotel\nindia\njuliet\nkilo\nlima\nmike\nE 1\n"
+                );
             }
             _ => panic!("Unexpected edit type"),
         }

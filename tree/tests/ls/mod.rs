@@ -589,7 +589,8 @@ fn test_ls_size_align() {
 #[test]
 fn test_ls_time() {
     // This gets inherited by child processes
-    std::env::set_var("TZ", "UTC0");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("TZ", "UTC0") };
 
     let test_dir = &format!("{}/test_ls_time", env!("CARGO_TARGET_TMPDIR"));
     let a = &format!("{test_dir}/a");

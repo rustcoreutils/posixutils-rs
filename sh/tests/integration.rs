@@ -17,13 +17,15 @@ fn set_env_vars() {
         } else {
             current_dir.join("sh/tests/read_dir")
         };
-        std::env::set_var("TEST_READ_DIR", read_dir);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("TEST_READ_DIR", read_dir) };
 
         let write_dir = Path::new(concat!(env!("CARGO_TARGET_TMPDIR"), "/sh_test_write_dir"));
         if !write_dir.exists() {
             std::fs::create_dir(&write_dir).expect("failed to create write_dir");
         }
-        std::env::set_var("TEST_WRITE_DIR", write_dir);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("TEST_WRITE_DIR", write_dir) };
         TEST_VARS_ARE_SET.store(true, Ordering::SeqCst);
     }
     while !TEST_VARS_ARE_SET.load(Ordering::SeqCst) {}

@@ -59,11 +59,14 @@ fn main() -> io::Result<()> {
 
     for file in &args.files {
         let path = Path::new(file);
-        if let Ok(file) = File::open(path) {
-            let reader = BufReader::new(file);
-            process_file(reader, args.single)?;
-        } else {
-            eprintln!("what: {}: {}", gettext("Cannot open file"), file.display());
+        match File::open(path) {
+            Ok(file) => {
+                let reader = BufReader::new(file);
+                process_file(reader, args.single)?;
+            }
+            _ => {
+                eprintln!("what: {}: {}", gettext("Cannot open file"), file.display());
+            }
         }
     }
 

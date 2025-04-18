@@ -1,0 +1,132 @@
+.\"	$OpenBSD: cal.1,v 1.33 2024/07/31 17:09:23 jmc Exp $
+.\"	$NetBSD: cal.1,v 1.6 1995/09/02 05:34:20 jtc Exp $
+.\"
+.\" Copyright (c) 1989, 1990, 1993
+.\"	The Regents of the University of California.  All rights reserved.
+.\"
+.\" This code is derived from software contributed to Berkeley by
+.\" Kim Letkeman.
+.\"
+.\" Redistribution and use in source and binary forms, with or without
+.\" modification, are permitted provided that the following conditions
+.\" are met:
+.\" 1. Redistributions of source code must retain the above copyright
+.\"    notice, this list of conditions and the following disclaimer.
+.\" 2. Redistributions in binary form must reproduce the above copyright
+.\"    notice, this list of conditions and the following disclaimer in the
+.\"    documentation and/or other materials provided with the distribution.
+.\" 3. Neither the name of the University nor the names of its contributors
+.\"    may be used to endorse or promote products derived from this software
+.\"    without specific prior written permission.
+.\"
+.\" THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+.\" ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+.\" IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+.\" ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+.\" FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+.\" DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+.\" OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+.\" HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+.\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+.\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+.\" SUCH DAMAGE.
+.\"
+.\"     @(#)cal.1	8.2 (Berkeley) 4/28/95
+.\"
+.Dd $Mdocdate: July 31 2024 $
+.Dt CAL 1
+.Os
+.Sh NAME
+.Nm cal
+.Nd displays a calendar
+.Sh SYNOPSIS
+.Nm cal
+.Op Fl jmwy
+.Op Ar month
+.Op Ar year
+.Sh DESCRIPTION
+.Nm
+displays a simple calendar.
+Calendars may be displayed by month or by year.
+.Pp
+The options are as follows:
+.Bl -tag -width Ds
+.It Fl j
+Display Julian dates (days one-based, numbered from January 1).
+The options
+.Fl j
+and
+.Fl w
+are mutually exclusive.
+.It Fl m
+Display weeks starting on Monday instead of Sunday.
+.It Fl w
+Display week numbers in the month display.
+If
+.Fl m
+is specified, the ISO week format is assumed.
+The options
+.Fl j
+and
+.Fl w
+are mutually exclusive.
+.It Fl y
+Display a calendar for the current year.
+.El
+.Pp
+A single numerical parameter specifies the
+.Ar year
+(1 \- 9999)
+to be displayed.
+The year must be fully specified:
+.Dq Li cal 89
+will
+.Em not
+display a calendar for 1989.
+Two parameters denote the
+.Ar month
+(1 \- 12, or a month name or abbreviation thereof)
+and
+.Ar year .
+Alternatively,
+a single parameter may be given specifying
+the name or abbreviated name of a month:
+in that case a calendar is displayed for that month of the current year.
+If no parameters are specified, the current month's calendar is
+displayed.
+.Pp
+A year starts on January 1st.
+.Pp
+The Gregorian Reformation is assumed to have occurred in 1752 after the 2nd
+of September.
+By this time, most countries had recognized the Reformation (although a
+few did not recognize it until the early 1900s).
+Eleven days following that date were eliminated by the Reformation, so the
+calendar for that month is a bit unusual.
+.Sh EXIT STATUS
+.Ex -std cal
+.Sh SEE ALSO
+.Xr calendar 1
+.Sh STANDARDS
+The
+.Nm
+utility is compliant with the
+X/Open System Interfaces option of the
+.St -p1003.1-2024
+specification.
+.Pp
+The flags
+.Op Fl jmwy ,
+as well as the ability to specify a month name as a single argument,
+are extensions to that specification.
+.Pp
+The week number computed by
+.Fl mw
+is compliant with the
+.St -iso8601
+specification.
+.Sh HISTORY
+A
+.Nm
+command appeared in
+.At v1 .

@@ -80,11 +80,14 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] gencat (i18n)
  - [x] grep
  - [x] head
+ - [x] iconv (i18n)
  - [x] join
  - [x] link
  - [x] ls
  - [x] m4
+ - [x] make
  - [x] mkdir
+ - [x] more
  - [x] mv
  - [x] nl
  - [x] nm (Development)
@@ -95,6 +98,8 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] realpath
  - [x] rm
  - [x] rmdir
+ - [x] sed
+ - [x] sh
  - [x] sort
  - [x] split
  - [x] strings
@@ -116,6 +121,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
 ## Stage 2 - Feature-complete and POSIX compliant
 
+ - [x] batch (cron cat.)
  - [x] cat
  - [x] chgrp
  - [x] chmod
@@ -127,12 +133,14 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] logname
  - [x] mesg
  - [x] mkfifo
+ - [x] newgrp
  - [x] nice
  - [x] nohup
  - [x] pathchk
  - [x] pwd
  - [x] renice
  - [x] sleep
+ - [x] talk
  - [x] tee
  - [x] touch
  - [x] tty
@@ -166,7 +174,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
 ### Cron category
  - [ ] at (cron cat.)
- - [ ] batch (cron cat.)
  - [ ] crontab (cron cat.)
 
 ### Development category
@@ -190,7 +197,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
  ### i18n category
  - [ ] gettext (i18n)
- - [ ] iconv (i18n) (status: in progress)
  - [ ] locale (i18n)
  - [ ] localedef (i18n)
  - [ ] msgfmt (i18n)
@@ -210,15 +216,9 @@ Because it is a FAQ, the major differences between this project and uutils are:
 ### Misc. category
  - [ ] lp
  - [ ] mailx
- - [ ] make (status: in progress)
- - [ ] man (status: in progress)
- - [ ] more
- - [ ] newgrp
- - [ ] patch (status: in progress)
+ - [ ] man
+ - [ ] patch
  - [ ] pax
- - [ ] sed
- - [ ] sh -- Volunteer starting point at https://github.com/rustcoreutils/posixutils-rs/tree/shell
- - [ ] talk (status: in progress)
 
 ## Installation
 

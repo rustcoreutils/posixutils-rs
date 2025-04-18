@@ -8,9 +8,8 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, textdomain};
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use libc::{regcomp, regex_t, regexec, regfree, REG_EXTENDED, REG_ICASE, REG_NOMATCH};
-use plib::PROJECT_NAME;
 use std::{
     ffi::CString,
     fs::File,
@@ -488,9 +487,10 @@ impl GrepModel {
 //     1 - No lines were selected.
 //     >1 - An error occurred.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
-    // Parse command line arguments
+    setlocale(LocaleCategory::LcAll, "");
+    textdomain("posixutils-rs")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+
     let mut args = Args::parse();
 
     let exit_code = args

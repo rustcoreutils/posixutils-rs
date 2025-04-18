@@ -10,7 +10,6 @@
 use chrono::Local;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 
 /// ipcs - report XSI interprocess communication facilities status
 #[derive(Parser)]
@@ -71,7 +70,7 @@ fn display_message_queues(_args: &Args) {
     #[cfg(not(target_os = "macos"))]
     use std::ffi::CStr;
 
-    println!("Message Queues:");
+    println!("{}", gettext("Message Queues:"));
     println!("T     ID     KEY        MODE       OWNER    GROUP");
 
     #[cfg(not(target_os = "macos"))]
@@ -142,7 +141,7 @@ fn display_shared_memory(_args: &Args) {
         return;
     }
 
-    println!("Shared Memory:");
+    println!("{}", gettext("Shared Memory:"));
     println!("T     ID     KEY        MODE       OWNER    GROUP");
 
     for shmid in 0..=maxid {
@@ -190,7 +189,7 @@ fn display_semaphores(_args: &Args) {
     let mut semid: i32 = 0;
     let mut sem_ds: semid_ds = unsafe { std::mem::zeroed() };
 
-    println!("Semaphores:");
+    println!("{}", gettext("Semaphores:"));
     println!("T     ID     KEY        MODE       OWNER    GROUP    NSEMS");
 
     loop {
@@ -241,7 +240,10 @@ fn get_current_date() -> String {
 }
 
 fn display_ipc_status(args: &Args) {
-    println!("IPC status from {} as of {}", "source", get_current_date());
+    println!(
+        "{}",
+        gettext!("IPC status from {} as of {}", "source", get_current_date())
+    );
 
     if args.message_queues {
         display_message_queues(args);
@@ -257,13 +259,11 @@ fn display_ipc_status(args: &Args) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Parse command line arguments
-    let mut args = Args::parse();
-
-    // Set locale and text domain for localization
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain("posixutils-rs")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+
+    let mut args = Args::parse();
 
     // Validate arguments and determine what to display
     if args.all {

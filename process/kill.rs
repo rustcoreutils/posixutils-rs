@@ -7,103 +7,14 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod signal;
+
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 
-#[cfg(target_os = "macos")]
-const SIGLIST: [(&str, u32); 31] = [
-    ("HUP", 1),
-    ("INT", 2),
-    ("QUIT", 3),
-    ("ILL", 4),
-    ("TRAP", 5),
-    ("ABRT", 6),
-    ("EMT", 7),
-    ("FPE", 8),
-    ("KILL", 9),
-    ("BUS", 10),
-    ("SEGV", 11),
-    ("SYS", 12),
-    ("PIPE", 13),
-    ("ALRM", 14),
-    ("TERM", 15),
-    ("URG", 16),
-    ("STOP", 17),
-    ("TSTP", 18),
-    ("CONT", 19),
-    ("CHLD", 20),
-    ("TTIN", 21),
-    ("TTOU", 22),
-    ("IO", 23),
-    ("XCPU", 24),
-    ("XFSZ", 25),
-    ("VTALRM", 26),
-    ("PROF", 27),
-    ("WINCH", 28),
-    ("INFO", 29),
-    ("USR1", 30),
-    ("USR2", 31),
-];
-
-#[cfg(target_os = "linux")]
-const SIGLIST: [(&str, u32); 32] = [
-    ("HUP", 1),
-    ("INT", 2),
-    ("QUIT", 3),
-    ("ILL", 4),
-    ("TRAP", 5),
-    ("ABRT", 6),
-    ("IOT", 6),
-    ("BUS", 7),
-    ("FPE", 8),
-    ("KILL", 9),
-    ("USR1", 10),
-    ("SEGV", 11),
-    ("USR2", 12),
-    ("PIPE", 13),
-    ("ALRM", 14),
-    ("TERM", 15),
-    ("STKFLT", 16),
-    ("CHLD", 17),
-    ("CONT", 18),
-    ("STOP", 19),
-    ("TSTP", 20),
-    ("TTIN", 21),
-    ("TTOU", 22),
-    ("URG", 23),
-    ("XCPU", 24),
-    ("XFSZ", 25),
-    ("VTALRM", 26),
-    ("PROF", 27),
-    ("WINCH", 28),
-    ("IO", 29),
-    ("PWR", 30),
-    ("SYS", 31),
-];
-
-fn siglist_get(name: &str) -> Option<u32> {
-    for (signame, signo) in SIGLIST.iter() {
-        if *signame == name {
-            return Some(*signo);
-        }
-    }
-
-    None
-}
-
-fn lookup_signum(signame: &str) -> Result<u32, &'static str> {
-    if signame == "0" {
-        Ok(0)
-    } else {
-        match siglist_get(signame.to_uppercase().as_str()) {
-            Some(sig_no) => Ok(sig_no),
-            None => Err("Unknown signal name"),
-        }
-    }
-}
+use crate::signal::{list_signals, lookup_signum};
 
 enum ConfigMode {
-    Signal(u32),
+    Signal(i32),
     List,
 }
 
@@ -114,7 +25,7 @@ struct Config {
 
 fn parse_cmdline() -> Result<Config, &'static str> {
     let mut pids = Vec::new();
-    let mut mode = ConfigMode::Signal(libc::SIGTERM as u32);
+    let mut mode = ConfigMode::Signal(libc::SIGTERM);
     let mut in_args = true;
     let mut in_s_arg = false;
     for arg in std::env::args().skip(1) {
@@ -130,7 +41,7 @@ fn parse_cmdline() -> Result<Config, &'static str> {
             } else if arg == "--" {
                 in_args = false;
             } else if let Some(st) = arg.strip_prefix("-") {
-                let sig_no = match st.parse::<u32>() {
+                let sig_no: i32 = match st.parse() {
                     Ok(signo) => signo,
                     Err(_) => lookup_signum(st)?,
                 };
@@ -157,19 +68,7 @@ fn parse_cmdline() -> Result<Config, &'static str> {
     Ok(Config { mode, pids })
 }
 
-fn list_signals() -> u32 {
-    let mut output = String::new();
-    for (name, _) in SIGLIST.iter() {
-        output.push_str(name);
-        output.push(' ');
-    }
-
-    println!("{}", output);
-
-    0
-}
-
-fn send_signal(prog_cfg: &Config, sig_no: u32) -> u32 {
+fn send_signal(prog_cfg: &Config, sig_no: i32) -> u32 {
     let mut exit_code = 0;
 
     for pid in &prog_cfg.pids {
@@ -186,13 +85,16 @@ fn send_signal(prog_cfg: &Config, sig_no: u32) -> u32 {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain("posixutils-rs")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
 
     let prog_cfg = parse_cmdline()?;
 
     let exit_code = match prog_cfg.mode {
-        ConfigMode::List => list_signals(),
+        ConfigMode::List => {
+            list_signals();
+            0
+        }
         ConfigMode::Signal(sig_no) => send_signal(&prog_cfg, sig_no),
     };
 

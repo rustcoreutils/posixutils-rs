@@ -7,12 +7,12 @@
 // SPDX-License-Identifier: MIT
 //
 
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use libc::{signal, SIGINT, SIG_IGN};
-use plib::PROJECT_NAME;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
+
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use plib::BUFSZ;
 
 #[derive(Parser)]
 #[command(version, about = gettext("tee - duplicate standard input"))]
@@ -32,16 +32,9 @@ struct TeeFile {
     f: File,
 }
 
+#[derive(Default)]
 struct TeeInfo {
     outputs: Vec<TeeFile>,
-}
-
-impl TeeInfo {
-    fn new() -> TeeInfo {
-        TeeInfo {
-            outputs: Vec::new(),
-        }
-    }
 }
 
 fn open_outputs(args: &Args, info: &mut TeeInfo) -> io::Result<()> {
@@ -72,7 +65,7 @@ fn open_outputs(args: &Args, info: &mut TeeInfo) -> io::Result<()> {
 }
 
 fn tee_stdin(info: &mut TeeInfo) -> io::Result<()> {
-    let mut buffer = [0; plib::BUFSZ];
+    let mut buffer = [0; BUFSZ];
 
     loop {
         let n_read_res = io::stdin().read(&mut buffer[..]);
@@ -100,20 +93,19 @@ fn tee_stdin(info: &mut TeeInfo) -> io::Result<()> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
-    let args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain("posixutils-rs")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+
+    let args = Args::parse();
 
     if args.ignore {
         unsafe {
-            signal(SIGINT, SIG_IGN);
+            libc::signal(libc::SIGINT, libc::SIG_IGN);
         }
     }
 
-    let mut state = TeeInfo::new();
+    let mut state = TeeInfo::default();
 
     open_outputs(&args, &mut state)?;
     tee_stdin(&mut state)?;

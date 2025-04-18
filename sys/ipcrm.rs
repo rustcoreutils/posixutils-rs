@@ -7,15 +7,15 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::ffi::{c_int, c_ushort};
+use std::io::{self, Error, ErrorKind};
+use std::ptr;
+
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 #[cfg(not(target_os = "macos"))]
 use libc::{msgctl, msgget, msqid_ds};
 use libc::{semctl, semget, shmctl, shmget, shmid_ds};
-use plib::PROJECT_NAME;
-use std::ffi::{c_int, c_ushort};
-use std::io::{self, Error, ErrorKind};
-use std::ptr;
 
 #[derive(Parser)]
 #[command(
@@ -197,12 +197,11 @@ fn remove_ipcs(args: &Args) -> io::Result<()> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
-    let args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain("posixutils-rs")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+
+    let args = Args::parse();
 
     let mut exit_code = 0;
 

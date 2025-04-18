@@ -1,0 +1,25 @@
+// This file used for testing `go to tag` command of more utility.
+// `go to tag` command has attribute `tagstring` that contains name 
+// or pattern of searched code object. This tags file contains 
+// file and line where are located `tagstring` object `SeekPositions` 
+// that used in tests. More use `find` utility to find tags files 
+// and then `grep` utility search `tagstring` object over tags files
+// content.
+
+!_TAG_FILE_FORMAT	2	/extended format; --format=1 will not append ;" to lines/
+!_TAG_FILE_SORTED	1	/0=unsorted, 1=sorted, 2=foldcase/
+!_TAG_OUTPUT_EXCMD	mixed	/number, pattern, mixed, or combineV2/
+!_TAG_OUTPUT_FILESEP	slash	/slash or backslash/
+!_TAG_OUTPUT_MODE	u-ctags	/u-ctags or e-ctags/
+!_TAG_PATTERN_LENGTH_LIMIT	96	/0 for no limit/
+!_TAG_PROC_CWD	/root/rustprojects/posixutils-rs/display/	//
+!_TAG_PROGRAM_AUTHOR	Universal Ctags Team	//
+!_TAG_PROGRAM_NAME	Universal Ctags	/Derived from Exuberant Ctags/
+!_TAG_PROGRAM_URL	https://ctags.io/	/official site/
+!_TAG_PROGRAM_VERSION	5.9.0	//
+SeekPositions	more.rs	/^    SeekPositions(#[from] SeekPositionsError),$/;"	e	line:160	enum:MoreError
+SeekPositions	more.rs	/^impl DoubleEndedIterator for SeekPositions {$/;"	c	line:635
+SeekPositions	more.rs	/^impl Iterator for SeekPositions {$/;"	c	line:543
+SeekPositions	more.rs	/^impl SeekPositions {$/;"	c	line:365
+SeekPositions	more.rs	/^struct SeekPositions {$/;"	s	line:346
+SeekPositionsError	more.rs	/^enum SeekPositionsError {$/;"	g	line:198

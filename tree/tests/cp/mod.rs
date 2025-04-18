@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::{run_test, TestPlan};
+use plib::testing::{run_test, TestPlan};
 use std::ffi::CString;
 use std::io::{Read, Write};
 use std::os::unix::fs::FileTypeExt;
@@ -795,7 +795,7 @@ fn test_cp_part_symlink() {
 
         unix::fs::symlink(&reg_abs, &slink).unwrap();
 
-        cd_and_cp_test(&dir, &args, &err_str, err_code);
+        cd_and_cp_test(dir, &args, &err_str, err_code);
 
         fs::remove_dir_all(test_dir).unwrap();
         fs::remove_dir_all(other_dir).unwrap();
@@ -893,7 +893,7 @@ fn test_cp_special_bits() {
         if passwd.is_null() {
             panic!("{}", io::Error::last_os_error());
         }
-        let uid = (&*passwd).pw_uid;
+        let uid = (*passwd).pw_uid;
 
         // chown "$NON_ROOT_USERNAME" .
         let md = fs::metadata(test_dir).unwrap();

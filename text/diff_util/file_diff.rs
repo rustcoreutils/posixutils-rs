@@ -1,30 +1,27 @@
 use super::{
-    change::ChangeData,
     common::{FormatOptions, OutputFormat},
     constants::COULD_NOT_UNWRAP_FILENAME,
     diff_exit_status::DiffExitStatus,
-    file_data::FileData,
-    functions::{check_existance, is_binary, system_time_to_rfc2822, vec_min},
+    file_data::{FileData, LineReader},
+    functions::{check_existance, is_binary, system_time_to_rfc2822},
     hunks::Hunks,
 };
 
-use crate::diff_util::{
-    change::Change,
-    constants::NO_NEW_LINE_AT_END_OF_FILE,
-    functions::{calculate_hash, increase_by_one_if},
-};
+use crate::diff_util::constants::NO_NEW_LINE_AT_END_OF_FILE;
 
 use std::{
+    cmp::Reverse,
     collections::HashMap,
-    fs::File,
+    fmt::Write,
+    fs::{read_to_string, File},
     io::{self, BufReader, Read},
     os::unix::fs::MetadataExt,
     path::PathBuf,
 };
 
 pub struct FileDiff<'a> {
-    file1: &'a mut FileData,
-    file2: &'a mut FileData,
+    file1: &'a mut FileData<'a>,
+    file2: &'a mut FileData<'a>,
     hunks: Hunks,
     format_options: &'a FormatOptions,
     are_different: bool,
@@ -32,21 +29,17 @@ pub struct FileDiff<'a> {
 
 impl<'a> FileDiff<'a> {
     fn new(
-        file1: &'a mut FileData,
-        file2: &'a mut FileData,
+        file1: &'a mut FileData<'a>,
+        file2: &'a mut FileData<'a>,
         format_options: &'a FormatOptions,
     ) -> Self {
         Self {
             file1,
             file2,
-            hunks: Hunks::new(),
+            hunks: Default::default(),
             format_options,
             are_different: false,
         }
-    }
-
-    pub fn are_different(&self) -> bool {
-        self.are_different
     }
 
     pub fn file_diff(
@@ -56,22 +49,64 @@ impl<'a> FileDiff<'a> {
         show_if_different: Option<String>,
     ) -> io::Result<DiffExitStatus> {
         if is_binary(&path1)? || is_binary(&path2)? {
-            return Self::binary_file_diff(&path1, &path2);
+            Self::binary_file_diff(&path1, &path2)
         } else {
-            let mut file1 = FileData::get_file(path1)?;
-            let mut file2 = FileData::get_file(path2)?;
+            let content1 = read_to_string(&path1)?.into_bytes();
+            let linereader1 = LineReader::new(&content1);
+            let ends_with_newline1 = linereader1.ends_with_newline();
+            let mut lines1 = Vec::new();
+            for line in linereader1 {
+                if !format_options.ignore_trailing_white_spaces {
+                    lines1.push(line);
+                } else {
+                    lines1.push(line.trim_end());
+                }
+            }
+
+            let content2 = read_to_string(&path2)?.into_bytes();
+            let linereader2 = LineReader::new(&content2);
+            let ends_with_newline2 = linereader2.ends_with_newline();
+            let mut lines2 = Vec::new();
+            for line in linereader2 {
+                if !format_options.ignore_trailing_white_spaces {
+                    lines2.push(line);
+                } else {
+                    lines2.push(line.trim_end());
+                }
+            }
+            let mut file1 = FileData::get_file(path1, lines1, ends_with_newline1)?;
+            let mut file2 = FileData::get_file(path2, lines2, ends_with_newline2)?;
 
             let mut diff = FileDiff::new(&mut file1, &mut file2, format_options);
 
-            diff.needleman_wunsch_diff_lines();
+            // histogram diff
+            let mut lcs_indices: Vec<i32> = vec![-1; diff.file1.lines().len()];
+            let num_lines1 = diff.file1.lines().len();
+            let num_lines2 = diff.file2.lines().len();
+            FileDiff::histogram_lcs(
+                diff.file1,
+                diff.file2,
+                0,
+                num_lines1,
+                0,
+                num_lines2,
+                &mut lcs_indices,
+            );
 
-            if diff.are_different() {
+            diff.hunks
+                .create_hunks_from_lcs(&lcs_indices, num_lines1, num_lines2);
+
+            if diff.hunks.hunk_count() > 0 {
+                diff.are_different = true;
+            }
+
+            if diff.are_different {
                 if let Some(show_if_different) = show_if_different {
                     println!("{}", show_if_different);
                 }
             }
 
-            return diff.print();
+            diff.print()
         }
     }
 
@@ -91,7 +126,7 @@ impl<'a> FileDiff<'a> {
                 return Ok(DiffExitStatus::Trouble);
             }
 
-            return FileDiff::file_diff(path1, path2, format_options, None);
+            FileDiff::file_diff(path1, path2, format_options, None)
         } else {
             let path2_file = path2.clone();
             let path2_file = path2_file.file_name().expect(COULD_NOT_UNWRAP_FILENAME);
@@ -101,7 +136,7 @@ impl<'a> FileDiff<'a> {
                 return Ok(DiffExitStatus::Trouble);
             }
 
-            return FileDiff::file_diff(path1, path2, format_options, None);
+            FileDiff::file_diff(path1, path2, format_options, None)
         }
     }
 
@@ -138,9 +173,9 @@ impl<'a> FileDiff<'a> {
         self.order_hunks_by_output_format();
 
         if let OutputFormat::Context(context) = self.format_options.output_format {
-            self.print_context(context);
+            let _ = self.print_context(context);
         } else if let OutputFormat::Unified(unified) = self.format_options.output_format {
-            self.print_unified(unified);
+            let _ = self.print_unified(unified);
         } else {
             let hunks_count = self.hunks.hunks().len();
 
@@ -160,7 +195,7 @@ impl<'a> FileDiff<'a> {
                         eprintln!("OutputFormat::Context should be handled in other place");
                         return Ok(DiffExitStatus::Trouble);
                     }
-                    OutputFormat::ForwardEditScript => hunk.print_forward_edit_script(
+                    OutputFormat::ForwardEditScript => hunk.print_edit_script(
                         self.file1,
                         self.file2,
                         hunk_index == hunks_count - 1,
@@ -173,164 +208,86 @@ impl<'a> FileDiff<'a> {
             }
         }
 
-        if self.are_different() {
-            return Ok(DiffExitStatus::Different);
+        if self.are_different {
+            Ok(DiffExitStatus::Different)
         } else {
-            return Ok(DiffExitStatus::NotDifferent);
+            Ok(DiffExitStatus::NotDifferent)
         }
     }
 
-    fn compare_lines(&self, l1: &str, l2: &str) -> bool {
-        if self.format_options.ignore_trailing_white_spaces {
-            l1.trim_end() == l2.trim_end()
-        } else {
-            l1 == l2
-        }
-    }
-
-    fn needleman_wunsch_diff_lines(&mut self) {
-        let n = self.file1.lines().len();
-        let m = self.file2.lines().len();
-        let mut distances = vec![vec![0; m + 1]; n + 1];
-        let mut file1_considered_lines = vec![0; 0];
-        let mut file2_considered_lines = vec![0; 0];
-
-        for i in 0..=n {
-            distances[i][0] = i;
-        }
-
-        for j in 0..=m {
-            distances[0][j] = j;
+    /// Longest common subsequence (LCS) algorithm by recursively building a histogram.
+    /// Indices in lcs_indices will be the line number in file1 while values will
+    /// be the corresponding line number in file2. If the value is -1, then the
+    /// line is not part of the LCS.
+    pub fn histogram_lcs(
+        file1: &FileData,
+        file2: &FileData,
+        mut x0: usize,
+        mut x1: usize,
+        mut y0: usize,
+        mut y1: usize,
+        lcs_indices: &mut Vec<i32>,
+    ) {
+        // collect common elements at the beginning
+        while (x0 < x1) && (y0 < y1) && (file1.line(x0) == file2.line(y0)) {
+            lcs_indices[x0] = y0 as i32;
+            x0 += 1;
+            y0 += 1;
         }
 
-        for i in 1..=n {
-            for j in 1..=m {
-                let cost = if self.compare_lines(self.file1.line(i - 1), self.file2.line(j - 1)) {
-                    if !file1_considered_lines.contains(&i) && !file2_considered_lines.contains(&j)
-                    {
-                        file1_considered_lines.push(i);
-                        file2_considered_lines.push(j);
-
-                        self.add_change(Change::Unchanged(ChangeData::new(i, j)));
-                    }
-                    0
-                } else {
-                    1
-                };
-
-                let inserted = distances[i - 1][j] + 1;
-                let deleted = distances[i][j - 1] + 1;
-                let substituted = distances[i - 1][j - 1] + cost;
-
-                distances[i][j] = vec_min(&[inserted, deleted, substituted]);
-            }
+        if (x0 == x1) || (y0 == y1) {
+            // we can return early
+            return;
         }
 
-        let (mut i, mut j) = (n, m);
+        // collect common elements at the end
+        while (x0 < x1) && (y0 < y1) && (file1.line(x1 - 1) == file2.line(y1 - 1)) {
+            lcs_indices[x1 - 1] = (y1 - 1) as i32;
+            x1 -= 1;
+            y1 -= 1;
+        }
 
-        while i > 0 || j > 0 {
-            if j > 0 && distances[i][j] == distances[i][j - 1] + 1 {
-                self.add_change(Change::Insert(ChangeData::new(i, j)));
-
-                j -= 1
-            } else if i > 0 && distances[i][j] == distances[i - 1][j] + 1 {
-                self.add_change(Change::Delete(ChangeData::new(i, j)));
-
-                i -= 1
+        // build histogram
+        let mut hist: HashMap<&str, Vec<i32>> = HashMap::new();
+        for i in x0..x1 {
+            if let Some(rec) = hist.get_mut(file1.line(i)) {
+                rec[0] += 1_i32;
+                rec[1] = i as i32;
             } else {
-                if !self.compare_lines(self.file1.line(i - 1), self.file2.line(j - 1)) {
-                    self.add_change(Change::Substitute(ChangeData::new(i, j)));
-                }
-
-                i -= 1;
-                j -= 1
+                hist.insert(file1.line(i), vec![1, i as i32, 0, -1]);
             }
         }
-    }
-
-    fn add_change(&mut self, change: Change) {
-        if let Change::None = change {
-        } else {
-            if !self.are_different {
-                self.are_different = match &change {
-                    Change::None => false,
-                    Change::Unchanged(_) => false,
-                    Change::Insert(_) => true,
-                    Change::Delete(_) => true,
-                    Change::Substitute(_) => true,
-                }
-            }
-
-            let (l1, l2) = change.get_lns();
-
-            if l1 != 0 {
-                self.file1.set_change(change, l1 - 1);
-            }
-
-            if l2 != 0 {
-                self.file2.set_change(change, l2 - 1);
+        for i in y0..y1 {
+            if let Some(rec) = hist.get_mut(file2.line(i)) {
+                rec[2] += 1_i32;
+                rec[3] = i as i32;
+            } else {
+                hist.insert(file2.line(i), vec![0, -1, 1, i as i32]);
             }
         }
 
-        self.hunks.add_change(change);
-    }
-
-    fn get_context_ranges(&self, context: usize) -> Vec<(usize, usize, usize, usize)> {
-        let f1_lines = self.file1.lines().len();
-        let f2_lines = self.file2.lines().len();
-
-        let mut change_ranges = self
-            .hunks
-            .hunks()
+        // find lowest-occurrence item that appears in both files
+        let key = hist
             .iter()
-            .filter(|hunk| !Change::is_none(hunk.kind()) && !Change::is_unchanged(hunk.kind()))
-            .map(|hunk| {
-                (
-                    hunk.ln1_start() as i64,
-                    hunk.ln1_end() as i64,
-                    hunk.ln2_start() as i64,
-                    hunk.ln2_end() as i64,
-                )
+            .filter(|(_k, v)| (v[0] > 0) && (v[2] > 0))
+            .min_by(|a, b| {
+                let c = a.1[0] + a.1[2];
+                let d = b.1[0] + b.1[2];
+                c.cmp(&d)
             })
-            .collect::<Vec<(i64, i64, i64, i64)>>();
+            .map(|(k, _v)| *k);
 
-        change_ranges.sort_by_key(|change| (change.1, change.3));
-
-        let mut context_ranges = vec![(usize::MIN, usize::MIN, usize::MIN, usize::MIN); 0];
-
-        let f1_max = if self.file1.ends_with_newline() && f1_lines - 1 >= 1 {
-            f1_lines - 1
-        } else {
-            f1_lines
-        };
-
-        let f2_max = if self.file2.ends_with_newline() && f2_lines - 1 >= 1 {
-            f2_lines - 1
-        } else {
-            f2_lines
-        };
-
-        for cr in change_ranges {
-            let ln1s = i64::clamp(cr.0 - context as i64, 1, f1_max as i64);
-            let ln1e = i64::clamp(cr.1 + context as i64, 1, f1_max as i64);
-            let ln2s = i64::clamp(cr.2 - context as i64, 1, f2_max as i64);
-            let ln2e = i64::clamp(cr.3 + context as i64, 1, f2_max as i64);
-
-            if !context_ranges.is_empty() {
-                // Overlap check
-                if let Some((_, ln1_end, _, ln2_end)) = context_ranges.last_mut() {
-                    if *ln1_end >= ln1s as usize || *ln2_end >= ln2s as usize {
-                        *ln1_end = ln1e as usize;
-                        *ln2_end = ln2e as usize;
-                        continue;
-                    }
-                }
+        match key {
+            None => {}
+            Some(k) => {
+                let rec = hist.get(k).unwrap();
+                let x1_new = rec[1] as usize;
+                let y1_new = rec[3] as usize;
+                lcs_indices[x1_new] = y1_new as i32;
+                FileDiff::histogram_lcs(file1, file2, x0, x1_new, y0, y1_new, lcs_indices);
+                FileDiff::histogram_lcs(file1, file2, x1_new + 1, x1, y1_new + 1, y1, lcs_indices);
             }
-
-            context_ranges.push((ln1s as usize, ln1e as usize, ln2s as usize, ln2e as usize));
         }
-
-        return context_ranges;
     }
 
     fn order_hunks_by_output_format(&mut self) {
@@ -351,220 +308,384 @@ impl<'a> FileDiff<'a> {
     }
 
     fn order_hunks_descending(&mut self) {
-        self.order_hunks_ascending();
-        self.hunks.hunks_mut().reverse();
+        self.hunks
+            .hunks_mut()
+            .sort_by_key(|hunk| Reverse((hunk.ln1_end(), hunk.ln2_end())));
     }
 
-    fn print_context(&mut self, context: usize) {
+    fn print_context(&mut self, context: usize) -> Result<(), std::fmt::Error> {
         println!(
             "*** {}",
-            Self::get_header(self.file1, &self.format_options.label1())
+            Self::get_header(self.file1, self.format_options.label1())
         );
         println!(
             "--- {}",
-            Self::get_header(self.file2, &self.format_options.label2())
+            Self::get_header(self.file2, self.format_options.label2())
         );
 
-        let change_ranges = self.get_context_ranges(context);
+        let mut diff_disp = ContextDiffDisplay::default();
 
-        for cr_index in 0..change_ranges.len() {
-            let cr = change_ranges[cr_index];
-
-            println!("***************");
-            println!("*** {},{} ***", cr.0, cr.1);
-            if self.file1.expected_changed_in_range(
-                cr.0 - 1,
-                cr.1 - 1,
-                &vec![Change::is_delete, Change::is_substitute],
-            ) {
-                for i in cr.0..=cr.1 {
-                    println!(
-                        "{} {}",
-                        self.file1.get_context_identifier(i - 1),
-                        self.file1.line(i - 1)
-                    );
+        for hunk in self.hunks.hunks() {
+            // move cursor to the start of context for first hunk
+            if diff_disp.curr_pos1 == 0 {
+                if hunk.ln1_start() > context {
+                    // this is guaranteed to be >= 0 due to the above conditions
+                    diff_disp
+                        .update_curr_pos(hunk.ln1_start() - context, hunk.ln2_start() - context);
                 }
+                diff_disp.set_context_start();
             }
 
-            if cr_index == change_ranges.len() - 1 {
-                if self.file1.ends_with_newline() == false {
-                    println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
-                }
+            // do we have enough context between hunks?
+            if (diff_disp.curr_pos1 != 0) && (hunk.ln1_start() - diff_disp.curr_pos1 > context * 2)
+            {
+                // add context after the previous hunk
+                diff_disp.write_line(
+                    self.file1,
+                    diff_disp.curr_pos1,
+                    diff_disp.curr_pos1 + context,
+                    "  ",
+                    true,
+                )?;
+                diff_disp.write_line(
+                    self.file2,
+                    diff_disp.curr_pos2,
+                    diff_disp.curr_pos2 + context,
+                    "  ",
+                    false,
+                )?;
+                // update current position and print the whole section
+                diff_disp.update_curr_pos(hunk.ln1_start() - context, hunk.ln2_start() - context);
+                // check if we have something to display other than just context
+                let print_lines1 = diff_disp.hunk_lines[0]
+                    .split('\n')
+                    .any(|x| x.starts_with('-') || x.starts_with('!'));
+                diff_disp.print_section(true, print_lines1);
+                let print_lines2 = diff_disp.hunk_lines[1]
+                    .split('\n')
+                    .any(|x| x.starts_with('-') || x.starts_with('!'));
+                diff_disp.print_section(false, print_lines2);
             }
 
-            println!("--- {},{} ---", cr.2, cr.3);
+            // add context before current hunk
+            diff_disp.write_line(
+                self.file1,
+                diff_disp.curr_pos1,
+                hunk.ln1_start(),
+                "  ",
+                true,
+            )?;
+            // add delete hunk
+            let h1_prefix = if hunk.ln2_end() - hunk.ln2_start() > 0 {
+                "! "
+            } else {
+                "- "
+            };
+            diff_disp.write_line(
+                self.file1,
+                hunk.ln1_start(),
+                hunk.ln1_end(),
+                h1_prefix,
+                true,
+            )?;
 
-            if self.file2.expected_changed_in_range(
-                cr.2 - 1,
-                cr.3 - 1,
-                &vec![Change::is_insert, Change::is_substitute],
-            ) {
-                for i in cr.2..=cr.3 {
-                    println!(
-                        "{} {}",
-                        self.file2.get_context_identifier(i - 1),
-                        self.file2.line(i - 1)
-                    );
-                }
-            }
-
-            if cr_index == change_ranges.len() - 1 {
-                if self.file2.ends_with_newline() == false {
-                    println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
-                }
-            }
+            // context before insertion
+            diff_disp.write_line(
+                self.file2,
+                diff_disp.curr_pos2,
+                hunk.ln2_start(),
+                "  ",
+                false,
+            )?;
+            // add insert hunk
+            let h2_prefix = if hunk.ln1_end() - hunk.ln1_start() > 0 {
+                "! "
+            } else {
+                "+ "
+            };
+            diff_disp.write_line(
+                self.file2,
+                hunk.ln2_start(),
+                hunk.ln2_end(),
+                h2_prefix,
+                false,
+            )?;
         }
+
+        // print final hunk
+        if !diff_disp.hunk_lines.is_empty() {
+            // display the remaining context if possible
+            if diff_disp.curr_pos1 < self.file1.lines().len() {
+                let end1 = self.file1.lines().len().min(diff_disp.curr_pos1 + context);
+                let end2 = self.file2.lines().len().min(diff_disp.curr_pos2 + context);
+                diff_disp.write_line(self.file1, diff_disp.curr_pos1, end1, " ", true)?;
+                diff_disp.write_line(self.file2, diff_disp.curr_pos2, end2, " ", false)?;
+            }
+            let print_lines1 = diff_disp.hunk_lines[0]
+                .split('\n')
+                .any(|x| x.starts_with('-') || x.starts_with('!'));
+            diff_disp.print_section(true, print_lines1);
+            let print_lines2 = diff_disp.hunk_lines[1]
+                .split('\n')
+                .any(|x| x.starts_with('+') || x.starts_with('!'));
+            diff_disp.print_section(false, print_lines2);
+        }
+
+        if !self.file1.ends_with_newline() {
+            println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
+        }
+        if !self.file2.ends_with_newline() {
+            println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
+        }
+        Ok(())
     }
 
-    fn print_unified(&mut self, unified: usize) {
+    fn print_unified(&mut self, unified: usize) -> Result<(), std::fmt::Error> {
         println!(
             "--- {}",
-            Self::get_header(self.file1, &self.format_options.label1())
+            Self::get_header(self.file1, self.format_options.label1())
         );
         println!(
             "+++ {}",
-            Self::get_header(self.file2, &self.format_options.label2())
+            Self::get_header(self.file2, self.format_options.label2())
         );
 
-        let context_ranges = self.get_context_ranges(unified);
+        let mut diff_disp = UnifiedDiffDisplay::default();
 
-        for cr_index in 0..context_ranges.len() {
-            let cr = context_ranges[cr_index];
-            let mut changes = HashMap::<u64, Change>::new();
-
-            for f1_line in cr.0..=cr.1 {
-                let change = self.file1.change(f1_line - 1);
-                changes.insert(calculate_hash(change), change.clone());
-            }
-
-            for f2_line in cr.2..=cr.3 {
-                let change = self.file2.change(f2_line - 1);
-                let hash = calculate_hash(change);
-                if changes.contains_key(&hash) == false {
-                    changes.insert(calculate_hash(change), change.clone());
+        for hunk in self.hunks.hunks() {
+            // move cursor to the start of context for first hunk
+            if diff_disp.curr_pos1 == 0 {
+                if hunk.ln1_start() > unified {
+                    // this is guaranteed to be >= 0 due to the above conditions
+                    diff_disp
+                        .update_curr_pos(hunk.ln1_start() - unified, hunk.ln2_start() - unified);
                 }
+                diff_disp.set_context_start();
             }
 
-            if changes.values().any(|change| {
-                Change::is_delete(change)
-                    || Change::is_insert(change)
-                    || Change::is_substitute(change)
-            }) {
-                let mut values = changes.values().cloned().collect::<Vec<Change>>();
-                values.sort_by_key(|change| change.get_lns());
-
-                let f1_range = if values.iter().all(|change| change.is_insert()) {
-                    format!("{},{}", cr.0, 0)
-                } else {
-                    let start = cr.0;
-                    let count = cr.1 - cr.0 + 1;
-                    if count == 1 {
-                        format!("{}", start)
-                    } else {
-                        format!("{},{}", start, count)
-                    }
-                };
-
-                let f2_range = if values.iter().all(|change| change.is_delete()) {
-                    format!("{},{}", cr.2, 0)
-                } else {
-                    let start = cr.2;
-                    let count = cr.3 - cr.2 + 1;
-                    if count == 1 {
-                        format!("{}", start)
-                    } else {
-                        format!("{},{}", start, count)
-                    }
-                };
-
-                let unchanged_count = values.iter().filter(|change| change.is_unchanged()).count();
-                let insert_count = values.iter().filter(|change| change.is_insert()).count();
-                let delete_count = values.iter().filter(|change| change.is_delete()).count();
-                let substitute_count = values
-                    .iter()
-                    .filter(|change| change.is_substitute())
-                    .count();
-
-                let mut printed_unchanged = 0usize;
-                let mut printed_insert = 0usize;
-                let mut printed_delete = 0usize;
-                let mut printed_substitute = 0usize;
-
-                let mut f1_no_eof_printable = true;
-                let mut f2_no_eof_printable = true;
-
-                println!("@@ -{} +{} @@", f1_range, f2_range);
-
-                for change in values {
-                    increase_by_one_if(change.is_unchanged(), &mut printed_unchanged);
-                    increase_by_one_if(change.is_insert(), &mut printed_insert);
-                    increase_by_one_if(change.is_delete(), &mut printed_delete);
-                    increase_by_one_if(change.is_substitute(), &mut printed_substitute);
-
-                    let printables = match change {
-                        Change::None => vec![String::new(); 0],
-                        Change::Unchanged(data) => {
-                            vec![format!(" {}", self.file1.line(data.ln1() - 1))]
-                        }
-                        Change::Insert(data) => {
-                            vec![format!("+{}", self.file2.line(data.ln2() - 1))]
-                        }
-                        Change::Delete(data) => {
-                            vec![format!("-{}", self.file1.line(data.ln1() - 1))]
-                        }
-                        Change::Substitute(data) => {
-                            vec![
-                                format!("-{}", self.file1.line(data.ln1() - 1)),
-                                format!("+{}", self.file2.line(data.ln2() - 1)),
-                            ]
-                        }
-                    };
-
-                    if change.is_none() {
-                        continue;
-                    }
-
-                    println!("{}", printables[0]);
-
-                    if f1_no_eof_printable
-                        && cr_index == context_ranges.len() - 1
-                        && printed_unchanged == unchanged_count
-                        && printed_delete == delete_count
-                        && printed_substitute == substitute_count
-                        && self.file1.ends_with_newline() == false
-                    {
-                        println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
-                        f1_no_eof_printable = false;
-                    }
-
-                    if change.is_substitute() {
-                        println!("{}", printables[1]);
-                    }
-
-                    if f2_no_eof_printable
-                        && unified != 0
-                        && cr_index == context_ranges.len() - 1
-                        && insert_count == printed_insert
-                        && printed_substitute == substitute_count
-                        && self.file2.ends_with_newline() == false
-                    {
-                        println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
-                        f2_no_eof_printable = false;
-                    }
-                }
+            // do we have enough context between hunks?
+            if (diff_disp.curr_pos1 != 0) && (hunk.ln1_start() - diff_disp.curr_pos1 > unified * 2)
+            {
+                // add context after the previous hunk
+                diff_disp.write_line(
+                    self.file1,
+                    diff_disp.curr_pos1,
+                    diff_disp.curr_pos1 + unified,
+                    " ",
+                )?;
+                // update current position and print the whole section
+                diff_disp.update_curr_pos(hunk.ln1_start() - unified, hunk.ln2_start() - unified);
+                diff_disp.print_section();
             }
+
+            // add context before current hunk
+            diff_disp.write_line(self.file1, diff_disp.curr_pos1, hunk.ln1_start(), " ")?;
+            // add delete hunk
+            diff_disp.write_line(self.file1, hunk.ln1_start(), hunk.ln1_end(), "-")?;
+            // add insert hunk
+            diff_disp.write_line(self.file2, hunk.ln2_start(), hunk.ln2_end(), "+")?;
         }
+
+        // print final hunk
+        if !diff_disp.hunk_lines.is_empty() {
+            // display the remaining context if possible
+            if diff_disp.curr_pos1 < self.file1.lines().len() {
+                let end = self.file1.lines().len().min(diff_disp.curr_pos1 + unified);
+                diff_disp.write_line(self.file1, diff_disp.curr_pos1, end, " ")?;
+            }
+            diff_disp.print_section();
+        }
+
+        if !self.file1.ends_with_newline() {
+            println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
+        }
+        if !self.file2.ends_with_newline() {
+            println!("{}", NO_NEW_LINE_AT_END_OF_FILE);
+        }
+        Ok(())
     }
 
     pub fn get_header(file: &FileData, label: &Option<String>) -> String {
         if let Some(label) = label {
-            return format!("{}", label);
+            label.to_string()
         } else {
-            return format!(
+            format!(
                 "{}\t{}",
                 file.path(),
                 system_time_to_rfc2822(file.modified())
-            );
+            )
         }
+    }
+}
+
+#[derive(Default)]
+pub struct UnifiedDiffDisplay {
+    curr_pos1: usize,
+    curr_pos2: usize,
+    //`context_start` and `hunk_len` to get the values for the hunk header
+    //keep track of the lines where context start
+    context_start1: usize,
+    context_start2: usize,
+    //keep track of the length of the current hunk
+    hunk1_len: usize,
+    hunk2_len: usize,
+    hunk_lines: String,
+}
+
+impl UnifiedDiffDisplay {
+    pub fn write_line(
+        &mut self,
+        file: &FileData,
+        start: usize,
+        end: usize,
+        prefix: &str,
+    ) -> Result<(), std::fmt::Error> {
+        let mut offset = 0;
+        for i in start..end {
+            writeln!(self.hunk_lines, "{prefix}{}", file.line(i))?;
+            offset += 1;
+        }
+        if prefix == " " {
+            self.curr_pos1 += offset;
+            self.hunk1_len += offset;
+            self.hunk2_len += offset;
+        } else if prefix == "-" {
+            self.curr_pos1 += offset;
+            self.hunk1_len += offset;
+        } else if prefix == "+" {
+            self.hunk2_len += offset;
+        }
+        Ok(())
+    }
+
+    pub fn set_context_start(&mut self) {
+        self.context_start1 = self.curr_pos1 + 1;
+        self.context_start2 = self.curr_pos2 + 1;
+    }
+    pub fn update_curr_pos(&mut self, curr1: usize, curr2: usize) {
+        self.curr_pos1 = curr1;
+        self.curr_pos2 = curr2;
+    }
+
+    pub fn print_section(&mut self) {
+        println!(
+            "@@ -{},{} +{},{} @@",
+            self.context_start1, self.hunk1_len, self.context_start2, self.hunk2_len
+        );
+        self.print_hunk();
+        self.context_start1 = self.curr_pos1 + 1;
+        self.context_start2 = self.curr_pos2 + 1;
+        self.hunk1_len = 0;
+        self.hunk2_len = 0;
+    }
+
+    pub fn print_hunk(&mut self) {
+        if self.hunk_lines.ends_with('\n') {
+            self.hunk_lines.pop();
+        }
+        println!("{}", self.hunk_lines);
+        self.hunk_lines.clear();
+    }
+}
+
+#[derive(Default)]
+pub struct ContextDiffDisplay {
+    curr_pos1: usize,
+    curr_pos2: usize,
+    //`context_start` and `hunk_len` to get the values for the hunk header
+    //keep track of the lines where context start
+    context_start1: usize,
+    context_start2: usize,
+    //keep track of the length of the current hunk
+    hunk1_len: usize,
+    hunk2_len: usize,
+    hunk_lines: [String; 2],
+}
+
+impl ContextDiffDisplay {
+    pub fn set_context_start(&mut self) {
+        self.context_start1 = self.curr_pos1 + 1;
+        self.context_start2 = self.curr_pos2 + 1;
+    }
+    pub fn update_curr_pos(&mut self, curr1: usize, curr2: usize) {
+        self.curr_pos1 = curr1;
+        self.curr_pos2 = curr2;
+    }
+
+    pub fn write_line(
+        &mut self,
+        file: &FileData,
+        start: usize,
+        end: usize,
+        prefix: &str,
+        is_file1: bool,
+    ) -> Result<(), std::fmt::Error> {
+        let mut offset = 0;
+        let file_index = if is_file1 { 0 } else { 1 };
+
+        for i in start..end {
+            writeln!(self.hunk_lines[file_index], "{prefix}{}", file.line(i))?;
+            offset += 1;
+        }
+        if prefix.starts_with(" ") {
+            if is_file1 {
+                self.curr_pos1 += offset;
+                self.hunk1_len += offset;
+            } else {
+                self.curr_pos2 += offset;
+                self.hunk2_len += offset;
+            }
+        } else if prefix.starts_with("-") {
+            self.curr_pos1 += offset;
+            self.hunk1_len += offset;
+        } else if prefix.starts_with("+") {
+            self.curr_pos2 += offset;
+            self.hunk2_len += offset;
+        } else if prefix.starts_with("!") {
+            if is_file1 {
+                self.curr_pos1 += offset;
+                self.hunk1_len += offset;
+            } else {
+                self.curr_pos2 += offset;
+                self.hunk2_len += offset;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn print_section(&mut self, is_file1: bool, print_lines: bool) {
+        if is_file1 {
+            println!(
+                "***************\n*** {},{} ****",
+                self.context_start1,
+                self.context_start1 + self.hunk1_len - 1
+            );
+            if print_lines {
+                self.print_hunk(true);
+            }
+            self.context_start1 = self.curr_pos1 + 1;
+            self.hunk1_len = 0;
+        } else {
+            println!(
+                "--- {},{} ----",
+                self.context_start2,
+                self.context_start2 + self.hunk2_len - 1
+            );
+            if print_lines {
+                self.print_hunk(false);
+            }
+            self.context_start2 = self.curr_pos2 + 1;
+            self.hunk2_len = 0;
+        }
+    }
+
+    pub fn print_hunk(&mut self, is_file1: bool) {
+        let file_index = if is_file1 { 0 } else { 1 };
+        let lines = &mut self.hunk_lines[file_index];
+        if lines.ends_with('\n') {
+            lines.pop();
+        }
+        println!("{}", lines);
+        self.hunk_lines[file_index].clear();
     }
 }

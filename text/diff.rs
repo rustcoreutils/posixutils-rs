@@ -25,7 +25,6 @@ use diff_util::{
     functions::check_existance,
 };
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 
 /// diff - compare two files
 #[derive(Parser, Clone)]
@@ -104,10 +103,6 @@ impl From<&Args> for OutputFormat {
 }
 
 fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
-
     let path1 = PathBuf::from(&args.file1);
     let path2 = PathBuf::from(&args.file2);
 
@@ -136,16 +131,19 @@ fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
     let path2_is_file = fs::metadata(&path2)?.is_file();
 
     if path1_is_file && path2_is_file {
-        return FileDiff::file_diff(path1, path2, &format_options, None);
+        FileDiff::file_diff(path1, path2, &format_options, None)
     } else if !path1_is_file && !path2_is_file {
-        return DirDiff::dir_diff(path1, path2, &format_options, args.recurse);
+        DirDiff::dir_diff(path1, path2, &format_options, args.recurse)
     } else {
-        return FileDiff::file_dir_diff(path1, path2, &format_options);
+        FileDiff::file_dir_diff(path1, path2, &format_options)
     }
 }
 
 fn main() -> DiffExitStatus {
-    // parse command line arguments
+    setlocale(LocaleCategory::LcAll, "");
+    textdomain("posixutils-rs").unwrap();
+    bind_textdomain_codeset("posixutils-rs", "UTF-8").unwrap();
+
     let args = Args::parse();
 
     let result = check_difference(args);

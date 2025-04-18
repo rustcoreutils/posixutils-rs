@@ -1,0 +1,30 @@
+0
+value
+readonly a='value'
+0
+val2 val2
+readonly a='value'
+readonly b='val2'
+readonly c='val2'
+0
+value3
+readonly a='value'
+readonly b='val2'
+readonly c='val2'
+readonly d='value3'
+value
+0
+value
+readonly a='value'
+readonly b='val2'
+readonly c='val2'
+readonly d='value3'
+readonly var='value'
+
+
+readonly a='value'
+readonly b='val2'
+readonly c='val2'
+readonly d='value3'
+readonly var='value'
+readonly var2

@@ -7,11 +7,6 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::{
-    ffi::{OsStr, OsString},
-    io::Read,
-};
-
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use object::{
@@ -19,7 +14,10 @@ use object::{
     build::elf::{Builder, Section, SectionData},
     elf,
 };
-use plib::PROJECT_NAME;
+use std::{
+    ffi::{OsStr, OsString},
+    io::Read,
+};
 
 #[derive(Parser)]
 #[command(version, about = gettext("strip - remove unnecessary information from strippable files"))]
@@ -145,10 +143,11 @@ fn strip_file(file: &OsStr) {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain("posixutils-rs")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
 
     let args = Args::parse();
+
     for file in args.input_files {
         strip_file(&file);
     }

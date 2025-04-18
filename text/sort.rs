@@ -18,7 +18,6 @@ use std::{
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 
 /// Sort, merge, or sequence check text files
 #[derive(Parser)]
@@ -121,7 +120,7 @@ impl Args {
 }
 
 /// A struct representing a range field with various sorting and comparison options.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct RangeField {
     /// The number of the field to be considered in the range.
     field_number: usize,
@@ -147,21 +146,6 @@ struct RangeField {
     /// A boolean flag to indicate if the field should be compared in dictionary order
     /// (considers only alphanumeric characters and blanks).
     dictionary_order: bool,
-}
-
-impl RangeField {
-    fn new() -> RangeField {
-        Self {
-            field_number: 0,
-            first_character: 0,
-            numeric_sort: false,
-            ignore_leading_blanks: false,
-            reverse: false,
-            ignore_nonprintable: false,
-            fold_case: false,
-            dictionary_order: false,
-        }
-    }
 }
 
 /// Updates two RangeField objects based on their comparison options.
@@ -744,7 +728,7 @@ fn create_ranges(
     let mut key_ranges = key_ranges.iter();
 
     // Convert key ranges to numeric representations
-    let mut ranges: (RangeField, Option<RangeField>) = (RangeField::new(), None);
+    let mut ranges: (RangeField, Option<RangeField>) = (RangeField::default(), None);
 
     ranges.0 = {
         let key_range = key_ranges.next().unwrap().to_string();
@@ -945,19 +929,26 @@ fn merge_files(paths: &mut Vec<Box<dyn Read>>, output_path: &Option<PathBuf>) ->
 ///
 /// A vector of strings (`Vec<String>`) where consecutive empty strings are merged with the nearest non-empty string.
 ///
+/// # Examples
+///
+/// ```
+/// let result = merge_empty_lines(vec!["line1", "line2", "", "", "", "lineN"]);
+/// assert_eq!(result, vec!["line1", "line2", "   lineN"]);
+/// ```
+///
 fn merge_empty_lines(vec: Vec<&str>) -> Vec<String> {
     let mut empty_count = 0;
     let mut result = vec![];
 
-    for i in 0..vec.len() {
-        if vec[i].is_empty() {
+    for i in vec {
+        if i.is_empty() {
             empty_count += 1;
         } else if empty_count > 0 {
             let spaces = " ".repeat(empty_count);
-            result.push(format!("{}{}", spaces, vec[i]));
+            result.push(format!("{}{}", spaces, i));
             empty_count = 0;
         } else {
-            result.push(vec[i].to_string());
+            result.push(i.to_string());
         }
     }
 
@@ -1011,14 +1002,13 @@ fn sort(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
+    setlocale(LocaleCategory::LcAll, "");
+    textdomain("posixutils-rs")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+
     let args = Args::parse();
 
     args.validate_args()?;
-
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
     let mut exit_code = 0;
 
@@ -1028,4 +1018,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     std::process::exit(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_merge_empty_lines() {
+        let result = merge_empty_lines(vec!["line1", "line2", "", "", "", "lineN"]);
+        assert_eq!(result, vec!["line1", "line2", "   lineN"]);
+    }
 }

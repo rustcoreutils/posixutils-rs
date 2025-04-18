@@ -7,19 +7,17 @@
 // SPDX-License-Identifier: MIT
 //
 
-use libc::{
-    S_IRGRP, S_IROTH, S_IRUSR, S_IRWXG, S_IRWXO, S_IRWXU, S_ISUID, S_ISVTX, S_IWGRP, S_IWOTH,
-    S_IWUSR, S_IXGRP, S_IXOTH, S_IXUSR,
-};
+use libc::{S_IRWXG, S_IRWXO, S_IRWXU, S_ISGID, S_ISUID, S_ISVTX, S_IXGRP, S_IXOTH, S_IXUSR};
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Default)]
 pub enum ChmodActionOp {
     Add,
     Remove,
+    #[default]
     Set,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ChmodAction {
     pub op: ChmodActionOp,
 
@@ -37,25 +35,7 @@ pub struct ChmodAction {
     dirty: bool,
 }
 
-impl ChmodAction {
-    pub fn new() -> ChmodAction {
-        ChmodAction {
-            op: ChmodActionOp::Set,
-            copy_user: false,
-            copy_group: false,
-            copy_others: false,
-            read: false,
-            write: false,
-            execute: false,
-            execute_dir: false,
-            setuid: false,
-            sticky: false,
-            dirty: false,
-        }
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ChmodClause {
     // wholist
     pub user: bool,
@@ -68,39 +48,21 @@ pub struct ChmodClause {
     dirty: bool,
 }
 
-impl ChmodClause {
-    pub fn new() -> ChmodClause {
-        ChmodClause {
-            user: false,
-            group: false,
-            others: false,
-            actions: Vec::new(),
-            dirty: false,
-        }
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ChmodSymbolic {
     pub clauses: Vec<ChmodClause>,
 }
 
-impl ChmodSymbolic {
-    pub fn new() -> ChmodSymbolic {
-        ChmodSymbolic {
-            clauses: Vec::new(),
-        }
-    }
-}
-
 #[derive(Debug)]
 pub enum ChmodMode {
-    Absolute(u32),
+    /// (Numeric value, number of digits in octal notation)
+    Absolute(u32, u32),
     Symbolic(ChmodSymbolic),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 enum ParseState {
+    #[default]
     Wholist,
     Actionlist,
     ListOrCopy,
@@ -111,14 +73,14 @@ enum ParseState {
 
 pub fn parse(mode: &str) -> Result<ChmodMode, String> {
     if let Ok(m) = u32::from_str_radix(mode, 8) {
-        return Ok(ChmodMode::Absolute(m));
+        return Ok(ChmodMode::Absolute(m, mode.len() as u32));
     }
 
-    let mut state = ParseState::Wholist;
     let mut done_with_char;
-    let mut symbolic = ChmodSymbolic::new();
-    let mut clause = ChmodClause::new();
-    let mut action = ChmodAction::new();
+    let mut state = ParseState::default();
+    let mut symbolic = ChmodSymbolic::default();
+    let mut clause = ChmodClause::default();
+    let mut action = ChmodAction::default();
 
     for c in mode.chars() {
         done_with_char = false;
@@ -156,7 +118,7 @@ pub fn parse(mode: &str) -> Result<ChmodMode, String> {
                             action.dirty = false;
                             done_with_char = false;
                             symbolic.clauses.push(clause);
-                            clause = ChmodClause::new();
+                            clause = ChmodClause::default();
                             state = ParseState::NextClause;
                         }
                     }
@@ -177,7 +139,7 @@ pub fn parse(mode: &str) -> Result<ChmodMode, String> {
                             done_with_char = false;
                             clause.actions.push(action);
                             clause.dirty = true;
-                            action = ChmodAction::new();
+                            action = ChmodAction::default();
                             state = ParseState::Actionlist;
                         }
                     }
@@ -196,7 +158,7 @@ pub fn parse(mode: &str) -> Result<ChmodMode, String> {
                             done_with_char = false;
                             clause.actions.push(action);
                             clause.dirty = true;
-                            action = ChmodAction::new();
+                            action = ChmodAction::default();
                             state = ParseState::Actionlist;
                         }
                     }
@@ -225,155 +187,212 @@ pub fn parse(mode: &str) -> Result<ChmodMode, String> {
 }
 
 // apply symbolic mutations to the given file at path
-pub fn mutate(cur_mode: u32, symbolic: &ChmodSymbolic) -> u32 {
-    let mut new_mode = cur_mode;
-    let mut user = cur_mode & S_IRWXU as u32;
-    let mut group = cur_mode & S_IRWXG as u32;
-    let mut others = cur_mode & S_IRWXO as u32;
+pub fn mutate(init_mode: u32, is_dir: bool, symbolic: &ChmodSymbolic) -> u32 {
+    let mut user = init_mode & S_IRWXU as u32;
+    let mut group = init_mode & S_IRWXG as u32;
+    let mut others = init_mode & S_IRWXO as u32;
+    let mut special = init_mode & (S_ISUID | S_ISGID | S_ISVTX) as u32;
+
+    let mut cached_umask = None;
+
+    let mut get_umask = || -> u32 {
+        match cached_umask {
+            Some(m) => m,
+            None => {
+                // WARNING:
+                // Potential umask race-condition. Tests that exercise this code path must be
+                // located in tree/tree-tests-umask.rs so that they would not be run in parallel.
+
+                let m = unsafe { libc::umask(0) };
+                unsafe { libc::umask(m) }; // Immediately revert
+
+                let mask = m as u32; // Cast for macOS
+                cached_umask = Some(mask);
+                mask
+            }
+        }
+    };
 
     // apply each clause
     for clause in &symbolic.clauses {
+        let who_is_not_specified = !(clause.user || clause.group || clause.others);
+
         // apply each action
         for action in &clause.actions {
+            let mut rwx = 0;
+            if action.read {
+                rwx |= 0b100;
+            }
+            if action.write {
+                rwx |= 0b010;
+            }
+            if action.execute {
+                rwx |= 0b001;
+            }
+
+            // Specification says:
+            // "if the current (unmodified) file mode bits have at least one of the execute bits"
+            //
+            // Upon testing the GNU chmod implementation, "current" here does not mean the initial
+            // mode bits, but the mode bits built by the previous clauses.
+            let has_any_exec_bits =
+                ((user | group | others) & (S_IXUSR | S_IXGRP | S_IXOTH) as u32) != 0;
+
             match action.op {
                 // add bits to the mode
                 ChmodActionOp::Add => {
-                    if action.copy_user {
-                        user |= cur_mode & S_IRWXU as u32;
+                    if clause.user {
+                        user |= rwx << 6;
                     }
-                    if action.copy_group {
-                        group |= cur_mode & S_IRWXG as u32;
+                    if clause.group {
+                        group |= rwx << 3;
                     }
-                    if action.copy_others {
-                        others |= cur_mode & S_IRWXO as u32;
+                    if clause.others {
+                        others |= rwx;
                     }
-                    if action.read {
-                        user |= S_IRUSR as u32;
-                        group |= S_IRGRP as u32;
-                        others |= S_IROTH as u32;
+
+                    if who_is_not_specified {
+                        let umask = get_umask();
+
+                        user |= (rwx << 6) & !umask;
+                        group |= (rwx << 3) & !umask;
+                        others |= rwx & !umask;
                     }
-                    if action.write {
-                        user |= S_IWUSR as u32;
-                        group |= S_IWGRP as u32;
-                        others |= S_IWOTH as u32;
-                    }
-                    if action.execute {
-                        user |= S_IXUSR as u32;
-                        group |= S_IXGRP as u32;
-                        others |= S_IXOTH as u32;
-                    }
-                    if action.execute_dir {
-                        user |= S_IXUSR as u32;
-                        group |= S_IXGRP as u32;
-                        others |= S_IXOTH as u32;
-                    }
+
                     if action.setuid {
-                        user |= S_ISUID as u32;
-                    }
-                    if action.sticky {
-                        others |= S_ISVTX as u32;
+                        // If "who" is missing, set both `S_ISUID` and `S_ISGID`
+                        if clause.user || who_is_not_specified {
+                            special |= S_ISUID as u32;
+                        }
+                        if clause.group || who_is_not_specified {
+                            special |= S_ISGID as u32;
+                        }
                     }
                 }
 
                 // remove bits from the mode
                 ChmodActionOp::Remove => {
-                    if action.copy_user {
-                        user &= !(cur_mode & S_IRWXU as u32);
+                    if clause.user {
+                        user &= !(rwx << 6);
                     }
-                    if action.copy_group {
-                        group &= !(cur_mode & S_IRWXG as u32);
+                    if clause.group {
+                        group &= !(rwx << 3);
                     }
-                    if action.copy_others {
-                        others &= !(cur_mode & S_IRWXO as u32);
+                    if clause.others {
+                        others &= !rwx;
                     }
-                    if action.read {
-                        user &= !S_IRUSR as u32;
-                        group &= !S_IRGRP as u32;
-                        others &= !S_IROTH as u32;
-                    }
-                    if action.write {
-                        user &= !S_IWUSR as u32;
-                        group &= !S_IWGRP as u32;
-                        others &= !S_IWOTH as u32;
-                    }
-                    if action.execute {
-                        user &= !S_IXUSR as u32;
-                        group &= !S_IXGRP as u32;
-                        others &= !S_IXOTH as u32;
-                    }
-                    if action.execute_dir {
-                        user &= !S_IXUSR as u32;
-                        group &= !S_IXGRP as u32;
-                        others &= !S_IXOTH as u32;
-                    }
-                    if action.setuid {
-                        user &= !S_ISUID as u32;
-                    }
-                    if action.sticky {
-                        others &= !S_ISVTX as u32;
+
+                    if who_is_not_specified {
+                        let umask = get_umask();
+
+                        user &= !(rwx << 6) & !umask;
+                        group &= !(rwx << 3) & !umask;
+                        others &= !rwx & !umask;
                     }
                 }
 
                 // set the mode bits
                 ChmodActionOp::Set => {
-                    if action.copy_user {
-                        user = cur_mode & S_IRWXU as u32;
-                    } else {
-                        user = 0;
+                    // See the EXTENDED DESCRIPTION section of
+                    // https://pubs.opengroup.org/onlinepubs/9699919799/utilities/chmod.html
+                    // for the meaning of "permcopy" and "permlist"
+
+                    // The 3 permission bits to copy from "permcopy"
+                    let copy_value = match (action.copy_user, action.copy_group, action.copy_others)
+                    {
+                        (true, false, false) => user >> 6,
+                        (false, true, false) => group >> 3,
+                        (false, false, true) => others,
+                        (false, false, false) => {
+                            // Either a "permlist" was specified or nothing is
+                            0
+                        }
+                        _ => panic!(
+                            "Only one of 'u', 'g', or 'o' can be used as the source for copying"
+                        ),
+                    };
+
+                    // Should be at most 3 bits
+                    debug_assert!(copy_value <= 0b111);
+
+                    if clause.user {
+                        user = (copy_value | rwx) << 6;
                     }
-                    if action.copy_group {
-                        group = cur_mode & S_IRWXG as u32;
-                    } else {
-                        group = 0;
+                    if clause.group {
+                        group = (copy_value | rwx) << 3;
                     }
-                    if action.copy_others {
-                        others = cur_mode & S_IRWXO as u32;
-                    } else {
-                        others = 0;
+                    if clause.others {
+                        others = copy_value | rwx;
                     }
-                    if action.read {
-                        user |= S_IRUSR as u32;
-                        group |= S_IRGRP as u32;
-                        others |= S_IROTH as u32;
+
+                    if who_is_not_specified {
+                        let umask = get_umask();
+
+                        user = (copy_value | rwx) << 6 & !umask;
+                        group = (copy_value | rwx) << 3 & !umask;
+                        others = (copy_value | rwx) & !umask;
                     }
-                    if action.write {
-                        user |= S_IWUSR as u32;
-                        group |= S_IWGRP as u32;
-                        others |= S_IWOTH as u32;
+
+                    // Always reset when "op" is "="
+                    special = 0;
+                }
+            }
+
+            if action.setuid {
+                match action.op {
+                    ChmodActionOp::Add | ChmodActionOp::Set => {
+                        // If "who" is missing, set both `S_ISUID` and `S_ISGID`
+                        if clause.user || who_is_not_specified {
+                            special |= S_ISUID as u32;
+                        }
+                        if clause.group || who_is_not_specified {
+                            special |= S_ISGID as u32;
+                        }
                     }
-                    if action.execute {
-                        user |= S_IXUSR as u32;
-                        group |= S_IXGRP as u32;
-                        others |= S_IXOTH as u32;
+                    ChmodActionOp::Remove => {
+                        // If "who" is missing, remove both `S_ISUID` and `S_ISGID`
+                        if clause.user || who_is_not_specified {
+                            special &= !S_ISUID as u32;
+                        }
+                        if clause.group || who_is_not_specified {
+                            special &= !S_ISGID as u32;
+                        }
                     }
-                    if action.execute_dir {
-                        user |= S_IXUSR as u32;
-                        group |= S_IXGRP as u32;
-                        others |= S_IXOTH as u32;
+                }
+            }
+
+            if action.sticky {
+                // Not affected by the umask
+                match action.op {
+                    ChmodActionOp::Add | ChmodActionOp::Set => {
+                        special |= S_ISVTX as u32;
                     }
-                    if action.setuid {
-                        user |= S_ISUID as u32;
+                    ChmodActionOp::Remove => {
+                        special &= !S_ISVTX as u32;
                     }
-                    if action.sticky {
-                        others |= S_ISVTX as u32;
+                }
+            }
+
+            if action.execute_dir && (is_dir || has_any_exec_bits) {
+                let mask = if who_is_not_specified { get_umask() } else { 0 };
+
+                match action.op {
+                    ChmodActionOp::Add | ChmodActionOp::Set => {
+                        user |= S_IXUSR as u32 & !mask;
+                        group |= S_IXGRP as u32 & !mask;
+                        others |= S_IXOTH as u32 & !mask;
+                    }
+                    ChmodActionOp::Remove => {
+                        user &= !S_IXUSR as u32 & !mask;
+                        group &= !S_IXGRP as u32 & !mask;
+                        others &= !S_IXOTH as u32 & !mask;
                     }
                 }
             }
         }
-
-        // apply the clause
-        if clause.user {
-            new_mode = (new_mode & !S_IRWXU as u32) | user;
-        }
-        if clause.group {
-            new_mode = (new_mode & !S_IRWXG as u32) | group;
-        }
-        if clause.others {
-            new_mode = (new_mode & !S_IRWXO as u32) | others;
-        }
     }
 
-    new_mode
+    user | group | others | special
 }
 
 #[cfg(test)]
@@ -421,5 +440,140 @@ mod tests {
             }
             _ => panic!("unexpected mode"),
         }
+    }
+
+    fn parse_symbolic(mode: &str) -> ChmodSymbolic {
+        match parse(mode).unwrap() {
+            ChmodMode::Symbolic(s) => s,
+            _ => panic!("Incorrect parsing result"),
+        }
+    }
+
+    #[test]
+    fn test_mutate_mode_empty_who() {
+        // NOTE: Potential umask race condition here
+        let umask = unsafe {
+            let m = libc::umask(0);
+            libc::umask(m);
+            m as u32
+        };
+
+        let mode = mutate(0, false, &parse_symbolic("=rwx"));
+
+        assert_eq!(mode | umask, 0o777);
+    }
+
+    // Clears all file mode bits
+    #[test]
+    fn test_mutate_mode_chmod_example_1() {
+        assert_eq!(mutate(0o777, false, &parse_symbolic("a+=")), 0);
+        assert_eq!(mutate(0o777, false, &parse_symbolic("a+,a=")), 0);
+    }
+
+    // Clears group and other write bits
+    #[test]
+    fn test_mutate_mode_chmod_example_2() {
+        assert_eq!(
+            mutate(0b111_010_010, false, &parse_symbolic("go+-w")),
+            0o700
+        );
+        assert_eq!(
+            mutate(0b111_010_010, false, &parse_symbolic("go+,go-w")),
+            0o700
+        );
+    }
+
+    // Sets group bit to match other bits and then clears group write bit
+    #[test]
+    fn test_mutate_mode_chmod_example_3() {
+        assert_eq!(
+            mutate(0o007, false, &parse_symbolic("g=o-w")),
+            0b000_101_111
+        );
+        assert_eq!(
+            mutate(0o007, false, &parse_symbolic("g=o,g-w")),
+            0b000_101_111
+        );
+    }
+
+    // Clears group read bit and sets group write bit
+    #[test]
+    fn test_mutate_mode_chmod_example_4() {
+        assert_eq!(
+            mutate(0b000_100_000, false, &parse_symbolic("g-r+w")),
+            0b000_010_000
+        );
+        assert_eq!(
+            mutate(0b000_100_000, false, &parse_symbolic("g-r,g+w")),
+            0b000_010_000
+        );
+    }
+
+    // Sets owner bits to match group bits and sets other bits to match group bits
+    #[test]
+    fn test_mutate_mode_chmod_example_5() {
+        assert_eq!(mutate(0o070, false, &parse_symbolic("uo=g")), 0o777);
+    }
+
+    #[test]
+    fn test_mutate_mode_exec_dir() {
+        let plus_exec_dir = parse_symbolic("+X");
+
+        // Always apply X on directories
+        assert_eq!(mutate(0o444, true, &plus_exec_dir), 0o555);
+
+        // Ignore X on non-directories not having any execute bits
+        assert_eq!(
+            mutate(0o444 /* a=rw */, false, &plus_exec_dir),
+            0o444 /* Still a=rw */
+        );
+
+        // Apply X when file has an execute bit
+        assert_eq!(mutate(0o544, false, &plus_exec_dir), 0o555);
+        assert_eq!(mutate(0o454, false, &plus_exec_dir), 0o555);
+        assert_eq!(mutate(0o445, false, &plus_exec_dir), 0o555);
+        assert_eq!(mutate(0o554, false, &plus_exec_dir), 0o555);
+        assert_eq!(mutate(0o545, false, &plus_exec_dir), 0o555);
+        assert_eq!(mutate(0o455, false, &plus_exec_dir), 0o555);
+        assert_eq!(mutate(0o555, false, &plus_exec_dir), 0o555);
+
+        // =X should clear the read permission on user
+        assert_eq!(mutate(0o500, false, &parse_symbolic("=X")), 0o111);
+        // +X should retain the read permission on user
+        assert_eq!(mutate(0o500, false, &parse_symbolic("+X")), 0o511);
+
+        // -X removes execute permission on everyone
+        assert_eq!(mutate(0o711, false, &parse_symbolic("-X")), 0o600);
+
+        // Add execute permission on user then +X
+        assert_eq!(mutate(0o400, false, &parse_symbolic("u=x,+X")), 0o111);
+    }
+
+    #[test]
+    fn test_mutate_mode_clear_set_copy_then_reset() {
+        assert_eq!(
+            mutate(0o111, false, &parse_symbolic("a=,u=rwx,g=u,u=")),
+            0o070
+        );
+        assert_eq!(
+            mutate(0o111, false, &parse_symbolic("a=,u=rwx,o=u,u=")),
+            0o007
+        );
+        assert_eq!(
+            mutate(0o111, false, &parse_symbolic("a=,g=rwx,u=g,g=")),
+            0o700
+        );
+        assert_eq!(
+            mutate(0o111, false, &parse_symbolic("a=,g=rwx,o=g,g=")),
+            0o007
+        );
+        assert_eq!(
+            mutate(0o111, false, &parse_symbolic("a=,o=rwx,u=o,o=")),
+            0o700
+        );
+        assert_eq!(
+            mutate(0o111, false, &parse_symbolic("a=,o=rwx,g=o,o=")),
+            0o070
+        );
     }
 }

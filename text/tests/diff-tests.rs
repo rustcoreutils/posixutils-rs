@@ -12,10 +12,11 @@
 mod constants;
 
 use constants::{EXIT_STATUS_DIFFERENCE, EXIT_STATUS_NO_DIFFERENCE};
-use plib::{run_test, TestPlan};
+use plib::testing::{run_test, TestPlan};
+use std::{collections::HashMap, path::PathBuf, process::Stdio, sync::LazyLock};
 
 fn diff_test(args: &[&str], expected_output: &str, expected_diff_exit_status: u8) {
-    let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
+    let str_args = args.iter().cloned().map(str::to_owned).collect();
 
     run_test(TestPlan {
         cmd: String::from("diff"),
@@ -26,8 +27,6 @@ fn diff_test(args: &[&str], expected_output: &str, expected_diff_exit_status: u8
         expected_exit_code: i32::from(expected_diff_exit_status),
     });
 }
-
-use std::{path::PathBuf, process::Stdio};
 
 fn diff_base_path() -> PathBuf {
     PathBuf::from("tests").join("diff")
@@ -74,14 +73,13 @@ fn f1_txt_with_eol_spaces_path() -> String {
 }
 
 struct DiffTestHelper {
-    pub key: String,
     content: String,
     file1_path: String,
     file2_path: String,
 }
 
 impl DiffTestHelper {
-    fn new(options: &str, file1_path: String, file2_path: String, key: String) -> Self {
+    fn new(options: &str, file1_path: String, file2_path: String) -> Self {
         let args = format!(
             "run --release --bin diff --{} {} {}",
             options, file1_path, file2_path
@@ -99,7 +97,6 @@ impl DiffTestHelper {
         let content = String::from_utf8(output.stdout).expect("Failed to read output of Command!");
 
         Self {
-            key,
             file1_path,
             file2_path,
             content,
@@ -119,20 +116,7 @@ impl DiffTestHelper {
     }
 }
 
-static mut DIFF_TEST_INPUT: Vec<DiffTestHelper> = vec![];
-
-fn input_by_key(key: &str) -> &DiffTestHelper {
-    unsafe {
-        DIFF_TEST_INPUT
-            .iter()
-            .filter(|data| data.key == key)
-            .nth(0)
-            .unwrap()
-    }
-}
-
-#[ctor::ctor]
-fn diff_tests_setup() {
+fn get_diff_test_helper_hash_map() -> HashMap<String, DiffTestHelper> {
     let diff_test_helper_init_data = [
         ("", f1_txt_path(), f2_txt_path(), "test_diff_normal"),
         (" -c", f1_txt_path(), f2_txt_path(), "test_diff_context3"),
@@ -210,14 +194,33 @@ fn diff_tests_setup() {
         ),
     ];
 
-    for row in diff_test_helper_init_data {
-        unsafe { DIFF_TEST_INPUT.push(DiffTestHelper::new(row.0, row.1, row.2, row.3.to_string())) }
+    let mut diff_test_helper_hash_map =
+        HashMap::<String, DiffTestHelper>::with_capacity(diff_test_helper_init_data.len());
+
+    for (options, file1_path, file2_path, key) in diff_test_helper_init_data {
+        let insert_option = diff_test_helper_hash_map.insert(
+            key.to_owned(),
+            DiffTestHelper::new(options, file1_path, file2_path),
+        );
+
+        assert!(insert_option.is_none());
     }
+
+    diff_test_helper_hash_map
+}
+
+fn input_by_key(key: &str) -> &'static DiffTestHelper {
+    static DIFF_TEST_INPUT: LazyLock<HashMap<String, DiffTestHelper>> =
+        LazyLock::new(get_diff_test_helper_hash_map);
+
+    // Initialized on first access
+    DIFF_TEST_INPUT.get(key).unwrap()
 }
 
 #[test]
 fn test_diff_normal() {
     let data = input_by_key("test_diff_normal");
+
     diff_test(
         &[data.file1_path(), data.file2_path()],
         data.content(),
@@ -316,6 +319,7 @@ fn test_diff_unified10() {
 #[test]
 fn test_diff_file_directory() {
     let data = input_by_key("test_diff_file_directory");
+
     diff_test(
         &[data.file1_path(), data.file2_path()],
         data.content(),
@@ -326,6 +330,7 @@ fn test_diff_file_directory() {
 #[test]
 fn test_diff_directories() {
     let data = input_by_key("test_diff_directories");
+
     diff_test(
         &[data.file1_path(), data.file2_path()],
         data.content(),
@@ -391,6 +396,7 @@ fn test_diff_directories_recursive_unified() {
 #[test]
 fn test_diff_counting_eol_spaces() {
     let data = input_by_key("test_diff_counting_eol_spaces");
+
     diff_test(
         &[data.file1_path(), data.file2_path()],
         data.content(),

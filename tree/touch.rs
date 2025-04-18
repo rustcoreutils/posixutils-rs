@@ -10,7 +10,6 @@
 use chrono::{DateTime, Datelike, LocalResult, TimeZone, Utc};
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 
 /// touch - change file access and modification times
 #[derive(Parser)]
@@ -248,13 +247,11 @@ fn touch_file(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
-    let mut args = Args::parse();
-
-    // initialize translations
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain("posixutils-rs")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+
+    let mut args = Args::parse();
 
     // default to changing both access and modification times
     if !args.access && !args.mtime {

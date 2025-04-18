@@ -15,10 +15,9 @@ use crate::mntent::MountTable;
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 #[cfg(target_os = "macos")]
 use std::ffi::CStr;
-use std::{cmp, ffi::CString, io};
+use std::{cmp, ffi::CString, fmt::Display, io};
 
 #[derive(Parser)]
 #[command(version, about = gettext("df - report free storage space"))]
@@ -59,55 +58,62 @@ pub enum OutputMode {
     /// The format of the default output from df is unspecified,
     /// but all space figures are reported in 512-byte units
     Unspecified,
+    Unspecified1K,
 }
 
 impl OutputMode {
     pub fn new(kilo: bool, portable: bool) -> Self {
         match (kilo, portable) {
             (true, true) => Self::Posix,
+            (true, false) => Self::Unspecified1K,
             (false, true) => Self::PosixLegacy,
-            _ => Self::Unspecified,
+            (false, false) => Self::Unspecified,
         }
     }
 
     pub fn get_block_size(&self) -> u64 {
         match self {
-            OutputMode::Posix => 1024,
-            OutputMode::PosixLegacy => 512,
-            OutputMode::Unspecified => 512,
+            OutputMode::Posix | OutputMode::Unspecified1K => 1024,
+            OutputMode::PosixLegacy | OutputMode::Unspecified => 512,
         }
     }
+}
+
+pub enum FieldType {
+    Str,
+    Num,
+    Pcent,
 }
 
 pub struct Field {
     caption: String,
     width: usize,
+    typ: FieldType,
 }
 
 impl Field {
-    pub fn new(caption: String, min_width: usize) -> Self {
+    pub fn new(caption: String, min_width: usize, typ: FieldType) -> Self {
         let width = cmp::max(caption.len(), min_width);
-        Self { caption, width }
+        Self {
+            caption,
+            width,
+            typ,
+        }
     }
 
-    pub fn print_header(&self) {
-        print!("{: <width$} ", self.caption, width = self.width);
+    pub fn format<T: Display>(&self, value: &T) -> String {
+        match self.typ {
+            FieldType::Str => format!("{value: <width$}", width = self.width),
+            FieldType::Num => format!("{value: >width$}", width = self.width),
+            FieldType::Pcent => format!("{value: >width$}", width = self.width - 1),
+        }
     }
+}
 
-    pub fn print_header_align_right(&self) {
-        print!("{: >width$} ", self.caption, width = self.width);
-    }
-
-    pub fn print_string(&self, value: &String) {
-        print!("{: <width$} ", value, width = self.width);
-    }
-
-    pub fn print_u64(&self, value: u64) {
-        print!("{: >width$} ", value, width = self.width);
-    }
-
-    pub fn print_percentage(&self, value: u32) {
-        print!("{: >width$}% ", value, width = self.width - 1);
+/// Print header
+impl Display for Field {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.format(&self.caption))
     }
 }
 
@@ -134,46 +140,54 @@ impl Fields {
         let size_caption = format!("{}-{}", mode.get_block_size(), gettext("blocks"));
         Self {
             mode,
-            source: Field::new(gettext("Filesystem"), 14),
-            size: Field::new(size_caption, 10),
-            used: Field::new(gettext("Used"), 10),
-            avail: Field::new(gettext("Available"), 10),
-            pcent: Field::new(gettext("Capacity"), 5),
-            target: Field::new(gettext("Mounted on"), 0),
+            source: Field::new(gettext("Filesystem"), 14, FieldType::Str),
+            size: Field::new(size_caption, 10, FieldType::Num),
+            used: Field::new(gettext("Used"), 10, FieldType::Num),
+            avail: Field::new(gettext("Available"), 10, FieldType::Num),
+            pcent: Field::new(gettext("Capacity"), 5, FieldType::Pcent),
+            target: Field::new(gettext("Mounted on"), 0, FieldType::Str),
         }
     }
+}
 
-    pub fn print_header(&self) {
-        self.source.print_header();
-        self.size.print_header_align_right();
-        self.used.print_header_align_right();
-        self.avail.print_header_align_right();
-        self.pcent.print_header_align_right();
-        self.target.print_header();
-        println!();
+/// Print header
+impl Display for Fields {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {} {} {} {} {}",
+            self.source, self.size, self.used, self.avail, self.pcent, self.target
+        )
     }
+}
 
-    fn print_row(
-        &self,
-        fsname: &String,
-        total: u64,
-        used: u64,
-        avail: u64,
-        percentage_used: u32,
-        target: &String,
-    ) {
-        // The remaining output with -P shall consist of one line of information
-        // for each specified file system. These lines shall be formatted as follows:
-        // "%s %d %d %d %d%% %s\n", <file system name>, <total space>,
-        //     <space used>, <space free>, <percentage used>,
-        //     <file system root>
-        self.source.print_string(fsname);
-        self.size.print_u64(total);
-        self.used.print_u64(used);
-        self.avail.print_u64(avail);
-        self.pcent.print_percentage(percentage_used);
-        self.target.print_string(target);
-        println!();
+pub struct FieldsData<'a> {
+    pub fields: &'a Fields,
+    pub source: &'a String,
+    pub size: u64,
+    pub used: u64,
+    pub avail: u64,
+    pub pcent: u32,
+    pub target: &'a String,
+}
+
+impl Display for FieldsData<'_> {
+    // The remaining output with -P shall consist of one line of information
+    // for each specified file system. These lines shall be formatted as follows:
+    // "%s %d %d %d %d%% %s\n", <file system name>, <total space>,
+    //     <space used>, <space free>, <percentage used>,
+    //     <file system root>
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {} {} {} {}% {}",
+            self.fields.source.format(self.source),
+            self.fields.size.format(&self.size),
+            self.fields.used.format(&self.used),
+            self.fields.avail.format(&self.avail),
+            self.fields.pcent.format(&self.pcent),
+            self.fields.target.format(self.target)
+        )
     }
 }
 
@@ -206,11 +220,7 @@ struct Mount {
 }
 
 impl Mount {
-    fn print(&self, fields: &Fields) {
-        if !self.masked {
-            return;
-        }
-
+    fn to_row<'a>(&'a self, fields: &'a Fields) -> FieldsData<'a> {
         let sf = self.cached_statfs;
 
         let block_size = fields.mode.get_block_size();
@@ -227,14 +237,15 @@ impl Mount {
         let percentage_used = percentage_used * 100.0;
         let percentage_used = percentage_used.ceil() as u32;
 
-        fields.print_row(
-            &self.devname,
-            total,
+        FieldsData {
+            fields: fields,
+            source: &self.devname,
+            size: total,
             used,
             avail,
-            percentage_used,
-            &self.dir,
-        );
+            pcent: percentage_used,
+            target: &self.dir,
+        }
     }
 }
 
@@ -311,7 +322,7 @@ fn read_mount_info() -> io::Result<MountList> {
 fn read_mount_info() -> io::Result<MountList> {
     let mut info = MountList::new();
 
-    let mounts = MountTable::try_new()?;
+    let mounts = MountTable::open_system()?;
     for mount in mounts {
         unsafe {
             let mut buf: libc::statfs = std::mem::zeroed();
@@ -352,12 +363,11 @@ fn mask_fs_by_file(info: &mut MountList, filename: &str) -> io::Result<()> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
-    let args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain("posixutils-rs")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+
+    let args = Args::parse();
 
     let mut info = read_mount_info()?;
 
@@ -373,10 +383,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mode = OutputMode::new(args.kilo, args.portable);
     let fields = Fields::new(mode);
-    fields.print_header();
+    // Print header
+    println!("{}", fields);
 
     for mount in &info.mounts {
-        mount.print(&fields);
+        if mount.masked {
+            let row = mount.to_row(&fields);
+            println!("{}", row);
+        }
     }
 
     Ok(())

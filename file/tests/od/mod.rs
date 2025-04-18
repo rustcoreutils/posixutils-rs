@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::{run_test, TestPlan};
+use plib::testing::{run_test, TestPlan};
 
 fn od_test(args: &[&str], test_data: &str, expected_output: &str) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
@@ -278,8 +278,8 @@ fn test_od_22() {
 // Given that most other implementations of `od` print one or more leading spaces, for compatibility, one
 // leading space will be printed.
 //
-// Busybox, GNU Core Utilities, uutils's coreutils: 1 leading space
-// Toybox: 2 leading spaces
+// BusyBox, GNU Core Utilities, uutils's coreutils: 1 leading space
+// toybox: 2 leading spaces
 //
 // Also, none of these implementations print trailing spaces
 #[test]

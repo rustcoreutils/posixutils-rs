@@ -14,7 +14,6 @@
 use chrono::{DateTime, Datelike, Local, LocalResult, TimeZone, Utc};
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 
 const DEF_TIMESTR: &str = "%a %b %e %H:%M:%S %Z %Y";
 
@@ -146,12 +145,11 @@ fn set_time(utc: bool, timestr: &str) -> Result<(), &'static str> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
-    let args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain("posixutils-rs")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+
+    let args = Args::parse();
 
     match &args.timestr {
         None => show_time(args.utc, DEF_TIMESTR),

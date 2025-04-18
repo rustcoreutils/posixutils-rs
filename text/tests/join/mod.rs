@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::{run_test, TestPlan};
+use plib::testing::{run_test, TestPlan};
 
 fn run_test_join(
     args: &[&str],
@@ -36,7 +36,7 @@ fn simple_test() {
 
     let expected_output = "1 Alice HR\n2 Bob Finance\n3 Charlie IT\n";
 
-    run_test_join(&args, &expected_output, "", 0)
+    run_test_join(&args, expected_output, "", 0)
 }
 
 #[test]
@@ -48,7 +48,7 @@ fn a_test() {
 
     let expected_output = "1 Alice HR\n2 Bob Finance\n3 Charlie IT\n4 Kos\n";
 
-    run_test_join(&args, &expected_output, "", 0)
+    run_test_join(&args, expected_output, "", 0)
 }
 
 #[test]
@@ -60,7 +60,7 @@ fn v_test() {
 
     let expected_output = "4 Kos\n";
 
-    run_test_join(&args, &expected_output, "", 0)
+    run_test_join(&args, expected_output, "", 0)
 }
 
 #[test]
@@ -72,7 +72,7 @@ fn o_test() {
 
     let expected_output = "Alice 1 HR 1\nBob 2 Finance 2\nCharlie 3 IT 3\n";
 
-    run_test_join(&args, &expected_output, "", 0)
+    run_test_join(&args, expected_output, "", 0)
 }
 
 #[test]
@@ -91,7 +91,7 @@ fn e_test() {
 
     let expected_output = "Alice 1 HR\nBob 2 Finance\nCharlie 3 IT\nKos 4 Wandalen\n";
 
-    run_test_join(&args, &expected_output, "", 0)
+    run_test_join(&args, expected_output, "", 0)
 }
 
 #[test]
@@ -103,7 +103,7 @@ fn t_test() {
 
     let expected_output = "";
 
-    run_test_join(&args, &expected_output, "", 0)
+    run_test_join(&args, expected_output, "", 0)
 }
 
 #[test]
@@ -115,7 +115,7 @@ fn fields_test() {
 
     let expected_output = "1 Alice HR\n2 Bob Finance\n3 Charlie IT\n";
 
-    run_test_join(&args, &expected_output, "", 0)
+    run_test_join(&args, expected_output, "", 0)
 }
 
 #[test]
@@ -128,7 +128,7 @@ fn three_fields_test() {
     let expected_output =
         "1 Bob HR Director HR\n2 Charlie Finance Analyst Finance\n3 Alice Engineering Manager IT\n";
 
-    run_test_join(&args, &expected_output, "", 0)
+    run_test_join(&args, expected_output, "", 0)
 }
 
 #[test]
@@ -140,5 +140,5 @@ fn third_field_join_test() {
 
     let expected_output = "1 Bob HR Director HR\n2 Charlie Finance Analyst Finance\n";
 
-    run_test_join(&args, &expected_output, "", 0)
+    run_test_join(&args, expected_output, "", 0)
 }

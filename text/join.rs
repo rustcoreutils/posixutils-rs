@@ -9,7 +9,6 @@
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
@@ -103,22 +102,28 @@ fn process_files2(
                     let mut res: Vec<String> = Vec::new();
                     for num in order {
                         let f_num: Vec<&str> = num.split('.').collect();
+                        assert_eq!(f_num.len(), 2);
+                        let mut n: usize = f_num[1].parse()?;
+                        n -= 1;
                         if f_num[0] == "1" {
-                            if fields1.len() <= f_num[1].parse::<usize>()? - 1 {
+                            if fields1.len() <= n {
                                 if let Some(e) = &e {
                                     res.push(e.to_string());
                                 }
                             } else {
-                                res.push(fields1[f_num[1].parse::<usize>()? - 1].clone());
+                                res.push(fields1[n].clone());
                             }
                         } else if f_num[0] == "2" {
-                            if fields2.len() <= f_num[1].parse::<usize>()? - 1 {
+                            if fields2.len() <= n {
                                 if let Some(e) = &e {
                                     res.push(e.to_string());
                                 }
                             } else {
-                                res.push(fields2[f_num[1].parse::<usize>()? - 1].clone());
+                                res.push(fields2[n].clone());
                             }
+                        } else {
+                            // TODO:
+                            panic!("f_num[0] not in (1, 2)");
                         }
                     }
                     if v == 0 {
@@ -179,11 +184,11 @@ fn join(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain("posixutils-rs")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+
+    let args = Args::parse();
 
     let mut exit_code = 0;
 

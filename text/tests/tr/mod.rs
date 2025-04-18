@@ -8,18 +8,53 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::{run_test, TestPlan};
+use plib::testing::{run_test, run_test_u8, TestPlan, TestPlanU8};
+
+fn tr_test_binary(args: &[&str], test_data: &[u8], expected_output: &[u8]) {
+    let str_args = args
+        .iter()
+        .map(|st| st.to_owned().to_owned())
+        .collect::<Vec<_>>();
+
+    run_test_u8(TestPlanU8 {
+        cmd: "tr".to_owned(),
+        args: str_args,
+        stdin_data: test_data.to_owned(),
+        expected_out: expected_output.to_owned(),
+        expected_err: Vec::<u8>::new(),
+        expected_exit_code: 0_i32,
+    });
+}
 
 fn tr_test(args: &[&str], test_data: &str, expected_output: &str) {
-    let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
+    let str_args = args
+        .iter()
+        .map(|st| st.to_owned().to_owned())
+        .collect::<Vec<_>>();
 
     run_test(TestPlan {
-        cmd: String::from("tr"),
+        cmd: "tr".to_owned(),
         args: str_args,
-        stdin_data: String::from(test_data),
-        expected_out: String::from(expected_output),
-        expected_err: String::from(""),
-        expected_exit_code: 0,
+        stdin_data: test_data.to_owned(),
+        expected_out: expected_output.to_owned(),
+        expected_err: String::new(),
+        expected_exit_code: 0_i32,
+    });
+}
+
+fn tr_bad_arguments_failure_test(args: &[&str], expected_stderr: &str) {
+    let str_args = args
+        .iter()
+        .map(|st| st.to_owned().to_owned())
+        .collect::<Vec<_>>();
+
+    run_test(TestPlan {
+        cmd: "tr".to_owned(),
+        args: str_args,
+        stdin_data: String::new(),
+        expected_out: String::new(),
+        expected_err: expected_stderr.to_owned(),
+        expected_exit_code: 1_i32,
     });
 }
 
@@ -269,7 +304,13 @@ fn tr_ross_1b() {
 
 #[test]
 fn tr_ross_2() {
-    tr_test(&["-dcs", "[:lower:]", "n-rs-z"], "amzAMZ123.-+amz", "amzam");
+    // Modified expected output to match other implementations
+    // "amzam" -> "amzamz"
+    tr_test(
+        &["-dcs", "[:lower:]", "n-rs-z"],
+        "amzAMZ123.-+amz",
+        "amzamz",
+    );
 }
 
 #[test]
@@ -339,15 +380,416 @@ fn tr_d_space_n() {
 546869732069732061207375697465206f6620527573742d6e617469766520636f726520636f6d6d616e64206c696e65207574696c74696573202863702c206d762c0a61776b2c206d616b652c2076692c202e2e2e29207573696e6720504f5349582e323032342061732074686520626173656c696e652073706563696669636174696f6e2e0a\
 ";
 
-    tr_test(&["-d", r#" \n"#], input, output);
+    tr_test(&["-d", r" \n"], input, output);
 }
 
 #[test]
 fn tr_ignored_backslash() {
-    tr_test(&["-d", r#"\z"#], "xyz", "xy");
+    tr_test(&["-d", r"\z"], "xyz", "xy");
 }
 
 #[test]
 fn tr_escaped_backslash() {
-    tr_test(&["-d", r#"\\"#], r#"a\b\c"#, "abc");
+    tr_test(&["-d", r"\\"], r"a\b\c", "abc");
+}
+
+#[test]
+fn tr_octal_sequence() {
+    tr_test(&["2", r"\44"], "123\n", "1$3\n");
+}
+
+#[test]
+fn tr_octal_sequence_two() {
+    tr_test(&["21", r"\44Z"], "123123\n", "Z$3Z$3\n");
+}
+
+#[test]
+fn tr_reverse_order_simple() {
+    tr_test(&["21", "AB"], "12\n", "BA\n");
+}
+
+#[test]
+fn tr_duplicate_string1_character_precedence() {
+    tr_test(&["AA", "CB"], "AAAA", "BBBB");
+}
+
+// Prevent regression to:
+//
+//    Error: Missing symbol after '['
+#[test]
+fn tr_left_square_bracket_literal() {
+    tr_test(&["1", "["], "123", "[23");
+}
+
+// Prevent regression to:
+//
+//    Error: Missing '*' after '[' for symbol ':'
+#[test]
+fn tr_multiple_transformations() {
+    tr_test(&["3[:lower:]", "![:upper:]"], "abc123", "ABC12!");
+}
+
+#[test]
+fn tr_equiv_not_one_char() {
+    tr_bad_arguments_failure_test(
+        &["-d", "[=aa=]"],
+        "tr: aa: equivalence class operand must be a single character\n",
+    );
+}
+
+#[test]
+fn tr_backwards_range_normal() {
+    tr_bad_arguments_failure_test(
+        &["-d", "b-a"],
+        "tr: range-endpoints of 'b-a' are in reverse collating sequence order\n",
+    );
+}
+
+#[test]
+fn tr_backwards_range_backslash() {
+    tr_bad_arguments_failure_test(
+        &["-d", r"\t-\b"],
+        r"tr: range-endpoints of '\t-\u{8}' are in reverse collating sequence order
+",
+    );
+}
+
+#[test]
+fn tr_backwards_range_octal() {
+    tr_bad_arguments_failure_test(
+        &["-d", r"\045-\044"],
+        "tr: range-endpoints of '%-$' are in reverse collating sequence order\n",
+    );
+}
+
+#[test]
+fn tr_backwards_range_mixed() {
+    tr_bad_arguments_failure_test(
+        &["-d", r"A-\t"],
+        r"tr: range-endpoints of 'A-\t' are in reverse collating sequence order
+",
+    );
+}
+
+#[test]
+fn tr_mixed_range() {
+    tr_test(
+        &["-d", r"\044-Z"],
+        "$123456789ABCDEFGHIabcdefghi",
+        "abcdefghi",
+    );
+}
+
+#[test]
+fn tr_two_ranges() {
+    tr_test(&["ab12", r"\044-\045Y-Z"], "21ba", "ZY%$");
+}
+
+#[test]
+fn tr_bad_octal_range() {
+    tr_bad_arguments_failure_test(
+        &["-d", r"\046-\048"],
+        r"tr: range-endpoints of '&-\u{4}' are in reverse collating sequence order
+",
+    );
+}
+
+#[test]
+fn tr_bad_x_n_construct_decimal() {
+    tr_bad_arguments_failure_test(
+        &["-d", "[a*100000000000000000000]"],
+        "tr: invalid repeat count '100000000000000000000' in [c*n] construct\n",
+    );
+}
+
+#[test]
+fn tr_bad_x_n_construct_octal() {
+    tr_bad_arguments_failure_test(
+        &["-d", "[a*010000000000000000000000]"],
+        "tr: invalid repeat count '010000000000000000000000' in [c*n] construct\n",
+    );
+}
+
+#[test]
+fn tr_bad_x_n_construct_non_decimal_non_octal() {
+    tr_bad_arguments_failure_test(
+        &["-d", "[a*a]"],
+        "tr: invalid repeat count 'a' in [c*n] construct\n",
+    );
+}
+
+#[test]
+fn tr_trailing_hyphen() {
+    tr_test(&["ab", "c-"], "abc123", "c-c123");
+}
+
+#[test]
+fn tr_backslash_range() {
+    tr_test(
+        &["1-9", r"\b-\r"],
+        r"\ 987654321 -",
+        "\\ \x0D\x0D\x0D\x0D\x0C\x0B\x0A\x09\x08 -",
+    );
+}
+
+#[test]
+fn tr_fill_with_last_char() {
+    tr_test(&["1-34-8", "A-C!"], "987654321", "9!!!!!CBA");
+}
+
+#[test]
+fn tr_octal_above_one_byte_value() {
+    let args = &["-d", r"\501"];
+
+    let str_args = args
+        .iter()
+        .map(|st| st.to_owned().to_owned())
+        .collect::<Vec<String>>();
+
+    run_test(TestPlan {
+        cmd: "tr".to_owned(),
+        args: str_args,
+        stdin_data: "(1Ł)".to_owned(),
+        expected_out: "Ł)".to_owned(),
+        expected_err: r"tr: warning: the ambiguous octal escape \501 is being interpreted as the 2-byte sequence \050, 1
+".to_owned(),
+        expected_exit_code: 0_i32,
+    });
+}
+
+#[test]
+fn tr_short_octal_with_non_octal_digits_after() {
+    // Interpret as \004, '8', and the range from '1' through '3'
+    tr_test(&["-d", r"\0481-3"], "A 123 \x04 456 789 Z", "A   456 79 Z");
+}
+
+#[test]
+fn tr_octal_parsing_ambiguous() {
+    // "If an ordinary digit (representing itself) is to follow an octal sequence, the octal sequence must use the full three digits to avoid ambiguity."
+    // https://pubs.opengroup.org/onlinepubs/9799919799/utilities/tr.html
+    // Interpret as \123, not \012 and '3'
+    tr_test(
+        &["-d", r"\123"],
+        "321 \\ \x0A \x53 \x50 \x02 \x01 \\ CBA",
+        "321 \\ \x0A  \x50 \x02 \x01 \\ CBA",
+    );
+}
+
+#[test]
+fn tr_octal_parsing_non_ambiguous() {
+    // See above
+    // Interpret as \012 and 'A'
+    tr_test(
+        &["-d", r"\12A"],
+        "321 \\ \x0A \x53 \x50 \x02 \x01 \\ CBA",
+        "321 \\  \x53 \x50 \x02 \x01 \\ CB",
+    );
+}
+
+#[test]
+fn tr_equiv_class_and_other_deletions() {
+    tr_test(&["-d", "4[=a=]2"], "1 3 A a 2 4", "1 3 A   ");
+}
+
+#[test]
+fn tr_string2_equiv_inappropriate() {
+    tr_bad_arguments_failure_test(
+        &["1", "[=a=]"],
+        "tr: [=c=] expressions may not appear in string2 when translating\n",
+    );
+}
+
+#[test]
+fn tr_equivalence_class_low_priority() {
+    const INPUT: &str = "aaa bbb ccc 123";
+    const OUTPUT: &str = "YYY bbb ccc 123";
+
+    tr_test(&["[=a=]a", "XY"], INPUT, OUTPUT);
+
+    tr_test(&["a[=a=]", "XY"], INPUT, OUTPUT);
+}
+
+#[test]
+fn tr_arguments_validation_error_message_format() {
+    tr_bad_arguments_failure_test(
+        &["a"],
+        "tr: missing operand after 'a'. Two strings must be given when translating.\n",
+    );
+}
+
+// POSIX does not specify how invalid backslash sequences are handled, so there is some flexibility here
+// Still, something useful should be done (for instance, tr should not abort in this case)
+#[test]
+fn tr_ranges_with_invalid_escape_sequences() {
+    const INPUT: &str = "abcdef ABCDEF -\\ \x07 -\\ 123456789";
+
+    // "\7-\9" is:
+    //     treated as a range from \007 through '9' by bsdutils and GNU Core Utilities
+    //     treated as: 1) a range from \007 through '\', and 2) separately the character '9', by BusyBox
+    tr_test(&["-d", r"\7-\9"], INPUT, r"abcdefABCDEF\\");
+
+    // Similar to above
+    tr_test(&["-d", r"\7-\A"], INPUT, r"abcdefBCDEF\\");
+}
+
+// Make sure state is persisted through multiple calls to `transform`
+#[test]
+fn tr_streaming_state() {
+    let a_s = "a".repeat(16_usize * 1_024_usize);
+
+    tr_test(&["-s", "a", "b"], &a_s, "b");
+}
+
+#[test]
+fn tr_minimal_d_s() {
+    tr_test(&["-d", "-s", "", "A"], "1AA", "1A");
+}
+
+#[test]
+fn tr_missing_equiv() {
+    tr_bad_arguments_failure_test(
+        &["-d", "[==]"],
+        "tr: input '[==]' is invalid: missing equivalence class character\n",
+    );
+}
+
+#[test]
+fn tr_missing_character_class() {
+    tr_bad_arguments_failure_test(
+        &["-d", "[::]"],
+        "tr: input '[::]' is invalid: missing character class name\n",
+    );
+}
+
+#[test]
+fn tr_8_bit() {
+    tr_test_binary(&[r"\377", "A"], b"\xFF", b"A");
+}
+
+#[test]
+fn tr_multi_byte_utf_8() {
+    tr_test(&["-d", "ᛆᚠ"], "ᛆᚠᛏᚢᛆᛘᚢᚦᛌᛏᚭᚿᛏᛆᚱᚢᚿᛆᛧᚦᛆᛧ", "ᛏᚢᛘᚢᚦᛌᛏᚭᚿᛏᚱᚢᚿᛧᚦᛧ");
+}
+
+#[test]
+fn tr_c_d_s_squeeze_not_complemented() {
+    tr_test(&["-c", "-d", "-s", "D", "D"], "DDD AAABBBCCC DDD", "D");
+}
+
+#[test]
+fn tr_squeeze_independent_of_translation() {
+    tr_test(&["-s", "1", "23"], "111 222 333", "2 2 3");
+}
+
+#[test]
+fn tr_complemented_squeeze_independent_of_translation() {
+    tr_test(&["-c", "-s", "1", "23"], "111 222 333", "1113");
+}
+
+#[test]
+fn tr_c_s_as_many_as_needed() {
+    tr_test(&["-c", "-s", "B", "[d*]"], "AAA BBB CCC", "dBBBd");
+}
+
+// Only BusyBox and uutils' coreutils handle this "correctly"
+// bsdutils runs forever (or a very long time)
+// GNU Core Utilities rejects this because of the "[d*] argument"
+#[test]
+fn tr_non_standard_d_s() {
+    tr_test(&["-d", "-s", "B", "[C*]"], "AAA BBB CCC DDD", "AAA  C DDD");
+}
+
+// Different from bsdutils, but bsdutils doesn't handle 8-bit non-UTF-8 data
+#[test]
+fn tr_multi_byte_complement_translation() {
+    tr_test(&["-c", "ᛏ", "A"], "ᛆᚠᛏ", "AAAAAAᛏ");
+}
+
+#[test]
+fn tr_multi_byte_indexing_check() {
+    tr_test(&["-c", "ᛏ", "B"], "ᛏA", "ᛏB");
+}
+
+// BusyBox does not parse escape backslash/escape sequences inside [x*n] constructs
+// Other implementations do
+#[test]
+fn tr_slash_n_as_many_as_needed() {
+    tr_test(
+        &["b-c", r"[\n*]"],
+        "The big black fox jumped over the fence",
+        "\
+The 
+ig 
+la
+k fox jumped over the fen
+e",
+    );
+}
+
+#[test]
+fn tr_slash_n_broken_x_n_construct() {
+    tr_test(
+        &["b-e", r"[\nZ]"],
+        "The big black fox jumped over the fence",
+        "\
+Th] [ig [la
+k fox jump]Z ov]r th] f]n
+]",
+    );
+}
+
+#[test]
+fn tr_octal_in_as_many_as_needed() {
+    tr_test(
+        &["a-d", r"[\123*2]9"],
+        "The big black fox jumped over the fence",
+        "The Sig SlS9k fox jumpe9 over the fen9e",
+    );
+}
+
+#[test]
+fn tr_invalid_octal_in_as_many_as_needed() {
+    tr_test(
+        &["a-d", r"[\128*2]"],
+        "The big black fox jumped over the fence",
+        "\
+The 
+ig 
+l[8k fox jumpe* over the fen8e",
+    );
+}
+
+#[test]
+fn tr_invalid_multi_byte_range() {
+    tr_bad_arguments_failure_test(
+        &["-d", "ᛆ-ᚦ"],
+        r"tr: range-endpoints of '\u{16c6}-\u{16a6}' are in reverse collating sequence order
+",
+    );
+}
+
+#[test]
+fn tr_multi_byte_range() {
+    tr_test(
+        &["-d", "ᚢ-ᛆ"],
+        "A ᛆᚠᛏᚢᛆᛘᚢᚦᛌᛏᚭᚿᛏᛆᚱᚢᚿᛆᛧᚦᛆᛧ B",
+        "\
+A ᚠᛏᛘᛌᛏᛏᛧᛧ B",
+    );
+}
+
+#[test]
+fn tr_multi_byte_squeeze_translate() {
+    tr_test(&["-s", "ᚢ", "A"], "123 ᚢᚢᚢᚢᚢᚢ 456", "123 A 456");
+}
+
+#[test]
+fn tr_dash_d_two_strings() {
+    tr_bad_arguments_failure_test(
+        &["-d", "A", "B"],
+        "\
+tr: extra operand 'B'
+Only one string may be given when deleting without squeezing repeats.
+",
+    );
 }

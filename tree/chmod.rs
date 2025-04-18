@@ -7,13 +7,14 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod common;
+
+use self::common::error_string;
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use modestr::{ChmodMode, ChmodSymbolic};
-use plib::{modestr, PROJECT_NAME};
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
-use std::{fs, io};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use modestr::ChmodMode;
+use plib::modestr;
+use std::{cell::RefCell, io, os::unix::fs::MetadataExt};
 
 /// chmod - change the file modes
 #[derive(Parser)]
@@ -24,75 +25,121 @@ struct Args {
     recurse: bool,
 
     /// Represents the change to be made to the file mode bits of each file named by one of the file operands.
+    #[arg(allow_hyphen_values = true)] // To allow passing `chmod -x f`
     mode: String,
 
     /// The files to change
     files: Vec<String>,
 }
 
-// apply symbolic mutations to the given file at path
-fn set_permissions_symbolic(path: &Path, symbolic: &ChmodSymbolic) -> Result<(), io::Error> {
-    // query the current mode bits
-    let metadata = fs::metadata(path)?;
-    let mut perms = metadata.permissions();
-
-    // perform mutations on the mode bits
-    let new_mode = modestr::mutate(perms.mode(), symbolic);
-
-    // update path in filesystem
-    perms.set_mode(new_mode);
-    fs::set_permissions(path, perms)?;
-
-    Ok(())
-}
-
 fn chmod_file(filename: &str, mode: &ChmodMode, recurse: bool) -> Result<(), io::Error> {
-    let path = Path::new(filename);
-    let metadata = fs::metadata(path)?;
+    let terminate = RefCell::new(false);
+    let result = RefCell::new(Ok(())); // Either `Ok(())` or the last error encountered
 
-    if metadata.is_dir() && recurse {
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            let entry_path = entry.path();
-            let entry_filename = entry_path.to_str().unwrap();
-            chmod_file(entry_filename, mode, recurse)?;
-        }
-    }
+    ftw::traverse_directory(
+        filename,
+        |entry| {
+            if *terminate.borrow() {
+                return Ok(false);
+            }
 
-    match mode {
-        // set the mode bits to the given value
-        ChmodMode::Absolute(m) => {
-            fs::set_permissions(path, fs::Permissions::from_mode(*m))?;
-        }
+            let md = entry.metadata().unwrap();
+            let is_dir = md.is_dir();
 
-        // apply symbolic mutations to the mode bits
-        ChmodMode::Symbolic(s) => {
-            set_permissions_symbolic(path, s)?;
-        }
-    }
+            let new_mode = match mode {
+                ChmodMode::Absolute(m, num_digits) => {
+                    // Done to match the behavior of coreutils chmod:
+                    // "For directories chmod preserves set-user-ID and set-group-ID bits unless
+                    // you explicitly specify otherwise"
+                    //
+                    // Odd quirk: 0755 would not clear the set-group-ID bit but 00755 would even
+                    // though the set-group-ID is at the 4th position from the right
+                    if is_dir && (*num_digits < 5) {
+                        *m | (md.mode() & (libc::S_ISUID | libc::S_ISGID) as u32)
+                    } else {
+                        *m
+                    }
+                }
+                ChmodMode::Symbolic(s) => modestr::mutate(md.mode(), is_dir, s),
+            };
 
-    Ok(())
+            if md.is_symlink() {
+                // Uses libc::fstatat to check for the validity of the symlink
+                let is_dangling = {
+                    let target_deref_md =
+                        ftw::Metadata::new(entry.dir_fd(), entry.file_name(), true);
+                    target_deref_md.is_err()
+                };
+
+                if is_dangling {
+                    let err_str = gettext!("cannot operate on dangling symlink '{}'", entry.path());
+                    *result.borrow_mut() = Err(io::Error::other(err_str));
+                    *terminate.borrow_mut() = true;
+                    return Err(());
+                } else {
+                    // Symlink permissions are always lrwxrwxrwx
+                    // fchmodat with AT_SYMLINK_NOFOLLOW on Linux would fail
+                    if cfg!(target_os = "linux") {
+                        return Ok(is_dir && recurse);
+                    }
+                }
+            }
+
+            let ret = unsafe {
+                libc::fchmodat(
+                    entry.dir_fd(),
+                    entry.file_name().as_ptr(),
+                    new_mode as libc::mode_t, // Cast for macOS
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+
+            if ret != 0 {
+                let e = io::Error::last_os_error();
+
+                *result.borrow_mut() = Err(e);
+                *terminate.borrow_mut() = true;
+                return Err(());
+            }
+
+            Ok(is_dir && recurse)
+        },
+        |_| Ok(()), // No-op
+        |entry, error| {
+            let e = error.inner();
+            let err_str = gettext!("cannot access '{}': {}", entry.path(), error_string(&e));
+            *result.borrow_mut() = Err(io::Error::other(err_str));
+            *terminate.borrow_mut() = true;
+        },
+        ftw::TraverseDirectoryOpts {
+            follow_symlinks_on_args: true, // Default behavior of coreutils chmod with or without -R
+            ..Default::default()
+        },
+    );
+
+    result.into_inner()
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
-    let args = Args::parse();
-
-    // initialize translations
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain("posixutils-rs")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+
+    let args = Args::parse();
 
     let mut exit_code = 0;
 
     // parse the mode string
-    let mode = modestr::parse(&args.mode)?;
+    let Ok(mode) = modestr::parse(&args.mode) else {
+        eprintln!("chmod: {}", gettext!("invalid mode: '{}'", args.mode));
+        std::process::exit(1);
+    };
 
     // apply the mode to each file
     for filename in &args.files {
         if let Err(e) = chmod_file(filename, &mode, args.recurse) {
             exit_code = 1;
-            eprintln!("{}: {}", filename, e);
+            eprintln!("chmod: {}", error_string(&e));
         }
     }
 

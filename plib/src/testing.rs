@@ -30,7 +30,7 @@ pub struct TestPlanU8 {
     pub expected_exit_code: i32,
 }
 
-fn run_test_base(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> Output {
+pub fn run_test_base(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> Output {
     let relpath = if cfg!(debug_assertions) {
         format!("target/debug/{}", cmd)
     } else {
@@ -49,7 +49,7 @@ fn run_test_base(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> Output {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect(format!("failed to spawn command {}", cmd).as_str());
+        .unwrap_or_else(|_| panic!("failed to spawn command {cmd}"));
 
     // Separate the mutable borrow of stdin from the child process
     if let Some(mut stdin) = child.stdin.take() {

@@ -10,7 +10,7 @@
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use modestr::ChmodMode;
-use plib::{modestr, PROJECT_NAME};
+use plib::modestr;
 use std::ffi::CString;
 use std::io;
 use std::path::PathBuf;
@@ -45,8 +45,8 @@ fn create_dir_with_mode(path: &str, mode: u32) -> io::Result<()> {
 
 fn do_mkdir(dirname: &str, mode: &ChmodMode, parents: bool) -> io::Result<()> {
     let mode_val = match mode {
-        ChmodMode::Absolute(mode) => *mode,
-        ChmodMode::Symbolic(sym) => modestr::mutate(0o777, sym),
+        ChmodMode::Absolute(mode, _) => *mode,
+        ChmodMode::Symbolic(sym) => modestr::mutate(0o777, true, sym),
     };
 
     if parents {
@@ -66,19 +66,18 @@ fn do_mkdir(dirname: &str, mode: &ChmodMode, parents: bool) -> io::Result<()> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
-    let args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain("posixutils-rs")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+
+    let args = Args::parse();
 
     let mut exit_code = 0;
 
     // parse the mode string
     let mode = match args.mode {
         Some(mode) => modestr::parse(&mode)?,
-        None => ChmodMode::Absolute(0o777),
+        None => ChmodMode::Absolute(0o777, 3),
     };
 
     // apply the mode to each file

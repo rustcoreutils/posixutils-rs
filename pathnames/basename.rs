@@ -7,10 +7,10 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::path::Path;
+
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
-use std::path::Path;
 
 #[derive(Parser)]
 #[command(
@@ -52,12 +52,11 @@ fn show_basename(args: &Args) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
-    let args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain("posixutils-rs")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+
+    let args = Args::parse();
 
     show_basename(&args);
 

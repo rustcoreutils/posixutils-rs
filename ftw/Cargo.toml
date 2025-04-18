@@ -1,10 +1,11 @@
 [package]
 name = "ftw"
-version = "0.2.1"
+version = "0.2.2"
 authors = ["Jeff Garzik"]
 repository.workspace = true
 license.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 libc.workspace = true

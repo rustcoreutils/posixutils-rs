@@ -14,7 +14,6 @@
 use chrono::Datelike;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 
 #[derive(Parser)]
 #[command(version, about = gettext("cal - print a calendar"))]
@@ -53,37 +52,37 @@ fn print_month(month: u32, year: u32) {
         _ => unreachable!(),
     };
 
-    println!("{} {}", month_name, year);
+    println!("    {} {}", month_name, year);
     println!("{}", gettext("Su Mo Tu We Th Fr Sa"));
 
-    let mut day = 1;
-    let mut weekday = 1;
-    let mut days_in_month = 31;
-    if month == 4 || month == 6 || month == 9 || month == 11 {
-        days_in_month = 30;
-    } else if month == 2 {
-        if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
-            days_in_month = 29;
-        } else {
-            days_in_month = 28;
+    let first_day = chrono::NaiveDate::from_ymd_opt(year as i32, month, 1).unwrap();
+    let start_weekday = first_day.weekday().num_days_from_sunday(); // 0 (Sun) to 6 (Sat)
+
+    let days_in_month = match month {
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+                29
+            } else {
+                28
+            }
         }
+        _ => 31,
+    };
+
+    // Print initial padding
+    for _ in 0..start_weekday {
+        print!("   ");
     }
 
-    while day <= days_in_month {
-        print!("{:2}", day);
-        day += 1;
-        weekday += 1;
-        if weekday > 7 {
+    for day in 1..=days_in_month {
+        print!("{:2} ", day);
+        if (start_weekday + day) % 7 == 0 {
             println!();
-            weekday = 1;
-        } else {
-            print!(" ");
         }
     }
 
-    if weekday != 1 {
-        println!();
-    }
+    println!();
 }
 
 fn print_year(year: u32) {
@@ -94,12 +93,11 @@ fn print_year(year: u32) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
-    let mut args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain("posixutils-rs")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+
+    let mut args = Args::parse();
 
     // If no arguments are provided, display the current month
     if args.month.is_none() && args.year.is_none() {

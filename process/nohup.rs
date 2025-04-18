@@ -7,20 +7,52 @@
 // SPDX-License-Identifier: MIT
 //
 
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use libc::signal;
-use libc::{dup, dup2, SIGHUP, SIG_IGN};
-use plib::PROJECT_NAME;
 use std::env;
 use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal};
 use std::os::unix::io::AsRawFd;
 use std::process::{self, Command};
 
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use libc::{dup, dup2, signal, SIGHUP, SIG_IGN};
+
+enum NohupDir {
+    Current,
+    Home,
+}
+
+fn get_nohup_out_file() -> Result<(File, NohupDir), io::Error> {
+    // Attempting to open or create a nohup.out file in the current directory
+    match OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("nohup.out")
+    {
+        Ok(file) => Ok((file, NohupDir::Current)),
+        Err(_) => {
+            // If unsuccessful, attempt to create a nohup.out file in the home directory
+            if let Some(home_dir) = dirs::home_dir() {
+                let mut home_nohup_path = home_dir;
+                home_nohup_path.push("nohup.out");
+                let file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(home_nohup_path)?;
+                Ok((file, NohupDir::Home))
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Home directory not found",
+                ))
+            }
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain("posixutils-rs")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
 
     unsafe {
         // Ignore the SIGHUP signal
@@ -107,39 +139,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("Error: command found but could not be invoked");
                     process::exit(126);
                 }
-            }
-        }
-    }
-}
-
-enum NohupDir {
-    Current,
-    Home,
-}
-
-fn get_nohup_out_file() -> Result<(File, NohupDir), io::Error> {
-    // Attempting to open or create a nohup.out file in the current directory
-    match OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("nohup.out")
-    {
-        Ok(file) => Ok((file, NohupDir::Current)),
-        Err(_) => {
-            // If unsuccessful, attempt to create a nohup.out file in the home directory
-            if let Some(home_dir) = dirs::home_dir() {
-                let mut home_nohup_path = home_dir;
-                home_nohup_path.push("nohup.out");
-                let file = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(home_nohup_path)?;
-                Ok((file, NohupDir::Home))
-            } else {
-                Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "Home directory not found",
-                ))
             }
         }
     }

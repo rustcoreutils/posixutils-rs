@@ -9,8 +9,6 @@
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use libc::{signal, SIGALRM, SIG_IGN};
-use plib::PROJECT_NAME;
 use std::{thread, time};
 
 #[derive(Parser)]
@@ -24,16 +22,15 @@ struct Args {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
-    let args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain("posixutils-rs")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+
+    let args = Args::parse();
 
     unsafe {
         // Ignore the SIGALRM signal
-        signal(SIGALRM, SIG_IGN);
+        libc::signal(libc::SIGALRM, libc::SIG_IGN);
     }
 
     thread::sleep(time::Duration::from_secs(args.seconds));

@@ -1,10 +1,11 @@
 [package]
 name = "posixutils-text"
-version = "0.2.1"
+version = "0.2.2"
 authors = ["Jeff Garzik"]
 repository.workspace = true
 license.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 plib = { path = "../plib" }
@@ -14,12 +15,15 @@ topological-sort = "0.2"
 regex.workspace = true
 chrono.workspace = true
 libc.workspace = true
+thiserror = "1.0"
 notify-debouncer-full = "0.3"
-ctor = "0.2"
 diff = "0.1"
 dirs = "5.0"
-deunicode = "1.6"
 walkdir = "2"
+
+[dev-dependencies]
+proptest = "1"
+rand = "0.8"
 
 [lints]
 workspace = true
@@ -95,6 +99,10 @@ path = "./paste.rs"
 [[bin]]
 name = "pr"
 path = "./pr.rs"
+
+[[bin]]
+name = "sed"
+path = "./sed.rs"
 
 [[bin]]
 name = "tsort"

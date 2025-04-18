@@ -7,14 +7,14 @@
 // SPDX-License-Identifier: MIT
 //
 
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 use std::collections::HashMap;
 use std::env;
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
+
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 
 #[derive(Parser)]
 #[command(version, about = gettext("env - set the environment for command invocation"))]
@@ -92,12 +92,11 @@ fn exec_util(envs: HashMap<String, String>, util_args: Vec<String>) -> io::Resul
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
-    let args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain("posixutils-rs")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+
+    let args = Args::parse();
 
     let (envs, util_args) = separate_ops(&args.operands);
     let new_env = merge_env(&envs, args.ignore_env);

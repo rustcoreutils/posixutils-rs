@@ -8,7 +8,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{run_test, run_test_u8, TestPlan, TestPlanU8};
 use std::fs;
 use std::path::PathBuf;
 
@@ -27,7 +27,7 @@ fn run_paste_test(args: Vec<&str>, expected_output_filename: &str) {
     let args = args.into_iter().map(ToOwned::to_owned).collect();
 
     run_test(TestPlan {
-        cmd: String::from("paste"),
+        cmd: "paste".to_owned(),
         args,
         expected_out,
         expected_err: String::new(),
@@ -92,7 +92,7 @@ fn paste_simple_multi_line_input() {
         .collect();
 
     run_test(TestPlan {
-        cmd: String::from("paste"),
+        cmd: "paste".to_owned(),
         args,
         expected_out: "Line 1Line 2Line 3\n".to_owned(),
         expected_err: String::new(),
@@ -114,7 +114,7 @@ fn paste_multiple_stdin() {
         .collect();
 
     run_test(TestPlan {
-        cmd: String::from("paste"),
+        cmd: "paste".to_owned(),
         args,
         expected_out: "\
 Line 1ALine 2BLine 3CLine 4
@@ -147,7 +147,7 @@ fn paste_multiple_stdin_serial_test_one() {
         .collect();
 
     run_test(TestPlan {
-        cmd: String::from("paste"),
+        cmd: "paste".to_owned(),
         args,
         expected_out: "\
 Line 1ALine 2BLine 3CLine 4ALine 5BLine 6CLine 7ALine 8BLine 9
@@ -182,7 +182,7 @@ fn paste_multiple_stdin_serial_test_two() {
         .collect();
 
     run_test(TestPlan {
-        cmd: String::from("paste"),
+        cmd: "paste".to_owned(),
         args,
         expected_out: "\
 O!K!1!234!here
@@ -200,4 +200,133 @@ here"
             .to_owned(),
         expected_exit_code: 0,
     });
+}
+
+#[test]
+fn paste_non_utf8_input() {
+    const INPUT: &[u8] = b"String with non-UTF-8 bytes: \xFF\x00\xFF.\n";
+
+    let args = ["--", "-"]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+
+    run_test_u8(TestPlanU8 {
+        args,
+        cmd: "paste".to_owned(),
+        expected_err: Vec::<u8>::new(),
+        expected_exit_code: 0,
+        expected_out: INPUT.to_vec(),
+        stdin_data: INPUT.to_vec(),
+    });
+}
+
+#[test]
+fn paste_backslash_zero_delimiter() {
+    let args = ["-d", r#"\0\!\0"#, "-s", "--", "-"]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+
+    run_test(TestPlan {
+        args,
+        cmd: "paste".to_owned(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+        expected_out: "\
+AB!CDE!F
+"
+        .to_owned(),
+        stdin_data: "\
+A
+B
+C
+D
+E
+F
+"
+        .to_owned(),
+    });
+}
+
+#[test]
+fn paste_trailing_unescaped_backslash_delimiter() {
+    let args = ["-d", r#"\\\"#, "-s", "--", "-"]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+
+    run_test(TestPlan {
+        args,
+        cmd: "paste".to_owned(),
+        expected_err: r#"paste: delimiter list ends with an unescaped backslash: \\\
+"#
+        .to_owned(),
+        expected_exit_code: 1,
+        expected_out: String::new(),
+        stdin_data: String::new(),
+    });
+}
+
+#[test]
+fn paste_trailing_escaped_backslash_delimiter() {
+    let args = ["-d", r#"\\!\@\\"#, "-s", "--", "-"]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+
+    run_test(TestPlan {
+        args,
+        cmd: "paste".to_owned(),
+        expected_err: String::new(),
+        expected_exit_code: 0,
+        expected_out: r#"A\B!C@D\E\F!G@H\I\J
+"#
+        .to_owned(),
+        stdin_data: "\
+A
+B
+C
+D
+E
+F
+G
+H
+I
+J
+"
+        .to_owned(),
+    });
+}
+
+#[test]
+fn paste_custom_delimiters() {
+    run_paste_test(
+        vec![
+            "-d",
+            "!@#",
+            "--",
+            "tests/paste/input1.txt",
+            "tests/paste/input2.txt",
+            "tests/paste/input1.txt",
+            "tests/paste/input2.txt",
+            "tests/paste/input2.txt",
+        ],
+        "output_paste_custom_delimiters.txt",
+    );
+}
+
+#[test]
+fn paste_custom_delimiters_serial() {
+    run_paste_test(
+        vec![
+            "-d",
+            "!@#",
+            "-s",
+            "--",
+            "tests/paste/input1.txt",
+            "tests/paste/input2.txt",
+        ],
+        "output_paste_custom_delimiters_serial.txt",
+    );
 }

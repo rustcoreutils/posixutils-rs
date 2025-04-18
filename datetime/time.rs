@@ -12,14 +12,17 @@ use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use clap::Parser;
-
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
+use gettextrs::{
+    bind_textdomain_codeset, bindtextdomain, gettext, setlocale, textdomain, LocaleCategory,
+};
 
 #[derive(Parser)]
 #[command(
     version,
-    about = gettext("time - time a simple command or give resource usage")
+    about = gettext("time - time a simple command or give resource usage"),
+    help_template = gettext("{about}\n\nUsage: {usage}\n\nArguments:\n{positionals}\n\nOptions:\n{options}"),
+    disable_help_flag = true,
+    disable_version_flag = true,
 )]
 struct Args {
     #[arg(
@@ -38,6 +41,12 @@ struct Args {
         help = gettext("Arguments for the utility")
     )]
     arguments: Vec<String>,
+
+    #[arg(short, long, help = gettext("Print help"), action = clap::ArgAction::HelpLong)]
+    help: Option<bool>,
+
+    #[arg(short = 'V', long, help = gettext("Print version"), action = clap::ArgAction::Version)]
+    version: Option<bool>,
 }
 
 enum TimeError {
@@ -122,11 +131,12 @@ impl Status {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain("posixutils-rs")?;
+    bindtextdomain("posixutils-rs", "locale")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+
+    let args = Args::parse();
 
     if let Err(err) = time(args) {
         match err {

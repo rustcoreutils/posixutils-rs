@@ -13,8 +13,8 @@
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use plib::io::input_stream;
 use plib::lzw::UnixLZWReader;
-use plib::PROJECT_NAME;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
@@ -39,7 +39,7 @@ struct Args {
 }
 
 fn uncompress_file(pathname: &PathBuf) -> io::Result<()> {
-    let file = plib::io::input_stream(pathname, false)?;
+    let file = input_stream(pathname, false)?;
     let mut decoder = UnixLZWReader::new(file);
 
     loop {
@@ -60,12 +60,11 @@ fn prog_is_zcat() -> bool {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
-    let mut args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain("posixutils-rs")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+
+    let mut args = Args::parse();
 
     // if no file args, read from stdin
     if args.files.is_empty() {

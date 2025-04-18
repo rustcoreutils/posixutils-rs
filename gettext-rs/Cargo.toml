@@ -1,7 +1,8 @@
 [package]
 name = "gettext-rs"
-version = "0.2.1"
+version = "0.2.2"
 edition.workspace = true
+rust-version.workspace = true
 
 [lints]
 workspace = true

@@ -1,17 +1,22 @@
 [package]
 name = "posixutils-display"
-version = "0.2.1"
+version = "0.2.2"
 authors = ["Jeff Garzik"]
 repository.workspace = true
 license.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
-plib = { path = "../plib" }
 clap.workspace = true
+clap.features = ["env"]
 gettext-rs.workspace = true
 libc.workspace = true
+termion = "4.0"
 thiserror = "1.0"
+
+[dev-dependencies]
+plib = { path = "../plib" }
 
 [lints]
 workspace = true
@@ -25,5 +30,5 @@ name = "printf"
 path = "./printf.rs"
 
 [[bin]]
-name = "man"
-path = "./man.rs"
+name = "more"
+path = "./more.rs"

@@ -38,7 +38,7 @@ impl<'a> DirDiff<'a> {
         let mut dir2: DirData = DirData::load(path2)?;
 
         let mut dir_diff = DirDiff::new(&mut dir1, &mut dir2, format_options, recursive);
-        return dir_diff.analyze();
+        dir_diff.analyze()
     }
 
     fn analyze(&mut self) -> io::Result<DiffExitStatus> {
@@ -48,16 +48,15 @@ impl<'a> DirDiff<'a> {
             let is_file = dir_data
                 .files()
                 .get_key_value(file_name)
-                .expect(
-                    format!(
+                .unwrap_or_else(|| {
+                    panic!(
                         "Could not find file in {}",
                         dir_data
                             .path()
                             .to_str()
                             .unwrap_or(COULD_NOT_UNWRAP_FILENAME)
                     )
-                    .as_str(),
-                )
+                })
                 .1
                 .file_type()?
                 .is_file();
@@ -217,6 +216,6 @@ impl<'a> DirDiff<'a> {
             }
         }
 
-        return Ok(exit_status);
+        Ok(exit_status)
     }
 }

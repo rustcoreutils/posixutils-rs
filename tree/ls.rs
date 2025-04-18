@@ -12,7 +12,7 @@ mod ls_util;
 use self::ls_util::{ls_from_utf8_lossy, Entry, LongFormatPadding, MultiColumnPadding};
 use clap::{CommandFactory, FromArgMatches, Parser};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::{platform::P_WINSIZE_REQUEST_CODE, PROJECT_NAME};
+use plib::platform::P_WINSIZE_REQUEST_CODE;
 use std::{
     collections::HashMap,
     ffi::{CString, OsStr},
@@ -419,20 +419,16 @@ impl Config {
                 MULTI_COLUMN | STREAM_OUTPUT_FORMAT | MUTI_COLUMN_ACROSS => {
                     long_format_state.push(false);
                 }
-                ONE_ENTRY_PER_LINE => loop {
+                ONE_ENTRY_PER_LINE => {
                     // Remove any `false` that was added by -C, -m or -x until
                     // a `true` is reached or the vec is empty
-                    match long_format_state.last().copied() {
-                        Some(enabled) => {
-                            if enabled {
-                                break;
-                            } else {
-                                long_format_state.pop();
-                            }
+                    while let Some(enabled) = long_format_state.last().copied() {
+                        if enabled {
+                            break;
                         }
-                        None => break,
+                        long_format_state.pop();
                     }
-                },
+                }
                 _ => unreachable!(),
             }
         }
@@ -1228,7 +1224,7 @@ fn process_single_dir(
             let dir_parent = {
                 let mut comps = canonical_dir_path.as_inner().components();
 
-                let is_dot = dir_entry.file_name().to_bytes_with_nul() == &[b'.', 0];
+                let is_dot = dir_entry.file_name().to_bytes_with_nul() == [b'.', 0];
 
                 if !is_dot {
                     comps.next_back();
@@ -1324,9 +1320,8 @@ fn process_single_dir(
 
 fn main() -> ExitCode {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME).unwrap();
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8").unwrap();
-
+    textdomain("posixutils-rs").unwrap();
+    bind_textdomain_codeset("posixutils-rs", "UTF-8").unwrap();
     let (config, paths) = Config::new();
 
     match ls(paths, &config) {

@@ -12,7 +12,6 @@ use std::ffi::OsString;
 use clap::{Parser, ValueEnum};
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use object::{Object, ObjectSection};
-use plib::PROJECT_NAME;
 
 #[derive(Clone, Copy, ValueEnum)]
 enum OffsetFormat {
@@ -188,10 +187,11 @@ where
 
 fn main() -> StringsResult {
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain("posixutils-rs")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
 
     let args = Args::parse();
+
     match CharacterSet::from_env() {
         CharacterSet::Utf8 => {
             for file in args.input_files {

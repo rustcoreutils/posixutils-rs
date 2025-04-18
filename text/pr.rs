@@ -9,14 +9,15 @@
 
 mod pr_util;
 
-use chrono::{DateTime, Local};
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
+
+use chrono::{DateTime, Local};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use plib::io::input_stream;
 
 use self::pr_util::{line_transform, Args, PageIterator, Parameters};
 
@@ -221,7 +222,7 @@ fn pr_serial(path: &PathBuf, params: &Parameters) -> io::Result<()> {
         dt.format(DATE_TIME_FORMAT).to_string()
     };
 
-    let stream = plib::io::input_stream(path, true)?;
+    let stream = input_stream(path, true)?;
 
     let column_width = column_width(params.num_columns, params.page_width);
 
@@ -416,7 +417,7 @@ fn pr_merged(paths: &[PathBuf], params: &Parameters) -> io::Result<()> {
 
     let mut page_iterators = Vec::with_capacity(paths.len());
     for p in paths {
-        let stream = plib::io::input_stream(p, true)?;
+        let stream = input_stream(p, true)?;
         let it = PageIterator::new(stream, params.body_lines_per_page);
         page_iterators.push(it);
     }
@@ -462,14 +463,12 @@ fn pr_merged(paths: &[PathBuf], params: &Parameters) -> io::Result<()> {
             );
         }
 
-        let mut required_rows = 0;
-        for page in pages.iter() {
-            if let Some(p) = page {
-                if p.num_nonpadding_lines > required_rows {
-                    required_rows = p.num_nonpadding_lines;
-                }
-            }
-        }
+        let required_rows = pages
+            .iter()
+            .flatten()
+            .map(|p| p.num_nonpadding_lines)
+            .max()
+            .unwrap_or_default();
 
         let mut pages: Vec<_> = pages
             .into_iter()
@@ -532,10 +531,9 @@ fn pr_merged(paths: &[PathBuf], params: &Parameters) -> io::Result<()> {
 }
 
 fn main() -> ExitCode {
-    // Initialize translation system
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME).unwrap();
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8").unwrap();
+    textdomain("posixutils-rs").unwrap();
+    bind_textdomain_codeset("posixutils-rs", "UTF-8").unwrap();
 
     let args = Args::parse_custom();
 

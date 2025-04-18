@@ -8,7 +8,6 @@
 
 use clap::{error::ErrorKind, Parser};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 use thiserror::Error;
 
 use binrw::{binrw, BinReaderExt, BinWrite, Endian};
@@ -68,7 +67,7 @@ const MAX_USER_INPUT_LENGTH: usize = 128;
 /// The version number for the talk protocol.
 const TALK_VERSION: u8 = 1;
 
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Default, Copy, Clone, PartialEq)]
 #[binrw]
 #[brw(repr(u8))]
 /// Represents the types of messages exchanged in the communication.
@@ -76,6 +75,7 @@ enum MessageType {
     /// Leave invitation with server.
     LeaveInvite,
     /// Check for invitation by callee.
+    #[default]
     LookUp,
     /// Delete invitation by caller.
     Delete,
@@ -207,6 +207,7 @@ pub struct Osockaddr {
     pub sa_data: [u8; 14],
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for Osockaddr {
     fn default() -> Self {
         Osockaddr {
@@ -294,7 +295,7 @@ impl Default for CtlMsg {
     fn default() -> Self {
         CtlMsg {
             vers: 1,
-            r#type: MessageType::LookUp as u8,
+            r#type: MessageType::default() as u8,
             answer: Answer::Success as u8,
             pad: 0,
             id_num: 0,
@@ -359,14 +360,11 @@ impl Default for CtlRes {
     fn default() -> Self {
         CtlRes {
             vers: 0,
-            r#type: MessageType::LookUp,
+            r#type: MessageType::default(),
             answer: Answer::Failed,
             pad: 0,
             id_num: 0,
-            addr: Osockaddr {
-                sa_family: 0,
-                sa_data: [0; 14],
-            },
+            addr: Osockaddr::default(),
         }
     }
 }
@@ -834,7 +832,7 @@ fn process_input_char(
             eprint!("\x1B[{};H\x1B[K", *top_line + 1);
             *top_line += 1;
 
-            if *top_line >= split_row.checked_sub(1).unwrap_or(0) {
+            if *top_line >= split_row.saturating_sub(1) {
                 eprint!("\x1B[{};H", 2);
                 *top_line = 2;
             }
@@ -1331,12 +1329,8 @@ fn draw_terminal(split_row: u16, width: u16) -> io::Result<io::StdoutLock<'stati
     // Move the cursor to the split row and draw the split line.
     write!(handle, "\x1b[{};0H", split_row)?;
     // Draw the horizontal split line (─) across the width of the terminal.
-    writeln!(
-        handle,
-        "└{:─<width$}┘",
-        "",
-        width = (width as usize).checked_sub(2).unwrap_or(0)
-    )?;
+    let width = usize::from(width.saturating_sub(2));
+    writeln!(handle, "└{:─<width$}┘", "", width = width)?;
     // Move the cursor back to the top-left corner and then down by one line.
     write!(handle, "\x1b[1;H")?;
     write!(handle, "\x1B[1B")?;
@@ -1726,6 +1720,10 @@ fn get_terminal_size() -> (u16, u16) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    setlocale(LocaleCategory::LcAll, "");
+    textdomain("posixutils-rs")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+
     let args = Args::try_parse().unwrap_or_else(|err| {
         if err.kind() == ErrorKind::DisplayHelp || err.kind() == ErrorKind::DisplayVersion {
             // Print help or version message
@@ -1738,9 +1736,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Exit with a non-zero status code
         std::process::exit(1);
     });
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
     let mut exit_code = 0;
 

@@ -12,11 +12,10 @@
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 use std::ffi::OsStr;
 use std::path::{Component, Path};
 
-const PWD_ENV: &'static str = "PWD";
+const PWD_ENV: &str = "PWD";
 
 /// pwd - return working directory name
 #[derive(Parser)]
@@ -53,12 +52,11 @@ fn dirname_valid(name: &OsStr) -> bool {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
-    let args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain("posixutils-rs")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+
+    let args = Args::parse();
 
     let mut cwd = std::env::current_dir()?.into_os_string();
     if args.env {

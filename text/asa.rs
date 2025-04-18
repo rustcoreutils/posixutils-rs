@@ -11,11 +11,12 @@
 // - add tests
 //
 
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 use std::io::{self, BufRead};
 use std::path::PathBuf;
+
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use plib::io::input_reader;
 
 /// asa - interpret carriage-control characters
 #[derive(Parser)]
@@ -30,14 +31,16 @@ struct AsaState {
     lines: Vec<String>,
 }
 
-impl AsaState {
-    fn new() -> AsaState {
-        AsaState {
+impl Default for AsaState {
+    fn default() -> Self {
+        Self {
             first_line: true,
-            lines: Vec::new(),
+            lines: Default::default(),
         }
     }
+}
 
+impl AsaState {
     fn push(&mut self, line: &str) {
         self.lines.push(line.to_string());
         if self.first_line {
@@ -67,9 +70,9 @@ impl AsaState {
 }
 
 fn asa_file(pathname: &PathBuf) -> io::Result<()> {
-    let mut reader = plib::io::input_reader(pathname, false)?;
+    let mut reader = input_reader(pathname, false)?;
     let mut line_no: usize = 0;
-    let mut state = AsaState::new();
+    let mut state = AsaState::default();
 
     loop {
         line_no += 1;
@@ -125,12 +128,11 @@ fn asa_file(pathname: &PathBuf) -> io::Result<()> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
-    let mut args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain("posixutils-rs")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+
+    let mut args = Args::parse();
 
     // if no files, read from stdin
     if args.files.is_empty() {

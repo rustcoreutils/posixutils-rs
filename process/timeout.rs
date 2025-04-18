@@ -7,94 +7,21 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod signal;
+
+use std::error::Error;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::Path;
+use std::process::{Command, ExitStatus};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::Mutex;
+use std::time::Duration;
+
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
-use std::{
-    error::Error,
-    os::unix::{
-        fs::PermissionsExt,
-        process::{CommandExt, ExitStatusExt},
-    },
-    path::Path,
-    process::{Command, ExitStatus},
-    sync::{
-        atomic::{AtomicBool, AtomicI32, Ordering},
-        Mutex,
-    },
-    time::Duration,
-};
 
-#[cfg(target_os = "macos")]
-const SIGLIST: [(&str, i32); 31] = [
-    ("HUP", 1),
-    ("INT", 2),
-    ("QUIT", 3),
-    ("ILL", 4),
-    ("TRAP", 5),
-    ("ABRT", 6),
-    ("EMT", 7),
-    ("FPE", 8),
-    ("KILL", 9),
-    ("BUS", 10),
-    ("SEGV", 11),
-    ("SYS", 12),
-    ("PIPE", 13),
-    ("ALRM", 14),
-    ("TERM", 15),
-    ("URG", 16),
-    ("STOP", 17),
-    ("TSTP", 18),
-    ("CONT", 19),
-    ("CHLD", 20),
-    ("TTIN", 21),
-    ("TTOU", 22),
-    ("IO", 23),
-    ("XCPU", 24),
-    ("XFSZ", 25),
-    ("VTALRM", 26),
-    ("PROF", 27),
-    ("WINCH", 28),
-    ("INFO", 29),
-    ("USR1", 30),
-    ("USR2", 31),
-];
-
-#[cfg(target_os = "linux")]
-const SIGLIST: [(&str, i32); 32] = [
-    ("HUP", 1),
-    ("INT", 2),
-    ("QUIT", 3),
-    ("ILL", 4),
-    ("TRAP", 5),
-    ("ABRT", 6),
-    ("IOT", 6),
-    ("BUS", 7),
-    ("FPE", 8),
-    ("KILL", 9),
-    ("USR1", 10),
-    ("SEGV", 11),
-    ("USR2", 12),
-    ("PIPE", 13),
-    ("ALRM", 14),
-    ("TERM", 15),
-    ("STKFLT", 16),
-    ("CHLD", 17),
-    ("CONT", 18),
-    ("STOP", 19),
-    ("TSTP", 20),
-    ("TTIN", 21),
-    ("TTOU", 22),
-    ("URG", 23),
-    ("XCPU", 24),
-    ("XFSZ", 25),
-    ("VTALRM", 26),
-    ("PROF", 27),
-    ("WINCH", 28),
-    ("IO", 29),
-    ("PWR", 30),
-    ("SYS", 31),
-];
+use crate::signal::parse_signal;
 
 static FOREGROUND: AtomicBool = AtomicBool::new(false);
 static FIRST_SIGNAL: AtomicI32 = AtomicI32::new(libc::SIGTERM);
@@ -159,31 +86,6 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
     };
 
     Ok(Duration::from_secs_f64(value * multiplier))
-}
-
-/// Parses [str] into [Signal].
-///
-/// # Arguments
-///
-/// * `s` - [str] that represents the signal name.
-///
-/// # Returns
-///
-/// Returns the parsed [Signal] value.
-///
-/// # Errors
-///
-/// Returns an [String] error if passed invalid signal name.
-fn parse_signal(s: &str) -> Result<i32, String> {
-    let normalized = s.trim().to_uppercase();
-    let normalized = normalized.strip_prefix("SIG").unwrap_or(&normalized);
-
-    for (name, num) in SIGLIST.iter() {
-        if name == &normalized {
-            return Ok(*num);
-        }
-    }
-    Err(format!("invalid signal name '{s}'"))
 }
 
 /// Starts the timeout after which [libc::SIGALRM] will be send.
@@ -548,7 +450,7 @@ fn timeout(args: Args) -> i32 {
             }
             128 + signal
         } else {
-            eprintln!("timeout: unknown status from commnad: {status}");
+            eprintln!("timeout: unknown status from command: {status}");
             return 125;
         };
 
@@ -566,7 +468,10 @@ fn timeout(args: Args) -> i32 {
 ///     126 - The utility specified by utility was found but could not be executed.
 ///     127 - The utility specified by utility could not be found.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Parse command line arguments
+    setlocale(LocaleCategory::LcAll, "");
+    textdomain("posixutils-rs")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+
     let args = Args::try_parse().unwrap_or_else(|err| match err.kind() {
         clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
             print!("{err}");
@@ -581,10 +486,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(125);
         }
     });
-
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
     let exit_code = timeout(args);
     std::process::exit(exit_code);

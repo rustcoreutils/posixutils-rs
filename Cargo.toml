@@ -10,6 +10,7 @@ members = [
 	"file",
 	"fs",
 	"ftw",
+	"make",
 	"m4",
 	"m4/test-manager",
 	"gettext-rs",
@@ -19,6 +20,7 @@ members = [
 	"process",
 	"sccs",
 	"screen",
+	"sh",
 	"sys",
 	"text",
 	"tree",
@@ -31,6 +33,7 @@ members = [
 repository = "https://github.com/rustcoreutils/posixutils-rs"
 license = "MIT"
 edition = "2021"
+rust-version = "1.84.0"
 
 [workspace.dependencies]
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "cargo"] }
@@ -39,6 +42,7 @@ libc = "0.2"
 regex = "1.10"
 gettext-rs = { path = "./gettext-rs" }
 errno = "0.3"
+chrono-tz = "0.10"
 
 [workspace.lints]
 

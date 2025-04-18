@@ -9,7 +9,6 @@
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 
 /// uname - return system name
 #[derive(Parser)]
@@ -63,7 +62,10 @@ fn print_info(args: &Args, info: uname::Info) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
+    setlocale(LocaleCategory::LcAll, "");
+    textdomain("posixutils-rs")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+
     let mut args = Args::parse();
 
     if args.all {
@@ -75,10 +77,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else if !args.machine && !args.node && !args.release && !args.system && !args.osversion {
         args.system = true;
     }
-
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
 
     let mut exit_code = 0;
 

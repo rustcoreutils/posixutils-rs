@@ -7,12 +7,17 @@
 // SPDX-License-Identifier: MIT
 //
 
+use std::{
+    ffi::OsStr,
+    io::{self, Read},
+    ops::AddAssign,
+    path::PathBuf,
+};
+
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
-use std::ffi::OsStr;
-use std::io::{self, Read};
-use std::path::PathBuf;
+use plib::io::input_stream;
+use plib::BUFSZ;
 
 /// wc - word, line, and byte or character count
 #[derive(Parser)]
@@ -38,36 +43,30 @@ struct Args {
     files: Vec<PathBuf>,
 }
 
+#[derive(Default)]
 struct CountInfo {
     words: usize,
     chars: usize,
     nl: usize,
 }
 
-impl CountInfo {
-    fn new() -> CountInfo {
-        CountInfo {
-            words: 0,
-            chars: 0,
-            nl: 0,
-        }
-    }
-
-    fn accum(&mut self, count: &CountInfo) {
-        self.words = self.words + count.words;
-        self.chars = self.chars + count.chars;
-        self.nl = self.nl + count.nl;
+impl AddAssign for CountInfo {
+    fn add_assign(&mut self, rhs: Self) {
+        self.words += rhs.words;
+        self.chars += rhs.chars;
+        self.nl += rhs.nl;
     }
 }
 
+/// is_space
 const fn create_table() -> [bool; 256] {
     let mut table = [false; 256];
-    table[9] = true;
-    table[10] = true;
-    table[11] = true;
-    table[12] = true;
-    table[13] = true;
-    table[32] = true;
+    table[b'\t' as usize] = true;
+    table[b'\n' as usize] = true;
+    table[11 /* \v */] = true;
+    table[12 /* \f */] = true;
+    table['\r' as usize] = true;
+    table[' ' as usize] = true;
     table
 }
 
@@ -76,12 +75,8 @@ const BYTE_TABLE: [bool; 256] = create_table();
 fn build_display_str(args: &Args, count: &CountInfo, filename: &OsStr) -> String {
     let mut output = String::with_capacity(filename.len() + (3 * 10));
 
-    let multi_file = args.files.len() > 1;
-    let only_lines = (args.words == false) && (args.bytes == false) && (args.chars == false);
-    let only_words = (args.lines == false) && (args.bytes == false) && (args.chars == false);
-    let only_bytechars = (args.lines == false) && (args.words == false);
-
     if args.lines {
+        let only_lines = !args.words && !args.bytes && !args.chars;
         let numstr = match only_lines {
             true => format!("{}", count.nl),
             false => format!("{:>8}", count.nl),
@@ -92,6 +87,7 @@ fn build_display_str(args: &Args, count: &CountInfo, filename: &OsStr) -> String
         if !output.is_empty() {
             output.push(' ');
         }
+        let only_words = !args.lines && !args.bytes && !args.chars;
         let numstr = match only_words {
             true => format!("{}", count.words),
             false => format!("{:>8}", count.words),
@@ -102,6 +98,7 @@ fn build_display_str(args: &Args, count: &CountInfo, filename: &OsStr) -> String
         if !output.is_empty() {
             output.push(' ');
         }
+        let only_bytechars = !args.lines && !args.words;
         let numstr = match only_bytechars {
             true => format!("{}", count.chars),
             false => format!("{:>8}", count.chars),
@@ -109,6 +106,7 @@ fn build_display_str(args: &Args, count: &CountInfo, filename: &OsStr) -> String
         output.push_str(&numstr);
     }
 
+    let multi_file = args.files.len() > 1;
     if multi_file {
         output.push(' ');
 
@@ -123,9 +121,9 @@ fn build_display_str(args: &Args, count: &CountInfo, filename: &OsStr) -> String
 }
 
 fn wc_file_bytes(count: &mut CountInfo, pathname: &PathBuf, chars_mode: bool) -> io::Result<()> {
-    let mut file = plib::io::input_stream(pathname, false)?;
+    let mut file = input_stream(pathname, false)?;
 
-    let mut buffer = [0; plib::BUFSZ];
+    let mut buffer = [0; BUFSZ];
     let mut was_space = true;
 
     loop {
@@ -171,7 +169,10 @@ fn wc_file(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
+    setlocale(LocaleCategory::LcAll, "");
+    textdomain("posixutils-rs")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+
     let mut args = Args::parse();
 
     let mut chars_mode = false;
@@ -186,16 +187,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         chars_mode = true;
     }
 
-    setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
-
     let mut exit_code = 0;
-    let mut totals = CountInfo::new();
+    let mut totals = CountInfo::default();
 
     // input via stdin
     if args.files.is_empty() {
-        let mut count = CountInfo::new();
+        let mut count = CountInfo::default();
 
         if let Err(e) = wc_file(&args, chars_mode, &PathBuf::new(), &mut count) {
             exit_code = 1;
@@ -205,14 +202,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // input files
     } else {
         for filename in &args.files {
-            let mut count = CountInfo::new();
+            let mut count = CountInfo::default();
 
             if let Err(e) = wc_file(&args, chars_mode, filename, &mut count) {
                 exit_code = 1;
                 eprintln!("{}: {}", filename.display(), e);
             }
 
-            totals.accum(&count);
+            totals += count;
         }
     }
 

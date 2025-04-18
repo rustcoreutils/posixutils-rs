@@ -7,11 +7,13 @@
 // SPDX-License-Identifier: MIT
 //
 
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::PathBuf;
+
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use plib::io::input_stream;
+use plib::BUFSZ;
 
 /// expand - convert tabs to spaces
 #[derive(Parser)]
@@ -66,9 +68,9 @@ fn space_out(column: &mut usize, writer: &mut BufWriter<dyn Write>) -> io::Resul
 
 fn expand_file(tablist: &TabList, pathname: &PathBuf) -> io::Result<()> {
     // open file, or stdin
-    let mut file = plib::io::input_stream(pathname, false)?;
+    let mut file = input_stream(pathname, false)?;
 
-    let mut raw_buffer = [0; plib::BUFSZ];
+    let mut raw_buffer = [0; BUFSZ];
     let mut writer = BufWriter::new(io::stdout());
     let mut column: usize = 1;
     let mut cur_stop = 0;
@@ -130,12 +132,11 @@ fn expand_file(tablist: &TabList, pathname: &PathBuf) -> io::Result<()> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
-    let mut args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain("posixutils-rs")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+
+    let mut args = Args::parse();
 
     let tablist = {
         if let Some(ref tablist) = args.tablist {

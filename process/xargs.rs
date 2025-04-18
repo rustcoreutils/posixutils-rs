@@ -14,11 +14,12 @@
 // - write tests
 //
 
-use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use plib::PROJECT_NAME;
 use std::io::{self, Read};
 use std::process::{Command, Stdio};
+
+use clap::Parser;
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use plib::BUFSZ;
 
 const ARG_MAX: i32 = 131072; // arbitrary.  todo: discover actual value
 const MAX_ARGS_BYTES: usize = ARG_MAX as usize - 2048;
@@ -304,7 +305,7 @@ impl ParseState {
 fn read_and_spawn(args: &Args) -> io::Result<()> {
     let mut state = ParseState::new(args);
 
-    let mut buffer = [0; plib::BUFSZ];
+    let mut buffer = [0; BUFSZ];
 
     // read stdin until EOF
     loop {
@@ -346,12 +347,11 @@ fn read_and_spawn(args: &Args) -> io::Result<()> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // parse command line arguments
-    let args = Args::parse();
-
     setlocale(LocaleCategory::LcAll, "");
-    textdomain(PROJECT_NAME)?;
-    bind_textdomain_codeset(PROJECT_NAME, "UTF-8")?;
+    textdomain("posixutils-rs")?;
+    bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
+
+    let args = Args::parse();
 
     read_and_spawn(&args)?;
 

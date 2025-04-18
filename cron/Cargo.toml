@@ -1,0 +1,33 @@
+[package]
+name = "posixutils-cron"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gettext-rs = { workspace = true }
+plib = { path = "../plib" }
+clap = { workspace = true }
+libc = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+tempfile = { workspace = true }
+
+[[bin]]
+name = "at"
+path = "./at.rs"
+
+[[bin]]
+name = "batch"
+path = "./batch.rs"
+
+[[bin]]
+name = "crontab"
+path = "./crontab.rs"
+
+[[bin]]
+name = "crond"
+path = "./crond.rs"
+
+[lib]
+name = "cron"
+path = "./lib.rs"

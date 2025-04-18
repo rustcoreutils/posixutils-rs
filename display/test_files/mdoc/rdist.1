@@ -1,0 +1,866 @@
+.\"	$OpenBSD: rdist.1,v 1.51 2024/12/30 07:13:33 jmc Exp $
+.\"
+.\" Copyright (c) 1983 Regents of the University of California.
+.\" All rights reserved.
+.\"
+.\" Redistribution and use in source and binary forms, with or without
+.\" modification, are permitted provided that the following conditions
+.\" are met:
+.\" 1. Redistributions of source code must retain the above copyright
+.\"    notice, this list of conditions and the following disclaimer.
+.\" 2. Redistributions in binary form must reproduce the above copyright
+.\"    notice, this list of conditions and the following disclaimer in the
+.\"    documentation and/or other materials provided with the distribution.
+.\" 3. Neither the name of the University nor the names of its contributors
+.\"    may be used to endorse or promote products derived from this software
+.\"    without specific prior written permission.
+.\"
+.\" THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+.\" ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+.\" IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+.\" ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+.\" FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+.\" DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+.\" OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+.\" HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+.\" LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+.\" OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+.\" SUCH DAMAGE.
+.\"
+.\"	$From: rdist.man,v 6.34 1996/01/29 22:37:19 mcooper Exp $
+.\"	@(#)rdist.1	6.6 (Berkeley) 5/13/86
+.\"
+.Dd $Mdocdate: December 30 2024 $
+.Dt RDIST 1
+.Os
+.Sh NAME
+.Nm rdist
+.Nd remote file distribution client program
+.Sh SYNOPSIS
+.Nm rdist
+.Bk -words
+.Op Fl DFnV
+.Op Fl A Ar num
+.Op Fl a Ar num
+.Op Fl c Ar mini_distfile
+.Op Fl d Ar var Ns = Ns Ar value
+.Op Fl f Ar distfile
+.Op Fl L Ar remote_logopts
+.Op Fl l Ar local_logopts
+.Op Fl M Ar maxproc
+.Op Fl m Ar host
+.Op Fl o Ar distopts
+.Op Fl P Ar rsh-path
+.Op Fl p Ar rdistd-path
+.Op Fl t Ar timeout
+.Op Ar name ...
+.Ek
+.Sh DESCRIPTION
+.Nm
+is a program to maintain identical copies of files over multiple hosts.
+It preserves the owner, group, mode, and mtime of files if possible and
+can update programs that are executing.
+.Pp
+.Nm
+reads commands from
+.Pa distfile
+to direct the updating of files and/or directories.
+If
+.Pa distfile
+is
+.Sq - ,
+the standard input is used.
+If no
+.Fl f
+option is present, the program looks first for
+.Pa distfile ,
+then
+.Pa Distfile ,
+to use as the input.
+If no names are specified on the command line,
+.Nm
+will update all of the files and directories listed in
+.Pa distfile .
+If the file
+.Pa /etc/Distfile
+exists,
+it will be run automatically by the clock daemon
+.Xr cron 8 ,
+via the system script
+.Xr daily 8 .
+.Pp
+If
+.Ar name
+is specified,
+it is taken to be the name of a file to be updated
+or the label of a command to execute.
+If label and file names conflict, it is assumed to be a label.
+These may be used together to update specific files using specific commands.
+.Pp
+.Nm
+uses a remote shell command to access each target host.
+By default,
+.Xr ssh 1
+is used unless overridden by the
+.Fl P
+option or the
+.Ev RSH
+environment variable.
+If the target host is the string
+.Dq localhost
+and the remote user name is the same as the local user name,
+.Nm
+will run the command:
+.Bd -literal -offset indent
+/bin/sh -c rdistd -S
+.Ed
+.Pp
+Otherwise,
+.Nm
+will run the command:
+.Bd -literal -offset indent
+ssh <host> -l <login_name> rdistd -S
+.Ed
+.Pp
+.Ar host
+is the name of the target host;
+.Ar login_name
+is the name of the user to make the connection as.
+.Pp
+On each target host
+.Nm
+will attempt to run the command:
+.Bd -literal -offset indent
+rdistd -S
+.Ed
+.Pp
+Or if the
+.Fl p
+option was specified,
+.Nm
+will attempt to run the command:
+.Bd -literal -offset indent
+<rdistd path> -S
+.Ed
+.Pp
+If no
+.Fl p
+option is specified, or
+.Aq Ar rdistd path
+is a simple filename,
+.Xr rdistd 1
+or
+.Aq Ar rdistd path
+must be somewhere in the
+.Ev PATH
+of the user running
+.Nm
+on the remote (target) host.
+.Pp
+The options are as follows:
+.Bl -tag -width Ds
+.It Fl A Ar num
+Set the minimum number of free files (inodes) on a filesystem that must exist
+for
+.Nm
+to update or install a file.
+.It Fl a Ar num
+Set the minimum amount of free space (in bytes) on a filesystem that must exist
+for
+.Nm
+to update or install a file.
+.It Fl c Ar mini_distfile
+Forces
+.Nm
+to interpret the remaining arguments as a small distfile.
+The format is:
+.Bd -literal -offset indent
+$ rdist -c name ... [login@]host[:dest]
+.Ed
+.Pp
+The equivalent distfile is as follows:
+.Bd -literal -offset indent
+(  name ... ) -> [login@]host
+	install	[dest] ;
+.Ed
+.It Fl D
+Enable copious debugging messages.
+.It Xo
+.Fl d Ar var Ns = Ns Ar value
+.Xc
+Define
+.Ar var
+to have
+.Ar value .
+This
+option is used to define or override variable definitions in
+.Pa distfile .
+.Ar value
+can be the empty string, one name, or a list of names surrounded by
+parentheses and separated by tabs and/or spaces.
+.It Fl F
+Do not fork any child
+.Nm
+processes.
+All clients are updated sequentially.
+.It Fl f Ar distfile
+Set the name of the distfile to
+.Ar distfile .
+If
+.Sq -
+(dash) is used then read from standard input (stdin).
+.It Fl L Ar remote_logopts
+Set remote logging options.
+See the section
+.Sx MESSAGE LOGGING
+for details on the syntax for
+.Ar remote_logopts .
+.It Fl l Ar local_logopts
+Set local logging options.
+See the section
+.Sx MESSAGE LOGGING
+for details on the syntax for
+.Ar local_logopts .
+.It Fl M Ar maxproc
+Set the maximum number of simultaneously running child
+.Nm
+processes to
+.Ar maxproc .
+The default is 4.
+.It Fl m Ar host
+Limit which machines are to be updated.
+Multiple
+.Fl m
+arguments can be given to limit updates to a subset of the hosts listed in
+.Pa distfile .
+.It Fl n
+Print the commands without executing them.
+This option is useful for debugging a distfile.
+.It Fl o Ar distopts
+Specify the dist options to enable.
+.Ar distopts
+is a comma separated list of options which are listed below.
+The valid values for
+.Ar distopts
+are:
+.Bl -tag -width Ds
+.It Ic chknfs
+Do not check or update files on the target host
+that reside on NFS filesystems.
+.It Ic chkreadonly
+Enable a check on the target host
+to see if a file resides on a read-only filesystem.
+If a file does, then no checking or updating of the file is attempted.
+.It Ic chksym
+If the target on the remote host is a symbolic link, but is not on the
+master host, the remote target will be left a symbolic link.
+This behavior is generally considered a bug in the original version of
+.Nm rdist ,
+but is present to allow compatibility with older versions.
+.It Ic compare
+Binary comparison.
+Perform a binary comparison and update files if they differ rather than
+comparing dates and sizes.
+.It Ic defgroup Ns Op = Ns Ar groupname
+If the group of a file to be transferred does not exist on the destination
+host, use the specified group instead.
+If
+.Ar groupname
+is not specified, the
+.Em bin
+group is used.
+.It Ic defowner Ns Op = Ns Ar owner
+If the owner of a file to be transferred does not exist on the destination
+host, use the specified owner instead.
+If
+.Ar owner
+is not specified, the user
+.Em bin
+is used.
+.It Ic follow
+Follow symbolic links.
+Copy the file that the link points to rather than the link itself.
+.It Ic history
+When
+.Ic savetargets
+and
+.Ic history
+are both defined then the target file that is updated is first renamed from
+.Pa file
+to
+.Pa file.NNN
+where NNN increases for each generation update.
+The first generation is 001, and the last is 999.
+After 999 generations, the counter is reset and stuck to 001,
+and 001 will get overwritten all the time.
+This is undesirable behavior, so some other method needs to be devised
+to clean up or limit the number of generations.
+.It Ic ignlnks
+Ignore unresolved links.
+.Nm
+will normally try to maintain the link structure of files being transferred
+and warn the user if all the links cannot be found.
+.It Ic nochkgroup
+Do not check group ownership of files that already exist.
+The file ownership is only set when the file is updated.
+.It Ic nochkmode
+Do not check file and directory permission modes.
+The permission mode is only set when the file is updated.
+.It Ic nochkowner
+Do not check user ownership of files that already exist.
+The file ownership is only set when the file is updated.
+.It Ic nodescend
+Do not descend into a directory.
+Normally,
+.Nm
+will recursively check directories.
+If this option is enabled, then any files listed in the file list in the
+distfile that are directories are not recursively scanned.
+Only the existence, ownership, and mode of the directory are checked.
+.It Ic noexec
+Automatically exclude executable binary files in
+.Xr elf 5
+format from being checked or updated.
+.It Ic numchkgroup
+Use the numeric group ID (GID) to check group ownership instead of
+the group name.
+.It Ic numchkowner
+Use the numeric user ID (UID) to check user ownership instead of
+the user name.
+.It Ic quiet
+Quiet mode.
+Files that are being modified are normally printed on standard output.
+This option suppresses that.
+.It Ic remove
+Remove extraneous files.
+If a directory is being updated, any files that exist on the remote host
+that do not exist in the master directory are removed.
+This is useful for maintaining truly identical copies of directories.
+.It Ic savetargets
+Save files that are updated instead of removing them.
+Any target file that is updated is first renamed from
+.Pa file
+to
+.Pa file.OLD .
+.It Ic sparse
+Enable checking for sparse files.
+One of the most common types of sparse files are those produced by
+.Xr dbopen 3 .
+This option adds some additional processing overhead so it should
+only be enabled for targets likely to contain sparse files.
+.It Ic updateperm
+Do not send the whole file when the size and the modification time match.
+Instead, just update the ownership, group, and permissions as necessary.
+.It Ic verify
+Verify that the files are up to date on all the hosts.
+Any files that are out of date will be displayed
+but no files will be changed and no mail will be sent.
+.It Ic whole
+Whole mode.
+The whole file name is appended to the destination directory name.
+Normally, only the last component of a name is used when renaming files.
+This will preserve the directory structure of the files being
+copied instead of flattening the directory structure.
+For example, rdisting a list of files such as
+.Pa /p/dir1/f1
+and
+.Pa /p/dir2/f2
+to
+.Pa /tmp/dir
+would create files
+.Pa /tmp/dir/p/dir1/f1
+and
+.Pa /tmp/dir/p/dir2/f2
+instead of
+.Pa /tmp/dir/dir1/f1
+and
+.Pa /tmp/dir/dir2/f2 .
+.It Ic younger
+Younger mode.
+Files are normally updated if their
+.Em mtime
+and
+.Em size
+(see
+.Xr stat 2 )
+disagree.
+This option causes
+.Nm
+not to update files that are younger than the master copy.
+This can be used to prevent newer copies on other hosts from being replaced.
+A warning message is printed for files which are newer than the master copy.
+.El
+.It Fl P Ar rsh-path
+Set the path to the remote shell command.
+.Ar rsh-path
+may be a colon separated list of possible pathnames,
+in which case the first component of the path to exist is used.
+.It Fl p Ar rdistd-path
+Set the path where the rdistd server is searched for on the target host.
+.It Fl t Ar timeout
+Set the timeout period,
+in seconds,
+for waiting for responses from the remote
+.Nm
+server.
+The default is 900 seconds.
+.It Fl V
+Print version information and exit.
+.El
+.Sh DISTFILES
+The
+.Pa distfile
+contains a sequence of entries that specify the files
+to be copied, the destination hosts, and what operations to perform
+to do the updating.
+Each entry has one of the following formats.
+.Bd -literal -offset indent
+<variable name> = <name list>
+[ label: ] <source list> -> <destination list> <command list>
+[ label: ] <source list> :: <timestamp file> <command list>
+.Ed
+.Pp
+The first format is used for defining variables.
+The second format is used for distributing files to other hosts.
+The third format is used for making lists of files that have been changed
+since some given date.
+The
+.Ar source list
+specifies a list of files and/or directories on the local host which are to
+be used as the master copy for distribution.
+The
+.Ar destination list
+is the list of hosts to which these files are to be copied.
+Each file in the source list is added to a list of changes if the file
+is out of date on the host which is being updated (second format) or
+the file is newer than the
+.Ar timestamp file
+(third format).
+.Pp
+Newlines, tabs, and blanks are only used as separators and are
+otherwise ignored.
+Comments begin with
+.Sq #
+and end with a newline.
+.Pp
+Variables to be expanded begin with
+.Sq $
+followed by one character or a name enclosed in curly braces
+(see the examples at the end).
+.Pp
+Labels are optional.
+They are used to identify a specific command to execute
+(for example, allowing an update of a subset of a repository).
+.Pp
+The source and destination lists have the following format:
+.Bd -literal -offset indent
+<name>
+.Ed
+or
+.Bd -literal -compact -offset indent
+`(' <zero or more names separated by whitespace> `)'
+.Ed
+.Pp
+These simple lists can be modified by using one level of set addition,
+subtraction, or intersection like this:
+.Pp
+.Dl list - list
+or
+.Dl list + list
+or
+.Dl list & list
+.Pp
+If additional modifications are needed (e.g.\&
+.Do
+all servers and client machines except for the OSF/1 machines
+.Dc )
+then the list will have to be explicitly constructed in steps using
+.Dq temporary
+variables.
+.Pp
+The shell meta-characters
+.Sq \&[ ,
+.Sq \&] ,
+.Sq \&{ ,
+.Sq \&} ,
+.Sq * ,
+and
+.Sq \&?
+are recognized and expanded (on the local host only) in the same way as
+.Xr ksh 1 .
+They can be escaped with a backslash.
+The
+.Sq ~
+character is also expanded in the same way as
+.Xr ksh 1
+but is expanded separately on the local and destination hosts.
+When the
+.Fl o Ar whole
+option is used with a file name that begins with
+.Sq \&~ ,
+everything except the home directory is appended to the destination name.
+File names which do not begin with
+.Sq /
+or
+.Sq ~
+use the destination user's
+home directory as the root directory for the rest of the file name.
+.Pp
+The command list consists of zero or more commands of the following
+format:
+.Bl -column "except_pat" "<pattern list>" "opt_dest_name" ";" -offset indent
+.It install Ta <options> Ta opt_dest_name Ta ;
+.It notify Ta <name list> Ta "" Ta ;
+.It except Ta <name list> Ta "" Ta ;
+.It except_pat Ta <pattern list> Ta "" Ta ;
+.It special Ta <name list> Ta string Ta ;
+.It cmdspecial Ta <name list> Ta string Ta ;
+.El
+.Pp
+The
+.Cm install
+command is used to copy out-of-date files and/or directories.
+Each source file is copied to each host in the destination list.
+Directories are recursively copied in the same way.
+.Ar opt_dest_name
+is an optional parameter to rename files.
+If no
+.Cm install
+command appears in the command list or the destination name is not specified,
+the source file name is used.
+Directories in the path name will be created if they
+do not exist on the remote host.
+The
+.Fl o Ar distopts
+option as specified above has the same semantics as
+on the command line except
+.Ar distopts
+only applies to the files in the source list.
+The login name used on the destination host is the same as the local host
+unless the destination name is of the format
+.Dq login@host .
+.Pp
+The
+.Cm notify
+command is used to mail the list of files updated (and any errors
+that may have occurred) to the listed names.
+If no `@' appears in the name, the destination host is appended to
+the name
+(e.g. name1@host, name2@host, ...).
+.Pp
+The
+.Cm except
+command is used to update all of the files in the source list
+.Sy except
+for the files listed in
+.Ar name list .
+This is usually used to copy everything in a directory except certain files.
+.Pp
+The
+.Cm except_pat
+command is like the
+.Cm except
+command except that
+.Ar pattern list
+is a list of basic regular expressions
+(see
+.Xr re_format 7
+for details).
+If one of the patterns matches some string within a file name, that file will
+be ignored.
+Note that since
+.Sq \e
+is a quote character, it must be doubled to become
+part of the regular expression.
+Variables are expanded in
+.Ar pattern list
+but not shell file pattern matching characters.
+To include a
+.Sq $ ,
+it must be escaped with
+.Sq \e .
+.Pp
+The
+.Cm special
+command is used to specify
+.Xr sh 1
+commands that are to be executed on the remote host after the file in
+.Ar name list
+is updated or installed.
+If the
+.Ar name list
+is omitted then the shell commands will be executed for every file
+updated or installed.
+.Ar string
+starts and ends with
+.Sq \&"
+and can cross multiple lines in
+.Pa distfile .
+Multiple commands to the shell should be separated by `;'.
+Commands are executed in the user's home directory on the host
+being updated.
+The
+.Cm special
+command can be used, for example, to rebuild private databases
+after a program has been updated.
+The following environment variables are set for each
+.Cm special
+command:
+.Pp
+.Bl -tag -width "BASEFILE" -offset 3n -compact
+.It Ev FILE
+The full pathname of the local file that was just updated.
+.It Ev REMFILE
+The full pathname of the remote file that was just updated.
+.It BASEFILE
+The basename of the remote file that was just updated.
+.El
+.Pp
+The
+.Cm cmdspecial
+command is similar to the
+.Cm special
+command, except it is executed only when the entire command is completed
+instead of after each file is updated.
+The list of files is placed in the
+.Ev FILES
+environment variable.
+Each file name in
+.Ev FILES
+is separated by a
+.Sq :\&
+(colon).
+.Pp
+If a hostname ends in a
+.Sq +
+(plus sign),
+then the plus
+is stripped off and NFS checks are disabled.
+This is equivalent to disabling the
+.Fl o Ar chknfs
+option just for this one host.
+.Sh MESSAGE LOGGING
+.Nm
+uses a collection of predefined message
+.Em facilities
+that each contain a list of message
+.Em types
+specifying which types of messages to send to that facility.
+The local client
+and the remote server
+each maintain their own copy
+of what types of messages to log to what facilities.
+.Pp
+The
+.Fl l
+.Ar local_logopts
+option specifies the logging options to use locally;
+.Fl L
+.Ar remote_logopts
+specifies the logging options to pass to the remote server.
+.Pp
+Logging options should be of the form:
+.Pp
+.D1 facility=types:facility=types...
+.Pp
+The valid facility names are:
+.Bl -tag -width Ds -offset indent
+.It Ic file
+Log to a file.
+To specify the file name, use the format
+.Dq file=filename=types .
+For example:
+.Pp
+.Dl file=/tmp/rdist.log=all,debug
+.It Ic notify
+Use the internal
+.Nm
+.Ic notify
+facility.
+This facility is used in conjunction with the
+.Ic notify
+keyword in a
+.Pa distfile
+to specify what messages are mailed to the
+.Ic notify
+address.
+.It Ic stdout
+Messages to standard output.
+.It Ic syslog
+Use the
+.Xr syslogd 8
+facility.
+.El
+.Pp
+.Ar types
+should be a comma separated list of message types.
+Each message type specified enables that message level.
+This is unlike the
+.Xr syslog 3
+system facility which uses an ascending order scheme.
+The following are the valid types:
+.Bl -tag -width Ds -offset indent
+.It Ic all
+All but debug messages.
+.It Ic change
+Things that change.
+This includes files that are installed or updated in some way.
+.It Ic debug
+Debugging information.
+.It Ic ferror
+Fatal errors.
+.It Ic info
+General information.
+.It Ic nerror
+Normal errors that are not fatal.
+.It Ic notice
+General info about things that change.
+This includes things like making directories which are needed in order
+to install a specific target, but which are not explicitly specified in the
+.Pa distfile .
+.It Ic warning
+Warnings about errors which are not as serious as
+.Ic nerror
+type messages.
+.El
+.Pp
+Here is a sample command line option:
+.Bd -literal -offset indent
+-l stdout=all:syslog=change,notice:file=/tmp/rdist.log=all
+.Ed
+.Pp
+This entry will set local message logging to have all but debug
+messages sent to standard output, change and notice messages will
+be sent to
+.Xr syslog 3 ,
+and all messages will be written to the file
+.Pa /tmp/rdist.log .
+.Sh ENVIRONMENT
+.Bl -tag -width "TMPDIR"
+.It RSH
+Name of the default remote shell program to use.
+The default is
+.Xr ssh 1 .
+.It TMPDIR
+Name of the temporary directory to use.
+The default is
+.Pa /tmp .
+.El
+.Sh FILES
+.Bl -tag -width "$TMPDIR/rdist*XXX" -compact
+.It Pa {d,D}istfile
+.Nm
+command file.
+.It Pa /etc/Distfile
+System-wide
+.Nm
+command file.
+.It Pa $TMPDIR/rdist*
+Temporary file for update lists.
+.El
+.Sh EXAMPLES
+The following is an example
+.Pa distfile :
+.Bd -literal -offset indent
+HOSTS = ( matisse root@arpa)
+
+FILES = ( /bin /lib /usr/bin /usr/games
+	/usr/include/{*.h,{stand,sys,vax*,pascal,machine}/*.h}
+	/usr/lib /usr/man/man? /usr/ucb /usr/local/rdist )
+
+EXLIB = ( Mail.rc aliases aliases.db crontab dshrc
+	sendmail.cf sendmail.hf sendmail.st uucp vfont )
+
+${FILES} -> ${HOSTS}
+	install -oremove,chknfs ;
+	except /usr/lib/${EXLIB} ;
+	except /usr/games/lib ;
+	special /usr/lib/sendmail "/usr/lib/sendmail -bi" ;
+
+srcs:
+/usr/src/bin -> arpa
+	except_pat ( \e\e.o\e$ /SCCS\e$ ) ;
+
+IMAGEN = (ips dviimp catdvi)
+
+imagen:
+/usr/local/${IMAGEN} -> arpa
+	install /usr/local/lib ;
+	notify ralph ;
+
+sendmail.cf :: stamp.cory
+	notify root@cory ;
+.Ed
+.Pp
+Using the above
+.Pa distfile :
+.Pp
+Update everything that's out of date,
+making any relevant notifications:
+.Pp
+.Dl $ rdist
+.Pp
+Update files in
+.Pa /usr/src/bin
+to host
+.Dq arpa ,
+except for files with names ending
+.Dq .o
+or
+.Dq /SCCS :
+.Pp
+.Dl $ rdist srcs
+.Pp
+Update
+.Pa sendmail.cf
+if it's older than timestamp file
+.Pa stamp.cory ,
+notifying root@cory if an update has happened:
+.Pp
+.Dl $ rdist sendmail.cf
+.Sh SEE ALSO
+.Xr rdistd 1 ,
+.Xr sh 1 ,
+.Xr ssh 1 ,
+.Xr re_format 7 ,
+.Xr daily 8 ,
+.Xr syslogd 8
+.Sh STANDARDS
+The options
+.Op Fl bhiNOqRrsvwxy
+are still recognized for backwards compatibility.
+.Sh CAVEATS
+If the basename of a file
+(the last component in the pathname)
+is
+.Sq .\& ,
+.Nm
+assumes the remote (destination) name is a directory.
+That is,
+.Pa /tmp/.\&
+means that
+.Pa /tmp
+should be a directory on the remote host.
+.Sh BUGS
+Source files must reside on the local host where
+.Nm
+is executed.
+.Pp
+Variable expansion only works for name lists;
+there should be a general macro facility.
+.Pp
+.Nm
+aborts on files which have a negative mtime (before Jan 1, 1970).
+.Pp
+If a hardlinked file is listed more than once in the same target,
+.Nm
+will report missing links.
+Only one instance of a link should be listed in each target.
+.Pp
+The
+.Ic defowner ,
+.Ic defgroup ,
+and
+.Ic updateperm
+options are extensions to the 6.1.0 protocol and will not work with earlier
+versions of rdist 6.

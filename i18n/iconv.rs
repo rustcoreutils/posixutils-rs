@@ -31,7 +31,7 @@ use strum_macros::{Display, EnumIter, EnumString};
 mod iconv_lib;
 
 #[derive(Parser)]
-#[command(version, about=gettext("iconv — codeset conversion"))]
+#[command(version, about=gettext("iconv - codeset conversion"))]
 struct Args {
     #[arg(short = 'c', help=gettext("Omit invalid characters of the input file from the output"))]
     omit_invalid: bool,

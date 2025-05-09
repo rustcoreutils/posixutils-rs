@@ -1825,12 +1825,17 @@ mod tests {
     fn test_w() {
         let test_data = [
             // correct
-            ("w ./tests/sed/assets/newfile", "abc\ncdf\n", "abc\ncdf\n", ""),
             ("w atyfv", "abc\ncdf\n", "abc\ncdf\n", ""),
             ("w./tests/sed/assets/r", "", "", ""),
-            ("w./tests/sed/assets/newfile", "a\n", "a\n", ""),
+            ("w newfile", "a\n", "a\n", ""),
             ("w ; h", "abc\ncdf\n", "abc\ncdf\n", ""),
             // wrong
+            (
+                "w ./dir/newfile", 
+                "abc\ncdf\n", 
+                "", 
+                "sed: read stdin: can't find './dir/newfile': no such file or directory (os error 2)\n",
+            ),
             (
                 "w./tests/s\x04ed/assets/abc",
                 "a\n",

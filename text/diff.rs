@@ -14,17 +14,16 @@
 
 mod diff_util;
 
-use std::{fs, io, path::PathBuf};
-
 use clap::Parser;
 use diff_util::{
     common::{FormatOptions, OutputFormat},
     diff_exit_status::DiffExitStatus,
     dir_diff::DirDiff,
     file_diff::FileDiff,
-    functions::check_existance,
+    functions::check_existence,
 };
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use std::{fs, io, path::PathBuf};
 
 /// diff - compare two files
 #[derive(Parser, Clone)]
@@ -53,6 +52,10 @@ struct Args {
     /// Apply diff recursively to files and directories of the same name
     #[arg(short, long)]
     recurse: bool,
+
+    /// Print a message even when there are no differences between files
+    #[arg(short = 's', long = "report-identical-files")]
+    report_identical_files: bool,
 
     /// Output 3 lines of unified context
     #[arg(short)]
@@ -103,17 +106,16 @@ impl From<&Args> for OutputFormat {
 }
 
 fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
-    let path1 = PathBuf::from(&args.file1);
-    let path2 = PathBuf::from(&args.file2);
+    let path1 = PathBuf::from(args.file1.as_str());
+    let path2 = PathBuf::from(args.file2.as_str());
 
-    let path1_exists = check_existance(&path1)?;
-    let path2_exists = check_existance(&path2)?;
+    let path1_path = path1.as_path();
+    let path2_path = path2.as_path();
+
+    let path1_exists = check_existence(path1_path);
+    let path2_exists = check_existence(path2_path);
 
     if !path1_exists || !path2_exists {
-        return Ok(DiffExitStatus::Trouble);
-    }
-
-    if path1 == path2 {
         return Ok(DiffExitStatus::Trouble);
     }
 
@@ -124,18 +126,24 @@ fn check_difference(args: Args) -> io::Result<DiffExitStatus> {
         output_format,
         args.label,
         args.label2,
+        args.report_identical_files,
     );
+
     let format_options = format_options.unwrap();
 
-    let path1_is_file = fs::metadata(&path1)?.is_file();
-    let path2_is_file = fs::metadata(&path2)?.is_file();
+    let path1_is_file = fs::metadata(path1_path)?.is_file();
+    let path2_is_file = fs::metadata(path2_path)?.is_file();
 
     if path1_is_file && path2_is_file {
-        FileDiff::file_diff(path1, path2, &format_options, None)
+        FileDiff::file_diff(path1_path, path2_path, &format_options, None)
     } else if !path1_is_file && !path2_is_file {
-        DirDiff::dir_diff(path1, path2, &format_options, args.recurse)
+        DirDiff::dir_diff(path1_path, path2_path, &format_options, args.recurse)
     } else {
-        FileDiff::file_dir_diff(path1, path2, &format_options)
+        Ok(FileDiff::file_dir_diff(
+            path1_path,
+            path2_path,
+            &format_options,
+        )?)
     }
 }
 
@@ -151,7 +159,7 @@ fn main() -> DiffExitStatus {
     match result {
         Ok(diff_exit_status) => diff_exit_status,
         Err(error) => {
-            eprintln!("diff: {}", error);
+            eprintln!("diff: {error}");
 
             DiffExitStatus::Trouble
         }

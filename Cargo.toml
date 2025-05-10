@@ -11,6 +11,7 @@ members = [
 	"fs",
 	"ftw",
 	"make",
+	"man",
 	"m4",
 	"m4/test-manager",
 	"gettext-rs",

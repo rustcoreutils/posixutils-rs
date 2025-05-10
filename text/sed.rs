@@ -25,6 +25,8 @@ use std::{
     path::PathBuf,
 };
 
+const DEFAULT_TMP_DIR: &str = "../target/tmp";
+
 static ERE: Mutex<bool> = Mutex::new(false);
 
 #[derive(Parser, Debug, Clone)]
@@ -1346,7 +1348,7 @@ fn print_multiline_binary(line: &str) {
                 }
             }
         }
-    } else if let Some(line) = line.strip_suffix(&['\n']) {
+    } else if let Some(line) = line.strip_suffix(['\n']) {
         println!("{}$", line);
     } else {
         print!("{}$", line);
@@ -1414,6 +1416,16 @@ fn filter_comments(raw_script: impl AsRef<str>) -> String {
         raw_script_without_comments += "\n";
     }
     raw_script_without_comments
+}
+
+/// Get path to [`wfile`] in tmp dir
+fn get_tmp_path(wfile: PathBuf) -> PathBuf {
+    let mut tmp_path =
+        PathBuf::from(std::env::var("CARGO_TARGET_TMPDIR").unwrap_or(DEFAULT_TMP_DIR.to_string()));
+
+    tmp_path.extend(&wfile);
+
+    tmp_path
 }
 
 /// Contains [`Command`] sequence of all [`Sed`] session
@@ -1821,6 +1833,15 @@ fn execute_replace(
         Some(wfile)
     }) {
         if replace && wfile.components().next().is_some() {
+            let mut wfile = wfile.clone();
+            if !(wfile.is_absolute()
+                || wfile.starts_with("./")
+                || wfile.starts_with("../")
+                || wfile.exists())
+            {
+                wfile = get_tmp_path(wfile);
+            }
+
             if let Ok(mut file) = std::fs::OpenOptions::new()
                 .append(true)
                 .create(true)
@@ -2213,6 +2234,15 @@ impl Sed {
     }
 
     fn execute_w(&mut self, wfile: PathBuf) -> Result<(), SedError> {
+        let mut wfile = wfile.clone();
+        if !(wfile.is_absolute()
+            || wfile.starts_with("./")
+            || wfile.starts_with("../")
+            || wfile.exists())
+        {
+            wfile = get_tmp_path(wfile);
+        }
+
         let _ = match std::fs::OpenOptions::new()
             .append(true)
             .create(true)

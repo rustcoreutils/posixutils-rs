@@ -7,24 +7,36 @@
 //
 
 mod preprocess {
-    use posixutils_make::parser::preprocessor::preprocess;
+    use posixutils_make::parser::preprocessor::{generate_macro_table, preprocess};
+    use posixutils_make::rule::target::Target;
+    use std::path::PathBuf;
 
     #[test]
     fn test_macros_simple() {
-        const MACROS: &'static str = r#"
-VAR = var
+        const MACROS: &str = r#"VAR = var
 V = ok
 
 all:
-	$(VAR) $V ${VAR} ${V} $(V)
-"#;
+    $(VAR) $V ${VAR} ${V} $(V)"#;
 
-        const EXPECTED: &'static str = r#"
-
+        const EXPECTED: &str = r#"
 all:
-	var ok var ok ok
+    var ok var ok ok
 "#;
-        let Ok(result) = preprocess(MACROS) else {
+        let table = generate_macro_table(
+            MACROS,
+            &Target::Simple { name: "test" },
+            &(PathBuf::new(), PathBuf::new()),
+            [].iter(),
+        )
+        .unwrap();
+        let Ok(result) = preprocess(
+            MACROS,
+            &table,
+            &Target::Simple { name: "test" },
+            &(PathBuf::new(), PathBuf::new()),
+            [].iter(),
+        ) else {
             panic!("Test must be preprocessed without an error")
         };
         assert_eq!(result, EXPECTED);
@@ -52,15 +64,12 @@ rule: prerequisite
             .collect::<Vec<_>>(),
             vec![
                 (IDENTIFIER, "VARIABLE"),
-                (WHITESPACE, " "),
                 (EQUALS, "="),
-                (WHITESPACE, " "),
                 (IDENTIFIER, "value"),
                 (NEWLINE, "\n"),
                 (NEWLINE, "\n"),
                 (IDENTIFIER, "rule"),
                 (COLON, ":"),
-                (WHITESPACE, " "),
                 (IDENTIFIER, "prerequisite"),
                 (NEWLINE, "\n"),
                 (INDENT, "\t"),
@@ -92,7 +101,6 @@ rule: prerequisite
             .collect::<Vec<_>>(),
             vec![
                 (EXPORT, "export"),
-                (WHITESPACE, " "),
                 (IDENTIFIER, "VARIABLE"),
                 (NEWLINE, "\n"),
             ]
@@ -109,12 +117,9 @@ rule: prerequisite
             .collect::<Vec<_>>(),
             vec![
                 (EXPORT, "export"),
-                (WHITESPACE, " "),
                 (IDENTIFIER, "VARIABLE"),
-                (WHITESPACE, " "),
                 (COLON, ":"),
                 (EQUALS, "="),
-                (WHITESPACE, " "),
                 (IDENTIFIER, "value"),
                 (NEWLINE, "\n"),
             ]
@@ -131,7 +136,6 @@ rule: prerequisite
             .collect::<Vec<_>>(),
             [
                 (INCLUDE, "include"),
-                (WHITESPACE, " "),
                 (IDENTIFIER, "FILENAME"),
                 (NEWLINE, "\n")
             ]
@@ -151,9 +155,7 @@ rule: prerequisite
             vec![
                 (IDENTIFIER, "rule"),
                 (COLON, ":"),
-                (WHITESPACE, " "),
                 (IDENTIFIER, "prerequisite1"),
-                (WHITESPACE, " "),
                 (IDENTIFIER, "prerequisite2"),
                 (NEWLINE, "\n"),
                 (INDENT, "\t"),
@@ -173,10 +175,8 @@ rule: prerequisite
                 .collect::<Vec<_>>(),
             vec![
                 (IDENTIFIER, "VARIABLE"),
-                (WHITESPACE, " "),
                 (QUESTION, "?"),
                 (EQUALS, "="),
-                (WHITESPACE, " "),
                 (IDENTIFIER, "value"),
                 (NEWLINE, "\n"),
             ]
@@ -194,11 +194,9 @@ endif
             .collect::<Vec<_>>(),
             vec![
                 (IDENTIFIER, "ifneq"),
-                (WHITESPACE, " "),
                 (LPAREN, "("),
                 (IDENTIFIER, "a"),
                 (COMMA, ","),
-                (WHITESPACE, " "),
                 (IDENTIFIER, "b"),
                 (RPAREN, ")"),
                 (NEWLINE, "\n"),
@@ -217,9 +215,7 @@ endif
                 .collect::<Vec<_>>(),
             vec![
                 (IDENTIFIER, "VARIABLE"),
-                (WHITESPACE, " "),
                 (EQUALS, "="),
-                (WHITESPACE, " "),
                 (DOLLAR, "$"),
                 (LPAREN, "("),
                 (IDENTIFIER, "value"),
@@ -238,9 +234,7 @@ endif
                 .collect::<Vec<_>>(),
             vec![
                 (IDENTIFIER, "VARIABLE"),
-                (WHITESPACE, " "),
                 (EQUALS, "="),
-                (WHITESPACE, " "),
                 (DOLLAR, "$"),
                 (LPAREN, "("),
                 (IDENTIFIER, "value"),
@@ -256,20 +250,35 @@ endif
 }
 
 mod parse {
-    use posixutils_make::parser::preprocessor::preprocess;
+    use posixutils_make::parser::preprocessor::{generate_macro_table, preprocess};
     use posixutils_make::parser::{parse::parse, Makefile};
+    use posixutils_make::rule::target::Target;
     use rowan::ast::AstNode;
+    use std::path::PathBuf;
 
     #[test]
     fn test_parse_simple() {
         const SIMPLE: &str = r#"VARIABLE = command2
 
-rule: dependency
-	command
-	${VARIABLE}
+        rule: dependency
+        	command
+        	${VARIABLE}
 
-"#;
-        let Ok(processed) = preprocess(SIMPLE) else {
+        "#;
+        let table = generate_macro_table(
+            SIMPLE,
+            &Target::Simple { name: "test" },
+            &(PathBuf::new(), PathBuf::new()),
+            [].iter(),
+        )
+        .unwrap();
+        let Ok(processed) = preprocess(
+            SIMPLE,
+            &table,
+            &Target::Simple { name: "test" },
+            &(PathBuf::new(), PathBuf::new()),
+            [].iter(),
+        ) else {
             panic!("Must be preprocessed without an error")
         };
         let parsed = parse(&processed);
@@ -280,22 +289,22 @@ rule: dependency
             format!("{:#?}", node),
             r#"ROOT@0..38
   NEWLINE@0..1 "\n"
-  RULE@1..38
+  RULE@1..37
     IDENTIFIER@1..5 "rule"
     COLON@5..6 ":"
-    WHITESPACE@6..7 " "
-    EXPR@7..17
-      IDENTIFIER@7..17 "dependency"
-    NEWLINE@17..18 "\n"
-    RECIPE@18..27
-      INDENT@18..19 "\t"
-      TEXT@19..26 "command"
-      NEWLINE@26..27 "\n"
-    RECIPE@27..37
-      INDENT@27..28 "\t"
-      TEXT@28..36 "command2"
-      NEWLINE@36..37 "\n"
-    NEWLINE@37..38 "\n"
+    EXPR@6..16
+      IDENTIFIER@6..16 "dependency"
+    NEWLINE@16..17 "\n"
+    RECIPE@17..26
+      INDENT@17..18 "\t"
+      TEXT@18..25 "command"
+      NEWLINE@25..26 "\n"
+    RECIPE@26..36
+      INDENT@26..27 "\t"
+      TEXT@27..35 "command2"
+      NEWLINE@35..36 "\n"
+    NEWLINE@36..37 "\n"
+  NEWLINE@37..38 "\n"
 "#
         );
 
@@ -315,12 +324,26 @@ rule: dependency
     #[test]
     fn test_parse_export_assign() {
         const EXPORT: &str = r#"export VARIABLE := value
-"#;
-        let Ok(processed) = preprocess(EXPORT).map_err(|e| println!("{e:?}")) else {
+        "#;
+        let table = generate_macro_table(
+            EXPORT,
+            &Target::Simple { name: "test" },
+            &(PathBuf::new(), PathBuf::new()),
+            [].iter(),
+        )
+        .unwrap();
+        let Ok(processed) = preprocess(
+            EXPORT,
+            &table,
+            &Target::Simple { name: "test" },
+            &(PathBuf::new(), PathBuf::new()),
+            [].iter(),
+        )
+        .map_err(|e| println!("{e:?}")) else {
             panic!("Must be preprocessed without an error")
         };
         let parsed = parse(&processed);
-        assert!(parsed.clone().err().is_some());
+        assert!(parsed.clone().err().is_none());
     }
 
     // TODO: create `include` test with real files
@@ -365,21 +388,19 @@ rule: dependency
         let node = parsed.clone().unwrap().syntax();
         assert_eq!(
             format!("{:#?}", node),
-            r#"ROOT@0..40
-  RULE@0..40
+            r#"ROOT@0..38
+  RULE@0..38
     IDENTIFIER@0..4 "rule"
     COLON@4..5 ":"
-    WHITESPACE@5..6 " "
-    EXPR@6..29
-      IDENTIFIER@6..17 "dependency1"
-      WHITESPACE@17..18 " "
-      IDENTIFIER@18..29 "dependency2"
-    NEWLINE@29..30 "\n"
-    RECIPE@30..39
-      INDENT@30..31 "\t"
-      TEXT@31..38 "command"
-      NEWLINE@38..39 "\n"
-    NEWLINE@39..40 "\n"
+    EXPR@5..27
+      IDENTIFIER@5..16 "dependency1"
+      IDENTIFIER@16..27 "dependency2"
+    NEWLINE@27..28 "\n"
+    RECIPE@28..37
+      INDENT@28..29 "\t"
+      TEXT@29..36 "command"
+      NEWLINE@36..37 "\n"
+    NEWLINE@37..38 "\n"
 "#
         );
         let root = parsed.unwrap().root().clone_for_update();

@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Represents the configuration of the make utility
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +36,7 @@ pub struct Config {
     pub precious: bool,
 
     pub rules: BTreeMap<String, BTreeSet<String>>,
+    pub macros: HashMap<String, String>,
 }
 
 impl Default for Config {
@@ -113,6 +114,7 @@ impl Default for Config {
                     .collect::<BTreeSet<String>>(),
             )
             ]),
+            macros: HashMap::new()
         }
     }
 }

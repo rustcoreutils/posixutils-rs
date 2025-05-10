@@ -20,7 +20,7 @@ use std::{
     time::SystemTime,
 };
 
-use parser::{Makefile, VariableDefinition};
+use parser::Makefile;
 
 use crate::special_target::InferenceTarget;
 use config::Config;
@@ -38,7 +38,6 @@ const DEFAULT_SHELL: &str = "/bin/sh";
 ///
 /// The only way to create a Make is from a Makefile and a Config.
 pub struct Make {
-    macros: Vec<VariableDefinition>,
     rules: Vec<Rule>,
     default_rule: Option<Rule>, // .DEFAULT
     pub config: Config,
@@ -111,7 +110,7 @@ impl Make {
         for prerequisite in &newer_prerequisites {
             self.build_target(prerequisite)?;
         }
-        rule.run(&self.config, &self.macros, target, up_to_date)?;
+        rule.run(&self.config, target, up_to_date)?;
 
         Ok(true)
     }
@@ -183,10 +182,16 @@ impl Make {
 impl TryFrom<(Makefile, Config)> for Make {
     type Error = ErrorCode;
 
-    fn try_from((makefile, config): (Makefile, Config)) -> Result<Self, Self::Error> {
+    fn try_from((makefile, mut config): (Makefile, Config)) -> Result<Self, Self::Error> {
         let mut rules = vec![];
         let mut special_rules = vec![];
         let mut inference_rules = vec![];
+
+        for macr in makefile.macros() {
+            config
+                .macros
+                .insert(macr.name().unwrap(), macr.raw_value().unwrap());
+        }
 
         for rule in makefile.rules() {
             let rule = Rule::from(rule);
@@ -205,7 +210,6 @@ impl TryFrom<(Makefile, Config)> for Make {
 
         let mut make = Self {
             rules,
-            macros: makefile.variable_definitions().collect(),
             default_rule: None,
             config,
         };

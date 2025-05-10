@@ -27,10 +27,6 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn is_whitespace(c: char) -> bool {
-        c == ' ' || c == '\t'
-    }
-
     fn is_newline(c: char) -> bool {
         c == '\n' || c == '\r'
     }
@@ -64,6 +60,9 @@ impl<'a> Lexer<'a> {
     /// - `None` if the input is exhausted.
     ///
     fn next_token(&mut self) -> Option<(SyntaxKind, String)> {
+        while matches!(self.input.peek(), Some(' ')) {
+            self.input.next();
+        }
         if let Some(&c) = self.input.peek() {
             match (c, self.line_type) {
                 ('\t', None) => {
@@ -96,9 +95,6 @@ impl<'a> Lexer<'a> {
                     Some((SyntaxKind::TEXT, self.read_while(|c| !Self::is_newline(c))))
                 }
                 LineType::Other => match c {
-                    c if Self::is_whitespace(c) => {
-                        Some((SyntaxKind::WHITESPACE, self.read_while(Self::is_whitespace)))
-                    }
                     c if Self::is_valid_identifier_char(c) => {
                         let ident = self.read_while(Self::is_valid_identifier_char);
 

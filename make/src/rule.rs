@@ -12,10 +12,11 @@ pub mod prerequisite;
 pub mod recipe;
 pub mod target;
 
+use crate::parser::preprocessor::preprocess;
 use crate::{
     config::Config as GlobalConfig,
     error_code::ErrorCode::{self, *},
-    parser::{Rule as ParsedRule, VariableDefinition},
+    parser::Rule as ParsedRule,
     signal_handler, DEFAULT_SHELL, DEFAULT_SHELL_VAR,
 };
 use config::Config;
@@ -35,6 +36,7 @@ use std::{
     time::SystemTime,
 };
 use target::Target;
+// use crate::parser::MacroDef;
 
 type LazyArcMutex<T> = LazyLock<Arc<Mutex<T>>>;
 
@@ -58,7 +60,7 @@ impl Rule {
         self.targets.iter()
     }
 
-    pub fn prerequisites(&self) -> impl Iterator<Item = &Prerequisite> {
+    pub fn prerequisites(&self) -> impl Iterator<Item = &Prerequisite> + Clone {
         self.prerequisites.iter()
     }
 
@@ -72,7 +74,6 @@ impl Rule {
     pub fn run(
         &self,
         global_config: &GlobalConfig,
-        macros: &[VariableDefinition],
         target: &Target,
         up_to_date: bool,
     ) -> Result<(), ErrorCode> {
@@ -81,7 +82,7 @@ impl Rule {
             dry_run: global_dry_run,
             silent: global_silent,
             touch: global_touch,
-            env_macros: global_env_macros,
+            env_macros: _,
             quit: global_quit,
             clear: _,
             print: global_print,
@@ -89,6 +90,7 @@ impl Rule {
             terminate: global_terminate,
             precious: global_precious,
             rules: _,
+            ref macros,
         } = *global_config;
         let Config {
             ignore: rule_ignore,
@@ -124,7 +126,6 @@ impl Rule {
                 let silent = global_silent || rule_silent || recipe_silent;
                 let force_run = recipe_force_run;
                 let touch = global_touch;
-                let env_macros = global_env_macros;
                 let quit = global_quit;
                 let print = global_print;
                 let precious = global_precious || rule_precious;
@@ -170,9 +171,16 @@ impl Rule {
                         .unwrap_or(DEFAULT_SHELL),
                 );
 
-                self.init_env(env_macros, &mut command, macros);
+                // self.init_env(env_macros, &mut command, macros);
+                let recipe = self.substitute_general_macros(
+                    recipe,
+                    target,
+                    macros,
+                    &inout,
+                    self.prerequisites(),
+                );
                 let recipe =
-                    self.substitute_internal_macros(target, recipe, &inout, self.prerequisites());
+                    self.substitute_internal_macros(target, &recipe, &inout, self.prerequisites());
                 command.args(["-c", recipe.as_ref()]);
 
                 let status = match command.status() {
@@ -218,6 +226,19 @@ impl Rule {
         }
 
         Ok(())
+    }
+
+    fn substitute_general_macros<'a>(
+        &self,
+        recipe: &Recipe,
+        target: &Target,
+        macros: &HashMap<String, String>,
+        files: &(PathBuf, PathBuf),
+        prereqs: impl Iterator<Item = &'a Prerequisite> + Clone,
+    ) -> Recipe {
+        let recipe = recipe.inner();
+        let result = preprocess(recipe, macros, target, files, prereqs).unwrap();
+        Recipe::new(result)
     }
 
     fn substitute_internal_macros<'a>(
@@ -266,24 +287,24 @@ impl Rule {
         Recipe::new(result)
     }
 
-    /// A helper function to initialize env vars for shell commands.
-    fn init_env(&self, env_macros: bool, command: &mut Command, variables: &[VariableDefinition]) {
-        let mut macros: HashMap<String, String> = variables
-            .iter()
-            .map(|v| {
-                (
-                    v.name().unwrap_or_default(),
-                    v.raw_value().unwrap_or_default(),
-                )
-            })
-            .collect();
-
-        if env_macros {
-            let env_vars: HashMap<String, String> = std::env::vars().collect();
-            macros.extend(env_vars);
-        }
-        command.envs(macros);
-    }
+    // A helper function to initialize env vars for shell commands.
+    // fn init_env(&self, env_macros: bool, command: &mut Command, variables: &[MacroDef]) {
+    //     let mut macros: HashMap<String, String> = variables
+    //         .iter()
+    //         .map(|v| {
+    //             (
+    //                 v.name().unwrap_or_default(),
+    //                 v.raw_value().unwrap_or_default(),
+    //             )
+    //         })
+    //         .collect();
+    //
+    //     if env_macros {
+    //         let env_vars: HashMap<String, String> = std::env::vars().collect();
+    //         macros.extend(env_vars);
+    //     }
+    //     command.envs(macros);
+    // }
 }
 
 impl From<ParsedRule> for Rule {

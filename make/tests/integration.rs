@@ -372,7 +372,7 @@ mod macros {
 mod target_behavior {
     use super::*;
     use libc::{kill, SIGINT};
-    use posixutils_make::parser::parse::ParseError;
+
     use std::{thread, time::Duration};
 
     #[test]
@@ -381,10 +381,7 @@ mod target_behavior {
             &["-f", "tests/makefiles/target_behavior/no_targets.mk"],
             "",
             "make: parse error:  *** No targets. Stop.\n\n",
-            ErrorCode::ParserError {
-                constraint: ParseError(vec![]),
-            }
-            .into(),
+            6,
         );
     }
 

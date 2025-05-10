@@ -8,7 +8,7 @@
 //
 
 use core::str::FromStr;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -179,6 +179,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         keep_going,
         mut targets,
     } = Args::parse();
+    let target_list = targets
+        .iter()
+        .filter_map(|x| x.clone().into_string().ok())
+        .fold(String::new(), |acc, x| acc + " " + &x);
 
     let mut status_code = 0;
 
@@ -199,6 +203,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         print,
         precious: false,
         terminate,
+        macros: HashMap::from([
+            (String::from("MAKECMDGOALS"), target_list),
+            (String::from("MAKE"), env::args().next().unwrap()),
+        ]),
         ..Default::default()
     };
 

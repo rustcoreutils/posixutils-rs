@@ -75,7 +75,6 @@ impl rowan::Language for Lang {
 use rowan::GreenNode;
 
 use super::SyntaxKind;
-use crate::parser::preprocessor::preprocess;
 /// You can construct GreenNodes by hand, but a builder
 /// is helpful for top-down parsers: it maintains a stack
 /// of currently in-progress nodes
@@ -144,7 +143,7 @@ pub fn parse(text: &str) -> Result<Parsed, ParseError> {
             self.builder.start_node(RECIPE.into());
             self.expect(INDENT);
             self.expect(TEXT);
-            self.expect(NEWLINE);
+            self.try_expect(NEWLINE);
             self.builder.finish_node();
         }
 
@@ -156,9 +155,18 @@ pub fn parse(text: &str) -> Result<Parsed, ParseError> {
                 self.expect(IDENTIFIER);
                 self.skip_ws();
             }
-            self.expect(NEWLINE);
+            self.try_expect(NEWLINE);
             self.builder.token(IDENTIFIER.into(), "variables.mk");
             dbg!(&self.builder);
+            self.builder.finish_node();
+        }
+
+        fn parse_macro_defintion(&mut self) {
+            self.builder.start_node(MACRODEF.into());
+            self.try_expect(EXPORT);
+            self.expect(IDENTIFIER);
+            self.expect(EQUALS);
+            self.parse_expr();
             self.builder.finish_node();
         }
 
@@ -167,7 +175,10 @@ pub fn parse(text: &str) -> Result<Parsed, ParseError> {
             self.skip_ws();
             self.try_expect(EXPORT);
             self.skip_ws();
-            self.expect(IDENTIFIER);
+            let is_pattern = self.try_expect(PERCENT);
+            if !is_pattern {
+                self.expect(IDENTIFIER);
+            }
             self.skip_ws();
             if self.tokens.pop() == Some((COLON, ":".to_string())) {
                 self.builder.token(COLON.into(), ":");
@@ -176,7 +187,7 @@ pub fn parse(text: &str) -> Result<Parsed, ParseError> {
             }
             self.skip_ws();
             self.parse_expr();
-            self.expect(NEWLINE);
+            self.try_expect(NEWLINE);
             loop {
                 match self.current() {
                     Some(INDENT) => {
@@ -197,7 +208,10 @@ pub fn parse(text: &str) -> Result<Parsed, ParseError> {
         fn parse(mut self) -> Parse {
             self.builder.start_node(ROOT.into());
             loop {
-                match self.find(|&&(k, _)| k == COLON || k == NEWLINE || k == INCLUDE) {
+                match self
+                    .find(|&&(k, _)| k == COLON || k == NEWLINE || k == INCLUDE || k == EQUALS)
+                {
+                    Some((EQUALS, "=")) => self.parse_macro_defintion(),
                     Some((COLON, ":")) => {
                         self.parse_rule();
                     }
@@ -347,12 +361,16 @@ macro_rules! ast_node {
     };
 }
 
+ast_node!(Macro, MACRO);
+ast_node!(MacroDef, MACRODEF);
 ast_node!(Makefile, ROOT);
 ast_node!(Rule, RULE);
 ast_node!(Identifier, IDENTIFIER);
-ast_node!(VariableDefinition, VARIABLE);
 
-impl VariableDefinition {
+impl Macro {}
+impl MacroDef {}
+
+impl MacroDef {
     pub fn name(&self) -> Option<String> {
         self.syntax().children_with_tokens().find_map(|it| {
             it.as_token().and_then(|it| {
@@ -403,15 +421,17 @@ impl Makefile {
         self.syntax().children().filter_map(Rule::cast)
     }
 
+    pub fn macros(&self) -> impl Iterator<Item = MacroDef> {
+        self.syntax().children().filter_map(MacroDef::cast)
+    }
+
     pub fn rules_by_target<'a>(&'a self, target: &'a str) -> impl Iterator<Item = Rule> + 'a {
         self.rules()
             .filter(move |rule| rule.targets().any(|t| t == target))
     }
 
-    pub fn variable_definitions(&self) -> impl Iterator<Item = VariableDefinition> {
-        self.syntax()
-            .children()
-            .filter_map(VariableDefinition::cast)
+    pub fn variable_definitions(&self) -> impl Iterator<Item = MacroDef> {
+        self.syntax().children().filter_map(MacroDef::cast)
     }
 
     pub fn add_rule(&mut self, target: &str) -> Rule {
@@ -530,7 +550,6 @@ impl FromStr for Makefile {
     type Err = ParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let processed = preprocess(s).map_err(|e| ParseError(vec![e.to_string()]))?;
-        parse(&processed).map(|node| node.root())
+        parse(s).map(|node| node.root())
     }
 }

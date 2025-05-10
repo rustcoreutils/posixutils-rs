@@ -1,0 +1,71 @@
+.\"	$OpenBSD: fgen.1,v 1.7 2023/01/04 14:58:04 jsg Exp $
+.\"	$NetBSD: fgen.1,v 1.6 2001/06/13 10:46:05 wiz Exp $
+.\"
+.\" Copyright (c) 1998 Eduardo Horvath, All Rights Reserved.
+.\"
+.\" Redistribution and use in source and binary forms, with or without
+.\" modification, are permitted provided that the following conditions
+.\" are met:
+.\" 1. Redistributions of source code must retain the above copyright
+.\"    notice, this list of conditions and the following disclaimer.
+.\" 2. Redistributions in binary form must reproduce the above copyright
+.\"    notice, this list of conditions and the following disclaimer in the
+.\"    documentation and/or other materials provided with the distribution.
+.\"
+.\" THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+.\" IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+.\" OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+.\" IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+.\" INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+.\" NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+.\" DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+.\" THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+.\" (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+.\" THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+.\"
+.Dd $Mdocdate: January 4 2023 $
+.Dt FGEN 1
+.Os
+.Sh NAME
+.Nm fgen
+.Nd IEEE 1275 Open Firmware FCode Tokenizer
+.Sh SYNOPSIS
+.Nm
+.Op Fl d Ar level
+.Op Fl o Ar outfile
+.Ar infile
+.Sh DESCRIPTION
+Reads Forth source and generates tokenized FCode object file.
+.Pp
+The options are as follows:
+.Bl -tag -width Ds
+.It Fl d Ar level
+Sets the debug
+.Ar level .
+When the debug level is greater than zero, additional debugging messages
+are printed to standard output.
+Different levels of verbosity are available if compiled with DEBUG.
+.It Fl o Ar outfile
+Write output to
+.Ar outfile
+instead of standard output.
+.El
+.Sh AUTHORS
+Written by
+.An Eduardo E. Horvath Aq Mt eeh@one-o.com
+.Sh BUGS
+String escape sequences are not recognized so things such as
+.Pp
+.Li \&" foo \&"\&(01 02\&) \&"n \&"
+.Pp
+will result in the string
+.Pp
+.Dq  foo \&"\&(01 02\&) \&"n .
+.Pp
+Hexadecimal numbers with dots in them such as
+.Li 100.0000
+are not parsed.
+.Pp
+Permissions on the output file are often incorrect.
+.Pp
+Output to the standard output device can cause problems.

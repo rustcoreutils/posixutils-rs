@@ -1,5 +1,5 @@
 [package]
-name = "posixutils-display"
+name = "posixutils-man"
 version = "0.2.2"
 authors = ["Jeff Garzik"]
 repository.workspace = true
@@ -12,24 +12,21 @@ clap.workspace = true
 clap.features = ["env"]
 gettext-rs.workspace = true
 libc.workspace = true
-termion = "4.0"
+pest = "2.7"
+pest_derive = "2.7"
 thiserror = "1.0"
+chrono = { version = "0.4", features = ["unstable-locales"] }
 regex.workspace = true
+terminfo = "0.9.0"
+lazy_static = "1.4"
 
 [dev-dependencies]
 plib = { path = "../plib" }
+rstest = "0.25.0"
 
 [lints]
 workspace = true
 
 [[bin]]
-name = "echo"
-path = "./echo.rs"
-
-[[bin]]
-name = "printf"
-path = "./printf.rs"
-
-[[bin]]
-name = "more"
-path = "./more.rs"
+name = "man"
+path = "./man.rs"

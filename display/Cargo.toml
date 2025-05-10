@@ -14,7 +14,6 @@ gettext-rs.workspace = true
 libc.workspace = true
 termion = "4.0"
 thiserror = "1.0"
-regex.workspace = true
 
 [dev-dependencies]
 plib = { path = "../plib" }

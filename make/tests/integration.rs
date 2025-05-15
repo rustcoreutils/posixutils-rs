@@ -380,7 +380,7 @@ mod target_behavior {
         run_test_helper(
             &["-f", "tests/makefiles/target_behavior/no_targets.mk"],
             "",
-            "make: parse error:  *** No targets. Stop.\n\n",
+            "make: no targets to execute\n",
             6,
         );
     }

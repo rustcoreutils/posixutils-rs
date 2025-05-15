@@ -23,7 +23,7 @@ bindgen = { version = "0.70.0", features = ["runtime"] }
 workspace = true
 
 [dev-dependencies]
-sysinfo = "0.32"
+sysinfo = "0.31"
 
 
 [[bin]]

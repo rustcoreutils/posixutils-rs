@@ -9,6 +9,7 @@
 
 mod chgrp;
 mod chmod;
+mod chown;
 mod cp;
 mod link;
 mod ls;

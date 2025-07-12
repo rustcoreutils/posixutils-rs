@@ -6,40 +6,20 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// TODO:
-// - implement -h, -H, -L, -P
-//
 
+mod common;
+
+use self::common::{chown_traverse, error_string, ChangeOwnershipArgs};
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use std::ffi::CString;
-use std::os::unix::fs::MetadataExt;
-use std::path::Path;
-use std::{fs, io};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
+use std::{ffi::CString, io};
 
 /// chown - change the file ownership
 #[derive(Parser)]
 #[command(version, about)]
 struct Args {
-    /// Change symbolic links, rather than the files they point to
-    #[arg(short = 'h', long)]
-    no_derereference: bool,
-
-    /// Follow command line symlinks during -R recursion
-    #[arg(short = 'H', long)]
-    follow_cli: bool,
-
-    /// Follow symlinks during -R recursion
-    #[arg(short = 'L', group = "deref")]
-    dereference: bool,
-
-    /// Never follow symlinks during -R recursion
-    #[arg(short = 'P', group = "deref")]
-    no_dereference2: bool,
-
-    /// Recursively change groups of directories and their contents
-    #[arg(short, short_alias = 'R', long)]
-    recurse: bool,
+    #[command(flatten)]
+    delegate: ChangeOwnershipArgs,
 
     /// Owner and group are changed to OWNER[:GROUP]
     owner_group: String,
@@ -48,89 +28,77 @@ struct Args {
     files: Vec<String>,
 }
 
-fn chown_file(filename: &str, uid: u32, gid: Option<u32>, recurse: bool) -> Result<(), io::Error> {
-    let path = Path::new(filename);
-    let metadata = fs::metadata(path)?;
-
-    // recurse into directories
-    if metadata.is_dir() && recurse {
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            let entry_path = entry.path();
-            let entry_filename = entry_path.to_str().unwrap();
-            chown_file(entry_filename, uid, gid, recurse)?;
-        }
-    }
-
-    // change the user, and optionally, the group
-    let pathstr = CString::new(filename).unwrap();
-    let gid = {
-        if let Some(gid) = gid {
-            gid
-        } else {
-            metadata.gid()
-        }
-    };
-    unsafe {
-        if libc::chown(pathstr.as_ptr(), uid, gid) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-
-    Ok(())
-}
-
 // lookup string group by name, or parse numeric group ID
-fn parse_group(group: &str) -> Result<u32, &'static str> {
+fn parse_group(group: &str) -> Result<u32, String> {
     match group.parse::<u32>() {
         Ok(gid) => Ok(gid),
         Err(_) => {
             // lookup group by name
             let group_cstr = CString::new(group).unwrap();
-            let group = unsafe { libc::getgrnam(group_cstr.as_ptr()) };
-            if group.is_null() {
-                return Err("group not found");
+            let group_name = unsafe { libc::getgrnam(group_cstr.as_ptr()) };
+            if group_name.is_null() {
+                return Err(gettext!("invalid group: '{}'", group));
             }
 
-            let gid = unsafe { (*group).gr_gid };
+            let gid = unsafe { (*group_name).gr_gid };
             Ok(gid)
         }
     }
 }
 
 // lookup string user by name, or parse numeric user ID
-fn parse_user(user: &str) -> Result<u32, &'static str> {
+fn parse_user(user: &str) -> Result<u32, String> {
     match user.parse::<u32>() {
         Ok(uid) => Ok(uid),
         Err(_) => {
             // lookup user by name
             let user_cstr = CString::new(user).unwrap();
-            let user = unsafe { libc::getpwnam(user_cstr.as_ptr()) };
-            if user.is_null() {
-                return Err("user not found");
+            let user_name = unsafe { libc::getpwnam(user_cstr.as_ptr()) };
+            if user_name.is_null() {
+                return Err(gettext!("invalid user: '{}'", user));
             }
 
-            let uid = unsafe { (*user).pw_uid };
+            let uid = unsafe { (*user_name).pw_uid };
             Ok(uid)
         }
     }
 }
 
-fn parse_owner_group(owner_group: &str) -> Result<(u32, Option<u32>), &'static str> {
-    match owner_group.split_once(':') {
-        None => {
-            let uid = parse_user(owner_group)?;
-            Ok((uid, None))
-        }
-        Some((owner, group)) => {
-            let uid = parse_user(owner)?;
-            let gid = parse_group(group)?;
-            Ok((uid, Some(gid)))
+enum ParseOwnerGroupResult {
+    EmptyOrColon,
+    OwnerOnly(u32),
+    OwnerGroup((Option<u32>, Option<u32>)),
+}
+
+fn parse_owner_group(owner_group: &str) -> Result<ParseOwnerGroupResult, String> {
+    if owner_group.is_empty() || owner_group == ":" {
+        return Ok(ParseOwnerGroupResult::EmptyOrColon);
+    } else {
+        match owner_group.split_once(':') {
+            None => {
+                let uid = parse_user(owner_group)?;
+                Ok(ParseOwnerGroupResult::OwnerOnly(uid))
+            }
+            Some((owner, group)) => {
+                let uid = if owner.is_empty() {
+                    None
+                } else {
+                    Some(parse_user(owner)?)
+                };
+
+                let gid = if group.is_empty() {
+                    None
+                } else {
+                    Some(parse_group(group)?)
+                };
+
+                Ok(ParseOwnerGroupResult::OwnerGroup((uid, gid)))
+            }
         }
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), io::Error> {
     setlocale(LocaleCategory::LcAll, "");
     textdomain("posixutils-rs")?;
     bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
@@ -139,14 +107,70 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut exit_code = 0;
 
-    // lookup the owner and group
-    let (uid, gid) = parse_owner_group(&args.owner_group)?;
+    let (uid, gid) = match parse_owner_group(&args.owner_group) {
+        Ok(owner_group) => match owner_group {
+            ParseOwnerGroupResult::EmptyOrColon => {
+                // GNU behavior: If `owner_group` is empty or just ":", do nothing
+                return Ok(());
+            }
+            ParseOwnerGroupResult::OwnerOnly(uid) => (Some(uid), None),
+            ParseOwnerGroupResult::OwnerGroup(pair) => match pair {
+                (None, None) => {
+                    // Should have been handled in the `ParseOwnerGroupResult::EmptyOrColon` branch
+                    unreachable!()
+                }
+                (None, Some(gid)) => {
+                    // `chown :group f` is equivalent to `chgrp group f`
+                    (None, Some(gid))
+                }
+                (Some(_), None) => {
+                    // `chown owner: f` is invalid. There needs to be a group after the :
+                    let err_str = gettext!("invalid spec: '{}'", &args.owner_group);
+                    eprintln!("chown: {}", err_str);
+                    std::process::exit(1);
+                }
+                (Some(uid), Some(gid)) => (Some(uid), Some(gid)),
+            },
+        },
+        Err(err_str) => {
+            eprintln!("chown: {}", err_str);
+            std::process::exit(1);
+        }
+    };
 
     // apply the group to each file
     for filename in &args.files {
-        if let Err(e) = chown_file(filename, uid, gid, args.recurse) {
+        let success = chown_traverse(
+            filename,
+            uid,
+            gid,
+            &args.delegate,
+            |e: io::Error, path: ftw::DisplayablePath| {
+                let err_str = match e.kind() {
+                    io::ErrorKind::PermissionDenied => {
+                        gettext!("cannot read directory '{}': {}", path, error_string(&e))
+                    }
+                    io::ErrorKind::NotFound => {
+                        gettext!("cannot access '{}': {}", path, error_string(&e))
+                    }
+                    _ => {
+                        gettext!("changing ownership of '{}': {}", path, error_string(&e))
+                    }
+                };
+                eprintln!("chown: {}", err_str);
+            },
+            |e: io::Error, path: ftw::DisplayablePath| {
+                let err_str = if uid.is_none() {
+                    gettext!("changing group of '{}': {}", path, error_string(&e))
+                } else {
+                    gettext!("changing ownership of '{}': {}", path, error_string(&e))
+                };
+
+                eprintln!("chown: {}", err_str);
+            },
+        );
+        if !success {
             exit_code = 1;
-            eprintln!("{}: {}", filename, e);
         }
     }
 

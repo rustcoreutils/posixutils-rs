@@ -296,7 +296,6 @@ dependencies = [
  "num-traits",
  "pure-rust-locales",
  "wasm-bindgen",
- "windows-targets 0.52.6",
  "windows-link",
 ]
 
@@ -709,7 +708,7 @@ checksum = "162ee34ebcb7c64a8abebc059ce0fee27c2262618d7b60ed8faf72fef13c3650"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.89",
+ "syn 2.0.100",
 ]
 
 [[package]]
@@ -1488,18 +1487,10 @@ dependencies = [
 name = "posixutils-display"
 version = "0.2.2"
 dependencies = [
- "aho-corasick",
- "chrono",
  "clap",
  "gettext-rs",
  "libc",
- "once_cell",
- "pest",
- "pest_derive",
  "plib",
- "regex",
- "rstest",
- "terminfo 0.9.0",
  "termion",
  "thiserror 1.0.69",
 ]
@@ -1567,6 +1558,24 @@ dependencies = [
  "libc",
  "plib",
  "rowan",
+]
+
+[[package]]
+name = "posixutils-man"
+version = "0.2.2"
+dependencies = [
+ "chrono",
+ "clap",
+ "gettext-rs",
+ "lazy_static",
+ "libc",
+ "pest",
+ "pest_derive",
+ "plib",
+ "regex",
+ "rstest",
+ "terminfo 0.9.0",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -1975,7 +1984,7 @@ dependencies = [
  "regex",
  "relative-path",
  "rustc_version",
- "syn 2.0.89",
+ "syn 2.0.100",
  "unicode-ident",
 ]
 
@@ -2911,7 +2920,7 @@ version = "0.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e97b544156e9bebe1a0ffbc03484fc1ffe3100cbce3ffb17eac35f7cdd7ab36"
 dependencies = [
- "memchr"
+ "memchr",
 ]
 
 [[package]]
@@ -2920,7 +2929,7 @@ version = "0.39.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6f42320e61fe2cfd34354ecb597f86f413484a798ba44a8ca1165c58d42da6c1"
 dependencies = [
- "bitflags 2.9.0"
+ "bitflags 2.9.0",
 ]
 
 [[package]]

@@ -35,7 +35,7 @@ struct Args {
     #[arg(short = 'm', long)]
     chars: bool,
 
-    /// Count number of lines in each file
+    /// Count number of words in each file
     #[arg(short, long)]
     words: bool,
 

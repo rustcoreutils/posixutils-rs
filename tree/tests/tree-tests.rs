@@ -11,6 +11,7 @@ mod chgrp;
 mod chmod;
 mod chown;
 mod cp;
+mod du;
 mod link;
 mod ls;
 mod mkdir;

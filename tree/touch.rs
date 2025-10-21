@@ -139,7 +139,7 @@ fn parse_tm_ref_file(filename: &str) -> Result<DateTime<Utc>, Box<dyn std::error
 fn touch_file_new(time: libc::time_t, filename: &str) -> Result<(), Box<dyn std::error::Error>> {
     // open file for writing, creating if necessary
     let flags = libc::O_CREAT | libc::O_WRONLY | libc::O_TRUNC;
-    let fd = unsafe { libc::open(filename.as_ptr() as *const i8, flags, 0o666) };
+    let fd = unsafe { libc::open(filename.as_ptr() as *const libc::c_char, flags, 0o666) };
     if fd < 0 {
         return Err("Failed to open file".into());
     }
@@ -219,7 +219,7 @@ fn touch_file_existing(
     ];
 
     // set file times
-    if unsafe { libc::utimes(filename.as_ptr() as *const i8, times.as_ptr()) } < 0 {
+    if unsafe { libc::utimes(filename.as_ptr() as *const libc::c_char, times.as_ptr()) } < 0 {
         return Err("Failed to change file times".into());
     }
 

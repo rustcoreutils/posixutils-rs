@@ -785,7 +785,7 @@ fn mkstemp(mut template: Vec<u8>) -> Result<Vec<u8>> {
     // SAFETY: According to https://man7.org/linux/man-pages/man3/mkstemp.3.html it seems like this is correct.
     let file_descriptor = unsafe {
         // Docs: https://pubs.opengroup.org/onlinepubs/009604499/functions/mkstemp.html
-        libc::mkstemp(template_pointer as *mut i8)
+        libc::mkstemp(template_pointer as *mut libc::c_char)
     };
     if file_descriptor < 0 {
         let e = errno::errno();

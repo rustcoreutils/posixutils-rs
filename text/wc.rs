@@ -106,15 +106,11 @@ fn build_display_str(args: &Args, count: &CountInfo, filename: &OsStr) -> String
         output.push_str(&numstr);
     }
 
-    let multi_file = args.files.len() > 1;
-    if multi_file {
-        output.push(' ');
-
-        if filename.is_empty() {
-            output.push_str("(stdin)");
-        } else {
-            output.push_str(filename.to_string_lossy().as_ref());
-        }
+    output.push(' ');
+    if filename.is_empty() {
+        output.push_str("(stdin)");
+    } else {
+        output.push_str(filename.to_string_lossy().as_ref());
     }
 
     output

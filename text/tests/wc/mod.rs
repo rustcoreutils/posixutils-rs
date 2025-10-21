@@ -25,21 +25,21 @@ fn wc_test(args: &[&str], test_data: &str, expected_output: &str) {
 
 #[test]
 fn wc_empty() {
-    wc_test(&["-c"], "", "0\n");
-    wc_test(&["-l"], "", "0\n");
-    wc_test(&["-w"], "", "0\n");
+    wc_test(&["-c"], "", "0 (stdin)\n");
+    wc_test(&["-l"], "", "0 (stdin)\n");
+    wc_test(&["-w"], "", "0 (stdin)\n");
 }
 
 #[test]
 fn wc_one() {
-    wc_test(&["-c"], "x", "1\n");
-    wc_test(&["-l"], "x", "0\n");
-    wc_test(&["-w"], "x", "1\n");
+    wc_test(&["-c"], "x", "1 (stdin)\n");
+    wc_test(&["-l"], "x", "0 (stdin)\n");
+    wc_test(&["-w"], "x", "1 (stdin)\n");
 }
 
 #[test]
 fn wc_two() {
-    wc_test(&["-c"], "x y\n", "4\n");
-    wc_test(&["-l"], "x y\n", "1\n");
-    wc_test(&["-w"], "x y\n", "2\n");
+    wc_test(&["-c"], "x y\n", "4 (stdin)\n");
+    wc_test(&["-l"], "x y\n", "1 (stdin)\n");
+    wc_test(&["-w"], "x y\n", "2 (stdin)\n");
 }

@@ -3048,6 +3048,91 @@ mod test {
     }
 
     #[test]
+    fn compile_unterminated_if() {
+        let (instructions, constant) = compile_stmt("if (1) \n 1");
+        assert_eq!(
+            instructions,
+            vec![
+                OpCode::PushConstant(0),
+                OpCode::JumpIfFalse(3),
+                OpCode::PushConstant(1),
+                OpCode::Pop,
+            ]
+        );
+        assert_eq!(constant, vec![Constant::Number(1.0), Constant::Number(1.0)]);
+
+        let (instructions, constant) = compile_stmt("if (1) \n 1; \n else \n 2");
+        assert_eq!(
+            instructions,
+            vec![
+                OpCode::PushConstant(0),
+                OpCode::JumpIfFalse(4),
+                OpCode::PushConstant(1),
+                OpCode::Pop,
+                OpCode::Jump(3),
+                OpCode::PushConstant(2),
+                OpCode::Pop,
+            ]
+        );
+        assert_eq!(
+            constant,
+            vec![
+                Constant::Number(1.0),
+                Constant::Number(1.0),
+                Constant::Number(2.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn compile_unterminated_while() {
+        let (instructions, constant) = compile_stmt("while (1) \n 1");
+        assert_eq!(
+            instructions,
+            vec![
+                OpCode::PushConstant(0),
+                OpCode::JumpIfFalse(4),
+                OpCode::PushConstant(1),
+                OpCode::Pop,
+                OpCode::Jump(-4),
+            ]
+        );
+        assert_eq!(constant, vec![Constant::Number(1.0), Constant::Number(1.0)]);
+    }
+
+    #[test]
+    fn test_compile_unterminated_for() {
+        let (instructions, constant) = compile_stmt("for (i = 0; i < 10; i++) 1");
+        assert_eq!(
+            instructions,
+            vec![
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
+                OpCode::PushConstant(0),
+                OpCode::Assign,
+                OpCode::Pop,
+                OpCode::GetGlobal(FIRST_GLOBAL_VAR),
+                OpCode::PushConstant(1),
+                OpCode::Lt,
+                OpCode::JumpIfFalse(7),
+                OpCode::PushConstant(2),
+                OpCode::Pop,
+                OpCode::GlobalScalarRef(FIRST_GLOBAL_VAR),
+                OpCode::PostInc,
+                OpCode::Pop,
+                OpCode::Jump(-9),
+            ]
+        );
+        assert_eq!(
+            constant,
+            vec![
+                Constant::Number(0.0),
+                Constant::Number(10.0),
+                Constant::Number(1.0),
+            ]
+        );
+    }
+
+    #[test]
     fn test_compile_break_inside_while_loop() {
         let (instructions, _) = compile_stmt("while (1) { 1; break; }");
         assert_eq!(

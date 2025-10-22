@@ -3083,7 +3083,7 @@ mod test {
             ]
         );
     }
-    
+
     #[test]
     fn compile_unterminated_while() {
         let (instructions, constant) = compile_stmt("while (1) \n 1");
@@ -3099,7 +3099,7 @@ mod test {
         );
         assert_eq!(constant, vec![Constant::Number(1.0), Constant::Number(1.0)]);
     }
-    
+
     #[test]
     fn test_compile_unterminated_for() {
         let (instructions, constant) = compile_stmt("for (i = 0; i < 10; i++) 1");

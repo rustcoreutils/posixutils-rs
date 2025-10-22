@@ -149,7 +149,7 @@ terminated_statement = _{
   | terminatable_statement ~ ";" ~ opt_newline
 }
 
-t_if       =  { "if" ~ "(" ~ expr ~ ")" ~ opt_newline ~ terminated_statement ~ ("else" ~ opt_newline ~ terminated_statement)? }
+t_if       =  { "if" ~ "(" ~ expr ~ ")" ~ opt_newline ~ terminated_statement ~ (!"else" | "else" ~ opt_newline ~ terminated_statement) }
 t_while    =  { "while" ~ "(" ~ expr ~ ")" ~ opt_newline ~ terminated_statement }
 t_for      =  { "for" ~ "(" ~ simple_statement? ~ ";" ~ expr? ~ ";" ~ simple_statement? ~ ")" ~ opt_newline ~ terminated_statement }
 t_foreach  =  { "for" ~ "(" ~ name ~ "in" ~ name ~ ")" ~ opt_newline ~ terminated_statement }
@@ -163,7 +163,7 @@ unterminated_statement = _{
   | ut_foreach
 }
 
-ut_if      = { "if" ~ "(" ~ expr ~ ")" ~ opt_newline ~ (unterminated_statement | terminated_statement ~ "else" ~ opt_newline ~ unterminated_statement) }
+ut_if      = { "if" ~ "(" ~ expr ~ ")" ~ opt_newline ~ (terminated_statement ~ "else" ~ opt_newline ~ unterminated_statement | unterminated_statement) }
 ut_while   = { "while" ~ "(" ~ expr ~ ")" ~ opt_newline ~ unterminated_statement }
 ut_for     = { "for" ~ "(" ~ simple_statement? ~ ";" ~ expr? ~ ";" ~ simple_statement? ~ ")" ~ opt_newline ~ unterminated_statement }
 ut_foreach = { "for" ~ "(" ~ name ~ in_op ~ name ~ ")" ~ opt_newline ~ unterminated_statement }

@@ -14,7 +14,8 @@ mod common;
 
 use clap::Parser;
 use common::{
-    expand_remote_path, is_local_system, parse_path_spec, send_mail, ssh_exec, ssh_fetch_file,
+    expand_remote_path, is_local_system, parse_path_spec, send_mail, shell_escape, ssh_exec,
+    ssh_fetch_file,
 };
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use std::env;
@@ -139,6 +140,7 @@ fn main() -> ExitCode {
 }
 
 /// Parsed command information
+#[derive(Debug)]
 struct ParsedCommand {
     exec_host: String,
     command: String,
@@ -147,6 +149,7 @@ struct ParsedCommand {
 }
 
 /// Reference to a file in the command
+#[derive(Debug)]
 struct FileRef {
     system: String,
     path: String,
@@ -265,9 +268,13 @@ fn execute_uux(
             .map_err(|e| format!("failed to create work dir: {}", e))?;
     } else {
         // Create remote working directory
-        let (code, _, stderr) =
-            ssh_exec(&parsed.exec_host, &format!("mkdir -p '{}'", work_dir), None)
-                .map_err(|e| format!("ssh failed: {}", e))?;
+        let work_dir_escaped = shell_escape(&work_dir);
+        let (code, _, stderr) = ssh_exec(
+            &parsed.exec_host,
+            &format!("mkdir -p {}", work_dir_escaped),
+            None,
+        )
+        .map_err(|e| format!("ssh failed: {}", e))?;
         if code != 0 {
             return Err(format!(
                 "failed to create remote work dir: {}",
@@ -303,7 +310,8 @@ fn execute_uux(
     }
 
     // Execute the command
-    let full_cmd = format!("cd '{}' && {}", work_dir, parsed.command);
+    let work_dir_escaped = shell_escape(&work_dir);
+    let full_cmd = format!("cd {} && {}", work_dir_escaped, parsed.command);
 
     let (code, stdout, stderr) = if exec_local {
         // Local execution
@@ -362,7 +370,12 @@ fn execute_uux(
     if exec_local {
         let _ = std::fs::remove_dir_all(&work_dir);
     } else {
-        let _ = ssh_exec(&parsed.exec_host, &format!("rm -rf '{}'", work_dir), None);
+        let work_dir_escaped = shell_escape(&work_dir);
+        let _ = ssh_exec(
+            &parsed.exec_host,
+            &format!("rm -rf {}", work_dir_escaped),
+            None,
+        );
     }
 
     // Print any stderr
@@ -378,4 +391,153 @@ fn execute_uux(
     let _ = stdout;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_simple_local_command() {
+        let result = parse_command_string("echo hello").unwrap();
+        assert_eq!(result.exec_host, "");
+        assert_eq!(result.command, "echo hello");
+        assert!(result.input_files.is_empty());
+        assert!(result.output_file.is_none());
+    }
+
+    #[test]
+    fn test_parse_remote_command() {
+        let result = parse_command_string("remotehost!cat file.txt").unwrap();
+        assert_eq!(result.exec_host, "remotehost");
+        assert_eq!(result.command, "cat file.txt");
+        assert!(result.input_files.is_empty());
+        assert!(result.output_file.is_none());
+    }
+
+    #[test]
+    fn test_parse_command_with_output_redirect_separate() {
+        let result = parse_command_string("host!cmd > output.txt").unwrap();
+        assert_eq!(result.exec_host, "host");
+        assert_eq!(result.command, "cmd > output.txt");
+        assert!(result.output_file.is_some());
+        let out = result.output_file.unwrap();
+        assert_eq!(out.system, "host"); // defaults to exec host
+        assert_eq!(out.path, "output.txt");
+    }
+
+    #[test]
+    fn test_parse_command_with_output_redirect_combined() {
+        let result = parse_command_string("host!cmd >output.txt").unwrap();
+        assert_eq!(result.exec_host, "host");
+        assert_eq!(result.command, "cmd >output.txt");
+        assert!(result.output_file.is_some());
+        let out = result.output_file.unwrap();
+        assert_eq!(out.system, "host");
+        assert_eq!(out.path, "output.txt");
+    }
+
+    #[test]
+    fn test_parse_command_with_remote_output() {
+        let result = parse_command_string("host!cmd > otherhost!output.txt").unwrap();
+        assert_eq!(result.exec_host, "host");
+        assert!(result.output_file.is_some());
+        let out = result.output_file.unwrap();
+        assert_eq!(out.system, "otherhost");
+        assert_eq!(out.path, "output.txt");
+    }
+
+    #[test]
+    fn test_parse_command_with_input_file_from_other_system() {
+        let result = parse_command_string("exechost!cat otherhost!/path/to/file.txt").unwrap();
+        assert_eq!(result.exec_host, "exechost");
+        // Input file should be extracted, basename used in command
+        assert_eq!(result.command, "cat file.txt");
+        assert_eq!(result.input_files.len(), 1);
+        assert_eq!(result.input_files[0].system, "otherhost");
+        assert_eq!(result.input_files[0].path, "/path/to/file.txt");
+    }
+
+    #[test]
+    fn test_parse_command_with_multiple_input_files() {
+        let result = parse_command_string("exechost!diff remote1!/a.txt remote2!/b.txt").unwrap();
+        assert_eq!(result.exec_host, "exechost");
+        assert_eq!(result.command, "diff a.txt b.txt");
+        assert_eq!(result.input_files.len(), 2);
+        assert_eq!(result.input_files[0].system, "remote1");
+        assert_eq!(result.input_files[0].path, "/a.txt");
+        assert_eq!(result.input_files[1].system, "remote2");
+        assert_eq!(result.input_files[1].path, "/b.txt");
+    }
+
+    #[test]
+    fn test_parse_command_with_tilde_expansion() {
+        let result = parse_command_string("host!cat > ~/output.txt").unwrap();
+        assert!(result.output_file.is_some());
+        let out = result.output_file.unwrap();
+        // ~/output.txt should expand to PUBDIR/output.txt
+        assert!(out.path.contains("uucppublic"));
+        assert!(out.path.ends_with("/output.txt"));
+    }
+
+    #[test]
+    fn test_parse_command_input_file_with_tilde() {
+        let result = parse_command_string("exechost!cat otherhost!~/data.txt").unwrap();
+        assert_eq!(result.input_files.len(), 1);
+        assert!(result.input_files[0].path.contains("uucppublic"));
+        assert!(result.input_files[0].path.ends_with("/data.txt"));
+    }
+
+    #[test]
+    fn test_parse_empty_command() {
+        let result = parse_command_string("");
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "empty command");
+    }
+
+    #[test]
+    fn test_parse_whitespace_only_command() {
+        let result = parse_command_string("   ");
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "empty command");
+    }
+
+    #[test]
+    fn test_parse_local_command_with_bang_in_argument() {
+        // A ! at the start of a token should not be treated as a system reference
+        let result = parse_command_string("echo !important").unwrap();
+        assert_eq!(result.exec_host, "");
+        assert_eq!(result.command, "echo !important");
+        assert!(result.input_files.is_empty());
+    }
+
+    #[test]
+    fn test_parse_command_complex_with_redirect_and_input() {
+        let result =
+            parse_command_string("exechost!process remote!/input.dat > local!/output.dat").unwrap();
+        assert_eq!(result.exec_host, "exechost");
+        // input.dat basename should be in command
+        assert!(result.command.contains("input.dat"));
+        // Should have one input file
+        assert_eq!(result.input_files.len(), 1);
+        assert_eq!(result.input_files[0].system, "remote");
+        // Should have output file
+        assert!(result.output_file.is_some());
+        let out = result.output_file.unwrap();
+        assert_eq!(out.system, "local");
+    }
+
+    #[test]
+    fn test_parse_command_with_multiple_args() {
+        let result = parse_command_string("host!grep -r pattern dir/").unwrap();
+        assert_eq!(result.exec_host, "host");
+        assert_eq!(result.command, "grep -r pattern dir/");
+    }
+
+    #[test]
+    fn test_parse_command_preserves_flags() {
+        let result = parse_command_string("host!ls -la /tmp").unwrap();
+        assert_eq!(result.exec_host, "host");
+        assert_eq!(result.command, "ls -la /tmp");
+    }
 }

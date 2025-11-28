@@ -12,6 +12,25 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Default public directory for UUCP
 pub const PUBDIR: &str = "/var/spool/uucppublic";
 
+/// Escape a string for safe use in shell single quotes.
+/// This handles the case where the string contains single quotes by ending the
+/// quoted string, adding an escaped single quote, and starting a new quoted string.
+/// Example: "it's" becomes "'it'\''s'"
+pub fn shell_escape(s: &str) -> String {
+    let mut result = String::with_capacity(s.len() + 2);
+    result.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            // End single quote, add escaped single quote, start new single quote
+            result.push_str("'\\''");
+        } else {
+            result.push(c);
+        }
+    }
+    result.push('\'');
+    result
+}
+
 /// Get the spool directory path
 pub fn spool_dir() -> PathBuf {
     if let Ok(dir) = env::var("UUCP_SPOOL") {
@@ -338,7 +357,8 @@ pub fn ssh_send_file(
     // Optionally create directory on remote
     if create_dirs {
         if let Some(parent) = Path::new(remote_path).parent() {
-            let mkdir_cmd = format!("mkdir -p '{}'", parent.display());
+            let parent_escaped = shell_escape(&parent.display().to_string());
+            let mkdir_cmd = format!("mkdir -p {}", parent_escaped);
             let status = Command::new("ssh")
                 .args(["-T", "-o", "BatchMode=yes", host, &mkdir_cmd])
                 .status()?;
@@ -356,7 +376,8 @@ pub fn ssh_send_file(
     let mut content = Vec::new();
     file.read_to_end(&mut content)?;
 
-    let cat_cmd = format!("cat > '{}'", remote_path);
+    let remote_escaped = shell_escape(remote_path);
+    let cat_cmd = format!("cat > {}", remote_escaped);
     let mut child = Command::new("ssh")
         .args(["-T", "-o", "BatchMode=yes", host, &cat_cmd])
         .stdin(Stdio::piped())
@@ -391,7 +412,8 @@ pub fn ssh_fetch_file(
         }
     }
 
-    let cat_cmd = format!("cat '{}'", remote_path);
+    let remote_escaped = shell_escape(remote_path);
+    let cat_cmd = format!("cat {}", remote_escaped);
     let output = Command::new("ssh")
         .args(["-T", "-o", "BatchMode=yes", host, &cat_cmd])
         .output()?;
@@ -456,12 +478,51 @@ pub fn send_mail(to: &str, subject: &str, body: &str) -> io::Result<()> {
 
 /// Send mail on remote system
 pub fn send_remote_mail(host: &str, to: &str, subject: &str, body: &str) -> io::Result<()> {
+    let body_escaped = shell_escape(body);
+    let subject_escaped = shell_escape(subject);
+    let to_escaped = shell_escape(to);
     let cmd = format!(
-        "echo '{}' | mail -s '{}' '{}'",
-        body.replace('\'', "'\"'\"'"),
-        subject.replace('\'', "'\"'\"'"),
-        to
+        "echo {} | mail -s {} {}",
+        body_escaped, subject_escaped, to_escaped
     );
     let _ = ssh_exec(host, &cmd, None);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_shell_escape_simple() {
+        assert_eq!(shell_escape("hello"), "'hello'");
+    }
+
+    #[test]
+    fn test_shell_escape_with_spaces() {
+        assert_eq!(shell_escape("hello world"), "'hello world'");
+    }
+
+    #[test]
+    fn test_shell_escape_with_single_quote() {
+        assert_eq!(shell_escape("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn test_shell_escape_with_multiple_quotes() {
+        assert_eq!(shell_escape("it's a 'test'"), "'it'\\''s a '\\''test'\\'''");
+    }
+
+    #[test]
+    fn test_shell_escape_with_special_chars() {
+        assert_eq!(shell_escape("$HOME"), "'$HOME'");
+        assert_eq!(shell_escape("`whoami`"), "'`whoami`'");
+        assert_eq!(shell_escape("$(id)"), "'$(id)'");
+        assert_eq!(shell_escape("a;rm -rf /"), "'a;rm -rf /'");
+    }
+
+    #[test]
+    fn test_shell_escape_empty() {
+        assert_eq!(shell_escape(""), "''");
+    }
 }

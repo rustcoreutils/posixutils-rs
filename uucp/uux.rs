@@ -13,7 +13,9 @@
 mod common;
 
 use clap::Parser;
-use common::{is_local_system, parse_path_spec, send_mail, ssh_exec, ssh_fetch_file, PUBDIR};
+use common::{
+    expand_remote_path, is_local_system, parse_path_spec, send_mail, ssh_exec, ssh_fetch_file,
+};
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use std::env;
 use std::io::{self, Read};
@@ -191,9 +193,9 @@ fn parse_command_string(cmd: &str) -> Result<ParsedCommand, String> {
                 } else {
                     sys
                 },
-                path: expand_tilde(&path),
+                path: expand_remote_path(&path),
             });
-            command_parts.push(expand_tilde(&path));
+            command_parts.push(expand_remote_path(&path));
             in_redirect = false;
             i += 1;
             continue;
@@ -208,9 +210,9 @@ fn parse_command_string(cmd: &str) -> Result<ParsedCommand, String> {
                 } else {
                     sys
                 },
-                path: expand_tilde(&path),
+                path: expand_remote_path(&path),
             });
-            command_parts.push(format!(">{}", expand_tilde(&path)));
+            command_parts.push(format!(">{}", expand_remote_path(&path)));
             i += 1;
             continue;
         }
@@ -222,7 +224,7 @@ fn parse_command_string(cmd: &str) -> Result<ParsedCommand, String> {
             if !is_local_system(&sys) && sys != exec_host {
                 input_files.push(FileRef {
                     system: sys,
-                    path: expand_tilde(&path),
+                    path: expand_remote_path(&path),
                 });
             }
             // Use just the basename in the command
@@ -244,15 +246,6 @@ fn parse_command_string(cmd: &str) -> Result<ParsedCommand, String> {
         input_files,
         output_file,
     })
-}
-
-/// Expand tilde to PUBDIR
-fn expand_tilde(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/") {
-        format!("{}/{}", PUBDIR, rest)
-    } else {
-        path.to_string()
-    }
 }
 
 /// Execute the uux command

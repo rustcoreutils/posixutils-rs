@@ -14,8 +14,8 @@ mod common;
 
 use clap::Parser;
 use common::{
-    expand_local_path, is_local_system, parse_path_spec, send_mail, send_remote_mail,
-    ssh_fetch_file, ssh_send_file, Job, PUBDIR,
+    expand_local_path, expand_remote_path, is_local_system, parse_path_spec, send_mail,
+    send_remote_mail, ssh_fetch_file, ssh_send_file, Job,
 };
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use std::env;
@@ -100,7 +100,7 @@ fn main() -> ExitCode {
     let dest_path_expanded = if dest_is_local {
         expand_local_path(&dest_path)
     } else {
-        expand_tilde_for_remote(&dest_path)
+        expand_remote_path(&dest_path)
     };
 
     // Process each source
@@ -122,7 +122,7 @@ fn main() -> ExitCode {
         let src_path_expanded = if src_is_local {
             expand_local_path(&src_path)
         } else {
-            expand_tilde_for_remote(&src_path)
+            expand_remote_path(&src_path)
         };
 
         // Determine the actual destination filename
@@ -226,15 +226,6 @@ fn main() -> ExitCode {
     }
 
     ExitCode::SUCCESS
-}
-
-/// Expand tilde paths for remote (convert ~/ to PUBDIR path)
-fn expand_tilde_for_remote(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/") {
-        format!("{}/{}", PUBDIR, rest)
-    } else {
-        path.to_string()
-    }
 }
 
 /// Copy file locally

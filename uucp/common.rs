@@ -54,6 +54,15 @@ pub fn parse_path_spec(spec: &str) -> (String, String) {
     }
 }
 
+/// Expand tilde in path for remote system (convert ~/ to PUBDIR)
+pub fn expand_remote_path(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        format!("{}/{}", PUBDIR, rest)
+    } else {
+        path.to_string()
+    }
+}
+
 /// Expand tilde in path for local system
 pub fn expand_local_path(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {

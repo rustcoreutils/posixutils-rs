@@ -357,11 +357,18 @@ fn execute_uux(
 
         if out_local && !exec_local {
             // Output needs to come from remote exec host to local
-            // The output was written to a file on remote, fetch it
-            // (This is simplified - in practice we'd need to know the exact output path)
+            // TODO: fetch output file from remote exec host
+            eprintln!(
+                "uux: warning: cross-system output file routing not yet implemented \
+                (output on local, execution on remote)"
+            );
         } else if !out_local && exec_local {
             // Output needs to go from local exec to remote
-            // Would need to send the output file
+            // TODO: send output file to remote system
+            eprintln!(
+                "uux: warning: cross-system output file routing not yet implemented \
+                (output on remote, execution on local)"
+            );
         }
         // If both on same host, output is already in place
     }

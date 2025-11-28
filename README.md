@@ -115,6 +115,9 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] unexpand
  - [x] uniq
  - [x] unlink
+ - [x] uucp (UUCP)
+ - [x] uustat (UUCP)
+ - [x] uux (UUCP)
  - [x] wc
  - [x] what (SCCS)
  - [x] zcat (compress cat.)
@@ -131,6 +134,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] ipcrm (IPC)
  - [x] ln
  - [x] logname
+ - [x] man
  - [x] mesg
  - [x] mkfifo
  - [x] newgrp
@@ -177,12 +181,12 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] crontab (cron cat.)
 
 ### Development category
- - [ ] c17 (Development) -- Volunteer starting point at https://github.com/rustcoreutils/posixutils-rs/tree/c99
+ - [ ] c17 (Development)
  - [ ] cflow (Development)
  - [ ] ctags (Development)
  - [ ] cxref (Development)
- - [ ] lex (Development) -- Volunteer starting point at https://github.com/rustcoreutils/posixutils-rs/tree/lex
- - [ ] yacc (Development) -- Volunteer starting point at https://github.com/rustcoreutils/posixutils-rs/tree/yacc
+ - [ ] lex (Development)
+ - [ ] yacc (Development)
 
 ### SCCS category
  - [ ] admin (SCCS)
@@ -203,20 +207,14 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] ngettext (i18n)
  - [ ] xgettext (i18n)
 
-### UUCP category 
- - [ ] uucp (UUCP)
- - [ ] uustat (UUCP)
- - [ ] uux (UUCP)
-
 ### Editors category
- - [ ] ed (Editors) -- Volunteer starting point at https://github.com/rustcoreutils/posixutils-rs/tree/ed
+ - [ ] ed (Editors)
  - [ ] ex (Editors)
  - [ ] vi (Editors)
 
 ### Misc. category
  - [ ] lp
  - [ ] mailx
- - [ ] man
  - [ ] patch
  - [ ] pax
 

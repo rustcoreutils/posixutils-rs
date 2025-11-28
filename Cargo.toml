@@ -26,6 +26,7 @@ members = [
 	"text",
 	"tree",
 	"users",
+	"uucp",
 	"xform",
 	"i18n"
 ]

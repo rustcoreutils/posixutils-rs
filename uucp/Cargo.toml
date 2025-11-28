@@ -1,0 +1,32 @@
+[package]
+name = "posixutils-uucp"
+version = "0.2.2"
+authors = ["Jeff Garzik"]
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+plib = { path = "../plib" }
+clap.workspace = true
+gettext-rs.workspace = true
+
+[dev-dependencies]
+tempfile = "3.10"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "uucp"
+path = "./uucp.rs"
+
+[[bin]]
+name = "uux"
+path = "./uux.rs"
+
+[[bin]]
+name = "uustat"
+path = "./uustat.rs"
+

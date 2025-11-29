@@ -87,7 +87,11 @@ fn test_block_device_roundtrip() {
     fs::create_dir(&src_dir).unwrap();
     let dev_path = src_dir.join("myblock");
     let path_cstr = CString::new(dev_path.as_os_str().as_bytes()).unwrap();
-    let dev = libc::makedev(8, 0); // /dev/sda major=8, minor=0
+    // makedev has different signatures on different platforms
+    #[cfg(target_os = "macos")]
+    let dev = libc::makedev(8i32, 0i32); // /dev/sda major=8, minor=0
+    #[cfg(not(target_os = "macos"))]
+    let dev = libc::makedev(8u32, 0u32); // /dev/sda major=8, minor=0
     unsafe {
         let ret = libc::mknod(path_cstr.as_ptr(), libc::S_IFBLK | 0o660, dev);
         if ret != 0 {
@@ -144,7 +148,11 @@ fn test_char_device_roundtrip() {
     fs::create_dir(&src_dir).unwrap();
     let dev_path = src_dir.join("mychar");
     let path_cstr = CString::new(dev_path.as_os_str().as_bytes()).unwrap();
-    let dev = libc::makedev(1, 3); // /dev/null major=1, minor=3
+    // makedev has different signatures on different platforms
+    #[cfg(target_os = "macos")]
+    let dev = libc::makedev(1i32, 3i32); // /dev/null major=1, minor=3
+    #[cfg(not(target_os = "macos"))]
+    let dev = libc::makedev(1u32, 3u32); // /dev/null major=1, minor=3
     unsafe {
         let ret = libc::mknod(path_cstr.as_ptr(), libc::S_IFCHR | 0o666, dev);
         if ret != 0 {

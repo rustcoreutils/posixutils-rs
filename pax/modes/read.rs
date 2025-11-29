@@ -395,7 +395,13 @@ fn extract_device(path: &Path, entry: &ArchiveEntry, options: &ReadOptions) -> P
     let path_cstr = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| PaxError::InvalidHeader("path contains null".to_string()))?;
 
+    // makedev has different signatures on different platforms:
+    // - Linux: makedev(major: u32, minor: u32) -> u64
+    // - macOS: makedev(major: i32, minor: i32) -> i32
+    #[cfg(target_os = "macos")]
     let dev = libc::makedev(entry.devmajor as i32, entry.devminor as i32);
+    #[cfg(not(target_os = "macos"))]
+    let dev = libc::makedev(entry.devmajor, entry.devminor);
     let type_bits: libc::mode_t = match entry.entry_type {
         EntryType::BlockDevice => libc::S_IFBLK,
         EntryType::CharDevice => libc::S_IFCHR,

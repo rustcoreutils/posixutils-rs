@@ -93,6 +93,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] nm (Development)
  - [x] od
  - [x] paste
+ - [x] pax
  - [x] pr
  - [x] readlink
  - [x] realpath
@@ -216,7 +217,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] lp
  - [ ] mailx
  - [ ] patch
- - [ ] pax
 
 ## Installation
 

@@ -1599,6 +1599,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "posixutils-pax"
+version = "0.2.2"
+dependencies = [
+ "clap",
+ "filetime",
+ "gettext-rs",
+ "libc",
+ "plib",
+ "tempfile",
+]
+
+[[package]]
 name = "posixutils-process"
 version = "0.2.2"
 dependencies = [

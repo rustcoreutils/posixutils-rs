@@ -1,0 +1,29 @@
+[package]
+name = "posixutils-pax"
+version = "0.2.2"
+authors = ["Jeff Garzik"]
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+# Run all tests including those that require special environments
+posixutils_test_all = []
+# Tests that require root privileges (mknod, device creation)
+requires_root = ["posixutils_test_all"]
+
+[dependencies]
+libc.workspace = true
+clap.workspace = true
+gettext-rs.workspace = true
+plib = { path = "../plib" }
+
+[dev-dependencies]
+tempfile = "3"
+filetime = "0.2"
+
+[[bin]]
+name = "pax"
+path = "./main.rs"
+

@@ -119,6 +119,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] uucp (UUCP)
  - [x] uustat (UUCP)
  - [x] uux (UUCP)
+ - [x] vi (Editors)
  - [x] wc
  - [x] what (SCCS)
  - [x] zcat (compress cat.)
@@ -211,7 +212,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
 ### Editors category
  - [ ] ed (Editors)
  - [ ] ex (Editors)
- - [ ] vi (Editors)
 
 ### Misc. category
  - [ ] lp

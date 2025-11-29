@@ -17,6 +17,7 @@ members = [
 	"gettext-rs",
 	"misc",
 	"pathnames",
+	"pax",
 	"plib",
 	"process",
 	"sccs",

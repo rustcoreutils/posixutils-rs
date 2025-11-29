@@ -125,16 +125,15 @@ impl Terminal {
                 return Ok(TerminalSize::default());
             }
 
-            // Validate and clamp values to safe bounds to protect against
-            // malformed terminal responses that could cause division by zero
-            // or excessive memory allocation
-            let rows = ws.ws_row.clamp(Self::MIN_ROWS, Self::MAX_ROWS);
-            let cols = ws.ws_col.clamp(Self::MIN_COLS, Self::MAX_COLS);
-
-            // If values were zero or invalid, use defaults
+            // If values are zero or invalid, use defaults
             if ws.ws_row == 0 || ws.ws_col == 0 {
                 return Ok(TerminalSize::default());
             }
+
+            // Clamp values to safe bounds to protect against
+            // excessive memory allocation from malformed terminal responses
+            let rows = ws.ws_row.clamp(Self::MIN_ROWS, Self::MAX_ROWS);
+            let cols = ws.ws_col.clamp(Self::MIN_COLS, Self::MAX_COLS);
 
             Ok(TerminalSize { rows, cols })
         }

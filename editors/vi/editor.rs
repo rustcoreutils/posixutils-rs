@@ -129,6 +129,7 @@ pub struct Editor {
     /// Accumulated text for ex insert mode.
     ex_insert_text: Vec<String>,
     /// Whether running in headless mode (for testing).
+    #[allow(dead_code)]
     headless: bool,
 }
 

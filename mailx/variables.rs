@@ -83,12 +83,6 @@ impl Variables {
         self.booleans.remove(name);
     }
 
-    /// Check if a variable is set (either as string or boolean)
-    pub fn is_set(&self, name: &str) -> bool {
-        let name = if name == "ask" { "asksub" } else { name };
-        self.values.contains_key(name) || self.booleans.get(name).copied().unwrap_or(false)
-    }
-
     /// Get the escape character
     pub fn escape_char(&self) -> char {
         self.get("escape")

@@ -288,7 +288,9 @@ fn test_pax_long_paths() {
             || stderr.contains("File name too long")
             || stderr.contains("Is a directory")
         {
-            eprintln!("Skipping long path test: filesystem/environment doesn't support very long paths");
+            eprintln!(
+                "Skipping long path test: filesystem/environment doesn't support very long paths"
+            );
             return;
         }
     }

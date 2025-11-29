@@ -1496,6 +1496,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "posixutils-editors"
+version = "0.2.2"
+dependencies = [
+ "libc",
+ "plib",
+ "regex",
+ "tempfile",
+ "termios",
+]
+
+[[package]]
 name = "posixutils-file"
 version = "0.2.2"
 dependencies = [

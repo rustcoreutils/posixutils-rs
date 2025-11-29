@@ -1,0 +1,26 @@
+[package]
+name = "posixutils-editors"
+version = "0.2.2"
+authors = ["Jeff Garzik"]
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+termios = "0.3"
+libc.workspace = true
+regex.workspace = true
+plib = { path = "../plib" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lib]
+name = "vi_rs"
+path = "./vi/lib.rs"
+
+[[bin]]
+name = "vi"
+path = "./vi/main.rs"
+

@@ -85,6 +85,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] link
  - [x] ls
  - [x] m4
+ - [x] mailx
  - [x] make
  - [x] mkdir
  - [x] more
@@ -215,7 +216,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
 ### Misc. category
  - [ ] lp
- - [ ] mailx
  - [ ] patch
 
 ## Installation

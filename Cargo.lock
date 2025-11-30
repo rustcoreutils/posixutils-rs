@@ -1609,6 +1609,7 @@ dependencies = [
  "gettext-rs",
  "libc",
  "plib",
+ "tempfile",
 ]
 
 [[package]]

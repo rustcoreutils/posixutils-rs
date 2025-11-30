@@ -14,6 +14,7 @@ gettext-rs.workspace = true
 
 [dev-dependencies]
 plib = { path = "../plib" }
+tempfile = "3"
 
 [lints]
 workspace = true

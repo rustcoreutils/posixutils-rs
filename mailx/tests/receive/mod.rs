@@ -8,33 +8,37 @@
 //
 //! Receive mode integration tests for mailx
 //!
-//! These tests verify receive mode functionality using temporary mbox files,
+//! These tests verify receive mode functionality using static test data files,
 //! allowing them to run without system mail access or special privileges.
+//!
+//! Test data files:
+//! - testdata.mbox: 3 messages (alice, bob, charlie)
+//! - testdata-single.mbox: 1 message (alice)
+//! - testdata-5msg.mbox: 5 messages (alice, bob, charlie, alice@different, dave)
 
 use plib::testing::{run_test, run_test_with_checker, TestPlan};
 use std::io::Write;
+use std::path::PathBuf;
 use tempfile::NamedTempFile;
 
-/// Sample mbox content with two test messages
-const TEST_MBOX: &str = r#"From sender@example.com Fri Nov 29 10:00:00 2024
-From: sender@example.com
-To: user@localhost
-Subject: First Test Message
-Date: Fri, 29 Nov 2024 10:00:00 +0000
+/// Get path to static test data file in tests/ directory
+fn test_data_path(filename: &str) -> PathBuf {
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("tests");
+    path.push(filename);
+    path
+}
 
-This is the body of the first test message.
-It has multiple lines.
+/// Copy a static test data file to a temporary location
+/// Use this for tests that may modify the mailbox (quit saves changes)
+fn copy_test_data(filename: &str) -> NamedTempFile {
+    let src_path = test_data_path(filename);
+    let content = std::fs::read_to_string(&src_path)
+        .unwrap_or_else(|e| panic!("Failed to read {}: {}", src_path.display(), e));
+    create_temp_mbox(&content)
+}
 
-From another@example.org Fri Nov 29 11:00:00 2024
-From: another@example.org
-To: user@localhost
-Subject: Second Test Message
-Date: Fri, 29 Nov 2024 11:00:00 +0000
-
-This is the second message body.
-"#;
-
-/// Helper to create a temporary mbox file
+/// Helper to create a temporary mbox file (for tests needing custom content)
 fn create_temp_mbox(content: &str) -> NamedTempFile {
     let mut file = NamedTempFile::new().expect("failed to create temp mbox");
     file.write_all(content.as_bytes())
@@ -50,8 +54,7 @@ fn create_temp_mbox(content: &str) -> NamedTempFile {
 /// - Header summary output format
 #[test]
 fn receive_headers_only() {
-    let mbox = create_temp_mbox(TEST_MBOX);
-    let mbox_path = mbox.path().to_str().unwrap();
+    let mbox_path = test_data_path("testdata.mbox");
 
     run_test_with_checker(
         TestPlan {
@@ -60,7 +63,7 @@ fn receive_headers_only() {
                 String::from("-n"),
                 String::from("-H"),
                 String::from("-f"),
-                String::from(mbox_path),
+                mbox_path.to_str().unwrap().to_string(),
             ],
             stdin_data: String::new(),
             expected_out: String::new(),
@@ -70,24 +73,24 @@ fn receive_headers_only() {
         |_plan, output| {
             let stdout = String::from_utf8_lossy(&output.stdout);
 
-            // Verify header output contains our test messages
+            // Verify header output contains our test messages (alice, bob, charlie)
             assert!(
-                stdout.contains("sender@example.com") || stdout.contains("sender"),
+                stdout.contains("alice") || stdout.contains("Alice"),
                 "Should show first sender in headers: {}",
                 stdout
             );
             assert!(
-                stdout.contains("another@example.org") || stdout.contains("another"),
+                stdout.contains("bob") || stdout.contains("Bob"),
                 "Should show second sender in headers: {}",
                 stdout
             );
             assert!(
-                stdout.contains("First Test Message"),
+                stdout.contains("Meeting Tomorrow"),
                 "Should show first subject: {}",
                 stdout
             );
             assert!(
-                stdout.contains("Second Test Message"),
+                stdout.contains("Project Update"),
                 "Should show second subject: {}",
                 stdout
             );
@@ -103,7 +106,7 @@ fn receive_headers_only() {
 /// - quit command
 #[test]
 fn receive_print_message() {
-    let mbox = create_temp_mbox(TEST_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -124,19 +127,19 @@ fn receive_print_message() {
         |_plan, output| {
             let stdout = String::from_utf8_lossy(&output.stdout);
 
-            // Verify message 1 was printed
+            // Verify message 1 was printed (alice's meeting message)
             assert!(
-                stdout.contains("From: sender@example.com"),
+                stdout.contains("alice@example.com") || stdout.contains("Alice Smith"),
                 "Should show From header: {}",
                 stdout
             );
             assert!(
-                stdout.contains("Subject: First Test Message"),
+                stdout.contains("Meeting Tomorrow"),
                 "Should show Subject header: {}",
                 stdout
             );
             assert!(
-                stdout.contains("first test message"),
+                stdout.contains("meeting tomorrow") || stdout.contains("2pm"),
                 "Should show message body: {}",
                 stdout
             );
@@ -151,7 +154,7 @@ fn receive_print_message() {
 /// - Message numbering
 #[test]
 fn receive_from_command() {
-    let mbox = create_temp_mbox(TEST_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -188,7 +191,7 @@ fn receive_from_command() {
 /// - -e returns 1 when no mail
 #[test]
 fn receive_check_mail_exists() {
-    let mbox = create_temp_mbox(TEST_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     // With mail present, -e should return 0
@@ -233,36 +236,6 @@ fn receive_check_mail_empty() {
 // POSIX Command Tests
 // =============================================================================
 
-/// Multi-message mbox for testing
-const MULTI_MSG_MBOX: &str = r#"From alice@example.com Fri Nov 29 10:00:00 2024
-From: alice@example.com
-To: user@localhost
-Subject: First Message
-Date: Fri, 29 Nov 2024 10:00:00 +0000
-
-First message body line 1.
-First message body line 2.
-First message body line 3.
-First message body line 4.
-First message body line 5.
-
-From bob@example.org Fri Nov 29 11:00:00 2024
-From: bob@example.org
-To: user@localhost
-Subject: Second Message
-Date: Fri, 29 Nov 2024 11:00:00 +0000
-
-Second message body.
-
-From charlie@example.net Fri Nov 29 12:00:00 2024
-From: charlie@example.net
-To: user@localhost
-Subject: Third Message
-Date: Fri, 29 Nov 2024 12:00:00 +0000
-
-Third message body.
-"#;
-
 // -----------------------------------------------------------------------------
 // cd/chdir command
 // -----------------------------------------------------------------------------
@@ -270,7 +243,7 @@ Third message body.
 /// Test cd command changes directory
 #[test]
 fn cmd_cd_to_tmp() {
-    let mbox = create_temp_mbox(TEST_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -302,7 +275,7 @@ fn cmd_cd_to_tmp() {
 /// Test chdir alias
 #[test]
 fn cmd_chdir_alias() {
-    let mbox = create_temp_mbox(TEST_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -334,7 +307,7 @@ fn cmd_chdir_alias() {
 /// Test cd to home directory (no argument)
 #[test]
 fn cmd_cd_home() {
-    let mbox = create_temp_mbox(TEST_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -365,7 +338,7 @@ fn cmd_cd_home() {
 /// Test copy command saves messages to file
 #[test]
 fn cmd_copy_to_file() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
     let save_file = NamedTempFile::new().expect("failed to create temp file");
     let save_path = save_file.path().to_str().unwrap();
@@ -400,7 +373,7 @@ fn cmd_copy_to_file() {
 /// Test copy multiple messages
 #[test]
 fn cmd_copy_multiple() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
     let save_file = NamedTempFile::new().expect("failed to create temp file");
     let save_path = save_file.path().to_str().unwrap();
@@ -438,7 +411,7 @@ fn cmd_copy_multiple() {
 /// Test delete command
 #[test]
 fn cmd_delete() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -476,7 +449,7 @@ fn cmd_delete() {
 /// Test dp (delete and print) command
 #[test]
 fn cmd_dp() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -509,7 +482,7 @@ fn cmd_dp() {
 /// Test dt alias for dp
 #[test]
 fn cmd_dt() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -545,7 +518,7 @@ fn cmd_dt() {
 /// Test echo command
 #[test]
 fn cmd_echo() {
-    let mbox = create_temp_mbox(TEST_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -581,7 +554,7 @@ fn cmd_echo() {
 /// Test exit command doesn't save changes
 #[test]
 fn cmd_exit() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -608,7 +581,7 @@ fn cmd_exit() {
 /// Test xit alias for exit
 #[test]
 fn cmd_xit() {
-    let mbox = create_temp_mbox(TEST_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -638,7 +611,7 @@ fn cmd_xit() {
 /// Test file command displays current mailbox info
 #[test]
 fn cmd_file_info() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -671,7 +644,7 @@ fn cmd_file_info() {
 /// Test folder alias for file
 #[test]
 fn cmd_folder_alias() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -707,7 +680,7 @@ fn cmd_folder_alias() {
 /// Test headers command
 #[test]
 fn cmd_headers() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -725,7 +698,7 @@ fn cmd_headers() {
             expected_exit_code: 0,
         },
         |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
             assert!(
                 stdout.contains("alice") && stdout.contains("bob"),
                 "headers should show message summary: {}",
@@ -743,7 +716,7 @@ fn cmd_headers() {
 /// Test help command
 #[test]
 fn cmd_help() {
-    let mbox = create_temp_mbox(TEST_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -776,7 +749,7 @@ fn cmd_help() {
 /// Test ? alias for help
 #[test]
 fn cmd_question_mark() {
-    let mbox = create_temp_mbox(TEST_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -812,7 +785,7 @@ fn cmd_question_mark() {
 /// Test hold command
 #[test]
 fn cmd_hold() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -839,7 +812,7 @@ fn cmd_hold() {
 /// Test preserve alias for hold
 #[test]
 fn cmd_preserve() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -869,7 +842,7 @@ fn cmd_preserve() {
 /// Test list command shows all available commands
 #[test]
 fn cmd_list() {
-    let mbox = create_temp_mbox(TEST_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -909,7 +882,7 @@ fn cmd_list() {
 /// Test mbox command marks message for moving to mbox
 #[test]
 fn cmd_mbox() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -939,7 +912,7 @@ fn cmd_mbox() {
 /// Test next command advances to next message
 #[test]
 fn cmd_next() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -977,7 +950,7 @@ fn cmd_next() {
 /// Test pipe command
 #[test]
 fn cmd_pipe() {
-    let mbox = create_temp_mbox(TEST_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -998,7 +971,7 @@ fn cmd_pipe() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             // pipe to cat should output the message
             assert!(
-                stdout.contains("sender@example.com") || stdout.contains("first test message"),
+                stdout.contains("alice@example.com") || stdout.contains("meeting tomorrow"),
                 "pipe should output message through command: {}",
                 stdout
             );
@@ -1010,7 +983,7 @@ fn cmd_pipe() {
 /// Test | alias for pipe
 #[test]
 fn cmd_pipe_alias() {
-    let mbox = create_temp_mbox(TEST_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -1030,7 +1003,7 @@ fn cmd_pipe_alias() {
         |_plan, output| {
             let stdout = String::from_utf8_lossy(&output.stdout);
             assert!(
-                stdout.contains("sender@example.com") || stdout.contains("first test message"),
+                stdout.contains("alice@example.com") || stdout.contains("meeting tomorrow"),
                 "| should work like pipe: {}",
                 stdout
             );
@@ -1046,7 +1019,7 @@ fn cmd_pipe_alias() {
 /// Test Print command shows all headers
 #[test]
 fn cmd_print_uppercase() {
-    let mbox = create_temp_mbox(TEST_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -1079,7 +1052,7 @@ fn cmd_print_uppercase() {
 /// Test Type alias for Print
 #[test]
 fn cmd_type_uppercase() {
-    let mbox = create_temp_mbox(TEST_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -1115,7 +1088,7 @@ fn cmd_type_uppercase() {
 /// Test save command saves message to file
 #[test]
 fn cmd_save() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
     let save_file = NamedTempFile::new().expect("failed to create temp file");
     let save_path = save_file.path().to_str().unwrap();
@@ -1149,7 +1122,7 @@ fn cmd_save() {
 /// Test write command saves message body only (no headers)
 #[test]
 fn cmd_write() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
     let save_file = NamedTempFile::new().expect("failed to create temp file");
     let save_path = save_file.path().to_str().unwrap();
@@ -1187,7 +1160,7 @@ fn cmd_write() {
 /// Test size command displays message size
 #[test]
 fn cmd_size() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -1220,7 +1193,7 @@ fn cmd_size() {
 /// Test size command with multiple messages
 #[test]
 fn cmd_size_multiple() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -1257,7 +1230,7 @@ fn cmd_size_multiple() {
 /// Test source command reads commands from file
 #[test]
 fn cmd_source() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     // Create a command file
@@ -1302,7 +1275,7 @@ fn cmd_source() {
 /// Test top command shows first lines of message
 #[test]
 fn cmd_top() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -1323,7 +1296,7 @@ fn cmd_top() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             // top should show headers and first lines of body
             assert!(
-                stdout.contains("From:") && stdout.contains("First message body"),
+                stdout.contains("From:") && stdout.contains("reminder"),
                 "top should show message beginning: {}",
                 stdout
             );
@@ -1339,7 +1312,7 @@ fn cmd_top() {
 /// Test touch command marks message for mbox
 #[test]
 fn cmd_touch() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -1369,7 +1342,7 @@ fn cmd_touch() {
 /// Test undelete command restores deleted message
 #[test]
 fn cmd_undelete() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -1391,7 +1364,7 @@ fn cmd_undelete() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             // After undelete, msg 1 should be visible again
             assert!(
-                stdout.contains("alice") || stdout.contains("First"),
+                stdout.contains("alice") || stdout.contains("Meeting"),
                 "undelete should restore message: {}",
                 stdout
             );
@@ -1407,7 +1380,7 @@ fn cmd_undelete() {
 /// Test z command scrolls headers forward
 #[test]
 fn cmd_z_forward() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -1434,7 +1407,7 @@ fn cmd_z_forward() {
 /// Test z- command scrolls headers backward
 #[test]
 fn cmd_z_backward() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -1464,7 +1437,7 @@ fn cmd_z_backward() {
 /// Test = command shows current message number
 #[test]
 fn cmd_equals() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -1501,7 +1474,7 @@ fn cmd_equals() {
 /// Test ! command executes shell command
 #[test]
 fn cmd_shell_escape() {
-    let mbox = create_temp_mbox(TEST_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -1537,7 +1510,7 @@ fn cmd_shell_escape() {
 /// Test entering message number prints that message
 #[test]
 fn cmd_message_number() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -1574,7 +1547,7 @@ fn cmd_message_number() {
 /// Test # comments are ignored
 #[test]
 fn cmd_comment() {
-    let mbox = create_temp_mbox(TEST_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -1610,7 +1583,7 @@ fn cmd_comment() {
 /// Test blank lines are handled
 #[test]
 fn cmd_blank_line() {
-    let mbox = create_temp_mbox(TEST_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -1643,49 +1616,6 @@ fn cmd_blank_line() {
 // Message List Syntax Tests
 // =============================================================================
 
-/// Five-message mbox for comprehensive message list testing
-const FIVE_MSG_MBOX: &str = r#"From alice@example.com Fri Nov 29 10:00:00 2024
-From: alice@example.com
-To: user@localhost
-Subject: Meeting Tomorrow
-Date: Fri, 29 Nov 2024 10:00:00 +0000
-Status: RO
-
-First message body.
-
-From bob@example.org Fri Nov 29 11:00:00 2024
-From: bob@example.org
-To: user@localhost
-Subject: Project Update
-Date: Fri, 29 Nov 2024 11:00:00 +0000
-
-Second message body (unread).
-
-From charlie@example.net Fri Nov 29 12:00:00 2024
-From: charlie@example.net
-To: user@localhost
-Subject: Urgent Request
-Date: Fri, 29 Nov 2024 12:00:00 +0000
-
-Third message body.
-
-From alice@different.org Fri Nov 29 13:00:00 2024
-From: alice@different.org
-To: user@localhost
-Subject: Another Meeting
-Date: Fri, 29 Nov 2024 13:00:00 +0000
-
-Fourth message from different alice.
-
-From dave@example.com Fri Nov 29 14:00:00 2024
-From: dave@example.com
-To: user@localhost
-Subject: Final Report
-Date: Fri, 29 Nov 2024 14:00:00 +0000
-
-Fifth and last message.
-"#;
-
 // -----------------------------------------------------------------------------
 // Range syntax: n-m
 // -----------------------------------------------------------------------------
@@ -1693,7 +1623,7 @@ Fifth and last message.
 /// Test message range 1-3
 #[test]
 fn msglist_range() {
-    let mbox = create_temp_mbox(FIVE_MSG_MBOX);
+    let mbox = copy_test_data("testdata-5msg.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -1711,7 +1641,7 @@ fn msglist_range() {
             expected_exit_code: 0,
         },
         |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
             // Should show messages 1, 2, 3
             assert!(
                 stdout.contains("alice") && stdout.contains("bob") && stdout.contains("charlie"),
@@ -1732,7 +1662,7 @@ fn msglist_range() {
 /// Test message range 3-5
 #[test]
 fn msglist_range_end() {
-    let mbox = create_temp_mbox(FIVE_MSG_MBOX);
+    let mbox = copy_test_data("testdata-5msg.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -1750,7 +1680,7 @@ fn msglist_range_end() {
             expected_exit_code: 0,
         },
         |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
             // Should show messages 3, 4, 5
             assert!(
                 stdout.contains("charlie") && stdout.contains("dave"),
@@ -1769,7 +1699,7 @@ fn msglist_range_end() {
 /// Test . (current message)
 #[test]
 fn msglist_dot_current() {
-    let mbox = create_temp_mbox(FIVE_MSG_MBOX);
+    let mbox = copy_test_data("testdata-5msg.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -1803,7 +1733,7 @@ fn msglist_dot_current() {
 /// Test ^ (first message)
 #[test]
 fn msglist_caret_first() {
-    let mbox = create_temp_mbox(FIVE_MSG_MBOX);
+    let mbox = copy_test_data("testdata-5msg.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -1822,9 +1752,10 @@ fn msglist_caret_first() {
         },
         |_plan, output| {
             let stdout = String::from_utf8_lossy(&output.stdout);
+            let stdout_lower = stdout.to_lowercase();
             // ^ should show first message (alice, Meeting Tomorrow)
             assert!(
-                stdout.contains("alice") && stdout.contains("Meeting Tomorrow"),
+                stdout_lower.contains("alice") && stdout.contains("Meeting Tomorrow"),
                 "^ should show first message: {}",
                 stdout
             );
@@ -1836,7 +1767,7 @@ fn msglist_caret_first() {
 /// Test $ (last message)
 #[test]
 fn msglist_dollar_last() {
-    let mbox = create_temp_mbox(FIVE_MSG_MBOX);
+    let mbox = copy_test_data("testdata-5msg.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -1855,9 +1786,10 @@ fn msglist_dollar_last() {
         },
         |_plan, output| {
             let stdout = String::from_utf8_lossy(&output.stdout);
+            let stdout_lower = stdout.to_lowercase();
             // $ should show last message (dave, Final Report)
             assert!(
-                stdout.contains("dave") && stdout.contains("Final Report"),
+                stdout_lower.contains("dave") && stdout.contains("Final Report"),
                 "$ should show last message: {}",
                 stdout
             );
@@ -1869,7 +1801,7 @@ fn msglist_dollar_last() {
 /// Test * (all messages)
 #[test]
 fn msglist_star_all() {
-    let mbox = create_temp_mbox(FIVE_MSG_MBOX);
+    let mbox = copy_test_data("testdata-5msg.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -1906,7 +1838,7 @@ fn msglist_star_all() {
 /// Test + (next message)
 #[test]
 fn msglist_plus_next() {
-    let mbox = create_temp_mbox(FIVE_MSG_MBOX);
+    let mbox = copy_test_data("testdata-5msg.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -1940,7 +1872,7 @@ fn msglist_plus_next() {
 /// Test - (previous message)
 #[test]
 fn msglist_minus_prev() {
-    let mbox = create_temp_mbox(FIVE_MSG_MBOX);
+    let mbox = copy_test_data("testdata-5msg.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -1978,7 +1910,7 @@ fn msglist_minus_prev() {
 /// Test /pattern searches subjects
 #[test]
 fn msglist_subject_search() {
-    let mbox = create_temp_mbox(FIVE_MSG_MBOX);
+    let mbox = copy_test_data("testdata-5msg.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -2011,7 +1943,7 @@ fn msglist_subject_search() {
 /// Test /pattern is case-insensitive
 #[test]
 fn msglist_subject_search_case() {
-    let mbox = create_temp_mbox(FIVE_MSG_MBOX);
+    let mbox = copy_test_data("testdata-5msg.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -2048,7 +1980,7 @@ fn msglist_subject_search_case() {
 /// Test :d (deleted messages) - for undelete
 #[test]
 fn msglist_type_deleted() {
-    let mbox = create_temp_mbox(FIVE_MSG_MBOX);
+    let mbox = copy_test_data("testdata-5msg.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -2067,7 +1999,7 @@ fn msglist_type_deleted() {
             expected_exit_code: 0,
         },
         |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
             // After undelete :d, all messages should be visible
             assert!(
                 stdout.contains("alice") && stdout.contains("charlie"),
@@ -2086,7 +2018,7 @@ fn msglist_type_deleted() {
 /// Test address matching (sender name)
 #[test]
 fn msglist_address_match() {
-    let mbox = create_temp_mbox(FIVE_MSG_MBOX);
+    let mbox = copy_test_data("testdata-5msg.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -2119,7 +2051,7 @@ fn msglist_address_match() {
 /// Test address matching with full email
 #[test]
 fn msglist_address_full_email() {
-    let mbox = create_temp_mbox(FIVE_MSG_MBOX);
+    let mbox = copy_test_data("testdata-5msg.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -2152,7 +2084,7 @@ fn msglist_address_full_email() {
 /// Test allnet variable - match by login only
 #[test]
 fn msglist_allnet_login_match() {
-    let mbox = create_temp_mbox(FIVE_MSG_MBOX);
+    let mbox = copy_test_data("testdata-5msg.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -2192,7 +2124,7 @@ fn msglist_allnet_login_match() {
 /// Test multiple message specs separated by space
 #[test]
 fn msglist_multiple_specs() {
-    let mbox = create_temp_mbox(FIVE_MSG_MBOX);
+    let mbox = copy_test_data("testdata-5msg.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -2210,7 +2142,7 @@ fn msglist_multiple_specs() {
             expected_exit_code: 0,
         },
         |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
             // Should show messages 1, 3, 5
             assert!(
                 stdout.contains("alice") && stdout.contains("charlie") && stdout.contains("dave"),
@@ -2225,7 +2157,7 @@ fn msglist_multiple_specs() {
 /// Test range combined with numbers
 #[test]
 fn msglist_range_and_number() {
-    let mbox = create_temp_mbox(FIVE_MSG_MBOX);
+    let mbox = copy_test_data("testdata-5msg.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -2243,7 +2175,7 @@ fn msglist_range_and_number() {
             expected_exit_code: 0,
         },
         |_plan, output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
             // Should show messages 1, 2, 5 but not 3, 4
             assert!(
                 stdout.contains("alice") && stdout.contains("bob") && stdout.contains("dave"),
@@ -2262,7 +2194,7 @@ fn msglist_range_and_number() {
 /// Test if r (receive mode) conditional in mailrc
 #[test]
 fn conditional_if_receive_mode() {
-    let mbox = create_temp_mbox(TEST_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     // Create mailrc with conditional for receive mode
@@ -2339,7 +2271,7 @@ fn conditional_if_send_mode() {
 /// Test else branch in conditional
 #[test]
 fn conditional_else_branch() {
-    let mbox = create_temp_mbox(TEST_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     // In receive mode: if s (false) -> else branch should execute
@@ -2381,7 +2313,7 @@ fn conditional_else_branch() {
 /// Test nested conditionals
 #[test]
 fn conditional_nested() {
-    let mbox = create_temp_mbox(TEST_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     // Nested if r inside if r (both true in receive mode)
@@ -2418,7 +2350,7 @@ fn conditional_nested() {
 /// Test commands outside conditionals always execute
 #[test]
 fn conditional_commands_outside() {
-    let mbox = create_temp_mbox(TEST_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     let mailrc =

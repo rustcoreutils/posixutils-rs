@@ -30,11 +30,10 @@ use tempfile::NamedTempFile;
 // Test Data Helpers
 // =============================================================================
 
-/// Get path to static test data file
+/// Get path to static test data file in tests/ directory
 fn test_data_path(filename: &str) -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("tests");
-    path.push("cli");
     path.push(filename);
     path
 }

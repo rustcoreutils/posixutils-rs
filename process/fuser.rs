@@ -1402,9 +1402,8 @@ fn print_matches(name: &mut Names, user: bool) -> Result<(), io::Error> {
         }
 
         #[cfg(target_os = "macos")]
-        match procs.access {
-            Access::Cwd => entry.0.push('c'),
-            _ => (),
+        if procs.access == Access::Cwd {
+            entry.0.push('c');
         }
     }
 

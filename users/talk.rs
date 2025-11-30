@@ -514,9 +514,9 @@ fn spawn_input_thread(
     width: u16,
     top_line: Arc<Mutex<u16>>,
     bottom_line: Arc<Mutex<u16>>,
-    output_buffer: &mut String,
+    output_buffer: &mut str,
 ) -> Result<(), TalkError> {
-    let mut output = output_buffer.clone();
+    let mut output = output_buffer.to_owned();
     thread::spawn(move || {
         // Set terminal to raw mode
         let stdin_fd = libc::STDIN_FILENO;
@@ -725,7 +725,7 @@ fn handle_backspace<W: Write>(
 fn handle_character<W: Write>(
     c: char,
     line_buffer: &mut String,
-    output_buffer: &mut String,
+    output_buffer: &mut str,
     split_row: u16,
     bottom_line: u16,
     top_line: u16,

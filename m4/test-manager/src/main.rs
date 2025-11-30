@@ -59,11 +59,10 @@ fn update_snapshots(args: &Args, update: &UpdateSnapshots) {
     dir.map(|result| result.unwrap())
         .filter(|entry| {
             if !(entry.path().is_file()
-                && match entry.path().extension().map(|e| e.as_bytes()) {
-                    Some(b"m4") => true,
-                    Some(b"args") => true,
-                    _ => false,
-                })
+                && matches!(
+                    entry.path().extension().map(|e| e.as_bytes()),
+                    Some(b"m4") | Some(b"args")
+                ))
             {
                 return false;
             }

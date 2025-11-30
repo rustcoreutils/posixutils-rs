@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 macro_rules! reduce {
     ($e : expr) => {
-        $e - 0x20
+        ($e - 0x20)
     };
 }
 
@@ -77,9 +77,9 @@ fn decode_historical_line(line: &str) -> Vec<u8> {
         let chunk = chunk.to_vec();
 
         let out_chunk = [
-            reduce!(chunk[0]) << 2 | (reduce!(chunk[1])) >> 4,
-            reduce!(chunk[1]) << 4 | reduce!(chunk[2]) >> 2,
-            reduce!(chunk[2]) << 6 | reduce!(chunk[3]),
+            (reduce!(chunk[0]) << 2) | (reduce!(chunk[1]) >> 4),
+            (reduce!(chunk[1]) << 4) | (reduce!(chunk[2]) >> 2),
+            (reduce!(chunk[2]) << 6) | reduce!(chunk[3]),
         ];
 
         out.extend_from_slice(&out_chunk);

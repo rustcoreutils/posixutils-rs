@@ -142,23 +142,20 @@ fn show_cchars(tty_params: &HashMap<&'static str, ParamType>, ti: &Termios) {
     // minor inefficiency: 2nd iteration through param list
 
     for (name, param) in tty_params {
-        match param {
-            ParamType::Cchar(_pflg, chidx) => {
-                let ch = ti.c_cc[*chidx] as char;
-                let ch_rev = cchar_rev.get(&ch);
-                let ch_str = {
-                    if ch == '\0' {
-                        String::from("<undef>")
-                    } else if let Some(ch_xlat) = ch_rev {
-                        format!("^{}", ch_xlat)
-                    } else {
-                        format!("{}", ti.c_cc[*chidx] as u8)
-                    }
-                };
+        if let ParamType::Cchar(_pflg, chidx) = param {
+            let ch = ti.c_cc[*chidx] as char;
+            let ch_rev = cchar_rev.get(&ch);
+            let ch_str = {
+                if ch == '\0' {
+                    String::from("<undef>")
+                } else if let Some(ch_xlat) = ch_rev {
+                    format!("^{}", ch_xlat)
+                } else {
+                    format!("{}", ti.c_cc[*chidx])
+                }
+            };
 
-                v.push(format!("{} = {}", name, ch_str));
-            }
-            _ => {}
+            v.push(format!("{} = {}", name, ch_str));
         }
     }
 

@@ -170,15 +170,13 @@ pub fn from_ucs4<I: Iterator<Item = u32> + 'static>(
             let high_surrogate = ((code_point >> 10) as u16) + 0xD800;
             let low_surrogate = ((code_point & 0x3FF) as u16) + 0xDC00;
             utf16.extend_from_slice(&[high_surrogate, low_surrogate]);
+        } else if !omit_invalid {
+            return Vec::new();
         } else {
-            if !omit_invalid {
-                return Vec::new();
-            } else {
-                if !suppress_error {
-                    eprintln!("Error: Invalid Unicode code point U+{:X}", code_point);
-                }
-                exit(1)
+            if !suppress_error {
+                eprintln!("Error: Invalid Unicode code point U+{:X}", code_point);
             }
+            exit(1)
         }
 
         to_bytes(&utf16, variant)

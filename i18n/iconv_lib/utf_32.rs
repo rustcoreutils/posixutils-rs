@@ -42,23 +42,20 @@ pub fn to_ucs4<I: Iterator<Item = u8> + 'static>(
 
             if !bom_checked {
                 let first_word = BigEndian::read_u32(&buffer);
-                match variant {
-                    UTF32Variant::UTF32 => {
-                        if first_word == BOM {
-                            variant = UTF32Variant::UTF32BE;
-                            buffer.clear();
-                        } else if first_word == BOM_OE {
-                            variant = UTF32Variant::UTF32LE;
-                            buffer.clear();
+                if variant == UTF32Variant::UTF32 {
+                    if first_word == BOM {
+                        variant = UTF32Variant::UTF32BE;
+                        buffer.clear();
+                    } else if first_word == BOM_OE {
+                        variant = UTF32Variant::UTF32LE;
+                        buffer.clear();
+                    } else {
+                        variant = if cfg!(target_endian = "little") {
+                            UTF32Variant::UTF32LE
                         } else {
-                            variant = if cfg!(target_endian = "little") {
-                                UTF32Variant::UTF32LE
-                            } else {
-                                UTF32Variant::UTF32BE
-                            };
-                        }
+                            UTF32Variant::UTF32BE
+                        };
                     }
-                    _ => {}
                 }
                 bom_checked = true;
                 if buffer.is_empty() {

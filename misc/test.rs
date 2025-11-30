@@ -78,7 +78,10 @@ fn parse_unary_op(s: &str) -> Option<UnaryOp> {
 }
 
 fn want_metadata(op: &UnaryOp) -> bool {
-    !matches!(op, UnaryOp::Terminal | UnaryOp::StrNonZero | UnaryOp::StrZero)
+    !matches!(
+        op,
+        UnaryOp::Terminal | UnaryOp::StrNonZero | UnaryOp::StrZero
+    )
 }
 
 fn eval_str(s: &str) -> bool {

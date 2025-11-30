@@ -168,16 +168,14 @@ pub fn to_ucs4<I: Iterator<Item = u8> + 'static>(
                 }
                 buffer.drain(0..4);
                 return Some(code_point);
+            } else if omit_invalid {
+                buffer.drain(0..1);
+                continue;
             } else {
-                if omit_invalid {
-                    buffer.drain(0..1);
-                    continue;
-                } else {
-                    if !suppress_error {
-                        eprintln!("Error: Invalid byte");
-                    }
-                    exit(1);
+                if !suppress_error {
+                    eprintln!("Error: Invalid byte");
                 }
+                exit(1);
             }
         }
     });
@@ -225,19 +223,17 @@ pub fn from_ucs4<I: Iterator<Item = u32> + 'static>(
                 0x80 | (((code_point >> 6) & 0x3F) as u8),
                 0x80 | ((code_point & 0x3F) as u8),
             ])
+        } else if omit_invalid {
+            None
         } else {
-            if omit_invalid {
-                None
-            } else {
-                if !suppress_error {
-                    eprintln!(
-                        "Error: Code point U+{:X} is out of valid Unicode range",
-                        code_point
-                    );
-                    exit(1)
-                }
-                Some(vec![])
+            if !suppress_error {
+                eprintln!(
+                    "Error: Code point U+{:X} is out of valid Unicode range",
+                    code_point
+                );
+                exit(1)
             }
+            Some(vec![])
         }
     });
     Box::new(iter.flatten())

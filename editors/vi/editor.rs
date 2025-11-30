@@ -531,13 +531,8 @@ impl Editor {
                     }
                 }
                 Err(e) => {
-                    // Print error message
-                    if !self.silent_mode {
-                        eprintln!("{}", e);
-                    } else {
-                        // In silent mode, errors still go to stderr
-                        eprintln!("{}", e);
-                    }
+                    // Errors always go to stderr
+                    eprintln!("{}", e);
                     // In silent mode, errors are fatal
                     if self.silent_mode {
                         self.exit_code = 1;
@@ -2251,7 +2246,9 @@ impl Editor {
                 for ch in line.content().chars() {
                     match ch {
                         '\t' => listed.push_str("^I"),
-                        c if c.is_control() => {
+                        c if c.is_ascii_control() => {
+                            // Only convert ASCII control characters (0x00-0x1F)
+                            // to ^@ through ^_ notation
                             listed.push('^');
                             listed.push((c as u8 + b'@') as char);
                         }
@@ -2716,8 +2713,10 @@ impl Editor {
 
     /// Execute :suspend or :stop command - suspend the editor.
     fn execute_ex_suspend(&mut self) -> Result<()> {
-        // Restore terminal before suspending
-        self.terminal.disable_raw_mode()?;
+        // Only restore terminal if we're in visual mode (raw mode active)
+        if !self.ex_standalone_mode {
+            self.terminal.disable_raw_mode()?;
+        }
 
         // Send SIGTSTP to self
         #[cfg(unix)]
@@ -2725,9 +2724,11 @@ impl Editor {
             libc::raise(libc::SIGTSTP);
         }
 
-        // When we resume, re-enable raw mode and redraw
-        self.terminal.enable_raw_mode()?;
-        self.terminal.clear_screen()?;
+        // Re-enable terminal handling if we were in visual mode
+        if !self.ex_standalone_mode {
+            self.terminal.enable_raw_mode()?;
+            self.terminal.clear_screen()?;
+        }
 
         Ok(())
     }

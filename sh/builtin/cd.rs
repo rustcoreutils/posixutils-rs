@@ -121,7 +121,7 @@ impl BuiltinUtility for Cd {
                 }
 
                 if !handle_dot_dot_physically {
-                    if !curr_path.as_bytes().first().is_some_and(|c| *c == b'/') {
+                    if curr_path.as_bytes().first().is_none_or(|c| *c != b'/') {
                         let mut new_curr_path = shell
                             .environment
                             .get_str_value("PWD")

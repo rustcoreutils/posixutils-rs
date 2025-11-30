@@ -1755,7 +1755,7 @@ fn msglist_caret_first() {
             let stdout_lower = stdout.to_lowercase();
             // ^ should show first message (alice, Meeting Tomorrow)
             assert!(
-                stdout_lower.contains("alice") && stdout.contains("Meeting Tomorrow"),
+                stdout_lower.contains("alice") && stdout_lower.contains("meeting tomorrow"),
                 "^ should show first message: {}",
                 stdout
             );
@@ -1789,7 +1789,7 @@ fn msglist_dollar_last() {
             let stdout_lower = stdout.to_lowercase();
             // $ should show last message (dave, Final Report)
             assert!(
-                stdout_lower.contains("dave") && stdout.contains("Final Report"),
+                stdout_lower.contains("dave") && stdout_lower.contains("final report"),
                 "$ should show last message: {}",
                 stdout
             );

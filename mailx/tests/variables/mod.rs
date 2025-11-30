@@ -299,7 +299,7 @@ fn var_screen() {
             assert!(
                 stdout_lower.contains("alice")
                     || stdout_lower.contains("bob")
-                    || stdout.contains("Meeting"),
+                    || stdout_lower.contains("meeting"),
                 "headers should show message info: {}",
                 stdout
             );

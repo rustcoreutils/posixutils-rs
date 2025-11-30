@@ -114,6 +114,36 @@ pub fn send_mode(args: &Args, vars: &Variables) -> Result<(), String> {
         msg.subject = subject.trim().to_string();
     }
 
+    // Prompt for Cc if askcc is set
+    if is_tty && vars.get_bool("askcc") {
+        print!("Cc: ");
+        io::stdout().flush().map_err(|e| e.to_string())?;
+
+        let mut cc = String::new();
+        io::stdin().read_line(&mut cc).map_err(|e| e.to_string())?;
+        for addr in cc.split(',') {
+            let addr = addr.trim();
+            if !addr.is_empty() {
+                msg.add_cc(addr);
+            }
+        }
+    }
+
+    // Prompt for Bcc if askbcc is set
+    if is_tty && vars.get_bool("askbcc") {
+        print!("Bcc: ");
+        io::stdout().flush().map_err(|e| e.to_string())?;
+
+        let mut bcc = String::new();
+        io::stdin().read_line(&mut bcc).map_err(|e| e.to_string())?;
+        for addr in bcc.split(',') {
+            let addr = addr.trim();
+            if !addr.is_empty() {
+                msg.add_bcc(addr);
+            }
+        }
+    }
+
     // Read message body
     let stdin = io::stdin();
     let escape_char = vars.escape_char();
@@ -124,10 +154,23 @@ pub fn send_mode(args: &Args, vars: &Variables) -> Result<(), String> {
         loop {
             let mut line = String::new();
             match stdin.lock().read_line(&mut line) {
-                Ok(0) => break, // EOF
+                Ok(0) => {
+                    // EOF - if ignoreeof is set, ignore it
+                    if vars.get_bool("ignoreeof") {
+                        println!("Use \".\" to terminate letter.");
+                        continue;
+                    }
+                    break;
+                }
                 Ok(_) => {}
                 Err(e) => {
                     if e.kind() == io::ErrorKind::Interrupted {
+                        // If ignore is set, just print @ and continue
+                        if vars.get_bool("ignore") {
+                            println!("@");
+                            continue;
+                        }
+
                         interrupt_count += 1;
                         if interrupt_count >= 2 {
                             // Save to dead letter and abort
@@ -160,8 +203,8 @@ pub fn send_mode(args: &Args, vars: &Variables) -> Result<(), String> {
                 continue;
             }
 
-            // Check for single period (if dot is set)
-            if vars.get_bool("dot") && line.trim() == "." {
+            // Check for single period (if dot is set, or ignoreeof forces it)
+            if (vars.get_bool("dot") || vars.get_bool("ignoreeof")) && line.trim() == "." {
                 break;
             }
 
@@ -192,6 +235,22 @@ pub fn send_message(
     let recipients = msg.all_recipients();
     if recipients.is_empty() {
         return Err("No recipients".to_string());
+    }
+
+    // Debug mode - don't actually send, just print diagnostics
+    if vars.get_bool("debug") {
+        eprintln!("--- Debug mode: message not sent ---");
+        eprintln!("To: {}", msg.to.join(", "));
+        if !msg.cc.is_empty() {
+            eprintln!("Cc: {}", msg.cc.join(", "));
+        }
+        if !msg.bcc.is_empty() {
+            eprintln!("Bcc: {}", msg.bcc.join(", "));
+        }
+        eprintln!("Subject: {}", msg.subject);
+        eprintln!("Body: {} bytes", msg.body.len());
+        eprintln!("---");
+        return Ok(());
     }
 
     // Try to use sendmail
@@ -323,28 +382,40 @@ pub fn compose_reply(original: &Message, reply_all: bool, vars: &Variables) -> C
         // Add original sender
         msg.add_to(original.from());
 
-        // Add all To: recipients except ourselves
+        // Add all To: recipients
+        // If metoo is not set, exclude ourselves and our alternates
         let user = env::var("USER").unwrap_or_default();
+        let include_self = vars.get_bool("metoo");
+
         for addr in original.to().split(',') {
             let addr = addr.trim();
-            if !addr.is_empty()
-                && !addr.to_lowercase().contains(&user.to_lowercase())
-                && !vars.is_alternate(addr)
-            {
-                msg.add_to(addr);
+            if addr.is_empty() {
+                continue;
             }
+            // Skip self unless metoo is set
+            if !include_self
+                && (addr.to_lowercase().contains(&user.to_lowercase()) || vars.is_alternate(addr))
+            {
+                continue;
+            }
+            msg.add_to(addr);
         }
 
         // Add Cc: recipients
         if let Some(cc) = original.get_header("cc") {
             for addr in cc.split(',') {
                 let addr = addr.trim();
-                if !addr.is_empty()
-                    && !addr.to_lowercase().contains(&user.to_lowercase())
-                    && !vars.is_alternate(addr)
-                {
-                    msg.add_cc(addr);
+                if addr.is_empty() {
+                    continue;
                 }
+                // Skip self unless metoo is set
+                if !include_self
+                    && (addr.to_lowercase().contains(&user.to_lowercase())
+                        || vars.is_alternate(addr))
+                {
+                    continue;
+                }
+                msg.add_cc(addr);
             }
         }
     } else {

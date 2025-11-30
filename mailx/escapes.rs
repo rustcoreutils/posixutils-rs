@@ -71,8 +71,13 @@ pub fn handle_escape(
             Ok(EscapeResult::continue_input())
         }
         ':' | '_' => {
-            // Execute mailx command (limited in send mode)
-            // This is mainly for receive mode
+            // Execute mailx command
+            // In input mode, only a subset of commands are valid
+            if !args.is_empty() {
+                if let Err(e) = execute_input_mode_command(args, msg, mb, vars) {
+                    eprintln!("{}", e);
+                }
+            }
             Ok(EscapeResult::continue_input())
         }
         'A' => {
@@ -338,6 +343,7 @@ fn expand_escapes(s: &str) -> String {
 fn expand_filename(name: &str, vars: &Variables) -> String {
     let name = name.trim();
 
+    // Handle + prefix (folder variable) - this is mailx-specific, not shell
     if let Some(rest) = name.strip_prefix('+') {
         if let Some(folder) = vars.get("folder") {
             let folder = if folder.starts_with('/') {
@@ -346,16 +352,38 @@ fn expand_filename(name: &str, vars: &Variables) -> String {
                 let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
                 format!("{}/{}", home, folder)
             };
-            return format!("{}/{}", folder, rest);
+            let expanded_rest = shell_expand(rest, vars);
+            return format!("{}/{}", folder, expanded_rest);
         }
     }
 
-    if let Some(rest) = name.strip_prefix('~') {
-        let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        return format!("{}{}", home, rest);
+    // Use shell for word expansion (POSIX wordexp semantics)
+    shell_expand(name, vars)
+}
+
+/// Perform shell word expansion on a string using /bin/sh
+/// This provides POSIX wordexp() semantics: tilde, parameter, command substitution, etc.
+fn shell_expand(s: &str, vars: &Variables) -> String {
+    if s.is_empty() {
+        return s.to_string();
     }
 
-    name.to_string()
+    // Shell out to get proper expansion
+    // Use printf %s to avoid issues with echo and backslashes
+    let shell = vars.get("SHELL").unwrap_or("/bin/sh");
+
+    let output = Command::new(shell)
+        .arg("-c")
+        .arg(format!("printf '%s' {}", s))
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).to_string(),
+        _ => {
+            // If shell expansion fails, return original string
+            s.to_string()
+        }
+    }
 }
 
 fn edit_message(msg: &mut ComposedMessage, editor: &str) -> Result<(), String> {
@@ -605,5 +633,52 @@ fn pipe_through_command(input: &str, cmd: &str, vars: &Variables) -> Result<Stri
             output.status.code().unwrap_or(-1),
             stderr
         ))
+    }
+}
+
+/// Execute a mailx command from input mode (~: or ~_)
+/// Only a subset of commands are allowed in input mode
+fn execute_input_mode_command(
+    line: &str,
+    _msg: &mut ComposedMessage,
+    _mb: Option<&Mailbox>,
+    vars: &Variables,
+) -> Result<(), String> {
+    let line = line.trim();
+    if line.is_empty() {
+        return Ok(());
+    }
+
+    // Parse command and arguments
+    let (cmd, args) = if let Some(pos) = line.find(char::is_whitespace) {
+        (&line[..pos], line[pos..].trim())
+    } else {
+        (line, "")
+    };
+
+    let cmd_lower = cmd.to_lowercase();
+
+    // Handle allowed commands in input mode
+    match cmd_lower.as_str() {
+        // set/unset variables
+        "se" | "set" => {
+            for arg in args.split_whitespace() {
+                println!("{}", arg);
+            }
+            Ok(())
+        }
+        // echo
+        "ec" | "ech" | "echo" => {
+            println!("{}", args);
+            Ok(())
+        }
+        // Shell escape
+        cmd if cmd.starts_with('!') => {
+            let shell_cmd = &line[1..];
+            run_shell_command(shell_cmd, vars)?;
+            println!("!");
+            Ok(())
+        }
+        _ => Err(format!("Unknown command: {}", cmd)),
     }
 }

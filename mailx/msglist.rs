@@ -2,10 +2,31 @@
 //! Handles the various message specification formats defined by POSIX
 
 use crate::mailbox::Mailbox;
-use crate::message::MessageState;
+use crate::message::{extract_login, MessageState};
 
 /// Parse a message list specification and return matching message numbers
+/// If allnet is true, address matching compares only the login part (before @)
 pub fn parse_msglist(spec: &str, mb: &Mailbox, for_undelete: bool) -> Result<Vec<usize>, String> {
+    parse_msglist_with_opts(spec, mb, for_undelete, false)
+}
+
+/// Parse a message list with allnet option
+#[allow(dead_code)]
+pub fn parse_msglist_allnet(
+    spec: &str,
+    mb: &Mailbox,
+    for_undelete: bool,
+    allnet: bool,
+) -> Result<Vec<usize>, String> {
+    parse_msglist_with_opts(spec, mb, for_undelete, allnet)
+}
+
+fn parse_msglist_with_opts(
+    spec: &str,
+    mb: &Mailbox,
+    for_undelete: bool,
+    allnet: bool,
+) -> Result<Vec<usize>, String> {
     let spec = spec.trim();
 
     if spec.is_empty() {
@@ -21,7 +42,7 @@ pub fn parse_msglist(spec: &str, mb: &Mailbox, for_undelete: bool) -> Result<Vec
 
     // Split by whitespace to get individual specs
     for token in spec.split_whitespace() {
-        let msgs = parse_single_spec(token, mb, for_undelete)?;
+        let msgs = parse_single_spec(token, mb, for_undelete, allnet)?;
         result.extend(msgs);
     }
 
@@ -45,15 +66,20 @@ pub fn parse_msglist(spec: &str, mb: &Mailbox, for_undelete: bool) -> Result<Vec
     }
 }
 
-fn parse_single_spec(spec: &str, mb: &Mailbox, for_undelete: bool) -> Result<Vec<usize>, String> {
+fn parse_single_spec(
+    spec: &str,
+    mb: &Mailbox,
+    for_undelete: bool,
+    allnet: bool,
+) -> Result<Vec<usize>, String> {
     // Check for range (n-m)
     if let Some(dash_pos) = spec.find('-') {
         if dash_pos > 0 && dash_pos < spec.len() - 1 {
             let start_str = &spec[..dash_pos];
             let end_str = &spec[dash_pos + 1..];
 
-            let start = parse_single_number(start_str, mb, for_undelete)?;
-            let end = parse_single_number(end_str, mb, for_undelete)?;
+            let start = parse_single_number(start_str, mb, for_undelete, allnet)?;
+            let end = parse_single_number(end_str, mb, for_undelete, allnet)?;
 
             if start > end {
                 return Err("Invalid range".to_string());
@@ -192,14 +218,26 @@ fn parse_single_spec(spec: &str, mb: &Mailbox, for_undelete: bool) -> Result<Vec
                 }
             } else {
                 // Address match
-                let search = spec.to_lowercase();
+                // If allnet is true, compare only login parts
+                let search = if allnet {
+                    extract_login(spec).to_lowercase()
+                } else {
+                    spec.to_lowercase()
+                };
                 let matches: Vec<usize> = mb
                     .messages
                     .iter()
                     .enumerate()
                     .filter(|(_, m)| {
-                        (for_undelete || m.state != MessageState::Deleted)
-                            && m.from().to_lowercase().contains(&search)
+                        if !(for_undelete || m.state != MessageState::Deleted) {
+                            return false;
+                        }
+                        if allnet {
+                            // Compare login parts only
+                            extract_login(m.from()).to_lowercase().contains(&search)
+                        } else {
+                            m.from().to_lowercase().contains(&search)
+                        }
                     })
                     .map(|(i, _)| i + 1)
                     .collect();
@@ -214,8 +252,13 @@ fn parse_single_spec(spec: &str, mb: &Mailbox, for_undelete: bool) -> Result<Vec
     }
 }
 
-fn parse_single_number(spec: &str, mb: &Mailbox, for_undelete: bool) -> Result<usize, String> {
-    let msgs = parse_single_spec(spec, mb, for_undelete)?;
+fn parse_single_number(
+    spec: &str,
+    mb: &Mailbox,
+    for_undelete: bool,
+    allnet: bool,
+) -> Result<usize, String> {
+    let msgs = parse_single_spec(spec, mb, for_undelete, allnet)?;
     msgs.first()
         .copied()
         .ok_or_else(|| "Invalid message specification".to_string())

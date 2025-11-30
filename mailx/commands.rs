@@ -8,9 +8,21 @@ use std::process::Command;
 use crate::escapes::handle_escape;
 use crate::mailbox::Mailbox;
 use crate::message::{extract_login, MessageState};
-use crate::msglist::{parse_message, parse_msglist};
+#[allow(unused_imports)]
+use crate::msglist::{parse_message, parse_msglist, parse_msglist_allnet};
 use crate::send::{compose_reply, send_message, ComposedMessage};
 use crate::variables::{parse_set_arg, Variables};
+
+/// Parse a message list, using allnet setting from vars
+#[allow(dead_code)]
+fn msglist(
+    spec: &str,
+    mb: &Mailbox,
+    vars: &Variables,
+    for_undelete: bool,
+) -> Result<Vec<usize>, String> {
+    parse_msglist_allnet(spec, mb, for_undelete, vars.get_bool("allnet"))
+}
 
 /// Result of executing a command
 pub enum CommandResult {
@@ -1090,6 +1102,10 @@ fn cmd_set(args: &str, vars: &mut Variables) -> Result<CommandResult, String> {
             vars.unset(&arg[2..]);
         } else {
             let (name, value) = parse_set_arg(arg);
+            // Reject onehop - we permanently operate in noonehop mode
+            if name == "onehop" {
+                return Err("onehop is not supported; operating in noonehop mode".to_string());
+            }
             if let Some(val) = value {
                 vars.set(name, val);
             } else {
@@ -1107,6 +1123,10 @@ fn cmd_set_startup(args: &str, vars: &mut Variables) -> Result<(), String> {
             vars.unset(&arg[2..]);
         } else {
             let (name, value) = parse_set_arg(arg);
+            // Silently skip onehop - we permanently operate in noonehop mode
+            if name == "onehop" {
+                continue;
+            }
             if let Some(val) = value {
                 vars.set(name, val);
             } else {
@@ -1117,15 +1137,54 @@ fn cmd_set_startup(args: &str, vars: &mut Variables) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_shell(cmd: &str, vars: &Variables) -> Result<CommandResult, String> {
+fn cmd_shell(cmd: &str, vars: &mut Variables) -> Result<CommandResult, String> {
+    // Expand ! to previous command if bang is set
+    let cmd = if vars.get_bool("bang") {
+        expand_bang(cmd, vars.last_shell_cmd.as_deref())
+    } else {
+        cmd.to_string()
+    };
+
     let shell = vars.get("SHELL").unwrap_or("/bin/sh");
     Command::new(shell)
         .arg("-c")
-        .arg(cmd)
+        .arg(&cmd)
         .status()
         .map_err(|e| e.to_string())?;
+
+    // Save as last command
+    vars.last_shell_cmd = Some(cmd);
+
     println!("!");
     Ok(CommandResult::Continue)
+}
+
+/// Expand unescaped ! to the previous command
+fn expand_bang(cmd: &str, prev: Option<&str>) -> String {
+    let prev = prev.unwrap_or("");
+    let mut result = String::new();
+    let mut chars = cmd.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            // Escaped character
+            if let Some(&next) = chars.peek() {
+                if next == '!' {
+                    result.push('!');
+                    chars.next();
+                    continue;
+                }
+            }
+            result.push(c);
+        } else if c == '!' {
+            // Expand to previous command
+            result.push_str(prev);
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
 }
 
 fn cmd_shell_interactive(vars: &Variables) -> Result<CommandResult, String> {

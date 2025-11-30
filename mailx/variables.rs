@@ -17,6 +17,8 @@ pub struct Variables {
     pub ignored_headers: Vec<String>,
     /// Retained header fields
     pub retained_headers: Vec<String>,
+    /// Last shell command (for ! expansion with bang variable)
+    pub last_shell_cmd: Option<String>,
 }
 
 impl Variables {
@@ -28,6 +30,7 @@ impl Variables {
             alternates: Vec::new(),
             ignored_headers: Vec::new(),
             retained_headers: Vec::new(),
+            last_shell_cmd: None,
         };
 
         // Set defaults per POSIX

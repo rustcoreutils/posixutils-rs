@@ -515,9 +515,8 @@ impl Config {
             args.reverse_sorting = false;
 
             // -A is also ignored
-            match file_inclusion {
-                FileInclusion::Default => file_inclusion = FileInclusion::All,
-                _ => (),
+            if matches!(file_inclusion, FileInclusion::Default) {
+                file_inclusion = FileInclusion::All;
             }
         }
 
@@ -1147,10 +1146,8 @@ fn process_single_dir(
                 let path_str = ls_from_utf8_lossy(path.as_os_str().as_bytes());
 
                 {
-                    let include_dot_and_double_dot = match config.file_inclusion {
-                        FileInclusion::All => true,
-                        _ => false,
-                    };
+                    let include_dot_and_double_dot =
+                        matches!(config.file_inclusion, FileInclusion::All);
 
                     if is_dot_or_double_dot && !include_dot_and_double_dot {
                         // Skip
@@ -1206,10 +1203,8 @@ fn process_single_dir(
                 if include_entry {
                     entries.push(entry);
 
-                    if config.recursive {
-                        if metadata.is_dir() {
-                            return Ok(true);
-                        }
+                    if config.recursive && metadata.is_dir() {
+                        return Ok(true);
                     }
                 }
 

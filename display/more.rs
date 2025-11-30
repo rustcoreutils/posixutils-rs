@@ -591,7 +591,7 @@ impl SeekPositions {
             let reader = BufReader::new(&mut self.buffer).lines();
             for line in reader {
                 if let Ok(line) = line {
-                    seek_pos += line.as_bytes().len();
+                    seek_pos += line.len();
                 }
                 i += 1;
                 if i >= n {

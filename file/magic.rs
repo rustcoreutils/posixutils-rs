@@ -426,7 +426,7 @@ impl RawMagicFileLine {
     fn string_test(&self, tf_reader: &mut BufReader<File>) -> bool {
         if let Value::String(val) = &self.value {
             let mut buf = vec![0u8; val.len()];
-            if let Err(_) = tf_reader.read_exact(&mut buf) {
+            if tf_reader.read_exact(&mut buf).is_err() {
                 return false;
             }
 
@@ -439,7 +439,7 @@ impl RawMagicFileLine {
 
     fn number_test(&self, size: u64, mask: Option<u64>, tf_reader: &mut BufReader<File>) -> bool {
         let mut buf = vec![0; size as usize];
-        if let Err(_) = tf_reader.read_exact(&mut buf) {
+        if tf_reader.read_exact(&mut buf).is_err() {
             return false;
         }
 

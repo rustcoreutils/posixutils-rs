@@ -90,8 +90,7 @@ pub fn run_test_base_with_env(
     }
 
     // Ensure we wait for the process to complete after writing to stdin
-    let output = child.wait_with_output().expect("failed to wait for child");
-    output
+    child.wait_with_output().expect("failed to wait for child")
 }
 
 /// Run a test command (without custom environment variables)

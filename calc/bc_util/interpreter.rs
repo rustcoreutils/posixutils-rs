@@ -201,7 +201,7 @@ impl Interpreter {
                     .ok_or("array index is too large")? as usize;
                 if let Some(call_frame) = self.call_frames.last_mut() {
                     if let Some(array) = &mut call_frame.array_variables[name_index(*name)] {
-                        return Ok(get_or_extend(array, index as usize));
+                        return Ok(get_or_extend(array, index));
                     }
                 }
                 Ok(get_or_extend(

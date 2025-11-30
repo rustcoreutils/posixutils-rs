@@ -86,6 +86,7 @@ pub enum ForkResult {
     Parent { child: Pid },
 }
 
+#[allow(clippy::comparison_chain)]
 pub fn fork() -> OsResult<ForkResult> {
     // fork in general is not safe for multithreaded programs, but all code in this module is single
     // threaded, so this is safe

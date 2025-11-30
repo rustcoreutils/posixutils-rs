@@ -460,7 +460,7 @@ fn get_password() -> Result<passwd, io::Error> {
 ///
 /// This function returns an `Option<Group>`. If a matching group is found,
 /// it returns `Some(Group)`, otherwise it returns `None`.
-fn find_matching_group(group_identifier: &str, groups: &Vec<Group>) -> Option<Group> {
+fn find_matching_group(group_identifier: &str, groups: &[Group]) -> Option<Group> {
     // Helper closure to clone and return the group
     let clone_group = |group: &Group| {
         Some(Group {
@@ -527,7 +527,6 @@ fn logger(name: &str, gid: u32) {
 ///
 /// Returns `Ok(group.gid)` if the user has the necessary permissions to access the group. If a password is required
 /// and does not match, it returns an `Err` with `io::ErrorKind::PermissionDenied`.
-
 fn check_perms(group: &Group, password: passwd) -> Result<u32, io::Error> {
     let pw_name = unsafe {
         CStr::from_ptr(password.pw_name)

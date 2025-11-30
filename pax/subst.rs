@@ -124,13 +124,7 @@ impl Substitution {
         let mut pos = 0;
         let mut any_match = false;
 
-        loop {
-            // Try to match at or after current position
-            let matches = match self.regex.captures_at(&result, pos) {
-                Some(m) => m,
-                None => break,
-            };
-
+        while let Some(matches) = self.regex.captures_at(&result, pos) {
             any_match = true;
 
             // Build the replacement string

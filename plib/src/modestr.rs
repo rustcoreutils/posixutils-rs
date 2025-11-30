@@ -328,8 +328,8 @@ pub fn mutate(init_mode: u32, is_dir: bool, symbolic: &ChmodSymbolic) -> u32 {
                     if who_is_not_specified {
                         let umask = get_umask();
 
-                        user = (copy_value | rwx) << 6 & !umask;
-                        group = (copy_value | rwx) << 3 & !umask;
+                        user = ((copy_value | rwx) << 6) & !umask;
+                        group = ((copy_value | rwx) << 3) & !umask;
                         others = (copy_value | rwx) & !umask;
                     }
 

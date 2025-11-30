@@ -151,8 +151,8 @@ where
 /// * It reads, left-to-right, the first two operators `-a++`.
 /// * Because the minus takes precedence over the increment it is evaluated immediately `(-a)++`.
 /// * It then reads the remaining input and evaluates the increment next in order to preserve its
-/// position in the expression \
-/// `((-a)++)**b`.
+///   position in the expression \
+///   `((-a)++)**b`.
 pub fn precedence<I, O, E, E2, F, G, H1, H3, H2, P1, P2, P3, Q>(
     mut prefix: H1,
     mut postfix: H2,

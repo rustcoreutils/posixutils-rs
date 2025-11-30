@@ -110,7 +110,7 @@ fn get_magic_files(args: &Args) -> Vec<PathBuf> {
     magic_files
 }
 
-fn analyze_file(mut path: String, args: &Args, magic_files: &Vec<PathBuf>) {
+fn analyze_file(mut path: String, args: &Args, magic_files: &[PathBuf]) {
     if path == "-" {
         path = String::new();
         io::stdin().read_line(&mut path).unwrap();

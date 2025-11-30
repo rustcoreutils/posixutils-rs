@@ -232,7 +232,7 @@ impl Mailbox {
                 let address_field = if show_to && msg.from().contains(&user) {
                     format!("To {}", truncate(msg.to(), 18))
                 } else {
-                    msg.from_short()
+                    msg.short_from()
                 };
 
                 let date = msg.short_date();

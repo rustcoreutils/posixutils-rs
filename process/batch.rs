@@ -274,13 +274,12 @@ fn next_job_id() -> Result<u32, Box<dyn std::error::Error>> {
 
     let (next_job_id, mut file) = match file_opt.open(&job_file_number) {
         Ok(mut file) => {
-            file.read_to_string(&mut buf)
-                .map_err(|e| NextJobError::Io(e))?;
-            file.rewind().map_err(|e| NextJobError::Io(e))?;
+            file.read_to_string(&mut buf).map_err(NextJobError::Io)?;
+            file.rewind().map_err(NextJobError::Io)?;
 
             (
                 u32::from_str_radix(buf.trim_end_matches("\n"), 16)
-                    .map_err(|e| NextJobError::FromStr(e))?,
+                    .map_err(NextJobError::FromStr)?,
                 file,
             )
         }

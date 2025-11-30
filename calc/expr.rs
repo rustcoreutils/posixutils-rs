@@ -66,11 +66,7 @@ fn token_display(t: &Token) -> String {
 
 // is token an lval?
 fn token_is_lval(t: &Token) -> bool {
-    match t {
-        Token::Integer(_) => true,
-        Token::Str(_) => true,
-        _ => false,
-    }
+    matches!(t, Token::Integer(_) | Token::Str(_))
 }
 
 // is token zero?

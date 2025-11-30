@@ -144,38 +144,34 @@ impl UlimitArgs {
             return Err("ulimit: cannot set limit for all resources".to_string());
         }
 
-        if limit.is_none() && resource_limit.is_some() {
-            if newlimit.is_some() {
-                return Ok(UlimitArgs {
-                    limit: LimitType::Both,
-                    resource: resource_limit.unwrap(),
-                    newlimit,
-                });
+        match (limit, resource_limit) {
+            (None, Some(resource)) => {
+                if newlimit.is_some() {
+                    Ok(UlimitArgs {
+                        limit: LimitType::Both,
+                        resource,
+                        newlimit,
+                    })
+                } else {
+                    Ok(UlimitArgs {
+                        limit: LimitType::Soft,
+                        resource,
+                        newlimit: None,
+                    })
+                }
             }
-            return Ok(UlimitArgs {
-                limit: LimitType::Soft,
-                resource: resource_limit.unwrap(),
-                newlimit: None,
-            });
-        }
-
-        if limit.is_some() && resource_limit.is_none() {
-            return Ok(UlimitArgs {
-                limit: limit.unwrap(),
+            (Some(lim), None) => Ok(UlimitArgs {
+                limit: lim,
                 resource: ResourceLimit::FSize,
                 newlimit,
-            });
-        }
-
-        if limit.is_some() && resource_limit.is_some() {
-            return Ok(UlimitArgs {
-                limit: limit.unwrap(),
-                resource: resource_limit.unwrap(),
+            }),
+            (Some(lim), Some(resource)) => Ok(UlimitArgs {
+                limit: lim,
+                resource,
                 newlimit,
-            });
+            }),
+            (None, None) => Err("ulimit: invalid arguments".to_string()),
         }
-
-        Err("ulimit: invalid arguments".to_string())
     }
 }
 

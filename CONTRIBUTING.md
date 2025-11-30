@@ -39,9 +39,18 @@ There are several ways to contribute to posixutils-rs:
    Code should be readable by unfamiliar developers.  Avoid dense,
    uncommented code.
 
-### Testing, POSIX compliance and programmaticgoals
+### Testing, POSIX compliance and programmatic goals
 
 * All utilities should have tests.
+* Use plib's TestPlan framework for integration tests.
+* Test pattern:
+	1. Pre-generate input data files.
+	2. Run system OS utility on input data files,
+	   generating known-good output.
+	3. Store input and output in-tree, as known-good data.
+	4. Write a TestPlan that executes our utility, using
+	   static input data, and compares output with
+	   static output data.
 * Only "quick" tests should be run automatically in `cargo test`
 * Longer tests, or tests requiring root access, should be triggered
   via special environment variables.
@@ -50,7 +59,9 @@ There are several ways to contribute to posixutils-rs:
 * If a system has an OS-specific feature that _must_ be
   exposed through a given utility, do so.
 * Race-free userland.  See `ftw` internal crate.
-* Push small crates out:  Create tiny, light-dep crates from common functionality (such as Lex or Yacc file parsing), and publish via cargo.  Remove from main posixutils tree and set of crates.
+* Push small crates out:  Create tiny, light-dep crates from common
+  functionality (such as Lex or Yacc file parsing), and publish via cargo.
+  Remove from main posixutils tree and set of crates.
 
 ### Testing and Bug Reporting: Info to provide in GH issue
 

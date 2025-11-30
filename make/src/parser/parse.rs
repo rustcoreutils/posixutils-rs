@@ -296,7 +296,6 @@ pub fn parse(text: &str) -> Result<Parsed, ParseError> {
 /// It is also immutable, like a GreenNode,
 /// but it contains parent pointers, offsets, and
 /// has identity semantics.
-
 type SyntaxNode = rowan::SyntaxNode<Lang>;
 #[allow(unused)]
 type SyntaxToken = rowan::SyntaxToken<Lang>;

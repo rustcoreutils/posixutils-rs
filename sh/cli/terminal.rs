@@ -43,7 +43,7 @@ impl Terminal {
     /// # Panic
     /// Panics if the current process is not attached to a terminal.
     pub fn set_nonblocking_no_echo(&self) {
-        let mut termios = self.base_settings.clone().unwrap();
+        let mut termios = self.base_settings.unwrap();
         termios.c_lflag &= !(libc::ECHO | libc::ICANON);
         termios.c_cc[libc::VMIN] = 0;
         termios.c_cc[libc::VTIME] = 0;
@@ -53,7 +53,7 @@ impl Terminal {
     /// # Panic
     /// Panics if the current process is not attached to a terminal.
     pub fn set_nonblocking(&self) {
-        let mut termios = self.base_settings.clone().unwrap();
+        let mut termios = self.base_settings.unwrap();
         termios.c_lflag &= !libc::ICANON;
         termios.c_cc[libc::VMIN] = 0;
         termios.c_cc[libc::VTIME] = 0;

@@ -649,12 +649,10 @@ fn get_file_mode_string(metadata: &ftw::Metadata) -> String {
                 (false, true) => 'T',
                 (false, false) => '-',
             }
+        } else if mode & (libc::S_IXOTH as u32) != 0 {
+            'x'
         } else {
-            if mode & (libc::S_IXOTH as u32) != 0 {
-                'x'
-            } else {
-                '-'
-            }
+            '-'
         }
     });
 

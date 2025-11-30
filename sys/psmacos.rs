@@ -109,13 +109,11 @@ fn get_process_info(pid: pid_t) -> Option<ProcessInfo> {
 fn get_tty_name(tty_dev: u32) -> Option<String> {
     let dev_dir = "/dev/";
     if let Ok(entries) = fs::read_dir(dev_dir) {
-        for entry in entries {
-            if let Ok(entry) = entry {
-                let path = entry.path();
-                if let Ok(metadata) = fs::metadata(&path) {
-                    if metadata.rdev() == tty_dev as u64 {
-                        return Some(path.file_name()?.to_string_lossy().into_owned());
-                    }
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Ok(metadata) = fs::metadata(&path) {
+                if metadata.rdev() == tty_dev as u64 {
+                    return Some(path.file_name()?.to_string_lossy().into_owned());
                 }
             }
         }

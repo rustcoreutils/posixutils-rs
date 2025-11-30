@@ -398,7 +398,7 @@ pub struct MatchIter<'r, 't> {
     offset: usize,
 }
 
-impl<'r, 't> Iterator for MatchIter<'r, 't> {
+impl Iterator for MatchIter<'_, '_> {
     type Item = Match;
 
     fn next(&mut self) -> Option<Self::Item> {

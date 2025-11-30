@@ -46,17 +46,17 @@ impl From<ExpandedWord> for String {
     }
 }
 
-impl ToString for ExpandedWord {
-    fn to_string(&self) -> String {
-        self.parts
-            .iter()
-            .map(|p| match p {
-                ExpandedWordPart::UnquotedLiteral(s) => s.as_str(),
-                ExpandedWordPart::QuotedLiteral(s) => s.as_str(),
-                ExpandedWordPart::GeneratedUnquotedLiteral(s) => s.as_str(),
-                ExpandedWordPart::FieldEnd => "",
-            })
-            .collect()
+impl std::fmt::Display for ExpandedWord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for p in &self.parts {
+            match p {
+                ExpandedWordPart::UnquotedLiteral(s) => f.write_str(s)?,
+                ExpandedWordPart::QuotedLiteral(s) => f.write_str(s)?,
+                ExpandedWordPart::GeneratedUnquotedLiteral(s) => f.write_str(s)?,
+                ExpandedWordPart::FieldEnd => {}
+            }
+        }
+        Ok(())
     }
 }
 

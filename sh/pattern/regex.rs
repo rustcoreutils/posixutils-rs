@@ -9,40 +9,15 @@
 
 use crate::pattern::parse::{BracketExpression, BracketItem, PatternItem, RangeEndpoint};
 use core::fmt;
-use std::ffi::{CStr, CString};
+use plib::regex::{Match, Regex as PlibRegex, RegexFlags};
+use std::ffi::CStr;
 use std::fmt::{Formatter, Write};
-use std::ptr;
 
-fn regex_compilation_result(
-    status_integer: libc::c_int,
-    regex: &libc::regex_t,
-) -> Result<(), String> {
-    if status_integer != 0 {
-        let mut error_buffer = vec![b'\0'; 128];
-        unsafe {
-            libc::regerror(
-                status_integer,
-                ptr::from_ref(regex),
-                error_buffer.as_mut_ptr() as *mut libc::c_char,
-                128,
-            )
-        };
-        let error = CStr::from_bytes_until_nul(&error_buffer)
-            .expect("error message returned from `libc::regerror` is an invalid CString");
-        Err(error.to_string_lossy().into_owned())
-    } else {
-        Ok(())
-    }
-}
-
-// TODO: the implementation is copied from awk, maybe we should consider putting it in a shared crate
+/// A regex wrapper that provides CStr-compatible API for shell pattern matching.
+/// Internally uses plib::regex for POSIX BRE support.
 pub struct Regex {
-    /// if the regex was initialized with an empty string,
-    /// `raw_regex` will be empty. This is to allow
-    /// empty string regexes on MacOS, which otherwise
-    /// would return a REG_EMPTY on compilation.
-    raw_regex: Option<libc::regex_t>,
-    regex_string: CString,
+    inner: PlibRegex,
+    pattern_string: String,
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -51,95 +26,58 @@ pub struct RegexMatch {
     pub end: usize,
 }
 
+impl From<Match> for RegexMatch {
+    fn from(m: Match) -> Self {
+        RegexMatch {
+            start: m.start,
+            end: m.end,
+        }
+    }
+}
+
 pub struct MatchIter<'a> {
-    string: &'a CStr,
-    next_start: usize,
-    regex: &'a Regex,
+    inner: plib::regex::MatchIter<'a, 'a>,
 }
 
 impl Iterator for MatchIter<'_> {
     type Item = RegexMatch;
     fn next(&mut self) -> Option<Self::Item> {
-        self.regex.raw_regex?;
-        if self.next_start >= self.string.to_bytes().len() {
-            return None;
-        }
-        let mut match_range = libc::regmatch_t {
-            rm_so: -1,
-            rm_eo: -1,
-        };
-        let exec_status = unsafe {
-            libc::regexec(
-                ptr::from_ref(&self.regex.raw_regex.unwrap()),
-                self.string.as_ptr().add(self.next_start),
-                1,
-                ptr::from_mut(&mut match_range),
-                0,
-            )
-        };
-        if exec_status == libc::REG_NOMATCH {
-            return None;
-        }
-        let result = RegexMatch {
-            start: self.next_start + match_range.rm_so as usize,
-            end: self.next_start + match_range.rm_eo as usize,
-        };
-        self.next_start += match_range.rm_eo as usize;
-        Some(result)
+        self.inner.next().map(RegexMatch::from)
     }
 }
 
 impl Regex {
-    pub fn new(regex: CString) -> Result<Self, String> {
-        if regex.is_empty() {
-            return Ok(Self {
-                raw_regex: None,
-                regex_string: regex,
-            });
-        }
-        let mut raw = unsafe { std::mem::zeroed::<libc::regex_t>() };
-        // difference from awk implementation: use 0 instead of REG_EXTENDED
-        let compilation_status =
-            unsafe { libc::regcomp(ptr::from_mut(&mut raw), regex.as_ptr(), 0) };
-        regex_compilation_result(compilation_status, &raw)?;
+    pub fn new(pattern: &str) -> Result<Self, String> {
+        let inner = PlibRegex::new(pattern, RegexFlags::bre()).map_err(|e| e.to_string())?;
         Ok(Self {
-            raw_regex: Some(raw),
-            regex_string: regex,
+            inner,
+            pattern_string: pattern.to_string(),
         })
     }
 
     pub fn match_locations<'a>(&'a self, string: &'a CStr) -> MatchIter<'a> {
+        // Convert CStr to &str - shell strings should always be valid UTF-8
+        let s = string.to_str().unwrap_or("");
         MatchIter {
-            next_start: 0,
-            regex: self,
-            string,
+            inner: self.inner.find_iter(s),
         }
     }
 
     pub fn matches(&self, string: &CStr) -> bool {
-        self.match_locations(string).next().is_some()
-    }
-}
-
-impl Drop for Regex {
-    fn drop(&mut self) {
-        if let Some(regex) = &mut self.raw_regex {
-            unsafe {
-                libc::regfree(ptr::from_mut(regex));
-            }
-        }
+        let s = string.to_str().unwrap_or("");
+        self.inner.is_match(s)
     }
 }
 
 impl fmt::Display for Regex {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.regex_string.to_str().unwrap())
+        write!(f, "{}", self.pattern_string)
     }
 }
 
 impl PartialEq for Regex {
     fn eq(&self, other: &Self) -> bool {
-        self.regex_string == other.regex_string
+        self.pattern_string == other.pattern_string
     }
 }
 
@@ -216,8 +154,7 @@ pub fn parsed_pattern_to_regex(parsed_pattern: &[PatternItem]) -> Result<Regex, 
             PatternItem::BracketExpression(expr) => push_bracket_expression(expr, &mut regex_str),
         }
     }
-    let regex_cstr = CString::new(regex_str).expect("pattern cannot contain null characters");
-    Regex::new(regex_cstr)
+    Regex::new(&regex_str)
 }
 
 #[cfg(test)]

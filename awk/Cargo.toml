@@ -13,6 +13,7 @@ libc.workspace = true
 pest = "2.7"
 pest_derive = "2.7"
 lexical = { version = "6.1", features = ["format"] }
+plib = { path = "../plib" }
 rand = { version = "0.8", default-features = false, features = ["small_rng"] }
 
 [dev-dependencies]

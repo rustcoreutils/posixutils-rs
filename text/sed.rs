@@ -9,18 +9,14 @@
 
 use clap::{command, Parser};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use libc::{
-    ioctl, regcomp, regex_t, regexec, regmatch_t, winsize, REG_EXTENDED, STDERR_FILENO,
-    STDIN_FILENO, STDOUT_FILENO, TIOCGWINSZ,
-};
+use libc::{ioctl, winsize, STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO, TIOCGWINSZ};
+use plib::regex::{Regex as PlibRegex, RegexFlags};
 use std::sync::Mutex;
 use std::{
     collections::{HashMap, HashSet},
-    ffi::CString,
     fmt::{self, Debug},
     fs::File,
     io::{BufRead, BufReader, Error, ErrorKind, Write},
-    mem::MaybeUninit,
     ops::Range,
     path::PathBuf,
 };
@@ -167,7 +163,7 @@ enum AddressToken {
     Last,
     /// Context related line number that
     /// calculated from this BRE match
-    Pattern(regex_t, String),
+    Pattern(PlibRegex, String),
     /// Used for handling char related exceptions, when parsing [`AddressRange`]
     Delimiter,
 }
@@ -267,13 +263,13 @@ enum ReplaceFlag {
     AppendToIfReplace(PathBuf), // w
 }
 
-/// Newtype for implementing [`Debug`] trait for regex_t
+/// Newtype for implementing [`Debug`] trait for Regex
 #[derive(Clone)]
-struct Regex(regex_t);
+struct Regex(PlibRegex);
 
 impl Debug for Regex {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("Regex").finish()
+        f.debug_tuple("Regex").field(&self.0.as_str()).finish()
     }
 }
 
@@ -444,7 +440,7 @@ impl Command {
                 reached_now.push(match token {
                     AddressToken::Number(position) => *position == line_number + 1,
                     AddressToken::Pattern(re, pattern) => {
-                        !(match_pattern(*re, pattern.clone(), line, line_number + 1)?.is_empty())
+                        !(match_pattern(re, pattern, line, line_number + 1)?.is_empty())
                     }
                     AddressToken::Last => match i {
                         0 => last_line,
@@ -480,7 +476,7 @@ impl Command {
     }
 }
 
-/// Function [`regexec`] can return from 1 to 9 range that can be nested.
+/// The regex can return from 1 to 9 range that can be nested.
 /// [`delete_nested_ranges`] function deletes ranges that contain another ranges.
 fn delete_nested_ranges(mut ranges: Vec<(usize, Range<usize>)>) -> Vec<(usize, Range<usize>)> {
     let mut result: Vec<(usize, Range<usize>)> = Vec::new();
@@ -496,7 +492,7 @@ fn delete_nested_ranges(mut ranges: Vec<(usize, Range<usize>)>) -> Vec<(usize, R
     result
 }
 
-/// Function [`regexec`] can return from 1 to 9 range. Some
+/// The regex can return from 1 to 9 range. Some
 /// of them cam be invalid for usage. So this function filter
 /// invalid ranges.
 fn filter_groups(groups: &mut Vec<(usize, Range<usize>)>, pattern: &str, haystack: &str) {
@@ -599,54 +595,62 @@ fn sort_groups(match_subranges: &mut [HashMap<usize, Range<usize>>]) {
 /// [`re`] - pattern for search in haystack
 /// [`line_number`] - current line number in input file, used in error message
 fn match_pattern(
-    re: regex_t,
-    pattern: String,
+    re: &PlibRegex,
+    pattern: &str,
     haystack: &str,
-    line_number: usize,
+    _line_number: usize,
 ) -> Result<Vec<HashMap<usize, std::ops::Range<usize>>>, SedError> {
-    let match_t: regmatch_t = unsafe { MaybeUninit::zeroed().assume_init() };
     let mut match_subranges = vec![];
-    let mut i = 0;
-    let mut last_offset = 0;
-    let c_input = CString::new(haystack).map_err(|err| {
-        SedError::ScriptParse(
-            format!(
-                "line {} contains nul byte in {} position",
-                line_number,
-                err.nul_position()
-            ),
-            None,
-        )
-    })?;
-    let mut c_input = c_input.as_ptr();
-    while i <= haystack.len() {
-        let mut pmatch = vec![match_t; 9];
-        unsafe {
-            c_input = c_input.add(last_offset);
-            let _ = regexec(&re as *const regex_t, c_input, 9, pmatch.as_mut_ptr(), 0);
-        }
+    let mut offset = 0;
 
-        let mut groups = pmatch
-            .to_vec()
+    while offset <= haystack.len() {
+        let Some(matches) = re.captures_at(haystack, offset) else {
+            break;
+        };
+
+        // The whole match is always in matches[0]
+        let whole_match = &matches[0];
+
+        // Convert plib::regex matches to (group_number, Range) format
+        // In sed, group numbers are 1-9 (not 0-indexed)
+        // A capture group is "used" if it's not at position 0,0 OR if it matches the whole match position
+        let mut groups: Vec<(usize, Range<usize>)> = matches
             .iter()
             .enumerate()
-            .filter(|(_, m)| !((m.rm_so < 0) && (m.rm_eo < 0)))
-            .map(|(j, m)| (j + 1, ((m.rm_so as usize) + i)..((m.rm_eo as usize) + i)))
-            .collect::<Vec<_>>();
+            .skip(1) // Skip group 0 (whole match)
+            .filter(|(_, m)| {
+                // Filter out unused capture groups
+                // An unused group in plib::regex is Match::default() = {0, 0}
+                // A used group will either:
+                // - Have non-zero start/end, OR
+                // - Be at the same position as the whole match (for zero-length matches)
+                (m.start != 0 || m.end != 0)
+                    || (m.start == whole_match.start && m.end == whole_match.end)
+            })
+            .map(|(j, m)| (j, m.start..m.end))
+            .collect();
 
-        filter_groups(&mut groups, &pattern, haystack);
-        last_offset = groups
-            .iter()
-            .map(|(_, r)| r.end - r.start)
-            .max()
-            .unwrap_or(0);
-        if last_offset == 0 {
-            last_offset = 1;
+        // For simple patterns without capture groups, use the whole match as group 1
+        // This handles patterns like "foo", "^", "$", ".*", etc.
+        if groups.is_empty() {
+            groups.push((1, whole_match.start..whole_match.end));
         }
-        i += last_offset;
+
+        filter_groups(&mut groups, pattern, haystack);
+
+        // Advance past this match
+        // Use the whole match end position, ensuring we always move forward
+        let next_offset = if whole_match.end > offset {
+            whole_match.end
+        } else {
+            offset + 1
+        };
+
+        offset = next_offset;
         match_subranges.push(groups);
     }
-    filter_groups_when_line_size_check_in_pattern(&mut match_subranges, &pattern);
+
+    filter_groups_when_line_size_check_in_pattern(&mut match_subranges, pattern);
     let mut match_subranges = delete_groups_duplicates(match_subranges);
     sort_groups(&mut match_subranges);
 
@@ -1246,51 +1250,23 @@ fn parse_replace_flags(chars: &[char], i: &mut usize) -> Result<Vec<ReplaceFlag>
     Ok(flags)
 }
 
-/// Compiles [`pattern`] as [`regex_t`]
-fn compile_regex(pattern: String) -> Result<regex_t, SedError> {
-    #[cfg(target_os = "macos")]
-    let mut pattern = pattern.replace("\\\\", "\\");
-    #[cfg(all(unix, not(target_os = "macos")))]
+/// Compiles [`pattern`] as a POSIX regex (BRE or ERE based on ERE flag)
+fn compile_regex(pattern: String) -> Result<PlibRegex, SedError> {
+    // Normalize backslash escapes
     let pattern = pattern.replace("\\\\", "\\");
-    let mut cflags = 0;
+
+    // Check ERE flag to determine regex mode
     let ere = ERE.lock().unwrap();
-    if *ere {
-        cflags |= REG_EXTENDED;
-    }
-
-    // macOS version of [regcomp](regcomp) from `libc` provides additional check
-    // for empty regex. In this case, an error
-    // [REG_EMPTY](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/regcomp.3.html)
-    // will be returned. Therefore, an empty pattern is replaced with ".*".
-    #[cfg(target_os = "macos")]
-    {
-        pattern = if pattern.is_empty() {
-            String::from(".*")
-        } else {
-            pattern
-        };
-    }
-
-    let c_pattern = CString::new(pattern.clone()).map_err(|err| {
-        SedError::ScriptParse(
-            format!(
-                "pattern '{}' contains nul byte in {} position",
-                pattern,
-                err.nul_position()
-            ),
-            None,
-        )
-    })?;
-    let mut regex = unsafe { std::mem::zeroed::<regex_t>() };
-
-    if unsafe { regcomp(&mut regex, c_pattern.as_ptr(), cflags) } == 0 {
-        Ok(regex)
+    let flags = if *ere {
+        RegexFlags::ere()
     } else {
-        Err(SedError::ScriptParse(
-            format!("can't compile pattern '{}'", pattern),
-            None,
-        ))
-    }
+        RegexFlags::bre()
+    };
+
+    // plib::regex handles macOS empty pattern workaround internally
+    PlibRegex::new(&pattern, flags).map_err(|e| {
+        SedError::ScriptParse(format!("can't compile pattern '{}': {}", pattern, e), None)
+    })
 }
 
 fn screen_width() -> Option<usize> {
@@ -1794,7 +1770,7 @@ fn execute_replace(
     let Command::Replace(_, re, pattern, replacement, flags) = command else {
         unreachable!();
     };
-    let match_subranges = match_pattern(re.0, pattern, pattern_space, line_number)?;
+    let match_subranges = match_pattern(&re.0, &pattern, pattern_space, line_number)?;
     let is_replace_n = |f: &ReplaceFlag| {
         let ReplaceFlag::ReplaceNth(_) = f.clone() else {
             return false;
@@ -1906,7 +1882,7 @@ struct Sed {
     /// [`true`] if since last t at least one replacement [`Command`]
     /// was performed in cycle limits
     has_replacements_since_t: bool,
-    /// Last regex_t in applied [`Command`]  
+    /// Last regex pattern in applied [`Command`]
     last_regex: Option<Regex>,
     /// Next line for processing
     next_line: String,

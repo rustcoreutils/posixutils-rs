@@ -9,18 +9,15 @@
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use libc::{
-    getegid, getgid, getuid, regcomp, regex_t, regexec, setgid, setuid, REG_ICASE, REG_NOMATCH,
-};
+use libc::{getegid, getgid, getuid, setgid, setuid};
+use plib::regex::{Regex, RegexFlags};
 use std::collections::HashMap;
-use std::ffi::CString;
 use std::fs::File;
 use std::io::{stdout, BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::ops::{Not, Range};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::process::{exit, ExitStatus};
-use std::ptr;
 use std::str::FromStr;
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::Mutex;
@@ -942,7 +939,7 @@ struct SourceContext {
     /// Current search pattern
     current_pattern: String,
     /// Last search settings
-    last_search: Option<(regex_t, bool, Direction)>,
+    last_search: Option<(Regex, bool, Direction)>,
     /// Storage for marks that were set durring current [`Source`] processing
     marked_positions: HashMap<char, usize>,
     /// Flag that [`true`] if input files count is more that 1
@@ -1206,7 +1203,7 @@ impl SourceContext {
     pub fn search(
         &mut self,
         count: Option<usize>,
-        pattern: regex_t,
+        pattern: Regex,
         is_not: bool,
         direction: Direction,
     ) -> Result<(), MoreError> {
@@ -1222,21 +1219,10 @@ impl SourceContext {
                     Direction::Backward => haystack + &last_string,
                 };
             }
-            let c_input = CString::new(haystack)
-                .map_err(|_| MoreError::StringParse(self.current_source.name()))?;
-            let has_match = unsafe {
-                regexec(
-                    &pattern as *const regex_t,
-                    c_input.as_ptr(),
-                    0,
-                    ptr::null_mut(),
-                    0,
-                )
-            };
             let has_match = if is_not {
-                has_match == REG_NOMATCH
+                !pattern.is_match(&haystack)
             } else {
-                has_match != REG_NOMATCH
+                pattern.is_match(&haystack)
             };
             if has_match {
                 let Some((rows, _)) = self.terminal_size else {
@@ -1291,7 +1277,7 @@ impl SourceContext {
             } else {
                 direction.clone()
             };
-            self.search(count, *pattern, *is_not, direction)
+            self.search(count, pattern.clone(), *is_not, direction)
         } else {
             Err(MoreError::SourceContext(
                 SourceContextError::MissingLastSearch,
@@ -1647,39 +1633,19 @@ impl Prompt {
     }
 }
 
-/// Compiles [`pattern`] as [`regex_t`]
-fn compile_regex(pattern: String, ignore_case: bool) -> Result<regex_t, MoreError> {
-    #[cfg(target_os = "macos")]
-    let mut pattern = pattern.replace("\\\\", "\\");
-    #[cfg(all(unix, not(target_os = "macos")))]
+/// Compiles [`pattern`] as a POSIX BRE regex
+fn compile_regex(pattern: String, ignore_case: bool) -> Result<Regex, MoreError> {
+    // Normalize backslash escapes
     let pattern = pattern.replace("\\\\", "\\");
-    let mut cflags = 0;
-    if ignore_case {
-        cflags |= REG_ICASE;
-    }
 
-    // macOS version of [regcomp](regcomp) from `libc` provides additional check
-    // for empty regex. In this case, an error
-    // [REG_EMPTY](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/regcomp.3.html)
-    // will be returned. Therefore, an empty pattern is replaced with ".*".
-    #[cfg(target_os = "macos")]
-    {
-        pattern = if pattern == "" {
-            String::from(".*")
-        } else {
-            pattern
-        };
-    }
-
-    let c_pattern =
-        CString::new(pattern.clone()).map_err(|_| MoreError::StringParse(pattern.clone()))?;
-    let mut regex = unsafe { std::mem::zeroed::<regex_t>() };
-
-    if unsafe { regcomp(&mut regex, c_pattern.as_ptr(), cflags) } == 0 {
-        Ok(regex)
+    let flags = if ignore_case {
+        RegexFlags::bre().ignore_case()
     } else {
-        Err(MoreError::StringParse(pattern))
-    }
+        RegexFlags::bre()
+    };
+
+    // plib::regex handles macOS empty pattern workaround internally
+    Regex::new(&pattern, flags).map_err(|_| MoreError::StringParse(pattern))
 }
 
 /// More state

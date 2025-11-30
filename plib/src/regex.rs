@@ -303,7 +303,7 @@ impl Regex {
     /// `Some(Vec<Match>)` with captures (positions relative to start of `text`),
     /// or `None` if no match found at or after offset.
     pub fn captures_at(&self, text: &str, offset: usize) -> Option<Vec<Match>> {
-        if offset >= text.len() {
+        if offset > text.len() {
             return None;
         }
 
@@ -402,7 +402,7 @@ impl<'r, 't> Iterator for MatchIter<'r, 't> {
     type Item = Match;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.offset >= self.text.len() {
+        if self.offset > self.text.len() {
             return None;
         }
 
@@ -570,5 +570,59 @@ mod tests {
         // In ERE, ( is grouping, \( is literal
         let re = Regex::ere(r"main\(").unwrap();
         assert!(re.is_match("int main() {"));
+    }
+
+    #[test]
+    fn test_captures_at_empty_string() {
+        // Regression test: captures_at must use `offset > text.len()` not `offset >= text.len()`
+        // to allow patterns like ^$ to match empty strings
+        let re = Regex::bre("^$").unwrap();
+
+        // Pattern ^$ should match an empty string
+        let caps = re.captures("");
+        assert!(caps.is_some(), "^$ should match empty string");
+
+        // captures_at with offset 0 on empty string should also match
+        let caps = re.captures_at("", 0);
+        assert!(
+            caps.is_some(),
+            "captures_at(\"\", 0) should match ^$ pattern"
+        );
+
+        // The match should be at position 0..0 (zero-length match)
+        let caps = caps.unwrap();
+        assert_eq!(caps[0].start, 0);
+        assert_eq!(caps[0].end, 0);
+
+        // captures_at with offset past end should return None
+        let caps = re.captures_at("", 1);
+        assert!(caps.is_none(), "captures_at(\"\", 1) should return None");
+    }
+
+    #[test]
+    fn test_find_iter_empty_string() {
+        // Regression test: find_iter must handle empty strings correctly
+        let re = Regex::bre("^$").unwrap();
+
+        // find_iter on empty string should yield exactly one match
+        let matches: Vec<Match> = re.find_iter("").collect();
+        assert_eq!(matches.len(), 1, "^$ should match empty string once");
+        assert_eq!(matches[0], Match { start: 0, end: 0 });
+    }
+
+    #[test]
+    fn test_captures_at_end_of_string() {
+        // Test that $ anchor works at end of non-empty string
+        let re = Regex::bre("$").unwrap();
+
+        // $ should match at the end of "hello" (position 5)
+        let caps = re.captures_at("hello", 5);
+        assert!(
+            caps.is_some(),
+            "$ should match at end of string (offset == len)"
+        );
+        let caps = caps.unwrap();
+        assert_eq!(caps[0].start, 5);
+        assert_eq!(caps[0].end, 5);
     }
 }

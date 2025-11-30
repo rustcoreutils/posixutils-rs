@@ -9,8 +9,8 @@
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use std::fs;
-use std::io::{self, BufRead, Write};
+use plib::io::input_reader;
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 
 const NO1: u32 = 1 << 0;
@@ -72,8 +72,8 @@ fn line_out(lead_dup: &'static str, outmask: u32, curtype: u32, s: &str) -> io::
     Ok(())
 }
 
-fn open_file(pathname: &PathBuf) -> io::Result<io::BufReader<fs::File>> {
-    Ok(io::BufReader::new(fs::File::open(pathname)?))
+fn open_file(pathname: &PathBuf) -> io::Result<BufReader<Box<dyn Read>>> {
+    input_reader(pathname, true)
 }
 
 fn comm_file(
@@ -106,10 +106,7 @@ fn comm_file(
         if buf1.is_empty() {
             line_out(lead_dup, mask, NO2, &buf2)?;
             buf2.clear();
-        } else if buf2.is_empty() {
-            line_out(lead_dup, mask, NO1, &buf1)?;
-            buf1.clear();
-        } else if buf1 < buf2 {
+        } else if buf2.is_empty() || buf1 < buf2 {
             line_out(lead_dup, mask, NO1, &buf1)?;
             buf1.clear();
         } else if buf2 < buf1 {

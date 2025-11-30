@@ -1652,7 +1652,7 @@ fn compile_regex(pattern: String, ignore_case: bool) -> Result<Regex, MoreError>
 struct MoreControl {
     /// Program arguments
     args: Args,
-    /// Terminal for displaying content in interactive session  
+    /// Terminal for displaying content in interactive session
     terminal: Option<Terminal>,
     /// Context of reading current [`Source`]
     context: SourceContext,
@@ -1674,6 +1674,8 @@ struct MoreControl {
     is_new_file: bool,
     /// Last search has succeess match
     is_matched: bool,
+    /// Buffered stdin content for '-' operand (stdin can only be read once)
+    stdin_buffer: Option<String>,
 }
 
 impl MoreControl {
@@ -1682,20 +1684,46 @@ impl MoreControl {
         let terminal = Terminal::new(args.test, args.lines, args.plain).ok();
         let mut current_position = None;
         let mut file_pathes = vec![];
+        // Buffer stdin if '-' appears in file list (stdin can only be read once)
+        let stdin_buffer: Option<String> = if args.input_files.iter().any(|f| f == "-") {
+            let mut buf = String::new();
+            use std::io::Read;
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .map_err(|_| MoreError::InputRead)?;
+            Some(buf)
+        } else {
+            None
+        };
+
         let source = if args.input_files.is_empty()
             || (args.input_files.len() == 1 && args.input_files[0] == *"-")
         {
-            let Some(Ok(buf)) = BufReader::new(std::io::stdin().lock()).lines().next() else {
-                return Err(MoreError::InputRead);
-            };
-            Source::Buffer(Cursor::new(buf))
+            if let Some(buf) = stdin_buffer.clone() {
+                Source::Buffer(Cursor::new(buf))
+            } else {
+                let Some(Ok(buf)) = BufReader::new(std::io::stdin().lock()).lines().next() else {
+                    return Err(MoreError::InputRead);
+                };
+                Source::Buffer(Cursor::new(buf))
+            }
         } else {
             for file_string in &args.input_files {
-                let path = to_path(file_string.clone())?;
-                file_pathes.push(path);
+                if file_string == "-" {
+                    // Use a special path marker for stdin entries
+                    file_pathes.push(PathBuf::from("-"));
+                } else {
+                    let path = to_path(file_string.clone())?;
+                    file_pathes.push(path);
+                }
             }
             current_position = Some(0);
-            Source::File(file_pathes[0].clone())
+            let first_file = &file_pathes[0];
+            if first_file == &PathBuf::from("-") {
+                Source::Buffer(Cursor::new(stdin_buffer.clone().unwrap_or_default()))
+            } else {
+                Source::File(first_file.clone())
+            }
         };
         let size = terminal
             .as_ref()
@@ -1720,6 +1748,7 @@ impl MoreControl {
             file_pathes,
             is_new_file: false,
             is_matched: false,
+            stdin_buffer,
         })
     }
 
@@ -1740,23 +1769,40 @@ impl MoreControl {
             }
         } else {
             for file_path in &input_files {
+                // Handle '-' as stdin
+                let source = if *file_path == PathBuf::from("-") {
+                    let buf = self.stdin_buffer.clone().unwrap_or_default();
+                    Source::Buffer(Cursor::new(buf))
+                } else {
+                    Source::File(file_path.clone())
+                };
+
                 let Ok(_) = self
                     .context
-                    .set_source(Source::File(file_path.clone()))
+                    .set_source(source)
                     .inspect_err(|e| self.handle_error(e.clone()))
                 else {
                     return;
                 };
                 if input_files.len() > 1 {
-                    let Ok(header) = format_file_header(
-                        file_path.clone(),
-                        self.context.terminal_size.map(|ts| ts.1),
-                    )
-                    .inspect_err(|e| self.handle_error(e.clone())) else {
-                        return;
-                    };
-                    for line in header {
-                        println!("{line}");
+                    // Format header differently for stdin vs file
+                    if *file_path == PathBuf::from("-") {
+                        let header_width = 18; // len("(standard input)") + 4
+                        let border = ":".repeat(header_width);
+                        println!("{border}");
+                        println!("(standard input)");
+                        println!("{border}");
+                    } else {
+                        let Ok(header) = format_file_header(
+                            file_path.clone(),
+                            self.context.terminal_size.map(|ts| ts.1),
+                        )
+                        .inspect_err(|e| self.handle_error(e.clone())) else {
+                            return;
+                        };
+                        for line in header {
+                            println!("{line}");
+                        }
                     }
                 }
 
@@ -2182,6 +2228,13 @@ impl MoreControl {
                 let _ = self.context.set_source(self.context.last_source.clone());
                 self.last_position = None;
             }
+        } else if file_string == "-" {
+            // Handle stdin as a source using the buffered content
+            self.context.goto_eof(None);
+            let _ = self.context.update_screen();
+            let buf = self.stdin_buffer.clone().unwrap_or_default();
+            self.context.set_source(Source::Buffer(Cursor::new(buf)))?;
+            self.last_position = self.current_position;
         } else {
             self.context.goto_eof(None);
             let _ = self.context.update_screen();
@@ -2922,6 +2975,31 @@ pub fn commands_usage() -> String {
     buf
 }
 
+/// Parse arguments with MORE environment variable support.
+/// POSIX specifies: "more $MORE options operands"
+/// Command line options override those from MORE.
+fn parse_args_with_more_env() -> Args {
+    // Get the MORE environment variable
+    if let Ok(more_env) = std::env::var("MORE") {
+        // Parse MORE variable into args
+        let more_args: Vec<String> = more_env.split_whitespace().map(String::from).collect();
+
+        if !more_args.is_empty() {
+            // Get actual command line args (skip program name)
+            let cmd_args: Vec<String> = std::env::args().collect();
+
+            // Build combined args: program name, MORE args, then command line args
+            let mut combined_args = vec![cmd_args[0].clone()];
+            combined_args.extend(more_args);
+            combined_args.extend(cmd_args.into_iter().skip(1));
+
+            return Args::parse_from(combined_args);
+        }
+    }
+
+    Args::parse()
+}
+
 fn main() {
     let _ = setlocale(
         LocaleCategory::LcAll,
@@ -2930,7 +3008,7 @@ fn main() {
     let _ = textdomain(PROJECT_NAME);
     let _ = bind_textdomain_codeset(PROJECT_NAME, "UTF-8");
 
-    let args = Args::parse();
+    let args = parse_args_with_more_env();
     match MoreControl::new(args) {
         Ok(mut ctl) => {
             if ctl.terminal.is_none() {

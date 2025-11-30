@@ -506,7 +506,7 @@ fn test_float_e_negative() {
 
 // Floating point tests - %E (uppercase scientific)
 #[test]
-fn test_float_E_basic() {
+fn test_float_big_e_basic() {
     printf_test(&["%E", "12345.6789"], "1.234568E+04");
 }
 

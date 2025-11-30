@@ -433,7 +433,7 @@ impl Rule {
     pub fn targets(&self) -> impl Iterator<Item = String> {
         self.syntax()
             .children_with_tokens()
-            .take_while(|it| it.as_token().map_or(true, |t| t.kind() != COLON))
+            .take_while(|it| it.as_token().is_none_or(|t| t.kind() != COLON))
             .filter_map(|it| it.as_token().map(|t| t.text().to_string()))
     }
 

@@ -6,16 +6,15 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// TODO:
-// - err on line num == 0
-//
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use regex::Regex;
+use libc::{regcomp, regex_t, regexec, regfree, REG_NOMATCH};
+use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Error, ErrorKind, Read, Write};
 use std::path::PathBuf;
+use std::ptr;
 
 /// csplit - split files based on context
 #[derive(Parser)]
@@ -44,8 +43,56 @@ struct Args {
     operands: Vec<String>,
 }
 
+/// POSIX Basic Regular Expression wrapper using libc regcomp/regexec
+struct BreRegex {
+    regex: regex_t,
+    #[cfg(test)]
+    pattern: String,
+}
+
+impl BreRegex {
+    fn new(pattern: &str) -> io::Result<Self> {
+        let c_pattern =
+            CString::new(pattern).map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
+        let mut regex = unsafe { std::mem::zeroed::<regex_t>() };
+
+        // Use 0 for cflags to get BRE (not REG_EXTENDED)
+        let result = unsafe { regcomp(&mut regex, c_pattern.as_ptr(), 0) };
+        if result != 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("invalid BRE pattern: {}", pattern),
+            ));
+        }
+
+        Ok(BreRegex {
+            regex,
+            #[cfg(test)]
+            pattern: pattern.to_string(),
+        })
+    }
+
+    fn is_match(&self, text: &str) -> bool {
+        let Ok(c_text) = CString::new(text) else {
+            return false;
+        };
+        unsafe { regexec(&self.regex, c_text.as_ptr(), 0, ptr::null_mut(), 0) != REG_NOMATCH }
+    }
+
+    #[cfg(test)]
+    fn as_str(&self) -> &str {
+        &self.pattern
+    }
+}
+
+impl Drop for BreRegex {
+    fn drop(&mut self) {
+        unsafe { regfree(&mut self.regex) }
+    }
+}
+
 enum Operand {
-    Rx(Regex, isize, bool),
+    Rx(BreRegex, isize, bool),
     LineNum(usize),
     Repeat(usize),
 }
@@ -388,7 +435,7 @@ fn process_lines(
     state.outf.as_mut().unwrap().write_all(lines.as_bytes())?;
     new_files.push(file_name);
     if !suppress {
-        println!("{}\n", lines.len());
+        println!("{}", lines.len());
     }
 
     state.close_output();
@@ -451,11 +498,7 @@ fn parse_op_rx(opstr: &str, delim: char) -> io::Result<Operand> {
     // parse string sandwiched between two delimiter chars
     let end_pos = res.unwrap();
     let re_str = &opstr[1..end_pos];
-    let res = Regex::new(re_str);
-    if res.is_err() {
-        return Err(Error::new(ErrorKind::Other, "invalid regex"));
-    }
-    let re = res.unwrap();
+    let re = BreRegex::new(re_str)?;
 
     // reference offset string
     let mut offset_str = &opstr[end_pos + 1..];
@@ -497,25 +540,25 @@ fn parse_op_rx(opstr: &str, delim: char) -> io::Result<Operand> {
 /// problem parsing the operand.
 ///
 fn parse_op_repeat(opstr: &str) -> io::Result<Operand> {
-    // a regex fully describes what must be parsed
-    let re = Regex::new(r"^\{(\d*|[*])}$").unwrap();
+    // Must match pattern: {num} or {*}
+    if !opstr.starts_with('{') || !opstr.ends_with('}') {
+        return Err(Error::new(ErrorKind::Other, "invalid repeating operand"));
+    }
 
-    // grab and parse capture #1, if matched
-    match re.captures(opstr) {
-        None => {}
-        Some(caps) => {
-            let numstr = caps.get(1).unwrap().as_str();
-            if numstr == "*" {
-                return Ok(Operand::Repeat(usize::MAX));
-            }
-            match numstr.parse::<usize>() {
-                Ok(n) => return Ok(Operand::Repeat(n)),
-                Err(_e) => {}
-            }
+    let inner = &opstr[1..opstr.len() - 1];
+
+    if inner == "*" {
+        return Ok(Operand::Repeat(usize::MAX));
+    }
+
+    // Parse as number (must be all digits)
+    if inner.chars().all(|c| c.is_ascii_digit()) && !inner.is_empty() {
+        match inner.parse::<usize>() {
+            Ok(n) => return Ok(Operand::Repeat(n)),
+            Err(_) => {}
         }
     }
 
-    // error cases fall through to here
     Err(Error::new(ErrorKind::Other, "invalid repeating operand"))
 }
 
@@ -523,6 +566,7 @@ fn parse_op_repeat(opstr: &str) -> io::Result<Operand> {
 ///
 /// This function parses a line number operand from the input string. The line number operand
 /// specifies a simple positive integer indicating the line number at which to perform a split.
+/// POSIX specifies lines are numbered starting at 1.
 ///
 /// # Arguments
 ///
@@ -535,12 +579,16 @@ fn parse_op_repeat(opstr: &str) -> io::Result<Operand> {
 ///
 /// # Errors
 ///
-/// Returns an error if the input string cannot be parsed as a positive integer or if there is
-/// a problem parsing the operand.
+/// Returns an error if the input string cannot be parsed as a positive integer, is zero, or
+/// if there is a problem parsing the operand.
 ///
 fn parse_op_linenum(opstr: &str) -> io::Result<Operand> {
     // parse simple positive integer
     match opstr.parse::<usize>() {
+        Ok(0) => Err(Error::new(
+            ErrorKind::Other,
+            "line number must be greater than zero",
+        )),
         Ok(n) => Ok(Operand::LineNum(n)),
         Err(e) => {
             let msg = format!("{}", e);
@@ -580,7 +628,7 @@ fn parse_operands(args: &Args) -> io::Result<SplitOps> {
                 '/' => parse_op_rx(opstr, '/')?,
                 '%' => parse_op_rx(opstr, '%')?,
                 '{' => parse_op_repeat(opstr)?,
-                '1'..='9' => parse_op_linenum(opstr)?,
+                '0'..='9' => parse_op_linenum(opstr)?,
                 _ => return Err(Error::new(ErrorKind::Other, "invalid operand")),
             }
         };
@@ -591,12 +639,40 @@ fn parse_operands(args: &Args) -> io::Result<SplitOps> {
     Ok(SplitOps { ops })
 }
 
+/// Validates that the prefix + suffix won't exceed NAME_MAX
+fn validate_prefix(prefix: &str, suffix_len: u8) -> io::Result<()> {
+    // Get NAME_MAX for the current directory
+    #[cfg(target_os = "macos")]
+    const NAME_MAX: usize = 255;
+
+    #[cfg(not(target_os = "macos"))]
+    const NAME_MAX: usize = libc::NAME_MAX as usize;
+
+    // Maximum filename length is prefix + suffix digits
+    let max_filename_len = prefix.len() + suffix_len as usize;
+
+    if max_filename_len > NAME_MAX {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "prefix too long: '{}' with {} digit suffix exceeds NAME_MAX ({})",
+                prefix, suffix_len, NAME_MAX
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     setlocale(LocaleCategory::LcAll, "");
     textdomain("posixutils-rs")?;
     bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
 
     let args = Args::parse();
+
+    // Validate prefix won't exceed NAME_MAX
+    validate_prefix(&args.prefix, args.num)?;
 
     let ctx = parse_operands(&args)?;
 
@@ -894,6 +970,7 @@ mod tests {
     #[test]
     fn test_split_c_file_1() {
         // Test valid operands
+        // In BRE, ( is literal, \( starts grouping - so use "main(" not "main\("
         let args = Args {
             prefix: String::from("c_file"),
             keep: false,
@@ -901,7 +978,7 @@ mod tests {
             suppress: false,
             filename: PathBuf::from("tests/assets/test_file_c"),
             operands: vec![
-                String::from(r"%main\(%"),
+                String::from("%main(%"),
                 String::from("/^}/+1"),
                 String::from("{3}"),
             ],
@@ -958,7 +1035,7 @@ mod tests {
             suppress: false,
             filename: PathBuf::from("tests/assets/test_file_c"),
             operands: vec![
-                String::from(r"%main\(%+1"),
+                String::from("%main(%+1"),
                 String::from("/^}/+1"),
                 String::from("{3}"),
             ],
@@ -1014,7 +1091,7 @@ mod tests {
             suppress: false,
             filename: PathBuf::from("tests/assets/test_file_c"),
             operands: vec![
-                String::from(r"%main\(%-1"),
+                String::from("%main(%-1"),
                 String::from("/^}/+1"),
                 String::from("{3}"),
             ],
@@ -1071,7 +1148,7 @@ mod tests {
             suppress: false,
             filename: PathBuf::from("tests/assets/test_file_c"),
             operands: vec![
-                String::from(r"%main\(%"),
+                String::from("%main(%"),
                 String::from("/^}/"),
                 String::from("{3}"),
             ],
@@ -1128,7 +1205,7 @@ mod tests {
             suppress: false,
             filename: PathBuf::from("tests/assets/test_file_c"),
             operands: vec![
-                String::from(r"%main\(%"),
+                String::from("%main(%"),
                 String::from("/^}/-1"),
                 String::from("{3}"),
             ],

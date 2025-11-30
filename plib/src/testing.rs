@@ -136,12 +136,8 @@ pub fn run_test_with_checker<F: FnMut(&TestPlan, &Output)>(plan: TestPlan, mut c
 ///
 /// Like `run_test` but allows setting environment variables for the subprocess.
 pub fn run_test_with_env(plan: TestPlan, env_vars: &[(&str, &str)]) {
-    let output = run_test_base_with_env(
-        &plan.cmd,
-        &plan.args,
-        plan.stdin_data.as_bytes(),
-        env_vars,
-    );
+    let output =
+        run_test_base_with_env(&plan.cmd, &plan.args, plan.stdin_data.as_bytes(), env_vars);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(stdout, plan.expected_out);
@@ -163,11 +159,7 @@ pub fn run_test_with_checker_and_env<F: FnMut(&TestPlan, &Output)>(
     env_vars: &[(&str, &str)],
     mut checker: F,
 ) {
-    let output = run_test_base_with_env(
-        &plan.cmd,
-        &plan.args,
-        plan.stdin_data.as_bytes(),
-        env_vars,
-    );
+    let output =
+        run_test_base_with_env(&plan.cmd, &plan.args, plan.stdin_data.as_bytes(), env_vars);
     checker(&plan, &output);
 }

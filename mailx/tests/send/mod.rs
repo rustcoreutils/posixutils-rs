@@ -208,7 +208,10 @@ fn send_debug_mode_via_mailrc() {
                 "Should show subject in debug output: {}",
                 stderr
             );
-            assert!(output.status.success(), "Debug mode should exit successfully");
+            assert!(
+                output.status.success(),
+                "Debug mode should exit successfully"
+            );
         },
     );
 

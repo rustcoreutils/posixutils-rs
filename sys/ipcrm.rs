@@ -25,53 +25,56 @@ use libc::{semctl, semget, shmctl, shmget, shmid_ds};
 struct Args {
     #[arg(
         short = 's',
-        long,
-        help = gettext("Remove the shared memory identifier semid from the system")
+        action = clap::ArgAction::Append,
+        help = gettext("Remove the semaphore identifier semid from the system")
     )]
-    semid: Option<i32>,
+    semid: Vec<i32>,
 
     #[arg(
         short = 'S',
-        long,
-        help = gettext("Remove the shared memory identifier, created with key semkey, from the system")
+        action = clap::ArgAction::Append,
+        help = gettext("Remove the semaphore identifier, created with key semkey, from the system")
     )]
-    semkey: Option<i32>,
+    semkey: Vec<i32>,
 
     #[arg(
         short = 'm',
-        long,
+        action = clap::ArgAction::Append,
         help = gettext("Remove the shared memory identifier shmid from the system")
     )]
-    shmid: Option<i32>,
+    shmid: Vec<i32>,
 
     #[arg(
         short = 'M',
-        long,
+        action = clap::ArgAction::Append,
         help = gettext("Remove the shared memory identifier, created with key shmkey, from the system")
     )]
-    shmkey: Option<i32>,
+    shmkey: Vec<i32>,
 
     #[cfg(not(target_os = "macos"))]
     #[arg(
         short = 'q',
-        long,
+        action = clap::ArgAction::Append,
         help = gettext("Remove the message queue identifier msgid from the system")
     )]
-    msgid: Option<i32>,
+    msgid: Vec<i32>,
 
     #[cfg(not(target_os = "macos"))]
     #[arg(
         short = 'Q',
-        long,
+        action = clap::ArgAction::Append,
         help = gettext("Remove the message queue identifier, created with key msgkey, from the system")
     )]
-    msgkey: Option<i32>,
+    msgkey: Vec<i32>,
 }
 
 #[cfg(not(target_os = "macos"))]
 fn msg_key_lookup(msgkey: i32) -> io::Result<i32> {
     if msgkey == libc::IPC_PRIVATE {
-        return Err(Error::new(ErrorKind::Other, "Invalid key"));
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            gettext("invalid key: IPC_PRIVATE"),
+        ));
     }
     let res: i32 = unsafe { msgget(msgkey, 0) };
 
@@ -83,7 +86,7 @@ fn msg_key_lookup(msgkey: i32) -> io::Result<i32> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn msg_rm(msgid: i32) -> io::Result<i32> {
+fn msg_rm(msgid: i32) -> io::Result<()> {
     let res: i32 = unsafe {
         msgctl(
             msgid,
@@ -95,13 +98,16 @@ fn msg_rm(msgid: i32) -> io::Result<i32> {
     if res < 0 {
         Err(io::Error::last_os_error())
     } else {
-        Ok(res)
+        Ok(())
     }
 }
 
 fn shm_key_lookup(shmkey: i32) -> io::Result<i32> {
     if shmkey == libc::IPC_PRIVATE {
-        return Err(Error::new(ErrorKind::Other, "Invalid key"));
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            gettext("invalid key: IPC_PRIVATE"),
+        ));
     }
     let res: i32 = unsafe { shmget(shmkey, 0, 0) };
 
@@ -112,7 +118,7 @@ fn shm_key_lookup(shmkey: i32) -> io::Result<i32> {
     }
 }
 
-fn shm_rm(shmid: i32) -> io::Result<i32> {
+fn shm_rm(shmid: i32) -> io::Result<()> {
     let res: i32 = unsafe {
         shmctl(
             shmid,
@@ -124,13 +130,16 @@ fn shm_rm(shmid: i32) -> io::Result<i32> {
     if res < 0 {
         Err(io::Error::last_os_error())
     } else {
-        Ok(res)
+        Ok(())
     }
 }
 
 fn sem_key_lookup(semkey: i32) -> io::Result<i32> {
     if semkey == libc::IPC_PRIVATE {
-        return Err(Error::new(ErrorKind::Other, "Invalid key"));
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            gettext("invalid key: IPC_PRIVATE"),
+        ));
     }
     let res: i32 = unsafe { semget(semkey, 0, 0) };
 
@@ -141,16 +150,15 @@ fn sem_key_lookup(semkey: i32) -> io::Result<i32> {
     }
 }
 
-// Define the union semun as per your requirements
+// Define the union semun as per POSIX requirements
 #[repr(C)]
 union semun {
     val: c_int,               // for SETVAL
     buf: *mut libc::semid_ds, // for IPC_STAT and IPC_SET
     array: *mut c_ushort,     // for GETALL and SETALL
-                              // Depending on your platform, you might need to add other fields as well
 }
 
-fn sem_rm(semid: i32) -> io::Result<i32> {
+fn sem_rm(semid: i32) -> io::Result<()> {
     let arg = semun { val: 0 };
 
     let res: i32 = unsafe { semctl(semid, 0, libc::IPC_RMID, arg) };
@@ -158,42 +166,105 @@ fn sem_rm(semid: i32) -> io::Result<i32> {
     if res < 0 {
         Err(io::Error::last_os_error())
     } else {
-        Ok(res)
+        Ok(())
     }
 }
 
-fn remove_ipcs(args: &Args) -> io::Result<()> {
-    // remove semaphores
-    if let Some(semkey) = args.semkey {
-        let semid = sem_key_lookup(semkey)?;
-        sem_rm(semid)?;
-    }
-    if let Some(semid) = args.semid {
-        sem_rm(semid)?;
+fn remove_ipcs(args: &Args) -> i32 {
+    let mut exit_code = 0;
+
+    // Remove semaphores by key
+    for semkey in &args.semkey {
+        match sem_key_lookup(*semkey) {
+            Ok(semid) => {
+                if let Err(e) = sem_rm(semid) {
+                    eprintln!("ipcrm: {}: {}", gettext("semaphore key"), e);
+                    exit_code = 1;
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "ipcrm: {}: 0x{:x}: {}",
+                    gettext("semaphore key"),
+                    *semkey,
+                    e
+                );
+                exit_code = 1;
+            }
+        }
     }
 
-    // remove shared memory segments
-    if let Some(shmkey) = args.shmkey {
-        let shmid = shm_key_lookup(shmkey)?;
-        shm_rm(shmid)?;
-    }
-    if let Some(shmid) = args.shmid {
-        shm_rm(shmid)?;
+    // Remove semaphores by ID
+    for semid in &args.semid {
+        if let Err(e) = sem_rm(*semid) {
+            eprintln!("ipcrm: {}: {}: {}", gettext("semaphore id"), semid, e);
+            exit_code = 1;
+        }
     }
 
-    // remove message queues
+    // Remove shared memory segments by key
+    for shmkey in &args.shmkey {
+        match shm_key_lookup(*shmkey) {
+            Ok(shmid) => {
+                if let Err(e) = shm_rm(shmid) {
+                    eprintln!("ipcrm: {}: {}", gettext("shared memory key"), e);
+                    exit_code = 1;
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "ipcrm: {}: 0x{:x}: {}",
+                    gettext("shared memory key"),
+                    *shmkey,
+                    e
+                );
+                exit_code = 1;
+            }
+        }
+    }
+
+    // Remove shared memory segments by ID
+    for shmid in &args.shmid {
+        if let Err(e) = shm_rm(*shmid) {
+            eprintln!("ipcrm: {}: {}: {}", gettext("shared memory id"), shmid, e);
+            exit_code = 1;
+        }
+    }
+
+    // Remove message queues (Linux only)
     #[cfg(not(target_os = "macos"))]
     {
-        if let Some(msgkey) = args.msgkey {
-            let msgid = msg_key_lookup(msgkey)?;
-            msg_rm(msgid)?;
+        // Remove message queues by key
+        for msgkey in &args.msgkey {
+            match msg_key_lookup(*msgkey) {
+                Ok(msgid) => {
+                    if let Err(e) = msg_rm(msgid) {
+                        eprintln!("ipcrm: {}: {}", gettext("message queue key"), e);
+                        exit_code = 1;
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "ipcrm: {}: 0x{:x}: {}",
+                        gettext("message queue key"),
+                        *msgkey,
+                        e
+                    );
+                    exit_code = 1;
+                }
+            }
         }
-        if let Some(msgid) = args.msgid {
-            msg_rm(msgid)?;
+
+        // Remove message queues by ID
+        for msgid in &args.msgid {
+            if let Err(e) = msg_rm(*msgid) {
+                eprintln!("ipcrm: {}: {}: {}", gettext("message queue id"), msgid, e);
+                exit_code = 1;
+            }
         }
     }
 
-    Ok(())
+    exit_code
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -203,12 +274,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    let mut exit_code = 0;
-
-    if let Err(e) = remove_ipcs(&args) {
-        exit_code = 1;
-        eprintln!("{}", e);
-    }
+    let exit_code = remove_ipcs(&args);
 
     std::process::exit(exit_code)
 }

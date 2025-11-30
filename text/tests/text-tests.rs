@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod asa;
 mod comm;
 mod csplit;
 mod cut;

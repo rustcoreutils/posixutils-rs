@@ -6,60 +6,92 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// TODO:
-// - echo needs to translate backslash-escaped octal numbers:
-// ```
-// \0num
-//	Write an 8-bit value that is the 0, 1, 2 or 3-digit octal number _num_.
-//
 
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use std::io::{self, Write};
 
 fn translate_str(skip_nl: bool, s: &str) -> String {
     let mut output = String::with_capacity(s.len());
-
-    let mut in_bs = false;
     let mut nl = true;
 
-    for ch in s.chars() {
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let ch = chars[i];
         if ch == '\\' {
-            in_bs = true;
-        } else if in_bs {
-            in_bs = false;
-            match ch {
+            if i + 1 >= chars.len() {
+                // Trailing backslash - preserve it
+                output.push('\\');
+                i += 1;
+                continue;
+            }
+
+            let next = chars[i + 1];
+            match next {
                 'a' => {
                     output.push('\x07');
+                    i += 2;
                 }
                 'b' => {
                     output.push('\x08');
+                    i += 2;
                 }
                 'c' => {
                     nl = false;
                     break;
                 }
                 'f' => {
-                    output.push('\x12');
+                    output.push('\x0c');
+                    i += 2;
                 }
                 'n' => {
                     output.push('\n');
+                    i += 2;
                 }
                 'r' => {
                     output.push('\r');
+                    i += 2;
                 }
                 't' => {
                     output.push('\t');
+                    i += 2;
                 }
                 'v' => {
-                    output.push('\x11');
+                    output.push('\x0b');
+                    i += 2;
                 }
                 '\\' => {
                     output.push('\\');
+                    i += 2;
                 }
-                _ => {}
+                '0' => {
+                    // Octal escape: \0num where num is 0-3 octal digits
+                    i += 2; // Skip \0
+                    let mut octal_value: u8 = 0;
+                    let mut digits = 0;
+
+                    while digits < 3 && i < chars.len() {
+                        let digit = chars[i];
+                        if ('0'..='7').contains(&digit) {
+                            octal_value = octal_value * 8 + (digit as u8 - b'0');
+                            i += 1;
+                            digits += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    output.push(octal_value as char);
+                }
+                _ => {
+                    // Unknown escape - preserve the character after backslash
+                    output.push(next);
+                    i += 2;
+                }
             }
         } else {
             output.push(ch);
+            i += 1;
         }
     }
 

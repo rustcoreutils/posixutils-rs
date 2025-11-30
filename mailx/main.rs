@@ -98,7 +98,7 @@ fn run_receive_mode(args: &Args) -> i32 {
     }
 
     let mailbox_path = if args.read_mbox {
-        args.file.clone().unwrap_or_else(|| get_mbox_path())
+        args.file.clone().unwrap_or_else(get_mbox_path)
     } else {
         args.file.clone().unwrap_or_else(get_system_mailbox)
     };

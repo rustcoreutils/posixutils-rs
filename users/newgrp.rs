@@ -76,18 +76,18 @@ fn newgrp(args: Args) -> Result<(), io::Error> {
     let groups = plib::group::load();
 
     // Retrieve current user information
-    let pwd = get_password().or_else(|_| {
-        Err(io::Error::new(
+    let pwd = get_password().map_err(|_| {
+        io::Error::new(
             io::ErrorKind::NotFound,
             "Could not retrieve current user information.",
-        ))
+        )
     })?;
     let user_name = unsafe { CStr::from_ptr(pwd.pw_name) }
         .to_str()
-        .unwrap_or_else(|_| "???");
+        .unwrap_or("???");
 
     if args.login {
-        set_login_environment(&user_name)?;
+        set_login_environment(user_name)?;
     }
 
     let group_identifier = args.group.trim();
@@ -126,12 +126,12 @@ fn newgrp(args: Args) -> Result<(), io::Error> {
         if new_gid_in_supplementary {
             // New GID is also in the supplementary list; change the effective GID
             change_effective_gid_and_uid(group.gid, group_identifier)?;
-            logger(&user_name, group.gid);
+            logger(user_name, group.gid);
         } else {
             // New GID is not in the supplementary list; add it if possible
             add_gid_to_groups(group.gid);
             change_effective_gid_and_uid(group.gid, group_identifier)?;
-            logger(&user_name, group.gid);
+            logger(user_name, group.gid);
         }
     } else {
         // The effective GID is not in the supplementary list
@@ -143,7 +143,7 @@ fn newgrp(args: Args) -> Result<(), io::Error> {
             add_gid_to_groups(current_gid);
         }
         change_gid_and_uid(group.gid, group_identifier)?;
-        logger(&user_name, group.gid);
+        logger(user_name, group.gid);
     }
 
     Ok(())
@@ -755,11 +755,11 @@ fn read_password() -> io::Result<String> {
 ///
 fn set_login_environment(user: &str) -> Result<(), io::Error> {
     // Get the user's shell from the password entry
-    let pwd = get_password().or_else(|_| {
-        Err(io::Error::new(
+    let pwd = get_password().map_err(|_| {
+        io::Error::new(
             io::ErrorKind::NotFound,
             "Could not retrieve user information.",
-        ))
+        )
     })?;
 
     let user_shell = unsafe { CStr::from_ptr(pwd.pw_shell) }

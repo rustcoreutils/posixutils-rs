@@ -129,10 +129,8 @@ fn process_files2(
                     if v == 0 {
                         println!("{}", res.join(" "));
                     }
-                } else {
-                    if v == 0 {
-                        println!("{} {}", fields1.join(" "), fields2[1..].join(" "));
-                    }
+                } else if v == 0 {
+                    println!("{} {}", fields1.join(" "), fields2[1..].join(" "));
                 }
             }
         }

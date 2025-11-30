@@ -1264,7 +1264,7 @@ fn compile_regex(pattern: String) -> Result<regex_t, SedError> {
     // will be returned. Therefore, an empty pattern is replaced with ".*".
     #[cfg(target_os = "macos")]
     {
-        pattern = if pattern == "" {
+        pattern = if pattern.is_empty() {
             String::from(".*")
         } else {
             pattern

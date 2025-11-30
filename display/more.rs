@@ -1787,10 +1787,11 @@ impl MoreControl {
                 if input_files.len() > 1 {
                     // Format header differently for stdin vs file
                     if *file_path == PathBuf::from("-") {
-                        let header_width = 18; // len("(standard input)") + 4
+                        const STDIN_LABEL: &str = "(standard input)";
+                        let header_width = STDIN_LABEL.len() + 2; // 2 for border padding
                         let border = ":".repeat(header_width);
                         println!("{border}");
-                        println!("(standard input)");
+                        println!("{STDIN_LABEL}");
                         println!("{border}");
                     } else {
                         let Ok(header) = format_file_header(

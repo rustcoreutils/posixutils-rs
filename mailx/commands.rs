@@ -1507,7 +1507,7 @@ fn expand_folder_name(name: &str, vars: &Variables) -> String {
 fn compose_message(
     composed: &mut ComposedMessage,
     mb: &Mailbox,
-    vars: &Variables,
+    vars: &mut Variables,
 ) -> Result<(), String> {
     let stdin = io::stdin();
     let escape_char = vars.escape_char();

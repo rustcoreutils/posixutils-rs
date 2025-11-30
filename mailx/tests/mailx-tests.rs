@@ -7,6 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod cli;
 mod receive;
 mod send;
 mod variables;

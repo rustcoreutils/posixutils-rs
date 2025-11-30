@@ -45,7 +45,7 @@ fn run_send_mode(args: &Args) -> i32 {
         load_startup_files(&mut vars, RcMode::Send);
     }
 
-    if let Err(e) = send_mode(args, &vars) {
+    if let Err(e) = send_mode(args, &mut vars) {
         eprintln!("mailx: {}", e);
         return 1;
     }

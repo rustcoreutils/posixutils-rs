@@ -14,6 +14,8 @@ use crate::variables::Variables;
 pub struct EscapeResult {
     pub done: bool,
     pub abort: bool,
+    /// Whether to save to dead letter on abort (true for ~q, false for ~x)
+    pub save_dead_letter: bool,
 }
 
 impl EscapeResult {
@@ -21,6 +23,7 @@ impl EscapeResult {
         EscapeResult {
             done: false,
             abort: false,
+            save_dead_letter: false,
         }
     }
 
@@ -28,13 +31,25 @@ impl EscapeResult {
         EscapeResult {
             done: true,
             abort: false,
+            save_dead_letter: false,
         }
     }
 
-    pub fn abort() -> Self {
+    /// Abort and save to dead letter (~q behavior)
+    pub fn abort_with_save() -> Self {
         EscapeResult {
             done: true,
             abort: true,
+            save_dead_letter: true,
+        }
+    }
+
+    /// Abort without saving (~x behavior)
+    pub fn abort_without_save() -> Self {
+        EscapeResult {
+            done: true,
+            abort: true,
+            save_dead_letter: false,
         }
     }
 }
@@ -43,7 +58,7 @@ impl EscapeResult {
 pub fn handle_escape(
     line: &str,
     msg: &mut ComposedMessage,
-    vars: &Variables,
+    vars: &mut Variables,
     mb: Option<&Mailbox>,
 ) -> Result<EscapeResult, String> {
     if line.is_empty() {
@@ -60,8 +75,19 @@ pub fn handle_escape(
             Ok(EscapeResult::finish())
         }
         '!' => {
-            // Shell escape
-            run_shell_command(args, vars)?;
+            // Shell escape with bang expansion
+            let cmd = if vars.get_bool("bang") {
+                // Expand ! to previous command
+                expand_bang(args, vars.last_shell_cmd.as_deref())
+            } else {
+                args.to_string()
+            };
+
+            run_shell_command(&cmd, vars)?;
+
+            // Store for future bang expansion
+            vars.last_shell_cmd = Some(cmd);
+
             println!("!");
             Ok(EscapeResult::continue_input())
         }
@@ -176,28 +202,42 @@ pub fn handle_escape(
             Ok(EscapeResult::continue_input())
         }
         'p' => {
-            // Print the message
-            println!("-------\nMessage contains:");
+            // Print the message, using pager if longer than crt lines
+            let mut output = String::from("-------\nMessage contains:\n");
             if !msg.to.is_empty() {
-                println!("To: {}", msg.to.join(", "));
+                output.push_str(&format!("To: {}\n", msg.to.join(", ")));
             }
             if !msg.cc.is_empty() {
-                println!("Cc: {}", msg.cc.join(", "));
+                output.push_str(&format!("Cc: {}\n", msg.cc.join(", ")));
             }
             if !msg.bcc.is_empty() {
-                println!("Bcc: {}", msg.bcc.join(", "));
+                output.push_str(&format!("Bcc: {}\n", msg.bcc.join(", ")));
             }
             if !msg.subject.is_empty() {
-                println!("Subject: {}", msg.subject);
+                output.push_str(&format!("Subject: {}\n", msg.subject));
             }
-            println!();
-            print!("{}", msg.body);
-            println!("-------");
+            output.push('\n');
+            output.push_str(&msg.body);
+            output.push_str("-------\n");
+
+            // Check if we should use pager (crt variable)
+            let line_count = output.lines().count();
+            let use_pager = vars
+                .get_number("crt")
+                .map(|crt| line_count > crt as usize)
+                .unwrap_or(false);
+
+            if use_pager {
+                let pager = vars.get("PAGER").unwrap_or("more");
+                pipe_output_through_pager(&output, pager);
+            } else {
+                print!("{}", output);
+            }
             Ok(EscapeResult::continue_input())
         }
         'q' => {
             // Quit, save to dead letter
-            Ok(EscapeResult::abort())
+            Ok(EscapeResult::abort_with_save())
         }
         'r' | '<' => {
             // Read file or command output
@@ -249,10 +289,7 @@ pub fn handle_escape(
         }
         'x' => {
             // Exit without saving
-            Ok(EscapeResult {
-                done: true,
-                abort: true,
-            })
+            Ok(EscapeResult::abort_without_save())
         }
         '|' => {
             // Pipe body through command
@@ -291,6 +328,33 @@ fn run_shell_command(cmd: &str, vars: &Variables) -> Result<(), String> {
         .status()
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Expand ! to the previous shell command when bang is set
+/// Backslash-escaped ! characters (\!) are preserved as literal !
+fn expand_bang(cmd: &str, last_cmd: Option<&str>) -> String {
+    let last = last_cmd.unwrap_or("");
+    let mut result = String::new();
+    let mut chars = cmd.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            // Check for escaped !
+            if chars.peek() == Some(&'!') {
+                result.push('!');
+                chars.next(); // consume the !
+            } else {
+                result.push(c);
+            }
+        } else if c == '!' {
+            // Replace with last command
+            result.push_str(last);
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
 }
 
 fn run_shell_command_output(cmd: &str, vars: &Variables) -> Result<String, String> {
@@ -634,6 +698,24 @@ fn pipe_through_command(input: &str, cmd: &str, vars: &Variables) -> Result<Stri
             stderr
         ))
     }
+}
+
+/// Pipe output through a pager (e.g., more, less)
+fn pipe_output_through_pager(text: &str, pager: &str) {
+    let mut child = match Command::new(pager).stdin(Stdio::piped()).spawn() {
+        Ok(c) => c,
+        Err(_) => {
+            // Fallback: just print directly
+            print!("{}", text);
+            return;
+        }
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(text.as_bytes());
+    }
+
+    let _ = child.wait();
 }
 
 /// Execute a mailx command from input mode (~: or ~_)

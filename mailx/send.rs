@@ -81,7 +81,7 @@ impl ComposedMessage {
 }
 
 /// Run send mode
-pub fn send_mode(args: &Args, vars: &Variables) -> Result<(), String> {
+pub fn send_mode(args: &Args, vars: &mut Variables) -> Result<(), String> {
     let is_tty = io::stdin().is_terminal();
 
     let mut msg = ComposedMessage::new();
@@ -193,7 +193,10 @@ pub fn send_mode(args: &Args, vars: &Variables) -> Result<(), String> {
                 let result = handle_escape(&line[1..], &mut msg, vars, None)?;
                 if result.done {
                     if result.abort {
-                        if vars.get_bool("save") && !msg.body.is_empty() {
+                        // Only save to dead letter if the escape requested it (~q)
+                        // The ~x escape does NOT save to dead letter
+                        if result.save_dead_letter && vars.get_bool("save") && !msg.body.is_empty()
+                        {
                             save_dead_letter(&msg, vars);
                         }
                         return Err("Aborted".to_string());

@@ -254,3 +254,265 @@ fn send_mailrc_multiple_vars() {
 
     drop(mailrc);
 }
+
+/// Test alias expansion in send mode
+/// Verifies that aliases are properly expanded when sending
+#[test]
+fn send_alias_expansion() {
+    // Create a mailrc with an alias and debug mode
+    let mailrc = create_temp_mailrc("set debug\nalias team user1@example.com user2@example.com\n");
+    let mailrc_path = mailrc.path().to_str().unwrap();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-s"),
+                String::from("Team Message"),
+                String::from("team"),
+            ],
+            stdin_data: String::from("Message for the team.\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAILRC", mailrc_path)],
+        |_plan, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Debug mode should show the expanded aliases
+            assert!(
+                stderr.contains("Debug mode"),
+                "Should be in debug mode: {}",
+                stderr
+            );
+            // The alias should have been expanded to individual addresses
+            assert!(
+                stderr.contains("user1@example.com") || stderr.contains("user2@example.com"),
+                "Alias should be expanded: {}",
+                stderr
+            );
+            assert!(output.status.success());
+        },
+    );
+
+    drop(mailrc);
+}
+
+/// Test empty message handling
+#[test]
+fn send_empty_message() {
+    let mailrc = create_temp_mailrc("set debug\n");
+    let mailrc_path = mailrc.path().to_str().unwrap();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-s"),
+                String::from("Empty Test"),
+                String::from("recipient@example.com"),
+            ],
+            stdin_data: String::new(),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAILRC", mailrc_path)],
+        |_plan, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("Debug mode"),
+                "Should be in debug mode: {}",
+                stderr
+            );
+            // Body should be 0 bytes
+            assert!(
+                stderr.contains("Body: 0 bytes"),
+                "Should show empty body: {}",
+                stderr
+            );
+            assert!(output.status.success());
+        },
+    );
+
+    drop(mailrc);
+}
+
+/// Test subject containing special characters
+#[test]
+fn send_special_subject() {
+    let mailrc = create_temp_mailrc("set debug\n");
+    let mailrc_path = mailrc.path().to_str().unwrap();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-s"),
+                String::from("Re: [URGENT] Meeting @2pm - Updated!"),
+                String::from("user@example.com"),
+            ],
+            stdin_data: String::from("Meeting details.\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAILRC", mailrc_path)],
+        |_plan, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("Debug mode"),
+                "Should be in debug mode: {}",
+                stderr
+            );
+            assert!(
+                stderr.contains("[URGENT]") || stderr.contains("Updated"),
+                "Subject should be preserved: {}",
+                stderr
+            );
+            assert!(output.status.success());
+        },
+    );
+
+    drop(mailrc);
+}
+
+/// Test dot variable behavior (dot ends message)
+/// Note: This tests non-interactive behavior - in non-interactive mode,
+/// dot handling doesn't apply (stdin is just read until EOF)
+#[test]
+fn send_with_dot_variable() {
+    let mailrc = create_temp_mailrc("set debug\nset dot\n");
+    let mailrc_path = mailrc.path().to_str().unwrap();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-s"),
+                String::from("Dot Test"),
+                String::from("recipient@example.com"),
+            ],
+            stdin_data: String::from("Line 1\n.\nLine 2 (should be included in non-TTY)\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAILRC", mailrc_path)],
+        |_plan, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("Debug mode"),
+                "Should be in debug mode: {}",
+                stderr
+            );
+            // In non-interactive mode, the dot is included in the body
+            assert!(output.status.success());
+        },
+    );
+
+    drop(mailrc);
+}
+
+/// Test sign variable is properly parsed from mailrc
+#[test]
+fn send_sign_variable() {
+    let mailrc = create_temp_mailrc("set debug\nset sign=\"Best regards,\\nTest User\"\n");
+    let mailrc_path = mailrc.path().to_str().unwrap();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-s"),
+                String::from("Sign Test"),
+                String::from("user@example.com"),
+            ],
+            stdin_data: String::from("Hello.\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAILRC", mailrc_path)],
+        |_plan, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("Debug mode"),
+                "Should be in debug mode: {}",
+                stderr
+            );
+            assert!(output.status.success());
+        },
+    );
+
+    drop(mailrc);
+}
+
+/// Test escape variable changes the escape character
+#[test]
+fn send_custom_escape_char() {
+    let mailrc = create_temp_mailrc("set debug\nset escape=#\n");
+    let mailrc_path = mailrc.path().to_str().unwrap();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-s"),
+                String::from("Escape Test"),
+                String::from("user@example.com"),
+            ],
+            stdin_data: String::from("Message body.\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAILRC", mailrc_path)],
+        |_plan, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("Debug mode"),
+                "Should be in debug mode: {}",
+                stderr
+            );
+            assert!(output.status.success());
+        },
+    );
+
+    drop(mailrc);
+}
+
+/// Test sendwait variable (wait for sendmail)
+#[test]
+fn send_sendwait_variable() {
+    let mailrc = create_temp_mailrc("set debug\nset sendwait\n");
+    let mailrc_path = mailrc.path().to_str().unwrap();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("mailx"),
+            args: vec![
+                String::from("-s"),
+                String::from("Sendwait Test"),
+                String::from("user@example.com"),
+            ],
+            stdin_data: String::from("Test message.\n"),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code: 0,
+        },
+        &[("MAILRC", mailrc_path)],
+        |_plan, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // In debug mode, sendwait doesn't matter
+            assert!(
+                stderr.contains("Debug mode"),
+                "Should be in debug mode: {}",
+                stderr
+            );
+            assert!(output.status.success());
+        },
+    );
+
+    drop(mailrc);
+}

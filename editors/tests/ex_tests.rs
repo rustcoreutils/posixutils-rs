@@ -256,3 +256,71 @@ fn test_ex_version_command() {
     // Just verify it runs without error
     ex_test("version\nq!\n", "");
 }
+
+// ============================================================================
+// Shift Command Tests
+// ============================================================================
+
+#[test]
+fn test_ex_shift_right() {
+    ex_test(
+        "a\nline one\nline two\n.\n1,2>\n1,$p\nq!\n",
+        "        line one\n        line two\n",
+    );
+}
+
+#[test]
+fn test_ex_shift_left() {
+    ex_test("a\n        indented\n.\n1<\n1p\nq!\n", "indented\n");
+}
+
+// ============================================================================
+// Line Number Command Tests
+// ============================================================================
+
+#[test]
+fn test_ex_line_number() {
+    ex_test("a\nline one\nline two\nline three\n.\n=\nq!\n", "3\n");
+}
+
+#[test]
+fn test_ex_line_number_with_address() {
+    ex_test("a\nline one\nline two\nline three\n.\n2=\nq!\n", "2\n");
+}
+
+// ============================================================================
+// Print with Line Numbers (#) Tests
+// ============================================================================
+
+#[test]
+fn test_ex_hash_command() {
+    ex_test(
+        "a\nfirst\nsecond\n.\n1,2#\nq!\n",
+        "     1\tfirst\n     2\tsecond\n",
+    );
+}
+
+// ============================================================================
+// Z Command Tests
+// ============================================================================
+
+#[test]
+fn test_ex_z_command() {
+    // z should display lines from the file
+    ex_test(
+        "a\nline 1\nline 2\nline 3\nline 4\nline 5\n.\n1z3\nq!\n",
+        "line 1\nline 2\nline 3\n",
+    );
+}
+
+// ============================================================================
+// Repeat Substitute (&) Tests
+// ============================================================================
+
+#[test]
+fn test_ex_repeat_substitute() {
+    ex_test(
+        "a\nhello world\nhello universe\n.\n1s/hello/hi/\n2&\n1,$p\nq!\n",
+        "hi world\nhi universe\n",
+    );
+}

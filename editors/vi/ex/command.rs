@@ -157,6 +157,36 @@ pub enum ExCommand {
     Visual,
     /// Enter open mode (:o, :open).
     Open { line: Option<usize> },
+    /// Adjust window (:z).
+    Z {
+        line: Option<usize>,
+        ztype: Option<char>,
+        count: Option<usize>,
+    },
+    /// Shift left (:<).
+    ShiftLeft {
+        range: AddressRange,
+        count: Option<usize>,
+    },
+    /// Shift right (:>).
+    ShiftRight {
+        range: AddressRange,
+        count: Option<usize>,
+    },
+    /// Write line number (:=).
+    LineNumber { line: Option<usize> },
+    /// Execute buffer (:@, :*).
+    Execute {
+        range: AddressRange,
+        buffer: Option<char>,
+    },
+    /// Suspend editor (:suspend, :stop, :sus).
+    Suspend,
+    /// Repeat substitute (:&).
+    RepeatSubstitute {
+        range: AddressRange,
+        flags: SubstituteFlags,
+    },
     /// No operation (empty command).
     Nop,
 }

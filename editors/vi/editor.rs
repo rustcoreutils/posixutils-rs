@@ -1931,6 +1931,34 @@ impl Editor {
             }
             ExCommand::Visual => Ok(ExResult::EnterVisual),
             ExCommand::Open { line } => Ok(ExResult::EnterOpen(line)),
+            ExCommand::Z { line, ztype, count } => {
+                let output = self.execute_ex_z(line, ztype, count)?;
+                Ok(ExResult::Output(output))
+            }
+            ExCommand::ShiftLeft { range, count } => {
+                self.execute_ex_shift_left(&range, count)?;
+                Ok(ExResult::Continue)
+            }
+            ExCommand::ShiftRight { range, count } => {
+                self.execute_ex_shift_right(&range, count)?;
+                Ok(ExResult::Continue)
+            }
+            ExCommand::LineNumber { line } => {
+                let line_num = self.execute_ex_line_number(line)?;
+                Ok(ExResult::Output(vec![line_num.to_string()]))
+            }
+            ExCommand::Execute { range, buffer } => {
+                self.execute_ex_execute(&range, buffer)?;
+                Ok(ExResult::Continue)
+            }
+            ExCommand::Suspend => {
+                self.execute_ex_suspend()?;
+                Ok(ExResult::Continue)
+            }
+            ExCommand::RepeatSubstitute { range, flags } => {
+                self.execute_ex_repeat_substitute(&range, &flags)?;
+                Ok(ExResult::Continue)
+            }
             ExCommand::Nop => Ok(ExResult::Continue),
             _ => {
                 // Other commands not yet implemented
@@ -2503,6 +2531,221 @@ impl Editor {
         let idx = (name as u8 - b'a') as usize;
         self.marks[idx] = Some(Position::new(target_line, 0));
         Ok(())
+    }
+
+    /// Execute :z command - adjust window display.
+    fn execute_ex_z(
+        &mut self,
+        line: Option<usize>,
+        ztype: Option<char>,
+        count: Option<usize>,
+    ) -> Result<Vec<String>> {
+        let scroll = self.options.scroll;
+        let count = count.unwrap_or(2 * scroll);
+        let mut target_line = line.unwrap_or_else(|| self.buffer.cursor().line);
+
+        // If no type and no line, advance to next line
+        if line.is_none() && ztype.is_none() {
+            target_line = (target_line + 1).min(self.buffer.line_count());
+        }
+
+        // Adjust target based on type
+        let start_line = match ztype {
+            Some('+') => target_line,
+            Some('-') => target_line.saturating_sub(count - 1).max(1),
+            Some('.') | Some('=') => {
+                // Center on this line
+                let half = count / 2;
+                target_line.saturating_sub(half).max(1)
+            }
+            Some('^') => target_line.saturating_sub(2 * count - 1).max(1),
+            None => target_line,
+            _ => target_line,
+        };
+
+        // Collect lines to output
+        let mut output = Vec::new();
+        let end_line = (start_line + count - 1).min(self.buffer.line_count());
+
+        if let Some('=') = ztype {
+            // For '=', print separator line around current line
+            let cols = self.terminal.size().cols as usize;
+            let separator: String = std::iter::repeat('-').take(40.min(cols / 2)).collect();
+            let half = count / 2;
+            let before_start = target_line.saturating_sub(half).max(1);
+
+            for i in before_start..target_line {
+                if let Some(line) = self.buffer.line(i) {
+                    output.push(line.content().to_string());
+                }
+            }
+            output.push(separator.clone());
+            if let Some(line) = self.buffer.line(target_line) {
+                output.push(line.content().to_string());
+            }
+            output.push(separator);
+            for i in (target_line + 1)..=(target_line + half).min(self.buffer.line_count()) {
+                if let Some(line) = self.buffer.line(i) {
+                    output.push(line.content().to_string());
+                }
+            }
+        } else {
+            for i in start_line..=end_line {
+                if let Some(line) = self.buffer.line(i) {
+                    output.push(line.content().to_string());
+                }
+            }
+        }
+
+        // Update current line
+        let new_current = if ztype == Some('=') {
+            target_line
+        } else {
+            end_line
+        };
+        self.buffer.set_line(new_current);
+        self.buffer.move_to_first_non_blank();
+
+        Ok(output)
+    }
+
+    /// Execute :< command - shift lines left.
+    fn execute_ex_shift_left(&mut self, range: &AddressRange, count: Option<usize>) -> Result<()> {
+        let (start, end) = self.resolve_range(range)?;
+        let shift_amount = count.unwrap_or(1) * self.options.shiftwidth;
+
+        for line_num in start..=end {
+            if let Some(line) = self.buffer.line(line_num) {
+                let content = line.content().to_string();
+                // Count leading whitespace
+                let leading: usize = content
+                    .chars()
+                    .take_while(|c| c.is_whitespace())
+                    .map(|c| if c == '\t' { self.options.tabstop } else { 1 })
+                    .sum();
+
+                if leading > 0 {
+                    let new_indent = leading.saturating_sub(shift_amount);
+                    let trimmed = content.trim_start();
+                    let new_content = format!("{}{}", " ".repeat(new_indent), trimmed);
+                    let _ = self.buffer.replace_line(line_num, &new_content);
+                }
+            }
+        }
+
+        self.buffer.set_line(end);
+        self.buffer.move_to_first_non_blank();
+        Ok(())
+    }
+
+    /// Execute :> command - shift lines right.
+    fn execute_ex_shift_right(&mut self, range: &AddressRange, count: Option<usize>) -> Result<()> {
+        let (start, end) = self.resolve_range(range)?;
+        let shift_amount = count.unwrap_or(1) * self.options.shiftwidth;
+
+        for line_num in start..=end {
+            if let Some(line) = self.buffer.line(line_num) {
+                let content = line.content().to_string();
+                // Don't shift empty lines
+                if !content.is_empty() {
+                    let new_content = format!("{}{}", " ".repeat(shift_amount), content);
+                    let _ = self.buffer.replace_line(line_num, &new_content);
+                }
+            }
+        }
+
+        self.buffer.set_line(end);
+        self.buffer.move_to_first_non_blank();
+        Ok(())
+    }
+
+    /// Execute := command - print line number.
+    fn execute_ex_line_number(&self, line: Option<usize>) -> Result<usize> {
+        // Default to last line in buffer
+        let line_num = line.unwrap_or_else(|| self.buffer.line_count());
+        Ok(line_num)
+    }
+
+    /// Execute :@ or :* command - execute buffer contents as ex commands.
+    fn execute_ex_execute(&mut self, range: &AddressRange, buffer: Option<char>) -> Result<()> {
+        // Get the buffer to execute
+        let buffer_char = buffer.unwrap_or_else(|| {
+            // Use last executed buffer, default to unnamed
+            self.last_macro_register.unwrap_or('"')
+        });
+
+        // Get buffer contents
+        let content = if buffer_char == '"' {
+            // Unnamed buffer
+            self.registers.get('"').map(|r| r.text.clone())
+        } else if buffer_char.is_ascii_alphabetic() {
+            self.registers.get(buffer_char).map(|r| r.text.clone())
+        } else {
+            None
+        };
+
+        let content = match content {
+            Some(c) if !c.is_empty() => c,
+            _ => return Err(ViError::BufferEmpty(buffer_char)),
+        };
+
+        // Remember this buffer for @@ / **
+        self.last_macro_register = Some(buffer_char);
+
+        // Execute for each line in the range (or just once if no explicit range)
+        let (start, end) = if range.explicit {
+            self.resolve_range(range)?
+        } else {
+            let current = self.buffer.cursor().line;
+            (current, current)
+        };
+
+        for line_num in start..=end {
+            self.buffer.set_line(line_num);
+            // Execute each line of the buffer content as an ex command
+            for cmd_line in content.lines() {
+                let cmd_line = cmd_line.trim();
+                if !cmd_line.is_empty() {
+                    self.execute_ex_input(cmd_line)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Execute :suspend or :stop command - suspend the editor.
+    fn execute_ex_suspend(&mut self) -> Result<()> {
+        // Restore terminal before suspending
+        self.terminal.disable_raw_mode()?;
+
+        // Send SIGTSTP to self
+        #[cfg(unix)]
+        unsafe {
+            libc::raise(libc::SIGTSTP);
+        }
+
+        // When we resume, re-enable raw mode and redraw
+        self.terminal.enable_raw_mode()?;
+        self.terminal.clear_screen()?;
+
+        Ok(())
+    }
+
+    /// Execute :& command - repeat last substitute.
+    fn execute_ex_repeat_substitute(
+        &mut self,
+        range: &AddressRange,
+        flags: &SubstituteFlags,
+    ) -> Result<()> {
+        // Get last substitute pattern and replacement
+        let (pattern, replacement) = match &self.last_substitution {
+            Some((p, r, _)) => (p.clone(), r.clone()),
+            None => return Err(ViError::NoPreviousSubstitution),
+        };
+
+        // Use provided flags or default to last flags
+        self.substitute(range, &pattern, &replacement, flags)
     }
 
     /// Search for next match.

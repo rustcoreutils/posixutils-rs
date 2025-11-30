@@ -591,12 +591,9 @@ fn parse_operands(args: &Args) -> io::Result<SplitOps> {
 
 /// Validates that the prefix + suffix won't exceed NAME_MAX
 fn validate_prefix(prefix: &str, suffix_len: u8) -> io::Result<()> {
-    // Get NAME_MAX for the current directory
-    #[cfg(target_os = "macos")]
+    // POSIX NAME_MAX is typically 255 on most systems (macOS, Linux, BSDs)
+    // Using a constant avoids platform-specific libc differences
     const NAME_MAX: usize = 255;
-
-    #[cfg(not(target_os = "macos"))]
-    const NAME_MAX: usize = libc::NAME_MAX as usize;
 
     // Maximum filename length is prefix + suffix digits
     let max_filename_len = prefix.len() + suffix_len as usize;

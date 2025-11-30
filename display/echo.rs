@@ -6,65 +6,104 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// TODO:
-// - echo needs to translate backslash-escaped octal numbers:
-// ```
-// \0num
-//	Write an 8-bit value that is the 0, 1, 2 or 3-digit octal number _num_.
-//
 
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
 use std::io::{self, Write};
 
-fn translate_str(skip_nl: bool, s: &str) -> String {
-    let mut output = String::with_capacity(s.len());
-
-    let mut in_bs = false;
+fn translate_str(skip_nl: bool, s: &str) -> Vec<u8> {
+    let mut output = Vec::with_capacity(s.len());
     let mut nl = true;
 
-    for ch in s.chars() {
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let ch = chars[i];
         if ch == '\\' {
-            in_bs = true;
-        } else if in_bs {
-            in_bs = false;
-            match ch {
+            if i + 1 >= chars.len() {
+                // Trailing backslash - preserve it
+                output.push(b'\\');
+                i += 1;
+                continue;
+            }
+
+            let next = chars[i + 1];
+            match next {
                 'a' => {
-                    output.push('\x07');
+                    output.push(0x07);
+                    i += 2;
                 }
                 'b' => {
-                    output.push('\x08');
+                    output.push(0x08);
+                    i += 2;
                 }
                 'c' => {
                     nl = false;
                     break;
                 }
                 'f' => {
-                    output.push('\x12');
+                    output.push(0x0c);
+                    i += 2;
                 }
                 'n' => {
-                    output.push('\n');
+                    output.push(b'\n');
+                    i += 2;
                 }
                 'r' => {
-                    output.push('\r');
+                    output.push(b'\r');
+                    i += 2;
                 }
                 't' => {
-                    output.push('\t');
+                    output.push(b'\t');
+                    i += 2;
                 }
                 'v' => {
-                    output.push('\x11');
+                    output.push(0x0b);
+                    i += 2;
                 }
                 '\\' => {
-                    output.push('\\');
+                    output.push(b'\\');
+                    i += 2;
                 }
-                _ => {}
+                '0' => {
+                    // Octal escape: \0num where num is 0-3 octal digits
+                    i += 2; // Skip \0
+                    let mut octal_value: u8 = 0;
+                    let mut digits = 0;
+
+                    while digits < 3 && i < chars.len() {
+                        let digit = chars[i];
+                        if ('0'..='7').contains(&digit) {
+                            octal_value = octal_value * 8 + (digit as u8 - b'0');
+                            i += 1;
+                            digits += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    // Push raw byte value directly - octal escapes produce single bytes
+                    output.push(octal_value);
+                }
+                _ => {
+                    // Unknown escape - preserve the character after backslash
+                    // Encode the char as UTF-8 bytes
+                    let mut buf = [0u8; 4];
+                    let encoded = next.encode_utf8(&mut buf);
+                    output.extend_from_slice(encoded.as_bytes());
+                    i += 2;
+                }
             }
         } else {
-            output.push(ch);
+            // Encode the char as UTF-8 bytes
+            let mut buf = [0u8; 4];
+            let encoded = ch.encode_utf8(&mut buf);
+            output.extend_from_slice(encoded.as_bytes());
+            i += 1;
         }
     }
 
     if nl && !skip_nl {
-        output.push('\n');
+        output.push(b'\n');
     }
 
     output
@@ -87,9 +126,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let echo_str = translate_str(skip_nl, &args.join(" "));
+    let echo_bytes = translate_str(skip_nl, &args.join(" "));
 
-    io::stdout().write_all(echo_str.as_bytes())?;
+    io::stdout().write_all(&echo_bytes)?;
 
     Ok(())
 }

@@ -33,35 +33,25 @@ There are several ways to contribute to posixutils-rs:
    Small, lightweight utility with command line processing,
    core algorithm, and zero external crate dependencies.
 3. "only std"  When an external crate is required, avoid mega-crates.  Prefer
-   std-only, or, tiny crates such as `atty` that perform a single,
+   std-only, or, tiny crates such as `tempfile` that perform a single,
    lightweight function.
 4. Correctness, readability, performance, in that order.
    Code should be readable by unfamiliar developers.  Avoid dense,
    uncommented code.
+5. Write small functions. Break up large functions.
+   The compiler can inline as needed.
 
 ### Testing, POSIX compliance and programmatic goals
 
-* All utilities should have tests.
-* Use plib's TestPlan framework for integration tests.
-* Test pattern:
-	1. Pre-generate input data files.
-	2. Run system OS utility on input data files,
-	   generating known-good output.
-	3. Store input and output in-tree, as known-good data.
-	4. Write a TestPlan that executes our utility, using
-	   static input data, and compares output with
-	   static output data.
-* Only "quick" tests should be run automatically in `cargo test`
-* Longer tests, or tests requiring root access, should be triggered
-  via special environment variables.
 * POSIX compliance
-* Support the most widely used GNU/BSD extensions
-* If a system has an OS-specific feature that _must_ be
-  exposed through a given utility, do so.
-* Race-free userland.  See `ftw` internal crate.
+* Full integration test coverage
+* Support widely used GNU/BSD extensions
+* Race-free userland.  (See `ftw` internal crate.)
 * Push small crates out:  Create tiny, light-dep crates from common
   functionality (such as Lex or Yacc file parsing), and publish via cargo.
   Remove from main posixutils tree and set of crates.
+* If a system has an OS-specific feature that _must_ be
+  exposed through a given utility, do so.
 
 ### Testing and Bug Reporting: Info to provide in GH issue
 
@@ -70,3 +60,17 @@ There are several ways to contribute to posixutils-rs:
 * Provide any error output from the utility.
 * Describe expected results:  What did you expect to happen, and did not?
 
+### Writing tests
+
+* Test pattern:
+	1. Pre-generate input data files.
+	2. Run system OS utility on input data files,
+	   generating known-good output.
+	3. Store input and output in-tree, as known-good data.
+	4. Write a TestPlan that executes our utility, using
+	   static input data, and compares output with
+	   static output data (OS reference data).
+* Use plib's TestPlan framework for integration tests.
+* Only "quick" tests should be run automatically in `cargo test`
+* Longer tests, or tests requiring root access, should be triggered
+  via special environment variables.

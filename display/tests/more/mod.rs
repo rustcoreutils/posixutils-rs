@@ -9,7 +9,7 @@
 
 use std::process::Output;
 
-use plib::testing::{run_test_with_checker, TestPlan};
+use plib::testing::{run_test_with_checker, run_test_with_checker_and_env, TestPlan};
 
 fn test_checker_more(plan: &TestPlan, output: &Output) {
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -42,6 +42,30 @@ fn run_test_more(
             expected_err: String::from(expected_err),
             expected_exit_code,
         },
+        test_checker_more,
+    );
+}
+
+fn run_test_more_with_env(
+    args: &[&str],
+    stdin_data: &str,
+    expected_out: &str,
+    expected_err: &str,
+    expected_exit_code: i32,
+    env_vars: &[(&str, &str)],
+) {
+    let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
+
+    run_test_with_checker_and_env(
+        TestPlan {
+            cmd: String::from("more"),
+            args: str_args,
+            stdin_data: String::from(stdin_data),
+            expected_out: String::from(expected_out),
+            expected_err: String::from(expected_err),
+            expected_exit_code,
+        },
+        env_vars,
         test_checker_more,
     );
 }
@@ -1175,5 +1199,67 @@ fn test_flags_n_tag() {
         "",
         "",
         0,
+    );
+}
+
+// POSIX compliance tests: MORE environment variable
+#[test]
+fn test_more_env_variable() {
+    // Test that MORE environment variable is parsed and applied
+    // Using -s option from MORE env var
+    run_test_more_with_env(
+        &[
+            "--test",
+            "-p",
+            "\":n:n:n:n:n\"",
+            "test_files/README.md",
+            "test_files/TODO.md",
+            "test_files/styled.txt",
+        ],
+        ":n ",
+        "",
+        "",
+        0,
+        &[("MORE", "-s")],
+    );
+}
+
+#[test]
+fn test_more_env_variable_with_n() {
+    // Test that MORE environment variable with -n option is parsed
+    run_test_more_with_env(
+        &[
+            "--test",
+            "-p",
+            "\":n:n:n:n:n\"",
+            "test_files/README.md",
+            "test_files/TODO.md",
+            "test_files/styled.txt",
+        ],
+        ":n ",
+        "",
+        "",
+        0,
+        &[("MORE", "-n 15")],
+    );
+}
+
+#[test]
+fn test_more_env_variable_combined() {
+    // Test that MORE environment variable can combine multiple options
+    run_test_more_with_env(
+        &[
+            "--test",
+            "-p",
+            "\":n:n:n:n:n\"",
+            "test_files/README.md",
+            "test_files/TODO.md",
+            "test_files/styled.txt",
+        ],
+        ":n ",
+        "",
+        "",
+        0,
+        &[("MORE", "-s -c")],
     );
 }

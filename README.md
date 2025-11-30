@@ -58,6 +58,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
 ## Stage 3 - Test coverage
 
  - [x] ar (Development)
+ - [x] asa
  - [x] awk
  - [x] basename
  - [x] bc
@@ -70,6 +71,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] cut
  - [x] diff
  - [x] dirname
+ - [x] echo
  - [x] ex (Editors)
  - [x] expand
  - [x] expr
@@ -97,6 +99,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] paste
  - [x] pax
  - [x] pr
+ - [x] printf
  - [x] readlink
  - [x] realpath
  - [x] rm
@@ -108,6 +111,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] strings
  - [x] strip (Development)
  - [x] tail
+ - [x] test
  - [x] time
  - [x] timeout
  - [x] tr
@@ -158,22 +162,18 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
 ## Stage 1 - Rough draft
 
- - [x] asa
  - [x] cal
  - [x] df
  - [x] du
- - [x] echo
  - [x] dd
  - [x] getconf
  - [x] id
  - [x] ipcs (IPC)
  - [x] kill
  - [x] logger
- - [x] printf
  - [x] ps
  - [x] stty
  - [x] tabs
- - [x] test
  - [x] tput
  - [x] tsort
  - [x] who

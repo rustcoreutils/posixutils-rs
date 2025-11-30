@@ -72,7 +72,7 @@ enum ParseOwnerGroupResult {
 
 fn parse_owner_group(owner_group: &str) -> Result<ParseOwnerGroupResult, String> {
     if owner_group.is_empty() || owner_group == ":" {
-        return Ok(ParseOwnerGroupResult::EmptyOrColon);
+        Ok(ParseOwnerGroupResult::EmptyOrColon)
     } else {
         match owner_group.split_once(':') {
             None => {

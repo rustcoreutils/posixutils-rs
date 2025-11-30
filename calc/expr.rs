@@ -227,14 +227,12 @@ fn logop(lhs: &Token, rhs: &Token, is_and: bool) -> Token {
         } else {
             Token::Integer(0)
         }
+    } else if !lhs_zero {
+        lhs.clone()
+    } else if !rhs_zero {
+        rhs.clone()
     } else {
-        if !lhs_zero {
-            lhs.clone()
-        } else if !rhs_zero {
-            rhs.clone()
-        } else {
-            Token::Integer(0)
-        }
+        Token::Integer(0)
     }
 }
 

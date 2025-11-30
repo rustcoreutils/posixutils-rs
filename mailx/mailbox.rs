@@ -230,7 +230,7 @@ impl Mailbox {
 
                 // Decide whether to show To or From
                 let address_field = if show_to && msg.from().contains(&user) {
-                    format!("To {}", truncate(&msg.to().to_string(), 18))
+                    format!("To {}", truncate(msg.to(), 18))
                 } else {
                     msg.from_short()
                 };

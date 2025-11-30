@@ -238,7 +238,7 @@ impl Mount {
         let percentage_used = percentage_used.ceil() as u32;
 
         FieldsData {
-            fields: fields,
+            fields,
             source: &self.devname,
             size: total,
             used,

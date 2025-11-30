@@ -595,7 +595,7 @@ fn spawn_input_thread(
                             '\n' => {
                                 if let Err(e) = handle_newline(
                                     &mut line_buffer,
-                                    &mut *bottom_line,
+                                    &mut bottom_line,
                                     split_row,
                                     &mut handle,
                                 ) {

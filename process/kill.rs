@@ -72,7 +72,7 @@ fn send_signal(prog_cfg: &Config, sig_no: i32) -> u32 {
     let mut exit_code = 0;
 
     for pid in &prog_cfg.pids {
-        let res = unsafe { libc::kill(*pid as libc::pid_t, sig_no as i32) };
+        let res = unsafe { libc::kill(*pid as libc::pid_t, sig_no) };
         if res != 0 {
             let err = std::io::Error::last_os_error();
             eprintln!("kill pid {}: {}", pid, err);

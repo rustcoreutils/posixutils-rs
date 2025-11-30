@@ -102,7 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // If no arguments are provided, display the current month
     if args.month.is_none() && args.year.is_none() {
         let now = chrono::Local::now();
-        args.month = Some(now.month() as u32);
+        args.month = Some(now.month());
         args.year = Some(now.year() as u32);
 
     // If only one argument is provided, assume it is the entire year

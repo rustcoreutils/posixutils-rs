@@ -16,7 +16,7 @@ pub struct EntryInternal<'a> {
     phantom: PhantomData<&'a libc::dirent>,
 }
 
-impl<'a> EntryInternal<'a> {
+impl EntryInternal<'_> {
     pub fn name_cstr(&self) -> &CStr {
         // Avoid dereferencing `dirent` when getting its fields. See note at:
         // https://github.com/rust-lang/rust/blob/1.80.1/library/std/src/sys/pal/unix/fs.rs#L725-L742
@@ -193,7 +193,7 @@ pub struct DeferredDirIterator<'a> {
     visited: RefMut<'a, HashSet<libc::ino_t>>,
 }
 
-impl<'a> Drop for DeferredDirIterator<'a> {
+impl Drop for DeferredDirIterator<'_> {
     fn drop(&mut self) {
         unsafe {
             libc::closedir(self.dirp);

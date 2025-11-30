@@ -2567,7 +2567,7 @@ impl Editor {
         if let Some('=') = ztype {
             // For '=', print separator line around current line
             let cols = self.terminal.size().cols as usize;
-            let separator: String = std::iter::repeat('-').take(40.min(cols / 2)).collect();
+            let separator: String = "-".repeat(40.min(cols / 2));
             let half = count / 2;
             let before_start = target_line.saturating_sub(half).max(1);
 

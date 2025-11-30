@@ -1561,6 +1561,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "posixutils-mailx"
+version = "0.2.2"
+dependencies = [
+ "chrono",
+ "dirs 5.0.1",
+ "filetime",
+ "plib",
+ "tempfile",
+]
+
+[[package]]
 name = "posixutils-make"
 version = "0.2.2"
 dependencies = [

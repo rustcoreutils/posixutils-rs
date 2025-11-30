@@ -1,0 +1,22 @@
+[package]
+name = "posixutils-mailx"
+version = "0.2.2"
+authors = ["Jeff Garzik"]
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+dirs = "5"
+plib = { path = "../plib" }
+
+[dev-dependencies]
+tempfile = "3"
+filetime = "0.2"
+
+[[bin]]
+name = "mailx"
+path = "./main.rs"
+

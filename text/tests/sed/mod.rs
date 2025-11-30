@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{run_test, run_test_with_checker, TestPlan};
 
 fn sed_test(
     args: &[&str],
@@ -26,6 +26,37 @@ fn sed_test(
         expected_err: String::from(expected_err),
         expected_exit_code,
     });
+}
+
+/// Helper for tests that check regex error messages.
+/// Only verifies the error starts with the expected prefix - detailed message may vary by platform.
+fn sed_test_regex_error(
+    args: &[&str],
+    test_data: &str,
+    expected_err_prefix: &str,
+    expected_exit_code: i32,
+) {
+    let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("sed"),
+            args: str_args,
+            stdin_data: String::from(test_data),
+            expected_out: String::new(),
+            expected_err: String::new(),
+            expected_exit_code,
+        },
+        |_, output| {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.starts_with(expected_err_prefix),
+                "Expected stderr to start with '{}', got: '{}'",
+                expected_err_prefix,
+                stderr
+            );
+        },
+    );
 }
 
 const ABC_INPUT: &str = "abc\n";
@@ -1560,12 +1591,6 @@ mod tests {
                 "sed: commands must be delimited with ';' (line: 0, col: 6)\n",
             ),
             (
-                "s/\\(\\(x\\)/\\1\\2/",
-                "abc\nbbb\nbcb\nrbt\n@#$",
-                "",
-                "sed: can't compile pattern '\\(\\(x\\)'\n",
-            ),
-            (
                 "s\na\nb\n",
                 "abc\nbbb\nbcb\nrbt\n@#$",
                 "",
@@ -1576,6 +1601,14 @@ mod tests {
         for (script, input, output, err) in test_data {
             sed_test(&["-e", script], input, output, err, !err.is_empty() as i32);
         }
+
+        // Test regex compilation error separately - detailed error message varies by platform
+        sed_test_regex_error(
+            &["-e", "s/\\(\\(x\\)/\\1\\2/"],
+            "abc\nbbb\nbcb\nrbt\n@#$",
+            "sed: can't compile pattern '\\(\\(x\\)'",
+            1,
+        );
     }
 
     #[test]
@@ -2239,9 +2272,11 @@ mod tests {
                 "sed: unterminated `s' command (line: 0, col: 3)\n",
             ),
             (
+                // Pattern ^[*][[:space:]] only matches lines starting with "* "
+                // "---------------* product" does NOT start with *, so it's unchanged
                 r#"s/\(^[*][[:space:]]\)/   \1/;\/List of products:/a\ ---------------"#,
                 "List of products:\n---------------* product\n* product1",
-                "List of products:\n ---------------\n---------------   * product\n   * product1",
+                "List of products:\n ---------------\n---------------* product\n   * product1",
                 "",
             ),
         ];

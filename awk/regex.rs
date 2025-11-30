@@ -7,36 +7,14 @@
 // SPDX-License-Identifier: MIT
 //
 
+use plib::regex::{Match, Regex as PlibRegex, RegexFlags};
 use std::ffi::CString;
-use std::ptr;
 
-fn regex_compilation_result(
-    status_integer: libc::c_int,
-    regex: &libc::regex_t,
-) -> Result<(), String> {
-    if status_integer != 0 {
-        let mut error_buffer = vec![b'\0'; 128];
-        unsafe {
-            libc::regerror(
-                status_integer,
-                ptr::from_ref(regex),
-                error_buffer.as_mut_ptr() as *mut libc::c_char,
-                128,
-            )
-        };
-        let error = CString::from_vec_with_nul(error_buffer)
-            .expect("error message returned from `libc::regerror` is an invalid CString");
-        Err(error
-            .into_string()
-            .expect("error message from `libc::regerror' contains invalid utf-8"))
-    } else {
-        Ok(())
-    }
-}
-
+/// A regex wrapper that provides CString-compatible API for AWK.
+/// Internally uses plib::regex for POSIX ERE support.
 pub struct Regex {
-    raw_regex: libc::regex_t,
-    regex_string: CString,
+    inner: PlibRegex,
+    pattern_string: String,
 }
 
 #[cfg_attr(test, derive(Debug))]
@@ -46,8 +24,20 @@ pub struct RegexMatch {
     pub end: usize,
 }
 
+impl From<Match> for RegexMatch {
+    fn from(m: Match) -> Self {
+        RegexMatch {
+            start: m.start,
+            end: m.end,
+        }
+    }
+}
+
+/// Iterator over regex matches in a string.
+/// Owns the input CString to preserve lifetimes.
 pub struct MatchIter<'re> {
-    string: CString,
+    // Store the string as owned String to avoid lifetime issues
+    string: String,
     next_start: usize,
     regex: &'re Regex,
 }
@@ -55,86 +45,74 @@ pub struct MatchIter<'re> {
 impl Iterator for MatchIter<'_> {
     type Item = RegexMatch;
     fn next(&mut self) -> Option<Self::Item> {
-        if self.next_start >= self.string.as_bytes().len() {
+        if self.next_start >= self.string.len() {
             return None;
         }
-        let mut match_range = libc::regmatch_t {
-            rm_so: -1,
-            rm_eo: -1,
-        };
-        let exec_status = unsafe {
-            libc::regexec(
-                ptr::from_ref(&self.regex.raw_regex),
-                self.string.as_ptr().add(self.next_start),
-                1,
-                ptr::from_mut(&mut match_range),
-                0,
-            )
-        };
-        if exec_status == libc::REG_NOMATCH {
-            return None;
-        }
+
+        // Find match starting from current offset
+        let substring = &self.string[self.next_start..];
+        let m = self.regex.inner.find(substring)?;
+
         let result = RegexMatch {
-            start: self.next_start + match_range.rm_so as usize,
-            end: self.next_start + match_range.rm_eo as usize,
+            start: self.next_start + m.start,
+            end: self.next_start + m.end,
         };
-        self.next_start += match_range.rm_eo as usize;
+
+        // Move past this match for next iteration
+        // Ensure we make progress even on zero-width matches
+        self.next_start = if m.end > 0 {
+            self.next_start + m.end
+        } else {
+            self.next_start + 1
+        };
+
         Some(result)
     }
 }
 
 impl Regex {
     pub fn new(regex: CString) -> Result<Self, String> {
-        let mut raw = unsafe { std::mem::zeroed::<libc::regex_t>() };
-        let compilation_status =
-            unsafe { libc::regcomp(ptr::from_mut(&mut raw), regex.as_ptr(), libc::REG_EXTENDED) };
-        regex_compilation_result(compilation_status, &raw)?;
+        let pattern = regex.to_str().map_err(|e| e.to_string())?;
+        let inner = PlibRegex::new(pattern, RegexFlags::ere()).map_err(|e| e.to_string())?;
         Ok(Self {
-            raw_regex: raw,
-            regex_string: regex,
+            inner,
+            pattern_string: pattern.to_string(),
         })
     }
 
+    /// Returns an iterator over all match locations in the string.
+    /// Takes ownership of the CString.
     pub fn match_locations(&self, string: CString) -> MatchIter {
+        let s = string.into_string().unwrap_or_default();
         MatchIter {
             next_start: 0,
             regex: self,
-            string,
+            string: s,
         }
     }
 
     pub fn matches(&self, string: &CString) -> bool {
-        let exec_status = unsafe {
-            libc::regexec(
-                ptr::from_ref(&self.raw_regex),
-                string.as_ptr(),
-                0,
-                ptr::null_mut(),
-                0,
-            )
-        };
-        exec_status != libc::REG_NOMATCH
+        let s = string.to_str().unwrap_or("");
+        self.inner.is_match(s)
     }
 }
 
 impl Drop for Regex {
     fn drop(&mut self) {
-        unsafe {
-            libc::regfree(ptr::from_mut(&mut self.raw_regex));
-        }
+        // plib::regex handles cleanup internally
     }
 }
 
 #[cfg(test)]
 impl core::fmt::Debug for Regex {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        writeln!(f, "/{}/", self.regex_string.to_str().unwrap())
+        writeln!(f, "/{}/", self.pattern_string)
     }
 }
 
 impl PartialEq for Regex {
     fn eq(&self, other: &Self) -> bool {
-        self.regex_string == other.regex_string
+        self.pattern_string == other.pattern_string
     }
 }
 

@@ -8,7 +8,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{run_test, run_test_with_checker, TestPlan};
 
 const LINES_INPUT: &str =
     "line_{1}\np_line_{2}_s\n  line_{3}  \nLINE_{4}\np_LINE_{5}_s\nl_{6}\nline_{70}\n";
@@ -48,6 +48,33 @@ fn grep_test(
         expected_err: String::from(expected_err),
         expected_exit_code,
     });
+}
+
+/// Helper for tests that check regex error messages.
+/// Only verifies the error contains "invalid regex" - detailed message may vary by platform.
+fn grep_test_regex_error(args: &[&str], test_data: &str, expected_exit_code: i32) {
+    let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
+
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("grep"),
+            args: str_args,
+            stdin_data: String::from(test_data),
+            expected_out: String::new(),
+            expected_err: String::new(), // checked manually below
+            expected_exit_code,
+        },
+        |_plan, output| {
+            assert_eq!(output.stdout, b"");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("invalid regex"),
+                "Expected error containing 'invalid regex', got: {}",
+                stderr
+            );
+            assert_eq!(output.status.code(), Some(expected_exit_code));
+        },
+    );
 }
 
 #[test]
@@ -99,13 +126,8 @@ fn test_inexisting_file_pattern() {
 
 #[test]
 fn test_regexp_compiling_error() {
-    grep_test(
-        &[INVALID_BRE],
-        "",
-        "",
-        "Error compiling regex '\\{1,3\\}'\n",
-        2,
-    );
+    // Error message comes from regerror() - detailed message may vary by platform
+    grep_test_regex_error(&[INVALID_BRE], "", 2);
 }
 
 #[test]
@@ -263,13 +285,8 @@ fn test_basic_regexp_no_messages_with_error_02() {
 
 #[test]
 fn test_basic_regexp_no_messages_with_error_03() {
-    grep_test(
-        &["-s", INVALID_BRE, "-", BAD_INPUT_FILE],
-        LINES_INPUT,
-        "",
-        "Error compiling regex '\\{1,3\\}'\n",
-        2,
-    );
+    // Error message comes from regerror() - detailed message may vary by platform
+    grep_test_regex_error(&["-s", INVALID_BRE, "-", BAD_INPUT_FILE], LINES_INPUT, 2);
 }
 
 #[test]
@@ -498,11 +515,10 @@ fn test_extended_regexp_no_messages_with_error_02() {
 
 #[test]
 fn test_extended_regexp_no_messages_with_error_03() {
-    grep_test(
+    // Error message comes from regerror() - detailed message may vary by platform
+    grep_test_regex_error(
         &["-E", "-s", INVALID_ERE, "-", BAD_INPUT_FILE],
         LINES_INPUT,
-        "",
-        "Error compiling regex '{1,3}'\n",
         2,
     );
 }

@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 gettext-rs.workspace = true
 libc.workspace = true
+plib = { path = "../plib" }
 
 [dev-dependencies]
 plib = { path = "../plib" }

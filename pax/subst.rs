@@ -19,19 +19,16 @@
 //! - `g` flag: global replacement (all occurrences)
 //! - `p` flag: print successful substitutions to stderr
 //!
-//! This implementation uses POSIX regcomp/regexec for BRE support.
+//! This implementation uses plib::regex for POSIX BRE support.
 
 use crate::error::{PaxError, PaxResult};
-use std::ffi::{CStr, CString};
-
-/// Maximum number of subexpression matches (POSIX requires at least 9)
-const MAX_MATCHES: usize = 10;
+use plib::regex::{Match, Regex, RegexFlags, MAX_CAPTURES};
 
 /// A compiled substitution expression from -s option
 #[derive(Debug)]
 pub struct Substitution {
     /// Compiled POSIX regex
-    regex: PosixRegex,
+    regex: Regex,
     /// Replacement template string (with & and \n references)
     replacement: String,
     /// Replace all occurrences (g flag)
@@ -53,8 +50,6 @@ pub enum SubstResult {
 
 impl Clone for Substitution {
     fn clone(&self) -> Self {
-        // Re-parse the pattern to create a new compiled regex
-        // This is safe because we already validated it
         Substitution {
             regex: self.regex.clone(),
             replacement: self.replacement.clone(),
@@ -112,7 +107,8 @@ impl Substitution {
         }
 
         // Compile the POSIX BRE regex
-        let regex = PosixRegex::compile(&old_pattern)?;
+        let regex = Regex::new(&old_pattern, RegexFlags::bre())
+            .map_err(|e| PaxError::PatternError(e.to_string()))?;
 
         Ok(Substitution {
             regex,
@@ -130,8 +126,7 @@ impl Substitution {
 
         loop {
             // Try to match at or after current position
-            let search_str = &result[pos..];
-            let matches = match self.regex.exec(search_str) {
+            let matches = match self.regex.captures_at(&result, pos) {
                 Some(m) => m,
                 None => break,
             };
@@ -139,11 +134,11 @@ impl Substitution {
             any_match = true;
 
             // Build the replacement string
-            let replacement = build_replacement(&self.replacement, search_str, &matches);
+            let replacement = build_replacement(&self.replacement, &result, &matches);
 
             // Get the absolute positions in result
-            let match_start = pos + matches[0].0;
-            let match_end = pos + matches[0].1;
+            let match_start = matches[0].start;
+            let match_end = matches[0].end;
 
             // Replace the matched portion
             let new_result = format!(
@@ -192,27 +187,26 @@ impl Substitution {
 }
 
 /// Build the replacement string from template and match groups
-fn build_replacement(
-    template: &str,
-    input: &str,
-    matches: &[(usize, usize); MAX_MATCHES],
-) -> String {
+fn build_replacement(template: &str, input: &str, matches: &[Match]) -> String {
     let mut result = String::new();
     let mut chars = template.chars().peekable();
 
     while let Some(c) = chars.next() {
         if c == '&' {
             // & is replaced by entire match
-            if matches[0].1 > matches[0].0 {
-                result.push_str(&input[matches[0].0..matches[0].1]);
+            if !matches.is_empty() && matches[0].end > matches[0].start {
+                result.push_str(&input[matches[0].start..matches[0].end]);
             }
         } else if c == '\\' {
             if let Some(&next) = chars.peek() {
                 if next.is_ascii_digit() && next != '0' {
                     // \1 through \9 - backreference
                     let idx = (next as usize) - ('0' as usize);
-                    if idx < MAX_MATCHES && matches[idx].1 > matches[idx].0 {
-                        result.push_str(&input[matches[idx].0..matches[idx].1]);
+                    if idx < matches.len()
+                        && idx < MAX_CAPTURES
+                        && matches[idx].end > matches[idx].start
+                    {
+                        result.push_str(&input[matches[idx].start..matches[idx].end]);
                     }
                     chars.next();
                 } else if next == '\\' {
@@ -292,142 +286,6 @@ pub fn apply_substitutions(substitutions: &[Substitution], path: &str) -> SubstR
     SubstResult::Unchanged
 }
 
-/// Wrapper around POSIX regex functions
-#[derive(Debug)]
-struct PosixRegex {
-    /// The original pattern string (for cloning)
-    pattern: String,
-    /// Compiled regex_t
-    #[cfg(unix)]
-    compiled: *mut libc::regex_t,
-    #[cfg(not(unix))]
-    compiled: (),
-}
-
-impl Clone for PosixRegex {
-    fn clone(&self) -> Self {
-        // Re-compile the pattern
-        PosixRegex::compile(&self.pattern).expect("failed to clone already-valid regex")
-    }
-}
-
-impl PosixRegex {
-    /// Compile a POSIX Basic Regular Expression
-    #[cfg(unix)]
-    fn compile(pattern: &str) -> PaxResult<Self> {
-        let c_pattern = CString::new(pattern)
-            .map_err(|_| PaxError::PatternError("pattern contains null byte".to_string()))?;
-
-        unsafe {
-            let regex_ptr =
-                libc::malloc(std::mem::size_of::<libc::regex_t>()) as *mut libc::regex_t;
-            if regex_ptr.is_null() {
-                return Err(PaxError::PatternError(
-                    "failed to allocate regex".to_string(),
-                ));
-            }
-
-            // REG_NEWLINE is not used - we want . to NOT match newline by default
-            let flags = 0; // BRE with no special flags
-
-            let result = libc::regcomp(regex_ptr, c_pattern.as_ptr(), flags);
-            if result != 0 {
-                // Get error message
-                let mut errbuf = [0u8; 256];
-                libc::regerror(
-                    result,
-                    regex_ptr,
-                    errbuf.as_mut_ptr() as *mut libc::c_char,
-                    errbuf.len(),
-                );
-                libc::regfree(regex_ptr);
-                libc::free(regex_ptr as *mut libc::c_void);
-
-                let err_msg = CStr::from_ptr(errbuf.as_ptr() as *const libc::c_char)
-                    .to_string_lossy()
-                    .to_string();
-                return Err(PaxError::PatternError(format!(
-                    "invalid regex '{}': {}",
-                    pattern, err_msg
-                )));
-            }
-
-            Ok(PosixRegex {
-                pattern: pattern.to_string(),
-                compiled: regex_ptr,
-            })
-        }
-    }
-
-    #[cfg(not(unix))]
-    fn compile(pattern: &str) -> PaxResult<Self> {
-        // Fallback for non-Unix - just store the pattern
-        // This won't actually work for matching
-        Ok(PosixRegex {
-            pattern: pattern.to_string(),
-            compiled: (),
-        })
-    }
-
-    /// Execute the regex against a string
-    /// Returns array of (start, end) for each match group, or None if no match
-    #[cfg(unix)]
-    fn exec(&self, input: &str) -> Option<[(usize, usize); MAX_MATCHES]> {
-        let c_input = match CString::new(input) {
-            Ok(s) => s,
-            Err(_) => return None,
-        };
-
-        unsafe {
-            let mut matches: [libc::regmatch_t; MAX_MATCHES] = std::mem::zeroed();
-
-            let result = libc::regexec(
-                self.compiled,
-                c_input.as_ptr(),
-                MAX_MATCHES,
-                matches.as_mut_ptr(),
-                0,
-            );
-
-            if result != 0 {
-                return None;
-            }
-
-            // Convert regmatch_t to (usize, usize) pairs
-            let mut result_matches = [(0usize, 0usize); MAX_MATCHES];
-            for (i, m) in matches.iter().enumerate() {
-                if m.rm_so >= 0 && m.rm_eo >= 0 {
-                    result_matches[i] = (m.rm_so as usize, m.rm_eo as usize);
-                }
-            }
-
-            Some(result_matches)
-        }
-    }
-
-    #[cfg(not(unix))]
-    fn exec(&self, _input: &str) -> Option<[(usize, usize); MAX_MATCHES]> {
-        // Fallback for non-Unix - no matching capability
-        None
-    }
-}
-
-#[cfg(unix)]
-impl Drop for PosixRegex {
-    fn drop(&mut self) {
-        unsafe {
-            if !self.compiled.is_null() {
-                libc::regfree(self.compiled);
-                libc::free(self.compiled as *mut libc::c_void);
-            }
-        }
-    }
-}
-
-// SAFETY: The compiled regex is not shared between threads
-unsafe impl Send for PosixRegex {}
-unsafe impl Sync for PosixRegex {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -479,7 +337,7 @@ mod tests {
         // But our parser handles delimiter escaping in the -s expression itself
         let s = Substitution::parse("/foo\\/bar/baz/").unwrap();
         // The pattern should be "foo/bar" (with literal /)
-        assert_eq!(s.regex.pattern, "foo/bar");
+        assert_eq!(s.regex.as_str(), "foo/bar");
     }
 
     #[test]

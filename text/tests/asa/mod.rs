@@ -162,3 +162,27 @@ fn asa_fortran_style_report() {
     let expected = "\x0cREPORT TITLE\n\nDATA LINE 1\nDATA LINE 2\n\nSECTION 2\nDATA LINE 3\n";
     asa_test(input, expected);
 }
+
+// Test multi-byte UTF-8 content (control char is ASCII, content is UTF-8)
+#[test]
+fn asa_utf8_content() {
+    asa_test(" héllo wörld\n", "héllo wörld\n");
+}
+
+#[test]
+fn asa_cjk_content() {
+    asa_test(" 日本語テスト\n", "日本語テスト\n");
+}
+
+// Test multi-byte UTF-8 as control character (non-standard, treated as space per POSIX)
+#[test]
+fn asa_multibyte_control_char() {
+    // Multi-byte char as control: treated as unknown, like space
+    asa_test("éhello\n", "hello\n");
+}
+
+#[test]
+fn asa_cjk_control_char() {
+    // 3-byte CJK char as control: treated as unknown, like space
+    asa_test("日test\n", "test\n");
+}

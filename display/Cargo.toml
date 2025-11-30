@@ -12,6 +12,7 @@ clap.workspace = true
 clap.features = ["env"]
 gettext-rs.workspace = true
 libc.workspace = true
+plib = { path = "../plib" }
 termion = "4.0"
 thiserror = "1.0"
 

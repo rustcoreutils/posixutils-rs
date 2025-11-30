@@ -324,15 +324,96 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
         }
         "c" | "change" => Ok(ExCommand::Change { range }),
 
+        // Visual and open mode commands
+        "vi" | "visual" => Ok(ExCommand::Visual),
+        "o" | "open" => {
+            let line = range.start.as_ref().and_then(|a| {
+                if let Address::Line(n) = a {
+                    Some(*n)
+                } else {
+                    None
+                }
+            });
+            Ok(ExCommand::Open { line })
+        }
+
+        // Adjust window (z command)
+        "z" => {
+            let line = range.start.as_ref().and_then(|a| {
+                if let Address::Line(n) = a {
+                    Some(*n)
+                } else {
+                    None
+                }
+            });
+            let (ztype, count) = parse_z_args(args);
+            Ok(ExCommand::Z { line, ztype, count })
+        }
+
+        // Shift left/right
+        "<" => Ok(ExCommand::ShiftLeft {
+            range,
+            count: parse_optional_count(args),
+        }),
+        ">" => Ok(ExCommand::ShiftRight {
+            range,
+            count: parse_optional_count(args),
+        }),
+
+        // Write line number
+        "=" => {
+            let line = range.start.as_ref().and_then(|a| {
+                if let Address::Line(n) = a {
+                    Some(*n)
+                } else {
+                    None
+                }
+            });
+            Ok(ExCommand::LineNumber { line })
+        }
+
+        // Execute buffer
+        "@" | "*" => {
+            let buffer = args
+                .chars()
+                .next()
+                .filter(|c| c.is_ascii_alphabetic() || *c == '@' || *c == '*');
+            Ok(ExCommand::Execute { range, buffer })
+        }
+
+        // Suspend
+        "su" | "sus" | "suspend" | "st" | "stop" => Ok(ExCommand::Suspend),
+
+        // Repeat substitute (&)
+        "&" => {
+            let flags = SubstituteFlags::parse(args);
+            Ok(ExCommand::RepeatSubstitute { range, flags })
+        }
+
+        // Print with line numbers (#) - alias for number
+        "#" => Ok(ExCommand::Number {
+            range,
+            count: parse_optional_count(args),
+        }),
+
         _ => Err(ViError::InvalidCommand(cmd_name)),
     }
 }
 
 /// Split command name from arguments.
 fn split_command(input: &str) -> (&str, &str) {
-    // Special case: ! is a single-character command
-    if let Some(rest) = input.strip_prefix('!') {
-        return ("!", rest.trim_start());
+    // Special case: single-character commands
+    let first_char = input.chars().next();
+    match first_char {
+        Some('!') => return ("!", input[1..].trim_start()),
+        Some('<') => return ("<", input[1..].trim_start()),
+        Some('>') => return (">", input[1..].trim_start()),
+        Some('=') => return ("=", input[1..].trim_start()),
+        Some('@') => return ("@", input[1..].trim_start()),
+        Some('*') => return ("*", input[1..].trim_start()),
+        Some('&') => return ("&", input[1..].trim_start()),
+        Some('#') => return ("#", input[1..].trim_start()),
+        _ => {}
     }
 
     // Find end of command name (letters only, or special chars like !)
@@ -500,6 +581,25 @@ fn parse_line_number(args: &str) -> Result<usize> {
     args.trim()
         .parse()
         .map_err(|_| ViError::InvalidAddress("invalid line number".to_string()))
+}
+
+/// Parse z command arguments (type character and optional count).
+fn parse_z_args(args: &str) -> (Option<char>, Option<usize>) {
+    let args = args.trim();
+    if args.is_empty() {
+        return (None, None);
+    }
+
+    let first = args.chars().next().unwrap();
+    // Valid z types: +, -, ., =, ^
+    if ['+', '-', '.', '=', '^'].contains(&first) {
+        let count = args[1..].trim().parse().ok();
+        (Some(first), count)
+    } else {
+        // Just a count
+        let count = args.parse().ok();
+        (None, count)
+    }
 }
 
 #[cfg(test)]

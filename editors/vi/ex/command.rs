@@ -153,6 +153,40 @@ pub enum ExCommand {
     Insert { line: usize },
     /// Change lines (:c, :change).
     Change { range: AddressRange },
+    /// Enter visual mode (:vi, :visual).
+    Visual,
+    /// Enter open mode (:o, :open).
+    Open { line: Option<usize> },
+    /// Adjust window (:z).
+    Z {
+        line: Option<usize>,
+        ztype: Option<char>,
+        count: Option<usize>,
+    },
+    /// Shift left (:<).
+    ShiftLeft {
+        range: AddressRange,
+        count: Option<usize>,
+    },
+    /// Shift right (:>).
+    ShiftRight {
+        range: AddressRange,
+        count: Option<usize>,
+    },
+    /// Write line number (:=).
+    LineNumber { line: Option<usize> },
+    /// Execute buffer (:@, :*).
+    Execute {
+        range: AddressRange,
+        buffer: Option<char>,
+    },
+    /// Suspend editor (:suspend, :stop, :sus).
+    Suspend,
+    /// Repeat substitute (:&).
+    RepeatSubstitute {
+        range: AddressRange,
+        flags: SubstituteFlags,
+    },
     /// No operation (empty command).
     Nop,
 }
@@ -218,6 +252,10 @@ pub enum ExResult {
     Insert(usize, usize),
     /// Command needs more input (for :g).
     Pending(String),
+    /// Enter visual mode.
+    EnterVisual,
+    /// Enter open mode at optional line.
+    EnterOpen(Option<usize>),
 }
 
 #[cfg(test)]

@@ -8,7 +8,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use plib::testing::{run_test, TestPlan};
+use plib::testing::{run_test, run_test_with_checker, TestPlan};
 
 fn csplit_test(args: &[&str], test_data: &str, expected_output: &str) {
     let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
@@ -257,16 +257,27 @@ fn test_csplit_error_invalid_bre() {
         .map(|s| String::from(*s))
         .collect();
 
-    run_test(TestPlan {
-        cmd: String::from("csplit"),
-        args: str_args,
-        stdin_data: String::from("line1\nline2\n"),
-        expected_out: String::from(""),
-        expected_err: String::from(
-            "Error: Custom { kind: InvalidInput, error: \"invalid BRE pattern: [invalid\" }\n",
-        ),
-        expected_exit_code: 1,
-    });
+    // Use checker to only verify error prefix - detailed message may vary by platform
+    run_test_with_checker(
+        TestPlan {
+            cmd: String::from("csplit"),
+            args: str_args,
+            stdin_data: String::from("line1\nline2\n"),
+            expected_out: String::from(""),
+            expected_err: String::new(), // checked manually below
+            expected_exit_code: 1,
+        },
+        |_plan, output| {
+            assert_eq!(output.stdout, b"");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("invalid regex"),
+                "Expected error containing 'invalid regex', got: {}",
+                stderr
+            );
+            assert_eq!(output.status.code(), Some(1));
+        },
+    );
 }
 
 // Test -k option: files should be kept on error

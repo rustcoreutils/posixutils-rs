@@ -9,12 +9,10 @@
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use libc::{regcomp, regex_t, regexec, regfree, REG_NOMATCH};
-use std::ffi::CString;
+use plib::regex::Regex;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Error, ErrorKind, Read, Write};
 use std::path::PathBuf;
-use std::ptr;
 
 /// csplit - split files based on context
 #[derive(Parser)]
@@ -43,56 +41,8 @@ struct Args {
     operands: Vec<String>,
 }
 
-/// POSIX Basic Regular Expression wrapper using libc regcomp/regexec
-struct BreRegex {
-    regex: regex_t,
-    #[cfg(test)]
-    pattern: String,
-}
-
-impl BreRegex {
-    fn new(pattern: &str) -> io::Result<Self> {
-        let c_pattern =
-            CString::new(pattern).map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
-        let mut regex = unsafe { std::mem::zeroed::<regex_t>() };
-
-        // Use 0 for cflags to get BRE (not REG_EXTENDED)
-        let result = unsafe { regcomp(&mut regex, c_pattern.as_ptr(), 0) };
-        if result != 0 {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                format!("invalid BRE pattern: {}", pattern),
-            ));
-        }
-
-        Ok(BreRegex {
-            regex,
-            #[cfg(test)]
-            pattern: pattern.to_string(),
-        })
-    }
-
-    fn is_match(&self, text: &str) -> bool {
-        let Ok(c_text) = CString::new(text) else {
-            return false;
-        };
-        unsafe { regexec(&self.regex, c_text.as_ptr(), 0, ptr::null_mut(), 0) != REG_NOMATCH }
-    }
-
-    #[cfg(test)]
-    fn as_str(&self) -> &str {
-        &self.pattern
-    }
-}
-
-impl Drop for BreRegex {
-    fn drop(&mut self) {
-        unsafe { regfree(&mut self.regex) }
-    }
-}
-
 enum Operand {
-    Rx(BreRegex, isize, bool),
+    Rx(Regex, isize, bool),
     LineNum(usize),
     Repeat(usize),
 }
@@ -498,7 +448,7 @@ fn parse_op_rx(opstr: &str, delim: char) -> io::Result<Operand> {
     // parse string sandwiched between two delimiter chars
     let end_pos = res.unwrap();
     let re_str = &opstr[1..end_pos];
-    let re = BreRegex::new(re_str)?;
+    let re = Regex::bre(re_str)?;
 
     // reference offset string
     let mut offset_str = &opstr[end_pos + 1..];

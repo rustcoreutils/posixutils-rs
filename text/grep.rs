@@ -9,13 +9,11 @@
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
-use libc::{regcomp, regex_t, regexec, regfree, REG_EXTENDED, REG_ICASE, REG_NOMATCH};
+use plib::regex::{Regex, RegexFlags};
 use std::{
-    ffi::CString,
     fs::File,
     io::{self, BufRead, BufReader},
     path::{Path, PathBuf},
-    ptr,
 };
 
 /// grep - search a file for a pattern.
@@ -201,10 +199,10 @@ impl Args {
     }
 }
 
-/// Newtype over `Vec[libc::regex_t]`. Provides functionality for matching input data.
+/// Holds patterns for matching input data - either fixed strings or compiled regexes.
 enum Patterns {
     Fixed(Vec<String>, bool, bool),
-    Regex(Vec<regex_t>),
+    Regex(Vec<Regex>),
 }
 
 impl Patterns {
@@ -244,44 +242,25 @@ impl Patterns {
         } else {
             let mut ps = vec![];
 
-            let mut cflags = 0;
-            if extended_regexp {
-                cflags |= REG_EXTENDED;
-            }
+            // Build flags for regex compilation
+            let mut flags = if extended_regexp {
+                RegexFlags::ere()
+            } else {
+                RegexFlags::bre()
+            };
             if ignore_case {
-                cflags |= REG_ICASE;
+                flags = flags.ignore_case();
             }
-            for mut pattern in patterns {
-                // macOS version of [regcomp](regcomp) from `libc`
-                // provides additional check for empty regex. In this case,
-                // an error [REG_EMPTY](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/regcomp.3.html)
-                // will be returned.
 
-                // Therefore, an empty pattern is replaced with ".*".
-                #[cfg(target_os = "macos")]
-                {
-                    pattern = if pattern.is_empty() {
-                        String::from(".*")
-                    } else {
-                        pattern
-                    };
-                }
-                pattern = if line_regexp {
+            for pattern in patterns {
+                // For -x option, anchor the pattern to match entire line
+                let pattern = if line_regexp {
                     format!("^{pattern}$")
                 } else {
                     pattern
                 };
 
-                let c_pattern = CString::new(pattern).map_err(|err| err.to_string())?;
-                let mut regex = unsafe { std::mem::zeroed::<regex_t>() };
-
-                let result = unsafe { regcomp(&mut regex, c_pattern.as_ptr(), cflags) };
-                if result != 0 {
-                    return Err(format!(
-                        "Error compiling regex '{}'",
-                        c_pattern.to_string_lossy()
-                    ));
-                }
+                let regex = Regex::new(&pattern, flags).map_err(|e| e.to_string())?;
                 ps.push(regex);
             }
             Ok(Self::Regex(ps))
@@ -314,25 +293,7 @@ impl Patterns {
                     }
                 })
             }
-            Patterns::Regex(patterns) => {
-                let c_input = CString::new(input).unwrap();
-                patterns.iter().any(|p| unsafe {
-                    regexec(p, c_input.as_ptr(), 0, ptr::null_mut(), 0) != REG_NOMATCH
-                })
-            }
-        }
-    }
-}
-
-impl Drop for Patterns {
-    fn drop(&mut self) {
-        match &self {
-            Patterns::Fixed(_, _, _) => {}
-            Patterns::Regex(regexes) => {
-                for regex in regexes {
-                    unsafe { regfree(regex as *const regex_t as *mut regex_t) }
-                }
-            }
+            Patterns::Regex(patterns) => patterns.iter().any(|re| re.is_match(input)),
         }
     }
 }

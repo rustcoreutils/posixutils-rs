@@ -131,6 +131,10 @@ pub struct Editor {
     /// Whether running in headless mode (for testing).
     #[allow(dead_code)]
     headless: bool,
+    /// Whether running in ex standalone mode (line-oriented).
+    ex_standalone_mode: bool,
+    /// Silent/batch mode (suppress prompts and messages).
+    silent_mode: bool,
 }
 
 impl Editor {
@@ -170,6 +174,71 @@ impl Editor {
             ex_insert_mode: None,
             ex_insert_text: Vec::new(),
             headless: false,
+            ex_standalone_mode: false,
+            silent_mode: false,
+        })
+    }
+
+    /// Create a new editor with specified mode options.
+    ///
+    /// # Arguments
+    /// * `ex_mode` - If true, start in ex (line-oriented) mode
+    /// * `silent` - If true, suppress prompts and informational messages
+    pub fn new_with_mode(ex_mode: bool, silent: bool) -> Result<Self> {
+        let mut editor = if ex_mode && !silent {
+            // Ex mode with terminal - still need terminal for potential visual switch
+            Self::new()?
+        } else if ex_mode && silent {
+            // Ex silent mode - no terminal needed, use headless-like setup
+            Self::new_ex_silent()?
+        } else {
+            // Visual mode
+            Self::new()?
+        };
+
+        editor.ex_standalone_mode = ex_mode;
+        editor.silent_mode = silent;
+
+        Ok(editor)
+    }
+
+    /// Create an editor for ex silent/batch mode (no terminal).
+    fn new_ex_silent() -> Result<Self> {
+        let size = TerminalSize { rows: 24, cols: 80 };
+        let mut options = Options::default();
+        options.set_window_size(size.rows as usize);
+
+        let shell = ShellExecutor::new(&options.shell);
+
+        Ok(Self {
+            buffer: Buffer::new(),
+            mode: Mode::Command,
+            parser: CommandParser::new(),
+            insert_state: None,
+            ex_input: String::new(),
+            options,
+            registers: Registers::new(),
+            undo: UndoManager::new(),
+            search: SearchState::new(),
+            files: FileManager::new(),
+            terminal: Terminal::new_dummy(),
+            screen: Screen::new(size),
+            message: None,
+            is_error: false,
+            marks: [None; 26],
+            should_quit: false,
+            exit_code: 0,
+            shell,
+            pending_filter: None,
+            last_find: None,
+            last_substitution: None,
+            last_command: None,
+            last_macro_register: None,
+            ex_insert_mode: None,
+            ex_insert_text: Vec::new(),
+            headless: false,
+            ex_standalone_mode: true,
+            silent_mode: true,
         })
     }
 
@@ -211,7 +280,19 @@ impl Editor {
             ex_insert_mode: None,
             ex_insert_text: Vec::new(),
             headless: true,
+            ex_standalone_mode: false,
+            silent_mode: false,
         }
+    }
+
+    /// Set read-only mode.
+    pub fn set_readonly(&mut self, readonly: bool) {
+        self.files.set_readonly(readonly);
+    }
+
+    /// Execute an initial command (from -c or +command).
+    pub fn execute_initial_command(&mut self, cmd: &str) -> Result<()> {
+        self.execute_ex_input(cmd)
     }
 
     /// Set the buffer content directly (for testing).
@@ -324,22 +405,157 @@ impl Editor {
 
     /// Run the editor main loop.
     pub fn run(&mut self) -> Result<i32> {
+        if self.ex_standalone_mode {
+            // Ex mode: line-oriented editing
+            self.run_ex_mode()
+        } else {
+            // Visual mode: screen-oriented editing
+            self.run_visual_mode()
+        }
+    }
+
+    /// Run in visual (screen) mode.
+    fn run_visual_mode(&mut self) -> Result<i32> {
         self.terminal.enable_raw_mode()?;
         self.terminal.enter_alternate_screen()?;
 
-        let result = self.main_loop();
+        let result = self.visual_main_loop();
 
         self.terminal.leave_alternate_screen()?;
         self.terminal.disable_raw_mode()?;
 
+        // Check if we should switch to ex mode (Q was pressed)
+        if self.ex_standalone_mode && !self.should_quit {
+            return self.run_ex_mode();
+        }
+
         result.map(|_| self.exit_code)
     }
 
-    /// Main editing loop.
-    fn main_loop(&mut self) -> Result<()> {
-        let mut reader = InputReader::new();
+    /// Run in ex (line) mode.
+    fn run_ex_mode(&mut self) -> Result<i32> {
+        use std::io::{self, BufRead, Write};
+
+        let stdin = io::stdin();
+        let mut stdout = io::stdout();
 
         while !self.should_quit {
+            // Check if we should switch to visual mode
+            if !self.ex_standalone_mode {
+                // Switch to visual mode
+                return self.run_visual_mode();
+            }
+
+            // Check if we're in text input mode (:a, :i, :c)
+            if self.ex_insert_mode.is_some() {
+                // Read text lines until we see a line containing only "."
+                let mut line = String::new();
+                match stdin.lock().read_line(&mut line) {
+                    Ok(0) => {
+                        // EOF - finalize and quit
+                        let _ = self.finalize_ex_insert();
+                        self.should_quit = true;
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        if !self.silent_mode {
+                            eprintln!("Read error: {}", e);
+                        }
+                        self.should_quit = true;
+                        self.exit_code = 1;
+                        break;
+                    }
+                }
+
+                let line = line.trim_end();
+                if line == "." {
+                    // End of text input
+                    if let Err(e) = self.finalize_ex_insert() {
+                        if !self.silent_mode {
+                            eprintln!("{}", e);
+                        }
+                    } else if !self.silent_mode {
+                        if let Some(msg) = &self.message {
+                            println!("{}", msg);
+                        }
+                    }
+                    self.message = None;
+                } else {
+                    // Accumulate text
+                    self.ex_insert_text.push(line.to_string());
+                }
+                continue;
+            }
+
+            // Print prompt unless in silent mode
+            if !self.silent_mode {
+                print!(":");
+                stdout.flush()?;
+            }
+
+            // Read a line of input
+            let mut line = String::new();
+            match stdin.lock().read_line(&mut line) {
+                Ok(0) => {
+                    // EOF - treat as quit
+                    self.should_quit = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    if !self.silent_mode {
+                        eprintln!("Read error: {}", e);
+                    }
+                    self.should_quit = true;
+                    self.exit_code = 1;
+                    break;
+                }
+            }
+
+            // Remove trailing newline
+            let line = line.trim_end();
+
+            // Execute the command
+            match self.execute_ex_input(line) {
+                Ok(()) => {
+                    // Check if we switched to visual mode
+                    if !self.ex_standalone_mode {
+                        continue; // Will switch on next iteration
+                    }
+                    // Print any message
+                    if !self.silent_mode {
+                        if let Some(msg) = &self.message {
+                            println!("{}", msg);
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Print error message
+                    if !self.silent_mode {
+                        eprintln!("{}", e);
+                    } else {
+                        // In silent mode, errors still go to stderr
+                        eprintln!("{}", e);
+                    }
+                    // In silent mode, errors are fatal
+                    if self.silent_mode {
+                        self.exit_code = 1;
+                        self.should_quit = true;
+                    }
+                }
+            }
+            self.message = None;
+        }
+
+        Ok(self.exit_code)
+    }
+
+    /// Visual mode main editing loop.
+    fn visual_main_loop(&mut self) -> Result<()> {
+        let mut reader = InputReader::new();
+
+        while !self.should_quit && !self.ex_standalone_mode {
             self.refresh_screen()?;
 
             let key = reader.read_key()?;
@@ -763,10 +979,11 @@ impl Editor {
                 self.buffer.set_line(target);
                 self.buffer.move_to_first_non_blank();
             }
-            // Enter ex mode
+            // Enter ex mode (Q = leave visual, enter line-oriented ex mode)
             'Q' => {
-                self.mode = Mode::Ex;
-                self.ex_input.clear();
+                // Set flag to exit visual loop and enter ex standalone mode
+                self.ex_standalone_mode = true;
+                self.mode = Mode::Command; // Reset mode
             }
             // Redraw window command
             'z' => {
@@ -1466,13 +1683,35 @@ impl Editor {
                 self.set_error(&msg);
             }
             ExResult::Output(lines) => {
-                self.set_message(&lines.join("\n"));
+                if self.ex_standalone_mode {
+                    // In ex mode, print output directly to stdout
+                    // Note: Output from :p, :nu, :l is NOT suppressed by -s
+                    // (POSIX says -s suppresses "informational messages", not command output)
+                    for line in &lines {
+                        println!("{}", line);
+                    }
+                } else {
+                    // In visual mode, show as message
+                    self.set_message(&lines.join("\n"));
+                }
             }
             ExResult::Insert(line, col) => {
                 self.buffer.set_cursor(Position::new(line, col));
                 self.enter_insert(InsertKind::Insert);
             }
             ExResult::Pending(_) => {}
+            ExResult::EnterVisual => {
+                // Signal to switch to visual mode
+                self.ex_standalone_mode = false;
+            }
+            ExResult::EnterOpen(line) => {
+                // Enter open mode at specified line
+                if let Some(l) = line {
+                    self.buffer.set_line(l);
+                }
+                self.mode = Mode::Open;
+                self.ex_standalone_mode = false;
+            }
         }
 
         Ok(())
@@ -1635,6 +1874,20 @@ impl Editor {
                 self.execute_ex_yank(&range, register, count)?;
                 Ok(ExResult::Continue)
             }
+            ExCommand::Print { range, count } => {
+                let lines = self.get_lines_for_output(&range, count)?;
+                Ok(ExResult::Output(lines))
+            }
+            ExCommand::Number { range, count } => {
+                let lines = self.get_lines_with_numbers(&range, count)?;
+                Ok(ExResult::Output(lines))
+            }
+            ExCommand::List { range, count } => {
+                let lines = self.get_lines_for_list(&range, count)?;
+                Ok(ExResult::Output(lines))
+            }
+            ExCommand::Visual => Ok(ExResult::EnterVisual),
+            ExCommand::Open { line } => Ok(ExResult::EnterOpen(line)),
             ExCommand::Nop => Ok(ExResult::Continue),
             _ => {
                 // Other commands not yet implemented
@@ -1851,6 +2104,94 @@ impl Editor {
                 Err(e)
             }
         }
+    }
+
+    /// Get lines for :p (print) command output.
+    fn get_lines_for_output(
+        &self,
+        range: &AddressRange,
+        count: Option<usize>,
+    ) -> Result<Vec<String>> {
+        let current = self.buffer.cursor().line;
+        let (start, end) = if range.explicit {
+            range.resolve(&self.buffer, current)?
+        } else if let Some(c) = count {
+            // If count given without range, start at current line
+            (current, (current + c - 1).min(self.buffer.line_count()))
+        } else {
+            // No range, no count: print current line
+            (current, current)
+        };
+
+        let mut lines = Vec::new();
+        for line_num in start..=end {
+            if let Some(line) = self.buffer.line(line_num) {
+                lines.push(line.content().to_string());
+            }
+        }
+        Ok(lines)
+    }
+
+    /// Get lines with line numbers for :nu (number) command output.
+    fn get_lines_with_numbers(
+        &self,
+        range: &AddressRange,
+        count: Option<usize>,
+    ) -> Result<Vec<String>> {
+        let current = self.buffer.cursor().line;
+        let (start, end) = if range.explicit {
+            range.resolve(&self.buffer, current)?
+        } else if let Some(c) = count {
+            (current, (current + c - 1).min(self.buffer.line_count()))
+        } else {
+            (current, current)
+        };
+
+        let mut lines = Vec::new();
+        for line_num in start..=end {
+            if let Some(line) = self.buffer.line(line_num) {
+                lines.push(format!("{:6}\t{}", line_num, line.content()));
+            }
+        }
+        Ok(lines)
+    }
+
+    /// Get lines in list format for :l (list) command output.
+    /// This shows non-printable characters.
+    fn get_lines_for_list(
+        &self,
+        range: &AddressRange,
+        count: Option<usize>,
+    ) -> Result<Vec<String>> {
+        let current = self.buffer.cursor().line;
+        let (start, end) = if range.explicit {
+            range.resolve(&self.buffer, current)?
+        } else if let Some(c) = count {
+            (current, (current + c - 1).min(self.buffer.line_count()))
+        } else {
+            (current, current)
+        };
+
+        let mut lines = Vec::new();
+        for line_num in start..=end {
+            if let Some(line) = self.buffer.line(line_num) {
+                // Convert non-printable characters to visible form
+                let mut listed = String::new();
+                for ch in line.content().chars() {
+                    match ch {
+                        '\t' => listed.push_str("^I"),
+                        c if c.is_control() => {
+                            listed.push('^');
+                            listed.push((c as u8 + b'@') as char);
+                        }
+                        c => listed.push(c),
+                    }
+                }
+                listed.push('$'); // End of line marker
+                lines.push(listed);
+            }
+        }
+        Ok(lines)
     }
 
     /// Search for next match.

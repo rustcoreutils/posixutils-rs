@@ -22,5 +22,9 @@ path = "./vi/lib.rs"
 
 [[bin]]
 name = "vi"
-path = "./vi/main.rs"
+path = "vi_main.rs"
+
+[[bin]]
+name = "ex"
+path = "ex_main.rs"
 

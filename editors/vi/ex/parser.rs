@@ -324,6 +324,19 @@ pub fn parse_ex_command(input: &str) -> Result<ExCommand> {
         }
         "c" | "change" => Ok(ExCommand::Change { range }),
 
+        // Visual and open mode commands
+        "vi" | "visual" => Ok(ExCommand::Visual),
+        "o" | "open" => {
+            let line = range.start.as_ref().and_then(|a| {
+                if let Address::Line(n) = a {
+                    Some(*n)
+                } else {
+                    None
+                }
+            });
+            Ok(ExCommand::Open { line })
+        }
+
         _ => Err(ViError::InvalidCommand(cmd_name)),
     }
 }

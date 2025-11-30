@@ -153,6 +153,10 @@ pub enum ExCommand {
     Insert { line: usize },
     /// Change lines (:c, :change).
     Change { range: AddressRange },
+    /// Enter visual mode (:vi, :visual).
+    Visual,
+    /// Enter open mode (:o, :open).
+    Open { line: Option<usize> },
     /// No operation (empty command).
     Nop,
 }
@@ -218,6 +222,10 @@ pub enum ExResult {
     Insert(usize, usize),
     /// Command needs more input (for :g).
     Pending(String),
+    /// Enter visual mode.
+    EnterVisual,
+    /// Enter open mode at optional line.
+    EnterOpen(Option<usize>),
 }
 
 #[cfg(test)]

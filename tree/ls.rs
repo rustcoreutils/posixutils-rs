@@ -1203,10 +1203,8 @@ fn process_single_dir(
                 if include_entry {
                     entries.push(entry);
 
-                    if config.recursive {
-                        if metadata.is_dir() {
-                            return Ok(true);
-                        }
+                    if config.recursive && metadata.is_dir() {
+                        return Ok(true);
                     }
                 }
 

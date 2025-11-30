@@ -60,13 +60,13 @@ where
     let source_file_type = source_md.file_type();
     let source_is_dir = source_file_type == ftw::FileType::Directory;
 
-    let source_is_special_file = match source_file_type {
+    let source_is_special_file = matches!(
+        source_file_type,
         ftw::FileType::BlockDevice
-        | ftw::FileType::CharacterDevice
-        | ftw::FileType::Fifo
-        | ftw::FileType::Socket => true,
-        _ => false,
-    };
+            | ftw::FileType::CharacterDevice
+            | ftw::FileType::Fifo
+            | ftw::FileType::Socket
+    );
     // -R is required for step 4
     if source_is_special_file && cfg.recursive {
         copy_special_file(

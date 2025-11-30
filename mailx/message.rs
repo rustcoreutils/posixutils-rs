@@ -186,7 +186,7 @@ impl Message {
     }
 
     /// Extract the sender's name or address for header display
-    pub fn from_short(&self) -> String {
+    pub fn short_from(&self) -> String {
         let from = self.from();
         // Try to extract name from "Name <email>" format
         if let Some(start) = from.find('<') {

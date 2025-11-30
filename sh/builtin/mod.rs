@@ -71,6 +71,7 @@ mod unalias;
 mod unset;
 mod wait;
 
+#[allow(clippy::enum_variant_names)]
 pub enum BuiltinError {
     CustomError(String),
     AssignmentError(CannotModifyReadonly),

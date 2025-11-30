@@ -187,17 +187,17 @@ impl Args {
         let page_column_regex = Regex::new(r"^\+\d+(?::\d+)?|-\d+\b").unwrap();
 
         let mut env_args: Vec<_> = std::env::args()
-            .filter_map(|s| {
+            .map(|s| {
                 // Map the arguments +FIRST_PAGE[:LAST_PAGE] and -COLUMN
                 // to something that `clap` can parse
                 if page_column_regex.is_match(&s) {
                     if s.starts_with('+') {
-                        Some(format!("--pages={}", s.strip_prefix('+').unwrap()))
+                        format!("--pages={}", s.strip_prefix('+').unwrap())
                     } else {
-                        Some(format!("--columns={}", s.strip_prefix('-').unwrap()))
+                        format!("--columns={}", s.strip_prefix('-').unwrap())
                     }
                 } else {
-                    Some(s)
+                    s
                 }
             })
             .collect();

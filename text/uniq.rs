@@ -171,6 +171,7 @@ fn process_line(line: &str, fields: Option<usize>, chars: Option<usize>) -> Stri
 /// # Errors
 ///
 /// Returns an error if there is an issue writing to the output.
+#[allow(clippy::if_same_then_else)]
 fn output_result<W: Write>(
     output: &mut W,
     line: &str,

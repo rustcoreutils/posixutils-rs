@@ -118,9 +118,9 @@ impl FromStr for Signal {
     }
 }
 
-impl Into<i32> for Signal {
-    fn into(self) -> i32 {
-        match self {
+impl From<Signal> for i32 {
+    fn from(value: Signal) -> i32 {
+        match value {
             Signal::SigHup => libc::SIGHUP,
             Signal::SigInt => libc::SIGINT,
             Signal::SigQuit => libc::SIGQUIT,

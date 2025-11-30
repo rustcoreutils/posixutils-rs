@@ -506,9 +506,8 @@ fn parse_op_repeat(opstr: &str) -> io::Result<Operand> {
 
     // Parse as number (must be all digits)
     if inner.chars().all(|c| c.is_ascii_digit()) && !inner.is_empty() {
-        match inner.parse::<usize>() {
-            Ok(n) => return Ok(Operand::Repeat(n)),
-            Err(_) => {}
+        if let Ok(n) = inner.parse::<usize>() {
+            return Ok(Operand::Repeat(n));
         }
     }
 

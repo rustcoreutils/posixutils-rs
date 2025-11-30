@@ -57,6 +57,7 @@ fn parse_fields(line: &str, sep: char) -> Vec<String> {
     line.split(sep).map(|s| s.to_string()).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_files2(
     file1_path: &PathBuf,
     file2_path: &PathBuf,

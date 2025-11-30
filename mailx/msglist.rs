@@ -163,22 +163,22 @@ fn parse_single_spec(
         }
         _ => {
             // Could be a number, /string, :c, or address
-            if spec.starts_with('/') {
+            if let Some(suffix) = spec.strip_prefix('/') {
                 // Search subject
-                let search = &spec[1..].to_lowercase();
+                let search = suffix.to_lowercase();
                 let matches: Vec<usize> = mb
                     .messages
                     .iter()
                     .enumerate()
                     .filter(|(_, m)| {
                         (for_undelete || m.state != MessageState::Deleted)
-                            && m.subject().to_lowercase().contains(search)
+                            && m.subject().to_lowercase().contains(&search)
                     })
                     .map(|(i, _)| i + 1)
                     .collect();
 
                 if matches.is_empty() {
-                    Err(format!("No messages matching /{}", &spec[1..]))
+                    Err(format!("No messages matching /{}", suffix))
                 } else {
                     Ok(matches)
                 }

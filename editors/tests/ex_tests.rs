@@ -97,10 +97,7 @@ fn test_ex_substitute_global() {
     );
 }
 
-// Note: yank/put, copy, and move commands are parsed but not yet fully implemented
-// These tests are disabled until the commands are implemented
 #[test]
-#[ignore = "put command not yet fully implemented"]
 fn test_ex_yank_and_put() {
     ex_test(
         "a\nline one\nline two\n.\n1y\n2pu\n1,$p\nq!\n",
@@ -109,7 +106,6 @@ fn test_ex_yank_and_put() {
 }
 
 #[test]
-#[ignore = "copy command not yet fully implemented"]
 fn test_ex_copy() {
     ex_test(
         "a\nline one\nline two\n.\n1co2\n1,$p\nq!\n",
@@ -118,7 +114,6 @@ fn test_ex_copy() {
 }
 
 #[test]
-#[ignore = "move command not yet fully implemented"]
 fn test_ex_move() {
     ex_test(
         "a\nline one\nline two\nline three\n.\n1m2\n1,$p\nq!\n",
@@ -135,7 +130,6 @@ fn test_ex_goto_line() {
 }
 
 #[test]
-#[ignore = "join command not yet fully implemented"]
 fn test_ex_join() {
     ex_test(
         "a\nline one\nline two\n.\n1,2j\n1p\nq!\n",
@@ -209,7 +203,6 @@ fn test_ex_last_line_address() {
 // ============================================================================
 
 #[test]
-#[ignore = "global command not yet fully implemented"]
 fn test_ex_global_delete() {
     ex_test(
         "a\nkeep this\ndelete me\nkeep this too\ndelete me also\n.\ng/delete/d\n1,$p\nq!\n",
@@ -218,7 +211,6 @@ fn test_ex_global_delete() {
 }
 
 #[test]
-#[ignore = "global command not yet fully implemented"]
 fn test_ex_global_print() {
     ex_test(
         "a\napple\nbanana\napricot\ncherry\n.\ng/^a/p\nq!\n",

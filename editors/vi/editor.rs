@@ -3,7 +3,7 @@
 //! This module contains the Editor struct which ties together all
 //! the components of the vi editor.
 
-use crate::buffer::{Buffer, BufferMode, Position, Range};
+use crate::buffer::{Buffer, BufferMode, Line, Position, Range};
 use crate::command::CommandParser;
 use crate::error::{Result, ViError};
 use crate::ex::command::SubstituteFlags;
@@ -1886,6 +1886,49 @@ impl Editor {
                 let lines = self.get_lines_for_list(&range, count)?;
                 Ok(ExResult::Output(lines))
             }
+            ExCommand::Join { range, count } => {
+                self.execute_ex_join(&range, count)?;
+                Ok(ExResult::Continue)
+            }
+            ExCommand::Put { line, register } => {
+                self.execute_ex_put(line, register)?;
+                Ok(ExResult::Continue)
+            }
+            ExCommand::Copy { range, dest } => {
+                self.execute_ex_copy(&range, dest)?;
+                Ok(ExResult::Continue)
+            }
+            ExCommand::Move { range, dest } => {
+                self.execute_ex_move(&range, dest)?;
+                Ok(ExResult::Continue)
+            }
+            ExCommand::Read { range, file } => {
+                self.execute_ex_read(&range, file.as_deref())?;
+                Ok(ExResult::Continue)
+            }
+            ExCommand::Global {
+                range,
+                pattern,
+                command,
+                invert,
+            } => {
+                self.execute_ex_global(&range, &pattern, &command, invert)?;
+                Ok(ExResult::Continue)
+            }
+            ExCommand::Cd { path } => {
+                self.execute_ex_cd(path.as_deref())?;
+                Ok(ExResult::Continue)
+            }
+            ExCommand::Pwd => {
+                let cwd = std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "unknown".to_string());
+                Ok(ExResult::Message(cwd))
+            }
+            ExCommand::Mark { line, name } => {
+                self.execute_ex_mark(line, name)?;
+                Ok(ExResult::Continue)
+            }
             ExCommand::Visual => Ok(ExResult::EnterVisual),
             ExCommand::Open { line } => Ok(ExResult::EnterOpen(line)),
             ExCommand::Nop => Ok(ExResult::Continue),
@@ -2192,6 +2235,274 @@ impl Editor {
             }
         }
         Ok(lines)
+    }
+
+    /// Execute :join command - join lines together.
+    fn execute_ex_join(&mut self, range: &AddressRange, count: Option<usize>) -> Result<()> {
+        let current = self.buffer.cursor().line;
+
+        // Determine the range of lines to join
+        let (start, mut end) = if range.explicit {
+            range.resolve(&self.buffer, current)?
+        } else if let Some(c) = count {
+            // No address: current line and current + count
+            (current, (current + c).min(self.buffer.line_count()))
+        } else {
+            // No address, no count: current line and next line
+            (current, (current + 1).min(self.buffer.line_count()))
+        };
+
+        // Apply count to extend the range if both range and count are specified
+        if range.explicit && count.is_some() {
+            end = (end + count.unwrap() - 1).min(self.buffer.line_count());
+        }
+
+        if start >= end || start > self.buffer.line_count() {
+            return Ok(()); // Nothing to join
+        }
+
+        // Build the joined line
+        let mut result = String::new();
+        for line_num in start..=end {
+            if let Some(line) = self.buffer.line(line_num) {
+                let content = line.content();
+                if result.is_empty() {
+                    result = content.to_string();
+                } else {
+                    // Add space and trimmed content (POSIX: discard leading spaces)
+                    let trimmed = content.trim_start();
+                    if !trimmed.is_empty() {
+                        if !result.is_empty() && !result.ends_with(' ') {
+                            result.push(' ');
+                        }
+                        result.push_str(trimmed);
+                    }
+                }
+            }
+        }
+
+        // Delete lines from end to start+1 (in reverse to preserve line numbers)
+        for line_num in (start + 1..=end).rev() {
+            self.buffer.delete_line(line_num);
+        }
+
+        // Replace the first line with the joined result
+        if let Some(line) = self.buffer.line_mut(start) {
+            *line = Line::from(result.as_str());
+        }
+
+        self.buffer.set_line(start);
+
+        let join_count = end - start;
+        self.set_message(&format!("{} lines joined", join_count + 1));
+        Ok(())
+    }
+
+    /// Execute :put command - put text from register after line.
+    fn execute_ex_put(&mut self, line: Option<usize>, register: Option<char>) -> Result<()> {
+        let target_line = line.unwrap_or_else(|| self.buffer.cursor().line);
+        let reg = register.unwrap_or('"');
+
+        let content = self.registers.get(reg).ok_or(ViError::BufferEmpty(reg))?;
+
+        // Insert lines after target
+        let lines: Vec<&str> = content.text.lines().collect();
+        for (i, line_text) in lines.iter().enumerate() {
+            self.buffer
+                .insert_line_after(target_line + i, Line::from(*line_text));
+        }
+
+        self.buffer.set_line(target_line + lines.len());
+        Ok(())
+    }
+
+    /// Execute :copy command - copy lines to destination.
+    fn execute_ex_copy(&mut self, range: &AddressRange, dest: usize) -> Result<()> {
+        let current = self.buffer.cursor().line;
+        let (start, end) = range.resolve(&self.buffer, current)?;
+
+        // Collect the lines to copy
+        let mut lines_to_copy = Vec::new();
+        for line_num in start..=end {
+            if let Some(line) = self.buffer.line(line_num) {
+                lines_to_copy.push(line.content().to_string());
+            }
+        }
+
+        // Insert after destination line
+        let insert_after = if dest == 0 { 0 } else { dest };
+        for (i, line_text) in lines_to_copy.iter().enumerate() {
+            self.buffer
+                .insert_line_after(insert_after + i, Line::from(line_text.as_str()));
+        }
+
+        self.buffer.set_line(insert_after + lines_to_copy.len());
+
+        let copy_count = end - start + 1;
+        self.set_message(&format!("{} lines copied", copy_count));
+        Ok(())
+    }
+
+    /// Execute :move command - move lines to destination.
+    fn execute_ex_move(&mut self, range: &AddressRange, dest: usize) -> Result<()> {
+        let current = self.buffer.cursor().line;
+        let (start, end) = range.resolve(&self.buffer, current)?;
+
+        // Can't move lines into themselves
+        if dest >= start && dest <= end {
+            return Err(ViError::InvalidRange(
+                "Cannot move lines into themselves".to_string(),
+            ));
+        }
+
+        // Collect the lines to move
+        let mut lines_to_move = Vec::new();
+        for line_num in start..=end {
+            if let Some(line) = self.buffer.line(line_num) {
+                lines_to_move.push(line.content().to_string());
+            }
+        }
+
+        // Delete original lines (in reverse order)
+        for line_num in (start..=end).rev() {
+            self.buffer.delete_line(line_num);
+        }
+
+        // Adjust destination if it was after the deleted lines
+        let adjusted_dest = if dest > end {
+            dest - (end - start + 1)
+        } else {
+            dest
+        };
+
+        // Insert at new location
+        let insert_after = if adjusted_dest == 0 { 0 } else { adjusted_dest };
+        for (i, line_text) in lines_to_move.iter().enumerate() {
+            self.buffer
+                .insert_line_after(insert_after + i, Line::from(line_text.as_str()));
+        }
+
+        self.buffer.set_line(insert_after + lines_to_move.len());
+
+        let move_count = end - start + 1;
+        self.set_message(&format!("{} lines moved", move_count));
+        Ok(())
+    }
+
+    /// Execute :read command - read file into buffer.
+    fn execute_ex_read(&mut self, range: &AddressRange, file: Option<&str>) -> Result<()> {
+        let current = self.buffer.cursor().line;
+        let insert_after = if range.explicit {
+            let (_, end) = range.resolve(&self.buffer, current)?;
+            end
+        } else {
+            current
+        };
+
+        let path = file
+            .map(|s| s.to_string())
+            .or_else(|| self.files.current_file().map(|p| p.display().to_string()))
+            .ok_or(ViError::NoFileName)?;
+
+        let content = std::fs::read_to_string(&path).map_err(ViError::Io)?;
+
+        let lines: Vec<&str> = content.lines().collect();
+        for (i, line_text) in lines.iter().enumerate() {
+            self.buffer
+                .insert_line_after(insert_after + i, Line::from(*line_text));
+        }
+
+        self.buffer.set_line(insert_after + lines.len());
+
+        let bytes = content.len();
+        self.set_message(&format!(
+            "\"{}\" {} lines, {} bytes",
+            path,
+            lines.len(),
+            bytes
+        ));
+        Ok(())
+    }
+
+    /// Execute :global command - execute command on matching lines.
+    fn execute_ex_global(
+        &mut self,
+        range: &AddressRange,
+        pattern: &str,
+        command: &str,
+        invert: bool,
+    ) -> Result<()> {
+        let current = self.buffer.cursor().line;
+        let (start, end) = if range.explicit {
+            range.resolve(&self.buffer, current)?
+        } else {
+            (1, self.buffer.line_count())
+        };
+
+        // Compile the pattern
+        let regex =
+            regex::Regex::new(pattern).map_err(|e| ViError::InvalidPattern(e.to_string()))?;
+
+        // Collect matching line numbers first (to avoid mutation during iteration)
+        let mut matching_lines = Vec::new();
+        for line_num in start..=end {
+            if let Some(line) = self.buffer.line(line_num) {
+                let matches = regex.is_match(line.content());
+                if matches != invert {
+                    matching_lines.push(line_num);
+                }
+            }
+        }
+
+        // Execute command on each matching line
+        // Process in reverse for delete commands to preserve line numbers
+        let is_delete = command.trim().starts_with('d');
+        if is_delete {
+            matching_lines.reverse();
+        }
+
+        for line_num in matching_lines {
+            // Move cursor to the line
+            self.buffer.set_line(line_num);
+            // Execute the command
+            if let Err(e) = self.execute_ex_input(command) {
+                self.set_error(&e.to_string());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Execute :cd command - change directory.
+    fn execute_ex_cd(&mut self, path: Option<&str>) -> Result<()> {
+        let target = if let Some(p) = path {
+            std::path::PathBuf::from(p)
+        } else {
+            // Try to get home directory from environment
+            std::env::var("HOME")
+                .map(std::path::PathBuf::from)
+                .map_err(|_| ViError::ShellError("Cannot determine home directory".to_string()))?
+        };
+
+        std::env::set_current_dir(&target).map_err(|e| {
+            ViError::ShellError(format!("Cannot change to {}: {}", target.display(), e))
+        })?;
+
+        self.set_message(&format!("{}", target.display()));
+        Ok(())
+    }
+
+    /// Execute :mark command - set a mark.
+    fn execute_ex_mark(&mut self, line: Option<usize>, name: char) -> Result<()> {
+        let target_line = line.unwrap_or_else(|| self.buffer.cursor().line);
+
+        if !name.is_ascii_lowercase() {
+            return Err(ViError::MarkNotSet(name));
+        }
+
+        let idx = (name as u8 - b'a') as usize;
+        self.marks[idx] = Some(Position::new(target_line, 0));
+        Ok(())
     }
 
     /// Search for next match.

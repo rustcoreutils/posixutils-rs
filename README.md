@@ -70,6 +70,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] cut
  - [x] diff
  - [x] dirname
+ - [x] ex (Editors)
  - [x] expand
  - [x] expr
  - [x] false
@@ -123,6 +124,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] vi (Editors)
  - [x] wc
  - [x] what (SCCS)
+ - [x] yacc (Development)
  - [x] zcat (compress cat.)
 
 ## Stage 2 - Feature-complete and POSIX compliant
@@ -189,7 +191,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] ctags (Development)
  - [ ] cxref (Development)
  - [ ] lex (Development)
- - [ ] yacc (Development)
 
 ### SCCS category
  - [ ] admin (SCCS)
@@ -212,7 +213,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
 ### Editors category
  - [ ] ed (Editors)
- - [ ] ex (Editors)
 
 ### Misc. category
  - [ ] lp

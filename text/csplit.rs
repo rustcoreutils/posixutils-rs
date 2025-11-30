@@ -492,7 +492,10 @@ fn parse_op_rx(opstr: &str, delim: char) -> io::Result<Operand> {
 fn parse_op_repeat(opstr: &str) -> io::Result<Operand> {
     // Must match pattern: {num} or {*}
     if !opstr.starts_with('{') || !opstr.ends_with('}') {
-        return Err(Error::new(ErrorKind::Other, "invalid repeating operand"));
+        return Err(Error::new(
+            ErrorKind::Other,
+            "invalid repeat operand: expected {num} or {*}",
+        ));
     }
 
     let inner = &opstr[1..opstr.len() - 1];
@@ -509,7 +512,10 @@ fn parse_op_repeat(opstr: &str) -> io::Result<Operand> {
         }
     }
 
-    Err(Error::new(ErrorKind::Other, "invalid repeating operand"))
+    Err(Error::new(
+        ErrorKind::Other,
+        "invalid repeat operand: expected {num} or {*}",
+    ))
 }
 
 /// Parses a line number operand from a string.
@@ -778,7 +784,7 @@ mod tests {
         match parse_op_repeat(opstr) {
             Err(e) => {
                 assert_eq!(e.kind(), ErrorKind::Other);
-                assert_eq!(e.to_string(), "invalid repeating operand");
+                assert!(e.to_string().starts_with("invalid repeat operand"));
             }
             _ => panic!("Expected Err"),
         }
@@ -790,7 +796,7 @@ mod tests {
         match parse_op_repeat(opstr) {
             Err(e) => {
                 assert_eq!(e.kind(), ErrorKind::Other);
-                assert_eq!(e.to_string(), "invalid repeating operand");
+                assert!(e.to_string().starts_with("invalid repeat operand"));
             }
             _ => panic!("Expected Err"),
         }

@@ -940,7 +940,7 @@ struct SourceContext {
     current_pattern: String,
     /// Last search settings
     last_search: Option<(Regex, bool, Direction)>,
-    /// Storage for marks that were set durring current [`Source`] processing
+    /// Storage for marks that were set during current [`Source`] processing
     marked_positions: HashMap<char, usize>,
     /// Flag that [`true`] if input files count is more that 1
     is_many_files: bool,

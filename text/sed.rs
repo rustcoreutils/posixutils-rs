@@ -493,7 +493,7 @@ fn delete_nested_ranges(mut ranges: Vec<(usize, Range<usize>)>) -> Vec<(usize, R
 }
 
 /// The regex can return from 1 to 9 range. Some
-/// of them cam be invalid for usage. So this function filter
+/// of them can be invalid for usage. So this function filters
 /// invalid ranges.
 fn filter_groups(groups: &mut Vec<(usize, Range<usize>)>, pattern: &str, haystack: &str) {
     groups.retain(|(_, m)| {

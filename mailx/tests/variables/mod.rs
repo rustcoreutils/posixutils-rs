@@ -20,69 +20,36 @@
 //! - Mailbox operation variables (hold, keep, keepsave, append)
 //! - Shell command variables (bang)
 //! - Special rejections (onehop)
+//!
+//! Test data files:
+//! - testdata.mbox: 3 messages (alice, bob, charlie)
+//! - testdata-single.mbox: 1 message (alice)
+//! - testdata-5msg.mbox: 5 messages
 
 use plib::testing::{run_test_with_checker, run_test_with_checker_and_env, TestPlan};
 use std::io::Write;
+use std::path::PathBuf;
 use tempfile::{NamedTempFile, TempDir};
-
-// =============================================================================
-// Test Data
-// =============================================================================
-
-/// Minimal mbox content (single message)
-const MINIMAL_MBOX: &str = r#"From test@example.com Fri Nov 29 12:00:00 2024
-From: test@example.com
-To: user@localhost
-Subject: Test Message
-Date: Fri, 29 Nov 2024 12:00:00 +0000
-
-This is the test message body.
-"#;
-
-/// Multi-message mbox for testing message lists and display
-const MULTI_MSG_MBOX: &str = r#"From alice@example.com Fri Nov 29 10:00:00 2024
-From: alice@example.com
-To: user@localhost
-Subject: First Message
-Date: Fri, 29 Nov 2024 10:00:00 +0000
-
-First message body.
-Line two of first message.
-Line three of first message.
-Line four of first message.
-Line five of first message.
-
-From bob@example.org Fri Nov 29 11:00:00 2024
-From: bob@example.org
-To: user@localhost
-Subject: Second Message
-Date: Fri, 29 Nov 2024 11:00:00 +0000
-
-Second message body.
-
-From alice@different.net Fri Nov 29 12:00:00 2024
-From: alice@different.net
-To: user@localhost
-Subject: Third Message from Alice
-Date: Fri, 29 Nov 2024 12:00:00 +0000
-
-Third message body.
-"#;
-
-/// Mbox where user is the sender (for showto testing)
-#[allow(dead_code)]
-const USER_SENT_MBOX: &str = r#"From user@localhost Fri Nov 29 10:00:00 2024
-From: user@localhost
-To: recipient@example.com
-Subject: Sent by User
-Date: Fri, 29 Nov 2024 10:00:00 +0000
-
-Message sent by the user.
-"#;
 
 // =============================================================================
 // Helper Functions
 // =============================================================================
+
+/// Get path to static test data file in tests/ directory
+fn test_data_path(filename: &str) -> PathBuf {
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("tests");
+    path.push(filename);
+    path
+}
+
+/// Copy a static test data file to a temporary location
+fn copy_test_data(filename: &str) -> NamedTempFile {
+    let src_path = test_data_path(filename);
+    let content = std::fs::read_to_string(&src_path)
+        .unwrap_or_else(|e| panic!("Failed to read {}: {}", src_path.display(), e));
+    create_temp_mbox(&content)
+}
 
 /// Helper to create a temporary mbox file
 fn create_temp_mbox(content: &str) -> NamedTempFile {
@@ -109,7 +76,7 @@ fn create_temp_mailrc(content: &str) -> NamedTempFile {
 /// Test setting and displaying variables
 #[test]
 fn set_and_display() {
-    let mbox = create_temp_mbox(MINIMAL_MBOX);
+    let mbox = copy_test_data("testdata-single.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -146,7 +113,7 @@ fn set_and_display() {
 /// Test unsetting variables with 'set noVAR' and 'unset VAR'
 #[test]
 fn unset_variables() {
-    let mbox = create_temp_mbox(MINIMAL_MBOX);
+    let mbox = copy_test_data("testdata-single.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -174,7 +141,7 @@ fn unset_variables() {
 /// Test onehop variable rejection
 #[test]
 fn onehop_rejected() {
-    let mbox = create_temp_mbox(MINIMAL_MBOX);
+    let mbox = copy_test_data("testdata-single.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -214,7 +181,7 @@ fn onehop_rejected() {
 /// When set (default), headers are displayed when entering receive mode
 #[test]
 fn var_header_enabled() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     // Default behavior with header enabled (no -N flag)
@@ -235,7 +202,7 @@ fn var_header_enabled() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             // Should show header summary with message info
             assert!(
-                stdout.contains("alice") || stdout.contains("First Message"),
+                stdout.contains("alice") || stdout.contains("Meeting Tomorrow"),
                 "With header set, should show message summary: {}",
                 stdout
             );
@@ -246,7 +213,7 @@ fn var_header_enabled() {
 /// Test 'noheader' - suppress headers on startup (same as -N flag)
 #[test]
 fn var_header_disabled() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
     let mailrc = create_temp_mailrc("set noheader\n");
     let mailrc_path = mailrc.path().to_str().unwrap();
@@ -273,7 +240,7 @@ fn var_header_disabled() {
 /// Test 'toplines' variable - number of lines shown by 'top' command
 #[test]
 fn var_toplines() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -295,7 +262,7 @@ fn var_toplines() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             // top command should show limited lines from the message
             assert!(
-                stdout.contains("First message body") || stdout.contains("From:"),
+                stdout.contains("reminder") || stdout.contains("From:"),
                 "top command should show message content: {}",
                 stdout
             );
@@ -307,7 +274,7 @@ fn var_toplines() {
 /// Test 'screen' variable - number of headers per screen
 #[test]
 fn var_screen() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -327,9 +294,12 @@ fn var_screen() {
         },
         |_plan, output| {
             let stdout = String::from_utf8_lossy(&output.stdout);
+            let stdout_lower = stdout.to_lowercase();
             // headers command should show messages
             assert!(
-                stdout.contains("alice") || stdout.contains("bob") || stdout.contains("Message"),
+                stdout_lower.contains("alice")
+                    || stdout_lower.contains("bob")
+                    || stdout_lower.contains("meeting"),
                 "headers should show message info: {}",
                 stdout
             );
@@ -341,7 +311,7 @@ fn var_screen() {
 /// Test 'autoprint' variable - print next message after delete
 #[test]
 fn var_autoprint() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -380,7 +350,7 @@ fn var_autoprint() {
 /// Test 'folder' variable - directory for mail folders
 #[test]
 fn var_folder() {
-    let mbox = create_temp_mbox(MINIMAL_MBOX);
+    let mbox = copy_test_data("testdata-single.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
     let temp_dir = TempDir::new().expect("failed to create temp dir");
     let folder_path = temp_dir.path().to_str().unwrap();
@@ -414,7 +384,7 @@ fn var_folder() {
 /// Test 'SHELL' variable - shell for ! commands
 #[test]
 fn var_shell() {
-    let mbox = create_temp_mbox(MINIMAL_MBOX);
+    let mbox = copy_test_data("testdata-single.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -447,7 +417,7 @@ fn var_shell() {
 /// Test 'LISTER' variable - command for listing folders
 #[test]
 fn var_lister() {
-    let mbox = create_temp_mbox(MINIMAL_MBOX);
+    let mbox = copy_test_data("testdata-single.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
     let temp_dir = TempDir::new().expect("failed to create temp dir");
     let folder_path = temp_dir.path().to_str().unwrap();
@@ -480,7 +450,7 @@ fn var_lister() {
 /// Test 'prompt' variable - command prompt string
 #[test]
 fn var_prompt() {
-    let mbox = create_temp_mbox(MINIMAL_MBOX);
+    let mbox = copy_test_data("testdata-single.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
     let mailrc = create_temp_mailrc("set prompt=\"TESTPROMPT> \"\n");
     let mailrc_path = mailrc.path().to_str().unwrap();
@@ -510,7 +480,7 @@ fn var_prompt() {
 /// Test 'quiet' variable - suppress version banner
 #[test]
 fn var_quiet() {
-    let mbox = create_temp_mbox(MINIMAL_MBOX);
+    let mbox = copy_test_data("testdata-single.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
     let mailrc = create_temp_mailrc("set quiet\n");
     let mailrc_path = mailrc.path().to_str().unwrap();
@@ -545,7 +515,7 @@ fn var_quiet() {
 /// Test 'escape' variable - escape character for compose mode
 #[test]
 fn var_escape() {
-    let mbox = create_temp_mbox(MINIMAL_MBOX);
+    let mbox = copy_test_data("testdata-single.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -578,7 +548,7 @@ fn var_escape() {
 /// Test 'indentprefix' variable - prefix for quoted text
 #[test]
 fn var_indentprefix() {
-    let mbox = create_temp_mbox(MINIMAL_MBOX);
+    let mbox = copy_test_data("testdata-single.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -615,7 +585,7 @@ fn var_indentprefix() {
 /// When set, "alice" matches both alice@example.com and alice@different.net
 #[test]
 fn var_allnet_enabled() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -635,10 +605,9 @@ fn var_allnet_enabled() {
         },
         |_plan, output| {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            // Should match messages from alice@example.com and alice@different.net
-            // Look for indicators of multiple matches
+            // Should match messages from alice@example.com
             assert!(
-                stdout.contains("alice") || stdout.contains("First") || stdout.contains("Third"),
+                stdout.contains("alice") || stdout.contains("Meeting"),
                 "allnet should match by login: {}",
                 stdout
             );
@@ -650,7 +619,7 @@ fn var_allnet_enabled() {
 /// Test without 'allnet' - full address matching
 #[test]
 fn var_allnet_disabled() {
-    let mbox = create_temp_mbox(MULTI_MSG_MBOX);
+    let mbox = copy_test_data("testdata.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -672,7 +641,7 @@ fn var_allnet_disabled() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             // Should find only alice@example.com message
             assert!(
-                stdout.contains("alice") || stdout.contains("First"),
+                stdout.contains("alice") || stdout.contains("Meeting"),
                 "Should match specific address: {}",
                 stdout
             );
@@ -688,7 +657,7 @@ fn var_allnet_disabled() {
 /// Test 'bang' variable - enable ! expansion in shell commands
 #[test]
 fn var_bang_enabled() {
-    let mbox = create_temp_mbox(MINIMAL_MBOX);
+    let mbox = copy_test_data("testdata-single.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -725,7 +694,7 @@ fn var_bang_enabled() {
 /// Test alias command - define and display mail aliases
 #[test]
 fn alias_define_and_display() {
-    let mbox = create_temp_mbox(MINIMAL_MBOX);
+    let mbox = copy_test_data("testdata-single.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -759,7 +728,7 @@ fn alias_define_and_display() {
 /// Test unalias command
 #[test]
 fn unalias_command() {
-    let mbox = create_temp_mbox(MINIMAL_MBOX);
+    let mbox = copy_test_data("testdata-single.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -792,7 +761,7 @@ fn unalias_command() {
 /// Test alternates command - declare alternate addresses
 #[test]
 fn alternates_command() {
-    let mbox = create_temp_mbox(MINIMAL_MBOX);
+    let mbox = copy_test_data("testdata-single.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -829,7 +798,7 @@ fn alternates_command() {
 /// Test discard command - suppress header fields
 #[test]
 fn discard_command() {
-    let mbox = create_temp_mbox(MINIMAL_MBOX);
+    let mbox = copy_test_data("testdata-single.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -864,7 +833,7 @@ fn discard_command() {
 /// Test retain command - retain only specified headers
 #[test]
 fn retain_command() {
-    let mbox = create_temp_mbox(MINIMAL_MBOX);
+    let mbox = copy_test_data("testdata-single.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -901,7 +870,7 @@ fn retain_command() {
 /// Test that default variables are properly set
 #[test]
 fn default_variables() {
-    let mbox = create_temp_mbox(MINIMAL_MBOX);
+    let mbox = copy_test_data("testdata-single.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -933,7 +902,7 @@ fn default_variables() {
 /// When set, read messages are held in system mailbox instead of moving to mbox
 #[test]
 fn var_hold() {
-    let mbox = create_temp_mbox(MINIMAL_MBOX);
+    let mbox = copy_test_data("testdata-single.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -965,7 +934,7 @@ fn var_hold() {
 /// Test 'keep' variable - keep empty mailboxes
 #[test]
 fn var_keep() {
-    let mbox = create_temp_mbox(MINIMAL_MBOX);
+    let mbox = copy_test_data("testdata-single.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -997,7 +966,7 @@ fn var_keep() {
 /// Test 'keepsave' variable
 #[test]
 fn var_keepsave() {
-    let mbox = create_temp_mbox(MINIMAL_MBOX);
+    let mbox = copy_test_data("testdata-single.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(
@@ -1029,7 +998,7 @@ fn var_keepsave() {
 /// Test 'append' variable - append vs prepend to mbox
 #[test]
 fn var_append() {
-    let mbox = create_temp_mbox(MINIMAL_MBOX);
+    let mbox = copy_test_data("testdata-single.mbox");
     let mbox_path = mbox.path().to_str().unwrap();
 
     run_test_with_checker(

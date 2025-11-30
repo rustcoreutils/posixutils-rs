@@ -1,0 +1,74 @@
+From alice@example.com Fri Nov 29 10:00:00 2024
+From: Alice Smith <alice@example.com>
+To: testuser@localhost
+Subject: Meeting Tomorrow
+Date: Fri, 29 Nov 2024 10:00:00 +0000
+Message-ID: <msg001@example.com>
+Status: RO
+
+Hi,
+
+Just a reminder about our meeting tomorrow at 2pm.
+
+Best,
+Alice
+
+From bob@example.org Fri Nov 29 11:30:00 2024
+From: Bob Jones <bob@example.org>
+To: testuser@localhost
+Subject: Project Update
+Date: Fri, 29 Nov 2024 11:30:00 +0000
+Message-ID: <msg002@example.org>
+
+Hello,
+
+The project is on track. Here's a quick status update:
+- Phase 1: Complete
+- Phase 2: In progress
+- Phase 3: Scheduled
+
+Thanks,
+Bob
+
+From charlie@example.net Fri Nov 29 14:00:00 2024
+From: Charlie Brown <charlie@example.net>
+To: testuser@localhost
+Subject: Urgent Request
+Date: Fri, 29 Nov 2024 14:00:00 +0000
+Message-ID: <msg003@example.net>
+
+Hi,
+
+This is an urgent request that needs immediate attention.
+
+Thanks,
+Charlie
+
+From alice@different.org Fri Nov 29 15:00:00 2024
+From: Alice Wong <alice@different.org>
+To: testuser@localhost
+Subject: Another Meeting
+Date: Fri, 29 Nov 2024 15:00:00 +0000
+Message-ID: <msg004@different.org>
+
+Hi,
+
+Can we schedule another meeting for next week?
+
+Thanks,
+Alice
+
+From dave@example.com Fri Nov 29 16:00:00 2024
+From: Dave Wilson <dave@example.com>
+To: testuser@localhost
+Subject: Final Report
+Date: Fri, 29 Nov 2024 16:00:00 +0000
+Message-ID: <msg005@example.com>
+
+Team,
+
+Please find attached the final report for Q4.
+
+Best regards,
+Dave
+

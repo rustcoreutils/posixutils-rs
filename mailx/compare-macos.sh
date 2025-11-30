@@ -32,7 +32,7 @@ fi
 REPO_ROOT="$(cd "$MAILX_DIR/.." && pwd)"
 
 # Test data file
-TESTDATA="$MAILX_DIR/tests/cli/testdata.mbox"
+TESTDATA="$MAILX_DIR/tests/testdata.mbox"
 
 # Check prerequisites
 if [[ ! -f /usr/bin/mailx ]]; then

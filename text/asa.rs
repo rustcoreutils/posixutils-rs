@@ -23,7 +23,7 @@ struct Args {
 }
 
 fn asa_file(pathname: &PathBuf) -> io::Result<()> {
-    let mut reader = input_reader(pathname, false)?;
+    let mut reader = input_reader(pathname, true)?;
     let mut first_line = true;
     let mut had_output = false;
 
@@ -40,14 +40,15 @@ fn asa_file(pathname: &PathBuf) -> io::Result<()> {
             None => continue, // empty line shouldn't happen, but handle gracefully
         };
 
-        // Extract line content: skip first char, exclude trailing newline
+        // Extract line content: skip first char (may be multi-byte), exclude trailing newline
+        let first_char_len = ch.len_utf8();
         let line_end = if raw_line.ends_with('\n') {
             raw_line.len() - 1
         } else {
             raw_line.len()
         };
-        let line = if line_end > 1 {
-            &raw_line[1..line_end]
+        let line = if line_end > first_char_len {
+            &raw_line[first_char_len..line_end]
         } else {
             "" // control char only, no content
         };
@@ -112,9 +113,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut args = Args::parse();
 
-    // if no files, read from stdin
+    // if no files, read from stdin (use "-" to indicate stdin)
     if args.files.is_empty() {
-        args.files.push(PathBuf::new());
+        args.files.push(PathBuf::from("-"));
     }
 
     let mut exit_code = 0;

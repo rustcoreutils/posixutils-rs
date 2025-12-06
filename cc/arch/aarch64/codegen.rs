@@ -1229,9 +1229,12 @@ impl Aarch64CodeGen {
         let stack_size = alloc.stack_size();
         let callee_saved = alloc.callee_saved_used().to_vec();
 
-        // For variadic functions, we need extra space for the register save area
+        // For variadic functions on Linux/FreeBSD, we need extra space for the register save area
         // AAPCS64: 8 GP regs (x0-x7) * 8 bytes = 64 bytes
-        let reg_save_area_size: i32 = if is_variadic { 64 } else { 0 };
+        // On Darwin (macOS/iOS), variadic args are passed on the stack by the caller,
+        // so we don't need a register save area.
+        let is_darwin = self.target.os == crate::target::Os::MacOS;
+        let reg_save_area_size: i32 = if is_variadic && !is_darwin { 64 } else { 0 };
 
         // Calculate total frame size
         // Need space for: fp/lr (16 bytes) + callee-saved regs + local vars + reg save area
@@ -1435,10 +1438,11 @@ impl Aarch64CodeGen {
             }
         }
 
-        // For variadic functions, save ALL argument registers to the register save area
+        // For variadic functions on Linux/FreeBSD, save ALL argument registers to the register save area
         // This must be done BEFORE any code uses these registers, so va_arg can access them
         // AAPCS64: x0-x7 are saved at reg_save_area_offset from FP
-        if is_variadic {
+        // On Darwin, variadic args are passed on the stack by the caller, so we skip this.
+        if is_variadic && !is_darwin {
             let arg_regs = Reg::arg_regs();
             for (i, reg) in arg_regs.iter().enumerate() {
                 // Each register at offset: reg_save_area_offset + (i * 8)
@@ -3029,9 +3033,10 @@ impl Aarch64CodeGen {
 
         // For Darwin variadic calls, we need to:
         // 1. First pass fixed args in registers as normal
-        // 2. Then push ALL variadic args onto the stack (in reverse order for correct layout)
+        // 2. Allocate stack space for variadic args (with 16-byte alignment)
+        // 3. Store variadic args at 8-byte offsets from sp (like clang does)
         if is_darwin_variadic {
-            // Collect variadic args to push in reverse order
+            // Collect variadic args and fixed args separately
             let mut variadic_args: Vec<(PseudoId, bool, u32)> = Vec::new();
 
             // Process all arguments
@@ -3051,7 +3056,7 @@ impl Aarch64CodeGen {
                 };
 
                 if i >= variadic_start {
-                    // Variadic arg - collect for stack pushing
+                    // Variadic arg - collect for stack storing
                     variadic_args.push((arg, is_fp, arg_size));
                 } else {
                     // Fixed arg - use registers as normal
@@ -3065,7 +3070,6 @@ impl Aarch64CodeGen {
                             self.emit_fp_move(arg, fp_arg_regs[fp_arg_idx], fp_size, frame_size);
                             fp_arg_idx += 1;
                         }
-                        // Fixed args shouldn't overflow to stack in well-formed calls
                     } else if int_arg_idx < int_arg_regs.len() {
                         self.emit_move(arg, int_arg_regs[int_arg_idx], arg_size, frame_size);
                         int_arg_idx += 1;
@@ -3073,33 +3077,49 @@ impl Aarch64CodeGen {
                 }
             }
 
-            // Push variadic args in reverse order so first variadic arg ends up at [sp]
-            for (arg, is_fp, arg_size) in variadic_args.into_iter().rev() {
-                if is_fp {
-                    // Load FP value to temp register, then store to stack
-                    // For variadic calls on Darwin, floats are passed as 8-byte values on stack
-                    self.emit_fp_move(arg, VReg::V16, arg_size, frame_size);
-                    self.push_lir(Aarch64Inst::StrFp {
-                        size: FpSize::Double, // Always 8 bytes on stack for Darwin variadic
-                        src: VReg::V16,
-                        addr: MemAddr::PreIndex {
-                            base: Reg::SP,
-                            offset: -16,
-                        },
-                    });
-                } else {
-                    // Integer/pointer arg
-                    self.emit_move(arg, Reg::X9, arg_size, frame_size);
-                    self.push_lir(Aarch64Inst::Str {
-                        size: OperandSize::B64,
-                        src: Reg::X9,
-                        addr: MemAddr::PreIndex {
-                            base: Reg::SP,
-                            offset: -16,
-                        },
-                    });
+            // Calculate stack space for variadic args: 8 bytes each, rounded up to 16
+            let num_variadic = variadic_args.len();
+            if num_variadic > 0 {
+                let variadic_bytes = (num_variadic * 8) as i32;
+                let aligned_bytes = (variadic_bytes + 15) & !15; // Round up to 16
+
+                // Allocate stack space for variadic args
+                self.push_lir(Aarch64Inst::Sub {
+                    size: OperandSize::B64,
+                    src1: Reg::sp(),
+                    src2: GpOperand::Imm(aligned_bytes as i64),
+                    dst: Reg::sp(),
+                });
+
+                // Store variadic args at 8-byte offsets from sp
+                // First variadic arg at [sp+0], second at [sp+8], etc.
+                for (idx, (arg, is_fp, arg_size)) in variadic_args.into_iter().enumerate() {
+                    let offset = (idx * 8) as i32;
+                    if is_fp {
+                        self.emit_fp_move(arg, VReg::V16, arg_size, frame_size);
+                        self.push_lir(Aarch64Inst::StrFp {
+                            size: FpSize::Double,
+                            src: VReg::V16,
+                            addr: MemAddr::BaseOffset {
+                                base: Reg::SP,
+                                offset,
+                            },
+                        });
+                    } else {
+                        self.emit_move(arg, Reg::X9, arg_size, frame_size);
+                        self.push_lir(Aarch64Inst::Str {
+                            size: OperandSize::B64,
+                            src: Reg::X9,
+                            addr: MemAddr::BaseOffset {
+                                base: Reg::SP,
+                                offset,
+                            },
+                        });
+                    }
                 }
-                stack_args += 1;
+
+                // Track stack space for cleanup
+                stack_args = (aligned_bytes + 15) / 16; // Number of 16-byte units
             }
         } else {
             // Standard AAPCS64 (Linux, FreeBSD) or non-variadic calls
@@ -3858,12 +3878,17 @@ impl Aarch64CodeGen {
     // Variadic function support (va_* builtins)
     // ========================================================================
     //
-    // On macOS ARM64 (Apple Silicon) and AAPCS64, va_list is a char* pointer
-    // pointing to the first variadic argument in the register save area.
+    // Platform-specific va_list handling:
     //
-    // In the prologue, we save x0-x7 to the register save area. va_start
-    // computes the address of the first variadic argument by skipping
-    // the fixed parameters: reg_save_area + (num_fixed_gp_params * 8)
+    // Linux/FreeBSD (AAPCS64):
+    //   - va_list is a char* pointing to register save area
+    //   - In prologue, we save x0-x7 to the register save area
+    //   - va_start computes: reg_save_area + (num_fixed_gp_params * 8)
+    //
+    // Darwin (macOS/iOS):
+    //   - Variadic args are passed on the stack by the caller
+    //   - va_list is a char* pointing to the caller's stack
+    //   - va_start computes: FP + frame_size (where caller placed variadic args)
 
     /// Emit va_start: Initialize va_list to point to first variadic arg
     /// Note: ap_addr is the ADDRESS of the va_list variable (from symaddr), not the va_list itself
@@ -3876,9 +3901,18 @@ impl Aarch64CodeGen {
         let ap_loc = self.get_location(ap_addr);
         let (scratch0, scratch1) = Reg::scratch_regs();
 
-        // Compute address of first variadic argument in the register save area
-        // First variadic arg is at: FP + reg_save_area_offset + (num_fixed_gp_params * 8)
-        let vararg_offset = self.reg_save_area_offset + (self.num_fixed_gp_params as i32 * 8);
+        // Compute address of first variadic argument
+        let is_darwin = self.target.os == crate::target::Os::MacOS;
+        let vararg_offset = if is_darwin {
+            // Darwin: Variadic args are on the stack, placed by the caller
+            // They start at FP + frame_size (the original SP before prologue)
+            frame_size
+        } else {
+            // Linux/FreeBSD: Variadic args are in the register save area
+            // First variadic arg is at: reg_save_area_offset + (num_fixed_gp_params * 8)
+            self.reg_save_area_offset + (self.num_fixed_gp_params as i32 * 8)
+        };
+
         self.push_lir(Aarch64Inst::Add {
             size: OperandSize::B64,
             src1: Reg::X29,

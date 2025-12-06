@@ -1175,7 +1175,7 @@ impl Aarch64CodeGen {
                 src1: fp,
                 src2: lr,
                 addr: MemAddr::PreIndex {
-                    base: Reg::X29, // sp
+                    base: Reg::SP,
                     offset: -total_frame,
                 },
             });
@@ -1198,7 +1198,7 @@ impl Aarch64CodeGen {
             // Set up frame pointer: mov x29, sp
             self.push_lir(Aarch64Inst::Mov {
                 size: OperandSize::B64,
-                src: GpOperand::Reg(Reg::X29), // sp
+                src: GpOperand::Reg(Reg::SP),
                 dst: fp,
             });
             if self.emit_debug {
@@ -1218,7 +1218,7 @@ impl Aarch64CodeGen {
                         src1: callee_saved[i],
                         src2: callee_saved[i + 1],
                         addr: MemAddr::BaseOffset {
-                            base: Reg::X29, // sp
+                            base: Reg::X29, // fp
                             offset,
                         },
                     });
@@ -1240,7 +1240,7 @@ impl Aarch64CodeGen {
                         size: OperandSize::B64,
                         src: callee_saved[i],
                         addr: MemAddr::BaseOffset {
-                            base: Reg::X29, // sp
+                            base: Reg::X29, // fp
                             offset,
                         },
                     });
@@ -1262,7 +1262,7 @@ impl Aarch64CodeGen {
                 src1: fp,
                 src2: lr,
                 addr: MemAddr::PreIndex {
-                    base: Reg::X29, // sp
+                    base: Reg::SP,
                     offset: -16,
                 },
             });
@@ -1274,7 +1274,7 @@ impl Aarch64CodeGen {
             // mov x29, sp
             self.push_lir(Aarch64Inst::Mov {
                 size: OperandSize::B64,
-                src: GpOperand::Reg(Reg::X29), // sp
+                src: GpOperand::Reg(Reg::SP),
                 dst: fp,
             });
             if self.emit_debug {
@@ -1306,7 +1306,7 @@ impl Aarch64CodeGen {
                             size: OperandSize::B64,
                             src: Reg::X8,
                             addr: MemAddr::BaseOffset {
-                                base: Reg::X29, // sp
+                                base: Reg::X29, // fp
                                 offset: total_frame + offset,
                             },
                         });
@@ -1332,7 +1332,7 @@ impl Aarch64CodeGen {
                                         size: OperandSize::B64,
                                         src: arg_regs[i],
                                         addr: MemAddr::BaseOffset {
-                                            base: Reg::X29, // sp
+                                            base: Reg::X29, // fp
                                             offset: total_frame + offset,
                                         },
                                     });

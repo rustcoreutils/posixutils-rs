@@ -1601,18 +1601,19 @@ mod tests {
     fn test_stp_ldp() {
         let target = linux_target();
 
+        // Test stp with SP as base (valid prologue pattern)
         let mut out = String::new();
         let inst = Aarch64Inst::Stp {
             size: OperandSize::B64,
             src1: Reg::X29,
             src2: Reg::X30,
             addr: MemAddr::PreIndex {
-                base: Reg::X29,
+                base: Reg::SP,
                 offset: -16,
             },
         };
         inst.emit(&target, &mut out);
-        assert!(out.contains("stp x29, x30, [x29, #-16]!"));
+        assert!(out.contains("stp x29, x30, [sp, #-16]!"));
     }
 
     #[test]

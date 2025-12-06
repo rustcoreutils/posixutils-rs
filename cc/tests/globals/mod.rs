@@ -1,0 +1,296 @@
+//
+// Copyright (c) 2024 Jeff Garzik
+//
+// This file is part of the posixutils-rs project covered under
+// the MIT License.  For the full license text, please see the LICENSE
+// file in the root directory of this project.
+// SPDX-License-Identifier: MIT
+//
+// Integration tests for global variables
+//
+
+use crate::common::{cleanup_exe, compile, create_c_file, run};
+
+// ============================================================================
+// Basic Global Variable Tests
+// ============================================================================
+
+#[test]
+fn test_global_int_initialized() {
+    let c_file = create_c_file(
+        "global_int_init",
+        r#"
+int global_counter = 42;
+int main(void) {
+    return global_counter;
+}
+"#,
+    );
+
+    let exe = compile(&c_file.path().to_path_buf());
+    assert!(exe.is_some(), "compilation should succeed");
+
+    let exit_code = run(exe.as_ref().unwrap());
+    assert_eq!(exit_code, 42, "expected exit code 42");
+
+    cleanup_exe(&exe);
+}
+
+#[test]
+fn test_global_int_uninitialized() {
+    let c_file = create_c_file(
+        "global_int_uninit",
+        r#"
+int global_uninit;
+int main(void) {
+    return global_uninit;
+}
+"#,
+    );
+
+    let exe = compile(&c_file.path().to_path_buf());
+    assert!(exe.is_some(), "compilation should succeed");
+
+    let exit_code = run(exe.as_ref().unwrap());
+    // Uninitialized global should be zero
+    assert_eq!(exit_code, 0, "expected exit code 0");
+
+    cleanup_exe(&exe);
+}
+
+#[test]
+fn test_global_static() {
+    let c_file = create_c_file(
+        "global_static",
+        r#"
+static int static_var = 10;
+int main(void) {
+    return static_var;
+}
+"#,
+    );
+
+    let exe = compile(&c_file.path().to_path_buf());
+    assert!(exe.is_some(), "compilation should succeed");
+
+    let exit_code = run(exe.as_ref().unwrap());
+    assert_eq!(exit_code, 10, "expected exit code 10");
+
+    cleanup_exe(&exe);
+}
+
+#[test]
+fn test_global_static_uninitialized() {
+    let c_file = create_c_file(
+        "global_static_uninit",
+        r#"
+static int static_uninit;
+int main(void) {
+    return static_uninit;
+}
+"#,
+    );
+
+    let exe = compile(&c_file.path().to_path_buf());
+    assert!(exe.is_some(), "compilation should succeed");
+
+    let exit_code = run(exe.as_ref().unwrap());
+    // Static uninitialized should be zero
+    assert_eq!(exit_code, 0, "expected exit code 0");
+
+    cleanup_exe(&exe);
+}
+
+// ============================================================================
+// Multiple Global Variables
+// ============================================================================
+
+#[test]
+fn test_multiple_globals() {
+    let c_file = create_c_file(
+        "multiple_globals",
+        r#"
+int a = 10;
+int b = 20;
+int c = 12;
+int main(void) {
+    return a + b + c;
+}
+"#,
+    );
+
+    let exe = compile(&c_file.path().to_path_buf());
+    assert!(exe.is_some(), "compilation should succeed");
+
+    let exit_code = run(exe.as_ref().unwrap());
+    assert_eq!(exit_code, 42, "expected exit code 42");
+
+    cleanup_exe(&exe);
+}
+
+#[test]
+fn test_globals_different_types() {
+    let c_file = create_c_file(
+        "globals_diff_types",
+        r#"
+char c = 1;
+short s = 2;
+int i = 3;
+long l = 4;
+int main(void) {
+    return c + s + i + l;
+}
+"#,
+    );
+
+    let exe = compile(&c_file.path().to_path_buf());
+    assert!(exe.is_some(), "compilation should succeed");
+
+    let exit_code = run(exe.as_ref().unwrap());
+    assert_eq!(exit_code, 10, "expected exit code 10");
+
+    cleanup_exe(&exe);
+}
+
+// ============================================================================
+// Global Variable Modification
+// ============================================================================
+
+#[test]
+fn test_global_modification() {
+    let c_file = create_c_file(
+        "global_modify",
+        r#"
+int counter = 0;
+int main(void) {
+    counter = 42;
+    return counter;
+}
+"#,
+    );
+
+    let exe = compile(&c_file.path().to_path_buf());
+    assert!(exe.is_some(), "compilation should succeed");
+
+    let exit_code = run(exe.as_ref().unwrap());
+    assert_eq!(exit_code, 42, "expected exit code 42");
+
+    cleanup_exe(&exe);
+}
+
+#[test]
+fn test_global_increment() {
+    let c_file = create_c_file(
+        "global_increment",
+        r#"
+int counter = 40;
+int main(void) {
+    counter = counter + 1;
+    counter = counter + 1;
+    return counter;
+}
+"#,
+    );
+
+    let exe = compile(&c_file.path().to_path_buf());
+    assert!(exe.is_some(), "compilation should succeed");
+
+    let exit_code = run(exe.as_ref().unwrap());
+    assert_eq!(exit_code, 42, "expected exit code 42");
+
+    cleanup_exe(&exe);
+}
+
+// ============================================================================
+// Float/Double Global Variables
+// ============================================================================
+
+#[test]
+fn test_global_double() {
+    let c_file = create_c_file(
+        "global_double",
+        r#"
+double d = 42.5;
+int main(void) {
+    return (int)d;
+}
+"#,
+    );
+
+    let exe = compile(&c_file.path().to_path_buf());
+    assert!(exe.is_some(), "compilation should succeed");
+
+    let exit_code = run(exe.as_ref().unwrap());
+    assert_eq!(exit_code, 42, "expected exit code 42");
+
+    cleanup_exe(&exe);
+}
+
+#[test]
+fn test_global_float() {
+    let c_file = create_c_file(
+        "global_float",
+        r#"
+float f = 42.9f;
+int main(void) {
+    return (int)f;
+}
+"#,
+    );
+
+    let exe = compile(&c_file.path().to_path_buf());
+    assert!(exe.is_some(), "compilation should succeed");
+
+    let exit_code = run(exe.as_ref().unwrap());
+    assert_eq!(exit_code, 42, "expected exit code 42");
+
+    cleanup_exe(&exe);
+}
+
+// ============================================================================
+// Pointer Globals
+// ============================================================================
+
+#[test]
+fn test_global_pointer_null() {
+    let c_file = create_c_file(
+        "global_ptr_null",
+        r#"
+int *ptr = 0;
+int main(void) {
+    return ptr ? 1 : 0;
+}
+"#,
+    );
+
+    let exe = compile(&c_file.path().to_path_buf());
+    assert!(exe.is_some(), "compilation should succeed");
+
+    let exit_code = run(exe.as_ref().unwrap());
+    assert_eq!(exit_code, 0, "expected exit code 0");
+
+    cleanup_exe(&exe);
+}
+
+#[test]
+fn test_global_pointer_to_global() {
+    let c_file = create_c_file(
+        "global_ptr_to_global",
+        r#"
+int value = 42;
+int *ptr;
+int main(void) {
+    ptr = &value;
+    return *ptr;
+}
+"#,
+    );
+
+    let exe = compile(&c_file.path().to_path_buf());
+    assert!(exe.is_some(), "compilation should succeed");
+
+    let exit_code = run(exe.as_ref().unwrap());
+    assert_eq!(exit_code, 42, "expected exit code 42");
+
+    cleanup_exe(&exe);
+}

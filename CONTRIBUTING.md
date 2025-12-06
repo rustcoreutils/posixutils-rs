@@ -71,6 +71,9 @@ There are several ways to contribute to posixutils-rs:
 	   static input data, and compares output with
 	   static output data (OS reference data).
 * Use plib's TestPlan framework for integration tests.
+* Integration test harness should ONLY contain `mod` statements.
+  Test logic is in $module/tests/$category/mod.rs files.
 * Only "quick" tests should be run automatically in `cargo test`
 * Longer tests, or tests requiring root access, should be triggered
   via special environment variables.
+

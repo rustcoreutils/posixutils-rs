@@ -263,7 +263,7 @@ fn parse_stmt(
     in_loop: bool,
     statements: &mut Vec<StmtInstruction>,
     source_locations: &mut Vec<usize>,
-) -> Result<usize, PestError> {
+) -> Result<usize, Box<PestError>> {
     let stmt = first_child(stmt);
     let (line, _) = stmt.line_col();
     source_locations.push(line);
@@ -271,12 +271,12 @@ fn parse_stmt(
     match stmt.as_rule() {
         Rule::break_stmt => {
             if !in_loop {
-                return Err(pest::error::Error::new_from_span(
+                return Err(Box::new(pest::error::Error::new_from_span(
                     pest::error::ErrorVariant::CustomError {
                         message: "break outside of loop".to_string(),
                     },
                     stmt.as_span(),
-                ));
+                )));
             }
             statements.push(StmtInstruction::Break);
         }
@@ -286,12 +286,12 @@ fn parse_stmt(
         Rule::return_stmt => {
             // return ( "(" expr? ")" )?
             if !in_function {
-                return Err(pest::error::Error::new_from_span(
+                return Err(Box::new(pest::error::Error::new_from_span(
                     pest::error::ErrorVariant::CustomError {
                         message: "return outside of function".to_string(),
                     },
                     stmt.as_span(),
-                ));
+                )));
             }
             let mut inner = stmt.into_inner();
             if let Some(expr) = inner.next() {
@@ -381,7 +381,7 @@ fn parse_stmt(
     Ok(instruction_count)
 }
 
-fn parse_function(func: Pair<Rule>, file: Rc<str>) -> Result<Function, PestError> {
+fn parse_function(func: Pair<Rule>, file: Rc<str>) -> Result<Function, Box<PestError>> {
     let mut function = func.into_inner();
 
     // define letter ( parameter_list ) auto_define_list statement_list end
@@ -586,7 +586,7 @@ pub fn parse_program(text: &str, file_path: Option<&str>) -> Result<Program, Par
                     if let Err(e) =
                         parse_stmt(stmt, false, false, &mut instructions, &mut source_locations)
                     {
-                        errors.push(e);
+                        errors.push(*e);
                     }
                 }
             }
@@ -595,7 +595,7 @@ pub fn parse_program(text: &str, file_path: Option<&str>) -> Result<Program, Par
                     name: f.name,
                     function: f,
                 }),
-                Err(e) => errors.push(e),
+                Err(e) => errors.push(*e),
             },
             Rule::EOI => {}
             _ => unreachable!(),

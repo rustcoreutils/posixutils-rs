@@ -190,6 +190,7 @@ fn stty_show_long(ti: Termios) -> io::Result<()> {
 }
 
 // display compact, parse-able form stty values
+#[allow(clippy::unnecessary_cast)] // tcflag_t is u64 on macOS, u32 on Linux
 fn stty_show_compact(ti: Termios) -> io::Result<()> {
     // encode settings as pairs of (String,u64)
     let mut tiv = vec![

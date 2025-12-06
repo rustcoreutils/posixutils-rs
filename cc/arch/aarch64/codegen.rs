@@ -2398,6 +2398,16 @@ impl Aarch64CodeGen {
             None => return,
         };
         let dst_loc = self.get_location(target);
+
+        // Check if this is an FP load
+        let is_fp =
+            insn.typ.as_ref().is_some_and(|t| t.is_float()) || matches!(dst_loc, Loc::VReg(_));
+
+        if is_fp {
+            self.emit_fp_load(insn, frame_size);
+            return;
+        }
+
         let dst_reg = match &dst_loc {
             Loc::Reg(r) => *r,
             _ => Reg::X9,
@@ -2515,6 +2525,119 @@ impl Aarch64CodeGen {
 
         if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
             self.emit_move_to_loc(dst_reg, &dst_loc, reg_size, frame_size);
+        }
+    }
+
+    /// Emit a floating-point load instruction
+    fn emit_fp_load(&mut self, insn: &Instruction, frame_size: i32) {
+        let size = insn.size.max(32);
+        let addr = match insn.src.first() {
+            Some(&s) => s,
+            None => return,
+        };
+        let target = match insn.target {
+            Some(t) => t,
+            None => return,
+        };
+        let dst_loc = self.get_location(target);
+        let dst_vreg = match &dst_loc {
+            Loc::VReg(v) => *v,
+            _ => VReg::V17,
+        };
+        let addr_loc = self.get_location(addr);
+
+        let fp_size = if size <= 32 {
+            FpSize::Single
+        } else {
+            FpSize::Double
+        };
+
+        match addr_loc {
+            Loc::Reg(r) => {
+                self.push_lir(Aarch64Inst::LdrFp {
+                    size: fp_size,
+                    addr: MemAddr::BaseOffset {
+                        base: r,
+                        offset: insn.offset as i32,
+                    },
+                    dst: dst_vreg,
+                });
+            }
+            Loc::Stack(offset) => {
+                // Check if the address operand is a symbol (local variable) or a temp (spilled address)
+                let is_symbol = self
+                    .pseudos
+                    .iter()
+                    .find(|p| p.id == addr)
+                    .is_some_and(|p| matches!(p.kind, PseudoKind::Sym(_)));
+
+                if is_symbol {
+                    // Local variable - load directly from stack slot
+                    let total_offset = frame_size + offset + insn.offset as i32;
+                    self.push_lir(Aarch64Inst::LdrFp {
+                        size: fp_size,
+                        addr: MemAddr::BaseOffset {
+                            base: Reg::sp(),
+                            offset: total_offset,
+                        },
+                        dst: dst_vreg,
+                    });
+                } else {
+                    // Spilled address - load address first, then load from that address
+                    let adjusted = frame_size + offset;
+                    self.push_lir(Aarch64Inst::Ldr {
+                        size: OperandSize::B64,
+                        addr: MemAddr::BaseOffset {
+                            base: Reg::sp(),
+                            offset: adjusted,
+                        },
+                        dst: Reg::X16,
+                    });
+                    self.push_lir(Aarch64Inst::LdrFp {
+                        size: fp_size,
+                        addr: MemAddr::BaseOffset {
+                            base: Reg::X16,
+                            offset: insn.offset as i32,
+                        },
+                        dst: dst_vreg,
+                    });
+                }
+            }
+            Loc::Global(name) => {
+                // Load FP value from global using ADRP + LDR
+                let sym = if name.starts_with('.') {
+                    Symbol::local(&name)
+                } else {
+                    Symbol::global(&name)
+                };
+                let (scratch0, _) = Reg::scratch_regs();
+                self.push_lir(Aarch64Inst::Adrp {
+                    sym: sym.clone(),
+                    dst: scratch0,
+                });
+                self.push_lir(Aarch64Inst::LdrFpSymOffset {
+                    size: fp_size,
+                    sym,
+                    base: scratch0,
+                    dst: dst_vreg,
+                });
+            }
+            _ => {
+                self.emit_move(addr, Reg::X16, 64, frame_size);
+                self.push_lir(Aarch64Inst::LdrFp {
+                    size: fp_size,
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::X16,
+                        offset: insn.offset as i32,
+                    },
+                    dst: dst_vreg,
+                });
+            }
+        }
+
+        // Move to final destination if needed
+        if !matches!(&dst_loc, Loc::VReg(v) if *v == dst_vreg) {
+            self.emit_fp_move_to_loc(dst_vreg, &dst_loc, size, frame_size);
         }
     }
 

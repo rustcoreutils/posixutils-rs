@@ -636,6 +636,16 @@ pub enum Aarch64Inst {
         dst: VReg,
     },
 
+    /// LDR (FP) with symbol page offset (used with ADRP for global FP loads)
+    /// macOS: ldr dst, [base, symbol@PAGEOFF]
+    /// Linux: ldr dst, [base, :lo12:symbol]
+    LdrFpSymOffset {
+        size: FpSize,
+        sym: Symbol,
+        base: Reg,
+        dst: VReg,
+    },
+
     /// STR (FP) - Store FP register
     StrFp {
         size: FpSize,
@@ -1348,6 +1358,39 @@ impl EmitAsm for Aarch64Inst {
                     FpSize::Double => src.name_d(),
                 };
                 let _ = writeln!(out, "    str {}, {}", name, addr.format());
+            }
+
+            Aarch64Inst::LdrFpSymOffset {
+                size,
+                sym,
+                base,
+                dst,
+            } => {
+                let sym_name = sym.format_for_target(target);
+                let fp_name = match size {
+                    FpSize::Single => dst.name_s(),
+                    FpSize::Double => dst.name_d(),
+                };
+                match target.os {
+                    Os::MacOS => {
+                        let _ = writeln!(
+                            out,
+                            "    ldr {}, [{}, {}@PAGEOFF]",
+                            fp_name,
+                            base.name64(),
+                            sym_name
+                        );
+                    }
+                    Os::Linux | Os::FreeBSD => {
+                        let _ = writeln!(
+                            out,
+                            "    ldr {}, [{}, :lo12:{}]",
+                            fp_name,
+                            base.name64(),
+                            sym_name
+                        );
+                    }
+                }
             }
 
             Aarch64Inst::Fadd {

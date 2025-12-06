@@ -3457,14 +3457,25 @@ impl Aarch64CodeGen {
         // Load source to FP register
         self.emit_fp_move(src, VReg::V17, src_size, frame_size);
 
-        // Convert between float sizes
+        // Convert between float sizes if they differ
         // fcvt: convert between single and double precision
-        self.push_lir(Aarch64Inst::Fcvt {
-            src_size: src_fp_size,
-            dst_size: dst_fp_size,
-            src: VReg::V17,
-            dst: dst_vreg,
-        });
+        // Note: On Apple Silicon, long double == double (both 64-bit),
+        // so skip fcvt when sizes are equal to avoid invalid "fcvt d, d"
+        if src_fp_size != dst_fp_size {
+            self.push_lir(Aarch64Inst::Fcvt {
+                src_size: src_fp_size,
+                dst_size: dst_fp_size,
+                src: VReg::V17,
+                dst: dst_vreg,
+            });
+        } else if dst_vreg != VReg::V17 {
+            // Same size, just move if needed
+            self.push_lir(Aarch64Inst::FmovReg {
+                size: dst_fp_size,
+                src: VReg::V17,
+                dst: dst_vreg,
+            });
+        }
 
         if !matches!(&dst_loc, Loc::VReg(v) if *v == dst_vreg) {
             self.emit_fp_move_to_loc(dst_vreg, &dst_loc, dst_size, frame_size);

@@ -619,9 +619,12 @@ impl RegAlloc {
                     }
                     PseudoKind::Sym(name) => {
                         // Check if this is a local variable or a global symbol
-                        if func.locals.contains_key(name) {
-                            // Local variable - allocate stack space
-                            self.stack_offset += 8;
+                        if let Some(local) = func.locals.get(name) {
+                            // Local variable - allocate stack space based on actual type size
+                            let size = local.typ.size_bytes().max(8) as i32;
+                            // Align to 8 bytes
+                            let aligned_size = (size + 7) & !7;
+                            self.stack_offset += aligned_size;
                             self.locations
                                 .insert(interval.pseudo, Loc::Stack(-self.stack_offset));
                         } else {

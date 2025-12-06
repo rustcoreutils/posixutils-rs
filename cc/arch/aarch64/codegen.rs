@@ -1773,10 +1773,31 @@ impl Aarch64CodeGen {
 
             Opcode::SymAddr => {
                 if let (Some(target), Some(&src)) = (insn.target, insn.src.first()) {
-                    if let Some(Loc::Reg(dst)) = self.locations.get(&target).cloned() {
-                        if let Some(Loc::Global(name)) = self.locations.get(&src).cloned() {
-                            self.emit_load_addr(&name, dst);
+                    let dst_loc = self.get_location(target);
+                    let dst_reg = match &dst_loc {
+                        Loc::Reg(r) => *r,
+                        _ => Reg::X9,
+                    };
+                    let src_loc = self.get_location(src);
+                    match src_loc {
+                        Loc::Global(name) => {
+                            self.emit_load_addr(&name, dst_reg);
                         }
+                        Loc::Stack(offset) => {
+                            // Get address of stack location using add
+                            let adjusted = *total_frame + offset;
+                            self.push_lir(Aarch64Inst::Add {
+                                size: OperandSize::B64,
+                                src1: Reg::SP,
+                                src2: GpOperand::Imm(adjusted as i64),
+                                dst: dst_reg,
+                            });
+                        }
+                        _ => {}
+                    }
+                    // Move to final destination if needed
+                    if !matches!(&dst_loc, Loc::Reg(r) if *r == dst_reg) {
+                        self.emit_move_to_loc(dst_reg, &dst_loc, 64, *total_frame);
                     }
                 }
             }

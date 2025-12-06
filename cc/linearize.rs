@@ -23,6 +23,11 @@ use crate::symbol::SymbolTable;
 use crate::types::{MemberInfo, Type, TypeKind, TypeModifiers};
 use std::collections::HashMap;
 
+/// Maximum size (in bits) for aggregate types (struct/union) to be passed or
+/// returned by value in registers. Aggregates larger than this require
+/// indirect passing (pointer) or sret (struct return pointer).
+pub const MAX_REGISTER_AGGREGATE_BITS: u32 = 64;
+
 /// Information about a local variable
 #[derive(Clone)]
 struct LocalVarInfo {
@@ -490,12 +495,12 @@ impl<'a> Linearizer<'a> {
         let mut ir_func = Function::new(&func.name, func.return_type.clone());
         ir_func.is_static = is_static;
 
-        // Check if function returns a large struct (> 8 bytes)
-        // According to System V AMD64 ABI, large structs are returned via a hidden
-        // first parameter that points to caller-allocated space
+        // Check if function returns a large struct
+        // Large structs are returned via a hidden first parameter (sret)
+        // that points to caller-allocated space
         let returns_large_struct = (func.return_type.kind == TypeKind::Struct
             || func.return_type.kind == TypeKind::Union)
-            && func.return_type.size_bits() > 64;
+            && func.return_type.size_bits() > MAX_REGISTER_AGGREGATE_BITS;
 
         // Argument index offset: if returning large struct, first arg is hidden return pointer
         let arg_offset: u32 = if returns_large_struct { 1 } else { 0 };
@@ -551,9 +556,9 @@ impl<'a> Linearizer<'a> {
                 func.add_local(&name, local_sym, typ.clone(), is_volatile, None);
             }
 
-            // For large structs (> 8 bytes), arg_pseudo is a pointer to the struct
+            // For large structs, arg_pseudo is a pointer to the struct
             // We need to copy the data from that pointer to local storage
-            if typ.size_bits() > 64 {
+            if typ.size_bits() > MAX_REGISTER_AGGREGATE_BITS {
                 // arg_pseudo is a pointer - copy each 8-byte chunk
                 let struct_size = typ.size_bits() / 8;
                 let mut offset = 0i64;
@@ -2231,11 +2236,11 @@ impl<'a> Linearizer<'a> {
                     None // No type info, assume non-variadic
                 };
 
-                // Check if function returns a large struct (> 8 bytes)
+                // Check if function returns a large struct
                 // If so, allocate space and pass address as hidden first argument
                 let returns_large_struct = (typ.kind == TypeKind::Struct
                     || typ.kind == TypeKind::Union)
-                    && typ.size_bits() > 64;
+                    && typ.size_bits() > MAX_REGISTER_AGGREGATE_BITS;
 
                 let (result_sym, mut arg_vals, mut arg_types_vec) = if returns_large_struct {
                     // Allocate local storage for the return value
@@ -2273,12 +2278,12 @@ impl<'a> Linearizer<'a> {
                 };
 
                 // Linearize regular arguments
-                // For structs > 8 bytes, pass by reference (address) instead of by value
+                // For large structs, pass by reference (address) instead of by value
                 for a in args.iter() {
                     let arg_type = self.expr_type(a);
                     let arg_val = if (arg_type.kind == TypeKind::Struct
                         || arg_type.kind == TypeKind::Union)
-                        && arg_type.size_bits() > 64
+                        && arg_type.size_bits() > MAX_REGISTER_AGGREGATE_BITS
                     {
                         // Large struct: pass address instead of value
                         // The argument type becomes a pointer

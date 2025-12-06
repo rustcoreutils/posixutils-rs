@@ -43,8 +43,12 @@ use token::{preprocess, show_token, token_type_name, StreamTable, Tokenizer};
 #[command(version, about = gettext("pcc - compile standard C programs"))]
 struct Args {
     /// Input files
-    #[arg(required = true)]
+    #[arg(required_unless_present = "print_targets")]
     files: Vec<String>,
+
+    /// Print registered targets
+    #[arg(long = "print-targets", help = gettext("Display available target architectures"))]
+    print_targets: bool,
 
     /// Dump tokens (for debugging tokenizer)
     #[arg(
@@ -330,6 +334,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
 
     let args = Args::parse();
+
+    // Handle --print-targets
+    if args.print_targets {
+        println!("  Registered Targets:");
+        println!("    aarch64    - AArch64 (little endian)");
+        println!("    x86-64     - 64-bit X86: EM64T and AMD64");
+        return Ok(());
+    }
 
     // Detect target (use --target if specified, otherwise detect host)
     let target = if let Some(ref triple) = args.target {

@@ -2984,12 +2984,21 @@ impl Aarch64CodeGen {
         // - Floating-point arguments: V0-V7 (8 registers)
         // - Indirect result (large struct return): X8
         // Each class has its own register allocation
+        //
+        // Apple ARM64 (Darwin) divergence for variadic functions:
+        // ALL variadic arguments (after the last named parameter) must be passed
+        // on the stack, not in registers. This differs from standard AAPCS64.
         let int_arg_regs = Reg::arg_regs();
         let fp_arg_regs = VReg::arg_regs();
 
         let mut int_arg_idx = 0;
         let mut fp_arg_idx = 0;
         let mut stack_args = 0;
+
+        // For Darwin variadic calls, determine where variadic args start
+        let variadic_start = insn.variadic_arg_start.unwrap_or(usize::MAX);
+        let is_darwin_variadic =
+            self.target.os == crate::target::Os::MacOS && insn.variadic_arg_start.is_some();
 
         // Check if this call returns a large struct
         // If so, the first argument is the sret pointer and goes in X8 (not X0)
@@ -3018,47 +3027,140 @@ impl Aarch64CodeGen {
             0
         };
 
-        // Move arguments to registers
-        for (i, &arg) in insn.src.iter().enumerate().skip(args_start) {
-            // Get argument type if available, otherwise fall back to location-based detection
-            let arg_type = insn.arg_types.get(i);
-            let is_fp = if let Some(typ) = arg_type {
-                typ.is_float()
-            } else {
-                // Fall back to location-based detection for backwards compatibility
-                let arg_loc = self.get_location(arg);
-                matches!(arg_loc, Loc::VReg(_) | Loc::FImm(_))
-            };
+        // For Darwin variadic calls, we need to:
+        // 1. First pass fixed args in registers as normal
+        // 2. Then push ALL variadic args onto the stack (in reverse order for correct layout)
+        if is_darwin_variadic {
+            // Collect variadic args to push in reverse order
+            let mut variadic_args: Vec<(PseudoId, bool, u32)> = Vec::new();
 
-            // Get argument size from type, with minimum 32-bit for register ops
-            let arg_size = if let Some(typ) = arg_type {
-                typ.size_bits().max(32)
-            } else {
-                64 // Default for backwards compatibility
-            };
+            // Process all arguments
+            for (i, &arg) in insn.src.iter().enumerate().skip(args_start) {
+                let arg_type = insn.arg_types.get(i);
+                let is_fp = if let Some(typ) = arg_type {
+                    typ.is_float()
+                } else {
+                    let arg_loc = self.get_location(arg);
+                    matches!(arg_loc, Loc::VReg(_) | Loc::FImm(_))
+                };
 
-            if is_fp {
-                // FP size from type (32 for float, 64 for double)
-                let fp_size = if let Some(typ) = arg_type {
-                    typ.size_bits()
+                let arg_size = if let Some(typ) = arg_type {
+                    typ.size_bits().max(32)
                 } else {
                     64
                 };
-                if fp_arg_idx < fp_arg_regs.len() {
-                    self.emit_fp_move(arg, fp_arg_regs[fp_arg_idx], fp_size, frame_size);
-                    fp_arg_idx += 1;
+
+                if i >= variadic_start {
+                    // Variadic arg - collect for stack pushing
+                    variadic_args.push((arg, is_fp, arg_size));
                 } else {
-                    // FP arg on stack
-                    self.emit_fp_move(arg, VReg::V16, fp_size, frame_size);
-                    // LIR: store FP reg to stack with pre-decrement
-                    let fp_sz = if fp_size == 32 {
-                        FpSize::Single
-                    } else {
-                        FpSize::Double
-                    };
+                    // Fixed arg - use registers as normal
+                    if is_fp {
+                        let fp_size = if let Some(typ) = arg_type {
+                            typ.size_bits()
+                        } else {
+                            64
+                        };
+                        if fp_arg_idx < fp_arg_regs.len() {
+                            self.emit_fp_move(arg, fp_arg_regs[fp_arg_idx], fp_size, frame_size);
+                            fp_arg_idx += 1;
+                        }
+                        // Fixed args shouldn't overflow to stack in well-formed calls
+                    } else if int_arg_idx < int_arg_regs.len() {
+                        self.emit_move(arg, int_arg_regs[int_arg_idx], arg_size, frame_size);
+                        int_arg_idx += 1;
+                    }
+                }
+            }
+
+            // Push variadic args in reverse order so first variadic arg ends up at [sp]
+            for (arg, is_fp, arg_size) in variadic_args.into_iter().rev() {
+                if is_fp {
+                    // Load FP value to temp register, then store to stack
+                    // For variadic calls on Darwin, floats are passed as 8-byte values on stack
+                    self.emit_fp_move(arg, VReg::V16, arg_size, frame_size);
                     self.push_lir(Aarch64Inst::StrFp {
-                        size: fp_sz,
+                        size: FpSize::Double, // Always 8 bytes on stack for Darwin variadic
                         src: VReg::V16,
+                        addr: MemAddr::PreIndex {
+                            base: Reg::SP,
+                            offset: -16,
+                        },
+                    });
+                } else {
+                    // Integer/pointer arg
+                    self.emit_move(arg, Reg::X9, arg_size, frame_size);
+                    self.push_lir(Aarch64Inst::Str {
+                        size: OperandSize::B64,
+                        src: Reg::X9,
+                        addr: MemAddr::PreIndex {
+                            base: Reg::SP,
+                            offset: -16,
+                        },
+                    });
+                }
+                stack_args += 1;
+            }
+        } else {
+            // Standard AAPCS64 (Linux, FreeBSD) or non-variadic calls
+            // Move arguments to registers
+            for (i, &arg) in insn.src.iter().enumerate().skip(args_start) {
+                // Get argument type if available, otherwise fall back to location-based detection
+                let arg_type = insn.arg_types.get(i);
+                let is_fp = if let Some(typ) = arg_type {
+                    typ.is_float()
+                } else {
+                    // Fall back to location-based detection for backwards compatibility
+                    let arg_loc = self.get_location(arg);
+                    matches!(arg_loc, Loc::VReg(_) | Loc::FImm(_))
+                };
+
+                // Get argument size from type, with minimum 32-bit for register ops
+                let arg_size = if let Some(typ) = arg_type {
+                    typ.size_bits().max(32)
+                } else {
+                    64 // Default for backwards compatibility
+                };
+
+                if is_fp {
+                    // FP size from type (32 for float, 64 for double)
+                    let fp_size = if let Some(typ) = arg_type {
+                        typ.size_bits()
+                    } else {
+                        64
+                    };
+                    if fp_arg_idx < fp_arg_regs.len() {
+                        self.emit_fp_move(arg, fp_arg_regs[fp_arg_idx], fp_size, frame_size);
+                        fp_arg_idx += 1;
+                    } else {
+                        // FP arg on stack
+                        self.emit_fp_move(arg, VReg::V16, fp_size, frame_size);
+                        // LIR: store FP reg to stack with pre-decrement
+                        let fp_sz = if fp_size == 32 {
+                            FpSize::Single
+                        } else {
+                            FpSize::Double
+                        };
+                        self.push_lir(Aarch64Inst::StrFp {
+                            size: fp_sz,
+                            src: VReg::V16,
+                            addr: MemAddr::PreIndex {
+                                base: Reg::SP,
+                                offset: -16,
+                            },
+                        });
+                        stack_args += 1;
+                    }
+                } else if int_arg_idx < int_arg_regs.len() {
+                    self.emit_move(arg, int_arg_regs[int_arg_idx], arg_size, frame_size);
+                    int_arg_idx += 1;
+                } else {
+                    // Integer arg on stack - always store 8 bytes on aarch64
+                    self.emit_move(arg, Reg::X9, arg_size, frame_size);
+                    // LIR: store GP reg to stack with pre-decrement
+                    self.push_lir(Aarch64Inst::Str {
+                        size: OperandSize::B64,
+                        src: Reg::X9,
                         addr: MemAddr::PreIndex {
                             base: Reg::SP,
                             offset: -16,
@@ -3066,22 +3168,6 @@ impl Aarch64CodeGen {
                     });
                     stack_args += 1;
                 }
-            } else if int_arg_idx < int_arg_regs.len() {
-                self.emit_move(arg, int_arg_regs[int_arg_idx], arg_size, frame_size);
-                int_arg_idx += 1;
-            } else {
-                // Integer arg on stack - always store 8 bytes on aarch64
-                self.emit_move(arg, Reg::X9, arg_size, frame_size);
-                // LIR: store GP reg to stack with pre-decrement
-                self.push_lir(Aarch64Inst::Str {
-                    size: OperandSize::B64,
-                    src: Reg::X9,
-                    addr: MemAddr::PreIndex {
-                        base: Reg::SP,
-                        offset: -16,
-                    },
-                });
-                stack_args += 1;
             }
         }
 

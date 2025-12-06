@@ -1461,6 +1461,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "posixutils-cc"
+version = "0.2.2"
+dependencies = [
+ "bitflags 2.9.0",
+ "clap",
+ "gettext-rs",
+ "plib",
+ "tempfile",
+]
+
+[[package]]
 name = "posixutils-datetime"
 version = "0.2.2"
 dependencies = [

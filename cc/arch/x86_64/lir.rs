@@ -1,0 +1,1280 @@
+//
+// Copyright (c) 2024 Jeff Garzik
+//
+// This file is part of the posixutils-rs project covered under
+// the MIT License.  For the full license text, please see the LICENSE
+// file in the root directory of this project.
+// SPDX-License-Identifier: MIT
+//
+// x86-64 Low-level Intermediate Representation (LIR)
+//
+// Strongly-typed representation of x86-64 assembly instructions.
+// Each instruction variant encodes all operands in typed fields,
+// enabling peephole optimizations before final assembly emission.
+//
+
+// Allow dead code - LIR infrastructure for future phases
+#![allow(dead_code)]
+
+use super::codegen::{Reg, XmmReg};
+use crate::arch::lir::{Directive, EmitAsm, FpSize, Label, OperandSize, Symbol};
+use crate::target::{Os, Target};
+use std::fmt::{self, Write};
+
+// ============================================================================
+// Memory Addressing Modes
+// ============================================================================
+
+/// x86-64 memory addressing mode
+#[derive(Debug, Clone, PartialEq)]
+pub enum MemAddr {
+    /// [base + offset] - Register indirect with displacement
+    BaseOffset { base: Reg, offset: i32 },
+
+    /// [rip + symbol] - PC-relative addressing for position-independent code
+    RipRelative(Symbol),
+
+    /// [base + index * scale + offset] - Full SIB addressing
+    Sib {
+        base: Reg,
+        index: Reg,
+        scale: u8, // 1, 2, 4, or 8
+        offset: i32,
+    },
+
+    /// [offset] - Absolute address (rare, mainly for globals on some platforms)
+    Absolute(i64),
+}
+
+impl MemAddr {
+    /// Format memory operand in AT&T syntax
+    pub fn format(&self, target: &Target) -> String {
+        match self {
+            MemAddr::BaseOffset { base, offset } => {
+                if *offset == 0 {
+                    format!("({})", base.name64())
+                } else {
+                    format!("{}({})", offset, base.name64())
+                }
+            }
+            MemAddr::RipRelative(sym) => {
+                format!("{}(%rip)", sym.format_for_target(target))
+            }
+            MemAddr::Sib {
+                base,
+                index,
+                scale,
+                offset,
+            } => {
+                if *offset == 0 {
+                    format!("({},{},{})", base.name64(), index.name64(), scale)
+                } else {
+                    format!("{}({},{},{})", offset, base.name64(), index.name64(), scale)
+                }
+            }
+            MemAddr::Absolute(addr) => {
+                format!("{:#x}", addr)
+            }
+        }
+    }
+}
+
+// ============================================================================
+// General-Purpose Operands
+// ============================================================================
+
+/// x86-64 general-purpose operand (register, memory, or immediate)
+#[derive(Debug, Clone, PartialEq)]
+pub enum GpOperand {
+    /// Register operand
+    Reg(Reg),
+    /// Memory operand
+    Mem(MemAddr),
+    /// Immediate integer value
+    Imm(i64),
+}
+
+impl GpOperand {
+    /// Format operand in AT&T syntax for given size
+    pub fn format(&self, size: OperandSize, target: &Target) -> String {
+        match self {
+            GpOperand::Reg(r) => r.name_for_size(size.bits()).to_string(),
+            GpOperand::Mem(addr) => addr.format(target),
+            GpOperand::Imm(v) => format!("${}", v),
+        }
+    }
+
+    /// Check if this is a register operand
+    pub fn is_reg(&self) -> bool {
+        matches!(self, GpOperand::Reg(_))
+    }
+
+    /// Get register if this is a register operand
+    pub fn as_reg(&self) -> Option<Reg> {
+        match self {
+            GpOperand::Reg(r) => Some(*r),
+            _ => None,
+        }
+    }
+}
+
+// ============================================================================
+// XMM (Floating-Point) Operands
+// ============================================================================
+
+/// x86-64 XMM operand (register or memory)
+#[derive(Debug, Clone, PartialEq)]
+pub enum XmmOperand {
+    /// XMM register operand
+    Reg(XmmReg),
+    /// Memory operand
+    Mem(MemAddr),
+}
+
+impl XmmOperand {
+    /// Format operand in AT&T syntax
+    pub fn format(&self, target: &Target) -> String {
+        match self {
+            XmmOperand::Reg(r) => r.name().to_string(),
+            XmmOperand::Mem(addr) => addr.format(target),
+        }
+    }
+}
+
+// ============================================================================
+// Condition Codes
+// ============================================================================
+
+/// Integer condition codes for comparisons and conditional jumps/sets
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IntCC {
+    /// Equal (ZF=1)
+    E,
+    /// Not equal (ZF=0)
+    Ne,
+    /// Less than (signed) (SF!=OF)
+    L,
+    /// Less than or equal (signed) (ZF=1 or SF!=OF)
+    Le,
+    /// Greater than (signed) (ZF=0 and SF=OF)
+    G,
+    /// Greater than or equal (signed) (SF=OF)
+    Ge,
+    /// Below (unsigned) (CF=1)
+    B,
+    /// Below or equal (unsigned) (CF=1 or ZF=1)
+    Be,
+    /// Above (unsigned) (CF=0 and ZF=0)
+    A,
+    /// Above or equal (unsigned) (CF=0)
+    Ae,
+    /// Sign (SF=1)
+    S,
+    /// Not sign (SF=0)
+    Ns,
+    /// Parity (PF=1) - for FP unordered
+    P,
+    /// Not parity (PF=0) - for FP ordered
+    Np,
+}
+
+impl IntCC {
+    /// x86-64 condition code suffix
+    pub fn suffix(&self) -> &'static str {
+        match self {
+            IntCC::E => "e",
+            IntCC::Ne => "ne",
+            IntCC::L => "l",
+            IntCC::Le => "le",
+            IntCC::G => "g",
+            IntCC::Ge => "ge",
+            IntCC::B => "b",
+            IntCC::Be => "be",
+            IntCC::A => "a",
+            IntCC::Ae => "ae",
+            IntCC::S => "s",
+            IntCC::Ns => "ns",
+            IntCC::P => "p",
+            IntCC::Np => "np",
+        }
+    }
+
+    /// Get the inverse condition
+    pub fn inverse(&self) -> IntCC {
+        match self {
+            IntCC::E => IntCC::Ne,
+            IntCC::Ne => IntCC::E,
+            IntCC::L => IntCC::Ge,
+            IntCC::Le => IntCC::G,
+            IntCC::G => IntCC::Le,
+            IntCC::Ge => IntCC::L,
+            IntCC::B => IntCC::Ae,
+            IntCC::Be => IntCC::A,
+            IntCC::A => IntCC::Be,
+            IntCC::Ae => IntCC::B,
+            IntCC::S => IntCC::Ns,
+            IntCC::Ns => IntCC::S,
+            IntCC::P => IntCC::Np,
+            IntCC::Np => IntCC::P,
+        }
+    }
+}
+
+impl fmt::Display for IntCC {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.suffix())
+    }
+}
+
+// ============================================================================
+// Shift Count
+// ============================================================================
+
+/// Shift/rotate count specifier
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShiftCount {
+    /// Immediate shift count (0-63)
+    Imm(u8),
+    /// Use %cl register for count
+    Cl,
+}
+
+// ============================================================================
+// Call Target
+// ============================================================================
+
+/// Target for call instructions
+#[derive(Debug, Clone, PartialEq)]
+pub enum CallTarget {
+    /// Direct call to symbol
+    Direct(Symbol),
+    /// Indirect call through register
+    Indirect(Reg),
+    /// Indirect call through memory
+    IndirectMem(MemAddr),
+}
+
+// ============================================================================
+// x86-64 LIR Instructions
+// ============================================================================
+
+/// x86-64 Low-level IR instruction
+#[derive(Debug, Clone)]
+pub enum X86Inst {
+    // ========================================================================
+    // Data Movement
+    // ========================================================================
+    /// MOV - Move data between registers/memory
+    Mov {
+        size: OperandSize,
+        src: GpOperand,
+        dst: GpOperand,
+    },
+
+    /// MOVABS - Move 64-bit immediate to register
+    MovAbs { imm: i64, dst: Reg },
+
+    /// MOVZX - Move with zero extension
+    Movzx {
+        src_size: OperandSize,
+        dst_size: OperandSize,
+        src: GpOperand,
+        dst: Reg,
+    },
+
+    /// MOVSX - Move with sign extension
+    Movsx {
+        src_size: OperandSize,
+        dst_size: OperandSize,
+        src: GpOperand,
+        dst: Reg,
+    },
+
+    /// LEA - Load effective address
+    Lea { addr: MemAddr, dst: Reg },
+
+    /// PUSH - Push value onto stack
+    Push { src: GpOperand },
+
+    /// POP - Pop value from stack
+    Pop { dst: Reg },
+
+    /// XCHG - Exchange register contents
+    Xchg { size: OperandSize, r1: Reg, r2: Reg },
+
+    // ========================================================================
+    // Integer Arithmetic
+    // ========================================================================
+    /// ADD - Integer addition
+    Add {
+        size: OperandSize,
+        src: GpOperand,
+        dst: Reg,
+    },
+
+    /// SUB - Integer subtraction
+    Sub {
+        size: OperandSize,
+        src: GpOperand,
+        dst: Reg,
+    },
+
+    /// IMUL - Signed multiply (2-operand form: dst *= src)
+    IMul2 {
+        size: OperandSize,
+        src: GpOperand,
+        dst: Reg,
+    },
+
+    /// IMUL - Signed multiply (1-operand form: RDX:RAX = RAX * src)
+    IMul1 { size: OperandSize, src: GpOperand },
+
+    /// MUL - Unsigned multiply (1-operand form: RDX:RAX = RAX * src)
+    Mul1 { size: OperandSize, src: GpOperand },
+
+    /// IDIV - Signed divide (RDX:RAX / src -> RAX quotient, RDX remainder)
+    IDiv {
+        size: OperandSize,
+        divisor: GpOperand,
+    },
+
+    /// DIV - Unsigned divide (RDX:RAX / src -> RAX quotient, RDX remainder)
+    Div {
+        size: OperandSize,
+        divisor: GpOperand,
+    },
+
+    /// NEG - Two's complement negation
+    Neg { size: OperandSize, dst: Reg },
+
+    /// INC - Increment by 1
+    Inc { size: OperandSize, dst: GpOperand },
+
+    /// DEC - Decrement by 1
+    Dec { size: OperandSize, dst: GpOperand },
+
+    // ========================================================================
+    // Bitwise Operations
+    // ========================================================================
+    /// NOT - One's complement (bitwise NOT)
+    Not { size: OperandSize, dst: Reg },
+
+    /// AND - Bitwise AND
+    And {
+        size: OperandSize,
+        src: GpOperand,
+        dst: Reg,
+    },
+
+    /// OR - Bitwise OR
+    Or {
+        size: OperandSize,
+        src: GpOperand,
+        dst: Reg,
+    },
+
+    /// XOR - Bitwise exclusive OR
+    Xor {
+        size: OperandSize,
+        src: GpOperand,
+        dst: Reg,
+    },
+
+    /// SHL/SAL - Shift left
+    Shl {
+        size: OperandSize,
+        count: ShiftCount,
+        dst: Reg,
+    },
+
+    /// SHR - Logical shift right
+    Shr {
+        size: OperandSize,
+        count: ShiftCount,
+        dst: Reg,
+    },
+
+    /// SAR - Arithmetic shift right
+    Sar {
+        size: OperandSize,
+        count: ShiftCount,
+        dst: Reg,
+    },
+
+    /// ROR - Rotate right
+    Ror {
+        size: OperandSize,
+        count: ShiftCount,
+        dst: Reg,
+    },
+
+    // ========================================================================
+    // Comparison and Conditional
+    // ========================================================================
+    /// CMP - Compare (sets flags based on dst - src)
+    Cmp {
+        size: OperandSize,
+        src: GpOperand,
+        dst: GpOperand,
+    },
+
+    /// TEST - Test (sets flags based on dst AND src)
+    Test {
+        size: OperandSize,
+        src: GpOperand,
+        dst: GpOperand,
+    },
+
+    /// SETcc - Set byte based on condition
+    SetCC { cc: IntCC, dst: Reg },
+
+    /// CMOVcc - Conditional move
+    CMov {
+        cc: IntCC,
+        size: OperandSize,
+        src: GpOperand,
+        dst: Reg,
+    },
+
+    // ========================================================================
+    // Control Flow
+    // ========================================================================
+    /// JMP - Unconditional jump
+    Jmp { target: Label },
+
+    /// Jcc - Conditional jump
+    Jcc { cc: IntCC, target: Label },
+
+    /// CALL - Function call
+    Call { target: CallTarget },
+
+    /// RET - Return from function
+    Ret,
+
+    // ========================================================================
+    // Floating-Point (SSE)
+    // ========================================================================
+    /// MOVSS/MOVSD - Move scalar floating-point
+    MovFp {
+        size: FpSize,
+        src: XmmOperand,
+        dst: XmmOperand,
+    },
+
+    /// MOVD/MOVQ - Move between GP and XMM registers
+    MovGpXmm {
+        size: OperandSize,
+        src: Reg,
+        dst: XmmReg,
+    },
+
+    /// MOVD/MOVQ - Move from XMM to GP register
+    MovXmmGp {
+        size: OperandSize,
+        src: XmmReg,
+        dst: Reg,
+    },
+
+    /// ADDSS/ADDSD - Add scalar floating-point
+    AddFp {
+        size: FpSize,
+        src: XmmOperand,
+        dst: XmmReg,
+    },
+
+    /// SUBSS/SUBSD - Subtract scalar floating-point
+    SubFp {
+        size: FpSize,
+        src: XmmOperand,
+        dst: XmmReg,
+    },
+
+    /// MULSS/MULSD - Multiply scalar floating-point
+    MulFp {
+        size: FpSize,
+        src: XmmOperand,
+        dst: XmmReg,
+    },
+
+    /// DIVSS/DIVSD - Divide scalar floating-point
+    DivFp {
+        size: FpSize,
+        src: XmmOperand,
+        dst: XmmReg,
+    },
+
+    /// XORPS/XORPD - XOR packed floating-point (used for zeroing/negation)
+    XorFp {
+        size: FpSize,
+        src: XmmReg,
+        dst: XmmReg,
+    },
+
+    /// UCOMISS/UCOMISD - Unordered compare scalar floating-point
+    UComiFp {
+        size: FpSize,
+        src: XmmOperand,
+        dst: XmmReg,
+    },
+
+    /// CVTSI2SS/CVTSI2SD - Convert integer to scalar floating-point
+    CvtIntToFp {
+        int_size: OperandSize,
+        fp_size: FpSize,
+        src: GpOperand,
+        dst: XmmReg,
+    },
+
+    /// CVTTSS2SI/CVTTSD2SI - Convert scalar FP to integer (truncate toward zero)
+    CvtFpToInt {
+        fp_size: FpSize,
+        int_size: OperandSize,
+        src: XmmOperand,
+        dst: Reg,
+    },
+
+    /// CVTSS2SD/CVTSD2SS - Convert between FP sizes
+    CvtFpFp {
+        src_size: FpSize,
+        dst_size: FpSize,
+        src: XmmReg,
+        dst: XmmReg,
+    },
+
+    // ========================================================================
+    // Special Instructions
+    // ========================================================================
+    /// CLTD/CDQ - Sign extend EAX into EDX:EAX (32-bit)
+    Cltd,
+
+    /// CQTO/CQO - Sign extend RAX into RDX:RAX (64-bit)
+    Cqto,
+
+    /// BSWAP - Byte swap
+    Bswap { size: OperandSize, reg: Reg },
+
+    /// XORPS with same register - Fast zero XMM register
+    XorpsSelf { reg: XmmReg },
+
+    // ========================================================================
+    // Directives (Architecture-Independent)
+    // ========================================================================
+    /// Assembler directives (labels, sections, CFI, .loc, data, etc.)
+    /// These are architecture-independent and use the shared Directive type.
+    Directive(Directive),
+}
+
+// ============================================================================
+// EmitAsm Implementation
+// ============================================================================
+
+impl EmitAsm for X86Inst {
+    fn emit(&self, target: &Target, out: &mut String) {
+        match self {
+            // Data Movement
+            X86Inst::Mov { size, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    mov{} {}, {}",
+                    size.x86_suffix(),
+                    src.format(*size, target),
+                    dst.format(*size, target)
+                );
+            }
+
+            X86Inst::MovAbs { imm, dst } => {
+                let _ = writeln!(out, "    movabsq ${}, {}", imm, dst.name64());
+            }
+
+            X86Inst::Movzx {
+                src_size,
+                dst_size,
+                src,
+                dst,
+            } => {
+                let op = match (src_size, dst_size) {
+                    (OperandSize::B8, OperandSize::B16) => "movzbw",
+                    (OperandSize::B8, OperandSize::B32) => "movzbl",
+                    (OperandSize::B8, OperandSize::B64) => "movzbq",
+                    (OperandSize::B16, OperandSize::B32) => "movzwl",
+                    (OperandSize::B16, OperandSize::B64) => "movzwq",
+                    _ => "movzbl", // fallback
+                };
+                let _ = writeln!(
+                    out,
+                    "    {} {}, {}",
+                    op,
+                    src.format(*src_size, target),
+                    dst.name_for_size(dst_size.bits())
+                );
+            }
+
+            X86Inst::Movsx {
+                src_size,
+                dst_size,
+                src,
+                dst,
+            } => {
+                let op = match (src_size, dst_size) {
+                    (OperandSize::B8, OperandSize::B16) => "movsbw",
+                    (OperandSize::B8, OperandSize::B32) => "movsbl",
+                    (OperandSize::B8, OperandSize::B64) => "movsbq",
+                    (OperandSize::B16, OperandSize::B32) => "movswl",
+                    (OperandSize::B16, OperandSize::B64) => "movswq",
+                    (OperandSize::B32, OperandSize::B64) => "movslq",
+                    _ => "movsbl", // fallback
+                };
+                let _ = writeln!(
+                    out,
+                    "    {} {}, {}",
+                    op,
+                    src.format(*src_size, target),
+                    dst.name_for_size(dst_size.bits())
+                );
+            }
+
+            X86Inst::Lea { addr, dst } => {
+                let _ = writeln!(out, "    leaq {}, {}", addr.format(target), dst.name64());
+            }
+
+            X86Inst::Push { src } => {
+                let _ = writeln!(out, "    pushq {}", src.format(OperandSize::B64, target));
+            }
+
+            X86Inst::Pop { dst } => {
+                let _ = writeln!(out, "    popq {}", dst.name64());
+            }
+
+            X86Inst::Xchg { size, r1, r2 } => {
+                let _ = writeln!(
+                    out,
+                    "    xchg{} {}, {}",
+                    size.x86_suffix(),
+                    r1.name_for_size(size.bits()),
+                    r2.name_for_size(size.bits())
+                );
+            }
+
+            // Integer Arithmetic
+            X86Inst::Add { size, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    add{} {}, {}",
+                    size.x86_suffix(),
+                    src.format(*size, target),
+                    dst.name_for_size(size.bits())
+                );
+            }
+
+            X86Inst::Sub { size, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    sub{} {}, {}",
+                    size.x86_suffix(),
+                    src.format(*size, target),
+                    dst.name_for_size(size.bits())
+                );
+            }
+
+            X86Inst::IMul2 { size, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    imul{} {}, {}",
+                    size.x86_suffix(),
+                    src.format(*size, target),
+                    dst.name_for_size(size.bits())
+                );
+            }
+
+            X86Inst::IMul1 { size, src } => {
+                let _ = writeln!(
+                    out,
+                    "    imul{} {}",
+                    size.x86_suffix(),
+                    src.format(*size, target)
+                );
+            }
+
+            X86Inst::Mul1 { size, src } => {
+                let _ = writeln!(
+                    out,
+                    "    mul{} {}",
+                    size.x86_suffix(),
+                    src.format(*size, target)
+                );
+            }
+
+            X86Inst::IDiv { size, divisor } => {
+                let _ = writeln!(
+                    out,
+                    "    idiv{} {}",
+                    size.x86_suffix(),
+                    divisor.format(*size, target)
+                );
+            }
+
+            X86Inst::Div { size, divisor } => {
+                let _ = writeln!(
+                    out,
+                    "    div{} {}",
+                    size.x86_suffix(),
+                    divisor.format(*size, target)
+                );
+            }
+
+            X86Inst::Neg { size, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    neg{} {}",
+                    size.x86_suffix(),
+                    dst.name_for_size(size.bits())
+                );
+            }
+
+            X86Inst::Inc { size, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    inc{} {}",
+                    size.x86_suffix(),
+                    dst.format(*size, target)
+                );
+            }
+
+            X86Inst::Dec { size, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    dec{} {}",
+                    size.x86_suffix(),
+                    dst.format(*size, target)
+                );
+            }
+
+            // Bitwise Operations
+            X86Inst::Not { size, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    not{} {}",
+                    size.x86_suffix(),
+                    dst.name_for_size(size.bits())
+                );
+            }
+
+            X86Inst::And { size, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    and{} {}, {}",
+                    size.x86_suffix(),
+                    src.format(*size, target),
+                    dst.name_for_size(size.bits())
+                );
+            }
+
+            X86Inst::Or { size, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    or{} {}, {}",
+                    size.x86_suffix(),
+                    src.format(*size, target),
+                    dst.name_for_size(size.bits())
+                );
+            }
+
+            X86Inst::Xor { size, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    xor{} {}, {}",
+                    size.x86_suffix(),
+                    src.format(*size, target),
+                    dst.name_for_size(size.bits())
+                );
+            }
+
+            X86Inst::Shl { size, count, dst } => {
+                let count_str = match count {
+                    ShiftCount::Imm(n) => format!("${}", n),
+                    ShiftCount::Cl => "%cl".to_string(),
+                };
+                let _ = writeln!(
+                    out,
+                    "    shl{} {}, {}",
+                    size.x86_suffix(),
+                    count_str,
+                    dst.name_for_size(size.bits())
+                );
+            }
+
+            X86Inst::Shr { size, count, dst } => {
+                let count_str = match count {
+                    ShiftCount::Imm(n) => format!("${}", n),
+                    ShiftCount::Cl => "%cl".to_string(),
+                };
+                let _ = writeln!(
+                    out,
+                    "    shr{} {}, {}",
+                    size.x86_suffix(),
+                    count_str,
+                    dst.name_for_size(size.bits())
+                );
+            }
+
+            X86Inst::Sar { size, count, dst } => {
+                let count_str = match count {
+                    ShiftCount::Imm(n) => format!("${}", n),
+                    ShiftCount::Cl => "%cl".to_string(),
+                };
+                let _ = writeln!(
+                    out,
+                    "    sar{} {}, {}",
+                    size.x86_suffix(),
+                    count_str,
+                    dst.name_for_size(size.bits())
+                );
+            }
+
+            X86Inst::Ror { size, count, dst } => {
+                let count_str = match count {
+                    ShiftCount::Imm(n) => format!("${}", n),
+                    ShiftCount::Cl => "%cl".to_string(),
+                };
+                let _ = writeln!(
+                    out,
+                    "    ror{} {}, {}",
+                    size.x86_suffix(),
+                    count_str,
+                    dst.name_for_size(size.bits())
+                );
+            }
+
+            // Comparison and Conditional
+            X86Inst::Cmp { size, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    cmp{} {}, {}",
+                    size.x86_suffix(),
+                    src.format(*size, target),
+                    dst.format(*size, target)
+                );
+            }
+
+            X86Inst::Test { size, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    test{} {}, {}",
+                    size.x86_suffix(),
+                    src.format(*size, target),
+                    dst.format(*size, target)
+                );
+            }
+
+            X86Inst::SetCC { cc, dst } => {
+                let _ = writeln!(out, "    set{} {}", cc.suffix(), dst.name8());
+            }
+
+            X86Inst::CMov { cc, size, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    cmov{}{} {}, {}",
+                    cc.suffix(),
+                    size.x86_suffix(),
+                    src.format(*size, target),
+                    dst.name_for_size(size.bits())
+                );
+            }
+
+            // Control Flow
+            X86Inst::Jmp { target: lbl } => {
+                let _ = writeln!(out, "    jmp {}", lbl.name());
+            }
+
+            X86Inst::Jcc { cc, target: lbl } => {
+                let _ = writeln!(out, "    j{} {}", cc.suffix(), lbl.name());
+            }
+
+            X86Inst::Call {
+                target: call_target,
+            } => match call_target {
+                CallTarget::Direct(sym) => {
+                    // On Linux/FreeBSD, external symbols need @PLT for PIC
+                    let sym_name = sym.format_for_target(target);
+                    match target.os {
+                        Os::Linux | Os::FreeBSD if !sym.is_local => {
+                            let _ = writeln!(out, "    call {}@PLT", sym_name);
+                        }
+                        _ => {
+                            let _ = writeln!(out, "    call {}", sym_name);
+                        }
+                    }
+                }
+                CallTarget::Indirect(reg) => {
+                    let _ = writeln!(out, "    call *{}", reg.name64());
+                }
+                CallTarget::IndirectMem(addr) => {
+                    let _ = writeln!(out, "    call *{}", addr.format(target));
+                }
+            },
+
+            X86Inst::Ret => {
+                let _ = writeln!(out, "    ret");
+            }
+
+            // Floating-Point
+            X86Inst::MovFp { size, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    mov{} {}, {}",
+                    size.x86_suffix(),
+                    src.format(target),
+                    dst.format(target)
+                );
+            }
+
+            X86Inst::MovGpXmm { size, src, dst } => {
+                let op = if size.bits() <= 32 { "movd" } else { "movq" };
+                let _ = writeln!(
+                    out,
+                    "    {} {}, {}",
+                    op,
+                    src.name_for_size(size.bits()),
+                    dst.name()
+                );
+            }
+
+            X86Inst::MovXmmGp { size, src, dst } => {
+                let op = if size.bits() <= 32 { "movd" } else { "movq" };
+                let _ = writeln!(
+                    out,
+                    "    {} {}, {}",
+                    op,
+                    src.name(),
+                    dst.name_for_size(size.bits())
+                );
+            }
+
+            X86Inst::AddFp { size, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    add{} {}, {}",
+                    size.x86_suffix(),
+                    src.format(target),
+                    dst.name()
+                );
+            }
+
+            X86Inst::SubFp { size, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    sub{} {}, {}",
+                    size.x86_suffix(),
+                    src.format(target),
+                    dst.name()
+                );
+            }
+
+            X86Inst::MulFp { size, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    mul{} {}, {}",
+                    size.x86_suffix(),
+                    src.format(target),
+                    dst.name()
+                );
+            }
+
+            X86Inst::DivFp { size, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    div{} {}, {}",
+                    size.x86_suffix(),
+                    src.format(target),
+                    dst.name()
+                );
+            }
+
+            X86Inst::XorFp { size, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    xor{} {}, {}",
+                    size.x86_packed_suffix(),
+                    src.name(),
+                    dst.name()
+                );
+            }
+
+            X86Inst::UComiFp { size, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    ucomi{} {}, {}",
+                    size.x86_suffix(),
+                    src.format(target),
+                    dst.name()
+                );
+            }
+
+            X86Inst::CvtIntToFp {
+                int_size,
+                fp_size,
+                src,
+                dst,
+            } => {
+                let int_suffix = if int_size.bits() <= 32 { "l" } else { "q" };
+                let _ = writeln!(
+                    out,
+                    "    cvtsi2{}{} {}, {}",
+                    fp_size.x86_suffix(),
+                    int_suffix,
+                    src.format(*int_size, target),
+                    dst.name()
+                );
+            }
+
+            X86Inst::CvtFpToInt {
+                fp_size,
+                int_size,
+                src,
+                dst,
+            } => {
+                let int_suffix = if int_size.bits() <= 32 { "l" } else { "q" };
+                let _ = writeln!(
+                    out,
+                    "    cvtt{}2si{} {}, {}",
+                    fp_size.x86_suffix(),
+                    int_suffix,
+                    src.format(target),
+                    dst.name_for_size(int_size.bits())
+                );
+            }
+
+            X86Inst::CvtFpFp {
+                src_size,
+                dst_size,
+                src,
+                dst,
+            } => {
+                let _ = writeln!(
+                    out,
+                    "    cvt{}2{} {}, {}",
+                    src_size.x86_suffix(),
+                    dst_size.x86_suffix(),
+                    src.name(),
+                    dst.name()
+                );
+            }
+
+            // Special Instructions
+            X86Inst::Cltd => {
+                let _ = writeln!(out, "    cltd");
+            }
+
+            X86Inst::Cqto => {
+                let _ = writeln!(out, "    cqto");
+            }
+
+            X86Inst::Bswap { size, reg } => {
+                if size.bits() == 16 {
+                    // x86 bswap doesn't work for 16-bit, use xchg or rol
+                    let _ = writeln!(out, "    rolw $8, {}", reg.name16());
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "    bswap{}",
+                        if size.bits() == 32 {
+                            format!(" {}", reg.name32())
+                        } else {
+                            format!(" {}", reg.name64())
+                        }
+                    );
+                }
+            }
+
+            X86Inst::XorpsSelf { reg } => {
+                let _ = writeln!(out, "    xorps {}, {}", reg.name(), reg.name());
+            }
+
+            // Directives - delegate to shared implementation
+            X86Inst::Directive(dir) => {
+                dir.emit(target, out);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+/// Emit a sequence of LIR instructions to assembly text
+pub fn emit_instrs(instrs: &[X86Inst], target: &Target) -> String {
+    let mut out = String::new();
+    for inst in instrs {
+        inst.emit(target, &mut out);
+    }
+    out
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::target::{Arch, Os};
+
+    fn linux_target() -> Target {
+        Target::new(Arch::X86_64, Os::Linux)
+    }
+
+    fn macos_target() -> Target {
+        Target::new(Arch::X86_64, Os::MacOS)
+    }
+
+    #[test]
+    fn test_mov_emit() {
+        let target = linux_target();
+        let mut out = String::new();
+
+        let inst = X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::Rax),
+            dst: GpOperand::Reg(Reg::Rbx),
+        };
+        inst.emit(&target, &mut out);
+        assert_eq!(out.trim(), "movq %rax, %rbx");
+    }
+
+    #[test]
+    fn test_mov_sizes() {
+        let target = linux_target();
+
+        // Test all sizes
+        for (size, expected_suffix) in [
+            (OperandSize::B8, "b"),
+            (OperandSize::B16, "w"),
+            (OperandSize::B32, "l"),
+            (OperandSize::B64, "q"),
+        ] {
+            let mut out = String::new();
+            let inst = X86Inst::Mov {
+                size,
+                src: GpOperand::Imm(42),
+                dst: GpOperand::Reg(Reg::Rax),
+            };
+            inst.emit(&target, &mut out);
+            assert!(
+                out.contains(&format!("mov{}", expected_suffix)),
+                "Expected mov{}, got: {}",
+                expected_suffix,
+                out
+            );
+        }
+    }
+
+    #[test]
+    fn test_mem_addr_format() {
+        let target = linux_target();
+
+        let addr = MemAddr::BaseOffset {
+            base: Reg::Rbp,
+            offset: -8,
+        };
+        assert_eq!(addr.format(&target), "-8(%rbp)");
+
+        let addr = MemAddr::BaseOffset {
+            base: Reg::Rsp,
+            offset: 0,
+        };
+        assert_eq!(addr.format(&target), "(%rsp)");
+
+        let addr = MemAddr::RipRelative(Symbol::global("printf"));
+        assert_eq!(addr.format(&target), "printf(%rip)");
+    }
+
+    #[test]
+    fn test_symbol_macos_prefix() {
+        let linux = linux_target();
+        let macos = macos_target();
+
+        let sym = Symbol::global("main");
+        assert_eq!(sym.format_for_target(&linux), "main");
+        assert_eq!(sym.format_for_target(&macos), "_main");
+
+        let mut out = String::new();
+        let inst = X86Inst::Call {
+            target: CallTarget::Direct(Symbol::global("printf")),
+        };
+        inst.emit(&macos, &mut out);
+        assert!(out.contains("_printf"));
+    }
+
+    #[test]
+    fn test_conditional_jump() {
+        let target = linux_target();
+
+        for (cc, expected) in [
+            (IntCC::E, "je"),
+            (IntCC::Ne, "jne"),
+            (IntCC::L, "jl"),
+            (IntCC::G, "jg"),
+            (IntCC::B, "jb"),
+            (IntCC::A, "ja"),
+        ] {
+            let mut out = String::new();
+            let inst = X86Inst::Jcc {
+                cc,
+                target: Label::new("test", 1),
+            };
+            inst.emit(&target, &mut out);
+            assert!(
+                out.contains(expected),
+                "Expected {}, got: {}",
+                expected,
+                out
+            );
+        }
+    }
+
+    #[test]
+    fn test_fp_instructions() {
+        let target = linux_target();
+
+        let mut out = String::new();
+        let inst = X86Inst::AddFp {
+            size: FpSize::Double,
+            src: XmmOperand::Reg(XmmReg::Xmm1),
+            dst: XmmReg::Xmm0,
+        };
+        inst.emit(&target, &mut out);
+        assert!(out.contains("addsd"));
+
+        let mut out = String::new();
+        let inst = X86Inst::AddFp {
+            size: FpSize::Single,
+            src: XmmOperand::Reg(XmmReg::Xmm1),
+            dst: XmmReg::Xmm0,
+        };
+        inst.emit(&target, &mut out);
+        assert!(out.contains("addss"));
+    }
+
+    #[test]
+    fn test_emit_instrs() {
+        let target = linux_target();
+
+        let instrs = vec![
+            X86Inst::Push {
+                src: GpOperand::Reg(Reg::Rbp),
+            },
+            X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Reg(Reg::Rsp),
+                dst: GpOperand::Reg(Reg::Rbp),
+            },
+            X86Inst::Ret,
+        ];
+
+        let out = emit_instrs(&instrs, &target);
+        assert!(out.contains("pushq %rbp"));
+        assert!(out.contains("movq %rsp, %rbp"));
+        assert!(out.contains("ret"));
+    }
+}

@@ -6,12 +6,24 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
   linux-ubuntu:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: System info
+        run: |
+          echo "=== Architecture ==="
+          uname -a
+          echo "=== CPU ==="
+          lscpu | head -20
+          echo "=== Toolchain ==="
+          rustc --version
+          cargo --version
+          cc --version || true
+          as --version || true
       - name: Fetch
         run: cargo fetch
       - name: Build
@@ -39,9 +51,26 @@ jobs:
         with:
           path: ~/.cargo/registry/cache
           key: registry-${{ runner.os }}-${{ steps.rust-version.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+      - name: System info
+        run: |
+          echo "=== Architecture ==="
+          uname -a
+          arch
+          echo "=== Toolchain ==="
+          rustc --version
+          cargo --version
+          cc --version || true
+          as -version || true
+          echo "=== Xcode ==="
+          xcodebuild -version || true
       - name: Fetch
         run: cargo fetch
       - name: Build
         run: cargo build --release --verbose
       - name: Run tests
         run: cargo test --release --verbose
+      - name: Run cc tests (detailed)
+        if: failure()
+        run: |
+          echo "=== Re-running cc tests with more detail ==="
+          cargo test --release -p posixutils-cc --verbose -- --nocapture --test-threads=1 2>&1 | head -500

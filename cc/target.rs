@@ -145,6 +145,37 @@ impl Default for Target {
     }
 }
 
+impl Target {
+    /// Parse a target triple (e.g., "aarch64-apple-darwin", "x86_64-unknown-linux-gnu")
+    pub fn from_triple(triple: &str) -> Option<Self> {
+        let parts: Vec<&str> = triple.split('-').collect();
+        if parts.is_empty() {
+            return None;
+        }
+
+        let arch = match parts[0] {
+            "x86_64" => Arch::X86_64,
+            "aarch64" | "arm64" => Arch::Aarch64,
+            _ => return None,
+        };
+
+        // Detect OS from triple (second or third part typically)
+        let os = if triple.contains("linux") {
+            Os::Linux
+        } else if triple.contains("darwin") || triple.contains("macos") || triple.contains("apple")
+        {
+            Os::MacOS
+        } else if triple.contains("freebsd") {
+            Os::FreeBSD
+        } else {
+            // Default based on arch
+            Os::Linux
+        };
+
+        Some(Self::new(arch, os))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

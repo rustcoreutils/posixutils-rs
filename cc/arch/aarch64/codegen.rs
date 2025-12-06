@@ -952,6 +952,10 @@ pub struct Aarch64CodeGen {
     last_debug_file: u16,
     /// Whether to emit debug info (.file/.loc directives)
     emit_debug: bool,
+    /// Offset from FP to register save area (for variadic functions)
+    reg_save_area_offset: i32,
+    /// Number of fixed GP parameters (for variadic functions)
+    num_fixed_gp_params: usize,
 }
 
 impl Aarch64CodeGen {
@@ -968,7 +972,21 @@ impl Aarch64CodeGen {
             last_debug_line: 0,
             last_debug_file: 0,
             emit_debug: false,
+            reg_save_area_offset: 0,
+            num_fixed_gp_params: 0,
         }
+    }
+
+    /// Check if a function contains va_start (indicating it's variadic)
+    fn is_variadic_function(func: &Function) -> bool {
+        for block in &func.blocks {
+            for insn in &block.insns {
+                if matches!(insn.op, crate::ir::Opcode::VaStart) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Push a LIR instruction to the buffer (deferred emission)
@@ -1122,6 +1140,9 @@ impl Aarch64CodeGen {
     }
 
     fn emit_function(&mut self, func: &Function) {
+        // Check if this function uses varargs
+        let is_variadic = Self::is_variadic_function(func);
+
         // Register allocation
         let mut alloc = RegAlloc::new();
         self.locations = alloc.allocate(func);
@@ -1130,14 +1151,27 @@ impl Aarch64CodeGen {
         let stack_size = alloc.stack_size();
         let callee_saved = alloc.callee_saved_used().to_vec();
 
+        // For variadic functions, we need extra space for the register save area
+        // AAPCS64: 8 GP regs (x0-x7) * 8 bytes = 64 bytes
+        let reg_save_area_size: i32 = if is_variadic { 64 } else { 0 };
+
         // Calculate total frame size
-        // Need space for: fp/lr (16 bytes) + callee-saved regs + local vars
+        // Need space for: fp/lr (16 bytes) + callee-saved regs + local vars + reg save area
         // Round up callee-saved count to even for 16-byte alignment
         let callee_saved_pairs = (callee_saved.len() + 1) / 2;
         let callee_saved_size = callee_saved_pairs as i32 * 16;
-        let total_frame = 16 + callee_saved_size + stack_size;
+        let total_frame = 16 + callee_saved_size + stack_size + reg_save_area_size;
         // Ensure 16-byte alignment
         let total_frame = (total_frame + 15) & !15;
+
+        // Track register save area offset for va_start (offset from FP)
+        // Layout: [fp/lr][callee-saved][locals][reg_save_area]
+        // The save area is at FP + 16 + callee_saved_size + stack_size
+        self.reg_save_area_offset = if is_variadic {
+            16 + callee_saved_size + stack_size
+        } else {
+            0
+        };
 
         // Save function name and frame size for label generation
         self.current_fn = func.name.clone();
@@ -1320,6 +1354,34 @@ impl Aarch64CodeGen {
             }
         }
 
+        // For variadic functions, save ALL argument registers to the register save area
+        // This must be done BEFORE any code uses these registers, so va_arg can access them
+        // AAPCS64: x0-x7 are saved at reg_save_area_offset from FP
+        if is_variadic {
+            let arg_regs = Reg::arg_regs();
+            for (i, reg) in arg_regs.iter().enumerate() {
+                // Each register at offset: reg_save_area_offset + (i * 8)
+                let offset = self.reg_save_area_offset + (i as i32 * 8);
+                self.push_lir(Aarch64Inst::Str {
+                    size: OperandSize::B64,
+                    src: *reg,
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::X29, // fp
+                        offset,
+                    },
+                });
+            }
+        }
+
+        // Count fixed GP parameters for va_start
+        if is_variadic {
+            self.num_fixed_gp_params = func
+                .params
+                .iter()
+                .filter(|(_, typ)| !typ.is_float())
+                .count();
+        }
+
         // Move arguments from registers to their allocated locations if needed
         // Note: On AAPCS64, sret uses X8, so regular args still start at X0
         let arg_regs = Reg::arg_regs();
@@ -1412,7 +1474,15 @@ impl Aarch64CodeGen {
                     }
                 }
 
-                // Epilogue: restore callee-saved registers
+                // Epilogue: reset SP to FP first (required for alloca support, since
+                // alloca may have moved SP during function execution)
+                self.push_lir(Aarch64Inst::Mov {
+                    size: OperandSize::B64,
+                    src: GpOperand::Reg(Reg::X29),
+                    dst: Reg::SP,
+                });
+
+                // Restore callee-saved registers (now safe since SP == FP)
                 if *total_frame > 16 {
                     let mut offset = 16;
                     let mut i = 0;
@@ -3644,64 +3714,65 @@ impl Aarch64CodeGen {
     // Variadic function support (va_* builtins)
     // ========================================================================
     //
-    // On macOS ARM64 (Apple Silicon), va_list is simply a char* pointer
-    // pointing to the first variadic argument on the stack. This is much
-    // simpler than x86-64 or Linux ARM64.
+    // On macOS ARM64 (Apple Silicon) and AAPCS64, va_list is a char* pointer
+    // pointing to the first variadic argument in the register save area.
     //
-    // The calling convention places all variadic arguments on the stack,
-    // starting at a known offset from the frame pointer.
+    // In the prologue, we save x0-x7 to the register save area. va_start
+    // computes the address of the first variadic argument by skipping
+    // the fixed parameters: reg_save_area + (num_fixed_gp_params * 8)
 
     /// Emit va_start: Initialize va_list to point to first variadic arg
+    /// Note: ap_addr is the ADDRESS of the va_list variable (from symaddr), not the va_list itself
     fn emit_va_start(&mut self, insn: &Instruction, frame_size: i32) {
         let ap_addr = match insn.src.first() {
             Some(&s) => s,
             None => return,
         };
 
-        // For macOS ARM64, va_list is char*
-        // We need to compute the address of the first variadic argument on the stack
-        // The variadic arguments are passed on the stack, after the register save area
-        //
-        // For now, emit a placeholder that sets ap to point to stack area
-        // This will need refinement based on actual stack layout
-
         let ap_loc = self.get_location(ap_addr);
-        let (scratch0, _) = Reg::scratch_regs();
+        let (scratch0, scratch1) = Reg::scratch_regs();
 
-        // On Apple ARM64, variadic args start at frame pointer + 16 (after saved fp, lr)
-        // plus any space used for register-passed args that were spilled
-        // For simplicity, we'll use fp + 16 as the base for now
-        // ap = fp + 16 (where variadic args start on Apple ABI)
-        // Linux ARM64 uses the same for now
+        // Compute address of first variadic argument in the register save area
+        // First variadic arg is at: FP + reg_save_area_offset + (num_fixed_gp_params * 8)
+        let vararg_offset = self.reg_save_area_offset + (self.num_fixed_gp_params as i32 * 8);
         self.push_lir(Aarch64Inst::Add {
             size: OperandSize::B64,
             src1: Reg::X29,
-            src2: GpOperand::Imm(16),
+            src2: GpOperand::Imm(vararg_offset as i64),
             dst: scratch0,
         });
 
-        // Store the computed address to ap (FP-relative for alloca safety)
+        // ap_loc contains the ADDRESS of the va_list variable
+        // We need to store scratch0 TO that address (indirect store)
         match ap_loc {
             Loc::Stack(offset) => {
+                // The stack location contains the address of ap, load it first
                 let actual_offset = if offset < 0 {
                     frame_size + offset
                 } else {
                     offset
                 };
-                self.push_lir(Aarch64Inst::Str {
+                self.push_lir(Aarch64Inst::Ldr {
                     size: OperandSize::B64,
-                    src: scratch0,
                     addr: MemAddr::BaseOffset {
                         base: Reg::X29,
                         offset: actual_offset,
                     },
+                    dst: scratch1,
+                });
+                // Store the computed va_list pointer to *scratch1
+                self.push_lir(Aarch64Inst::Str {
+                    size: OperandSize::B64,
+                    src: scratch0,
+                    addr: MemAddr::Base(scratch1),
                 });
             }
             Loc::Reg(r) => {
-                self.push_lir(Aarch64Inst::Mov {
+                // r contains the address of ap, store scratch0 to [r]
+                self.push_lir(Aarch64Inst::Str {
                     size: OperandSize::B64,
-                    src: GpOperand::Reg(scratch0),
-                    dst: r,
+                    src: scratch0,
+                    addr: MemAddr::Base(r),
                 });
             }
             _ => {}
@@ -3709,6 +3780,7 @@ impl Aarch64CodeGen {
     }
 
     /// Emit va_arg: Get the next variadic argument of the specified type
+    /// Note: ap_addr is the ADDRESS of the va_list variable (from symaddr), not the va_list itself
     fn emit_va_arg(&mut self, insn: &Instruction, frame_size: i32) {
         let ap_addr = match insn.src.first() {
             Some(&s) => s,
@@ -3728,9 +3800,11 @@ impl Aarch64CodeGen {
         let dst_loc = self.get_location(target);
         let (scratch0, scratch1) = Reg::scratch_regs();
 
-        // Load current ap value (FP-relative for alloca safety)
-        match &ap_loc {
+        // ap_loc contains the ADDRESS of the va_list variable (from symaddr)
+        // First, get the address of ap into scratch1, then load ap value from there
+        let ap_ptr_reg = match &ap_loc {
             Loc::Stack(offset) => {
+                // Stack location contains the address of ap
                 let actual_offset = if *offset < 0 {
                     frame_size + *offset
                 } else {
@@ -3742,20 +3816,30 @@ impl Aarch64CodeGen {
                         base: Reg::X29,
                         offset: actual_offset,
                     },
-                    dst: scratch0,
+                    dst: scratch1,
                 });
+                scratch1
             }
             Loc::Reg(r) => {
-                if *r != scratch0 {
+                // Register contains the address of ap
+                if *r != scratch1 {
                     self.push_lir(Aarch64Inst::Mov {
                         size: OperandSize::B64,
                         src: GpOperand::Reg(*r),
-                        dst: scratch0,
+                        dst: scratch1,
                     });
                 }
+                scratch1
             }
             _ => return,
-        }
+        };
+
+        // Load the current ap pointer value from [ap_ptr_reg]
+        self.push_lir(Aarch64Inst::Ldr {
+            size: OperandSize::B64,
+            addr: MemAddr::Base(ap_ptr_reg),
+            dst: scratch0,
+        });
 
         // Load the argument from *ap
         if arg_type.is_float() {
@@ -3843,28 +3927,37 @@ impl Aarch64CodeGen {
             dst: scratch0,
         });
 
-        // Store updated ap back (FP-relative for alloca safety)
+        // Store updated ap back to [&ap] (ap_loc contains the address of ap)
+        // Need to reload the address since scratch1 may have been clobbered
         match &ap_loc {
             Loc::Stack(offset) => {
+                // Reload the address of ap into scratch1
                 let actual_offset = if *offset < 0 {
                     frame_size + *offset
                 } else {
                     *offset
                 };
-                self.push_lir(Aarch64Inst::Str {
+                self.push_lir(Aarch64Inst::Ldr {
                     size: OperandSize::B64,
-                    src: scratch0,
                     addr: MemAddr::BaseOffset {
                         base: Reg::X29,
                         offset: actual_offset,
                     },
+                    dst: scratch1,
+                });
+                // Store updated ap to [scratch1]
+                self.push_lir(Aarch64Inst::Str {
+                    size: OperandSize::B64,
+                    src: scratch0,
+                    addr: MemAddr::Base(scratch1),
                 });
             }
             Loc::Reg(r) => {
-                self.push_lir(Aarch64Inst::Mov {
+                // r contains the address of ap, store scratch0 to [r]
+                self.push_lir(Aarch64Inst::Str {
                     size: OperandSize::B64,
-                    src: GpOperand::Reg(scratch0),
-                    dst: *r,
+                    src: scratch0,
+                    addr: MemAddr::Base(*r),
                 });
             }
             _ => {}
@@ -3872,6 +3965,7 @@ impl Aarch64CodeGen {
     }
 
     /// Emit va_copy: Copy a va_list
+    /// Note: Both addresses are pointers to va_list variables (from symaddr)
     fn emit_va_copy(&mut self, insn: &Instruction, frame_size: i32) {
         let dest_addr = match insn.src.first() {
             Some(&s) => s,
@@ -3884,11 +3978,11 @@ impl Aarch64CodeGen {
 
         let dest_loc = self.get_location(dest_addr);
         let src_loc = self.get_location(src_addr);
-        let (scratch0, _) = Reg::scratch_regs();
+        let (scratch0, scratch1) = Reg::scratch_regs();
 
-        // On macOS ARM64, va_list is just a pointer, so copy is simple
-        // Load src value (FP-relative for alloca safety)
-        match &src_loc {
+        // Both src_loc and dest_loc contain ADDRESSES of va_list variables
+        // Get the address of src va_list into scratch1
+        let src_ptr_reg = match &src_loc {
             Loc::Stack(offset) => {
                 let actual_offset = if *offset < 0 {
                     frame_size + *offset
@@ -3901,22 +3995,22 @@ impl Aarch64CodeGen {
                         base: Reg::X29,
                         offset: actual_offset,
                     },
-                    dst: scratch0,
+                    dst: scratch1,
                 });
+                scratch1
             }
-            Loc::Reg(r) => {
-                if *r != scratch0 {
-                    self.push_lir(Aarch64Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Reg(*r),
-                        dst: scratch0,
-                    });
-                }
-            }
+            Loc::Reg(r) => *r,
             _ => return,
-        }
+        };
 
-        // Store to dest (FP-relative for alloca safety)
+        // Load the src va_list pointer value from [src_ptr_reg]
+        self.push_lir(Aarch64Inst::Ldr {
+            size: OperandSize::B64,
+            addr: MemAddr::Base(src_ptr_reg),
+            dst: scratch0,
+        });
+
+        // Get the address of dest va_list and store scratch0 there
         match &dest_loc {
             Loc::Stack(offset) => {
                 let actual_offset = if *offset < 0 {
@@ -3924,20 +4018,25 @@ impl Aarch64CodeGen {
                 } else {
                     *offset
                 };
-                self.push_lir(Aarch64Inst::Str {
+                self.push_lir(Aarch64Inst::Ldr {
                     size: OperandSize::B64,
-                    src: scratch0,
                     addr: MemAddr::BaseOffset {
                         base: Reg::X29,
                         offset: actual_offset,
                     },
+                    dst: scratch1,
+                });
+                self.push_lir(Aarch64Inst::Str {
+                    size: OperandSize::B64,
+                    src: scratch0,
+                    addr: MemAddr::Base(scratch1),
                 });
             }
             Loc::Reg(r) => {
-                self.push_lir(Aarch64Inst::Mov {
+                self.push_lir(Aarch64Inst::Str {
                     size: OperandSize::B64,
-                    src: GpOperand::Reg(scratch0),
-                    dst: *r,
+                    src: scratch0,
+                    addr: MemAddr::Base(*r),
                 });
             }
             _ => {}

@@ -113,6 +113,10 @@ struct Args {
     /// Disable CFI unwind tables (enabled by default)
     #[arg(long = "fno-unwind-tables", help = gettext("Disable CFI unwind table generation"))]
     no_unwind_tables: bool,
+
+    /// Target triple (e.g., aarch64-apple-darwin, x86_64-unknown-linux-gnu)
+    #[arg(long = "target", value_name = "triple", help = gettext("Target triple for cross-compilation"))]
+    target: Option<String>,
 }
 
 fn process_file(
@@ -327,8 +331,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    // Detect target
-    let target = Target::host();
+    // Detect target (use --target if specified, otherwise detect host)
+    let target = if let Some(ref triple) = args.target {
+        match Target::from_triple(triple) {
+            Some(t) => t,
+            None => {
+                eprintln!("pcc: unsupported target: {}", triple);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        Target::host()
+    };
 
     let mut streams = StreamTable::new();
 

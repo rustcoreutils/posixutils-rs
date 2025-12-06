@@ -2928,11 +2928,12 @@ impl Aarch64CodeGen {
         let mut fp_arg_idx = 0;
         let mut stack_args = 0;
 
-        // Check if this call returns a large struct (> 16 bytes)
+        // Check if this call returns a large struct (> 8 bytes)
         // If so, the first argument is the sret pointer and goes in X8 (not X0)
+        // Note: Must match linearizer threshold of > 64 bits
         let returns_large_struct = insn.typ.as_ref().is_some_and(|t| {
             (t.kind == crate::types::TypeKind::Struct || t.kind == crate::types::TypeKind::Union)
-                && t.size_bits() > 128
+                && t.size_bits() > 64
         });
 
         // Also check if return type is a pointer to a large struct (linearizer wraps it)
@@ -2941,7 +2942,7 @@ impl Aarch64CodeGen {
                 if let Some(pointee) = t.get_base() {
                     (pointee.kind == crate::types::TypeKind::Struct
                         || pointee.kind == crate::types::TypeKind::Union)
-                        && pointee.size_bits() > 128
+                        && pointee.size_bits() > 64
                 } else {
                     false
                 }

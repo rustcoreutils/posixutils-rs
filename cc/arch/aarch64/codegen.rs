@@ -772,10 +772,12 @@ impl RegAlloc {
         let mut intervals: HashMap<PseudoId, IntervalInfo> = HashMap::new();
         let mut pos = 0usize;
 
-        // First pass: compute block end positions
+        // First pass: compute block start and end positions
+        let mut block_start_pos: HashMap<BasicBlockId, usize> = HashMap::new();
         let mut block_end_pos: HashMap<BasicBlockId, usize> = HashMap::new();
         let mut temp_pos = 0usize;
         for block in &func.blocks {
+            block_start_pos.insert(block.id, temp_pos);
             temp_pos += block.insns.len();
             block_end_pos.insert(block.id, temp_pos.saturating_sub(1));
         }
@@ -878,6 +880,54 @@ impl RegAlloc {
             }
         }
 
+        // Detect loops via back edges and extend lifetimes of variables used in loop bodies
+        // A back edge is a branch from a block to an earlier block (lower start position)
+        // Any variable used in a block that's part of a loop must be live until the back edge
+        let mut loop_back_edges: Vec<(BasicBlockId, BasicBlockId, usize)> = Vec::new(); // (from, to, from_end_pos)
+        for block in &func.blocks {
+            // Check the last instruction for branch targets
+            if let Some(last_insn) = block.insns.last() {
+                // Collect branch targets (bb_true for unconditional/conditional, bb_false for conditional)
+                let mut targets = Vec::new();
+                if let Some(target) = last_insn.bb_true {
+                    targets.push(target);
+                }
+                if let Some(target) = last_insn.bb_false {
+                    targets.push(target);
+                }
+
+                // Check if any target is a back edge (to an earlier block)
+                let from_start = block_start_pos.get(&block.id).copied().unwrap_or(0);
+                for target_bb in targets {
+                    let target_start = block_start_pos.get(&target_bb).copied().unwrap_or(0);
+                    if target_start < from_start {
+                        // This is a back edge - the loop spans from target_bb to block
+                        let from_end = block_end_pos.get(&block.id).copied().unwrap_or(0);
+                        loop_back_edges.push((block.id, target_bb, from_end));
+                    }
+                }
+            }
+        }
+
+        // For each loop, extend lifetimes of variables used within the loop
+        for (_from_bb, to_bb, back_edge_pos) in &loop_back_edges {
+            let loop_start = block_start_pos.get(to_bb).copied().unwrap_or(0);
+
+            // Extend any variable that:
+            // 1. Is defined before the loop (first_def < loop_start)
+            // 2. Is used inside the loop (last_use >= loop_start && last_use <= back_edge_pos)
+            for info in intervals.values_mut() {
+                if info.first_def < loop_start
+                    && info.last_use >= loop_start
+                    && info.last_use <= *back_edge_pos
+                {
+                    // This variable is used inside the loop but defined outside
+                    // Extend its lifetime to the back edge
+                    info.last_use = info.last_use.max(*back_edge_pos);
+                }
+            }
+        }
+
         // Find the maximum position in the function
         let max_pos = pos.saturating_sub(1);
 
@@ -948,6 +998,8 @@ pub struct Aarch64CodeGen {
     current_fn: String,
     /// Total frame size for current function
     frame_size: i32,
+    /// Size of callee-saved register area (for computing local variable offsets)
+    callee_saved_size: i32,
     /// Whether to emit basic unwind tables (cfi_startproc/cfi_endproc)
     emit_unwind_tables: bool,
     /// Last emitted source line (for avoiding duplicate .loc directives)
@@ -958,6 +1010,9 @@ pub struct Aarch64CodeGen {
     emit_debug: bool,
     /// Offset from FP to register save area (for variadic functions)
     reg_save_area_offset: i32,
+    /// Size of register save area (for variadic functions)
+    /// Used to compute correct FP-relative offsets for local variables
+    reg_save_area_size: i32,
     /// Number of fixed GP parameters (for variadic functions)
     num_fixed_gp_params: usize,
 }
@@ -972,11 +1027,13 @@ impl Aarch64CodeGen {
             pseudos: Vec::new(),
             current_fn: String::new(),
             frame_size: 0,
+            callee_saved_size: 0,
             emit_unwind_tables: true, // Default to emitting basic unwind tables
             last_debug_line: 0,
             last_debug_file: 0,
             emit_debug: false,
             reg_save_area_offset: 0,
+            reg_save_area_size: 0,
             num_fixed_gp_params: 0,
         }
     }
@@ -991,6 +1048,23 @@ impl Aarch64CodeGen {
             }
         }
         false
+    }
+
+    /// Compute the actual FP-relative offset for a stack location.
+    /// For local variables (negative offsets), this accounts for the
+    /// register save area in varargs functions which is placed at the
+    /// end of the frame (after locals).
+    #[inline]
+    fn stack_offset(&self, frame_size: i32, offset: i32) -> i32 {
+        if offset < 0 {
+            // Local variable: use frame size minus reg_save_area
+            // Layout: [fp/lr][callee-saved][locals][reg_save_area]
+            // Locals are at offsets from (frame_size - reg_save_area_size)
+            (frame_size - self.reg_save_area_size) + offset
+        } else {
+            // Positive offset (arguments passed on stack) - use as-is
+            offset
+        }
     }
 
     /// Push a LIR instruction to the buffer (deferred emission)
@@ -1177,9 +1251,11 @@ impl Aarch64CodeGen {
             0
         };
 
-        // Save function name and frame size for label generation
+        // Save function name, frame size, and callee-saved size for label generation and offset calculation
         self.current_fn = func.name.clone();
         self.frame_size = total_frame;
+        self.callee_saved_size = callee_saved_size;
+        self.reg_save_area_size = reg_save_area_size;
 
         // Function prologue
         self.push_lir(Aarch64Inst::Directive(Directive::Blank));
@@ -1345,12 +1421,13 @@ impl Aarch64CodeGen {
             }) {
                 if let Some(Loc::Stack(offset)) = self.locations.get(&sret.id) {
                     if *offset < 0 {
+                        let actual_offset = self.stack_offset(total_frame, *offset);
                         self.push_lir(Aarch64Inst::Str {
                             size: OperandSize::B64,
                             src: Reg::X8,
                             addr: MemAddr::BaseOffset {
                                 base: Reg::X29, // fp
-                                offset: total_frame + offset,
+                                offset: actual_offset,
                             },
                         });
                     }
@@ -1399,12 +1476,13 @@ impl Aarch64CodeGen {
                             if let Some(Loc::Stack(offset)) = self.locations.get(&pseudo.id) {
                                 // Move from arg register to stack
                                 if *offset < 0 {
+                                    let actual_offset = self.stack_offset(total_frame, *offset);
                                     self.push_lir(Aarch64Inst::Str {
                                         size: OperandSize::B64,
                                         src: arg_regs[i],
                                         addr: MemAddr::BaseOffset {
                                             base: Reg::X29, // fp
-                                            offset: total_frame + offset,
+                                            offset: actual_offset,
                                         },
                                     });
                                 }
@@ -1560,11 +1638,7 @@ impl Aarch64CodeGen {
                             });
                         }
                         Loc::Stack(offset) => {
-                            let actual_offset = if *offset < 0 {
-                                *total_frame + *offset
-                            } else {
-                                *offset
-                            };
+                            let actual_offset = self.stack_offset(*total_frame, *offset);
                             // LIR: load from stack (FP-relative for alloca safety)
                             self.push_lir(Aarch64Inst::Ldr {
                                 size: OperandSize::B64,
@@ -1674,11 +1748,7 @@ impl Aarch64CodeGen {
                             }
                         }
                         Loc::Stack(offset) => {
-                            let actual_offset = if *offset < 0 {
-                                *total_frame + *offset
-                            } else {
-                                *offset
-                            };
+                            let actual_offset = self.stack_offset(*total_frame, *offset);
                             // LIR: load from stack (FP-relative for alloca safety)
                             self.push_lir(Aarch64Inst::Ldr {
                                 size: op_size,
@@ -1864,7 +1934,7 @@ impl Aarch64CodeGen {
                         }
                         Loc::Stack(offset) => {
                             // Get address of stack location (FP-relative for alloca safety)
-                            let adjusted = *total_frame + offset;
+                            let adjusted = self.stack_offset(*total_frame, offset);
                             self.push_lir(Aarch64Inst::Add {
                                 size: OperandSize::B64,
                                 src1: Reg::X29,
@@ -2091,11 +2161,7 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::Stack(offset) => {
-                let actual_offset = if offset < 0 {
-                    frame_size + offset
-                } else {
-                    offset
-                };
+                let actual_offset = self.stack_offset(frame_size, offset);
                 // LIR: load from stack (FP-relative for alloca safety)
                 self.push_lir(Aarch64Inst::Ldr {
                     size: op_size,
@@ -2153,11 +2219,7 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::Stack(offset) => {
-                let actual_offset = if *offset < 0 {
-                    frame_size + *offset
-                } else {
-                    *offset
-                };
+                let actual_offset = self.stack_offset(frame_size, *offset);
                 // LIR: store to stack (FP-relative for alloca safety)
                 let op_size = OperandSize::from_bits(size);
                 self.push_lir(Aarch64Inst::Str {
@@ -2566,7 +2628,7 @@ impl Aarch64CodeGen {
 
                 if is_symbol {
                     // Local variable - load directly from stack slot (FP-relative for alloca safety)
-                    let total_offset = frame_size + offset + insn.offset as i32;
+                    let total_offset = self.stack_offset(frame_size, offset) + insn.offset as i32;
                     let mem_addr = MemAddr::BaseOffset {
                         base: Reg::X29,
                         offset: total_offset,
@@ -2574,7 +2636,7 @@ impl Aarch64CodeGen {
                     emit_load_lir(self, mem_addr);
                 } else {
                     // Spilled address - load address first (FP-relative for alloca safety)
-                    let adjusted = frame_size + offset;
+                    let adjusted = self.stack_offset(frame_size, offset);
                     self.push_lir(Aarch64Inst::Ldr {
                         size: OperandSize::B64,
                         addr: MemAddr::BaseOffset {
@@ -2655,7 +2717,7 @@ impl Aarch64CodeGen {
 
                 if is_symbol {
                     // Local variable - load directly from stack slot (FP-relative for alloca safety)
-                    let total_offset = frame_size + offset + insn.offset as i32;
+                    let total_offset = self.stack_offset(frame_size, offset) + insn.offset as i32;
                     self.push_lir(Aarch64Inst::LdrFp {
                         size: fp_size,
                         addr: MemAddr::BaseOffset {
@@ -2666,7 +2728,7 @@ impl Aarch64CodeGen {
                     });
                 } else {
                     // Spilled address - load address first (FP-relative for alloca safety)
-                    let adjusted = frame_size + offset;
+                    let adjusted = self.stack_offset(frame_size, offset);
                     self.push_lir(Aarch64Inst::Ldr {
                         size: OperandSize::B64,
                         addr: MemAddr::BaseOffset {
@@ -2773,7 +2835,7 @@ impl Aarch64CodeGen {
 
                 if is_symbol {
                     // Local variable - store directly to stack slot (FP-relative for alloca safety)
-                    let total_offset = frame_size + offset + insn.offset as i32;
+                    let total_offset = self.stack_offset(frame_size, offset) + insn.offset as i32;
                     let mem_addr = MemAddr::BaseOffset {
                         base: Reg::X29,
                         offset: total_offset,
@@ -2781,7 +2843,7 @@ impl Aarch64CodeGen {
                     emit_store_lir(self, mem_addr);
                 } else {
                     // Spilled address - load address first (FP-relative for alloca safety)
-                    let adjusted = frame_size + offset;
+                    let adjusted = self.stack_offset(frame_size, offset);
                     self.push_lir(Aarch64Inst::Ldr {
                         size: OperandSize::B64,
                         addr: MemAddr::BaseOffset {
@@ -2833,7 +2895,7 @@ impl Aarch64CodeGen {
         // Load source address into X16 (FP-relative for alloca safety)
         match value_loc {
             Loc::Stack(offset) => {
-                let total_offset = frame_size + offset;
+                let total_offset = self.stack_offset(frame_size, offset);
                 self.push_lir(Aarch64Inst::Add {
                     size: OperandSize::B64,
                     src1: Reg::X29,
@@ -2859,7 +2921,7 @@ impl Aarch64CodeGen {
         // Load destination address into X17 (FP-relative for alloca safety)
         match addr_loc {
             Loc::Stack(offset) => {
-                let total_offset = frame_size + offset + insn.offset as i32;
+                let total_offset = self.stack_offset(frame_size, offset) + insn.offset as i32;
                 self.push_lir(Aarch64Inst::Add {
                     size: OperandSize::B64,
                     src1: Reg::X29,
@@ -3310,11 +3372,7 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::Stack(offset) => {
-                let actual_offset = if offset < 0 {
-                    frame_size + offset
-                } else {
-                    offset
-                };
+                let actual_offset = self.stack_offset(frame_size, offset);
                 // FP-relative for alloca safety
                 self.push_lir(Aarch64Inst::LdrFp {
                     size: fp_size,
@@ -3389,11 +3447,7 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::Stack(offset) => {
-                let actual_offset = if *offset < 0 {
-                    frame_size + *offset
-                } else {
-                    *offset
-                };
+                let actual_offset = self.stack_offset(frame_size, *offset);
                 // FP-relative for alloca safety
                 self.push_lir(Aarch64Inst::StrFp {
                     size: fp_size,
@@ -3751,11 +3805,7 @@ impl Aarch64CodeGen {
         match ap_loc {
             Loc::Stack(offset) => {
                 // The stack location contains the address of ap, load it first
-                let actual_offset = if offset < 0 {
-                    frame_size + offset
-                } else {
-                    offset
-                };
+                let actual_offset = self.stack_offset(frame_size, offset);
                 self.push_lir(Aarch64Inst::Ldr {
                     size: OperandSize::B64,
                     addr: MemAddr::BaseOffset {
@@ -3809,11 +3859,7 @@ impl Aarch64CodeGen {
         let ap_ptr_reg = match &ap_loc {
             Loc::Stack(offset) => {
                 // Stack location contains the address of ap
-                let actual_offset = if *offset < 0 {
-                    frame_size + *offset
-                } else {
-                    *offset
-                };
+                let actual_offset = self.stack_offset(frame_size, *offset);
                 self.push_lir(Aarch64Inst::Ldr {
                     size: OperandSize::B64,
                     addr: MemAddr::BaseOffset {
@@ -3867,11 +3913,7 @@ impl Aarch64CodeGen {
                 }
                 Loc::Stack(offset) => {
                     // FP-relative for alloca safety
-                    let actual_offset = if *offset < 0 {
-                        frame_size + *offset
-                    } else {
-                        *offset
-                    };
+                    let actual_offset = self.stack_offset(frame_size, *offset);
                     self.push_lir(Aarch64Inst::StrFp {
                         size: fp_size_enum,
                         src: VReg::V16,
@@ -3905,11 +3947,7 @@ impl Aarch64CodeGen {
                 }
                 Loc::Stack(offset) => {
                     // FP-relative for alloca safety
-                    let actual_offset = if *offset < 0 {
-                        frame_size + *offset
-                    } else {
-                        *offset
-                    };
+                    let actual_offset = self.stack_offset(frame_size, *offset);
                     self.push_lir(Aarch64Inst::Str {
                         size: OperandSize::B64,
                         src: scratch1,
@@ -3936,11 +3974,7 @@ impl Aarch64CodeGen {
         match &ap_loc {
             Loc::Stack(offset) => {
                 // Reload the address of ap into scratch1
-                let actual_offset = if *offset < 0 {
-                    frame_size + *offset
-                } else {
-                    *offset
-                };
+                let actual_offset = self.stack_offset(frame_size, *offset);
                 self.push_lir(Aarch64Inst::Ldr {
                     size: OperandSize::B64,
                     addr: MemAddr::BaseOffset {
@@ -3988,11 +4022,7 @@ impl Aarch64CodeGen {
         // Get the address of src va_list into scratch1
         let src_ptr_reg = match &src_loc {
             Loc::Stack(offset) => {
-                let actual_offset = if *offset < 0 {
-                    frame_size + *offset
-                } else {
-                    *offset
-                };
+                let actual_offset = self.stack_offset(frame_size, *offset);
                 self.push_lir(Aarch64Inst::Ldr {
                     size: OperandSize::B64,
                     addr: MemAddr::BaseOffset {
@@ -4017,11 +4047,7 @@ impl Aarch64CodeGen {
         // Get the address of dest va_list and store scratch0 there
         match &dest_loc {
             Loc::Stack(offset) => {
-                let actual_offset = if *offset < 0 {
-                    frame_size + *offset
-                } else {
-                    *offset
-                };
+                let actual_offset = self.stack_offset(frame_size, *offset);
                 self.push_lir(Aarch64Inst::Ldr {
                     size: OperandSize::B64,
                     addr: MemAddr::BaseOffset {

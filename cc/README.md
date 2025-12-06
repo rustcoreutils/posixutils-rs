@@ -94,6 +94,7 @@ Supported:
 - Bitfields (named, unnamed, zero-width for alignment)
 
 Not yet implemented:
+- `inline` and inlining support
 - -fverbose-asm
 - Complex initializers
 - VLAs (variable-length arrays)

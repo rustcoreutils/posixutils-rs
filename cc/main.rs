@@ -53,11 +53,7 @@ struct Args {
     print_targets: bool,
 
     /// Dump tokens (for debugging tokenizer)
-    #[arg(
-        short = 'T',
-        long = "dump-tokens",
-        help = gettext("Dump tokens to stdout")
-    )]
+    #[arg(long = "dump-tokens", help = gettext("Dump tokens to stdout"))]
     dump_tokens: bool,
 
     /// Run preprocessor and dump result
@@ -65,11 +61,7 @@ struct Args {
     preprocess_only: bool,
 
     /// Dump AST (for debugging parser)
-    #[arg(
-        short = 'A',
-        long = "dump-ast",
-        help = gettext("Parse and dump AST to stdout")
-    )]
+    #[arg(long = "dump-ast", help = gettext("Parse and dump AST to stdout"))]
     dump_ast: bool,
 
     /// Dump IR (for debugging linearizer)

@@ -1251,20 +1251,12 @@ impl X86_64CodeGen {
     }
 
     fn emit_block(&mut self, block: &crate::ir::BasicBlock, types: &TypeTable) {
-        // Emit block label (include function name for uniqueness)
-        if let Some(label) = &block.label {
-            // LIR: named block label (using Raw since format differs from standard)
-            self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                ".L_{}_{}:",
-                self.current_fn, label
-            ))));
-        } else {
-            // LIR: numbered block label
-            self.push_lir(X86Inst::Directive(Directive::BlockLabel(Label::new(
-                &self.current_fn,
-                block.id.0,
-            ))));
-        }
+        // Always emit block ID label for consistency with jumps
+        // (jumps reference blocks by ID, not by C label name)
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(Label::new(
+            &self.current_fn,
+            block.id.0,
+        ))));
 
         // Emit instructions
         for insn in &block.insns {

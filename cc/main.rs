@@ -108,10 +108,6 @@ struct Args {
     #[arg(short = 'o', value_name = "file", help = gettext("Place output in file"))]
     output: Option<String>,
 
-    /// Dump generated assembly (for debugging codegen)
-    #[arg(long = "dump-asm", help = gettext("Dump generated assembly to stdout"))]
-    dump_asm: bool,
-
     /// Generate debug information (DWARF)
     #[arg(short = 'g', help = gettext("Generate debug information"))]
     debug: bool,
@@ -247,11 +243,6 @@ fn process_file(
         arch::codegen::create_codegen_with_options(target.clone(), emit_unwind_tables);
     let asm = codegen.generate(&module, &types);
 
-    if args.dump_asm {
-        print!("{}", asm);
-        return Ok(());
-    }
-
     // Determine output file names
     // For stdin ("-"), use "stdin" as the default stem
     let stem = if path == "-" {
@@ -268,10 +259,15 @@ fn process_file(
     if args.asm_only {
         // Output assembly
         let asm_file = args.output.clone().unwrap_or_else(|| format!("{}.s", stem));
-        let mut file = File::create(&asm_file)?;
-        file.write_all(asm.as_bytes())?;
-        if args.verbose {
-            eprintln!("Wrote assembly to {}", asm_file);
+        if asm_file == "-" {
+            // Write to stdout
+            print!("{}", asm);
+        } else {
+            let mut file = File::create(&asm_file)?;
+            file.write_all(asm.as_bytes())?;
+            if args.verbose {
+                eprintln!("Wrote assembly to {}", asm_file);
+            }
         }
         return Ok(());
     }

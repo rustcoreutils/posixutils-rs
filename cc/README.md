@@ -52,20 +52,20 @@ cargo test --release -p posixutils-cc
 
 The compiler supports C input via `-` for stdin, and can output intermediate representations:
 
-- `--dump-asm` - Output assembly to stdout (instead of invoking assembler/linker)
+- `-S -o -` - Output assembly to stdout (standard clang/gcc option)
 - `--dump-ir` - Output IR before code generation
 
 Examples:
 
 ```bash
 # Compile from stdin, view generated assembly
-echo 'int main() { return 42; }' | ./target/release/pcc - --dump-asm
+echo 'int main() { return 42; }' | ./target/release/pcc - -S -o -
 
 # View IR for a source file
 ./target/release/pcc myfile.c --dump-ir
 
 # Using heredoc for multi-line test cases
-./target/release/pcc - --dump-asm <<'EOF'
+./target/release/pcc - -S -o - <<'EOF'
 int add(int a, int b) {
     return a + b;
 }
@@ -94,7 +94,7 @@ Supported:
 - Bitfields (named, unnamed, zero-width for alignment)
 
 Not yet implemented:
-- goto, longjmp, setjmp
+- longjmp, setjmp
 - `inline` and inlining support
 - multi-register returns (for structs larger than 8 bytes)
 - -fverbose-asm

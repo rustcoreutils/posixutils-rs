@@ -30,9 +30,6 @@ pub fn get_arch_macros(target: &Target) -> Vec<(&'static str, Option<&'static st
     let mut macros = vec![
         // Common architecture macros based on type sizes
         ("__CHAR_BIT__", Some("8")),
-        // All our targets are 64-bit
-        ("__LP64__", Some("1")),
-        ("_LP64", Some("1")),
         ("__SIZEOF_POINTER__", Some("8")),
         // Type sizes
         ("__SIZEOF_SHORT__", Some("2")),
@@ -43,6 +40,12 @@ pub fn get_arch_macros(target: &Target) -> Vec<(&'static str, Option<&'static st
         ("__SIZEOF_DOUBLE__", Some("8")),
         ("__CHAR_UNSIGNED__", char_unsigned),
     ];
+
+    // LP64 macros only on LP64 targets (Unix), not on LLP64 (Windows)
+    if target.long_width == 64 {
+        macros.push(("__LP64__", Some("1")));
+        macros.push(("_LP64", Some("1")));
+    }
 
     // Architecture-specific
     match target.arch {

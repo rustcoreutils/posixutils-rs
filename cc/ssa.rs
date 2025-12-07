@@ -18,18 +18,8 @@ use crate::dominate::{compute_dominance_frontiers, domtree_build, idf_compute};
 use crate::ir::{
     BasicBlockId, Function, InsnRef, Instruction, Opcode, Pseudo, PseudoId, PseudoKind,
 };
-use crate::types::Type;
+use crate::types::{TypeId, TypeTable};
 use std::collections::{HashMap, HashSet};
-
-// ============================================================================
-// Promotability Check
-// ============================================================================
-
-/// Check if a type is promotable to SSA form.
-/// Only scalar types (integers, pointers, floats) can be promoted.
-fn is_promotable_type(typ: &Type) -> bool {
-    typ.is_scalar()
-}
 
 // ============================================================================
 // SSA Conversion State
@@ -112,7 +102,9 @@ impl<'a> SsaConverter<'a> {
 #[derive(Default)]
 struct VarInfo {
     /// Type of the variable
-    typ: Type,
+    typ: TypeId,
+    /// Size of the type in bits
+    size: u32,
     /// Blocks that store to this variable
     def_blocks: Vec<BasicBlockId>,
     /// Total number of stores
@@ -128,19 +120,20 @@ struct VarInfo {
 }
 
 /// Analyze a variable to determine if it can be promoted to SSA.
-fn analyze_variable(func: &Function, var_name: &str) -> Option<VarInfo> {
+fn analyze_variable(func: &Function, types: &TypeTable, var_name: &str) -> Option<VarInfo> {
     let local = func.get_local(var_name)?;
     let sym_id = local.sym;
-    let typ = local.typ.clone();
+    let typ = local.typ;
     let decl_block = local.decl_block;
 
-    // Check basic promotability
-    if local.is_volatile || !is_promotable_type(&typ) {
+    // Check basic promotability - only scalar types can be promoted
+    if local.is_volatile || !types.is_scalar(typ) {
         return None;
     }
 
     let mut info = VarInfo {
         typ,
+        size: types.size_bits(typ),
         decl_block,
         ..Default::default()
     };
@@ -232,7 +225,7 @@ fn insert_phi_nodes(converter: &mut SsaConverter, var_name: &str, var_info: &Var
         let target = converter.alloc_phi();
 
         // Create phi instruction
-        let phi = Instruction::phi(target, var_info.typ.clone());
+        let phi = Instruction::phi(target, var_info.typ, var_info.size);
 
         // Store the variable name for later phi renaming
         // We'll use the phi_list field to store this temporarily
@@ -610,7 +603,7 @@ fn remove_dead_stores(func: &mut Function, dead_stores: &[InsnRef]) {
 ///    - Record stores as new definitions
 ///    - Fill in phi operands from predecessors
 /// 4. Remove dead stores
-pub fn ssa_convert(func: &mut Function) {
+pub fn ssa_convert(func: &mut Function, types: &TypeTable) {
     if func.blocks.is_empty() {
         return;
     }
@@ -625,7 +618,7 @@ pub fn ssa_convert(func: &mut Function) {
     let local_names: Vec<String> = converter.func.locals.keys().cloned().collect();
 
     for var_name in &local_names {
-        if let Some(var_info) = analyze_variable(converter.func, var_name) {
+        if let Some(var_info) = analyze_variable(converter.func, types, var_name) {
             // Skip if all usage is in a single block (no phi needed)
             if var_info.single_block.is_some() {
                 // Could do local rewriting here but skip for now
@@ -666,9 +659,8 @@ pub fn ssa_convert(func: &mut Function) {
 mod tests {
     use super::*;
     use crate::ir::BasicBlock;
-    use crate::types::TypeKind;
 
-    fn make_simple_if_cfg() -> Function {
+    fn make_simple_if_cfg(types: &TypeTable) -> Function {
         // Create a CFG with a simple if-then-else:
         //
         // int x = 1;
@@ -683,7 +675,8 @@ mod tests {
         //        v   v
         //       merge(3)
 
-        let mut func = Function::new("test", Type::basic(TypeKind::Int));
+        let int_id = types.int_id;
+        let mut func = Function::new("test", int_id);
 
         // Create symbol pseudo for local variable 'x'
         let x_sym = PseudoId(0);
@@ -692,7 +685,7 @@ mod tests {
         func.add_local(
             "x",
             x_sym,
-            Type::basic(TypeKind::Int),
+            int_id,
             false, // not volatile
             Some(BasicBlockId(0)),
         );
@@ -710,12 +703,7 @@ mod tests {
         entry.children = vec![BasicBlockId(1), BasicBlockId(2)];
         entry.add_insn(Instruction::new(Opcode::Entry));
         // Store x = 1
-        entry.add_insn(Instruction::store(
-            val1,
-            x_sym,
-            0,
-            Type::basic(TypeKind::Int),
-        ));
+        entry.add_insn(Instruction::store(val1, x_sym, 0, int_id, 32));
         // Conditional branch
         entry.add_insn(Instruction::cbr(cond, BasicBlockId(1), BasicBlockId(2)));
 
@@ -723,12 +711,7 @@ mod tests {
         let mut then_bb = BasicBlock::new(BasicBlockId(1));
         then_bb.parents = vec![BasicBlockId(0)];
         then_bb.children = vec![BasicBlockId(3)];
-        then_bb.add_insn(Instruction::store(
-            val2,
-            x_sym,
-            0,
-            Type::basic(TypeKind::Int),
-        ));
+        then_bb.add_insn(Instruction::store(val2, x_sym, 0, int_id, 32));
         then_bb.add_insn(Instruction::br(BasicBlockId(3)));
 
         // Else block: (no assignment)
@@ -743,12 +726,7 @@ mod tests {
         let result = PseudoId(4);
         func.add_pseudo(Pseudo::reg(result, 0));
         // Load x
-        merge.add_insn(Instruction::load(
-            result,
-            x_sym,
-            0,
-            Type::basic(TypeKind::Int),
-        ));
+        merge.add_insn(Instruction::load(result, x_sym, 0, int_id, 32));
         merge.add_insn(Instruction::ret(Some(result)));
 
         func.entry = BasicBlockId(0);
@@ -758,9 +736,10 @@ mod tests {
 
     #[test]
     fn test_analyze_variable() {
-        let func = make_simple_if_cfg();
+        let types = TypeTable::new();
+        let func = make_simple_if_cfg(&types);
 
-        let info = analyze_variable(&func, "x").unwrap();
+        let info = analyze_variable(&func, &types, "x").unwrap();
         assert_eq!(info.store_count, 2); // One in entry, one in then
         assert_eq!(info.def_blocks.len(), 2);
         assert!(!info.addr_taken);
@@ -768,8 +747,9 @@ mod tests {
 
     #[test]
     fn test_ssa_convert_creates_phi() {
-        let mut func = make_simple_if_cfg();
-        ssa_convert(&mut func);
+        let types = TypeTable::new();
+        let mut func = make_simple_if_cfg(&types);
+        ssa_convert(&mut func, &types);
 
         // After SSA conversion, merge block should have a phi node
         let merge = func.get_block(BasicBlockId(3)).unwrap();
@@ -780,7 +760,8 @@ mod tests {
 
     #[test]
     fn test_domtree_built() {
-        let mut func = make_simple_if_cfg();
+        let types = TypeTable::new();
+        let mut func = make_simple_if_cfg(&types);
         domtree_build(&mut func);
 
         // Entry should be the root (no idom)

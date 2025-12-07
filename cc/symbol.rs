@@ -10,7 +10,7 @@
 // Based on sparse's scope-aware symbol management
 //
 
-use crate::types::Type;
+use crate::types::TypeId;
 use std::collections::HashMap;
 
 // ============================================================================
@@ -82,8 +82,8 @@ pub struct Symbol {
     /// Which namespace this symbol belongs to
     pub namespace: Namespace,
 
-    /// The type of this symbol
-    pub typ: Type,
+    /// The type of this symbol (interned TypeId)
+    pub typ: TypeId,
 
     /// Scope depth where this symbol was declared
     pub scope_depth: u32,
@@ -97,7 +97,7 @@ pub struct Symbol {
 
 impl Symbol {
     /// Create a new variable symbol
-    pub fn variable(name: String, typ: Type, scope_depth: u32) -> Self {
+    pub fn variable(name: String, typ: TypeId, scope_depth: u32) -> Self {
         Self {
             name,
             kind: SymbolKind::Variable,
@@ -110,7 +110,7 @@ impl Symbol {
     }
 
     /// Create a new function symbol
-    pub fn function(name: String, typ: Type, scope_depth: u32) -> Self {
+    pub fn function(name: String, typ: TypeId, scope_depth: u32) -> Self {
         Self {
             name,
             kind: SymbolKind::Function,
@@ -123,7 +123,7 @@ impl Symbol {
     }
 
     /// Create a new parameter symbol
-    pub fn parameter(name: String, typ: Type, scope_depth: u32) -> Self {
+    pub fn parameter(name: String, typ: TypeId, scope_depth: u32) -> Self {
         Self {
             name,
             kind: SymbolKind::Parameter,
@@ -135,13 +135,13 @@ impl Symbol {
         }
     }
 
-    /// Create a new enum constant symbol
-    pub fn enum_constant(name: String, value: i64, scope_depth: u32) -> Self {
+    /// Create a new enum constant symbol (requires int_id from TypeTable)
+    pub fn enum_constant(name: String, value: i64, int_id: TypeId, scope_depth: u32) -> Self {
         Self {
             name,
             kind: SymbolKind::EnumConstant,
             namespace: Namespace::Ordinary,
-            typ: Type::basic(crate::types::TypeKind::Int),
+            typ: int_id,
             scope_depth,
             defined: true,
             enum_value: Some(value),
@@ -149,7 +149,7 @@ impl Symbol {
     }
 
     /// Create a new tag symbol (struct/union/enum tag)
-    pub fn tag(name: String, typ: Type, scope_depth: u32) -> Self {
+    pub fn tag(name: String, typ: TypeId, scope_depth: u32) -> Self {
         Self {
             name,
             kind: SymbolKind::Tag,
@@ -162,7 +162,7 @@ impl Symbol {
     }
 
     /// Create a new typedef symbol
-    pub fn typedef(name: String, typ: Type, scope_depth: u32) -> Self {
+    pub fn typedef(name: String, typ: TypeId, scope_depth: u32) -> Self {
         Self {
             name,
             kind: SymbolKind::Typedef,
@@ -335,11 +335,11 @@ impl SymbolTable {
     }
 
     /// Look up a typedef by name
-    /// Returns the aliased type if found
-    pub fn lookup_typedef(&self, name: &str) -> Option<&Type> {
+    /// Returns the aliased TypeId if found
+    pub fn lookup_typedef(&self, name: &str) -> Option<TypeId> {
         self.lookup(name, Namespace::Ordinary).and_then(|s| {
             if s.is_typedef() {
-                Some(&s.typ)
+                Some(s.typ) // TypeId is Copy
             } else {
                 None
             }
@@ -392,14 +392,15 @@ impl std::error::Error for SymbolError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Type, TypeKind};
+    use crate::types::{Type, TypeKind, TypeTable};
 
     #[test]
     fn test_declare_and_lookup() {
+        let types = TypeTable::new();
         let mut table = SymbolTable::new();
 
         // Declare a variable
-        let sym = Symbol::variable("x".to_string(), Type::basic(TypeKind::Int), 0);
+        let sym = Symbol::variable("x".to_string(), types.int_id, 0);
         let _id = table.declare(sym).unwrap();
 
         // Look it up
@@ -410,17 +411,18 @@ mod tests {
 
     #[test]
     fn test_scopes() {
+        let types = TypeTable::new();
         let mut table = SymbolTable::new();
 
         // Declare x in global scope
-        let sym1 = Symbol::variable("x".to_string(), Type::basic(TypeKind::Int), 0);
+        let sym1 = Symbol::variable("x".to_string(), types.int_id, 0);
         table.declare(sym1).unwrap();
 
         // Enter a new scope
         table.enter_scope();
 
         // Declare y in inner scope
-        let sym2 = Symbol::variable("y".to_string(), Type::basic(TypeKind::Char), 0);
+        let sym2 = Symbol::variable("y".to_string(), types.char_id, 0);
         table.declare(sym2).unwrap();
 
         // Both should be visible
@@ -437,41 +439,43 @@ mod tests {
 
     #[test]
     fn test_shadowing() {
+        let types = TypeTable::new();
         let mut table = SymbolTable::new();
 
         // Declare x as int in global scope
-        let sym1 = Symbol::variable("x".to_string(), Type::basic(TypeKind::Int), 0);
+        let sym1 = Symbol::variable("x".to_string(), types.int_id, 0);
         table.declare(sym1).unwrap();
 
         // Enter a new scope
         table.enter_scope();
 
         // Shadow x with char
-        let sym2 = Symbol::variable("x".to_string(), Type::basic(TypeKind::Char), 0);
+        let sym2 = Symbol::variable("x".to_string(), types.char_id, 0);
         table.declare(sym2).unwrap();
 
         // Should find the inner x (char)
         let found = table.lookup("x", Namespace::Ordinary).unwrap();
-        assert_eq!(found.typ.kind, TypeKind::Char);
+        assert_eq!(types.kind(found.typ), TypeKind::Char);
 
         // Leave scope
         table.leave_scope();
 
         // Should find the outer x (int)
         let found = table.lookup("x", Namespace::Ordinary).unwrap();
-        assert_eq!(found.typ.kind, TypeKind::Int);
+        assert_eq!(types.kind(found.typ), TypeKind::Int);
     }
 
     #[test]
     fn test_redefinition_error() {
+        let types = TypeTable::new();
         let mut table = SymbolTable::new();
 
         // Declare x
-        let sym1 = Symbol::variable("x".to_string(), Type::basic(TypeKind::Int), 0);
+        let sym1 = Symbol::variable("x".to_string(), types.int_id, 0);
         table.declare(sym1).unwrap();
 
         // Try to redeclare x in the same scope
-        let sym2 = Symbol::variable("x".to_string(), Type::basic(TypeKind::Char), 0);
+        let sym2 = Symbol::variable("x".to_string(), types.char_id, 0);
         let result = table.declare(sym2);
 
         assert!(matches!(result, Err(SymbolError::Redefinition(_))));
@@ -498,14 +502,11 @@ mod tests {
 
     #[test]
     fn test_function_symbol() {
+        let mut types = TypeTable::new();
         let mut table = SymbolTable::new();
 
         // Declare a function
-        let func_type = Type::function(
-            Type::basic(TypeKind::Int),
-            vec![Type::basic(TypeKind::Int)],
-            false,
-        );
+        let func_type = types.intern(Type::function(types.int_id, vec![types.int_id], false));
         let func = Symbol::function("foo".to_string(), func_type, 0);
         table.declare(func).unwrap();
 

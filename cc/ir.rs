@@ -15,7 +15,7 @@
 //
 
 use crate::diag::Position;
-use crate::types::Type;
+use crate::types::TypeId;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -419,8 +419,8 @@ pub struct Instruction {
     pub target: Option<PseudoId>,
     /// Source operands
     pub src: Vec<PseudoId>,
-    /// Type of the result
-    pub typ: Option<Type>,
+    /// Type of the result (interned TypeId)
+    pub typ: Option<TypeId>,
     /// For branches: true target
     pub bb_true: Option<BasicBlockId>,
     /// For conditional branches: false target
@@ -439,8 +439,8 @@ pub struct Instruction {
     pub switch_cases: Vec<(i64, BasicBlockId)>,
     /// For switch: default block (if no case matches)
     pub switch_default: Option<BasicBlockId>,
-    /// For calls: argument types (parallel to src for Call instructions)
-    pub arg_types: Vec<Type>,
+    /// For calls: argument types (parallel to src for Call instructions, interned TypeIds)
+    pub arg_types: Vec<TypeId>,
     /// For variadic calls: index where variadic arguments start (0-based)
     /// All arguments at this index and beyond are variadic (should be passed on stack)
     pub variadic_arg_start: Option<usize>,
@@ -504,10 +504,16 @@ impl Instruction {
         self
     }
 
-    /// Set the type
-    pub fn with_type(mut self, typ: Type) -> Self {
-        self.size = typ.size_bits();
+    /// Set the type (caller should also call with_size if needed)
+    pub fn with_type(mut self, typ: TypeId) -> Self {
         self.typ = Some(typ);
+        self
+    }
+
+    /// Set type and size together (convenience for callers with TypeTable access)
+    pub fn with_type_and_size(mut self, typ: TypeId, size: u32) -> Self {
+        self.typ = Some(typ);
+        self.size = size;
         self
     }
 
@@ -557,10 +563,8 @@ impl Instruction {
     }
 
     /// Create a return instruction with type
-    pub fn ret_typed(src: Option<PseudoId>, typ: Type) -> Self {
-        let mut insn = Self::ret(src).with_type(typ.clone());
-        insn.size = typ.size_bits();
-        insn
+    pub fn ret_typed(src: Option<PseudoId>, typ: TypeId, size: u32) -> Self {
+        Self::ret(src).with_type_and_size(typ, size)
     }
 
     /// Create an unconditional branch
@@ -594,37 +598,44 @@ impl Instruction {
     }
 
     /// Create a binary operation
-    pub fn binop(op: Opcode, target: PseudoId, src1: PseudoId, src2: PseudoId, typ: Type) -> Self {
+    pub fn binop(
+        op: Opcode,
+        target: PseudoId,
+        src1: PseudoId,
+        src2: PseudoId,
+        typ: TypeId,
+        size: u32,
+    ) -> Self {
         Self::new(op)
             .with_target(target)
             .with_src2(src1, src2)
-            .with_type(typ)
+            .with_type_and_size(typ, size)
     }
 
     /// Create a unary operation
-    pub fn unop(op: Opcode, target: PseudoId, src: PseudoId, typ: Type) -> Self {
+    pub fn unop(op: Opcode, target: PseudoId, src: PseudoId, typ: TypeId, size: u32) -> Self {
         Self::new(op)
             .with_target(target)
             .with_src(src)
-            .with_type(typ)
+            .with_type_and_size(typ, size)
     }
 
     /// Create a load instruction
-    pub fn load(target: PseudoId, addr: PseudoId, offset: i64, typ: Type) -> Self {
+    pub fn load(target: PseudoId, addr: PseudoId, offset: i64, typ: TypeId, size: u32) -> Self {
         Self::new(Opcode::Load)
             .with_target(target)
             .with_src(addr)
             .with_offset(offset)
-            .with_type(typ)
+            .with_type_and_size(typ, size)
     }
 
     /// Create a store instruction
-    pub fn store(value: PseudoId, addr: PseudoId, offset: i64, typ: Type) -> Self {
+    pub fn store(value: PseudoId, addr: PseudoId, offset: i64, typ: TypeId, size: u32) -> Self {
         Self::new(Opcode::Store)
             .with_src(addr)
             .with_src(value)
             .with_offset(offset)
-            .with_type(typ)
+            .with_type_and_size(typ, size)
     }
 
     /// Create a call instruction
@@ -632,10 +643,13 @@ impl Instruction {
         target: Option<PseudoId>,
         func: &str,
         args: Vec<PseudoId>,
-        arg_types: Vec<Type>,
-        ret_type: Type,
+        arg_types: Vec<TypeId>,
+        ret_type: TypeId,
+        ret_size: u32,
     ) -> Self {
-        let mut insn = Self::new(Opcode::Call).with_func(func).with_type(ret_type);
+        let mut insn = Self::new(Opcode::Call)
+            .with_func(func)
+            .with_type_and_size(ret_type, ret_size);
         if let Some(t) = target {
             insn.target = Some(t);
         }
@@ -645,16 +659,18 @@ impl Instruction {
     }
 
     /// Create a symbol address instruction (get address of a symbol like string literals)
-    pub fn sym_addr(target: PseudoId, sym: PseudoId, typ: Type) -> Self {
+    pub fn sym_addr(target: PseudoId, sym: PseudoId, typ: TypeId) -> Self {
         Self::new(Opcode::SymAddr)
             .with_target(target)
             .with_src(sym)
-            .with_type(typ)
+            .with_type_and_size(typ, 64) // Pointers are always 64-bit
     }
 
     /// Create a phi node
-    pub fn phi(target: PseudoId, typ: Type) -> Self {
-        Self::new(Opcode::Phi).with_target(target).with_type(typ)
+    pub fn phi(target: PseudoId, typ: TypeId, size: u32) -> Self {
+        Self::new(Opcode::Phi)
+            .with_target(target)
+            .with_type_and_size(typ, size)
     }
 
     /// Create a select (ternary) instruction
@@ -663,12 +679,13 @@ impl Instruction {
         cond: PseudoId,
         if_true: PseudoId,
         if_false: PseudoId,
-        typ: Type,
+        typ: TypeId,
+        size: u32,
     ) -> Self {
         Self::new(Opcode::Select)
             .with_target(target)
             .with_src3(cond, if_true, if_false)
-            .with_type(typ)
+            .with_type_and_size(typ, size)
     }
 }
 
@@ -883,8 +900,8 @@ impl fmt::Display for BasicBlock {
 pub struct LocalVar {
     /// Symbol pseudo for this variable (address)
     pub sym: PseudoId,
-    /// Type of the variable
-    pub typ: Type,
+    /// Type of the variable (interned TypeId)
+    pub typ: TypeId,
     /// Is this variable volatile?
     pub is_volatile: bool,
     /// Block where this variable was declared (for scope-aware phi placement)
@@ -897,10 +914,10 @@ pub struct LocalVar {
 pub struct Function {
     /// Function name
     pub name: String,
-    /// Return type
-    pub return_type: Type,
-    /// Parameter names and types
-    pub params: Vec<(String, Type)>,
+    /// Return type (interned TypeId)
+    pub return_type: TypeId,
+    /// Parameter names and types (interned TypeIds)
+    pub params: Vec<(String, TypeId)>,
     /// All basic blocks
     pub blocks: Vec<BasicBlock>,
     /// Entry block ID
@@ -919,7 +936,7 @@ impl Default for Function {
     fn default() -> Self {
         Self {
             name: String::new(),
-            return_type: Type::default(),
+            return_type: TypeId::INVALID,
             params: Vec::new(),
             blocks: Vec::new(),
             entry: BasicBlockId(0),
@@ -933,7 +950,7 @@ impl Default for Function {
 
 impl Function {
     /// Create a new function
-    pub fn new(name: impl Into<String>, return_type: Type) -> Self {
+    pub fn new(name: impl Into<String>, return_type: TypeId) -> Self {
         Self {
             name: name.into(),
             return_type,
@@ -942,7 +959,7 @@ impl Function {
     }
 
     /// Add a parameter
-    pub fn add_param(&mut self, name: impl Into<String>, typ: Type) {
+    pub fn add_param(&mut self, name: impl Into<String>, typ: TypeId) {
         self.params.push((name.into(), typ));
     }
 
@@ -971,7 +988,7 @@ impl Function {
         &mut self,
         name: impl Into<String>,
         sym: PseudoId,
-        typ: Type,
+        typ: TypeId,
         is_volatile: bool,
         decl_block: Option<BasicBlockId>,
     ) {
@@ -1015,12 +1032,12 @@ impl Function {
 impl fmt::Display for Function {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Function header
-        write!(f, "define {} {}(", self.return_type, self.name)?;
+        write!(f, "define type#{} {}(", self.return_type.0, self.name)?;
         for (i, (name, typ)) in self.params.iter().enumerate() {
             if i > 0 {
                 write!(f, ", ")?;
             }
-            write!(f, "{} %{}", typ, name)?;
+            write!(f, "type#{} %{}", typ.0, name)?;
         }
         writeln!(f, ") {{")?;
 
@@ -1069,7 +1086,7 @@ pub struct Module {
     /// Functions
     pub functions: Vec<Function>,
     /// Global variables (name, type, initializer)
-    pub globals: Vec<(String, Type, Initializer)>,
+    pub globals: Vec<(String, TypeId, Initializer)>,
     /// String literals (label, content)
     pub strings: Vec<(String, String)>,
     /// Generate debug info
@@ -1096,7 +1113,7 @@ impl Module {
     }
 
     /// Add a global variable
-    pub fn add_global(&mut self, name: impl Into<String>, typ: Type, init: Initializer) {
+    pub fn add_global(&mut self, name: impl Into<String>, typ: TypeId, init: Initializer) {
         self.globals.push((name.into(), typ, init));
     }
 
@@ -1119,8 +1136,8 @@ impl fmt::Display for Module {
         // Globals
         for (name, typ, init) in &self.globals {
             match init {
-                Initializer::None => writeln!(f, "@{}: {}", name, typ)?,
-                _ => writeln!(f, "@{}: {} = {}", name, typ, init)?,
+                Initializer::None => writeln!(f, "@{}: type#{}", name, typ.0)?,
+                _ => writeln!(f, "@{}: type#{} = {}", name, typ.0, init)?,
             }
         }
 
@@ -1144,7 +1161,7 @@ impl fmt::Display for Module {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::TypeKind;
+    use crate::types::{Type, TypeTable};
 
     #[test]
     fn test_opcode_is_terminator() {
@@ -1175,8 +1192,15 @@ mod tests {
 
     #[test]
     fn test_instruction_binop() {
-        let typ = Type::basic(TypeKind::Int);
-        let insn = Instruction::binop(Opcode::Add, PseudoId(3), PseudoId(1), PseudoId(2), typ);
+        let types = TypeTable::new();
+        let insn = Instruction::binop(
+            Opcode::Add,
+            PseudoId(3),
+            PseudoId(1),
+            PseudoId(2),
+            types.int_id,
+            32,
+        );
         assert_eq!(insn.op, Opcode::Add);
         assert_eq!(insn.target, Some(PseudoId(3)));
         assert_eq!(insn.src.len(), 2);
@@ -1184,8 +1208,15 @@ mod tests {
 
     #[test]
     fn test_instruction_display() {
-        let typ = Type::basic(TypeKind::Int);
-        let insn = Instruction::binop(Opcode::Add, PseudoId(3), PseudoId(1), PseudoId(2), typ);
+        let types = TypeTable::new();
+        let insn = Instruction::binop(
+            Opcode::Add,
+            PseudoId(3),
+            PseudoId(1),
+            PseudoId(2),
+            types.int_id,
+            32,
+        );
         let s = format!("{}", insn);
         assert!(s.contains("add"));
         assert!(s.contains("%3"));
@@ -1207,8 +1238,9 @@ mod tests {
 
     #[test]
     fn test_function_display() {
-        let mut func = Function::new("main", Type::basic(TypeKind::Int));
-        func.add_param("argc", Type::basic(TypeKind::Int));
+        let types = TypeTable::new();
+        let mut func = Function::new("main", types.int_id);
+        func.add_param("argc", types.int_id);
 
         let mut entry = BasicBlock::new(BasicBlockId(0));
         entry.add_insn(Instruction::ret(Some(PseudoId(0))));
@@ -1236,17 +1268,16 @@ mod tests {
 
     #[test]
     fn test_call_instruction() {
-        let typ = Type::basic(TypeKind::Int);
-        let arg_types = vec![
-            Type::pointer(Type::basic(TypeKind::Char)),
-            Type::basic(TypeKind::Int),
-        ];
+        let mut types = TypeTable::new();
+        let char_ptr = types.intern(Type::pointer(types.char_id));
+        let arg_types = vec![char_ptr, types.int_id];
         let call = Instruction::call(
             Some(PseudoId(1)),
             "printf",
             vec![PseudoId(2), PseudoId(3)],
             arg_types.clone(),
-            typ,
+            types.int_id,
+            32,
         );
         assert_eq!(call.op, Opcode::Call);
         assert_eq!(call.func_name, Some("printf".to_string()));
@@ -1256,24 +1287,25 @@ mod tests {
 
     #[test]
     fn test_load_store() {
-        let typ = Type::basic(TypeKind::Int);
+        let types = TypeTable::new();
 
-        let load = Instruction::load(PseudoId(1), PseudoId(2), 8, typ.clone());
+        let load = Instruction::load(PseudoId(1), PseudoId(2), 8, types.int_id, 32);
         assert_eq!(load.op, Opcode::Load);
         assert_eq!(load.offset, 8);
 
-        let store = Instruction::store(PseudoId(1), PseudoId(2), 0, typ);
+        let store = Instruction::store(PseudoId(1), PseudoId(2), 0, types.int_id, 32);
         assert_eq!(store.op, Opcode::Store);
         assert_eq!(store.src.len(), 2);
     }
 
     #[test]
     fn test_module() {
+        let types = TypeTable::new();
         let mut module = Module::new();
 
-        module.add_global("counter", Type::basic(TypeKind::Int), Initializer::Int(0));
+        module.add_global("counter", types.int_id, Initializer::Int(0));
 
-        let func = Function::new("main", Type::basic(TypeKind::Int));
+        let func = Function::new("main", types.int_id);
         module.add_function(func);
 
         assert_eq!(module.globals.len(), 1);

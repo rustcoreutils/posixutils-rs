@@ -499,7 +499,7 @@ fn visit_domtree(
 mod tests {
     use super::*;
     use crate::ir::{BasicBlock, Instruction, Opcode};
-    use crate::types::{Type, TypeKind};
+    use crate::types::TypeTable;
 
     fn make_test_cfg() -> Function {
         // Create a simple CFG:
@@ -514,7 +514,8 @@ mod tests {
         //          v
         //        exit(4)
 
-        let mut func = Function::new("test", Type::basic(TypeKind::Void));
+        let types = TypeTable::new();
+        let mut func = Function::new("test", types.void_id);
 
         let mut entry = BasicBlock::new(BasicBlockId(0));
         entry.children = vec![BasicBlockId(1), BasicBlockId(2)];

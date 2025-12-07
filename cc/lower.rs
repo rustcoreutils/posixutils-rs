@@ -140,7 +140,7 @@ pub fn lower_function(func: &mut Function) {
 mod tests {
     use super::*;
     use crate::ir::{BasicBlock, Instruction, Opcode, Pseudo, PseudoId};
-    use crate::types::{Type, TypeKind};
+    use crate::types::TypeTable;
 
     fn make_loop_cfg() -> Function {
         // Create a simple loop CFG:
@@ -158,7 +158,9 @@ mod tests {
         // With phi node in cond block:
         //   %3 = phi [.L0: %1], [.L2: %2]
 
-        let mut func = Function::new("test", Type::basic(TypeKind::Int));
+        let types = TypeTable::new();
+        let int_type = types.int_id;
+        let mut func = Function::new("test", int_type);
 
         // Entry block
         let mut entry = BasicBlock::new(BasicBlockId(0));
@@ -177,7 +179,7 @@ mod tests {
         cond.children = vec![BasicBlockId(2), BasicBlockId(3)];
 
         // Phi node: %3 = phi [.L0: %1], [.L2: %2]
-        let mut phi = Instruction::phi(PseudoId(3), Type::basic(TypeKind::Int));
+        let mut phi = Instruction::phi(PseudoId(3), int_type, 32);
         phi.phi_list = vec![
             (BasicBlockId(0), PseudoId(1)),
             (BasicBlockId(2), PseudoId(2)),
@@ -199,7 +201,8 @@ mod tests {
             PseudoId(2),
             PseudoId(3),
             PseudoId(4), // constant 1
-            Type::basic(TypeKind::Int),
+            int_type,
+            32,
         );
         body.add_insn(add);
         body.add_insn(Instruction::br(BasicBlockId(1)));

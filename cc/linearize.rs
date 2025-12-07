@@ -1684,6 +1684,812 @@ impl<'a> Linearizer<'a> {
         }
     }
 
+    /// Linearize a type cast expression
+    fn linearize_cast(&mut self, inner_expr: &Expr, cast_type: TypeId) -> PseudoId {
+        let src = self.linearize_expr(inner_expr);
+        let src_type = self.expr_type(inner_expr);
+
+        // Emit conversion if needed
+        let src_is_float = self.types.is_float(src_type);
+        let dst_is_float = self.types.is_float(cast_type);
+
+        if src_is_float && !dst_is_float {
+            // Float to integer conversion
+            let result = self.alloc_pseudo();
+            let pseudo = Pseudo::reg(result, result.0);
+            if let Some(func) = &mut self.current_func {
+                func.add_pseudo(pseudo);
+            }
+            // FCvtS for signed int, FCvtU for unsigned
+            let opcode = if self.types.is_unsigned(cast_type) {
+                Opcode::FCvtU
+            } else {
+                Opcode::FCvtS
+            };
+            let mut insn = Instruction::new(opcode)
+                .with_target(result)
+                .with_src(src)
+                .with_type(cast_type);
+            insn.src_size = self.types.size_bits(src_type);
+            self.emit(insn);
+            result
+        } else if !src_is_float && dst_is_float {
+            // Integer to float conversion
+            let result = self.alloc_pseudo();
+            let pseudo = Pseudo::reg(result, result.0);
+            if let Some(func) = &mut self.current_func {
+                func.add_pseudo(pseudo);
+            }
+            // SCvtF for signed int, UCvtF for unsigned
+            let opcode = if self.types.is_unsigned(src_type) {
+                Opcode::UCvtF
+            } else {
+                Opcode::SCvtF
+            };
+            let mut insn = Instruction::new(opcode)
+                .with_target(result)
+                .with_src(src)
+                .with_type(cast_type);
+            insn.src_size = self.types.size_bits(src_type);
+            self.emit(insn);
+            result
+        } else if src_is_float && dst_is_float {
+            // Float to float conversion (e.g., float to double)
+            let src_size = self.types.size_bits(src_type);
+            let dst_size = self.types.size_bits(cast_type);
+            if src_size != dst_size {
+                let result = self.alloc_pseudo();
+                let pseudo = Pseudo::reg(result, result.0);
+                if let Some(func) = &mut self.current_func {
+                    func.add_pseudo(pseudo);
+                }
+                let mut insn = Instruction::new(Opcode::FCvtF)
+                    .with_target(result)
+                    .with_src(src)
+                    .with_type(cast_type);
+                insn.src_size = src_size;
+                self.emit(insn);
+                result
+            } else {
+                src // Same size, no conversion needed
+            }
+        } else {
+            // Integer to integer conversion
+            // Use emit_convert for proper type conversions including _Bool
+            self.emit_convert(src, src_type, cast_type)
+        }
+    }
+
+    /// Linearize a struct member access expression (e.g., s.member)
+    fn linearize_member(&mut self, expr: &Expr, inner_expr: &Expr, member: StringId) -> PseudoId {
+        // Get address of the struct base
+        let base = self.linearize_lvalue(inner_expr);
+        let struct_type = self.expr_type(inner_expr);
+
+        // Look up member offset and type
+        let member_info = self
+            .types
+            .find_member(struct_type, member)
+            .unwrap_or_else(|| MemberInfo {
+                offset: 0,
+                typ: self.expr_type(expr),
+                bit_offset: None,
+                bit_width: None,
+                storage_unit_size: None,
+            });
+
+        // If member type is an array, return the address (arrays decay to pointers)
+        if self.types.kind(member_info.typ) == TypeKind::Array {
+            if member_info.offset == 0 {
+                base
+            } else {
+                let result = self.alloc_pseudo();
+                let offset_val = self.emit_const(member_info.offset as i64, self.types.long_id);
+                self.emit(Instruction::binop(
+                    Opcode::Add,
+                    result,
+                    base,
+                    offset_val,
+                    self.types.long_id,
+                    64,
+                ));
+                result
+            }
+        } else if let (Some(bit_offset), Some(bit_width), Some(storage_size)) = (
+            member_info.bit_offset,
+            member_info.bit_width,
+            member_info.storage_unit_size,
+        ) {
+            // Bitfield read
+            self.emit_bitfield_load(
+                base,
+                member_info.offset,
+                bit_offset,
+                bit_width,
+                storage_size,
+                member_info.typ,
+            )
+        } else {
+            let result = self.alloc_pseudo();
+            let size = self.types.size_bits(member_info.typ);
+            self.emit(Instruction::load(
+                result,
+                base,
+                member_info.offset as i64,
+                member_info.typ,
+                size,
+            ));
+            result
+        }
+    }
+
+    /// Linearize a pointer member access expression (e.g., p->member)
+    fn linearize_arrow(&mut self, expr: &Expr, inner_expr: &Expr, member: StringId) -> PseudoId {
+        // Pointer already contains the struct address
+        let ptr = self.linearize_expr(inner_expr);
+        let ptr_type = self.expr_type(inner_expr);
+
+        // Dereference pointer to get struct type
+        let struct_type = self
+            .types
+            .base_type(ptr_type)
+            .unwrap_or_else(|| self.expr_type(expr));
+
+        // Look up member offset and type
+        let member_info = self
+            .types
+            .find_member(struct_type, member)
+            .unwrap_or_else(|| MemberInfo {
+                offset: 0,
+                typ: self.expr_type(expr),
+                bit_offset: None,
+                bit_width: None,
+                storage_unit_size: None,
+            });
+
+        // If member type is an array, return the address (arrays decay to pointers)
+        if self.types.kind(member_info.typ) == TypeKind::Array {
+            if member_info.offset == 0 {
+                ptr
+            } else {
+                let result = self.alloc_pseudo();
+                let offset_val = self.emit_const(member_info.offset as i64, self.types.long_id);
+                self.emit(Instruction::binop(
+                    Opcode::Add,
+                    result,
+                    ptr,
+                    offset_val,
+                    self.types.long_id,
+                    64,
+                ));
+                result
+            }
+        } else if let (Some(bit_offset), Some(bit_width), Some(storage_size)) = (
+            member_info.bit_offset,
+            member_info.bit_width,
+            member_info.storage_unit_size,
+        ) {
+            // Bitfield read
+            self.emit_bitfield_load(
+                ptr,
+                member_info.offset,
+                bit_offset,
+                bit_width,
+                storage_size,
+                member_info.typ,
+            )
+        } else {
+            let result = self.alloc_pseudo();
+            let size = self.types.size_bits(member_info.typ);
+            self.emit(Instruction::load(
+                result,
+                ptr,
+                member_info.offset as i64,
+                member_info.typ,
+                size,
+            ));
+            result
+        }
+    }
+
+    /// Linearize an array index expression (e.g., arr[i])
+    fn linearize_index(&mut self, expr: &Expr, array: &Expr, index: &Expr) -> PseudoId {
+        // In C, a[b] is defined as *(a + b), so either operand can be the pointer
+        // Handle commutative form: 0[arr] is equivalent to arr[0]
+        let array_type = self.expr_type(array);
+        let index_type = self.expr_type(index);
+
+        let array_kind = self.types.kind(array_type);
+        let (ptr_expr, idx_expr, idx_type) =
+            if array_kind == TypeKind::Pointer || array_kind == TypeKind::Array {
+                (array, index, index_type)
+            } else {
+                // Swap: index is actually the pointer/array
+                (index, array, array_type)
+            };
+
+        let arr = self.linearize_expr(ptr_expr);
+        let idx = self.linearize_expr(idx_expr);
+
+        // Get element type from the expression type
+        let elem_type = self.expr_type(expr);
+        let elem_size = self.types.size_bits(elem_type) / 8;
+        let elem_size_val = self.emit_const(elem_size as i64, self.types.long_id);
+
+        // Sign-extend index to 64-bit for proper pointer arithmetic (negative indices)
+        let idx_extended = self.emit_convert(idx, idx_type, self.types.long_id);
+
+        let offset = self.alloc_pseudo();
+        let ptr_typ = self.types.long_id;
+        self.emit(Instruction::binop(
+            Opcode::Mul,
+            offset,
+            idx_extended,
+            elem_size_val,
+            ptr_typ,
+            64,
+        ));
+
+        let addr = self.alloc_pseudo();
+        self.emit(Instruction::binop(
+            Opcode::Add,
+            addr,
+            arr,
+            offset,
+            ptr_typ,
+            64,
+        ));
+
+        // If element type is an array, just return the address (arrays decay to pointers)
+        if self.types.kind(elem_type) == TypeKind::Array {
+            addr
+        } else {
+            let result = self.alloc_pseudo();
+            let size = self.types.size_bits(elem_type);
+            self.emit(Instruction::load(result, addr, 0, elem_type, size));
+            result
+        }
+    }
+
+    /// Linearize a function call expression
+    fn linearize_call(&mut self, expr: &Expr, func_expr: &Expr, args: &[Expr]) -> PseudoId {
+        // Get function name
+        let func_name = match &func_expr.kind {
+            ExprKind::Ident { name, .. } => self.str(*name).to_string(),
+            _ => "<indirect>".to_string(),
+        };
+
+        let typ = self.expr_type(expr); // Use evaluated type (function return type)
+
+        // Check if this is a variadic function call
+        // If the function expression has a type, check its variadic flag
+        let variadic_arg_start = if let Some(func_type) = func_expr.typ {
+            let ft = self.types.get(func_type);
+            if ft.variadic {
+                // Variadic args start after the fixed parameters
+                ft.params.as_ref().map(|p| p.len())
+            } else {
+                None
+            }
+        } else {
+            None // No type info, assume non-variadic
+        };
+
+        // Check if function returns a large struct
+        // If so, allocate space and pass address as hidden first argument
+        let typ_kind = self.types.kind(typ);
+        let returns_large_struct = (typ_kind == TypeKind::Struct || typ_kind == TypeKind::Union)
+            && self.types.size_bits(typ) > self.target.max_aggregate_register_bits;
+
+        let (result_sym, mut arg_vals, mut arg_types_vec) = if returns_large_struct {
+            // Allocate local storage for the return value
+            let sret_sym = self.alloc_pseudo();
+            let sret_pseudo = Pseudo::sym(sret_sym, format!("__sret_{}", sret_sym.0));
+            if let Some(func) = &mut self.current_func {
+                func.add_pseudo(sret_pseudo);
+                // Internal sret storage is never volatile
+                func.add_local(
+                    format!("__sret_{}", sret_sym.0),
+                    sret_sym,
+                    typ,
+                    false,
+                    self.current_bb,
+                );
+            }
+
+            // Get address of the allocated space
+            let sret_addr = self.alloc_pseudo();
+            let addr_pseudo = Pseudo::reg(sret_addr, sret_addr.0);
+            if let Some(func) = &mut self.current_func {
+                func.add_pseudo(addr_pseudo);
+            }
+            self.emit(Instruction::sym_addr(
+                sret_addr,
+                sret_sym,
+                self.types.pointer_to(typ),
+            ));
+
+            // Hidden return pointer is the first argument (pointer type)
+            (sret_sym, vec![sret_addr], vec![self.types.pointer_to(typ)])
+        } else {
+            let result = self.alloc_pseudo();
+            (result, Vec::new(), Vec::new())
+        };
+
+        // Linearize regular arguments
+        // For large structs, pass by reference (address) instead of by value
+        for a in args.iter() {
+            let arg_type = self.expr_type(a);
+            let arg_kind = self.types.kind(arg_type);
+            let arg_val = if (arg_kind == TypeKind::Struct || arg_kind == TypeKind::Union)
+                && self.types.size_bits(arg_type) > self.target.max_aggregate_register_bits
+            {
+                // Large struct: pass address instead of value
+                // The argument type becomes a pointer
+                arg_types_vec.push(self.types.pointer_to(arg_type));
+                self.linearize_lvalue(a)
+            } else {
+                arg_types_vec.push(arg_type);
+                self.linearize_expr(a)
+            };
+            arg_vals.push(arg_val);
+        }
+
+        if returns_large_struct {
+            // For large struct returns, the return value is the address
+            // stored in result_sym (which is a local symbol containing the struct)
+            let result = self.alloc_pseudo();
+            let result_pseudo = Pseudo::reg(result, result.0);
+            if let Some(func) = &mut self.current_func {
+                func.add_pseudo(result_pseudo);
+            }
+            let ptr_typ = self.types.pointer_to(typ);
+            let mut call_insn = Instruction::call(
+                Some(result),
+                &func_name,
+                arg_vals,
+                arg_types_vec,
+                ptr_typ,
+                64, // pointers are 64-bit
+            );
+            call_insn.variadic_arg_start = variadic_arg_start;
+            call_insn.is_sret_call = true;
+            self.emit(call_insn);
+            // Return the symbol (address) where struct is stored
+            result_sym
+        } else {
+            let ret_size = self.types.size_bits(typ);
+            let mut call_insn = Instruction::call(
+                Some(result_sym),
+                &func_name,
+                arg_vals,
+                arg_types_vec,
+                typ,
+                ret_size,
+            );
+            call_insn.variadic_arg_start = variadic_arg_start;
+            self.emit(call_insn);
+            result_sym
+        }
+    }
+
+    /// Linearize a post-increment or post-decrement expression
+    fn linearize_postop(&mut self, operand: &Expr, is_inc: bool) -> PseudoId {
+        let val = self.linearize_expr(operand);
+        let typ = self.expr_type(operand);
+        let is_float = self.types.is_float(typ);
+        let is_ptr = self.types.kind(typ) == TypeKind::Pointer;
+
+        // For locals, we need to save the old value before updating
+        // because the pseudo will be reloaded from stack which gets overwritten
+        let is_local = if let ExprKind::Ident { name, .. } = &operand.kind {
+            self.locals.contains_key(self.str(*name))
+        } else {
+            false
+        };
+
+        let old_val = if is_local {
+            // Copy the old value to a temp
+            let temp = self.alloc_pseudo();
+            let pseudo = Pseudo::reg(temp, temp.0);
+            if let Some(func) = &mut self.current_func {
+                func.add_pseudo(pseudo);
+            }
+            self.emit(
+                Instruction::new(Opcode::Copy)
+                    .with_target(temp)
+                    .with_src(val)
+                    .with_size(self.types.size_bits(typ)),
+            );
+            temp
+        } else {
+            val
+        };
+
+        // For pointers, increment/decrement by element size; for others, by 1
+        let delta = if is_ptr {
+            let elem_type = self.types.base_type(typ).unwrap_or(self.types.char_id);
+            let elem_size = self.types.size_bits(elem_type) / 8;
+            self.emit_const(elem_size as i64, self.types.long_id)
+        } else if is_float {
+            self.emit_fconst(1.0, typ)
+        } else {
+            self.emit_const(1, typ)
+        };
+        let result = self.alloc_pseudo();
+        let pseudo = Pseudo::reg(result, result.0);
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(pseudo);
+        }
+        let opcode = if is_float {
+            if is_inc {
+                Opcode::FAdd
+            } else {
+                Opcode::FSub
+            }
+        } else if is_inc {
+            Opcode::Add
+        } else {
+            Opcode::Sub
+        };
+        let arith_type = if is_ptr { self.types.long_id } else { typ };
+        let arith_size = self.types.size_bits(arith_type);
+        self.emit(Instruction::binop(
+            opcode, result, val, delta, arith_type, arith_size,
+        ));
+
+        // For _Bool, normalize the result (any non-zero -> 1)
+        let final_result = if self.types.kind(typ) == TypeKind::Bool {
+            self.emit_convert(result, self.types.int_id, typ)
+        } else {
+            result
+        };
+
+        // Store to local, update parameter mapping, or store through pointer
+        let store_size = self.types.size_bits(typ);
+        match &operand.kind {
+            ExprKind::Ident { name, .. } => {
+                let name_str = self.str(*name).to_string();
+                if let Some(local) = self.locals.get(&name_str).cloned() {
+                    self.emit(Instruction::store(
+                        final_result,
+                        local.sym,
+                        0,
+                        typ,
+                        store_size,
+                    ));
+                } else if self.var_map.contains_key(&name_str) {
+                    self.var_map.insert(name_str.clone(), final_result);
+                } else {
+                    // Global variable - emit store
+                    let sym_id = self.alloc_pseudo();
+                    let pseudo = Pseudo::sym(sym_id, name_str.clone());
+                    if let Some(func) = &mut self.current_func {
+                        func.add_pseudo(pseudo);
+                    }
+                    self.emit(Instruction::store(final_result, sym_id, 0, typ, store_size));
+                }
+            }
+            ExprKind::Unary {
+                op: UnaryOp::Deref,
+                operand: ptr_expr,
+            } => {
+                // (*p)++ or (*p)-- - store back through the pointer
+                let addr = self.linearize_expr(ptr_expr);
+                self.emit(Instruction::store(final_result, addr, 0, typ, store_size));
+            }
+            _ => {}
+        }
+
+        old_val // Return old value
+    }
+
+    /// Linearize a binary expression (arithmetic, comparison, logical operators)
+    fn linearize_binary(
+        &mut self,
+        expr: &Expr,
+        op: BinaryOp,
+        left: &Expr,
+        right: &Expr,
+    ) -> PseudoId {
+        // Handle short-circuit operators before linearizing both operands
+        // C99 requires that && and || only evaluate the RHS if needed
+        if op == BinaryOp::LogAnd {
+            return self.emit_logical_and(left, right);
+        }
+        if op == BinaryOp::LogOr {
+            return self.emit_logical_or(left, right);
+        }
+
+        let left_typ = self.expr_type(left);
+        let right_typ = self.expr_type(right);
+        let result_typ = self.expr_type(expr);
+
+        // Check for pointer arithmetic: ptr +/- int or int + ptr
+        let left_kind = self.types.kind(left_typ);
+        let right_kind = self.types.kind(right_typ);
+        let left_is_ptr_or_arr = left_kind == TypeKind::Pointer || left_kind == TypeKind::Array;
+        let right_is_ptr_or_arr = right_kind == TypeKind::Pointer || right_kind == TypeKind::Array;
+        let is_ptr_arith = (op == BinaryOp::Add || op == BinaryOp::Sub)
+            && ((left_is_ptr_or_arr && self.types.is_integer(right_typ))
+                || (self.types.is_integer(left_typ) && right_is_ptr_or_arr));
+
+        // Check for pointer difference: ptr - ptr
+        let is_ptr_diff = op == BinaryOp::Sub && left_is_ptr_or_arr && right_is_ptr_or_arr;
+
+        if is_ptr_diff {
+            // Pointer difference: (ptr1 - ptr2) / element_size
+            let left_val = self.linearize_expr(left);
+            let right_val = self.linearize_expr(right);
+
+            // Compute byte difference
+            let byte_diff = self.alloc_pseudo();
+            self.emit(Instruction::binop(
+                Opcode::Sub,
+                byte_diff,
+                left_val,
+                right_val,
+                self.types.long_id,
+                64,
+            ));
+
+            // Get element size from the pointer type
+            let elem_type = self.types.base_type(left_typ).unwrap_or(self.types.char_id);
+            let elem_size = self.types.size_bits(elem_type) / 8;
+
+            // Divide by element size
+            let scale = self.emit_const(elem_size as i64, self.types.long_id);
+            let result = self.alloc_pseudo();
+            self.emit(Instruction::binop(
+                Opcode::DivS,
+                result,
+                byte_diff,
+                scale,
+                self.types.long_id,
+                64,
+            ));
+            result
+        } else if is_ptr_arith {
+            // Pointer arithmetic: scale integer operand by element size
+            let (ptr_val, ptr_typ, int_val) = if left_is_ptr_or_arr {
+                let ptr = self.linearize_expr(left);
+                let int = self.linearize_expr(right);
+                (ptr, left_typ, int)
+            } else {
+                // int + ptr case
+                let int = self.linearize_expr(left);
+                let ptr = self.linearize_expr(right);
+                (ptr, right_typ, int)
+            };
+
+            // Get element size
+            let elem_type = self.types.base_type(ptr_typ).unwrap_or(self.types.char_id);
+            let elem_size = self.types.size_bits(elem_type) / 8;
+
+            // Scale the integer by element size
+            let scale = self.emit_const(elem_size as i64, self.types.long_id);
+            let scaled_offset = self.alloc_pseudo();
+            // Extend int_val to 64-bit for proper address arithmetic
+            let int_val_extended =
+                self.emit_convert(int_val, self.types.int_id, self.types.long_id);
+            self.emit(Instruction::binop(
+                Opcode::Mul,
+                scaled_offset,
+                int_val_extended,
+                scale,
+                self.types.long_id,
+                64,
+            ));
+
+            // Add (or subtract) to pointer
+            let result = self.alloc_pseudo();
+            let opcode = if op == BinaryOp::Sub {
+                Opcode::Sub
+            } else {
+                Opcode::Add
+            };
+            self.emit(Instruction::binop(
+                opcode,
+                result,
+                ptr_val,
+                scaled_offset,
+                self.types.long_id,
+                64,
+            ));
+            result
+        } else {
+            // For comparisons, compute common type for both operands
+            // (usual arithmetic conversions)
+            let operand_typ = if op.is_comparison() {
+                self.common_type(left_typ, right_typ)
+            } else {
+                result_typ
+            };
+
+            // Linearize operands
+            let left_val = self.linearize_expr(left);
+            let right_val = self.linearize_expr(right);
+
+            // Emit type conversions if needed
+            let left_val = self.emit_convert(left_val, left_typ, operand_typ);
+            let right_val = self.emit_convert(right_val, right_typ, operand_typ);
+
+            self.emit_binary(op, left_val, right_val, result_typ, operand_typ)
+        }
+    }
+
+    /// Linearize a unary expression (prefix operators, address-of, dereference, etc.)
+    fn linearize_unary(&mut self, expr: &Expr, op: UnaryOp, operand: &Expr) -> PseudoId {
+        // Handle AddrOf specially - we need the lvalue address, not the value
+        if op == UnaryOp::AddrOf {
+            return self.linearize_lvalue(operand);
+        }
+
+        // Handle PreInc/PreDec specially - they need store-back
+        if op == UnaryOp::PreInc || op == UnaryOp::PreDec {
+            let val = self.linearize_expr(operand);
+            let typ = self.expr_type(operand);
+            let is_float = self.types.is_float(typ);
+            let is_ptr = self.types.kind(typ) == TypeKind::Pointer;
+
+            // Compute new value - for pointers, scale by element size
+            let increment = if is_ptr {
+                let elem_type = self.types.base_type(typ).unwrap_or(self.types.char_id);
+                let elem_size = self.types.size_bits(elem_type) / 8;
+                self.emit_const(elem_size as i64, self.types.long_id)
+            } else if is_float {
+                self.emit_fconst(1.0, typ)
+            } else {
+                self.emit_const(1, typ)
+            };
+            let result = self.alloc_pseudo();
+            let pseudo = Pseudo::reg(result, result.0);
+            if let Some(func) = &mut self.current_func {
+                func.add_pseudo(pseudo);
+            }
+            let opcode = if is_float {
+                if op == UnaryOp::PreInc {
+                    Opcode::FAdd
+                } else {
+                    Opcode::FSub
+                }
+            } else if op == UnaryOp::PreInc {
+                Opcode::Add
+            } else {
+                Opcode::Sub
+            };
+            let size = self.types.size_bits(typ);
+            self.emit(Instruction::binop(
+                opcode, result, val, increment, typ, size,
+            ));
+
+            // For _Bool, normalize the result (any non-zero -> 1)
+            let final_result = if self.types.kind(typ) == TypeKind::Bool {
+                self.emit_convert(result, self.types.int_id, typ)
+            } else {
+                result
+            };
+
+            // Store back to the variable
+            if let ExprKind::Ident { name, .. } = &operand.kind {
+                let name_str = self.str(*name).to_string();
+                if let Some(local) = self.locals.get(&name_str).cloned() {
+                    let store_size = self.types.size_bits(typ);
+                    self.emit(Instruction::store(
+                        final_result,
+                        local.sym,
+                        0,
+                        typ,
+                        store_size,
+                    ));
+                } else if self.var_map.contains_key(&name_str) {
+                    self.var_map.insert(name_str.clone(), final_result);
+                } else {
+                    // Global variable - emit store
+                    let sym_id = self.alloc_pseudo();
+                    let pseudo = Pseudo::sym(sym_id, name_str.clone());
+                    if let Some(func) = &mut self.current_func {
+                        func.add_pseudo(pseudo);
+                    }
+                    let store_size = self.types.size_bits(typ);
+                    self.emit(Instruction::store(final_result, sym_id, 0, typ, store_size));
+                }
+            }
+
+            return final_result;
+        }
+
+        let src = self.linearize_expr(operand);
+        let result_typ = self.expr_type(expr);
+        let operand_typ = self.expr_type(operand);
+        // For logical NOT, use operand type for comparison size
+        let typ = if op == UnaryOp::Not {
+            operand_typ
+        } else {
+            result_typ
+        };
+        self.emit_unary(op, src, typ)
+    }
+
+    /// Linearize an identifier expression (variable reference)
+    fn linearize_ident(&mut self, expr: &Expr, name: StringId) -> PseudoId {
+        let name_str = self.str(name).to_string();
+        // First check if it's an enum constant
+        if let Some(value) = self.symbols.get_enum_value(name) {
+            self.emit_const(value, self.types.int_id)
+        }
+        // Check if it's a local variable
+        else if let Some(local) = self.locals.get(&name_str).cloned() {
+            // Check if this is a static local (sentinel value)
+            if local.sym.0 == u32::MAX {
+                // Static local - look up the global name and treat as global
+                let key = format!("{}.{}", self.current_func_name, &name_str);
+                if let Some(static_info) = self.static_locals.get(&key).cloned() {
+                    let sym_id = self.alloc_pseudo();
+                    let pseudo = Pseudo::sym(sym_id, static_info.global_name);
+                    if let Some(func) = &mut self.current_func {
+                        func.add_pseudo(pseudo);
+                    }
+                    let typ = static_info.typ;
+                    // Arrays decay to pointers - get address, not value
+                    if self.types.kind(typ) == TypeKind::Array {
+                        let result = self.alloc_pseudo();
+                        let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
+                        let ptr_type = self.types.pointer_to(elem_type);
+                        self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
+                        return result;
+                    } else {
+                        let result = self.alloc_pseudo();
+                        let size = self.types.size_bits(typ);
+                        self.emit(Instruction::load(result, sym_id, 0, typ, size));
+                        return result;
+                    }
+                }
+            }
+            let result = self.alloc_pseudo();
+            let pseudo = Pseudo::reg(result, result.0);
+            if let Some(func) = &mut self.current_func {
+                func.add_pseudo(pseudo);
+            }
+            // Arrays decay to pointers - get address, not value
+            if self.types.kind(local.typ) == TypeKind::Array {
+                let elem_type = self.types.base_type(local.typ).unwrap_or(self.types.int_id);
+                let ptr_type = self.types.pointer_to(elem_type);
+                self.emit(Instruction::sym_addr(result, local.sym, ptr_type));
+            } else {
+                let size = self.types.size_bits(local.typ);
+                self.emit(Instruction::load(result, local.sym, 0, local.typ, size));
+            }
+            result
+        }
+        // Check if it's a parameter (already SSA value)
+        else if let Some(&pseudo) = self.var_map.get(&name_str) {
+            pseudo
+        }
+        // Global variable - create symbol reference and load
+        else {
+            let sym_id = self.alloc_pseudo();
+            let pseudo = Pseudo::sym(sym_id, name_str.clone());
+            if let Some(func) = &mut self.current_func {
+                func.add_pseudo(pseudo);
+            }
+            let typ = self.expr_type(expr);
+            // Arrays decay to pointers - get address, not value
+            if self.types.kind(typ) == TypeKind::Array {
+                let result = self.alloc_pseudo();
+                let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
+                let ptr_type = self.types.pointer_to(elem_type);
+                self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
+                result
+            } else {
+                let result = self.alloc_pseudo();
+                let size = self.types.size_bits(typ);
+                self.emit(Instruction::load(result, sym_id, 0, typ, size));
+                result
+            }
+        }
+    }
+
     fn linearize_expr(&mut self, expr: &Expr) -> PseudoId {
         // Set current position for debug info
         self.current_pos = Some(expr.pos);
@@ -1728,508 +2534,17 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
-            ExprKind::Ident { name, .. } => {
-                let name_str = self.str(*name).to_string();
-                // First check if it's an enum constant
-                if let Some(value) = self.symbols.get_enum_value(*name) {
-                    self.emit_const(value, self.types.int_id)
-                }
-                // Check if it's a local variable
-                else if let Some(local) = self.locals.get(&name_str).cloned() {
-                    // Check if this is a static local (sentinel value)
-                    if local.sym.0 == u32::MAX {
-                        // Static local - look up the global name and treat as global
-                        let key = format!("{}.{}", self.current_func_name, &name_str);
-                        if let Some(static_info) = self.static_locals.get(&key).cloned() {
-                            let sym_id = self.alloc_pseudo();
-                            let pseudo = Pseudo::sym(sym_id, static_info.global_name);
-                            if let Some(func) = &mut self.current_func {
-                                func.add_pseudo(pseudo);
-                            }
-                            let typ = static_info.typ;
-                            // Arrays decay to pointers - get address, not value
-                            if self.types.kind(typ) == TypeKind::Array {
-                                let result = self.alloc_pseudo();
-                                let elem_type =
-                                    self.types.base_type(typ).unwrap_or(self.types.int_id);
-                                let ptr_type = self.types.pointer_to(elem_type);
-                                self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
-                                return result;
-                            } else {
-                                let result = self.alloc_pseudo();
-                                let size = self.types.size_bits(typ);
-                                self.emit(Instruction::load(result, sym_id, 0, typ, size));
-                                return result;
-                            }
-                        }
-                    }
-                    let result = self.alloc_pseudo();
-                    let pseudo = Pseudo::reg(result, result.0);
-                    if let Some(func) = &mut self.current_func {
-                        func.add_pseudo(pseudo);
-                    }
-                    // Arrays decay to pointers - get address, not value
-                    if self.types.kind(local.typ) == TypeKind::Array {
-                        let elem_type =
-                            self.types.base_type(local.typ).unwrap_or(self.types.int_id);
-                        let ptr_type = self.types.pointer_to(elem_type);
-                        self.emit(Instruction::sym_addr(result, local.sym, ptr_type));
-                    } else {
-                        let size = self.types.size_bits(local.typ);
-                        self.emit(Instruction::load(result, local.sym, 0, local.typ, size));
-                    }
-                    result
-                }
-                // Check if it's a parameter (already SSA value)
-                else if let Some(&pseudo) = self.var_map.get(&name_str) {
-                    pseudo
-                }
-                // Global variable - create symbol reference and load
-                else {
-                    let sym_id = self.alloc_pseudo();
-                    let pseudo = Pseudo::sym(sym_id, name_str.clone());
-                    if let Some(func) = &mut self.current_func {
-                        func.add_pseudo(pseudo);
-                    }
-                    let typ = self.expr_type(expr);
-                    // Arrays decay to pointers - get address, not value
-                    if self.types.kind(typ) == TypeKind::Array {
-                        let result = self.alloc_pseudo();
-                        let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
-                        let ptr_type = self.types.pointer_to(elem_type);
-                        self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
-                        result
-                    } else {
-                        let result = self.alloc_pseudo();
-                        let size = self.types.size_bits(typ);
-                        self.emit(Instruction::load(result, sym_id, 0, typ, size));
-                        result
-                    }
-                }
-            }
+            ExprKind::Ident { name, .. } => self.linearize_ident(expr, *name),
 
-            ExprKind::Unary { op, operand } => {
-                // Handle AddrOf specially - we need the lvalue address, not the value
-                if *op == UnaryOp::AddrOf {
-                    return self.linearize_lvalue(operand);
-                }
+            ExprKind::Unary { op, operand } => self.linearize_unary(expr, *op, operand),
 
-                // Handle PreInc/PreDec specially - they need store-back
-                if *op == UnaryOp::PreInc || *op == UnaryOp::PreDec {
-                    let val = self.linearize_expr(operand);
-                    let typ = self.expr_type(operand);
-                    let is_float = self.types.is_float(typ);
-                    let is_ptr = self.types.kind(typ) == TypeKind::Pointer;
-
-                    // Compute new value - for pointers, scale by element size
-                    let increment = if is_ptr {
-                        let elem_type = self.types.base_type(typ).unwrap_or(self.types.char_id);
-                        let elem_size = self.types.size_bits(elem_type) / 8;
-                        self.emit_const(elem_size as i64, self.types.long_id)
-                    } else if is_float {
-                        self.emit_fconst(1.0, typ)
-                    } else {
-                        self.emit_const(1, typ)
-                    };
-                    let result = self.alloc_pseudo();
-                    let pseudo = Pseudo::reg(result, result.0);
-                    if let Some(func) = &mut self.current_func {
-                        func.add_pseudo(pseudo);
-                    }
-                    let opcode = if is_float {
-                        if *op == UnaryOp::PreInc {
-                            Opcode::FAdd
-                        } else {
-                            Opcode::FSub
-                        }
-                    } else if *op == UnaryOp::PreInc {
-                        Opcode::Add
-                    } else {
-                        Opcode::Sub
-                    };
-                    let size = self.types.size_bits(typ);
-                    self.emit(Instruction::binop(
-                        opcode, result, val, increment, typ, size,
-                    ));
-
-                    // For _Bool, normalize the result (any non-zero -> 1)
-                    let final_result = if self.types.kind(typ) == TypeKind::Bool {
-                        self.emit_convert(result, self.types.int_id, typ)
-                    } else {
-                        result
-                    };
-
-                    // Store back to the variable
-                    if let ExprKind::Ident { name, .. } = &operand.kind {
-                        let name_str = self.str(*name).to_string();
-                        if let Some(local) = self.locals.get(&name_str).cloned() {
-                            let store_size = self.types.size_bits(typ);
-                            self.emit(Instruction::store(
-                                final_result,
-                                local.sym,
-                                0,
-                                typ,
-                                store_size,
-                            ));
-                        } else if self.var_map.contains_key(&name_str) {
-                            self.var_map.insert(name_str.clone(), final_result);
-                        } else {
-                            // Global variable - emit store
-                            let sym_id = self.alloc_pseudo();
-                            let pseudo = Pseudo::sym(sym_id, name_str.clone());
-                            if let Some(func) = &mut self.current_func {
-                                func.add_pseudo(pseudo);
-                            }
-                            let store_size = self.types.size_bits(typ);
-                            self.emit(Instruction::store(final_result, sym_id, 0, typ, store_size));
-                        }
-                    }
-
-                    return final_result;
-                }
-
-                let src = self.linearize_expr(operand);
-                let result_typ = self.expr_type(expr);
-                let operand_typ = self.expr_type(operand);
-                // For logical NOT, use operand type for comparison size
-                let typ = if *op == UnaryOp::Not {
-                    operand_typ
-                } else {
-                    result_typ
-                };
-                self.emit_unary(*op, src, typ)
-            }
-
-            ExprKind::Binary { op, left, right } => {
-                // Handle short-circuit operators before linearizing both operands
-                // C99 requires that && and || only evaluate the RHS if needed
-                if *op == BinaryOp::LogAnd {
-                    return self.emit_logical_and(left, right);
-                }
-                if *op == BinaryOp::LogOr {
-                    return self.emit_logical_or(left, right);
-                }
-
-                let left_typ = self.expr_type(left);
-                let right_typ = self.expr_type(right);
-                let result_typ = self.expr_type(expr);
-
-                // Check for pointer arithmetic: ptr +/- int or int + ptr
-                let left_kind = self.types.kind(left_typ);
-                let right_kind = self.types.kind(right_typ);
-                let left_is_ptr_or_arr =
-                    left_kind == TypeKind::Pointer || left_kind == TypeKind::Array;
-                let right_is_ptr_or_arr =
-                    right_kind == TypeKind::Pointer || right_kind == TypeKind::Array;
-                let is_ptr_arith = (*op == BinaryOp::Add || *op == BinaryOp::Sub)
-                    && ((left_is_ptr_or_arr && self.types.is_integer(right_typ))
-                        || (self.types.is_integer(left_typ) && right_is_ptr_or_arr));
-
-                // Check for pointer difference: ptr - ptr
-                let is_ptr_diff = *op == BinaryOp::Sub && left_is_ptr_or_arr && right_is_ptr_or_arr;
-
-                if is_ptr_diff {
-                    // Pointer difference: (ptr1 - ptr2) / element_size
-                    let left_val = self.linearize_expr(left);
-                    let right_val = self.linearize_expr(right);
-
-                    // Compute byte difference
-                    let byte_diff = self.alloc_pseudo();
-                    self.emit(Instruction::binop(
-                        Opcode::Sub,
-                        byte_diff,
-                        left_val,
-                        right_val,
-                        self.types.long_id,
-                        64,
-                    ));
-
-                    // Get element size from the pointer type
-                    let elem_type = self.types.base_type(left_typ).unwrap_or(self.types.char_id);
-                    let elem_size = self.types.size_bits(elem_type) / 8;
-
-                    // Divide by element size
-                    let scale = self.emit_const(elem_size as i64, self.types.long_id);
-                    let result = self.alloc_pseudo();
-                    self.emit(Instruction::binop(
-                        Opcode::DivS,
-                        result,
-                        byte_diff,
-                        scale,
-                        self.types.long_id,
-                        64,
-                    ));
-                    result
-                } else if is_ptr_arith {
-                    // Pointer arithmetic: scale integer operand by element size
-                    let (ptr_val, ptr_typ, int_val) = if left_is_ptr_or_arr {
-                        let ptr = self.linearize_expr(left);
-                        let int = self.linearize_expr(right);
-                        (ptr, left_typ, int)
-                    } else {
-                        // int + ptr case
-                        let int = self.linearize_expr(left);
-                        let ptr = self.linearize_expr(right);
-                        (ptr, right_typ, int)
-                    };
-
-                    // Get element size
-                    let elem_type = self.types.base_type(ptr_typ).unwrap_or(self.types.char_id);
-                    let elem_size = self.types.size_bits(elem_type) / 8;
-
-                    // Scale the integer by element size
-                    let scale = self.emit_const(elem_size as i64, self.types.long_id);
-                    let scaled_offset = self.alloc_pseudo();
-                    // Extend int_val to 64-bit for proper address arithmetic
-                    let int_val_extended =
-                        self.emit_convert(int_val, self.types.int_id, self.types.long_id);
-                    self.emit(Instruction::binop(
-                        Opcode::Mul,
-                        scaled_offset,
-                        int_val_extended,
-                        scale,
-                        self.types.long_id,
-                        64,
-                    ));
-
-                    // Add (or subtract) to pointer
-                    let result = self.alloc_pseudo();
-                    let opcode = if *op == BinaryOp::Sub {
-                        Opcode::Sub
-                    } else {
-                        Opcode::Add
-                    };
-                    self.emit(Instruction::binop(
-                        opcode,
-                        result,
-                        ptr_val,
-                        scaled_offset,
-                        self.types.long_id,
-                        64,
-                    ));
-                    result
-                } else {
-                    // For comparisons, compute common type for both operands
-                    // (usual arithmetic conversions)
-                    let operand_typ = if op.is_comparison() {
-                        self.common_type(left_typ, right_typ)
-                    } else {
-                        result_typ
-                    };
-
-                    // Linearize operands
-                    let left_val = self.linearize_expr(left);
-                    let right_val = self.linearize_expr(right);
-
-                    // Emit type conversions if needed
-                    let left_val = self.emit_convert(left_val, left_typ, operand_typ);
-                    let right_val = self.emit_convert(right_val, right_typ, operand_typ);
-
-                    self.emit_binary(*op, left_val, right_val, result_typ, operand_typ)
-                }
-            }
+            ExprKind::Binary { op, left, right } => self.linearize_binary(expr, *op, left, right),
 
             ExprKind::Assign { op, target, value } => self.emit_assign(*op, target, value),
 
-            ExprKind::PostInc(operand) => {
-                let val = self.linearize_expr(operand);
-                let typ = self.expr_type(operand);
-                let is_float = self.types.is_float(typ);
-                let is_ptr = self.types.kind(typ) == TypeKind::Pointer;
+            ExprKind::PostInc(operand) => self.linearize_postop(operand, true),
 
-                // For locals, we need to save the old value before updating
-                // because the pseudo will be reloaded from stack which gets overwritten
-                let is_local = if let ExprKind::Ident { name, .. } = &operand.kind {
-                    self.locals.contains_key(self.str(*name))
-                } else {
-                    false
-                };
-
-                let old_val = if is_local {
-                    // Copy the old value to a temp
-                    let temp = self.alloc_pseudo();
-                    let pseudo = Pseudo::reg(temp, temp.0);
-                    if let Some(func) = &mut self.current_func {
-                        func.add_pseudo(pseudo);
-                    }
-                    self.emit(
-                        Instruction::new(Opcode::Copy)
-                            .with_target(temp)
-                            .with_src(val)
-                            .with_size(self.types.size_bits(typ)),
-                    );
-                    temp
-                } else {
-                    val
-                };
-
-                // For pointers, increment by element size; for others, increment by 1
-                let increment = if is_ptr {
-                    let elem_type = self.types.base_type(typ).unwrap_or(self.types.char_id);
-                    let elem_size = self.types.size_bits(elem_type) / 8;
-                    self.emit_const(elem_size as i64, self.types.long_id)
-                } else if is_float {
-                    self.emit_fconst(1.0, typ)
-                } else {
-                    self.emit_const(1, typ)
-                };
-                let result = self.alloc_pseudo();
-                let pseudo = Pseudo::reg(result, result.0);
-                if let Some(func) = &mut self.current_func {
-                    func.add_pseudo(pseudo);
-                }
-                let opcode = if is_float { Opcode::FAdd } else { Opcode::Add };
-                let arith_type = if is_ptr { self.types.long_id } else { typ };
-                let arith_size = self.types.size_bits(arith_type);
-                self.emit(Instruction::binop(
-                    opcode, result, val, increment, arith_type, arith_size,
-                ));
-
-                // For _Bool, normalize the result (any non-zero -> 1)
-                let final_result = if self.types.kind(typ) == TypeKind::Bool {
-                    self.emit_convert(result, self.types.int_id, typ)
-                } else {
-                    result
-                };
-
-                // Store to local, update parameter mapping, or store through pointer
-                let store_size = self.types.size_bits(typ);
-                match &operand.kind {
-                    ExprKind::Ident { name, .. } => {
-                        let name_str = self.str(*name).to_string();
-                        if let Some(local) = self.locals.get(&name_str).cloned() {
-                            self.emit(Instruction::store(
-                                final_result,
-                                local.sym,
-                                0,
-                                typ,
-                                store_size,
-                            ));
-                        } else if self.var_map.contains_key(&name_str) {
-                            self.var_map.insert(name_str.clone(), final_result);
-                        } else {
-                            // Global variable - emit store
-                            let sym_id = self.alloc_pseudo();
-                            let pseudo = Pseudo::sym(sym_id, name_str.clone());
-                            if let Some(func) = &mut self.current_func {
-                                func.add_pseudo(pseudo);
-                            }
-                            self.emit(Instruction::store(final_result, sym_id, 0, typ, store_size));
-                        }
-                    }
-                    ExprKind::Unary {
-                        op: UnaryOp::Deref,
-                        operand: ptr_expr,
-                    } => {
-                        // (*p)++ - store back through the pointer
-                        let addr = self.linearize_expr(ptr_expr);
-                        self.emit(Instruction::store(final_result, addr, 0, typ, store_size));
-                    }
-                    _ => {}
-                }
-
-                old_val // Return old value
-            }
-
-            ExprKind::PostDec(operand) => {
-                let val = self.linearize_expr(operand);
-                let typ = self.expr_type(operand);
-                let is_float = self.types.is_float(typ);
-                let is_ptr = self.types.kind(typ) == TypeKind::Pointer;
-
-                // For locals, we need to save the old value before updating
-                // because the pseudo will be reloaded from stack which gets overwritten
-                let is_local = if let ExprKind::Ident { name, .. } = &operand.kind {
-                    self.locals.contains_key(self.str(*name))
-                } else {
-                    false
-                };
-
-                let old_val = if is_local {
-                    // Copy the old value to a temp
-                    let temp = self.alloc_pseudo();
-                    let pseudo = Pseudo::reg(temp, temp.0);
-                    if let Some(func) = &mut self.current_func {
-                        func.add_pseudo(pseudo);
-                    }
-                    self.emit(
-                        Instruction::new(Opcode::Copy)
-                            .with_target(temp)
-                            .with_src(val)
-                            .with_size(self.types.size_bits(typ)),
-                    );
-                    temp
-                } else {
-                    val
-                };
-
-                // For pointers, decrement by element size; for others, decrement by 1
-                let decrement = if is_ptr {
-                    let elem_type = self.types.base_type(typ).unwrap_or(self.types.char_id);
-                    let elem_size = self.types.size_bits(elem_type) / 8;
-                    self.emit_const(elem_size as i64, self.types.long_id)
-                } else if is_float {
-                    self.emit_fconst(1.0, typ)
-                } else {
-                    self.emit_const(1, typ)
-                };
-                let result = self.alloc_pseudo();
-                let pseudo = Pseudo::reg(result, result.0);
-                if let Some(func) = &mut self.current_func {
-                    func.add_pseudo(pseudo);
-                }
-                let opcode = if is_float { Opcode::FSub } else { Opcode::Sub };
-                let arith_type = if is_ptr { self.types.long_id } else { typ };
-                let arith_size = self.types.size_bits(arith_type);
-                self.emit(Instruction::binop(
-                    opcode, result, val, decrement, arith_type, arith_size,
-                ));
-
-                // For _Bool, normalize the result (any non-zero -> 1)
-                let final_result = if self.types.kind(typ) == TypeKind::Bool {
-                    self.emit_convert(result, self.types.int_id, typ)
-                } else {
-                    result
-                };
-
-                // Store to local, update parameter mapping, or store through pointer
-                let store_size = self.types.size_bits(typ);
-                match &operand.kind {
-                    ExprKind::Ident { name, .. } => {
-                        let name_str = self.str(*name).to_string();
-                        if let Some(local) = self.locals.get(&name_str).cloned() {
-                            self.emit(Instruction::store(
-                                final_result,
-                                local.sym,
-                                0,
-                                typ,
-                                store_size,
-                            ));
-                        } else if self.var_map.contains_key(&name_str) {
-                            self.var_map.insert(name_str.clone(), final_result);
-                        } else {
-                            // Global variable - emit store
-                            let sym_id = self.alloc_pseudo();
-                            let pseudo = Pseudo::sym(sym_id, name_str.clone());
-                            if let Some(func) = &mut self.current_func {
-                                func.add_pseudo(pseudo);
-                            }
-                            self.emit(Instruction::store(final_result, sym_id, 0, typ, store_size));
-                        }
-                    }
-                    ExprKind::Unary {
-                        op: UnaryOp::Deref,
-                        operand: ptr_expr,
-                    } => {
-                        // (*p)-- - store back through the pointer
-                        let addr = self.linearize_expr(ptr_expr);
-                        self.emit(Instruction::store(final_result, addr, 0, typ, store_size));
-                    }
-                    _ => {}
-                }
-
-                old_val // Return old value
-            }
+            ExprKind::PostDec(operand) => self.linearize_postop(operand, false),
 
             ExprKind::Conditional {
                 cond,
@@ -2250,402 +2565,24 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
-            ExprKind::Call { func, args } => {
-                // Get function name
-                let func_name = match &func.kind {
-                    ExprKind::Ident { name, .. } => self.str(*name).to_string(),
-                    _ => "<indirect>".to_string(),
-                };
-
-                let typ = self.expr_type(expr); // Use evaluated type (function return type)
-
-                // Check if this is a variadic function call
-                // If the function expression has a type, check its variadic flag
-                let variadic_arg_start = if let Some(func_type) = func.typ {
-                    let ft = self.types.get(func_type);
-                    if ft.variadic {
-                        // Variadic args start after the fixed parameters
-                        ft.params.as_ref().map(|p| p.len())
-                    } else {
-                        None
-                    }
-                } else {
-                    None // No type info, assume non-variadic
-                };
-
-                // Check if function returns a large struct
-                // If so, allocate space and pass address as hidden first argument
-                let typ_kind = self.types.kind(typ);
-                let returns_large_struct = (typ_kind == TypeKind::Struct
-                    || typ_kind == TypeKind::Union)
-                    && self.types.size_bits(typ) > self.target.max_aggregate_register_bits;
-
-                let (result_sym, mut arg_vals, mut arg_types_vec) = if returns_large_struct {
-                    // Allocate local storage for the return value
-                    let sret_sym = self.alloc_pseudo();
-                    let sret_pseudo = Pseudo::sym(sret_sym, format!("__sret_{}", sret_sym.0));
-                    if let Some(func) = &mut self.current_func {
-                        func.add_pseudo(sret_pseudo);
-                        // Internal sret storage is never volatile
-                        func.add_local(
-                            format!("__sret_{}", sret_sym.0),
-                            sret_sym,
-                            typ,
-                            false,
-                            self.current_bb,
-                        );
-                    }
-
-                    // Get address of the allocated space
-                    let sret_addr = self.alloc_pseudo();
-                    let addr_pseudo = Pseudo::reg(sret_addr, sret_addr.0);
-                    if let Some(func) = &mut self.current_func {
-                        func.add_pseudo(addr_pseudo);
-                    }
-                    self.emit(Instruction::sym_addr(
-                        sret_addr,
-                        sret_sym,
-                        self.types.pointer_to(typ),
-                    ));
-
-                    // Hidden return pointer is the first argument (pointer type)
-                    (sret_sym, vec![sret_addr], vec![self.types.pointer_to(typ)])
-                } else {
-                    let result = self.alloc_pseudo();
-                    (result, Vec::new(), Vec::new())
-                };
-
-                // Linearize regular arguments
-                // For large structs, pass by reference (address) instead of by value
-                for a in args.iter() {
-                    let arg_type = self.expr_type(a);
-                    let arg_kind = self.types.kind(arg_type);
-                    let arg_val = if (arg_kind == TypeKind::Struct || arg_kind == TypeKind::Union)
-                        && self.types.size_bits(arg_type) > self.target.max_aggregate_register_bits
-                    {
-                        // Large struct: pass address instead of value
-                        // The argument type becomes a pointer
-                        arg_types_vec.push(self.types.pointer_to(arg_type));
-                        self.linearize_lvalue(a)
-                    } else {
-                        arg_types_vec.push(arg_type);
-                        self.linearize_expr(a)
-                    };
-                    arg_vals.push(arg_val);
-                }
-
-                if returns_large_struct {
-                    // For large struct returns, the return value is the address
-                    // stored in result_sym (which is a local symbol containing the struct)
-                    let result = self.alloc_pseudo();
-                    let result_pseudo = Pseudo::reg(result, result.0);
-                    if let Some(func) = &mut self.current_func {
-                        func.add_pseudo(result_pseudo);
-                    }
-                    let ptr_typ = self.types.pointer_to(typ);
-                    let mut call_insn = Instruction::call(
-                        Some(result),
-                        &func_name,
-                        arg_vals,
-                        arg_types_vec,
-                        ptr_typ,
-                        64, // pointers are 64-bit
-                    );
-                    call_insn.variadic_arg_start = variadic_arg_start;
-                    call_insn.is_sret_call = true;
-                    self.emit(call_insn);
-                    // Return the symbol (address) where struct is stored
-                    result_sym
-                } else {
-                    let ret_size = self.types.size_bits(typ);
-                    let mut call_insn = Instruction::call(
-                        Some(result_sym),
-                        &func_name,
-                        arg_vals,
-                        arg_types_vec,
-                        typ,
-                        ret_size,
-                    );
-                    call_insn.variadic_arg_start = variadic_arg_start;
-                    self.emit(call_insn);
-                    result_sym
-                }
-            }
+            ExprKind::Call { func, args } => self.linearize_call(expr, func, args),
 
             ExprKind::Member {
                 expr: inner_expr,
                 member,
-            } => {
-                // Get address of the struct base
-                let base = self.linearize_lvalue(inner_expr);
-                let struct_type = self.expr_type(inner_expr);
-
-                // Look up member offset and type
-                let member_info =
-                    self.types
-                        .find_member(struct_type, *member)
-                        .unwrap_or_else(|| MemberInfo {
-                            offset: 0,
-                            typ: self.expr_type(expr),
-                            bit_offset: None,
-                            bit_width: None,
-                            storage_unit_size: None,
-                        });
-
-                // If member type is an array, return the address (arrays decay to pointers)
-                if self.types.kind(member_info.typ) == TypeKind::Array {
-                    if member_info.offset == 0 {
-                        base
-                    } else {
-                        let result = self.alloc_pseudo();
-                        let offset_val =
-                            self.emit_const(member_info.offset as i64, self.types.long_id);
-                        self.emit(Instruction::binop(
-                            Opcode::Add,
-                            result,
-                            base,
-                            offset_val,
-                            self.types.long_id,
-                            64,
-                        ));
-                        result
-                    }
-                } else if let (Some(bit_offset), Some(bit_width), Some(storage_size)) = (
-                    member_info.bit_offset,
-                    member_info.bit_width,
-                    member_info.storage_unit_size,
-                ) {
-                    // Bitfield read
-                    self.emit_bitfield_load(
-                        base,
-                        member_info.offset,
-                        bit_offset,
-                        bit_width,
-                        storage_size,
-                        member_info.typ,
-                    )
-                } else {
-                    let result = self.alloc_pseudo();
-                    let size = self.types.size_bits(member_info.typ);
-                    self.emit(Instruction::load(
-                        result,
-                        base,
-                        member_info.offset as i64,
-                        member_info.typ,
-                        size,
-                    ));
-                    result
-                }
-            }
+            } => self.linearize_member(expr, inner_expr, *member),
 
             ExprKind::Arrow {
                 expr: inner_expr,
                 member,
-            } => {
-                // Pointer already contains the struct address
-                let ptr = self.linearize_expr(inner_expr);
-                let ptr_type = self.expr_type(inner_expr);
+            } => self.linearize_arrow(expr, inner_expr, *member),
 
-                // Dereference pointer to get struct type
-                let struct_type = self
-                    .types
-                    .base_type(ptr_type)
-                    .unwrap_or_else(|| self.expr_type(expr));
-
-                // Look up member offset and type
-                let member_info =
-                    self.types
-                        .find_member(struct_type, *member)
-                        .unwrap_or_else(|| MemberInfo {
-                            offset: 0,
-                            typ: self.expr_type(expr),
-                            bit_offset: None,
-                            bit_width: None,
-                            storage_unit_size: None,
-                        });
-
-                // If member type is an array, return the address (arrays decay to pointers)
-                if self.types.kind(member_info.typ) == TypeKind::Array {
-                    if member_info.offset == 0 {
-                        ptr
-                    } else {
-                        let result = self.alloc_pseudo();
-                        let offset_val =
-                            self.emit_const(member_info.offset as i64, self.types.long_id);
-                        self.emit(Instruction::binop(
-                            Opcode::Add,
-                            result,
-                            ptr,
-                            offset_val,
-                            self.types.long_id,
-                            64,
-                        ));
-                        result
-                    }
-                } else if let (Some(bit_offset), Some(bit_width), Some(storage_size)) = (
-                    member_info.bit_offset,
-                    member_info.bit_width,
-                    member_info.storage_unit_size,
-                ) {
-                    // Bitfield read
-                    self.emit_bitfield_load(
-                        ptr,
-                        member_info.offset,
-                        bit_offset,
-                        bit_width,
-                        storage_size,
-                        member_info.typ,
-                    )
-                } else {
-                    let result = self.alloc_pseudo();
-                    let size = self.types.size_bits(member_info.typ);
-                    self.emit(Instruction::load(
-                        result,
-                        ptr,
-                        member_info.offset as i64,
-                        member_info.typ,
-                        size,
-                    ));
-                    result
-                }
-            }
-
-            ExprKind::Index { array, index } => {
-                // In C, a[b] is defined as *(a + b), so either operand can be the pointer
-                // Handle commutative form: 0[arr] is equivalent to arr[0]
-                let array_type = self.expr_type(array);
-                let index_type = self.expr_type(index);
-
-                let array_kind = self.types.kind(array_type);
-                let (ptr_expr, idx_expr, idx_type) =
-                    if array_kind == TypeKind::Pointer || array_kind == TypeKind::Array {
-                        (array, index, index_type)
-                    } else {
-                        // Swap: index is actually the pointer/array
-                        (index, array, array_type)
-                    };
-
-                let arr = self.linearize_expr(ptr_expr);
-                let idx = self.linearize_expr(idx_expr);
-
-                // Get element type from the expression type
-                let elem_type = self.expr_type(expr);
-                let elem_size = self.types.size_bits(elem_type) / 8;
-                let elem_size_val = self.emit_const(elem_size as i64, self.types.long_id);
-
-                // Sign-extend index to 64-bit for proper pointer arithmetic (negative indices)
-                let idx_extended = self.emit_convert(idx, idx_type, self.types.long_id);
-
-                let offset = self.alloc_pseudo();
-                let ptr_typ = self.types.long_id;
-                self.emit(Instruction::binop(
-                    Opcode::Mul,
-                    offset,
-                    idx_extended,
-                    elem_size_val,
-                    ptr_typ,
-                    64,
-                ));
-
-                let addr = self.alloc_pseudo();
-                self.emit(Instruction::binop(
-                    Opcode::Add,
-                    addr,
-                    arr,
-                    offset,
-                    ptr_typ,
-                    64,
-                ));
-
-                // If element type is an array, just return the address (arrays decay to pointers)
-                if self.types.kind(elem_type) == TypeKind::Array {
-                    addr
-                } else {
-                    let result = self.alloc_pseudo();
-                    let size = self.types.size_bits(elem_type);
-                    self.emit(Instruction::load(result, addr, 0, elem_type, size));
-                    result
-                }
-            }
+            ExprKind::Index { array, index } => self.linearize_index(expr, array, index),
 
             ExprKind::Cast {
                 cast_type,
                 expr: inner_expr,
-            } => {
-                let src = self.linearize_expr(inner_expr);
-                let src_type = self.expr_type(inner_expr);
-                let cast_type = *cast_type; // Copy the TypeId
-
-                // Emit conversion if needed
-                let src_is_float = self.types.is_float(src_type);
-                let dst_is_float = self.types.is_float(cast_type);
-
-                if src_is_float && !dst_is_float {
-                    // Float to integer conversion
-                    let result = self.alloc_pseudo();
-                    let pseudo = Pseudo::reg(result, result.0);
-                    if let Some(func) = &mut self.current_func {
-                        func.add_pseudo(pseudo);
-                    }
-                    // FCvtS for signed int, FCvtU for unsigned
-                    let opcode = if self.types.is_unsigned(cast_type) {
-                        Opcode::FCvtU
-                    } else {
-                        Opcode::FCvtS
-                    };
-                    let mut insn = Instruction::new(opcode)
-                        .with_target(result)
-                        .with_src(src)
-                        .with_type(cast_type);
-                    insn.src_size = self.types.size_bits(src_type);
-                    self.emit(insn);
-                    result
-                } else if !src_is_float && dst_is_float {
-                    // Integer to float conversion
-                    let result = self.alloc_pseudo();
-                    let pseudo = Pseudo::reg(result, result.0);
-                    if let Some(func) = &mut self.current_func {
-                        func.add_pseudo(pseudo);
-                    }
-                    // SCvtF for signed int, UCvtF for unsigned
-                    let opcode = if self.types.is_unsigned(src_type) {
-                        Opcode::UCvtF
-                    } else {
-                        Opcode::SCvtF
-                    };
-                    let mut insn = Instruction::new(opcode)
-                        .with_target(result)
-                        .with_src(src)
-                        .with_type(cast_type);
-                    insn.src_size = self.types.size_bits(src_type);
-                    self.emit(insn);
-                    result
-                } else if src_is_float && dst_is_float {
-                    // Float to float conversion (e.g., float to double)
-                    let src_size = self.types.size_bits(src_type);
-                    let dst_size = self.types.size_bits(cast_type);
-                    if src_size != dst_size {
-                        let result = self.alloc_pseudo();
-                        let pseudo = Pseudo::reg(result, result.0);
-                        if let Some(func) = &mut self.current_func {
-                            func.add_pseudo(pseudo);
-                        }
-                        let mut insn = Instruction::new(Opcode::FCvtF)
-                            .with_target(result)
-                            .with_src(src)
-                            .with_type(cast_type);
-                        insn.src_size = src_size;
-                        self.emit(insn);
-                        result
-                    } else {
-                        src // Same size, no conversion needed
-                    }
-                } else {
-                    // Integer to integer conversion
-                    // Use emit_convert for proper type conversions including _Bool
-                    self.emit_convert(src, src_type, cast_type)
-                }
-            }
+            } => self.linearize_cast(inner_expr, *cast_type),
 
             ExprKind::SizeofType(typ) => {
                 let size = self.types.size_bits(*typ) / 8;

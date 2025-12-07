@@ -11,6 +11,7 @@
 
 use crate::ir::Module;
 use crate::target::Target;
+use crate::types::TypeTable;
 
 /// pcc version string for assembly header
 pub const PCC_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -49,7 +50,7 @@ pub fn generate_header_comments(target: &Target) -> Vec<String> {
 /// Trait for architecture-specific code generators
 pub trait CodeGenerator {
     /// Generate assembly code for the given IR module
-    fn generate(&mut self, module: &Module) -> String;
+    fn generate(&mut self, module: &Module, types: &TypeTable) -> String;
 
     /// Set whether to emit basic unwind tables (cfi_startproc/cfi_endproc)
     fn set_emit_unwind_tables(&mut self, emit: bool);

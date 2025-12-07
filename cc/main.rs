@@ -201,12 +201,13 @@ fn process_file(
         return Ok(());
     }
 
-    // Create symbol table BEFORE parsing
+    // Create symbol table and type table BEFORE parsing
     // symbols are bound during parsing
     let mut symbols = SymbolTable::new();
+    let mut types = types::TypeTable::new();
 
     // Parse (this also binds symbols to the symbol table)
-    let mut parser = CParser::new(&preprocessed, idents, &mut symbols);
+    let mut parser = CParser::new(&preprocessed, idents, &mut symbols, &mut types);
     let ast = parser
         .parse_translation_unit()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("parse error: {}", e)))?;
@@ -217,8 +218,14 @@ fn process_file(
     }
 
     // Linearize to IR
-    let mut module =
-        linearize::linearize_with_debug(&ast, &symbols, args.debug, Some(display_path));
+    let mut module = linearize::linearize_with_debug(
+        &ast,
+        &symbols,
+        &types,
+        target,
+        args.debug,
+        Some(display_path),
+    );
 
     if args.dump_ir {
         print!("{}", module);
@@ -232,7 +239,7 @@ fn process_file(
     let emit_unwind_tables = !args.no_unwind_tables;
     let mut codegen =
         arch::codegen::create_codegen_with_options(target.clone(), emit_unwind_tables);
-    let asm = codegen.generate(&module);
+    let asm = codegen.generate(&module, &types);
 
     if args.dump_asm {
         print!("{}", asm);

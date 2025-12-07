@@ -20,10 +20,10 @@
 use crate::arch::aarch64::lir::{Aarch64Inst, CallTarget, Cond, GpOperand, MemAddr};
 use crate::arch::codegen::CodeGenerator;
 use crate::arch::lir::{Directive, FpSize, Label, OperandSize, Symbol};
+use crate::arch::DEFAULT_LIR_BUFFER_CAPACITY;
 use crate::ir::{Function, Initializer, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
-use crate::linearize::MAX_REGISTER_AGGREGATE_BITS;
 use crate::target::Target;
-use crate::types::{Type, TypeModifiers};
+use crate::types::{TypeId, TypeModifiers, TypeTable};
 use std::collections::HashMap;
 
 // ============================================================================
@@ -518,7 +518,7 @@ impl RegAlloc {
     }
 
     /// Perform register allocation for a function
-    pub fn allocate(&mut self, func: &Function) -> HashMap<PseudoId, Loc> {
+    pub fn allocate(&mut self, func: &Function, types: &TypeTable) -> HashMap<PseudoId, Loc> {
         // Reset state
         self.locations.clear();
         self.free_regs = Reg::allocatable().to_vec();
@@ -531,7 +531,7 @@ impl RegAlloc {
         self.fp_pseudos.clear();
 
         // Identify which pseudos need FP registers
-        self.identify_fp_pseudos(func);
+        self.identify_fp_pseudos(func, types);
 
         // Pre-allocate argument registers (integer and FP separately)
         let int_arg_regs = Reg::arg_regs();
@@ -562,7 +562,7 @@ impl RegAlloc {
                 if let PseudoKind::Arg(arg_idx) = pseudo.kind {
                     // Match by adjusted index (sret shifts arg_idx but not register allocation)
                     if arg_idx == (i as u32) + arg_idx_offset {
-                        let is_fp = typ.is_float();
+                        let is_fp = types.is_float(*typ);
                         if is_fp {
                             if fp_arg_idx < fp_arg_regs.len() {
                                 self.locations
@@ -622,7 +622,7 @@ impl RegAlloc {
                         // Check if this is a local variable or a global symbol
                         if let Some(local) = func.locals.get(name) {
                             // Local variable - allocate stack space based on actual type size
-                            let size = local.typ.size_bytes().max(8) as i32;
+                            let size = (types.size_bits(local.typ) / 8).max(8) as i32;
                             // Align to 8 bytes
                             let aligned_size = (size + 7) & !7;
                             self.stack_offset += aligned_size;
@@ -679,7 +679,7 @@ impl RegAlloc {
     }
 
     /// Identify which pseudos need FP registers by scanning the IR
-    fn identify_fp_pseudos(&mut self, func: &Function) {
+    fn identify_fp_pseudos(&mut self, func: &Function, types: &TypeTable) {
         for block in &func.blocks {
             for insn in &block.insns {
                 // Check if this instruction produces a floating-point result
@@ -703,8 +703,8 @@ impl RegAlloc {
 
                 // Also check if the type is floating point
                 // (but exclude comparisons which always produce int regardless of operand type)
-                if let Some(ref typ) = insn.typ {
-                    if typ.is_float()
+                if let Some(typ) = insn.typ {
+                    if types.is_float(typ)
                         && !matches!(
                             insn.op,
                             Opcode::FCmpOEq
@@ -1022,7 +1022,7 @@ impl Aarch64CodeGen {
         Self {
             target,
             output: String::new(),
-            lir_buffer: Vec::new(),
+            lir_buffer: Vec::with_capacity(DEFAULT_LIR_BUFFER_CAPACITY),
             locations: HashMap::new(),
             pseudos: Vec::new(),
             current_fn: String::new(),
@@ -1109,15 +1109,15 @@ impl Aarch64CodeGen {
         self.push_lir(Aarch64Inst::Directive(Directive::Text));
     }
 
-    fn emit_global(&mut self, name: &str, typ: &Type, init: &Initializer) {
-        let size = typ.size_bits() / 8;
+    fn emit_global(&mut self, name: &str, typ: &TypeId, init: &Initializer, types: &TypeTable) {
+        let size = types.size_bits(*typ) / 8;
         let size = if size == 0 { 8 } else { size }; // Default to 8 bytes
 
         // Check storage class - skip .globl for static
-        let is_static = typ.modifiers.contains(TypeModifiers::STATIC);
+        let is_static = types.get(*typ).modifiers.contains(TypeModifiers::STATIC);
 
         // Get alignment from type info
-        let align = typ.alignment() as u32;
+        let align = types.alignment(*typ) as u32;
 
         // Use .comm for uninitialized external (non-static) globals
         let use_bss = matches!(init, Initializer::None) && !is_static;
@@ -1217,13 +1217,13 @@ impl Aarch64CodeGen {
         result
     }
 
-    fn emit_function(&mut self, func: &Function) {
+    fn emit_function(&mut self, func: &Function, types: &TypeTable) {
         // Check if this function uses varargs
         let is_variadic = Self::is_variadic_function(func);
 
         // Register allocation
         let mut alloc = RegAlloc::new();
-        self.locations = alloc.allocate(func);
+        self.locations = alloc.allocate(func, types);
         self.pseudos = func.pseudos.clone();
 
         let stack_size = alloc.stack_size();
@@ -1463,7 +1463,7 @@ impl Aarch64CodeGen {
             self.num_fixed_gp_params = func
                 .params
                 .iter()
-                .filter(|(_, typ)| !typ.is_float())
+                .filter(|(_, typ)| !types.is_float(*typ))
                 .count();
         }
 
@@ -1503,7 +1503,7 @@ impl Aarch64CodeGen {
 
         // Emit basic blocks
         for block in &func.blocks {
-            self.emit_block(block, &frame_info);
+            self.emit_block(block, &frame_info, types);
         }
 
         // CFI: End procedure
@@ -1512,7 +1512,12 @@ impl Aarch64CodeGen {
         }
     }
 
-    fn emit_block(&mut self, block: &crate::ir::BasicBlock, frame_info: &(i32, Vec<Reg>)) {
+    fn emit_block(
+        &mut self,
+        block: &crate::ir::BasicBlock,
+        frame_info: &(i32, Vec<Reg>),
+        types: &TypeTable,
+    ) {
         // Emit block label using LIR (include function name for uniqueness)
         if let Some(label) = &block.label {
             // LIR: named block label (using Raw since format differs from standard)
@@ -1530,11 +1535,11 @@ impl Aarch64CodeGen {
 
         // Emit instructions
         for insn in &block.insns {
-            self.emit_insn(insn, frame_info);
+            self.emit_insn(insn, frame_info, types);
         }
     }
 
-    fn emit_insn(&mut self, insn: &Instruction, frame_info: &(i32, Vec<Reg>)) {
+    fn emit_insn(&mut self, insn: &Instruction, frame_info: &(i32, Vec<Reg>), types: &TypeTable) {
         // Emit .loc directive for debug info
         self.emit_loc(insn);
 
@@ -1862,7 +1867,7 @@ impl Aarch64CodeGen {
             }
 
             Opcode::Load => {
-                self.emit_load(insn, *total_frame);
+                self.emit_load(insn, *total_frame, types);
             }
 
             Opcode::Store => {
@@ -1870,7 +1875,7 @@ impl Aarch64CodeGen {
             }
 
             Opcode::Call => {
-                self.emit_call(insn, *total_frame);
+                self.emit_call(insn, *total_frame, types);
             }
 
             Opcode::SetVal => {
@@ -1914,13 +1919,7 @@ impl Aarch64CodeGen {
             Opcode::Copy => {
                 if let (Some(target), Some(&src)) = (insn.target, insn.src.first()) {
                     // Pass the type for proper sign/zero extension
-                    self.emit_copy_with_type(
-                        src,
-                        target,
-                        insn.size,
-                        insn.typ.as_ref(),
-                        *total_frame,
-                    );
+                    self.emit_copy_with_type(src, target, insn.size, insn.typ, *total_frame, types);
                 }
             }
 
@@ -2006,7 +2005,7 @@ impl Aarch64CodeGen {
             }
 
             Opcode::VaArg => {
-                self.emit_va_arg(insn, *total_frame);
+                self.emit_va_arg(insn, *total_frame, types);
             }
 
             Opcode::VaEnd => {
@@ -2532,7 +2531,7 @@ impl Aarch64CodeGen {
         }
     }
 
-    fn emit_load(&mut self, insn: &Instruction, frame_size: i32) {
+    fn emit_load(&mut self, insn: &Instruction, frame_size: i32, types: &TypeTable) {
         let mem_size = insn.size;
         let reg_size = insn.size.max(32);
         let addr = match insn.src.first() {
@@ -2546,8 +2545,7 @@ impl Aarch64CodeGen {
         let dst_loc = self.get_location(target);
 
         // Check if this is an FP load
-        let is_fp =
-            insn.typ.as_ref().is_some_and(|t| t.is_float()) || matches!(dst_loc, Loc::VReg(_));
+        let is_fp = insn.typ.is_some_and(|t| types.is_float(t)) || matches!(dst_loc, Loc::VReg(_));
 
         if is_fp {
             self.emit_fp_load(insn, frame_size);
@@ -2561,10 +2559,10 @@ impl Aarch64CodeGen {
 
         // Determine if we need sign or zero extension for small types
         // For plain char, use target.char_signed to determine signedness
-        let is_unsigned = insn.typ.as_ref().is_some_and(|t| {
-            if t.is_unsigned() {
+        let is_unsigned = insn.typ.is_some_and(|t| {
+            if types.is_unsigned(t) {
                 true
-            } else if t.is_plain_char() {
+            } else if types.is_plain_char(t) {
                 // Plain char: unsigned if target says char is not signed
                 !self.target.char_signed
             } else {
@@ -2977,7 +2975,7 @@ impl Aarch64CodeGen {
         }
     }
 
-    fn emit_call(&mut self, insn: &Instruction, frame_size: i32) {
+    fn emit_call(&mut self, insn: &Instruction, frame_size: i32, types: &TypeTable) {
         let func_name = match &insn.func_name {
             Some(n) => n.clone(),
             None => return,
@@ -3004,26 +3002,9 @@ impl Aarch64CodeGen {
         let is_darwin_variadic =
             self.target.os == crate::target::Os::MacOS && insn.variadic_arg_start.is_some();
 
-        // Check if this call returns a large struct
-        // If so, the first argument is the sret pointer and goes in X8 (not X0)
-        let returns_large_struct = insn.typ.as_ref().is_some_and(|t| {
-            (t.kind == crate::types::TypeKind::Struct || t.kind == crate::types::TypeKind::Union)
-                && t.size_bits() > MAX_REGISTER_AGGREGATE_BITS
-        });
-
-        // Also check if return type is a pointer to a large struct (linearizer wraps it)
-        let returns_large_struct = returns_large_struct
-            || insn.typ.as_ref().is_some_and(|t| {
-                if let Some(pointee) = t.get_base() {
-                    (pointee.kind == crate::types::TypeKind::Struct
-                        || pointee.kind == crate::types::TypeKind::Union)
-                        && pointee.size_bits() > MAX_REGISTER_AGGREGATE_BITS
-                } else {
-                    false
-                }
-            });
-
-        let args_start = if returns_large_struct && !insn.src.is_empty() {
+        // Check if this call returns a large struct via sret (hidden pointer argument).
+        // The linearizer sets is_sret_call=true and puts the sret pointer as the first arg.
+        let args_start = if insn.is_sret_call && !insn.src.is_empty() {
             // First argument is sret pointer - move to X8
             self.emit_move(insn.src[0], Reg::X8, 64, frame_size);
             1 // Skip first arg in main loop
@@ -3041,16 +3022,16 @@ impl Aarch64CodeGen {
 
             // Process all arguments
             for (i, &arg) in insn.src.iter().enumerate().skip(args_start) {
-                let arg_type = insn.arg_types.get(i);
+                let arg_type = insn.arg_types.get(i).copied();
                 let is_fp = if let Some(typ) = arg_type {
-                    typ.is_float()
+                    types.is_float(typ)
                 } else {
                     let arg_loc = self.get_location(arg);
                     matches!(arg_loc, Loc::VReg(_) | Loc::FImm(_))
                 };
 
                 let arg_size = if let Some(typ) = arg_type {
-                    typ.size_bits().max(32)
+                    types.size_bits(typ).max(32)
                 } else {
                     64
                 };
@@ -3062,7 +3043,7 @@ impl Aarch64CodeGen {
                     // Fixed arg - use registers as normal
                     if is_fp {
                         let fp_size = if let Some(typ) = arg_type {
-                            typ.size_bits()
+                            types.size_bits(typ)
                         } else {
                             64
                         };
@@ -3126,9 +3107,9 @@ impl Aarch64CodeGen {
             // Move arguments to registers
             for (i, &arg) in insn.src.iter().enumerate().skip(args_start) {
                 // Get argument type if available, otherwise fall back to location-based detection
-                let arg_type = insn.arg_types.get(i);
+                let arg_type = insn.arg_types.get(i).copied();
                 let is_fp = if let Some(typ) = arg_type {
-                    typ.is_float()
+                    types.is_float(typ)
                 } else {
                     // Fall back to location-based detection for backwards compatibility
                     let arg_loc = self.get_location(arg);
@@ -3137,7 +3118,7 @@ impl Aarch64CodeGen {
 
                 // Get argument size from type, with minimum 32-bit for register ops
                 let arg_size = if let Some(typ) = arg_type {
-                    typ.size_bits().max(32)
+                    types.size_bits(typ).max(32)
                 } else {
                     64 // Default for backwards compatibility
                 };
@@ -3145,7 +3126,7 @@ impl Aarch64CodeGen {
                 if is_fp {
                     // FP size from type (32 for float, 64 for double)
                     let fp_size = if let Some(typ) = arg_type {
-                        typ.size_bits()
+                        types.size_bits(typ)
                     } else {
                         64
                     };
@@ -3210,8 +3191,8 @@ impl Aarch64CodeGen {
         if let Some(target) = insn.target {
             let dst_loc = self.get_location(target);
             // Check if return value is floating-point based on type or location
-            let is_fp_result = if let Some(ref typ) = insn.typ {
-                typ.is_float()
+            let is_fp_result = if let Some(typ) = insn.typ {
+                types.is_float(typ)
             } else {
                 matches!(dst_loc, Loc::VReg(_) | Loc::FImm(_))
             };
@@ -3378,8 +3359,9 @@ impl Aarch64CodeGen {
         src: PseudoId,
         dst: PseudoId,
         size: u32,
-        typ: Option<&Type>,
+        typ: Option<TypeId>,
         frame_size: i32,
+        types: &TypeTable,
     ) {
         // Keep actual size for handling narrow types
         let actual_size = size;
@@ -3394,9 +3376,9 @@ impl Aarch64CodeGen {
         // Determine if the type is unsigned (for proper sign/zero extension)
         // For plain char, use target.char_signed to determine signedness
         let is_unsigned = typ.is_some_and(|t| {
-            if t.is_unsigned() {
+            if types.is_unsigned(t) {
                 true
-            } else if t.is_plain_char() {
+            } else if types.is_plain_char(t) {
                 // Plain char: unsigned if target says char is not signed
                 !self.target.char_signed
             } else {
@@ -3955,7 +3937,7 @@ impl Aarch64CodeGen {
 
     /// Emit va_arg: Get the next variadic argument of the specified type
     /// Note: ap_addr is the ADDRESS of the va_list variable (from symaddr), not the va_list itself
-    fn emit_va_arg(&mut self, insn: &Instruction, frame_size: i32) {
+    fn emit_va_arg(&mut self, insn: &Instruction, frame_size: i32, types: &TypeTable) {
         let ap_addr = match insn.src.first() {
             Some(&s) => s,
             None => return,
@@ -3965,9 +3947,8 @@ impl Aarch64CodeGen {
             None => return,
         };
 
-        let default_type = Type::basic(crate::types::TypeKind::Int);
-        let arg_type = insn.typ.as_ref().unwrap_or(&default_type);
-        let arg_size = arg_type.size_bits().max(32);
+        let arg_type = insn.typ.unwrap_or(types.int_id);
+        let arg_size = types.size_bits(arg_type).max(32);
         let arg_bytes = (arg_size / 8).max(8) as i64; // Minimum 8 bytes per slot on ARM64
 
         let ap_loc = self.get_location(ap_addr);
@@ -4012,9 +3993,9 @@ impl Aarch64CodeGen {
         });
 
         // Load the argument from *ap
-        if arg_type.is_float() {
+        if types.is_float(arg_type) {
             // Load floating point value
-            let fp_size = arg_type.size_bits();
+            let fp_size = types.size_bits(arg_type);
             let fp_size_enum = FpSize::from_bits(fp_size);
             self.push_lir(Aarch64Inst::LdrFp {
                 size: fp_size_enum,
@@ -4494,7 +4475,7 @@ impl Aarch64CodeGen {
 // ============================================================================
 
 impl CodeGenerator for Aarch64CodeGen {
-    fn generate(&mut self, module: &Module) -> String {
+    fn generate(&mut self, module: &Module, types: &TypeTable) -> String {
         self.output.clear();
         self.lir_buffer.clear();
         self.last_debug_line = 0;
@@ -4515,7 +4496,7 @@ impl CodeGenerator for Aarch64CodeGen {
 
         // Emit globals
         for (name, typ, init) in &module.globals {
-            self.emit_global(name, typ, init);
+            self.emit_global(name, typ, init, types);
         }
 
         // Emit string literals
@@ -4523,7 +4504,7 @@ impl CodeGenerator for Aarch64CodeGen {
 
         // Emit functions
         for func in &module.functions {
-            self.emit_function(func);
+            self.emit_function(func, types);
         }
 
         // Flush all buffered LIR instructions to output

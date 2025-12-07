@@ -11,7 +11,7 @@
 //
 
 use crate::diag::Position;
-use crate::types::Type;
+use crate::types::TypeId;
 
 // ============================================================================
 // Operators
@@ -116,8 +116,8 @@ pub struct Expr {
     /// The expression kind/variant
     pub kind: ExprKind,
     /// The computed type of this expression (like sparse's expr->ctype)
-    /// None before type evaluation, Some after
-    pub typ: Option<Type>,
+    /// None before type evaluation, Some after (interned TypeId)
+    pub typ: Option<TypeId>,
     /// Source position for debug info
     pub pos: Position,
 }
@@ -132,8 +132,8 @@ impl Expr {
         }
     }
 
-    /// Create an expression with a known type and position
-    pub fn typed(kind: ExprKind, typ: Type, pos: Position) -> Self {
+    /// Create an expression with a known type ID and position
+    pub fn typed(kind: ExprKind, typ: TypeId, pos: Position) -> Self {
         Self {
             kind,
             typ: Some(typ),
@@ -151,9 +151,9 @@ impl Expr {
         }
     }
 
-    /// Create an expression with a known type but default position (for tests)
+    /// Create an expression with a known type ID but default position (for tests)
     #[cfg(test)]
-    pub fn typed_unpositioned(kind: ExprKind, typ: Type) -> Self {
+    pub fn typed_unpositioned(kind: ExprKind, typ: TypeId) -> Self {
         Self {
             kind,
             typ: Some(typ),
@@ -239,12 +239,12 @@ pub enum ExprKind {
 
     /// Type cast: (type)expr
     Cast {
-        cast_type: Type,
+        cast_type: TypeId,
         expr: Box<Expr>,
     },
 
     /// sizeof type: sizeof(int)
-    SizeofType(Type),
+    SizeofType(TypeId),
 
     /// sizeof expression: sizeof expr
     SizeofExpr(Box<Expr>),
@@ -274,8 +274,8 @@ pub enum ExprKind {
     VaArg {
         /// The va_list to read from
         ap: Box<Expr>,
-        /// The type of argument to retrieve
-        arg_type: Type,
+        /// The type of argument to retrieve (interned TypeId)
+        arg_type: TypeId,
     },
 
     /// __builtin_va_end(ap)
@@ -351,13 +351,13 @@ pub struct InitElement {
 
 // Test-only helper constructors for AST nodes
 #[cfg(test)]
-use crate::types::TypeKind;
+use crate::types::TypeTable;
 
 #[cfg(test)]
 impl Expr {
     /// Create an integer literal (typed as int) - no position (for tests/internal use)
-    pub fn int(value: i64) -> Self {
-        Expr::typed_unpositioned(ExprKind::IntLit(value), Type::basic(TypeKind::Int))
+    pub fn int(value: i64, types: &TypeTable) -> Self {
+        Expr::typed_unpositioned(ExprKind::IntLit(value), types.int_id)
     }
 
     /// Create a variable reference (untyped - needs type evaluation) - no position
@@ -368,7 +368,7 @@ impl Expr {
     }
 
     /// Create a variable reference with a known type - no position
-    pub fn var_typed(name: &str, typ: Type) -> Self {
+    pub fn var_typed(name: &str, typ: TypeId) -> Self {
         Expr::typed_unpositioned(
             ExprKind::Ident {
                 name: name.to_string(),
@@ -377,8 +377,8 @@ impl Expr {
         )
     }
 
-    /// Create a binary expression (result type matches left operand for arithmetic)
-    pub fn binary(op: BinaryOp, left: Expr, right: Expr) -> Self {
+    /// Create a binary expression (using TypeTable for type inference)
+    pub fn binary(op: BinaryOp, left: Expr, right: Expr, types: &TypeTable) -> Self {
         // Derive type from operands - comparisons return int, arithmetic uses left type
         let result_type = match op {
             BinaryOp::Lt
@@ -388,11 +388,8 @@ impl Expr {
             | BinaryOp::Eq
             | BinaryOp::Ne
             | BinaryOp::LogAnd
-            | BinaryOp::LogOr => Type::basic(TypeKind::Int),
-            _ => left
-                .typ
-                .clone()
-                .unwrap_or_else(|| Type::basic(TypeKind::Int)),
+            | BinaryOp::LogOr => types.int_id,
+            _ => left.typ.unwrap_or(types.int_id),
         };
         let pos = left.pos;
         Expr::typed(
@@ -407,13 +404,10 @@ impl Expr {
     }
 
     /// Create a unary expression
-    pub fn unary(op: UnaryOp, operand: Expr) -> Self {
+    pub fn unary(op: UnaryOp, operand: Expr, types: &TypeTable) -> Self {
         let result_type = match op {
-            UnaryOp::Not => Type::basic(TypeKind::Int),
-            _ => operand
-                .typ
-                .clone()
-                .unwrap_or_else(|| Type::basic(TypeKind::Int)),
+            UnaryOp::Not => types.int_id,
+            _ => operand.typ.unwrap_or(types.int_id),
         };
         let pos = operand.pos;
         Expr::typed(
@@ -427,11 +421,8 @@ impl Expr {
     }
 
     /// Create an assignment (result type is target type)
-    pub fn assign(target: Expr, value: Expr) -> Self {
-        let result_type = target
-            .typ
-            .clone()
-            .unwrap_or_else(|| Type::basic(TypeKind::Int));
+    pub fn assign(target: Expr, value: Expr, types: &TypeTable) -> Self {
+        let result_type = target.typ.unwrap_or(types.int_id);
         let pos = target.pos;
         Expr::typed(
             ExprKind::Assign {
@@ -445,14 +436,14 @@ impl Expr {
     }
 
     /// Create a function call (returns int by default - proper type needs evaluation)
-    pub fn call(func: Expr, args: Vec<Expr>) -> Self {
+    pub fn call(func: Expr, args: Vec<Expr>, types: &TypeTable) -> Self {
         let pos = func.pos;
         Expr::typed(
             ExprKind::Call {
                 func: Box::new(func),
                 args,
             },
-            Type::basic(TypeKind::Int),
+            types.int_id,
             pos,
         )
     }
@@ -552,8 +543,8 @@ pub struct Declaration {
 pub struct InitDeclarator {
     /// The name being declared
     pub name: String,
-    /// The complete type (after applying declarator modifiers)
-    pub typ: Type,
+    /// The complete type (after applying declarator modifiers) - interned TypeId
+    pub typ: TypeId,
     /// Optional initializer
     pub init: Option<Expr>,
 }
@@ -561,7 +552,7 @@ pub struct InitDeclarator {
 #[cfg(test)]
 impl Declaration {
     /// Create a simple declaration with one variable
-    pub fn simple(name: &str, typ: Type, init: Option<Expr>) -> Self {
+    pub fn simple(name: &str, typ: TypeId, init: Option<Expr>) -> Self {
         Declaration {
             declarators: vec![InitDeclarator {
                 name: name.to_string(),
@@ -580,14 +571,15 @@ impl Declaration {
 #[derive(Debug, Clone)]
 pub struct Parameter {
     pub name: Option<String>,
-    pub typ: Type,
+    /// Parameter type (interned TypeId)
+    pub typ: TypeId,
 }
 
 /// A function definition
 #[derive(Debug, Clone)]
 pub struct FunctionDef {
-    /// Return type
-    pub return_type: Type,
+    /// Return type (interned TypeId)
+    pub return_type: TypeId,
     /// Function name
     pub name: String,
     /// Parameters
@@ -644,7 +636,8 @@ mod tests {
 
     #[test]
     fn test_int_literal() {
-        let expr = Expr::int(42);
+        let types = TypeTable::new();
+        let expr = Expr::int(42, &types);
         match expr.kind {
             ExprKind::IntLit(v) => assert_eq!(v, 42),
             _ => panic!("Expected IntLit"),
@@ -653,8 +646,14 @@ mod tests {
 
     #[test]
     fn test_binary_expr() {
+        let types = TypeTable::new();
         // 1 + 2
-        let expr = Expr::binary(BinaryOp::Add, Expr::int(1), Expr::int(2));
+        let expr = Expr::binary(
+            BinaryOp::Add,
+            Expr::int(1, &types),
+            Expr::int(2, &types),
+            &types,
+        );
 
         match expr.kind {
             ExprKind::Binary { op, left, right } => {
@@ -674,9 +673,15 @@ mod tests {
 
     #[test]
     fn test_nested_binary() {
+        let types = TypeTable::new();
         // 1 + 2 * 3 (represented as 1 + (2 * 3))
-        let mul = Expr::binary(BinaryOp::Mul, Expr::int(2), Expr::int(3));
-        let add = Expr::binary(BinaryOp::Add, Expr::int(1), mul);
+        let mul = Expr::binary(
+            BinaryOp::Mul,
+            Expr::int(2, &types),
+            Expr::int(3, &types),
+            &types,
+        );
+        let add = Expr::binary(BinaryOp::Add, Expr::int(1, &types), mul, &types);
 
         match add.kind {
             ExprKind::Binary { op, left, right } => {
@@ -696,8 +701,9 @@ mod tests {
 
     #[test]
     fn test_unary_expr() {
+        let types = TypeTable::new();
         // -x
-        let expr = Expr::unary(UnaryOp::Neg, Expr::var("x"));
+        let expr = Expr::unary(UnaryOp::Neg, Expr::var("x"), &types);
 
         match expr.kind {
             ExprKind::Unary { op, operand } => {
@@ -713,8 +719,9 @@ mod tests {
 
     #[test]
     fn test_assignment() {
+        let types = TypeTable::new();
         // x = 5
-        let expr = Expr::assign(Expr::var("x"), Expr::int(5));
+        let expr = Expr::assign(Expr::var("x"), Expr::int(5, &types), &types);
 
         match expr.kind {
             ExprKind::Assign { op, target, value } => {
@@ -734,8 +741,13 @@ mod tests {
 
     #[test]
     fn test_function_call() {
+        let types = TypeTable::new();
         // foo(1, 2)
-        let expr = Expr::call(Expr::var("foo"), vec![Expr::int(1), Expr::int(2)]);
+        let expr = Expr::call(
+            Expr::var("foo"),
+            vec![Expr::int(1, &types), Expr::int(2, &types)],
+            &types,
+        );
 
         match expr.kind {
             ExprKind::Call { func, args } => {
@@ -751,10 +763,11 @@ mod tests {
 
     #[test]
     fn test_if_stmt() {
+        let types = TypeTable::new();
         // if (x) return 1;
         let stmt = Stmt::If {
             cond: Expr::var("x"),
-            then_stmt: Box::new(Stmt::Return(Some(Expr::int(1)))),
+            then_stmt: Box::new(Stmt::Return(Some(Expr::int(1, &types)))),
             else_stmt: None,
         };
 
@@ -811,21 +824,23 @@ mod tests {
 
     #[test]
     fn test_declaration() {
+        let types = TypeTable::new();
         // int x = 5;
-        let decl = Declaration::simple("x", Type::basic(TypeKind::Int), Some(Expr::int(5)));
+        let decl = Declaration::simple("x", types.int_id, Some(Expr::int(5, &types)));
 
         assert_eq!(decl.declarators.len(), 1);
         assert_eq!(decl.declarators[0].name, "x");
-        assert_eq!(decl.declarators[0].typ.kind, TypeKind::Int);
+        assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Int);
         assert!(decl.declarators[0].init.is_some());
     }
 
     #[test]
     fn test_translation_unit() {
+        let types = TypeTable::new();
         let mut tu = TranslationUnit::new();
 
         // Add a declaration
-        let decl = Declaration::simple("x", Type::basic(TypeKind::Int), None);
+        let decl = Declaration::simple("x", types.int_id, None);
         tu.add(ExternalDecl::Declaration(decl));
 
         assert_eq!(tu.items.len(), 1);
@@ -833,13 +848,14 @@ mod tests {
 
     #[test]
     fn test_for_loop() {
+        let types = TypeTable::new();
         // for (int i = 0; i < 10; i++) {}
         let init = ForInit::Declaration(Declaration::simple(
             "i",
-            Type::basic(TypeKind::Int),
-            Some(Expr::int(0)),
+            types.int_id,
+            Some(Expr::int(0, &types)),
         ));
-        let cond = Expr::binary(BinaryOp::Lt, Expr::var("i"), Expr::int(10));
+        let cond = Expr::binary(BinaryOp::Lt, Expr::var("i"), Expr::int(10, &types), &types);
         let post = Expr::new_unpositioned(ExprKind::PostInc(Box::new(Expr::var("i"))));
 
         let stmt = Stmt::For {

@@ -94,7 +94,9 @@ Supported:
 - Bitfields (named, unnamed, zero-width for alignment)
 
 Not yet implemented:
+- goto, longjmp, setjmp
 - `inline` and inlining support
+- multi-register returns (for structs larger than 8 bytes)
 - -fverbose-asm
 - Complex initializers
 - VLAs (variable-length arrays)
@@ -129,5 +131,9 @@ Please run `cargo fmt` before committing code, and `cargo clippy` regularly whil
 ```bash
 cargo fmt && cargo clippy -p posixutils-cc
 ```
+
+DO NOT `allow(dead_code)` to fix warnings. Instead, remove dead code; do
+not leave it around as a maintenance burden (and LLM token
+tax).
 
 Read CONTRIBUTING.md in the root of the repository for more details.

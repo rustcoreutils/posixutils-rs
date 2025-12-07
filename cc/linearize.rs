@@ -20,13 +20,9 @@ use crate::parse::ast::{
 };
 use crate::ssa::ssa_convert;
 use crate::symbol::SymbolTable;
-use crate::types::{MemberInfo, Type, TypeKind, TypeModifiers};
+use crate::target::Target;
+use crate::types::{MemberInfo, TypeId, TypeKind, TypeModifiers, TypeTable};
 use std::collections::HashMap;
-
-/// Maximum size (in bits) for aggregate types (struct/union) to be passed or
-/// returned by value in registers. Aggregates larger than this require
-/// indirect passing (pointer) or sret (struct return pointer).
-pub const MAX_REGISTER_AGGREGATE_BITS: u32 = 64;
 
 /// Information about a local variable
 #[derive(Clone)]
@@ -34,7 +30,7 @@ struct LocalVarInfo {
     /// Symbol pseudo (address of the variable)
     sym: PseudoId,
     /// Type of the variable
-    typ: Type,
+    typ: TypeId,
 }
 
 /// Information about a static local variable
@@ -43,7 +39,7 @@ struct StaticLocalInfo {
     /// Global symbol name (unique across translation unit)
     global_name: String,
     /// Type of the variable
-    typ: Type,
+    typ: TypeId,
 }
 
 // ============================================================================
@@ -76,6 +72,8 @@ pub struct Linearizer<'a> {
     run_ssa: bool,
     /// Symbol table for looking up enum constants, etc.
     symbols: &'a SymbolTable,
+    /// Type table for type information
+    types: &'a TypeTable,
     /// Hidden struct return pointer (for functions returning large structs)
     struct_return_ptr: Option<PseudoId>,
     /// Size of struct being returned (for functions returning large structs)
@@ -89,11 +87,13 @@ pub struct Linearizer<'a> {
     static_locals: HashMap<String, StaticLocalInfo>,
     /// Current source position for debug info
     current_pos: Option<Position>,
+    /// Target configuration (architecture, ABI details)
+    target: &'a Target,
 }
 
 impl<'a> Linearizer<'a> {
     /// Create a new linearizer
-    pub fn new(symbols: &'a SymbolTable) -> Self {
+    pub fn new(symbols: &'a SymbolTable, types: &'a TypeTable, target: &'a Target) -> Self {
         Self {
             module: Module::new(),
             current_func: None,
@@ -107,21 +107,23 @@ impl<'a> Linearizer<'a> {
             continue_targets: Vec::new(),
             run_ssa: true, // Enable SSA conversion by default
             symbols,
+            types,
             struct_return_ptr: None,
             struct_return_size: 0,
             current_func_name: String::new(),
             static_local_counter: 0,
             static_locals: HashMap::new(),
             current_pos: None,
+            target,
         }
     }
 
     /// Create a linearizer with SSA conversion disabled (for testing)
     #[cfg(test)]
-    pub fn new_no_ssa(symbols: &'a SymbolTable) -> Self {
+    pub fn new_no_ssa(symbols: &'a SymbolTable, types: &'a TypeTable, target: &'a Target) -> Self {
         Self {
             run_ssa: false,
-            ..Self::new(symbols)
+            ..Self::new(symbols, types, target)
         }
     }
 
@@ -179,10 +181,10 @@ impl<'a> Linearizer<'a> {
 
     /// Apply C99 integer promotions (6.3.1.1)
     /// Types smaller than int are promoted to int (or unsigned int if int can't hold all values)
-    fn integer_promote(typ: &Type) -> Type {
+    fn integer_promote(&self, typ_id: TypeId) -> TypeId {
         // Integer promotions apply to _Bool, char, short (and their unsigned variants)
         // They are promoted to int if int can represent all values, otherwise unsigned int
-        match typ.kind {
+        match self.types.kind(typ_id) {
             TypeKind::Bool | TypeKind::Char | TypeKind::Short => {
                 // int (32-bit signed) can represent all values of:
                 // - _Bool (0-1)
@@ -191,15 +193,15 @@ impl<'a> Linearizer<'a> {
                 // - short/signed short (-32768 to 32767)
                 // - unsigned short (0 to 65535)
                 // So always promote to int
-                Type::basic(TypeKind::Int)
+                self.types.int_id
             }
-            _ => typ.clone(),
+            _ => typ_id,
         }
     }
 
     /// Compute the common type for usual arithmetic conversions (C99 6.3.1.8)
     /// Returns the wider type that both operands should be converted to
-    fn common_type(left: &Type, right: &Type) -> Type {
+    fn common_type(&self, left: TypeId, right: TypeId) -> TypeId {
         // C99 6.3.1.8 usual arithmetic conversions:
         // 1. If either is long double, convert to long double
         // 2. Else if either is double, convert to double
@@ -212,36 +214,38 @@ impl<'a> Linearizer<'a> {
         //    e. Otherwise convert both to unsigned version of signed type
 
         // Check for floating point types
-        let left_float = left.is_float();
-        let right_float = right.is_float();
+        let left_float = self.types.is_float(left);
+        let right_float = self.types.is_float(right);
+
+        let left_kind = self.types.kind(left);
+        let right_kind = self.types.kind(right);
 
         if left_float || right_float {
             // At least one operand is floating point
             // Use the wider floating point type
-            if left.kind == TypeKind::LongDouble || right.kind == TypeKind::LongDouble {
-                return Type::basic(TypeKind::LongDouble);
+            if left_kind == TypeKind::LongDouble || right_kind == TypeKind::LongDouble {
+                return self.types.longdouble_id;
             }
-            if left.kind == TypeKind::Double || right.kind == TypeKind::Double {
-                return Type::basic(TypeKind::Double);
+            if left_kind == TypeKind::Double || right_kind == TypeKind::Double {
+                return self.types.double_id;
             }
             // Both are float or one is float and one is integer
-            return Type::basic(TypeKind::Float);
+            return self.types.float_id;
         }
 
         // Apply integer promotions first (C99 6.3.1.1)
-        let left_promoted = Self::integer_promote(left);
-        let right_promoted = Self::integer_promote(right);
+        let left_promoted = self.integer_promote(left);
+        let right_promoted = self.integer_promote(right);
 
-        let left_size = left_promoted.size_bits();
-        let right_size = right_promoted.size_bits();
-        let left_unsigned = left_promoted.is_unsigned();
-        let right_unsigned = right_promoted.is_unsigned();
+        let left_size = self.types.size_bits(left_promoted);
+        let right_size = self.types.size_bits(right_promoted);
+        let left_unsigned = self.types.is_unsigned(left_promoted);
+        let right_unsigned = self.types.is_unsigned(right_promoted);
+        let left_kind = self.types.kind(left_promoted);
+        let right_kind = self.types.kind(right_promoted);
 
         // If both have same type after promotion, use that type
-        if left_promoted.kind == right_promoted.kind
-            && left_unsigned == right_unsigned
-            && left_size == right_size
-        {
+        if left_kind == right_kind && left_unsigned == right_unsigned && left_size == right_size {
             return left_promoted;
         }
 
@@ -255,53 +259,55 @@ impl<'a> Linearizer<'a> {
         }
 
         // Mixed signedness case
-        let (signed_typ, unsigned_typ) = if left_unsigned {
-            (&right_promoted, &left_promoted)
+        let (signed_id, unsigned_id) = if left_unsigned {
+            (right_promoted, left_promoted)
         } else {
-            (&left_promoted, &right_promoted)
+            (left_promoted, right_promoted)
         };
 
-        let signed_size = signed_typ.size_bits();
-        let unsigned_size = unsigned_typ.size_bits();
+        let signed_size = self.types.size_bits(signed_id);
+        let unsigned_size = self.types.size_bits(unsigned_id);
 
         // If unsigned has rank >= signed, convert to unsigned
         if unsigned_size >= signed_size {
-            return unsigned_typ.clone();
+            return unsigned_id;
         }
 
         // If signed type can represent all values of unsigned type, use signed
         // (This is true when signed_size > unsigned_size on our platforms)
         if signed_size > unsigned_size {
-            return signed_typ.clone();
+            return signed_id;
         }
 
         // Otherwise convert both to unsigned version of signed type
         // (This case shouldn't happen on LP64 since we already handled size comparisons)
-        Type::with_modifiers(signed_typ.kind, TypeModifiers::UNSIGNED)
+        self.types.unsigned_version(signed_id)
     }
 
     /// Emit a type conversion if needed
     /// Returns the (possibly converted) pseudo ID
-    fn emit_convert(&mut self, val: PseudoId, from_typ: &Type, to_typ: &Type) -> PseudoId {
-        let from_size = from_typ.size_bits();
-        let to_size = to_typ.size_bits();
-        let from_float = from_typ.is_float();
-        let to_float = to_typ.is_float();
+    fn emit_convert(&mut self, val: PseudoId, from_typ: TypeId, to_typ: TypeId) -> PseudoId {
+        let from_size = self.types.size_bits(from_typ);
+        let to_size = self.types.size_bits(to_typ);
+        let from_float = self.types.is_float(from_typ);
+        let to_float = self.types.is_float(to_typ);
+        let from_kind = self.types.kind(from_typ);
+        let to_kind = self.types.kind(to_typ);
 
         // Same type and size - no conversion needed
-        if from_typ.kind == to_typ.kind && from_size == to_size {
+        if from_kind == to_kind && from_size == to_size {
             return val;
         }
 
         // Array to pointer conversion (decay) - no actual conversion needed
         // The array value is already the address of the first element (64-bit)
-        if from_typ.kind == TypeKind::Array && to_typ.kind == TypeKind::Pointer {
+        if from_kind == TypeKind::Array && to_kind == TypeKind::Pointer {
             return val;
         }
 
         // Pointer to pointer conversion - no actual conversion needed
         // All pointers are the same size (64-bit)
-        if from_typ.kind == TypeKind::Pointer && to_typ.kind == TypeKind::Pointer {
+        if from_kind == TypeKind::Pointer && to_kind == TypeKind::Pointer {
             return val;
         }
 
@@ -309,7 +315,7 @@ impl<'a> Linearizer<'a> {
         // When any scalar value is converted to _Bool:
         // - Result is 0 if the value compares equal to 0
         // - Result is 1 otherwise
-        if to_typ.kind == TypeKind::Bool && from_typ.kind != TypeKind::Bool {
+        if to_kind == TypeKind::Bool && from_kind != TypeKind::Bool {
             let result = self.alloc_pseudo();
             let pseudo = Pseudo::reg(result, result.0);
             if let Some(func) = &mut self.current_func {
@@ -317,7 +323,7 @@ impl<'a> Linearizer<'a> {
             }
 
             // Create a zero constant for comparison
-            let zero = self.emit_const(0, from_typ.clone());
+            let zero = self.emit_const(0, from_typ);
 
             // Compare val != 0
             let opcode = if from_float {
@@ -326,8 +332,7 @@ impl<'a> Linearizer<'a> {
                 Opcode::SetNe
             };
 
-            let mut insn = Instruction::binop(opcode, result, val, zero, to_typ.clone());
-            insn.size = to_size;
+            let mut insn = Instruction::binop(opcode, result, val, zero, to_typ, to_size);
             insn.src_size = from_size;
             self.emit(insn);
 
@@ -347,22 +352,21 @@ impl<'a> Linearizer<'a> {
                 Opcode::FCvtF
             } else if from_float {
                 // Float to integer
-                if to_typ.is_unsigned() {
+                if self.types.is_unsigned(to_typ) {
                     Opcode::FCvtU
                 } else {
                     Opcode::FCvtS
                 }
             } else {
                 // Integer to float
-                if from_typ.is_unsigned() {
+                if self.types.is_unsigned(from_typ) {
                     Opcode::UCvtF
                 } else {
                     Opcode::SCvtF
                 }
             };
 
-            let mut insn = Instruction::unop(opcode, result, val, to_typ.clone());
-            insn.size = to_size;
+            let mut insn = Instruction::unop(opcode, result, val, to_typ, to_size);
             insn.src_size = from_size;
             self.emit(insn);
             return result;
@@ -382,19 +386,17 @@ impl<'a> Linearizer<'a> {
 
         if to_size > from_size {
             // Extending - use sign or zero extension based on source type
-            let opcode = if from_typ.is_unsigned() {
+            let opcode = if self.types.is_unsigned(from_typ) {
                 Opcode::Zext
             } else {
                 Opcode::Sext
             };
-            let mut insn = Instruction::unop(opcode, result, val, to_typ.clone());
-            insn.size = to_size;
+            let mut insn = Instruction::unop(opcode, result, val, to_typ, to_size);
             insn.src_size = from_size;
             self.emit(insn);
         } else {
             // Truncating
-            let mut insn = Instruction::unop(Opcode::Trunc, result, val, to_typ.clone());
-            insn.size = to_size;
+            let mut insn = Instruction::unop(Opcode::Trunc, result, val, to_typ, to_size);
             insn.src_size = from_size;
             self.emit(insn);
         }
@@ -446,12 +448,16 @@ impl<'a> Linearizer<'a> {
     fn linearize_global_decl(&mut self, decl: &Declaration) {
         for declarator in &decl.declarators {
             // Skip function declarations (they're just forward declarations for external functions)
-            if declarator.typ.kind == TypeKind::Function {
+            if self.types.kind(declarator.typ) == TypeKind::Function {
                 continue;
             }
 
             // Skip extern declarations - they don't define storage
-            if declarator.typ.modifiers.contains(TypeModifiers::EXTERN) {
+            if self
+                .types
+                .modifiers(declarator.typ)
+                .contains(TypeModifiers::EXTERN)
+            {
                 continue;
             }
 
@@ -465,7 +471,7 @@ impl<'a> Linearizer<'a> {
                 });
 
             self.module
-                .add_global(&declarator.name, declarator.typ.clone(), init);
+                .add_global(&declarator.name, declarator.typ, init);
         }
     }
 
@@ -491,16 +497,19 @@ impl<'a> Linearizer<'a> {
         // Note: static_locals is NOT cleared - it persists across functions
 
         // Create function
-        let is_static = func.return_type.modifiers.contains(TypeModifiers::STATIC);
-        let mut ir_func = Function::new(&func.name, func.return_type.clone());
+        let is_static = self
+            .types
+            .modifiers(func.return_type)
+            .contains(TypeModifiers::STATIC);
+        let mut ir_func = Function::new(&func.name, func.return_type);
         ir_func.is_static = is_static;
 
+        let ret_kind = self.types.kind(func.return_type);
         // Check if function returns a large struct
         // Large structs are returned via a hidden first parameter (sret)
         // that points to caller-allocated space
-        let returns_large_struct = (func.return_type.kind == TypeKind::Struct
-            || func.return_type.kind == TypeKind::Union)
-            && func.return_type.size_bits() > MAX_REGISTER_AGGREGATE_BITS;
+        let returns_large_struct = (ret_kind == TypeKind::Struct || ret_kind == TypeKind::Union)
+            && self.types.size_bits(func.return_type) > self.target.max_aggregate_register_bits;
 
         // Argument index offset: if returning large struct, first arg is hidden return pointer
         let arg_offset: u32 = if returns_large_struct { 1 } else { 0 };
@@ -511,17 +520,17 @@ impl<'a> Linearizer<'a> {
             let sret_pseudo = Pseudo::arg(sret_id, 0).with_name("__sret");
             ir_func.add_pseudo(sret_pseudo);
             self.struct_return_ptr = Some(sret_id);
-            self.struct_return_size = func.return_type.size_bits();
+            self.struct_return_size = self.types.size_bits(func.return_type);
         }
 
         // Add parameters
         // For struct/union parameters, we need to copy them to local storage
         // so member access works properly
-        let mut struct_params: Vec<(String, Type, PseudoId)> = Vec::new();
+        let mut struct_params: Vec<(String, TypeId, PseudoId)> = Vec::new();
 
         for (i, param) in func.params.iter().enumerate() {
             let name = param.name.clone().unwrap_or_else(|| format!("arg{}", i));
-            ir_func.add_param(&name, param.typ.clone());
+            ir_func.add_param(&name, param.typ);
 
             // Create argument pseudo (offset by 1 if there's a hidden return pointer)
             let pseudo_id = self.alloc_pseudo();
@@ -529,8 +538,9 @@ impl<'a> Linearizer<'a> {
             ir_func.add_pseudo(pseudo);
 
             // For struct/union types, we'll copy to a local later
-            if param.typ.kind == TypeKind::Struct || param.typ.kind == TypeKind::Union {
-                struct_params.push((name, param.typ.clone(), pseudo_id));
+            let param_kind = self.types.kind(param.typ);
+            if param_kind == TypeKind::Struct || param_kind == TypeKind::Union {
+                struct_params.push((name, param.typ, pseudo_id));
             } else {
                 self.var_map.insert(name, pseudo_id);
             }
@@ -552,15 +562,16 @@ impl<'a> Linearizer<'a> {
             let sym = Pseudo::sym(local_sym, name.clone());
             if let Some(func) = &mut self.current_func {
                 func.add_pseudo(sym);
-                let is_volatile = typ.modifiers.contains(TypeModifiers::VOLATILE);
-                func.add_local(&name, local_sym, typ.clone(), is_volatile, None);
+                let is_volatile = self.types.modifiers(typ).contains(TypeModifiers::VOLATILE);
+                func.add_local(&name, local_sym, typ, is_volatile, None);
             }
 
+            let typ_size = self.types.size_bits(typ);
             // For large structs, arg_pseudo is a pointer to the struct
             // We need to copy the data from that pointer to local storage
-            if typ.size_bits() > MAX_REGISTER_AGGREGATE_BITS {
+            if typ_size > self.target.max_aggregate_register_bits {
                 // arg_pseudo is a pointer - copy each 8-byte chunk
-                let struct_size = typ.size_bits() / 8;
+                let struct_size = typ_size / 8;
                 let mut offset = 0i64;
                 while offset < struct_size as i64 {
                     // Load 8 bytes from arg_pseudo + offset
@@ -573,20 +584,22 @@ impl<'a> Linearizer<'a> {
                         temp,
                         arg_pseudo,
                         offset,
-                        Type::basic(TypeKind::Long),
+                        self.types.long_id,
+                        64,
                     ));
                     // Store to local_sym + offset
                     self.emit(Instruction::store(
                         temp,
                         local_sym,
                         offset,
-                        Type::basic(TypeKind::Long),
+                        self.types.long_id,
+                        64,
                     ));
                     offset += 8;
                 }
             } else {
                 // Small struct: arg_pseudo contains the value directly
-                self.emit(Instruction::store(arg_pseudo, local_sym, 0, typ.clone()));
+                self.emit(Instruction::store(arg_pseudo, local_sym, 0, typ, typ_size));
             }
 
             // Register as a local variable
@@ -604,11 +617,11 @@ impl<'a> Linearizer<'a> {
 
         // Ensure function ends with a return
         if !self.is_terminated() {
-            if func.return_type.kind == TypeKind::Void {
+            if ret_kind == TypeKind::Void {
                 self.emit(Instruction::ret(None));
             } else {
                 // Return 0 as default
-                let zero = self.emit_const(0, Type::basic(TypeKind::Int));
+                let zero = self.emit_const(0, self.types.int_id);
                 self.emit(Instruction::ret(Some(zero)));
             }
         }
@@ -616,7 +629,7 @@ impl<'a> Linearizer<'a> {
         // Run SSA conversion if enabled
         if self.run_ssa {
             if let Some(ref mut ir_func) = self.current_func {
-                ssa_convert(ir_func);
+                ssa_convert(ir_func, self.types);
             }
         }
 
@@ -697,23 +710,30 @@ impl<'a> Linearizer<'a> {
                                 temp,
                                 src_addr,
                                 byte_offset,
-                                Type::basic(TypeKind::Long),
+                                self.types.long_id,
+                                64,
                             ));
                             // Store to destination
                             self.emit(Instruction::store(
                                 temp,
                                 sret_ptr,
                                 byte_offset,
-                                Type::basic(TypeKind::Long),
+                                self.types.long_id,
+                                64,
                             ));
                             byte_offset += 8;
                         }
 
                         // Return the hidden pointer (ABI requirement)
-                        self.emit(Instruction::ret_typed(Some(sret_ptr), Type::pointer(typ)));
+                        self.emit(Instruction::ret_typed(
+                            Some(sret_ptr),
+                            self.types.void_ptr_id,
+                            64,
+                        ));
                     } else {
                         let val = self.linearize_expr(e);
-                        self.emit(Instruction::ret_typed(Some(val), typ));
+                        let typ_size = self.types.size_bits(typ);
+                        self.emit(Instruction::ret_typed(Some(val), typ, typ_size));
                     }
                 } else {
                     self.emit(Instruction::ret(None));
@@ -771,10 +791,10 @@ impl<'a> Linearizer<'a> {
 
     fn linearize_local_decl(&mut self, decl: &Declaration) {
         for declarator in &decl.declarators {
-            let typ = declarator.typ.clone();
+            let typ = declarator.typ;
 
             // Check if this is a static local variable
-            if typ.modifiers.contains(TypeModifiers::STATIC) {
+            if self.types.modifiers(typ).contains(TypeModifiers::STATIC) {
                 // Static local: create a global with unique name
                 self.linearize_static_local(declarator);
                 continue;
@@ -789,37 +809,27 @@ impl<'a> Linearizer<'a> {
                 func.add_pseudo(sym);
                 // Register with function's local variable tracking for SSA
                 // Pass the current basic block as the declaration block for scope-aware phi placement
-                let is_volatile = typ.modifiers.contains(TypeModifiers::VOLATILE);
-                func.add_local(
-                    &unique_name,
-                    sym_id,
-                    typ.clone(),
-                    is_volatile,
-                    self.current_bb,
-                );
+                let is_volatile = self.types.modifiers(typ).contains(TypeModifiers::VOLATILE);
+                func.add_local(&unique_name, sym_id, typ, is_volatile, self.current_bb);
             }
 
             // Track in linearizer's locals map
-            self.locals.insert(
-                declarator.name.clone(),
-                LocalVarInfo {
-                    sym: sym_id,
-                    typ: typ.clone(),
-                },
-            );
+            self.locals
+                .insert(declarator.name.clone(), LocalVarInfo { sym: sym_id, typ });
 
             // If there's an initializer, emit Store(s)
             if let Some(init) = &declarator.init {
                 if let ExprKind::InitList { elements } = &init.kind {
                     // Handle initializer list for arrays and structs
-                    self.linearize_init_list(sym_id, &typ, elements);
+                    self.linearize_init_list(sym_id, typ, elements);
                 } else {
                     // Simple scalar initializer
                     let val = self.linearize_expr(init);
                     // Convert the value to the target type (important for _Bool normalization)
                     let init_type = self.expr_type(init);
-                    let converted = self.emit_convert(val, &init_type, &typ);
-                    self.emit(Instruction::store(converted, sym_id, 0, typ));
+                    let converted = self.emit_convert(val, init_type, typ);
+                    let size = self.types.size_bits(typ);
+                    self.emit(Instruction::store(converted, sym_id, 0, typ, size));
                 }
             }
         }
@@ -845,7 +855,7 @@ impl<'a> Linearizer<'a> {
             key,
             StaticLocalInfo {
                 global_name: global_name.clone(),
-                typ: declarator.typ.clone(),
+                typ: declarator.typ,
             },
         );
 
@@ -856,7 +866,7 @@ impl<'a> Linearizer<'a> {
             LocalVarInfo {
                 // Use a sentinel value - we'll handle static locals specially
                 sym: PseudoId(u32::MAX),
-                typ: declarator.typ.clone(),
+                typ: declarator.typ,
             },
         );
 
@@ -883,12 +893,11 @@ impl<'a> Linearizer<'a> {
             });
 
         // Add as a global (type already has STATIC modifier which codegen uses)
-        self.module
-            .add_global(&global_name, declarator.typ.clone(), init);
+        self.module.add_global(&global_name, declarator.typ, init);
     }
 
     /// Linearize an initializer list for arrays or structs
-    fn linearize_init_list(&mut self, base_sym: PseudoId, typ: &Type, elements: &[InitElement]) {
+    fn linearize_init_list(&mut self, base_sym: PseudoId, typ: TypeId, elements: &[InitElement]) {
         self.linearize_init_list_at_offset(base_sym, 0, typ, elements);
     }
 
@@ -897,17 +906,13 @@ impl<'a> Linearizer<'a> {
         &mut self,
         base_sym: PseudoId,
         base_offset: i64,
-        typ: &Type,
+        typ: TypeId,
         elements: &[InitElement],
     ) {
-        match typ.kind {
+        match self.types.kind(typ) {
             TypeKind::Array => {
-                let elem_type = typ
-                    .base
-                    .as_ref()
-                    .map(|b| (**b).clone())
-                    .unwrap_or_else(|| Type::basic(TypeKind::Int));
-                let elem_size = elem_type.size_bits() / 8;
+                let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
+                let elem_size = self.types.size_bits(elem_type) / 8;
 
                 for (idx, element) in elements.iter().enumerate() {
                     // Calculate the actual index considering designators
@@ -932,27 +937,26 @@ impl<'a> Linearizer<'a> {
                         self.linearize_init_list_at_offset(
                             base_sym,
                             offset,
-                            &elem_type,
+                            elem_type,
                             nested_elems,
                         );
                     } else {
                         // Scalar value
                         let val = self.linearize_expr(&element.value);
                         let val_type = self.expr_type(&element.value);
-                        let converted = self.emit_convert(val, &val_type, &elem_type);
+                        let converted = self.emit_convert(val, val_type, elem_type);
+                        let elem_size = self.types.size_bits(elem_type);
                         self.emit(Instruction::store(
-                            converted,
-                            base_sym,
-                            offset,
-                            elem_type.clone(),
+                            converted, base_sym, offset, elem_type, elem_size,
                         ));
                     }
                 }
             }
             TypeKind::Struct | TypeKind::Union => {
                 // Get struct fields from the type's composite data
-                if let Some(composite) = &typ.composite {
-                    let members = &composite.members;
+                if let Some(composite) = self.types.get(typ).composite.as_ref() {
+                    // Clone members to avoid borrow issues
+                    let members: Vec<_> = composite.members.clone();
 
                     for (idx, element) in elements.iter().enumerate() {
                         // Find the field (by designator or position)
@@ -972,7 +976,7 @@ impl<'a> Linearizer<'a> {
                         };
 
                         let offset = base_offset + member.offset as i64;
-                        let field_type = member.typ.clone();
+                        let field_type = member.typ;
 
                         // Handle nested initializer lists or scalar values
                         if let ExprKind::InitList {
@@ -983,15 +987,18 @@ impl<'a> Linearizer<'a> {
                             self.linearize_init_list_at_offset(
                                 base_sym,
                                 offset,
-                                &field_type,
+                                field_type,
                                 nested_elems,
                             );
                         } else {
                             // Scalar value
                             let val = self.linearize_expr(&element.value);
                             let val_type = self.expr_type(&element.value);
-                            let converted = self.emit_convert(val, &val_type, &field_type);
-                            self.emit(Instruction::store(converted, base_sym, offset, field_type));
+                            let converted = self.emit_convert(val, val_type, field_type);
+                            let field_size = self.types.size_bits(field_type);
+                            self.emit(Instruction::store(
+                                converted, base_sym, offset, field_type, field_size,
+                            ));
                         }
                     }
                 }
@@ -1001,12 +1008,14 @@ impl<'a> Linearizer<'a> {
                 if let Some(element) = elements.first() {
                     let val = self.linearize_expr(&element.value);
                     let val_type = self.expr_type(&element.value);
-                    let converted = self.emit_convert(val, &val_type, typ);
+                    let converted = self.emit_convert(val, val_type, typ);
+                    let typ_size = self.types.size_bits(typ);
                     self.emit(Instruction::store(
                         converted,
                         base_sym,
                         base_offset,
-                        typ.clone(),
+                        typ,
+                        typ_size,
                     ));
                 }
             }
@@ -1215,7 +1224,7 @@ impl<'a> Linearizer<'a> {
         // Linearize the switch expression
         let switch_val = self.linearize_expr(expr);
         let expr_type = self.expr_type(expr);
-        let size = expr_type.size_bits();
+        let size = self.types.size_bits(expr_type);
 
         let exit_bb = self.alloc_bb();
 
@@ -1453,8 +1462,8 @@ impl<'a> Linearizer<'a> {
     /// Get the type of an expression.
     /// PANICS if expression has no type - type evaluation pass must run first.
     /// Following sparse's design: the IR should ALWAYS receive fully typed input.
-    fn expr_type(&self, expr: &Expr) -> Type {
-        expr.typ.clone().expect(
+    fn expr_type(&self, expr: &Expr) -> TypeId {
+        expr.typ.expect(
             "BUG: expression has no type. Type evaluation pass must run before linearization.",
         )
     }
@@ -1479,7 +1488,7 @@ impl<'a> Linearizer<'a> {
                             self.emit(Instruction::sym_addr(
                                 result,
                                 sym_id,
-                                Type::pointer(static_info.typ),
+                                self.types.pointer_to(static_info.typ),
                             ));
                             return result;
                         }
@@ -1488,7 +1497,7 @@ impl<'a> Linearizer<'a> {
                     self.emit(Instruction::sym_addr(
                         result,
                         local.sym,
-                        Type::pointer(local.typ),
+                        self.types.pointer_to(local.typ),
                     ));
                     result
                 } else {
@@ -1500,7 +1509,11 @@ impl<'a> Linearizer<'a> {
                     }
                     let result = self.alloc_pseudo();
                     let typ = self.expr_type(expr);
-                    self.emit(Instruction::sym_addr(result, sym_id, Type::pointer(typ)));
+                    self.emit(Instruction::sym_addr(
+                        result,
+                        sym_id,
+                        self.types.pointer_to(typ),
+                    ));
                     result
                 }
             }
@@ -1518,28 +1531,29 @@ impl<'a> Linearizer<'a> {
                 // s.m as lvalue = &s + offset(m)
                 let base = self.linearize_lvalue(inner);
                 let struct_type = self.expr_type(inner);
-                let member_info = struct_type
-                    .find_member(member)
-                    .unwrap_or_else(|| MemberInfo {
-                        offset: 0,
-                        typ: self.expr_type(expr),
-                        bit_offset: None,
-                        bit_width: None,
-                        storage_unit_size: None,
-                    });
+                let member_info =
+                    self.types
+                        .find_member(struct_type, member)
+                        .unwrap_or_else(|| MemberInfo {
+                            offset: 0,
+                            typ: self.expr_type(expr),
+                            bit_offset: None,
+                            bit_width: None,
+                            storage_unit_size: None,
+                        });
 
                 if member_info.offset == 0 {
                     base
                 } else {
-                    let offset_val =
-                        self.emit_const(member_info.offset as i64, Type::basic(TypeKind::Long));
+                    let offset_val = self.emit_const(member_info.offset as i64, self.types.long_id);
                     let result = self.alloc_pseudo();
                     self.emit(Instruction::binop(
                         Opcode::Add,
                         result,
                         base,
                         offset_val,
-                        Type::basic(TypeKind::Long),
+                        self.types.long_id,
+                        64,
                     ));
                     result
                 }
@@ -1551,33 +1565,33 @@ impl<'a> Linearizer<'a> {
                 // ptr->m as lvalue = ptr + offset(m)
                 let ptr = self.linearize_expr(inner);
                 let ptr_type = self.expr_type(inner);
-                let struct_type = ptr_type
-                    .base
-                    .as_ref()
-                    .map(|b| b.as_ref().clone())
+                let struct_type = self
+                    .types
+                    .base_type(ptr_type)
                     .unwrap_or_else(|| self.expr_type(expr));
-                let member_info = struct_type
-                    .find_member(member)
-                    .unwrap_or_else(|| MemberInfo {
-                        offset: 0,
-                        typ: self.expr_type(expr),
-                        bit_offset: None,
-                        bit_width: None,
-                        storage_unit_size: None,
-                    });
+                let member_info =
+                    self.types
+                        .find_member(struct_type, member)
+                        .unwrap_or_else(|| MemberInfo {
+                            offset: 0,
+                            typ: self.expr_type(expr),
+                            bit_offset: None,
+                            bit_width: None,
+                            storage_unit_size: None,
+                        });
 
                 if member_info.offset == 0 {
                     ptr
                 } else {
-                    let offset_val =
-                        self.emit_const(member_info.offset as i64, Type::basic(TypeKind::Long));
+                    let offset_val = self.emit_const(member_info.offset as i64, self.types.long_id);
                     let result = self.alloc_pseudo();
                     self.emit(Instruction::binop(
                         Opcode::Add,
                         result,
                         ptr,
                         offset_val,
-                        Type::basic(TypeKind::Long),
+                        self.types.long_id,
+                        64,
                     ));
                     result
                 }
@@ -1588,8 +1602,9 @@ impl<'a> Linearizer<'a> {
                 let array_type = self.expr_type(array);
                 let index_type = self.expr_type(index);
 
+                let array_kind = self.types.kind(array_type);
                 let (ptr_expr, idx_expr, idx_type) =
-                    if array_type.kind == TypeKind::Pointer || array_type.kind == TypeKind::Array {
+                    if array_kind == TypeKind::Pointer || array_kind == TypeKind::Array {
                         (array, index, index_type)
                     } else {
                         // Swap: index is actually the pointer/array
@@ -1599,11 +1614,11 @@ impl<'a> Linearizer<'a> {
                 let arr = self.linearize_expr(ptr_expr);
                 let idx = self.linearize_expr(idx_expr);
                 let elem_type = self.expr_type(expr);
-                let elem_size = elem_type.size_bits() / 8;
-                let elem_size_val = self.emit_const(elem_size as i64, Type::basic(TypeKind::Long));
+                let elem_size = self.types.size_bits(elem_type) / 8;
+                let elem_size_val = self.emit_const(elem_size as i64, self.types.long_id);
 
                 // Sign-extend index to 64-bit for proper pointer arithmetic (negative indices)
-                let idx_extended = self.emit_convert(idx, &idx_type, &Type::basic(TypeKind::Long));
+                let idx_extended = self.emit_convert(idx, idx_type, self.types.long_id);
 
                 let offset = self.alloc_pseudo();
                 self.emit(Instruction::binop(
@@ -1611,7 +1626,8 @@ impl<'a> Linearizer<'a> {
                     offset,
                     idx_extended,
                     elem_size_val,
-                    Type::basic(TypeKind::Long),
+                    self.types.long_id,
+                    64,
                 ));
 
                 let addr = self.alloc_pseudo();
@@ -1620,7 +1636,8 @@ impl<'a> Linearizer<'a> {
                     addr,
                     arr,
                     offset,
-                    Type::basic(TypeKind::Long),
+                    self.types.long_id,
+                    64,
                 ));
                 addr
             }
@@ -1678,7 +1695,7 @@ impl<'a> Linearizer<'a> {
             ExprKind::Ident { name, .. } => {
                 // First check if it's an enum constant
                 if let Some(value) = self.symbols.get_enum_value(name) {
-                    self.emit_const(value, Type::basic(TypeKind::Int))
+                    self.emit_const(value, self.types.int_id)
                 }
                 // Check if it's a local variable
                 else if let Some(local) = self.locals.get(name).cloned() {
@@ -1694,22 +1711,17 @@ impl<'a> Linearizer<'a> {
                             }
                             let typ = static_info.typ;
                             // Arrays decay to pointers - get address, not value
-                            if typ.kind == TypeKind::Array {
+                            if self.types.kind(typ) == TypeKind::Array {
                                 let result = self.alloc_pseudo();
-                                self.emit(Instruction::sym_addr(
-                                    result,
-                                    sym_id,
-                                    Type::pointer(
-                                        typ.base
-                                            .as_ref()
-                                            .map(|b| (**b).clone())
-                                            .unwrap_or_else(|| Type::basic(TypeKind::Int)),
-                                    ),
-                                ));
+                                let elem_type =
+                                    self.types.base_type(typ).unwrap_or(self.types.int_id);
+                                let ptr_type = self.types.pointer_to(elem_type);
+                                self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
                                 return result;
                             } else {
                                 let result = self.alloc_pseudo();
-                                self.emit(Instruction::load(result, sym_id, 0, typ));
+                                let size = self.types.size_bits(typ);
+                                self.emit(Instruction::load(result, sym_id, 0, typ, size));
                                 return result;
                             }
                         }
@@ -1720,21 +1732,14 @@ impl<'a> Linearizer<'a> {
                         func.add_pseudo(pseudo);
                     }
                     // Arrays decay to pointers - get address, not value
-                    if local.typ.kind == TypeKind::Array {
-                        self.emit(Instruction::sym_addr(
-                            result,
-                            local.sym,
-                            Type::pointer(
-                                local
-                                    .typ
-                                    .base
-                                    .as_ref()
-                                    .map(|b| (**b).clone())
-                                    .unwrap_or_else(|| Type::basic(TypeKind::Int)),
-                            ),
-                        ));
+                    if self.types.kind(local.typ) == TypeKind::Array {
+                        let elem_type =
+                            self.types.base_type(local.typ).unwrap_or(self.types.int_id);
+                        let ptr_type = self.types.pointer_to(elem_type);
+                        self.emit(Instruction::sym_addr(result, local.sym, ptr_type));
                     } else {
-                        self.emit(Instruction::load(result, local.sym, 0, local.typ));
+                        let size = self.types.size_bits(local.typ);
+                        self.emit(Instruction::load(result, local.sym, 0, local.typ, size));
                     }
                     result
                 }
@@ -1751,22 +1756,16 @@ impl<'a> Linearizer<'a> {
                     }
                     let typ = self.expr_type(expr);
                     // Arrays decay to pointers - get address, not value
-                    if typ.kind == TypeKind::Array {
+                    if self.types.kind(typ) == TypeKind::Array {
                         let result = self.alloc_pseudo();
-                        self.emit(Instruction::sym_addr(
-                            result,
-                            sym_id,
-                            Type::pointer(
-                                typ.base
-                                    .as_ref()
-                                    .map(|b| (**b).clone())
-                                    .unwrap_or_else(|| Type::basic(TypeKind::Int)),
-                            ),
-                        ));
+                        let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
+                        let ptr_type = self.types.pointer_to(elem_type);
+                        self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
                         result
                     } else {
                         let result = self.alloc_pseudo();
-                        self.emit(Instruction::load(result, sym_id, 0, typ));
+                        let size = self.types.size_bits(typ);
+                        self.emit(Instruction::load(result, sym_id, 0, typ, size));
                         result
                     }
                 }
@@ -1782,22 +1781,18 @@ impl<'a> Linearizer<'a> {
                 if *op == UnaryOp::PreInc || *op == UnaryOp::PreDec {
                     let val = self.linearize_expr(operand);
                     let typ = self.expr_type(operand);
-                    let is_float = typ.is_float();
-                    let is_ptr = typ.kind == TypeKind::Pointer;
+                    let is_float = self.types.is_float(typ);
+                    let is_ptr = self.types.kind(typ) == TypeKind::Pointer;
 
                     // Compute new value - for pointers, scale by element size
                     let increment = if is_ptr {
-                        let elem_type = typ
-                            .base
-                            .as_ref()
-                            .map(|b| (**b).clone())
-                            .unwrap_or_else(|| Type::basic(TypeKind::Char));
-                        let elem_size = elem_type.size_bits() / 8;
-                        self.emit_const(elem_size as i64, Type::basic(TypeKind::Long))
+                        let elem_type = self.types.base_type(typ).unwrap_or(self.types.char_id);
+                        let elem_size = self.types.size_bits(elem_type) / 8;
+                        self.emit_const(elem_size as i64, self.types.long_id)
                     } else if is_float {
-                        self.emit_fconst(1.0, typ.clone())
+                        self.emit_fconst(1.0, typ)
                     } else {
-                        self.emit_const(1, typ.clone())
+                        self.emit_const(1, typ)
                     };
                     let result = self.alloc_pseudo();
                     let pseudo = Pseudo::reg(result, result.0);
@@ -1815,17 +1810,14 @@ impl<'a> Linearizer<'a> {
                     } else {
                         Opcode::Sub
                     };
+                    let size = self.types.size_bits(typ);
                     self.emit(Instruction::binop(
-                        opcode,
-                        result,
-                        val,
-                        increment,
-                        typ.clone(),
+                        opcode, result, val, increment, typ, size,
                     ));
 
                     // For _Bool, normalize the result (any non-zero -> 1)
-                    let final_result = if typ.kind == TypeKind::Bool {
-                        self.emit_convert(result, &Type::basic(TypeKind::Int), &typ)
+                    let final_result = if self.types.kind(typ) == TypeKind::Bool {
+                        self.emit_convert(result, self.types.int_id, typ)
                     } else {
                         result
                     };
@@ -1833,7 +1825,14 @@ impl<'a> Linearizer<'a> {
                     // Store back to the variable
                     if let ExprKind::Ident { name, .. } = &operand.kind {
                         if let Some(local) = self.locals.get(name).cloned() {
-                            self.emit(Instruction::store(final_result, local.sym, 0, typ));
+                            let store_size = self.types.size_bits(typ);
+                            self.emit(Instruction::store(
+                                final_result,
+                                local.sym,
+                                0,
+                                typ,
+                                store_size,
+                            ));
                         } else if self.var_map.contains_key(name) {
                             self.var_map.insert(name.clone(), final_result);
                         } else {
@@ -1843,7 +1842,8 @@ impl<'a> Linearizer<'a> {
                             if let Some(func) = &mut self.current_func {
                                 func.add_pseudo(pseudo);
                             }
-                            self.emit(Instruction::store(final_result, sym_id, 0, typ));
+                            let store_size = self.types.size_bits(typ);
+                            self.emit(Instruction::store(final_result, sym_id, 0, typ, store_size));
                         }
                     }
 
@@ -1877,13 +1877,15 @@ impl<'a> Linearizer<'a> {
                 let result_typ = self.expr_type(expr);
 
                 // Check for pointer arithmetic: ptr +/- int or int + ptr
+                let left_kind = self.types.kind(left_typ);
+                let right_kind = self.types.kind(right_typ);
                 let left_is_ptr_or_arr =
-                    left_typ.kind == TypeKind::Pointer || left_typ.kind == TypeKind::Array;
+                    left_kind == TypeKind::Pointer || left_kind == TypeKind::Array;
                 let right_is_ptr_or_arr =
-                    right_typ.kind == TypeKind::Pointer || right_typ.kind == TypeKind::Array;
+                    right_kind == TypeKind::Pointer || right_kind == TypeKind::Array;
                 let is_ptr_arith = (*op == BinaryOp::Add || *op == BinaryOp::Sub)
-                    && ((left_is_ptr_or_arr && right_typ.is_integer())
-                        || (left_typ.is_integer() && right_is_ptr_or_arr));
+                    && ((left_is_ptr_or_arr && self.types.is_integer(right_typ))
+                        || (self.types.is_integer(left_typ) && right_is_ptr_or_arr));
 
                 // Check for pointer difference: ptr - ptr
                 let is_ptr_diff = *op == BinaryOp::Sub && left_is_ptr_or_arr && right_is_ptr_or_arr;
@@ -1900,26 +1902,24 @@ impl<'a> Linearizer<'a> {
                         byte_diff,
                         left_val,
                         right_val,
-                        Type::basic(TypeKind::Long),
+                        self.types.long_id,
+                        64,
                     ));
 
                     // Get element size from the pointer type
-                    let elem_type = left_typ
-                        .base
-                        .as_ref()
-                        .map(|b| (**b).clone())
-                        .unwrap_or_else(|| Type::basic(TypeKind::Char));
-                    let elem_size = elem_type.size_bits() / 8;
+                    let elem_type = self.types.base_type(left_typ).unwrap_or(self.types.char_id);
+                    let elem_size = self.types.size_bits(elem_type) / 8;
 
                     // Divide by element size
-                    let scale = self.emit_const(elem_size as i64, Type::basic(TypeKind::Long));
+                    let scale = self.emit_const(elem_size as i64, self.types.long_id);
                     let result = self.alloc_pseudo();
                     self.emit(Instruction::binop(
                         Opcode::DivS,
                         result,
                         byte_diff,
                         scale,
-                        Type::basic(TypeKind::Long),
+                        self.types.long_id,
+                        64,
                     ));
                     result
                 } else if is_ptr_arith {
@@ -1927,37 +1927,31 @@ impl<'a> Linearizer<'a> {
                     let (ptr_val, ptr_typ, int_val) = if left_is_ptr_or_arr {
                         let ptr = self.linearize_expr(left);
                         let int = self.linearize_expr(right);
-                        (ptr, left_typ.clone(), int)
+                        (ptr, left_typ, int)
                     } else {
                         // int + ptr case
                         let int = self.linearize_expr(left);
                         let ptr = self.linearize_expr(right);
-                        (ptr, right_typ.clone(), int)
+                        (ptr, right_typ, int)
                     };
 
                     // Get element size
-                    let elem_type = ptr_typ
-                        .base
-                        .as_ref()
-                        .map(|b| (**b).clone())
-                        .unwrap_or_else(|| Type::basic(TypeKind::Char));
-                    let elem_size = elem_type.size_bits() / 8;
+                    let elem_type = self.types.base_type(ptr_typ).unwrap_or(self.types.char_id);
+                    let elem_size = self.types.size_bits(elem_type) / 8;
 
                     // Scale the integer by element size
-                    let scale = self.emit_const(elem_size as i64, Type::basic(TypeKind::Long));
+                    let scale = self.emit_const(elem_size as i64, self.types.long_id);
                     let scaled_offset = self.alloc_pseudo();
                     // Extend int_val to 64-bit for proper address arithmetic
-                    let int_val_extended = self.emit_convert(
-                        int_val,
-                        &Type::basic(TypeKind::Int),
-                        &Type::basic(TypeKind::Long),
-                    );
+                    let int_val_extended =
+                        self.emit_convert(int_val, self.types.int_id, self.types.long_id);
                     self.emit(Instruction::binop(
                         Opcode::Mul,
                         scaled_offset,
                         int_val_extended,
                         scale,
-                        Type::basic(TypeKind::Long),
+                        self.types.long_id,
+                        64,
                     ));
 
                     // Add (or subtract) to pointer
@@ -1972,16 +1966,17 @@ impl<'a> Linearizer<'a> {
                         result,
                         ptr_val,
                         scaled_offset,
-                        Type::basic(TypeKind::Long),
+                        self.types.long_id,
+                        64,
                     ));
                     result
                 } else {
                     // For comparisons, compute common type for both operands
                     // (usual arithmetic conversions)
                     let operand_typ = if op.is_comparison() {
-                        Self::common_type(&left_typ, &right_typ)
+                        self.common_type(left_typ, right_typ)
                     } else {
-                        result_typ.clone()
+                        result_typ
                     };
 
                     // Linearize operands
@@ -1989,8 +1984,8 @@ impl<'a> Linearizer<'a> {
                     let right_val = self.linearize_expr(right);
 
                     // Emit type conversions if needed
-                    let left_val = self.emit_convert(left_val, &left_typ, &operand_typ);
-                    let right_val = self.emit_convert(right_val, &right_typ, &operand_typ);
+                    let left_val = self.emit_convert(left_val, left_typ, operand_typ);
+                    let right_val = self.emit_convert(right_val, right_typ, operand_typ);
 
                     self.emit_binary(*op, left_val, right_val, result_typ, operand_typ)
                 }
@@ -2001,8 +1996,8 @@ impl<'a> Linearizer<'a> {
             ExprKind::PostInc(operand) => {
                 let val = self.linearize_expr(operand);
                 let typ = self.expr_type(operand);
-                let is_float = typ.is_float();
-                let is_ptr = typ.kind == TypeKind::Pointer;
+                let is_float = self.types.is_float(typ);
+                let is_ptr = self.types.kind(typ) == TypeKind::Pointer;
 
                 // For locals, we need to save the old value before updating
                 // because the pseudo will be reloaded from stack which gets overwritten
@@ -2023,7 +2018,7 @@ impl<'a> Linearizer<'a> {
                         Instruction::new(Opcode::Copy)
                             .with_target(temp)
                             .with_src(val)
-                            .with_size(typ.size_bits()),
+                            .with_size(self.types.size_bits(typ)),
                     );
                     temp
                 } else {
@@ -2032,17 +2027,13 @@ impl<'a> Linearizer<'a> {
 
                 // For pointers, increment by element size; for others, increment by 1
                 let increment = if is_ptr {
-                    let elem_type = typ
-                        .base
-                        .as_ref()
-                        .map(|b| (**b).clone())
-                        .unwrap_or_else(|| Type::basic(TypeKind::Char));
-                    let elem_size = elem_type.size_bits() / 8;
-                    self.emit_const(elem_size as i64, Type::basic(TypeKind::Long))
+                    let elem_type = self.types.base_type(typ).unwrap_or(self.types.char_id);
+                    let elem_size = self.types.size_bits(elem_type) / 8;
+                    self.emit_const(elem_size as i64, self.types.long_id)
                 } else if is_float {
-                    self.emit_fconst(1.0, typ.clone())
+                    self.emit_fconst(1.0, typ)
                 } else {
-                    self.emit_const(1, typ.clone())
+                    self.emit_const(1, typ)
                 };
                 let result = self.alloc_pseudo();
                 let pseudo = Pseudo::reg(result, result.0);
@@ -2050,27 +2041,31 @@ impl<'a> Linearizer<'a> {
                     func.add_pseudo(pseudo);
                 }
                 let opcode = if is_float { Opcode::FAdd } else { Opcode::Add };
-                let arith_type = if is_ptr {
-                    Type::basic(TypeKind::Long)
-                } else {
-                    typ.clone()
-                };
+                let arith_type = if is_ptr { self.types.long_id } else { typ };
+                let arith_size = self.types.size_bits(arith_type);
                 self.emit(Instruction::binop(
-                    opcode, result, val, increment, arith_type,
+                    opcode, result, val, increment, arith_type, arith_size,
                 ));
 
                 // For _Bool, normalize the result (any non-zero -> 1)
-                let final_result = if typ.kind == TypeKind::Bool {
-                    self.emit_convert(result, &Type::basic(TypeKind::Int), &typ)
+                let final_result = if self.types.kind(typ) == TypeKind::Bool {
+                    self.emit_convert(result, self.types.int_id, typ)
                 } else {
                     result
                 };
 
                 // Store to local, update parameter mapping, or store through pointer
+                let store_size = self.types.size_bits(typ);
                 match &operand.kind {
                     ExprKind::Ident { name, .. } => {
                         if let Some(local) = self.locals.get(name).cloned() {
-                            self.emit(Instruction::store(final_result, local.sym, 0, typ));
+                            self.emit(Instruction::store(
+                                final_result,
+                                local.sym,
+                                0,
+                                typ,
+                                store_size,
+                            ));
                         } else if self.var_map.contains_key(name) {
                             self.var_map.insert(name.clone(), final_result);
                         } else {
@@ -2080,7 +2075,7 @@ impl<'a> Linearizer<'a> {
                             if let Some(func) = &mut self.current_func {
                                 func.add_pseudo(pseudo);
                             }
-                            self.emit(Instruction::store(final_result, sym_id, 0, typ));
+                            self.emit(Instruction::store(final_result, sym_id, 0, typ, store_size));
                         }
                     }
                     ExprKind::Unary {
@@ -2089,7 +2084,7 @@ impl<'a> Linearizer<'a> {
                     } => {
                         // (*p)++ - store back through the pointer
                         let addr = self.linearize_expr(ptr_expr);
-                        self.emit(Instruction::store(final_result, addr, 0, typ));
+                        self.emit(Instruction::store(final_result, addr, 0, typ, store_size));
                     }
                     _ => {}
                 }
@@ -2100,8 +2095,8 @@ impl<'a> Linearizer<'a> {
             ExprKind::PostDec(operand) => {
                 let val = self.linearize_expr(operand);
                 let typ = self.expr_type(operand);
-                let is_float = typ.is_float();
-                let is_ptr = typ.kind == TypeKind::Pointer;
+                let is_float = self.types.is_float(typ);
+                let is_ptr = self.types.kind(typ) == TypeKind::Pointer;
 
                 // For locals, we need to save the old value before updating
                 // because the pseudo will be reloaded from stack which gets overwritten
@@ -2122,7 +2117,7 @@ impl<'a> Linearizer<'a> {
                         Instruction::new(Opcode::Copy)
                             .with_target(temp)
                             .with_src(val)
-                            .with_size(typ.size_bits()),
+                            .with_size(self.types.size_bits(typ)),
                     );
                     temp
                 } else {
@@ -2131,17 +2126,13 @@ impl<'a> Linearizer<'a> {
 
                 // For pointers, decrement by element size; for others, decrement by 1
                 let decrement = if is_ptr {
-                    let elem_type = typ
-                        .base
-                        .as_ref()
-                        .map(|b| (**b).clone())
-                        .unwrap_or_else(|| Type::basic(TypeKind::Char));
-                    let elem_size = elem_type.size_bits() / 8;
-                    self.emit_const(elem_size as i64, Type::basic(TypeKind::Long))
+                    let elem_type = self.types.base_type(typ).unwrap_or(self.types.char_id);
+                    let elem_size = self.types.size_bits(elem_type) / 8;
+                    self.emit_const(elem_size as i64, self.types.long_id)
                 } else if is_float {
-                    self.emit_fconst(1.0, typ.clone())
+                    self.emit_fconst(1.0, typ)
                 } else {
-                    self.emit_const(1, typ.clone())
+                    self.emit_const(1, typ)
                 };
                 let result = self.alloc_pseudo();
                 let pseudo = Pseudo::reg(result, result.0);
@@ -2149,27 +2140,31 @@ impl<'a> Linearizer<'a> {
                     func.add_pseudo(pseudo);
                 }
                 let opcode = if is_float { Opcode::FSub } else { Opcode::Sub };
-                let arith_type = if is_ptr {
-                    Type::basic(TypeKind::Long)
-                } else {
-                    typ.clone()
-                };
+                let arith_type = if is_ptr { self.types.long_id } else { typ };
+                let arith_size = self.types.size_bits(arith_type);
                 self.emit(Instruction::binop(
-                    opcode, result, val, decrement, arith_type,
+                    opcode, result, val, decrement, arith_type, arith_size,
                 ));
 
                 // For _Bool, normalize the result (any non-zero -> 1)
-                let final_result = if typ.kind == TypeKind::Bool {
-                    self.emit_convert(result, &Type::basic(TypeKind::Int), &typ)
+                let final_result = if self.types.kind(typ) == TypeKind::Bool {
+                    self.emit_convert(result, self.types.int_id, typ)
                 } else {
                     result
                 };
 
                 // Store to local, update parameter mapping, or store through pointer
+                let store_size = self.types.size_bits(typ);
                 match &operand.kind {
                     ExprKind::Ident { name, .. } => {
                         if let Some(local) = self.locals.get(name).cloned() {
-                            self.emit(Instruction::store(final_result, local.sym, 0, typ));
+                            self.emit(Instruction::store(
+                                final_result,
+                                local.sym,
+                                0,
+                                typ,
+                                store_size,
+                            ));
                         } else if self.var_map.contains_key(name) {
                             self.var_map.insert(name.clone(), final_result);
                         } else {
@@ -2179,7 +2174,7 @@ impl<'a> Linearizer<'a> {
                             if let Some(func) = &mut self.current_func {
                                 func.add_pseudo(pseudo);
                             }
-                            self.emit(Instruction::store(final_result, sym_id, 0, typ));
+                            self.emit(Instruction::store(final_result, sym_id, 0, typ, store_size));
                         }
                     }
                     ExprKind::Unary {
@@ -2188,7 +2183,7 @@ impl<'a> Linearizer<'a> {
                     } => {
                         // (*p)-- - store back through the pointer
                         let addr = self.linearize_expr(ptr_expr);
-                        self.emit(Instruction::store(final_result, addr, 0, typ));
+                        self.emit(Instruction::store(final_result, addr, 0, typ, store_size));
                     }
                     _ => {}
                 }
@@ -2207,9 +2202,10 @@ impl<'a> Linearizer<'a> {
 
                 let result = self.alloc_pseudo();
                 let typ = self.expr_type(expr); // Use evaluated type
+                let size = self.types.size_bits(typ);
 
                 self.emit(Instruction::select(
-                    result, cond_val, then_val, else_val, typ,
+                    result, cond_val, then_val, else_val, typ, size,
                 ));
                 result
             }
@@ -2225,10 +2221,11 @@ impl<'a> Linearizer<'a> {
 
                 // Check if this is a variadic function call
                 // If the function expression has a type, check its variadic flag
-                let variadic_arg_start = if let Some(ref func_type) = func.typ {
-                    if func_type.variadic {
+                let variadic_arg_start = if let Some(func_type) = func.typ {
+                    let ft = self.types.get(func_type);
+                    if ft.variadic {
                         // Variadic args start after the fixed parameters
-                        func_type.params.as_ref().map(|p| p.len())
+                        ft.params.as_ref().map(|p| p.len())
                     } else {
                         None
                     }
@@ -2238,9 +2235,10 @@ impl<'a> Linearizer<'a> {
 
                 // Check if function returns a large struct
                 // If so, allocate space and pass address as hidden first argument
-                let returns_large_struct = (typ.kind == TypeKind::Struct
-                    || typ.kind == TypeKind::Union)
-                    && typ.size_bits() > MAX_REGISTER_AGGREGATE_BITS;
+                let typ_kind = self.types.kind(typ);
+                let returns_large_struct = (typ_kind == TypeKind::Struct
+                    || typ_kind == TypeKind::Union)
+                    && self.types.size_bits(typ) > self.target.max_aggregate_register_bits;
 
                 let (result_sym, mut arg_vals, mut arg_types_vec) = if returns_large_struct {
                     // Allocate local storage for the return value
@@ -2252,7 +2250,7 @@ impl<'a> Linearizer<'a> {
                         func.add_local(
                             format!("__sret_{}", sret_sym.0),
                             sret_sym,
-                            typ.clone(),
+                            typ,
                             false,
                             self.current_bb,
                         );
@@ -2267,11 +2265,11 @@ impl<'a> Linearizer<'a> {
                     self.emit(Instruction::sym_addr(
                         sret_addr,
                         sret_sym,
-                        Type::pointer(typ.clone()),
+                        self.types.pointer_to(typ),
                     ));
 
                     // Hidden return pointer is the first argument (pointer type)
-                    (sret_sym, vec![sret_addr], vec![Type::pointer(typ.clone())])
+                    (sret_sym, vec![sret_addr], vec![self.types.pointer_to(typ)])
                 } else {
                     let result = self.alloc_pseudo();
                     (result, Vec::new(), Vec::new())
@@ -2281,13 +2279,13 @@ impl<'a> Linearizer<'a> {
                 // For large structs, pass by reference (address) instead of by value
                 for a in args.iter() {
                     let arg_type = self.expr_type(a);
-                    let arg_val = if (arg_type.kind == TypeKind::Struct
-                        || arg_type.kind == TypeKind::Union)
-                        && arg_type.size_bits() > MAX_REGISTER_AGGREGATE_BITS
+                    let arg_kind = self.types.kind(arg_type);
+                    let arg_val = if (arg_kind == TypeKind::Struct || arg_kind == TypeKind::Union)
+                        && self.types.size_bits(arg_type) > self.target.max_aggregate_register_bits
                     {
                         // Large struct: pass address instead of value
                         // The argument type becomes a pointer
-                        arg_types_vec.push(Type::pointer(arg_type));
+                        arg_types_vec.push(self.types.pointer_to(arg_type));
                         self.linearize_lvalue(a)
                     } else {
                         arg_types_vec.push(arg_type);
@@ -2304,24 +2302,29 @@ impl<'a> Linearizer<'a> {
                     if let Some(func) = &mut self.current_func {
                         func.add_pseudo(result_pseudo);
                     }
+                    let ptr_typ = self.types.pointer_to(typ);
                     let mut call_insn = Instruction::call(
                         Some(result),
                         &func_name,
                         arg_vals,
                         arg_types_vec,
-                        Type::pointer(typ),
+                        ptr_typ,
+                        64, // pointers are 64-bit
                     );
                     call_insn.variadic_arg_start = variadic_arg_start;
+                    call_insn.is_sret_call = true;
                     self.emit(call_insn);
                     // Return the symbol (address) where struct is stored
                     result_sym
                 } else {
+                    let ret_size = self.types.size_bits(typ);
                     let mut call_insn = Instruction::call(
                         Some(result_sym),
                         &func_name,
                         arg_vals,
                         arg_types_vec,
                         typ,
+                        ret_size,
                     );
                     call_insn.variadic_arg_start = variadic_arg_start;
                     self.emit(call_insn);
@@ -2338,30 +2341,32 @@ impl<'a> Linearizer<'a> {
                 let struct_type = self.expr_type(inner_expr);
 
                 // Look up member offset and type
-                let member_info = struct_type
-                    .find_member(member)
-                    .unwrap_or_else(|| MemberInfo {
-                        offset: 0,
-                        typ: self.expr_type(expr),
-                        bit_offset: None,
-                        bit_width: None,
-                        storage_unit_size: None,
-                    });
+                let member_info =
+                    self.types
+                        .find_member(struct_type, member)
+                        .unwrap_or_else(|| MemberInfo {
+                            offset: 0,
+                            typ: self.expr_type(expr),
+                            bit_offset: None,
+                            bit_width: None,
+                            storage_unit_size: None,
+                        });
 
                 // If member type is an array, return the address (arrays decay to pointers)
-                if member_info.typ.kind == TypeKind::Array {
+                if self.types.kind(member_info.typ) == TypeKind::Array {
                     if member_info.offset == 0 {
                         base
                     } else {
                         let result = self.alloc_pseudo();
                         let offset_val =
-                            self.emit_const(member_info.offset as i64, Type::basic(TypeKind::Long));
+                            self.emit_const(member_info.offset as i64, self.types.long_id);
                         self.emit(Instruction::binop(
                             Opcode::Add,
                             result,
                             base,
                             offset_val,
-                            Type::basic(TypeKind::Long),
+                            self.types.long_id,
+                            64,
                         ));
                         result
                     }
@@ -2377,15 +2382,17 @@ impl<'a> Linearizer<'a> {
                         bit_offset,
                         bit_width,
                         storage_size,
-                        &member_info.typ,
+                        member_info.typ,
                     )
                 } else {
                     let result = self.alloc_pseudo();
+                    let size = self.types.size_bits(member_info.typ);
                     self.emit(Instruction::load(
                         result,
                         base,
                         member_info.offset as i64,
                         member_info.typ,
+                        size,
                     ));
                     result
                 }
@@ -2400,37 +2407,38 @@ impl<'a> Linearizer<'a> {
                 let ptr_type = self.expr_type(inner_expr);
 
                 // Dereference pointer to get struct type
-                let struct_type = ptr_type
-                    .base
-                    .as_ref()
-                    .map(|b| b.as_ref().clone())
+                let struct_type = self
+                    .types
+                    .base_type(ptr_type)
                     .unwrap_or_else(|| self.expr_type(expr));
 
                 // Look up member offset and type
-                let member_info = struct_type
-                    .find_member(member)
-                    .unwrap_or_else(|| MemberInfo {
-                        offset: 0,
-                        typ: self.expr_type(expr),
-                        bit_offset: None,
-                        bit_width: None,
-                        storage_unit_size: None,
-                    });
+                let member_info =
+                    self.types
+                        .find_member(struct_type, member)
+                        .unwrap_or_else(|| MemberInfo {
+                            offset: 0,
+                            typ: self.expr_type(expr),
+                            bit_offset: None,
+                            bit_width: None,
+                            storage_unit_size: None,
+                        });
 
                 // If member type is an array, return the address (arrays decay to pointers)
-                if member_info.typ.kind == TypeKind::Array {
+                if self.types.kind(member_info.typ) == TypeKind::Array {
                     if member_info.offset == 0 {
                         ptr
                     } else {
                         let result = self.alloc_pseudo();
                         let offset_val =
-                            self.emit_const(member_info.offset as i64, Type::basic(TypeKind::Long));
+                            self.emit_const(member_info.offset as i64, self.types.long_id);
                         self.emit(Instruction::binop(
                             Opcode::Add,
                             result,
                             ptr,
                             offset_val,
-                            Type::basic(TypeKind::Long),
+                            self.types.long_id,
+                            64,
                         ));
                         result
                     }
@@ -2446,15 +2454,17 @@ impl<'a> Linearizer<'a> {
                         bit_offset,
                         bit_width,
                         storage_size,
-                        &member_info.typ,
+                        member_info.typ,
                     )
                 } else {
                     let result = self.alloc_pseudo();
+                    let size = self.types.size_bits(member_info.typ);
                     self.emit(Instruction::load(
                         result,
                         ptr,
                         member_info.offset as i64,
                         member_info.typ,
+                        size,
                     ));
                     result
                 }
@@ -2466,8 +2476,9 @@ impl<'a> Linearizer<'a> {
                 let array_type = self.expr_type(array);
                 let index_type = self.expr_type(index);
 
+                let array_kind = self.types.kind(array_type);
                 let (ptr_expr, idx_expr, idx_type) =
-                    if array_type.kind == TypeKind::Pointer || array_type.kind == TypeKind::Array {
+                    if array_kind == TypeKind::Pointer || array_kind == TypeKind::Array {
                         (array, index, index_type)
                     } else {
                         // Swap: index is actually the pointer/array
@@ -2479,31 +2490,40 @@ impl<'a> Linearizer<'a> {
 
                 // Get element type from the expression type
                 let elem_type = self.expr_type(expr);
-                let elem_size = elem_type.size_bits() / 8;
-                let elem_size_val = self.emit_const(elem_size as i64, Type::basic(TypeKind::Long));
+                let elem_size = self.types.size_bits(elem_type) / 8;
+                let elem_size_val = self.emit_const(elem_size as i64, self.types.long_id);
 
                 // Sign-extend index to 64-bit for proper pointer arithmetic (negative indices)
-                let idx_extended = self.emit_convert(idx, &idx_type, &Type::basic(TypeKind::Long));
+                let idx_extended = self.emit_convert(idx, idx_type, self.types.long_id);
 
                 let offset = self.alloc_pseudo();
-                let ptr_typ = Type::basic(TypeKind::Long);
+                let ptr_typ = self.types.long_id;
                 self.emit(Instruction::binop(
                     Opcode::Mul,
                     offset,
                     idx_extended,
                     elem_size_val,
-                    ptr_typ.clone(),
+                    ptr_typ,
+                    64,
                 ));
 
                 let addr = self.alloc_pseudo();
-                self.emit(Instruction::binop(Opcode::Add, addr, arr, offset, ptr_typ));
+                self.emit(Instruction::binop(
+                    Opcode::Add,
+                    addr,
+                    arr,
+                    offset,
+                    ptr_typ,
+                    64,
+                ));
 
                 // If element type is an array, just return the address (arrays decay to pointers)
-                if elem_type.kind == TypeKind::Array {
+                if self.types.kind(elem_type) == TypeKind::Array {
                     addr
                 } else {
                     let result = self.alloc_pseudo();
-                    self.emit(Instruction::load(result, addr, 0, elem_type));
+                    let size = self.types.size_bits(elem_type);
+                    self.emit(Instruction::load(result, addr, 0, elem_type, size));
                     result
                 }
             }
@@ -2514,10 +2534,11 @@ impl<'a> Linearizer<'a> {
             } => {
                 let src = self.linearize_expr(inner_expr);
                 let src_type = self.expr_type(inner_expr);
+                let cast_type = *cast_type; // Copy the TypeId
 
                 // Emit conversion if needed
-                let src_is_float = src_type.is_float();
-                let dst_is_float = cast_type.is_float();
+                let src_is_float = self.types.is_float(src_type);
+                let dst_is_float = self.types.is_float(cast_type);
 
                 if src_is_float && !dst_is_float {
                     // Float to integer conversion
@@ -2527,7 +2548,7 @@ impl<'a> Linearizer<'a> {
                         func.add_pseudo(pseudo);
                     }
                     // FCvtS for signed int, FCvtU for unsigned
-                    let opcode = if cast_type.is_unsigned() {
+                    let opcode = if self.types.is_unsigned(cast_type) {
                         Opcode::FCvtU
                     } else {
                         Opcode::FCvtS
@@ -2535,8 +2556,8 @@ impl<'a> Linearizer<'a> {
                     let mut insn = Instruction::new(opcode)
                         .with_target(result)
                         .with_src(src)
-                        .with_type(cast_type.clone());
-                    insn.src_size = src_type.size_bits();
+                        .with_type(cast_type);
+                    insn.src_size = self.types.size_bits(src_type);
                     self.emit(insn);
                     result
                 } else if !src_is_float && dst_is_float {
@@ -2547,7 +2568,7 @@ impl<'a> Linearizer<'a> {
                         func.add_pseudo(pseudo);
                     }
                     // SCvtF for signed int, UCvtF for unsigned
-                    let opcode = if src_type.is_unsigned() {
+                    let opcode = if self.types.is_unsigned(src_type) {
                         Opcode::UCvtF
                     } else {
                         Opcode::SCvtF
@@ -2555,13 +2576,15 @@ impl<'a> Linearizer<'a> {
                     let mut insn = Instruction::new(opcode)
                         .with_target(result)
                         .with_src(src)
-                        .with_type(cast_type.clone());
-                    insn.src_size = src_type.size_bits();
+                        .with_type(cast_type);
+                    insn.src_size = self.types.size_bits(src_type);
                     self.emit(insn);
                     result
                 } else if src_is_float && dst_is_float {
                     // Float to float conversion (e.g., float to double)
-                    if src_type.size_bits() != cast_type.size_bits() {
+                    let src_size = self.types.size_bits(src_type);
+                    let dst_size = self.types.size_bits(cast_type);
+                    if src_size != dst_size {
                         let result = self.alloc_pseudo();
                         let pseudo = Pseudo::reg(result, result.0);
                         if let Some(func) = &mut self.current_func {
@@ -2570,8 +2593,8 @@ impl<'a> Linearizer<'a> {
                         let mut insn = Instruction::new(Opcode::FCvtF)
                             .with_target(result)
                             .with_src(src)
-                            .with_type(cast_type.clone());
-                        insn.src_size = src_type.size_bits();
+                            .with_type(cast_type);
+                        insn.src_size = src_size;
                         self.emit(insn);
                         result
                     } else {
@@ -2580,28 +2603,28 @@ impl<'a> Linearizer<'a> {
                 } else {
                     // Integer to integer conversion
                     // Use emit_convert for proper type conversions including _Bool
-                    self.emit_convert(src, &src_type, cast_type)
+                    self.emit_convert(src, src_type, cast_type)
                 }
             }
 
             ExprKind::SizeofType(typ) => {
-                let size = typ.size_bits() / 8;
+                let size = self.types.size_bits(*typ) / 8;
                 // sizeof returns size_t, which is unsigned long in our implementation
-                let result_typ = Type::with_modifiers(TypeKind::Long, TypeModifiers::UNSIGNED);
+                let result_typ = self.types.ulong_id;
                 self.emit_const(size as i64, result_typ)
             }
 
             ExprKind::SizeofExpr(inner_expr) => {
                 // Get type from expression and compute size
                 let inner_typ = self.expr_type(inner_expr);
-                let size = inner_typ.size_bits() / 8;
+                let size = self.types.size_bits(inner_typ) / 8;
                 // sizeof returns size_t, which is unsigned long in our implementation
-                let result_typ = Type::with_modifiers(TypeKind::Long, TypeModifiers::UNSIGNED);
+                let result_typ = self.types.ulong_id;
                 self.emit_const(size as i64, result_typ)
             }
 
             ExprKind::Comma(exprs) => {
-                let mut result = self.emit_const(0, Type::basic(TypeKind::Int));
+                let mut result = self.emit_const(0, self.types.int_id);
                 for e in exprs {
                     result = self.linearize_expr(e);
                 }
@@ -2628,7 +2651,7 @@ impl<'a> Linearizer<'a> {
                     .with_target(result)
                     .with_src(ap_addr)
                     .with_func(last_param.clone())
-                    .with_type(Type::basic(TypeKind::Void));
+                    .with_type(self.types.void_id);
                 self.emit(insn);
                 result
             }
@@ -2642,7 +2665,7 @@ impl<'a> Linearizer<'a> {
                 let insn = Instruction::new(Opcode::VaArg)
                     .with_target(result)
                     .with_src(ap_addr)
-                    .with_type(arg_type.clone());
+                    .with_type(*arg_type);
                 self.emit(insn);
                 result
             }
@@ -2655,7 +2678,7 @@ impl<'a> Linearizer<'a> {
                 let insn = Instruction::new(Opcode::VaEnd)
                     .with_target(result)
                     .with_src(ap_addr)
-                    .with_type(Type::basic(TypeKind::Void));
+                    .with_type(self.types.void_id);
                 self.emit(insn);
                 result
             }
@@ -2670,7 +2693,7 @@ impl<'a> Linearizer<'a> {
                     .with_target(result)
                     .with_src(dest_addr)
                     .with_src(src_addr)
-                    .with_type(Type::basic(TypeKind::Void));
+                    .with_type(self.types.void_id);
                 self.emit(insn);
                 result
             }
@@ -2686,10 +2709,7 @@ impl<'a> Linearizer<'a> {
                     .with_target(result)
                     .with_src(arg_val)
                     .with_size(16)
-                    .with_type(Type::with_modifiers(
-                        TypeKind::Short,
-                        TypeModifiers::UNSIGNED,
-                    ));
+                    .with_type(self.types.ushort_id);
                 self.emit(insn);
                 result
             }
@@ -2702,7 +2722,7 @@ impl<'a> Linearizer<'a> {
                     .with_target(result)
                     .with_src(arg_val)
                     .with_size(32)
-                    .with_type(Type::with_modifiers(TypeKind::Int, TypeModifiers::UNSIGNED));
+                    .with_type(self.types.uint_id);
                 self.emit(insn);
                 result
             }
@@ -2715,10 +2735,7 @@ impl<'a> Linearizer<'a> {
                     .with_target(result)
                     .with_src(arg_val)
                     .with_size(64)
-                    .with_type(Type::with_modifiers(
-                        TypeKind::LongLong,
-                        TypeModifiers::UNSIGNED,
-                    ));
+                    .with_type(self.types.ulonglong_id);
                 self.emit(insn);
                 result
             }
@@ -2730,15 +2747,14 @@ impl<'a> Linearizer<'a> {
                 let insn = Instruction::new(Opcode::Alloca)
                     .with_target(result)
                     .with_src(size_val)
-                    .with_size(64) // Returns pointer (64-bit)
-                    .with_type(Type::pointer(Type::basic(TypeKind::Void)));
+                    .with_type_and_size(self.types.void_ptr_id, 64);
                 self.emit(insn);
                 result
             }
         }
     }
 
-    fn emit_const(&mut self, val: i64, typ: Type) -> PseudoId {
+    fn emit_const(&mut self, val: i64, typ: TypeId) -> PseudoId {
         let id = self.alloc_pseudo();
         let pseudo = Pseudo::val(id, val);
         if let Some(func) = &mut self.current_func {
@@ -2748,13 +2764,13 @@ impl<'a> Linearizer<'a> {
         // Emit setval instruction
         let insn = Instruction::new(Opcode::SetVal)
             .with_target(id)
-            .with_type(typ);
+            .with_type_and_size(typ, self.types.size_bits(typ));
         self.emit(insn);
 
         id
     }
 
-    fn emit_fconst(&mut self, val: f64, typ: Type) -> PseudoId {
+    fn emit_fconst(&mut self, val: f64, typ: TypeId) -> PseudoId {
         let id = self.alloc_pseudo();
         let pseudo = Pseudo::fval(id, val);
         if let Some(func) = &mut self.current_func {
@@ -2764,7 +2780,7 @@ impl<'a> Linearizer<'a> {
         // Emit setval instruction
         let insn = Instruction::new(Opcode::SetVal)
             .with_target(id)
-            .with_type(typ);
+            .with_type_and_size(typ, self.types.size_bits(typ));
         self.emit(insn);
 
         id
@@ -2779,16 +2795,17 @@ impl<'a> Linearizer<'a> {
         bit_offset: u32,
         bit_width: u32,
         storage_size: u32,
-        typ: &Type,
+        typ: TypeId,
     ) -> PseudoId {
         // Determine storage type based on storage unit size
         let storage_type = match storage_size {
-            1 => Type::with_modifiers(TypeKind::Char, TypeModifiers::UNSIGNED),
-            2 => Type::with_modifiers(TypeKind::Short, TypeModifiers::UNSIGNED),
-            4 => Type::with_modifiers(TypeKind::Int, TypeModifiers::UNSIGNED),
-            8 => Type::with_modifiers(TypeKind::Long, TypeModifiers::UNSIGNED),
-            _ => Type::with_modifiers(TypeKind::Int, TypeModifiers::UNSIGNED),
+            1 => self.types.uchar_id,
+            2 => self.types.ushort_id,
+            4 => self.types.uint_id,
+            8 => self.types.ulong_id,
+            _ => self.types.uint_id,
         };
+        let storage_bits = storage_size * 8;
 
         // 1. Load the entire storage unit
         let storage_val = self.alloc_pseudo();
@@ -2796,19 +2813,21 @@ impl<'a> Linearizer<'a> {
             storage_val,
             base,
             byte_offset as i64,
-            storage_type.clone(),
+            storage_type,
+            storage_bits,
         ));
 
         // 2. Shift right by bit_offset (using logical shift for unsigned extraction)
         let shifted = if bit_offset > 0 {
-            let shift_amount = self.emit_const(bit_offset as i64, Type::basic(TypeKind::Int));
+            let shift_amount = self.emit_const(bit_offset as i64, self.types.int_id);
             let shifted = self.alloc_pseudo();
             self.emit(Instruction::binop(
                 Opcode::Lsr,
                 shifted,
                 storage_val,
                 shift_amount,
-                storage_type.clone(),
+                storage_type,
+                storage_bits,
             ));
             shifted
         } else {
@@ -2817,19 +2836,20 @@ impl<'a> Linearizer<'a> {
 
         // 3. Mask to bit_width bits
         let mask = (1u64 << bit_width) - 1;
-        let mask_val = self.emit_const(mask as i64, storage_type.clone());
+        let mask_val = self.emit_const(mask as i64, storage_type);
         let masked = self.alloc_pseudo();
         self.emit(Instruction::binop(
             Opcode::And,
             masked,
             shifted,
             mask_val,
-            storage_type.clone(),
+            storage_type,
+            storage_bits,
         ));
 
         // 4. Sign extend if this is a signed bitfield
-        if !typ.is_unsigned() && bit_width < storage_size * 8 {
-            self.emit_sign_extend_bitfield(masked, bit_width, storage_size * 8)
+        if !self.types.is_unsigned(typ) && bit_width < storage_bits {
+            self.emit_sign_extend_bitfield(masked, bit_width, storage_bits)
         } else {
             masked
         }
@@ -2844,16 +2864,17 @@ impl<'a> Linearizer<'a> {
     ) -> PseudoId {
         // Sign extend by shifting left then arithmetic shifting right
         let shift_amount = target_bits - bit_width;
-        let typ = Type::basic(TypeKind::Int);
+        let typ = self.types.int_id;
 
-        let shift_val = self.emit_const(shift_amount as i64, typ.clone());
+        let shift_val = self.emit_const(shift_amount as i64, typ);
         let shifted_left = self.alloc_pseudo();
         self.emit(Instruction::binop(
             Opcode::Shl,
             shifted_left,
             value,
             shift_val,
-            typ.clone(),
+            typ,
+            32,
         ));
 
         let result = self.alloc_pseudo();
@@ -2863,6 +2884,7 @@ impl<'a> Linearizer<'a> {
             shifted_left,
             shift_val,
             typ,
+            32,
         ));
         result
     }
@@ -2879,12 +2901,13 @@ impl<'a> Linearizer<'a> {
     ) {
         // Determine storage type based on storage unit size
         let storage_type = match storage_size {
-            1 => Type::with_modifiers(TypeKind::Char, TypeModifiers::UNSIGNED),
-            2 => Type::with_modifiers(TypeKind::Short, TypeModifiers::UNSIGNED),
-            4 => Type::with_modifiers(TypeKind::Int, TypeModifiers::UNSIGNED),
-            8 => Type::with_modifiers(TypeKind::Long, TypeModifiers::UNSIGNED),
-            _ => Type::with_modifiers(TypeKind::Int, TypeModifiers::UNSIGNED),
+            1 => self.types.uchar_id,
+            2 => self.types.ushort_id,
+            4 => self.types.uint_id,
+            8 => self.types.ulong_id,
+            _ => self.types.uint_id,
         };
+        let storage_bits = storage_size * 8;
 
         // 1. Load current storage unit value
         let old_val = self.alloc_pseudo();
@@ -2892,13 +2915,14 @@ impl<'a> Linearizer<'a> {
             old_val,
             base,
             byte_offset as i64,
-            storage_type.clone(),
+            storage_type,
+            storage_bits,
         ));
 
         // 2. Create mask for the bitfield bits: ~(((1 << width) - 1) << offset)
         let field_mask = ((1u64 << bit_width) - 1) << bit_offset;
         let clear_mask = !field_mask;
-        let clear_mask_val = self.emit_const(clear_mask as i64, storage_type.clone());
+        let clear_mask_val = self.emit_const(clear_mask as i64, storage_type);
 
         // 3. Clear the bitfield bits in old value
         let cleared = self.alloc_pseudo();
@@ -2907,30 +2931,33 @@ impl<'a> Linearizer<'a> {
             cleared,
             old_val,
             clear_mask_val,
-            storage_type.clone(),
+            storage_type,
+            storage_bits,
         ));
 
         // 4. Mask new value to bit_width and shift to position
         let value_mask = (1u64 << bit_width) - 1;
-        let value_mask_val = self.emit_const(value_mask as i64, storage_type.clone());
+        let value_mask_val = self.emit_const(value_mask as i64, storage_type);
         let masked_new = self.alloc_pseudo();
         self.emit(Instruction::binop(
             Opcode::And,
             masked_new,
             new_value,
             value_mask_val,
-            storage_type.clone(),
+            storage_type,
+            storage_bits,
         ));
 
         let positioned = if bit_offset > 0 {
-            let shift_val = self.emit_const(bit_offset as i64, Type::basic(TypeKind::Int));
+            let shift_val = self.emit_const(bit_offset as i64, self.types.int_id);
             let positioned = self.alloc_pseudo();
             self.emit(Instruction::binop(
                 Opcode::Shl,
                 positioned,
                 masked_new,
                 shift_val,
-                storage_type.clone(),
+                storage_type,
+                storage_bits,
             ));
             positioned
         } else {
@@ -2944,7 +2971,8 @@ impl<'a> Linearizer<'a> {
             combined,
             cleared,
             positioned,
-            storage_type.clone(),
+            storage_type,
+            storage_bits,
         ));
 
         // 6. Store back
@@ -2953,12 +2981,14 @@ impl<'a> Linearizer<'a> {
             base,
             byte_offset as i64,
             storage_type,
+            storage_bits,
         ));
     }
 
-    fn emit_unary(&mut self, op: UnaryOp, src: PseudoId, typ: Type) -> PseudoId {
+    fn emit_unary(&mut self, op: UnaryOp, src: PseudoId, typ: TypeId) -> PseudoId {
         let result = self.alloc_pseudo();
-        let is_float = typ.is_float();
+        let is_float = self.types.is_float(typ);
+        let size = self.types.size_bits(typ);
 
         let opcode = match op {
             UnaryOp::Neg => {
@@ -2971,11 +3001,25 @@ impl<'a> Linearizer<'a> {
             UnaryOp::Not => {
                 // Logical not: compare with 0
                 if is_float {
-                    let zero = self.emit_fconst(0.0, typ.clone());
-                    self.emit(Instruction::binop(Opcode::FCmpOEq, result, src, zero, typ));
+                    let zero = self.emit_fconst(0.0, typ);
+                    self.emit(Instruction::binop(
+                        Opcode::FCmpOEq,
+                        result,
+                        src,
+                        zero,
+                        typ,
+                        size,
+                    ));
                 } else {
-                    let zero = self.emit_const(0, typ.clone());
-                    self.emit(Instruction::binop(Opcode::SetEq, result, src, zero, typ));
+                    let zero = self.emit_const(0, typ);
+                    self.emit(Instruction::binop(
+                        Opcode::SetEq,
+                        result,
+                        src,
+                        zero,
+                        typ,
+                        size,
+                    ));
                 }
                 return result;
             }
@@ -2986,53 +3030,49 @@ impl<'a> Linearizer<'a> {
             UnaryOp::Deref => {
                 // Dereferencing a pointer-to-array gives an array, which is just an address
                 // (arrays decay to their first element's address)
-                if typ.kind == TypeKind::Array {
+                if self.types.kind(typ) == TypeKind::Array {
                     return src;
                 }
-                self.emit(Instruction::load(result, src, 0, typ));
+                self.emit(Instruction::load(result, src, 0, typ, size));
                 return result;
             }
             UnaryOp::PreInc => {
-                let is_ptr = typ.kind == TypeKind::Pointer;
+                let is_ptr = self.types.kind(typ) == TypeKind::Pointer;
                 let increment = if is_ptr {
-                    let elem_type = typ
-                        .base
-                        .as_ref()
-                        .map(|b| (**b).clone())
-                        .unwrap_or_else(|| Type::basic(TypeKind::Char));
-                    let elem_size = elem_type.size_bits() / 8;
-                    self.emit_const(elem_size as i64, Type::basic(TypeKind::Long))
+                    let elem_type = self.types.base_type(typ).unwrap_or(self.types.char_id);
+                    let elem_size = self.types.size_bits(elem_type) / 8;
+                    self.emit_const(elem_size as i64, self.types.long_id)
                 } else if is_float {
-                    self.emit_fconst(1.0, typ.clone())
+                    self.emit_fconst(1.0, typ)
                 } else {
-                    self.emit_const(1, typ.clone())
+                    self.emit_const(1, typ)
                 };
                 let opcode = if is_float { Opcode::FAdd } else { Opcode::Add };
-                self.emit(Instruction::binop(opcode, result, src, increment, typ));
+                self.emit(Instruction::binop(
+                    opcode, result, src, increment, typ, size,
+                ));
                 return result;
             }
             UnaryOp::PreDec => {
-                let is_ptr = typ.kind == TypeKind::Pointer;
+                let is_ptr = self.types.kind(typ) == TypeKind::Pointer;
                 let decrement = if is_ptr {
-                    let elem_type = typ
-                        .base
-                        .as_ref()
-                        .map(|b| (**b).clone())
-                        .unwrap_or_else(|| Type::basic(TypeKind::Char));
-                    let elem_size = elem_type.size_bits() / 8;
-                    self.emit_const(elem_size as i64, Type::basic(TypeKind::Long))
+                    let elem_type = self.types.base_type(typ).unwrap_or(self.types.char_id);
+                    let elem_size = self.types.size_bits(elem_type) / 8;
+                    self.emit_const(elem_size as i64, self.types.long_id)
                 } else if is_float {
-                    self.emit_fconst(1.0, typ.clone())
+                    self.emit_fconst(1.0, typ)
                 } else {
-                    self.emit_const(1, typ.clone())
+                    self.emit_const(1, typ)
                 };
                 let opcode = if is_float { Opcode::FSub } else { Opcode::Sub };
-                self.emit(Instruction::binop(opcode, result, src, decrement, typ));
+                self.emit(Instruction::binop(
+                    opcode, result, src, decrement, typ, size,
+                ));
                 return result;
             }
         };
 
-        self.emit(Instruction::unop(opcode, result, src, typ));
+        self.emit(Instruction::unop(opcode, result, src, typ, size));
         result
     }
 
@@ -3041,12 +3081,13 @@ impl<'a> Linearizer<'a> {
         op: BinaryOp,
         left: PseudoId,
         right: PseudoId,
-        result_typ: Type,
-        operand_typ: Type,
+        result_typ: TypeId,
+        operand_typ: TypeId,
     ) -> PseudoId {
         let result = self.alloc_pseudo();
 
-        let is_float = operand_typ.is_float();
+        let is_float = self.types.is_float(operand_typ);
+        let is_unsigned = self.types.is_unsigned(operand_typ);
 
         let opcode = match op {
             BinaryOp::Add => {
@@ -3073,7 +3114,7 @@ impl<'a> Linearizer<'a> {
             BinaryOp::Div => {
                 if is_float {
                     Opcode::FDiv
-                } else if operand_typ.is_unsigned() {
+                } else if is_unsigned {
                     Opcode::DivU
                 } else {
                     Opcode::DivS
@@ -3082,7 +3123,7 @@ impl<'a> Linearizer<'a> {
             BinaryOp::Mod => {
                 // Modulo is not supported for floats in hardware - use fmod() library call
                 // For now, use integer modulo (semantic analysis should catch float % float)
-                if operand_typ.is_unsigned() {
+                if is_unsigned {
                     Opcode::ModU
                 } else {
                     Opcode::ModS
@@ -3091,7 +3132,7 @@ impl<'a> Linearizer<'a> {
             BinaryOp::Lt => {
                 if is_float {
                     Opcode::FCmpOLt
-                } else if operand_typ.is_unsigned() {
+                } else if is_unsigned {
                     Opcode::SetB
                 } else {
                     Opcode::SetLt
@@ -3100,7 +3141,7 @@ impl<'a> Linearizer<'a> {
             BinaryOp::Gt => {
                 if is_float {
                     Opcode::FCmpOGt
-                } else if operand_typ.is_unsigned() {
+                } else if is_unsigned {
                     Opcode::SetA
                 } else {
                     Opcode::SetGt
@@ -3109,7 +3150,7 @@ impl<'a> Linearizer<'a> {
             BinaryOp::Le => {
                 if is_float {
                     Opcode::FCmpOLe
-                } else if operand_typ.is_unsigned() {
+                } else if is_unsigned {
                     Opcode::SetBe
                 } else {
                     Opcode::SetLe
@@ -3118,7 +3159,7 @@ impl<'a> Linearizer<'a> {
             BinaryOp::Ge => {
                 if is_float {
                     Opcode::FCmpOGe
-                } else if operand_typ.is_unsigned() {
+                } else if is_unsigned {
                     Opcode::SetAe
                 } else {
                     Opcode::SetGe
@@ -3149,7 +3190,7 @@ impl<'a> Linearizer<'a> {
             BinaryOp::Shl => Opcode::Shl,
             BinaryOp::Shr => {
                 // Logical shift for unsigned, arithmetic for signed
-                if operand_typ.is_unsigned() {
+                if is_unsigned {
                     Opcode::Lsr
                 } else {
                     Opcode::Asr
@@ -3178,19 +3219,24 @@ impl<'a> Linearizer<'a> {
             | Opcode::FCmpOGe => operand_typ,
             _ => result_typ,
         };
-        self.emit(Instruction::binop(opcode, result, left, right, insn_typ));
+        let insn_size = self.types.size_bits(insn_typ);
+        self.emit(Instruction::binop(
+            opcode, result, left, right, insn_typ, insn_size,
+        ));
         result
     }
 
-    fn emit_compare_zero(&mut self, val: PseudoId, operand_typ: &Type) -> PseudoId {
+    fn emit_compare_zero(&mut self, val: PseudoId, operand_typ: TypeId) -> PseudoId {
         let result = self.alloc_pseudo();
-        let zero = self.emit_const(0, operand_typ.clone());
+        let zero = self.emit_const(0, operand_typ);
+        let size = self.types.size_bits(operand_typ);
         self.emit(Instruction::binop(
             Opcode::SetNe,
             result,
             val,
             zero,
-            operand_typ.clone(),
+            operand_typ,
+            size,
         ));
         result
     }
@@ -3199,7 +3245,7 @@ impl<'a> Linearizer<'a> {
     /// If a is false, skip evaluation of b and return 0.
     /// Otherwise, evaluate b and return (b != 0).
     fn emit_logical_and(&mut self, left: &Expr, right: &Expr) -> PseudoId {
-        let result_typ = Type::basic(TypeKind::Int);
+        let result_typ = self.types.int_id;
 
         // Create basic blocks
         let eval_b_bb = self.alloc_bb();
@@ -3208,11 +3254,11 @@ impl<'a> Linearizer<'a> {
         // Evaluate LHS
         let left_typ = self.expr_type(left);
         let left_val = self.linearize_expr(left);
-        let left_bool = self.emit_compare_zero(left_val, &left_typ);
+        let left_bool = self.emit_compare_zero(left_val, left_typ);
 
         // Emit the short-circuit value (0) BEFORE the branch, while still in LHS block
         // This value will be used if we short-circuit (LHS is false)
-        let zero = self.emit_const(0, result_typ.clone());
+        let zero = self.emit_const(0, result_typ);
 
         // Get the block where LHS evaluation ended (may differ from initial block
         // if LHS contains nested control flow)
@@ -3227,7 +3273,7 @@ impl<'a> Linearizer<'a> {
         self.switch_bb(eval_b_bb);
         let right_typ = self.expr_type(right);
         let right_val = self.linearize_expr(right);
-        let right_bool = self.emit_compare_zero(right_val, &right_typ);
+        let right_bool = self.emit_compare_zero(right_val, right_typ);
 
         // Get the actual block where RHS evaluation ended (may differ from eval_b_bb
         // if RHS contains nested control flow like another &&/||)
@@ -3243,7 +3289,7 @@ impl<'a> Linearizer<'a> {
         // Result is 0 if we came from lhs_end_bb (LHS was false),
         // or right_bool if we came from rhs_end_bb (LHS was true)
         let result = self.alloc_pseudo();
-        let mut phi_insn = Instruction::phi(result, result_typ);
+        let mut phi_insn = Instruction::phi(result, result_typ, 32);
         phi_insn.phi_list.push((lhs_end_bb, zero));
         phi_insn.phi_list.push((rhs_end_bb, right_bool));
         self.emit(phi_insn);
@@ -3255,7 +3301,7 @@ impl<'a> Linearizer<'a> {
     /// If a is true, skip evaluation of b and return 1.
     /// Otherwise, evaluate b and return (b != 0).
     fn emit_logical_or(&mut self, left: &Expr, right: &Expr) -> PseudoId {
-        let result_typ = Type::basic(TypeKind::Int);
+        let result_typ = self.types.int_id;
 
         // Create basic blocks
         let eval_b_bb = self.alloc_bb();
@@ -3264,11 +3310,11 @@ impl<'a> Linearizer<'a> {
         // Evaluate LHS
         let left_typ = self.expr_type(left);
         let left_val = self.linearize_expr(left);
-        let left_bool = self.emit_compare_zero(left_val, &left_typ);
+        let left_bool = self.emit_compare_zero(left_val, left_typ);
 
         // Emit the short-circuit value (1) BEFORE the branch, while still in LHS block
         // This value will be used if we short-circuit (LHS is true)
-        let one = self.emit_const(1, result_typ.clone());
+        let one = self.emit_const(1, result_typ);
 
         // Get the block where LHS evaluation ended (may differ from initial block
         // if LHS contains nested control flow)
@@ -3283,7 +3329,7 @@ impl<'a> Linearizer<'a> {
         self.switch_bb(eval_b_bb);
         let right_typ = self.expr_type(right);
         let right_val = self.linearize_expr(right);
-        let right_bool = self.emit_compare_zero(right_val, &right_typ);
+        let right_bool = self.emit_compare_zero(right_val, right_typ);
 
         // Get the actual block where RHS evaluation ended (may differ from eval_b_bb
         // if RHS contains nested control flow like another &&/||)
@@ -3299,7 +3345,7 @@ impl<'a> Linearizer<'a> {
         // Result is 1 if we came from lhs_end_bb (LHS was true),
         // or right_bool if we came from rhs_end_bb (LHS was false)
         let result = self.alloc_pseudo();
-        let mut phi_insn = Instruction::phi(result, result_typ);
+        let mut phi_insn = Instruction::phi(result, result_typ, 32);
         phi_insn.phi_list.push((lhs_end_bb, one));
         phi_insn.phi_list.push((rhs_end_bb, right_bool));
         self.emit(phi_insn);
@@ -3313,23 +3359,22 @@ impl<'a> Linearizer<'a> {
         let value_typ = self.expr_type(value);
 
         // Check for pointer compound assignment (p += n or p -= n)
-        let is_ptr_arith = target_typ.kind == TypeKind::Pointer
-            && value_typ.is_integer()
+        let is_ptr_arith = self.types.kind(target_typ) == TypeKind::Pointer
+            && self.types.is_integer(value_typ)
             && (op == AssignOp::AddAssign || op == AssignOp::SubAssign);
 
         // Convert RHS to target type if needed (but not for pointer arithmetic)
         let rhs = if is_ptr_arith {
             // For pointer arithmetic, scale the integer by element size
-            let elem_type = target_typ
-                .base
-                .as_ref()
-                .map(|b| (**b).clone())
-                .unwrap_or_else(|| Type::basic(TypeKind::Char));
-            let elem_size = elem_type.size_bits() / 8;
-            let scale = self.emit_const(elem_size as i64, Type::basic(TypeKind::Long));
+            let elem_type = self
+                .types
+                .base_type(target_typ)
+                .unwrap_or(self.types.char_id);
+            let elem_size = self.types.size_bits(elem_type) / 8;
+            let scale = self.emit_const(elem_size as i64, self.types.long_id);
 
             // Extend the integer to 64-bit for proper arithmetic
-            let rhs_extended = self.emit_convert(rhs, &value_typ, &Type::basic(TypeKind::Long));
+            let rhs_extended = self.emit_convert(rhs, value_typ, self.types.long_id);
 
             let scaled = self.alloc_pseudo();
             let pseudo = Pseudo::reg(scaled, scaled.0);
@@ -3341,11 +3386,12 @@ impl<'a> Linearizer<'a> {
                 scaled,
                 rhs_extended,
                 scale,
-                Type::basic(TypeKind::Long),
+                self.types.long_id,
+                64,
             ));
             scaled
         } else {
-            self.emit_convert(rhs, &value_typ, &target_typ)
+            self.emit_convert(rhs, value_typ, target_typ)
         };
 
         let final_val = match op {
@@ -3359,7 +3405,8 @@ impl<'a> Linearizer<'a> {
                     func.add_pseudo(pseudo);
                 }
 
-                let is_float = target_typ.is_float();
+                let is_float = self.types.is_float(target_typ);
+                let is_unsigned = self.types.is_unsigned(target_typ);
                 let opcode = match op {
                     AssignOp::AddAssign => {
                         if is_float {
@@ -3385,7 +3432,7 @@ impl<'a> Linearizer<'a> {
                     AssignOp::DivAssign => {
                         if is_float {
                             Opcode::FDiv
-                        } else if target_typ.is_unsigned() {
+                        } else if is_unsigned {
                             Opcode::DivU
                         } else {
                             Opcode::DivS
@@ -3393,7 +3440,7 @@ impl<'a> Linearizer<'a> {
                     }
                     AssignOp::ModAssign => {
                         // Modulo not supported for floats
-                        if target_typ.is_unsigned() {
+                        if is_unsigned {
                             Opcode::ModU
                         } else {
                             Opcode::ModS
@@ -3404,7 +3451,7 @@ impl<'a> Linearizer<'a> {
                     AssignOp::XorAssign => Opcode::Xor,
                     AssignOp::ShlAssign => Opcode::Shl,
                     AssignOp::ShrAssign => {
-                        if target_typ.is_unsigned() {
+                        if is_unsigned {
                             Opcode::Lsr
                         } else {
                             Opcode::Asr
@@ -3415,16 +3462,20 @@ impl<'a> Linearizer<'a> {
 
                 // For pointer arithmetic, use Long type for the operation
                 let arith_type = if is_ptr_arith {
-                    Type::basic(TypeKind::Long)
+                    self.types.long_id
                 } else {
-                    target_typ.clone()
+                    target_typ
                 };
-                self.emit(Instruction::binop(opcode, result, lhs, rhs, arith_type));
+                let arith_size = self.types.size_bits(arith_type);
+                self.emit(Instruction::binop(
+                    opcode, result, lhs, rhs, arith_type, arith_size,
+                ));
                 result
             }
         };
 
         // Store based on target expression type
+        let target_size = self.types.size_bits(target_typ);
         match &target.kind {
             ExprKind::Ident { name, .. } => {
                 if let Some(local) = self.locals.get(name).cloned() {
@@ -3438,7 +3489,13 @@ impl<'a> Linearizer<'a> {
                             if let Some(func) = &mut self.current_func {
                                 func.add_pseudo(pseudo);
                             }
-                            self.emit(Instruction::store(final_val, sym_id, 0, target_typ.clone()));
+                            self.emit(Instruction::store(
+                                final_val,
+                                sym_id,
+                                0,
+                                target_typ,
+                                target_size,
+                            ));
                         }
                     } else {
                         // Regular local variable: emit Store
@@ -3446,7 +3503,8 @@ impl<'a> Linearizer<'a> {
                             final_val,
                             local.sym,
                             0,
-                            target_typ.clone(),
+                            target_typ,
+                            target_size,
                         ));
                     }
                 } else if self.var_map.contains_key(name) {
@@ -3461,22 +3519,29 @@ impl<'a> Linearizer<'a> {
                     if let Some(func) = &mut self.current_func {
                         func.add_pseudo(pseudo);
                     }
-                    self.emit(Instruction::store(final_val, sym_id, 0, target_typ.clone()));
+                    self.emit(Instruction::store(
+                        final_val,
+                        sym_id,
+                        0,
+                        target_typ,
+                        target_size,
+                    ));
                 }
             }
             ExprKind::Member { expr, member } => {
                 // Struct member: get address and store with offset
                 let base = self.linearize_lvalue(expr);
                 let struct_type = self.expr_type(expr);
-                let member_info = struct_type
-                    .find_member(member)
-                    .unwrap_or_else(|| MemberInfo {
-                        offset: 0,
-                        typ: target_typ.clone(),
-                        bit_offset: None,
-                        bit_width: None,
-                        storage_unit_size: None,
-                    });
+                let member_info =
+                    self.types
+                        .find_member(struct_type, member)
+                        .unwrap_or(MemberInfo {
+                            offset: 0,
+                            typ: target_typ,
+                            bit_offset: None,
+                            bit_width: None,
+                            storage_unit_size: None,
+                        });
                 if let (Some(bit_offset), Some(bit_width), Some(storage_size)) = (
                     member_info.bit_offset,
                     member_info.bit_width,
@@ -3492,11 +3557,13 @@ impl<'a> Linearizer<'a> {
                         final_val,
                     );
                 } else {
+                    let member_size = self.types.size_bits(member_info.typ);
                     self.emit(Instruction::store(
                         final_val,
                         base,
                         member_info.offset as i64,
                         member_info.typ,
+                        member_size,
                     ));
                 }
             }
@@ -3504,20 +3571,17 @@ impl<'a> Linearizer<'a> {
                 // Pointer member: pointer value is the base address
                 let ptr = self.linearize_expr(expr);
                 let ptr_type = self.expr_type(expr);
-                let struct_type = ptr_type
-                    .base
-                    .as_ref()
-                    .map(|b| b.as_ref().clone())
-                    .unwrap_or_else(|| target_typ.clone());
-                let member_info = struct_type
-                    .find_member(member)
-                    .unwrap_or_else(|| MemberInfo {
-                        offset: 0,
-                        typ: target_typ.clone(),
-                        bit_offset: None,
-                        bit_width: None,
-                        storage_unit_size: None,
-                    });
+                let struct_type = self.types.base_type(ptr_type).unwrap_or(target_typ);
+                let member_info =
+                    self.types
+                        .find_member(struct_type, member)
+                        .unwrap_or(MemberInfo {
+                            offset: 0,
+                            typ: target_typ,
+                            bit_offset: None,
+                            bit_width: None,
+                            storage_unit_size: None,
+                        });
                 if let (Some(bit_offset), Some(bit_width), Some(storage_size)) = (
                     member_info.bit_offset,
                     member_info.bit_width,
@@ -3533,11 +3597,13 @@ impl<'a> Linearizer<'a> {
                         final_val,
                     );
                 } else {
+                    let member_size = self.types.size_bits(member_info.typ);
                     self.emit(Instruction::store(
                         final_val,
                         ptr,
                         member_info.offset as i64,
                         member_info.typ,
+                        member_size,
                     ));
                 }
             }
@@ -3547,7 +3613,13 @@ impl<'a> Linearizer<'a> {
             } => {
                 // Dereference: store to the pointer address
                 let ptr = self.linearize_expr(operand);
-                self.emit(Instruction::store(final_val, ptr, 0, target_typ.clone()));
+                self.emit(Instruction::store(
+                    final_val,
+                    ptr,
+                    0,
+                    target_typ,
+                    target_size,
+                ));
             }
             ExprKind::Index { array, index } => {
                 // Array subscript: compute address and store
@@ -3555,8 +3627,9 @@ impl<'a> Linearizer<'a> {
                 let array_type = self.expr_type(array);
                 let index_type = self.expr_type(index);
 
+                let array_kind = self.types.kind(array_type);
                 let (ptr_expr, idx_expr, idx_type) =
-                    if array_type.kind == TypeKind::Pointer || array_type.kind == TypeKind::Array {
+                    if array_kind == TypeKind::Pointer || array_kind == TypeKind::Array {
                         (array, index, index_type)
                     } else {
                         // Swap: index is actually the pointer/array
@@ -3565,26 +3638,40 @@ impl<'a> Linearizer<'a> {
 
                 let arr = self.linearize_expr(ptr_expr);
                 let idx = self.linearize_expr(idx_expr);
-                let elem_size = target_typ.size_bits() / 8;
-                let elem_size_val = self.emit_const(elem_size as i64, Type::basic(TypeKind::Long));
+                let elem_size = target_size / 8;
+                let elem_size_val = self.emit_const(elem_size as i64, self.types.long_id);
 
                 // Sign-extend index to 64-bit for proper pointer arithmetic (negative indices)
-                let idx_extended = self.emit_convert(idx, &idx_type, &Type::basic(TypeKind::Long));
+                let idx_extended = self.emit_convert(idx, idx_type, self.types.long_id);
 
                 let offset = self.alloc_pseudo();
-                let ptr_typ = Type::basic(TypeKind::Long);
+                let ptr_typ = self.types.long_id;
                 self.emit(Instruction::binop(
                     Opcode::Mul,
                     offset,
                     idx_extended,
                     elem_size_val,
-                    ptr_typ.clone(),
+                    ptr_typ,
+                    64,
                 ));
 
                 let addr = self.alloc_pseudo();
-                self.emit(Instruction::binop(Opcode::Add, addr, arr, offset, ptr_typ));
+                self.emit(Instruction::binop(
+                    Opcode::Add,
+                    addr,
+                    arr,
+                    offset,
+                    ptr_typ,
+                    64,
+                ));
 
-                self.emit(Instruction::store(final_val, addr, 0, target_typ.clone()));
+                self.emit(Instruction::store(
+                    final_val,
+                    addr,
+                    0,
+                    target_typ,
+                    target_size,
+                ));
             }
             _ => {
                 // Other lvalues - should not happen for valid C code
@@ -3601,18 +3688,25 @@ impl<'a> Linearizer<'a> {
 
 /// Linearize an AST to IR (convenience wrapper for tests)
 #[cfg(test)]
-pub fn linearize(tu: &TranslationUnit, symbols: &SymbolTable) -> Module {
-    linearize_with_debug(tu, symbols, false, None)
+pub fn linearize(
+    tu: &TranslationUnit,
+    symbols: &SymbolTable,
+    types: &TypeTable,
+    target: &Target,
+) -> Module {
+    linearize_with_debug(tu, symbols, types, target, false, None)
 }
 
 /// Linearize an AST to IR with debug info support
 pub fn linearize_with_debug(
     tu: &TranslationUnit,
     symbols: &SymbolTable,
+    types: &TypeTable,
+    target: &Target,
     debug: bool,
     source_file: Option<&str>,
 ) -> Module {
-    let mut linearizer = Linearizer::new(symbols);
+    let mut linearizer = Linearizer::new(symbols, types, target);
     let mut module = linearizer.linearize(tu);
     module.debug = debug;
     if let Some(path) = source_file {
@@ -3642,14 +3736,15 @@ mod tests {
         }
     }
 
-    fn test_linearize(tu: &TranslationUnit) -> Module {
+    fn test_linearize(tu: &TranslationUnit, types: &TypeTable) -> Module {
         let symbols = SymbolTable::new();
-        linearize(tu, &symbols)
+        let target = Target::host();
+        linearize(tu, &symbols, types, &target)
     }
 
-    fn make_simple_func(name: &str, body: Stmt) -> FunctionDef {
+    fn make_simple_func(name: &str, body: Stmt, types: &TypeTable) -> FunctionDef {
         FunctionDef {
-            return_type: Type::basic(TypeKind::Int),
+            return_type: types.int_id,
             name: name.to_string(),
             params: vec![],
             body,
@@ -3659,12 +3754,13 @@ mod tests {
 
     #[test]
     fn test_linearize_empty_function() {
-        let func = make_simple_func("test", Stmt::Block(vec![]));
+        let types = TypeTable::new();
+        let func = make_simple_func("test", Stmt::Block(vec![]), &types);
         let tu = TranslationUnit {
             items: vec![ExternalDecl::FunctionDef(func)],
         };
 
-        let module = test_linearize(&tu);
+        let module = test_linearize(&tu, &types);
         assert_eq!(module.functions.len(), 1);
         assert_eq!(module.functions[0].name, "test");
         assert!(!module.functions[0].blocks.is_empty());
@@ -3672,68 +3768,79 @@ mod tests {
 
     #[test]
     fn test_linearize_return() {
-        let func = make_simple_func("test", Stmt::Return(Some(Expr::int(42))));
+        let types = TypeTable::new();
+        let func = make_simple_func("test", Stmt::Return(Some(Expr::int(42, &types))), &types);
         let tu = TranslationUnit {
             items: vec![ExternalDecl::FunctionDef(func)],
         };
 
-        let module = test_linearize(&tu);
+        let module = test_linearize(&tu, &types);
         let ir = format!("{}", module);
         assert!(ir.contains("ret"));
     }
 
     #[test]
     fn test_linearize_if() {
+        let types = TypeTable::new();
         let func = make_simple_func(
             "test",
             Stmt::If {
-                cond: Expr::int(1),
-                then_stmt: Box::new(Stmt::Return(Some(Expr::int(1)))),
-                else_stmt: Some(Box::new(Stmt::Return(Some(Expr::int(0))))),
+                cond: Expr::int(1, &types),
+                then_stmt: Box::new(Stmt::Return(Some(Expr::int(1, &types)))),
+                else_stmt: Some(Box::new(Stmt::Return(Some(Expr::int(0, &types))))),
             },
+            &types,
         );
         let tu = TranslationUnit {
             items: vec![ExternalDecl::FunctionDef(func)],
         };
 
-        let module = test_linearize(&tu);
+        let module = test_linearize(&tu, &types);
         let ir = format!("{}", module);
         assert!(ir.contains("cbr")); // Conditional branch
     }
 
     #[test]
     fn test_linearize_while() {
+        let types = TypeTable::new();
         let func = make_simple_func(
             "test",
             Stmt::While {
-                cond: Expr::int(1),
+                cond: Expr::int(1, &types),
                 body: Box::new(Stmt::Break),
             },
+            &types,
         );
         let tu = TranslationUnit {
             items: vec![ExternalDecl::FunctionDef(func)],
         };
 
-        let module = test_linearize(&tu);
+        let module = test_linearize(&tu, &types);
         assert!(module.functions[0].blocks.len() >= 3); // cond, body, exit
     }
 
     #[test]
     fn test_linearize_for() {
+        let types = TypeTable::new();
         // for (int i = 0; i < 10; i++) { }
-        let int_type = Type::basic(TypeKind::Int);
-        let i_var = Expr::var_typed("i", int_type.clone());
+        let int_type = types.int_id;
+        let i_var = Expr::var_typed("i", int_type);
         let func = make_simple_func(
             "test",
             Stmt::For {
                 init: Some(ForInit::Declaration(Declaration {
                     declarators: vec![crate::parse::ast::InitDeclarator {
                         name: "i".to_string(),
-                        typ: int_type.clone(),
-                        init: Some(Expr::int(0)),
+                        typ: int_type,
+                        init: Some(Expr::int(0, &types)),
                     }],
                 })),
-                cond: Some(Expr::binary(BinaryOp::Lt, i_var.clone(), Expr::int(10))),
+                cond: Some(Expr::binary(
+                    BinaryOp::Lt,
+                    i_var.clone(),
+                    Expr::int(10, &types),
+                    &types,
+                )),
                 post: Some(Expr::typed(
                     ExprKind::PostInc(Box::new(i_var)),
                     int_type,
@@ -3741,31 +3848,40 @@ mod tests {
                 )),
                 body: Box::new(Stmt::Empty),
             },
+            &types,
         );
         let tu = TranslationUnit {
             items: vec![ExternalDecl::FunctionDef(func)],
         };
 
-        let module = test_linearize(&tu);
+        let module = test_linearize(&tu, &types);
         assert!(module.functions[0].blocks.len() >= 4); // entry, cond, body, post, exit
     }
 
     #[test]
     fn test_linearize_binary_expr() {
+        let types = TypeTable::new();
         // return 1 + 2 * 3;
         let func = make_simple_func(
             "test",
             Stmt::Return(Some(Expr::binary(
                 BinaryOp::Add,
-                Expr::int(1),
-                Expr::binary(BinaryOp::Mul, Expr::int(2), Expr::int(3)),
+                Expr::int(1, &types),
+                Expr::binary(
+                    BinaryOp::Mul,
+                    Expr::int(2, &types),
+                    Expr::int(3, &types),
+                    &types,
+                ),
+                &types,
             ))),
+            &types,
         );
         let tu = TranslationUnit {
             items: vec![ExternalDecl::FunctionDef(func)],
         };
 
-        let module = test_linearize(&tu);
+        let module = test_linearize(&tu, &types);
         let ir = format!("{}", module);
         assert!(ir.contains("mul"));
         assert!(ir.contains("add"));
@@ -3773,24 +3889,26 @@ mod tests {
 
     #[test]
     fn test_linearize_function_with_params() {
-        let int_type = Type::basic(TypeKind::Int);
+        let types = TypeTable::new();
+        let int_type = types.int_id;
         let func = FunctionDef {
-            return_type: int_type.clone(),
+            return_type: int_type,
             name: "add".to_string(),
             params: vec![
                 Parameter {
                     name: Some("a".to_string()),
-                    typ: int_type.clone(),
+                    typ: int_type,
                 },
                 Parameter {
                     name: Some("b".to_string()),
-                    typ: int_type.clone(),
+                    typ: int_type,
                 },
             ],
             body: Stmt::Return(Some(Expr::binary(
                 BinaryOp::Add,
-                Expr::var_typed("a", int_type.clone()),
+                Expr::var_typed("a", int_type),
                 Expr::var_typed("b", int_type),
+                &types,
             ))),
             pos: test_pos(),
         };
@@ -3798,7 +3916,7 @@ mod tests {
             items: vec![ExternalDecl::FunctionDef(func)],
         };
 
-        let module = test_linearize(&tu);
+        let module = test_linearize(&tu, &types);
         let ir = format!("{}", module);
         assert!(ir.contains("add"));
         assert!(ir.contains("%a"));
@@ -3807,18 +3925,21 @@ mod tests {
 
     #[test]
     fn test_linearize_call() {
+        let types = TypeTable::new();
         let func = make_simple_func(
             "test",
             Stmt::Return(Some(Expr::call(
                 Expr::var("foo"),
-                vec![Expr::int(1), Expr::int(2)],
+                vec![Expr::int(1, &types), Expr::int(2, &types)],
+                &types,
             ))),
+            &types,
         );
         let tu = TranslationUnit {
             items: vec![ExternalDecl::FunctionDef(func)],
         };
 
-        let module = test_linearize(&tu);
+        let module = test_linearize(&tu, &types);
         let ir = format!("{}", module);
         assert!(ir.contains("call"));
         assert!(ir.contains("foo"));
@@ -3826,38 +3947,45 @@ mod tests {
 
     #[test]
     fn test_linearize_comparison() {
+        let types = TypeTable::new();
         let func = make_simple_func(
             "test",
-            Stmt::Return(Some(Expr::binary(BinaryOp::Lt, Expr::int(1), Expr::int(2)))),
+            Stmt::Return(Some(Expr::binary(
+                BinaryOp::Lt,
+                Expr::int(1, &types),
+                Expr::int(2, &types),
+                &types,
+            ))),
+            &types,
         );
         let tu = TranslationUnit {
             items: vec![ExternalDecl::FunctionDef(func)],
         };
 
-        let module = test_linearize(&tu);
+        let module = test_linearize(&tu, &types);
         let ir = format!("{}", module);
         assert!(ir.contains("setlt"));
     }
 
     #[test]
     fn test_linearize_unsigned_comparison() {
-        use crate::types::TypeModifiers;
+        let types = TypeTable::new();
 
         // Create unsigned comparison: (unsigned)1 < (unsigned)2
-        let uint_type = Type::with_modifiers(TypeKind::Int, TypeModifiers::UNSIGNED);
-        let mut left = Expr::int(1);
-        left.typ = Some(uint_type.clone());
-        let mut right = Expr::int(2);
+        let uint_type = types.uint_id;
+        let mut left = Expr::int(1, &types);
+        left.typ = Some(uint_type);
+        let mut right = Expr::int(2, &types);
         right.typ = Some(uint_type);
-        let mut cmp = Expr::binary(BinaryOp::Lt, left, right);
-        cmp.typ = Some(Type::basic(TypeKind::Int));
+        let mut cmp = Expr::binary(BinaryOp::Lt, left, right, &types);
+        cmp.typ = Some(types.int_id);
 
-        let func = make_simple_func("test", Stmt::Return(Some(cmp)));
+        let func = make_simple_func("test", Stmt::Return(Some(cmp)), &types);
         let tu = TranslationUnit {
             items: vec![ExternalDecl::FunctionDef(func)],
         };
 
-        let module = test_linearize(&tu);
+        let module = test_linearize(&tu, &types);
         let ir = format!("{}", module);
         // Should use unsigned comparison opcode (setb = set if below)
         assert!(
@@ -3869,12 +3997,13 @@ mod tests {
 
     #[test]
     fn test_display_module() {
-        let func = make_simple_func("main", Stmt::Return(Some(Expr::int(0))));
+        let types = TypeTable::new();
+        let func = make_simple_func("main", Stmt::Return(Some(Expr::int(0, &types))), &types);
         let tu = TranslationUnit {
             items: vec![ExternalDecl::FunctionDef(func)],
         };
 
-        let module = test_linearize(&tu);
+        let module = test_linearize(&tu, &types);
         let ir = format!("{}", module);
 
         // Should have proper structure
@@ -3886,36 +4015,40 @@ mod tests {
 
     #[test]
     fn test_type_propagation_expr_type() {
-        use crate::types::TypeModifiers;
+        let types = TypeTable::new();
 
         // Create an expression with a type annotation
-        let mut expr = Expr::int(42);
+        let mut expr = Expr::int(42, &types);
         // Simulate type evaluation having set the type
-        expr.typ = Some(Type::basic(TypeKind::Int));
+        expr.typ = Some(types.int_id);
 
         // Create linearizer and test that expr_type reads from the expression
         let symbols = SymbolTable::new();
-        let linearizer = Linearizer::new(&symbols);
+        let target = Target::host();
+        let linearizer = Linearizer::new(&symbols, &types, &target);
         let typ = linearizer.expr_type(&expr);
-        assert_eq!(typ.kind, TypeKind::Int);
+        assert_eq!(types.kind(typ), TypeKind::Int);
 
         // Test with unsigned type
-        let mut unsigned_expr = Expr::int(42);
-        unsigned_expr.typ = Some(Type::with_modifiers(TypeKind::Int, TypeModifiers::UNSIGNED));
+        let mut unsigned_expr = Expr::int(42, &types);
+        unsigned_expr.typ = Some(types.uint_id);
         let typ = linearizer.expr_type(&unsigned_expr);
-        assert!(typ.is_unsigned());
+        assert!(types.is_unsigned(typ));
     }
 
     #[test]
     fn test_type_propagation_double_literal() {
+        let types = TypeTable::new();
+
         // Create a double literal
         let mut expr = Expr::new(ExprKind::FloatLit(3.14), test_pos());
-        expr.typ = Some(Type::basic(TypeKind::Double));
+        expr.typ = Some(types.double_id);
 
         let symbols = SymbolTable::new();
-        let linearizer = Linearizer::new(&symbols);
+        let target = Target::host();
+        let linearizer = Linearizer::new(&symbols, &types, &target);
         let typ = linearizer.expr_type(&expr);
-        assert_eq!(typ.kind, TypeKind::Double);
+        assert_eq!(types.kind(typ), TypeKind::Double);
     }
 
     // ========================================================================
@@ -3923,26 +4056,28 @@ mod tests {
     // ========================================================================
 
     /// Helper to linearize without SSA conversion (for comparing before/after)
-    fn linearize_no_ssa(tu: &TranslationUnit) -> Module {
+    fn linearize_no_ssa(tu: &TranslationUnit, types: &TypeTable) -> Module {
         let symbols = SymbolTable::new();
-        let mut linearizer = Linearizer::new_no_ssa(&symbols);
+        let target = Target::host();
+        let mut linearizer = Linearizer::new_no_ssa(&symbols, types, &target);
         linearizer.linearize(tu)
     }
 
     #[test]
     fn test_local_var_emits_load_store() {
+        let types = TypeTable::new();
         // int test() { int x = 1; return x; }
-        let int_type = Type::basic(TypeKind::Int);
+        let int_type = types.int_id;
         let func = FunctionDef {
-            return_type: int_type.clone(),
+            return_type: int_type,
             name: "test".to_string(),
             params: vec![],
             body: Stmt::Block(vec![
                 BlockItem::Declaration(Declaration {
                     declarators: vec![crate::parse::ast::InitDeclarator {
                         name: "x".to_string(),
-                        typ: int_type.clone(),
-                        init: Some(Expr::int(1)),
+                        typ: int_type,
+                        init: Some(Expr::int(1, &types)),
                     }],
                 }),
                 BlockItem::Statement(Stmt::Return(Some(Expr::var_typed("x", int_type)))),
@@ -3954,7 +4089,7 @@ mod tests {
         };
 
         // Without SSA, should have store and load
-        let module = linearize_no_ssa(&tu);
+        let module = linearize_no_ssa(&tu, &types);
         let ir = format!("{}", module);
         assert!(
             ir.contains("store"),
@@ -3970,35 +4105,37 @@ mod tests {
 
     #[test]
     fn test_ssa_converts_local_to_phi() {
+        let types = TypeTable::new();
         // int test(int cond) {
         //     int x = 1;
         //     if (cond) x = 2;
         //     return x;
         // }
-        let int_type = Type::basic(TypeKind::Int);
+        let int_type = types.int_id;
 
         let func = FunctionDef {
-            return_type: int_type.clone(),
+            return_type: int_type,
             name: "test".to_string(),
             params: vec![Parameter {
                 name: Some("cond".to_string()),
-                typ: int_type.clone(),
+                typ: int_type,
             }],
             body: Stmt::Block(vec![
                 // int x = 1;
                 BlockItem::Declaration(Declaration {
                     declarators: vec![crate::parse::ast::InitDeclarator {
                         name: "x".to_string(),
-                        typ: int_type.clone(),
-                        init: Some(Expr::int(1)),
+                        typ: int_type,
+                        init: Some(Expr::int(1, &types)),
                     }],
                 }),
                 // if (cond) x = 2;
                 BlockItem::Statement(Stmt::If {
-                    cond: Expr::var_typed("cond", int_type.clone()),
+                    cond: Expr::var_typed("cond", int_type),
                     then_stmt: Box::new(Stmt::Expr(Expr::assign(
-                        Expr::var_typed("x", int_type.clone()),
-                        Expr::int(2),
+                        Expr::var_typed("x", int_type),
+                        Expr::int(2, &types),
+                        &types,
                     ))),
                     else_stmt: None,
                 }),
@@ -4012,7 +4149,7 @@ mod tests {
         };
 
         // With SSA, should have phi node at merge point
-        let module = test_linearize(&tu);
+        let module = test_linearize(&tu, &types);
         let ir = format!("{}", module);
 
         // Should have a phi instruction
@@ -4025,17 +4162,18 @@ mod tests {
 
     #[test]
     fn test_ssa_loop_variable() {
+        let types = TypeTable::new();
         // int test() {
         //     int i = 0;
         //     while (i < 10) { i = i + 1; }
         //     return i;
         // }
-        let int_type = Type::basic(TypeKind::Int);
+        let int_type = types.int_id;
 
-        let i_var = || Expr::var_typed("i", int_type.clone());
+        let i_var = || Expr::var_typed("i", int_type);
 
         let func = FunctionDef {
-            return_type: int_type.clone(),
+            return_type: int_type,
             name: "test".to_string(),
             params: vec![],
             body: Stmt::Block(vec![
@@ -4043,16 +4181,17 @@ mod tests {
                 BlockItem::Declaration(Declaration {
                     declarators: vec![crate::parse::ast::InitDeclarator {
                         name: "i".to_string(),
-                        typ: int_type.clone(),
-                        init: Some(Expr::int(0)),
+                        typ: int_type,
+                        init: Some(Expr::int(0, &types)),
                     }],
                 }),
                 // while (i < 10) { i = i + 1; }
                 BlockItem::Statement(Stmt::While {
-                    cond: Expr::binary(BinaryOp::Lt, i_var(), Expr::int(10)),
+                    cond: Expr::binary(BinaryOp::Lt, i_var(), Expr::int(10, &types), &types),
                     body: Box::new(Stmt::Expr(Expr::assign(
                         i_var(),
-                        Expr::binary(BinaryOp::Add, i_var(), Expr::int(1)),
+                        Expr::binary(BinaryOp::Add, i_var(), Expr::int(1, &types), &types),
+                        &types,
                     ))),
                 }),
                 // return i;
@@ -4065,7 +4204,7 @@ mod tests {
         };
 
         // With SSA, should have phi node at loop header
-        let module = test_linearize(&tu);
+        let module = test_linearize(&tu, &types);
         let ir = format!("{}", module);
 
         // Loop should have a phi at the condition block
@@ -4074,29 +4213,31 @@ mod tests {
 
     #[test]
     fn test_short_circuit_and() {
+        let types = TypeTable::new();
         // int test(int a, int b) {
         //     return a && b;
         // }
         // Short-circuit: if a is false, don't evaluate b
-        let int_type = Type::basic(TypeKind::Int);
+        let int_type = types.int_id;
 
         let func = FunctionDef {
-            return_type: int_type.clone(),
+            return_type: int_type,
             name: "test".to_string(),
             params: vec![
                 Parameter {
                     name: Some("a".to_string()),
-                    typ: int_type.clone(),
+                    typ: int_type,
                 },
                 Parameter {
                     name: Some("b".to_string()),
-                    typ: int_type.clone(),
+                    typ: int_type,
                 },
             ],
             body: Stmt::Return(Some(Expr::binary(
                 BinaryOp::LogAnd,
-                Expr::var_typed("a", int_type.clone()),
+                Expr::var_typed("a", int_type),
                 Expr::var_typed("b", int_type),
+                &types,
             ))),
             pos: test_pos(),
         };
@@ -4104,7 +4245,7 @@ mod tests {
             items: vec![ExternalDecl::FunctionDef(func)],
         };
 
-        let module = test_linearize(&tu);
+        let module = test_linearize(&tu, &types);
         let ir = format!("{}", module);
 
         // Short-circuit AND should have:
@@ -4124,29 +4265,31 @@ mod tests {
 
     #[test]
     fn test_short_circuit_or() {
+        let types = TypeTable::new();
         // int test(int a, int b) {
         //     return a || b;
         // }
         // Short-circuit: if a is true, don't evaluate b
-        let int_type = Type::basic(TypeKind::Int);
+        let int_type = types.int_id;
 
         let func = FunctionDef {
-            return_type: int_type.clone(),
+            return_type: int_type,
             name: "test".to_string(),
             params: vec![
                 Parameter {
                     name: Some("a".to_string()),
-                    typ: int_type.clone(),
+                    typ: int_type,
                 },
                 Parameter {
                     name: Some("b".to_string()),
-                    typ: int_type.clone(),
+                    typ: int_type,
                 },
             ],
             body: Stmt::Return(Some(Expr::binary(
                 BinaryOp::LogOr,
-                Expr::var_typed("a", int_type.clone()),
+                Expr::var_typed("a", int_type),
                 Expr::var_typed("b", int_type),
+                &types,
             ))),
             pos: test_pos(),
         };
@@ -4154,7 +4297,7 @@ mod tests {
             items: vec![ExternalDecl::FunctionDef(func)],
         };
 
-        let module = test_linearize(&tu);
+        let module = test_linearize(&tu, &types);
         let ir = format!("{}", module);
 
         // Short-circuit OR should have:

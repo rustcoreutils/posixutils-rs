@@ -269,3 +269,44 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("struct_pointer", code), 0);
 }
+
+// ============================================================================
+// Large Struct Return: Return struct >8 bytes requiring sret (hidden pointer)
+// This tests the sret ABI where large structs are returned via a hidden pointer.
+// On ARM64, the sret pointer goes in X8 (not X0 like other args).
+// On x86-64, the sret pointer goes in RDI (first arg register).
+// ============================================================================
+
+#[test]
+fn struct_return_large() {
+    let code = r#"
+struct large {
+    long first;
+    long second;
+};
+
+struct large make_large(long a, long b) {
+    struct large s;
+    s.first = a;
+    s.second = b;
+    return s;
+}
+
+int main(void) {
+    struct large result;
+    result = make_large(300000, 200000);
+
+    // Verify the struct was correctly returned
+    if (result.first != 300000) return 1;
+    if (result.second != 200000) return 2;
+
+    // Test with different values to ensure correct member mapping
+    result = make_large(42, 84);
+    if (result.first != 42) return 3;
+    if (result.second != 84) return 4;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("struct_return_large", code), 0);
+}

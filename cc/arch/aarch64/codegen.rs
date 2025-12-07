@@ -1518,20 +1518,12 @@ impl Aarch64CodeGen {
         frame_info: &(i32, Vec<Reg>),
         types: &TypeTable,
     ) {
-        // Emit block label using LIR (include function name for uniqueness)
-        if let Some(label) = &block.label {
-            // LIR: named block label (using Raw since format differs from standard)
-            self.push_lir(Aarch64Inst::Directive(Directive::Raw(format!(
-                ".L_{}_{}:",
-                self.current_fn, label
-            ))));
-        } else {
-            // LIR: numbered block label
-            self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(Label::new(
-                &self.current_fn,
-                block.id.0,
-            ))));
-        }
+        // Always emit block ID label for consistency with jumps
+        // (jumps reference blocks by ID, not by C label name)
+        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(Label::new(
+            &self.current_fn,
+            block.id.0,
+        ))));
 
         // Emit instructions
         for insn in &block.insns {

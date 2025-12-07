@@ -850,3 +850,90 @@ int main(void) {
     assert_eq!(exit_code, 0, "enum_switch: switch on enum should work");
     cleanup_exe(&exe);
 }
+
+// ============================================================================
+// Goto Statement Tests
+// ============================================================================
+
+/// Test: Basic forward goto
+#[test]
+fn test_goto_forward() {
+    let c_file = create_c_file(
+        "goto_forward",
+        r#"
+int main(void) {
+    int x = 1;
+    goto skip;
+    x = 99;  // Should be skipped
+skip:
+    return x;  // Should return 1
+}
+"#,
+    );
+
+    let exe = compile(&c_file.path().to_path_buf());
+    assert!(exe.is_some(), "goto_forward: compilation should succeed");
+    let exit_code = run(exe.as_ref().unwrap());
+    assert_eq!(
+        exit_code, 1,
+        "goto_forward: should skip assignment and return 1"
+    );
+    cleanup_exe(&exe);
+}
+
+/// Test: Backward goto (loop-like pattern)
+#[test]
+fn test_goto_backward() {
+    let c_file = create_c_file(
+        "goto_backward",
+        r#"
+int main(void) {
+    int sum = 0;
+    int i = 1;
+loop:
+    sum = sum + i;
+    i = i + 1;
+    if (i <= 5)
+        goto loop;
+    return sum;  // Should return 1+2+3+4+5 = 15
+}
+"#,
+    );
+
+    let exe = compile(&c_file.path().to_path_buf());
+    assert!(exe.is_some(), "goto_backward: compilation should succeed");
+    let exit_code = run(exe.as_ref().unwrap());
+    assert_eq!(exit_code, 15, "goto_backward: loop via goto should sum 1-5");
+    cleanup_exe(&exe);
+}
+
+/// Test: Multiple labels and gotos
+#[test]
+fn test_goto_multiple_labels() {
+    let c_file = create_c_file(
+        "goto_multi",
+        r#"
+int main(void) {
+    int x = 0;
+    goto first;
+second:
+    x = x + 10;
+    goto done;
+first:
+    x = x + 1;
+    goto second;
+done:
+    return x;  // Should return 11
+}
+"#,
+    );
+
+    let exe = compile(&c_file.path().to_path_buf());
+    assert!(exe.is_some(), "goto_multi: compilation should succeed");
+    let exit_code = run(exe.as_ref().unwrap());
+    assert_eq!(
+        exit_code, 11,
+        "goto_multi: should follow first->second->done path"
+    );
+    cleanup_exe(&exe);
+}

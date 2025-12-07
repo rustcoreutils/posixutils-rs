@@ -379,6 +379,36 @@ impl<'a> Preprocessor<'a> {
             self.define_macro(Macro::predefined(name, Some(value)));
         }
 
+        // Type definition macros (for <stdint.h> and <stddef.h>)
+        for (name, value) in arch::get_type_macros(self.target) {
+            self.define_macro(Macro::predefined(name, Some(value)));
+        }
+
+        // Fixed-width integer limit macros (for <stdint.h>)
+        for (name, value) in arch::get_stdint_limit_macros(self.target) {
+            self.define_macro(Macro::predefined(name, Some(value)));
+        }
+
+        // Integer constant suffix macros
+        for (name, value) in arch::get_suffix_macros(self.target) {
+            self.define_macro(Macro::predefined(name, Some(value)));
+        }
+
+        // Format specifier macros (for <inttypes.h>)
+        for (name, value) in arch::get_format_macros(self.target) {
+            self.define_macro(Macro::predefined(name, Some(value)));
+        }
+
+        // Additional sizeof macros
+        for (name, value) in arch::get_additional_sizeof_macros(self.target) {
+            self.define_macro(Macro::predefined(name, Some(value)));
+        }
+
+        // Miscellaneous macros
+        for (name, value) in arch::get_misc_macros(self.target) {
+            self.define_macro(Macro::predefined(name, Some(value)));
+        }
+
         // OS macros
         for (name, value) in os::get_os_macros(self.target) {
             if let Some(v) = value {
@@ -1842,34 +1872,12 @@ impl<'a> Preprocessor<'a> {
 
         match builtin {
             BuiltinMacro::HasAttribute => {
-                // Return true for common attributes we support
-                matches!(
-                    name.as_str(),
-                    "noreturn"
-                        | "const"
-                        | "pure"
-                        | "unused"
-                        | "used"
-                        | "deprecated"
-                        | "weak"
-                        | "aligned"
-                        | "packed"
-                        | "format"
-                        | "nonnull"
-                        | "returns_nonnull"
-                        | "warn_unused_result"
-                        | "visibility"
-                        | "always_inline"
-                        | "noinline"
-                        | "cold"
-                        | "hot"
-                        | "malloc"
-                        | "constructor"
-                        | "destructor"
-                )
+                // We don't currently implement any __attribute__ semantics
+                let _ = name;
+                false
             }
             BuiltinMacro::HasBuiltin => {
-                // Return true for builtins we support
+                // Return true only for builtins actually implemented in the compiler
                 matches!(
                     name.as_str(),
                     "__builtin_va_list"
@@ -1880,39 +1888,20 @@ impl<'a> Preprocessor<'a> {
                         | "__builtin_bswap16"
                         | "__builtin_bswap32"
                         | "__builtin_bswap64"
-                        | "__builtin_expect"
-                        | "__builtin_unreachable"
-                        | "__builtin_trap"
+                        | "__builtin_alloca"
                         | "__builtin_constant_p"
                         | "__builtin_types_compatible_p"
-                        | "__builtin_offsetof"
-                        | "__builtin_alloca"
                 )
             }
             BuiltinMacro::HasFeature => {
-                // C11/C99 features
-                matches!(
-                    name.as_str(),
-                    "c_alignas"
-                        | "c_alignof"
-                        | "c_static_assert"
-                        | "c_generic_selections"
-                        | "c_thread_local"
-                )
+                // We don't currently implement any C11/C23 features
+                let _ = name;
+                false
             }
             BuiltinMacro::HasExtension => {
-                // Extensions we support (basically same as features for now)
-                matches!(
-                    name.as_str(),
-                    "c_alignas"
-                        | "c_alignof"
-                        | "c_static_assert"
-                        | "c_generic_selections"
-                        | "attribute_deprecated_with_message"
-                        | "attribute_unavailable_with_message"
-                        | "enumerator_attributes"
-                        | "cxx_attributes"
-                )
+                // We don't currently implement any extensions
+                let _ = name;
+                false
             }
             _ => false,
         }
@@ -2194,6 +2183,24 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             return self.eval_defined();
         }
 
+        // Handle __has_attribute(X)
+        if self.is_ident("__has_attribute") {
+            self.advance();
+            return self.eval_has_attribute();
+        }
+
+        // Handle __has_builtin(X)
+        if self.is_ident("__has_builtin") {
+            self.advance();
+            return self.eval_has_builtin_expr();
+        }
+
+        // Handle __has_feature(X) and __has_extension(X)
+        if self.is_ident("__has_feature") || self.is_ident("__has_extension") {
+            self.advance();
+            return self.eval_has_feature();
+        }
+
         // Handle parenthesized expression
         if self.is_special(b'(' as u32) {
             self.advance();
@@ -2271,6 +2278,79 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
         }
 
         result
+    }
+
+    /// Get the identifier argument from a __has_* expression: __has_*(ident)
+    fn get_has_arg(&mut self) -> Option<String> {
+        if !self.is_special(b'(' as u32) {
+            return None;
+        }
+        self.advance(); // consume '('
+
+        let name = self.get_ident();
+        if name.is_some() {
+            self.advance(); // consume identifier
+        }
+
+        if self.is_special(b')' as u32) {
+            self.advance(); // consume ')'
+        }
+
+        name
+    }
+
+    /// Evaluate __has_attribute(X)
+    fn eval_has_attribute(&mut self) -> i64 {
+        let _name = match self.get_has_arg() {
+            Some(n) => n,
+            None => return 0,
+        };
+
+        // We don't currently implement any __attribute__ semantics
+        // Return 0 for all attribute queries
+        0
+    }
+
+    /// Evaluate __has_builtin(X)
+    fn eval_has_builtin_expr(&mut self) -> i64 {
+        let name = match self.get_has_arg() {
+            Some(n) => n,
+            None => return 0,
+        };
+
+        // Return 1 for builtins actually implemented in the compiler
+        let supported = matches!(
+            name.as_str(),
+            "__builtin_va_list"
+                | "__builtin_va_start"
+                | "__builtin_va_end"
+                | "__builtin_va_arg"
+                | "__builtin_va_copy"
+                | "__builtin_bswap16"
+                | "__builtin_bswap32"
+                | "__builtin_bswap64"
+                | "__builtin_alloca"
+                | "__builtin_constant_p"
+                | "__builtin_types_compatible_p"
+        );
+
+        if supported {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Evaluate __has_feature(X) and __has_extension(X)
+    fn eval_has_feature(&mut self) -> i64 {
+        let _name = match self.get_has_arg() {
+            Some(n) => n,
+            None => return 0,
+        };
+
+        // We don't currently implement any C11/C23 features
+        // Return 0 for all feature queries
+        0
     }
 
     fn parse_number(&self, s: &str) -> i64 {

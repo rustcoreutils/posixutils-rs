@@ -101,11 +101,13 @@ int main() {
     );
     let c_path = c_file.path().to_path_buf();
 
-    // Compile with --dump-asm to see generated assembly
+    // Compile with -S -o - to output assembly to stdout
     let output = run_test_base(
         "pcc",
         &vec![
-            "--dump-asm".to_string(),
+            "-S".to_string(),
+            "-o".to_string(),
+            "-".to_string(),
             c_path.to_string_lossy().to_string(),
         ],
         &[],
@@ -113,7 +115,7 @@ int main() {
 
     assert!(
         output.status.success(),
-        "pcc --dump-asm failed: {}",
+        "pcc -S -o - failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -148,11 +150,13 @@ int main() {
     );
     let c_path = c_file.path().to_path_buf();
 
-    // Compile with --dump-asm --fno-unwind-tables
+    // Compile with -S -o - --fno-unwind-tables
     let output = run_test_base(
         "pcc",
         &vec![
-            "--dump-asm".to_string(),
+            "-S".to_string(),
+            "-o".to_string(),
+            "-".to_string(),
             "--fno-unwind-tables".to_string(),
             c_path.to_string_lossy().to_string(),
         ],
@@ -161,7 +165,7 @@ int main() {
 
     assert!(
         output.status.success(),
-        "pcc --dump-asm --fno-unwind-tables failed: {}",
+        "pcc -S -o - --fno-unwind-tables failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -191,12 +195,14 @@ int main() {
     );
     let c_path = c_file.path().to_path_buf();
 
-    // Compile with -g --dump-asm to see generated assembly
+    // Compile with -g -S -o - to see generated assembly
     let output = run_test_base(
         "pcc",
         &vec![
             "-g".to_string(),
-            "--dump-asm".to_string(),
+            "-S".to_string(),
+            "-o".to_string(),
+            "-".to_string(),
             c_path.to_string_lossy().to_string(),
         ],
         &[],
@@ -204,7 +210,7 @@ int main() {
 
     assert!(
         output.status.success(),
-        "pcc -g --dump-asm failed: {}",
+        "pcc -g -S -o - failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -242,11 +248,13 @@ int main() {
     );
     let c_path = c_file.path().to_path_buf();
 
-    // Compile without -g
+    // Compile without -g (using -S -o - for stdout)
     let output = run_test_base(
         "pcc",
         &vec![
-            "--dump-asm".to_string(),
+            "-S".to_string(),
+            "-o".to_string(),
+            "-".to_string(),
             c_path.to_string_lossy().to_string(),
         ],
         &[],
@@ -254,7 +262,7 @@ int main() {
 
     assert!(
         output.status.success(),
-        "pcc --dump-asm failed: {}",
+        "pcc -S -o - failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 

@@ -784,7 +784,14 @@ impl<'a> Linearizer<'a> {
             Stmt::Goto(label) => {
                 let label_str = self.str(*label).to_string();
                 let target = self.get_or_create_label(&label_str);
-                self.emit(Instruction::br(target));
+                if let Some(current) = self.current_bb {
+                    self.emit(Instruction::br(target));
+                    self.link_bb(current, target);
+                }
+
+                // Set current_bb to None - any subsequent code until a label is dead
+                // emit() will safely skip when current_bb is None
+                self.current_bb = None;
             }
 
             Stmt::Label { name, stmt } => {

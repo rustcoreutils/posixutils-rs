@@ -13,6 +13,7 @@ mod alloca;
 mod bswap;
 mod constant_p;
 mod debug;
+mod has_feature;
 mod storage;
 mod types_compatible;
 mod varargs;

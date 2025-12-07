@@ -340,9 +340,6 @@ pub enum Directive {
 
     /// Blank line for readability
     Blank,
-
-    /// Raw assembly line (escape hatch for special cases)
-    Raw(String),
 }
 
 impl Directive {
@@ -547,9 +544,6 @@ impl EmitAsm for Directive {
             }
             Directive::Blank => {
                 let _ = writeln!(out);
-            }
-            Directive::Raw(text) => {
-                let _ = writeln!(out, "{}", text);
             }
         }
     }

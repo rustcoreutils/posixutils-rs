@@ -379,6 +379,36 @@ impl<'a> Preprocessor<'a> {
             self.define_macro(Macro::predefined(name, Some(value)));
         }
 
+        // Type definition macros (for <stdint.h> and <stddef.h>)
+        for (name, value) in arch::get_type_macros(self.target) {
+            self.define_macro(Macro::predefined(name, Some(value)));
+        }
+
+        // Fixed-width integer limit macros (for <stdint.h>)
+        for (name, value) in arch::get_stdint_limit_macros(self.target) {
+            self.define_macro(Macro::predefined(name, Some(value)));
+        }
+
+        // Integer constant suffix macros
+        for (name, value) in arch::get_suffix_macros(self.target) {
+            self.define_macro(Macro::predefined(name, Some(value)));
+        }
+
+        // Format specifier macros (for <inttypes.h>)
+        for (name, value) in arch::get_format_macros(self.target) {
+            self.define_macro(Macro::predefined(name, Some(value)));
+        }
+
+        // Additional sizeof macros
+        for (name, value) in arch::get_additional_sizeof_macros(self.target) {
+            self.define_macro(Macro::predefined(name, Some(value)));
+        }
+
+        // Miscellaneous macros
+        for (name, value) in arch::get_misc_macros(self.target) {
+            self.define_macro(Macro::predefined(name, Some(value)));
+        }
+
         // OS macros
         for (name, value) in os::get_os_macros(self.target) {
             if let Some(v) = value {

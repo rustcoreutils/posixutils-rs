@@ -100,8 +100,6 @@ Not yet implemented:
 - -fverbose-asm
 - Complex initializers
 - VLAs (variable-length arrays)
-- _Complex and _Atomic types
-- Thread-local storage, alignas, etc.
 - top builtins to implement:
   __builtin_expect
   __builtin_clz / clzl / clzll
@@ -109,9 +107,12 @@ Not yet implemented:
   __sync_synchronize
   __sync_fetch_and_add (and maybe a couple of its siblings)
   __builtin_unreachable (helps optimizations + silences some warnings)
-- string interning
 - DCE and other opt passes
 - assembly peephole optimizations
+- _Complex
+- C11 Alignment Specifiers (_Alignas, _Alignof)
+- C11 Thread-Local Storage (_Thread_local) and atomics (_Atomic)
+- Other C11 features: _Static_assert, _Generic, _Noreturn, anonymous structs
 
 ## Known Issues
 

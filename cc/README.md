@@ -99,6 +99,7 @@ Not yet implemented:
 - multi-register returns (for structs larger than 8 bytes)
 - -fverbose-asm
 - Complex initializers
+- constant expression evaluation
 - VLAs (variable-length arrays)
 - top builtins to implement:
   __builtin_expect

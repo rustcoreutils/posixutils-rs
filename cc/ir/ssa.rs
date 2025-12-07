@@ -14,10 +14,8 @@
 // - Renames variables to complete SSA construction
 //
 
-use crate::dominate::{compute_dominance_frontiers, domtree_build, idf_compute};
-use crate::ir::{
-    BasicBlockId, Function, InsnRef, Instruction, Opcode, Pseudo, PseudoId, PseudoKind,
-};
+use super::dominate::{compute_dominance_frontiers, domtree_build, idf_compute};
+use super::{BasicBlockId, Function, InsnRef, Instruction, Opcode, Pseudo, PseudoId, PseudoKind};
 use crate::types::{TypeId, TypeTable};
 use std::collections::{HashMap, HashSet};
 

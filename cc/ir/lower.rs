@@ -15,7 +15,7 @@
 // - Phi elimination: Converts SSA phi nodes to copy instructions
 //
 
-use crate::ir::{BasicBlockId, Function, Instruction, Module, Opcode};
+use super::{BasicBlockId, Function, Instruction, Module, Opcode};
 use std::collections::HashMap;
 
 // ============================================================================

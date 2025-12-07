@@ -98,20 +98,27 @@ pub fn cleanup_exe(exe_file: &Option<PathBuf>) {
 /// Compile inline C code and run, returning exit code
 /// Temp files are cleaned up automatically via tempfile
 pub fn compile_and_run(name: &str, content: &str) -> i32 {
+    compile_and_run_with_opts(name, content, &[])
+}
+
+/// Compile inline C code with optimization and run, returning exit code
+pub fn compile_and_run_optimized(name: &str, content: &str) -> i32 {
+    compile_and_run_with_opts(name, content, &["-O1".to_string()])
+}
+
+/// Compile inline C code with extra options and run, returning exit code
+/// Temp files are cleaned up automatically via tempfile
+pub fn compile_and_run_with_opts(name: &str, content: &str, extra_opts: &[String]) -> i32 {
     let c_file = create_c_file(name, content);
     let c_path = c_file.path().to_path_buf();
 
     let exe_path = std::env::temp_dir().join(format!("pcc_exe_{}", name));
 
-    let output = run_test_base(
-        "pcc",
-        &vec![
-            "-o".to_string(),
-            exe_path.to_string_lossy().to_string(),
-            c_path.to_string_lossy().to_string(),
-        ],
-        &[],
-    );
+    let mut args = vec!["-o".to_string(), exe_path.to_string_lossy().to_string()];
+    args.extend(extra_opts.iter().cloned());
+    args.push(c_path.to_string_lossy().to_string());
+
+    let output = run_test_base("pcc", &args, &[]);
 
     if !output.status.success() {
         eprintln!(

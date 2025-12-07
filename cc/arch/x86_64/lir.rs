@@ -13,9 +13,6 @@
 // enabling peephole optimizations before final assembly emission.
 //
 
-// Allow dead code - LIR infrastructure for future phases
-#![allow(dead_code)]
-
 use super::codegen::{Reg, XmmReg};
 use crate::arch::lir::{Directive, EmitAsm, FpSize, Label, OperandSize, Symbol};
 use crate::target::{Os, Target};
@@ -26,6 +23,7 @@ use std::fmt::{self, Write};
 // ============================================================================
 
 /// x86-64 memory addressing mode
+#[allow(dead_code)] // Documents full instruction set
 #[derive(Debug, Clone, PartialEq)]
 pub enum MemAddr {
     /// [base + offset] - Register indirect with displacement
@@ -103,19 +101,6 @@ impl GpOperand {
             GpOperand::Imm(v) => format!("${}", v),
         }
     }
-
-    /// Check if this is a register operand
-    pub fn is_reg(&self) -> bool {
-        matches!(self, GpOperand::Reg(_))
-    }
-
-    /// Get register if this is a register operand
-    pub fn as_reg(&self) -> Option<Reg> {
-        match self {
-            GpOperand::Reg(r) => Some(*r),
-            _ => None,
-        }
-    }
 }
 
 // ============================================================================
@@ -146,6 +131,7 @@ impl XmmOperand {
 // ============================================================================
 
 /// Integer condition codes for comparisons and conditional jumps/sets
+#[allow(dead_code)] // Documents full instruction set
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IntCC {
     /// Equal (ZF=1)
@@ -198,26 +184,6 @@ impl IntCC {
             IntCC::Np => "np",
         }
     }
-
-    /// Get the inverse condition
-    pub fn inverse(&self) -> IntCC {
-        match self {
-            IntCC::E => IntCC::Ne,
-            IntCC::Ne => IntCC::E,
-            IntCC::L => IntCC::Ge,
-            IntCC::Le => IntCC::G,
-            IntCC::G => IntCC::Le,
-            IntCC::Ge => IntCC::L,
-            IntCC::B => IntCC::Ae,
-            IntCC::Be => IntCC::A,
-            IntCC::A => IntCC::Be,
-            IntCC::Ae => IntCC::B,
-            IntCC::S => IntCC::Ns,
-            IntCC::Ns => IntCC::S,
-            IntCC::P => IntCC::Np,
-            IntCC::Np => IntCC::P,
-        }
-    }
 }
 
 impl fmt::Display for IntCC {
@@ -244,6 +210,7 @@ pub enum ShiftCount {
 // ============================================================================
 
 /// Target for call instructions
+#[allow(dead_code)] // Documents full instruction set
 #[derive(Debug, Clone, PartialEq)]
 pub enum CallTarget {
     /// Direct call to symbol
@@ -259,6 +226,7 @@ pub enum CallTarget {
 // ============================================================================
 
 /// x86-64 Low-level IR instruction
+#[allow(dead_code)] // Documents full instruction set
 #[derive(Debug, Clone)]
 pub enum X86Inst {
     // ========================================================================
@@ -1099,19 +1067,6 @@ impl EmitAsm for X86Inst {
 }
 
 // ============================================================================
-// Utility Functions
-// ============================================================================
-
-/// Emit a sequence of LIR instructions to assembly text
-pub fn emit_instrs(instrs: &[X86Inst], target: &Target) -> String {
-    let mut out = String::new();
-    for inst in instrs {
-        inst.emit(target, &mut out);
-    }
-    out
-}
-
-// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1254,27 +1209,5 @@ mod tests {
         };
         inst.emit(&target, &mut out);
         assert!(out.contains("addss"));
-    }
-
-    #[test]
-    fn test_emit_instrs() {
-        let target = linux_target();
-
-        let instrs = vec![
-            X86Inst::Push {
-                src: GpOperand::Reg(Reg::Rbp),
-            },
-            X86Inst::Mov {
-                size: OperandSize::B64,
-                src: GpOperand::Reg(Reg::Rsp),
-                dst: GpOperand::Reg(Reg::Rbp),
-            },
-            X86Inst::Ret,
-        ];
-
-        let out = emit_instrs(&instrs, &target);
-        assert!(out.contains("pushq %rbp"));
-        assert!(out.contains("movq %rsp, %rbp"));
-        assert!(out.contains("ret"));
     }
 }

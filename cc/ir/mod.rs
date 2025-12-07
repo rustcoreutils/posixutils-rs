@@ -14,6 +14,13 @@
 // optimization passes.
 //
 
+pub mod dce;
+pub mod dominate;
+pub mod instcombine;
+pub mod linearize;
+pub mod lower;
+pub mod ssa;
+
 use crate::diag::Position;
 use crate::types::TypeId;
 use std::collections::HashMap;
@@ -1010,6 +1017,28 @@ impl Function {
     /// Get a local variable
     pub fn get_local(&self, name: &str) -> Option<&LocalVar> {
         self.locals.get(name)
+    }
+
+    /// Compute the next available pseudo ID
+    /// This scans all existing pseudos to find the maximum ID, then returns max + 1
+    pub fn next_pseudo_id(&self) -> PseudoId {
+        let max_id = self.pseudos.iter().map(|p| p.id.0).max().unwrap_or(0);
+        PseudoId(max_id + 1)
+    }
+
+    /// Create a new constant integer pseudo and return its ID
+    /// The pseudo is added to self.pseudos
+    pub fn create_const_pseudo(&mut self, value: i64) -> PseudoId {
+        let id = self.next_pseudo_id();
+        let pseudo = Pseudo::val(id, value);
+        self.add_pseudo(pseudo);
+        id
+    }
+
+    /// Get a pseudo by its ID
+    #[cfg(test)]
+    pub fn get_pseudo(&self, id: PseudoId) -> Option<&Pseudo> {
+        self.pseudos.iter().find(|p| p.id == id)
     }
 
     /// Check if block a dominates block b

@@ -498,3 +498,182 @@ _Noreturn void exit(int status);
 2. Type system: mark function type as noreturn
 3. Semantic: warn if function can return
 4. Codegen: can omit function epilogue, enable optimizations
+
+---
+
+## Optimization Passes
+
+### Overview
+
+The compiler uses a sparse-style SSA IR, which is well-suited for classical optimizations. Passes are run iteratively until a fixed point is reached.
+
+### Pass 1: SCCP - Sparse Conditional Constant Propagation
+
+**Status:** Not implemented
+
+**What it does:**
+- Propagate constants through the CFG, only along reachable paths
+- If a branch's condition is constant, mark only that successor reachable
+- Lattice: `{UNDEF, CONST(c), UNKNOWN}`
+- Forward dataflow across the CFG updating φs
+
+**Simpler alternative:** Global constant propagation without conditional pruning.
+
+### Pass 2: CFG Simplification
+
+**Status:** Not implemented
+
+**What it does:**
+- Convert constant-condition branches into unconditional jumps
+- Merge simple blocks: A → B where A's only successor is B and B's only predecessor is A
+- Remove jumps to jumps (fallthrough simplification)
+
+**Implementation:**
+- After DCE, walk the CFG
+- If branch/switch has constant condition → replace with direct jump
+- If block just jumps, no φ, no side effects → inline successor or merge
+
+### Pass 3: Copy Propagation & SSA Cleanup
+
+**Status:** Not implemented
+
+**What it does:**
+- `t1 = x; y = t1;` → `y = x`
+- φ simplifications: `t = φ(x, x, x)` → `t = x`
+
+**Implementation:**
+- Use SSA def-use chains
+- For each `t = x` where x is SSA value and t isn't address-taken, replace uses of t with x
+- For φ-nodes where all incoming operands are same → replace uses and remove φ
+- Run DCE afterwards
+
+### Pass 4: Local CSE / Value Numbering
+
+**Status:** Not implemented
+
+**What it does:**
+- Inside a block, recognize when re-computing same pure expression
+- `t1 = a + b; t2 = a + b;` → `t2 = t1`
+
+**Implementation:**
+- For each block: maintain map `(opcode, operand1, operand2, type) → SSA value`
+- When expression already in map, reuse prior value
+- Limit to pure operations: arithmetic, logical ops, comparisons
+
+### Pass 5: GVN - Global Value Numbering
+
+**Status:** Not implemented (optional, bigger investment)
+
+**What it does:**
+- Deduplicate computations across blocks, not just inside one
+- More global version of CSE respecting control flow and dominance
+
+**Implementation:**
+- Walk in dominator order
+- Assign "value numbers" to expressions
+- Equivalent expressions sharing same number are merged
+
+### Pass 6: Conservative Function Inlining
+
+**Status:** Not implemented
+
+**What it does:**
+- Inline small, non-recursive, non-varargs functions into callers
+- Exposes new optimization opportunities
+
+**Constraints:**
+- Only inline static/internal functions
+- Limit by IR size: e.g. ≤ N instructions, ≤ M basic blocks
+- Reject varargs, VLAs, alloca, weird control flow
+
+**After inlining:** Re-run InstCombine → SCCP → DCE
+
+### Pass 7: LICM - Loop-Invariant Code Motion
+
+**Status:** Not implemented
+
+**What it does:**
+- Hoist computations that are pure and loop-invariant
+
+**Implementation:**
+- Detect natural loops via back edges and dominators
+- Only hoist arithmetic/logical ops whose operands are defined outside loop
+- Don't hoist loads/stores without alias analysis
+
+### Pass 8: Loop Canonicalization & Strength Reduction
+
+**Status:** Not implemented (low priority)
+
+**What it does:**
+- Normalize induction variables: `for (i = 0; i < n; ++i)` style
+- Replace multiplications with additions
+
+**Implementation:**
+- Identify induction variables: φ node in loop header with one incoming from preheader, one from latch
+- Handle simple patterns: `i = φ(i0, i + c)`
+- Turn `base + i * c` patterns into increments
+
+### Suggested Pass Pipeline
+
+```
+IR generation + SSA construction
+    ↓
+Early InstCombine (constant folding + algebraic)
+    ↓
+SCCP (or simple global const prop)
+    ↓
+DCE + unreachable block removal
+    ↓
+CFG simplification
+    ↓
+Copy propagation + φ simplification → DCE
+    ↓
+Local CSE → InstCombine
+    ↓
+[Later] GVN → DCE/CFG simplify
+    ↓
+[Later] Conservative inlining → re-run passes 2-7
+    ↓
+[Later] LICM + loop opts → final InstCombine + DCE
+```
+
+### Implementation Priority
+
+| Priority | Pass | Complexity | Impact |
+|----------|------|------------|--------|
+| 1 | CFG simplify | Low | Medium |
+| 2 | Copy/φ cleanup | Low | Medium |
+| 3 | Local CSE | Medium | Medium |
+| 4 | SCCP | Medium | High |
+| 5 | GVN | High | Medium |
+| 6 | Inlining | High | High |
+| 7 | LICM | Medium | Medium |
+| 8 | Loop opts | High | Low |
+
+---
+
+## Assembly Peephole Optimizations
+
+### Overview
+
+Post-codegen peephole optimizations on the generated assembly. These are low-complexity, high-impact micro-optimizations.
+
+### Potential Optimizations
+
+| Pattern | Optimization |
+|---------|--------------|
+| `mov %rax, %rax` | Delete (no-op move) |
+| `mov %rax, %rbx; mov %rbx, %rax` | Delete second (useless copy-back) |
+| `add $0, %rax` | Delete (no-op add) |
+| `sub $0, %rax` | Delete (no-op sub) |
+| `imul $1, %rax, %rax` | Delete (multiply by 1) |
+| `xor %rax, %rax; mov $0, %rax` | Keep only xor (shorter encoding) |
+| `cmp $0, %rax; je L` | `test %rax, %rax; je L` (shorter) |
+| `mov $imm, %rax; add %rax, %rbx` | `add $imm, %rbx` if imm fits |
+
+### Implementation Approach
+
+1. Parse LIR instructions before emission
+2. Pattern match on instruction sequences (2-3 instruction windows)
+3. Replace with optimized sequences
+4. Run multiple passes until no changes

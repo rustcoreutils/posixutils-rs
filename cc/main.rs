@@ -11,13 +11,10 @@
 
 mod arch;
 mod diag;
-mod dominate;
 mod ir;
-mod linearize;
-mod lower;
+mod opt;
 mod os;
 mod parse;
-mod ssa;
 mod strings;
 mod symbol;
 mod target;
@@ -111,6 +108,10 @@ struct Args {
     /// Target triple (e.g., aarch64-apple-darwin, x86_64-unknown-linux-gnu)
     #[arg(long = "target", value_name = "triple", help = gettext("Target triple for cross-compilation"))]
     target: Option<String>,
+
+    /// Optimization level (0=none, 1=basic optimizations)
+    #[arg(short = 'O', default_value = "0", value_name = "level", help = gettext("Optimization level"))]
+    opt_level: u32,
 }
 
 fn process_file(
@@ -211,7 +212,7 @@ fn process_file(
     }
 
     // Linearize to IR
-    let mut module = linearize::linearize_with_debug(
+    let mut module = ir::linearize::linearize_with_debug(
         &ast,
         &symbols,
         &types,
@@ -221,13 +222,18 @@ fn process_file(
         Some(display_path),
     );
 
+    // Optimize IR (if enabled)
+    if args.opt_level > 0 {
+        opt::optimize_module(&mut module, args.opt_level);
+    }
+
     if args.dump_ir {
         print!("{}", module);
         return Ok(());
     }
 
     // Lower IR (phi elimination, etc.)
-    lower::lower_module(&mut module);
+    ir::lower::lower_module(&mut module);
 
     // Generate assembly
     let emit_unwind_tables = !args.no_unwind_tables;

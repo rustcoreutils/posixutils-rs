@@ -11,10 +11,6 @@
 // These tests verify that optimizations don't break program correctness.
 // Tests are aggregated to reduce compile/link cycles.
 //
-// Note: MVP InstCombine only does algebraic simplifications (x + 0 -> x, etc.)
-// and does NOT do constant folding (2 + 3 -> 5) because that would require
-// creating new constant pseudos.
-//
 
 use crate::common::compile_and_run_optimized;
 

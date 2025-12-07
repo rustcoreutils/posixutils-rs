@@ -190,6 +190,12 @@ fn simplify_sub(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
 
     let src1 = insn.src[0];
     let src2 = insn.src[1];
+
+    // Identity: x - x -> 0
+    if src1 == src2 {
+        return Simplification::FoldToConst(0);
+    }
+
     let val1 = get_const(pseudos, src1);
     let val2 = get_const(pseudos, src2);
 
@@ -202,9 +208,6 @@ fn simplify_sub(insn: &Instruction, pseudos: &[Pseudo]) -> Simplification {
 
         _ => Simplification::None,
     }
-
-    // Identity: x - x -> 0 is handled by constant folding if both are constants,
-    // but for same-pseudo case we need a separate check
 }
 
 // ============================================================================
@@ -1046,6 +1049,31 @@ mod tests {
 
         let new_const = func.get_pseudo(result_insn.src[0]).unwrap();
         assert_eq!(new_const.kind, PseudoKind::Val(7));
+    }
+
+    #[test]
+    fn test_sub_self() {
+        // x - x -> 0
+        let types = TypeTable::new();
+        let insn = Instruction::binop(
+            Opcode::Sub,
+            PseudoId(1),
+            PseudoId(0),
+            PseudoId(0),
+            types.int_id,
+            32,
+        );
+        let pseudos = vec![Pseudo::reg(PseudoId(0), 0), Pseudo::reg(PseudoId(1), 1)];
+        let mut func = make_test_func_with_insn(insn, pseudos);
+
+        let changed = run(&mut func);
+        assert!(changed);
+
+        let result_insn = &func.blocks[0].insns[1];
+        assert_eq!(result_insn.op, Opcode::Copy);
+
+        let new_const = func.get_pseudo(result_insn.src[0]).unwrap();
+        assert_eq!(new_const.kind, PseudoKind::Val(0));
     }
 
     #[test]

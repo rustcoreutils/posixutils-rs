@@ -15,6 +15,7 @@ use super::ast::{
     FunctionDef, InitDeclarator, InitElement, Parameter, Stmt, TranslationUnit, UnaryOp,
 };
 use crate::diag;
+use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol, SymbolTable};
 use crate::token::lexer::{IdentTable, Position, SpecialToken, Token, TokenType, TokenValue};
 use crate::types::{
@@ -271,10 +272,25 @@ impl<'a> Parser<'a> {
     /// Get the identifier name from an Ident token value
     fn get_ident_name(&self, token: &Token) -> Option<String> {
         if let TokenValue::Ident(id) = &token.value {
-            self.idents.get(*id).map(|s| s.to_string())
+            self.idents.get_opt(*id).map(|s| s.to_string())
         } else {
             None
         }
+    }
+
+    /// Get the StringId directly from an Ident token
+    fn get_ident_id(&self, token: &Token) -> Option<StringId> {
+        if let TokenValue::Ident(id) = &token.value {
+            Some(*id)
+        } else {
+            None
+        }
+    }
+
+    /// Get string value for a StringId
+    #[inline]
+    fn str(&self, id: StringId) -> &str {
+        self.idents.get(id)
     }
 
     /// Skip StreamBegin/StreamEnd tokens
@@ -1155,8 +1171,9 @@ impl<'a> Parser<'a> {
         }
 
         // Check if this looks like a type name (keyword or typedef)
-        let name = self.get_ident_name(self.current())?;
-        if !Self::is_type_keyword(&name) && self.symbols.lookup_typedef(&name).is_none() {
+        let name_id = self.get_ident_id(self.current())?;
+        let name = self.str(name_id);
+        if !Self::is_type_keyword(name) && self.symbols.lookup_typedef(name_id).is_none() {
             // Not a type keyword and not a typedef
             return None;
         }
@@ -1171,12 +1188,13 @@ impl<'a> Parser<'a> {
                 break;
             }
 
-            let name = match self.get_ident_name(self.current()) {
-                Some(n) => n,
+            let name_id = match self.get_ident_id(self.current()) {
+                Some(id) => id,
                 None => break,
             };
+            let name = self.str(name_id);
 
-            match name.as_str() {
+            match name {
                 "const" => {
                     self.advance();
                     modifiers |= TypeModifiers::CONST;
@@ -1271,12 +1289,12 @@ impl<'a> Parser<'a> {
                 "struct" => {
                     self.advance(); // consume 'struct'
                                     // For struct tag reference, look up directly in symbol table
-                    if let Some(tag_name) = self.get_ident_name(self.current()) {
+                    if let Some(tag_name) = self.get_ident_id(self.current()) {
                         if !self.is_special(b'{') {
                             // This is a tag reference (e.g., "struct Point*")
                             // Look up the existing tag to get its TypeId directly
                             self.advance(); // consume tag name
-                            if let Some(existing) = self.symbols.lookup_tag(&tag_name) {
+                            if let Some(existing) = self.symbols.lookup_tag(tag_name) {
                                 let mut result_id = existing.typ;
                                 // Handle pointer
                                 while self.is_special(b'*') {
@@ -1344,11 +1362,11 @@ impl<'a> Parser<'a> {
                 "union" => {
                     self.advance(); // consume 'union'
                                     // For union tag reference, look up directly in symbol table
-                    if let Some(tag_name) = self.get_ident_name(self.current()) {
+                    if let Some(tag_name) = self.get_ident_id(self.current()) {
                         if !self.is_special(b'{') {
                             // This is a tag reference
                             self.advance(); // consume tag name
-                            if let Some(existing) = self.symbols.lookup_tag(&tag_name) {
+                            if let Some(existing) = self.symbols.lookup_tag(tag_name) {
                                 let mut result_id = existing.typ;
                                 while self.is_special(b'*') {
                                     self.advance();
@@ -1438,7 +1456,7 @@ impl<'a> Parser<'a> {
                 _ => {
                     // Check if it's a typedef name
                     if base_kind.is_none() {
-                        if let Some(typedef_type_id) = self.symbols.lookup_typedef(&name) {
+                        if let Some(typedef_type_id) = self.symbols.lookup_typedef(name_id) {
                             self.advance();
                             // For typedef, we already have a TypeId - just apply pointer/array modifiers
                             let mut result_id = typedef_type_id;
@@ -1551,7 +1569,7 @@ impl<'a> Parser<'a> {
                 // Get member type from struct type
                 let member_type = expr
                     .typ
-                    .and_then(|t| self.types.find_member(t, &member))
+                    .and_then(|t| self.types.find_member(t, member))
                     .map(|info| info.typ)
                     .unwrap_or(self.types.int_id);
                 expr = Self::typed_expr(
@@ -1570,7 +1588,7 @@ impl<'a> Parser<'a> {
                 let member_type = expr
                     .typ
                     .and_then(|t| self.types.base_type(t))
-                    .and_then(|struct_type| self.types.find_member(struct_type, &member))
+                    .and_then(|struct_type| self.types.find_member(struct_type, member))
                     .map(|info| info.typ)
                     .unwrap_or(self.types.int_id);
                 expr = Self::typed_expr(
@@ -1639,18 +1657,18 @@ impl<'a> Parser<'a> {
         Ok(args)
     }
 
-    /// Expect and consume an identifier, returning its name
-    fn expect_identifier(&mut self) -> ParseResult<String> {
+    /// Expect and consume an identifier, returning its StringId
+    fn expect_identifier(&mut self) -> ParseResult<StringId> {
         if self.peek() != TokenType::Ident {
             return Err(ParseError::new("expected identifier", self.current_pos()));
         }
 
-        let name = self
-            .get_ident_name(self.current())
+        let id = self
+            .get_ident_id(self.current())
             .ok_or_else(|| ParseError::new("invalid identifier", self.current_pos()))?;
 
         self.advance();
-        Ok(name)
+        Ok(id)
     }
 
     /// Check if an expression is const and report error if assigning to it
@@ -1837,10 +1855,11 @@ impl<'a> Parser<'a> {
                 let token = self.consume();
                 let token_pos = token.pos;
                 if let TokenValue::Ident(id) = &token.value {
-                    let name = self.idents.get(*id).unwrap_or("").to_string();
+                    let name_id = *id;
+                    let name_str = self.idents.get_opt(name_id).unwrap_or("");
 
                     // Check for varargs builtins that need special parsing
-                    match name.as_str() {
+                    match name_str {
                         "__builtin_va_start" => {
                             // __builtin_va_start(ap, last_param)
                             self.expect_special(b'(')?;
@@ -1984,10 +2003,14 @@ impl<'a> Parser<'a> {
                     // Look up symbol to get type (during parsing, symbol is in scope)
                     let typ = self
                         .symbols
-                        .lookup(&name, Namespace::Ordinary)
+                        .lookup(name_id, Namespace::Ordinary)
                         .map(|s| s.typ)
                         .unwrap_or(self.types.int_id); // Default to int if not found
-                    Ok(Self::typed_expr(ExprKind::Ident { name }, typ, token_pos))
+                    Ok(Self::typed_expr(
+                        ExprKind::Ident { name: name_id },
+                        typ,
+                        token_pos,
+                    ))
                 } else {
                     Err(ParseError::new("invalid identifier token", token.pos))
                 }
@@ -2590,10 +2613,11 @@ impl Parser<'_> {
             return false;
         }
 
-        if let Some(name) = self.get_ident_name(self.current()) {
+        if let Some(name_id) = self.get_ident_id(self.current()) {
+            let name = self.str(name_id);
             // Check for type keywords first
             if matches!(
-                name.as_str(),
+                name,
                 "void"
                     | "char"
                     | "short"
@@ -2621,7 +2645,7 @@ impl Parser<'_> {
                 return true;
             }
             // Also check for typedef names
-            self.symbols.lookup_typedef(&name).is_some()
+            self.symbols.lookup_typedef(name_id).is_some()
         } else {
             false
         }
@@ -2701,13 +2725,15 @@ impl Parser<'_> {
                 };
 
                 // Bind to symbol table (like sparse's bind_symbol)
-                if !name.is_empty() {
+                // Note: StringId is Copy, check for empty by comparing to empty string
+                let name_str = self.str(name);
+                if !name_str.is_empty() {
                     if is_typedef {
                         // For typedef, the type being aliased is the declarator type
-                        let sym = Symbol::typedef(name.clone(), typ, self.symbols.depth());
+                        let sym = Symbol::typedef(name, typ, self.symbols.depth());
                         let _ = self.symbols.declare(sym);
                     } else {
-                        let sym = Symbol::variable(name.clone(), typ, self.symbols.depth());
+                        let sym = Symbol::variable(name, typ, self.symbols.depth());
                         let _ = self.symbols.declare(sym);
                     }
                 }
@@ -2740,12 +2766,13 @@ impl Parser<'_> {
                 break;
             }
 
-            let name = match self.get_ident_name(self.current()) {
-                Some(n) => n,
+            let name_id = match self.get_ident_id(self.current()) {
+                Some(id) => id,
                 None => break,
             };
+            let name = self.str(name_id);
 
-            match name.as_str() {
+            match name {
                 // Skip __attribute__ in the type specifier loop
                 "__attribute__" | "__attribute" => {
                     self.skip_extensions();
@@ -2871,7 +2898,7 @@ impl Parser<'_> {
                     // Check if it's a typedef name
                     // Only consume the typedef if we haven't already seen a base type
                     if base_kind.is_none() {
-                        if let Some(typedef_type_id) = self.symbols.lookup_typedef(&name) {
+                        if let Some(typedef_type_id) = self.symbols.lookup_typedef(name_id) {
                             self.advance();
                             // Get the underlying type and merge in any modifiers we collected
                             let typedef_type = self.types.get(typedef_type_id);
@@ -2924,10 +2951,7 @@ impl Parser<'_> {
                     next_value
                 };
 
-                constants.push(EnumConstant {
-                    name: name.clone(),
-                    value,
-                });
+                constants.push(EnumConstant { name, value });
                 next_value = value + 1;
 
                 // Register enum constant in symbol table (Ordinary namespace)
@@ -2949,7 +2973,7 @@ impl Parser<'_> {
             self.expect_special(b'}')?;
 
             let composite = CompositeType {
-                tag: tag.clone(),
+                tag,
                 members: Vec::new(),
                 enum_constants: constants,
                 size: 4,
@@ -2960,22 +2984,22 @@ impl Parser<'_> {
             let enum_type = Type::enum_type(composite);
 
             // Register tag if present
-            if let Some(ref tag_name) = tag {
+            if let Some(tag_name) = tag {
                 let enum_type_id = self.types.intern(enum_type.clone());
-                let sym = Symbol::tag(tag_name.clone(), enum_type_id, self.symbols.depth());
+                let sym = Symbol::tag(tag_name, enum_type_id, self.symbols.depth());
                 let _ = self.symbols.declare(sym);
             }
 
             Ok(enum_type)
         } else {
             // Forward reference - look up existing tag
-            if let Some(ref tag_name) = tag {
+            if let Some(tag_name) = tag {
                 // Look up or create incomplete type
                 if let Some(existing) = self.symbols.lookup_tag(tag_name) {
                     // Return a clone of the underlying type
                     Ok(self.types.get(existing.typ).clone())
                 } else {
-                    Ok(Type::incomplete_enum(tag_name.clone()))
+                    Ok(Type::incomplete_enum(tag_name))
                 }
             } else {
                 Err(ParseError::new(
@@ -3033,7 +3057,7 @@ impl Parser<'_> {
                     let width = self.parse_bitfield_width()?;
 
                     members.push(StructMember {
-                        name: String::new(),
+                        name: StringId::EMPTY,
                         typ: member_base_type_id,
                         offset: 0,
                         bit_offset: None,
@@ -3091,7 +3115,7 @@ impl Parser<'_> {
             };
 
             let composite = CompositeType {
-                tag: tag.clone(),
+                tag,
                 members,
                 enum_constants: Vec::new(),
                 size,
@@ -3106,23 +3130,23 @@ impl Parser<'_> {
             };
 
             // Register tag if present
-            if let Some(ref tag_name) = tag {
+            if let Some(tag_name) = tag {
                 let typ_id = self.types.intern(struct_type.clone());
-                let sym = Symbol::tag(tag_name.clone(), typ_id, self.symbols.depth());
+                let sym = Symbol::tag(tag_name, typ_id, self.symbols.depth());
                 let _ = self.symbols.declare(sym);
             }
 
             Ok(struct_type)
         } else {
             // Forward reference
-            if let Some(ref tag_name) = tag {
+            if let Some(tag_name) = tag {
                 // Look up existing tag
                 if let Some(existing) = self.symbols.lookup_tag(tag_name) {
                     Ok(self.types.get(existing.typ).clone())
                 } else if is_union {
-                    Ok(Type::incomplete_union(tag_name.clone()))
+                    Ok(Type::incomplete_union(tag_name))
                 } else {
-                    Ok(Type::incomplete_struct(tag_name.clone()))
+                    Ok(Type::incomplete_struct(tag_name))
                 }
             } else {
                 Err(ParseError::new(
@@ -3140,7 +3164,7 @@ impl Parser<'_> {
     /// - `(*p)` means p is a pointer
     /// - `[3]` after the parens means "to array of 3"
     ///   So p is "pointer to array of 3 ints"
-    fn parse_declarator(&mut self, base_type_id: TypeId) -> ParseResult<(String, TypeId)> {
+    fn parse_declarator(&mut self, base_type_id: TypeId) -> ParseResult<(StringId, TypeId)> {
         // Collect pointer modifiers (they bind tighter than array/function)
         let mut pointer_modifiers: Vec<TypeModifiers> = Vec::new();
         while self.is_special(b'*') {
@@ -3434,7 +3458,7 @@ impl Parser<'_> {
 
         // Bind function to symbol table at current (global) scope
         // Like sparse's bind_symbol() in parse.c
-        let func_sym = Symbol::function(name.clone(), func_type_id, self.symbols.depth());
+        let func_sym = Symbol::function(name, func_type_id, self.symbols.depth());
         let _ = self.symbols.declare(func_sym); // Ignore redefinition errors for now
 
         // Enter function scope for parameters and body
@@ -3442,9 +3466,8 @@ impl Parser<'_> {
 
         // Bind parameters in function scope
         for param in &params {
-            if let Some(param_name) = &param.name {
-                let param_sym =
-                    Symbol::parameter(param_name.clone(), param.typ, self.symbols.depth());
+            if let Some(param_name) = param.name {
+                let param_sym = Symbol::parameter(param_name, param.typ, self.symbols.depth());
                 let _ = self.symbols.declare(param_sym);
             }
         }
@@ -3543,10 +3566,10 @@ impl Parser<'_> {
             // Parse optional parameter name
             let param_name = if self.peek() == TokenType::Ident {
                 // Check if it's actually a name (not a type keyword)
-                if let Some(name) = self.get_ident_name(self.current()) {
+                if let Some(name_id) = self.get_ident_id(self.current()) {
                     if !self.is_declaration_start() {
                         self.advance();
-                        Some(name)
+                        Some(name_id)
                     } else {
                         None
                     }
@@ -3663,10 +3686,10 @@ impl Parser<'_> {
 
                 // Add to symbol table
                 if is_typedef {
-                    let sym = Symbol::typedef(name.clone(), typ, self.symbols.depth());
+                    let sym = Symbol::typedef(name, typ, self.symbols.depth());
                     let _ = self.symbols.declare(sym);
                 } else {
-                    let var_sym = Symbol::variable(name.clone(), typ, self.symbols.depth());
+                    let var_sym = Symbol::variable(name, typ, self.symbols.depth());
                     let _ = self.symbols.declare(var_sym);
                 }
 
@@ -3750,10 +3773,10 @@ impl Parser<'_> {
 
                 // Add to symbol table
                 if is_typedef {
-                    let sym = Symbol::typedef(name.clone(), full_typ, self.symbols.depth());
+                    let sym = Symbol::typedef(name, full_typ, self.symbols.depth());
                     let _ = self.symbols.declare(sym);
                 } else {
-                    let var_sym = Symbol::variable(name.clone(), full_typ, self.symbols.depth());
+                    let var_sym = Symbol::variable(name, full_typ, self.symbols.depth());
                     let _ = self.symbols.declare(var_sym);
                 }
 
@@ -3788,7 +3811,7 @@ impl Parser<'_> {
                 let param_type_ids: Vec<TypeId> = params.iter().map(|p| p.typ).collect();
                 let func_type = Type::function(typ_id, param_type_ids.clone(), variadic);
                 let func_type_id = self.types.intern(func_type);
-                let func_sym = Symbol::function(name.clone(), func_type_id, self.symbols.depth());
+                let func_sym = Symbol::function(name, func_type_id, self.symbols.depth());
                 let _ = self.symbols.declare(func_sym);
 
                 // Enter function scope for parameters
@@ -3796,9 +3819,9 @@ impl Parser<'_> {
 
                 // Bind parameters in function scope
                 for param in &params {
-                    if let Some(param_name) = &param.name {
+                    if let Some(param_name) = param.name {
                         let param_sym =
-                            Symbol::parameter(param_name.clone(), param.typ, self.symbols.depth());
+                            Symbol::parameter(param_name, param.typ, self.symbols.depth());
                         let _ = self.symbols.declare(param_sym);
                     }
                 }
@@ -3824,7 +3847,7 @@ impl Parser<'_> {
                 let func_type_id = self.types.intern(func_type);
                 // Add function declaration to symbol table so the variadic flag
                 // is available when the function is called
-                let func_sym = Symbol::function(name.clone(), func_type_id, self.symbols.depth());
+                let func_sym = Symbol::function(name, func_type_id, self.symbols.depth());
                 let _ = self.symbols.declare(func_sym);
                 return Ok(ExternalDecl::Declaration(Declaration {
                     declarators: vec![InitDeclarator {
@@ -3881,11 +3904,11 @@ impl Parser<'_> {
 
         // Add to symbol table
         if is_typedef {
-            let sym = Symbol::typedef(name.clone(), var_type_id, self.symbols.depth());
+            let sym = Symbol::typedef(name, var_type_id, self.symbols.depth());
             let _ = self.symbols.declare(sym);
         } else {
             // Add global variable to symbol table so it can be referenced by later code
-            let var_sym = Symbol::variable(name.clone(), var_type_id, self.symbols.depth());
+            let var_sym = Symbol::variable(name, var_type_id, self.symbols.depth());
             let _ = self.symbols.declare(var_sym);
         }
 
@@ -3913,10 +3936,10 @@ impl Parser<'_> {
             };
             // Add to symbol table
             if is_typedef {
-                let sym = Symbol::typedef(decl_name.clone(), decl_type, self.symbols.depth());
+                let sym = Symbol::typedef(decl_name, decl_type, self.symbols.depth());
                 let _ = self.symbols.declare(sym);
             } else {
-                let var_sym = Symbol::variable(decl_name.clone(), decl_type, self.symbols.depth());
+                let var_sym = Symbol::variable(decl_name, decl_type, self.symbols.depth());
                 let _ = self.symbols.declare(var_sym);
             }
             declarators.push(InitDeclarator {
@@ -3983,7 +4006,7 @@ impl Parser<'_> {
             }
             ExprKind::Ident { name } => {
                 // Check for enum constant
-                self.symbols.get_enum_value(name)
+                self.symbols.get_enum_value(*name)
             }
             ExprKind::Conditional {
                 cond,
@@ -4053,19 +4076,26 @@ impl Parser<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::strings::StringTable;
     use crate::symbol::SymbolTable;
     use crate::token::lexer::Tokenizer;
 
-    fn parse_expr(input: &str) -> ParseResult<(Expr, TypeTable)> {
-        let mut tokenizer = Tokenizer::new(input.as_bytes(), 0);
+    fn parse_expr(input: &str) -> ParseResult<(Expr, TypeTable, StringTable)> {
+        let mut strings = StringTable::new();
+        let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
         let tokens = tokenizer.tokenize();
-        let idents = tokenizer.ident_table();
+        drop(tokenizer);
         let mut symbols = SymbolTable::new();
         let mut types = TypeTable::new();
-        let mut parser = Parser::new(&tokens, idents, &mut symbols, &mut types);
+        let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types);
         parser.skip_stream_tokens();
         let expr = parser.parse_expression()?;
-        Ok((expr, types))
+        Ok((expr, types, strings))
+    }
+
+    /// Helper to compare a StringId with a string literal
+    fn check_name(strings: &StringTable, id: StringId, expected: &str) {
+        assert_eq!(strings.get(id), expected);
     }
 
     // ========================================================================
@@ -4074,25 +4104,25 @@ mod tests {
 
     #[test]
     fn test_int_literal() {
-        let (expr, _types) = parse_expr("42").unwrap();
+        let (expr, _types, _strings) = parse_expr("42").unwrap();
         assert!(matches!(expr.kind, ExprKind::IntLit(42)));
     }
 
     #[test]
     fn test_hex_literal() {
-        let (expr, _types) = parse_expr("0xFF").unwrap();
+        let (expr, _types, _strings) = parse_expr("0xFF").unwrap();
         assert!(matches!(expr.kind, ExprKind::IntLit(255)));
     }
 
     #[test]
     fn test_octal_literal() {
-        let (expr, _types) = parse_expr("0777").unwrap();
+        let (expr, _types, _strings) = parse_expr("0777").unwrap();
         assert!(matches!(expr.kind, ExprKind::IntLit(511)));
     }
 
     #[test]
     fn test_float_literal() {
-        let (expr, _types) = parse_expr("3.14").unwrap();
+        let (expr, _types, _strings) = parse_expr("3.14").unwrap();
         match expr.kind {
             ExprKind::FloatLit(v) => assert!((v - 3.14).abs() < 0.001),
             _ => panic!("Expected FloatLit"),
@@ -4101,19 +4131,19 @@ mod tests {
 
     #[test]
     fn test_char_literal() {
-        let (expr, _types) = parse_expr("'a'").unwrap();
+        let (expr, _types, _strings) = parse_expr("'a'").unwrap();
         assert!(matches!(expr.kind, ExprKind::CharLit('a')));
     }
 
     #[test]
     fn test_char_escape() {
-        let (expr, _types) = parse_expr("'\\n'").unwrap();
+        let (expr, _types, _strings) = parse_expr("'\\n'").unwrap();
         assert!(matches!(expr.kind, ExprKind::CharLit('\n')));
     }
 
     #[test]
     fn test_string_literal() {
-        let (expr, _types) = parse_expr("\"hello\"").unwrap();
+        let (expr, _types, _strings) = parse_expr("\"hello\"").unwrap();
         match expr.kind {
             ExprKind::StringLit(s) => assert_eq!(s, "hello"),
             _ => panic!("Expected StringLit"),
@@ -4126,91 +4156,91 @@ mod tests {
 
     #[test]
     fn test_char_escape_newline() {
-        let (expr, _types) = parse_expr("'\\n'").unwrap();
+        let (expr, _types, _strings) = parse_expr("'\\n'").unwrap();
         assert!(matches!(expr.kind, ExprKind::CharLit('\n')));
     }
 
     #[test]
     fn test_char_escape_tab() {
-        let (expr, _types) = parse_expr("'\\t'").unwrap();
+        let (expr, _types, _strings) = parse_expr("'\\t'").unwrap();
         assert!(matches!(expr.kind, ExprKind::CharLit('\t')));
     }
 
     #[test]
     fn test_char_escape_carriage_return() {
-        let (expr, _types) = parse_expr("'\\r'").unwrap();
+        let (expr, _types, _strings) = parse_expr("'\\r'").unwrap();
         assert!(matches!(expr.kind, ExprKind::CharLit('\r')));
     }
 
     #[test]
     fn test_char_escape_backslash() {
-        let (expr, _types) = parse_expr("'\\\\'").unwrap();
+        let (expr, _types, _strings) = parse_expr("'\\\\'").unwrap();
         assert!(matches!(expr.kind, ExprKind::CharLit('\\')));
     }
 
     #[test]
     fn test_char_escape_single_quote() {
-        let (expr, _types) = parse_expr("'\\''").unwrap();
+        let (expr, _types, _strings) = parse_expr("'\\''").unwrap();
         assert!(matches!(expr.kind, ExprKind::CharLit('\'')));
     }
 
     #[test]
     fn test_char_escape_double_quote() {
-        let (expr, _types) = parse_expr("'\\\"'").unwrap();
+        let (expr, _types, _strings) = parse_expr("'\\\"'").unwrap();
         assert!(matches!(expr.kind, ExprKind::CharLit('"')));
     }
 
     #[test]
     fn test_char_escape_bell() {
-        let (expr, _types) = parse_expr("'\\a'").unwrap();
+        let (expr, _types, _strings) = parse_expr("'\\a'").unwrap();
         assert!(matches!(expr.kind, ExprKind::CharLit('\x07')));
     }
 
     #[test]
     fn test_char_escape_backspace() {
-        let (expr, _types) = parse_expr("'\\b'").unwrap();
+        let (expr, _types, _strings) = parse_expr("'\\b'").unwrap();
         assert!(matches!(expr.kind, ExprKind::CharLit('\x08')));
     }
 
     #[test]
     fn test_char_escape_formfeed() {
-        let (expr, _types) = parse_expr("'\\f'").unwrap();
+        let (expr, _types, _strings) = parse_expr("'\\f'").unwrap();
         assert!(matches!(expr.kind, ExprKind::CharLit('\x0C')));
     }
 
     #[test]
     fn test_char_escape_vertical_tab() {
-        let (expr, _types) = parse_expr("'\\v'").unwrap();
+        let (expr, _types, _strings) = parse_expr("'\\v'").unwrap();
         assert!(matches!(expr.kind, ExprKind::CharLit('\x0B')));
     }
 
     #[test]
     fn test_char_escape_null() {
-        let (expr, _types) = parse_expr("'\\0'").unwrap();
+        let (expr, _types, _strings) = parse_expr("'\\0'").unwrap();
         assert!(matches!(expr.kind, ExprKind::CharLit('\0')));
     }
 
     #[test]
     fn test_char_escape_hex() {
-        let (expr, _types) = parse_expr("'\\x41'").unwrap();
+        let (expr, _types, _strings) = parse_expr("'\\x41'").unwrap();
         assert!(matches!(expr.kind, ExprKind::CharLit('A')));
     }
 
     #[test]
     fn test_char_escape_hex_lowercase() {
-        let (expr, _types) = parse_expr("'\\x0a'").unwrap();
+        let (expr, _types, _strings) = parse_expr("'\\x0a'").unwrap();
         assert!(matches!(expr.kind, ExprKind::CharLit('\n')));
     }
 
     #[test]
     fn test_char_escape_octal() {
-        let (expr, _types) = parse_expr("'\\101'").unwrap();
+        let (expr, _types, _strings) = parse_expr("'\\101'").unwrap();
         assert!(matches!(expr.kind, ExprKind::CharLit('A'))); // octal 101 = 65 = 'A'
     }
 
     #[test]
     fn test_char_escape_octal_012() {
-        let (expr, _types) = parse_expr("'\\012'").unwrap();
+        let (expr, _types, _strings) = parse_expr("'\\012'").unwrap();
         assert!(matches!(expr.kind, ExprKind::CharLit('\n'))); // octal 012 = 10 = '\n'
     }
 
@@ -4220,7 +4250,7 @@ mod tests {
 
     #[test]
     fn test_string_escape_newline() {
-        let (expr, _types) = parse_expr("\"hello\\nworld\"").unwrap();
+        let (expr, _types, _strings) = parse_expr("\"hello\\nworld\"").unwrap();
         match expr.kind {
             ExprKind::StringLit(s) => assert_eq!(s, "hello\nworld"),
             _ => panic!("Expected StringLit"),
@@ -4229,7 +4259,7 @@ mod tests {
 
     #[test]
     fn test_string_escape_tab() {
-        let (expr, _types) = parse_expr("\"hello\\tworld\"").unwrap();
+        let (expr, _types, _strings) = parse_expr("\"hello\\tworld\"").unwrap();
         match expr.kind {
             ExprKind::StringLit(s) => assert_eq!(s, "hello\tworld"),
             _ => panic!("Expected StringLit"),
@@ -4238,7 +4268,7 @@ mod tests {
 
     #[test]
     fn test_string_escape_carriage_return() {
-        let (expr, _types) = parse_expr("\"hello\\rworld\"").unwrap();
+        let (expr, _types, _strings) = parse_expr("\"hello\\rworld\"").unwrap();
         match expr.kind {
             ExprKind::StringLit(s) => assert_eq!(s, "hello\rworld"),
             _ => panic!("Expected StringLit"),
@@ -4247,7 +4277,7 @@ mod tests {
 
     #[test]
     fn test_string_escape_backslash() {
-        let (expr, _types) = parse_expr("\"hello\\\\world\"").unwrap();
+        let (expr, _types, _strings) = parse_expr("\"hello\\\\world\"").unwrap();
         match expr.kind {
             ExprKind::StringLit(s) => assert_eq!(s, "hello\\world"),
             _ => panic!("Expected StringLit"),
@@ -4256,7 +4286,7 @@ mod tests {
 
     #[test]
     fn test_string_escape_double_quote() {
-        let (expr, _types) = parse_expr("\"hello\\\"world\"").unwrap();
+        let (expr, _types, _strings) = parse_expr("\"hello\\\"world\"").unwrap();
         match expr.kind {
             ExprKind::StringLit(s) => assert_eq!(s, "hello\"world"),
             _ => panic!("Expected StringLit"),
@@ -4265,7 +4295,7 @@ mod tests {
 
     #[test]
     fn test_string_escape_bell() {
-        let (expr, _types) = parse_expr("\"\\a\"").unwrap();
+        let (expr, _types, _strings) = parse_expr("\"\\a\"").unwrap();
         match expr.kind {
             ExprKind::StringLit(s) => assert_eq!(s, "\x07"),
             _ => panic!("Expected StringLit"),
@@ -4274,7 +4304,7 @@ mod tests {
 
     #[test]
     fn test_string_escape_backspace() {
-        let (expr, _types) = parse_expr("\"\\b\"").unwrap();
+        let (expr, _types, _strings) = parse_expr("\"\\b\"").unwrap();
         match expr.kind {
             ExprKind::StringLit(s) => assert_eq!(s, "\x08"),
             _ => panic!("Expected StringLit"),
@@ -4283,7 +4313,7 @@ mod tests {
 
     #[test]
     fn test_string_escape_formfeed() {
-        let (expr, _types) = parse_expr("\"\\f\"").unwrap();
+        let (expr, _types, _strings) = parse_expr("\"\\f\"").unwrap();
         match expr.kind {
             ExprKind::StringLit(s) => assert_eq!(s, "\x0C"),
             _ => panic!("Expected StringLit"),
@@ -4292,7 +4322,7 @@ mod tests {
 
     #[test]
     fn test_string_escape_vertical_tab() {
-        let (expr, _types) = parse_expr("\"\\v\"").unwrap();
+        let (expr, _types, _strings) = parse_expr("\"\\v\"").unwrap();
         match expr.kind {
             ExprKind::StringLit(s) => assert_eq!(s, "\x0B"),
             _ => panic!("Expected StringLit"),
@@ -4301,7 +4331,7 @@ mod tests {
 
     #[test]
     fn test_string_escape_null() {
-        let (expr, _types) = parse_expr("\"hello\\0world\"").unwrap();
+        let (expr, _types, _strings) = parse_expr("\"hello\\0world\"").unwrap();
         match expr.kind {
             ExprKind::StringLit(s) => {
                 assert_eq!(s.len(), 11);
@@ -4313,7 +4343,7 @@ mod tests {
 
     #[test]
     fn test_string_escape_hex() {
-        let (expr, _types) = parse_expr("\"\\x41\\x42\\x43\"").unwrap();
+        let (expr, _types, _strings) = parse_expr("\"\\x41\\x42\\x43\"").unwrap();
         match expr.kind {
             ExprKind::StringLit(s) => assert_eq!(s, "ABC"),
             _ => panic!("Expected StringLit"),
@@ -4322,7 +4352,7 @@ mod tests {
 
     #[test]
     fn test_string_escape_octal() {
-        let (expr, _types) = parse_expr("\"\\101\\102\\103\"").unwrap();
+        let (expr, _types, _strings) = parse_expr("\"\\101\\102\\103\"").unwrap();
         match expr.kind {
             ExprKind::StringLit(s) => assert_eq!(s, "ABC"), // octal 101,102,103 = A,B,C
             _ => panic!("Expected StringLit"),
@@ -4331,7 +4361,7 @@ mod tests {
 
     #[test]
     fn test_string_escape_octal_012() {
-        let (expr, _types) = parse_expr("\"line1\\012line2\"").unwrap();
+        let (expr, _types, _strings) = parse_expr("\"line1\\012line2\"").unwrap();
         match expr.kind {
             ExprKind::StringLit(s) => assert_eq!(s, "line1\nline2"), // octal 012 = newline
             _ => panic!("Expected StringLit"),
@@ -4340,7 +4370,7 @@ mod tests {
 
     #[test]
     fn test_string_multiple_escapes() {
-        let (expr, _types) = parse_expr("\"\\t\\n\\r\\\\\"").unwrap();
+        let (expr, _types, _strings) = parse_expr("\"\\t\\n\\r\\\\\"").unwrap();
         match expr.kind {
             ExprKind::StringLit(s) => assert_eq!(s, "\t\n\r\\"),
             _ => panic!("Expected StringLit"),
@@ -4349,7 +4379,7 @@ mod tests {
 
     #[test]
     fn test_string_mixed_content() {
-        let (expr, _types) = parse_expr("\"Name:\\tJohn\\nAge:\\t30\"").unwrap();
+        let (expr, _types, _strings) = parse_expr("\"Name:\\tJohn\\nAge:\\t30\"").unwrap();
         match expr.kind {
             ExprKind::StringLit(s) => assert_eq!(s, "Name:\tJohn\nAge:\t30"),
             _ => panic!("Expected StringLit"),
@@ -4358,7 +4388,7 @@ mod tests {
 
     #[test]
     fn test_string_empty() {
-        let (expr, _types) = parse_expr("\"\"").unwrap();
+        let (expr, _types, _strings) = parse_expr("\"\"").unwrap();
         match expr.kind {
             ExprKind::StringLit(s) => assert_eq!(s, ""),
             _ => panic!("Expected StringLit"),
@@ -4368,60 +4398,60 @@ mod tests {
     #[test]
     fn test_integer_literal_suffixes() {
         // Plain int
-        let (expr, types) = parse_expr("42").unwrap();
+        let (expr, types, _strings) = parse_expr("42").unwrap();
         assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Int);
         assert!(!types.is_unsigned(expr.typ.unwrap()));
 
         // Unsigned int
-        let (expr, types) = parse_expr("42U").unwrap();
+        let (expr, types, _strings) = parse_expr("42U").unwrap();
         assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Int);
         assert!(types.is_unsigned(expr.typ.unwrap()));
 
         // Long
-        let (expr, types) = parse_expr("42L").unwrap();
+        let (expr, types, _strings) = parse_expr("42L").unwrap();
         assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Long);
         assert!(!types.is_unsigned(expr.typ.unwrap()));
 
         // Unsigned long (UL)
-        let (expr, types) = parse_expr("42UL").unwrap();
+        let (expr, types, _strings) = parse_expr("42UL").unwrap();
         assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Long);
         assert!(types.is_unsigned(expr.typ.unwrap()));
 
         // Unsigned long (LU)
-        let (expr, types) = parse_expr("42LU").unwrap();
+        let (expr, types, _strings) = parse_expr("42LU").unwrap();
         assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Long);
         assert!(types.is_unsigned(expr.typ.unwrap()));
 
         // Long long
-        let (expr, types) = parse_expr("42LL").unwrap();
+        let (expr, types, _strings) = parse_expr("42LL").unwrap();
         assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::LongLong);
         assert!(!types.is_unsigned(expr.typ.unwrap()));
 
         // Unsigned long long (ULL)
-        let (expr, types) = parse_expr("42ULL").unwrap();
+        let (expr, types, _strings) = parse_expr("42ULL").unwrap();
         assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::LongLong);
         assert!(types.is_unsigned(expr.typ.unwrap()));
 
         // Unsigned long long (LLU)
-        let (expr, types) = parse_expr("42LLU").unwrap();
+        let (expr, types, _strings) = parse_expr("42LLU").unwrap();
         assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::LongLong);
         assert!(types.is_unsigned(expr.typ.unwrap()));
 
         // Hex with suffix
-        let (expr, types) = parse_expr("0xFFLL").unwrap();
+        let (expr, types, _strings) = parse_expr("0xFFLL").unwrap();
         assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::LongLong);
         assert!(!types.is_unsigned(expr.typ.unwrap()));
 
-        let (expr, types) = parse_expr("0xFFULL").unwrap();
+        let (expr, types, _strings) = parse_expr("0xFFULL").unwrap();
         assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::LongLong);
         assert!(types.is_unsigned(expr.typ.unwrap()));
     }
 
     #[test]
     fn test_identifier() {
-        let (expr, _types) = parse_expr("foo").unwrap();
+        let (expr, _types, strings) = parse_expr("foo").unwrap();
         match expr.kind {
-            ExprKind::Ident { name, .. } => assert_eq!(name, "foo"),
+            ExprKind::Ident { name, .. } => check_name(&strings, name, "foo"),
             _ => panic!("Expected Ident"),
         }
     }
@@ -4432,7 +4462,7 @@ mod tests {
 
     #[test]
     fn test_addition() {
-        let (expr, _types) = parse_expr("1 + 2").unwrap();
+        let (expr, _types, _strings) = parse_expr("1 + 2").unwrap();
         match expr.kind {
             ExprKind::Binary { op, left, right } => {
                 assert_eq!(op, BinaryOp::Add);
@@ -4445,7 +4475,7 @@ mod tests {
 
     #[test]
     fn test_subtraction() {
-        let (expr, _types) = parse_expr("5 - 3").unwrap();
+        let (expr, _types, _strings) = parse_expr("5 - 3").unwrap();
         match expr.kind {
             ExprKind::Binary { op, .. } => assert_eq!(op, BinaryOp::Sub),
             _ => panic!("Expected Binary"),
@@ -4454,7 +4484,7 @@ mod tests {
 
     #[test]
     fn test_multiplication() {
-        let (expr, _types) = parse_expr("2 * 3").unwrap();
+        let (expr, _types, _strings) = parse_expr("2 * 3").unwrap();
         match expr.kind {
             ExprKind::Binary { op, .. } => assert_eq!(op, BinaryOp::Mul),
             _ => panic!("Expected Binary"),
@@ -4463,7 +4493,7 @@ mod tests {
 
     #[test]
     fn test_division() {
-        let (expr, _types) = parse_expr("10 / 2").unwrap();
+        let (expr, _types, _strings) = parse_expr("10 / 2").unwrap();
         match expr.kind {
             ExprKind::Binary { op, .. } => assert_eq!(op, BinaryOp::Div),
             _ => panic!("Expected Binary"),
@@ -4472,7 +4502,7 @@ mod tests {
 
     #[test]
     fn test_modulo() {
-        let (expr, _types) = parse_expr("10 % 3").unwrap();
+        let (expr, _types, _strings) = parse_expr("10 % 3").unwrap();
         match expr.kind {
             ExprKind::Binary { op, .. } => assert_eq!(op, BinaryOp::Mod),
             _ => panic!("Expected Binary"),
@@ -4482,7 +4512,7 @@ mod tests {
     #[test]
     fn test_precedence_mul_add() {
         // 1 + 2 * 3 should be 1 + (2 * 3)
-        let (expr, _types) = parse_expr("1 + 2 * 3").unwrap();
+        let (expr, _types, _strings) = parse_expr("1 + 2 * 3").unwrap();
         match expr.kind {
             ExprKind::Binary { op, left, right } => {
                 assert_eq!(op, BinaryOp::Add);
@@ -4499,7 +4529,7 @@ mod tests {
     #[test]
     fn test_left_associativity() {
         // 1 - 2 - 3 should be (1 - 2) - 3
-        let (expr, _types) = parse_expr("1 - 2 - 3").unwrap();
+        let (expr, _types, _strings) = parse_expr("1 - 2 - 3").unwrap();
         match expr.kind {
             ExprKind::Binary { op, left, right } => {
                 assert_eq!(op, BinaryOp::Sub);
@@ -4519,25 +4549,25 @@ mod tests {
 
     #[test]
     fn test_comparison_ops() {
-        let (expr, _types) = parse_expr("a < b").unwrap();
+        let (expr, _types, _strings) = parse_expr("a < b").unwrap();
         match expr.kind {
             ExprKind::Binary { op, .. } => assert_eq!(op, BinaryOp::Lt),
             _ => panic!("Expected Binary"),
         }
 
-        let (expr, _types) = parse_expr("a > b").unwrap();
+        let (expr, _types, _strings) = parse_expr("a > b").unwrap();
         match expr.kind {
             ExprKind::Binary { op, .. } => assert_eq!(op, BinaryOp::Gt),
             _ => panic!("Expected Binary"),
         }
 
-        let (expr, _types) = parse_expr("a <= b").unwrap();
+        let (expr, _types, _strings) = parse_expr("a <= b").unwrap();
         match expr.kind {
             ExprKind::Binary { op, .. } => assert_eq!(op, BinaryOp::Le),
             _ => panic!("Expected Binary"),
         }
 
-        let (expr, _types) = parse_expr("a >= b").unwrap();
+        let (expr, _types, _strings) = parse_expr("a >= b").unwrap();
         match expr.kind {
             ExprKind::Binary { op, .. } => assert_eq!(op, BinaryOp::Ge),
             _ => panic!("Expected Binary"),
@@ -4546,13 +4576,13 @@ mod tests {
 
     #[test]
     fn test_equality_ops() {
-        let (expr, _types) = parse_expr("a == b").unwrap();
+        let (expr, _types, _strings) = parse_expr("a == b").unwrap();
         match expr.kind {
             ExprKind::Binary { op, .. } => assert_eq!(op, BinaryOp::Eq),
             _ => panic!("Expected Binary"),
         }
 
-        let (expr, _types) = parse_expr("a != b").unwrap();
+        let (expr, _types, _strings) = parse_expr("a != b").unwrap();
         match expr.kind {
             ExprKind::Binary { op, .. } => assert_eq!(op, BinaryOp::Ne),
             _ => panic!("Expected Binary"),
@@ -4561,13 +4591,13 @@ mod tests {
 
     #[test]
     fn test_logical_ops() {
-        let (expr, _types) = parse_expr("a && b").unwrap();
+        let (expr, _types, _strings) = parse_expr("a && b").unwrap();
         match expr.kind {
             ExprKind::Binary { op, .. } => assert_eq!(op, BinaryOp::LogAnd),
             _ => panic!("Expected Binary"),
         }
 
-        let (expr, _types) = parse_expr("a || b").unwrap();
+        let (expr, _types, _strings) = parse_expr("a || b").unwrap();
         match expr.kind {
             ExprKind::Binary { op, .. } => assert_eq!(op, BinaryOp::LogOr),
             _ => panic!("Expected Binary"),
@@ -4576,19 +4606,19 @@ mod tests {
 
     #[test]
     fn test_bitwise_ops() {
-        let (expr, _types) = parse_expr("a & b").unwrap();
+        let (expr, _types, _strings) = parse_expr("a & b").unwrap();
         match expr.kind {
             ExprKind::Binary { op, .. } => assert_eq!(op, BinaryOp::BitAnd),
             _ => panic!("Expected Binary"),
         }
 
-        let (expr, _types) = parse_expr("a | b").unwrap();
+        let (expr, _types, _strings) = parse_expr("a | b").unwrap();
         match expr.kind {
             ExprKind::Binary { op, .. } => assert_eq!(op, BinaryOp::BitOr),
             _ => panic!("Expected Binary"),
         }
 
-        let (expr, _types) = parse_expr("a ^ b").unwrap();
+        let (expr, _types, _strings) = parse_expr("a ^ b").unwrap();
         match expr.kind {
             ExprKind::Binary { op, .. } => assert_eq!(op, BinaryOp::BitXor),
             _ => panic!("Expected Binary"),
@@ -4597,13 +4627,13 @@ mod tests {
 
     #[test]
     fn test_shift_ops() {
-        let (expr, _types) = parse_expr("a << b").unwrap();
+        let (expr, _types, _strings) = parse_expr("a << b").unwrap();
         match expr.kind {
             ExprKind::Binary { op, .. } => assert_eq!(op, BinaryOp::Shl),
             _ => panic!("Expected Binary"),
         }
 
-        let (expr, _types) = parse_expr("a >> b").unwrap();
+        let (expr, _types, _strings) = parse_expr("a >> b").unwrap();
         match expr.kind {
             ExprKind::Binary { op, .. } => assert_eq!(op, BinaryOp::Shr),
             _ => panic!("Expected Binary"),
@@ -4616,12 +4646,12 @@ mod tests {
 
     #[test]
     fn test_unary_neg() {
-        let (expr, _types) = parse_expr("-x").unwrap();
+        let (expr, _types, strings) = parse_expr("-x").unwrap();
         match expr.kind {
             ExprKind::Unary { op, operand } => {
                 assert_eq!(op, UnaryOp::Neg);
                 match operand.kind {
-                    ExprKind::Ident { name, .. } => assert_eq!(name, "x"),
+                    ExprKind::Ident { name, .. } => check_name(&strings, name, "x"),
                     _ => panic!("Expected Ident"),
                 }
             }
@@ -4631,7 +4661,7 @@ mod tests {
 
     #[test]
     fn test_unary_not() {
-        let (expr, _types) = parse_expr("!x").unwrap();
+        let (expr, _types, _strings) = parse_expr("!x").unwrap();
         match expr.kind {
             ExprKind::Unary { op, .. } => assert_eq!(op, UnaryOp::Not),
             _ => panic!("Expected Unary"),
@@ -4640,7 +4670,7 @@ mod tests {
 
     #[test]
     fn test_unary_bitnot() {
-        let (expr, _types) = parse_expr("~x").unwrap();
+        let (expr, _types, _strings) = parse_expr("~x").unwrap();
         match expr.kind {
             ExprKind::Unary { op, .. } => assert_eq!(op, UnaryOp::BitNot),
             _ => panic!("Expected Unary"),
@@ -4649,7 +4679,7 @@ mod tests {
 
     #[test]
     fn test_unary_addr() {
-        let (expr, _types) = parse_expr("&x").unwrap();
+        let (expr, _types, _strings) = parse_expr("&x").unwrap();
         match expr.kind {
             ExprKind::Unary { op, .. } => assert_eq!(op, UnaryOp::AddrOf),
             _ => panic!("Expected Unary"),
@@ -4658,7 +4688,7 @@ mod tests {
 
     #[test]
     fn test_unary_deref() {
-        let (expr, _types) = parse_expr("*p").unwrap();
+        let (expr, _types, _strings) = parse_expr("*p").unwrap();
         match expr.kind {
             ExprKind::Unary { op, .. } => assert_eq!(op, UnaryOp::Deref),
             _ => panic!("Expected Unary"),
@@ -4667,7 +4697,7 @@ mod tests {
 
     #[test]
     fn test_pre_increment() {
-        let (expr, _types) = parse_expr("++x").unwrap();
+        let (expr, _types, _strings) = parse_expr("++x").unwrap();
         match expr.kind {
             ExprKind::Unary { op, .. } => assert_eq!(op, UnaryOp::PreInc),
             _ => panic!("Expected Unary"),
@@ -4676,7 +4706,7 @@ mod tests {
 
     #[test]
     fn test_pre_decrement() {
-        let (expr, _types) = parse_expr("--x").unwrap();
+        let (expr, _types, _strings) = parse_expr("--x").unwrap();
         match expr.kind {
             ExprKind::Unary { op, .. } => assert_eq!(op, UnaryOp::PreDec),
             _ => panic!("Expected Unary"),
@@ -4689,23 +4719,23 @@ mod tests {
 
     #[test]
     fn test_post_increment() {
-        let (expr, _types) = parse_expr("x++").unwrap();
+        let (expr, _types, _strings) = parse_expr("x++").unwrap();
         assert!(matches!(expr.kind, ExprKind::PostInc(_)));
     }
 
     #[test]
     fn test_post_decrement() {
-        let (expr, _types) = parse_expr("x--").unwrap();
+        let (expr, _types, _strings) = parse_expr("x--").unwrap();
         assert!(matches!(expr.kind, ExprKind::PostDec(_)));
     }
 
     #[test]
     fn test_array_subscript() {
-        let (expr, _types) = parse_expr("arr[5]").unwrap();
+        let (expr, _types, strings) = parse_expr("arr[5]").unwrap();
         match expr.kind {
             ExprKind::Index { array, index } => {
                 match array.kind {
-                    ExprKind::Ident { name, .. } => assert_eq!(name, "arr"),
+                    ExprKind::Ident { name, .. } => check_name(&strings, name, "arr"),
                     _ => panic!("Expected Ident"),
                 }
                 assert!(matches!(index.kind, ExprKind::IntLit(5)));
@@ -4716,14 +4746,14 @@ mod tests {
 
     #[test]
     fn test_member_access() {
-        let (expr, _types) = parse_expr("obj.field").unwrap();
+        let (expr, _types, strings) = parse_expr("obj.field").unwrap();
         match expr.kind {
             ExprKind::Member { expr, member } => {
                 match expr.kind {
-                    ExprKind::Ident { name, .. } => assert_eq!(name, "obj"),
+                    ExprKind::Ident { name, .. } => check_name(&strings, name, "obj"),
                     _ => panic!("Expected Ident"),
                 }
-                assert_eq!(member, "field");
+                check_name(&strings, member, "field");
             }
             _ => panic!("Expected Member"),
         }
@@ -4731,14 +4761,14 @@ mod tests {
 
     #[test]
     fn test_arrow_access() {
-        let (expr, _types) = parse_expr("ptr->field").unwrap();
+        let (expr, _types, strings) = parse_expr("ptr->field").unwrap();
         match expr.kind {
             ExprKind::Arrow { expr, member } => {
                 match expr.kind {
-                    ExprKind::Ident { name, .. } => assert_eq!(name, "ptr"),
+                    ExprKind::Ident { name, .. } => check_name(&strings, name, "ptr"),
                     _ => panic!("Expected Ident"),
                 }
-                assert_eq!(member, "field");
+                check_name(&strings, member, "field");
             }
             _ => panic!("Expected Arrow"),
         }
@@ -4746,11 +4776,11 @@ mod tests {
 
     #[test]
     fn test_function_call_no_args() {
-        let (expr, _types) = parse_expr("foo()").unwrap();
+        let (expr, _types, strings) = parse_expr("foo()").unwrap();
         match expr.kind {
             ExprKind::Call { func, args } => {
                 match func.kind {
-                    ExprKind::Ident { name, .. } => assert_eq!(name, "foo"),
+                    ExprKind::Ident { name, .. } => check_name(&strings, name, "foo"),
                     _ => panic!("Expected Ident"),
                 }
                 assert!(args.is_empty());
@@ -4761,11 +4791,11 @@ mod tests {
 
     #[test]
     fn test_function_call_with_args() {
-        let (expr, _types) = parse_expr("foo(1, 2, 3)").unwrap();
+        let (expr, _types, strings) = parse_expr("foo(1, 2, 3)").unwrap();
         match expr.kind {
             ExprKind::Call { func, args } => {
                 match func.kind {
-                    ExprKind::Ident { name, .. } => assert_eq!(name, "foo"),
+                    ExprKind::Ident { name, .. } => check_name(&strings, name, "foo"),
                     _ => panic!("Expected Ident"),
                 }
                 assert_eq!(args.len(), 3);
@@ -4777,16 +4807,16 @@ mod tests {
     #[test]
     fn test_chained_postfix() {
         // obj.arr[0]->next
-        let (expr, _types) = parse_expr("obj.arr[0]").unwrap();
+        let (expr, _types, strings) = parse_expr("obj.arr[0]").unwrap();
         match expr.kind {
             ExprKind::Index { array, index } => {
                 match array.kind {
                     ExprKind::Member { expr, member } => {
                         match expr.kind {
-                            ExprKind::Ident { name, .. } => assert_eq!(name, "obj"),
+                            ExprKind::Ident { name, .. } => check_name(&strings, name, "obj"),
                             _ => panic!("Expected Ident"),
                         }
-                        assert_eq!(member, "arr");
+                        check_name(&strings, member, "arr");
                     }
                     _ => panic!("Expected Member"),
                 }
@@ -4802,12 +4832,12 @@ mod tests {
 
     #[test]
     fn test_simple_assignment() {
-        let (expr, _types) = parse_expr("x = 5").unwrap();
+        let (expr, _types, strings) = parse_expr("x = 5").unwrap();
         match expr.kind {
             ExprKind::Assign { op, target, value } => {
                 assert_eq!(op, AssignOp::Assign);
                 match target.kind {
-                    ExprKind::Ident { name, .. } => assert_eq!(name, "x"),
+                    ExprKind::Ident { name, .. } => check_name(&strings, name, "x"),
                     _ => panic!("Expected Ident"),
                 }
                 assert!(matches!(value.kind, ExprKind::IntLit(5)));
@@ -4818,19 +4848,19 @@ mod tests {
 
     #[test]
     fn test_compound_assignments() {
-        let (expr, _types) = parse_expr("x += 5").unwrap();
+        let (expr, _types, _strings) = parse_expr("x += 5").unwrap();
         match expr.kind {
             ExprKind::Assign { op, .. } => assert_eq!(op, AssignOp::AddAssign),
             _ => panic!("Expected Assign"),
         }
 
-        let (expr, _types) = parse_expr("x -= 5").unwrap();
+        let (expr, _types, _strings) = parse_expr("x -= 5").unwrap();
         match expr.kind {
             ExprKind::Assign { op, .. } => assert_eq!(op, AssignOp::SubAssign),
             _ => panic!("Expected Assign"),
         }
 
-        let (expr, _types) = parse_expr("x *= 5").unwrap();
+        let (expr, _types, _strings) = parse_expr("x *= 5").unwrap();
         match expr.kind {
             ExprKind::Assign { op, .. } => assert_eq!(op, AssignOp::MulAssign),
             _ => panic!("Expected Assign"),
@@ -4840,16 +4870,16 @@ mod tests {
     #[test]
     fn test_assignment_right_associativity() {
         // a = b = c should be a = (b = c)
-        let (expr, _types) = parse_expr("a = b = c").unwrap();
+        let (expr, _types, strings) = parse_expr("a = b = c").unwrap();
         match expr.kind {
             ExprKind::Assign { target, value, .. } => {
                 match target.kind {
-                    ExprKind::Ident { name, .. } => assert_eq!(name, "a"),
+                    ExprKind::Ident { name, .. } => check_name(&strings, name, "a"),
                     _ => panic!("Expected Ident"),
                 }
                 match value.kind {
                     ExprKind::Assign { target, .. } => match target.kind {
-                        ExprKind::Ident { name, .. } => assert_eq!(name, "b"),
+                        ExprKind::Ident { name, .. } => check_name(&strings, name, "b"),
                         _ => panic!("Expected Ident"),
                     },
                     _ => panic!("Expected nested Assign"),
@@ -4865,7 +4895,7 @@ mod tests {
 
     #[test]
     fn test_ternary() {
-        let (expr, _types) = parse_expr("a ? b : c").unwrap();
+        let (expr, _types, strings) = parse_expr("a ? b : c").unwrap();
         match expr.kind {
             ExprKind::Conditional {
                 cond,
@@ -4873,15 +4903,15 @@ mod tests {
                 else_expr,
             } => {
                 match cond.kind {
-                    ExprKind::Ident { name, .. } => assert_eq!(name, "a"),
+                    ExprKind::Ident { name, .. } => check_name(&strings, name, "a"),
                     _ => panic!("Expected Ident"),
                 }
                 match then_expr.kind {
-                    ExprKind::Ident { name, .. } => assert_eq!(name, "b"),
+                    ExprKind::Ident { name, .. } => check_name(&strings, name, "b"),
                     _ => panic!("Expected Ident"),
                 }
                 match else_expr.kind {
-                    ExprKind::Ident { name, .. } => assert_eq!(name, "c"),
+                    ExprKind::Ident { name, .. } => check_name(&strings, name, "c"),
                     _ => panic!("Expected Ident"),
                 }
             }
@@ -4892,7 +4922,7 @@ mod tests {
     #[test]
     fn test_nested_ternary() {
         // a ? b : c ? d : e should be a ? b : (c ? d : e)
-        let (expr, _types) = parse_expr("a ? b : c ? d : e").unwrap();
+        let (expr, _types, _strings) = parse_expr("a ? b : c ? d : e").unwrap();
         match expr.kind {
             ExprKind::Conditional { else_expr, .. } => {
                 assert!(matches!(else_expr.kind, ExprKind::Conditional { .. }));
@@ -4907,7 +4937,7 @@ mod tests {
 
     #[test]
     fn test_comma_expr() {
-        let (expr, _types) = parse_expr("a, b, c").unwrap();
+        let (expr, _types, _strings) = parse_expr("a, b, c").unwrap();
         match expr.kind {
             ExprKind::Comma(exprs) => assert_eq!(exprs.len(), 3),
             _ => panic!("Expected Comma"),
@@ -4920,13 +4950,13 @@ mod tests {
 
     #[test]
     fn test_sizeof_expr() {
-        let (expr, _types) = parse_expr("sizeof x").unwrap();
+        let (expr, _types, _strings) = parse_expr("sizeof x").unwrap();
         assert!(matches!(expr.kind, ExprKind::SizeofExpr(_)));
     }
 
     #[test]
     fn test_sizeof_type() {
-        let (expr, types) = parse_expr("sizeof(int)").unwrap();
+        let (expr, types, _strings) = parse_expr("sizeof(int)").unwrap();
         match expr.kind {
             ExprKind::SizeofType(typ) => assert_eq!(types.kind(typ), TypeKind::Int),
             _ => panic!("Expected SizeofType"),
@@ -4936,7 +4966,7 @@ mod tests {
     #[test]
     fn test_sizeof_paren_expr() {
         // sizeof(x) where x is not a type
-        let (expr, _types) = parse_expr("sizeof(x)").unwrap();
+        let (expr, _types, _strings) = parse_expr("sizeof(x)").unwrap();
         assert!(matches!(expr.kind, ExprKind::SizeofExpr(_)));
     }
 
@@ -4946,12 +4976,12 @@ mod tests {
 
     #[test]
     fn test_cast() {
-        let (expr, types) = parse_expr("(int)x").unwrap();
+        let (expr, types, strings) = parse_expr("(int)x").unwrap();
         match expr.kind {
             ExprKind::Cast { cast_type, expr } => {
                 assert_eq!(types.kind(cast_type), TypeKind::Int);
                 match expr.kind {
-                    ExprKind::Ident { name, .. } => assert_eq!(name, "x"),
+                    ExprKind::Ident { name, .. } => check_name(&strings, name, "x"),
                     _ => panic!("Expected Ident"),
                 }
             }
@@ -4961,7 +4991,7 @@ mod tests {
 
     #[test]
     fn test_cast_unsigned_char() {
-        let (expr, types) = parse_expr("(unsigned char)x").unwrap();
+        let (expr, types, _strings) = parse_expr("(unsigned char)x").unwrap();
         match expr.kind {
             ExprKind::Cast { cast_type, .. } => {
                 assert_eq!(types.kind(cast_type), TypeKind::Char);
@@ -4976,7 +5006,7 @@ mod tests {
 
     #[test]
     fn test_cast_signed_int() {
-        let (expr, types) = parse_expr("(signed int)x").unwrap();
+        let (expr, types, _strings) = parse_expr("(signed int)x").unwrap();
         match expr.kind {
             ExprKind::Cast { cast_type, .. } => {
                 assert_eq!(types.kind(cast_type), TypeKind::Int);
@@ -4991,7 +5021,7 @@ mod tests {
 
     #[test]
     fn test_cast_unsigned_long() {
-        let (expr, types) = parse_expr("(unsigned long)x").unwrap();
+        let (expr, types, _strings) = parse_expr("(unsigned long)x").unwrap();
         match expr.kind {
             ExprKind::Cast { cast_type, .. } => {
                 assert_eq!(types.kind(cast_type), TypeKind::Long);
@@ -5006,7 +5036,7 @@ mod tests {
 
     #[test]
     fn test_cast_long_long() {
-        let (expr, types) = parse_expr("(long long)x").unwrap();
+        let (expr, types, _strings) = parse_expr("(long long)x").unwrap();
         match expr.kind {
             ExprKind::Cast { cast_type, .. } => {
                 assert_eq!(types.kind(cast_type), TypeKind::LongLong);
@@ -5017,7 +5047,7 @@ mod tests {
 
     #[test]
     fn test_cast_unsigned_long_long() {
-        let (expr, types) = parse_expr("(unsigned long long)x").unwrap();
+        let (expr, types, _strings) = parse_expr("(unsigned long long)x").unwrap();
         match expr.kind {
             ExprKind::Cast { cast_type, .. } => {
                 assert_eq!(types.kind(cast_type), TypeKind::LongLong);
@@ -5032,7 +5062,7 @@ mod tests {
 
     #[test]
     fn test_cast_pointer() {
-        let (expr, types) = parse_expr("(int*)x").unwrap();
+        let (expr, types, _strings) = parse_expr("(int*)x").unwrap();
         match expr.kind {
             ExprKind::Cast { cast_type, .. } => {
                 assert_eq!(types.kind(cast_type), TypeKind::Pointer);
@@ -5045,7 +5075,7 @@ mod tests {
 
     #[test]
     fn test_cast_void_pointer() {
-        let (expr, types) = parse_expr("(void*)x").unwrap();
+        let (expr, types, _strings) = parse_expr("(void*)x").unwrap();
         match expr.kind {
             ExprKind::Cast { cast_type, .. } => {
                 assert_eq!(types.kind(cast_type), TypeKind::Pointer);
@@ -5058,7 +5088,7 @@ mod tests {
 
     #[test]
     fn test_cast_unsigned_char_pointer() {
-        let (expr, types) = parse_expr("(unsigned char*)x").unwrap();
+        let (expr, types, _strings) = parse_expr("(unsigned char*)x").unwrap();
         match expr.kind {
             ExprKind::Cast { cast_type, .. } => {
                 assert_eq!(types.kind(cast_type), TypeKind::Pointer);
@@ -5072,7 +5102,7 @@ mod tests {
 
     #[test]
     fn test_cast_const_int() {
-        let (expr, types) = parse_expr("(const int)x").unwrap();
+        let (expr, types, _strings) = parse_expr("(const int)x").unwrap();
         match expr.kind {
             ExprKind::Cast { cast_type, .. } => {
                 assert_eq!(types.kind(cast_type), TypeKind::Int);
@@ -5087,7 +5117,7 @@ mod tests {
 
     #[test]
     fn test_cast_double_pointer() {
-        let (expr, types) = parse_expr("(int**)x").unwrap();
+        let (expr, types, _strings) = parse_expr("(int**)x").unwrap();
         match expr.kind {
             ExprKind::Cast { cast_type, .. } => {
                 assert_eq!(types.kind(cast_type), TypeKind::Pointer);
@@ -5102,7 +5132,7 @@ mod tests {
 
     #[test]
     fn test_sizeof_compound_type() {
-        let (expr, types) = parse_expr("sizeof(unsigned long long)").unwrap();
+        let (expr, types, _strings) = parse_expr("sizeof(unsigned long long)").unwrap();
         match expr.kind {
             ExprKind::SizeofType(typ) => {
                 assert_eq!(types.kind(typ), TypeKind::LongLong);
@@ -5114,7 +5144,7 @@ mod tests {
 
     #[test]
     fn test_sizeof_pointer_type() {
-        let (expr, types) = parse_expr("sizeof(int*)").unwrap();
+        let (expr, types, _strings) = parse_expr("sizeof(int*)").unwrap();
         match expr.kind {
             ExprKind::SizeofType(typ) => {
                 assert_eq!(types.kind(typ), TypeKind::Pointer);
@@ -5129,7 +5159,7 @@ mod tests {
 
     #[test]
     fn test_parentheses() {
-        let (expr, _types) = parse_expr("(1 + 2) * 3").unwrap();
+        let (expr, _types, _strings) = parse_expr("(1 + 2) * 3").unwrap();
         match expr.kind {
             ExprKind::Binary { op, left, .. } => {
                 assert_eq!(op, BinaryOp::Mul);
@@ -5149,14 +5179,14 @@ mod tests {
     #[test]
     fn test_complex_expr() {
         // x = a + b * c - d / e
-        let (expr, _types) = parse_expr("x = a + b * c - d / e").unwrap();
+        let (expr, _types, _strings) = parse_expr("x = a + b * c - d / e").unwrap();
         assert!(matches!(expr.kind, ExprKind::Assign { .. }));
     }
 
     #[test]
     fn test_function_call_complex() {
         // foo(a + b, c * d)
-        let (expr, _types) = parse_expr("foo(a + b, c * d)").unwrap();
+        let (expr, _types, _strings) = parse_expr("foo(a + b, c * d)").unwrap();
         match expr.kind {
             ExprKind::Call { args, .. } => {
                 assert_eq!(args.len(), 2);
@@ -5182,7 +5212,7 @@ mod tests {
     #[test]
     fn test_pointer_arithmetic() {
         // *p++
-        let (expr, _types) = parse_expr("*p++").unwrap();
+        let (expr, _types, _strings) = parse_expr("*p++").unwrap();
         match expr.kind {
             ExprKind::Unary {
                 op: UnaryOp::Deref,
@@ -5198,32 +5228,34 @@ mod tests {
     // Statement tests
     // ========================================================================
 
-    fn parse_stmt(input: &str) -> ParseResult<Stmt> {
-        let mut tokenizer = Tokenizer::new(input.as_bytes(), 0);
+    fn parse_stmt(input: &str) -> ParseResult<(Stmt, StringTable)> {
+        let mut strings = StringTable::new();
+        let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
         let tokens = tokenizer.tokenize();
-        let idents = tokenizer.ident_table();
+        drop(tokenizer);
         let mut symbols = SymbolTable::new();
         let mut types = TypeTable::new();
-        let mut parser = Parser::new(&tokens, idents, &mut symbols, &mut types);
+        let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types);
         parser.skip_stream_tokens();
-        parser.parse_statement()
+        let stmt = parser.parse_statement()?;
+        Ok((stmt, strings))
     }
 
     #[test]
     fn test_empty_stmt() {
-        let stmt = parse_stmt(";").unwrap();
+        let (stmt, _strings) = parse_stmt(";").unwrap();
         assert!(matches!(stmt, Stmt::Empty));
     }
 
     #[test]
     fn test_expr_stmt() {
-        let stmt = parse_stmt("x = 5;").unwrap();
+        let (stmt, _strings) = parse_stmt("x = 5;").unwrap();
         assert!(matches!(stmt, Stmt::Expr(_)));
     }
 
     #[test]
     fn test_if_stmt() {
-        let stmt = parse_stmt("if (x) y = 1;").unwrap();
+        let (stmt, _strings) = parse_stmt("if (x) y = 1;").unwrap();
         match stmt {
             Stmt::If {
                 cond,
@@ -5240,7 +5272,7 @@ mod tests {
 
     #[test]
     fn test_if_else_stmt() {
-        let stmt = parse_stmt("if (x) y = 1; else y = 2;").unwrap();
+        let (stmt, _strings) = parse_stmt("if (x) y = 1; else y = 2;").unwrap();
         match stmt {
             Stmt::If { else_stmt, .. } => {
                 assert!(else_stmt.is_some());
@@ -5251,7 +5283,7 @@ mod tests {
 
     #[test]
     fn test_while_stmt() {
-        let stmt = parse_stmt("while (x) x--;").unwrap();
+        let (stmt, _strings) = parse_stmt("while (x) x--;").unwrap();
         match stmt {
             Stmt::While { cond, body } => {
                 assert!(matches!(cond.kind, ExprKind::Ident { .. }));
@@ -5263,7 +5295,7 @@ mod tests {
 
     #[test]
     fn test_do_while_stmt() {
-        let stmt = parse_stmt("do x++; while (x < 10);").unwrap();
+        let (stmt, _strings) = parse_stmt("do x++; while (x < 10);").unwrap();
         match stmt {
             Stmt::DoWhile { body, cond } => {
                 assert!(matches!(*body, Stmt::Expr(_)));
@@ -5281,7 +5313,7 @@ mod tests {
 
     #[test]
     fn test_for_stmt_basic() {
-        let stmt = parse_stmt("for (i = 0; i < 10; i++) x++;").unwrap();
+        let (stmt, _strings) = parse_stmt("for (i = 0; i < 10; i++) x++;").unwrap();
         match stmt {
             Stmt::For {
                 init,
@@ -5300,7 +5332,7 @@ mod tests {
 
     #[test]
     fn test_for_stmt_with_decl() {
-        let stmt = parse_stmt("for (int i = 0; i < 10; i++) x++;").unwrap();
+        let (stmt, _strings) = parse_stmt("for (int i = 0; i < 10; i++) x++;").unwrap();
         match stmt {
             Stmt::For { init, .. } => {
                 assert!(matches!(init, Some(ForInit::Declaration(_))));
@@ -5311,7 +5343,7 @@ mod tests {
 
     #[test]
     fn test_for_stmt_empty() {
-        let stmt = parse_stmt("for (;;) ;").unwrap();
+        let (stmt, _strings) = parse_stmt("for (;;) ;").unwrap();
         match stmt {
             Stmt::For {
                 init,
@@ -5330,7 +5362,7 @@ mod tests {
 
     #[test]
     fn test_return_void() {
-        let stmt = parse_stmt("return;").unwrap();
+        let (stmt, _strings) = parse_stmt("return;").unwrap();
         match stmt {
             Stmt::Return(None) => {}
             _ => panic!("Expected Return(None)"),
@@ -5339,7 +5371,7 @@ mod tests {
 
     #[test]
     fn test_return_value() {
-        let stmt = parse_stmt("return 42;").unwrap();
+        let (stmt, _strings) = parse_stmt("return 42;").unwrap();
         match stmt {
             Stmt::Return(Some(ref e)) => {
                 assert!(matches!(e.kind, ExprKind::IntLit(42)));
@@ -5350,31 +5382,31 @@ mod tests {
 
     #[test]
     fn test_break_stmt() {
-        let stmt = parse_stmt("break;").unwrap();
+        let (stmt, _strings) = parse_stmt("break;").unwrap();
         assert!(matches!(stmt, Stmt::Break));
     }
 
     #[test]
     fn test_continue_stmt() {
-        let stmt = parse_stmt("continue;").unwrap();
+        let (stmt, _strings) = parse_stmt("continue;").unwrap();
         assert!(matches!(stmt, Stmt::Continue));
     }
 
     #[test]
     fn test_goto_stmt() {
-        let stmt = parse_stmt("goto label;").unwrap();
+        let (stmt, strings) = parse_stmt("goto label;").unwrap();
         match stmt {
-            Stmt::Goto(name) => assert_eq!(name, "label"),
+            Stmt::Goto(name) => check_name(&strings, name, "label"),
             _ => panic!("Expected Goto"),
         }
     }
 
     #[test]
     fn test_labeled_stmt() {
-        let stmt = parse_stmt("label: x = 1;").unwrap();
+        let (stmt, strings) = parse_stmt("label: x = 1;").unwrap();
         match stmt {
             Stmt::Label { name, stmt } => {
-                assert_eq!(name, "label");
+                check_name(&strings, name, "label");
                 assert!(matches!(*stmt, Stmt::Expr(_)));
             }
             _ => panic!("Expected Label"),
@@ -5383,7 +5415,7 @@ mod tests {
 
     #[test]
     fn test_block_stmt() {
-        let stmt = parse_stmt("{ x = 1; y = 2; }").unwrap();
+        let (stmt, _strings) = parse_stmt("{ x = 1; y = 2; }").unwrap();
         match stmt {
             Stmt::Block(items) => {
                 assert_eq!(items.len(), 2);
@@ -5396,7 +5428,7 @@ mod tests {
 
     #[test]
     fn test_block_with_decl() {
-        let stmt = parse_stmt("{ int x = 1; x++; }").unwrap();
+        let (stmt, _strings) = parse_stmt("{ int x = 1; x++; }").unwrap();
         match stmt {
             Stmt::Block(items) => {
                 assert_eq!(items.len(), 2);
@@ -5411,58 +5443,59 @@ mod tests {
     // Declaration tests
     // ========================================================================
 
-    fn parse_decl(input: &str) -> ParseResult<(Declaration, TypeTable)> {
-        let mut tokenizer = Tokenizer::new(input.as_bytes(), 0);
+    fn parse_decl(input: &str) -> ParseResult<(Declaration, TypeTable, StringTable)> {
+        let mut strings = StringTable::new();
+        let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
         let tokens = tokenizer.tokenize();
-        let idents = tokenizer.ident_table();
+        drop(tokenizer);
         let mut symbols = SymbolTable::new();
         let mut types = TypeTable::new();
-        let mut parser = Parser::new(&tokens, idents, &mut symbols, &mut types);
+        let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types);
         parser.skip_stream_tokens();
         let decl = parser.parse_declaration()?;
-        Ok((decl, types))
+        Ok((decl, types, strings))
     }
 
     #[test]
     fn test_simple_decl() {
-        let (decl, types) = parse_decl("int x;").unwrap();
+        let (decl, types, strings) = parse_decl("int x;").unwrap();
         assert_eq!(decl.declarators.len(), 1);
-        assert_eq!(decl.declarators[0].name, "x");
+        check_name(&strings, decl.declarators[0].name, "x");
         assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Int);
     }
 
     #[test]
     fn test_decl_with_init() {
-        let (decl, _types) = parse_decl("int x = 5;").unwrap();
+        let (decl, _types, _strings) = parse_decl("int x = 5;").unwrap();
         assert_eq!(decl.declarators.len(), 1);
         assert!(decl.declarators[0].init.is_some());
     }
 
     #[test]
     fn test_multiple_declarators() {
-        let (decl, _types) = parse_decl("int x, y, z;").unwrap();
+        let (decl, _types, strings) = parse_decl("int x, y, z;").unwrap();
         assert_eq!(decl.declarators.len(), 3);
-        assert_eq!(decl.declarators[0].name, "x");
-        assert_eq!(decl.declarators[1].name, "y");
-        assert_eq!(decl.declarators[2].name, "z");
+        check_name(&strings, decl.declarators[0].name, "x");
+        check_name(&strings, decl.declarators[1].name, "y");
+        check_name(&strings, decl.declarators[2].name, "z");
     }
 
     #[test]
     fn test_pointer_decl() {
-        let (decl, types) = parse_decl("int *p;").unwrap();
+        let (decl, types, _strings) = parse_decl("int *p;").unwrap();
         assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Pointer);
     }
 
     #[test]
     fn test_array_decl() {
-        let (decl, types) = parse_decl("int arr[10];").unwrap();
+        let (decl, types, _strings) = parse_decl("int arr[10];").unwrap();
         assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Array);
         assert_eq!(types.get(decl.declarators[0].typ).array_size, Some(10));
     }
 
     #[test]
     fn test_const_decl() {
-        let (decl, types) = parse_decl("const int x = 5;").unwrap();
+        let (decl, types, _strings) = parse_decl("const int x = 5;").unwrap();
         assert!(types
             .get(decl.declarators[0].typ)
             .modifiers
@@ -5471,7 +5504,7 @@ mod tests {
 
     #[test]
     fn test_unsigned_decl() {
-        let (decl, types) = parse_decl("unsigned int x;").unwrap();
+        let (decl, types, _strings) = parse_decl("unsigned int x;").unwrap();
         assert!(types
             .get(decl.declarators[0].typ)
             .modifiers
@@ -5480,7 +5513,7 @@ mod tests {
 
     #[test]
     fn test_long_long_decl() {
-        let (decl, types) = parse_decl("long long x;").unwrap();
+        let (decl, types, _strings) = parse_decl("long long x;").unwrap();
         assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::LongLong);
     }
 
@@ -5488,36 +5521,38 @@ mod tests {
     // Function parsing tests
     // ========================================================================
 
-    fn parse_func(input: &str) -> ParseResult<(FunctionDef, TypeTable)> {
-        let mut tokenizer = Tokenizer::new(input.as_bytes(), 0);
+    fn parse_func(input: &str) -> ParseResult<(FunctionDef, TypeTable, StringTable)> {
+        let mut strings = StringTable::new();
+        let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
         let tokens = tokenizer.tokenize();
-        let idents = tokenizer.ident_table();
+        drop(tokenizer);
         let mut symbols = SymbolTable::new();
         let mut types = TypeTable::new();
-        let mut parser = Parser::new(&tokens, idents, &mut symbols, &mut types);
+        let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types);
         parser.skip_stream_tokens();
         let func = parser.parse_function_def()?;
-        Ok((func, types))
+        Ok((func, types, strings))
     }
 
     #[test]
     fn test_simple_function() {
-        let (func, types) = parse_func("int main() { return 0; }").unwrap();
-        assert_eq!(func.name, "main");
+        let (func, types, strings) = parse_func("int main() { return 0; }").unwrap();
+        check_name(&strings, func.name, "main");
         assert_eq!(types.kind(func.return_type), TypeKind::Int);
         assert!(func.params.is_empty());
     }
 
     #[test]
     fn test_function_with_params() {
-        let (func, _types) = parse_func("int add(int a, int b) { return a + b; }").unwrap();
-        assert_eq!(func.name, "add");
+        let (func, _types, strings) =
+            parse_func("int add(int a, int b) { return a + b; }").unwrap();
+        check_name(&strings, func.name, "add");
         assert_eq!(func.params.len(), 2);
     }
 
     #[test]
     fn test_void_function() {
-        let (func, types) = parse_func("void foo(void) { }").unwrap();
+        let (func, types, _strings) = parse_func("void foo(void) { }").unwrap();
         assert_eq!(types.kind(func.return_type), TypeKind::Void);
         assert!(func.params.is_empty());
     }
@@ -5525,13 +5560,14 @@ mod tests {
     #[test]
     fn test_variadic_function() {
         // Variadic functions are parsed but variadic info is not tracked in FunctionDef
-        let (func, _types) = parse_func("int printf(char *fmt, ...) { return 0; }").unwrap();
-        assert_eq!(func.name, "printf");
+        let (func, _types, strings) =
+            parse_func("int printf(char *fmt, ...) { return 0; }").unwrap();
+        check_name(&strings, func.name, "printf");
     }
 
     #[test]
     fn test_pointer_return() {
-        let (func, types) = parse_func("int *getptr() { return 0; }").unwrap();
+        let (func, types, _strings) = parse_func("int *getptr() { return 0; }").unwrap();
         assert_eq!(types.kind(func.return_type), TypeKind::Pointer);
     }
 
@@ -5539,34 +5575,35 @@ mod tests {
     // Translation unit tests
     // ========================================================================
 
-    fn parse_tu(input: &str) -> ParseResult<(TranslationUnit, TypeTable)> {
-        let mut tokenizer = Tokenizer::new(input.as_bytes(), 0);
+    fn parse_tu(input: &str) -> ParseResult<(TranslationUnit, TypeTable, StringTable)> {
+        let mut strings = StringTable::new();
+        let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
         let tokens = tokenizer.tokenize();
-        let idents = tokenizer.ident_table();
+        drop(tokenizer);
         let mut symbols = SymbolTable::new();
         let mut types = TypeTable::new();
-        let mut parser = Parser::new(&tokens, idents, &mut symbols, &mut types);
+        let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types);
         let tu = parser.parse_translation_unit()?;
-        Ok((tu, types))
+        Ok((tu, types, strings))
     }
 
     #[test]
     fn test_simple_program() {
-        let (tu, _types) = parse_tu("int main() { return 0; }").unwrap();
+        let (tu, _types, _strings) = parse_tu("int main() { return 0; }").unwrap();
         assert_eq!(tu.items.len(), 1);
         assert!(matches!(tu.items[0], ExternalDecl::FunctionDef(_)));
     }
 
     #[test]
     fn test_global_var() {
-        let (tu, _types) = parse_tu("int x = 5;").unwrap();
+        let (tu, _types, _strings) = parse_tu("int x = 5;").unwrap();
         assert_eq!(tu.items.len(), 1);
         assert!(matches!(tu.items[0], ExternalDecl::Declaration(_)));
     }
 
     #[test]
     fn test_multiple_items() {
-        let (tu, _types) = parse_tu("int x; int main() { return x; }").unwrap();
+        let (tu, _types, _strings) = parse_tu("int x; int main() { return x; }").unwrap();
         assert_eq!(tu.items.len(), 2);
         assert!(matches!(tu.items[0], ExternalDecl::Declaration(_)));
         assert!(matches!(tu.items[1], ExternalDecl::FunctionDef(_)));
@@ -5574,11 +5611,11 @@ mod tests {
 
     #[test]
     fn test_function_declaration() {
-        let (tu, types) = parse_tu("int foo(int x);").unwrap();
+        let (tu, types, strings) = parse_tu("int foo(int x);").unwrap();
         assert_eq!(tu.items.len(), 1);
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "foo");
+                check_name(&strings, decl.declarators[0].name, "foo");
                 assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Function);
             }
             _ => panic!("Expected Declaration"),
@@ -5588,7 +5625,7 @@ mod tests {
     #[test]
     fn test_struct_only_declaration() {
         // Struct definition without a variable declarator
-        let (tu, _types) = parse_tu("struct point { int x; int y; };").unwrap();
+        let (tu, _types, _strings) = parse_tu("struct point { int x; int y; };").unwrap();
         assert_eq!(tu.items.len(), 1);
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
@@ -5602,12 +5639,12 @@ mod tests {
     #[test]
     fn test_struct_with_variable_declaration() {
         // Struct definition with a variable declarator
-        let (tu, types) = parse_tu("struct point { int x; int y; } p;").unwrap();
+        let (tu, types, strings) = parse_tu("struct point { int x; int y; } p;").unwrap();
         assert_eq!(tu.items.len(), 1);
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
                 assert_eq!(decl.declarators.len(), 1);
-                assert_eq!(decl.declarators[0].name, "p");
+                check_name(&strings, decl.declarators[0].name, "p");
                 assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Struct);
             }
             _ => panic!("Expected Declaration"),
@@ -5621,12 +5658,12 @@ mod tests {
     #[test]
     fn test_typedef_basic() {
         // Basic typedef declaration
-        let (tu, types) = parse_tu("typedef int myint;").unwrap();
+        let (tu, types, strings) = parse_tu("typedef int myint;").unwrap();
         assert_eq!(tu.items.len(), 1);
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
                 assert_eq!(decl.declarators.len(), 1);
-                assert_eq!(decl.declarators[0].name, "myint");
+                check_name(&strings, decl.declarators[0].name, "myint");
                 // The type includes the TYPEDEF modifier
                 assert!(types
                     .get(decl.declarators[0].typ)
@@ -5640,13 +5677,13 @@ mod tests {
     #[test]
     fn test_typedef_usage() {
         // Typedef declaration followed by usage
-        let (tu, types) = parse_tu("typedef int myint; myint x;").unwrap();
+        let (tu, types, strings) = parse_tu("typedef int myint; myint x;").unwrap();
         assert_eq!(tu.items.len(), 2);
 
         // First item: typedef declaration
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "myint");
+                check_name(&strings, decl.declarators[0].name, "myint");
             }
             _ => panic!("Expected typedef Declaration"),
         }
@@ -5654,7 +5691,7 @@ mod tests {
         // Second item: variable using typedef
         match &tu.items[1] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "x");
+                check_name(&strings, decl.declarators[0].name, "x");
                 // The variable should have int type (resolved from typedef)
                 assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Int);
             }
@@ -5665,13 +5702,13 @@ mod tests {
     #[test]
     fn test_typedef_pointer() {
         // Typedef for pointer type
-        let (tu, types) = parse_tu("typedef int *intptr; intptr p;").unwrap();
+        let (tu, types, strings) = parse_tu("typedef int *intptr; intptr p;").unwrap();
         assert_eq!(tu.items.len(), 2);
 
         // Variable should have pointer type
         match &tu.items[1] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "p");
+                check_name(&strings, decl.declarators[0].name, "p");
                 assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Pointer);
             }
             _ => panic!("Expected variable Declaration"),
@@ -5681,13 +5718,14 @@ mod tests {
     #[test]
     fn test_typedef_struct() {
         // Typedef for anonymous struct
-        let (tu, types) = parse_tu("typedef struct { int x; int y; } Point; Point p;").unwrap();
+        let (tu, types, strings) =
+            parse_tu("typedef struct { int x; int y; } Point; Point p;").unwrap();
         assert_eq!(tu.items.len(), 2);
 
         // Variable should have struct type
         match &tu.items[1] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "p");
+                check_name(&strings, decl.declarators[0].name, "p");
                 assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Struct);
             }
             _ => panic!("Expected variable Declaration"),
@@ -5697,13 +5735,14 @@ mod tests {
     #[test]
     fn test_typedef_chained() {
         // Chained typedef: typedef of typedef
-        let (tu, types) = parse_tu("typedef int myint; typedef myint myint2; myint2 x;").unwrap();
+        let (tu, types, strings) =
+            parse_tu("typedef int myint; typedef myint myint2; myint2 x;").unwrap();
         assert_eq!(tu.items.len(), 3);
 
         // Final variable should resolve to int
         match &tu.items[2] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "x");
+                check_name(&strings, decl.declarators[0].name, "x");
                 assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Int);
             }
             _ => panic!("Expected variable Declaration"),
@@ -5713,14 +5752,14 @@ mod tests {
     #[test]
     fn test_typedef_multiple() {
         // Multiple typedefs in one declaration
-        let (tu, types) = parse_tu("typedef int INT, *INTPTR;").unwrap();
+        let (tu, types, strings) = parse_tu("typedef int INT, *INTPTR;").unwrap();
         assert_eq!(tu.items.len(), 1);
 
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
                 assert_eq!(decl.declarators.len(), 2);
-                assert_eq!(decl.declarators[0].name, "INT");
-                assert_eq!(decl.declarators[1].name, "INTPTR");
+                check_name(&strings, decl.declarators[0].name, "INT");
+                check_name(&strings, decl.declarators[1].name, "INTPTR");
                 // INTPTR should be a pointer type
                 assert_eq!(types.kind(decl.declarators[1].typ), TypeKind::Pointer);
             }
@@ -5731,13 +5770,13 @@ mod tests {
     #[test]
     fn test_typedef_in_function() {
         // Typedef used in function parameter and return type
-        let (tu, types) =
+        let (tu, types, strings) =
             parse_tu("typedef int myint; myint add(myint a, myint b) { return a + b; }").unwrap();
         assert_eq!(tu.items.len(), 2);
 
         match &tu.items[1] {
             ExternalDecl::FunctionDef(func) => {
-                assert_eq!(func.name, "add");
+                check_name(&strings, func.name, "add");
                 // Return type should resolve to int
                 assert_eq!(types.kind(func.return_type), TypeKind::Int);
                 // Parameters should also resolve to int
@@ -5752,13 +5791,13 @@ mod tests {
     #[test]
     fn test_typedef_local_variable() {
         // Typedef used as local variable type inside function body
-        let (tu, _types) =
+        let (tu, _types, strings) =
             parse_tu("typedef int myint; int main(void) { myint x; x = 42; return 0; }").unwrap();
         assert_eq!(tu.items.len(), 2);
 
         match &tu.items[1] {
             ExternalDecl::FunctionDef(func) => {
-                assert_eq!(func.name, "main");
+                check_name(&strings, func.name, "main");
                 // Check that the body parsed correctly
                 match &func.body {
                     Stmt::Block(items) => {
@@ -5778,7 +5817,8 @@ mod tests {
     #[test]
     fn test_restrict_pointer_decl() {
         // Local variable with restrict qualifier
-        let (tu, _types) = parse_tu("int main(void) { int * restrict p; return 0; }").unwrap();
+        let (tu, _types, _strings) =
+            parse_tu("int main(void) { int * restrict p; return 0; }").unwrap();
         assert_eq!(tu.items.len(), 1);
         // Just verify it parses without error
     }
@@ -5786,14 +5826,14 @@ mod tests {
     #[test]
     fn test_restrict_function_param() {
         // Function with restrict-qualified pointer parameters
-        let (tu, types) =
+        let (tu, types, strings) =
             parse_tu("void copy(int * restrict dest, int * restrict src) { *dest = *src; }")
                 .unwrap();
         assert_eq!(tu.items.len(), 1);
 
         match &tu.items[0] {
             ExternalDecl::FunctionDef(func) => {
-                assert_eq!(func.name, "copy");
+                check_name(&strings, func.name, "copy");
                 assert_eq!(func.params.len(), 2);
                 // Both params should be restrict-qualified pointers
                 assert_eq!(types.kind(func.params[0].typ), TypeKind::Pointer);
@@ -5814,7 +5854,7 @@ mod tests {
     #[test]
     fn test_restrict_with_const() {
         // Pointer with both const and restrict qualifiers
-        let (tu, _types) =
+        let (tu, _types, _strings) =
             parse_tu("int main(void) { int * const restrict p = 0; return 0; }").unwrap();
         assert_eq!(tu.items.len(), 1);
         // Just verify it parses without error - both qualifiers should be accepted
@@ -5823,12 +5863,12 @@ mod tests {
     #[test]
     fn test_restrict_global_pointer() {
         // Global pointer with restrict qualifier
-        let (tu, types) = parse_tu("int * restrict global_ptr;").unwrap();
+        let (tu, types, strings) = parse_tu("int * restrict global_ptr;").unwrap();
         assert_eq!(tu.items.len(), 1);
 
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "global_ptr");
+                check_name(&strings, decl.declarators[0].name, "global_ptr");
                 assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Pointer);
                 assert!(types
                     .get(decl.declarators[0].typ)
@@ -5846,12 +5886,12 @@ mod tests {
     #[test]
     fn test_volatile_basic() {
         // Basic volatile variable
-        let (tu, types) = parse_tu("volatile int x;").unwrap();
+        let (tu, types, strings) = parse_tu("volatile int x;").unwrap();
         assert_eq!(tu.items.len(), 1);
 
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "x");
+                check_name(&strings, decl.declarators[0].name, "x");
                 assert!(types
                     .get(decl.declarators[0].typ)
                     .modifiers
@@ -5864,12 +5904,12 @@ mod tests {
     #[test]
     fn test_volatile_pointer() {
         // Pointer to volatile int
-        let (tu, types) = parse_tu("volatile int *p;").unwrap();
+        let (tu, types, strings) = parse_tu("volatile int *p;").unwrap();
         assert_eq!(tu.items.len(), 1);
 
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "p");
+                check_name(&strings, decl.declarators[0].name, "p");
                 assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Pointer);
                 // The base type should be volatile
                 let base_id = types.base_type(decl.declarators[0].typ).unwrap();
@@ -5885,12 +5925,12 @@ mod tests {
     #[test]
     fn test_volatile_pointer_itself() {
         // Volatile pointer to int (pointer itself is volatile)
-        let (tu, types) = parse_tu("int * volatile p;").unwrap();
+        let (tu, types, strings) = parse_tu("int * volatile p;").unwrap();
         assert_eq!(tu.items.len(), 1);
 
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "p");
+                check_name(&strings, decl.declarators[0].name, "p");
                 assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Pointer);
                 // The pointer type itself should be volatile
                 assert!(types
@@ -5905,12 +5945,12 @@ mod tests {
     #[test]
     fn test_volatile_const_combined() {
         // Both const and volatile
-        let (tu, types) = parse_tu("const volatile int x;").unwrap();
+        let (tu, types, strings) = parse_tu("const volatile int x;").unwrap();
         assert_eq!(tu.items.len(), 1);
 
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "x");
+                check_name(&strings, decl.declarators[0].name, "x");
                 assert!(types
                     .get(decl.declarators[0].typ)
                     .modifiers
@@ -5927,12 +5967,12 @@ mod tests {
     #[test]
     fn test_volatile_function_param() {
         // Function with volatile pointer parameter
-        let (tu, types) = parse_tu("void foo(volatile int *p) { *p = 1; }").unwrap();
+        let (tu, types, strings) = parse_tu("void foo(volatile int *p) { *p = 1; }").unwrap();
         assert_eq!(tu.items.len(), 1);
 
         match &tu.items[0] {
             ExternalDecl::FunctionDef(func) => {
-                assert_eq!(func.name, "foo");
+                check_name(&strings, func.name, "foo");
                 assert_eq!(func.params.len(), 1);
                 // Parameter is pointer to volatile int
                 assert_eq!(types.kind(func.params[0].typ), TypeKind::Pointer);
@@ -5953,13 +5993,13 @@ mod tests {
     #[test]
     fn test_attribute_on_function_declaration() {
         // Attribute on function declaration
-        let (tu, _types) = parse_tu("void foo(void) __attribute__((noreturn));").unwrap();
+        let (tu, _types, strings) = parse_tu("void foo(void) __attribute__((noreturn));").unwrap();
         assert_eq!(tu.items.len(), 1);
 
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
                 assert_eq!(decl.declarators.len(), 1);
-                assert_eq!(decl.declarators[0].name, "foo");
+                check_name(&strings, decl.declarators[0].name, "foo");
             }
             _ => panic!("Expected Declaration"),
         }
@@ -5968,13 +6008,14 @@ mod tests {
     #[test]
     fn test_attribute_on_struct() {
         // Attribute between struct keyword and name (with variable)
-        let (tu, types) = parse_tu("struct __attribute__((packed)) foo { int x; } s;").unwrap();
+        let (tu, types, strings) =
+            parse_tu("struct __attribute__((packed)) foo { int x; } s;").unwrap();
         assert_eq!(tu.items.len(), 1);
 
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
                 assert_eq!(decl.declarators.len(), 1);
-                assert_eq!(decl.declarators[0].name, "s");
+                check_name(&strings, decl.declarators[0].name, "s");
                 assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Struct);
             }
             _ => panic!("Expected Declaration"),
@@ -5984,14 +6025,14 @@ mod tests {
     #[test]
     fn test_attribute_after_struct() {
         // Attribute after struct closing brace (with variable)
-        let (tu, types) =
+        let (tu, types, strings) =
             parse_tu("struct foo { int x; } __attribute__((aligned(16))) s;").unwrap();
         assert_eq!(tu.items.len(), 1);
 
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
                 assert_eq!(decl.declarators.len(), 1);
-                assert_eq!(decl.declarators[0].name, "s");
+                check_name(&strings, decl.declarators[0].name, "s");
                 assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Struct);
             }
             _ => panic!("Expected Declaration"),
@@ -6001,7 +6042,8 @@ mod tests {
     #[test]
     fn test_attribute_on_struct_only() {
         // Attribute on struct-only definition (no variable)
-        let (tu, _types) = parse_tu("struct __attribute__((packed)) foo { int x; };").unwrap();
+        let (tu, _types, _strings) =
+            parse_tu("struct __attribute__((packed)) foo { int x; };").unwrap();
         assert_eq!(tu.items.len(), 1);
 
         match &tu.items[0] {
@@ -6016,13 +6058,13 @@ mod tests {
     #[test]
     fn test_attribute_on_variable() {
         // Attribute on variable declaration
-        let (tu, _types) = parse_tu("int x __attribute__((aligned(8)));").unwrap();
+        let (tu, _types, strings) = parse_tu("int x __attribute__((aligned(8)));").unwrap();
         assert_eq!(tu.items.len(), 1);
 
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
                 assert_eq!(decl.declarators.len(), 1);
-                assert_eq!(decl.declarators[0].name, "x");
+                check_name(&strings, decl.declarators[0].name, "x");
             }
             _ => panic!("Expected Declaration"),
         }
@@ -6031,12 +6073,13 @@ mod tests {
     #[test]
     fn test_attribute_multiple() {
         // Multiple attributes in one list
-        let (tu, _types) = parse_tu("void foo(void) __attribute__((noreturn, cold));").unwrap();
+        let (tu, _types, strings) =
+            parse_tu("void foo(void) __attribute__((noreturn, cold));").unwrap();
         assert_eq!(tu.items.len(), 1);
 
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "foo");
+                check_name(&strings, decl.declarators[0].name, "foo");
             }
             _ => panic!("Expected Declaration"),
         }
@@ -6045,7 +6088,7 @@ mod tests {
     #[test]
     fn test_attribute_with_args() {
         // Attribute with multiple arguments
-        let (tu, _types) = parse_tu(
+        let (tu, _types, strings) = parse_tu(
             "void foo(const char *fmt, ...) __attribute__((__format__(__printf__, 1, 2)));",
         )
         .unwrap();
@@ -6053,7 +6096,7 @@ mod tests {
 
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "foo");
+                check_name(&strings, decl.declarators[0].name, "foo");
             }
             _ => panic!("Expected Declaration"),
         }
@@ -6062,13 +6105,13 @@ mod tests {
     #[test]
     fn test_attribute_before_declaration() {
         // Attribute before declaration
-        let (tu, _types) =
+        let (tu, _types, strings) =
             parse_tu("__attribute__((visibility(\"default\"))) int exported_var;").unwrap();
         assert_eq!(tu.items.len(), 1);
 
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "exported_var");
+                check_name(&strings, decl.declarators[0].name, "exported_var");
             }
             _ => panic!("Expected Declaration"),
         }
@@ -6077,12 +6120,12 @@ mod tests {
     #[test]
     fn test_attribute_underscore_variant() {
         // __attribute variant (single underscore pair)
-        let (tu, _types) = parse_tu("void foo(void) __attribute((noreturn));").unwrap();
+        let (tu, _types, strings) = parse_tu("void foo(void) __attribute((noreturn));").unwrap();
         assert_eq!(tu.items.len(), 1);
 
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "foo");
+                check_name(&strings, decl.declarators[0].name, "foo");
             }
             _ => panic!("Expected Declaration"),
         }
@@ -6099,7 +6142,7 @@ mod tests {
     #[test]
     fn test_const_assignment_parses() {
         // Assignment to const variable should still parse (errors are reported but parsing continues)
-        let (tu, _types) =
+        let (tu, _types, _strings) =
             parse_tu("int main(void) { const int x = 42; x = 10; return 0; }").unwrap();
         assert_eq!(tu.items.len(), 1);
         // Verify we got a function definition
@@ -6109,7 +6152,7 @@ mod tests {
     #[test]
     fn test_const_pointer_deref_parses() {
         // Assignment through pointer to const should still parse
-        let (tu, _types) =
+        let (tu, _types, _strings) =
             parse_tu("int main(void) { int v = 1; const int *p = &v; *p = 2; return 0; }").unwrap();
         assert_eq!(tu.items.len(), 1);
         assert!(matches!(tu.items[0], ExternalDecl::FunctionDef(_)));
@@ -6118,7 +6161,7 @@ mod tests {
     #[test]
     fn test_const_usage_valid() {
         // Valid const usage - reading const values
-        let (tu, _types) =
+        let (tu, _types, _strings) =
             parse_tu("int main(void) { const int x = 42; int y = x + 1; return y; }").unwrap();
         assert_eq!(tu.items.len(), 1);
         assert!(matches!(tu.items[0], ExternalDecl::FunctionDef(_)));
@@ -6127,7 +6170,7 @@ mod tests {
     #[test]
     fn test_const_pointer_types() {
         // Different const pointer combinations
-        let (tu, _types) = parse_tu(
+        let (tu, _types, _strings) = parse_tu(
             "int main(void) { int v = 1; const int *a = &v; int * const b = &v; const int * const c = &v; return 0; }",
         )
         .unwrap();
@@ -6141,12 +6184,12 @@ mod tests {
 
     #[test]
     fn test_function_decl_no_params() {
-        let (tu, types) = parse_tu("int foo(void);").unwrap();
+        let (tu, types, strings) = parse_tu("int foo(void);").unwrap();
         assert_eq!(tu.items.len(), 1);
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
                 assert_eq!(decl.declarators.len(), 1);
-                assert_eq!(decl.declarators[0].name, "foo");
+                check_name(&strings, decl.declarators[0].name, "foo");
                 assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Function);
                 assert!(!types.is_variadic(decl.declarators[0].typ));
                 // Check return type
@@ -6164,11 +6207,11 @@ mod tests {
 
     #[test]
     fn test_function_decl_one_param() {
-        let (tu, types) = parse_tu("int square(int x);").unwrap();
+        let (tu, types, strings) = parse_tu("int square(int x);").unwrap();
         assert_eq!(tu.items.len(), 1);
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "square");
+                check_name(&strings, decl.declarators[0].name, "square");
                 assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Function);
                 assert!(!types.is_variadic(decl.declarators[0].typ));
                 if let Some(params) = types.params(decl.declarators[0].typ) {
@@ -6182,11 +6225,11 @@ mod tests {
 
     #[test]
     fn test_function_decl_multiple_params() {
-        let (tu, types) = parse_tu("int add(int a, int b, int c);").unwrap();
+        let (tu, types, strings) = parse_tu("int add(int a, int b, int c);").unwrap();
         assert_eq!(tu.items.len(), 1);
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "add");
+                check_name(&strings, decl.declarators[0].name, "add");
                 assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Function);
                 assert!(!types.is_variadic(decl.declarators[0].typ));
                 if let Some(params) = types.params(decl.declarators[0].typ) {
@@ -6202,11 +6245,11 @@ mod tests {
 
     #[test]
     fn test_function_decl_void_return() {
-        let (tu, types) = parse_tu("void do_something(int x);").unwrap();
+        let (tu, types, strings) = parse_tu("void do_something(int x);").unwrap();
         assert_eq!(tu.items.len(), 1);
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "do_something");
+                check_name(&strings, decl.declarators[0].name, "do_something");
                 assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Function);
                 if let Some(base_id) = types.base_type(decl.declarators[0].typ) {
                     assert_eq!(types.kind(base_id), TypeKind::Void);
@@ -6218,11 +6261,11 @@ mod tests {
 
     #[test]
     fn test_function_decl_pointer_return() {
-        let (tu, types) = parse_tu("char *get_string(void);").unwrap();
+        let (tu, types, strings) = parse_tu("char *get_string(void);").unwrap();
         assert_eq!(tu.items.len(), 1);
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "get_string");
+                check_name(&strings, decl.declarators[0].name, "get_string");
                 assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Function);
                 if let Some(base_id) = types.base_type(decl.declarators[0].typ) {
                     assert_eq!(types.kind(base_id), TypeKind::Pointer);
@@ -6234,11 +6277,11 @@ mod tests {
 
     #[test]
     fn test_function_decl_pointer_param() {
-        let (tu, types) = parse_tu("void process(int *data, int count);").unwrap();
+        let (tu, types, strings) = parse_tu("void process(int *data, int count);").unwrap();
         assert_eq!(tu.items.len(), 1);
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "process");
+                check_name(&strings, decl.declarators[0].name, "process");
                 if let Some(params) = types.params(decl.declarators[0].typ) {
                     assert_eq!(params.len(), 2);
                     assert_eq!(types.kind(params[0]), TypeKind::Pointer);
@@ -6256,11 +6299,11 @@ mod tests {
     #[test]
     fn test_function_decl_variadic_printf() {
         // Classic printf prototype
-        let (tu, types) = parse_tu("int printf(const char *fmt, ...);").unwrap();
+        let (tu, types, strings) = parse_tu("int printf(const char *fmt, ...);").unwrap();
         assert_eq!(tu.items.len(), 1);
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "printf");
+                check_name(&strings, decl.declarators[0].name, "printf");
                 assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Function);
                 // Should be marked as variadic
                 assert!(
@@ -6279,11 +6322,12 @@ mod tests {
 
     #[test]
     fn test_function_decl_variadic_sprintf() {
-        let (tu, types) = parse_tu("int sprintf(char *buf, const char *fmt, ...);").unwrap();
+        let (tu, types, strings) =
+            parse_tu("int sprintf(char *buf, const char *fmt, ...);").unwrap();
         assert_eq!(tu.items.len(), 1);
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "sprintf");
+                check_name(&strings, decl.declarators[0].name, "sprintf");
                 assert!(
                     types.is_variadic(decl.declarators[0].typ),
                     "sprintf should be marked as variadic"
@@ -6300,11 +6344,11 @@ mod tests {
     #[test]
     fn test_function_decl_variadic_custom() {
         // Custom variadic function with int first param
-        let (tu, types) = parse_tu("int sum_ints(int count, ...);").unwrap();
+        let (tu, types, strings) = parse_tu("int sum_ints(int count, ...);").unwrap();
         assert_eq!(tu.items.len(), 1);
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "sum_ints");
+                check_name(&strings, decl.declarators[0].name, "sum_ints");
                 assert!(
                     types.is_variadic(decl.declarators[0].typ),
                     "sum_ints should be marked as variadic"
@@ -6321,11 +6365,12 @@ mod tests {
     #[test]
     fn test_function_decl_variadic_multiple_fixed() {
         // Variadic function with multiple fixed parameters
-        let (tu, types) = parse_tu("int variadic_func(int a, double b, char *c, ...);").unwrap();
+        let (tu, types, strings) =
+            parse_tu("int variadic_func(int a, double b, char *c, ...);").unwrap();
         assert_eq!(tu.items.len(), 1);
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "variadic_func");
+                check_name(&strings, decl.declarators[0].name, "variadic_func");
                 assert!(
                     types.is_variadic(decl.declarators[0].typ),
                     "variadic_func should be marked as variadic"
@@ -6344,11 +6389,11 @@ mod tests {
     #[test]
     fn test_function_decl_variadic_void_return() {
         // Variadic function with void return type
-        let (tu, types) = parse_tu("void log_message(const char *fmt, ...);").unwrap();
+        let (tu, types, strings) = parse_tu("void log_message(const char *fmt, ...);").unwrap();
         assert_eq!(tu.items.len(), 1);
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "log_message");
+                check_name(&strings, decl.declarators[0].name, "log_message");
                 assert!(
                     types.is_variadic(decl.declarators[0].typ),
                     "log_message should be marked as variadic"
@@ -6364,11 +6409,11 @@ mod tests {
     #[test]
     fn test_function_decl_not_variadic() {
         // Make sure non-variadic functions are NOT marked as variadic
-        let (tu, types) = parse_tu("int regular_func(int a, int b);").unwrap();
+        let (tu, types, strings) = parse_tu("int regular_func(int a, int b);").unwrap();
         assert_eq!(tu.items.len(), 1);
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "regular_func");
+                check_name(&strings, decl.declarators[0].name, "regular_func");
                 assert!(
                     !types.is_variadic(decl.declarators[0].typ),
                     "regular_func should NOT be marked as variadic"
@@ -6381,8 +6426,9 @@ mod tests {
     #[test]
     fn test_variadic_function_definition() {
         // Variadic function definition (not just declaration)
-        let (func, _types) = parse_func("int my_printf(char *fmt, ...) { return 0; }").unwrap();
-        assert_eq!(func.name, "my_printf");
+        let (func, _types, strings) =
+            parse_func("int my_printf(char *fmt, ...) { return 0; }").unwrap();
+        check_name(&strings, func.name, "my_printf");
         // Note: FunctionDef doesn't directly expose variadic, but the function
         // body can use va_start etc. This test just ensures parsing succeeds.
         assert_eq!(func.params.len(), 1);
@@ -6391,7 +6437,7 @@ mod tests {
     #[test]
     fn test_multiple_function_decls_mixed() {
         // Mix of variadic and non-variadic declarations
-        let (tu, types) = parse_tu(
+        let (tu, types, strings) = parse_tu(
             "int printf(const char *fmt, ...); int puts(const char *s); int sprintf(char *buf, const char *fmt, ...);",
         )
         .unwrap();
@@ -6400,7 +6446,7 @@ mod tests {
         // printf - variadic
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "printf");
+                check_name(&strings, decl.declarators[0].name, "printf");
                 assert!(types.is_variadic(decl.declarators[0].typ));
             }
             _ => panic!("Expected Declaration"),
@@ -6409,7 +6455,7 @@ mod tests {
         // puts - not variadic
         match &tu.items[1] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "puts");
+                check_name(&strings, decl.declarators[0].name, "puts");
                 assert!(!types.is_variadic(decl.declarators[0].typ));
             }
             _ => panic!("Expected Declaration"),
@@ -6418,7 +6464,7 @@ mod tests {
         // sprintf - variadic
         match &tu.items[2] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "sprintf");
+                check_name(&strings, decl.declarators[0].name, "sprintf");
                 assert!(types.is_variadic(decl.declarators[0].typ));
             }
             _ => panic!("Expected Declaration"),
@@ -6428,12 +6474,12 @@ mod tests {
     #[test]
     fn test_function_decl_with_struct_param() {
         // Function declaration with struct parameter
-        let (tu, types) =
+        let (tu, types, strings) =
             parse_tu("struct point { int x; int y; }; void move_point(struct point p);").unwrap();
         assert_eq!(tu.items.len(), 2);
         match &tu.items[1] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "move_point");
+                check_name(&strings, decl.declarators[0].name, "move_point");
                 assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Function);
                 assert!(!types.is_variadic(decl.declarators[0].typ));
             }
@@ -6444,11 +6490,11 @@ mod tests {
     #[test]
     fn test_function_decl_array_decay() {
         // Array parameters decay to pointers in function declarations
-        let (tu, types) = parse_tu("void process_array(int arr[]);").unwrap();
+        let (tu, types, strings) = parse_tu("void process_array(int arr[]);").unwrap();
         assert_eq!(tu.items.len(), 1);
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "process_array");
+                check_name(&strings, decl.declarators[0].name, "process_array");
                 assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Function);
                 // The array parameter should decay to pointer
                 if let Some(params) = types.params(decl.declarators[0].typ) {
@@ -6469,12 +6515,12 @@ mod tests {
     #[test]
     fn test_function_pointer_declaration() {
         // Basic function pointer: void (*fp)(int)
-        let (tu, types) = parse_tu("void (*fp)(int);").unwrap();
+        let (tu, types, strings) = parse_tu("void (*fp)(int);").unwrap();
         assert_eq!(tu.items.len(), 1);
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
                 assert_eq!(decl.declarators.len(), 1);
-                assert_eq!(decl.declarators[0].name, "fp");
+                check_name(&strings, decl.declarators[0].name, "fp");
                 // fp should be a pointer to a function
                 assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Pointer);
                 // The base type of the pointer should be a function
@@ -6500,11 +6546,11 @@ mod tests {
     #[test]
     fn test_function_pointer_no_params() {
         // Function pointer with no parameters: int (*fp)(void)
-        let (tu, types) = parse_tu("int (*fp)(void);").unwrap();
+        let (tu, types, strings) = parse_tu("int (*fp)(void);").unwrap();
         assert_eq!(tu.items.len(), 1);
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "fp");
+                check_name(&strings, decl.declarators[0].name, "fp");
                 assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Pointer);
                 if let Some(base_id) = types.base_type(decl.declarators[0].typ) {
                     assert_eq!(types.kind(base_id), TypeKind::Function);
@@ -6521,11 +6567,11 @@ mod tests {
     #[test]
     fn test_function_pointer_multiple_params() {
         // Function pointer with multiple parameters: int (*fp)(int, char, double)
-        let (tu, types) = parse_tu("int (*fp)(int, char, double);").unwrap();
+        let (tu, types, strings) = parse_tu("int (*fp)(int, char, double);").unwrap();
         assert_eq!(tu.items.len(), 1);
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "fp");
+                check_name(&strings, decl.declarators[0].name, "fp");
                 assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Pointer);
                 if let Some(base_id) = types.base_type(decl.declarators[0].typ) {
                     assert_eq!(types.kind(base_id), TypeKind::Function);
@@ -6544,11 +6590,11 @@ mod tests {
     #[test]
     fn test_function_pointer_returning_pointer() {
         // Function pointer returning a pointer: char *(*fp)(int)
-        let (tu, types) = parse_tu("char *(*fp)(int);").unwrap();
+        let (tu, types, strings) = parse_tu("char *(*fp)(int);").unwrap();
         assert_eq!(tu.items.len(), 1);
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "fp");
+                check_name(&strings, decl.declarators[0].name, "fp");
                 assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Pointer);
                 if let Some(base_id) = types.base_type(decl.declarators[0].typ) {
                     assert_eq!(types.kind(base_id), TypeKind::Function);
@@ -6568,11 +6614,11 @@ mod tests {
     #[test]
     fn test_function_pointer_variadic() {
         // Variadic function pointer: int (*fp)(const char *, ...)
-        let (tu, types) = parse_tu("int (*fp)(const char *, ...);").unwrap();
+        let (tu, types, strings) = parse_tu("int (*fp)(const char *, ...);").unwrap();
         assert_eq!(tu.items.len(), 1);
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
-                assert_eq!(decl.declarators[0].name, "fp");
+                check_name(&strings, decl.declarators[0].name, "fp");
                 assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Pointer);
                 if let Some(base_id) = types.base_type(decl.declarators[0].typ) {
                     assert_eq!(types.kind(base_id), TypeKind::Function);
@@ -6594,22 +6640,22 @@ mod tests {
     #[test]
     fn test_bitfield_basic() {
         // Basic bitfield parsing - include a variable declarator
-        let (tu, types) =
+        let (tu, types, strings) =
             parse_tu("struct flags { unsigned int a : 4; unsigned int b : 4; } f;").unwrap();
         assert_eq!(tu.items.len(), 1);
         match &tu.items[0] {
             ExternalDecl::Declaration(decl) => {
                 assert_eq!(decl.declarators.len(), 1);
-                assert_eq!(decl.declarators[0].name, "f");
+                check_name(&strings, decl.declarators[0].name, "f");
                 assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Struct);
                 if let Some(composite) = types.composite(decl.declarators[0].typ) {
                     assert_eq!(composite.members.len(), 2);
                     // First bitfield
-                    assert_eq!(composite.members[0].name, "a");
+                    check_name(&strings, composite.members[0].name, "a");
                     assert_eq!(composite.members[0].bit_width, Some(4));
                     assert_eq!(composite.members[0].bit_offset, Some(0));
                     // Second bitfield
-                    assert_eq!(composite.members[1].name, "b");
+                    check_name(&strings, composite.members[1].name, "b");
                     assert_eq!(composite.members[1].bit_width, Some(4));
                     assert_eq!(composite.members[1].bit_offset, Some(4));
                 }
@@ -6621,7 +6667,7 @@ mod tests {
     #[test]
     fn test_bitfield_unnamed() {
         // Unnamed bitfield for padding
-        let (tu, types) = parse_tu(
+        let (tu, types, strings) = parse_tu(
             "struct padded { unsigned int a : 4; unsigned int : 4; unsigned int b : 8; } p;",
         )
         .unwrap();
@@ -6632,13 +6678,13 @@ mod tests {
                 if let Some(composite) = types.composite(decl.declarators[0].typ) {
                     assert_eq!(composite.members.len(), 3);
                     // First named bitfield
-                    assert_eq!(composite.members[0].name, "a");
+                    check_name(&strings, composite.members[0].name, "a");
                     assert_eq!(composite.members[0].bit_width, Some(4));
                     // Unnamed padding bitfield
-                    assert_eq!(composite.members[1].name, "");
+                    check_name(&strings, composite.members[1].name, "");
                     assert_eq!(composite.members[1].bit_width, Some(4));
                     // Second named bitfield
-                    assert_eq!(composite.members[2].name, "b");
+                    check_name(&strings, composite.members[2].name, "b");
                     assert_eq!(composite.members[2].bit_width, Some(8));
                 }
             }
@@ -6649,7 +6695,7 @@ mod tests {
     #[test]
     fn test_bitfield_zero_width() {
         // Zero-width bitfield forces alignment
-        let (tu, types) = parse_tu(
+        let (tu, types, strings) = parse_tu(
             "struct aligned { unsigned int a : 4; unsigned int : 0; unsigned int b : 4; } x;",
         )
         .unwrap();
@@ -6660,7 +6706,7 @@ mod tests {
                 if let Some(composite) = types.composite(decl.declarators[0].typ) {
                     assert_eq!(composite.members.len(), 3);
                     // After zero-width bitfield, b should start at new storage unit
-                    assert_eq!(composite.members[2].name, "b");
+                    check_name(&strings, composite.members[2].name, "b");
                     assert_eq!(composite.members[2].bit_width, Some(4));
                     // b should be at offset 0 within its storage unit
                     assert_eq!(composite.members[2].bit_offset, Some(0));
@@ -6675,7 +6721,7 @@ mod tests {
     #[test]
     fn test_bitfield_mixed_with_regular() {
         // Bitfield mixed with regular member
-        let (tu, types) =
+        let (tu, types, strings) =
             parse_tu("struct mixed { int x; unsigned int bits : 8; int y; } m;").unwrap();
         assert_eq!(tu.items.len(), 1);
         match &tu.items[0] {
@@ -6684,13 +6730,13 @@ mod tests {
                 if let Some(composite) = types.composite(decl.declarators[0].typ) {
                     assert_eq!(composite.members.len(), 3);
                     // x is regular member
-                    assert_eq!(composite.members[0].name, "x");
+                    check_name(&strings, composite.members[0].name, "x");
                     assert!(composite.members[0].bit_width.is_none());
                     // bits is a bitfield
-                    assert_eq!(composite.members[1].name, "bits");
+                    check_name(&strings, composite.members[1].name, "bits");
                     assert_eq!(composite.members[1].bit_width, Some(8));
                     // y is regular member
-                    assert_eq!(composite.members[2].name, "y");
+                    check_name(&strings, composite.members[2].name, "y");
                     assert!(composite.members[2].bit_width.is_none());
                 }
             }
@@ -6701,7 +6747,7 @@ mod tests {
     #[test]
     fn test_bitfield_struct_size() {
         // Verify struct size calculation with bitfields
-        let (tu, types) = parse_tu(
+        let (tu, types, _strings) = parse_tu(
             "struct small { unsigned int a : 1; unsigned int b : 1; unsigned int c : 1; } s;",
         )
         .unwrap();

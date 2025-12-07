@@ -11,7 +11,7 @@
 //
 
 use crate::diag;
-use std::collections::HashMap;
+use crate::strings::{StringId, StringTable};
 
 // Re-export Position for use by other modules
 pub use crate::diag::Position;
@@ -80,42 +80,9 @@ impl SpecialToken {
 // Identifier Interning
 // ============================================================================
 
-/// Identifier intern table (string interning for identifiers)
-pub struct IdentTable {
-    map: HashMap<String, u32>,
-    idents: Vec<String>,
-}
-
-impl IdentTable {
-    pub fn new() -> Self {
-        Self {
-            map: HashMap::new(),
-            idents: Vec::new(),
-        }
-    }
-
-    /// Intern an identifier, returning its unique ID
-    pub fn intern(&mut self, name: &str) -> u32 {
-        if let Some(&id) = self.map.get(name) {
-            return id;
-        }
-        let id = self.idents.len() as u32;
-        self.idents.push(name.to_string());
-        self.map.insert(name.to_string(), id);
-        id
-    }
-
-    /// Get identifier name by ID
-    pub fn get(&self, id: u32) -> Option<&str> {
-        self.idents.get(id as usize).map(|s| s.as_str())
-    }
-}
-
-impl Default for IdentTable {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// Identifier intern table - now a re-export of StringTable
+/// Kept for backward compatibility during transition
+pub type IdentTable = StringTable;
 
 // ============================================================================
 // Token Value
@@ -126,7 +93,7 @@ impl Default for IdentTable {
 pub enum TokenValue {
     None,
     Number(String),     // Numeric literal as string (pp-number)
-    Ident(u32),         // Identifier (interned ID)
+    Ident(StringId),    // Identifier (interned StringId)
     Special(u32),       // Operator/punctuator
     String(String),     // String literal content
     Char(String),       // Character literal content
@@ -237,7 +204,7 @@ impl Default for StreamTable {
 const EOF: i32 = -1;
 
 /// C Tokenizer following sparse's design
-pub struct Tokenizer<'a> {
+pub struct Tokenizer<'a, 'b> {
     // Input
     buffer: &'a [u8],
     offset: usize,
@@ -249,12 +216,12 @@ pub struct Tokenizer<'a> {
     newline: bool,
     whitespace: bool,
 
-    // Interning
-    idents: IdentTable,
+    // Interning - shared string table
+    strings: &'b mut StringTable,
 }
 
-impl<'a> Tokenizer<'a> {
-    pub fn new(buffer: &'a [u8], stream_id: u16) -> Self {
+impl<'a, 'b> Tokenizer<'a, 'b> {
+    pub fn new(buffer: &'a [u8], stream_id: u16, strings: &'b mut StringTable) -> Self {
         Self {
             buffer,
             offset: 0,
@@ -263,7 +230,7 @@ impl<'a> Tokenizer<'a> {
             col: 0,
             newline: true,
             whitespace: false,
-            idents: IdentTable::new(),
+            strings,
         }
     }
 
@@ -454,7 +421,7 @@ impl<'a> Tokenizer<'a> {
             }
         }
 
-        let id = self.idents.intern(&name);
+        let id = self.strings.intern(&name);
         Token::with_value(TokenType::Ident, pos, TokenValue::Ident(id))
     }
 
@@ -708,22 +675,6 @@ impl<'a> Tokenizer<'a> {
 
         tokens
     }
-
-    /// Get the identifier table (for looking up identifier names)
-    pub fn ident_table(&self) -> &IdentTable {
-        &self.idents
-    }
-
-    /// Get mutable access to the identifier table (for preprocessing)
-    pub fn ident_table_mut(&mut self) -> &mut IdentTable {
-        &mut self.idents
-    }
-
-    /// Take ownership of the identifier table (used by preprocessor tests)
-    #[cfg(test)]
-    pub fn into_ident_table(self) -> IdentTable {
-        self.idents
-    }
 }
 
 // ============================================================================
@@ -767,7 +718,7 @@ pub fn show_special(value: u32) -> String {
 }
 
 /// Format a token for display
-pub fn show_token(token: &Token, idents: &IdentTable) -> String {
+pub fn show_token(token: &Token, strings: &StringTable) -> String {
     match token.typ {
         TokenType::Eof => "<EOF>".to_string(),
         TokenType::Error => "<ERROR>".to_string(),
@@ -775,7 +726,7 @@ pub fn show_token(token: &Token, idents: &IdentTable) -> String {
         TokenType::StreamEnd => "<STREAM_END>".to_string(),
         TokenType::Ident => {
             if let TokenValue::Ident(id) = &token.value {
-                idents.get(*id).unwrap_or("<unknown>").to_string()
+                strings.get(*id).to_string()
             } else {
                 "<ident?>".to_string()
             }
@@ -850,11 +801,12 @@ pub fn token_type_name(typ: TokenType) -> &'static str {
 mod tests {
     use super::*;
 
-    fn tokenize_str(input: &str) -> (Vec<Token>, IdentTable) {
-        let mut tokenizer = Tokenizer::new(input.as_bytes(), 0);
+    fn tokenize_str(input: &str) -> (Vec<Token>, StringTable) {
+        let mut strings = StringTable::new();
+        let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
         let tokens = tokenizer.tokenize();
-        let idents = std::mem::take(&mut tokenizer.idents);
-        (tokens, idents)
+        drop(tokenizer);
+        (tokens, strings)
     }
 
     #[test]

@@ -19,6 +19,7 @@ use crate::parse::ast::{
     FunctionDef, InitElement, Stmt, TranslationUnit, UnaryOp,
 };
 use crate::ssa::ssa_convert;
+use crate::strings::{StringId, StringTable};
 use crate::symbol::SymbolTable;
 use crate::target::Target;
 use crate::types::{MemberInfo, TypeId, TypeKind, TypeModifiers, TypeTable};
@@ -74,6 +75,8 @@ pub struct Linearizer<'a> {
     symbols: &'a SymbolTable,
     /// Type table for type information
     types: &'a TypeTable,
+    /// String table for converting StringId to String at IR boundary
+    strings: &'a StringTable,
     /// Hidden struct return pointer (for functions returning large structs)
     struct_return_ptr: Option<PseudoId>,
     /// Size of struct being returned (for functions returning large structs)
@@ -93,7 +96,12 @@ pub struct Linearizer<'a> {
 
 impl<'a> Linearizer<'a> {
     /// Create a new linearizer
-    pub fn new(symbols: &'a SymbolTable, types: &'a TypeTable, target: &'a Target) -> Self {
+    pub fn new(
+        symbols: &'a SymbolTable,
+        types: &'a TypeTable,
+        strings: &'a StringTable,
+        target: &'a Target,
+    ) -> Self {
         Self {
             module: Module::new(),
             current_func: None,
@@ -108,6 +116,7 @@ impl<'a> Linearizer<'a> {
             run_ssa: true, // Enable SSA conversion by default
             symbols,
             types,
+            strings,
             struct_return_ptr: None,
             struct_return_size: 0,
             current_func_name: String::new(),
@@ -120,11 +129,22 @@ impl<'a> Linearizer<'a> {
 
     /// Create a linearizer with SSA conversion disabled (for testing)
     #[cfg(test)]
-    pub fn new_no_ssa(symbols: &'a SymbolTable, types: &'a TypeTable, target: &'a Target) -> Self {
+    pub fn new_no_ssa(
+        symbols: &'a SymbolTable,
+        types: &'a TypeTable,
+        strings: &'a StringTable,
+        target: &'a Target,
+    ) -> Self {
         Self {
             run_ssa: false,
-            ..Self::new(symbols, types, target)
+            ..Self::new(symbols, types, strings, target)
         }
+    }
+
+    /// Convert a StringId to a &str using the string table
+    #[inline]
+    fn str(&self, id: StringId) -> &str {
+        self.strings.get(id)
     }
 
     /// Linearize a translation unit
@@ -470,8 +490,8 @@ impl<'a> Linearizer<'a> {
                     _ => Initializer::None,
                 });
 
-            self.module
-                .add_global(&declarator.name, declarator.typ, init);
+            let name = self.str(declarator.name).to_string();
+            self.module.add_global(&name, declarator.typ, init);
         }
     }
 
@@ -493,7 +513,7 @@ impl<'a> Linearizer<'a> {
         self.continue_targets.clear();
         self.struct_return_ptr = None;
         self.struct_return_size = 0;
-        self.current_func_name = func.name.clone();
+        self.current_func_name = self.str(func.name).to_string();
         // Note: static_locals is NOT cleared - it persists across functions
 
         // Create function
@@ -501,7 +521,7 @@ impl<'a> Linearizer<'a> {
             .types
             .modifiers(func.return_type)
             .contains(TypeModifiers::STATIC);
-        let mut ir_func = Function::new(&func.name, func.return_type);
+        let mut ir_func = Function::new(self.str(func.name), func.return_type);
         ir_func.is_static = is_static;
 
         let ret_kind = self.types.kind(func.return_type);
@@ -529,7 +549,10 @@ impl<'a> Linearizer<'a> {
         let mut struct_params: Vec<(String, TypeId, PseudoId)> = Vec::new();
 
         for (i, param) in func.params.iter().enumerate() {
-            let name = param.name.clone().unwrap_or_else(|| format!("arg{}", i));
+            let name = param
+                .name
+                .map(|id| self.str(id).to_string())
+                .unwrap_or_else(|| format!("arg{}", i));
             ir_func.add_param(&name, param.typ);
 
             // Create argument pseudo (offset by 1 if there's a hidden return pointer)
@@ -759,12 +782,14 @@ impl<'a> Linearizer<'a> {
             }
 
             Stmt::Goto(label) => {
-                let target = self.get_or_create_label(label);
+                let label_str = self.str(*label).to_string();
+                let target = self.get_or_create_label(&label_str);
                 self.emit(Instruction::br(target));
             }
 
             Stmt::Label { name, stmt } => {
-                let label_bb = self.get_or_create_label(name);
+                let name_str = self.str(*name).to_string();
+                let label_bb = self.get_or_create_label(&name_str);
 
                 // If current block is not terminated, branch to label
                 if !self.is_terminated() {
@@ -814,8 +839,9 @@ impl<'a> Linearizer<'a> {
             }
 
             // Track in linearizer's locals map
+            let name_str = self.str(declarator.name).to_string();
             self.locals
-                .insert(declarator.name.clone(), LocalVarInfo { sym: sym_id, typ });
+                .insert(name_str, LocalVarInfo { sym: sym_id, typ });
 
             // If there's an initializer, emit Store(s)
             if let Some(init) = &declarator.init {
@@ -841,16 +867,18 @@ impl<'a> Linearizer<'a> {
     /// They are implemented as globals with unique names like `funcname.varname.N`.
     /// Initialization happens once at program start (compile-time).
     fn linearize_static_local(&mut self, declarator: &crate::parse::ast::InitDeclarator) {
+        let name_str = self.str(declarator.name).to_string();
+
         // Generate unique global name: funcname.varname.counter
         let global_name = format!(
             "{}.{}.{}",
-            self.current_func_name, declarator.name, self.static_local_counter
+            self.current_func_name, name_str, self.static_local_counter
         );
         self.static_local_counter += 1;
 
         // Track mapping from local name to global name for this function's scope
         // Use a key that includes function name to handle same-named statics in different functions
-        let key = format!("{}.{}", self.current_func_name, declarator.name);
+        let key = format!("{}.{}", self.current_func_name, name_str);
         self.static_locals.insert(
             key,
             StaticLocalInfo {
@@ -862,7 +890,7 @@ impl<'a> Linearizer<'a> {
         // Also insert with just the local name for the current function scope
         // This is used during expression linearization
         self.locals.insert(
-            declarator.name.clone(),
+            name_str,
             LocalVarInfo {
                 // Use a sentinel value - we'll handle static locals specially
                 sym: PseudoId(u32::MAX),
@@ -1334,7 +1362,7 @@ impl<'a> Linearizer<'a> {
             ExprKind::CharLit(c) => Some(*c as i64),
             ExprKind::Ident { name, .. } => {
                 // Check if it's an enum constant
-                self.symbols.get_enum_value(name)
+                self.symbols.get_enum_value(*name)
             }
             ExprKind::Unary { op, operand } => {
                 let val = self.eval_const_expr(operand)?;
@@ -1472,12 +1500,13 @@ impl<'a> Linearizer<'a> {
     fn linearize_lvalue(&mut self, expr: &Expr) -> PseudoId {
         match &expr.kind {
             ExprKind::Ident { name, .. } => {
+                let name_str = self.str(*name).to_string();
                 // For local variables, emit SymAddr to get the stack address
-                if let Some(local) = self.locals.get(name).cloned() {
+                if let Some(local) = self.locals.get(&name_str).cloned() {
                     // Check if this is a static local (sentinel value)
                     if local.sym.0 == u32::MAX {
                         // Static local - look up the global name
-                        let key = format!("{}.{}", self.current_func_name, name);
+                        let key = format!("{}.{}", self.current_func_name, name_str);
                         if let Some(static_info) = self.static_locals.get(&key).cloned() {
                             let sym_id = self.alloc_pseudo();
                             let pseudo = Pseudo::sym(sym_id, static_info.global_name);
@@ -1503,7 +1532,7 @@ impl<'a> Linearizer<'a> {
                 } else {
                     // Global variable - emit SymAddr to get its address
                     let sym_id = self.alloc_pseudo();
-                    let pseudo = Pseudo::sym(sym_id, name.clone());
+                    let pseudo = Pseudo::sym(sym_id, name_str.clone());
                     if let Some(func) = &mut self.current_func {
                         func.add_pseudo(pseudo);
                     }
@@ -1533,7 +1562,7 @@ impl<'a> Linearizer<'a> {
                 let struct_type = self.expr_type(inner);
                 let member_info =
                     self.types
-                        .find_member(struct_type, member)
+                        .find_member(struct_type, *member)
                         .unwrap_or_else(|| MemberInfo {
                             offset: 0,
                             typ: self.expr_type(expr),
@@ -1571,7 +1600,7 @@ impl<'a> Linearizer<'a> {
                     .unwrap_or_else(|| self.expr_type(expr));
                 let member_info =
                     self.types
-                        .find_member(struct_type, member)
+                        .find_member(struct_type, *member)
                         .unwrap_or_else(|| MemberInfo {
                             offset: 0,
                             typ: self.expr_type(expr),
@@ -1693,16 +1722,17 @@ impl<'a> Linearizer<'a> {
             }
 
             ExprKind::Ident { name, .. } => {
+                let name_str = self.str(*name).to_string();
                 // First check if it's an enum constant
-                if let Some(value) = self.symbols.get_enum_value(name) {
+                if let Some(value) = self.symbols.get_enum_value(*name) {
                     self.emit_const(value, self.types.int_id)
                 }
                 // Check if it's a local variable
-                else if let Some(local) = self.locals.get(name).cloned() {
+                else if let Some(local) = self.locals.get(&name_str).cloned() {
                     // Check if this is a static local (sentinel value)
                     if local.sym.0 == u32::MAX {
                         // Static local - look up the global name and treat as global
-                        let key = format!("{}.{}", self.current_func_name, name);
+                        let key = format!("{}.{}", self.current_func_name, &name_str);
                         if let Some(static_info) = self.static_locals.get(&key).cloned() {
                             let sym_id = self.alloc_pseudo();
                             let pseudo = Pseudo::sym(sym_id, static_info.global_name);
@@ -1744,13 +1774,13 @@ impl<'a> Linearizer<'a> {
                     result
                 }
                 // Check if it's a parameter (already SSA value)
-                else if let Some(&pseudo) = self.var_map.get(name) {
+                else if let Some(&pseudo) = self.var_map.get(&name_str) {
                     pseudo
                 }
                 // Global variable - create symbol reference and load
                 else {
                     let sym_id = self.alloc_pseudo();
-                    let pseudo = Pseudo::sym(sym_id, name.clone());
+                    let pseudo = Pseudo::sym(sym_id, name_str.clone());
                     if let Some(func) = &mut self.current_func {
                         func.add_pseudo(pseudo);
                     }
@@ -1824,7 +1854,8 @@ impl<'a> Linearizer<'a> {
 
                     // Store back to the variable
                     if let ExprKind::Ident { name, .. } = &operand.kind {
-                        if let Some(local) = self.locals.get(name).cloned() {
+                        let name_str = self.str(*name).to_string();
+                        if let Some(local) = self.locals.get(&name_str).cloned() {
                             let store_size = self.types.size_bits(typ);
                             self.emit(Instruction::store(
                                 final_result,
@@ -1833,12 +1864,12 @@ impl<'a> Linearizer<'a> {
                                 typ,
                                 store_size,
                             ));
-                        } else if self.var_map.contains_key(name) {
-                            self.var_map.insert(name.clone(), final_result);
+                        } else if self.var_map.contains_key(&name_str) {
+                            self.var_map.insert(name_str.clone(), final_result);
                         } else {
                             // Global variable - emit store
                             let sym_id = self.alloc_pseudo();
-                            let pseudo = Pseudo::sym(sym_id, name.clone());
+                            let pseudo = Pseudo::sym(sym_id, name_str.clone());
                             if let Some(func) = &mut self.current_func {
                                 func.add_pseudo(pseudo);
                             }
@@ -2002,7 +2033,7 @@ impl<'a> Linearizer<'a> {
                 // For locals, we need to save the old value before updating
                 // because the pseudo will be reloaded from stack which gets overwritten
                 let is_local = if let ExprKind::Ident { name, .. } = &operand.kind {
-                    self.locals.contains_key(name)
+                    self.locals.contains_key(self.str(*name))
                 } else {
                     false
                 };
@@ -2058,7 +2089,8 @@ impl<'a> Linearizer<'a> {
                 let store_size = self.types.size_bits(typ);
                 match &operand.kind {
                     ExprKind::Ident { name, .. } => {
-                        if let Some(local) = self.locals.get(name).cloned() {
+                        let name_str = self.str(*name).to_string();
+                        if let Some(local) = self.locals.get(&name_str).cloned() {
                             self.emit(Instruction::store(
                                 final_result,
                                 local.sym,
@@ -2066,12 +2098,12 @@ impl<'a> Linearizer<'a> {
                                 typ,
                                 store_size,
                             ));
-                        } else if self.var_map.contains_key(name) {
-                            self.var_map.insert(name.clone(), final_result);
+                        } else if self.var_map.contains_key(&name_str) {
+                            self.var_map.insert(name_str.clone(), final_result);
                         } else {
                             // Global variable - emit store
                             let sym_id = self.alloc_pseudo();
-                            let pseudo = Pseudo::sym(sym_id, name.clone());
+                            let pseudo = Pseudo::sym(sym_id, name_str.clone());
                             if let Some(func) = &mut self.current_func {
                                 func.add_pseudo(pseudo);
                             }
@@ -2101,7 +2133,7 @@ impl<'a> Linearizer<'a> {
                 // For locals, we need to save the old value before updating
                 // because the pseudo will be reloaded from stack which gets overwritten
                 let is_local = if let ExprKind::Ident { name, .. } = &operand.kind {
-                    self.locals.contains_key(name)
+                    self.locals.contains_key(self.str(*name))
                 } else {
                     false
                 };
@@ -2157,7 +2189,8 @@ impl<'a> Linearizer<'a> {
                 let store_size = self.types.size_bits(typ);
                 match &operand.kind {
                     ExprKind::Ident { name, .. } => {
-                        if let Some(local) = self.locals.get(name).cloned() {
+                        let name_str = self.str(*name).to_string();
+                        if let Some(local) = self.locals.get(&name_str).cloned() {
                             self.emit(Instruction::store(
                                 final_result,
                                 local.sym,
@@ -2165,12 +2198,12 @@ impl<'a> Linearizer<'a> {
                                 typ,
                                 store_size,
                             ));
-                        } else if self.var_map.contains_key(name) {
-                            self.var_map.insert(name.clone(), final_result);
+                        } else if self.var_map.contains_key(&name_str) {
+                            self.var_map.insert(name_str.clone(), final_result);
                         } else {
                             // Global variable - emit store
                             let sym_id = self.alloc_pseudo();
-                            let pseudo = Pseudo::sym(sym_id, name.clone());
+                            let pseudo = Pseudo::sym(sym_id, name_str.clone());
                             if let Some(func) = &mut self.current_func {
                                 func.add_pseudo(pseudo);
                             }
@@ -2213,7 +2246,7 @@ impl<'a> Linearizer<'a> {
             ExprKind::Call { func, args } => {
                 // Get function name
                 let func_name = match &func.kind {
-                    ExprKind::Ident { name, .. } => name.clone(),
+                    ExprKind::Ident { name, .. } => self.str(*name).to_string(),
                     _ => "<indirect>".to_string(),
                 };
 
@@ -2343,7 +2376,7 @@ impl<'a> Linearizer<'a> {
                 // Look up member offset and type
                 let member_info =
                     self.types
-                        .find_member(struct_type, member)
+                        .find_member(struct_type, *member)
                         .unwrap_or_else(|| MemberInfo {
                             offset: 0,
                             typ: self.expr_type(expr),
@@ -2415,7 +2448,7 @@ impl<'a> Linearizer<'a> {
                 // Look up member offset and type
                 let member_info =
                     self.types
-                        .find_member(struct_type, member)
+                        .find_member(struct_type, *member)
                         .unwrap_or_else(|| MemberInfo {
                             offset: 0,
                             typ: self.expr_type(expr),
@@ -2650,7 +2683,7 @@ impl<'a> Linearizer<'a> {
                 let insn = Instruction::new(Opcode::VaStart)
                     .with_target(result)
                     .with_src(ap_addr)
-                    .with_func(last_param.clone())
+                    .with_func(self.str(*last_param).to_string())
                     .with_type(self.types.void_id);
                 self.emit(insn);
                 result
@@ -3478,11 +3511,12 @@ impl<'a> Linearizer<'a> {
         let target_size = self.types.size_bits(target_typ);
         match &target.kind {
             ExprKind::Ident { name, .. } => {
-                if let Some(local) = self.locals.get(name).cloned() {
+                let name_str = self.str(*name).to_string();
+                if let Some(local) = self.locals.get(&name_str).cloned() {
                     // Check if this is a static local (sentinel value)
                     if local.sym.0 == u32::MAX {
                         // Static local - look up the global name and emit store to global
-                        let key = format!("{}.{}", self.current_func_name, name);
+                        let key = format!("{}.{}", self.current_func_name, &name_str);
                         if let Some(static_info) = self.static_locals.get(&key).cloned() {
                             let sym_id = self.alloc_pseudo();
                             let pseudo = Pseudo::sym(sym_id, static_info.global_name);
@@ -3507,15 +3541,15 @@ impl<'a> Linearizer<'a> {
                             target_size,
                         ));
                     }
-                } else if self.var_map.contains_key(name) {
+                } else if self.var_map.contains_key(&name_str) {
                     // Parameter: this is not SSA-correct but parameters
                     // shouldn't be reassigned. If they are, we'd need to
                     // demote them to locals. For now, just update the mapping.
-                    self.var_map.insert(name.clone(), final_val);
+                    self.var_map.insert(name_str.clone(), final_val);
                 } else {
                     // Global variable - emit store
                     let sym_id = self.alloc_pseudo();
-                    let pseudo = Pseudo::sym(sym_id, name.clone());
+                    let pseudo = Pseudo::sym(sym_id, name_str);
                     if let Some(func) = &mut self.current_func {
                         func.add_pseudo(pseudo);
                     }
@@ -3534,7 +3568,7 @@ impl<'a> Linearizer<'a> {
                 let struct_type = self.expr_type(expr);
                 let member_info =
                     self.types
-                        .find_member(struct_type, member)
+                        .find_member(struct_type, *member)
                         .unwrap_or(MemberInfo {
                             offset: 0,
                             typ: target_typ,
@@ -3574,7 +3608,7 @@ impl<'a> Linearizer<'a> {
                 let struct_type = self.types.base_type(ptr_type).unwrap_or(target_typ);
                 let member_info =
                     self.types
-                        .find_member(struct_type, member)
+                        .find_member(struct_type, *member)
                         .unwrap_or(MemberInfo {
                             offset: 0,
                             typ: target_typ,
@@ -3692,9 +3726,10 @@ pub fn linearize(
     tu: &TranslationUnit,
     symbols: &SymbolTable,
     types: &TypeTable,
+    strings: &StringTable,
     target: &Target,
 ) -> Module {
-    linearize_with_debug(tu, symbols, types, target, false, None)
+    linearize_with_debug(tu, symbols, types, strings, target, false, None)
 }
 
 /// Linearize an AST to IR with debug info support
@@ -3702,11 +3737,12 @@ pub fn linearize_with_debug(
     tu: &TranslationUnit,
     symbols: &SymbolTable,
     types: &TypeTable,
+    strings: &StringTable,
     target: &Target,
     debug: bool,
     source_file: Option<&str>,
 ) -> Module {
-    let mut linearizer = Linearizer::new(symbols, types, target);
+    let mut linearizer = Linearizer::new(symbols, types, strings, target);
     let mut module = linearizer.linearize(tu);
     module.debug = debug;
     if let Some(path) = source_file {
@@ -3723,6 +3759,7 @@ pub fn linearize_with_debug(
 mod tests {
     use super::*;
     use crate::parse::ast::{ExternalDecl, FunctionDef, Parameter};
+    use crate::strings::StringTable;
 
     /// Create a default position for test code
     fn test_pos() -> Position {
@@ -3736,16 +3773,16 @@ mod tests {
         }
     }
 
-    fn test_linearize(tu: &TranslationUnit, types: &TypeTable) -> Module {
+    fn test_linearize(tu: &TranslationUnit, types: &TypeTable, strings: &StringTable) -> Module {
         let symbols = SymbolTable::new();
         let target = Target::host();
-        linearize(tu, &symbols, types, &target)
+        linearize(tu, &symbols, types, strings, &target)
     }
 
-    fn make_simple_func(name: &str, body: Stmt, types: &TypeTable) -> FunctionDef {
+    fn make_simple_func(name: StringId, body: Stmt, types: &TypeTable) -> FunctionDef {
         FunctionDef {
             return_type: types.int_id,
-            name: name.to_string(),
+            name,
             params: vec![],
             body,
             pos: test_pos(),
@@ -3754,13 +3791,15 @@ mod tests {
 
     #[test]
     fn test_linearize_empty_function() {
+        let mut strings = StringTable::new();
         let types = TypeTable::new();
-        let func = make_simple_func("test", Stmt::Block(vec![]), &types);
+        let test_id = strings.intern("test");
+        let func = make_simple_func(test_id, Stmt::Block(vec![]), &types);
         let tu = TranslationUnit {
             items: vec![ExternalDecl::FunctionDef(func)],
         };
 
-        let module = test_linearize(&tu, &types);
+        let module = test_linearize(&tu, &types, &strings);
         assert_eq!(module.functions.len(), 1);
         assert_eq!(module.functions[0].name, "test");
         assert!(!module.functions[0].blocks.is_empty());
@@ -3768,22 +3807,26 @@ mod tests {
 
     #[test]
     fn test_linearize_return() {
+        let mut strings = StringTable::new();
         let types = TypeTable::new();
-        let func = make_simple_func("test", Stmt::Return(Some(Expr::int(42, &types))), &types);
+        let test_id = strings.intern("test");
+        let func = make_simple_func(test_id, Stmt::Return(Some(Expr::int(42, &types))), &types);
         let tu = TranslationUnit {
             items: vec![ExternalDecl::FunctionDef(func)],
         };
 
-        let module = test_linearize(&tu, &types);
+        let module = test_linearize(&tu, &types, &strings);
         let ir = format!("{}", module);
         assert!(ir.contains("ret"));
     }
 
     #[test]
     fn test_linearize_if() {
+        let mut strings = StringTable::new();
         let types = TypeTable::new();
+        let test_id = strings.intern("test");
         let func = make_simple_func(
-            "test",
+            test_id,
             Stmt::If {
                 cond: Expr::int(1, &types),
                 then_stmt: Box::new(Stmt::Return(Some(Expr::int(1, &types)))),
@@ -3795,16 +3838,18 @@ mod tests {
             items: vec![ExternalDecl::FunctionDef(func)],
         };
 
-        let module = test_linearize(&tu, &types);
+        let module = test_linearize(&tu, &types, &strings);
         let ir = format!("{}", module);
         assert!(ir.contains("cbr")); // Conditional branch
     }
 
     #[test]
     fn test_linearize_while() {
+        let mut strings = StringTable::new();
         let types = TypeTable::new();
+        let test_id = strings.intern("test");
         let func = make_simple_func(
-            "test",
+            test_id,
             Stmt::While {
                 cond: Expr::int(1, &types),
                 body: Box::new(Stmt::Break),
@@ -3815,22 +3860,25 @@ mod tests {
             items: vec![ExternalDecl::FunctionDef(func)],
         };
 
-        let module = test_linearize(&tu, &types);
+        let module = test_linearize(&tu, &types, &strings);
         assert!(module.functions[0].blocks.len() >= 3); // cond, body, exit
     }
 
     #[test]
     fn test_linearize_for() {
+        let mut strings = StringTable::new();
         let types = TypeTable::new();
+        let test_id = strings.intern("test");
+        let i_id = strings.intern("i");
         // for (int i = 0; i < 10; i++) { }
         let int_type = types.int_id;
-        let i_var = Expr::var_typed("i", int_type);
+        let i_var = Expr::var_typed(i_id, int_type);
         let func = make_simple_func(
-            "test",
+            test_id,
             Stmt::For {
                 init: Some(ForInit::Declaration(Declaration {
                     declarators: vec![crate::parse::ast::InitDeclarator {
-                        name: "i".to_string(),
+                        name: i_id,
                         typ: int_type,
                         init: Some(Expr::int(0, &types)),
                     }],
@@ -3854,16 +3902,18 @@ mod tests {
             items: vec![ExternalDecl::FunctionDef(func)],
         };
 
-        let module = test_linearize(&tu, &types);
+        let module = test_linearize(&tu, &types, &strings);
         assert!(module.functions[0].blocks.len() >= 4); // entry, cond, body, post, exit
     }
 
     #[test]
     fn test_linearize_binary_expr() {
+        let mut strings = StringTable::new();
         let types = TypeTable::new();
+        let test_id = strings.intern("test");
         // return 1 + 2 * 3;
         let func = make_simple_func(
-            "test",
+            test_id,
             Stmt::Return(Some(Expr::binary(
                 BinaryOp::Add,
                 Expr::int(1, &types),
@@ -3881,7 +3931,7 @@ mod tests {
             items: vec![ExternalDecl::FunctionDef(func)],
         };
 
-        let module = test_linearize(&tu, &types);
+        let module = test_linearize(&tu, &types, &strings);
         let ir = format!("{}", module);
         assert!(ir.contains("mul"));
         assert!(ir.contains("add"));
@@ -3889,25 +3939,29 @@ mod tests {
 
     #[test]
     fn test_linearize_function_with_params() {
+        let mut strings = StringTable::new();
         let types = TypeTable::new();
+        let add_id = strings.intern("add");
+        let a_id = strings.intern("a");
+        let b_id = strings.intern("b");
         let int_type = types.int_id;
         let func = FunctionDef {
             return_type: int_type,
-            name: "add".to_string(),
+            name: add_id,
             params: vec![
                 Parameter {
-                    name: Some("a".to_string()),
+                    name: Some(a_id),
                     typ: int_type,
                 },
                 Parameter {
-                    name: Some("b".to_string()),
+                    name: Some(b_id),
                     typ: int_type,
                 },
             ],
             body: Stmt::Return(Some(Expr::binary(
                 BinaryOp::Add,
-                Expr::var_typed("a", int_type),
-                Expr::var_typed("b", int_type),
+                Expr::var_typed(a_id, int_type),
+                Expr::var_typed(b_id, int_type),
                 &types,
             ))),
             pos: test_pos(),
@@ -3916,7 +3970,7 @@ mod tests {
             items: vec![ExternalDecl::FunctionDef(func)],
         };
 
-        let module = test_linearize(&tu, &types);
+        let module = test_linearize(&tu, &types, &strings);
         let ir = format!("{}", module);
         assert!(ir.contains("add"));
         assert!(ir.contains("%a"));
@@ -3925,11 +3979,14 @@ mod tests {
 
     #[test]
     fn test_linearize_call() {
+        let mut strings = StringTable::new();
         let types = TypeTable::new();
+        let test_id = strings.intern("test");
+        let foo_id = strings.intern("foo");
         let func = make_simple_func(
-            "test",
+            test_id,
             Stmt::Return(Some(Expr::call(
-                Expr::var("foo"),
+                Expr::var(foo_id),
                 vec![Expr::int(1, &types), Expr::int(2, &types)],
                 &types,
             ))),
@@ -3939,7 +3996,7 @@ mod tests {
             items: vec![ExternalDecl::FunctionDef(func)],
         };
 
-        let module = test_linearize(&tu, &types);
+        let module = test_linearize(&tu, &types, &strings);
         let ir = format!("{}", module);
         assert!(ir.contains("call"));
         assert!(ir.contains("foo"));
@@ -3947,9 +4004,11 @@ mod tests {
 
     #[test]
     fn test_linearize_comparison() {
+        let mut strings = StringTable::new();
         let types = TypeTable::new();
+        let test_id = strings.intern("test");
         let func = make_simple_func(
-            "test",
+            test_id,
             Stmt::Return(Some(Expr::binary(
                 BinaryOp::Lt,
                 Expr::int(1, &types),
@@ -3962,14 +4021,16 @@ mod tests {
             items: vec![ExternalDecl::FunctionDef(func)],
         };
 
-        let module = test_linearize(&tu, &types);
+        let module = test_linearize(&tu, &types, &strings);
         let ir = format!("{}", module);
         assert!(ir.contains("setlt"));
     }
 
     #[test]
     fn test_linearize_unsigned_comparison() {
+        let mut strings = StringTable::new();
         let types = TypeTable::new();
+        let test_id = strings.intern("test");
 
         // Create unsigned comparison: (unsigned)1 < (unsigned)2
         let uint_type = types.uint_id;
@@ -3980,12 +4041,12 @@ mod tests {
         let mut cmp = Expr::binary(BinaryOp::Lt, left, right, &types);
         cmp.typ = Some(types.int_id);
 
-        let func = make_simple_func("test", Stmt::Return(Some(cmp)), &types);
+        let func = make_simple_func(test_id, Stmt::Return(Some(cmp)), &types);
         let tu = TranslationUnit {
             items: vec![ExternalDecl::FunctionDef(func)],
         };
 
-        let module = test_linearize(&tu, &types);
+        let module = test_linearize(&tu, &types, &strings);
         let ir = format!("{}", module);
         // Should use unsigned comparison opcode (setb = set if below)
         assert!(
@@ -3997,13 +4058,15 @@ mod tests {
 
     #[test]
     fn test_display_module() {
+        let mut strings = StringTable::new();
         let types = TypeTable::new();
-        let func = make_simple_func("main", Stmt::Return(Some(Expr::int(0, &types))), &types);
+        let main_id = strings.intern("main");
+        let func = make_simple_func(main_id, Stmt::Return(Some(Expr::int(0, &types))), &types);
         let tu = TranslationUnit {
             items: vec![ExternalDecl::FunctionDef(func)],
         };
 
-        let module = test_linearize(&tu, &types);
+        let module = test_linearize(&tu, &types, &strings);
         let ir = format!("{}", module);
 
         // Should have proper structure
@@ -4015,6 +4078,7 @@ mod tests {
 
     #[test]
     fn test_type_propagation_expr_type() {
+        let strings = StringTable::new();
         let types = TypeTable::new();
 
         // Create an expression with a type annotation
@@ -4025,7 +4089,7 @@ mod tests {
         // Create linearizer and test that expr_type reads from the expression
         let symbols = SymbolTable::new();
         let target = Target::host();
-        let linearizer = Linearizer::new(&symbols, &types, &target);
+        let linearizer = Linearizer::new(&symbols, &types, &strings, &target);
         let typ = linearizer.expr_type(&expr);
         assert_eq!(types.kind(typ), TypeKind::Int);
 
@@ -4038,6 +4102,7 @@ mod tests {
 
     #[test]
     fn test_type_propagation_double_literal() {
+        let strings = StringTable::new();
         let types = TypeTable::new();
 
         // Create a double literal
@@ -4046,7 +4111,7 @@ mod tests {
 
         let symbols = SymbolTable::new();
         let target = Target::host();
-        let linearizer = Linearizer::new(&symbols, &types, &target);
+        let linearizer = Linearizer::new(&symbols, &types, &strings, &target);
         let typ = linearizer.expr_type(&expr);
         assert_eq!(types.kind(typ), TypeKind::Double);
     }
@@ -4056,31 +4121,34 @@ mod tests {
     // ========================================================================
 
     /// Helper to linearize without SSA conversion (for comparing before/after)
-    fn linearize_no_ssa(tu: &TranslationUnit, types: &TypeTable) -> Module {
+    fn linearize_no_ssa(tu: &TranslationUnit, types: &TypeTable, strings: &StringTable) -> Module {
         let symbols = SymbolTable::new();
         let target = Target::host();
-        let mut linearizer = Linearizer::new_no_ssa(&symbols, types, &target);
+        let mut linearizer = Linearizer::new_no_ssa(&symbols, types, strings, &target);
         linearizer.linearize(tu)
     }
 
     #[test]
     fn test_local_var_emits_load_store() {
+        let mut strings = StringTable::new();
         let types = TypeTable::new();
+        let test_id = strings.intern("test");
+        let x_id = strings.intern("x");
         // int test() { int x = 1; return x; }
         let int_type = types.int_id;
         let func = FunctionDef {
             return_type: int_type,
-            name: "test".to_string(),
+            name: test_id,
             params: vec![],
             body: Stmt::Block(vec![
                 BlockItem::Declaration(Declaration {
                     declarators: vec![crate::parse::ast::InitDeclarator {
-                        name: "x".to_string(),
+                        name: x_id,
                         typ: int_type,
                         init: Some(Expr::int(1, &types)),
                     }],
                 }),
-                BlockItem::Statement(Stmt::Return(Some(Expr::var_typed("x", int_type)))),
+                BlockItem::Statement(Stmt::Return(Some(Expr::var_typed(x_id, int_type)))),
             ]),
             pos: test_pos(),
         };
@@ -4089,7 +4157,7 @@ mod tests {
         };
 
         // Without SSA, should have store and load
-        let module = linearize_no_ssa(&tu, &types);
+        let module = linearize_no_ssa(&tu, &types, &strings);
         let ir = format!("{}", module);
         assert!(
             ir.contains("store"),
@@ -4105,7 +4173,11 @@ mod tests {
 
     #[test]
     fn test_ssa_converts_local_to_phi() {
+        let mut strings = StringTable::new();
         let types = TypeTable::new();
+        let test_id = strings.intern("test");
+        let cond_id = strings.intern("cond");
+        let x_id = strings.intern("x");
         // int test(int cond) {
         //     int x = 1;
         //     if (cond) x = 2;
@@ -4115,32 +4187,32 @@ mod tests {
 
         let func = FunctionDef {
             return_type: int_type,
-            name: "test".to_string(),
+            name: test_id,
             params: vec![Parameter {
-                name: Some("cond".to_string()),
+                name: Some(cond_id),
                 typ: int_type,
             }],
             body: Stmt::Block(vec![
                 // int x = 1;
                 BlockItem::Declaration(Declaration {
                     declarators: vec![crate::parse::ast::InitDeclarator {
-                        name: "x".to_string(),
+                        name: x_id,
                         typ: int_type,
                         init: Some(Expr::int(1, &types)),
                     }],
                 }),
                 // if (cond) x = 2;
                 BlockItem::Statement(Stmt::If {
-                    cond: Expr::var_typed("cond", int_type),
+                    cond: Expr::var_typed(cond_id, int_type),
                     then_stmt: Box::new(Stmt::Expr(Expr::assign(
-                        Expr::var_typed("x", int_type),
+                        Expr::var_typed(x_id, int_type),
                         Expr::int(2, &types),
                         &types,
                     ))),
                     else_stmt: None,
                 }),
                 // return x;
-                BlockItem::Statement(Stmt::Return(Some(Expr::var_typed("x", int_type)))),
+                BlockItem::Statement(Stmt::Return(Some(Expr::var_typed(x_id, int_type)))),
             ]),
             pos: test_pos(),
         };
@@ -4149,7 +4221,7 @@ mod tests {
         };
 
         // With SSA, should have phi node at merge point
-        let module = test_linearize(&tu, &types);
+        let module = test_linearize(&tu, &types, &strings);
         let ir = format!("{}", module);
 
         // Should have a phi instruction
@@ -4162,7 +4234,10 @@ mod tests {
 
     #[test]
     fn test_ssa_loop_variable() {
+        let mut strings = StringTable::new();
         let types = TypeTable::new();
+        let test_id = strings.intern("test");
+        let i_id = strings.intern("i");
         // int test() {
         //     int i = 0;
         //     while (i < 10) { i = i + 1; }
@@ -4170,17 +4245,17 @@ mod tests {
         // }
         let int_type = types.int_id;
 
-        let i_var = || Expr::var_typed("i", int_type);
+        let i_var = || Expr::var_typed(i_id, int_type);
 
         let func = FunctionDef {
             return_type: int_type,
-            name: "test".to_string(),
+            name: test_id,
             params: vec![],
             body: Stmt::Block(vec![
                 // int i = 0;
                 BlockItem::Declaration(Declaration {
                     declarators: vec![crate::parse::ast::InitDeclarator {
-                        name: "i".to_string(),
+                        name: i_id,
                         typ: int_type,
                         init: Some(Expr::int(0, &types)),
                     }],
@@ -4204,7 +4279,7 @@ mod tests {
         };
 
         // With SSA, should have phi node at loop header
-        let module = test_linearize(&tu, &types);
+        let module = test_linearize(&tu, &types, &strings);
         let ir = format!("{}", module);
 
         // Loop should have a phi at the condition block
@@ -4213,7 +4288,11 @@ mod tests {
 
     #[test]
     fn test_short_circuit_and() {
+        let mut strings = StringTable::new();
         let types = TypeTable::new();
+        let test_id = strings.intern("test");
+        let a_id = strings.intern("a");
+        let b_id = strings.intern("b");
         // int test(int a, int b) {
         //     return a && b;
         // }
@@ -4222,21 +4301,21 @@ mod tests {
 
         let func = FunctionDef {
             return_type: int_type,
-            name: "test".to_string(),
+            name: test_id,
             params: vec![
                 Parameter {
-                    name: Some("a".to_string()),
+                    name: Some(a_id),
                     typ: int_type,
                 },
                 Parameter {
-                    name: Some("b".to_string()),
+                    name: Some(b_id),
                     typ: int_type,
                 },
             ],
             body: Stmt::Return(Some(Expr::binary(
                 BinaryOp::LogAnd,
-                Expr::var_typed("a", int_type),
-                Expr::var_typed("b", int_type),
+                Expr::var_typed(a_id, int_type),
+                Expr::var_typed(b_id, int_type),
                 &types,
             ))),
             pos: test_pos(),
@@ -4245,7 +4324,7 @@ mod tests {
             items: vec![ExternalDecl::FunctionDef(func)],
         };
 
-        let module = test_linearize(&tu, &types);
+        let module = test_linearize(&tu, &types, &strings);
         let ir = format!("{}", module);
 
         // Short-circuit AND should have:
@@ -4265,7 +4344,11 @@ mod tests {
 
     #[test]
     fn test_short_circuit_or() {
+        let mut strings = StringTable::new();
         let types = TypeTable::new();
+        let test_id = strings.intern("test");
+        let a_id = strings.intern("a");
+        let b_id = strings.intern("b");
         // int test(int a, int b) {
         //     return a || b;
         // }
@@ -4274,21 +4357,21 @@ mod tests {
 
         let func = FunctionDef {
             return_type: int_type,
-            name: "test".to_string(),
+            name: test_id,
             params: vec![
                 Parameter {
-                    name: Some("a".to_string()),
+                    name: Some(a_id),
                     typ: int_type,
                 },
                 Parameter {
-                    name: Some("b".to_string()),
+                    name: Some(b_id),
                     typ: int_type,
                 },
             ],
             body: Stmt::Return(Some(Expr::binary(
                 BinaryOp::LogOr,
-                Expr::var_typed("a", int_type),
-                Expr::var_typed("b", int_type),
+                Expr::var_typed(a_id, int_type),
+                Expr::var_typed(b_id, int_type),
                 &types,
             ))),
             pos: test_pos(),
@@ -4297,7 +4380,7 @@ mod tests {
             items: vec![ExternalDecl::FunctionDef(func)],
         };
 
-        let module = test_linearize(&tu, &types);
+        let module = test_linearize(&tu, &types, &strings);
         let ir = format!("{}", module);
 
         // Short-circuit OR should have:

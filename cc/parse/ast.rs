@@ -11,6 +11,7 @@
 //
 
 use crate::diag::Position;
+use crate::strings::StringId;
 use crate::types::TypeId;
 
 // ============================================================================
@@ -179,7 +180,7 @@ pub enum ExprKind {
 
     /// Identifier (variable reference)
     Ident {
-        name: String,
+        name: StringId,
     },
 
     /// Unary operation
@@ -222,13 +223,13 @@ pub enum ExprKind {
     /// Member access: expr.member
     Member {
         expr: Box<Expr>,
-        member: String,
+        member: StringId,
     },
 
     /// Pointer member access: expr->member
     Arrow {
         expr: Box<Expr>,
-        member: String,
+        member: StringId,
     },
 
     /// Array subscript: array[index]
@@ -266,7 +267,7 @@ pub enum ExprKind {
         /// The va_list to initialize (lvalue)
         ap: Box<Expr>,
         /// Name of the last named parameter before ...
-        last_param: String,
+        last_param: StringId,
     },
 
     /// __builtin_va_arg(ap, type)
@@ -334,7 +335,7 @@ pub enum ExprKind {
 #[derive(Debug, Clone)]
 pub enum Designator {
     /// Field designator: .field_name
-    Field(String),
+    Field(StringId),
     /// Index designator: [constant_expr] - evaluated at parse time
     Index(i64),
 }
@@ -361,20 +362,13 @@ impl Expr {
     }
 
     /// Create a variable reference (untyped - needs type evaluation) - no position
-    pub fn var(name: &str) -> Self {
-        Expr::new_unpositioned(ExprKind::Ident {
-            name: name.to_string(),
-        })
+    pub fn var(name: StringId) -> Self {
+        Expr::new_unpositioned(ExprKind::Ident { name })
     }
 
     /// Create a variable reference with a known type - no position
-    pub fn var_typed(name: &str, typ: TypeId) -> Self {
-        Expr::typed_unpositioned(
-            ExprKind::Ident {
-                name: name.to_string(),
-            },
-            typ,
-        )
+    pub fn var_typed(name: StringId, typ: TypeId) -> Self {
+        Expr::typed_unpositioned(ExprKind::Ident { name }, typ)
     }
 
     /// Create a binary expression (using TypeTable for type inference)
@@ -496,10 +490,10 @@ pub enum Stmt {
     Continue,
 
     /// Goto statement: goto label;
-    Goto(String),
+    Goto(StringId),
 
     /// Labeled statement: label: stmt
-    Label { name: String, stmt: Box<Stmt> },
+    Label { name: StringId, stmt: Box<Stmt> },
 
     /// Switch statement: switch (expr) { cases }
     Switch { expr: Expr, body: Box<Stmt> },
@@ -542,7 +536,7 @@ pub struct Declaration {
 #[derive(Debug, Clone)]
 pub struct InitDeclarator {
     /// The name being declared
-    pub name: String,
+    pub name: StringId,
     /// The complete type (after applying declarator modifiers) - interned TypeId
     pub typ: TypeId,
     /// Optional initializer
@@ -552,13 +546,9 @@ pub struct InitDeclarator {
 #[cfg(test)]
 impl Declaration {
     /// Create a simple declaration with one variable
-    pub fn simple(name: &str, typ: TypeId, init: Option<Expr>) -> Self {
+    pub fn simple(name: StringId, typ: TypeId, init: Option<Expr>) -> Self {
         Declaration {
-            declarators: vec![InitDeclarator {
-                name: name.to_string(),
-                typ,
-                init,
-            }],
+            declarators: vec![InitDeclarator { name, typ, init }],
         }
     }
 }
@@ -570,7 +560,7 @@ impl Declaration {
 /// A function parameter
 #[derive(Debug, Clone)]
 pub struct Parameter {
-    pub name: Option<String>,
+    pub name: Option<StringId>,
     /// Parameter type (interned TypeId)
     pub typ: TypeId,
 }
@@ -581,7 +571,7 @@ pub struct FunctionDef {
     /// Return type (interned TypeId)
     pub return_type: TypeId,
     /// Function name
-    pub name: String,
+    pub name: StringId,
     /// Parameters
     pub params: Vec<Parameter>,
     /// Function body
@@ -632,6 +622,7 @@ impl Default for TranslationUnit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::strings::StringTable;
     use crate::types::TypeKind;
 
     #[test]
@@ -701,15 +692,17 @@ mod tests {
 
     #[test]
     fn test_unary_expr() {
+        let mut strings = StringTable::new();
         let types = TypeTable::new();
+        let x_id = strings.intern("x");
         // -x
-        let expr = Expr::unary(UnaryOp::Neg, Expr::var("x"), &types);
+        let expr = Expr::unary(UnaryOp::Neg, Expr::var(x_id), &types);
 
         match expr.kind {
             ExprKind::Unary { op, operand } => {
                 assert_eq!(op, UnaryOp::Neg);
                 match operand.kind {
-                    ExprKind::Ident { name, .. } => assert_eq!(name, "x"),
+                    ExprKind::Ident { name } => assert_eq!(name, x_id),
                     _ => panic!("Expected Ident"),
                 }
             }
@@ -719,15 +712,17 @@ mod tests {
 
     #[test]
     fn test_assignment() {
+        let mut strings = StringTable::new();
         let types = TypeTable::new();
+        let x_id = strings.intern("x");
         // x = 5
-        let expr = Expr::assign(Expr::var("x"), Expr::int(5, &types), &types);
+        let expr = Expr::assign(Expr::var(x_id), Expr::int(5, &types), &types);
 
         match expr.kind {
             ExprKind::Assign { op, target, value } => {
                 assert_eq!(op, AssignOp::Assign);
                 match target.kind {
-                    ExprKind::Ident { name, .. } => assert_eq!(name, "x"),
+                    ExprKind::Ident { name } => assert_eq!(name, x_id),
                     _ => panic!("Expected Ident"),
                 }
                 match value.kind {
@@ -741,10 +736,12 @@ mod tests {
 
     #[test]
     fn test_function_call() {
+        let mut strings = StringTable::new();
         let types = TypeTable::new();
+        let foo_id = strings.intern("foo");
         // foo(1, 2)
         let expr = Expr::call(
-            Expr::var("foo"),
+            Expr::var(foo_id),
             vec![Expr::int(1, &types), Expr::int(2, &types)],
             &types,
         );
@@ -752,7 +749,7 @@ mod tests {
         match expr.kind {
             ExprKind::Call { func, args } => {
                 match func.kind {
-                    ExprKind::Ident { name, .. } => assert_eq!(name, "foo"),
+                    ExprKind::Ident { name } => assert_eq!(name, foo_id),
                     _ => panic!("Expected Ident"),
                 }
                 assert_eq!(args.len(), 2);
@@ -763,10 +760,12 @@ mod tests {
 
     #[test]
     fn test_if_stmt() {
+        let mut strings = StringTable::new();
         let types = TypeTable::new();
+        let x_id = strings.intern("x");
         // if (x) return 1;
         let stmt = Stmt::If {
-            cond: Expr::var("x"),
+            cond: Expr::var(x_id),
             then_stmt: Box::new(Stmt::Return(Some(Expr::int(1, &types)))),
             else_stmt: None,
         };
@@ -778,7 +777,7 @@ mod tests {
                 else_stmt,
             } => {
                 match cond.kind {
-                    ExprKind::Ident { name, .. } => assert_eq!(name, "x"),
+                    ExprKind::Ident { name } => assert_eq!(name, x_id),
                     _ => panic!("Expected Ident"),
                 }
                 match *then_stmt {
@@ -796,18 +795,20 @@ mod tests {
 
     #[test]
     fn test_while_stmt() {
+        let mut strings = StringTable::new();
+        let x_id = strings.intern("x");
         // while (x) x--;
         let stmt = Stmt::While {
-            cond: Expr::var("x"),
+            cond: Expr::var(x_id),
             body: Box::new(Stmt::Expr(Expr::new_unpositioned(ExprKind::PostDec(
-                Box::new(Expr::var("x")),
+                Box::new(Expr::var(x_id)),
             )))),
         };
 
         match stmt {
             Stmt::While { cond, body } => {
                 match cond.kind {
-                    ExprKind::Ident { name, .. } => assert_eq!(name, "x"),
+                    ExprKind::Ident { name } => assert_eq!(name, x_id),
                     _ => panic!("Expected Ident"),
                 }
                 match *body {
@@ -824,23 +825,27 @@ mod tests {
 
     #[test]
     fn test_declaration() {
+        let mut strings = StringTable::new();
         let types = TypeTable::new();
+        let x_id = strings.intern("x");
         // int x = 5;
-        let decl = Declaration::simple("x", types.int_id, Some(Expr::int(5, &types)));
+        let decl = Declaration::simple(x_id, types.int_id, Some(Expr::int(5, &types)));
 
         assert_eq!(decl.declarators.len(), 1);
-        assert_eq!(decl.declarators[0].name, "x");
+        assert_eq!(decl.declarators[0].name, x_id);
         assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Int);
         assert!(decl.declarators[0].init.is_some());
     }
 
     #[test]
     fn test_translation_unit() {
+        let mut strings = StringTable::new();
         let types = TypeTable::new();
+        let x_id = strings.intern("x");
         let mut tu = TranslationUnit::new();
 
         // Add a declaration
-        let decl = Declaration::simple("x", types.int_id, None);
+        let decl = Declaration::simple(x_id, types.int_id, None);
         tu.add(ExternalDecl::Declaration(decl));
 
         assert_eq!(tu.items.len(), 1);
@@ -848,15 +853,17 @@ mod tests {
 
     #[test]
     fn test_for_loop() {
+        let mut strings = StringTable::new();
         let types = TypeTable::new();
+        let i_id = strings.intern("i");
         // for (int i = 0; i < 10; i++) {}
         let init = ForInit::Declaration(Declaration::simple(
-            "i",
+            i_id,
             types.int_id,
             Some(Expr::int(0, &types)),
         ));
-        let cond = Expr::binary(BinaryOp::Lt, Expr::var("i"), Expr::int(10, &types), &types);
-        let post = Expr::new_unpositioned(ExprKind::PostInc(Box::new(Expr::var("i"))));
+        let cond = Expr::binary(BinaryOp::Lt, Expr::var(i_id), Expr::int(10, &types), &types);
+        let post = Expr::new_unpositioned(ExprKind::PostInc(Box::new(Expr::var(i_id))));
 
         let stmt = Stmt::For {
             init: Some(init),

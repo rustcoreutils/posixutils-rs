@@ -16,7 +16,6 @@ use std::fmt;
 
 /// Target CPU architecture
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Variants used via cfg-based detection and tests
 pub enum Arch {
     X86_64,
     Aarch64,
@@ -33,7 +32,6 @@ impl fmt::Display for Arch {
 
 /// Target operating system
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Variants used via cfg-based detection and tests
 pub enum Os {
     Linux,
     MacOS,

@@ -10,11 +10,14 @@
 //
 
 mod arch;
+mod dce;
 mod diag;
 mod dominate;
+mod instcombine;
 mod ir;
 mod linearize;
 mod lower;
+mod opt;
 mod os;
 mod parse;
 mod ssa;
@@ -111,6 +114,10 @@ struct Args {
     /// Target triple (e.g., aarch64-apple-darwin, x86_64-unknown-linux-gnu)
     #[arg(long = "target", value_name = "triple", help = gettext("Target triple for cross-compilation"))]
     target: Option<String>,
+
+    /// Optimization level (0=none, 1=basic optimizations)
+    #[arg(short = 'O', default_value = "0", value_name = "level", help = gettext("Optimization level"))]
+    opt_level: u32,
 }
 
 fn process_file(
@@ -220,6 +227,11 @@ fn process_file(
         args.debug,
         Some(display_path),
     );
+
+    // Optimize IR (if enabled)
+    if args.opt_level > 0 {
+        opt::optimize_module(&mut module, args.opt_level);
+    }
 
     if args.dump_ir {
         print!("{}", module);

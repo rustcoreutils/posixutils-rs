@@ -13,9 +13,6 @@
 // enabling peephole optimizations before final assembly emission.
 //
 
-// Allow unused variants/methods - LIR defines complete instruction set for future use
-#![allow(dead_code)]
-
 use super::codegen::{Reg, VReg};
 use crate::arch::lir::{Directive, EmitAsm, FpSize, Label, OperandSize, Symbol};
 use crate::target::{Os, Target};
@@ -26,6 +23,7 @@ use std::fmt::{self, Write};
 // ============================================================================
 
 /// AArch64 memory addressing mode
+#[allow(dead_code)] // Documents full instruction set
 #[derive(Debug, Clone, PartialEq)]
 pub enum MemAddr {
     /// [base] - Register indirect
@@ -96,19 +94,6 @@ impl GpOperand {
             GpOperand::Imm(v) => format!("#{}", v),
         }
     }
-
-    /// Check if this is a register operand
-    pub fn is_reg(&self) -> bool {
-        matches!(self, GpOperand::Reg(_))
-    }
-
-    /// Get register if this is a register operand
-    pub fn as_reg(&self) -> Option<Reg> {
-        match self {
-            GpOperand::Reg(r) => Some(*r),
-            _ => None,
-        }
-    }
 }
 
 // ============================================================================
@@ -116,22 +101,11 @@ impl GpOperand {
 // ============================================================================
 
 /// AArch64 FP/SIMD operand (register)
+#[allow(dead_code)] // Documents full instruction set
 #[derive(Debug, Clone, PartialEq)]
 pub enum FpOperand {
     /// FP register operand
     Reg(VReg),
-}
-
-impl FpOperand {
-    /// Format operand in AArch64 syntax
-    pub fn format(&self, size: FpSize) -> String {
-        match self {
-            FpOperand::Reg(r) => match size {
-                FpSize::Single => r.name_s().to_string(),
-                FpSize::Double => r.name_d().to_string(),
-            },
-        }
-    }
 }
 
 // ============================================================================
@@ -139,6 +113,7 @@ impl FpOperand {
 // ============================================================================
 
 /// AArch64 condition codes for comparisons and conditional operations
+#[allow(dead_code)] // Documents full instruction set
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Cond {
     /// Equal (Z=1)
@@ -197,28 +172,6 @@ impl Cond {
             Cond::Nv => "nv",
         }
     }
-
-    /// Get the inverse condition
-    pub fn inverse(&self) -> Cond {
-        match self {
-            Cond::Eq => Cond::Ne,
-            Cond::Ne => Cond::Eq,
-            Cond::Cs => Cond::Cc,
-            Cond::Cc => Cond::Cs,
-            Cond::Mi => Cond::Pl,
-            Cond::Pl => Cond::Mi,
-            Cond::Vs => Cond::Vc,
-            Cond::Vc => Cond::Vs,
-            Cond::Hi => Cond::Ls,
-            Cond::Ls => Cond::Hi,
-            Cond::Ge => Cond::Lt,
-            Cond::Lt => Cond::Ge,
-            Cond::Gt => Cond::Le,
-            Cond::Le => Cond::Gt,
-            Cond::Al => Cond::Nv,
-            Cond::Nv => Cond::Al,
-        }
-    }
 }
 
 impl fmt::Display for Cond {
@@ -232,6 +185,7 @@ impl fmt::Display for Cond {
 // ============================================================================
 
 /// Shift type for shifted register operands
+#[allow(dead_code)] // Documents full instruction set
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ShiftType {
     /// Logical shift left
@@ -244,22 +198,12 @@ pub enum ShiftType {
     Ror,
 }
 
-impl ShiftType {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ShiftType::Lsl => "lsl",
-            ShiftType::Lsr => "lsr",
-            ShiftType::Asr => "asr",
-            ShiftType::Ror => "ror",
-        }
-    }
-}
-
 // ============================================================================
 // Extend Type
 // ============================================================================
 
 /// Extend type for extended register operands
+#[allow(dead_code)] // Documents full instruction set
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExtendType {
     /// Unsigned extend byte
@@ -280,26 +224,12 @@ pub enum ExtendType {
     Sxtx,
 }
 
-impl ExtendType {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ExtendType::Uxtb => "uxtb",
-            ExtendType::Uxth => "uxth",
-            ExtendType::Uxtw => "uxtw",
-            ExtendType::Uxtx => "uxtx",
-            ExtendType::Sxtb => "sxtb",
-            ExtendType::Sxth => "sxth",
-            ExtendType::Sxtw => "sxtw",
-            ExtendType::Sxtx => "sxtx",
-        }
-    }
-}
-
 // ============================================================================
 // Call Target
 // ============================================================================
 
 /// Target for call instructions
+#[allow(dead_code)] // Documents full instruction set
 #[derive(Debug, Clone, PartialEq)]
 pub enum CallTarget {
     /// Direct call to symbol
@@ -313,6 +243,7 @@ pub enum CallTarget {
 // ============================================================================
 
 /// AArch64 Low-level IR instruction
+#[allow(dead_code)] // Documents full instruction set
 #[derive(Debug, Clone)]
 pub enum Aarch64Inst {
     // ========================================================================
@@ -1554,19 +1485,6 @@ fn size_bits(size: FpSize) -> u32 {
 }
 
 // ============================================================================
-// Utility Functions
-// ============================================================================
-
-/// Emit a sequence of LIR instructions to assembly text
-pub fn emit_instrs(instrs: &[Aarch64Inst], target: &Target) -> String {
-    let mut out = String::new();
-    for inst in instrs {
-        inst.emit(target, &mut out);
-    }
-    out
-}
-
-// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1767,40 +1685,5 @@ mod tests {
         let mut out = String::new();
         inst.emit(&macos, &mut out);
         assert!(out.contains("bl _printf"));
-    }
-
-    #[test]
-    fn test_condition_inverse() {
-        assert_eq!(Cond::Eq.inverse(), Cond::Ne);
-        assert_eq!(Cond::Lt.inverse(), Cond::Ge);
-        assert_eq!(Cond::Hi.inverse(), Cond::Ls);
-    }
-
-    #[test]
-    fn test_emit_instrs() {
-        let target = linux_target();
-
-        let instrs = vec![
-            Aarch64Inst::Stp {
-                size: OperandSize::B64,
-                src1: Reg::X29,
-                src2: Reg::X30,
-                addr: MemAddr::PreIndex {
-                    base: Reg::X29,
-                    offset: -16,
-                },
-            },
-            Aarch64Inst::Mov {
-                size: OperandSize::B64,
-                src: GpOperand::Imm(42),
-                dst: Reg::X0,
-            },
-            Aarch64Inst::Ret,
-        ];
-
-        let out = emit_instrs(&instrs, &target);
-        assert!(out.contains("stp x29, x30"));
-        assert!(out.contains("mov x0, #42"));
-        assert!(out.contains("ret"));
     }
 }

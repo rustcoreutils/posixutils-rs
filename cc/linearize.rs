@@ -20,13 +20,9 @@ use crate::parse::ast::{
 };
 use crate::ssa::ssa_convert;
 use crate::symbol::SymbolTable;
+use crate::target::Target;
 use crate::types::{MemberInfo, TypeId, TypeKind, TypeModifiers, TypeTable};
 use std::collections::HashMap;
-
-/// Maximum size (in bits) for aggregate types (struct/union) to be passed or
-/// returned by value in registers. Aggregates larger than this require
-/// indirect passing (pointer) or sret (struct return pointer).
-pub const MAX_REGISTER_AGGREGATE_BITS: u32 = 64;
 
 /// Information about a local variable
 #[derive(Clone)]
@@ -91,11 +87,13 @@ pub struct Linearizer<'a> {
     static_locals: HashMap<String, StaticLocalInfo>,
     /// Current source position for debug info
     current_pos: Option<Position>,
+    /// Target configuration (architecture, ABI details)
+    target: &'a Target,
 }
 
 impl<'a> Linearizer<'a> {
     /// Create a new linearizer
-    pub fn new(symbols: &'a SymbolTable, types: &'a TypeTable) -> Self {
+    pub fn new(symbols: &'a SymbolTable, types: &'a TypeTable, target: &'a Target) -> Self {
         Self {
             module: Module::new(),
             current_func: None,
@@ -116,15 +114,16 @@ impl<'a> Linearizer<'a> {
             static_local_counter: 0,
             static_locals: HashMap::new(),
             current_pos: None,
+            target,
         }
     }
 
     /// Create a linearizer with SSA conversion disabled (for testing)
     #[cfg(test)]
-    pub fn new_no_ssa(symbols: &'a SymbolTable, types: &'a TypeTable) -> Self {
+    pub fn new_no_ssa(symbols: &'a SymbolTable, types: &'a TypeTable, target: &'a Target) -> Self {
         Self {
             run_ssa: false,
-            ..Self::new(symbols, types)
+            ..Self::new(symbols, types, target)
         }
     }
 
@@ -510,7 +509,7 @@ impl<'a> Linearizer<'a> {
         // Large structs are returned via a hidden first parameter (sret)
         // that points to caller-allocated space
         let returns_large_struct = (ret_kind == TypeKind::Struct || ret_kind == TypeKind::Union)
-            && self.types.size_bits(func.return_type) > MAX_REGISTER_AGGREGATE_BITS;
+            && self.types.size_bits(func.return_type) > self.target.max_aggregate_register_bits;
 
         // Argument index offset: if returning large struct, first arg is hidden return pointer
         let arg_offset: u32 = if returns_large_struct { 1 } else { 0 };
@@ -570,7 +569,7 @@ impl<'a> Linearizer<'a> {
             let typ_size = self.types.size_bits(typ);
             // For large structs, arg_pseudo is a pointer to the struct
             // We need to copy the data from that pointer to local storage
-            if typ_size > MAX_REGISTER_AGGREGATE_BITS {
+            if typ_size > self.target.max_aggregate_register_bits {
                 // arg_pseudo is a pointer - copy each 8-byte chunk
                 let struct_size = typ_size / 8;
                 let mut offset = 0i64;
@@ -2239,7 +2238,7 @@ impl<'a> Linearizer<'a> {
                 let typ_kind = self.types.kind(typ);
                 let returns_large_struct = (typ_kind == TypeKind::Struct
                     || typ_kind == TypeKind::Union)
-                    && self.types.size_bits(typ) > MAX_REGISTER_AGGREGATE_BITS;
+                    && self.types.size_bits(typ) > self.target.max_aggregate_register_bits;
 
                 let (result_sym, mut arg_vals, mut arg_types_vec) = if returns_large_struct {
                     // Allocate local storage for the return value
@@ -2282,7 +2281,7 @@ impl<'a> Linearizer<'a> {
                     let arg_type = self.expr_type(a);
                     let arg_kind = self.types.kind(arg_type);
                     let arg_val = if (arg_kind == TypeKind::Struct || arg_kind == TypeKind::Union)
-                        && self.types.size_bits(arg_type) > MAX_REGISTER_AGGREGATE_BITS
+                        && self.types.size_bits(arg_type) > self.target.max_aggregate_register_bits
                     {
                         // Large struct: pass address instead of value
                         // The argument type becomes a pointer
@@ -2313,6 +2312,7 @@ impl<'a> Linearizer<'a> {
                         64, // pointers are 64-bit
                     );
                     call_insn.variadic_arg_start = variadic_arg_start;
+                    call_insn.is_sret_call = true;
                     self.emit(call_insn);
                     // Return the symbol (address) where struct is stored
                     result_sym
@@ -3688,8 +3688,13 @@ impl<'a> Linearizer<'a> {
 
 /// Linearize an AST to IR (convenience wrapper for tests)
 #[cfg(test)]
-pub fn linearize(tu: &TranslationUnit, symbols: &SymbolTable, types: &TypeTable) -> Module {
-    linearize_with_debug(tu, symbols, types, false, None)
+pub fn linearize(
+    tu: &TranslationUnit,
+    symbols: &SymbolTable,
+    types: &TypeTable,
+    target: &Target,
+) -> Module {
+    linearize_with_debug(tu, symbols, types, target, false, None)
 }
 
 /// Linearize an AST to IR with debug info support
@@ -3697,10 +3702,11 @@ pub fn linearize_with_debug(
     tu: &TranslationUnit,
     symbols: &SymbolTable,
     types: &TypeTable,
+    target: &Target,
     debug: bool,
     source_file: Option<&str>,
 ) -> Module {
-    let mut linearizer = Linearizer::new(symbols, types);
+    let mut linearizer = Linearizer::new(symbols, types, target);
     let mut module = linearizer.linearize(tu);
     module.debug = debug;
     if let Some(path) = source_file {
@@ -3732,7 +3738,8 @@ mod tests {
 
     fn test_linearize(tu: &TranslationUnit, types: &TypeTable) -> Module {
         let symbols = SymbolTable::new();
-        linearize(tu, &symbols, types)
+        let target = Target::host();
+        linearize(tu, &symbols, types, &target)
     }
 
     fn make_simple_func(name: &str, body: Stmt, types: &TypeTable) -> FunctionDef {
@@ -4017,7 +4024,8 @@ mod tests {
 
         // Create linearizer and test that expr_type reads from the expression
         let symbols = SymbolTable::new();
-        let linearizer = Linearizer::new(&symbols, &types);
+        let target = Target::host();
+        let linearizer = Linearizer::new(&symbols, &types, &target);
         let typ = linearizer.expr_type(&expr);
         assert_eq!(types.kind(typ), TypeKind::Int);
 
@@ -4037,7 +4045,8 @@ mod tests {
         expr.typ = Some(types.double_id);
 
         let symbols = SymbolTable::new();
-        let linearizer = Linearizer::new(&symbols, &types);
+        let target = Target::host();
+        let linearizer = Linearizer::new(&symbols, &types, &target);
         let typ = linearizer.expr_type(&expr);
         assert_eq!(types.kind(typ), TypeKind::Double);
     }
@@ -4049,7 +4058,8 @@ mod tests {
     /// Helper to linearize without SSA conversion (for comparing before/after)
     fn linearize_no_ssa(tu: &TranslationUnit, types: &TypeTable) -> Module {
         let symbols = SymbolTable::new();
-        let mut linearizer = Linearizer::new_no_ssa(&symbols, types);
+        let target = Target::host();
+        let mut linearizer = Linearizer::new_no_ssa(&symbols, types, &target);
         linearizer.linearize(tu)
     }
 

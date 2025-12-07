@@ -5752,7 +5752,7 @@ mod tests {
     #[test]
     fn test_typedef_local_variable() {
         // Typedef used as local variable type inside function body
-        let (tu, types) =
+        let (tu, _types) =
             parse_tu("typedef int myint; int main(void) { myint x; x = 42; return 0; }").unwrap();
         assert_eq!(tu.items.len(), 2);
 

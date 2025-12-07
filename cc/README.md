@@ -96,6 +96,7 @@ Supported:
 Not yet implemented:
 - goto, longjmp, setjmp
 - `inline` and inlining support
+- multi-register returns (for structs larger than 8 bytes)
 - -fverbose-asm
 - Complex initializers
 - VLAs (variable-length arrays)

@@ -218,8 +218,14 @@ fn process_file(
     }
 
     // Linearize to IR
-    let mut module =
-        linearize::linearize_with_debug(&ast, &symbols, &types, args.debug, Some(display_path));
+    let mut module = linearize::linearize_with_debug(
+        &ast,
+        &symbols,
+        &types,
+        target,
+        args.debug,
+        Some(display_path),
+    );
 
     if args.dump_ir {
         print!("{}", module);

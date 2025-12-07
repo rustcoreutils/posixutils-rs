@@ -444,6 +444,9 @@ pub struct Instruction {
     /// For variadic calls: index where variadic arguments start (0-based)
     /// All arguments at this index and beyond are variadic (should be passed on stack)
     pub variadic_arg_start: Option<usize>,
+    /// For calls: true if this call returns a large struct via sret (hidden pointer arg).
+    /// The first element of `src` is the sret pointer when this is true.
+    pub is_sret_call: bool,
     /// Source position for debug info
     pub pos: Option<Position>,
 }
@@ -466,6 +469,7 @@ impl Default for Instruction {
             switch_default: None,
             arg_types: Vec::new(),
             variadic_arg_start: None,
+            is_sret_call: false,
             pos: None,
         }
     }

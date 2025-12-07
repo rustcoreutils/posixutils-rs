@@ -20,8 +20,8 @@
 use crate::arch::aarch64::lir::{Aarch64Inst, CallTarget, Cond, GpOperand, MemAddr};
 use crate::arch::codegen::CodeGenerator;
 use crate::arch::lir::{Directive, FpSize, Label, OperandSize, Symbol};
+use crate::arch::DEFAULT_LIR_BUFFER_CAPACITY;
 use crate::ir::{Function, Initializer, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
-use crate::linearize::MAX_REGISTER_AGGREGATE_BITS;
 use crate::target::Target;
 use crate::types::{TypeId, TypeModifiers, TypeTable};
 use std::collections::HashMap;
@@ -1022,7 +1022,7 @@ impl Aarch64CodeGen {
         Self {
             target,
             output: String::new(),
-            lir_buffer: Vec::new(),
+            lir_buffer: Vec::with_capacity(DEFAULT_LIR_BUFFER_CAPACITY),
             locations: HashMap::new(),
             pseudos: Vec::new(),
             current_fn: String::new(),
@@ -3002,28 +3002,9 @@ impl Aarch64CodeGen {
         let is_darwin_variadic =
             self.target.os == crate::target::Os::MacOS && insn.variadic_arg_start.is_some();
 
-        // Check if this call returns a large struct
-        // If so, the first argument is the sret pointer and goes in X8 (not X0)
-        let returns_large_struct = insn.typ.is_some_and(|t| {
-            let kind = types.kind(t);
-            (kind == crate::types::TypeKind::Struct || kind == crate::types::TypeKind::Union)
-                && types.size_bits(t) > MAX_REGISTER_AGGREGATE_BITS
-        });
-
-        // Also check if return type is a pointer to a large struct (linearizer wraps it)
-        let returns_large_struct = returns_large_struct
-            || insn.typ.is_some_and(|t| {
-                if let Some(pointee) = types.base_type(t) {
-                    let kind = types.kind(pointee);
-                    (kind == crate::types::TypeKind::Struct
-                        || kind == crate::types::TypeKind::Union)
-                        && types.size_bits(pointee) > MAX_REGISTER_AGGREGATE_BITS
-                } else {
-                    false
-                }
-            });
-
-        let args_start = if returns_large_struct && !insn.src.is_empty() {
+        // Check if this call returns a large struct via sret (hidden pointer argument).
+        // The linearizer sets is_sret_call=true and puts the sret pointer as the first arg.
+        let args_start = if insn.is_sret_call && !insn.src.is_empty() {
             // First argument is sret pointer - move to X8
             self.emit_move(insn.src[0], Reg::X8, 64, frame_size);
             1 // Skip first arg in main loop

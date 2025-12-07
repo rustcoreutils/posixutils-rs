@@ -63,6 +63,10 @@ pub struct Target {
     pub long_width: u32,
     /// char is signed by default
     pub char_signed: bool,
+    /// Maximum size (in bits) for aggregate types (struct/union) that can be
+    /// passed or returned by value in registers. Aggregates larger than this
+    /// require indirect passing (pointer) or sret (struct return pointer).
+    pub max_aggregate_register_bits: u32,
 }
 
 impl Target {
@@ -91,12 +95,20 @@ impl Target {
             (Arch::X86_64, _) => true,
         };
 
+        // Maximum aggregate size that can be returned in registers.
+        // Both x86-64 SysV ABI and AAPCS64 technically support returning
+        // 16-byte structs in registers (rax+rdx or x0+x1), but pcc currently
+        // only supports single-register returns. Use sret for >8 byte structs
+        // until multi-register returns are implemented.
+        let max_aggregate_register_bits = 64;
+
         Self {
             arch,
             os,
             pointer_width,
             long_width,
             char_signed,
+            max_aggregate_register_bits,
         }
     }
 

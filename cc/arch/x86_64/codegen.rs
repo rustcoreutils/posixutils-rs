@@ -19,6 +19,7 @@ use crate::arch::lir::{Directive, FpSize, Label, OperandSize, Symbol};
 use crate::arch::x86_64::lir::{
     CallTarget, GpOperand, IntCC, MemAddr, ShiftCount, X86Inst, XmmOperand,
 };
+use crate::arch::DEFAULT_LIR_BUFFER_CAPACITY;
 use crate::ir::{Function, Initializer, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
 use crate::target::Target;
 use crate::types::{TypeId, TypeModifiers, TypeTable};
@@ -879,7 +880,7 @@ impl X86_64CodeGen {
         Self {
             target,
             output: String::new(),
-            lir_buffer: Vec::new(),
+            lir_buffer: Vec::with_capacity(DEFAULT_LIR_BUFFER_CAPACITY),
             locations: HashMap::new(),
             pseudos: Vec::new(),
             current_fn: String::new(),

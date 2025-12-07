@@ -1233,7 +1233,7 @@ mod tests {
 
     #[test]
     fn test_types_compatible_pointers() {
-        let mut types = TypeTable::new();
+        let types = TypeTable::new();
         let int_ptr = Type::pointer(types.int_id);
         let int_ptr2 = Type::pointer(types.int_id);
         assert!(int_ptr.types_compatible(&int_ptr2));
@@ -1244,7 +1244,7 @@ mod tests {
 
     #[test]
     fn test_types_compatible_arrays() {
-        let mut types = TypeTable::new();
+        let types = TypeTable::new();
         let arr10 = Type::array(types.int_id, 10);
         let arr10_2 = Type::array(types.int_id, 10);
         assert!(arr10.types_compatible(&arr10_2));

@@ -10,15 +10,15 @@
 // Converts AST to SSA-style IR following sparse's design
 //
 
-use crate::diag::Position;
-use crate::ir::{
+use super::ssa::ssa_convert;
+use super::{
     BasicBlock, BasicBlockId, Function, Initializer, Instruction, Module, Opcode, Pseudo, PseudoId,
 };
+use crate::diag::Position;
 use crate::parse::ast::{
     AssignOp, BinaryOp, BlockItem, Declaration, Designator, Expr, ExprKind, ExternalDecl, ForInit,
     FunctionDef, InitElement, Stmt, TranslationUnit, UnaryOp,
 };
-use crate::ssa::ssa_convert;
 use crate::strings::{StringId, StringTable};
 use crate::symbol::SymbolTable;
 use crate::target::Target;

@@ -10,17 +10,11 @@
 //
 
 mod arch;
-mod dce;
 mod diag;
-mod dominate;
-mod instcombine;
 mod ir;
-mod linearize;
-mod lower;
 mod opt;
 mod os;
 mod parse;
-mod ssa;
 mod strings;
 mod symbol;
 mod target;
@@ -218,7 +212,7 @@ fn process_file(
     }
 
     // Linearize to IR
-    let mut module = linearize::linearize_with_debug(
+    let mut module = ir::linearize::linearize_with_debug(
         &ast,
         &symbols,
         &types,
@@ -239,7 +233,7 @@ fn process_file(
     }
 
     // Lower IR (phi elimination, etc.)
-    lower::lower_module(&mut module);
+    ir::lower::lower_module(&mut module);
 
     // Generate assembly
     let emit_unwind_tables = !args.no_unwind_tables;

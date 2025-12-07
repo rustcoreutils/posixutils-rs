@@ -15,7 +15,7 @@
 // 3. Delete all unmarked instructions
 //
 
-use crate::ir::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
+use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
 use std::collections::{HashSet, VecDeque};
 
 // ============================================================================

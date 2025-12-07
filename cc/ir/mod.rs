@@ -14,6 +14,13 @@
 // optimization passes.
 //
 
+pub mod dce;
+pub mod dominate;
+pub mod instcombine;
+pub mod linearize;
+pub mod lower;
+pub mod ssa;
+
 use crate::diag::Position;
 use crate::types::TypeId;
 use std::collections::HashMap;

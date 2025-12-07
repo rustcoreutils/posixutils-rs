@@ -14,7 +14,7 @@
 // - Identity patterns: x - x -> 0, x ^ x -> 0, etc.
 //
 
-use crate::ir::{Function, Instruction, Opcode, Pseudo, PseudoId, PseudoKind};
+use super::{Function, Instruction, Opcode, Pseudo, PseudoId, PseudoKind};
 use crate::types::TypeId;
 
 // ============================================================================

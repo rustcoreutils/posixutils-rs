@@ -12,8 +12,8 @@
 // used by optimization passes (InstCombine, DCE, etc.).
 //
 
-use crate::dce;
-use crate::instcombine;
+use crate::ir::dce;
+use crate::ir::instcombine;
 use crate::ir::{Function, Module};
 
 #[cfg(test)]

@@ -13,7 +13,7 @@
 // - IDF computation: "A Linear Time Algorithm for Placing phi-nodes" by Sreedhar and Gao
 //
 
-use crate::ir::{BasicBlockId, Function};
+use super::{BasicBlockId, Function};
 use std::collections::{HashMap, HashSet};
 
 // ============================================================================

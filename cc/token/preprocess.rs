@@ -487,7 +487,7 @@ impl<'a> Preprocessor<'a> {
                     }
                     // Check for macro expansion
                     if let TokenValue::Ident(id) = &token.value {
-                        if let Some(name) = idents.get(*id) {
+                        if let Some(name) = idents.get_opt(*id) {
                             let name = name.to_string();
                             if let Some(expanded) =
                                 self.try_expand_macro(&name, &token.pos, &mut iter, idents)
@@ -543,7 +543,7 @@ impl<'a> Preprocessor<'a> {
         let directive_name = match &directive_token.typ {
             TokenType::Ident => {
                 if let TokenValue::Ident(id) = &directive_token.value {
-                    idents.get(*id).map(|s| s.to_string())
+                    idents.get_opt(*id).map(|s| s.to_string())
                 } else {
                     None
                 }
@@ -635,7 +635,7 @@ impl<'a> Preprocessor<'a> {
         let macro_name = match &name_token.typ {
             TokenType::Ident => {
                 if let TokenValue::Ident(id) = &name_token.value {
-                    idents.get(*id).map(|s| s.to_string())
+                    idents.get_opt(*id).map(|s| s.to_string())
                 } else {
                     None
                 }
@@ -689,7 +689,7 @@ impl<'a> Preprocessor<'a> {
                                     break;
                                 }
                                 TokenValue::Ident(id) => {
-                                    if let Some(param_name) = idents.get(*id) {
+                                    if let Some(param_name) = idents.get_opt(*id) {
                                         params.push(MacroParam {
                                             name: param_name.to_string(),
                                             index: param_index,
@@ -756,7 +756,7 @@ impl<'a> Preprocessor<'a> {
                     // # stringify - look for following parameter
                     if i + 1 < tokens.len() {
                         if let TokenValue::Ident(id) = &tokens[i + 1].value {
-                            if let Some(name) = idents.get(*id) {
+                            if let Some(name) = idents.get_opt(*id) {
                                 // Check if it's a parameter
                                 for param in params {
                                     if param.name == name {
@@ -798,7 +798,7 @@ impl<'a> Preprocessor<'a> {
 
             // Check for parameter reference or __VA_ARGS__
             if let TokenValue::Ident(id) = &token.value {
-                if let Some(name) = idents.get(*id) {
+                if let Some(name) = idents.get_opt(*id) {
                     // Check if it's __VA_ARGS__
                     if name == "__VA_ARGS__" {
                         body.push(MacroToken {
@@ -844,7 +844,7 @@ impl<'a> Preprocessor<'a> {
         let value = match &token.value {
             TokenValue::Number(n) => MacroTokenValue::Number(n.clone()),
             TokenValue::Ident(id) => {
-                let name = idents.get(*id).unwrap_or("").to_string();
+                let name = idents.get_opt(*id).unwrap_or("").to_string();
                 MacroTokenValue::Ident(name)
             }
             TokenValue::String(s) => MacroTokenValue::String(s.clone()),
@@ -875,7 +875,7 @@ impl<'a> Preprocessor<'a> {
         if let Some(token) = iter.next() {
             if let TokenType::Ident = &token.typ {
                 if let TokenValue::Ident(id) = &token.value {
-                    if let Some(name) = idents.get(*id) {
+                    if let Some(name) = idents.get_opt(*id) {
                         self.undef_macro(name);
                     }
                 }
@@ -893,7 +893,7 @@ impl<'a> Preprocessor<'a> {
         let defined = if let Some(token) = iter.next() {
             if let TokenType::Ident = &token.typ {
                 if let TokenValue::Ident(id) = &token.value {
-                    if let Some(name) = idents.get(*id) {
+                    if let Some(name) = idents.get_opt(*id) {
                         self.is_defined(name)
                     } else {
                         false
@@ -920,7 +920,7 @@ impl<'a> Preprocessor<'a> {
         let defined = if let Some(token) = iter.next() {
             if let TokenType::Ident = &token.typ {
                 if let TokenValue::Ident(id) = &token.value {
-                    if let Some(name) = idents.get(*id) {
+                    if let Some(name) = idents.get_opt(*id) {
                         self.is_defined(name)
                     } else {
                         false
@@ -1136,7 +1136,7 @@ impl<'a> Preprocessor<'a> {
     /// Convert token to string
     fn token_to_string(&self, token: &Token, idents: &IdentTable) -> String {
         match &token.value {
-            TokenValue::Ident(id) => idents.get(*id).unwrap_or("").to_string(),
+            TokenValue::Ident(id) => idents.get_opt(*id).unwrap_or("").to_string(),
             TokenValue::Number(n) => n.clone(),
             TokenValue::String(s) => s.clone(),
             TokenValue::Special(code) => {
@@ -1263,37 +1263,16 @@ impl<'a> Preprocessor<'a> {
         // Create a new stream for this file
         let stream_id = diag::init_stream(&self.current_file);
 
-        // Tokenize the included file
-        let mut tokenizer = Tokenizer::new(&content, stream_id);
-        let tokens = tokenizer.tokenize();
-
-        // Build mapping from included file's ident IDs to main ident table IDs
-        let included_idents = tokenizer.ident_table();
-        let mut id_map: HashMap<u32, u32> = HashMap::new();
-        for i in 0.. {
-            if let Some(name) = included_idents.get(i) {
-                let new_id = idents.intern(name);
-                id_map.insert(i, new_id);
-            } else {
-                break;
-            }
-        }
-
-        // Remap token identifiers
-        let remapped_tokens: Vec<Token> = tokens
-            .into_iter()
-            .map(|mut token| {
-                if let TokenValue::Ident(old_id) = &token.value {
-                    if let Some(&new_id) = id_map.get(old_id) {
-                        token.value = TokenValue::Ident(new_id);
-                    }
-                }
-                token
-            })
-            .collect();
+        // Tokenize the included file using the same shared string table
+        // Since we use the same StringTable, all StringIds are consistent
+        // and no ID remapping is needed.
+        let tokens = {
+            let mut tokenizer = Tokenizer::new(&content, stream_id, idents);
+            tokenizer.tokenize()
+        };
 
         // Preprocess the included tokens
-        let preprocessed = self.preprocess(remapped_tokens, idents);
+        let preprocessed = self.preprocess(tokens, idents);
 
         // Filter out stream markers from included content
         for token in preprocessed {
@@ -1362,7 +1341,7 @@ impl<'a> Preprocessor<'a> {
         // Check for #pragma once
         if let Some(token) = iter.peek() {
             if let TokenValue::Ident(id) = &token.value {
-                if let Some(name) = idents.get(*id) {
+                if let Some(name) = idents.get_opt(*id) {
                     if name == "once" {
                         if let Ok(canonical) = Path::new(&self.current_file).canonicalize() {
                             self.once_files.insert(canonical);
@@ -1398,7 +1377,7 @@ impl<'a> Preprocessor<'a> {
             }
             match &token.value {
                 TokenValue::Ident(id) => {
-                    if let Some(name) = idents.get(*id) {
+                    if let Some(name) = idents.get_opt(*id) {
                         result.push_str(name);
                     }
                 }
@@ -1642,34 +1621,20 @@ impl<'a> Preprocessor<'a> {
         let right_str = self.token_to_string(&right[0], idents);
         let combined = format!("{}{}", left_str, right_str);
 
-        // Re-tokenize the combined string
+        // Re-tokenize the combined string using the same shared string table
+        // Since we use the same StringTable, all StringIds are consistent
+        // and no ID remapping is needed.
         let stream_id = diag::init_stream("<paste>");
-        let mut tokenizer = Tokenizer::new(combined.as_bytes(), stream_id);
-        let tokens = tokenizer.tokenize();
-
-        // Build mapping from paste_idents IDs to main idents IDs
-        let paste_idents = tokenizer.ident_table();
-        let mut id_map: HashMap<u32, u32> = HashMap::new();
-        for i in 0.. {
-            if let Some(name) = paste_idents.get(i) {
-                let new_id = idents.intern(name);
-                id_map.insert(i, new_id);
-            } else {
-                break;
-            }
-        }
+        let tokens = {
+            let mut tokenizer = Tokenizer::new(combined.as_bytes(), stream_id, idents);
+            tokenizer.tokenize()
+        };
 
         let mut result: Vec<_> = tokens
             .into_iter()
             .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
             .map(|mut t| {
                 t.pos = *pos;
-                // Remap identifier IDs
-                if let TokenValue::Ident(old_id) = &t.value {
-                    if let Some(&new_id) = id_map.get(old_id) {
-                        t.value = TokenValue::Ident(new_id);
-                    }
-                }
                 t
             })
             .collect();
@@ -2012,7 +1977,7 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
     fn is_ident(&self, expected: &str) -> bool {
         if let Some(tok) = self.current() {
             if let TokenValue::Ident(id) = &tok.value {
-                if let Some(name) = self.idents.get(*id) {
+                if let Some(name) = self.idents.get_opt(*id) {
                     return name == expected;
                 }
             }
@@ -2023,7 +1988,7 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
     fn get_ident(&self) -> Option<String> {
         if let Some(tok) = self.current() {
             if let TokenValue::Ident(id) = &tok.value {
-                return self.idents.get(*id).map(|s| s.to_string());
+                return self.idents.get_opt(*id).map(|s| s.to_string());
             }
         }
         None
@@ -2266,7 +2231,7 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
                 let ident_id = *id;
                 self.advance();
                 // Check if it's a defined macro with a value
-                if let Some(name) = self.idents.get(ident_id) {
+                if let Some(name) = self.idents.get_opt(ident_id) {
                     if let Some(mac) = self.pp.get_macro(name) {
                         if let Some(mt) = mac.body.first() {
                             if let MacroTokenValue::Number(n) = &mt.value {
@@ -2352,13 +2317,12 @@ mod tests {
 
     fn preprocess_str(input: &str) -> (Vec<Token>, IdentTable) {
         let target = Target::host();
-        let mut tokenizer = Tokenizer::new(input.as_bytes(), 0);
+        let mut strings = IdentTable::new();
+        let mut tokenizer = Tokenizer::new(input.as_bytes(), 0, &mut strings);
         let tokens = tokenizer.tokenize();
-        let result = {
-            let idents = tokenizer.ident_table_mut();
-            preprocess(tokens, &target, idents, "<test>")
-        };
-        (result, tokenizer.into_ident_table())
+        drop(tokenizer);
+        let result = preprocess(tokens, &target, &mut strings, "<test>");
+        (result, strings)
     }
 
     fn get_token_strings(tokens: &[Token], idents: &IdentTable) -> Vec<String> {
@@ -2367,7 +2331,7 @@ mod tests {
             .filter_map(|t| match &t.typ {
                 TokenType::Ident => {
                     if let TokenValue::Ident(id) = &t.value {
-                        idents.get(*id).map(|s| s.to_string())
+                        idents.get_opt(*id).map(|s| s.to_string())
                     } else {
                         None
                     }

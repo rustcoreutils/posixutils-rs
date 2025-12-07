@@ -10,6 +10,7 @@
 // Based on sparse's compositional type model
 //
 
+use crate::strings::StringId;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -39,8 +40,8 @@ impl TypeId {
 /// A struct/union member
 #[derive(Debug, Clone, PartialEq)]
 pub struct StructMember {
-    /// Member name (empty string for unnamed bitfields)
-    pub name: String,
+    /// Member name (StringId::EMPTY for unnamed bitfields)
+    pub name: StringId,
     /// Member type (interned TypeId)
     pub typ: TypeId,
     /// Byte offset within struct (0 for unions, offset of storage unit for bitfields)
@@ -71,8 +72,8 @@ pub struct MemberInfo {
 /// An enum constant
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnumConstant {
-    /// Constant name
-    pub name: String,
+    /// Constant name (interned StringId)
+    pub name: StringId,
     /// Constant value
     pub value: i64,
 }
@@ -80,8 +81,8 @@ pub struct EnumConstant {
 /// Composite type definition (struct, union, or enum)
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompositeType {
-    /// Tag name (e.g., "point" in "struct point")
-    pub tag: Option<String>,
+    /// Tag name (e.g., "point" in "struct point") - None for anonymous
+    pub tag: Option<StringId>,
     /// Members for struct/union
     pub members: Vec<StructMember>,
     /// Constants for enum
@@ -96,7 +97,7 @@ pub struct CompositeType {
 
 impl CompositeType {
     /// Create a new empty composite type (forward declaration)
-    pub fn incomplete(tag: Option<String>) -> Self {
+    pub fn incomplete(tag: Option<StringId>) -> Self {
         Self {
             tag,
             members: Vec::new(),
@@ -353,23 +354,23 @@ impl Type {
     }
 
     /// Create an incomplete (forward-declared) struct type
-    pub fn incomplete_struct(tag: String) -> Self {
+    pub fn incomplete_struct(tag: StringId) -> Self {
         Self::struct_type(CompositeType::incomplete(Some(tag)))
     }
 
     /// Create an incomplete (forward-declared) union type
-    pub fn incomplete_union(tag: String) -> Self {
+    pub fn incomplete_union(tag: StringId) -> Self {
         Self::union_type(CompositeType::incomplete(Some(tag)))
     }
 
     /// Create an incomplete (forward-declared) enum type
-    pub fn incomplete_enum(tag: String) -> Self {
+    pub fn incomplete_enum(tag: StringId) -> Self {
         Self::enum_type(CompositeType::incomplete(Some(tag)))
     }
 
     /// Find a member in a struct/union type
     /// Returns MemberInfo with full bitfield details if found
-    pub fn find_member(&self, name: &str) -> Option<MemberInfo> {
+    pub fn find_member(&self, name: StringId) -> Option<MemberInfo> {
         if let Some(ref composite) = self.composite {
             for member in &composite.members {
                 if member.name == name {
@@ -970,7 +971,7 @@ impl TypeTable {
     }
 
     /// Find a member in a struct/union type
-    pub fn find_member(&self, id: TypeId, name: &str) -> Option<MemberInfo> {
+    pub fn find_member(&self, id: TypeId, name: StringId) -> Option<MemberInfo> {
         self.get(id).find_member(name)
     }
 

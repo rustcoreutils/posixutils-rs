@@ -10,6 +10,7 @@
 // Based on sparse's scope-aware symbol management
 //
 
+use crate::strings::StringId;
 use crate::types::TypeId;
 use std::collections::HashMap;
 
@@ -73,8 +74,8 @@ pub enum StorageClass {
 /// A symbol in the symbol table
 #[derive(Debug, Clone)]
 pub struct Symbol {
-    /// The symbol's name
-    pub name: String,
+    /// The symbol's name (interned StringId)
+    pub name: StringId,
 
     /// What kind of symbol this is
     pub kind: SymbolKind,
@@ -97,7 +98,7 @@ pub struct Symbol {
 
 impl Symbol {
     /// Create a new variable symbol
-    pub fn variable(name: String, typ: TypeId, scope_depth: u32) -> Self {
+    pub fn variable(name: StringId, typ: TypeId, scope_depth: u32) -> Self {
         Self {
             name,
             kind: SymbolKind::Variable,
@@ -110,7 +111,7 @@ impl Symbol {
     }
 
     /// Create a new function symbol
-    pub fn function(name: String, typ: TypeId, scope_depth: u32) -> Self {
+    pub fn function(name: StringId, typ: TypeId, scope_depth: u32) -> Self {
         Self {
             name,
             kind: SymbolKind::Function,
@@ -123,7 +124,7 @@ impl Symbol {
     }
 
     /// Create a new parameter symbol
-    pub fn parameter(name: String, typ: TypeId, scope_depth: u32) -> Self {
+    pub fn parameter(name: StringId, typ: TypeId, scope_depth: u32) -> Self {
         Self {
             name,
             kind: SymbolKind::Parameter,
@@ -136,7 +137,7 @@ impl Symbol {
     }
 
     /// Create a new enum constant symbol (requires int_id from TypeTable)
-    pub fn enum_constant(name: String, value: i64, int_id: TypeId, scope_depth: u32) -> Self {
+    pub fn enum_constant(name: StringId, value: i64, int_id: TypeId, scope_depth: u32) -> Self {
         Self {
             name,
             kind: SymbolKind::EnumConstant,
@@ -149,7 +150,7 @@ impl Symbol {
     }
 
     /// Create a new tag symbol (struct/union/enum tag)
-    pub fn tag(name: String, typ: TypeId, scope_depth: u32) -> Self {
+    pub fn tag(name: StringId, typ: TypeId, scope_depth: u32) -> Self {
         Self {
             name,
             kind: SymbolKind::Tag,
@@ -162,7 +163,7 @@ impl Symbol {
     }
 
     /// Create a new typedef symbol
-    pub fn typedef(name: String, typ: TypeId, scope_depth: u32) -> Self {
+    pub fn typedef(name: StringId, typ: TypeId, scope_depth: u32) -> Self {
         Self {
             name,
             kind: SymbolKind::Typedef,
@@ -233,7 +234,7 @@ pub struct SymbolTable {
 
     /// Fast lookup: name -> list of symbol IDs with that name
     /// (most recent first, for shadowing)
-    name_map: HashMap<(String, Namespace), Vec<SymbolId>>,
+    name_map: HashMap<(StringId, Namespace), Vec<SymbolId>>,
 }
 
 impl SymbolTable {
@@ -266,7 +267,7 @@ impl SymbolTable {
             let scope = &self.scopes[self.current_scope as usize];
             for &sym_id in &scope.symbols {
                 let sym = &self.symbols[sym_id.0 as usize];
-                let key = (sym.name.clone(), sym.namespace);
+                let key = (sym.name, sym.namespace);
                 if let Some(ids) = self.name_map.get_mut(&key) {
                     // Remove this symbol from the list
                     ids.retain(|&id| id != sym_id);
@@ -293,14 +294,14 @@ impl SymbolTable {
         sym.scope_depth = self.scope_depth;
 
         // Check for redefinition in the same scope
-        let key = (sym.name.clone(), sym.namespace);
+        let key = (sym.name, sym.namespace);
         if let Some(ids) = self.name_map.get(&key) {
             for &id in ids {
                 let existing = &self.symbols[id.0 as usize];
                 if existing.scope_depth == self.scope_depth {
                     // Same scope - check for redefinition
                     if existing.defined && sym.defined {
-                        return Err(SymbolError::Redefinition(sym.name.clone()));
+                        return Err(SymbolError::Redefinition(sym.name));
                     }
                 }
             }
@@ -322,21 +323,21 @@ impl SymbolTable {
     /// Look up a symbol by name in the given namespace
     ///
     /// Searches from innermost scope outward
-    pub fn lookup(&self, name: &str, ns: Namespace) -> Option<&Symbol> {
-        let key = (name.to_string(), ns);
+    pub fn lookup(&self, name: StringId, ns: Namespace) -> Option<&Symbol> {
+        let key = (name, ns);
         self.name_map
             .get(&key)
             .and_then(|ids| ids.first().map(|id| &self.symbols[id.0 as usize]))
     }
 
     /// Look up a tag (struct/union/enum) by name
-    pub fn lookup_tag(&self, name: &str) -> Option<&Symbol> {
+    pub fn lookup_tag(&self, name: StringId) -> Option<&Symbol> {
         self.lookup(name, Namespace::Tag)
     }
 
     /// Look up a typedef by name
     /// Returns the aliased TypeId if found
-    pub fn lookup_typedef(&self, name: &str) -> Option<TypeId> {
+    pub fn lookup_typedef(&self, name: StringId) -> Option<TypeId> {
         self.lookup(name, Namespace::Ordinary).and_then(|s| {
             if s.is_typedef() {
                 Some(s.typ) // TypeId is Copy
@@ -347,7 +348,7 @@ impl SymbolTable {
     }
 
     /// Get the value of an enum constant
-    pub fn get_enum_value(&self, name: &str) -> Option<i64> {
+    pub fn get_enum_value(&self, name: StringId) -> Option<i64> {
         self.lookup(name, Namespace::Ordinary).and_then(|s| {
             if s.is_enum_constant() {
                 s.enum_value
@@ -369,10 +370,10 @@ impl Default for SymbolTable {
 // ============================================================================
 
 /// Symbol table errors
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolError {
     /// Attempted to redefine an existing symbol
-    Redefinition(String),
+    Redefinition(StringId),
 }
 
 impl std::fmt::Display for SymbolError {
@@ -392,90 +393,104 @@ impl std::error::Error for SymbolError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::strings::StringTable;
     use crate::types::{Type, TypeKind, TypeTable};
 
     #[test]
     fn test_declare_and_lookup() {
+        let mut strings = StringTable::new();
         let types = TypeTable::new();
         let mut table = SymbolTable::new();
 
+        let x_id = strings.intern("x");
+
         // Declare a variable
-        let sym = Symbol::variable("x".to_string(), types.int_id, 0);
+        let sym = Symbol::variable(x_id, types.int_id, 0);
         let _id = table.declare(sym).unwrap();
 
         // Look it up
-        let found = table.lookup("x", Namespace::Ordinary).unwrap();
-        assert_eq!(found.name, "x");
+        let found = table.lookup(x_id, Namespace::Ordinary).unwrap();
+        assert_eq!(found.name, x_id);
         assert_eq!(found.kind, SymbolKind::Variable);
     }
 
     #[test]
     fn test_scopes() {
+        let mut strings = StringTable::new();
         let types = TypeTable::new();
         let mut table = SymbolTable::new();
 
+        let x_id = strings.intern("x");
+        let y_id = strings.intern("y");
+
         // Declare x in global scope
-        let sym1 = Symbol::variable("x".to_string(), types.int_id, 0);
+        let sym1 = Symbol::variable(x_id, types.int_id, 0);
         table.declare(sym1).unwrap();
 
         // Enter a new scope
         table.enter_scope();
 
         // Declare y in inner scope
-        let sym2 = Symbol::variable("y".to_string(), types.char_id, 0);
+        let sym2 = Symbol::variable(y_id, types.char_id, 0);
         table.declare(sym2).unwrap();
 
         // Both should be visible
-        assert!(table.lookup("x", Namespace::Ordinary).is_some());
-        assert!(table.lookup("y", Namespace::Ordinary).is_some());
+        assert!(table.lookup(x_id, Namespace::Ordinary).is_some());
+        assert!(table.lookup(y_id, Namespace::Ordinary).is_some());
 
         // Leave scope
         table.leave_scope();
 
         // x should still be visible, y should not
-        assert!(table.lookup("x", Namespace::Ordinary).is_some());
-        assert!(table.lookup("y", Namespace::Ordinary).is_none());
+        assert!(table.lookup(x_id, Namespace::Ordinary).is_some());
+        assert!(table.lookup(y_id, Namespace::Ordinary).is_none());
     }
 
     #[test]
     fn test_shadowing() {
+        let mut strings = StringTable::new();
         let types = TypeTable::new();
         let mut table = SymbolTable::new();
 
+        let x_id = strings.intern("x");
+
         // Declare x as int in global scope
-        let sym1 = Symbol::variable("x".to_string(), types.int_id, 0);
+        let sym1 = Symbol::variable(x_id, types.int_id, 0);
         table.declare(sym1).unwrap();
 
         // Enter a new scope
         table.enter_scope();
 
         // Shadow x with char
-        let sym2 = Symbol::variable("x".to_string(), types.char_id, 0);
+        let sym2 = Symbol::variable(x_id, types.char_id, 0);
         table.declare(sym2).unwrap();
 
         // Should find the inner x (char)
-        let found = table.lookup("x", Namespace::Ordinary).unwrap();
+        let found = table.lookup(x_id, Namespace::Ordinary).unwrap();
         assert_eq!(types.kind(found.typ), TypeKind::Char);
 
         // Leave scope
         table.leave_scope();
 
         // Should find the outer x (int)
-        let found = table.lookup("x", Namespace::Ordinary).unwrap();
+        let found = table.lookup(x_id, Namespace::Ordinary).unwrap();
         assert_eq!(types.kind(found.typ), TypeKind::Int);
     }
 
     #[test]
     fn test_redefinition_error() {
+        let mut strings = StringTable::new();
         let types = TypeTable::new();
         let mut table = SymbolTable::new();
 
+        let x_id = strings.intern("x");
+
         // Declare x
-        let sym1 = Symbol::variable("x".to_string(), types.int_id, 0);
+        let sym1 = Symbol::variable(x_id, types.int_id, 0);
         table.declare(sym1).unwrap();
 
         // Try to redeclare x in the same scope
-        let sym2 = Symbol::variable("x".to_string(), types.char_id, 0);
+        let sym2 = Symbol::variable(x_id, types.char_id, 0);
         let result = table.declare(sym2);
 
         assert!(matches!(result, Err(SymbolError::Redefinition(_))));
@@ -502,15 +517,18 @@ mod tests {
 
     #[test]
     fn test_function_symbol() {
+        let mut strings = StringTable::new();
         let mut types = TypeTable::new();
         let mut table = SymbolTable::new();
 
+        let foo_id = strings.intern("foo");
+
         // Declare a function
         let func_type = types.intern(Type::function(types.int_id, vec![types.int_id], false));
-        let func = Symbol::function("foo".to_string(), func_type, 0);
+        let func = Symbol::function(foo_id, func_type, 0);
         table.declare(func).unwrap();
 
-        let found = table.lookup("foo", Namespace::Ordinary).unwrap();
+        let found = table.lookup(foo_id, Namespace::Ordinary).unwrap();
         assert_eq!(found.kind, SymbolKind::Function);
         assert!(!found.defined); // Not yet defined
     }

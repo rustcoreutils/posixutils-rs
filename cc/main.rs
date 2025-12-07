@@ -18,6 +18,7 @@ mod lower;
 mod os;
 mod parse;
 mod ssa;
+mod strings;
 mod symbol;
 mod target;
 mod token;
@@ -31,6 +32,7 @@ use std::path::Path;
 use std::process::Command;
 
 use parse::Parser as CParser;
+use strings::StringTable;
 use symbol::SymbolTable;
 use target::Target;
 use token::{preprocess, show_token, token_type_name, StreamTable, Tokenizer};
@@ -144,13 +146,17 @@ fn process_file(
     // Create stream
     let stream_id = streams.add(display_path.to_string());
 
+    // Create shared string table for identifier interning
+    let mut strings = StringTable::new();
+
     // Tokenize
-    let mut tokenizer = Tokenizer::new(&buffer, stream_id);
-    let tokens = tokenizer.tokenize();
+    let tokens = {
+        let mut tokenizer = Tokenizer::new(&buffer, stream_id, &mut strings);
+        tokenizer.tokenize()
+    };
 
     // Dump raw tokens if requested
     if args.dump_tokens && !args.preprocess_only {
-        let idents = tokenizer.ident_table();
         for token in &tokens {
             if args.verbose {
                 println!(
@@ -158,10 +164,10 @@ fn process_file(
                     token.pos.line,
                     token.pos.col,
                     token_type_name(token.typ),
-                    show_token(token, idents)
+                    show_token(token, &strings)
                 );
             } else {
-                let text = show_token(token, idents);
+                let text = show_token(token, &strings);
                 if !text.starts_with('<') {
                     print!("{} ", text);
                 }
@@ -174,8 +180,7 @@ fn process_file(
     }
 
     // Preprocess (may add new identifiers from included files)
-    let preprocessed = preprocess(tokens, target, tokenizer.ident_table_mut(), path);
-    let idents = tokenizer.ident_table();
+    let preprocessed = preprocess(tokens, target, &mut strings, path);
 
     if args.preprocess_only {
         // Output preprocessed tokens
@@ -186,10 +191,10 @@ fn process_file(
                     token.pos.line,
                     token.pos.col,
                     token_type_name(token.typ),
-                    show_token(token, idents)
+                    show_token(token, &strings)
                 );
             } else {
-                let text = show_token(token, idents);
+                let text = show_token(token, &strings);
                 if !text.starts_with('<') {
                     print!("{} ", text);
                 }
@@ -207,7 +212,7 @@ fn process_file(
     let mut types = types::TypeTable::new();
 
     // Parse (this also binds symbols to the symbol table)
-    let mut parser = CParser::new(&preprocessed, idents, &mut symbols, &mut types);
+    let mut parser = CParser::new(&preprocessed, &strings, &mut symbols, &mut types);
     let ast = parser
         .parse_translation_unit()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("parse error: {}", e)))?;
@@ -222,6 +227,7 @@ fn process_file(
         &ast,
         &symbols,
         &types,
+        &strings,
         target,
         args.debug,
         Some(display_path),

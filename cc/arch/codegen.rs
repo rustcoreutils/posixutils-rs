@@ -9,7 +9,7 @@
 // Architecture-independent code generation interface
 //
 
-use crate::ir::Module;
+use crate::ir::{Function, Module, Opcode};
 use crate::target::Target;
 use crate::types::TypeTable;
 
@@ -45,6 +45,41 @@ pub fn generate_header_comments(target: &Target) -> Vec<String> {
     ));
 
     comments
+}
+
+/// Check if a function uses variadic arguments (contains VaStart opcode)
+pub fn is_variadic_function(func: &Function) -> bool {
+    for block in &func.blocks {
+        for insn in &block.insns {
+            if matches!(insn.op, Opcode::VaStart) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Escape a string for assembly output (.ascii/.asciz directives)
+/// Non-printable and non-ASCII characters are escaped as octal byte sequences.
+pub fn escape_string(s: &str) -> String {
+    let mut result = String::new();
+    for c in s.chars() {
+        match c {
+            '\n' => result.push_str("\\n"),
+            '\r' => result.push_str("\\r"),
+            '\t' => result.push_str("\\t"),
+            '\\' => result.push_str("\\\\"),
+            '"' => result.push_str("\\\""),
+            c if c.is_ascii_graphic() || c == ' ' => result.push(c),
+            c => {
+                // Escape non-printable as octal bytes (handles UTF-8 correctly)
+                for byte in c.to_string().as_bytes() {
+                    result.push_str(&format!("\\{:03o}", byte));
+                }
+            }
+        }
+    }
+    result
 }
 
 /// Trait for architecture-specific code generators

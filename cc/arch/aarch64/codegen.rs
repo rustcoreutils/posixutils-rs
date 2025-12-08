@@ -18,965 +18,14 @@
 //
 
 use crate::arch::aarch64::lir::{Aarch64Inst, CallTarget, Cond, GpOperand, MemAddr};
-use crate::arch::codegen::CodeGenerator;
+use crate::arch::aarch64::regalloc::{Loc, Reg, RegAlloc, VReg};
+use crate::arch::codegen::{escape_string, is_variadic_function, CodeGenerator};
 use crate::arch::lir::{Directive, FpSize, Label, OperandSize, Symbol};
 use crate::arch::DEFAULT_LIR_BUFFER_CAPACITY;
 use crate::ir::{Function, Initializer, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
 use crate::target::Target;
 use crate::types::{TypeId, TypeModifiers, TypeTable};
 use std::collections::HashMap;
-
-// ============================================================================
-// AArch64 Register Definitions
-// ============================================================================
-
-/// AArch64 physical registers
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Reg {
-    // General purpose registers x0-x28
-    X0,
-    X1,
-    X2,
-    X3,
-    X4,
-    X5,
-    X6,
-    X7,
-    X8,
-    X9,
-    X10,
-    X11,
-    X12,
-    X13,
-    X14,
-    X15,
-    X16,
-    X17,
-    X18,
-    X19,
-    X20,
-    X21,
-    X22,
-    X23,
-    X24,
-    X25,
-    X26,
-    X27,
-    X28,
-    // Frame pointer
-    X29,
-    // Link register
-    X30,
-    // Stack pointer (special, shares encoding with XZR in some contexts)
-    SP,
-}
-
-impl Reg {
-    /// Get 64-bit register name
-    pub fn name64(&self) -> &'static str {
-        match self {
-            Reg::X0 => "x0",
-            Reg::X1 => "x1",
-            Reg::X2 => "x2",
-            Reg::X3 => "x3",
-            Reg::X4 => "x4",
-            Reg::X5 => "x5",
-            Reg::X6 => "x6",
-            Reg::X7 => "x7",
-            Reg::X8 => "x8",
-            Reg::X9 => "x9",
-            Reg::X10 => "x10",
-            Reg::X11 => "x11",
-            Reg::X12 => "x12",
-            Reg::X13 => "x13",
-            Reg::X14 => "x14",
-            Reg::X15 => "x15",
-            Reg::X16 => "x16",
-            Reg::X17 => "x17",
-            Reg::X18 => "x18",
-            Reg::X19 => "x19",
-            Reg::X20 => "x20",
-            Reg::X21 => "x21",
-            Reg::X22 => "x22",
-            Reg::X23 => "x23",
-            Reg::X24 => "x24",
-            Reg::X25 => "x25",
-            Reg::X26 => "x26",
-            Reg::X27 => "x27",
-            Reg::X28 => "x28",
-            Reg::X29 => "x29",
-            Reg::X30 => "x30",
-            Reg::SP => "sp",
-        }
-    }
-
-    /// Get 32-bit register name
-    pub fn name32(&self) -> &'static str {
-        match self {
-            Reg::X0 => "w0",
-            Reg::X1 => "w1",
-            Reg::X2 => "w2",
-            Reg::X3 => "w3",
-            Reg::X4 => "w4",
-            Reg::X5 => "w5",
-            Reg::X6 => "w6",
-            Reg::X7 => "w7",
-            Reg::X8 => "w8",
-            Reg::X9 => "w9",
-            Reg::X10 => "w10",
-            Reg::X11 => "w11",
-            Reg::X12 => "w12",
-            Reg::X13 => "w13",
-            Reg::X14 => "w14",
-            Reg::X15 => "w15",
-            Reg::X16 => "w16",
-            Reg::X17 => "w17",
-            Reg::X18 => "w18",
-            Reg::X19 => "w19",
-            Reg::X20 => "w20",
-            Reg::X21 => "w21",
-            Reg::X22 => "w22",
-            Reg::X23 => "w23",
-            Reg::X24 => "w24",
-            Reg::X25 => "w25",
-            Reg::X26 => "w26",
-            Reg::X27 => "w27",
-            Reg::X28 => "w28",
-            Reg::X29 => "w29",
-            Reg::X30 => "w30",
-            Reg::SP => "sp", // SP doesn't have a 32-bit form in normal use
-        }
-    }
-
-    /// Get register name for a given bit size
-    pub fn name_for_size(&self, bits: u32) -> &'static str {
-        match bits {
-            8 | 16 | 32 => self.name32(),
-            _ => self.name64(),
-        }
-    }
-
-    /// Is this a callee-saved register?
-    pub fn is_callee_saved(&self) -> bool {
-        matches!(
-            self,
-            Reg::X19
-                | Reg::X20
-                | Reg::X21
-                | Reg::X22
-                | Reg::X23
-                | Reg::X24
-                | Reg::X25
-                | Reg::X26
-                | Reg::X27
-                | Reg::X28
-        )
-    }
-
-    /// Argument registers in order (AAPCS64)
-    pub fn arg_regs() -> &'static [Reg] {
-        &[
-            Reg::X0,
-            Reg::X1,
-            Reg::X2,
-            Reg::X3,
-            Reg::X4,
-            Reg::X5,
-            Reg::X6,
-            Reg::X7,
-        ]
-    }
-
-    /// All allocatable registers
-    /// Excludes: x8 (indirect result), x16/x17 (linker scratch),
-    ///           x18 (platform), x29 (fp), x30 (lr), sp
-    pub fn allocatable() -> &'static [Reg] {
-        &[
-            Reg::X0,
-            Reg::X1,
-            Reg::X2,
-            Reg::X3,
-            Reg::X4,
-            Reg::X5,
-            Reg::X6,
-            Reg::X7,
-            // Skip x8 (indirect result register for large struct returns per AAPCS64)
-            Reg::X9,
-            Reg::X10,
-            Reg::X11,
-            Reg::X12,
-            Reg::X13,
-            Reg::X14,
-            Reg::X15,
-            // Skip x16, x17 (linker scratch)
-            // Skip x18 (platform reserved)
-            Reg::X19,
-            Reg::X20,
-            Reg::X21,
-            Reg::X22,
-            Reg::X23,
-            Reg::X24,
-            Reg::X25,
-            Reg::X26,
-            Reg::X27,
-            Reg::X28,
-            // Skip x29 (fp), x30 (lr)
-        ]
-    }
-
-    /// Scratch registers for codegen (not allocatable, used for temporaries)
-    /// x16 (IP0) and x17 (IP1) are linker scratch registers
-    pub fn scratch_regs() -> (Reg, Reg) {
-        (Reg::X16, Reg::X17)
-    }
-
-    /// Frame pointer register
-    pub fn fp() -> Reg {
-        Reg::X29
-    }
-
-    /// Link register
-    pub fn lr() -> Reg {
-        Reg::X30
-    }
-
-    /// Stack pointer register
-    pub fn sp() -> Reg {
-        Reg::SP
-    }
-
-    /// Platform reserved register (x18)
-    /// Should not be used; this is only for documentation and completeness
-    pub fn platform_reserved() -> Reg {
-        Reg::X18
-    }
-}
-
-// ============================================================================
-// AArch64 Floating-Point Register Definitions
-// ============================================================================
-
-/// AArch64 SIMD/FP registers (V0-V31, accessed as D0-D31 for double, S0-S31 for float)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum VReg {
-    V0,
-    V1,
-    V2,
-    V3,
-    V4,
-    V5,
-    V6,
-    V7,
-    V8,
-    V9,
-    V10,
-    V11,
-    V12,
-    V13,
-    V14,
-    V15,
-    V16,
-    V17,
-    V18,
-    V19,
-    V20,
-    V21,
-    V22,
-    V23,
-    V24,
-    V25,
-    V26,
-    V27,
-    V28,
-    V29,
-    V30,
-    V31,
-}
-
-impl VReg {
-    /// Get 64-bit (double) register name
-    pub fn name_d(&self) -> &'static str {
-        match self {
-            VReg::V0 => "d0",
-            VReg::V1 => "d1",
-            VReg::V2 => "d2",
-            VReg::V3 => "d3",
-            VReg::V4 => "d4",
-            VReg::V5 => "d5",
-            VReg::V6 => "d6",
-            VReg::V7 => "d7",
-            VReg::V8 => "d8",
-            VReg::V9 => "d9",
-            VReg::V10 => "d10",
-            VReg::V11 => "d11",
-            VReg::V12 => "d12",
-            VReg::V13 => "d13",
-            VReg::V14 => "d14",
-            VReg::V15 => "d15",
-            VReg::V16 => "d16",
-            VReg::V17 => "d17",
-            VReg::V18 => "d18",
-            VReg::V19 => "d19",
-            VReg::V20 => "d20",
-            VReg::V21 => "d21",
-            VReg::V22 => "d22",
-            VReg::V23 => "d23",
-            VReg::V24 => "d24",
-            VReg::V25 => "d25",
-            VReg::V26 => "d26",
-            VReg::V27 => "d27",
-            VReg::V28 => "d28",
-            VReg::V29 => "d29",
-            VReg::V30 => "d30",
-            VReg::V31 => "d31",
-        }
-    }
-
-    /// Get 32-bit (float) register name
-    pub fn name_s(&self) -> &'static str {
-        match self {
-            VReg::V0 => "s0",
-            VReg::V1 => "s1",
-            VReg::V2 => "s2",
-            VReg::V3 => "s3",
-            VReg::V4 => "s4",
-            VReg::V5 => "s5",
-            VReg::V6 => "s6",
-            VReg::V7 => "s7",
-            VReg::V8 => "s8",
-            VReg::V9 => "s9",
-            VReg::V10 => "s10",
-            VReg::V11 => "s11",
-            VReg::V12 => "s12",
-            VReg::V13 => "s13",
-            VReg::V14 => "s14",
-            VReg::V15 => "s15",
-            VReg::V16 => "s16",
-            VReg::V17 => "s17",
-            VReg::V18 => "s18",
-            VReg::V19 => "s19",
-            VReg::V20 => "s20",
-            VReg::V21 => "s21",
-            VReg::V22 => "s22",
-            VReg::V23 => "s23",
-            VReg::V24 => "s24",
-            VReg::V25 => "s25",
-            VReg::V26 => "s26",
-            VReg::V27 => "s27",
-            VReg::V28 => "s28",
-            VReg::V29 => "s29",
-            VReg::V30 => "s30",
-            VReg::V31 => "s31",
-        }
-    }
-
-    /// Get register name for a given size (32 = float, 64 = double)
-    pub fn name_for_size(&self, bits: u32) -> &'static str {
-        if bits <= 32 {
-            self.name_s()
-        } else {
-            self.name_d()
-        }
-    }
-
-    /// Is this a callee-saved FP register?
-    /// AAPCS64: v8-v15 (lower 64 bits) are callee-saved
-    pub fn is_callee_saved(&self) -> bool {
-        matches!(
-            self,
-            VReg::V8
-                | VReg::V9
-                | VReg::V10
-                | VReg::V11
-                | VReg::V12
-                | VReg::V13
-                | VReg::V14
-                | VReg::V15
-        )
-    }
-
-    /// FP argument registers in order (AAPCS64)
-    pub fn arg_regs() -> &'static [VReg] {
-        &[
-            VReg::V0,
-            VReg::V1,
-            VReg::V2,
-            VReg::V3,
-            VReg::V4,
-            VReg::V5,
-            VReg::V6,
-            VReg::V7,
-        ]
-    }
-
-    /// All allocatable FP registers
-    /// Note: V16, V17, V18 are reserved as scratch registers for codegen
-    pub fn allocatable() -> &'static [VReg] {
-        &[
-            VReg::V0,
-            VReg::V1,
-            VReg::V2,
-            VReg::V3,
-            VReg::V4,
-            VReg::V5,
-            VReg::V6,
-            VReg::V7,
-            VReg::V8,
-            VReg::V9,
-            VReg::V10,
-            VReg::V11,
-            VReg::V12,
-            VReg::V13,
-            VReg::V14,
-            VReg::V15,
-            // V16, V17, V18 reserved for scratch
-            VReg::V19,
-            VReg::V20,
-            VReg::V21,
-            VReg::V22,
-            VReg::V23,
-            VReg::V24,
-            VReg::V25,
-            VReg::V26,
-            VReg::V27,
-            VReg::V28,
-            VReg::V29,
-            VReg::V30,
-            VReg::V31,
-        ]
-    }
-}
-
-// ============================================================================
-// Operand - Location of a value (register or memory)
-// ============================================================================
-
-/// Location of a value
-#[derive(Debug, Clone)]
-pub enum Loc {
-    /// In a register
-    Reg(Reg),
-    /// In a floating-point register
-    VReg(VReg),
-    /// On the stack at [sp + offset] (positive offset from sp after allocation)
-    Stack(i32),
-    /// Immediate constant
-    Imm(i64),
-    /// Floating-point immediate constant
-    FImm(f64),
-    /// Global symbol
-    Global(String),
-}
-
-// ============================================================================
-// Register Allocator (Linear Scan)
-// ============================================================================
-
-/// Live interval for a pseudo
-#[derive(Debug, Clone)]
-struct LiveInterval {
-    pseudo: PseudoId,
-    start: usize,
-    end: usize,
-}
-
-/// Simple linear scan register allocator for AArch64
-pub struct RegAlloc {
-    /// Mapping from pseudo to location
-    locations: HashMap<PseudoId, Loc>,
-    /// Free registers
-    free_regs: Vec<Reg>,
-    /// Free FP registers
-    free_fp_regs: Vec<VReg>,
-    /// Active intervals (sorted by end point)
-    active: Vec<(LiveInterval, Reg)>,
-    /// Active FP intervals (sorted by end point)
-    active_fp: Vec<(LiveInterval, VReg)>,
-    /// Next stack slot offset
-    stack_offset: i32,
-    /// Callee-saved registers that were used
-    used_callee_saved: Vec<Reg>,
-    /// Callee-saved FP registers that were used
-    used_callee_saved_fp: Vec<VReg>,
-    /// Set of pseudos that need FP registers (determined by analyzing the IR)
-    fp_pseudos: std::collections::HashSet<PseudoId>,
-}
-
-impl RegAlloc {
-    pub fn new() -> Self {
-        Self {
-            locations: HashMap::new(),
-            free_regs: Reg::allocatable().to_vec(),
-            free_fp_regs: VReg::allocatable().to_vec(),
-            active: Vec::new(),
-            active_fp: Vec::new(),
-            stack_offset: 0,
-            used_callee_saved: Vec::new(),
-            used_callee_saved_fp: Vec::new(),
-            fp_pseudos: std::collections::HashSet::new(),
-        }
-    }
-
-    /// Perform register allocation for a function
-    pub fn allocate(&mut self, func: &Function, types: &TypeTable) -> HashMap<PseudoId, Loc> {
-        // Reset state
-        self.locations.clear();
-        self.free_regs = Reg::allocatable().to_vec();
-        self.free_fp_regs = VReg::allocatable().to_vec();
-        self.active.clear();
-        self.active_fp.clear();
-        self.stack_offset = 0;
-        self.used_callee_saved.clear();
-        self.used_callee_saved_fp.clear();
-        self.fp_pseudos.clear();
-
-        // Identify which pseudos need FP registers
-        self.identify_fp_pseudos(func, types);
-
-        // Pre-allocate argument registers (integer and FP separately)
-        let int_arg_regs = Reg::arg_regs();
-        let fp_arg_regs = VReg::arg_regs();
-        let mut int_arg_idx = 0usize;
-        let mut fp_arg_idx = 0usize;
-
-        // AAPCS64: Detect if there's a hidden return pointer for large struct returns.
-        // Unlike x86-64 where sret goes in RDI (first arg), AAPCS64 uses X8 (indirect
-        // result register) which does NOT shift other arguments.
-        let sret_pseudo = func
-            .pseudos
-            .iter()
-            .find(|p| matches!(p.kind, PseudoKind::Arg(0)) && p.name.as_deref() == Some("__sret"));
-
-        // If there's a hidden return pointer, allocate X8 for it
-        if let Some(sret) = sret_pseudo {
-            self.locations.insert(sret.id, Loc::Reg(Reg::X8));
-            // X8 is not in allocatable list, so no need to remove from free_regs
-        }
-
-        // Offset for matching arg_idx: if sret exists, real params have arg_idx starting at 1
-        let arg_idx_offset: u32 = if sret_pseudo.is_some() { 1 } else { 0 };
-
-        for (i, (_name, typ)) in func.params.iter().enumerate() {
-            // Find the pseudo for this argument
-            for pseudo in &func.pseudos {
-                if let PseudoKind::Arg(arg_idx) = pseudo.kind {
-                    // Match by adjusted index (sret shifts arg_idx but not register allocation)
-                    if arg_idx == (i as u32) + arg_idx_offset {
-                        let is_fp = types.is_float(*typ);
-                        if is_fp {
-                            if fp_arg_idx < fp_arg_regs.len() {
-                                self.locations
-                                    .insert(pseudo.id, Loc::VReg(fp_arg_regs[fp_arg_idx]));
-                                self.free_fp_regs.retain(|&r| r != fp_arg_regs[fp_arg_idx]);
-                                self.fp_pseudos.insert(pseudo.id);
-                            } else {
-                                // FP argument on stack
-                                let offset = 16 + (fp_arg_idx - fp_arg_regs.len()) as i32 * 8;
-                                self.locations.insert(pseudo.id, Loc::Stack(offset));
-                                self.fp_pseudos.insert(pseudo.id);
-                            }
-                            fp_arg_idx += 1;
-                        } else {
-                            if int_arg_idx < int_arg_regs.len() {
-                                self.locations
-                                    .insert(pseudo.id, Loc::Reg(int_arg_regs[int_arg_idx]));
-                                self.free_regs.retain(|&r| r != int_arg_regs[int_arg_idx]);
-                            } else {
-                                // Integer argument on stack
-                                let offset = 16 + (int_arg_idx - int_arg_regs.len()) as i32 * 8;
-                                self.locations.insert(pseudo.id, Loc::Stack(offset));
-                            }
-                            int_arg_idx += 1;
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Compute live intervals
-        let intervals = self.compute_live_intervals(func);
-
-        // Allocate registers using linear scan
-        for interval in intervals {
-            self.expire_old_intervals(interval.start);
-
-            // Check if already allocated (e.g., arguments)
-            if self.locations.contains_key(&interval.pseudo) {
-                continue;
-            }
-
-            // Check if this is a constant - constants don't need registers
-            if let Some(pseudo) = func.pseudos.iter().find(|p| p.id == interval.pseudo) {
-                match &pseudo.kind {
-                    PseudoKind::Val(v) => {
-                        self.locations.insert(interval.pseudo, Loc::Imm(*v));
-                        continue;
-                    }
-                    PseudoKind::FVal(v) => {
-                        self.locations.insert(interval.pseudo, Loc::FImm(*v));
-                        self.fp_pseudos.insert(interval.pseudo);
-                        continue;
-                    }
-                    PseudoKind::Sym(name) => {
-                        // Check if this is a local variable or a global symbol
-                        if let Some(local) = func.locals.get(name) {
-                            // Local variable - allocate stack space based on actual type size
-                            let size = (types.size_bits(local.typ) / 8).max(8) as i32;
-                            // Align to 8 bytes
-                            let aligned_size = (size + 7) & !7;
-                            self.stack_offset += aligned_size;
-                            self.locations
-                                .insert(interval.pseudo, Loc::Stack(-self.stack_offset));
-                        } else {
-                            // Global symbol
-                            self.locations
-                                .insert(interval.pseudo, Loc::Global(name.clone()));
-                        }
-                        continue;
-                    }
-                    _ => {}
-                }
-            }
-
-            // Check if this pseudo needs an FP register
-            let needs_fp = self.fp_pseudos.contains(&interval.pseudo);
-
-            if needs_fp {
-                // Try to allocate an FP register
-                if let Some(reg) = self.free_fp_regs.pop() {
-                    if reg.is_callee_saved() && !self.used_callee_saved_fp.contains(&reg) {
-                        self.used_callee_saved_fp.push(reg);
-                    }
-                    self.locations.insert(interval.pseudo, Loc::VReg(reg));
-                    self.active_fp.push((interval.clone(), reg));
-                    self.active_fp.sort_by_key(|(i, _)| i.end);
-                } else {
-                    // Spill to stack
-                    self.stack_offset += 8;
-                    self.locations
-                        .insert(interval.pseudo, Loc::Stack(-self.stack_offset));
-                }
-            } else {
-                // Try to allocate an integer register
-                if let Some(reg) = self.free_regs.pop() {
-                    if reg.is_callee_saved() && !self.used_callee_saved.contains(&reg) {
-                        self.used_callee_saved.push(reg);
-                    }
-                    self.locations.insert(interval.pseudo, Loc::Reg(reg));
-                    self.active.push((interval.clone(), reg));
-                    self.active.sort_by_key(|(i, _)| i.end);
-                } else {
-                    // Spill to stack
-                    self.stack_offset += 8;
-                    self.locations
-                        .insert(interval.pseudo, Loc::Stack(-self.stack_offset));
-                }
-            }
-        }
-
-        self.locations.clone()
-    }
-
-    /// Identify which pseudos need FP registers by scanning the IR
-    fn identify_fp_pseudos(&mut self, func: &Function, types: &TypeTable) {
-        for block in &func.blocks {
-            for insn in &block.insns {
-                // Check if this instruction produces a floating-point result
-                let is_fp_op = matches!(
-                    insn.op,
-                    Opcode::FAdd
-                        | Opcode::FSub
-                        | Opcode::FMul
-                        | Opcode::FDiv
-                        | Opcode::FNeg
-                        | Opcode::FCvtF
-                        | Opcode::UCvtF
-                        | Opcode::SCvtF
-                );
-
-                if is_fp_op {
-                    if let Some(target) = insn.target {
-                        self.fp_pseudos.insert(target);
-                    }
-                }
-
-                // Also check if the type is floating point
-                // (but exclude comparisons which always produce int regardless of operand type)
-                if let Some(typ) = insn.typ {
-                    if types.is_float(typ)
-                        && !matches!(
-                            insn.op,
-                            Opcode::FCmpOEq
-                                | Opcode::FCmpONe
-                                | Opcode::FCmpOLt
-                                | Opcode::FCmpOLe
-                                | Opcode::FCmpOGt
-                                | Opcode::FCmpOGe
-                        )
-                    {
-                        if let Some(target) = insn.target {
-                            self.fp_pseudos.insert(target);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Also mark pseudos that are FVal constants
-        for pseudo in &func.pseudos {
-            if matches!(pseudo.kind, PseudoKind::FVal(_)) {
-                self.fp_pseudos.insert(pseudo.id);
-            }
-        }
-    }
-
-    fn expire_old_intervals(&mut self, point: usize) {
-        // Expire integer register intervals
-        let mut to_remove = Vec::new();
-        for (i, (interval, reg)) in self.active.iter().enumerate() {
-            if interval.end < point {
-                self.free_regs.push(*reg);
-                to_remove.push(i);
-            }
-        }
-        // Remove in reverse order to preserve indices
-        for i in to_remove.into_iter().rev() {
-            self.active.remove(i);
-        }
-
-        // Expire FP register intervals
-        let mut to_remove_fp = Vec::new();
-        for (i, (interval, reg)) in self.active_fp.iter().enumerate() {
-            if interval.end < point {
-                self.free_fp_regs.push(*reg);
-                to_remove_fp.push(i);
-            }
-        }
-        for i in to_remove_fp.into_iter().rev() {
-            self.active_fp.remove(i);
-        }
-    }
-
-    fn compute_live_intervals(&self, func: &Function) -> Vec<LiveInterval> {
-        use crate::ir::BasicBlockId;
-
-        // Track earliest definition, latest definition, and latest use for each pseudo
-        struct IntervalInfo {
-            pseudo: PseudoId,
-            first_def: usize,
-            last_def: usize,
-            last_use: usize,
-        }
-
-        let mut intervals: HashMap<PseudoId, IntervalInfo> = HashMap::new();
-        let mut pos = 0usize;
-
-        // First pass: compute block start and end positions
-        let mut block_start_pos: HashMap<BasicBlockId, usize> = HashMap::new();
-        let mut block_end_pos: HashMap<BasicBlockId, usize> = HashMap::new();
-        let mut temp_pos = 0usize;
-        for block in &func.blocks {
-            block_start_pos.insert(block.id, temp_pos);
-            temp_pos += block.insns.len();
-            block_end_pos.insert(block.id, temp_pos.saturating_sub(1));
-        }
-
-        // Collect phi sources with their source blocks for later processing
-        // Also track phi targets - they need intervals extended to cover all their copy definitions
-        let mut phi_sources: Vec<(BasicBlockId, PseudoId)> = Vec::new();
-        let mut phi_targets: Vec<(BasicBlockId, PseudoId)> = Vec::new();
-
-        for block in &func.blocks {
-            for insn in &block.insns {
-                // Definition point - track both first and last definition
-                // This is important because phi elimination creates multiple definitions
-                // of the same pseudo (via Copy instructions in predecessor blocks)
-                if let Some(target) = insn.target {
-                    intervals
-                        .entry(target)
-                        .and_modify(|info| {
-                            info.first_def = info.first_def.min(pos);
-                            info.last_def = info.last_def.max(pos);
-                        })
-                        .or_insert(IntervalInfo {
-                            pseudo: target,
-                            first_def: pos,
-                            last_def: pos,
-                            last_use: pos,
-                        });
-                }
-
-                // Use points
-                for &src in &insn.src {
-                    if let Some(info) = intervals.get_mut(&src) {
-                        info.last_use = info.last_use.max(pos);
-                    } else {
-                        intervals.insert(
-                            src,
-                            IntervalInfo {
-                                pseudo: src,
-                                first_def: pos,
-                                last_def: pos,
-                                last_use: pos,
-                            },
-                        );
-                    }
-                }
-
-                // Collect phi sources - they need to be live at the END of their source block
-                // Also collect phi targets - they have Copy definitions in each source block
-                for (src_bb, pseudo) in &insn.phi_list {
-                    phi_sources.push((*src_bb, *pseudo));
-                    // The phi target (if present) is defined via Copy at the end of each source block
-                    if let Some(target) = insn.target {
-                        phi_targets.push((*src_bb, target));
-                    }
-                }
-
-                pos += 1;
-            }
-        }
-
-        // Process phi sources: extend their live interval to the end of their source block
-        // This is critical for loops where phi sources come from later blocks via back edges
-        for (src_bb, pseudo) in phi_sources {
-            if let Some(&end_pos) = block_end_pos.get(&src_bb) {
-                if let Some(info) = intervals.get_mut(&pseudo) {
-                    info.last_use = info.last_use.max(end_pos);
-                    info.last_def = info.last_def.max(end_pos);
-                } else {
-                    intervals.insert(
-                        pseudo,
-                        IntervalInfo {
-                            pseudo,
-                            first_def: end_pos,
-                            last_def: end_pos,
-                            last_use: end_pos,
-                        },
-                    );
-                }
-            }
-        }
-
-        // Process phi targets: extend their live interval to cover all Copy definitions
-        // The phi target is defined via Copy at the end of each source block
-        // For loops, this means the target must be live until the last Copy (at the loop back edge)
-        for (src_bb, target) in phi_targets {
-            if let Some(&end_pos) = block_end_pos.get(&src_bb) {
-                if let Some(info) = intervals.get_mut(&target) {
-                    info.last_def = info.last_def.max(end_pos);
-                } else {
-                    intervals.insert(
-                        target,
-                        IntervalInfo {
-                            pseudo: target,
-                            first_def: end_pos,
-                            last_def: end_pos,
-                            last_use: end_pos,
-                        },
-                    );
-                }
-            }
-        }
-
-        // Detect loops via back edges and extend lifetimes of variables used in loop bodies
-        // A back edge is a branch from a block to an earlier block (lower start position)
-        // Any variable used in a block that's part of a loop must be live until the back edge
-        let mut loop_back_edges: Vec<(BasicBlockId, BasicBlockId, usize)> = Vec::new(); // (from, to, from_end_pos)
-        for block in &func.blocks {
-            // Check the last instruction for branch targets
-            if let Some(last_insn) = block.insns.last() {
-                // Collect branch targets (bb_true for unconditional/conditional, bb_false for conditional)
-                let mut targets = Vec::new();
-                if let Some(target) = last_insn.bb_true {
-                    targets.push(target);
-                }
-                if let Some(target) = last_insn.bb_false {
-                    targets.push(target);
-                }
-
-                // Check if any target is a back edge (to an earlier block)
-                let from_start = block_start_pos.get(&block.id).copied().unwrap_or(0);
-                for target_bb in targets {
-                    let target_start = block_start_pos.get(&target_bb).copied().unwrap_or(0);
-                    if target_start < from_start {
-                        // This is a back edge - the loop spans from target_bb to block
-                        let from_end = block_end_pos.get(&block.id).copied().unwrap_or(0);
-                        loop_back_edges.push((block.id, target_bb, from_end));
-                    }
-                }
-            }
-        }
-
-        // For each loop, extend lifetimes of variables used within the loop
-        for (_from_bb, to_bb, back_edge_pos) in &loop_back_edges {
-            let loop_start = block_start_pos.get(to_bb).copied().unwrap_or(0);
-
-            // Extend any variable that:
-            // 1. Is defined before the loop (first_def < loop_start)
-            // 2. Is used inside the loop (last_use >= loop_start && last_use <= back_edge_pos)
-            for info in intervals.values_mut() {
-                if info.first_def < loop_start
-                    && info.last_use >= loop_start
-                    && info.last_use <= *back_edge_pos
-                {
-                    // This variable is used inside the loop but defined outside
-                    // Extend its lifetime to the back edge
-                    info.last_use = info.last_use.max(*back_edge_pos);
-                }
-            }
-        }
-
-        // Find the maximum position in the function
-        let max_pos = pos.saturating_sub(1);
-
-        // Convert to LiveInterval
-        // The interval spans from first_def to max(last_def, last_use)
-        // This ensures that pseudos with multiple definitions (from phi copies)
-        // stay live across all their definitions
-        //
-        // IMPORTANT: For loop variables, if last_def > last_use (definition comes after use
-        // due to back edge), the variable must stay live until the end of the function
-        // because it will be used again in the next loop iteration.
-        let mut result: Vec<_> = intervals
-            .into_values()
-            .map(|info| {
-                let end = if info.last_def > info.last_use {
-                    // Loop variable: definition after use means we wrap around
-                    // Extend to end of function to ensure it stays live
-                    max_pos
-                } else {
-                    info.last_def.max(info.last_use)
-                };
-                LiveInterval {
-                    pseudo: info.pseudo,
-                    start: info.first_def,
-                    end,
-                }
-            })
-            .collect();
-        result.sort_by_key(|i| i.start);
-        result
-    }
-
-    /// Get stack size needed (aligned to 16 bytes)
-    pub fn stack_size(&self) -> i32 {
-        // Align to 16 bytes
-        (self.stack_offset + 15) & !15
-    }
-
-    /// Get callee-saved registers that need to be preserved
-    pub fn callee_saved_used(&self) -> &[Reg] {
-        &self.used_callee_saved
-    }
-}
-
-impl Default for RegAlloc {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 // ============================================================================
 // AArch64 Code Generator
@@ -1036,18 +85,6 @@ impl Aarch64CodeGen {
             reg_save_area_size: 0,
             num_fixed_gp_params: 0,
         }
-    }
-
-    /// Check if a function contains va_start (indicating it's variadic)
-    fn is_variadic_function(func: &Function) -> bool {
-        for block in &func.blocks {
-            for insn in &block.insns {
-                if matches!(insn.op, crate::ir::Opcode::VaStart) {
-                    return true;
-                }
-            }
-        }
-        false
     }
 
     /// Compute the actual FP-relative offset for a stack location.
@@ -1187,39 +224,18 @@ impl Aarch64CodeGen {
         for (label, content) in strings {
             // Local label for string literal
             self.push_lir(Aarch64Inst::Directive(Directive::local_label(label)));
-            self.push_lir(Aarch64Inst::Directive(Directive::Asciz(
-                Self::escape_string(content),
-            )));
+            self.push_lir(Aarch64Inst::Directive(Directive::Asciz(escape_string(
+                content,
+            ))));
         }
 
         // Switch back to text section for functions
         self.push_lir(Aarch64Inst::Directive(Directive::Text));
     }
 
-    fn escape_string(s: &str) -> String {
-        let mut result = String::new();
-        for c in s.chars() {
-            match c {
-                '\n' => result.push_str("\\n"),
-                '\r' => result.push_str("\\r"),
-                '\t' => result.push_str("\\t"),
-                '\\' => result.push_str("\\\\"),
-                '"' => result.push_str("\\\""),
-                c if c.is_ascii_graphic() || c == ' ' => result.push(c),
-                c => {
-                    // Escape non-printable as octal
-                    for byte in c.to_string().as_bytes() {
-                        result.push_str(&format!("\\{:03o}", byte));
-                    }
-                }
-            }
-        }
-        result
-    }
-
     fn emit_function(&mut self, func: &Function, types: &TypeTable) {
         // Check if this function uses varargs
-        let is_variadic = Self::is_variadic_function(func);
+        let is_variadic = is_variadic_function(func);
 
         // Register allocation
         let mut alloc = RegAlloc::new();
@@ -1228,6 +244,7 @@ impl Aarch64CodeGen {
 
         let stack_size = alloc.stack_size();
         let callee_saved = alloc.callee_saved_used().to_vec();
+        let callee_saved_fp = alloc.callee_saved_fp_used().to_vec();
 
         // For variadic functions on Linux/FreeBSD, we need extra space for the register save area
         // AAPCS64: 8 GP regs (x0-x7) * 8 bytes = 64 bytes
@@ -1237,16 +254,20 @@ impl Aarch64CodeGen {
         let reg_save_area_size: i32 = if is_variadic && !is_darwin { 64 } else { 0 };
 
         // Calculate total frame size
-        // Need space for: fp/lr (16 bytes) + callee-saved regs + local vars + reg save area
-        // Round up callee-saved count to even for 16-byte alignment
-        let callee_saved_pairs = (callee_saved.len() + 1) / 2;
-        let callee_saved_size = callee_saved_pairs as i32 * 16;
+        // Need space for: fp/lr (16 bytes) + GP callee-saved + FP callee-saved + local vars + reg save area
+        // Round up callee-saved counts to even for 16-byte alignment
+        // Note: AAPCS64 only requires the lower 64 bits of V8-V15 to be preserved (d8-d15)
+        let callee_saved_gp_pairs = (callee_saved.len() + 1) / 2;
+        let callee_saved_gp_size = callee_saved_gp_pairs as i32 * 16;
+        let callee_saved_fp_pairs = (callee_saved_fp.len() + 1) / 2;
+        let callee_saved_fp_size = callee_saved_fp_pairs as i32 * 16; // 8 bytes per d-reg, 16 per pair
+        let callee_saved_size = callee_saved_gp_size + callee_saved_fp_size;
         let total_frame = 16 + callee_saved_size + stack_size + reg_save_area_size;
         // Ensure 16-byte alignment
         let total_frame = (total_frame + 15) & !15;
 
         // Track register save area offset for va_start (offset from FP)
-        // Layout: [fp/lr][callee-saved][locals][reg_save_area]
+        // Layout: [fp/lr][GP callee-saved][FP callee-saved][locals][reg_save_area]
         // The save area is at FP + 16 + callee_saved_size + stack_size
         self.reg_save_area_offset = if is_variadic {
             16 + callee_saved_size + stack_size
@@ -1377,6 +398,54 @@ impl Aarch64CodeGen {
                 }
                 offset += 16;
             }
+
+            // Save FP callee-saved registers (d8-d15) in pairs
+            // AAPCS64 only requires preserving the lower 64 bits
+            let mut i = 0;
+            while i < callee_saved_fp.len() {
+                if i + 1 < callee_saved_fp.len() {
+                    self.push_lir(Aarch64Inst::StpFp {
+                        size: FpSize::Double,
+                        src1: callee_saved_fp[i],
+                        src2: callee_saved_fp[i + 1],
+                        addr: MemAddr::BaseOffset {
+                            base: Reg::X29, // fp
+                            offset,
+                        },
+                    });
+                    if self.emit_debug {
+                        let cfi_offset1 = -(total_frame - offset);
+                        let cfi_offset2 = -(total_frame - offset - 8);
+                        self.push_lir(Aarch64Inst::Directive(Directive::cfi_offset(
+                            callee_saved_fp[i].name_d(),
+                            cfi_offset1,
+                        )));
+                        self.push_lir(Aarch64Inst::Directive(Directive::cfi_offset(
+                            callee_saved_fp[i + 1].name_d(),
+                            cfi_offset2,
+                        )));
+                    }
+                    i += 2;
+                } else {
+                    self.push_lir(Aarch64Inst::StrFp {
+                        size: FpSize::Double,
+                        src: callee_saved_fp[i],
+                        addr: MemAddr::BaseOffset {
+                            base: Reg::X29, // fp
+                            offset,
+                        },
+                    });
+                    if self.emit_debug {
+                        let cfi_offset = -(total_frame - offset);
+                        self.push_lir(Aarch64Inst::Directive(Directive::cfi_offset(
+                            callee_saved_fp[i].name_d(),
+                            cfi_offset,
+                        )));
+                    }
+                    i += 1;
+                }
+                offset += 16;
+            }
         } else {
             // Minimal frame: stp x29, x30, [sp, #-16]!
             self.push_lir(Aarch64Inst::Stp {
@@ -1499,7 +568,7 @@ impl Aarch64CodeGen {
         }
 
         // Store frame size for epilogue
-        let frame_info = (total_frame, callee_saved.clone());
+        let frame_info = (total_frame, callee_saved.clone(), callee_saved_fp.clone());
 
         // Emit basic blocks
         for block in &func.blocks {
@@ -1515,7 +584,7 @@ impl Aarch64CodeGen {
     fn emit_block(
         &mut self,
         block: &crate::ir::BasicBlock,
-        frame_info: &(i32, Vec<Reg>),
+        frame_info: &(i32, Vec<Reg>, Vec<VReg>),
         types: &TypeTable,
     ) {
         // Always emit block ID label for consistency with jumps
@@ -1531,11 +600,16 @@ impl Aarch64CodeGen {
         }
     }
 
-    fn emit_insn(&mut self, insn: &Instruction, frame_info: &(i32, Vec<Reg>), types: &TypeTable) {
+    fn emit_insn(
+        &mut self,
+        insn: &Instruction,
+        frame_info: &(i32, Vec<Reg>, Vec<VReg>),
+        types: &TypeTable,
+    ) {
         // Emit .loc directive for debug info
         self.emit_loc(insn);
 
-        let (total_frame, callee_saved) = frame_info;
+        let (total_frame, callee_saved, callee_saved_fp) = frame_info;
 
         match insn.op {
             Opcode::Entry => {
@@ -1546,7 +620,7 @@ impl Aarch64CodeGen {
                 // Move return value to x0 (integer) or v0 (float) if present
                 if let Some(&src) = insn.src.first() {
                     let src_loc = self.get_location(src);
-                    let is_fp = matches!(src_loc, Loc::VReg(_) | Loc::FImm(_));
+                    let is_fp = matches!(src_loc, Loc::VReg(_) | Loc::FImm(..));
 
                     if is_fp {
                         // FP return value goes in V0
@@ -1591,6 +665,34 @@ impl Aarch64CodeGen {
                                     offset,
                                 },
                                 dst: callee_saved[i],
+                            });
+                            i += 1;
+                        }
+                        offset += 16;
+                    }
+
+                    // Restore FP callee-saved registers (d8-d15)
+                    let mut i = 0;
+                    while i < callee_saved_fp.len() {
+                        if i + 1 < callee_saved_fp.len() {
+                            self.push_lir(Aarch64Inst::LdpFp {
+                                size: FpSize::Double,
+                                addr: MemAddr::BaseOffset {
+                                    base: Reg::sp(),
+                                    offset,
+                                },
+                                dst1: callee_saved_fp[i],
+                                dst2: callee_saved_fp[i + 1],
+                            });
+                            i += 2;
+                        } else {
+                            self.push_lir(Aarch64Inst::LdrFp {
+                                size: FpSize::Double,
+                                addr: MemAddr::BaseOffset {
+                                    base: Reg::sp(),
+                                    offset,
+                                },
+                                dst: callee_saved_fp[i],
                             });
                             i += 1;
                         }
@@ -1691,7 +793,7 @@ impl Aarch64CodeGen {
                                 src: *v,
                             });
                         }
-                        Loc::FImm(f) => {
+                        Loc::FImm(f, _) => {
                             // FP immediate as condition - branch based on non-zero
                             if *f != 0.0 {
                                 if let Some(target) = insn.bb_true {
@@ -1771,7 +873,7 @@ impl Aarch64CodeGen {
                         Loc::Global(name) => {
                             self.emit_load_global(name, scratch0, op_size);
                         }
-                        Loc::VReg(_) | Loc::FImm(_) => {
+                        Loc::VReg(_) | Loc::FImm(..) => {
                             // FP values shouldn't be used in switch statements
                             // This is unreachable in valid C code
                         }
@@ -2187,14 +1289,15 @@ impl Aarch64CodeGen {
                     dst,
                 });
             }
-            Loc::FImm(f) => {
-                // Load FP immediate as integer bits
-                let bits = if size <= 32 {
+            Loc::FImm(f, imm_size) => {
+                // Use the size from the FImm, not the passed-in size
+                // This ensures float constants are loaded as float, not double
+                let bits = if imm_size <= 32 {
                     (f as f32).to_bits() as i64
                 } else {
                     f.to_bits() as i64
                 };
-                self.emit_mov_imm(dst, bits, size);
+                self.emit_mov_imm(dst, bits, imm_size);
             }
         }
     }
@@ -3019,7 +2122,7 @@ impl Aarch64CodeGen {
                     types.is_float(typ)
                 } else {
                     let arg_loc = self.get_location(arg);
-                    matches!(arg_loc, Loc::VReg(_) | Loc::FImm(_))
+                    matches!(arg_loc, Loc::VReg(_) | Loc::FImm(..))
                 };
 
                 let arg_size = if let Some(typ) = arg_type {
@@ -3105,7 +2208,7 @@ impl Aarch64CodeGen {
                 } else {
                     // Fall back to location-based detection for backwards compatibility
                     let arg_loc = self.get_location(arg);
-                    matches!(arg_loc, Loc::VReg(_) | Loc::FImm(_))
+                    matches!(arg_loc, Loc::VReg(_) | Loc::FImm(..))
                 };
 
                 // Get argument size from type, with minimum 32-bit for register ops
@@ -3186,7 +2289,7 @@ impl Aarch64CodeGen {
             let is_fp_result = if let Some(typ) = insn.typ {
                 types.is_float(typ)
             } else {
-                matches!(dst_loc, Loc::VReg(_) | Loc::FImm(_))
+                matches!(dst_loc, Loc::VReg(_) | Loc::FImm(..))
             };
 
             // Get return value size from type
@@ -3363,7 +2466,7 @@ impl Aarch64CodeGen {
 
         // Check if this is a FP copy (source or dest is in VReg or is FImm)
         let is_fp_copy =
-            matches!(&src_loc, Loc::VReg(_) | Loc::FImm(_)) || matches!(&dst_loc, Loc::VReg(_));
+            matches!(&src_loc, Loc::VReg(_) | Loc::FImm(..)) || matches!(&dst_loc, Loc::VReg(_));
 
         // Determine if the type is unsigned (for proper sign/zero extension)
         // For plain char, use target.char_signed to determine signedness
@@ -3463,10 +2566,11 @@ impl Aarch64CodeGen {
                     dst,
                 });
             }
-            Loc::FImm(f) => {
+            Loc::FImm(f, imm_size) => {
                 // Load FP constant using integer register
+                // Use the size from the FImm for correct constant representation
                 let (scratch0, _) = Reg::scratch_regs();
-                let bits = if size <= 32 {
+                let bits = if imm_size <= 32 {
                     (f as f32).to_bits() as i64
                 } else {
                     f.to_bits() as i64

@@ -12,5 +12,6 @@
 pub mod codegen;
 pub mod lir;
 pub mod macros;
+pub mod regalloc;
 
 pub use macros::get_macros;

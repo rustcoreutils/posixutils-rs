@@ -2704,6 +2704,34 @@ impl<'a> Linearizer<'a> {
     /// Linearize an identifier expression (variable reference)
     fn linearize_ident(&mut self, expr: &Expr, name: StringId) -> PseudoId {
         let name_str = self.str(name).to_string();
+
+        // Handle C99 __func__ predefined identifier (6.4.2.2)
+        // __func__ behaves as if declared: static const char __func__[] = "function-name";
+        if name_str == "__func__" {
+            // Add function name as a string literal to the module
+            let label = self.module.add_string(self.current_func_name.clone());
+
+            // Create symbol pseudo for the string label
+            let sym_id = self.alloc_pseudo();
+            let sym_pseudo = Pseudo::sym(sym_id, label);
+            if let Some(func) = &mut self.current_func {
+                func.add_pseudo(sym_pseudo);
+            }
+
+            // Create result pseudo for the address
+            let result = self.alloc_pseudo();
+            let pseudo = Pseudo::reg(result, result.0);
+            if let Some(func) = &mut self.current_func {
+                func.add_pseudo(pseudo);
+            }
+
+            // Type: const char* (pointer to char)
+            let char_type = self.types.char_id;
+            let ptr_type = self.types.pointer_to(char_type);
+            self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
+            return result;
+        }
+
         // First check if it's an enum constant
         if let Some(value) = self.symbols.get_enum_value(name) {
             self.emit_const(value, self.types.int_id)

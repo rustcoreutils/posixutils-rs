@@ -2155,11 +2155,17 @@ impl<'a> Parser<'a> {
                     }
 
                     // Look up symbol to get type (during parsing, symbol is in scope)
-                    let typ = self
-                        .symbols
-                        .lookup(name_id, Namespace::Ordinary)
-                        .map(|s| s.typ)
-                        .unwrap_or(self.types.int_id); // Default to int if not found
+                    // C99 6.4.2.2: __func__ is a predefined identifier with type const char[]
+                    let name_str = self.str(name_id);
+                    let typ = if name_str == "__func__" {
+                        // __func__ behaves like a string literal (const char[])
+                        self.types.char_ptr_id
+                    } else {
+                        self.symbols
+                            .lookup(name_id, Namespace::Ordinary)
+                            .map(|s| s.typ)
+                            .unwrap_or(self.types.int_id) // Default to int if not found
+                    };
                     Ok(Self::typed_expr(
                         ExprKind::Ident { name: name_id },
                         typ,

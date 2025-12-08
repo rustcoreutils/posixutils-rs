@@ -41,6 +41,22 @@ int main(void) {
     return 6;
     #endif
 
+    #if !__has_builtin(__builtin_ctz)
+    return 7;
+    #endif
+
+    #if !__has_builtin(__builtin_ctzl)
+    return 8;
+    #endif
+
+    #if !__has_builtin(__builtin_ctzll)
+    return 9;
+    #endif
+
+    #if !__has_builtin(__builtin_unreachable)
+    return 10;
+    #endif
+
     return 0;
 }
 "#;
@@ -67,28 +83,34 @@ int main(void) {
     assert_eq!(compile_and_run("has_builtin_unsupported", code), 0);
 }
 
-/// Test __has_attribute always returns 0 (not yet implemented)
+/// Test __has_attribute returns correctly for supported and unsupported attributes
 #[test]
-fn has_attribute_returns_zero() {
+fn has_attribute_support() {
     let code = r#"
 int main(void) {
-    // __has_attribute currently returns 0 for all attributes
-    #if __has_attribute(unused)
+    // __has_attribute returns 1 for noreturn (supported)
+    #if !__has_attribute(noreturn)
     return 1;
     #endif
 
-    #if __has_attribute(noreturn)
+    // __has_attribute returns 1 for __noreturn__ (supported)
+    #if !__has_attribute(__noreturn__)
     return 2;
     #endif
 
-    #if __has_attribute(packed)
+    // __has_attribute returns 0 for unsupported attributes
+    #if __has_attribute(unused)
     return 3;
+    #endif
+
+    #if __has_attribute(packed)
+    return 4;
     #endif
 
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("has_attribute_zero", code), 0);
+    assert_eq!(compile_and_run("has_attribute_support", code), 0);
 }
 
 /// Test __has_feature always returns 0 (not yet implemented)

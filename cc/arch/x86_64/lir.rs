@@ -419,6 +419,10 @@ pub enum X86Inst {
     /// RET - Return from function
     Ret,
 
+    /// UD2 - Undefined instruction (trap)
+    /// Used for __builtin_unreachable() to signal unreachable code
+    Ud2,
+
     // ========================================================================
     // Floating-Point (SSE)
     // ========================================================================
@@ -520,6 +524,15 @@ pub enum X86Inst {
 
     /// BSWAP - Byte swap
     Bswap { size: OperandSize, reg: Reg },
+
+    /// BSF - Bit scan forward (find lowest set bit)
+    /// Returns index of least significant set bit
+    /// Result is undefined if src is 0
+    Bsf {
+        size: OperandSize,
+        src: GpOperand,
+        dst: Reg,
+    },
 
     /// XORPS with same register - Fast zero XMM register
     XorpsSelf { reg: XmmReg },
@@ -885,6 +898,10 @@ impl EmitAsm for X86Inst {
                 let _ = writeln!(out, "    ret");
             }
 
+            X86Inst::Ud2 => {
+                let _ = writeln!(out, "    ud2");
+            }
+
             // Floating-Point
             X86Inst::MovFp { size, src, dst } => {
                 let _ = writeln!(
@@ -1052,6 +1069,20 @@ impl EmitAsm for X86Inst {
                         }
                     );
                 }
+            }
+
+            X86Inst::Bsf { size, src, dst } => {
+                // BSF (bit scan forward) finds the index of the least significant set bit
+                // Using "rep bsf" which is TZCNT on BMI1-capable CPUs, BSF on older CPUs
+                // TZCNT has defined behavior for 0 (returns operand size), BSF doesn't
+                // Since __builtin_ctz has undefined behavior for 0, either is fine
+                let _ = writeln!(
+                    out,
+                    "    bsf{} {}, {}",
+                    size.x86_suffix(),
+                    src.format(*size, target),
+                    dst.name_for_size(size.bits())
+                );
             }
 
             X86Inst::XorpsSelf { reg } => {

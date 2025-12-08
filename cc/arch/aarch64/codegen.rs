@@ -188,10 +188,15 @@ impl Aarch64CodeGen {
         self.push_lir(Aarch64Inst::Directive(Directive::global_label(name)));
 
         // Emit initializer
+        self.emit_initializer_data(init, size as usize);
+    }
+
+    /// Emit data for an initializer, recursively handling complex types
+    fn emit_initializer_data(&mut self, init: &Initializer, size: usize) {
         match init {
             Initializer::None => {
-                // For static uninitialized, use .zero (not .comm)
-                self.push_lir(Aarch64Inst::Directive(Directive::Zero(size)));
+                // Zero-fill
+                self.push_lir(Aarch64Inst::Directive(Directive::Zero(size as u32)));
             }
             Initializer::Int(val) => match size {
                 1 => self.push_lir(Aarch64Inst::Directive(Directive::Byte(*val))),
@@ -209,6 +214,82 @@ impl Aarch64CodeGen {
                     let bits = val.to_bits();
                     self.push_lir(Aarch64Inst::Directive(Directive::Quad(bits as i64)));
                 }
+            }
+            Initializer::String(s) => {
+                // Emit string as .ascii (without null terminator)
+                self.push_lir(Aarch64Inst::Directive(Directive::Ascii(escape_string(s))));
+                // Zero-fill remaining bytes if array is larger than string
+                let string_len = s.len() + 1; // +1 for null terminator
+                if size > string_len {
+                    self.push_lir(Aarch64Inst::Directive(Directive::Zero(
+                        (size - string_len) as u32,
+                    )));
+                } else if size > s.len() {
+                    // Need null terminator
+                    self.push_lir(Aarch64Inst::Directive(Directive::Byte(0)));
+                }
+            }
+            Initializer::Array {
+                elem_size,
+                total_size,
+                elements,
+            } => {
+                // Emit array elements with gaps filled by zeros
+                let mut current_offset = 0usize;
+
+                for (offset, elem_init) in elements {
+                    // Zero-fill gap before this element
+                    if *offset > current_offset {
+                        self.push_lir(Aarch64Inst::Directive(Directive::Zero(
+                            (*offset - current_offset) as u32,
+                        )));
+                    }
+
+                    // Emit element
+                    self.emit_initializer_data(elem_init, *elem_size);
+                    current_offset = offset + elem_size;
+                }
+
+                // Zero-fill remaining space
+                if *total_size > current_offset {
+                    self.push_lir(Aarch64Inst::Directive(Directive::Zero(
+                        (*total_size - current_offset) as u32,
+                    )));
+                }
+            }
+            Initializer::Struct { total_size, fields } => {
+                // Emit struct fields with gaps (padding) filled by zeros
+                let mut current_offset = 0usize;
+
+                for (offset, field_size, field_init) in fields {
+                    // Zero-fill gap before this field (padding)
+                    if *offset > current_offset {
+                        self.push_lir(Aarch64Inst::Directive(Directive::Zero(
+                            (*offset - current_offset) as u32,
+                        )));
+                    }
+
+                    // Emit field with its proper size
+                    self.emit_initializer_data(field_init, *field_size);
+                    current_offset = offset + field_size;
+                }
+
+                // Zero-fill remaining space (trailing padding)
+                if *total_size > current_offset {
+                    self.push_lir(Aarch64Inst::Directive(Directive::Zero(
+                        (*total_size - current_offset) as u32,
+                    )));
+                }
+            }
+            Initializer::SymAddr(name) => {
+                // Emit symbol address as 64-bit relocatable reference
+                use crate::arch::lir::Symbol;
+                let sym = if name.starts_with('.') {
+                    Symbol::local(name.clone())
+                } else {
+                    Symbol::global(name.clone())
+                };
+                self.push_lir(Aarch64Inst::Directive(Directive::QuadSym(sym)));
             }
         }
     }
@@ -1126,8 +1207,38 @@ impl Aarch64CodeGen {
                 self.emit_bswap64(insn, *total_frame);
             }
 
+            // ================================================================
+            // Count trailing zeros builtins
+            // ================================================================
+            Opcode::Ctz32 => {
+                self.emit_ctz32(insn, *total_frame);
+            }
+
+            Opcode::Ctz64 => {
+                self.emit_ctz64(insn, *total_frame);
+            }
+
             Opcode::Alloca => {
                 self.emit_alloca(insn, *total_frame);
+            }
+
+            Opcode::Unreachable => {
+                // Emit brk #1 instruction - software breakpoint that traps
+                // This is used for __builtin_unreachable() to indicate code
+                // that should never be reached. If it is reached, the CPU
+                // will generate a SIGTRAP.
+                self.push_lir(Aarch64Inst::Brk { imm: 1 });
+            }
+
+            // ================================================================
+            // setjmp/longjmp support
+            // ================================================================
+            Opcode::Setjmp => {
+                self.emit_setjmp(insn, *total_frame);
+            }
+
+            Opcode::Longjmp => {
+                self.emit_longjmp(insn, *total_frame);
             }
 
             // Skip no-ops and unimplemented
@@ -3515,6 +3626,158 @@ impl Aarch64CodeGen {
             }
             _ => {}
         }
+    }
+
+    /// Emit __builtin_ctz - count trailing zeros for 32-bit value
+    fn emit_ctz32(&mut self, insn: &Instruction, frame_size: i32) {
+        self.emit_ctz(insn, frame_size, OperandSize::B32);
+    }
+
+    /// Emit __builtin_ctzl/__builtin_ctzll - count trailing zeros for 64-bit value
+    fn emit_ctz64(&mut self, insn: &Instruction, frame_size: i32) {
+        self.emit_ctz(insn, frame_size, OperandSize::B64);
+    }
+
+    /// Emit count trailing zeros - shared implementation
+    /// On AArch64, CTZ is computed as CLZ(RBIT(x))
+    fn emit_ctz(&mut self, insn: &Instruction, frame_size: i32, src_size: OperandSize) {
+        let src = match insn.src.first() {
+            Some(&s) => s,
+            None => return,
+        };
+        let dst = match insn.target {
+            Some(t) => t,
+            None => return,
+        };
+
+        let src_loc = self.get_location(src);
+        let dst_loc = self.get_location(dst);
+        let scratch = Reg::X9;
+
+        // Load source into scratch register
+        match src_loc {
+            Loc::Reg(r) => {
+                self.push_lir(Aarch64Inst::Mov {
+                    size: src_size,
+                    src: GpOperand::Reg(r),
+                    dst: scratch,
+                });
+            }
+            Loc::Stack(off) => {
+                // FP-relative for alloca safety
+                let adjusted = frame_size + off;
+                self.push_lir(Aarch64Inst::Ldr {
+                    size: src_size,
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::X29,
+                        offset: adjusted,
+                    },
+                    dst: scratch,
+                });
+            }
+            Loc::Imm(v) => {
+                self.push_lir(Aarch64Inst::Mov {
+                    size: src_size,
+                    src: GpOperand::Imm(v),
+                    dst: scratch,
+                });
+            }
+            _ => return,
+        }
+
+        // Reverse bits: RBIT
+        self.push_lir(Aarch64Inst::Rbit {
+            size: src_size,
+            src: scratch,
+            dst: scratch,
+        });
+
+        // Count leading zeros: CLZ - this gives us the count of trailing zeros
+        self.push_lir(Aarch64Inst::Clz {
+            size: src_size,
+            src: scratch,
+            dst: scratch,
+        });
+
+        // Store result (return type is int, always 32-bit)
+        match dst_loc {
+            Loc::Reg(r) => {
+                self.push_lir(Aarch64Inst::Mov {
+                    size: OperandSize::B32,
+                    src: GpOperand::Reg(scratch),
+                    dst: r,
+                });
+            }
+            Loc::Stack(off) => {
+                // FP-relative for alloca safety
+                let adjusted = frame_size + off;
+                self.push_lir(Aarch64Inst::Str {
+                    size: OperandSize::B32,
+                    src: scratch,
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::X29,
+                        offset: adjusted,
+                    },
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// Emit setjmp(env) - saves execution context
+    /// AAPCS64: env in X0, returns int in W0
+    fn emit_setjmp(&mut self, insn: &Instruction, frame_size: i32) {
+        let env = match insn.src.first() {
+            Some(&e) => e,
+            None => return,
+        };
+        let target = match insn.target {
+            Some(t) => t,
+            None => return,
+        };
+
+        // Put env argument in X0 (first argument register)
+        self.emit_move(env, Reg::X0, 64, frame_size);
+
+        // Call setjmp
+        self.push_lir(Aarch64Inst::Bl {
+            target: CallTarget::Direct(Symbol::global("setjmp")),
+        });
+
+        // Store result from W0 to target
+        let dst_loc = self.get_location(target);
+        self.emit_move_to_loc(Reg::X0, &dst_loc, 32, frame_size);
+    }
+
+    /// Emit longjmp(env, val) - restores execution context (noreturn)
+    /// AAPCS64: env in X0, val in X1
+    fn emit_longjmp(&mut self, insn: &Instruction, frame_size: i32) {
+        let env = match insn.src.first() {
+            Some(&e) => e,
+            None => return,
+        };
+        let val = match insn.src.get(1) {
+            Some(&v) => v,
+            None => return,
+        };
+
+        // IMPORTANT: Load val first into X1, THEN env into X0.
+        // If we loaded env into X0 first and val was passed as the first
+        // function argument (in X0), it would get overwritten.
+        // Put val argument in X1 (second argument register) FIRST
+        self.emit_move(val, Reg::X1, 32, frame_size);
+
+        // Put env argument in X0 (first argument register)
+        self.emit_move(env, Reg::X0, 64, frame_size);
+
+        // Call longjmp (noreturn - control never comes back)
+        self.push_lir(Aarch64Inst::Bl {
+            target: CallTarget::Direct(Symbol::global("longjmp")),
+        });
+
+        // Emit brk after longjmp since it never returns
+        // This helps catch any bugs where longjmp somehow returns
+        self.push_lir(Aarch64Inst::Brk { imm: 1 });
     }
 
     /// Emit __builtin_alloca - dynamic stack allocation

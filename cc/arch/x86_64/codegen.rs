@@ -186,10 +186,15 @@ impl X86_64CodeGen {
         self.push_lir(X86Inst::Directive(Directive::global_label(name)));
 
         // Emit initializer
+        self.emit_initializer_data(init, size as usize);
+    }
+
+    /// Emit data for an initializer, recursively handling complex types
+    fn emit_initializer_data(&mut self, init: &Initializer, size: usize) {
         match init {
             Initializer::None => {
-                // For static uninitialized, use .zero (not .comm)
-                self.push_lir(X86Inst::Directive(Directive::Zero(size)));
+                // Zero-fill
+                self.push_lir(X86Inst::Directive(Directive::Zero(size as u32)));
             }
             Initializer::Int(val) => match size {
                 1 => self.push_lir(X86Inst::Directive(Directive::Byte(*val))),
@@ -207,6 +212,84 @@ impl X86_64CodeGen {
                     let bits = val.to_bits();
                     self.push_lir(X86Inst::Directive(Directive::Quad(bits as i64)));
                 }
+            }
+            Initializer::String(s) => {
+                // Emit string as .ascii (without null terminator)
+                // The array size will include space for null if needed
+                use crate::arch::codegen::escape_string;
+                self.push_lir(X86Inst::Directive(Directive::Ascii(escape_string(s))));
+                // Zero-fill remaining bytes if array is larger than string
+                let string_len = s.len() + 1; // +1 for null terminator
+                if size > string_len {
+                    self.push_lir(X86Inst::Directive(Directive::Zero(
+                        (size - string_len) as u32,
+                    )));
+                } else if size > s.len() {
+                    // Need null terminator
+                    self.push_lir(X86Inst::Directive(Directive::Byte(0)));
+                }
+            }
+            Initializer::Array {
+                elem_size,
+                total_size,
+                elements,
+            } => {
+                // Emit array elements with gaps filled by zeros
+                let mut current_offset = 0usize;
+
+                for (offset, elem_init) in elements {
+                    // Zero-fill gap before this element
+                    if *offset > current_offset {
+                        self.push_lir(X86Inst::Directive(Directive::Zero(
+                            (*offset - current_offset) as u32,
+                        )));
+                    }
+
+                    // Emit element
+                    self.emit_initializer_data(elem_init, *elem_size);
+                    current_offset = offset + elem_size;
+                }
+
+                // Zero-fill remaining space
+                if *total_size > current_offset {
+                    self.push_lir(X86Inst::Directive(Directive::Zero(
+                        (*total_size - current_offset) as u32,
+                    )));
+                }
+            }
+            Initializer::Struct { total_size, fields } => {
+                // Emit struct fields with gaps (padding) filled by zeros
+                let mut current_offset = 0usize;
+
+                for (offset, field_size, field_init) in fields {
+                    // Zero-fill gap before this field (padding)
+                    if *offset > current_offset {
+                        self.push_lir(X86Inst::Directive(Directive::Zero(
+                            (*offset - current_offset) as u32,
+                        )));
+                    }
+
+                    // Emit field with its proper size
+                    self.emit_initializer_data(field_init, *field_size);
+                    current_offset = offset + field_size;
+                }
+
+                // Zero-fill remaining space (trailing padding)
+                if *total_size > current_offset {
+                    self.push_lir(X86Inst::Directive(Directive::Zero(
+                        (*total_size - current_offset) as u32,
+                    )));
+                }
+            }
+            Initializer::SymAddr(name) => {
+                // Emit symbol address as 64-bit relocatable reference
+                use crate::arch::lir::Symbol;
+                let sym = if name.starts_with('.') {
+                    Symbol::local(name.clone())
+                } else {
+                    Symbol::global(name.clone())
+                };
+                self.push_lir(X86Inst::Directive(Directive::QuadSym(sym)));
             }
         }
     }
@@ -849,8 +932,38 @@ impl X86_64CodeGen {
                 self.emit_bswap64(insn);
             }
 
+            // ================================================================
+            // Count trailing zeros builtins
+            // ================================================================
+            Opcode::Ctz32 => {
+                self.emit_ctz32(insn);
+            }
+
+            Opcode::Ctz64 => {
+                self.emit_ctz64(insn);
+            }
+
             Opcode::Alloca => {
                 self.emit_alloca(insn);
+            }
+
+            Opcode::Unreachable => {
+                // Emit ud2 instruction - undefined instruction that traps
+                // This is used for __builtin_unreachable() to indicate code
+                // that should never be reached. If it is reached, the CPU
+                // will generate a SIGILL.
+                self.push_lir(X86Inst::Ud2);
+            }
+
+            // ================================================================
+            // setjmp/longjmp support
+            // ================================================================
+            Opcode::Setjmp => {
+                self.emit_setjmp(insn);
+            }
+
+            Opcode::Longjmp => {
+                self.emit_longjmp(insn);
             }
 
             // Skip no-ops and unimplemented
@@ -4184,6 +4297,148 @@ impl X86_64CodeGen {
             }
             _ => {}
         }
+    }
+
+    /// Emit __builtin_ctz - count trailing zeros for 32-bit value
+    fn emit_ctz32(&mut self, insn: &Instruction) {
+        self.emit_ctz(insn, OperandSize::B32);
+    }
+
+    /// Emit __builtin_ctzl/__builtin_ctzll - count trailing zeros for 64-bit value
+    fn emit_ctz64(&mut self, insn: &Instruction) {
+        self.emit_ctz(insn, OperandSize::B64);
+    }
+
+    /// Emit count trailing zeros - shared implementation
+    fn emit_ctz(&mut self, insn: &Instruction, src_size: OperandSize) {
+        let src = match insn.src.first() {
+            Some(&s) => s,
+            None => return,
+        };
+        let dst = match insn.target {
+            Some(t) => t,
+            None => return,
+        };
+
+        let src_loc = self.get_location(src);
+        let dst_loc = self.get_location(dst);
+
+        // BSF (bit scan forward) finds index of least significant set bit
+        // which is equivalent to count of trailing zeros
+        // Use RAX as scratch register
+        match src_loc {
+            Loc::Reg(r) => {
+                self.push_lir(X86Inst::Bsf {
+                    size: src_size,
+                    src: GpOperand::Reg(r),
+                    dst: Reg::Rax,
+                });
+            }
+            Loc::Stack(off) => {
+                self.push_lir(X86Inst::Bsf {
+                    size: src_size,
+                    src: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset: off,
+                    }),
+                    dst: Reg::Rax,
+                });
+            }
+            Loc::Imm(v) => {
+                // Load immediate first, then BSF
+                self.push_lir(X86Inst::Mov {
+                    size: src_size,
+                    src: GpOperand::Imm(v),
+                    dst: GpOperand::Reg(Reg::Rax),
+                });
+                self.push_lir(X86Inst::Bsf {
+                    size: src_size,
+                    src: GpOperand::Reg(Reg::Rax),
+                    dst: Reg::Rax,
+                });
+            }
+            _ => return,
+        }
+
+        // Store result (return type is int, always 32-bit)
+        match dst_loc {
+            Loc::Reg(r) => {
+                if r != Reg::Rax {
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B32,
+                        src: GpOperand::Reg(Reg::Rax),
+                        dst: GpOperand::Reg(r),
+                    });
+                }
+            }
+            Loc::Stack(off) => {
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B32,
+                    src: GpOperand::Reg(Reg::Rax),
+                    dst: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset: off,
+                    }),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// Emit setjmp(env) - saves execution context
+    /// System V AMD64 ABI: env in RDI, returns int in EAX
+    fn emit_setjmp(&mut self, insn: &Instruction) {
+        let env = match insn.src.first() {
+            Some(&e) => e,
+            None => return,
+        };
+        let target = match insn.target {
+            Some(t) => t,
+            None => return,
+        };
+
+        // Put env argument in RDI (first argument register)
+        self.emit_move(env, Reg::Rdi, 64);
+
+        // Call setjmp
+        self.push_lir(X86Inst::Call {
+            target: CallTarget::Direct(Symbol::global("setjmp".to_string())),
+        });
+
+        // Store result from EAX to target
+        let dst_loc = self.get_location(target);
+        self.emit_move_to_loc(Reg::Rax, &dst_loc, 32);
+    }
+
+    /// Emit longjmp(env, val) - restores execution context (noreturn)
+    /// System V AMD64 ABI: env in RDI, val in RSI
+    fn emit_longjmp(&mut self, insn: &Instruction) {
+        let env = match insn.src.first() {
+            Some(&e) => e,
+            None => return,
+        };
+        let val = match insn.src.get(1) {
+            Some(&v) => v,
+            None => return,
+        };
+
+        // IMPORTANT: Load val first into RSI, THEN env into RDI.
+        // If we loaded env into RDI first and val was passed as the first
+        // function argument (in RDI), it would get overwritten.
+        // Put val argument in RSI (second argument register) FIRST
+        self.emit_move(val, Reg::Rsi, 32);
+
+        // Put env argument in RDI (first argument register)
+        self.emit_move(env, Reg::Rdi, 64);
+
+        // Call longjmp (noreturn - control never comes back)
+        self.push_lir(X86Inst::Call {
+            target: CallTarget::Direct(Symbol::global("longjmp".to_string())),
+        });
+
+        // Emit ud2 after longjmp since it never returns
+        // This helps catch any bugs where longjmp somehow returns
+        self.push_lir(X86Inst::Ud2);
     }
 
     /// Emit __builtin_alloca - dynamic stack allocation

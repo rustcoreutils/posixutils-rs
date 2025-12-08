@@ -14,7 +14,7 @@ use super::ssa::ssa_convert;
 use super::{
     BasicBlock, BasicBlockId, Function, Initializer, Instruction, Module, Opcode, Pseudo, PseudoId,
 };
-use crate::diag::Position;
+use crate::diag::{error, Position};
 use crate::parse::ast::{
     AssignOp, BinaryOp, BlockItem, Declaration, Designator, Expr, ExprKind, ExternalDecl, ForInit,
     FunctionDef, InitElement, Stmt, TranslationUnit, UnaryOp,
@@ -92,6 +92,11 @@ pub struct Linearizer<'a> {
     current_pos: Option<Position>,
     /// Target configuration (architecture, ABI details)
     target: &'a Target,
+    /// Whether current function is a non-static inline function
+    /// (used for enforcing C99 inline semantic restrictions)
+    current_func_is_non_static_inline: bool,
+    /// Set of file-scope static variable names (for inline semantic checks)
+    file_scope_statics: std::collections::HashSet<String>,
 }
 
 impl<'a> Linearizer<'a> {
@@ -124,6 +129,8 @@ impl<'a> Linearizer<'a> {
             static_locals: HashMap::new(),
             current_pos: None,
             target,
+            current_func_is_non_static_inline: false,
+            file_scope_statics: std::collections::HashSet::new(),
         }
     }
 
@@ -473,25 +480,221 @@ impl<'a> Linearizer<'a> {
             }
 
             // Skip extern declarations - they don't define storage
-            if self
-                .types
-                .modifiers(declarator.typ)
-                .contains(TypeModifiers::EXTERN)
-            {
+            let modifiers = self.types.modifiers(declarator.typ);
+            if modifiers.contains(TypeModifiers::EXTERN) {
                 continue;
             }
 
-            let init = declarator
-                .init
-                .as_ref()
-                .map_or(Initializer::None, |e| match &e.kind {
-                    ExprKind::IntLit(v) => Initializer::Int(*v),
-                    ExprKind::FloatLit(v) => Initializer::Float(*v),
-                    _ => Initializer::None,
-                });
+            let init = declarator.init.as_ref().map_or(Initializer::None, |e| {
+                self.ast_init_to_ir(e, declarator.typ)
+            });
 
             let name = self.str(declarator.name).to_string();
+
+            // Track file-scope static variables for inline semantic checks
+            if modifiers.contains(TypeModifiers::STATIC) {
+                self.file_scope_statics.insert(name.clone());
+            }
+
             self.module.add_global(&name, declarator.typ, init);
+        }
+    }
+
+    /// Convert an AST initializer expression to an IR Initializer
+    ///
+    /// This handles:
+    /// - Scalar initializers (int, float, char literals)
+    /// - String literals (for char arrays or char pointers)
+    /// - Array initializers with designated and positional elements
+    /// - Struct initializers with designated and positional fields
+    /// - Address-of expressions (&symbol)
+    /// - Nested initializers
+    fn ast_init_to_ir(&self, expr: &Expr, typ: TypeId) -> Initializer {
+        match &expr.kind {
+            ExprKind::IntLit(v) => Initializer::Int(*v),
+            ExprKind::FloatLit(v) => Initializer::Float(*v),
+            ExprKind::CharLit(c) => Initializer::Int(*c as i64),
+
+            // String literal - for arrays, store as String; for pointers, create label reference
+            ExprKind::StringLit(s) => {
+                let type_kind = self.types.kind(typ);
+                if type_kind == TypeKind::Array {
+                    // char array - embed the string directly
+                    Initializer::String(s.clone())
+                } else {
+                    // Pointer - would need to create a string constant and reference it
+                    // For now, just use SymAddr with a label we'll create
+                    let label = format!(".LC{}", self.module.strings.len());
+                    Initializer::SymAddr(label)
+                }
+            }
+
+            // Negative literal (fast path for simple cases)
+            ExprKind::Unary {
+                op: UnaryOp::Neg,
+                operand,
+            } => match &operand.kind {
+                ExprKind::IntLit(v) => Initializer::Int(-*v),
+                ExprKind::FloatLit(v) => Initializer::Float(-*v),
+                // For more complex expressions like -(1+2), try constant evaluation
+                _ => {
+                    if let Some(val) = self.eval_const_expr(expr) {
+                        Initializer::Int(val)
+                    } else {
+                        Initializer::None
+                    }
+                }
+            },
+
+            // Address-of expression
+            ExprKind::Unary {
+                op: UnaryOp::AddrOf,
+                operand,
+            } => {
+                if let ExprKind::Ident { name } = &operand.kind {
+                    Initializer::SymAddr(self.str(*name).to_string())
+                } else {
+                    Initializer::None
+                }
+            }
+
+            // Cast expression - evaluate the inner expression
+            ExprKind::Cast { expr: inner, .. } => self.ast_init_to_ir(inner, typ),
+
+            // Initializer list for arrays/structs
+            ExprKind::InitList { elements } => self.ast_init_list_to_ir(elements, typ),
+
+            // Identifier - for constant addresses (function pointers, array decay, etc.)
+            // or enum constants
+            ExprKind::Ident { name } => {
+                let type_kind = self.types.kind(typ);
+                // For pointer types, this is likely a function address or array decay
+                if type_kind == TypeKind::Pointer {
+                    Initializer::SymAddr(self.str(*name).to_string())
+                } else {
+                    // Check if it's an enum constant
+                    if let Some(val) = self.symbols.get_enum_value(*name) {
+                        Initializer::Int(val)
+                    } else {
+                        Initializer::None
+                    }
+                }
+            }
+
+            // Binary/unary expressions and other constant expressions
+            // Try to evaluate as integer constant expression
+            _ => {
+                if let Some(val) = self.eval_const_expr(expr) {
+                    Initializer::Int(val)
+                } else {
+                    Initializer::None
+                }
+            }
+        }
+    }
+
+    /// Convert an AST initializer list to an IR Initializer
+    fn ast_init_list_to_ir(&self, elements: &[InitElement], typ: TypeId) -> Initializer {
+        let type_kind = self.types.kind(typ);
+        let total_size = (self.types.size_bits(typ) / 8) as usize;
+
+        match type_kind {
+            TypeKind::Array => {
+                let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
+                let elem_size = (self.types.size_bits(elem_type) / 8) as usize;
+
+                let mut init_elements = Vec::new();
+                let mut current_idx: i64 = 0;
+
+                for element in elements {
+                    // Calculate the actual index considering designators
+                    let actual_idx = if element.designators.is_empty() {
+                        let idx = current_idx;
+                        current_idx += 1;
+                        idx
+                    } else {
+                        // Use the first designator (should be Index for arrays)
+                        let idx = match &element.designators[0] {
+                            Designator::Index(i) => *i,
+                            Designator::Field(_) => current_idx, // Fallback
+                        };
+                        current_idx = idx + 1;
+                        idx
+                    };
+
+                    let offset = (actual_idx as usize) * elem_size;
+                    let elem_init = self.ast_init_to_ir(&element.value, elem_type);
+                    init_elements.push((offset, elem_init));
+                }
+
+                // Sort elements by offset to ensure proper emission order
+                // (designated initializers can be in any order)
+                init_elements.sort_by_key(|(offset, _)| *offset);
+
+                Initializer::Array {
+                    elem_size,
+                    total_size,
+                    elements: init_elements,
+                }
+            }
+
+            TypeKind::Struct | TypeKind::Union => {
+                if let Some(composite) = self.types.get(typ).composite.as_ref() {
+                    let members = &composite.members;
+                    let mut init_fields = Vec::new();
+                    let mut current_field_idx = 0;
+
+                    for element in elements {
+                        // Find the field (by designator or position)
+                        let member = if let Some(Designator::Field(name)) =
+                            element.designators.first()
+                        {
+                            // Designated initializer: .field = value
+                            let found = members.iter().enumerate().find(|(_, m)| &m.name == name);
+                            if let Some((idx, m)) = found {
+                                current_field_idx = idx + 1;
+                                Some(m)
+                            } else {
+                                None
+                            }
+                        } else if current_field_idx < members.len() {
+                            // Positional initializer
+                            let m = &members[current_field_idx];
+                            current_field_idx += 1;
+                            Some(m)
+                        } else {
+                            None
+                        };
+
+                        if let Some(member) = member {
+                            let offset = member.offset;
+                            let field_size = (self.types.size_bits(member.typ) / 8) as usize;
+                            let field_init = self.ast_init_to_ir(&element.value, member.typ);
+                            init_fields.push((offset, field_size, field_init));
+                        }
+                    }
+
+                    // Sort fields by offset to ensure proper emission order
+                    // (designated initializers can be in any order)
+                    init_fields.sort_by_key(|(offset, _, _)| *offset);
+
+                    Initializer::Struct {
+                        total_size,
+                        fields: init_fields,
+                    }
+                } else {
+                    Initializer::None
+                }
+            }
+
+            _ => {
+                // For scalar types, just use the first element
+                if let Some(element) = elements.first() {
+                    self.ast_init_to_ir(&element.value, typ)
+                } else {
+                    Initializer::None
+                }
+            }
         }
     }
 
@@ -517,12 +720,24 @@ impl<'a> Linearizer<'a> {
         // Note: static_locals is NOT cleared - it persists across functions
 
         // Create function
-        let is_static = self
-            .types
-            .modifiers(func.return_type)
-            .contains(TypeModifiers::STATIC);
+        let modifiers = self.types.modifiers(func.return_type);
+        let is_static = modifiers.contains(TypeModifiers::STATIC);
+        let is_inline = modifiers.contains(TypeModifiers::INLINE);
+        let is_extern = modifiers.contains(TypeModifiers::EXTERN);
+        let is_noreturn = modifiers.contains(TypeModifiers::NORETURN);
+
+        // Track non-static inline functions for semantic restriction checks
+        // C99 6.7.4: non-static inline functions have restrictions on
+        // static variables they can access
+        self.current_func_is_non_static_inline = is_inline && !is_static;
+
         let mut ir_func = Function::new(self.str(func.name), func.return_type);
-        ir_func.is_static = is_static;
+        // For linkage:
+        // - static inline: internal linkage (same as static)
+        // - inline (without extern): inline definition only, internal linkage
+        // - extern inline: external linkage (provides external definition)
+        ir_func.is_static = is_static || (is_inline && !is_extern);
+        ir_func.is_noreturn = is_noreturn;
 
         let ret_kind = self.types.kind(func.return_type);
         // Check if function returns a large struct
@@ -876,6 +1091,26 @@ impl<'a> Linearizer<'a> {
     fn linearize_static_local(&mut self, declarator: &crate::parse::ast::InitDeclarator) {
         let name_str = self.str(declarator.name).to_string();
 
+        // C99 6.7.4p3: A non-static inline function cannot define a non-const
+        // function-local static variable
+        if self.current_func_is_non_static_inline {
+            let is_const = self
+                .types
+                .modifiers(declarator.typ)
+                .contains(TypeModifiers::CONST);
+            if !is_const {
+                if let Some(pos) = self.current_pos {
+                    error(
+                        pos,
+                        &format!(
+                            "non-static inline function '{}' cannot define non-const static variable '{}'",
+                            self.current_func_name, name_str
+                        ),
+                    );
+                }
+            }
+        }
+
         // Generate unique global name: funcname.varname.counter
         let global_name = format!(
             "{}.{}.{}",
@@ -906,26 +1141,9 @@ impl<'a> Linearizer<'a> {
         );
 
         // Determine initializer (static locals are initialized at compile time)
-        let init = declarator
-            .init
-            .as_ref()
-            .map_or(Initializer::None, |e| match &e.kind {
-                ExprKind::IntLit(v) => Initializer::Int(*v),
-                ExprKind::FloatLit(v) => Initializer::Float(*v),
-                ExprKind::CharLit(c) => Initializer::Int(*c as i64),
-                ExprKind::Unary {
-                    op: UnaryOp::Neg,
-                    operand,
-                } => {
-                    // Handle negative literals
-                    match &operand.kind {
-                        ExprKind::IntLit(v) => Initializer::Int(-*v),
-                        ExprKind::FloatLit(v) => Initializer::Float(-*v),
-                        _ => Initializer::None,
-                    }
-                }
-                _ => Initializer::None,
-            });
+        let init = declarator.init.as_ref().map_or(Initializer::None, |e| {
+            self.ast_init_to_ir(e, declarator.typ)
+        });
 
         // Add as a global (type already has STATIC modifier which codegen uses)
         self.module.add_global(&global_name, declarator.typ, init);
@@ -1362,15 +1580,20 @@ impl<'a> Linearizer<'a> {
         }
     }
 
-    /// Evaluate a constant expression (for case labels)
+    /// Evaluate a constant expression (for case labels, static initializers)
+    ///
+    /// C99 6.6 defines integer constant expressions. This function evaluates
+    /// expressions that can be computed at compile time.
     fn eval_const_expr(&self, expr: &Expr) -> Option<i64> {
         match &expr.kind {
             ExprKind::IntLit(val) => Some(*val),
             ExprKind::CharLit(c) => Some(*c as i64),
+
             ExprKind::Ident { name, .. } => {
                 // Check if it's an enum constant
                 self.symbols.get_enum_value(*name)
             }
+
             ExprKind::Unary { op, operand } => {
                 let val = self.eval_const_expr(operand)?;
                 match op {
@@ -1380,23 +1603,87 @@ impl<'a> Linearizer<'a> {
                     _ => None,
                 }
             }
+
             ExprKind::Binary { op, left, right } => {
                 let l = self.eval_const_expr(left)?;
                 let r = self.eval_const_expr(right)?;
                 match op {
-                    BinaryOp::Add => Some(l + r),
-                    BinaryOp::Sub => Some(l - r),
-                    BinaryOp::Mul => Some(l * r),
-                    BinaryOp::Div => Some(l / r),
-                    BinaryOp::Mod => Some(l % r),
+                    BinaryOp::Add => Some(l.wrapping_add(r)),
+                    BinaryOp::Sub => Some(l.wrapping_sub(r)),
+                    BinaryOp::Mul => Some(l.wrapping_mul(r)),
+                    BinaryOp::Div => {
+                        if r != 0 {
+                            Some(l / r)
+                        } else {
+                            None
+                        }
+                    }
+                    BinaryOp::Mod => {
+                        if r != 0 {
+                            Some(l % r)
+                        } else {
+                            None
+                        }
+                    }
                     BinaryOp::BitAnd => Some(l & r),
                     BinaryOp::BitOr => Some(l | r),
                     BinaryOp::BitXor => Some(l ^ r),
-                    BinaryOp::Shl => Some(l << r),
-                    BinaryOp::Shr => Some(l >> r),
-                    _ => None,
+                    BinaryOp::Shl | BinaryOp::Shr => {
+                        // Mask shift amount to match C semantics and target hardware behavior.
+                        // After C integer promotion: 8/16/32-bit types use 32-bit shifts (mask 31),
+                        // 64-bit types use 64-bit shifts (mask 63).
+                        let size_bits = left.typ.map(|t| self.types.size_bits(t)).unwrap_or(32);
+                        let mask = if size_bits > 32 { 63 } else { 31 };
+                        let shift_amt = (r & mask) as u32;
+                        match op {
+                            BinaryOp::Shl => Some(l << shift_amt),
+                            BinaryOp::Shr => Some(l >> shift_amt),
+                            _ => unreachable!(),
+                        }
+                    }
+                    BinaryOp::Lt => Some(if l < r { 1 } else { 0 }),
+                    BinaryOp::Le => Some(if l <= r { 1 } else { 0 }),
+                    BinaryOp::Gt => Some(if l > r { 1 } else { 0 }),
+                    BinaryOp::Ge => Some(if l >= r { 1 } else { 0 }),
+                    BinaryOp::Eq => Some(if l == r { 1 } else { 0 }),
+                    BinaryOp::Ne => Some(if l != r { 1 } else { 0 }),
+                    BinaryOp::LogAnd => Some(if l != 0 && r != 0 { 1 } else { 0 }),
+                    BinaryOp::LogOr => Some(if l != 0 || r != 0 { 1 } else { 0 }),
                 }
             }
+
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                let cond_val = self.eval_const_expr(cond)?;
+                if cond_val != 0 {
+                    self.eval_const_expr(then_expr)
+                } else {
+                    self.eval_const_expr(else_expr)
+                }
+            }
+
+            // sizeof(type) - constant for complete types
+            ExprKind::SizeofType(type_id) => {
+                let size_bits = self.types.size_bits(*type_id);
+                Some((size_bits / 8) as i64)
+            }
+
+            // sizeof(expr) - constant if expr type is complete
+            ExprKind::SizeofExpr(inner_expr) => {
+                if let Some(typ) = inner_expr.typ {
+                    let size_bits = self.types.size_bits(typ);
+                    Some((size_bits / 8) as i64)
+                } else {
+                    None
+                }
+            }
+
+            // Cast to integer type - evaluate inner expression
+            ExprKind::Cast { expr: inner, .. } => self.eval_const_expr(inner),
+
             _ => None,
         }
     }
@@ -1961,18 +2248,19 @@ impl<'a> Linearizer<'a> {
 
         let typ = self.expr_type(expr); // Use evaluated type (function return type)
 
-        // Check if this is a variadic function call
-        // If the function expression has a type, check its variadic flag
-        let variadic_arg_start = if let Some(func_type) = func_expr.typ {
+        // Check if this is a variadic function call and if it's noreturn
+        // If the function expression has a type, check its variadic and noreturn flags
+        let (variadic_arg_start, is_noreturn_call) = if let Some(func_type) = func_expr.typ {
             let ft = self.types.get(func_type);
-            if ft.variadic {
+            let variadic = if ft.variadic {
                 // Variadic args start after the fixed parameters
                 ft.params.as_ref().map(|p| p.len())
             } else {
                 None
-            }
+            };
+            (variadic, ft.noreturn)
         } else {
-            None // No type info, assume non-variadic
+            (None, false) // No type info, assume non-variadic and returns
         };
 
         // Check if function returns a large struct
@@ -2054,6 +2342,7 @@ impl<'a> Linearizer<'a> {
             );
             call_insn.variadic_arg_start = variadic_arg_start;
             call_insn.is_sret_call = true;
+            call_insn.is_noreturn_call = is_noreturn_call;
             self.emit(call_insn);
             // Return the symbol (address) where struct is stored
             result_sym
@@ -2068,6 +2357,7 @@ impl<'a> Linearizer<'a> {
                 ret_size,
             );
             call_insn.variadic_arg_start = variadic_arg_start;
+            call_insn.is_noreturn_call = is_noreturn_call;
             self.emit(call_insn);
             result_sym
         }
@@ -2468,6 +2758,21 @@ impl<'a> Linearizer<'a> {
         }
         // Global variable - create symbol reference and load
         else {
+            // C99 6.7.4p3: A non-static inline function cannot refer to
+            // a file-scope static variable
+            if self.current_func_is_non_static_inline && self.file_scope_statics.contains(&name_str)
+            {
+                if let Some(pos) = self.current_pos {
+                    error(
+                        pos,
+                        &format!(
+                            "non-static inline function '{}' cannot reference file-scope static variable '{}'",
+                            self.current_func_name, name_str
+                        ),
+                    );
+                }
+            }
+
             let sym_id = self.alloc_pseudo();
             let pseudo = Pseudo::sym(sym_id, name_str.clone());
             if let Some(func) = &mut self.current_func {
@@ -2717,6 +3022,37 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
+            // ================================================================
+            // Count trailing zeros builtins
+            // ================================================================
+            ExprKind::Ctz { arg } => {
+                // __builtin_ctz - counts trailing zeros in unsigned int (32-bit)
+                let arg_val = self.linearize_expr(arg);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::Ctz32)
+                    .with_target(result)
+                    .with_src(arg_val)
+                    .with_size(32)
+                    .with_type(self.types.int_id);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::Ctzl { arg } | ExprKind::Ctzll { arg } => {
+                // __builtin_ctzl/ctzll - counts trailing zeros in 64-bit value
+                let arg_val = self.linearize_expr(arg);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::Ctz64)
+                    .with_target(result)
+                    .with_src(arg_val)
+                    .with_size(64)
+                    .with_type(self.types.int_id);
+                self.emit(insn);
+                result
+            }
+
             ExprKind::Alloca { size } => {
                 let size_val = self.linearize_expr(size);
                 let result = self.alloc_pseudo();
@@ -2725,6 +3061,45 @@ impl<'a> Linearizer<'a> {
                     .with_target(result)
                     .with_src(size_val)
                     .with_type_and_size(self.types.void_ptr_id, 64);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::Unreachable => {
+                // __builtin_unreachable() - marks code path as never reached
+                // Emits an instruction that will trap if actually executed
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::Unreachable)
+                    .with_target(result)
+                    .with_type(self.types.void_id);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::Setjmp { env } => {
+                // setjmp(env) - saves execution context, returns int
+                let env_val = self.linearize_expr(env);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::Setjmp)
+                    .with_target(result)
+                    .with_src(env_val)
+                    .with_type_and_size(self.types.int_id, 32);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::Longjmp { env, val } => {
+                // longjmp(env, val) - restores execution context (never returns)
+                let env_val = self.linearize_expr(env);
+                let val_val = self.linearize_expr(val);
+                let result = self.alloc_pseudo();
+
+                let mut insn = Instruction::new(Opcode::Longjmp);
+                insn.target = Some(result);
+                insn.src = vec![env_val, val_val];
+                insn.typ = Some(self.types.void_id);
                 self.emit(insn);
                 result
             }

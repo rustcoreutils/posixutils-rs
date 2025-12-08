@@ -27,8 +27,15 @@ use std::collections::{HashSet, VecDeque};
 pub fn run(func: &mut Function) -> bool {
     let mut changed = false;
 
-    // Run both phases
+    // Run all phases
+    // 1. Fold conditional branches where one target is unreachable
+    //    This converts `cbr cond, unreachable, other` to `br other`
+    changed |= fold_branches_to_unreachable(func);
+
+    // 2. Eliminate dead instructions (mark-sweep on SSA values)
     changed |= eliminate_dead_code(func);
+
+    // 3. Remove blocks that are no longer reachable from entry
     changed |= remove_unreachable_blocks(func);
 
     changed
@@ -46,6 +53,7 @@ fn is_root(op: Opcode) -> bool {
             | Opcode::Br
             | Opcode::Cbr
             | Opcode::Switch
+            | Opcode::Unreachable
             | Opcode::Store
             | Opcode::Call
             | Opcode::Entry
@@ -54,6 +62,8 @@ fn is_root(op: Opcode) -> bool {
             | Opcode::VaCopy
             | Opcode::VaArg
             | Opcode::Alloca
+            | Opcode::Setjmp  // Has side effects (saves context)
+            | Opcode::Longjmp // Never returns (noreturn)
     )
 }
 
@@ -151,6 +161,82 @@ fn eliminate_dead_code(func: &mut Function) -> bool {
                     changed = true;
                 }
             }
+        }
+    }
+
+    changed
+}
+
+// ============================================================================
+// Unreachable Block Optimization
+// ============================================================================
+
+/// Identify blocks that end with Unreachable terminator.
+fn find_unreachable_blocks(func: &Function) -> HashSet<BasicBlockId> {
+    let mut unreachable_ends = HashSet::new();
+
+    for bb in &func.blocks {
+        // Check if the last instruction is Unreachable
+        if let Some(last) = bb.insns.last() {
+            if last.op == Opcode::Unreachable {
+                unreachable_ends.insert(bb.id);
+            }
+        }
+    }
+
+    unreachable_ends
+}
+
+/// Fold conditional branches where one target is unreachable.
+/// If `cbr cond, unreachable_block, other_block`, replace with `br other_block`.
+/// This enables further DCE to remove the unreachable block entirely.
+fn fold_branches_to_unreachable(func: &mut Function) -> bool {
+    let unreachable_blocks = find_unreachable_blocks(func);
+    if unreachable_blocks.is_empty() {
+        return false;
+    }
+
+    let mut changed = false;
+
+    for bb in &mut func.blocks {
+        // Look for conditional branches
+        for insn in &mut bb.insns {
+            if insn.op != Opcode::Cbr {
+                continue;
+            }
+
+            // Get the branch targets
+            let (true_target, false_target) = match (insn.bb_true, insn.bb_false) {
+                (Some(t), Some(f)) => (t, f),
+                _ => continue,
+            };
+
+            // Check if one target leads to unreachable
+            let true_unreachable = unreachable_blocks.contains(&true_target);
+            let false_unreachable = unreachable_blocks.contains(&false_target);
+
+            if true_unreachable && !false_unreachable {
+                // If true branch goes to unreachable, always take false branch
+                // Replace cbr with unconditional br to false_target
+                insn.op = Opcode::Br;
+                insn.bb_true = Some(false_target);
+                insn.bb_false = None;
+                insn.src.clear(); // Remove condition operand
+                                  // Update children: remove true_target from successors
+                bb.children.retain(|c| *c != true_target);
+                changed = true;
+            } else if false_unreachable && !true_unreachable {
+                // If false branch goes to unreachable, always take true branch
+                // Replace cbr with unconditional br to true_target
+                insn.op = Opcode::Br;
+                insn.bb_true = Some(true_target);
+                insn.bb_false = None;
+                insn.src.clear(); // Remove condition operand
+                                  // Update children: remove false_target from successors
+                bb.children.retain(|c| *c != false_target);
+                changed = true;
+            }
+            // If both are unreachable, leave as-is (both paths are UB anyway)
         }
     }
 
@@ -385,6 +471,7 @@ mod tests {
         assert!(is_root(Opcode::Call));
         assert!(is_root(Opcode::Br));
         assert!(is_root(Opcode::Cbr));
+        assert!(is_root(Opcode::Unreachable));
 
         assert!(!is_root(Opcode::Add));
         assert!(!is_root(Opcode::Mul));

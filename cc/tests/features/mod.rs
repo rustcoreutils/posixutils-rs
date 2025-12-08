@@ -12,9 +12,14 @@
 mod alloca;
 mod bswap;
 mod constant_p;
+mod ctz;
 mod debug;
 mod has_feature;
+mod inline;
+mod noreturn;
 mod optimization;
+mod setjmp;
 mod storage;
 mod types_compatible;
+mod unreachable;
 mod varargs;

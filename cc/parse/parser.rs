@@ -143,6 +143,14 @@ impl AttributeList {
     pub fn push(&mut self, attr: Attribute) {
         self.attrs.push(attr);
     }
+
+    /// Check if this attribute list contains a noreturn attribute
+    /// (either "noreturn" or "__noreturn__")
+    pub fn has_noreturn(&self) -> bool {
+        self.attrs
+            .iter()
+            .any(|a| a.name == "noreturn" || a.name == "__noreturn__")
+    }
 }
 
 impl fmt::Display for AttributeList {
@@ -1954,6 +1962,42 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
+                        "__builtin_ctz" => {
+                            // __builtin_ctz(x) - returns int, counts trailing zeros in unsigned int
+                            // Result is undefined if x is 0
+                            self.expect_special(b'(')?;
+                            let arg = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::Ctz { arg: Box::new(arg) },
+                                self.types.int_id,
+                                token_pos,
+                            ));
+                        }
+                        "__builtin_ctzl" => {
+                            // __builtin_ctzl(x) - returns int, counts trailing zeros in unsigned long
+                            // Result is undefined if x is 0
+                            self.expect_special(b'(')?;
+                            let arg = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::Ctzl { arg: Box::new(arg) },
+                                self.types.int_id,
+                                token_pos,
+                            ));
+                        }
+                        "__builtin_ctzll" => {
+                            // __builtin_ctzll(x) - returns int, counts trailing zeros in unsigned long long
+                            // Result is undefined if x is 0
+                            self.expect_special(b'(')?;
+                            let arg = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::Ctzll { arg: Box::new(arg) },
+                                self.types.int_id,
+                                token_pos,
+                            ));
+                        }
                         "__builtin_alloca" => {
                             // __builtin_alloca(size) - returns void*
                             self.expect_special(b'(')?;
@@ -1964,6 +2008,18 @@ impl<'a> Parser<'a> {
                                     size: Box::new(size),
                                 },
                                 self.types.void_ptr_id,
+                                token_pos,
+                            ));
+                        }
+                        "__builtin_unreachable" => {
+                            // __builtin_unreachable() - marks code as unreachable
+                            // Takes no arguments, returns void
+                            // Behavior is undefined if actually reached at runtime
+                            self.expect_special(b'(')?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::Unreachable,
+                                self.types.void_id,
                                 token_pos,
                             ));
                         }
@@ -1994,6 +2050,35 @@ impl<'a> Parser<'a> {
                             return Ok(Self::typed_expr(
                                 ExprKind::IntLit(if compatible { 1 } else { 0 }),
                                 self.types.int_id,
+                                token_pos,
+                            ));
+                        }
+                        "setjmp" | "_setjmp" => {
+                            // setjmp(env) - saves execution context, returns int
+                            // Returns 0 on direct call, non-zero when returning via longjmp
+                            self.expect_special(b'(')?;
+                            let env = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::Setjmp { env: Box::new(env) },
+                                self.types.int_id,
+                                token_pos,
+                            ));
+                        }
+                        "longjmp" | "_longjmp" => {
+                            // longjmp(env, val) - restores execution context (never returns)
+                            // Causes corresponding setjmp to return val (or 1 if val == 0)
+                            self.expect_special(b'(')?;
+                            let env = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let val = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::Longjmp {
+                                    env: Box::new(env),
+                                    val: Box::new(val),
+                                },
+                                self.types.void_id,
                                 token_pos,
                             ));
                         }
@@ -2634,6 +2719,9 @@ impl Parser<'_> {
                     | "auto"
                     | "register"
                     | "typedef"
+                    | "inline"
+                    | "_Noreturn"
+                    | "__noreturn__"
                     | "struct"
                     | "union"
                     | "enum"
@@ -2809,6 +2897,10 @@ impl Parser<'_> {
                 "inline" => {
                     self.advance();
                     modifiers |= TypeModifiers::INLINE;
+                }
+                "_Noreturn" | "__noreturn__" => {
+                    self.advance();
+                    modifiers |= TypeModifiers::NORETURN;
                 }
                 "signed" => {
                     self.advance();
@@ -3239,12 +3331,13 @@ impl Parser<'_> {
             let size = if self.is_special(b']') {
                 None
             } else {
-                // Parse constant expression for array size
+                // Parse constant expression for array size (C99 6.7.5.2)
                 let expr = self.parse_assignment_expr()?;
-                // For simplicity, only handle integer literals
-                match expr.kind {
-                    ExprKind::IntLit(n) => Some(n as usize),
-                    _ => None, // VLA or complex expression
+                // Evaluate as integer constant expression
+                match self.eval_const_expr(&expr) {
+                    Some(n) if n >= 0 => Some(n as usize),
+                    Some(_) => None, // Negative size is invalid
+                    None => None,    // Non-constant (VLA) or invalid expression
                 }
             };
             self.expect_special(b']')?;
@@ -3287,6 +3380,7 @@ impl Parser<'_> {
                     array_size: size,
                     params: None,
                     variadic: false,
+                    noreturn: false,
                     composite: None,
                 };
                 result_type_id = self.types.intern(arr_type);
@@ -3301,6 +3395,7 @@ impl Parser<'_> {
                     array_size: None,
                     params: None,
                     variadic: false,
+                    noreturn: false,
                     composite: None,
                 };
                 result_type_id = self.types.intern(ptr_type);
@@ -3325,6 +3420,7 @@ impl Parser<'_> {
                     array_size: None,
                     params: None,
                     variadic: false,
+                    noreturn: false,
                     composite: None,
                 };
                 result_type_id = self.types.intern(ptr_type);
@@ -3340,6 +3436,7 @@ impl Parser<'_> {
                     array_size: size,
                     params: None,
                     variadic: false,
+                    noreturn: false,
                     composite: None,
                 };
                 result_type_id = self.types.intern(arr_type);
@@ -3367,6 +3464,7 @@ impl Parser<'_> {
                     array_size: None,
                     params: None,
                     variadic: false,
+                    noreturn: false,
                     composite: None,
                 };
                 self.types.intern(ptr_type)
@@ -3383,6 +3481,7 @@ impl Parser<'_> {
                     array_size: decl_array_size,
                     params: None,
                     variadic: false,
+                    noreturn: false,
                     composite: None,
                 };
                 self.types.intern(arr_type)
@@ -3439,6 +3538,7 @@ impl Parser<'_> {
                 params: None,
                 variadic: false,
                 composite: None,
+                noreturn: false,
             };
             ret_type_id = self.types.intern(ptr_type);
         }
@@ -3558,6 +3658,7 @@ impl Parser<'_> {
                     array_size: None,
                     params: None,
                     variadic: false,
+                    noreturn: false,
                     composite: None,
                 };
                 typ_id = self.types.intern(ptr_type);
@@ -3599,6 +3700,7 @@ impl Parser<'_> {
                     array_size: None,
                     params: None,
                     variadic: false,
+                    noreturn: false,
                     composite: None,
                 };
                 typ_id = self.types.intern(ptr_type);
@@ -3737,6 +3839,7 @@ impl Parser<'_> {
                 array_size: None,
                 params: None,
                 variadic: false,
+                noreturn: false,
                 composite: None,
             };
             typ_id = self.types.intern(ptr_type);
@@ -3802,14 +3905,23 @@ impl Parser<'_> {
             let (params, variadic) = self.parse_parameter_list()?;
             self.expect_special(b')')?;
 
-            // Skip any __attribute__ after parameter list
-            self.skip_extensions();
+            // Parse __attribute__ after parameter list (e.g., __attribute__((noreturn)))
+            let attrs = self.parse_attributes();
+            // noreturn can come from __attribute__((noreturn)) or _Noreturn keyword in base type
+            let base_type = self.types.get(typ_id);
+            let is_noreturn =
+                attrs.has_noreturn() || base_type.modifiers.contains(TypeModifiers::NORETURN);
 
             if self.is_special(b'{') {
                 // Function definition
                 // Add function to symbol table so it can be called by other functions
                 let param_type_ids: Vec<TypeId> = params.iter().map(|p| p.typ).collect();
-                let func_type = Type::function(typ_id, param_type_ids.clone(), variadic);
+                let func_type = Type::function_with_attrs(
+                    typ_id,
+                    param_type_ids.clone(),
+                    variadic,
+                    is_noreturn,
+                );
                 let func_type_id = self.types.intern(func_type);
                 let func_sym = Symbol::function(name, func_type_id, self.symbols.depth());
                 let _ = self.symbols.declare(func_sym);
@@ -3843,7 +3955,8 @@ impl Parser<'_> {
                 // Function declaration
                 self.expect_special(b';')?;
                 let param_type_ids: Vec<TypeId> = params.iter().map(|p| p.typ).collect();
-                let func_type = Type::function(typ_id, param_type_ids, variadic);
+                let func_type =
+                    Type::function_with_attrs(typ_id, param_type_ids, variadic, is_noreturn);
                 let func_type_id = self.types.intern(func_type);
                 // Add function declaration to symbol table so the variadic flag
                 // is available when the function is called
@@ -3870,10 +3983,13 @@ impl Parser<'_> {
             let size = if self.is_special(b']') {
                 None
             } else {
+                // Parse constant expression for array size (C99 6.7.5.2)
                 let arr_expr = self.parse_assignment_expr()?;
-                match arr_expr.kind {
-                    ExprKind::IntLit(n) => Some(n as usize),
-                    _ => None,
+                // Evaluate as integer constant expression
+                match self.eval_const_expr(&arr_expr) {
+                    Some(n) if n >= 0 => Some(n as usize),
+                    Some(_) => None, // Negative size is invalid
+                    None => None,    // Non-constant (VLA) or invalid expression
                 }
             };
             self.expect_special(b']')?;
@@ -3954,11 +4070,20 @@ impl Parser<'_> {
         Ok(ExternalDecl::Declaration(Declaration { declarators }))
     }
 
-    /// Evaluate a constant expression (for enum values and case labels)
+    /// Evaluate a constant expression (for array sizes, enum values, case labels, static initializers)
+    ///
+    /// C99 6.6 defines integer constant expressions as:
+    /// - Integer/character literals
+    /// - Enum constants
+    /// - sizeof expressions
+    /// - Casts to integer types
+    /// - Unary/binary operators with constant operands
+    /// - Conditional expressions with constant operands
     fn eval_const_expr(&self, expr: &Expr) -> Option<i64> {
         match &expr.kind {
             ExprKind::IntLit(val) => Some(*val),
             ExprKind::CharLit(c) => Some(*c as i64),
+
             ExprKind::Unary { op, operand } => {
                 let val = self.eval_const_expr(operand)?;
                 match op {
@@ -3968,6 +4093,7 @@ impl Parser<'_> {
                     _ => None,
                 }
             }
+
             ExprKind::Binary { op, left, right } => {
                 let lval = self.eval_const_expr(left)?;
                 let rval = self.eval_const_expr(right)?;
@@ -4004,10 +4130,12 @@ impl Parser<'_> {
                     BinaryOp::LogOr => Some(if lval != 0 || rval != 0 { 1 } else { 0 }),
                 }
             }
+
             ExprKind::Ident { name } => {
                 // Check for enum constant
                 self.symbols.get_enum_value(*name)
             }
+
             ExprKind::Conditional {
                 cond,
                 then_expr,
@@ -4020,6 +4148,29 @@ impl Parser<'_> {
                     self.eval_const_expr(else_expr)
                 }
             }
+
+            // sizeof(type) - constant for complete types
+            ExprKind::SizeofType(type_id) => {
+                let size_bits = self.types.size_bits(*type_id);
+                Some((size_bits / 8) as i64)
+            }
+
+            // sizeof(expr) - constant if expr type is complete
+            ExprKind::SizeofExpr(inner_expr) => {
+                if let Some(typ) = inner_expr.typ {
+                    let size_bits = self.types.size_bits(typ);
+                    Some((size_bits / 8) as i64)
+                } else {
+                    None
+                }
+            }
+
+            // Cast to integer type - evaluate inner and truncate/extend as needed
+            ExprKind::Cast { expr: inner, .. } => {
+                // For integer constant expressions, we can evaluate the inner expression
+                self.eval_const_expr(inner)
+            }
+
             _ => None,
         }
     }

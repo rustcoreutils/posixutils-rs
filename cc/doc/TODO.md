@@ -1,5 +1,27 @@
 # pcc TODO
 
+## Table of Contents
+
+- [Technical Debt](#technical-debt)
+  - [R10 reserved globally for division scratch](#r10-reserved-globally-for-division-scratch)
+  - [XMM register save area for variadic functions](#xmm-register-save-area-for-variadic-functions-x86-64)
+- [Future Features](#future-features)
+  - [C11 Atomics (`_Atomic`)](#c11-atomics-_atomic-implementation)
+  - [C99 Complex Numbers (`_Complex`)](#c99-complex-numbers-_complex)
+  - [C11 Alignment Specifiers (`_Alignas`, `_Alignof`)](#c11-alignment-specifiers-_alignas-_alignof)
+  - [C11 Thread-Local Storage (`_Thread_local`)](#c11-thread-local-storage-_thread_local)
+  - [Other C11 Features](#other-c11-features)
+- [Optimization Passes](#optimization-passes)
+  - [Pass 1: SCCP](#pass-1-sccp---sparse-conditional-constant-propagation)
+  - [Pass 2: CFG Simplification](#pass-2-cfg-simplification)
+  - [Pass 3: Copy Propagation & SSA Cleanup](#pass-3-copy-propagation--ssa-cleanup)
+  - [Pass 4: Local CSE / Value Numbering](#pass-4-local-cse--value-numbering)
+  - [Pass 5: GVN](#pass-5-gvn---global-value-numbering)
+  - [Pass 6: Conservative Function Inlining](#pass-6-conservative-function-inlining)
+  - [Pass 7: LICM](#pass-7-licm---loop-invariant-code-motion)
+  - [Pass 8: Loop Canonicalization & Strength Reduction](#pass-8-loop-canonicalization--strength-reduction)
+- [Assembly Peephole Optimizations](#assembly-peephole-optimizations)
+
 ## Technical Debt
 
 ### R10 reserved globally for division scratch

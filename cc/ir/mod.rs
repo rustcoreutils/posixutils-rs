@@ -143,8 +143,19 @@ pub enum Opcode {
     Bswap32, // Byte-swap 32-bit value
     Bswap64, // Byte-swap 64-bit value
 
+    // Count trailing zeros builtins
+    Ctz32, // Count trailing zeros in 32-bit value
+    Ctz64, // Count trailing zeros in 64-bit value
+
     // Stack allocation builtin
     Alloca, // Dynamic stack allocation
+
+    // Optimization hints
+    Unreachable, // Code path is never reached (undefined behavior if reached)
+
+    // Non-local jumps (setjmp/longjmp)
+    Setjmp,  // Save execution context, returns 0 or value from longjmp
+    Longjmp, // Restore execution context (never returns)
 }
 
 impl Opcode {
@@ -152,7 +163,12 @@ impl Opcode {
     pub fn is_terminator(&self) -> bool {
         matches!(
             self,
-            Opcode::Ret | Opcode::Br | Opcode::Cbr | Opcode::Switch
+            Opcode::Ret
+                | Opcode::Br
+                | Opcode::Cbr
+                | Opcode::Switch
+                | Opcode::Unreachable
+                | Opcode::Longjmp
         )
     }
 
@@ -224,7 +240,12 @@ impl Opcode {
             Opcode::Bswap16 => "bswap16",
             Opcode::Bswap32 => "bswap32",
             Opcode::Bswap64 => "bswap64",
+            Opcode::Ctz32 => "ctz32",
+            Opcode::Ctz64 => "ctz64",
             Opcode::Alloca => "alloca",
+            Opcode::Unreachable => "unreachable",
+            Opcode::Setjmp => "setjmp",
+            Opcode::Longjmp => "longjmp",
         }
     }
 }
@@ -454,6 +475,9 @@ pub struct Instruction {
     /// For calls: true if this call returns a large struct via sret (hidden pointer arg).
     /// The first element of `src` is the sret pointer when this is true.
     pub is_sret_call: bool,
+    /// For calls: true if the called function is noreturn (never returns).
+    /// Code after a noreturn call is unreachable.
+    pub is_noreturn_call: bool,
     /// Source position for debug info
     pub pos: Option<Position>,
 }
@@ -477,6 +501,7 @@ impl Default for Instruction {
             arg_types: Vec::new(),
             variadic_arg_start: None,
             is_sret_call: false,
+            is_noreturn_call: false,
             pos: None,
         }
     }
@@ -941,6 +966,8 @@ pub struct Function {
     pub max_dom_level: u32,
     /// Is this function static (internal linkage)?
     pub is_static: bool,
+    /// Is this function noreturn (never returns)?
+    pub is_noreturn: bool,
 }
 
 impl Default for Function {
@@ -955,6 +982,7 @@ impl Default for Function {
             locals: HashMap::new(),
             max_dom_level: 0,
             is_static: false,
+            is_noreturn: false,
         }
     }
 }
@@ -1097,6 +1125,24 @@ pub enum Initializer {
     Int(i64),
     /// Float/double initializer
     Float(f64),
+    /// String literal initializer (for char arrays)
+    String(String),
+    /// Array initializer: element size in bytes, list of (offset, initializer) pairs
+    /// Elements not listed are zero-initialized
+    Array {
+        elem_size: usize,
+        total_size: usize,
+        elements: Vec<(usize, Initializer)>,
+    },
+    /// Struct initializer: list of (offset, size, initializer) tuples
+    /// Fields not listed are zero-initialized
+    Struct {
+        total_size: usize,
+        /// Each tuple is (offset, field_size, initializer)
+        fields: Vec<(usize, usize, Initializer)>,
+    },
+    /// Address of a symbol (for pointer initializers like `int *p = &x;`)
+    SymAddr(String),
 }
 
 impl fmt::Display for Initializer {
@@ -1105,6 +1151,32 @@ impl fmt::Display for Initializer {
             Initializer::None => write!(f, "0"),
             Initializer::Int(v) => write!(f, "{}", v),
             Initializer::Float(v) => write!(f, "{}", v),
+            Initializer::String(s) => write!(f, "\"{}\"", s.escape_default()),
+            Initializer::Array {
+                total_size,
+                elements,
+                ..
+            } => {
+                write!(f, "[{}]{{ ", total_size)?;
+                for (i, (off, init)) in elements.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "+{}: {}", off, init)?;
+                }
+                write!(f, " }}")
+            }
+            Initializer::Struct { total_size, fields } => {
+                write!(f, "struct({}){{ ", total_size)?;
+                for (i, (off, size, init)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "+{}[{}]: {}", off, size, init)?;
+                }
+                write!(f, " }}")
+            }
+            Initializer::SymAddr(name) => write!(f, "&{}", name),
         }
     }
 }

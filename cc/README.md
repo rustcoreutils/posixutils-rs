@@ -78,42 +78,22 @@ EOF
 ## Current Limitations
 
 Supported:
-- Basic types: void, char, short, int, long, long long (signed/unsigned), float, double, \_Bool
-- Pointers (including void\*), arrays, structs, unions
-- Control flow: if/else, while, do-while, for, switch, goto
-- Functions with parameters and return values
-- Function pointer declarations
-- Enums
-- Variadic functions (va\_list, va\_start, va\_arg, va\_copy, va\_end)
-- Storage class specifiers: static, extern
-  - Static local variables (block scope with static duration)
-  - Static functions (internal linkage)
-  - Static global variables (internal linkage)
-  - Extern declarations
-- C preprocessor basics (#include, #define, #ifdef, #ifndef, #if, #elif, #else, #endif)
-- Bitfields (named, unnamed, zero-width for alignment)
+- C99 standard
 
-Not yet implemented:
-- longjmp, setjmp
-- `inline` and inlining support
+Not yet implemented (exceptions to C99, or features we want to add):
+- Actual inlining optimization (the `inline` keyword is supported but functions are not inlined)
 - multi-register returns (for structs larger than 8 bytes)
 - -fverbose-asm
-- Complex initializers
-- constant expression evaluation
 - VLAs (variable-length arrays)
 - top builtins to implement:
   __builtin_expect
-  __builtin_clz / clzl / clzll
-  __builtin_ctz / ctzl / ctzll
   __sync_synchronize
   __sync_fetch_and_add (and maybe a couple of its siblings)
-  __builtin_unreachable (helps optimizations + silences some warnings)
-- DCE and other opt passes
 - assembly peephole optimizations
 - _Complex
 - C11 Alignment Specifiers (_Alignas, _Alignof)
 - C11 Thread-Local Storage (_Thread_local) and atomics (_Atomic)
-- Other C11 features: _Static_assert, _Generic, _Noreturn, anonymous structs
+- Other C11 features: _Static_assert, _Generic, anonymous structs
 
 ## Known Issues
 

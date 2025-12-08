@@ -475,6 +475,20 @@ pub enum Aarch64Inst {
         dst: Reg,
     },
 
+    /// RBIT - Reverse bits in register
+    Rbit {
+        size: OperandSize,
+        src: Reg,
+        dst: Reg,
+    },
+
+    /// CLZ - Count leading zeros
+    Clz {
+        size: OperandSize,
+        src: Reg,
+        dst: Reg,
+    },
+
     // ========================================================================
     // Comparison and Conditional
     // ========================================================================
@@ -547,6 +561,10 @@ pub enum Aarch64Inst {
 
     /// RET - Return from subroutine
     Ret,
+
+    /// BRK - Software breakpoint (trap)
+    /// Used for __builtin_unreachable() to signal unreachable code
+    Brk { imm: u16 },
 
     // ========================================================================
     // Floating-Point (Scalar)
@@ -1163,6 +1181,26 @@ impl EmitAsm for Aarch64Inst {
                 );
             }
 
+            Aarch64Inst::Rbit { size, src, dst } => {
+                let sz = size.bits().max(32);
+                let _ = writeln!(
+                    out,
+                    "    rbit {}, {}",
+                    dst.name_for_size(sz),
+                    src.name_for_size(sz)
+                );
+            }
+
+            Aarch64Inst::Clz { size, src, dst } => {
+                let sz = size.bits().max(32);
+                let _ = writeln!(
+                    out,
+                    "    clz {}, {}",
+                    dst.name_for_size(sz),
+                    src.name_for_size(sz)
+                );
+            }
+
             // Comparison and Conditional
             Aarch64Inst::Cmp { size, src1, src2 } => {
                 let sz = size.bits().max(32);
@@ -1256,6 +1294,10 @@ impl EmitAsm for Aarch64Inst {
 
             Aarch64Inst::Ret => {
                 let _ = writeln!(out, "    ret");
+            }
+
+            Aarch64Inst::Brk { imm } => {
+                let _ = writeln!(out, "    brk #{}", imm);
             }
 
             // Floating-Point

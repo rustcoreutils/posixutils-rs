@@ -78,27 +78,13 @@ EOF
 ## Current Limitations
 
 Supported:
-- Basic types: void, char, short, int, long, long long (signed/unsigned), float, double, \_Bool
-- Pointers (including void\*), arrays, structs, unions
-- Control flow: if/else, while, do-while, for, switch, goto
-- Functions with parameters and return values
-- Function pointer declarations
-- Enums
-- Variadic functions (va\_list, va\_start, va\_arg, va\_copy, va\_end)
-- Storage class specifiers: static, extern
-  - Static local variables (block scope with static duration)
-  - Static functions (internal linkage)
-  - Static global variables (internal linkage)
-  - Extern declarations
-- C preprocessor basics (#include, #define, #ifdef, #ifndef, #if, #elif, #else, #endif)
-- Bitfields (named, unnamed, zero-width for alignment)
+- C99 standard
 
-Not yet implemented:
+Not yet implemented (exceptions to C99, or features we want to add):
 - longjmp, setjmp
 - `inline` and inlining support
 - multi-register returns (for structs larger than 8 bytes)
 - -fverbose-asm
-- Complex initializers
 - constant expression evaluation
 - VLAs (variable-length arrays)
 - top builtins to implement:

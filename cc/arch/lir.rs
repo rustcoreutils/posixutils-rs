@@ -302,6 +302,12 @@ pub enum Directive {
     /// .asciz "string" - emit null-terminated string
     Asciz(String),
 
+    /// .ascii "string" - emit string without null terminator
+    Ascii(String),
+
+    /// .quad symbol - emit 64-bit symbol address (for relocations)
+    QuadSym(Symbol),
+
     // ========================================================================
     // CFI (Call Frame Information) Directives
     // ========================================================================
@@ -508,6 +514,12 @@ impl EmitAsm for Directive {
             }
             Directive::Asciz(s) => {
                 let _ = writeln!(out, "    .asciz \"{}\"", s);
+            }
+            Directive::Ascii(s) => {
+                let _ = writeln!(out, "    .ascii \"{}\"", s);
+            }
+            Directive::QuadSym(sym) => {
+                let _ = writeln!(out, "    .quad {}", sym.format_for_target(target));
             }
 
             // CFI directives

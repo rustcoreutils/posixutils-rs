@@ -1097,6 +1097,24 @@ pub enum Initializer {
     Int(i64),
     /// Float/double initializer
     Float(f64),
+    /// String literal initializer (for char arrays)
+    String(String),
+    /// Array initializer: element size in bytes, list of (offset, initializer) pairs
+    /// Elements not listed are zero-initialized
+    Array {
+        elem_size: usize,
+        total_size: usize,
+        elements: Vec<(usize, Initializer)>,
+    },
+    /// Struct initializer: list of (offset, size, initializer) tuples
+    /// Fields not listed are zero-initialized
+    Struct {
+        total_size: usize,
+        /// Each tuple is (offset, field_size, initializer)
+        fields: Vec<(usize, usize, Initializer)>,
+    },
+    /// Address of a symbol (for pointer initializers like `int *p = &x;`)
+    SymAddr(String),
 }
 
 impl fmt::Display for Initializer {
@@ -1105,6 +1123,32 @@ impl fmt::Display for Initializer {
             Initializer::None => write!(f, "0"),
             Initializer::Int(v) => write!(f, "{}", v),
             Initializer::Float(v) => write!(f, "{}", v),
+            Initializer::String(s) => write!(f, "\"{}\"", s.escape_default()),
+            Initializer::Array {
+                total_size,
+                elements,
+                ..
+            } => {
+                write!(f, "[{}]{{ ", total_size)?;
+                for (i, (off, init)) in elements.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "+{}: {}", off, init)?;
+                }
+                write!(f, " }}")
+            }
+            Initializer::Struct { total_size, fields } => {
+                write!(f, "struct({}){{ ", total_size)?;
+                for (i, (off, size, init)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "+{}[{}]: {}", off, size, init)?;
+                }
+                write!(f, " }}")
+            }
+            Initializer::SymAddr(name) => write!(f, "&{}", name),
         }
     }
 }

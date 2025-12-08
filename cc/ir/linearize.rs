@@ -481,17 +481,190 @@ impl<'a> Linearizer<'a> {
                 continue;
             }
 
-            let init = declarator
-                .init
-                .as_ref()
-                .map_or(Initializer::None, |e| match &e.kind {
-                    ExprKind::IntLit(v) => Initializer::Int(*v),
-                    ExprKind::FloatLit(v) => Initializer::Float(*v),
-                    _ => Initializer::None,
-                });
+            let init = declarator.init.as_ref().map_or(Initializer::None, |e| {
+                self.ast_init_to_ir(e, declarator.typ)
+            });
 
             let name = self.str(declarator.name).to_string();
             self.module.add_global(&name, declarator.typ, init);
+        }
+    }
+
+    /// Convert an AST initializer expression to an IR Initializer
+    ///
+    /// This handles:
+    /// - Scalar initializers (int, float, char literals)
+    /// - String literals (for char arrays or char pointers)
+    /// - Array initializers with designated and positional elements
+    /// - Struct initializers with designated and positional fields
+    /// - Address-of expressions (&symbol)
+    /// - Nested initializers
+    fn ast_init_to_ir(&self, expr: &Expr, typ: TypeId) -> Initializer {
+        match &expr.kind {
+            ExprKind::IntLit(v) => Initializer::Int(*v),
+            ExprKind::FloatLit(v) => Initializer::Float(*v),
+            ExprKind::CharLit(c) => Initializer::Int(*c as i64),
+
+            // String literal - for arrays, store as String; for pointers, create label reference
+            ExprKind::StringLit(s) => {
+                let type_kind = self.types.kind(typ);
+                if type_kind == TypeKind::Array {
+                    // char array - embed the string directly
+                    Initializer::String(s.clone())
+                } else {
+                    // Pointer - would need to create a string constant and reference it
+                    // For now, just use SymAddr with a label we'll create
+                    let label = format!(".LC{}", self.module.strings.len());
+                    Initializer::SymAddr(label)
+                }
+            }
+
+            // Negative literal
+            ExprKind::Unary {
+                op: UnaryOp::Neg,
+                operand,
+            } => match &operand.kind {
+                ExprKind::IntLit(v) => Initializer::Int(-*v),
+                ExprKind::FloatLit(v) => Initializer::Float(-*v),
+                _ => Initializer::None,
+            },
+
+            // Address-of expression
+            ExprKind::Unary {
+                op: UnaryOp::AddrOf,
+                operand,
+            } => {
+                if let ExprKind::Ident { name } = &operand.kind {
+                    Initializer::SymAddr(self.str(*name).to_string())
+                } else {
+                    Initializer::None
+                }
+            }
+
+            // Cast expression - evaluate the inner expression
+            ExprKind::Cast { expr: inner, .. } => self.ast_init_to_ir(inner, typ),
+
+            // Initializer list for arrays/structs
+            ExprKind::InitList { elements } => self.ast_init_list_to_ir(elements, typ),
+
+            // Identifier - for constant addresses (function pointers, array decay, etc.)
+            ExprKind::Ident { name } => {
+                let type_kind = self.types.kind(typ);
+                // For pointer types, this is likely a function address or array decay
+                if type_kind == TypeKind::Pointer {
+                    Initializer::SymAddr(self.str(*name).to_string())
+                } else {
+                    // Other cases - we can't evaluate arbitrary identifiers at compile time
+                    Initializer::None
+                }
+            }
+
+            _ => Initializer::None,
+        }
+    }
+
+    /// Convert an AST initializer list to an IR Initializer
+    fn ast_init_list_to_ir(&self, elements: &[InitElement], typ: TypeId) -> Initializer {
+        let type_kind = self.types.kind(typ);
+        let total_size = (self.types.size_bits(typ) / 8) as usize;
+
+        match type_kind {
+            TypeKind::Array => {
+                let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
+                let elem_size = (self.types.size_bits(elem_type) / 8) as usize;
+
+                let mut init_elements = Vec::new();
+                let mut current_idx: i64 = 0;
+
+                for element in elements {
+                    // Calculate the actual index considering designators
+                    let actual_idx = if element.designators.is_empty() {
+                        let idx = current_idx;
+                        current_idx += 1;
+                        idx
+                    } else {
+                        // Use the first designator (should be Index for arrays)
+                        let idx = match &element.designators[0] {
+                            Designator::Index(i) => *i,
+                            Designator::Field(_) => current_idx, // Fallback
+                        };
+                        current_idx = idx + 1;
+                        idx
+                    };
+
+                    let offset = (actual_idx as usize) * elem_size;
+                    let elem_init = self.ast_init_to_ir(&element.value, elem_type);
+                    init_elements.push((offset, elem_init));
+                }
+
+                // Sort elements by offset to ensure proper emission order
+                // (designated initializers can be in any order)
+                init_elements.sort_by_key(|(offset, _)| *offset);
+
+                Initializer::Array {
+                    elem_size,
+                    total_size,
+                    elements: init_elements,
+                }
+            }
+
+            TypeKind::Struct | TypeKind::Union => {
+                if let Some(composite) = self.types.get(typ).composite.as_ref() {
+                    let members = &composite.members;
+                    let mut init_fields = Vec::new();
+                    let mut current_field_idx = 0;
+
+                    for element in elements {
+                        // Find the field (by designator or position)
+                        let member = if let Some(Designator::Field(name)) =
+                            element.designators.first()
+                        {
+                            // Designated initializer: .field = value
+                            let found = members.iter().enumerate().find(|(_, m)| &m.name == name);
+                            if let Some((idx, m)) = found {
+                                current_field_idx = idx + 1;
+                                Some(m)
+                            } else {
+                                None
+                            }
+                        } else if current_field_idx < members.len() {
+                            // Positional initializer
+                            let m = &members[current_field_idx];
+                            current_field_idx += 1;
+                            Some(m)
+                        } else {
+                            None
+                        };
+
+                        if let Some(member) = member {
+                            let offset = member.offset;
+                            let field_size = (self.types.size_bits(member.typ) / 8) as usize;
+                            let field_init = self.ast_init_to_ir(&element.value, member.typ);
+                            init_fields.push((offset, field_size, field_init));
+                        }
+                    }
+
+                    // Sort fields by offset to ensure proper emission order
+                    // (designated initializers can be in any order)
+                    init_fields.sort_by_key(|(offset, _, _)| *offset);
+
+                    Initializer::Struct {
+                        total_size,
+                        fields: init_fields,
+                    }
+                } else {
+                    Initializer::None
+                }
+            }
+
+            _ => {
+                // For scalar types, just use the first element
+                if let Some(element) = elements.first() {
+                    self.ast_init_to_ir(&element.value, typ)
+                } else {
+                    Initializer::None
+                }
+            }
         }
     }
 
@@ -906,26 +1079,9 @@ impl<'a> Linearizer<'a> {
         );
 
         // Determine initializer (static locals are initialized at compile time)
-        let init = declarator
-            .init
-            .as_ref()
-            .map_or(Initializer::None, |e| match &e.kind {
-                ExprKind::IntLit(v) => Initializer::Int(*v),
-                ExprKind::FloatLit(v) => Initializer::Float(*v),
-                ExprKind::CharLit(c) => Initializer::Int(*c as i64),
-                ExprKind::Unary {
-                    op: UnaryOp::Neg,
-                    operand,
-                } => {
-                    // Handle negative literals
-                    match &operand.kind {
-                        ExprKind::IntLit(v) => Initializer::Int(-*v),
-                        ExprKind::FloatLit(v) => Initializer::Float(-*v),
-                        _ => Initializer::None,
-                    }
-                }
-                _ => Initializer::None,
-            });
+        let init = declarator.init.as_ref().map_or(Initializer::None, |e| {
+            self.ast_init_to_ir(e, declarator.typ)
+        });
 
         // Add as a global (type already has STATIC modifier which codegen uses)
         self.module.add_global(&global_name, declarator.typ, init);

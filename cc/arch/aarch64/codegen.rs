@@ -188,10 +188,15 @@ impl Aarch64CodeGen {
         self.push_lir(Aarch64Inst::Directive(Directive::global_label(name)));
 
         // Emit initializer
+        self.emit_initializer_data(init, size as usize);
+    }
+
+    /// Emit data for an initializer, recursively handling complex types
+    fn emit_initializer_data(&mut self, init: &Initializer, size: usize) {
         match init {
             Initializer::None => {
-                // For static uninitialized, use .zero (not .comm)
-                self.push_lir(Aarch64Inst::Directive(Directive::Zero(size)));
+                // Zero-fill
+                self.push_lir(Aarch64Inst::Directive(Directive::Zero(size as u32)));
             }
             Initializer::Int(val) => match size {
                 1 => self.push_lir(Aarch64Inst::Directive(Directive::Byte(*val))),
@@ -209,6 +214,82 @@ impl Aarch64CodeGen {
                     let bits = val.to_bits();
                     self.push_lir(Aarch64Inst::Directive(Directive::Quad(bits as i64)));
                 }
+            }
+            Initializer::String(s) => {
+                // Emit string as .ascii (without null terminator)
+                self.push_lir(Aarch64Inst::Directive(Directive::Ascii(escape_string(s))));
+                // Zero-fill remaining bytes if array is larger than string
+                let string_len = s.len() + 1; // +1 for null terminator
+                if size > string_len {
+                    self.push_lir(Aarch64Inst::Directive(Directive::Zero(
+                        (size - string_len) as u32,
+                    )));
+                } else if size > s.len() {
+                    // Need null terminator
+                    self.push_lir(Aarch64Inst::Directive(Directive::Byte(0)));
+                }
+            }
+            Initializer::Array {
+                elem_size,
+                total_size,
+                elements,
+            } => {
+                // Emit array elements with gaps filled by zeros
+                let mut current_offset = 0usize;
+
+                for (offset, elem_init) in elements {
+                    // Zero-fill gap before this element
+                    if *offset > current_offset {
+                        self.push_lir(Aarch64Inst::Directive(Directive::Zero(
+                            (*offset - current_offset) as u32,
+                        )));
+                    }
+
+                    // Emit element
+                    self.emit_initializer_data(elem_init, *elem_size);
+                    current_offset = offset + elem_size;
+                }
+
+                // Zero-fill remaining space
+                if *total_size > current_offset {
+                    self.push_lir(Aarch64Inst::Directive(Directive::Zero(
+                        (*total_size - current_offset) as u32,
+                    )));
+                }
+            }
+            Initializer::Struct { total_size, fields } => {
+                // Emit struct fields with gaps (padding) filled by zeros
+                let mut current_offset = 0usize;
+
+                for (offset, field_size, field_init) in fields {
+                    // Zero-fill gap before this field (padding)
+                    if *offset > current_offset {
+                        self.push_lir(Aarch64Inst::Directive(Directive::Zero(
+                            (*offset - current_offset) as u32,
+                        )));
+                    }
+
+                    // Emit field with its proper size
+                    self.emit_initializer_data(field_init, *field_size);
+                    current_offset = offset + field_size;
+                }
+
+                // Zero-fill remaining space (trailing padding)
+                if *total_size > current_offset {
+                    self.push_lir(Aarch64Inst::Directive(Directive::Zero(
+                        (*total_size - current_offset) as u32,
+                    )));
+                }
+            }
+            Initializer::SymAddr(name) => {
+                // Emit symbol address as 64-bit relocatable reference
+                use crate::arch::lir::Symbol;
+                let sym = if name.starts_with('.') {
+                    Symbol::local(name.clone())
+                } else {
+                    Symbol::global(name.clone())
+                };
+                self.push_lir(Aarch64Inst::Directive(Directive::QuadSym(sym)));
             }
         }
     }

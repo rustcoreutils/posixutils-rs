@@ -450,8 +450,8 @@ pub enum Loc {
     Stack(i32),
     /// Immediate constant
     Imm(i64),
-    /// Floating-point immediate constant
-    FImm(f64),
+    /// Floating-point immediate constant (value, size in bits)
+    FImm(f64, u32),
     /// Global symbol
     Global(String),
 }
@@ -514,6 +514,7 @@ impl RegAlloc {
         let intervals = self.compute_live_intervals(func);
 
         self.spill_args_across_calls(func, &intervals);
+        self.allocate_alloca_to_stack(func);
         self.run_linear_scan(func, types, intervals);
 
         self.locations.clone()
@@ -581,6 +582,21 @@ impl RegAlloc {
                             int_arg_idx += 1;
                         }
                         break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Force alloca results to stack to avoid clobbering issues
+    fn allocate_alloca_to_stack(&mut self, func: &Function) {
+        for block in &func.blocks {
+            for insn in &block.insns {
+                if insn.op == Opcode::Alloca {
+                    if let Some(target) = insn.target {
+                        self.stack_offset += 8;
+                        self.locations
+                            .insert(target, Loc::Stack(-self.stack_offset));
                     }
                 }
             }
@@ -662,7 +678,16 @@ impl RegAlloc {
                         continue;
                     }
                     PseudoKind::FVal(v) => {
-                        self.locations.insert(interval.pseudo, Loc::FImm(*v));
+                        let size = func
+                            .blocks
+                            .iter()
+                            .flat_map(|b| &b.insns)
+                            .find(|insn| {
+                                insn.op == Opcode::SetVal && insn.target == Some(interval.pseudo)
+                            })
+                            .map(|insn| insn.size)
+                            .unwrap_or(64);
+                        self.locations.insert(interval.pseudo, Loc::FImm(*v, size));
                         self.fp_pseudos.insert(interval.pseudo);
                         continue;
                     }

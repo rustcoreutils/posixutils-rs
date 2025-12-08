@@ -653,7 +653,7 @@ impl Aarch64CodeGen {
                 // Move return value to x0 (integer) or v0 (float) if present
                 if let Some(&src) = insn.src.first() {
                     let src_loc = self.get_location(src);
-                    let is_fp = matches!(src_loc, Loc::VReg(_) | Loc::FImm(_));
+                    let is_fp = matches!(src_loc, Loc::VReg(_) | Loc::FImm(..));
 
                     if is_fp {
                         // FP return value goes in V0
@@ -826,7 +826,7 @@ impl Aarch64CodeGen {
                                 src: *v,
                             });
                         }
-                        Loc::FImm(f) => {
+                        Loc::FImm(f, _) => {
                             // FP immediate as condition - branch based on non-zero
                             if *f != 0.0 {
                                 if let Some(target) = insn.bb_true {
@@ -906,7 +906,7 @@ impl Aarch64CodeGen {
                         Loc::Global(name) => {
                             self.emit_load_global(name, scratch0, op_size);
                         }
-                        Loc::VReg(_) | Loc::FImm(_) => {
+                        Loc::VReg(_) | Loc::FImm(..) => {
                             // FP values shouldn't be used in switch statements
                             // This is unreachable in valid C code
                         }
@@ -1322,14 +1322,15 @@ impl Aarch64CodeGen {
                     dst,
                 });
             }
-            Loc::FImm(f) => {
-                // Load FP immediate as integer bits
-                let bits = if size <= 32 {
+            Loc::FImm(f, imm_size) => {
+                // Use the size from the FImm, not the passed-in size
+                // This ensures float constants are loaded as float, not double
+                let bits = if imm_size <= 32 {
                     (f as f32).to_bits() as i64
                 } else {
                     f.to_bits() as i64
                 };
-                self.emit_mov_imm(dst, bits, size);
+                self.emit_mov_imm(dst, bits, imm_size);
             }
         }
     }
@@ -2154,7 +2155,7 @@ impl Aarch64CodeGen {
                     types.is_float(typ)
                 } else {
                     let arg_loc = self.get_location(arg);
-                    matches!(arg_loc, Loc::VReg(_) | Loc::FImm(_))
+                    matches!(arg_loc, Loc::VReg(_) | Loc::FImm(..))
                 };
 
                 let arg_size = if let Some(typ) = arg_type {
@@ -2240,7 +2241,7 @@ impl Aarch64CodeGen {
                 } else {
                     // Fall back to location-based detection for backwards compatibility
                     let arg_loc = self.get_location(arg);
-                    matches!(arg_loc, Loc::VReg(_) | Loc::FImm(_))
+                    matches!(arg_loc, Loc::VReg(_) | Loc::FImm(..))
                 };
 
                 // Get argument size from type, with minimum 32-bit for register ops
@@ -2321,7 +2322,7 @@ impl Aarch64CodeGen {
             let is_fp_result = if let Some(typ) = insn.typ {
                 types.is_float(typ)
             } else {
-                matches!(dst_loc, Loc::VReg(_) | Loc::FImm(_))
+                matches!(dst_loc, Loc::VReg(_) | Loc::FImm(..))
             };
 
             // Get return value size from type
@@ -2498,7 +2499,7 @@ impl Aarch64CodeGen {
 
         // Check if this is a FP copy (source or dest is in VReg or is FImm)
         let is_fp_copy =
-            matches!(&src_loc, Loc::VReg(_) | Loc::FImm(_)) || matches!(&dst_loc, Loc::VReg(_));
+            matches!(&src_loc, Loc::VReg(_) | Loc::FImm(..)) || matches!(&dst_loc, Loc::VReg(_));
 
         // Determine if the type is unsigned (for proper sign/zero extension)
         // For plain char, use target.char_signed to determine signedness
@@ -2598,10 +2599,11 @@ impl Aarch64CodeGen {
                     dst,
                 });
             }
-            Loc::FImm(f) => {
+            Loc::FImm(f, imm_size) => {
                 // Load FP constant using integer register
+                // Use the size from the FImm for correct constant representation
                 let (scratch0, _) = Reg::scratch_regs();
-                let bits = if size <= 32 {
+                let bits = if imm_size <= 32 {
                     (f as f32).to_bits() as i64
                 } else {
                     f.to_bits() as i64

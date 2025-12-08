@@ -910,6 +910,11 @@ impl RegAlloc {
     pub fn callee_saved_used(&self) -> &[Reg] {
         &self.used_callee_saved
     }
+
+    /// Get callee-saved floating-point registers that need to be preserved
+    pub fn callee_saved_fp_used(&self) -> &[VReg] {
+        &self.used_callee_saved_fp
+    }
 }
 
 impl Default for RegAlloc {

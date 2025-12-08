@@ -277,6 +277,7 @@ impl Aarch64CodeGen {
 
         let stack_size = alloc.stack_size();
         let callee_saved = alloc.callee_saved_used().to_vec();
+        let callee_saved_fp = alloc.callee_saved_fp_used().to_vec();
 
         // For variadic functions on Linux/FreeBSD, we need extra space for the register save area
         // AAPCS64: 8 GP regs (x0-x7) * 8 bytes = 64 bytes
@@ -286,16 +287,20 @@ impl Aarch64CodeGen {
         let reg_save_area_size: i32 = if is_variadic && !is_darwin { 64 } else { 0 };
 
         // Calculate total frame size
-        // Need space for: fp/lr (16 bytes) + callee-saved regs + local vars + reg save area
-        // Round up callee-saved count to even for 16-byte alignment
-        let callee_saved_pairs = (callee_saved.len() + 1) / 2;
-        let callee_saved_size = callee_saved_pairs as i32 * 16;
+        // Need space for: fp/lr (16 bytes) + GP callee-saved + FP callee-saved + local vars + reg save area
+        // Round up callee-saved counts to even for 16-byte alignment
+        // Note: AAPCS64 only requires the lower 64 bits of V8-V15 to be preserved (d8-d15)
+        let callee_saved_gp_pairs = (callee_saved.len() + 1) / 2;
+        let callee_saved_gp_size = callee_saved_gp_pairs as i32 * 16;
+        let callee_saved_fp_pairs = (callee_saved_fp.len() + 1) / 2;
+        let callee_saved_fp_size = callee_saved_fp_pairs as i32 * 16; // 8 bytes per d-reg, 16 per pair
+        let callee_saved_size = callee_saved_gp_size + callee_saved_fp_size;
         let total_frame = 16 + callee_saved_size + stack_size + reg_save_area_size;
         // Ensure 16-byte alignment
         let total_frame = (total_frame + 15) & !15;
 
         // Track register save area offset for va_start (offset from FP)
-        // Layout: [fp/lr][callee-saved][locals][reg_save_area]
+        // Layout: [fp/lr][GP callee-saved][FP callee-saved][locals][reg_save_area]
         // The save area is at FP + 16 + callee_saved_size + stack_size
         self.reg_save_area_offset = if is_variadic {
             16 + callee_saved_size + stack_size
@@ -426,6 +431,54 @@ impl Aarch64CodeGen {
                 }
                 offset += 16;
             }
+
+            // Save FP callee-saved registers (d8-d15) in pairs
+            // AAPCS64 only requires preserving the lower 64 bits
+            let mut i = 0;
+            while i < callee_saved_fp.len() {
+                if i + 1 < callee_saved_fp.len() {
+                    self.push_lir(Aarch64Inst::StpFp {
+                        size: FpSize::Double,
+                        src1: callee_saved_fp[i],
+                        src2: callee_saved_fp[i + 1],
+                        addr: MemAddr::BaseOffset {
+                            base: Reg::X29, // fp
+                            offset,
+                        },
+                    });
+                    if self.emit_debug {
+                        let cfi_offset1 = -(total_frame - offset);
+                        let cfi_offset2 = -(total_frame - offset - 8);
+                        self.push_lir(Aarch64Inst::Directive(Directive::cfi_offset(
+                            callee_saved_fp[i].name_d(),
+                            cfi_offset1,
+                        )));
+                        self.push_lir(Aarch64Inst::Directive(Directive::cfi_offset(
+                            callee_saved_fp[i + 1].name_d(),
+                            cfi_offset2,
+                        )));
+                    }
+                    i += 2;
+                } else {
+                    self.push_lir(Aarch64Inst::StrFp {
+                        size: FpSize::Double,
+                        src: callee_saved_fp[i],
+                        addr: MemAddr::BaseOffset {
+                            base: Reg::X29, // fp
+                            offset,
+                        },
+                    });
+                    if self.emit_debug {
+                        let cfi_offset = -(total_frame - offset);
+                        self.push_lir(Aarch64Inst::Directive(Directive::cfi_offset(
+                            callee_saved_fp[i].name_d(),
+                            cfi_offset,
+                        )));
+                    }
+                    i += 1;
+                }
+                offset += 16;
+            }
         } else {
             // Minimal frame: stp x29, x30, [sp, #-16]!
             self.push_lir(Aarch64Inst::Stp {
@@ -548,7 +601,7 @@ impl Aarch64CodeGen {
         }
 
         // Store frame size for epilogue
-        let frame_info = (total_frame, callee_saved.clone());
+        let frame_info = (total_frame, callee_saved.clone(), callee_saved_fp.clone());
 
         // Emit basic blocks
         for block in &func.blocks {
@@ -564,7 +617,7 @@ impl Aarch64CodeGen {
     fn emit_block(
         &mut self,
         block: &crate::ir::BasicBlock,
-        frame_info: &(i32, Vec<Reg>),
+        frame_info: &(i32, Vec<Reg>, Vec<VReg>),
         types: &TypeTable,
     ) {
         // Always emit block ID label for consistency with jumps
@@ -580,11 +633,16 @@ impl Aarch64CodeGen {
         }
     }
 
-    fn emit_insn(&mut self, insn: &Instruction, frame_info: &(i32, Vec<Reg>), types: &TypeTable) {
+    fn emit_insn(
+        &mut self,
+        insn: &Instruction,
+        frame_info: &(i32, Vec<Reg>, Vec<VReg>),
+        types: &TypeTable,
+    ) {
         // Emit .loc directive for debug info
         self.emit_loc(insn);
 
-        let (total_frame, callee_saved) = frame_info;
+        let (total_frame, callee_saved, callee_saved_fp) = frame_info;
 
         match insn.op {
             Opcode::Entry => {
@@ -640,6 +698,34 @@ impl Aarch64CodeGen {
                                     offset,
                                 },
                                 dst: callee_saved[i],
+                            });
+                            i += 1;
+                        }
+                        offset += 16;
+                    }
+
+                    // Restore FP callee-saved registers (d8-d15)
+                    let mut i = 0;
+                    while i < callee_saved_fp.len() {
+                        if i + 1 < callee_saved_fp.len() {
+                            self.push_lir(Aarch64Inst::LdpFp {
+                                size: FpSize::Double,
+                                addr: MemAddr::BaseOffset {
+                                    base: Reg::sp(),
+                                    offset,
+                                },
+                                dst1: callee_saved_fp[i],
+                                dst2: callee_saved_fp[i + 1],
+                            });
+                            i += 2;
+                        } else {
+                            self.push_lir(Aarch64Inst::LdrFp {
+                                size: FpSize::Double,
+                                addr: MemAddr::BaseOffset {
+                                    base: Reg::sp(),
+                                    offset,
+                                },
+                                dst: callee_saved_fp[i],
                             });
                             i += 1;
                         }

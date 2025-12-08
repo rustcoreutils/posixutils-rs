@@ -584,6 +584,22 @@ pub enum Aarch64Inst {
         addr: MemAddr,
     },
 
+    /// STP (FP) - Store pair of FP registers (for callee-saved register saves)
+    StpFp {
+        size: FpSize,
+        src1: VReg,
+        src2: VReg,
+        addr: MemAddr,
+    },
+
+    /// LDP (FP) - Load pair of FP registers (for callee-saved register restores)
+    LdpFp {
+        size: FpSize,
+        addr: MemAddr,
+        dst1: VReg,
+        dst2: VReg,
+    },
+
     /// FADD - FP add
     Fadd {
         size: FpSize,
@@ -1289,6 +1305,32 @@ impl EmitAsm for Aarch64Inst {
                     FpSize::Double => src.name_d(),
                 };
                 let _ = writeln!(out, "    str {}, {}", name, addr.format());
+            }
+
+            Aarch64Inst::StpFp {
+                size,
+                src1,
+                src2,
+                addr,
+            } => {
+                let (name1, name2) = match size {
+                    FpSize::Single => (src1.name_s(), src2.name_s()),
+                    FpSize::Double => (src1.name_d(), src2.name_d()),
+                };
+                let _ = writeln!(out, "    stp {}, {}, {}", name1, name2, addr.format());
+            }
+
+            Aarch64Inst::LdpFp {
+                size,
+                addr,
+                dst1,
+                dst2,
+            } => {
+                let (name1, name2) = match size {
+                    FpSize::Single => (dst1.name_s(), dst2.name_s()),
+                    FpSize::Double => (dst1.name_d(), dst2.name_d()),
+                };
+                let _ = writeln!(out, "    ldp {}, {}, {}", name1, name2, addr.format());
             }
 
             Aarch64Inst::LdrFpSymOffset {

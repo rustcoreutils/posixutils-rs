@@ -19,7 +19,7 @@
 
 use crate::arch::aarch64::lir::{Aarch64Inst, CallTarget, Cond, GpOperand, MemAddr};
 use crate::arch::aarch64::regalloc::{Loc, Reg, RegAlloc, VReg};
-use crate::arch::codegen::CodeGenerator;
+use crate::arch::codegen::{escape_string, is_variadic_function, CodeGenerator};
 use crate::arch::lir::{Directive, FpSize, Label, OperandSize, Symbol};
 use crate::arch::DEFAULT_LIR_BUFFER_CAPACITY;
 use crate::ir::{Function, Initializer, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
@@ -85,18 +85,6 @@ impl Aarch64CodeGen {
             reg_save_area_size: 0,
             num_fixed_gp_params: 0,
         }
-    }
-
-    /// Check if a function contains va_start (indicating it's variadic)
-    fn is_variadic_function(func: &Function) -> bool {
-        for block in &func.blocks {
-            for insn in &block.insns {
-                if matches!(insn.op, crate::ir::Opcode::VaStart) {
-                    return true;
-                }
-            }
-        }
-        false
     }
 
     /// Compute the actual FP-relative offset for a stack location.
@@ -236,39 +224,18 @@ impl Aarch64CodeGen {
         for (label, content) in strings {
             // Local label for string literal
             self.push_lir(Aarch64Inst::Directive(Directive::local_label(label)));
-            self.push_lir(Aarch64Inst::Directive(Directive::Asciz(
-                Self::escape_string(content),
-            )));
+            self.push_lir(Aarch64Inst::Directive(Directive::Asciz(escape_string(
+                content,
+            ))));
         }
 
         // Switch back to text section for functions
         self.push_lir(Aarch64Inst::Directive(Directive::Text));
     }
 
-    fn escape_string(s: &str) -> String {
-        let mut result = String::new();
-        for c in s.chars() {
-            match c {
-                '\n' => result.push_str("\\n"),
-                '\r' => result.push_str("\\r"),
-                '\t' => result.push_str("\\t"),
-                '\\' => result.push_str("\\\\"),
-                '"' => result.push_str("\\\""),
-                c if c.is_ascii_graphic() || c == ' ' => result.push(c),
-                c => {
-                    // Escape non-printable as octal
-                    for byte in c.to_string().as_bytes() {
-                        result.push_str(&format!("\\{:03o}", byte));
-                    }
-                }
-            }
-        }
-        result
-    }
-
     fn emit_function(&mut self, func: &Function, types: &TypeTable) {
         // Check if this function uses varargs
-        let is_variadic = Self::is_variadic_function(func);
+        let is_variadic = is_variadic_function(func);
 
         // Register allocation
         let mut alloc = RegAlloc::new();

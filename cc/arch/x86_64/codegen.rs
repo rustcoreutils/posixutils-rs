@@ -12,7 +12,7 @@
 // Uses linear scan register allocation and System V AMD64 ABI.
 //
 
-use crate::arch::codegen::CodeGenerator;
+use crate::arch::codegen::{escape_string, is_variadic_function, CodeGenerator};
 #[allow(unused_imports)]
 use crate::arch::lir::{Directive, FpSize, Label, OperandSize, Symbol};
 #[allow(unused_imports)]
@@ -211,24 +211,12 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Check if a function contains va_start (indicating it's variadic)
-    fn is_variadic_function(func: &Function) -> bool {
-        for block in &func.blocks {
-            for insn in &block.insns {
-                if matches!(insn.op, crate::ir::Opcode::VaStart) {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
     fn emit_function(&mut self, func: &Function, types: &TypeTable) {
         // Save current function name for unique label generation
         self.current_fn = func.name.clone();
 
         // Check if this function uses varargs
-        let is_variadic = Self::is_variadic_function(func);
+        let is_variadic = is_variadic_function(func);
 
         // Register allocation
         let mut alloc = RegAlloc::new();
@@ -4302,31 +4290,10 @@ impl X86_64CodeGen {
             // String labels are local (start with .)
             self.push_lir(X86Inst::Directive(Directive::local_label(label.clone())));
             // Emit string with proper escaping
-            self.push_lir(X86Inst::Directive(Directive::Asciz(Self::escape_string(
-                content,
-            ))));
+            self.push_lir(X86Inst::Directive(Directive::Asciz(escape_string(content))));
         }
 
         // Switch back to text section for functions
         self.push_lir(X86Inst::Directive(Directive::Text));
-    }
-
-    fn escape_string(s: &str) -> String {
-        let mut result = String::new();
-        for c in s.chars() {
-            match c {
-                '\n' => result.push_str("\\n"),
-                '\r' => result.push_str("\\r"),
-                '\t' => result.push_str("\\t"),
-                '\\' => result.push_str("\\\\"),
-                '"' => result.push_str("\\\""),
-                c if c.is_ascii_graphic() || c == ' ' => result.push(c),
-                c => {
-                    // Emit as octal escape
-                    result.push_str(&format!("\\{:03o}", c as u32));
-                }
-            }
-        }
-        result
     }
 }

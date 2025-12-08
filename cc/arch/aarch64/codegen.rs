@@ -3794,11 +3794,8 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::Imm(v) => {
-                self.push_lir(Aarch64Inst::Mov {
-                    size: src_size,
-                    src: GpOperand::Imm(v),
-                    dst: scratch,
-                });
+                // Use emit_mov_imm which handles large immediates with movz/movk
+                self.emit_mov_imm(scratch, v, src_size.bits());
             }
             _ => return,
         }
@@ -3888,11 +3885,8 @@ impl Aarch64CodeGen {
                 });
             }
             Loc::Imm(v) => {
-                self.push_lir(Aarch64Inst::Mov {
-                    size: src_size,
-                    src: GpOperand::Imm(v),
-                    dst: scratch,
-                });
+                // Use emit_mov_imm which handles large immediates with movz/movk
+                self.emit_mov_imm(scratch, v, src_size.bits());
             }
             _ => return,
         }

@@ -15,6 +15,7 @@ pub const DEFAULT_LIR_BUFFER_CAPACITY: usize = 5000;
 pub mod aarch64;
 pub mod codegen;
 pub mod lir;
+pub mod regalloc;
 pub mod x86_64;
 
 use crate::target::{Arch, Target};

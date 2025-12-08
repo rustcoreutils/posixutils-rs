@@ -10,6 +10,9 @@
 // Linear scan register allocation for x86-64
 //
 
+use crate::arch::regalloc::{
+    expire_intervals, find_call_positions, interval_crosses_call, LiveInterval,
+};
 use crate::ir::{Function, Opcode, PseudoId, PseudoKind};
 use crate::types::TypeTable;
 use std::collections::{HashMap, HashSet};
@@ -295,14 +298,6 @@ pub enum Loc {
 // Register Allocator (Linear Scan)
 // ============================================================================
 
-/// Live interval for a pseudo
-#[derive(Debug, Clone)]
-struct LiveInterval {
-    pseudo: PseudoId,
-    start: usize,
-    end: usize,
-}
-
 /// Simple linear scan register allocator for x86-64
 pub struct RegAlloc {
     /// Mapping from pseudo to location
@@ -422,33 +417,20 @@ impl RegAlloc {
 
     /// Spill arguments in caller-saved registers if their interval crosses a call
     fn spill_args_across_calls(&mut self, func: &Function, intervals: &[LiveInterval]) {
-        // Find all call positions
-        let mut call_positions: Vec<usize> = Vec::new();
-        let mut pos = 0usize;
-        for block in &func.blocks {
-            for insn in &block.insns {
-                if insn.op == Opcode::Call {
-                    call_positions.push(pos);
-                }
-                pos += 1;
-            }
-        }
+        let call_positions = find_call_positions(func);
 
         // Check arguments in caller-saved registers
         let int_arg_regs_set: Vec<Reg> = Reg::arg_regs().to_vec();
         for interval in intervals {
             if let Some(Loc::Reg(reg)) = self.locations.get(&interval.pseudo) {
-                if int_arg_regs_set.contains(reg) {
-                    let crosses_call = call_positions
-                        .iter()
-                        .any(|&call_pos| interval.start <= call_pos && call_pos < interval.end);
-                    if crosses_call {
-                        let reg_to_restore = *reg;
-                        self.stack_offset += 8;
-                        self.locations
-                            .insert(interval.pseudo, Loc::Stack(self.stack_offset));
-                        self.free_regs.push(reg_to_restore);
-                    }
+                if int_arg_regs_set.contains(reg)
+                    && interval_crosses_call(interval, &call_positions)
+                {
+                    let reg_to_restore = *reg;
+                    self.stack_offset += 8;
+                    self.locations
+                        .insert(interval.pseudo, Loc::Stack(self.stack_offset));
+                    self.free_regs.push(reg_to_restore);
                 }
             }
         }
@@ -615,28 +597,9 @@ impl RegAlloc {
 
     fn expire_old_intervals(&mut self, point: usize) {
         // Expire integer register intervals
-        let mut to_remove = Vec::new();
-        for (i, (interval, reg)) in self.active.iter().enumerate() {
-            if interval.end < point {
-                self.free_regs.push(*reg);
-                to_remove.push(i);
-            }
-        }
-        for i in to_remove.into_iter().rev() {
-            self.active.remove(i);
-        }
-
+        expire_intervals(&mut self.active, &mut self.free_regs, point);
         // Expire XMM register intervals
-        let mut to_remove_xmm = Vec::new();
-        for (i, (interval, xmm)) in self.active_xmm.iter().enumerate() {
-            if interval.end < point {
-                self.free_xmm_regs.push(*xmm);
-                to_remove_xmm.push(i);
-            }
-        }
-        for i in to_remove_xmm.into_iter().rev() {
-            self.active_xmm.remove(i);
-        }
+        expire_intervals(&mut self.active_xmm, &mut self.free_xmm_regs, point);
     }
 
     fn compute_live_intervals(&self, func: &Function) -> Vec<LiveInterval> {

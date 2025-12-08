@@ -1872,9 +1872,8 @@ impl<'a> Preprocessor<'a> {
 
         match builtin {
             BuiltinMacro::HasAttribute => {
-                // We don't currently implement any __attribute__ semantics
-                let _ = name;
-                false
+                // Return true for attributes we actually implement
+                matches!(name.as_str(), "noreturn" | "__noreturn__")
             }
             BuiltinMacro::HasBuiltin => {
                 // Return true only for builtins actually implemented in the compiler
@@ -2301,14 +2300,18 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
 
     /// Evaluate __has_attribute(X)
     fn eval_has_attribute(&mut self) -> i64 {
-        let _name = match self.get_has_arg() {
+        let name = match self.get_has_arg() {
             Some(n) => n,
             None => return 0,
         };
 
-        // We don't currently implement any __attribute__ semantics
-        // Return 0 for all attribute queries
-        0
+        // Return 1 for attributes we actually implement
+        let supported = matches!(name.as_str(), "noreturn" | "__noreturn__");
+        if supported {
+            1
+        } else {
+            0
+        }
     }
 
     /// Evaluate __has_builtin(X)

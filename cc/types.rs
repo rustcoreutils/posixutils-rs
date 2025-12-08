@@ -143,6 +143,9 @@ bitflags::bitflags! {
 
         // Inline
         const INLINE   = 1 << 12;
+
+        // Function specifier: noreturn (_Noreturn keyword, C11)
+        const NORETURN = 1 << 14;
     }
 }
 
@@ -239,6 +242,10 @@ pub struct Type {
     /// Is this function variadic? (for functions)
     pub variadic: bool,
 
+    /// Is this function noreturn? (for functions)
+    /// Set via __attribute__((noreturn)) or _Noreturn keyword
+    pub noreturn: bool,
+
     /// Composite type data (for struct, union, enum)
     pub composite: Option<Box<CompositeType>>,
 }
@@ -252,6 +259,7 @@ impl Default for Type {
             array_size: None,
             params: None,
             variadic: false,
+            noreturn: false,
             composite: None,
         }
     }
@@ -284,6 +292,7 @@ impl Type {
             array_size: None,
             params: None,
             variadic: false,
+            noreturn: false,
             composite: None,
         }
     }
@@ -297,12 +306,23 @@ impl Type {
             array_size: Some(size),
             params: None,
             variadic: false,
+            noreturn: false,
             composite: None,
         }
     }
 
     /// Create a function type (return type and param types are TypeIds)
     pub fn function(return_type: TypeId, params: Vec<TypeId>, variadic: bool) -> Self {
+        Self::function_with_attrs(return_type, params, variadic, false)
+    }
+
+    /// Create a function type with noreturn attribute
+    pub fn function_with_attrs(
+        return_type: TypeId,
+        params: Vec<TypeId>,
+        variadic: bool,
+        noreturn: bool,
+    ) -> Self {
         Self {
             kind: TypeKind::Function,
             modifiers: TypeModifiers::empty(),
@@ -310,6 +330,7 @@ impl Type {
             array_size: None,
             params: Some(params),
             variadic,
+            noreturn,
             composite: None,
         }
     }
@@ -323,6 +344,7 @@ impl Type {
             array_size: None,
             params: None,
             variadic: false,
+            noreturn: false,
             composite: Some(Box::new(composite)),
         }
     }
@@ -336,6 +358,7 @@ impl Type {
             array_size: None,
             params: None,
             variadic: false,
+            noreturn: false,
             composite: Some(Box::new(composite)),
         }
     }
@@ -349,6 +372,7 @@ impl Type {
             array_size: None,
             params: None,
             variadic: false,
+            noreturn: false,
             composite: Some(Box::new(composite)),
         }
     }
@@ -535,6 +559,7 @@ enum TypeKey {
         ret: TypeId,
         params: Vec<TypeId>,
         variadic: bool,
+        noreturn: bool,
     },
 }
 
@@ -676,6 +701,7 @@ impl TypeTable {
                     ret,
                     params,
                     variadic: typ.variadic,
+                    noreturn: typ.noreturn,
                 })
             }
             _ => Some(TypeKey::Basic(typ.kind, typ.modifiers.bits())),

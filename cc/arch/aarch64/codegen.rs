@@ -1230,6 +1230,17 @@ impl Aarch64CodeGen {
                 self.push_lir(Aarch64Inst::Brk { imm: 1 });
             }
 
+            // ================================================================
+            // setjmp/longjmp support
+            // ================================================================
+            Opcode::Setjmp => {
+                self.emit_setjmp(insn, *total_frame);
+            }
+
+            Opcode::Longjmp => {
+                self.emit_longjmp(insn, *total_frame);
+            }
+
             // Skip no-ops and unimplemented
             _ => {}
         }
@@ -3711,6 +3722,62 @@ impl Aarch64CodeGen {
             }
             _ => {}
         }
+    }
+
+    /// Emit setjmp(env) - saves execution context
+    /// AAPCS64: env in X0, returns int in W0
+    fn emit_setjmp(&mut self, insn: &Instruction, frame_size: i32) {
+        let env = match insn.src.first() {
+            Some(&e) => e,
+            None => return,
+        };
+        let target = match insn.target {
+            Some(t) => t,
+            None => return,
+        };
+
+        // Put env argument in X0 (first argument register)
+        self.emit_move(env, Reg::X0, 64, frame_size);
+
+        // Call setjmp
+        self.push_lir(Aarch64Inst::Bl {
+            target: CallTarget::Direct(Symbol::global("setjmp")),
+        });
+
+        // Store result from W0 to target
+        let dst_loc = self.get_location(target);
+        self.emit_move_to_loc(Reg::X0, &dst_loc, 32, frame_size);
+    }
+
+    /// Emit longjmp(env, val) - restores execution context (noreturn)
+    /// AAPCS64: env in X0, val in X1
+    fn emit_longjmp(&mut self, insn: &Instruction, frame_size: i32) {
+        let env = match insn.src.first() {
+            Some(&e) => e,
+            None => return,
+        };
+        let val = match insn.src.get(1) {
+            Some(&v) => v,
+            None => return,
+        };
+
+        // IMPORTANT: Load val first into X1, THEN env into X0.
+        // If we loaded env into X0 first and val was passed as the first
+        // function argument (in X0), it would get overwritten.
+        // Put val argument in X1 (second argument register) FIRST
+        self.emit_move(val, Reg::X1, 32, frame_size);
+
+        // Put env argument in X0 (first argument register)
+        self.emit_move(env, Reg::X0, 64, frame_size);
+
+        // Call longjmp (noreturn - control never comes back)
+        self.push_lir(Aarch64Inst::Bl {
+            target: CallTarget::Direct(Symbol::global("longjmp")),
+        });
+
+        // Emit brk after longjmp since it never returns
+        // This helps catch any bugs where longjmp somehow returns
+        self.push_lir(Aarch64Inst::Brk { imm: 1 });
     }
 
     /// Emit __builtin_alloca - dynamic stack allocation

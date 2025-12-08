@@ -955,6 +955,17 @@ impl X86_64CodeGen {
                 self.push_lir(X86Inst::Ud2);
             }
 
+            // ================================================================
+            // setjmp/longjmp support
+            // ================================================================
+            Opcode::Setjmp => {
+                self.emit_setjmp(insn);
+            }
+
+            Opcode::Longjmp => {
+                self.emit_longjmp(insn);
+            }
+
             // Skip no-ops and unimplemented
             _ => {}
         }
@@ -4372,6 +4383,62 @@ impl X86_64CodeGen {
             }
             _ => {}
         }
+    }
+
+    /// Emit setjmp(env) - saves execution context
+    /// System V AMD64 ABI: env in RDI, returns int in EAX
+    fn emit_setjmp(&mut self, insn: &Instruction) {
+        let env = match insn.src.first() {
+            Some(&e) => e,
+            None => return,
+        };
+        let target = match insn.target {
+            Some(t) => t,
+            None => return,
+        };
+
+        // Put env argument in RDI (first argument register)
+        self.emit_move(env, Reg::Rdi, 64);
+
+        // Call setjmp
+        self.push_lir(X86Inst::Call {
+            target: CallTarget::Direct(Symbol::global("setjmp".to_string())),
+        });
+
+        // Store result from EAX to target
+        let dst_loc = self.get_location(target);
+        self.emit_move_to_loc(Reg::Rax, &dst_loc, 32);
+    }
+
+    /// Emit longjmp(env, val) - restores execution context (noreturn)
+    /// System V AMD64 ABI: env in RDI, val in RSI
+    fn emit_longjmp(&mut self, insn: &Instruction) {
+        let env = match insn.src.first() {
+            Some(&e) => e,
+            None => return,
+        };
+        let val = match insn.src.get(1) {
+            Some(&v) => v,
+            None => return,
+        };
+
+        // IMPORTANT: Load val first into RSI, THEN env into RDI.
+        // If we loaded env into RDI first and val was passed as the first
+        // function argument (in RDI), it would get overwritten.
+        // Put val argument in RSI (second argument register) FIRST
+        self.emit_move(val, Reg::Rsi, 32);
+
+        // Put env argument in RDI (first argument register)
+        self.emit_move(env, Reg::Rdi, 64);
+
+        // Call longjmp (noreturn - control never comes back)
+        self.push_lir(X86Inst::Call {
+            target: CallTarget::Direct(Symbol::global("longjmp".to_string())),
+        });
+
+        // Emit ud2 after longjmp since it never returns
+        // This helps catch any bugs where longjmp somehow returns
+        self.push_lir(X86Inst::Ud2);
     }
 
     /// Emit __builtin_alloca - dynamic stack allocation

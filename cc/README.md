@@ -81,7 +81,6 @@ Supported:
 - C99 standard
 
 Not yet implemented (exceptions to C99, or features we want to add):
-- longjmp, setjmp
 - Actual inlining optimization (the `inline` keyword is supported but functions are not inlined)
 - multi-register returns (for structs larger than 8 bytes)
 - -fverbose-asm
@@ -94,7 +93,7 @@ Not yet implemented (exceptions to C99, or features we want to add):
 - _Complex
 - C11 Alignment Specifiers (_Alignas, _Alignof)
 - C11 Thread-Local Storage (_Thread_local) and atomics (_Atomic)
-- Other C11 features: _Static_assert, _Generic, _Noreturn, anonymous structs
+- Other C11 features: _Static_assert, _Generic, anonymous structs
 
 ## Known Issues
 

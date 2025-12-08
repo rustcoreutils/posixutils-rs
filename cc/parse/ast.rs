@@ -361,6 +361,28 @@ pub enum ExprKind {
     /// If control flow reaches this point, behavior is undefined.
     /// Used for optimization hints and silencing warnings.
     Unreachable,
+
+    // =========================================================================
+    // setjmp/longjmp (non-local jumps)
+    // =========================================================================
+    /// setjmp(env)
+    /// Saves the current execution context in env.
+    /// Returns 0 on direct call, non-zero when returning via longjmp.
+    Setjmp {
+        /// The jmp_buf to save the context to
+        env: Box<Expr>,
+    },
+
+    /// longjmp(env, val)
+    /// Restores the execution context saved in env.
+    /// Causes the corresponding setjmp to return val (or 1 if val == 0).
+    /// This function never returns (noreturn).
+    Longjmp {
+        /// The jmp_buf containing the saved context
+        env: Box<Expr>,
+        /// The value to return from setjmp (1 if 0 is passed)
+        val: Box<Expr>,
+    },
 }
 
 // ============================================================================

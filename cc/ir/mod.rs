@@ -152,6 +152,10 @@ pub enum Opcode {
 
     // Optimization hints
     Unreachable, // Code path is never reached (undefined behavior if reached)
+
+    // Non-local jumps (setjmp/longjmp)
+    Setjmp,  // Save execution context, returns 0 or value from longjmp
+    Longjmp, // Restore execution context (never returns)
 }
 
 impl Opcode {
@@ -159,7 +163,12 @@ impl Opcode {
     pub fn is_terminator(&self) -> bool {
         matches!(
             self,
-            Opcode::Ret | Opcode::Br | Opcode::Cbr | Opcode::Switch | Opcode::Unreachable
+            Opcode::Ret
+                | Opcode::Br
+                | Opcode::Cbr
+                | Opcode::Switch
+                | Opcode::Unreachable
+                | Opcode::Longjmp
         )
     }
 
@@ -235,6 +244,8 @@ impl Opcode {
             Opcode::Ctz64 => "ctz64",
             Opcode::Alloca => "alloca",
             Opcode::Unreachable => "unreachable",
+            Opcode::Setjmp => "setjmp",
+            Opcode::Longjmp => "longjmp",
         }
     }
 }
@@ -464,6 +475,9 @@ pub struct Instruction {
     /// For calls: true if this call returns a large struct via sret (hidden pointer arg).
     /// The first element of `src` is the sret pointer when this is true.
     pub is_sret_call: bool,
+    /// For calls: true if the called function is noreturn (never returns).
+    /// Code after a noreturn call is unreachable.
+    pub is_noreturn_call: bool,
     /// Source position for debug info
     pub pos: Option<Position>,
 }
@@ -487,6 +501,7 @@ impl Default for Instruction {
             arg_types: Vec::new(),
             variadic_arg_start: None,
             is_sret_call: false,
+            is_noreturn_call: false,
             pos: None,
         }
     }
@@ -951,6 +966,8 @@ pub struct Function {
     pub max_dom_level: u32,
     /// Is this function static (internal linkage)?
     pub is_static: bool,
+    /// Is this function noreturn (never returns)?
+    pub is_noreturn: bool,
 }
 
 impl Default for Function {
@@ -965,6 +982,7 @@ impl Default for Function {
             locals: HashMap::new(),
             max_dom_level: 0,
             is_static: false,
+            is_noreturn: false,
         }
     }
 }

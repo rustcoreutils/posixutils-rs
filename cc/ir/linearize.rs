@@ -724,6 +724,7 @@ impl<'a> Linearizer<'a> {
         let is_static = modifiers.contains(TypeModifiers::STATIC);
         let is_inline = modifiers.contains(TypeModifiers::INLINE);
         let is_extern = modifiers.contains(TypeModifiers::EXTERN);
+        let is_noreturn = modifiers.contains(TypeModifiers::NORETURN);
 
         // Track non-static inline functions for semantic restriction checks
         // C99 6.7.4: non-static inline functions have restrictions on
@@ -736,6 +737,7 @@ impl<'a> Linearizer<'a> {
         // - inline (without extern): inline definition only, internal linkage
         // - extern inline: external linkage (provides external definition)
         ir_func.is_static = is_static || (is_inline && !is_extern);
+        ir_func.is_noreturn = is_noreturn;
 
         let ret_kind = self.types.kind(func.return_type);
         // Check if function returns a large struct
@@ -2235,18 +2237,19 @@ impl<'a> Linearizer<'a> {
 
         let typ = self.expr_type(expr); // Use evaluated type (function return type)
 
-        // Check if this is a variadic function call
-        // If the function expression has a type, check its variadic flag
-        let variadic_arg_start = if let Some(func_type) = func_expr.typ {
+        // Check if this is a variadic function call and if it's noreturn
+        // If the function expression has a type, check its variadic and noreturn flags
+        let (variadic_arg_start, is_noreturn_call) = if let Some(func_type) = func_expr.typ {
             let ft = self.types.get(func_type);
-            if ft.variadic {
+            let variadic = if ft.variadic {
                 // Variadic args start after the fixed parameters
                 ft.params.as_ref().map(|p| p.len())
             } else {
                 None
-            }
+            };
+            (variadic, ft.noreturn)
         } else {
-            None // No type info, assume non-variadic
+            (None, false) // No type info, assume non-variadic and returns
         };
 
         // Check if function returns a large struct
@@ -2328,6 +2331,7 @@ impl<'a> Linearizer<'a> {
             );
             call_insn.variadic_arg_start = variadic_arg_start;
             call_insn.is_sret_call = true;
+            call_insn.is_noreturn_call = is_noreturn_call;
             self.emit(call_insn);
             // Return the symbol (address) where struct is stored
             result_sym
@@ -2342,6 +2346,7 @@ impl<'a> Linearizer<'a> {
                 ret_size,
             );
             call_insn.variadic_arg_start = variadic_arg_start;
+            call_insn.is_noreturn_call = is_noreturn_call;
             self.emit(call_insn);
             result_sym
         }
@@ -3057,6 +3062,33 @@ impl<'a> Linearizer<'a> {
                 let insn = Instruction::new(Opcode::Unreachable)
                     .with_target(result)
                     .with_type(self.types.void_id);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::Setjmp { env } => {
+                // setjmp(env) - saves execution context, returns int
+                let env_val = self.linearize_expr(env);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::Setjmp)
+                    .with_target(result)
+                    .with_src(env_val)
+                    .with_type_and_size(self.types.int_id, 32);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::Longjmp { env, val } => {
+                // longjmp(env, val) - restores execution context (never returns)
+                let env_val = self.linearize_expr(env);
+                let val_val = self.linearize_expr(val);
+                let result = self.alloc_pseudo();
+
+                let mut insn = Instruction::new(Opcode::Longjmp);
+                insn.target = Some(result);
+                insn.src = vec![env_val, val_val];
+                insn.typ = Some(self.types.void_id);
                 self.emit(insn);
                 result
             }

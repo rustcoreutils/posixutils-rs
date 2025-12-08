@@ -62,6 +62,8 @@ fn is_root(op: Opcode) -> bool {
             | Opcode::VaCopy
             | Opcode::VaArg
             | Opcode::Alloca
+            | Opcode::Setjmp  // Has side effects (saves context)
+            | Opcode::Longjmp // Never returns (noreturn)
     )
 }
 

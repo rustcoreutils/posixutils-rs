@@ -143,6 +143,19 @@ impl AttributeList {
     pub fn push(&mut self, attr: Attribute) {
         self.attrs.push(attr);
     }
+
+    /// Check if this attribute list contains a noreturn attribute
+    /// (either "noreturn" or "__noreturn__")
+    pub fn has_noreturn(&self) -> bool {
+        self.attrs
+            .iter()
+            .any(|a| a.name == "noreturn" || a.name == "__noreturn__")
+    }
+
+    /// Merge another attribute list into this one
+    pub fn merge(&mut self, other: AttributeList) {
+        self.attrs.extend(other.attrs);
+    }
 }
 
 impl fmt::Display for AttributeList {
@@ -2045,6 +2058,35 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
+                        "setjmp" | "_setjmp" => {
+                            // setjmp(env) - saves execution context, returns int
+                            // Returns 0 on direct call, non-zero when returning via longjmp
+                            self.expect_special(b'(')?;
+                            let env = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::Setjmp { env: Box::new(env) },
+                                self.types.int_id,
+                                token_pos,
+                            ));
+                        }
+                        "longjmp" | "_longjmp" => {
+                            // longjmp(env, val) - restores execution context (never returns)
+                            // Causes corresponding setjmp to return val (or 1 if val == 0)
+                            self.expect_special(b'(')?;
+                            let env = self.parse_assignment_expr()?;
+                            self.expect_special(b',')?;
+                            let val = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::Longjmp {
+                                    env: Box::new(env),
+                                    val: Box::new(val),
+                                },
+                                self.types.void_id,
+                                token_pos,
+                            ));
+                        }
                         _ => {}
                     }
 
@@ -2683,6 +2725,8 @@ impl Parser<'_> {
                     | "register"
                     | "typedef"
                     | "inline"
+                    | "_Noreturn"
+                    | "__noreturn__"
                     | "struct"
                     | "union"
                     | "enum"
@@ -2858,6 +2902,10 @@ impl Parser<'_> {
                 "inline" => {
                     self.advance();
                     modifiers |= TypeModifiers::INLINE;
+                }
+                "_Noreturn" | "__noreturn__" => {
+                    self.advance();
+                    modifiers |= TypeModifiers::NORETURN;
                 }
                 "signed" => {
                     self.advance();
@@ -3337,6 +3385,7 @@ impl Parser<'_> {
                     array_size: size,
                     params: None,
                     variadic: false,
+                    noreturn: false,
                     composite: None,
                 };
                 result_type_id = self.types.intern(arr_type);
@@ -3351,6 +3400,7 @@ impl Parser<'_> {
                     array_size: None,
                     params: None,
                     variadic: false,
+                    noreturn: false,
                     composite: None,
                 };
                 result_type_id = self.types.intern(ptr_type);
@@ -3375,6 +3425,7 @@ impl Parser<'_> {
                     array_size: None,
                     params: None,
                     variadic: false,
+                    noreturn: false,
                     composite: None,
                 };
                 result_type_id = self.types.intern(ptr_type);
@@ -3390,6 +3441,7 @@ impl Parser<'_> {
                     array_size: size,
                     params: None,
                     variadic: false,
+                    noreturn: false,
                     composite: None,
                 };
                 result_type_id = self.types.intern(arr_type);
@@ -3417,6 +3469,7 @@ impl Parser<'_> {
                     array_size: None,
                     params: None,
                     variadic: false,
+                    noreturn: false,
                     composite: None,
                 };
                 self.types.intern(ptr_type)
@@ -3433,6 +3486,7 @@ impl Parser<'_> {
                     array_size: decl_array_size,
                     params: None,
                     variadic: false,
+                    noreturn: false,
                     composite: None,
                 };
                 self.types.intern(arr_type)
@@ -3489,6 +3543,7 @@ impl Parser<'_> {
                 params: None,
                 variadic: false,
                 composite: None,
+                noreturn: false,
             };
             ret_type_id = self.types.intern(ptr_type);
         }
@@ -3608,6 +3663,7 @@ impl Parser<'_> {
                     array_size: None,
                     params: None,
                     variadic: false,
+                    noreturn: false,
                     composite: None,
                 };
                 typ_id = self.types.intern(ptr_type);
@@ -3649,6 +3705,7 @@ impl Parser<'_> {
                     array_size: None,
                     params: None,
                     variadic: false,
+                    noreturn: false,
                     composite: None,
                 };
                 typ_id = self.types.intern(ptr_type);
@@ -3787,6 +3844,7 @@ impl Parser<'_> {
                 array_size: None,
                 params: None,
                 variadic: false,
+                noreturn: false,
                 composite: None,
             };
             typ_id = self.types.intern(ptr_type);
@@ -3852,14 +3910,23 @@ impl Parser<'_> {
             let (params, variadic) = self.parse_parameter_list()?;
             self.expect_special(b')')?;
 
-            // Skip any __attribute__ after parameter list
-            self.skip_extensions();
+            // Parse __attribute__ after parameter list (e.g., __attribute__((noreturn)))
+            let attrs = self.parse_attributes();
+            // noreturn can come from __attribute__((noreturn)) or _Noreturn keyword in base type
+            let base_type = self.types.get(typ_id);
+            let is_noreturn =
+                attrs.has_noreturn() || base_type.modifiers.contains(TypeModifiers::NORETURN);
 
             if self.is_special(b'{') {
                 // Function definition
                 // Add function to symbol table so it can be called by other functions
                 let param_type_ids: Vec<TypeId> = params.iter().map(|p| p.typ).collect();
-                let func_type = Type::function(typ_id, param_type_ids.clone(), variadic);
+                let func_type = Type::function_with_attrs(
+                    typ_id,
+                    param_type_ids.clone(),
+                    variadic,
+                    is_noreturn,
+                );
                 let func_type_id = self.types.intern(func_type);
                 let func_sym = Symbol::function(name, func_type_id, self.symbols.depth());
                 let _ = self.symbols.declare(func_sym);
@@ -3893,7 +3960,8 @@ impl Parser<'_> {
                 // Function declaration
                 self.expect_special(b';')?;
                 let param_type_ids: Vec<TypeId> = params.iter().map(|p| p.typ).collect();
-                let func_type = Type::function(typ_id, param_type_ids, variadic);
+                let func_type =
+                    Type::function_with_attrs(typ_id, param_type_ids, variadic, is_noreturn);
                 let func_type_id = self.types.intern(func_type);
                 // Add function declaration to symbol table so the variadic flag
                 // is available when the function is called

@@ -319,6 +319,33 @@ pub enum ExprKind {
         arg: Box<Expr>,
     },
 
+    // =========================================================================
+    // Count trailing zeros builtins
+    // =========================================================================
+    /// __builtin_ctz(x)
+    /// Returns the number of trailing 0-bits in x (32-bit unsigned int)
+    /// Result is undefined if x is 0
+    Ctz {
+        /// The value to count trailing zeros in
+        arg: Box<Expr>,
+    },
+
+    /// __builtin_ctzl(x)
+    /// Returns the number of trailing 0-bits in x (unsigned long)
+    /// Result is undefined if x is 0
+    Ctzl {
+        /// The value to count trailing zeros in
+        arg: Box<Expr>,
+    },
+
+    /// __builtin_ctzll(x)
+    /// Returns the number of trailing 0-bits in x (unsigned long long)
+    /// Result is undefined if x is 0
+    Ctzll {
+        /// The value to count trailing zeros in
+        arg: Box<Expr>,
+    },
+
     /// __builtin_alloca(size)
     /// Allocates size bytes on the stack, returns pointer
     Alloca {

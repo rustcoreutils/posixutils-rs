@@ -416,3 +416,158 @@ if (__builtin_types_compatible_p(int*, char*)) {
 
 **Standard Header Compatibility**:
 This builtin is compatible with GCC and Clang. It is commonly used in conjunction with `typeof()` for type-generic programming.
+
+## Count Trailing Zeros Builtins
+
+These builtins count the number of trailing zero bits in an integer value.
+
+### `__builtin_ctz(x)`
+
+**Signature**: `int __builtin_ctz(unsigned int x)`
+
+**Purpose**: Returns the number of trailing 0-bits in `x`, starting from the least significant bit position. If `x` is 0, the result is undefined.
+
+**Parameters**:
+- `x`: An unsigned int to count trailing zeros in
+
+**Returns**: The count of trailing zero bits (0 to 31).
+
+**Example**: `__builtin_ctz(8)` returns `3` because 8 = 0b1000 has 3 trailing zeros.
+
+**Usage**:
+```c
+unsigned int val = 40;  // 0b101000
+int zeros = __builtin_ctz(val);  // Returns 3
+```
+
+**Implementation**:
+- x86-64: Uses `bsf` (bit scan forward) instruction
+- AArch64: Uses `rbit` followed by `clz` (reverse bits, then count leading zeros)
+
+### `__builtin_ctzl(x)`
+
+**Signature**: `int __builtin_ctzl(unsigned long x)`
+
+**Purpose**: Returns the number of trailing 0-bits in `x`. If `x` is 0, the result is undefined.
+
+**Parameters**:
+- `x`: An unsigned long to count trailing zeros in
+
+**Returns**: The count of trailing zero bits (0 to 63 on LP64 systems).
+
+**Usage**:
+```c
+unsigned long val = 1UL << 40;
+int zeros = __builtin_ctzl(val);  // Returns 40
+```
+
+### `__builtin_ctzll(x)`
+
+**Signature**: `int __builtin_ctzll(unsigned long long x)`
+
+**Purpose**: Returns the number of trailing 0-bits in `x`. If `x` is 0, the result is undefined.
+
+**Parameters**:
+- `x`: An unsigned long long to count trailing zeros in
+
+**Returns**: The count of trailing zero bits (0 to 63).
+
+**Usage**:
+```c
+unsigned long long val = 0xFFFF000000000000ULL;  // 48 trailing zeros
+int zeros = __builtin_ctzll(val);  // Returns 48
+```
+
+### Common Use Cases
+
+**Finding the lowest set bit**:
+```c
+unsigned int lowest_bit = 1U << __builtin_ctz(x);
+```
+
+**Power of 2 detection** (combined with `__builtin_popcount` when available):
+```c
+// A number is a power of 2 if it has exactly one bit set
+// Alternatively: (x & (x - 1)) == 0 && x != 0
+```
+
+**Bit manipulation algorithms**:
+```c
+// Clear the lowest set bit
+x &= x - 1;
+
+// Get index of lowest set bit
+int idx = __builtin_ctz(x);
+```
+
+### Important Notes
+
+- **Undefined behavior for zero**: If the input is 0, the result is undefined. Always check for zero before calling if the input could be zero.
+- **Return type**: All three builtins return `int`, regardless of the input size.
+- **Portability**: These builtins are compatible with GCC and Clang.
+
+## Optimization Hints
+
+### `__builtin_unreachable()`
+
+**Signature**: `void __builtin_unreachable(void)`
+
+**Purpose**: Indicates to the compiler that the code path is never reached at runtime. If control flow actually reaches this point, the behavior is undefined.
+
+**Parameters**: None
+
+**Returns**: Does not return (void)
+
+**Important Notes**:
+- If this builtin is actually executed at runtime, it will trap with an undefined instruction (ud2 on x86-64, brk #1 on AArch64)
+- Use this to help the compiler optimize when you know certain code paths are impossible
+- Commonly used after a `switch` statement that handles all cases to indicate the `default` is unreachable
+
+**Usage**:
+```c
+enum State { START, RUNNING, DONE };
+
+void handle_state(enum State s) {
+    switch (s) {
+    case START:
+        init();
+        break;
+    case RUNNING:
+        process();
+        break;
+    case DONE:
+        cleanup();
+        break;
+    }
+    // If we get here with an invalid state, trap
+    __builtin_unreachable();
+}
+```
+
+**Common Use Cases**:
+
+**After exhaustive switch statements**:
+```c
+switch (value) {
+case 0: return "zero";
+case 1: return "one";
+case 2: return "two";
+default:
+    __builtin_unreachable();
+}
+```
+
+**Marking impossible conditions**:
+```c
+if (ptr == NULL) {
+    // We validated ptr earlier, this should never happen
+    __builtin_unreachable();
+}
+```
+
+**Implementation**:
+- x86-64: Emits `ud2` instruction (undefined instruction trap)
+- AArch64: Emits `brk #1` instruction (software breakpoint)
+
+**Standard Header Compatibility**:
+This builtin is compatible with GCC and Clang.

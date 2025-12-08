@@ -88,8 +88,6 @@ Not yet implemented (exceptions to C99, or features we want to add):
 - VLAs (variable-length arrays)
 - top builtins to implement:
   __builtin_expect
-  __builtin_clz / clzl / clzll
-  __builtin_ctz / ctzl / ctzll
   __sync_synchronize
   __sync_fetch_and_add (and maybe a couple of its siblings)
 - assembly peephole optimizations

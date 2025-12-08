@@ -143,6 +143,10 @@ pub enum Opcode {
     Bswap32, // Byte-swap 32-bit value
     Bswap64, // Byte-swap 64-bit value
 
+    // Count trailing zeros builtins
+    Ctz32, // Count trailing zeros in 32-bit value
+    Ctz64, // Count trailing zeros in 64-bit value
+
     // Stack allocation builtin
     Alloca, // Dynamic stack allocation
 
@@ -227,6 +231,8 @@ impl Opcode {
             Opcode::Bswap16 => "bswap16",
             Opcode::Bswap32 => "bswap32",
             Opcode::Bswap64 => "bswap64",
+            Opcode::Ctz32 => "ctz32",
+            Opcode::Ctz64 => "ctz64",
             Opcode::Alloca => "alloca",
             Opcode::Unreachable => "unreachable",
         }

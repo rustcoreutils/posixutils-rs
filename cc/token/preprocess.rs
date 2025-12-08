@@ -2329,9 +2329,13 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
                 | "__builtin_bswap16"
                 | "__builtin_bswap32"
                 | "__builtin_bswap64"
+                | "__builtin_ctz"
+                | "__builtin_ctzl"
+                | "__builtin_ctzll"
                 | "__builtin_alloca"
                 | "__builtin_constant_p"
                 | "__builtin_types_compatible_p"
+                | "__builtin_unreachable"
         );
 
         if supported {

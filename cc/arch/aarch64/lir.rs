@@ -475,6 +475,20 @@ pub enum Aarch64Inst {
         dst: Reg,
     },
 
+    /// RBIT - Reverse bits in register
+    Rbit {
+        size: OperandSize,
+        src: Reg,
+        dst: Reg,
+    },
+
+    /// CLZ - Count leading zeros
+    Clz {
+        size: OperandSize,
+        src: Reg,
+        dst: Reg,
+    },
+
     // ========================================================================
     // Comparison and Conditional
     // ========================================================================
@@ -1162,6 +1176,26 @@ impl EmitAsm for Aarch64Inst {
                 let _ = writeln!(
                     out,
                     "    rev16 {}, {}",
+                    dst.name_for_size(sz),
+                    src.name_for_size(sz)
+                );
+            }
+
+            Aarch64Inst::Rbit { size, src, dst } => {
+                let sz = size.bits().max(32);
+                let _ = writeln!(
+                    out,
+                    "    rbit {}, {}",
+                    dst.name_for_size(sz),
+                    src.name_for_size(sz)
+                );
+            }
+
+            Aarch64Inst::Clz { size, src, dst } => {
+                let sz = size.bits().max(32);
+                let _ = writeln!(
+                    out,
+                    "    clz {}, {}",
                     dst.name_for_size(sz),
                     src.name_for_size(sz)
                 );

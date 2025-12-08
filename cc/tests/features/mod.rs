@@ -12,6 +12,7 @@
 mod alloca;
 mod bswap;
 mod constant_p;
+mod ctz;
 mod debug;
 mod has_feature;
 mod inline;

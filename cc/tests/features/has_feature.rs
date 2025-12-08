@@ -41,6 +41,22 @@ int main(void) {
     return 6;
     #endif
 
+    #if !__has_builtin(__builtin_ctz)
+    return 7;
+    #endif
+
+    #if !__has_builtin(__builtin_ctzl)
+    return 8;
+    #endif
+
+    #if !__has_builtin(__builtin_ctzll)
+    return 9;
+    #endif
+
+    #if !__has_builtin(__builtin_unreachable)
+    return 10;
+    #endif
+
     return 0;
 }
 "#;

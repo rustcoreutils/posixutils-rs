@@ -1207,6 +1207,17 @@ impl Aarch64CodeGen {
                 self.emit_bswap64(insn, *total_frame);
             }
 
+            // ================================================================
+            // Count trailing zeros builtins
+            // ================================================================
+            Opcode::Ctz32 => {
+                self.emit_ctz32(insn, *total_frame);
+            }
+
+            Opcode::Ctz64 => {
+                self.emit_ctz64(insn, *total_frame);
+            }
+
             Opcode::Alloca => {
                 self.emit_alloca(insn, *total_frame);
             }
@@ -3595,6 +3606,102 @@ impl Aarch64CodeGen {
                 let adjusted = frame_size + off;
                 self.push_lir(Aarch64Inst::Str {
                     size: OperandSize::B64,
+                    src: scratch,
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::X29,
+                        offset: adjusted,
+                    },
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// Emit __builtin_ctz - count trailing zeros for 32-bit value
+    fn emit_ctz32(&mut self, insn: &Instruction, frame_size: i32) {
+        self.emit_ctz(insn, frame_size, OperandSize::B32);
+    }
+
+    /// Emit __builtin_ctzl/__builtin_ctzll - count trailing zeros for 64-bit value
+    fn emit_ctz64(&mut self, insn: &Instruction, frame_size: i32) {
+        self.emit_ctz(insn, frame_size, OperandSize::B64);
+    }
+
+    /// Emit count trailing zeros - shared implementation
+    /// On AArch64, CTZ is computed as CLZ(RBIT(x))
+    fn emit_ctz(&mut self, insn: &Instruction, frame_size: i32, src_size: OperandSize) {
+        let src = match insn.src.first() {
+            Some(&s) => s,
+            None => return,
+        };
+        let dst = match insn.target {
+            Some(t) => t,
+            None => return,
+        };
+
+        let src_loc = self.get_location(src);
+        let dst_loc = self.get_location(dst);
+        let scratch = Reg::X9;
+
+        // Load source into scratch register
+        match src_loc {
+            Loc::Reg(r) => {
+                self.push_lir(Aarch64Inst::Mov {
+                    size: src_size,
+                    src: GpOperand::Reg(r),
+                    dst: scratch,
+                });
+            }
+            Loc::Stack(off) => {
+                // FP-relative for alloca safety
+                let adjusted = frame_size + off;
+                self.push_lir(Aarch64Inst::Ldr {
+                    size: src_size,
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::X29,
+                        offset: adjusted,
+                    },
+                    dst: scratch,
+                });
+            }
+            Loc::Imm(v) => {
+                self.push_lir(Aarch64Inst::Mov {
+                    size: src_size,
+                    src: GpOperand::Imm(v),
+                    dst: scratch,
+                });
+            }
+            _ => return,
+        }
+
+        // Reverse bits: RBIT
+        self.push_lir(Aarch64Inst::Rbit {
+            size: src_size,
+            src: scratch,
+            dst: scratch,
+        });
+
+        // Count leading zeros: CLZ - this gives us the count of trailing zeros
+        self.push_lir(Aarch64Inst::Clz {
+            size: src_size,
+            src: scratch,
+            dst: scratch,
+        });
+
+        // Store result (return type is int, always 32-bit)
+        match dst_loc {
+            Loc::Reg(r) => {
+                self.push_lir(Aarch64Inst::Mov {
+                    size: OperandSize::B32,
+                    src: GpOperand::Reg(scratch),
+                    dst: r,
+                });
+            }
+            Loc::Stack(off) => {
+                // FP-relative for alloca safety
+                let adjusted = frame_size + off;
+                self.push_lir(Aarch64Inst::Str {
+                    size: OperandSize::B32,
                     src: scratch,
                     addr: MemAddr::BaseOffset {
                         base: Reg::X29,

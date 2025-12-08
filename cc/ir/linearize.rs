@@ -3006,6 +3006,37 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
+            // ================================================================
+            // Count trailing zeros builtins
+            // ================================================================
+            ExprKind::Ctz { arg } => {
+                // __builtin_ctz - counts trailing zeros in unsigned int (32-bit)
+                let arg_val = self.linearize_expr(arg);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::Ctz32)
+                    .with_target(result)
+                    .with_src(arg_val)
+                    .with_size(32)
+                    .with_type(self.types.int_id);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::Ctzl { arg } | ExprKind::Ctzll { arg } => {
+                // __builtin_ctzl/ctzll - counts trailing zeros in 64-bit value
+                let arg_val = self.linearize_expr(arg);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::Ctz64)
+                    .with_target(result)
+                    .with_src(arg_val)
+                    .with_size(64)
+                    .with_type(self.types.int_id);
+                self.emit(insn);
+                result
+            }
+
             ExprKind::Alloca { size } => {
                 let size_val = self.linearize_expr(size);
                 let result = self.alloc_pseudo();

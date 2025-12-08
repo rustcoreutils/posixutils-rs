@@ -932,6 +932,17 @@ impl X86_64CodeGen {
                 self.emit_bswap64(insn);
             }
 
+            // ================================================================
+            // Count trailing zeros builtins
+            // ================================================================
+            Opcode::Ctz32 => {
+                self.emit_ctz32(insn);
+            }
+
+            Opcode::Ctz64 => {
+                self.emit_ctz64(insn);
+            }
+
             Opcode::Alloca => {
                 self.emit_alloca(insn);
             }
@@ -4266,6 +4277,92 @@ impl X86_64CodeGen {
             Loc::Stack(off) => {
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B64,
+                    src: GpOperand::Reg(Reg::Rax),
+                    dst: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset: off,
+                    }),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// Emit __builtin_ctz - count trailing zeros for 32-bit value
+    fn emit_ctz32(&mut self, insn: &Instruction) {
+        self.emit_ctz(insn, OperandSize::B32);
+    }
+
+    /// Emit __builtin_ctzl/__builtin_ctzll - count trailing zeros for 64-bit value
+    fn emit_ctz64(&mut self, insn: &Instruction) {
+        self.emit_ctz(insn, OperandSize::B64);
+    }
+
+    /// Emit count trailing zeros - shared implementation
+    fn emit_ctz(&mut self, insn: &Instruction, src_size: OperandSize) {
+        let src = match insn.src.first() {
+            Some(&s) => s,
+            None => return,
+        };
+        let dst = match insn.target {
+            Some(t) => t,
+            None => return,
+        };
+
+        let src_loc = self.get_location(src);
+        let dst_loc = self.get_location(dst);
+
+        // BSF (bit scan forward) finds index of least significant set bit
+        // which is equivalent to count of trailing zeros
+        // Use RAX as scratch register
+        match src_loc {
+            Loc::Reg(r) => {
+                self.push_lir(X86Inst::Bsf {
+                    size: src_size,
+                    src: GpOperand::Reg(r),
+                    dst: Reg::Rax,
+                });
+            }
+            Loc::Stack(off) => {
+                self.push_lir(X86Inst::Bsf {
+                    size: src_size,
+                    src: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset: off,
+                    }),
+                    dst: Reg::Rax,
+                });
+            }
+            Loc::Imm(v) => {
+                // Load immediate first, then BSF
+                self.push_lir(X86Inst::Mov {
+                    size: src_size,
+                    src: GpOperand::Imm(v),
+                    dst: GpOperand::Reg(Reg::Rax),
+                });
+                self.push_lir(X86Inst::Bsf {
+                    size: src_size,
+                    src: GpOperand::Reg(Reg::Rax),
+                    dst: Reg::Rax,
+                });
+            }
+            _ => return,
+        }
+
+        // Store result (return type is int, always 32-bit)
+        match dst_loc {
+            Loc::Reg(r) => {
+                if r != Reg::Rax {
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B32,
+                        src: GpOperand::Reg(Reg::Rax),
+                        dst: GpOperand::Reg(r),
+                    });
+                }
+            }
+            Loc::Stack(off) => {
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B32,
                     src: GpOperand::Reg(Reg::Rax),
                     dst: GpOperand::Mem(MemAddr::BaseOffset {
                         base: Reg::Rbp,

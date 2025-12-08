@@ -652,10 +652,12 @@ impl RegAlloc {
         let mut intervals: HashMap<PseudoId, IntervalInfo> = HashMap::new();
         let mut pos = 0usize;
 
-        // First pass: compute block end positions
+        // First pass: compute block start and end positions
+        let mut block_start_pos: HashMap<BasicBlockId, usize> = HashMap::new();
         let mut block_end_pos: HashMap<BasicBlockId, usize> = HashMap::new();
         let mut temp_pos = 0usize;
         for block in &func.blocks {
+            block_start_pos.insert(block.id, temp_pos);
             temp_pos += block.insns.len();
             block_end_pos.insert(block.id, temp_pos.saturating_sub(1));
         }
@@ -742,6 +744,43 @@ impl RegAlloc {
                             last_use: end_pos,
                         },
                     );
+                }
+            }
+        }
+
+        // Handle loop back edges
+        let mut loop_back_edges: Vec<(BasicBlockId, BasicBlockId, usize)> = Vec::new();
+        for block in &func.blocks {
+            if let Some(last_insn) = block.insns.last() {
+                let mut targets = Vec::new();
+                if let Some(target) = last_insn.bb_true {
+                    targets.push(target);
+                }
+                if let Some(target) = last_insn.bb_false {
+                    targets.push(target);
+                }
+
+                let from_start = block_start_pos.get(&block.id).copied().unwrap_or(0);
+                for target_bb in targets {
+                    let target_start = block_start_pos.get(&target_bb).copied().unwrap_or(0);
+                    if target_start < from_start {
+                        let from_end = block_end_pos.get(&block.id).copied().unwrap_or(0);
+                        loop_back_edges.push((block.id, target_bb, from_end));
+                    }
+                }
+            }
+        }
+
+        // Extend lifetimes for loop variables
+        for (_from_bb, to_bb, back_edge_pos) in &loop_back_edges {
+            let loop_start = block_start_pos.get(to_bb).copied().unwrap_or(0);
+
+            for info in intervals.values_mut() {
+                if info.first_def < loop_start
+                    && info.last_use >= loop_start
+                    && info.last_use <= *back_edge_pos
+                {
+                    info.last_use = info.last_use.max(*back_edge_pos);
                 }
             }
         }

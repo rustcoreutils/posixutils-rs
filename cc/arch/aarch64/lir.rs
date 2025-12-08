@@ -13,7 +13,7 @@
 // enabling peephole optimizations before final assembly emission.
 //
 
-use super::codegen::{Reg, VReg};
+use super::regalloc::{Reg, VReg};
 use crate::arch::lir::{Directive, EmitAsm, FpSize, Label, OperandSize, Symbol};
 use crate::target::{Os, Target};
 use std::fmt::{self, Write};

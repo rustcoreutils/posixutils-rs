@@ -804,12 +804,11 @@ impl RegAlloc {
             }
         }
 
-        // Extend phi source intervals
+        // Extend phi source intervals to end of their source block
         for (src_bb, pseudo) in phi_sources {
             if let Some(&end_pos) = block_end_pos.get(&src_bb) {
                 if let Some(info) = intervals.get_mut(&pseudo) {
                     info.last_use = info.last_use.max(end_pos);
-                    info.last_def = info.last_def.max(end_pos);
                 } else {
                     intervals.insert(
                         pseudo,

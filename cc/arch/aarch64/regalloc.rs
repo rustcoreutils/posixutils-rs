@@ -370,6 +370,82 @@ impl VReg {
         }
     }
 
+    /// Get 8-bit (byte) register name for vector operations
+    pub fn name_b(&self) -> &'static str {
+        match self {
+            VReg::V0 => "b0",
+            VReg::V1 => "b1",
+            VReg::V2 => "b2",
+            VReg::V3 => "b3",
+            VReg::V4 => "b4",
+            VReg::V5 => "b5",
+            VReg::V6 => "b6",
+            VReg::V7 => "b7",
+            VReg::V8 => "b8",
+            VReg::V9 => "b9",
+            VReg::V10 => "b10",
+            VReg::V11 => "b11",
+            VReg::V12 => "b12",
+            VReg::V13 => "b13",
+            VReg::V14 => "b14",
+            VReg::V15 => "b15",
+            VReg::V16 => "b16",
+            VReg::V17 => "b17",
+            VReg::V18 => "b18",
+            VReg::V19 => "b19",
+            VReg::V20 => "b20",
+            VReg::V21 => "b21",
+            VReg::V22 => "b22",
+            VReg::V23 => "b23",
+            VReg::V24 => "b24",
+            VReg::V25 => "b25",
+            VReg::V26 => "b26",
+            VReg::V27 => "b27",
+            VReg::V28 => "b28",
+            VReg::V29 => "b29",
+            VReg::V30 => "b30",
+            VReg::V31 => "b31",
+        }
+    }
+
+    /// Get full vector register name (v0-v31)
+    pub fn name_v(&self) -> &'static str {
+        match self {
+            VReg::V0 => "v0",
+            VReg::V1 => "v1",
+            VReg::V2 => "v2",
+            VReg::V3 => "v3",
+            VReg::V4 => "v4",
+            VReg::V5 => "v5",
+            VReg::V6 => "v6",
+            VReg::V7 => "v7",
+            VReg::V8 => "v8",
+            VReg::V9 => "v9",
+            VReg::V10 => "v10",
+            VReg::V11 => "v11",
+            VReg::V12 => "v12",
+            VReg::V13 => "v13",
+            VReg::V14 => "v14",
+            VReg::V15 => "v15",
+            VReg::V16 => "v16",
+            VReg::V17 => "v17",
+            VReg::V18 => "v18",
+            VReg::V19 => "v19",
+            VReg::V20 => "v20",
+            VReg::V21 => "v21",
+            VReg::V22 => "v22",
+            VReg::V23 => "v23",
+            VReg::V24 => "v24",
+            VReg::V25 => "v25",
+            VReg::V26 => "v26",
+            VReg::V27 => "v27",
+            VReg::V28 => "v28",
+            VReg::V29 => "v29",
+            VReg::V30 => "v30",
+            VReg::V31 => "v31",
+        }
+    }
+
     /// Is this a callee-saved FP register?
     /// AAPCS64: v8-v15 (lower 64 bits) are callee-saved
     pub fn is_callee_saved(&self) -> bool {

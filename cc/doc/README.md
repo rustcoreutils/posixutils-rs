@@ -8,7 +8,9 @@ This directory contains detailed documentation for the pcc C compiler.
 |----------|-------------|
 | [ATTR.md](ATTR.md) | Function attributes (`__attribute__`, `_Noreturn`, `__has_attribute`) |
 | [BUILTIN.md](BUILTIN.md) | Compiler builtin functions (`__builtin_*`) |
+| [C99.md](C99.md) | C99 compliance status and remaining work |
 | [TODO.md](TODO.md) | Technical debt, future features, and optimization passes |
+| [BUGS.md](BUGS.md) | Known bugs (parse errors on valid C99 code) |
 
 ## Quick Links
 
@@ -24,9 +26,20 @@ This directory contains detailed documentation for the pcc C compiler.
   - Byte swapping (`__builtin_bswap16/32/64`)
   - Introspection (`__builtin_constant_p`, `__builtin_types_compatible_p`)
   - Stack allocation (`__builtin_alloca`)
-  - Bit operations (`__builtin_ctz`, `__builtin_ctzl`, `__builtin_ctzll`)
+  - Bit operations (`__builtin_ctz/clz/popcount` families)
   - Control flow (`__builtin_unreachable`)
   - Non-local jumps (`setjmp`, `longjmp`)
+
+### Compliance & Status
+
+- **C99 Compliance**: [C99.md](C99.md)
+  - Missing features (compound literals, VLAs, `_Complex`)
+  - Partial implementations
+  - Implementation roadmap
+
+- **Known Bugs**: [BUGS.md](BUGS.md)
+  - Parse errors on valid C99 code
+  - Codegen bugs
 
 ### Development
 

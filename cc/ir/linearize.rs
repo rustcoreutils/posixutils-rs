@@ -1628,8 +1628,19 @@ impl<'a> Linearizer<'a> {
                     BinaryOp::BitAnd => Some(l & r),
                     BinaryOp::BitOr => Some(l | r),
                     BinaryOp::BitXor => Some(l ^ r),
-                    BinaryOp::Shl => Some(l << (r as u32)),
-                    BinaryOp::Shr => Some(l >> (r as u32)),
+                    BinaryOp::Shl | BinaryOp::Shr => {
+                        // Mask shift amount to match C semantics and target hardware behavior.
+                        // After C integer promotion: 8/16/32-bit types use 32-bit shifts (mask 31),
+                        // 64-bit types use 64-bit shifts (mask 63).
+                        let size_bits = left.typ.map(|t| self.types.size_bits(t)).unwrap_or(32);
+                        let mask = if size_bits > 32 { 63 } else { 31 };
+                        let shift_amt = (r & mask) as u32;
+                        match op {
+                            BinaryOp::Shl => Some(l << shift_amt),
+                            BinaryOp::Shr => Some(l >> shift_amt),
+                            _ => unreachable!(),
+                        }
+                    }
                     BinaryOp::Lt => Some(if l < r { 1 } else { 0 }),
                     BinaryOp::Le => Some(if l <= r { 1 } else { 0 }),
                     BinaryOp::Gt => Some(if l > r { 1 } else { 0 }),

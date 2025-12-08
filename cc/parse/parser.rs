@@ -151,11 +151,6 @@ impl AttributeList {
             .iter()
             .any(|a| a.name == "noreturn" || a.name == "__noreturn__")
     }
-
-    /// Merge another attribute list into this one
-    pub fn merge(&mut self, other: AttributeList) {
-        self.attrs.extend(other.attrs);
-    }
 }
 
 impl fmt::Display for AttributeList {

@@ -512,6 +512,8 @@ impl RegAlloc {
         self.allocate_arguments(func, types);
 
         let intervals = self.compute_live_intervals(func);
+
+        self.spill_args_across_calls(func, &intervals);
         self.run_linear_scan(func, types, intervals);
 
         self.locations.clone()
@@ -579,6 +581,59 @@ impl RegAlloc {
                             int_arg_idx += 1;
                         }
                         break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Spill arguments in caller-saved registers if their interval crosses a call
+    fn spill_args_across_calls(&mut self, func: &Function, intervals: &[LiveInterval]) {
+        // Find all call positions
+        let mut call_positions: Vec<usize> = Vec::new();
+        let mut pos = 0usize;
+        for block in &func.blocks {
+            for insn in &block.insns {
+                if insn.op == Opcode::Call {
+                    call_positions.push(pos);
+                }
+                pos += 1;
+            }
+        }
+
+        // Check GP arguments in caller-saved registers (x0-x7)
+        let int_arg_regs_set: Vec<Reg> = Reg::arg_regs().to_vec();
+        for interval in intervals {
+            if let Some(Loc::Reg(reg)) = self.locations.get(&interval.pseudo) {
+                if int_arg_regs_set.contains(reg) {
+                    let crosses_call = call_positions
+                        .iter()
+                        .any(|&call_pos| interval.start <= call_pos && call_pos < interval.end);
+                    if crosses_call {
+                        let reg_to_restore = *reg;
+                        self.stack_offset += 8;
+                        self.locations
+                            .insert(interval.pseudo, Loc::Stack(-self.stack_offset));
+                        self.free_regs.push(reg_to_restore);
+                    }
+                }
+            }
+        }
+
+        // Check FP arguments in caller-saved registers (v0-v7)
+        let fp_arg_regs_set: Vec<VReg> = VReg::arg_regs().to_vec();
+        for interval in intervals {
+            if let Some(Loc::VReg(reg)) = self.locations.get(&interval.pseudo) {
+                if fp_arg_regs_set.contains(reg) {
+                    let crosses_call = call_positions
+                        .iter()
+                        .any(|&call_pos| interval.start <= call_pos && call_pos < interval.end);
+                    if crosses_call {
+                        let reg_to_restore = *reg;
+                        self.stack_offset += 8;
+                        self.locations
+                            .insert(interval.pseudo, Loc::Stack(-self.stack_offset));
+                        self.free_fp_regs.push(reg_to_restore);
                     }
                 }
             }

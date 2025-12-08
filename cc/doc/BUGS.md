@@ -80,26 +80,6 @@ parse error: unexpected token in expression
 
 ## Semantic/Codegen Bugs
 
-### `__func__` Generates Incorrect Code
-
-**Status**: Wrong code generated
-
-**Valid C99 Code**:
-```c
-int main(void) {
-    const char *name = __func__;
-    return 0;
-}
-```
-
-**Expected Behavior**: `__func__` should be implicitly defined as `static const char __func__[] = "main";`
-
-**Actual Behavior**: Generates reference to undefined global `___func__`
-
-**C99 Reference**: 6.4.2.2
-
----
-
 ### VLAs Allocate Fixed Storage
 
 **Status**: Wrong code generated

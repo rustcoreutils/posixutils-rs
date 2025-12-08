@@ -14,7 +14,7 @@ use super::ssa::ssa_convert;
 use super::{
     BasicBlock, BasicBlockId, Function, Initializer, Instruction, Module, Opcode, Pseudo, PseudoId,
 };
-use crate::diag::Position;
+use crate::diag::{error, Position};
 use crate::parse::ast::{
     AssignOp, BinaryOp, BlockItem, Declaration, Designator, Expr, ExprKind, ExternalDecl, ForInit,
     FunctionDef, InitElement, Stmt, TranslationUnit, UnaryOp,
@@ -92,6 +92,11 @@ pub struct Linearizer<'a> {
     current_pos: Option<Position>,
     /// Target configuration (architecture, ABI details)
     target: &'a Target,
+    /// Whether current function is a non-static inline function
+    /// (used for enforcing C99 inline semantic restrictions)
+    current_func_is_non_static_inline: bool,
+    /// Set of file-scope static variable names (for inline semantic checks)
+    file_scope_statics: std::collections::HashSet<String>,
 }
 
 impl<'a> Linearizer<'a> {
@@ -124,6 +129,8 @@ impl<'a> Linearizer<'a> {
             static_locals: HashMap::new(),
             current_pos: None,
             target,
+            current_func_is_non_static_inline: false,
+            file_scope_statics: std::collections::HashSet::new(),
         }
     }
 
@@ -473,11 +480,8 @@ impl<'a> Linearizer<'a> {
             }
 
             // Skip extern declarations - they don't define storage
-            if self
-                .types
-                .modifiers(declarator.typ)
-                .contains(TypeModifiers::EXTERN)
-            {
+            let modifiers = self.types.modifiers(declarator.typ);
+            if modifiers.contains(TypeModifiers::EXTERN) {
                 continue;
             }
 
@@ -486,6 +490,12 @@ impl<'a> Linearizer<'a> {
             });
 
             let name = self.str(declarator.name).to_string();
+
+            // Track file-scope static variables for inline semantic checks
+            if modifiers.contains(TypeModifiers::STATIC) {
+                self.file_scope_statics.insert(name.clone());
+            }
+
             self.module.add_global(&name, declarator.typ, init);
         }
     }
@@ -710,12 +720,22 @@ impl<'a> Linearizer<'a> {
         // Note: static_locals is NOT cleared - it persists across functions
 
         // Create function
-        let is_static = self
-            .types
-            .modifiers(func.return_type)
-            .contains(TypeModifiers::STATIC);
+        let modifiers = self.types.modifiers(func.return_type);
+        let is_static = modifiers.contains(TypeModifiers::STATIC);
+        let is_inline = modifiers.contains(TypeModifiers::INLINE);
+        let is_extern = modifiers.contains(TypeModifiers::EXTERN);
+
+        // Track non-static inline functions for semantic restriction checks
+        // C99 6.7.4: non-static inline functions have restrictions on
+        // static variables they can access
+        self.current_func_is_non_static_inline = is_inline && !is_static;
+
         let mut ir_func = Function::new(self.str(func.name), func.return_type);
-        ir_func.is_static = is_static;
+        // For linkage:
+        // - static inline: internal linkage (same as static)
+        // - inline (without extern): inline definition only, internal linkage
+        // - extern inline: external linkage (provides external definition)
+        ir_func.is_static = is_static || (is_inline && !is_extern);
 
         let ret_kind = self.types.kind(func.return_type);
         // Check if function returns a large struct
@@ -1068,6 +1088,26 @@ impl<'a> Linearizer<'a> {
     /// Initialization happens once at program start (compile-time).
     fn linearize_static_local(&mut self, declarator: &crate::parse::ast::InitDeclarator) {
         let name_str = self.str(declarator.name).to_string();
+
+        // C99 6.7.4p3: A non-static inline function cannot define a non-const
+        // function-local static variable
+        if self.current_func_is_non_static_inline {
+            let is_const = self
+                .types
+                .modifiers(declarator.typ)
+                .contains(TypeModifiers::CONST);
+            if !is_const {
+                if let Some(pos) = self.current_pos {
+                    error(
+                        pos,
+                        &format!(
+                            "non-static inline function '{}' cannot define non-const static variable '{}'",
+                            self.current_func_name, name_str
+                        ),
+                    );
+                }
+            }
+        }
 
         // Generate unique global name: funcname.varname.counter
         let global_name = format!(
@@ -2702,6 +2742,21 @@ impl<'a> Linearizer<'a> {
         }
         // Global variable - create symbol reference and load
         else {
+            // C99 6.7.4p3: A non-static inline function cannot refer to
+            // a file-scope static variable
+            if self.current_func_is_non_static_inline && self.file_scope_statics.contains(&name_str)
+            {
+                if let Some(pos) = self.current_pos {
+                    error(
+                        pos,
+                        &format!(
+                            "non-static inline function '{}' cannot reference file-scope static variable '{}'",
+                            self.current_func_name, name_str
+                        ),
+                    );
+                }
+            }
+
             let sym_id = self.alloc_pseudo();
             let pseudo = Pseudo::sym(sym_id, name_str.clone());
             if let Some(func) = &mut self.current_func {

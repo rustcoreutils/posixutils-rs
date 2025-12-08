@@ -82,7 +82,7 @@ Supported:
 
 Not yet implemented (exceptions to C99, or features we want to add):
 - longjmp, setjmp
-- `inline` and inlining support
+- Actual inlining optimization (the `inline` keyword is supported but functions are not inlined)
 - multi-register returns (for structs larger than 8 bytes)
 - -fverbose-asm
 - VLAs (variable-length arrays)

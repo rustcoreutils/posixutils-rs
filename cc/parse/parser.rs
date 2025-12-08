@@ -2634,6 +2634,7 @@ impl Parser<'_> {
                     | "auto"
                     | "register"
                     | "typedef"
+                    | "inline"
                     | "struct"
                     | "union"
                     | "enum"

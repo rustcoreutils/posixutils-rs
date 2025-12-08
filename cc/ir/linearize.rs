@@ -32,6 +32,15 @@ struct LocalVarInfo {
     sym: PseudoId,
     /// Type of the variable
     typ: TypeId,
+    /// For VLAs: symbol holding the number of elements (for runtime sizeof)
+    /// This is stored in a hidden local variable so it survives SSA.
+    vla_size_sym: Option<PseudoId>,
+    /// For VLAs: the element type (for sizeof computation)
+    vla_elem_type: Option<TypeId>,
+    /// For multi-dimensional VLAs: symbols storing each dimension's size
+    /// For int arr[n][m], this contains [sym_for_n, sym_for_m]
+    /// These are needed to compute runtime strides for outer dimension access.
+    vla_dim_syms: Vec<PseudoId>,
 }
 
 /// Information about a static local variable
@@ -846,6 +855,9 @@ impl<'a> Linearizer<'a> {
                 LocalVarInfo {
                     sym: local_sym,
                     typ,
+                    vla_size_sym: None,
+                    vla_elem_type: None,
+                    vla_dim_syms: vec![],
                 },
             );
         }
@@ -1047,6 +1059,18 @@ impl<'a> Linearizer<'a> {
                 continue;
             }
 
+            // Check if this is a VLA (Variable Length Array)
+            if !declarator.vla_sizes.is_empty() {
+                // C99 6.7.8: VLAs cannot have initializers
+                if declarator.init.is_some() {
+                    if let Some(pos) = self.current_pos {
+                        error(pos, "variable length arrays cannot have initializers");
+                    }
+                }
+                self.linearize_vla_decl(declarator);
+                continue;
+            }
+
             // Create a symbol pseudo for this local variable (its address)
             // Use unique name (name#id) to distinguish shadowed variables for SSA
             let sym_id = self.alloc_pseudo();
@@ -1062,8 +1086,16 @@ impl<'a> Linearizer<'a> {
 
             // Track in linearizer's locals map
             let name_str = self.str(declarator.name).to_string();
-            self.locals
-                .insert(name_str, LocalVarInfo { sym: sym_id, typ });
+            self.locals.insert(
+                name_str,
+                LocalVarInfo {
+                    sym: sym_id,
+                    typ,
+                    vla_size_sym: None,
+                    vla_elem_type: None,
+                    vla_dim_syms: vec![],
+                },
+            );
 
             // If there's an initializer, emit Store(s)
             if let Some(init) = &declarator.init {
@@ -1081,6 +1113,154 @@ impl<'a> Linearizer<'a> {
                 }
             }
         }
+    }
+
+    /// Linearize a VLA (Variable Length Array) declaration
+    ///
+    /// VLAs are allocated on the stack at runtime using Alloca.
+    /// The size is computed as: product of all dimension sizes * sizeof(element_type)
+    ///
+    /// Unlike regular arrays where the symbol is the address of stack memory,
+    /// for VLAs we store the Alloca result (pointer) and then access it through
+    /// a pointer load. We create a pointer variable to hold the VLA address.
+    ///
+    /// We also create hidden local variables to store the dimension sizes
+    /// so that sizeof(vla) can be computed at runtime.
+    fn linearize_vla_decl(&mut self, declarator: &crate::parse::ast::InitDeclarator) {
+        let typ = declarator.typ;
+
+        // Get the innermost element type from the array type
+        // For int arr[n][m], we need int (not int[m])
+        let mut elem_type = typ;
+        while self.types.kind(elem_type) == TypeKind::Array {
+            elem_type = self.types.base_type(elem_type).unwrap_or(self.types.int_id);
+        }
+        let elem_size = self.types.size_bytes(elem_type) as i64;
+
+        let ulong_type = self.types.ulong_id;
+
+        // Evaluate all VLA size expressions, store each in a hidden local,
+        // and compute total element count.
+        // For int arr[n][m], we store n and m separately (for stride computation)
+        // and compute total_count = n * m.
+        let mut vla_dim_syms: Vec<PseudoId> = Vec::new();
+        let mut total_count: Option<PseudoId> = None;
+
+        for (dim_idx, vla_size_expr) in declarator.vla_sizes.iter().enumerate() {
+            let dim_size = self.linearize_expr(vla_size_expr);
+
+            // Create a hidden local to store this dimension's size
+            // This is needed for runtime stride computation in multi-dimensional VLAs
+            let dim_sym_id = self.alloc_pseudo();
+            let dim_var_name = format!("__vla_dim{}_{}#{}", dim_idx, declarator.name, dim_sym_id.0);
+            let dim_sym = Pseudo::sym(dim_sym_id, dim_var_name.clone());
+
+            if let Some(func) = &mut self.current_func {
+                func.add_pseudo(dim_sym);
+                func.add_local(
+                    &dim_var_name,
+                    dim_sym_id,
+                    ulong_type,
+                    false,
+                    self.current_bb,
+                );
+            }
+
+            // Store the dimension size
+            let store_dim_insn = Instruction::store(dim_size, dim_sym_id, 0, ulong_type, 64);
+            self.emit(store_dim_insn);
+            vla_dim_syms.push(dim_sym_id);
+
+            // Update running total count
+            total_count = Some(match total_count {
+                None => dim_size,
+                Some(prev) => {
+                    // Multiply: prev * dim_size
+                    let result = self.alloc_pseudo();
+                    let mul_insn = Instruction::new(Opcode::Mul)
+                        .with_target(result)
+                        .with_src(prev)
+                        .with_src(dim_size)
+                        .with_size(64);
+                    self.emit(mul_insn);
+                    result
+                }
+            });
+        }
+        let num_elements = total_count.expect("VLA must have at least one size expression");
+
+        // Create a hidden local variable to store the total number of elements
+        // This is needed for sizeof(vla) to work at runtime
+        let size_sym_id = self.alloc_pseudo();
+        let size_var_name = format!("__vla_size_{}#{}", declarator.name, size_sym_id.0);
+        let size_sym = Pseudo::sym(size_sym_id, size_var_name.clone());
+
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(size_sym);
+            func.add_local(
+                &size_var_name,
+                size_sym_id,
+                ulong_type,
+                false,
+                self.current_bb,
+            );
+        }
+
+        // Store num_elements into the hidden size variable
+        let store_size_insn = Instruction::store(num_elements, size_sym_id, 0, ulong_type, 64);
+        self.emit(store_size_insn);
+
+        // Compute total size in bytes: num_elements * sizeof(element)
+        let elem_size_const = self.emit_const(elem_size, self.types.long_id);
+        let total_size = self.alloc_pseudo();
+        let mul_insn = Instruction::new(Opcode::Mul)
+            .with_target(total_size)
+            .with_src(num_elements)
+            .with_src(elem_size_const)
+            .with_size(64);
+        self.emit(mul_insn);
+
+        // Emit Alloca instruction to allocate stack space
+        let alloca_result = self.alloc_pseudo();
+        let alloca_insn = Instruction::new(Opcode::Alloca)
+            .with_target(alloca_result)
+            .with_src(total_size)
+            .with_type_and_size(self.types.void_ptr_id, 64);
+        self.emit(alloca_insn);
+
+        // Create a symbol pseudo for the VLA pointer variable
+        // This symbol stores the pointer to the VLA memory (like a pointer variable)
+        let sym_id = self.alloc_pseudo();
+        let unique_name = format!("{}#{}", declarator.name, sym_id.0);
+        let sym = Pseudo::sym(sym_id, unique_name.clone());
+
+        // Create a pointer type for the VLA (pointer to element type)
+        let ptr_type = self.types.pointer_to(elem_type);
+
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(sym);
+            // Register as a pointer variable, not as the array type
+            let is_volatile = self.types.modifiers(typ).contains(TypeModifiers::VOLATILE);
+            func.add_local(&unique_name, sym_id, ptr_type, is_volatile, self.current_bb);
+        }
+
+        // Store the Alloca result (pointer) into the VLA symbol
+        let store_insn = Instruction::store(alloca_result, sym_id, 0, ptr_type, 64);
+        self.emit(store_insn);
+
+        // Track in linearizer's locals map with pointer type and VLA size info
+        // This makes arr[i] behave like ptr[i] - load ptr, then offset
+        let name_str = self.str(declarator.name).to_string();
+        self.locals.insert(
+            name_str,
+            LocalVarInfo {
+                sym: sym_id,
+                typ: ptr_type,
+                vla_size_sym: Some(size_sym_id),
+                vla_elem_type: Some(elem_type),
+                vla_dim_syms,
+            },
+        );
     }
 
     /// Linearize a static local variable declaration
@@ -1137,6 +1317,9 @@ impl<'a> Linearizer<'a> {
                 // Use a sentinel value - we'll handle static locals specially
                 sym: PseudoId(u32::MAX),
                 typ: declarator.typ,
+                vla_size_sym: None,
+                vla_elem_type: None,
+                vla_dim_syms: vec![],
             },
         );
 
@@ -2200,14 +2383,95 @@ impl<'a> Linearizer<'a> {
 
         // Get element type from the expression type
         let elem_type = self.expr_type(expr);
-        let elem_size = self.types.size_bits(elem_type) / 8;
-        let elem_size_val = self.emit_const(elem_size as i64, self.types.long_id);
+        let ptr_typ = self.types.long_id;
+
+        // Check if we're indexing a VLA's outer dimension
+        // This requires runtime stride computation.
+        // For int arr[n][m], accessing arr[i] needs stride = m * sizeof(int)
+        let elem_size_val = if let ExprKind::Ident { name } = &ptr_expr.kind {
+            let name_str = self.str(*name).to_string();
+            if let Some(info) = self.locals.get(&name_str).cloned() {
+                // Check if this is a multi-dimensional VLA AND elem_type is an array
+                // (meaning we're accessing an outer dimension, not the innermost)
+                if info.vla_dim_syms.len() > 1 && self.types.kind(elem_type) == TypeKind::Array {
+                    // Compute runtime stride:
+                    // stride = (product of inner dimensions) * sizeof(innermost element)
+                    // For int arr[n][m] accessing arr[i]: stride = m * sizeof(int)
+                    // For int arr[n][m][k] accessing arr[i]: stride = m * k * sizeof(int)
+
+                    // Get innermost element type and its size
+                    let mut innermost = elem_type;
+                    while self.types.kind(innermost) == TypeKind::Array {
+                        innermost = self.types.base_type(innermost).unwrap_or(self.types.int_id);
+                    }
+                    let innermost_size = self.types.size_bytes(innermost) as i64;
+
+                    // Load all dimension sizes except the first (outermost we're indexing)
+                    // and multiply them together
+                    let mut stride: Option<PseudoId> = None;
+                    for dim_sym in info.vla_dim_syms.iter().skip(1) {
+                        // Load the dimension size
+                        let dim_val = self.alloc_pseudo();
+                        let load_insn =
+                            Instruction::load(dim_val, *dim_sym, 0, self.types.ulong_id, 64);
+                        self.emit(load_insn);
+
+                        stride = Some(match stride {
+                            None => dim_val,
+                            Some(prev) => {
+                                let result = self.alloc_pseudo();
+                                self.emit(Instruction::binop(
+                                    Opcode::Mul,
+                                    result,
+                                    prev,
+                                    dim_val,
+                                    ptr_typ,
+                                    64,
+                                ));
+                                result
+                            }
+                        });
+                    }
+
+                    // Multiply by sizeof(innermost element)
+                    let innermost_size_val = self.emit_const(innermost_size, self.types.long_id);
+                    match stride {
+                        Some(s) => {
+                            let result = self.alloc_pseudo();
+                            self.emit(Instruction::binop(
+                                Opcode::Mul,
+                                result,
+                                s,
+                                innermost_size_val,
+                                ptr_typ,
+                                64,
+                            ));
+                            result
+                        }
+                        None => innermost_size_val,
+                    }
+                } else {
+                    // Not a multi-dimensional VLA or accessing innermost dimension
+                    // Use compile-time size
+                    let elem_size = self.types.size_bits(elem_type) / 8;
+                    self.emit_const(elem_size as i64, self.types.long_id)
+                }
+            } else {
+                // Variable not found in locals (global or something else)
+                let elem_size = self.types.size_bits(elem_type) / 8;
+                self.emit_const(elem_size as i64, self.types.long_id)
+            }
+        } else {
+            // Not indexing an identifier directly (e.g., arr[i][j] where arr[i] is an Index)
+            // Use compile-time size
+            let elem_size = self.types.size_bits(elem_type) / 8;
+            self.emit_const(elem_size as i64, self.types.long_id)
+        };
 
         // Sign-extend index to 64-bit for proper pointer arithmetic (negative indices)
         let idx_extended = self.emit_convert(idx, idx_type, self.types.long_id);
 
         let offset = self.alloc_pseudo();
-        let ptr_typ = self.types.long_id;
         self.emit(Instruction::binop(
             Opcode::Mul,
             offset,
@@ -2306,6 +2570,7 @@ impl<'a> Linearizer<'a> {
 
         // Linearize regular arguments
         // For large structs, pass by reference (address) instead of by value
+        // For arrays (including VLAs), decay to pointer
         for a in args.iter() {
             let arg_type = self.expr_type(a);
             let arg_kind = self.types.kind(arg_type);
@@ -2316,6 +2581,12 @@ impl<'a> Linearizer<'a> {
                 // The argument type becomes a pointer
                 arg_types_vec.push(self.types.pointer_to(arg_type));
                 self.linearize_lvalue(a)
+            } else if arg_kind == TypeKind::Array {
+                // Array decay to pointer (C99 6.3.2.1)
+                // This applies to both fixed-size arrays and VLAs
+                let elem_type = self.types.base_type(arg_type).unwrap_or(self.types.int_id);
+                arg_types_vec.push(self.types.pointer_to(elem_type));
+                self.linearize_expr(a)
             } else {
                 arg_types_vec.push(arg_type);
                 self.linearize_expr(a)
@@ -2925,7 +3196,38 @@ impl<'a> Linearizer<'a> {
             }
 
             ExprKind::SizeofExpr(inner_expr) => {
-                // Get type from expression and compute size
+                // Check if this is a VLA variable - need runtime sizeof
+                if let ExprKind::Ident { name } = &inner_expr.kind {
+                    let name_str = self.str(*name).to_string();
+                    if let Some(info) = self.locals.get(&name_str).cloned() {
+                        if let (Some(size_sym), Some(elem_type)) =
+                            (info.vla_size_sym, info.vla_elem_type)
+                        {
+                            // VLA: compute sizeof at runtime as num_elements * sizeof(element)
+                            let result_typ = self.types.ulong_id;
+                            let elem_size = self.types.size_bytes(elem_type) as i64;
+
+                            // Load the stored number of elements
+                            let num_elements = self.alloc_pseudo();
+                            let load_insn =
+                                Instruction::load(num_elements, size_sym, 0, result_typ, 64);
+                            self.emit(load_insn);
+
+                            // Multiply by element size
+                            let elem_size_const = self.emit_const(elem_size, result_typ);
+                            let result = self.alloc_pseudo();
+                            let mul_insn = Instruction::new(Opcode::Mul)
+                                .with_target(result)
+                                .with_src(num_elements)
+                                .with_src(elem_size_const)
+                                .with_size(64);
+                            self.emit(mul_insn);
+                            return result;
+                        }
+                    }
+                }
+
+                // Non-VLA: compute size at compile time
                 let inner_typ = self.expr_type(inner_expr);
                 let size = self.types.size_bits(inner_typ) / 8;
                 // sizeof returns size_t, which is unsigned long in our implementation
@@ -4290,6 +4592,7 @@ mod tests {
                         name: i_id,
                         typ: int_type,
                         init: Some(Expr::int(0, &types)),
+                        vla_sizes: vec![],
                     }],
                 })),
                 cond: Some(Expr::binary(
@@ -4555,6 +4858,7 @@ mod tests {
                         name: x_id,
                         typ: int_type,
                         init: Some(Expr::int(1, &types)),
+                        vla_sizes: vec![],
                     }],
                 }),
                 BlockItem::Statement(Stmt::Return(Some(Expr::var_typed(x_id, int_type)))),
@@ -4608,6 +4912,7 @@ mod tests {
                         name: x_id,
                         typ: int_type,
                         init: Some(Expr::int(1, &types)),
+                        vla_sizes: vec![],
                     }],
                 }),
                 // if (cond) x = 2;
@@ -4667,6 +4972,7 @@ mod tests {
                         name: i_id,
                         typ: int_type,
                         init: Some(Expr::int(0, &types)),
+                        vla_sizes: vec![],
                     }],
                 }),
                 // while (i < 10) { i = i + 1; }

@@ -2829,7 +2829,7 @@ impl Parser<'_> {
         // e.g., "struct point { int x; int y; };"
         if !self.is_special(b';') {
             loop {
-                let (name, typ) = self.parse_declarator(base_type_id)?;
+                let (name, typ, vla_sizes) = self.parse_declarator(base_type_id)?;
                 let init = if self.is_special(b'=') {
                     self.advance();
                     Some(self.parse_initializer()?)
@@ -2837,7 +2837,12 @@ impl Parser<'_> {
                     None
                 };
 
-                declarators.push(InitDeclarator { name, typ, init });
+                declarators.push(InitDeclarator {
+                    name,
+                    typ,
+                    init,
+                    vla_sizes,
+                });
 
                 if self.is_special(b',') {
                     self.advance();
@@ -2871,7 +2876,7 @@ impl Parser<'_> {
         // e.g., "struct point { int x; int y; };"
         if !self.is_special(b';') {
             loop {
-                let (name, typ) = self.parse_declarator(base_type_id)?;
+                let (name, typ, vla_sizes) = self.parse_declarator(base_type_id)?;
 
                 let init = if self.is_special(b'=') {
                     if is_typedef {
@@ -2900,7 +2905,12 @@ impl Parser<'_> {
                     }
                 }
 
-                declarators.push(InitDeclarator { name, typ, init });
+                declarators.push(InitDeclarator {
+                    name,
+                    typ,
+                    init,
+                    vla_sizes,
+                });
 
                 if self.is_special(b',') {
                     self.advance();
@@ -3236,7 +3246,17 @@ impl Parser<'_> {
                 }
 
                 loop {
-                    let (name, typ) = self.parse_declarator(member_base_type_id)?;
+                    // VLAs are not allowed in struct members
+                    let (name, typ, vla_sizes) = self.parse_declarator(member_base_type_id)?;
+
+                    // C99 6.7.5.2: VLAs cannot be members of structures or unions
+                    if !vla_sizes.is_empty() {
+                        return Err(ParseError::new(
+                            "variable length arrays cannot be structure or union members"
+                                .to_string(),
+                            self.current_pos(),
+                        ));
+                    }
 
                     // Check for bitfield: name : width
                     let bit_width = if self.is_special(b':') {
@@ -3330,7 +3350,12 @@ impl Parser<'_> {
     /// - `(*p)` means p is a pointer
     /// - `[3]` after the parens means "to array of 3"
     ///   So p is "pointer to array of 3 ints"
-    fn parse_declarator(&mut self, base_type_id: TypeId) -> ParseResult<(StringId, TypeId)> {
+    ///
+    /// Returns: (name, type, VLA size expressions from outer to inner dimensions)
+    fn parse_declarator(
+        &mut self,
+        base_type_id: TypeId,
+    ) -> ParseResult<(StringId, TypeId, Vec<Expr>)> {
         // Collect pointer modifiers (they bind tighter than array/function)
         let mut pointer_modifiers: Vec<TypeModifiers> = Vec::new();
         while self.is_special(b'*') {
@@ -3382,7 +3407,10 @@ impl Parser<'_> {
                 // So we use a placeholder and fix it up after
 
                 // Parse the inner declarator with a placeholder type (void)
-                let (inner_name, inner_decl_type_id) = self.parse_declarator(self.types.void_id)?;
+                // Note: We ignore any VLA expression from inner declarators - VLAs would be
+                // in the outer array dimensions, not inner pointer/grouped declarators
+                let (inner_name, inner_decl_type_id, _inner_vla) =
+                    self.parse_declarator(self.types.void_id)?;
                 self.expect_special(b')')?;
 
                 // Now parse any suffix modifiers (arrays, function params)
@@ -3399,7 +3427,9 @@ impl Parser<'_> {
         };
 
         // Handle array declarators - collect all dimensions first
+        // Also track VLA expressions (non-constant size) for each dimension
         let mut dimensions: Vec<Option<usize>> = Vec::new();
+        let mut vla_exprs: Vec<Expr> = Vec::new();
         while self.is_special(b'[') {
             self.advance();
             let size = if self.is_special(b']') {
@@ -3411,7 +3441,11 @@ impl Parser<'_> {
                 match self.eval_const_expr(&expr) {
                     Some(n) if n >= 0 => Some(n as usize),
                     Some(_) => None, // Negative size is invalid
-                    None => None,    // Non-constant (VLA) or invalid expression
+                    None => {
+                        // Non-constant (VLA) - save expression for VLA handling
+                        vla_exprs.push(expr);
+                        None
+                    }
                 }
             };
             self.expect_special(b']')?;
@@ -3517,7 +3551,7 @@ impl Parser<'_> {
             }
         }
 
-        Ok((name, result_type_id))
+        Ok((name, result_type_id, vla_exprs))
     }
 
     /// Substitute the actual base type into a declarator parsed with a placeholder
@@ -3839,7 +3873,15 @@ impl Parser<'_> {
             if self.is_special(b'*') {
                 // This is a grouped declarator - use parse_declarator
                 self.pos = saved_pos; // restore position before '('
-                let (name, typ) = self.parse_declarator(base_type_id)?;
+                let (name, typ, vla_sizes) = self.parse_declarator(base_type_id)?;
+
+                // C99 6.7.5.2: VLAs must have block scope
+                if !vla_sizes.is_empty() {
+                    return Err(ParseError::new(
+                        "variable length arrays cannot have file scope".to_string(),
+                        self.current_pos(),
+                    ));
+                }
 
                 // Skip any __attribute__ after declarator
                 self.skip_extensions();
@@ -3870,7 +3912,12 @@ impl Parser<'_> {
                 }
 
                 return Ok(ExternalDecl::Declaration(Declaration {
-                    declarators: vec![InitDeclarator { name, typ, init }],
+                    declarators: vec![InitDeclarator {
+                        name,
+                        typ,
+                        init,
+                        vla_sizes: vec![],
+                    }],
                 }));
             }
             // Not a grouped declarator, restore position
@@ -3927,7 +3974,15 @@ impl Parser<'_> {
             if self.is_special(b'*') {
                 // This is a grouped declarator - use parse_declarator
                 self.pos = saved_pos; // restore position before '('
-                let (name, full_typ) = self.parse_declarator(typ_id)?;
+                let (name, full_typ, vla_sizes) = self.parse_declarator(typ_id)?;
+
+                // C99 6.7.5.2: VLAs must have block scope
+                if !vla_sizes.is_empty() {
+                    return Err(ParseError::new(
+                        "variable length arrays cannot have file scope".to_string(),
+                        self.current_pos(),
+                    ));
+                }
 
                 // Skip any __attribute__ after declarator
                 self.skip_extensions();
@@ -3962,6 +4017,7 @@ impl Parser<'_> {
                         name,
                         typ: full_typ,
                         init,
+                        vla_sizes: vec![],
                     }],
                 }));
             }
@@ -4041,6 +4097,7 @@ impl Parser<'_> {
                         name,
                         typ: func_type_id,
                         init: None,
+                        vla_sizes: vec![],
                     }],
                 }));
             }
@@ -4106,12 +4163,22 @@ impl Parser<'_> {
             name,
             typ: var_type_id,
             init,
+            vla_sizes: vec![],
         });
 
         // Handle additional declarators
         while self.is_special(b',') {
             self.advance();
-            let (decl_name, decl_type) = self.parse_declarator(base_type_id)?;
+            let (decl_name, decl_type, vla_sizes) = self.parse_declarator(base_type_id)?;
+
+            // C99 6.7.5.2: VLAs must have block scope
+            if !vla_sizes.is_empty() {
+                return Err(ParseError::new(
+                    "variable length arrays cannot have file scope".to_string(),
+                    self.current_pos(),
+                ));
+            }
+
             let decl_init = if self.is_special(b'=') {
                 if is_typedef {
                     return Err(ParseError::new(
@@ -4136,6 +4203,7 @@ impl Parser<'_> {
                 name: decl_name,
                 typ: decl_type,
                 init: decl_init,
+                vla_sizes: vec![],
             });
         }
 

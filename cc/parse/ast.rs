@@ -650,6 +650,10 @@ pub struct InitDeclarator {
     pub typ: TypeId,
     /// Optional initializer
     pub init: Option<Expr>,
+    /// For VLAs: runtime size expressions for each variable dimension
+    /// Empty for fixed-size arrays or non-array types.
+    /// For int arr[n][m], contains [n_expr, m_expr] (outer to inner order).
+    pub vla_sizes: Vec<Expr>,
 }
 
 #[cfg(test)]
@@ -657,7 +661,12 @@ impl Declaration {
     /// Create a simple declaration with one variable
     pub fn simple(name: StringId, typ: TypeId, init: Option<Expr>) -> Self {
         Declaration {
-            declarators: vec![InitDeclarator { name, typ, init }],
+            declarators: vec![InitDeclarator {
+                name,
+                typ,
+                init,
+                vla_sizes: vec![],
+            }],
         }
     }
 }

@@ -419,6 +419,10 @@ pub enum X86Inst {
     /// RET - Return from function
     Ret,
 
+    /// UD2 - Undefined instruction (trap)
+    /// Used for __builtin_unreachable() to signal unreachable code
+    Ud2,
+
     // ========================================================================
     // Floating-Point (SSE)
     // ========================================================================
@@ -883,6 +887,10 @@ impl EmitAsm for X86Inst {
 
             X86Inst::Ret => {
                 let _ = writeln!(out, "    ret");
+            }
+
+            X86Inst::Ud2 => {
+                let _ = writeln!(out, "    ud2");
             }
 
             // Floating-Point

@@ -145,6 +145,9 @@ pub enum Opcode {
 
     // Stack allocation builtin
     Alloca, // Dynamic stack allocation
+
+    // Optimization hints
+    Unreachable, // Code path is never reached (undefined behavior if reached)
 }
 
 impl Opcode {
@@ -152,7 +155,7 @@ impl Opcode {
     pub fn is_terminator(&self) -> bool {
         matches!(
             self,
-            Opcode::Ret | Opcode::Br | Opcode::Cbr | Opcode::Switch
+            Opcode::Ret | Opcode::Br | Opcode::Cbr | Opcode::Switch | Opcode::Unreachable
         )
     }
 
@@ -225,6 +228,7 @@ impl Opcode {
             Opcode::Bswap32 => "bswap32",
             Opcode::Bswap64 => "bswap64",
             Opcode::Alloca => "alloca",
+            Opcode::Unreachable => "unreachable",
         }
     }
 }

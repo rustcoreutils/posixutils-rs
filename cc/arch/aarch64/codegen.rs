@@ -1211,6 +1211,14 @@ impl Aarch64CodeGen {
                 self.emit_alloca(insn, *total_frame);
             }
 
+            Opcode::Unreachable => {
+                // Emit brk #1 instruction - software breakpoint that traps
+                // This is used for __builtin_unreachable() to indicate code
+                // that should never be reached. If it is reached, the CPU
+                // will generate a SIGTRAP.
+                self.push_lir(Aarch64Inst::Brk { imm: 1 });
+            }
+
             // Skip no-ops and unimplemented
             _ => {}
         }

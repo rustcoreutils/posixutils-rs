@@ -936,6 +936,14 @@ impl X86_64CodeGen {
                 self.emit_alloca(insn);
             }
 
+            Opcode::Unreachable => {
+                // Emit ud2 instruction - undefined instruction that traps
+                // This is used for __builtin_unreachable() to indicate code
+                // that should never be reached. If it is reached, the CPU
+                // will generate a SIGILL.
+                self.push_lir(X86Inst::Ud2);
+            }
+
             // Skip no-ops and unimplemented
             _ => {}
         }

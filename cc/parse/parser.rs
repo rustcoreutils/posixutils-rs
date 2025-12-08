@@ -1967,6 +1967,18 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
+                        "__builtin_unreachable" => {
+                            // __builtin_unreachable() - marks code as unreachable
+                            // Takes no arguments, returns void
+                            // Behavior is undefined if actually reached at runtime
+                            self.expect_special(b'(')?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::Unreachable,
+                                self.types.void_id,
+                                token_pos,
+                            ));
+                        }
                         "__builtin_constant_p" => {
                             // __builtin_constant_p(expr) - returns 1 if expr is a constant, 0 otherwise
                             // This is evaluated at compile time, not runtime

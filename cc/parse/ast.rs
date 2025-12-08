@@ -325,6 +325,15 @@ pub enum ExprKind {
         /// The size to allocate in bytes
         size: Box<Expr>,
     },
+
+    // =========================================================================
+    // Optimization hints
+    // =========================================================================
+    /// __builtin_unreachable()
+    /// Indicates that this code path is never reached.
+    /// If control flow reaches this point, behavior is undefined.
+    /// Used for optimization hints and silencing warnings.
+    Unreachable,
 }
 
 // ============================================================================

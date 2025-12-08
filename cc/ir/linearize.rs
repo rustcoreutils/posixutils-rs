@@ -3017,6 +3017,18 @@ impl<'a> Linearizer<'a> {
                 self.emit(insn);
                 result
             }
+
+            ExprKind::Unreachable => {
+                // __builtin_unreachable() - marks code path as never reached
+                // Emits an instruction that will trap if actually executed
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::Unreachable)
+                    .with_target(result)
+                    .with_type(self.types.void_id);
+                self.emit(insn);
+                result
+            }
         }
     }
 

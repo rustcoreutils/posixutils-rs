@@ -548,6 +548,10 @@ pub enum Aarch64Inst {
     /// RET - Return from subroutine
     Ret,
 
+    /// BRK - Software breakpoint (trap)
+    /// Used for __builtin_unreachable() to signal unreachable code
+    Brk { imm: u16 },
+
     // ========================================================================
     // Floating-Point (Scalar)
     // ========================================================================
@@ -1256,6 +1260,10 @@ impl EmitAsm for Aarch64Inst {
 
             Aarch64Inst::Ret => {
                 let _ = writeln!(out, "    ret");
+            }
+
+            Aarch64Inst::Brk { imm } => {
+                let _ = writeln!(out, "    brk #{}", imm);
             }
 
             // Floating-Point

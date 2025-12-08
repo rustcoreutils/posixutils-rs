@@ -18,4 +18,5 @@ mod inline;
 mod optimization;
 mod storage;
 mod types_compatible;
+mod unreachable;
 mod varargs;

@@ -2,6 +2,31 @@
 
 This document describes the compiler builtin functions and types supported by pcc.
 
+## Table of Contents
+
+- [Variadic Function Support](#variadic-function-support)
+  - [`__builtin_va_list`](#__builtin_va_list)
+  - [`__builtin_va_start`](#__builtin_va_startap-last_param)
+  - [`__builtin_va_arg`](#__builtin_va_argap-type)
+  - [`__builtin_va_end`](#__builtin_va_endap)
+  - [`__builtin_va_copy`](#__builtin_va_copydest-src)
+- [Byte-Swapping Builtins](#byte-swapping-builtins)
+  - [`__builtin_bswap16`](#__builtin_bswap16x)
+  - [`__builtin_bswap32`](#__builtin_bswap32x)
+  - [`__builtin_bswap64`](#__builtin_bswap64x)
+- [Compile-Time Introspection](#compile-time-introspection)
+  - [`__builtin_constant_p`](#__builtin_constant_pexpr)
+- [Stack Allocation](#stack-allocation)
+  - [`__builtin_alloca`](#__builtin_allocasize)
+- [Type Introspection](#type-introspection)
+  - [`__builtin_types_compatible_p`](#__builtin_types_compatible_ptype1-type2)
+- [Count Trailing Zeros Builtins](#count-trailing-zeros-builtins)
+  - [`__builtin_ctz`](#__builtin_ctzx)
+  - [`__builtin_ctzl`](#__builtin_ctzlx)
+  - [`__builtin_ctzll`](#__builtin_ctzllx)
+- [Optimization Hints](#optimization-hints)
+  - [`__builtin_unreachable`](#__builtin_unreachable)
+
 ## Variadic Function Support
 
 These builtins provide C99-compliant variadic function support, matching GCC and Clang behavior.

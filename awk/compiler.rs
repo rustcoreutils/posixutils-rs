@@ -1234,7 +1234,7 @@ impl Compiler {
                             matches!(print.as_rule(), Rule::printf_call | Rule::simple_printf);
                         let expressions = print.into_inner();
                         argc = expressions.len() as u16;
-                        if expressions.len() == 0 {
+                        if expressions.is_empty() {
                             // if it has no arguments it cannot be printf
                             assert!(!is_printf);
                             print_function = BuiltinFunction::Print;

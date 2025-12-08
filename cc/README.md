@@ -6,6 +6,17 @@ pcc is a C99 compiler targeting POSIX.2024 compliance. It currently supports x86
 
 Reference: [ISO/IEC 9899:1999 (C99)](https://www.open-std.org/jtc1/sc22/wg14/www/docs/n1256.pdf)
 
+## Quick start
+
+Build: `cargo build && cargo build --release`
+
+Testing (compiler subset): `cargo test --release -p posixutils-cc`
+
+Debugging, via stdio:
+```
+echo 'int main() { return 42; }' | ./target/release/pcc - -S -o -
+```
+
 ## Architecture
 
 The compiler pipeline:
@@ -31,22 +42,6 @@ Key source files:
 | `dominate.rs` | Dominator tree and dominance frontiers |
 | `codegen/x86_64/` | x86-64 code generator |
 | `codegen/aarch64/` | AArch64 code generator |
-
-## Building
-
-```bash
-cargo build && cargo build --release
-```
-
-This builds the whole tree, which is usually the best solution.
-
-## Testing
-
-For frequent compiler development, this runs the compiler subset of tests:
-
-```bash
-cargo test --release -p posixutils-cc
-```
 
 ## Debugging
 
@@ -84,7 +79,6 @@ Not yet implemented (exceptions to C99, or features we want to add):
 - Actual inlining optimization (the `inline` keyword is supported but functions are not inlined)
 - multi-register returns (for structs larger than 8 bytes)
 - -fverbose-asm
-- VLAs (variable-length arrays)
 - top builtins to implement:
   __builtin_expect
   __sync_synchronize

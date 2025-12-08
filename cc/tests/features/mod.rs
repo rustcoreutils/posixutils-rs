@@ -11,6 +11,7 @@
 
 mod alloca;
 mod bswap;
+mod clz;
 mod constant_p;
 mod ctz;
 mod debug;
@@ -18,6 +19,7 @@ mod has_feature;
 mod inline;
 mod noreturn;
 mod optimization;
+mod popcount;
 mod setjmp;
 mod storage;
 mod types_compatible;

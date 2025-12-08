@@ -534,6 +534,23 @@ pub enum X86Inst {
         dst: Reg,
     },
 
+    /// BSR - Bit scan reverse (find highest set bit)
+    /// Returns index of most significant set bit
+    /// Result is undefined if src is 0
+    Bsr {
+        size: OperandSize,
+        src: GpOperand,
+        dst: Reg,
+    },
+
+    /// POPCNT - Population count (count set bits)
+    /// Returns the number of 1 bits in the source operand
+    Popcnt {
+        size: OperandSize,
+        src: GpOperand,
+        dst: Reg,
+    },
+
     /// XORPS with same register - Fast zero XMM register
     XorpsSelf { reg: XmmReg },
 
@@ -1079,6 +1096,31 @@ impl EmitAsm for X86Inst {
                 let _ = writeln!(
                     out,
                     "    bsf{} {}, {}",
+                    size.x86_suffix(),
+                    src.format(*size, target),
+                    dst.name_for_size(size.bits())
+                );
+            }
+
+            X86Inst::Bsr { size, src, dst } => {
+                // BSR (bit scan reverse) finds the index of the most significant set bit
+                // Result is undefined if src is 0
+                // Since __builtin_clz has undefined behavior for 0, this is fine
+                let _ = writeln!(
+                    out,
+                    "    bsr{} {}, {}",
+                    size.x86_suffix(),
+                    src.format(*size, target),
+                    dst.name_for_size(size.bits())
+                );
+            }
+
+            X86Inst::Popcnt { size, src, dst } => {
+                // POPCNT counts the number of set bits
+                // Requires SSE4.2 or POPCNT feature (AMD ABM)
+                let _ = writeln!(
+                    out,
+                    "    popcnt{} {}, {}",
                     size.x86_suffix(),
                     src.format(*size, target),
                     dst.name_for_size(size.bits())

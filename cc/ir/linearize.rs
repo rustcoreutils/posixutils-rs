@@ -3053,6 +3053,68 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
+            // ================================================================
+            // Count leading zeros builtins
+            // ================================================================
+            ExprKind::Clz { arg } => {
+                // __builtin_clz - counts leading zeros in unsigned int (32-bit)
+                let arg_val = self.linearize_expr(arg);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::Clz32)
+                    .with_target(result)
+                    .with_src(arg_val)
+                    .with_size(32)
+                    .with_type(self.types.int_id);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::Clzl { arg } | ExprKind::Clzll { arg } => {
+                // __builtin_clzl/clzll - counts leading zeros in 64-bit value
+                let arg_val = self.linearize_expr(arg);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::Clz64)
+                    .with_target(result)
+                    .with_src(arg_val)
+                    .with_size(64)
+                    .with_type(self.types.int_id);
+                self.emit(insn);
+                result
+            }
+
+            // ================================================================
+            // Population count builtins
+            // ================================================================
+            ExprKind::Popcount { arg } => {
+                // __builtin_popcount - counts set bits in unsigned int (32-bit)
+                let arg_val = self.linearize_expr(arg);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::Popcount32)
+                    .with_target(result)
+                    .with_src(arg_val)
+                    .with_size(32)
+                    .with_type(self.types.int_id);
+                self.emit(insn);
+                result
+            }
+
+            ExprKind::Popcountl { arg } | ExprKind::Popcountll { arg } => {
+                // __builtin_popcountl/popcountll - counts set bits in 64-bit value
+                let arg_val = self.linearize_expr(arg);
+                let result = self.alloc_pseudo();
+
+                let insn = Instruction::new(Opcode::Popcount64)
+                    .with_target(result)
+                    .with_src(arg_val)
+                    .with_size(64)
+                    .with_type(self.types.int_id);
+                self.emit(insn);
+                result
+            }
+
             ExprKind::Alloca { size } => {
                 let size_val = self.linearize_expr(size);
                 let result = self.alloc_pseudo();

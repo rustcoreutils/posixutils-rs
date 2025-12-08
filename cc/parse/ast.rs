@@ -346,6 +346,57 @@ pub enum ExprKind {
         arg: Box<Expr>,
     },
 
+    // =========================================================================
+    // Count leading zeros builtins
+    // =========================================================================
+    /// __builtin_clz(x)
+    /// Returns the number of leading 0-bits in x (32-bit unsigned int)
+    /// Result is undefined if x is 0
+    Clz {
+        /// The value to count leading zeros in
+        arg: Box<Expr>,
+    },
+
+    /// __builtin_clzl(x)
+    /// Returns the number of leading 0-bits in x (unsigned long)
+    /// Result is undefined if x is 0
+    Clzl {
+        /// The value to count leading zeros in
+        arg: Box<Expr>,
+    },
+
+    /// __builtin_clzll(x)
+    /// Returns the number of leading 0-bits in x (unsigned long long)
+    /// Result is undefined if x is 0
+    Clzll {
+        /// The value to count leading zeros in
+        arg: Box<Expr>,
+    },
+
+    // =========================================================================
+    // Population count builtins
+    // =========================================================================
+    /// __builtin_popcount(x)
+    /// Returns the number of 1-bits in x (32-bit unsigned int)
+    Popcount {
+        /// The value to count set bits in
+        arg: Box<Expr>,
+    },
+
+    /// __builtin_popcountl(x)
+    /// Returns the number of 1-bits in x (unsigned long)
+    Popcountl {
+        /// The value to count set bits in
+        arg: Box<Expr>,
+    },
+
+    /// __builtin_popcountll(x)
+    /// Returns the number of 1-bits in x (unsigned long long)
+    Popcountll {
+        /// The value to count set bits in
+        arg: Box<Expr>,
+    },
+
     /// __builtin_alloca(size)
     /// Allocates size bytes on the stack, returns pointer
     Alloca {

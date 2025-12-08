@@ -943,6 +943,28 @@ impl X86_64CodeGen {
                 self.emit_ctz64(insn);
             }
 
+            // ================================================================
+            // Count leading zeros builtins
+            // ================================================================
+            Opcode::Clz32 => {
+                self.emit_clz32(insn);
+            }
+
+            Opcode::Clz64 => {
+                self.emit_clz64(insn);
+            }
+
+            // ================================================================
+            // Population count builtins
+            // ================================================================
+            Opcode::Popcount32 => {
+                self.emit_popcount32(insn);
+            }
+
+            Opcode::Popcount64 => {
+                self.emit_popcount64(insn);
+            }
+
             Opcode::Alloca => {
                 self.emit_alloca(insn);
             }
@@ -4352,6 +4374,187 @@ impl X86_64CodeGen {
                     dst: GpOperand::Reg(Reg::Rax),
                 });
                 self.push_lir(X86Inst::Bsf {
+                    size: src_size,
+                    src: GpOperand::Reg(Reg::Rax),
+                    dst: Reg::Rax,
+                });
+            }
+            _ => return,
+        }
+
+        // Store result (return type is int, always 32-bit)
+        match dst_loc {
+            Loc::Reg(r) => {
+                if r != Reg::Rax {
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B32,
+                        src: GpOperand::Reg(Reg::Rax),
+                        dst: GpOperand::Reg(r),
+                    });
+                }
+            }
+            Loc::Stack(off) => {
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B32,
+                    src: GpOperand::Reg(Reg::Rax),
+                    dst: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset: off,
+                    }),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// Emit __builtin_clz - count leading zeros for 32-bit value
+    fn emit_clz32(&mut self, insn: &Instruction) {
+        self.emit_clz(insn, OperandSize::B32);
+    }
+
+    /// Emit __builtin_clzl/__builtin_clzll - count leading zeros for 64-bit value
+    fn emit_clz64(&mut self, insn: &Instruction) {
+        self.emit_clz(insn, OperandSize::B64);
+    }
+
+    /// Emit count leading zeros - shared implementation
+    /// CLZ(x) = operand_bits - 1 - BSR(x)
+    fn emit_clz(&mut self, insn: &Instruction, src_size: OperandSize) {
+        let src = match insn.src.first() {
+            Some(&s) => s,
+            None => return,
+        };
+        let dst = match insn.target {
+            Some(t) => t,
+            None => return,
+        };
+
+        let src_loc = self.get_location(src);
+        let dst_loc = self.get_location(dst);
+
+        // BSR (bit scan reverse) finds index of most significant set bit
+        // CLZ = (operand_size - 1) - BSR_result
+        // Use RAX as scratch register
+        match src_loc {
+            Loc::Reg(r) => {
+                self.push_lir(X86Inst::Bsr {
+                    size: src_size,
+                    src: GpOperand::Reg(r),
+                    dst: Reg::Rax,
+                });
+            }
+            Loc::Stack(off) => {
+                self.push_lir(X86Inst::Bsr {
+                    size: src_size,
+                    src: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset: off,
+                    }),
+                    dst: Reg::Rax,
+                });
+            }
+            Loc::Imm(v) => {
+                // Load immediate first, then BSR
+                self.push_lir(X86Inst::Mov {
+                    size: src_size,
+                    src: GpOperand::Imm(v),
+                    dst: GpOperand::Reg(Reg::Rax),
+                });
+                self.push_lir(X86Inst::Bsr {
+                    size: src_size,
+                    src: GpOperand::Reg(Reg::Rax),
+                    dst: Reg::Rax,
+                });
+            }
+            _ => return,
+        }
+
+        // XOR RAX with (size - 1) to convert BSR result to CLZ
+        // Since BSR gives index from LSB, we need (size_bits - 1) - result
+        // XOR with (size_bits - 1) achieves this for valid inputs (non-zero)
+        let xor_value = (src_size.bits() - 1) as i64;
+        self.push_lir(X86Inst::Xor {
+            size: OperandSize::B32, // Result is always 32-bit int
+            src: GpOperand::Imm(xor_value),
+            dst: Reg::Rax,
+        });
+
+        // Store result (return type is int, always 32-bit)
+        match dst_loc {
+            Loc::Reg(r) => {
+                if r != Reg::Rax {
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B32,
+                        src: GpOperand::Reg(Reg::Rax),
+                        dst: GpOperand::Reg(r),
+                    });
+                }
+            }
+            Loc::Stack(off) => {
+                self.push_lir(X86Inst::Mov {
+                    size: OperandSize::B32,
+                    src: GpOperand::Reg(Reg::Rax),
+                    dst: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset: off,
+                    }),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// Emit __builtin_popcount - population count for 32-bit value
+    fn emit_popcount32(&mut self, insn: &Instruction) {
+        self.emit_popcount(insn, OperandSize::B32);
+    }
+
+    /// Emit __builtin_popcountl/__builtin_popcountll - population count for 64-bit value
+    fn emit_popcount64(&mut self, insn: &Instruction) {
+        self.emit_popcount(insn, OperandSize::B64);
+    }
+
+    /// Emit population count - shared implementation
+    fn emit_popcount(&mut self, insn: &Instruction, src_size: OperandSize) {
+        let src = match insn.src.first() {
+            Some(&s) => s,
+            None => return,
+        };
+        let dst = match insn.target {
+            Some(t) => t,
+            None => return,
+        };
+
+        let src_loc = self.get_location(src);
+        let dst_loc = self.get_location(dst);
+
+        // POPCNT instruction directly counts set bits
+        match src_loc {
+            Loc::Reg(r) => {
+                self.push_lir(X86Inst::Popcnt {
+                    size: src_size,
+                    src: GpOperand::Reg(r),
+                    dst: Reg::Rax,
+                });
+            }
+            Loc::Stack(off) => {
+                self.push_lir(X86Inst::Popcnt {
+                    size: src_size,
+                    src: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset: off,
+                    }),
+                    dst: Reg::Rax,
+                });
+            }
+            Loc::Imm(v) => {
+                // Load immediate first, then POPCNT
+                self.push_lir(X86Inst::Mov {
+                    size: src_size,
+                    src: GpOperand::Imm(v),
+                    dst: GpOperand::Reg(Reg::Rax),
+                });
+                self.push_lir(X86Inst::Popcnt {
                     size: src_size,
                     src: GpOperand::Reg(Reg::Rax),
                     dst: Reg::Rax,

@@ -147,6 +147,14 @@ pub enum Opcode {
     Ctz32, // Count trailing zeros in 32-bit value
     Ctz64, // Count trailing zeros in 64-bit value
 
+    // Count leading zeros builtins
+    Clz32, // Count leading zeros in 32-bit value
+    Clz64, // Count leading zeros in 64-bit value
+
+    // Population count builtins
+    Popcount32, // Count set bits in 32-bit value
+    Popcount64, // Count set bits in 64-bit value
+
     // Stack allocation builtin
     Alloca, // Dynamic stack allocation
 
@@ -242,6 +250,10 @@ impl Opcode {
             Opcode::Bswap64 => "bswap64",
             Opcode::Ctz32 => "ctz32",
             Opcode::Ctz64 => "ctz64",
+            Opcode::Clz32 => "clz32",
+            Opcode::Clz64 => "clz64",
+            Opcode::Popcount32 => "popcount32",
+            Opcode::Popcount64 => "popcount64",
             Opcode::Alloca => "alloca",
             Opcode::Unreachable => "unreachable",
             Opcode::Setjmp => "setjmp",

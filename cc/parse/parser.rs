@@ -1998,6 +1998,75 @@ impl<'a> Parser<'a> {
                                 token_pos,
                             ));
                         }
+                        "__builtin_clz" => {
+                            // __builtin_clz(x) - returns int, counts leading zeros in unsigned int
+                            // Result is undefined if x is 0
+                            self.expect_special(b'(')?;
+                            let arg = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::Clz { arg: Box::new(arg) },
+                                self.types.int_id,
+                                token_pos,
+                            ));
+                        }
+                        "__builtin_clzl" => {
+                            // __builtin_clzl(x) - returns int, counts leading zeros in unsigned long
+                            // Result is undefined if x is 0
+                            self.expect_special(b'(')?;
+                            let arg = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::Clzl { arg: Box::new(arg) },
+                                self.types.int_id,
+                                token_pos,
+                            ));
+                        }
+                        "__builtin_clzll" => {
+                            // __builtin_clzll(x) - returns int, counts leading zeros in unsigned long long
+                            // Result is undefined if x is 0
+                            self.expect_special(b'(')?;
+                            let arg = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::Clzll { arg: Box::new(arg) },
+                                self.types.int_id,
+                                token_pos,
+                            ));
+                        }
+                        "__builtin_popcount" => {
+                            // __builtin_popcount(x) - returns int, counts set bits in unsigned int
+                            self.expect_special(b'(')?;
+                            let arg = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::Popcount { arg: Box::new(arg) },
+                                self.types.int_id,
+                                token_pos,
+                            ));
+                        }
+                        "__builtin_popcountl" => {
+                            // __builtin_popcountl(x) - returns int, counts set bits in unsigned long
+                            self.expect_special(b'(')?;
+                            let arg = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::Popcountl { arg: Box::new(arg) },
+                                self.types.int_id,
+                                token_pos,
+                            ));
+                        }
+                        "__builtin_popcountll" => {
+                            // __builtin_popcountll(x) - returns int, counts set bits in unsigned long long
+                            self.expect_special(b'(')?;
+                            let arg = self.parse_assignment_expr()?;
+                            self.expect_special(b')')?;
+                            return Ok(Self::typed_expr(
+                                ExprKind::Popcountll { arg: Box::new(arg) },
+                                self.types.int_id,
+                                token_pos,
+                            ));
+                        }
                         "__builtin_alloca" => {
                             // __builtin_alloca(size) - returns void*
                             self.expect_special(b'(')?;

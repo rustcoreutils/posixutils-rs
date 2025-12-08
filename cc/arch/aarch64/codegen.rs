@@ -1218,6 +1218,28 @@ impl Aarch64CodeGen {
                 self.emit_ctz64(insn, *total_frame);
             }
 
+            // ================================================================
+            // Count leading zeros builtins
+            // ================================================================
+            Opcode::Clz32 => {
+                self.emit_clz32(insn, *total_frame);
+            }
+
+            Opcode::Clz64 => {
+                self.emit_clz64(insn, *total_frame);
+            }
+
+            // ================================================================
+            // Population count builtins
+            // ================================================================
+            Opcode::Popcount32 => {
+                self.emit_popcount32(insn, *total_frame);
+            }
+
+            Opcode::Popcount64 => {
+                self.emit_popcount64(insn, *total_frame);
+            }
+
             Opcode::Alloca => {
                 self.emit_alloca(insn, *total_frame);
             }
@@ -3696,6 +3718,208 @@ impl Aarch64CodeGen {
         self.push_lir(Aarch64Inst::Clz {
             size: src_size,
             src: scratch,
+            dst: scratch,
+        });
+
+        // Store result (return type is int, always 32-bit)
+        match dst_loc {
+            Loc::Reg(r) => {
+                self.push_lir(Aarch64Inst::Mov {
+                    size: OperandSize::B32,
+                    src: GpOperand::Reg(scratch),
+                    dst: r,
+                });
+            }
+            Loc::Stack(off) => {
+                // FP-relative for alloca safety
+                let adjusted = frame_size + off;
+                self.push_lir(Aarch64Inst::Str {
+                    size: OperandSize::B32,
+                    src: scratch,
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::X29,
+                        offset: adjusted,
+                    },
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// Emit __builtin_clz - count leading zeros for 32-bit value
+    fn emit_clz32(&mut self, insn: &Instruction, frame_size: i32) {
+        self.emit_clz(insn, frame_size, OperandSize::B32);
+    }
+
+    /// Emit __builtin_clzl/__builtin_clzll - count leading zeros for 64-bit value
+    fn emit_clz64(&mut self, insn: &Instruction, frame_size: i32) {
+        self.emit_clz(insn, frame_size, OperandSize::B64);
+    }
+
+    /// Emit count leading zeros - shared implementation
+    /// AArch64 has a direct CLZ instruction
+    fn emit_clz(&mut self, insn: &Instruction, frame_size: i32, src_size: OperandSize) {
+        let src = match insn.src.first() {
+            Some(&s) => s,
+            None => return,
+        };
+        let dst = match insn.target {
+            Some(t) => t,
+            None => return,
+        };
+
+        let src_loc = self.get_location(src);
+        let dst_loc = self.get_location(dst);
+        let scratch = Reg::X9;
+
+        // Load source into scratch register
+        match src_loc {
+            Loc::Reg(r) => {
+                self.push_lir(Aarch64Inst::Mov {
+                    size: src_size,
+                    src: GpOperand::Reg(r),
+                    dst: scratch,
+                });
+            }
+            Loc::Stack(off) => {
+                // FP-relative for alloca safety
+                let adjusted = frame_size + off;
+                self.push_lir(Aarch64Inst::Ldr {
+                    size: src_size,
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::X29,
+                        offset: adjusted,
+                    },
+                    dst: scratch,
+                });
+            }
+            Loc::Imm(v) => {
+                self.push_lir(Aarch64Inst::Mov {
+                    size: src_size,
+                    src: GpOperand::Imm(v),
+                    dst: scratch,
+                });
+            }
+            _ => return,
+        }
+
+        // Count leading zeros using CLZ instruction
+        self.push_lir(Aarch64Inst::Clz {
+            size: src_size,
+            src: scratch,
+            dst: scratch,
+        });
+
+        // Store result (return type is int, always 32-bit)
+        match dst_loc {
+            Loc::Reg(r) => {
+                self.push_lir(Aarch64Inst::Mov {
+                    size: OperandSize::B32,
+                    src: GpOperand::Reg(scratch),
+                    dst: r,
+                });
+            }
+            Loc::Stack(off) => {
+                // FP-relative for alloca safety
+                let adjusted = frame_size + off;
+                self.push_lir(Aarch64Inst::Str {
+                    size: OperandSize::B32,
+                    src: scratch,
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::X29,
+                        offset: adjusted,
+                    },
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// Emit __builtin_popcount - population count for 32-bit value
+    fn emit_popcount32(&mut self, insn: &Instruction, frame_size: i32) {
+        self.emit_popcount(insn, frame_size, OperandSize::B32);
+    }
+
+    /// Emit __builtin_popcountl/__builtin_popcountll - population count for 64-bit value
+    fn emit_popcount64(&mut self, insn: &Instruction, frame_size: i32) {
+        self.emit_popcount(insn, frame_size, OperandSize::B64);
+    }
+
+    /// Emit population count - shared implementation
+    /// On AArch64, popcount is computed as:
+    /// 1. fmov d0, x0   ; move GP to SIMD register
+    /// 2. cnt v0.8b, v0.8b  ; count bits per byte
+    /// 3. addv b0, v0.8b  ; sum all bytes
+    /// 4. fmov w0, s0   ; move result back to GP
+    fn emit_popcount(&mut self, insn: &Instruction, frame_size: i32, src_size: OperandSize) {
+        let src = match insn.src.first() {
+            Some(&s) => s,
+            None => return,
+        };
+        let dst = match insn.target {
+            Some(t) => t,
+            None => return,
+        };
+
+        let src_loc = self.get_location(src);
+        let dst_loc = self.get_location(dst);
+        let scratch = Reg::X9;
+        let fp_scratch = VReg::V16; // Use reserved scratch FP register
+
+        // Load source into scratch register
+        match src_loc {
+            Loc::Reg(r) => {
+                self.push_lir(Aarch64Inst::Mov {
+                    size: src_size,
+                    src: GpOperand::Reg(r),
+                    dst: scratch,
+                });
+            }
+            Loc::Stack(off) => {
+                // FP-relative for alloca safety
+                let adjusted = frame_size + off;
+                self.push_lir(Aarch64Inst::Ldr {
+                    size: src_size,
+                    addr: MemAddr::BaseOffset {
+                        base: Reg::X29,
+                        offset: adjusted,
+                    },
+                    dst: scratch,
+                });
+            }
+            Loc::Imm(v) => {
+                self.push_lir(Aarch64Inst::Mov {
+                    size: src_size,
+                    src: GpOperand::Imm(v),
+                    dst: scratch,
+                });
+            }
+            _ => return,
+        }
+
+        // Move to SIMD register (always use 64-bit for the fmov)
+        self.push_lir(Aarch64Inst::FmovFromGp {
+            size: FpSize::Double,
+            src: scratch,
+            dst: fp_scratch,
+        });
+
+        // Count bits per byte
+        self.push_lir(Aarch64Inst::Cnt {
+            src: fp_scratch,
+            dst: fp_scratch,
+        });
+
+        // Sum all bytes
+        self.push_lir(Aarch64Inst::Addv {
+            src: fp_scratch,
+            dst: fp_scratch,
+        });
+
+        // Move result back to GP register (use Single since result is in b0/s0)
+        self.push_lir(Aarch64Inst::FmovToGp {
+            size: FpSize::Single,
+            src: fp_scratch,
             dst: scratch,
         });
 

@@ -704,6 +704,28 @@ pub enum Aarch64Inst {
     },
 
     // ========================================================================
+    // SIMD/NEON Instructions for population count
+    // ========================================================================
+    /// CNT - Count set bits per byte in vector
+    /// Used for __builtin_popcount: counts 1-bits in each byte of a vector
+    Cnt {
+        /// Source vector register
+        src: VReg,
+        /// Destination vector register
+        dst: VReg,
+    },
+
+    /// ADDV - Add across vector
+    /// Sums all elements in a vector and places result in scalar
+    /// For popcount: sums the per-byte bit counts from CNT
+    Addv {
+        /// Source vector register
+        src: VReg,
+        /// Destination (scalar in vector register)
+        dst: VReg,
+    },
+
+    // ========================================================================
     // Directives (Architecture-Independent)
     // ========================================================================
     /// Assembler directives (labels, sections, CFI, .loc, data, etc.)
@@ -1550,6 +1572,19 @@ impl EmitAsm for Aarch64Inst {
                     dst.name_for_size(size_bits(*dst_size)),
                     src.name_for_size(size_bits(*src_size))
                 );
+            }
+
+            // SIMD/NEON Instructions
+            Aarch64Inst::Cnt { src, dst } => {
+                // CNT counts set bits per byte in a vector
+                // Use .8b arrangement for both 32-bit and 64-bit popcount
+                let _ = writeln!(out, "    cnt {}.8b, {}.8b", dst.name_v(), src.name_v());
+            }
+
+            Aarch64Inst::Addv { src, dst } => {
+                // ADDV adds across vector, result in scalar
+                // Use .8b arrangement (sum of 8 bytes)
+                let _ = writeln!(out, "    addv {}, {}.8b", dst.name_b(), src.name_v());
             }
 
             // Directives - delegate to shared implementation

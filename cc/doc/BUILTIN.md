@@ -24,6 +24,14 @@ This document describes the compiler builtin functions and types supported by pc
   - [`__builtin_ctz`](#__builtin_ctzx)
   - [`__builtin_ctzl`](#__builtin_ctzlx)
   - [`__builtin_ctzll`](#__builtin_ctzllx)
+- [Count Leading Zeros Builtins](#count-leading-zeros-builtins)
+  - [`__builtin_clz`](#__builtin_clzx)
+  - [`__builtin_clzl`](#__builtin_clzlx)
+  - [`__builtin_clzll`](#__builtin_clzllx)
+- [Population Count Builtins](#population-count-builtins)
+  - [`__builtin_popcount`](#__builtin_popcountx)
+  - [`__builtin_popcountl`](#__builtin_popcountlx)
+  - [`__builtin_popcountll`](#__builtin_popcountllx)
 - [Optimization Hints](#optimization-hints)
   - [`__builtin_unreachable`](#__builtin_unreachable)
 
@@ -530,6 +538,194 @@ int idx = __builtin_ctz(x);
 - **Undefined behavior for zero**: If the input is 0, the result is undefined. Always check for zero before calling if the input could be zero.
 - **Return type**: All three builtins return `int`, regardless of the input size.
 - **Portability**: These builtins are compatible with GCC and Clang.
+
+## Count Leading Zeros Builtins
+
+These builtins count the number of leading zero bits in an integer value.
+
+### `__builtin_clz(x)`
+
+**Signature**: `int __builtin_clz(unsigned int x)`
+
+**Purpose**: Returns the number of leading 0-bits in `x`, starting from the most significant bit position. If `x` is 0, the result is undefined.
+
+**Parameters**:
+- `x`: An unsigned int to count leading zeros in
+
+**Returns**: The count of leading zero bits (0 to 31).
+
+**Example**: `__builtin_clz(1)` returns `31` because 1 = 0b00000000000000000000000000000001 has 31 leading zeros.
+
+**Usage**:
+```c
+unsigned int val = 256;  // 0b100000000
+int zeros = __builtin_clz(val);  // Returns 23 (31 - 8)
+```
+
+**Implementation**:
+- x86-64: Uses `bsr` (bit scan reverse) instruction, then computes 31 - result
+- AArch64: Uses native `clz` instruction
+
+### `__builtin_clzl(x)`
+
+**Signature**: `int __builtin_clzl(unsigned long x)`
+
+**Purpose**: Returns the number of leading 0-bits in `x`. If `x` is 0, the result is undefined.
+
+**Parameters**:
+- `x`: An unsigned long to count leading zeros in
+
+**Returns**: The count of leading zero bits (0 to 63 on LP64 systems).
+
+**Usage**:
+```c
+unsigned long val = 1UL << 40;
+int zeros = __builtin_clzl(val);  // Returns 23 (63 - 40)
+```
+
+### `__builtin_clzll(x)`
+
+**Signature**: `int __builtin_clzll(unsigned long long x)`
+
+**Purpose**: Returns the number of leading 0-bits in `x`. If `x` is 0, the result is undefined.
+
+**Parameters**:
+- `x`: An unsigned long long to count leading zeros in
+
+**Returns**: The count of leading zero bits (0 to 63).
+
+**Usage**:
+```c
+unsigned long long val = 1ULL << 50;
+int zeros = __builtin_clzll(val);  // Returns 13 (63 - 50)
+```
+
+### Common Use Cases
+
+**Finding the highest set bit**:
+```c
+int highest_bit_index = 31 - __builtin_clz(x);  // For 32-bit
+int highest_bit_index = 63 - __builtin_clzll(x);  // For 64-bit
+```
+
+**Computing floor(log2(x))**:
+```c
+int log2_floor = 31 - __builtin_clz(x);  // x must be > 0
+```
+
+**Finding the next power of 2**:
+```c
+unsigned int next_pow2(unsigned int x) {
+    if (x == 0) return 1;
+    return 1U << (32 - __builtin_clz(x - 1));
+}
+```
+
+### Important Notes
+
+- **Undefined behavior for zero**: If the input is 0, the result is undefined. Always check for zero before calling if the input could be zero.
+- **Return type**: All three builtins return `int`, regardless of the input size.
+- **Portability**: These builtins are compatible with GCC and Clang.
+
+## Population Count Builtins
+
+These builtins count the number of set bits (1-bits) in an integer value.
+
+### `__builtin_popcount(x)`
+
+**Signature**: `int __builtin_popcount(unsigned int x)`
+
+**Purpose**: Returns the number of 1-bits in `x`.
+
+**Parameters**:
+- `x`: An unsigned int to count set bits in
+
+**Returns**: The count of set bits (0 to 32).
+
+**Example**: `__builtin_popcount(0xFF)` returns `8` because 0xFF = 0b11111111 has 8 set bits.
+
+**Usage**:
+```c
+unsigned int val = 0xAAAAAAAA;  // Alternating bits
+int count = __builtin_popcount(val);  // Returns 16
+```
+
+**Implementation**:
+- x86-64: Uses native `popcnt` instruction (requires SSE4.2 or POPCNT feature)
+- AArch64: Uses `cnt` (count bits per byte) followed by `addv` (horizontal add)
+
+### `__builtin_popcountl(x)`
+
+**Signature**: `int __builtin_popcountl(unsigned long x)`
+
+**Purpose**: Returns the number of 1-bits in `x`.
+
+**Parameters**:
+- `x`: An unsigned long to count set bits in
+
+**Returns**: The count of set bits (0 to 64 on LP64 systems).
+
+**Usage**:
+```c
+unsigned long val = 0xFFFFFFFFFFFFFFFFUL;
+int count = __builtin_popcountl(val);  // Returns 64
+```
+
+### `__builtin_popcountll(x)`
+
+**Signature**: `int __builtin_popcountll(unsigned long long x)`
+
+**Purpose**: Returns the number of 1-bits in `x`.
+
+**Parameters**:
+- `x`: An unsigned long long to count set bits in
+
+**Returns**: The count of set bits (0 to 64).
+
+**Usage**:
+```c
+unsigned long long val = 0x5555555555555555ULL;  // Alternating 0101...
+int count = __builtin_popcountll(val);  // Returns 32
+```
+
+### Common Use Cases
+
+**Hamming distance** (number of differing bits between two values):
+```c
+int hamming_distance(unsigned int a, unsigned int b) {
+    return __builtin_popcount(a ^ b);
+}
+```
+
+**Power of 2 detection**:
+```c
+// A number is a power of 2 if it has exactly one bit set
+int is_power_of_2(unsigned int x) {
+    return x != 0 && __builtin_popcount(x) == 1;
+}
+```
+
+**Counting set bits in a bitmap**:
+```c
+int count_flags(unsigned int flags) {
+    return __builtin_popcount(flags);
+}
+```
+
+**Parity calculation**:
+```c
+// Returns 1 if odd number of bits set, 0 if even
+int parity(unsigned int x) {
+    return __builtin_popcount(x) & 1;
+}
+```
+
+### Important Notes
+
+- **Zero is valid**: Unlike `__builtin_clz` and `__builtin_ctz`, these builtins have defined behavior for zero input (returns 0).
+- **Return type**: All three builtins return `int`, regardless of the input size.
+- **Portability**: These builtins are compatible with GCC and Clang.
+- **Hardware requirements**: On x86-64, the POPCNT instruction requires processor support (SSE4.2 or AMD ABM). Most modern processors (since ~2008) support this.
 
 ## Optimization Hints
 

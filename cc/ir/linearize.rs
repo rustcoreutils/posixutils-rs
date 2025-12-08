@@ -519,14 +519,21 @@ impl<'a> Linearizer<'a> {
                 }
             }
 
-            // Negative literal
+            // Negative literal (fast path for simple cases)
             ExprKind::Unary {
                 op: UnaryOp::Neg,
                 operand,
             } => match &operand.kind {
                 ExprKind::IntLit(v) => Initializer::Int(-*v),
                 ExprKind::FloatLit(v) => Initializer::Float(-*v),
-                _ => Initializer::None,
+                // For more complex expressions like -(1+2), try constant evaluation
+                _ => {
+                    if let Some(val) = self.eval_const_expr(expr) {
+                        Initializer::Int(val)
+                    } else {
+                        Initializer::None
+                    }
+                }
             },
 
             // Address-of expression
@@ -548,18 +555,31 @@ impl<'a> Linearizer<'a> {
             ExprKind::InitList { elements } => self.ast_init_list_to_ir(elements, typ),
 
             // Identifier - for constant addresses (function pointers, array decay, etc.)
+            // or enum constants
             ExprKind::Ident { name } => {
                 let type_kind = self.types.kind(typ);
                 // For pointer types, this is likely a function address or array decay
                 if type_kind == TypeKind::Pointer {
                     Initializer::SymAddr(self.str(*name).to_string())
                 } else {
-                    // Other cases - we can't evaluate arbitrary identifiers at compile time
-                    Initializer::None
+                    // Check if it's an enum constant
+                    if let Some(val) = self.symbols.get_enum_value(*name) {
+                        Initializer::Int(val)
+                    } else {
+                        Initializer::None
+                    }
                 }
             }
 
-            _ => Initializer::None,
+            // Binary/unary expressions and other constant expressions
+            // Try to evaluate as integer constant expression
+            _ => {
+                if let Some(val) = self.eval_const_expr(expr) {
+                    Initializer::Int(val)
+                } else {
+                    Initializer::None
+                }
+            }
         }
     }
 
@@ -1518,15 +1538,20 @@ impl<'a> Linearizer<'a> {
         }
     }
 
-    /// Evaluate a constant expression (for case labels)
+    /// Evaluate a constant expression (for case labels, static initializers)
+    ///
+    /// C99 6.6 defines integer constant expressions. This function evaluates
+    /// expressions that can be computed at compile time.
     fn eval_const_expr(&self, expr: &Expr) -> Option<i64> {
         match &expr.kind {
             ExprKind::IntLit(val) => Some(*val),
             ExprKind::CharLit(c) => Some(*c as i64),
+
             ExprKind::Ident { name, .. } => {
                 // Check if it's an enum constant
                 self.symbols.get_enum_value(*name)
             }
+
             ExprKind::Unary { op, operand } => {
                 let val = self.eval_const_expr(operand)?;
                 match op {
@@ -1536,23 +1561,76 @@ impl<'a> Linearizer<'a> {
                     _ => None,
                 }
             }
+
             ExprKind::Binary { op, left, right } => {
                 let l = self.eval_const_expr(left)?;
                 let r = self.eval_const_expr(right)?;
                 match op {
-                    BinaryOp::Add => Some(l + r),
-                    BinaryOp::Sub => Some(l - r),
-                    BinaryOp::Mul => Some(l * r),
-                    BinaryOp::Div => Some(l / r),
-                    BinaryOp::Mod => Some(l % r),
+                    BinaryOp::Add => Some(l.wrapping_add(r)),
+                    BinaryOp::Sub => Some(l.wrapping_sub(r)),
+                    BinaryOp::Mul => Some(l.wrapping_mul(r)),
+                    BinaryOp::Div => {
+                        if r != 0 {
+                            Some(l / r)
+                        } else {
+                            None
+                        }
+                    }
+                    BinaryOp::Mod => {
+                        if r != 0 {
+                            Some(l % r)
+                        } else {
+                            None
+                        }
+                    }
                     BinaryOp::BitAnd => Some(l & r),
                     BinaryOp::BitOr => Some(l | r),
                     BinaryOp::BitXor => Some(l ^ r),
-                    BinaryOp::Shl => Some(l << r),
-                    BinaryOp::Shr => Some(l >> r),
-                    _ => None,
+                    BinaryOp::Shl => Some(l << (r as u32)),
+                    BinaryOp::Shr => Some(l >> (r as u32)),
+                    BinaryOp::Lt => Some(if l < r { 1 } else { 0 }),
+                    BinaryOp::Le => Some(if l <= r { 1 } else { 0 }),
+                    BinaryOp::Gt => Some(if l > r { 1 } else { 0 }),
+                    BinaryOp::Ge => Some(if l >= r { 1 } else { 0 }),
+                    BinaryOp::Eq => Some(if l == r { 1 } else { 0 }),
+                    BinaryOp::Ne => Some(if l != r { 1 } else { 0 }),
+                    BinaryOp::LogAnd => Some(if l != 0 && r != 0 { 1 } else { 0 }),
+                    BinaryOp::LogOr => Some(if l != 0 || r != 0 { 1 } else { 0 }),
                 }
             }
+
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                let cond_val = self.eval_const_expr(cond)?;
+                if cond_val != 0 {
+                    self.eval_const_expr(then_expr)
+                } else {
+                    self.eval_const_expr(else_expr)
+                }
+            }
+
+            // sizeof(type) - constant for complete types
+            ExprKind::SizeofType(type_id) => {
+                let size_bits = self.types.size_bits(*type_id);
+                Some((size_bits / 8) as i64)
+            }
+
+            // sizeof(expr) - constant if expr type is complete
+            ExprKind::SizeofExpr(inner_expr) => {
+                if let Some(typ) = inner_expr.typ {
+                    let size_bits = self.types.size_bits(typ);
+                    Some((size_bits / 8) as i64)
+                } else {
+                    None
+                }
+            }
+
+            // Cast to integer type - evaluate inner expression
+            ExprKind::Cast { expr: inner, .. } => self.eval_const_expr(inner),
+
             _ => None,
         }
     }

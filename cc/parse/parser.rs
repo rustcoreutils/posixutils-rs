@@ -3239,12 +3239,13 @@ impl Parser<'_> {
             let size = if self.is_special(b']') {
                 None
             } else {
-                // Parse constant expression for array size
+                // Parse constant expression for array size (C99 6.7.5.2)
                 let expr = self.parse_assignment_expr()?;
-                // For simplicity, only handle integer literals
-                match expr.kind {
-                    ExprKind::IntLit(n) => Some(n as usize),
-                    _ => None, // VLA or complex expression
+                // Evaluate as integer constant expression
+                match self.eval_const_expr(&expr) {
+                    Some(n) if n >= 0 => Some(n as usize),
+                    Some(_) => None, // Negative size is invalid
+                    None => None,    // Non-constant (VLA) or invalid expression
                 }
             };
             self.expect_special(b']')?;
@@ -3870,10 +3871,13 @@ impl Parser<'_> {
             let size = if self.is_special(b']') {
                 None
             } else {
+                // Parse constant expression for array size (C99 6.7.5.2)
                 let arr_expr = self.parse_assignment_expr()?;
-                match arr_expr.kind {
-                    ExprKind::IntLit(n) => Some(n as usize),
-                    _ => None,
+                // Evaluate as integer constant expression
+                match self.eval_const_expr(&arr_expr) {
+                    Some(n) if n >= 0 => Some(n as usize),
+                    Some(_) => None, // Negative size is invalid
+                    None => None,    // Non-constant (VLA) or invalid expression
                 }
             };
             self.expect_special(b']')?;
@@ -3954,11 +3958,20 @@ impl Parser<'_> {
         Ok(ExternalDecl::Declaration(Declaration { declarators }))
     }
 
-    /// Evaluate a constant expression (for enum values and case labels)
+    /// Evaluate a constant expression (for array sizes, enum values, case labels, static initializers)
+    ///
+    /// C99 6.6 defines integer constant expressions as:
+    /// - Integer/character literals
+    /// - Enum constants
+    /// - sizeof expressions
+    /// - Casts to integer types
+    /// - Unary/binary operators with constant operands
+    /// - Conditional expressions with constant operands
     fn eval_const_expr(&self, expr: &Expr) -> Option<i64> {
         match &expr.kind {
             ExprKind::IntLit(val) => Some(*val),
             ExprKind::CharLit(c) => Some(*c as i64),
+
             ExprKind::Unary { op, operand } => {
                 let val = self.eval_const_expr(operand)?;
                 match op {
@@ -3968,6 +3981,7 @@ impl Parser<'_> {
                     _ => None,
                 }
             }
+
             ExprKind::Binary { op, left, right } => {
                 let lval = self.eval_const_expr(left)?;
                 let rval = self.eval_const_expr(right)?;
@@ -4004,10 +4018,12 @@ impl Parser<'_> {
                     BinaryOp::LogOr => Some(if lval != 0 || rval != 0 { 1 } else { 0 }),
                 }
             }
+
             ExprKind::Ident { name } => {
                 // Check for enum constant
                 self.symbols.get_enum_value(*name)
             }
+
             ExprKind::Conditional {
                 cond,
                 then_expr,
@@ -4020,6 +4036,29 @@ impl Parser<'_> {
                     self.eval_const_expr(else_expr)
                 }
             }
+
+            // sizeof(type) - constant for complete types
+            ExprKind::SizeofType(type_id) => {
+                let size_bits = self.types.size_bits(*type_id);
+                Some((size_bits / 8) as i64)
+            }
+
+            // sizeof(expr) - constant if expr type is complete
+            ExprKind::SizeofExpr(inner_expr) => {
+                if let Some(typ) = inner_expr.typ {
+                    let size_bits = self.types.size_bits(typ);
+                    Some((size_bits / 8) as i64)
+                } else {
+                    None
+                }
+            }
+
+            // Cast to integer type - evaluate inner and truncate/extend as needed
+            ExprKind::Cast { expr: inner, .. } => {
+                // For integer constant expressions, we can evaluate the inner expression
+                self.eval_const_expr(inner)
+            }
+
             _ => None,
         }
     }

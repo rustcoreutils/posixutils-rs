@@ -520,3 +520,98 @@ int main(void) {
 
     cleanup_exe(&exe);
 }
+
+// ============================================================================
+// Constant Expression Evaluation Tests (C99 6.6)
+// ============================================================================
+
+#[test]
+fn test_global_const_expr_init() {
+    let c_file = create_c_file(
+        "global_const_expr_init",
+        r#"
+int a = 2 + 3;
+int b = 10 * 4 + 2;
+int c = (1 << 4) | 10;
+int d = 100 / 5 % 7;
+int e = -10 + 52;
+int main(void) {
+    if (a != 5) return 1;
+    if (b != 42) return 2;
+    if (c != 26) return 3;
+    if (d != 6) return 4;
+    if (e != 42) return 5;
+    return 0;
+}
+"#,
+    );
+
+    let exe = compile(&c_file.path().to_path_buf());
+    assert!(exe.is_some(), "compilation should succeed");
+
+    let exit_code = run(exe.as_ref().unwrap());
+    assert_eq!(
+        exit_code, 0,
+        "all constant expression initializations should work"
+    );
+
+    cleanup_exe(&exe);
+}
+
+#[test]
+fn test_array_const_expr_size() {
+    let c_file = create_c_file(
+        "array_const_expr_size",
+        r#"
+int arr1[2 + 3];
+int arr2[sizeof(int) * 2];
+int main(void) {
+    int size1 = sizeof(arr1) / sizeof(arr1[0]);
+    int size2 = sizeof(arr2) / sizeof(arr2[0]);
+    if (size1 != 5) return 1;
+    if (size2 != 8) return 2;
+    return 0;
+}
+"#,
+    );
+
+    let exe = compile(&c_file.path().to_path_buf());
+    assert!(exe.is_some(), "compilation should succeed");
+
+    let exit_code = run(exe.as_ref().unwrap());
+    assert_eq!(
+        exit_code, 0,
+        "array sizes from constant expressions should work"
+    );
+
+    cleanup_exe(&exe);
+}
+
+#[test]
+fn test_enum_const_expr() {
+    let c_file = create_c_file(
+        "enum_const_expr",
+        r#"
+enum { X = 5, Y = X + 3, Z = Y * 2 };
+int arr[X + Y];
+int val = Z - Y;
+int main(void) {
+    int arr_size = sizeof(arr) / sizeof(arr[0]);
+    if (arr_size != 13) return 1;
+    if (val != 8) return 2;
+    return 0;
+}
+"#,
+    );
+
+    let exe = compile(&c_file.path().to_path_buf());
+    assert!(exe.is_some(), "compilation should succeed");
+
+    let exit_code = run(exe.as_ref().unwrap());
+    assert_eq!(
+        exit_code, 0,
+        "enum constants in constant expressions should work"
+    );
+
+    cleanup_exe(&exe);
+}

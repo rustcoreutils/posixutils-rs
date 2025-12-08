@@ -85,7 +85,6 @@ Not yet implemented (exceptions to C99, or features we want to add):
 - `inline` and inlining support
 - multi-register returns (for structs larger than 8 bytes)
 - -fverbose-asm
-- constant expression evaluation
 - VLAs (variable-length arrays)
 - top builtins to implement:
   __builtin_expect

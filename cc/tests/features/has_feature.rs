@@ -57,6 +57,30 @@ int main(void) {
     return 10;
     #endif
 
+    #if !__has_builtin(__builtin_clz)
+    return 11;
+    #endif
+
+    #if !__has_builtin(__builtin_clzl)
+    return 12;
+    #endif
+
+    #if !__has_builtin(__builtin_clzll)
+    return 13;
+    #endif
+
+    #if !__has_builtin(__builtin_popcount)
+    return 14;
+    #endif
+
+    #if !__has_builtin(__builtin_popcountl)
+    return 15;
+    #endif
+
+    #if !__has_builtin(__builtin_popcountll)
+    return 16;
+    #endif
+
     return 0;
 }
 "#;

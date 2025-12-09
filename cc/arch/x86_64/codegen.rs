@@ -168,8 +168,11 @@ impl X86_64CodeGen {
         // Data section
         self.push_lir(X86Inst::Directive(Directive::Data));
 
-        // Global visibility (if not static)
-        if !is_static {
+        // Check if this is a local symbol (starts with '.')
+        let is_local = name.starts_with('.');
+
+        // Global visibility (if not static and not local)
+        if !is_static && !is_local {
             self.push_lir(X86Inst::Directive(Directive::global(name)));
         }
 
@@ -182,8 +185,12 @@ impl X86_64CodeGen {
             self.push_lir(X86Inst::Directive(Directive::Align(align.trailing_zeros())));
         }
 
-        // Label
-        self.push_lir(X86Inst::Directive(Directive::global_label(name)));
+        // Label - use local_label for names starting with '.'
+        if is_local {
+            self.push_lir(X86Inst::Directive(Directive::local_label(name)));
+        } else {
+            self.push_lir(X86Inst::Directive(Directive::global_label(name)));
+        }
 
         // Emit initializer
         self.emit_initializer_data(init, size as usize);

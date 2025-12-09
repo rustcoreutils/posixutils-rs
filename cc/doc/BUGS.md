@@ -4,25 +4,6 @@ This file documents known bugs where valid C99 code fails to compile.
 
 ## Parse Errors on Valid C99 Code
 
-### Compound Literals
-
-**Status**: Parse error
-
-**Valid C99 Code**:
-```c
-struct Point { int x, y; };
-struct Point p = (struct Point){1, 2};  // Compound literal
-```
-
-**Error**:
-```
-parse error: unexpected token in expression
-```
-
-**C99 Reference**: 6.5.2.5
-
----
-
 ### Array Parameter with `static`
 
 **Status**: Parse error

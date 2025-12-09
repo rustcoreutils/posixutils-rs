@@ -310,3 +310,126 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("struct_return_large", code), 0);
 }
+
+// ============================================================================
+// Compound Literals (C99 6.5.2.5)
+// ============================================================================
+
+#[test]
+fn compound_literal_struct_basic() {
+    let code = r#"
+struct Point { int x; int y; };
+
+int main(void) {
+    struct Point p = (struct Point){10, 20};
+    if (p.x != 10) return 1;
+    if (p.y != 20) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("compound_literal_struct_basic", code), 0);
+}
+
+#[test]
+fn compound_literal_struct_designated() {
+    let code = r#"
+struct Point { int x; int y; };
+
+int main(void) {
+    struct Point p = (struct Point){.y = 30, .x = 40};
+    if (p.x != 40) return 1;
+    if (p.y != 30) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("compound_literal_struct_designated", code),
+        0
+    );
+}
+
+#[test]
+fn compound_literal_array() {
+    let code = r#"
+int main(void) {
+    int *p = (int[]){1, 2, 3, 4, 5};
+    if (p[0] != 1) return 1;
+    if (p[2] != 3) return 2;
+    if (p[4] != 5) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("compound_literal_array", code), 0);
+}
+
+#[test]
+fn compound_literal_as_argument() {
+    let code = r#"
+struct Point { int x; int y; };
+
+int sum_point(struct Point p) {
+    return p.x + p.y;
+}
+
+int main(void) {
+    int result = sum_point((struct Point){5, 7});
+    if (result != 12) return 1;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("compound_literal_as_argument", code), 0);
+}
+
+#[test]
+fn compound_literal_address_of() {
+    let code = r#"
+struct Point { int x; int y; };
+
+int main(void) {
+    struct Point *ptr = &(struct Point){100, 200};
+    if (ptr->x != 100) return 1;
+    if (ptr->y != 200) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("compound_literal_address_of", code), 0);
+}
+
+#[test]
+fn compound_literal_file_scope_struct() {
+    let code = r#"
+struct Point { int x; int y; };
+
+// File-scope compound literal - static storage
+struct Point origin = (struct Point){0, 0};
+
+int main(void) {
+    if (origin.x != 0) return 1;
+    if (origin.y != 0) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("compound_literal_file_scope_struct", code),
+        0
+    );
+}
+
+#[test]
+fn compound_literal_file_scope_array_ptr() {
+    let code = r#"
+// File-scope pointer to compound literal array
+int *primes = (int[]){2, 3, 5, 7, 11};
+
+int main(void) {
+    if (primes[0] != 2) return 1;
+    if (primes[2] != 5) return 2;
+    if (primes[4] != 11) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("compound_literal_file_scope_array_ptr", code),
+        0
+    );
+}

@@ -1511,12 +1511,19 @@ impl<'a> Parser<'a> {
             result_id = self.types.intern(Type::pointer(result_id));
         }
 
-        // Handle array declarators: int[10], char[20], etc.
+        // Handle array declarators: int[10], char[20], int[], etc.
         while self.is_special(b'[') {
             self.advance();
-            if let Ok(size_expr) = self.parse_conditional_expr() {
+            // Check for empty brackets [] (incomplete array type for compound literals)
+            if self.is_special(b']') {
+                // Empty brackets - create array with size 0 (size to be determined from initializer)
+                result_id = self.types.intern(Type::array(result_id, 0));
+            } else if let Ok(size_expr) = self.parse_conditional_expr() {
                 if let Some(size) = self.eval_const_expr(&size_expr) {
                     result_id = self.types.intern(Type::array(result_id, size as usize));
+                } else {
+                    // Non-constant size (VLA in type name) - create array with size 0
+                    result_id = self.types.intern(Type::array(result_id, 0));
                 }
             }
             if !self.is_special(b']') {
@@ -2214,11 +2221,42 @@ impl<'a> Parser<'a> {
                     let paren_pos = self.current_pos();
                     self.advance();
 
-                    // Try to detect cast (type) - simplified check
+                    // Try to detect cast (type) or compound literal (type){...}
                     if let Some(typ) = self.try_parse_type_name() {
                         self.expect_special(b')')?;
+
+                        // Check for compound literal: (type){ ... }
+                        if self.is_special(b'{') {
+                            let init_list = self.parse_initializer_list()?;
+                            let elements = match init_list.kind {
+                                ExprKind::InitList { elements } => elements,
+                                _ => unreachable!(),
+                            };
+
+                            // For incomplete array types (size 0), determine size from initializer
+                            let final_typ = if self.types.kind(typ) == TypeKind::Array
+                                && self.types.get(typ).array_size == Some(0)
+                            {
+                                // Array size should be determined from initializer element count
+                                let elem_type =
+                                    self.types.base_type(typ).unwrap_or(self.types.int_id);
+                                self.types.intern(Type::array(elem_type, elements.len()))
+                            } else {
+                                typ
+                            };
+
+                            return Ok(Self::typed_expr(
+                                ExprKind::CompoundLiteral {
+                                    typ: final_typ,
+                                    elements,
+                                },
+                                final_typ,
+                                paren_pos,
+                            ));
+                        }
+
+                        // Regular cast expression
                         let expr = self.parse_unary_expr()?;
-                        // Cast expression has the cast type
                         return Ok(Self::typed_expr(
                             ExprKind::Cast {
                                 cast_type: typ,

@@ -244,6 +244,13 @@ pub enum ExprKind {
         expr: Box<Expr>,
     },
 
+    /// Compound literal: (type){ init-list }
+    /// C99 6.5.2.5: Creates unnamed object with automatic/static storage
+    CompoundLiteral {
+        typ: TypeId,
+        elements: Vec<InitElement>,
+    },
+
     /// sizeof type: sizeof(int)
     SizeofType(TypeId),
 

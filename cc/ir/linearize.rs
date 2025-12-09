@@ -94,6 +94,8 @@ pub struct Linearizer<'a> {
     current_func_name: String,
     /// Counter for generating unique static local names
     static_local_counter: u32,
+    /// Counter for generating unique compound literal names (for file-scope compound literals)
+    compound_literal_counter: u32,
     /// Static local variables (local name -> static local info)
     /// This is persistent across function calls (not cleared per function)
     static_locals: HashMap<String, StaticLocalInfo>,
@@ -135,6 +137,7 @@ impl<'a> Linearizer<'a> {
             struct_return_size: 0,
             current_func_name: String::new(),
             static_local_counter: 0,
+            compound_literal_counter: 0,
             static_locals: HashMap::new(),
             current_pos: None,
             target,
@@ -518,7 +521,8 @@ impl<'a> Linearizer<'a> {
     /// - Struct initializers with designated and positional fields
     /// - Address-of expressions (&symbol)
     /// - Nested initializers
-    fn ast_init_to_ir(&self, expr: &Expr, typ: TypeId) -> Initializer {
+    /// - Compound literals (C99 6.5.2.5)
+    fn ast_init_to_ir(&mut self, expr: &Expr, typ: TypeId) -> Initializer {
         match &expr.kind {
             ExprKind::IntLit(v) => Initializer::Int(*v),
             ExprKind::FloatLit(v) => Initializer::Float(*v),
@@ -573,6 +577,33 @@ impl<'a> Linearizer<'a> {
             // Initializer list for arrays/structs
             ExprKind::InitList { elements } => self.ast_init_list_to_ir(elements, typ),
 
+            // Compound literal in initializer context (C99 6.5.2.5)
+            ExprKind::CompoundLiteral {
+                typ: cl_type,
+                elements,
+            } => {
+                // Check if compound literal type matches target type
+                if *cl_type == typ {
+                    // Direct value - treat like InitList
+                    self.ast_init_list_to_ir(elements, typ)
+                } else if self.types.kind(typ) == TypeKind::Pointer {
+                    // Pointer initialization - create anonymous static global
+                    // and return its address
+                    let anon_name = format!(".CL{}", self.compound_literal_counter);
+                    self.compound_literal_counter += 1;
+
+                    // Create the anonymous global
+                    let init = self.ast_init_list_to_ir(elements, *cl_type);
+                    self.module.add_global(&anon_name, *cl_type, init);
+
+                    // Return address of the anonymous global
+                    Initializer::SymAddr(anon_name)
+                } else {
+                    // Type mismatch - try to use the initializer list directly
+                    self.ast_init_list_to_ir(elements, typ)
+                }
+            }
+
             // Identifier - for constant addresses (function pointers, array decay, etc.)
             // or enum constants
             ExprKind::Ident { name } => {
@@ -603,7 +634,7 @@ impl<'a> Linearizer<'a> {
     }
 
     /// Convert an AST initializer list to an IR Initializer
-    fn ast_init_list_to_ir(&self, elements: &[InitElement], typ: TypeId) -> Initializer {
+    fn ast_init_list_to_ir(&mut self, elements: &[InitElement], typ: TypeId) -> Initializer {
         let type_kind = self.types.kind(typ);
         let total_size = (self.types.size_bits(typ) / 8) as usize;
 
@@ -2147,6 +2178,28 @@ impl<'a> Linearizer<'a> {
                 ));
                 addr
             }
+            ExprKind::CompoundLiteral { typ, elements } => {
+                // Compound literal as lvalue: create it and return its address
+                // This is used for &(struct S){...}
+                let sym_id = self.alloc_pseudo();
+                let unique_name = format!(".compound_literal#{}", sym_id.0);
+                let sym = Pseudo::sym(sym_id, unique_name.clone());
+                if let Some(func) = &mut self.current_func {
+                    func.add_pseudo(sym);
+                    func.add_local(&unique_name, sym_id, *typ, false, self.current_bb);
+                }
+                self.linearize_init_list(sym_id, *typ, elements);
+
+                // Return address of the compound literal
+                let result = self.alloc_pseudo();
+                let pseudo = Pseudo::reg(result, result.0);
+                if let Some(func) = &mut self.current_func {
+                    func.add_pseudo(pseudo);
+                }
+                let ptr_type = self.types.pointer_to(*typ);
+                self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
+                result
+            }
             _ => {
                 // Fallback: just evaluate the expression (shouldn't happen for valid lvalues)
                 self.linearize_expr(expr)
@@ -3247,6 +3300,44 @@ impl<'a> Linearizer<'a> {
                 // InitList is handled specially in linearize_local_decl and linearize_global_decl
                 // It shouldn't be reached here during normal expression evaluation
                 panic!("InitList should be handled in declaration context, not as standalone expression")
+            }
+
+            ExprKind::CompoundLiteral { typ, elements } => {
+                // Compound literals have automatic storage at block scope
+                // Create an anonymous local variable, similar to how local variables work
+
+                // Create a symbol pseudo for the compound literal (its address)
+                let sym_id = self.alloc_pseudo();
+                let unique_name = format!(".compound_literal#{}", sym_id.0);
+                let sym = Pseudo::sym(sym_id, unique_name.clone());
+                if let Some(func) = &mut self.current_func {
+                    func.add_pseudo(sym);
+                    // Register as local for proper stack allocation
+                    func.add_local(&unique_name, sym_id, *typ, false, self.current_bb);
+                }
+
+                // Initialize using existing init list machinery
+                self.linearize_init_list(sym_id, *typ, elements);
+
+                // For arrays: return pointer (array-to-pointer decay)
+                // For structs/scalars: load and return the value
+                let result = self.alloc_pseudo();
+                let pseudo = Pseudo::reg(result, result.0);
+                if let Some(func) = &mut self.current_func {
+                    func.add_pseudo(pseudo);
+                }
+
+                if self.types.kind(*typ) == TypeKind::Array {
+                    // Array compound literal - decay to pointer to first element
+                    let elem_type = self.types.base_type(*typ).unwrap_or(self.types.int_id);
+                    let ptr_type = self.types.pointer_to(elem_type);
+                    self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
+                } else {
+                    // Struct/scalar compound literal - load the value
+                    let size = self.types.size_bits(*typ);
+                    self.emit(Instruction::load(result, sym_id, 0, *typ, size));
+                }
+                result
             }
 
             // ================================================================

@@ -77,7 +77,6 @@ Supported:
 
 Not yet implemented (exceptions to C99, or features we want to add):
 - Actual inlining optimization (the `inline` keyword is supported but functions are not inlined)
-- multi-register returns (for structs larger than 8 bytes)
 - -fverbose-asm
 - top builtins to implement:
   __builtin_expect

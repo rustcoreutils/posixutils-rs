@@ -320,10 +320,10 @@ int main(void) {
 #[test]
 fn struct_return_two_register() {
     let code = r#"
-// 12-byte struct - uses two-register return (RAX+RDX or X0+X1)
+// 16-byte struct (12 bytes data + 4 bytes padding) - uses two-register return (RAX+RDX or X0+X1)
 struct medium {
     long first;   // 8 bytes
-    int second;   // 4 bytes (+ 4 padding = 16 total with alignment)
+    int second;   // 4 bytes (+ 4 bytes padding for alignment; total 16 bytes)
 };
 
 struct medium make_medium(long a, int b) {

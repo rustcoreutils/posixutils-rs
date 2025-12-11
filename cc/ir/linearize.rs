@@ -1091,7 +1091,7 @@ impl<'a> Linearizer<'a> {
                         if let Some(func) = &mut self.current_func {
                             func.add_pseudo(high_pseudo);
                         }
-                        // Always load 8 bytes for the high part - codegen will handle alignment
+                        // Load up to 8 bytes for the high part (may be less for structs < 16 bytes)
                         let high_size = std::cmp::min(64, struct_size - 64);
                         self.emit(Instruction::load(
                             high_temp,

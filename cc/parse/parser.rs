@@ -3895,7 +3895,7 @@ impl Parser<'_> {
 
                 // Parse optional qualifiers and static (C99 6.7.5.3)
                 let mut array_qualifiers = TypeModifiers::empty();
-                let mut _has_static = false; // Optimization hint, not used in codegen
+                let mut has_static = false; // Optimization hint, not used in codegen
                 let mut is_vla_star = false;
 
                 // Parse type qualifiers and static keyword
@@ -3903,8 +3903,14 @@ impl Parser<'_> {
                     if let Some(name) = self.get_ident_name(self.current()) {
                         match name.as_str() {
                             "static" => {
+                                if has_static {
+                                    diag::error(
+                                        self.current().pos,
+                                        "duplicate 'static' in array declarator",
+                                    );
+                                }
                                 self.advance();
-                                _has_static = true;
+                                has_static = true;
                             }
                             "const" => {
                                 self.advance();

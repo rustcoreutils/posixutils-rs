@@ -1048,6 +1048,11 @@ impl<'a> Linearizer<'a> {
                             self.types.void_ptr_id,
                             64,
                         ));
+                    } else if self.types.is_complex(typ) {
+                        // Complex return: codegen expects an address (pointer to the complex value)
+                        let addr = self.linearize_lvalue(e);
+                        let typ_size = self.types.size_bits(typ);
+                        self.emit(Instruction::ret_typed(Some(addr), typ, typ_size));
                     } else {
                         let val = self.linearize_expr(e);
                         let typ_size = self.types.size_bits(typ);

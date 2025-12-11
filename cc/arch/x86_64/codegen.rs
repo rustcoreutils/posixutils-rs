@@ -23,8 +23,24 @@ use crate::arch::x86_64::regalloc::{Loc, Reg, RegAlloc, XmmReg};
 use crate::arch::DEFAULT_LIR_BUFFER_CAPACITY;
 use crate::ir::{Function, Initializer, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
 use crate::target::Target;
-use crate::types::{TypeId, TypeModifiers, TypeTable};
+use crate::types::{TypeId, TypeKind, TypeModifiers, TypeTable};
 use std::collections::HashMap;
+
+// ============================================================================
+// Complex Type Helpers
+// ============================================================================
+
+/// Get FpSize and element offset for a complex type's components.
+/// Returns (FpSize for each component, byte offset to imaginary part).
+fn complex_fp_info(types: &TypeTable, complex_typ: TypeId) -> (FpSize, i32) {
+    let base = types.complex_base(complex_typ);
+    match types.kind(base) {
+        TypeKind::Float => (FpSize::Single, 4),
+        TypeKind::Double => (FpSize::Double, 8),
+        TypeKind::LongDouble => (FpSize::Double, 8), // TODO: arch-specific
+        _ => (FpSize::Double, 8),                    // fallback
+    }
+}
 
 // ============================================================================
 // x86-64 Code Generator
@@ -459,9 +475,10 @@ impl X86_64CodeGen {
                                     if let Some(Loc::Stack(offset)) = self.locations.get(&local.sym)
                                     {
                                         let adjusted = offset + self.callee_saved_offset;
+                                        let (fp_size, imag_offset) = complex_fp_info(types, *typ);
                                         // Store real part from first XMM register
                                         self.push_lir(X86Inst::MovFp {
-                                            size: FpSize::Double,
+                                            size: fp_size,
                                             src: XmmOperand::Reg(fp_arg_regs[fp_arg_idx]),
                                             dst: XmmOperand::Mem(MemAddr::BaseOffset {
                                                 base: Reg::Rbp,
@@ -470,11 +487,11 @@ impl X86_64CodeGen {
                                         });
                                         // Store imag part from second XMM register
                                         self.push_lir(X86Inst::MovFp {
-                                            size: FpSize::Double,
+                                            size: fp_size,
                                             src: XmmOperand::Reg(fp_arg_regs[fp_arg_idx + 1]),
                                             dst: XmmOperand::Mem(MemAddr::BaseOffset {
                                                 base: Reg::Rbp,
-                                                offset: -adjusted + 8,
+                                                offset: -adjusted + imag_offset,
                                             }),
                                         });
                                     }
@@ -585,6 +602,7 @@ impl X86_64CodeGen {
                     if is_complex {
                         // Complex return value: load real into XMM0, imag into XMM1
                         // The source is a pointer to the complex value
+                        let (fp_size, imag_offset) = complex_fp_info(types, insn.typ.unwrap());
                         match src_loc {
                             Loc::Stack(offset) => {
                                 // Stack slot contains a pointer to the complex value
@@ -599,7 +617,7 @@ impl X86_64CodeGen {
                                     dst: GpOperand::Reg(Reg::Rax),
                                 });
                                 self.push_lir(X86Inst::MovFp {
-                                    size: FpSize::Double,
+                                    size: fp_size,
                                     src: XmmOperand::Mem(MemAddr::BaseOffset {
                                         base: Reg::Rax,
                                         offset: 0,
@@ -607,10 +625,10 @@ impl X86_64CodeGen {
                                     dst: XmmOperand::Reg(XmmReg::Xmm0),
                                 });
                                 self.push_lir(X86Inst::MovFp {
-                                    size: FpSize::Double,
+                                    size: fp_size,
                                     src: XmmOperand::Mem(MemAddr::BaseOffset {
                                         base: Reg::Rax,
-                                        offset: 8,
+                                        offset: imag_offset,
                                     }),
                                     dst: XmmOperand::Reg(XmmReg::Xmm1),
                                 });
@@ -618,7 +636,7 @@ impl X86_64CodeGen {
                             Loc::Reg(r) => {
                                 // Address in register - load through it
                                 self.push_lir(X86Inst::MovFp {
-                                    size: FpSize::Double,
+                                    size: fp_size,
                                     src: XmmOperand::Mem(MemAddr::BaseOffset {
                                         base: r,
                                         offset: 0,
@@ -626,10 +644,10 @@ impl X86_64CodeGen {
                                     dst: XmmOperand::Reg(XmmReg::Xmm0),
                                 });
                                 self.push_lir(X86Inst::MovFp {
-                                    size: FpSize::Double,
+                                    size: fp_size,
                                     src: XmmOperand::Mem(MemAddr::BaseOffset {
                                         base: r,
-                                        offset: 8,
+                                        offset: imag_offset,
                                     }),
                                     dst: XmmOperand::Reg(XmmReg::Xmm1),
                                 });
@@ -2900,6 +2918,7 @@ impl X86_64CodeGen {
                 // Complex type: load both parts and put in 2 consecutive XMM registers
                 // The arg pseudo contains the ADDRESS of the complex value
                 let arg_loc = self.get_location(arg);
+                let (fp_size, imag_offset) = complex_fp_info(types, arg_type.unwrap());
                 match arg_loc {
                     Loc::Stack(offset) => {
                         // Stack slot contains the address of the complex value
@@ -2915,7 +2934,7 @@ impl X86_64CodeGen {
                         });
                         // Load real part from the complex value
                         self.push_lir(X86Inst::MovFp {
-                            size: FpSize::Double,
+                            size: fp_size,
                             src: XmmOperand::Mem(MemAddr::BaseOffset {
                                 base: Reg::R11,
                                 offset: 0,
@@ -2924,10 +2943,10 @@ impl X86_64CodeGen {
                         });
                         // Load imag part from the complex value
                         self.push_lir(X86Inst::MovFp {
-                            size: FpSize::Double,
+                            size: fp_size,
                             src: XmmOperand::Mem(MemAddr::BaseOffset {
                                 base: Reg::R11,
-                                offset: 8,
+                                offset: imag_offset,
                             }),
                             dst: XmmOperand::Reg(fp_arg_regs[fp_arg_idx + 1]),
                         });
@@ -2935,13 +2954,16 @@ impl X86_64CodeGen {
                     Loc::Reg(r) => {
                         // Address in register - load through it
                         self.push_lir(X86Inst::MovFp {
-                            size: FpSize::Double,
+                            size: fp_size,
                             src: XmmOperand::Mem(MemAddr::BaseOffset { base: r, offset: 0 }),
                             dst: XmmOperand::Reg(fp_arg_regs[fp_arg_idx]),
                         });
                         self.push_lir(X86Inst::MovFp {
-                            size: FpSize::Double,
-                            src: XmmOperand::Mem(MemAddr::BaseOffset { base: r, offset: 8 }),
+                            size: fp_size,
+                            src: XmmOperand::Mem(MemAddr::BaseOffset {
+                                base: r,
+                                offset: imag_offset,
+                            }),
                             dst: XmmOperand::Reg(fp_arg_regs[fp_arg_idx + 1]),
                         });
                     }
@@ -3007,12 +3029,13 @@ impl X86_64CodeGen {
             if is_complex_result {
                 // Complex return value is in XMM0 (real) + XMM1 (imag)
                 // Store both parts to the target location
+                let (fp_size, imag_offset) = complex_fp_info(types, insn.typ.unwrap());
                 match dst_loc {
                     Loc::Stack(offset) => {
                         let adjusted = offset + self.callee_saved_offset;
                         // Store real part from XMM0
                         self.push_lir(X86Inst::MovFp {
-                            size: FpSize::Double,
+                            size: fp_size,
                             src: XmmOperand::Reg(XmmReg::Xmm0),
                             dst: XmmOperand::Mem(MemAddr::BaseOffset {
                                 base: Reg::Rbp,
@@ -3021,25 +3044,28 @@ impl X86_64CodeGen {
                         });
                         // Store imag part from XMM1
                         self.push_lir(X86Inst::MovFp {
-                            size: FpSize::Double,
+                            size: fp_size,
                             src: XmmOperand::Reg(XmmReg::Xmm1),
                             dst: XmmOperand::Mem(MemAddr::BaseOffset {
                                 base: Reg::Rbp,
-                                offset: -adjusted + 8,
+                                offset: -adjusted + imag_offset,
                             }),
                         });
                     }
                     Loc::Reg(r) => {
                         // Address in register - store through it
                         self.push_lir(X86Inst::MovFp {
-                            size: FpSize::Double,
+                            size: fp_size,
                             src: XmmOperand::Reg(XmmReg::Xmm0),
                             dst: XmmOperand::Mem(MemAddr::BaseOffset { base: r, offset: 0 }),
                         });
                         self.push_lir(X86Inst::MovFp {
-                            size: FpSize::Double,
+                            size: fp_size,
                             src: XmmOperand::Reg(XmmReg::Xmm1),
-                            dst: XmmOperand::Mem(MemAddr::BaseOffset { base: r, offset: 8 }),
+                            dst: XmmOperand::Mem(MemAddr::BaseOffset {
+                                base: r,
+                                offset: imag_offset,
+                            }),
                         });
                     }
                     _ => {}

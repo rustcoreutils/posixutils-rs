@@ -24,8 +24,24 @@ use crate::arch::lir::{Directive, FpSize, Label, OperandSize, Symbol};
 use crate::arch::DEFAULT_LIR_BUFFER_CAPACITY;
 use crate::ir::{Function, Initializer, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
 use crate::target::Target;
-use crate::types::{TypeId, TypeModifiers, TypeTable};
+use crate::types::{TypeId, TypeKind, TypeModifiers, TypeTable};
 use std::collections::HashMap;
+
+// ============================================================================
+// Complex Type Helpers
+// ============================================================================
+
+/// Get FpSize and element offset for a complex type's components.
+/// Returns (FpSize for each component, byte offset to imaginary part).
+fn complex_fp_info(types: &TypeTable, complex_typ: TypeId) -> (FpSize, i32) {
+    let base = types.complex_base(complex_typ);
+    match types.kind(base) {
+        TypeKind::Float => (FpSize::Single, 4),
+        TypeKind::Double => (FpSize::Double, 8),
+        TypeKind::LongDouble => (FpSize::Double, 8), // TODO: arch-specific
+        _ => (FpSize::Double, 8),                    // fallback
+    }
+}
 
 // ============================================================================
 // AArch64 Code Generator
@@ -650,9 +666,10 @@ impl Aarch64CodeGen {
                                     if let Some(Loc::Stack(offset)) = self.locations.get(&local.sym)
                                     {
                                         let actual_offset = self.stack_offset(total_frame, *offset);
+                                        let (fp_size, imag_offset) = complex_fp_info(types, *typ);
                                         // Store real part from first FP register
                                         self.push_lir(Aarch64Inst::StrFp {
-                                            size: FpSize::Double,
+                                            size: fp_size,
                                             src: fp_arg_regs[fp_arg_idx],
                                             addr: MemAddr::BaseOffset {
                                                 base: Reg::X29,
@@ -661,11 +678,11 @@ impl Aarch64CodeGen {
                                         });
                                         // Store imag part from second FP register
                                         self.push_lir(Aarch64Inst::StrFp {
-                                            size: FpSize::Double,
+                                            size: fp_size,
                                             src: fp_arg_regs[fp_arg_idx + 1],
                                             addr: MemAddr::BaseOffset {
                                                 base: Reg::X29,
-                                                offset: actual_offset + 8,
+                                                offset: actual_offset + imag_offset,
                                             },
                                         });
                                     }
@@ -780,6 +797,7 @@ impl Aarch64CodeGen {
                     if is_complex {
                         // Complex return value: load real into V0, imag into V1
                         // The source is a pointer to the complex value
+                        let (fp_size, imag_offset) = complex_fp_info(types, insn.typ.unwrap());
                         match src_loc {
                             Loc::Stack(offset) => {
                                 // Stack slot contains a pointer to the complex value
@@ -793,7 +811,7 @@ impl Aarch64CodeGen {
                                     },
                                 });
                                 self.push_lir(Aarch64Inst::LdrFp {
-                                    size: FpSize::Double,
+                                    size: fp_size,
                                     dst: VReg::V0,
                                     addr: MemAddr::BaseOffset {
                                         base: Reg::X9,
@@ -801,25 +819,28 @@ impl Aarch64CodeGen {
                                     },
                                 });
                                 self.push_lir(Aarch64Inst::LdrFp {
-                                    size: FpSize::Double,
+                                    size: fp_size,
                                     dst: VReg::V1,
                                     addr: MemAddr::BaseOffset {
                                         base: Reg::X9,
-                                        offset: 8,
+                                        offset: imag_offset,
                                     },
                                 });
                             }
                             Loc::Reg(r) => {
                                 // Address in register - load through it
                                 self.push_lir(Aarch64Inst::LdrFp {
-                                    size: FpSize::Double,
+                                    size: fp_size,
                                     dst: VReg::V0,
                                     addr: MemAddr::BaseOffset { base: r, offset: 0 },
                                 });
                                 self.push_lir(Aarch64Inst::LdrFp {
-                                    size: FpSize::Double,
+                                    size: fp_size,
                                     dst: VReg::V1,
-                                    addr: MemAddr::BaseOffset { base: r, offset: 8 },
+                                    addr: MemAddr::BaseOffset {
+                                        base: r,
+                                        offset: imag_offset,
+                                    },
                                 });
                             }
                             _ => {}
@@ -2478,6 +2499,7 @@ impl Aarch64CodeGen {
                     // The arg pseudo contains the ADDRESS of the complex value
                     if fp_arg_idx + 1 < fp_arg_regs.len() {
                         let arg_loc = self.get_location(arg);
+                        let (fp_size, imag_offset) = complex_fp_info(types, arg_type.unwrap());
                         match arg_loc {
                             Loc::Stack(offset) => {
                                 // Stack slot contains the address of the complex value
@@ -2493,7 +2515,7 @@ impl Aarch64CodeGen {
                                 });
                                 // Load real part into first FP register
                                 self.push_lir(Aarch64Inst::LdrFp {
-                                    size: FpSize::Double,
+                                    size: fp_size,
                                     dst: fp_arg_regs[fp_arg_idx],
                                     addr: MemAddr::BaseOffset {
                                         base: Reg::X9,
@@ -2502,25 +2524,28 @@ impl Aarch64CodeGen {
                                 });
                                 // Load imag part into second FP register
                                 self.push_lir(Aarch64Inst::LdrFp {
-                                    size: FpSize::Double,
+                                    size: fp_size,
                                     dst: fp_arg_regs[fp_arg_idx + 1],
                                     addr: MemAddr::BaseOffset {
                                         base: Reg::X9,
-                                        offset: 8,
+                                        offset: imag_offset,
                                     },
                                 });
                             }
                             Loc::Reg(r) => {
                                 // Address in register - load through it
                                 self.push_lir(Aarch64Inst::LdrFp {
-                                    size: FpSize::Double,
+                                    size: fp_size,
                                     dst: fp_arg_regs[fp_arg_idx],
                                     addr: MemAddr::BaseOffset { base: r, offset: 0 },
                                 });
                                 self.push_lir(Aarch64Inst::LdrFp {
-                                    size: FpSize::Double,
+                                    size: fp_size,
                                     dst: fp_arg_regs[fp_arg_idx + 1],
-                                    addr: MemAddr::BaseOffset { base: r, offset: 8 },
+                                    addr: MemAddr::BaseOffset {
+                                        base: r,
+                                        offset: imag_offset,
+                                    },
                                 });
                             }
                             _ => {}
@@ -2611,12 +2636,13 @@ impl Aarch64CodeGen {
             if is_complex_result {
                 // Complex return value is in V0 (real) + V1 (imag)
                 // Store both parts to the target location
+                let (fp_size, imag_offset) = complex_fp_info(types, insn.typ.unwrap());
                 match dst_loc {
                     Loc::Stack(offset) => {
                         let actual_offset = self.stack_offset(frame_size, offset);
                         // Store real part from V0
                         self.push_lir(Aarch64Inst::StrFp {
-                            size: FpSize::Double,
+                            size: fp_size,
                             src: VReg::V0,
                             addr: MemAddr::BaseOffset {
                                 base: Reg::X29,
@@ -2625,25 +2651,28 @@ impl Aarch64CodeGen {
                         });
                         // Store imag part from V1
                         self.push_lir(Aarch64Inst::StrFp {
-                            size: FpSize::Double,
+                            size: fp_size,
                             src: VReg::V1,
                             addr: MemAddr::BaseOffset {
                                 base: Reg::X29,
-                                offset: actual_offset + 8,
+                                offset: actual_offset + imag_offset,
                             },
                         });
                     }
                     Loc::Reg(r) => {
                         // Address in register - store through it
                         self.push_lir(Aarch64Inst::StrFp {
-                            size: FpSize::Double,
+                            size: fp_size,
                             src: VReg::V0,
                             addr: MemAddr::BaseOffset { base: r, offset: 0 },
                         });
                         self.push_lir(Aarch64Inst::StrFp {
-                            size: FpSize::Double,
+                            size: fp_size,
                             src: VReg::V1,
-                            addr: MemAddr::BaseOffset { base: r, offset: 8 },
+                            addr: MemAddr::BaseOffset {
+                                base: r,
+                                offset: imag_offset,
+                            },
                         });
                     }
                     _ => {}

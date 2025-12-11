@@ -411,3 +411,162 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("complex_array", code), 0);
 }
+
+// ============================================================================
+// Float _Complex Function Calls (Tests for FP size handling)
+// ============================================================================
+
+#[test]
+fn float_complex_function_return() {
+    // Test function returning float _Complex (tests complex local return fix)
+    let code = r#"
+float _Complex make_complex(float real, float imag) {
+    float _Complex result;
+    float *rp = (float*)&result;
+    rp[0] = real;
+    rp[1] = imag;
+    return result;
+}
+
+int main(void) {
+    float _Complex c = make_complex(1.5f, 2.5f);
+    float *cp = (float*)&c;
+
+    // Check real part: 1.5
+    if (cp[0] < 1.4f || cp[0] > 1.6f) return 1;
+    // Check imaginary part: 2.5
+    if (cp[1] < 2.4f || cp[1] > 2.6f) return 2;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("float_complex_return", code), 0);
+}
+
+#[test]
+fn float_complex_function_argument() {
+    // Test function taking float _Complex argument
+    // Tests that float _Complex uses 4-byte offsets for real/imag parts
+    let code = r#"
+int check_real(float _Complex c) {
+    float *cp = (float*)&c;
+    float real = cp[0];
+    if (real < 3.4f || real > 3.6f) return 1;
+    return 0;
+}
+
+int check_imag(float _Complex c) {
+    float *cp = (float*)&c;
+    float imag = cp[1];
+    if (imag < 4.4f || imag > 4.6f) return 1;
+    return 0;
+}
+
+int main(void) {
+    float _Complex a;
+    float *ap = (float*)&a;
+    ap[0] = 3.5f;
+    ap[1] = 4.5f;
+
+    if (check_real(a) != 0) return 1;
+    if (check_imag(a) != 0) return 2;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("float_complex_arg", code), 0);
+}
+
+#[test]
+fn float_complex_add_function() {
+    // Test function that adds two float _Complex values
+    // This tests that float _Complex uses 4-byte offsets (not 8-byte like double)
+    let code = r#"
+float _Complex add_fc(float _Complex x, float _Complex y) {
+    return x + y;
+}
+
+int main(void) {
+    float _Complex a, b, c;
+    float *ap = (float*)&a;
+    float *bp = (float*)&b;
+    float *cp = (float*)&c;
+
+    // a = 1 + 2i
+    ap[0] = 1.0f; ap[1] = 2.0f;
+    // b = 3 + 4i
+    bp[0] = 3.0f; bp[1] = 4.0f;
+
+    c = add_fc(a, b);
+
+    // c should be 4 + 6i
+    if (cp[0] < 3.9f || cp[0] > 4.1f) return 1;
+    if (cp[1] < 5.9f || cp[1] > 6.1f) return 2;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("float_complex_add_func", code), 0);
+}
+
+#[test]
+fn float_complex_sub_function() {
+    // Test function that subtracts two float _Complex values
+    let code = r#"
+float _Complex sub_fc(float _Complex x, float _Complex y) {
+    return x - y;
+}
+
+int main(void) {
+    float _Complex a, b, c;
+    float *ap = (float*)&a;
+    float *bp = (float*)&b;
+    float *cp = (float*)&c;
+
+    // a = 5 + 7i
+    ap[0] = 5.0f; ap[1] = 7.0f;
+    // b = 3 + 4i
+    bp[0] = 3.0f; bp[1] = 4.0f;
+
+    c = sub_fc(a, b);
+
+    // c should be 2 + 3i
+    if (cp[0] < 1.9f || cp[0] > 2.1f) return 1;
+    if (cp[1] < 2.9f || cp[1] > 3.1f) return 2;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("float_complex_sub_func", code), 0);
+}
+
+#[test]
+fn float_complex_mul_function() {
+    // Test function that multiplies two float _Complex values
+    let code = r#"
+float _Complex mul_fc(float _Complex x, float _Complex y) {
+    return x * y;
+}
+
+int main(void) {
+    float _Complex a, b, c;
+    float *ap = (float*)&a;
+    float *bp = (float*)&b;
+    float *cp = (float*)&c;
+
+    // a = 1 + 2i
+    ap[0] = 1.0f; ap[1] = 2.0f;
+    // b = 3 + 4i
+    bp[0] = 3.0f; bp[1] = 4.0f;
+
+    c = mul_fc(a, b);
+
+    // c should be -5 + 10i (1*3 - 2*4 + (1*4 + 2*3)i)
+    if (cp[0] < -5.1f || cp[0] > -4.9f) return 1;
+    if (cp[1] < 9.9f || cp[1] > 10.1f) return 2;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("float_complex_mul_func", code), 0);
+}

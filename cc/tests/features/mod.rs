@@ -10,6 +10,7 @@
 //
 
 mod alloca;
+mod array_param_qualifiers;
 mod bswap;
 mod clz;
 mod constant_p;

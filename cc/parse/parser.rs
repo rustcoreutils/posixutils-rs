@@ -3892,16 +3892,67 @@ impl Parser<'_> {
             // adjusted to 'qualified pointer to type'"
             if self.is_special(b'[') {
                 self.advance();
-                // Skip the array size if present (ignored in parameter context)
-                if !self.is_special(b']') {
+
+                // Parse optional qualifiers and static (C99 6.7.5.3)
+                let mut array_qualifiers = TypeModifiers::empty();
+                let mut has_static = false; // Optimization hint, not used in codegen
+                let mut is_vla_star = false;
+
+                // Parse type qualifiers and static keyword
+                while self.peek() == TokenType::Ident {
+                    if let Some(name) = self.get_ident_name(self.current()) {
+                        match name.as_str() {
+                            "static" => {
+                                if has_static {
+                                    diag::error(
+                                        self.current().pos,
+                                        "duplicate 'static' in array declarator",
+                                    );
+                                }
+                                self.advance();
+                                has_static = true;
+                            }
+                            "const" => {
+                                self.advance();
+                                array_qualifiers |= TypeModifiers::CONST;
+                            }
+                            "volatile" => {
+                                self.advance();
+                                array_qualifiers |= TypeModifiers::VOLATILE;
+                            }
+                            "restrict" => {
+                                self.advance();
+                                array_qualifiers |= TypeModifiers::RESTRICT;
+                            }
+                            _ => break,
+                        }
+                    } else {
+                        break;
+                    }
+                }
+
+                // Check for [*] VLA unspecified size (C99 6.7.5.2)
+                if self.is_special(b'*') {
+                    let saved_pos = self.pos;
+                    self.advance();
+                    if self.is_special(b']') {
+                        is_vla_star = true;
+                    } else {
+                        self.pos = saved_pos; // Backtrack - it's an expression
+                    }
+                }
+
+                // Parse optional size expression (skip if [*] or already at ])
+                if !self.is_special(b']') && !is_vla_star {
                     let _ = self.parse_assignment_expr()?;
                 }
+
                 self.expect_special(b']')?;
 
-                // Convert array to pointer
+                // Convert array to pointer with qualifiers (C99 6.7.5.3)
                 let ptr_type = Type {
                     kind: TypeKind::Pointer,
-                    modifiers: TypeModifiers::empty(),
+                    modifiers: array_qualifiers,
                     base: Some(typ_id),
                     array_size: None,
                     params: None,

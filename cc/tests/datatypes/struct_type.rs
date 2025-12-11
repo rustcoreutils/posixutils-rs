@@ -312,6 +312,103 @@ int main(void) {
 }
 
 // ============================================================================
+// Two-Register Struct Return: Structs 9-16 bytes returned in RAX+RDX or X0+X1
+// Per System V AMD64 ABI and AAPCS64, structs up to 16 bytes are returned
+// in two general-purpose registers (not via sret hidden pointer).
+// ============================================================================
+
+#[test]
+fn struct_return_two_register() {
+    let code = r#"
+// 16-byte struct (12 bytes data + 4 bytes padding) - uses two-register return (RAX+RDX or X0+X1)
+struct medium {
+    long first;   // 8 bytes
+    int second;   // 4 bytes (+ 4 bytes padding for alignment; total 16 bytes)
+};
+
+struct medium make_medium(long a, int b) {
+    struct medium s;
+    s.first = a;
+    s.second = b;
+    return s;
+}
+
+// 16-byte struct - boundary case, also uses two registers
+struct sixteen {
+    long first;
+    long second;
+};
+
+struct sixteen make_sixteen(long a, long b) {
+    struct sixteen s;
+    s.first = a;
+    s.second = b;
+    return s;
+}
+
+int main(void) {
+    // Test 12-byte struct (with padding to 16)
+    struct medium m = make_medium(0x123456789ABCDEF0L, 42);
+    if (m.first != 0x123456789ABCDEF0L) return 1;
+    if (m.second != 42) return 2;
+
+    // Test 16-byte struct (boundary case)
+    struct sixteen s = make_sixteen(100, 200);
+    if (s.first != 100) return 3;
+    if (s.second != 200) return 4;
+
+    // Test with different values to ensure correct member mapping
+    m = make_medium(999, 888);
+    if (m.first != 999) return 5;
+    if (m.second != 888) return 6;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("struct_return_two_register", code), 0);
+}
+
+// ============================================================================
+// Large Struct Return (>16 bytes): Must use sret (hidden pointer parameter)
+// ============================================================================
+
+#[test]
+fn struct_return_sret_24_bytes() {
+    let code = r#"
+// 24-byte struct - must use sret (hidden pointer)
+struct huge {
+    long a;
+    long b;
+    long c;
+};
+
+struct huge make_huge(long x, long y, long z) {
+    struct huge h;
+    h.a = x;
+    h.b = y;
+    h.c = z;
+    return h;
+}
+
+int main(void) {
+    struct huge h = make_huge(111, 222, 333);
+    if (h.a != 111) return 1;
+    if (h.b != 222) return 2;
+    if (h.c != 333) return 3;
+
+    // Test with different values
+    h = make_huge(1000000, 2000000, 3000000);
+    if (h.a != 1000000) return 4;
+    if (h.b != 2000000) return 5;
+    if (h.c != 3000000) return 6;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("struct_return_sret_24_bytes", code), 0);
+}
+
+// ============================================================================
 // Compound Literals (C99 6.5.2.5)
 // ============================================================================
 

@@ -86,10 +86,12 @@ pub struct Linearizer<'a> {
     types: &'a TypeTable,
     /// String table for converting StringId to String at IR boundary
     strings: &'a StringTable,
-    /// Hidden struct return pointer (for functions returning large structs)
+    /// Hidden struct return pointer (for functions returning large structs via sret)
     struct_return_ptr: Option<PseudoId>,
-    /// Size of struct being returned (for functions returning large structs)
+    /// Size of struct being returned (for functions returning large structs via sret)
     struct_return_size: u32,
+    /// Type of struct being returned via two registers (9-16 bytes, per ABI)
+    two_reg_return_type: Option<TypeId>,
     /// Current function name (for generating unique static local names)
     current_func_name: String,
     /// Counter for generating unique static local names
@@ -135,6 +137,7 @@ impl<'a> Linearizer<'a> {
             strings,
             struct_return_ptr: None,
             struct_return_size: 0,
+            two_reg_return_type: None,
             current_func_name: String::new(),
             static_local_counter: 0,
             compound_literal_counter: 0,
@@ -756,6 +759,7 @@ impl<'a> Linearizer<'a> {
         self.continue_targets.clear();
         self.struct_return_ptr = None;
         self.struct_return_size = 0;
+        self.two_reg_return_type = None;
         self.current_func_name = self.str(func.name).to_string();
         // Note: static_locals is NOT cleared - it persists across functions
 
@@ -796,6 +800,17 @@ impl<'a> Linearizer<'a> {
             ir_func.add_pseudo(sret_pseudo);
             self.struct_return_ptr = Some(sret_id);
             self.struct_return_size = self.types.size_bits(func.return_type);
+        }
+
+        // Check if function returns a medium struct (9-16 bytes) via two registers
+        // This is the ABI-compliant way to return structs that fit in two GP registers
+        let struct_size_bits = self.types.size_bits(func.return_type);
+        let returns_two_reg_struct = (ret_kind == TypeKind::Struct || ret_kind == TypeKind::Union)
+            && struct_size_bits > 64
+            && struct_size_bits <= 128
+            && !returns_large_struct; // Only if not using sret
+        if returns_two_reg_struct {
+            self.two_reg_return_type = Some(func.return_type);
         }
 
         // Add parameters
@@ -853,9 +868,11 @@ impl<'a> Linearizer<'a> {
             }
 
             let typ_size = self.types.size_bits(typ);
-            // For large structs, arg_pseudo is a pointer to the struct
+            // For large structs (> 64 bits), arg_pseudo is a pointer to the struct
             // We need to copy the data from that pointer to local storage
-            if typ_size > self.target.max_aggregate_register_bits {
+            // Note: We receive struct parameters > 64 bits as pointers, even though
+            // the ABI allows two-register passing for 9-16 byte structs.
+            if typ_size > 64 {
                 // arg_pseudo is a pointer - copy each 8-byte chunk
                 let struct_size = typ_size / 8;
                 let mut offset = 0i64;
@@ -1048,6 +1065,48 @@ impl<'a> Linearizer<'a> {
                             self.types.void_ptr_id,
                             64,
                         ));
+                    } else if let Some(ret_type) = self.two_reg_return_type {
+                        // Two-register struct return (9-16 bytes)
+                        // Load struct data into two temps and emit ret with is_two_reg_return=true
+                        let src_addr = self.linearize_lvalue(e);
+                        let struct_size = self.types.size_bits(ret_type);
+
+                        // Load first 8 bytes
+                        let low_temp = self.alloc_pseudo();
+                        let low_pseudo = Pseudo::reg(low_temp, low_temp.0);
+                        if let Some(func) = &mut self.current_func {
+                            func.add_pseudo(low_pseudo);
+                        }
+                        self.emit(Instruction::load(
+                            low_temp,
+                            src_addr,
+                            0,
+                            self.types.long_id,
+                            64,
+                        ));
+
+                        // Load second portion (remaining bytes, up to 8)
+                        let high_temp = self.alloc_pseudo();
+                        let high_pseudo = Pseudo::reg(high_temp, high_temp.0);
+                        if let Some(func) = &mut self.current_func {
+                            func.add_pseudo(high_pseudo);
+                        }
+                        // Load up to 8 bytes for the high part (may be less for structs < 16 bytes)
+                        let high_size = std::cmp::min(64, struct_size - 64);
+                        self.emit(Instruction::load(
+                            high_temp,
+                            src_addr,
+                            8,
+                            self.types.long_id,
+                            high_size,
+                        ));
+
+                        // Emit return with both values and two_reg_return flag
+                        let mut ret_insn =
+                            Instruction::ret_typed(Some(low_temp), ret_type, struct_size);
+                        ret_insn.src.push(high_temp); // High part in src[1]
+                        ret_insn.is_two_reg_return = true;
+                        self.emit(ret_insn);
                     } else if self.types.is_complex(typ) {
                         // Complex return: codegen expects an address (pointer to the complex value)
                         let addr = self.linearize_lvalue(e);
@@ -2648,9 +2707,15 @@ impl<'a> Linearizer<'a> {
         // Check if function returns a large struct or complex type
         // Large structs: allocate space and pass address as hidden first argument
         // Complex types: allocate local storage for result (needs stack for 16-byte value)
+        // Two-register structs (9-16 bytes): allocate local storage, codegen stores two regs
         let typ_kind = self.types.kind(typ);
+        let struct_size_bits = self.types.size_bits(typ);
         let returns_large_struct = (typ_kind == TypeKind::Struct || typ_kind == TypeKind::Union)
-            && self.types.size_bits(typ) > self.target.max_aggregate_register_bits;
+            && struct_size_bits > self.target.max_aggregate_register_bits;
+        let returns_two_reg_struct = (typ_kind == TypeKind::Struct || typ_kind == TypeKind::Union)
+            && struct_size_bits > 64
+            && struct_size_bits <= 128
+            && !returns_large_struct;
         let returns_complex = self.types.is_complex(typ);
 
         let (result_sym, mut arg_vals, mut arg_types_vec) = if returns_large_struct {
@@ -2683,6 +2748,17 @@ impl<'a> Linearizer<'a> {
 
             // Hidden return pointer is the first argument (pointer type)
             (sret_sym, vec![sret_addr], vec![self.types.pointer_to(typ)])
+        } else if returns_two_reg_struct {
+            // Two-register struct returns: allocate local storage for the result
+            // Codegen will store RAX+RDX (x86-64) or X0+X1 (AArch64) to this location
+            let local_sym = self.alloc_pseudo();
+            let unique_name = format!("__2reg_{}", local_sym.0);
+            let local_pseudo = Pseudo::sym(local_sym, unique_name.clone());
+            if let Some(func) = &mut self.current_func {
+                func.add_pseudo(local_pseudo);
+                func.add_local(&unique_name, local_sym, typ, false, self.current_bb);
+            }
+            (local_sym, Vec::new(), Vec::new())
         } else if returns_complex {
             // Complex returns: allocate local storage for the result
             // Complex values are 16 bytes and need stack storage
@@ -2701,13 +2777,15 @@ impl<'a> Linearizer<'a> {
 
         // Linearize regular arguments
         // For large structs, pass by reference (address) instead of by value
+        // Note: We pass structs > 64 bits by reference. While the ABI allows
+        // two-register passing for 9-16 byte structs, we don't implement that yet.
         // For complex types, pass address so codegen can load real/imag into XMM registers
         // For arrays (including VLAs), decay to pointer
         for a in args.iter() {
             let arg_type = self.expr_type(a);
             let arg_kind = self.types.kind(arg_type);
             let arg_val = if (arg_kind == TypeKind::Struct || arg_kind == TypeKind::Union)
-                && self.types.size_bits(arg_type) > self.target.max_aggregate_register_bits
+                && self.types.size_bits(arg_type) > 64
             {
                 // Large struct: pass address instead of value
                 // The argument type becomes a pointer
@@ -2766,6 +2844,7 @@ impl<'a> Linearizer<'a> {
             );
             call_insn.variadic_arg_start = variadic_arg_start;
             call_insn.is_noreturn_call = is_noreturn_call;
+            call_insn.is_two_reg_return = returns_two_reg_struct;
             self.emit(call_insn);
             result_sym
         }

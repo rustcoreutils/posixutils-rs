@@ -789,12 +789,19 @@ impl Aarch64CodeGen {
 
             Opcode::Ret => {
                 // Move return value to x0 (integer), v0 (float), or v0+v1 (complex) if present
+                // Two-register struct returns (9-16 bytes) go in X0+X1
                 if let Some(&src) = insn.src.first() {
                     let src_loc = self.get_location(src);
                     let is_complex = insn.typ.is_some_and(|t| types.is_complex(t));
                     let is_fp = matches!(src_loc, Loc::VReg(_) | Loc::FImm(..));
 
-                    if is_complex {
+                    if insn.is_two_reg_return {
+                        // Two-register struct return: src[0] -> X0, src[1] -> X1
+                        self.emit_move(src, Reg::X0, 64, *total_frame);
+                        if let Some(&src2) = insn.src.get(1) {
+                            self.emit_move(src2, Reg::X1, 64, *total_frame);
+                        }
+                    } else if is_complex {
                         // Complex return value: load real into V0, imag into V1
                         // The source is a pointer to the complex value
                         let (fp_size, imag_offset) = complex_fp_info(types, insn.typ.unwrap());
@@ -2633,7 +2640,47 @@ impl Aarch64CodeGen {
             // Get return value size from type
             let ret_size = insn.size.max(32);
 
-            if is_complex_result {
+            if insn.is_two_reg_return {
+                // Two-register struct return: X0 has low 8 bytes, X1 has high 8 bytes
+                // Store both to the target location (which must be a stack slot)
+                match dst_loc {
+                    Loc::Stack(offset) => {
+                        let actual_offset = self.stack_offset(frame_size, offset);
+                        // Store X0 (low 8 bytes)
+                        self.push_lir(Aarch64Inst::Str {
+                            size: OperandSize::B64,
+                            src: Reg::X0,
+                            addr: MemAddr::BaseOffset {
+                                base: Reg::X29,
+                                offset: actual_offset,
+                            },
+                        });
+                        // Store X1 (high 8 bytes)
+                        self.push_lir(Aarch64Inst::Str {
+                            size: OperandSize::B64,
+                            src: Reg::X1,
+                            addr: MemAddr::BaseOffset {
+                                base: Reg::X29,
+                                offset: actual_offset + 8,
+                            },
+                        });
+                    }
+                    Loc::Reg(r) => {
+                        // Address in register - store through it
+                        self.push_lir(Aarch64Inst::Str {
+                            size: OperandSize::B64,
+                            src: Reg::X0,
+                            addr: MemAddr::BaseOffset { base: r, offset: 0 },
+                        });
+                        self.push_lir(Aarch64Inst::Str {
+                            size: OperandSize::B64,
+                            src: Reg::X1,
+                            addr: MemAddr::BaseOffset { base: r, offset: 8 },
+                        });
+                    }
+                    _ => {}
+                }
+            } else if is_complex_result {
                 // Complex return value is in V0 (real) + V1 (imag)
                 // Store both parts to the target location
                 let (fp_size, imag_offset) = complex_fp_info(types, insn.typ.unwrap());

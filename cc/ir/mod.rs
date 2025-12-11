@@ -490,6 +490,9 @@ pub struct Instruction {
     /// For calls: true if the called function is noreturn (never returns).
     /// Code after a noreturn call is unreachable.
     pub is_noreturn_call: bool,
+    /// For calls/returns: true if this returns a 9-16 byte struct via two registers
+    /// (RAX+RDX on x86-64, X0+X1 on AArch64) per ABI.
+    pub is_two_reg_return: bool,
     /// Source position for debug info
     pub pos: Option<Position>,
 }
@@ -514,6 +517,7 @@ impl Default for Instruction {
             variadic_arg_start: None,
             is_sret_call: false,
             is_noreturn_call: false,
+            is_two_reg_return: false,
             pos: None,
         }
     }

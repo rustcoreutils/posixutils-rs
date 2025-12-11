@@ -594,12 +594,19 @@ impl X86_64CodeGen {
             Opcode::Ret => {
                 // Move return value to appropriate register if present
                 // System V AMD64 ABI: integers in RAX, floats in XMM0, complex in XMM0+XMM1
+                // Two-register struct returns (9-16 bytes) go in RAX+RDX
                 if let Some(src) = insn.src.first() {
                     let src_loc = self.get_location(*src);
                     let is_complex = insn.typ.is_some_and(|t| types.is_complex(t));
                     let is_fp = matches!(src_loc, Loc::Xmm(_) | Loc::FImm(..))
                         || insn.typ.is_some_and(|t| types.is_float(t));
-                    if is_complex {
+                    if insn.is_two_reg_return {
+                        // Two-register struct return: src[0] -> RAX, src[1] -> RDX
+                        self.emit_move(*src, Reg::Rax, 64);
+                        if let Some(&src2) = insn.src.get(1) {
+                            self.emit_move(src2, Reg::Rdx, 64);
+                        }
+                    } else if is_complex {
                         // Complex return value: load real into XMM0, imag into XMM1
                         // The source is a pointer to the complex value
                         let (fp_size, imag_offset) = complex_fp_info(types, insn.typ.unwrap());
@@ -3026,7 +3033,47 @@ impl X86_64CodeGen {
             // Get return value size from type
             let ret_size = insn.size.max(32);
 
-            if is_complex_result {
+            if insn.is_two_reg_return {
+                // Two-register struct return: RAX has low 8 bytes, RDX has high 8 bytes
+                // Store both to the target location (which must be a stack slot)
+                match dst_loc {
+                    Loc::Stack(offset) => {
+                        let adjusted = offset + self.callee_saved_offset;
+                        // Store RAX (low 8 bytes)
+                        self.push_lir(X86Inst::Mov {
+                            size: OperandSize::B64,
+                            src: GpOperand::Reg(Reg::Rax),
+                            dst: GpOperand::Mem(MemAddr::BaseOffset {
+                                base: Reg::Rbp,
+                                offset: -adjusted,
+                            }),
+                        });
+                        // Store RDX (high 8 bytes)
+                        self.push_lir(X86Inst::Mov {
+                            size: OperandSize::B64,
+                            src: GpOperand::Reg(Reg::Rdx),
+                            dst: GpOperand::Mem(MemAddr::BaseOffset {
+                                base: Reg::Rbp,
+                                offset: -adjusted + 8,
+                            }),
+                        });
+                    }
+                    Loc::Reg(r) => {
+                        // Address in register - store through it
+                        self.push_lir(X86Inst::Mov {
+                            size: OperandSize::B64,
+                            src: GpOperand::Reg(Reg::Rax),
+                            dst: GpOperand::Mem(MemAddr::BaseOffset { base: r, offset: 0 }),
+                        });
+                        self.push_lir(X86Inst::Mov {
+                            size: OperandSize::B64,
+                            src: GpOperand::Reg(Reg::Rdx),
+                            dst: GpOperand::Mem(MemAddr::BaseOffset { base: r, offset: 8 }),
+                        });
+                    }
+                    _ => {}
+                }
+            } else if is_complex_result {
                 // Complex return value is in XMM0 (real) + XMM1 (imag)
                 // Store both parts to the target location
                 let (fp_size, imag_offset) = complex_fp_info(types, insn.typ.unwrap());

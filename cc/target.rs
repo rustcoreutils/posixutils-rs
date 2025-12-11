@@ -94,11 +94,10 @@ impl Target {
         };
 
         // Maximum aggregate size that can be returned in registers.
-        // Both x86-64 SysV ABI and AAPCS64 technically support returning
-        // 16-byte structs in registers (rax+rdx or x0+x1), but pcc currently
-        // only supports single-register returns. Use sret for >8 byte structs
-        // until multi-register returns are implemented.
-        let max_aggregate_register_bits = 64;
+        // Both x86-64 SysV ABI and AAPCS64 support returning 16-byte structs
+        // in two registers (rax+rdx or x0+x1). Structs larger than 16 bytes
+        // use sret (hidden pointer parameter).
+        let max_aggregate_register_bits = 128;
 
         Self {
             arch,

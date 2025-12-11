@@ -447,7 +447,41 @@ impl X86_64CodeGen {
                 if let PseudoKind::Arg(arg_idx) = pseudo.kind {
                     if arg_idx == (i as u32) + arg_idx_offset {
                         let is_fp = types.is_float(*typ);
-                        if is_fp {
+                        let is_complex = types.is_complex(*typ);
+                        if is_complex {
+                            // Complex argument - uses TWO consecutive XMM registers
+                            // double _Complex: XMM0+XMM1, XMM2+XMM3, etc.
+                            // Look up the local variable (same name as param) for stack location
+                            if fp_arg_idx + 1 < fp_arg_regs.len() {
+                                // Find the local for this parameter by name
+                                let param_name = &func.params[i].0;
+                                if let Some(local) = func.locals.get(param_name) {
+                                    if let Some(Loc::Stack(offset)) = self.locations.get(&local.sym)
+                                    {
+                                        let adjusted = offset + self.callee_saved_offset;
+                                        // Store real part from first XMM register
+                                        self.push_lir(X86Inst::MovFp {
+                                            size: FpSize::Double,
+                                            src: XmmOperand::Reg(fp_arg_regs[fp_arg_idx]),
+                                            dst: XmmOperand::Mem(MemAddr::BaseOffset {
+                                                base: Reg::Rbp,
+                                                offset: -adjusted,
+                                            }),
+                                        });
+                                        // Store imag part from second XMM register
+                                        self.push_lir(X86Inst::MovFp {
+                                            size: FpSize::Double,
+                                            src: XmmOperand::Reg(fp_arg_regs[fp_arg_idx + 1]),
+                                            dst: XmmOperand::Mem(MemAddr::BaseOffset {
+                                                base: Reg::Rbp,
+                                                offset: -adjusted + 8,
+                                            }),
+                                        });
+                                    }
+                                }
+                            }
+                            fp_arg_idx += 2; // Complex uses two XMM registers
+                        } else if is_fp {
                             // FP argument
                             if fp_arg_idx < fp_arg_regs.len() {
                                 if let Some(Loc::Stack(offset)) = self.locations.get(&pseudo.id) {
@@ -542,12 +576,67 @@ impl X86_64CodeGen {
 
             Opcode::Ret => {
                 // Move return value to appropriate register if present
-                // System V AMD64 ABI: integers in RAX, floats in XMM0
+                // System V AMD64 ABI: integers in RAX, floats in XMM0, complex in XMM0+XMM1
                 if let Some(src) = insn.src.first() {
                     let src_loc = self.get_location(*src);
+                    let is_complex = insn.typ.is_some_and(|t| types.is_complex(t));
                     let is_fp = matches!(src_loc, Loc::Xmm(_) | Loc::FImm(..))
                         || insn.typ.is_some_and(|t| types.is_float(t));
-                    if is_fp {
+                    if is_complex {
+                        // Complex return value: load real into XMM0, imag into XMM1
+                        // The source is a pointer to the complex value
+                        match src_loc {
+                            Loc::Stack(offset) => {
+                                // Stack slot contains a pointer to the complex value
+                                // Load the pointer first, then load through it
+                                let adjusted = offset + self.callee_saved_offset;
+                                self.push_lir(X86Inst::Mov {
+                                    size: OperandSize::B64,
+                                    src: GpOperand::Mem(MemAddr::BaseOffset {
+                                        base: Reg::Rbp,
+                                        offset: -adjusted,
+                                    }),
+                                    dst: GpOperand::Reg(Reg::Rax),
+                                });
+                                self.push_lir(X86Inst::MovFp {
+                                    size: FpSize::Double,
+                                    src: XmmOperand::Mem(MemAddr::BaseOffset {
+                                        base: Reg::Rax,
+                                        offset: 0,
+                                    }),
+                                    dst: XmmOperand::Reg(XmmReg::Xmm0),
+                                });
+                                self.push_lir(X86Inst::MovFp {
+                                    size: FpSize::Double,
+                                    src: XmmOperand::Mem(MemAddr::BaseOffset {
+                                        base: Reg::Rax,
+                                        offset: 8,
+                                    }),
+                                    dst: XmmOperand::Reg(XmmReg::Xmm1),
+                                });
+                            }
+                            Loc::Reg(r) => {
+                                // Address in register - load through it
+                                self.push_lir(X86Inst::MovFp {
+                                    size: FpSize::Double,
+                                    src: XmmOperand::Mem(MemAddr::BaseOffset {
+                                        base: r,
+                                        offset: 0,
+                                    }),
+                                    dst: XmmOperand::Reg(XmmReg::Xmm0),
+                                });
+                                self.push_lir(X86Inst::MovFp {
+                                    size: FpSize::Double,
+                                    src: XmmOperand::Mem(MemAddr::BaseOffset {
+                                        base: r,
+                                        offset: 8,
+                                    }),
+                                    dst: XmmOperand::Reg(XmmReg::Xmm1),
+                                });
+                            }
+                            _ => {}
+                        }
+                    } else if is_fp {
                         // Float return value goes in XMM0
                         self.emit_fp_move(*src, XmmReg::Xmm0, insn.size);
                     } else {
@@ -2691,6 +2780,7 @@ impl X86_64CodeGen {
 
         for i in 0..insn.src.len() {
             let arg_type = insn.arg_types.get(i).copied();
+            let is_complex = arg_type.is_some_and(|t| types.is_complex(t));
             let is_fp = if let Some(typ) = arg_type {
                 types.is_float(typ)
             } else {
@@ -2702,7 +2792,13 @@ impl X86_64CodeGen {
             // Variadic args start at index variadic_start, but use same register sequence
             let _is_variadic_arg = i >= variadic_start;
 
-            if is_fp {
+            if is_complex {
+                // Complex uses TWO consecutive XMM registers
+                if temp_fp_idx + 1 >= fp_arg_regs.len() {
+                    stack_arg_indices.push(i);
+                }
+                temp_fp_idx += 2;
+            } else if is_fp {
                 // Float args go in XMM registers (all args, including variadic)
                 if temp_fp_idx >= fp_arg_regs.len() {
                     stack_arg_indices.push(i);
@@ -2784,6 +2880,7 @@ impl X86_64CodeGen {
             let arg = insn.src[i];
             // Get argument type if available, otherwise fall back to location-based detection
             let arg_type = insn.arg_types.get(i).copied();
+            let is_complex = arg_type.is_some_and(|t| types.is_complex(t));
             let is_fp = if let Some(typ) = arg_type {
                 types.is_float(typ)
             } else {
@@ -2799,7 +2896,59 @@ impl X86_64CodeGen {
                 64 // Default for backwards compatibility
             };
 
-            if is_fp {
+            if is_complex {
+                // Complex type: load both parts and put in 2 consecutive XMM registers
+                // The arg pseudo contains the ADDRESS of the complex value
+                let arg_loc = self.get_location(arg);
+                match arg_loc {
+                    Loc::Stack(offset) => {
+                        // Stack slot contains the address of the complex value
+                        // First load the address into a temp register
+                        let adjusted = offset + self.callee_saved_offset;
+                        self.push_lir(X86Inst::Mov {
+                            size: OperandSize::B64,
+                            src: GpOperand::Mem(MemAddr::BaseOffset {
+                                base: Reg::Rbp,
+                                offset: -adjusted,
+                            }),
+                            dst: GpOperand::Reg(Reg::R11),
+                        });
+                        // Load real part from the complex value
+                        self.push_lir(X86Inst::MovFp {
+                            size: FpSize::Double,
+                            src: XmmOperand::Mem(MemAddr::BaseOffset {
+                                base: Reg::R11,
+                                offset: 0,
+                            }),
+                            dst: XmmOperand::Reg(fp_arg_regs[fp_arg_idx]),
+                        });
+                        // Load imag part from the complex value
+                        self.push_lir(X86Inst::MovFp {
+                            size: FpSize::Double,
+                            src: XmmOperand::Mem(MemAddr::BaseOffset {
+                                base: Reg::R11,
+                                offset: 8,
+                            }),
+                            dst: XmmOperand::Reg(fp_arg_regs[fp_arg_idx + 1]),
+                        });
+                    }
+                    Loc::Reg(r) => {
+                        // Address in register - load through it
+                        self.push_lir(X86Inst::MovFp {
+                            size: FpSize::Double,
+                            src: XmmOperand::Mem(MemAddr::BaseOffset { base: r, offset: 0 }),
+                            dst: XmmOperand::Reg(fp_arg_regs[fp_arg_idx]),
+                        });
+                        self.push_lir(X86Inst::MovFp {
+                            size: FpSize::Double,
+                            src: XmmOperand::Mem(MemAddr::BaseOffset { base: r, offset: 8 }),
+                            dst: XmmOperand::Reg(fp_arg_regs[fp_arg_idx + 1]),
+                        });
+                    }
+                    _ => {}
+                }
+                fp_arg_idx += 2;
+            } else if is_fp {
                 // FP size from type (32 for float, 64 for double)
                 let fp_size = if let Some(typ) = arg_type {
                     types.size_bits(typ)
@@ -2844,7 +2993,8 @@ impl X86_64CodeGen {
         // Handle return value
         if let Some(target) = insn.target {
             let dst_loc = self.get_location(target);
-            // Check if return value is floating-point based on its location or type
+            // Check if return value is complex or floating-point
+            let is_complex_result = insn.typ.is_some_and(|t| types.is_complex(t));
             let is_fp_result = if let Some(typ) = insn.typ {
                 types.is_float(typ)
             } else {
@@ -2854,7 +3004,47 @@ impl X86_64CodeGen {
             // Get return value size from type
             let ret_size = insn.size.max(32);
 
-            if is_fp_result {
+            if is_complex_result {
+                // Complex return value is in XMM0 (real) + XMM1 (imag)
+                // Store both parts to the target location
+                match dst_loc {
+                    Loc::Stack(offset) => {
+                        let adjusted = offset + self.callee_saved_offset;
+                        // Store real part from XMM0
+                        self.push_lir(X86Inst::MovFp {
+                            size: FpSize::Double,
+                            src: XmmOperand::Reg(XmmReg::Xmm0),
+                            dst: XmmOperand::Mem(MemAddr::BaseOffset {
+                                base: Reg::Rbp,
+                                offset: -adjusted,
+                            }),
+                        });
+                        // Store imag part from XMM1
+                        self.push_lir(X86Inst::MovFp {
+                            size: FpSize::Double,
+                            src: XmmOperand::Reg(XmmReg::Xmm1),
+                            dst: XmmOperand::Mem(MemAddr::BaseOffset {
+                                base: Reg::Rbp,
+                                offset: -adjusted + 8,
+                            }),
+                        });
+                    }
+                    Loc::Reg(r) => {
+                        // Address in register - store through it
+                        self.push_lir(X86Inst::MovFp {
+                            size: FpSize::Double,
+                            src: XmmOperand::Reg(XmmReg::Xmm0),
+                            dst: XmmOperand::Mem(MemAddr::BaseOffset { base: r, offset: 0 }),
+                        });
+                        self.push_lir(X86Inst::MovFp {
+                            size: FpSize::Double,
+                            src: XmmOperand::Reg(XmmReg::Xmm1),
+                            dst: XmmOperand::Mem(MemAddr::BaseOffset { base: r, offset: 8 }),
+                        });
+                    }
+                    _ => {}
+                }
+            } else if is_fp_result {
                 // FP return value is in XMM0
                 self.emit_fp_move_from_xmm(XmmReg::Xmm0, &dst_loc, ret_size);
             } else {

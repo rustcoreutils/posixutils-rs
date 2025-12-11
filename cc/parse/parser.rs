@@ -1148,6 +1148,7 @@ impl<'a> Parser<'a> {
             name,
             "void"
                 | "_Bool"
+                | "_Complex"
                 | "char"
                 | "short"
                 | "int"
@@ -1221,6 +1222,11 @@ impl<'a> Parser<'a> {
                 "unsigned" => {
                     self.advance();
                     modifiers |= TypeModifiers::UNSIGNED;
+                    parsed_something = true;
+                }
+                "_Complex" => {
+                    self.advance();
+                    modifiers |= TypeModifiers::COMPLEX;
                     parsed_something = true;
                 }
                 "short" => {
@@ -1819,20 +1825,39 @@ impl<'a> Parser<'a> {
     /// Compute usual arithmetic conversions (C99 6.3.1.8)
     fn usual_arithmetic_conversions(&mut self, left: TypeId, right: TypeId) -> TypeId {
         // C99 6.3.1.8: Usual arithmetic conversions
+        // For complex types: if either operand is complex, result is complex
+        // The underlying type follows the same rules as real types
+
+        let left_kind = self.types.kind(left);
+        let right_kind = self.types.kind(right);
+        let left_complex = self.types.is_complex(left);
+        let right_complex = self.types.is_complex(right);
+        let is_complex = left_complex || right_complex;
+
+        // Determine the underlying floating-point type
         // 1. If either is long double, result is long double
         // 2. If either is double, result is double
         // 3. If either is float, result is float
         // 4. Otherwise, integer promotions apply
 
-        let left_kind = self.types.kind(left);
-        let right_kind = self.types.kind(right);
-
         if left_kind == TypeKind::LongDouble || right_kind == TypeKind::LongDouble {
-            self.types.longdouble_id
+            if is_complex {
+                self.types.complex_longdouble_id
+            } else {
+                self.types.longdouble_id
+            }
         } else if left_kind == TypeKind::Double || right_kind == TypeKind::Double {
-            self.types.double_id
+            if is_complex {
+                self.types.complex_double_id
+            } else {
+                self.types.double_id
+            }
         } else if left_kind == TypeKind::Float || right_kind == TypeKind::Float {
-            self.types.float_id
+            if is_complex {
+                self.types.complex_float_id
+            } else {
+                self.types.float_id
+            }
         } else if left_kind == TypeKind::LongLong || right_kind == TypeKind::LongLong {
             // If either is unsigned long long, result is unsigned long long
             if self.types.is_unsigned(left) || self.types.is_unsigned(right) {
@@ -2852,6 +2877,7 @@ impl Parser<'_> {
                     | "long"
                     | "float"
                     | "double"
+                    | "_Complex"
                     | "signed"
                     | "unsigned"
                     | "const"
@@ -3061,6 +3087,10 @@ impl Parser<'_> {
                 "unsigned" => {
                     self.advance();
                     modifiers |= TypeModifiers::UNSIGNED;
+                }
+                "_Complex" => {
+                    self.advance();
+                    modifiers |= TypeModifiers::COMPLEX;
                 }
                 "short" => {
                     self.advance();

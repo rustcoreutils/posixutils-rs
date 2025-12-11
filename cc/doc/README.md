@@ -33,7 +33,6 @@ This directory contains detailed documentation for the pcc C compiler.
 ### Compliance & Status
 
 - **C99 Compliance**: [C99.md](C99.md)
-  - Missing features (compound literals, VLAs, `_Complex`)
   - Partial implementations
   - Implementation roadmap
 

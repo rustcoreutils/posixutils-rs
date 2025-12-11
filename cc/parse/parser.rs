@@ -3890,69 +3890,113 @@ impl Parser<'_> {
             // Handle array declarator in parameter: int arr[] becomes int *arr
             // C99 6.7.5.3: "A declaration of a parameter as 'array of type' shall be
             // adjusted to 'qualified pointer to type'"
+            // For multi-dimensional arrays like int mat[*][*], the outer dimension
+            // becomes a pointer, inner dimensions remain as array dimensions.
             if self.is_special(b'[') {
-                self.advance();
+                // First, collect all array dimensions (for multi-dimensional arrays)
+                // We need to parse them all before building the type, since C declarators
+                // are "inside-out" - the innermost dimension is closest to element type.
+                let mut dimensions: Vec<(TypeModifiers, Option<usize>)> = Vec::new();
+                let mut first_dimension = true;
 
-                // Parse optional qualifiers and static (C99 6.7.5.3)
-                let mut array_qualifiers = TypeModifiers::empty();
-                let mut has_static = false; // Optimization hint, not used in codegen
-                let mut is_vla_star = false;
-
-                // Parse type qualifiers and static keyword
-                while self.peek() == TokenType::Ident {
-                    if let Some(name) = self.get_ident_name(self.current()) {
-                        match name.as_str() {
-                            "static" => {
-                                if has_static {
-                                    diag::error(
-                                        self.current().pos,
-                                        "duplicate 'static' in array declarator",
-                                    );
-                                }
-                                self.advance();
-                                has_static = true;
-                            }
-                            "const" => {
-                                self.advance();
-                                array_qualifiers |= TypeModifiers::CONST;
-                            }
-                            "volatile" => {
-                                self.advance();
-                                array_qualifiers |= TypeModifiers::VOLATILE;
-                            }
-                            "restrict" => {
-                                self.advance();
-                                array_qualifiers |= TypeModifiers::RESTRICT;
-                            }
-                            _ => break,
-                        }
-                    } else {
-                        break;
-                    }
-                }
-
-                // Check for [*] VLA unspecified size (C99 6.7.5.2)
-                if self.is_special(b'*') {
-                    let saved_pos = self.pos;
+                while self.is_special(b'[') {
                     self.advance();
-                    if self.is_special(b']') {
-                        is_vla_star = true;
-                    } else {
-                        self.pos = saved_pos; // Backtrack - it's an expression
+
+                    // Parse optional qualifiers and static (C99 6.7.5.3)
+                    // Note: qualifiers/static only valid in first dimension for parameters
+                    let mut array_qualifiers = TypeModifiers::empty();
+                    let mut has_static = false;
+                    let mut is_vla_star = false;
+
+                    if first_dimension {
+                        // Parse type qualifiers and static keyword
+                        while self.peek() == TokenType::Ident {
+                            if let Some(name) = self.get_ident_name(self.current()) {
+                                match name.as_str() {
+                                    "static" => {
+                                        if has_static {
+                                            diag::error(
+                                                self.current().pos,
+                                                "duplicate 'static' in array declarator",
+                                            );
+                                        }
+                                        self.advance();
+                                        has_static = true;
+                                    }
+                                    "const" => {
+                                        self.advance();
+                                        array_qualifiers |= TypeModifiers::CONST;
+                                    }
+                                    "volatile" => {
+                                        self.advance();
+                                        array_qualifiers |= TypeModifiers::VOLATILE;
+                                    }
+                                    "restrict" => {
+                                        self.advance();
+                                        array_qualifiers |= TypeModifiers::RESTRICT;
+                                    }
+                                    _ => break,
+                                }
+                            } else {
+                                break;
+                            }
+                        }
                     }
+
+                    // Check for [*] VLA unspecified size (C99 6.7.5.2)
+                    if self.is_special(b'*') {
+                        let saved_pos = self.pos;
+                        self.advance();
+                        if self.is_special(b']') {
+                            is_vla_star = true;
+                        } else {
+                            self.pos = saved_pos; // Backtrack - it's an expression
+                        }
+                    }
+
+                    // Parse optional size expression and try to evaluate as constant
+                    let size = if is_vla_star || self.is_special(b']') {
+                        None // VLA or empty brackets
+                    } else {
+                        let expr = self.parse_assignment_expr()?;
+                        // Try to evaluate as constant expression
+                        match self.eval_const_expr(&expr) {
+                            Some(n) if n >= 0 => Some(n as usize),
+                            _ => None, // VLA (non-constant or negative)
+                        }
+                    };
+
+                    self.expect_special(b']')?;
+
+                    dimensions.push((array_qualifiers, size));
+                    first_dimension = false;
                 }
 
-                // Parse optional size expression (skip if [*] or already at ])
-                if !self.is_special(b']') && !is_vla_star {
-                    let _ = self.parse_assignment_expr()?;
+                // Build the type from innermost to outermost
+                // For int arr[M][N], we have dimensions = [(qualifiers, M), (empty, N)]
+                // Result type should be: pointer(qualifiers) -> array[N] -> int
+                // So we process dimensions in reverse, then make the first a pointer
+
+                // First, build array types for all inner dimensions (skip the first)
+                for (_qualifiers, size) in dimensions.iter().skip(1).rev() {
+                    let arr_type = Type {
+                        kind: TypeKind::Array,
+                        modifiers: TypeModifiers::empty(),
+                        base: Some(typ_id),
+                        array_size: *size,
+                        params: None,
+                        variadic: false,
+                        noreturn: false,
+                        composite: None,
+                    };
+                    typ_id = self.types.intern(arr_type);
                 }
 
-                self.expect_special(b']')?;
-
-                // Convert array to pointer with qualifiers (C99 6.7.5.3)
+                // The outermost (first) dimension becomes a pointer (C99 6.7.5.3)
+                let first_qualifiers = dimensions.first().map(|(q, _)| *q).unwrap_or_default();
                 let ptr_type = Type {
                     kind: TypeKind::Pointer,
-                    modifiers: array_qualifiers,
+                    modifiers: first_qualifiers,
                     base: Some(typ_id),
                     array_size: None,
                     params: None,

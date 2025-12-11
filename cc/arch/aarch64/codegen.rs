@@ -24,8 +24,24 @@ use crate::arch::lir::{Directive, FpSize, Label, OperandSize, Symbol};
 use crate::arch::DEFAULT_LIR_BUFFER_CAPACITY;
 use crate::ir::{Function, Initializer, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
 use crate::target::Target;
-use crate::types::{TypeId, TypeModifiers, TypeTable};
+use crate::types::{TypeId, TypeKind, TypeModifiers, TypeTable};
 use std::collections::HashMap;
+
+// ============================================================================
+// Complex Type Helpers
+// ============================================================================
+
+/// Get FpSize and element offset for a complex type's components.
+/// Returns (FpSize for each component, byte offset to imaginary part).
+fn complex_fp_info(types: &TypeTable, complex_typ: TypeId) -> (FpSize, i32) {
+    let base = types.complex_base(complex_typ);
+    match types.kind(base) {
+        TypeKind::Float => (FpSize::Single, 4),
+        TypeKind::Double => (FpSize::Double, 8),
+        TypeKind::LongDouble => (FpSize::Double, 8), // TODO: arch-specific
+        _ => (FpSize::Double, 8),                    // fallback
+    }
+}
 
 // ============================================================================
 // AArch64 Code Generator
@@ -626,30 +642,97 @@ impl Aarch64CodeGen {
 
         // Move arguments from registers to their allocated locations if needed
         // Note: On AAPCS64, sret uses X8, so regular args still start at X0
+        // Complex parameters use two consecutive FP registers (D0+D1, D2+D3, etc.)
         let arg_regs = Reg::arg_regs();
-        for (i, (_name, _typ)) in func.params.iter().enumerate() {
-            if i < arg_regs.len() {
-                // Find the pseudo for this argument
-                for pseudo in &func.pseudos {
-                    if let PseudoKind::Arg(arg_idx) = pseudo.kind {
-                        // With sret, params have arg_idx = i + 1, but still use arg_regs[i]
-                        if arg_idx == (i as u32) + arg_idx_offset {
-                            if let Some(Loc::Stack(offset)) = self.locations.get(&pseudo.id) {
-                                // Move from arg register to stack
-                                if *offset < 0 {
-                                    let actual_offset = self.stack_offset(total_frame, *offset);
-                                    self.push_lir(Aarch64Inst::Str {
-                                        size: OperandSize::B64,
-                                        src: arg_regs[i],
-                                        addr: MemAddr::BaseOffset {
-                                            base: Reg::X29, // fp
-                                            offset: actual_offset,
-                                        },
-                                    });
+        let fp_arg_regs = VReg::arg_regs();
+        let mut int_arg_idx = 0;
+        let mut fp_arg_idx = 0;
+
+        for (i, (_name, typ)) in func.params.iter().enumerate() {
+            let is_complex = types.is_complex(*typ);
+            let is_fp = types.is_float(*typ);
+
+            // Find the pseudo for this argument
+            for pseudo in &func.pseudos {
+                if let PseudoKind::Arg(arg_idx) = pseudo.kind {
+                    // With sret, params have arg_idx = i + 1, but still use arg_regs[i]
+                    if arg_idx == (i as u32) + arg_idx_offset {
+                        if is_complex {
+                            // Complex argument - uses TWO consecutive FP registers
+                            // Look up the local variable for stack location
+                            if fp_arg_idx + 1 < fp_arg_regs.len() {
+                                let param_name = &func.params[i].0;
+                                if let Some(local) = func.locals.get(param_name) {
+                                    if let Some(Loc::Stack(offset)) = self.locations.get(&local.sym)
+                                    {
+                                        let actual_offset = self.stack_offset(total_frame, *offset);
+                                        let (fp_size, imag_offset) = complex_fp_info(types, *typ);
+                                        // Store real part from first FP register
+                                        self.push_lir(Aarch64Inst::StrFp {
+                                            size: fp_size,
+                                            src: fp_arg_regs[fp_arg_idx],
+                                            addr: MemAddr::BaseOffset {
+                                                base: Reg::X29,
+                                                offset: actual_offset,
+                                            },
+                                        });
+                                        // Store imag part from second FP register
+                                        self.push_lir(Aarch64Inst::StrFp {
+                                            size: fp_size,
+                                            src: fp_arg_regs[fp_arg_idx + 1],
+                                            addr: MemAddr::BaseOffset {
+                                                base: Reg::X29,
+                                                offset: actual_offset + imag_offset,
+                                            },
+                                        });
+                                    }
                                 }
                             }
-                            break;
+                            fp_arg_idx += 2;
+                        } else if is_fp {
+                            // FP argument
+                            if fp_arg_idx < fp_arg_regs.len() {
+                                if let Some(Loc::Stack(offset)) = self.locations.get(&pseudo.id) {
+                                    if *offset < 0 {
+                                        let actual_offset = self.stack_offset(total_frame, *offset);
+                                        let fp_size = if types.size_bits(*typ) == 32 {
+                                            FpSize::Single
+                                        } else {
+                                            FpSize::Double
+                                        };
+                                        self.push_lir(Aarch64Inst::StrFp {
+                                            size: fp_size,
+                                            src: fp_arg_regs[fp_arg_idx],
+                                            addr: MemAddr::BaseOffset {
+                                                base: Reg::X29,
+                                                offset: actual_offset,
+                                            },
+                                        });
+                                    }
+                                }
+                            }
+                            fp_arg_idx += 1;
+                        } else {
+                            // GP argument
+                            if int_arg_idx < arg_regs.len() {
+                                if let Some(Loc::Stack(offset)) = self.locations.get(&pseudo.id) {
+                                    // Move from arg register to stack
+                                    if *offset < 0 {
+                                        let actual_offset = self.stack_offset(total_frame, *offset);
+                                        self.push_lir(Aarch64Inst::Str {
+                                            size: OperandSize::B64,
+                                            src: arg_regs[int_arg_idx],
+                                            addr: MemAddr::BaseOffset {
+                                                base: Reg::X29, // fp
+                                                offset: actual_offset,
+                                            },
+                                        });
+                                    }
+                                }
+                            }
+                            int_arg_idx += 1;
                         }
+                        break;
                     }
                 }
             }
@@ -705,12 +788,64 @@ impl Aarch64CodeGen {
             }
 
             Opcode::Ret => {
-                // Move return value to x0 (integer) or v0 (float) if present
+                // Move return value to x0 (integer), v0 (float), or v0+v1 (complex) if present
                 if let Some(&src) = insn.src.first() {
                     let src_loc = self.get_location(src);
+                    let is_complex = insn.typ.is_some_and(|t| types.is_complex(t));
                     let is_fp = matches!(src_loc, Loc::VReg(_) | Loc::FImm(..));
 
-                    if is_fp {
+                    if is_complex {
+                        // Complex return value: load real into V0, imag into V1
+                        // The source is a pointer to the complex value
+                        let (fp_size, imag_offset) = complex_fp_info(types, insn.typ.unwrap());
+                        match src_loc {
+                            Loc::Stack(offset) => {
+                                // Stack slot contains a pointer to the complex value
+                                let actual_offset = self.stack_offset(*total_frame, offset);
+                                self.push_lir(Aarch64Inst::Ldr {
+                                    size: OperandSize::B64,
+                                    dst: Reg::X9,
+                                    addr: MemAddr::BaseOffset {
+                                        base: Reg::X29,
+                                        offset: actual_offset,
+                                    },
+                                });
+                                self.push_lir(Aarch64Inst::LdrFp {
+                                    size: fp_size,
+                                    dst: VReg::V0,
+                                    addr: MemAddr::BaseOffset {
+                                        base: Reg::X9,
+                                        offset: 0,
+                                    },
+                                });
+                                self.push_lir(Aarch64Inst::LdrFp {
+                                    size: fp_size,
+                                    dst: VReg::V1,
+                                    addr: MemAddr::BaseOffset {
+                                        base: Reg::X9,
+                                        offset: imag_offset,
+                                    },
+                                });
+                            }
+                            Loc::Reg(r) => {
+                                // Address in register - load through it
+                                self.push_lir(Aarch64Inst::LdrFp {
+                                    size: fp_size,
+                                    dst: VReg::V0,
+                                    addr: MemAddr::BaseOffset { base: r, offset: 0 },
+                                });
+                                self.push_lir(Aarch64Inst::LdrFp {
+                                    size: fp_size,
+                                    dst: VReg::V1,
+                                    addr: MemAddr::BaseOffset {
+                                        base: r,
+                                        offset: imag_offset,
+                                    },
+                                });
+                            }
+                            _ => {}
+                        }
+                    } else if is_fp {
                         // FP return value goes in V0
                         self.emit_fp_move(src, VReg::V0, insn.size, *total_frame);
                     } else {
@@ -2343,6 +2478,7 @@ impl Aarch64CodeGen {
             for (i, &arg) in insn.src.iter().enumerate().skip(args_start) {
                 // Get argument type if available, otherwise fall back to location-based detection
                 let arg_type = insn.arg_types.get(i).copied();
+                let is_complex = arg_type.is_some_and(|t| types.is_complex(t));
                 let is_fp = if let Some(typ) = arg_type {
                     types.is_float(typ)
                 } else {
@@ -2358,7 +2494,68 @@ impl Aarch64CodeGen {
                     64 // Default for backwards compatibility
                 };
 
-                if is_fp {
+                if is_complex {
+                    // Complex type: load real/imag into TWO consecutive FP registers
+                    // The arg pseudo contains the ADDRESS of the complex value
+                    if fp_arg_idx + 1 < fp_arg_regs.len() {
+                        let arg_loc = self.get_location(arg);
+                        let (fp_size, imag_offset) = complex_fp_info(types, arg_type.unwrap());
+                        match arg_loc {
+                            Loc::Stack(offset) => {
+                                // Stack slot contains the address of the complex value
+                                let actual_offset = self.stack_offset(frame_size, offset);
+                                // Load address into temp register
+                                self.push_lir(Aarch64Inst::Ldr {
+                                    size: OperandSize::B64,
+                                    dst: Reg::X9,
+                                    addr: MemAddr::BaseOffset {
+                                        base: Reg::X29,
+                                        offset: actual_offset,
+                                    },
+                                });
+                                // Load real part into first FP register
+                                self.push_lir(Aarch64Inst::LdrFp {
+                                    size: fp_size,
+                                    dst: fp_arg_regs[fp_arg_idx],
+                                    addr: MemAddr::BaseOffset {
+                                        base: Reg::X9,
+                                        offset: 0,
+                                    },
+                                });
+                                // Load imag part into second FP register
+                                self.push_lir(Aarch64Inst::LdrFp {
+                                    size: fp_size,
+                                    dst: fp_arg_regs[fp_arg_idx + 1],
+                                    addr: MemAddr::BaseOffset {
+                                        base: Reg::X9,
+                                        offset: imag_offset,
+                                    },
+                                });
+                            }
+                            Loc::Reg(r) => {
+                                // Address in register - load through it
+                                self.push_lir(Aarch64Inst::LdrFp {
+                                    size: fp_size,
+                                    dst: fp_arg_regs[fp_arg_idx],
+                                    addr: MemAddr::BaseOffset { base: r, offset: 0 },
+                                });
+                                self.push_lir(Aarch64Inst::LdrFp {
+                                    size: fp_size,
+                                    dst: fp_arg_regs[fp_arg_idx + 1],
+                                    addr: MemAddr::BaseOffset {
+                                        base: r,
+                                        offset: imag_offset,
+                                    },
+                                });
+                            }
+                            _ => {}
+                        }
+                        fp_arg_idx += 2;
+                    } else {
+                        // Complex on stack - TODO: not implemented yet
+                        stack_args += 2;
+                    }
+                } else if is_fp {
                     // FP size from type (32 for float, 64 for double)
                     let fp_size = if let Some(typ) = arg_type {
                         types.size_bits(typ)
@@ -2425,7 +2622,8 @@ impl Aarch64CodeGen {
         // Move return value if needed
         if let Some(target) = insn.target {
             let dst_loc = self.get_location(target);
-            // Check if return value is floating-point based on type or location
+            // Check if return value is complex or floating-point
+            let is_complex_result = insn.typ.is_some_and(|t| types.is_complex(t));
             let is_fp_result = if let Some(typ) = insn.typ {
                 types.is_float(typ)
             } else {
@@ -2435,7 +2633,51 @@ impl Aarch64CodeGen {
             // Get return value size from type
             let ret_size = insn.size.max(32);
 
-            if is_fp_result {
+            if is_complex_result {
+                // Complex return value is in V0 (real) + V1 (imag)
+                // Store both parts to the target location
+                let (fp_size, imag_offset) = complex_fp_info(types, insn.typ.unwrap());
+                match dst_loc {
+                    Loc::Stack(offset) => {
+                        let actual_offset = self.stack_offset(frame_size, offset);
+                        // Store real part from V0
+                        self.push_lir(Aarch64Inst::StrFp {
+                            size: fp_size,
+                            src: VReg::V0,
+                            addr: MemAddr::BaseOffset {
+                                base: Reg::X29,
+                                offset: actual_offset,
+                            },
+                        });
+                        // Store imag part from V1
+                        self.push_lir(Aarch64Inst::StrFp {
+                            size: fp_size,
+                            src: VReg::V1,
+                            addr: MemAddr::BaseOffset {
+                                base: Reg::X29,
+                                offset: actual_offset + imag_offset,
+                            },
+                        });
+                    }
+                    Loc::Reg(r) => {
+                        // Address in register - store through it
+                        self.push_lir(Aarch64Inst::StrFp {
+                            size: fp_size,
+                            src: VReg::V0,
+                            addr: MemAddr::BaseOffset { base: r, offset: 0 },
+                        });
+                        self.push_lir(Aarch64Inst::StrFp {
+                            size: fp_size,
+                            src: VReg::V1,
+                            addr: MemAddr::BaseOffset {
+                                base: r,
+                                offset: imag_offset,
+                            },
+                        });
+                    }
+                    _ => {}
+                }
+            } else if is_fp_result {
                 // FP return value is in V0
                 self.emit_fp_move_to_loc(VReg::V0, &dst_loc, ret_size, frame_size);
             } else {

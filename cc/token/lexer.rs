@@ -395,6 +395,137 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         Token::with_value(TokenType::Number, pos, TokenValue::Number(num))
     }
 
+    /// Peek at buffer to check if there's a valid UCN sequence starting at current position.
+    /// If the buffer contains \uXXXX or \UXXXXXXXX (where X is hex digit), returns
+    /// Some((decoded_char, bytes_consumed)) where bytes_consumed includes the backslash.
+    /// Returns None if not a valid UCN.
+    fn peek_ucn(&self) -> Option<(char, usize)> {
+        let mut offset = self.offset;
+
+        // Skip any line splices to find the actual backslash
+        loop {
+            if offset >= self.buffer.len() {
+                return None;
+            }
+            let c = self.buffer[offset];
+            if c == b'\\' && offset + 1 < self.buffer.len() {
+                let next = self.buffer[offset + 1];
+                if next == b'\n' {
+                    offset += 2;
+                    continue;
+                } else if next == b'\r' {
+                    offset += 2;
+                    if offset < self.buffer.len() && self.buffer[offset] == b'\n' {
+                        offset += 1;
+                    }
+                    continue;
+                }
+                // Found non-splice backslash
+                break;
+            }
+            // Not a backslash at all
+            return None;
+        }
+
+        // Now offset points to backslash, check for 'u' or 'U'
+        if offset + 1 >= self.buffer.len() {
+            return None;
+        }
+
+        let u_char = self.buffer[offset + 1];
+        let expected_digits = match u_char {
+            b'u' => 4,
+            b'U' => 8,
+            _ => return None,
+        };
+
+        // Check we have enough hex digits
+        if offset + 2 + expected_digits > self.buffer.len() {
+            return None;
+        }
+
+        let hex_start = offset + 2;
+        let hex_end = hex_start + expected_digits;
+
+        // Validate all characters are hex digits
+        for i in hex_start..hex_end {
+            if !self.buffer[i].is_ascii_hexdigit() {
+                return None;
+            }
+        }
+
+        // Parse the hex value
+        let hex_str: String = self.buffer[hex_start..hex_end]
+            .iter()
+            .map(|&b| b as char)
+            .collect();
+        let val = u32::from_str_radix(&hex_str, 16).ok()?;
+        let ch = char::from_u32(val)?;
+
+        // Calculate bytes consumed from self.offset
+        let bytes_consumed = hex_end - self.offset;
+        Some((ch, bytes_consumed))
+    }
+
+    /// Try to consume a UCN sequence. If successful, returns the decoded character.
+    /// Otherwise returns None and leaves position unchanged.
+    fn try_consume_ucn(&mut self) -> Option<char> {
+        if let Some((ch, bytes)) = self.peek_ucn() {
+            // Consume the bytes by calling nextchar the right number of times
+            // This properly handles line/col tracking
+            for _ in 0..bytes {
+                self.nextchar();
+            }
+            Some(ch)
+        } else {
+            None
+        }
+    }
+
+    /// Try to consume a UCN sequence when the backslash has already been consumed.
+    /// Expects the next character to be 'u' or 'U'.
+    /// Returns the decoded character if successful, None otherwise.
+    fn try_consume_ucn_after_backslash(&mut self) -> Option<char> {
+        let c = self.peekchar();
+        if c == EOF {
+            return None;
+        }
+
+        let expected_digits = match c as u8 {
+            b'u' => 4,
+            b'U' => 8,
+            _ => return None,
+        };
+
+        // Check we have enough hex digits after the u/U
+        // Peek ahead without consuming
+        let mut offset = self.offset;
+        // Skip 'u' or 'U'
+        offset += 1;
+
+        if offset + expected_digits > self.buffer.len() {
+            return None;
+        }
+
+        // Validate all characters are hex digits
+        for i in 0..expected_digits {
+            if !self.buffer[offset + i].is_ascii_hexdigit() {
+                return None;
+            }
+        }
+
+        // Now consume and parse
+        self.nextchar(); // consume 'u' or 'U'
+
+        let mut hex = String::new();
+        for _ in 0..expected_digits {
+            hex.push(self.nextchar() as u8 as char);
+        }
+
+        let val = u32::from_str_radix(&hex, 16).ok()?;
+        char::from_u32(val)
+    }
+
     /// Get an identifier token
     fn get_identifier(&mut self, first: u8) -> Token {
         let pos = self.pos();
@@ -408,6 +539,17 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
                 break;
             }
             let cu = c as u8;
+
+            // Check for UCN escape sequence (\uXXXX or \UXXXXXXXX) - C99 6.4.3
+            if cu == b'\\' {
+                if let Some(uc) = self.try_consume_ucn() {
+                    name.push(uc);
+                    continue;
+                }
+                // Not a valid UCN, end identifier
+                break;
+            }
+
             if is_letter_or_digit(cu) {
                 self.nextchar(); // Now consume it
                 name.push(cu as char);
@@ -417,6 +559,40 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
                     self.nextchar(); // Consume the quote
                     return self.get_string_or_char(cu, true);
                 }
+                break;
+            }
+        }
+
+        let id = self.strings.intern(&name);
+        Token::with_value(TokenType::Ident, pos, TokenValue::Ident(id))
+    }
+
+    /// Get an identifier token starting with a UCN character (already consumed)
+    fn get_identifier_from_ucn(&mut self, first_ucn: char) -> Token {
+        let pos = self.pos();
+        let mut name = String::new();
+        name.push(first_ucn);
+
+        loop {
+            let c = self.peekchar();
+            if c == EOF {
+                break;
+            }
+            let cu = c as u8;
+
+            // Check for UCN escape sequence
+            if cu == b'\\' {
+                if let Some(uc) = self.try_consume_ucn() {
+                    name.push(uc);
+                    continue;
+                }
+                break;
+            }
+
+            if is_letter_or_digit(cu) {
+                self.nextchar();
+                name.push(cu as char);
+            } else {
                 break;
             }
         }
@@ -640,6 +816,15 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
 
         if class & LETTER != 0 {
             return Some(self.get_identifier(c));
+        }
+
+        // Check for UCN starting an identifier (\uXXXX or \UXXXXXXXX) - C99 6.4.3
+        // UCNs can appear at the start of an identifier
+        // Note: The backslash has already been consumed by skip_whitespace
+        if c == b'\\' {
+            if let Some(uc) = self.try_consume_ucn_after_backslash() {
+                return Some(self.get_identifier_from_ucn(uc));
+            }
         }
 
         self.get_special(c)
@@ -1333,5 +1518,58 @@ mod tests {
         let (tokens, idents) = tokenize_str("a // comment");
         assert_eq!(tokens.len(), 3);
         assert_eq!(show_token(&tokens[1], &idents), "a");
+    }
+
+    // ========================================================================
+    // UCN (Universal Character Name) tests - C99 6.4.3
+    // ========================================================================
+
+    #[test]
+    fn test_ucn_in_identifier() {
+        // Identifier with UCN: caf\u00E9 should become "café"
+        let (tokens, idents) = tokenize_str("caf\\u00E9");
+        assert_eq!(tokens.len(), 3); // StreamBegin, ident, StreamEnd
+        assert_eq!(tokens[1].typ, TokenType::Ident);
+        assert_eq!(show_token(&tokens[1], &idents), "café");
+    }
+
+    #[test]
+    fn test_ucn_identifier_start() {
+        // Identifier starting with UCN: \u00E9tat -> "état"
+        let (tokens, idents) = tokenize_str("\\u00E9tat");
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens[1].typ, TokenType::Ident);
+        assert_eq!(show_token(&tokens[1], &idents), "état");
+    }
+
+    #[test]
+    fn test_ucn_long_form() {
+        // Long UCN form: \U00000041 = 'A'
+        let (tokens, idents) = tokenize_str("test\\U00000041bc");
+        assert_eq!(tokens[1].typ, TokenType::Ident);
+        assert_eq!(show_token(&tokens[1], &idents), "testAbc");
+    }
+
+    #[test]
+    fn test_ucn_multiple_in_identifier() {
+        // Multiple UCNs in one identifier
+        let (tokens, idents) = tokenize_str("\\u00E9l\\u00E8ve");
+        assert_eq!(tokens[1].typ, TokenType::Ident);
+        assert_eq!(show_token(&tokens[1], &idents), "élève");
+    }
+
+    #[test]
+    fn test_ucn_only_identifier() {
+        // Identifier consisting only of UCN
+        let (tokens, idents) = tokenize_str("\\u03B1"); // Greek alpha
+        assert_eq!(tokens[1].typ, TokenType::Ident);
+        assert_eq!(show_token(&tokens[1], &idents), "α");
+    }
+
+    #[test]
+    fn test_ucn_lowercase_hex() {
+        // UCN with lowercase hex digits
+        let (tokens, idents) = tokenize_str("caf\\u00e9");
+        assert_eq!(show_token(&tokens[1], &idents), "café");
     }
 }

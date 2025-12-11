@@ -802,6 +802,8 @@ impl<'a> Linearizer<'a> {
         // For struct/union parameters, we need to copy them to local storage
         // so member access works properly
         let mut struct_params: Vec<(String, TypeId, PseudoId)> = Vec::new();
+        // Complex parameters also need local storage for real/imag access
+        let mut complex_params: Vec<(String, TypeId, PseudoId)> = Vec::new();
 
         for (i, param) in func.params.iter().enumerate() {
             let name = param
@@ -816,9 +818,15 @@ impl<'a> Linearizer<'a> {
             ir_func.add_pseudo(pseudo);
 
             // For struct/union types, we'll copy to a local later
+            // so member access works properly
             let param_kind = self.types.kind(param.typ);
             if param_kind == TypeKind::Struct || param_kind == TypeKind::Union {
                 struct_params.push((name, param.typ, pseudo_id));
+            } else if self.types.is_complex(param.typ) {
+                // Complex parameters: copy to local storage so real/imag access works
+                // Unlike structs, complex types are passed in FP registers per ABI,
+                // so we create local storage and the codegen handles the register split
+                complex_params.push((name, param.typ, pseudo_id));
             } else {
                 self.var_map.insert(name, pseudo_id);
             }
@@ -881,6 +889,35 @@ impl<'a> Linearizer<'a> {
             }
 
             // Register as a local variable
+            self.locals.insert(
+                name,
+                LocalVarInfo {
+                    sym: local_sym,
+                    typ,
+                    vla_size_sym: None,
+                    vla_elem_type: None,
+                    vla_dim_syms: vec![],
+                },
+            );
+        }
+
+        // Setup local storage for complex parameters
+        // Complex types are passed in FP registers per ABI - the prologue codegen
+        // handles storing from XMM registers to local storage
+        for (name, typ, _arg_pseudo) in complex_params {
+            // Create a symbol pseudo for this local variable (its address)
+            let local_sym = self.alloc_pseudo();
+            let sym = Pseudo::sym(local_sym, name.clone());
+            if let Some(func) = &mut self.current_func {
+                func.add_pseudo(sym);
+                let is_volatile = self.types.modifiers(typ).contains(TypeModifiers::VOLATILE);
+                func.add_local(&name, local_sym, typ, is_volatile, None);
+            }
+
+            // Don't emit a store here - the prologue codegen handles storing
+            // from XMM0+XMM1/XMM2+XMM3/etc to local storage
+
+            // Register as a local variable for name lookup
             self.locals.insert(
                 name,
                 LocalVarInfo {
@@ -1011,6 +1048,11 @@ impl<'a> Linearizer<'a> {
                             self.types.void_ptr_id,
                             64,
                         ));
+                    } else if self.types.is_complex(typ) {
+                        // Complex return: codegen expects an address (pointer to the complex value)
+                        let addr = self.linearize_lvalue(e);
+                        let typ_size = self.types.size_bits(typ);
+                        self.emit(Instruction::ret_typed(Some(addr), typ, typ_size));
                     } else {
                         let val = self.linearize_expr(e);
                         let typ_size = self.types.size_bits(typ);
@@ -1133,6 +1175,29 @@ impl<'a> Linearizer<'a> {
                 if let ExprKind::InitList { elements } = &init.kind {
                     // Handle initializer list for arrays and structs
                     self.linearize_init_list(sym_id, typ, elements);
+                } else if self.types.is_complex(typ) {
+                    // Complex type initialization - linearize_expr returns an address
+                    // to a temp containing the complex value. Copy from temp to local.
+                    let value_addr = self.linearize_expr(init);
+                    let base_typ = self.types.complex_base(typ);
+                    let base_bits = self.types.size_bits(base_typ);
+                    let base_bytes = (base_bits / 8) as i64;
+
+                    // Load real and imag parts from source temp
+                    let val_real = self.alloc_pseudo();
+                    let val_imag = self.alloc_pseudo();
+                    self.emit(Instruction::load(
+                        val_real, value_addr, 0, base_typ, base_bits,
+                    ));
+                    self.emit(Instruction::load(
+                        val_imag, value_addr, base_bytes, base_typ, base_bits,
+                    ));
+
+                    // Store to local variable
+                    self.emit(Instruction::store(val_real, sym_id, 0, base_typ, base_bits));
+                    self.emit(Instruction::store(
+                        val_imag, sym_id, base_bytes, base_typ, base_bits,
+                    ));
                 } else {
                     // Simple scalar initializer
                     let val = self.linearize_expr(init);
@@ -2580,11 +2645,13 @@ impl<'a> Linearizer<'a> {
             (None, false) // No type info, assume non-variadic and returns
         };
 
-        // Check if function returns a large struct
-        // If so, allocate space and pass address as hidden first argument
+        // Check if function returns a large struct or complex type
+        // Large structs: allocate space and pass address as hidden first argument
+        // Complex types: allocate local storage for result (needs stack for 16-byte value)
         let typ_kind = self.types.kind(typ);
         let returns_large_struct = (typ_kind == TypeKind::Struct || typ_kind == TypeKind::Union)
             && self.types.size_bits(typ) > self.target.max_aggregate_register_bits;
+        let returns_complex = self.types.is_complex(typ);
 
         let (result_sym, mut arg_vals, mut arg_types_vec) = if returns_large_struct {
             // Allocate local storage for the return value
@@ -2616,6 +2683,17 @@ impl<'a> Linearizer<'a> {
 
             // Hidden return pointer is the first argument (pointer type)
             (sret_sym, vec![sret_addr], vec![self.types.pointer_to(typ)])
+        } else if returns_complex {
+            // Complex returns: allocate local storage for the result
+            // Complex values are 16 bytes and need stack storage
+            let local_sym = self.alloc_pseudo();
+            let unique_name = format!("__cret_{}", local_sym.0);
+            let local_pseudo = Pseudo::sym(local_sym, unique_name.clone());
+            if let Some(func) = &mut self.current_func {
+                func.add_pseudo(local_pseudo);
+                func.add_local(&unique_name, local_sym, typ, false, self.current_bb);
+            }
+            (local_sym, Vec::new(), Vec::new())
         } else {
             let result = self.alloc_pseudo();
             (result, Vec::new(), Vec::new())
@@ -2623,6 +2701,7 @@ impl<'a> Linearizer<'a> {
 
         // Linearize regular arguments
         // For large structs, pass by reference (address) instead of by value
+        // For complex types, pass address so codegen can load real/imag into XMM registers
         // For arrays (including VLAs), decay to pointer
         for a in args.iter() {
             let arg_type = self.expr_type(a);
@@ -2633,6 +2712,11 @@ impl<'a> Linearizer<'a> {
                 // Large struct: pass address instead of value
                 // The argument type becomes a pointer
                 arg_types_vec.push(self.types.pointer_to(arg_type));
+                self.linearize_lvalue(a)
+            } else if self.types.is_complex(arg_type) {
+                // Complex types: pass address, codegen loads real/imag into XMM registers
+                // Type stays as complex (not pointer) so codegen knows it's complex
+                arg_types_vec.push(arg_type);
                 self.linearize_lvalue(a)
             } else if arg_kind == TypeKind::Array {
                 // Array decay to pointer (C99 6.3.2.1)
@@ -2911,6 +2995,12 @@ impl<'a> Linearizer<'a> {
                 64,
             ));
             result
+        } else if self.types.is_complex(result_typ) {
+            // Complex arithmetic: expand to real/imaginary operations
+            // For complex types, we need addresses to load real/imag parts
+            let left_addr = self.linearize_lvalue(left);
+            let right_addr = self.linearize_lvalue(right);
+            self.emit_complex_binary(op, left_addr, right_addr, result_typ)
         } else {
             // For comparisons, compute common type for both operands
             // (usual arithmetic conversions)
@@ -4061,6 +4151,299 @@ impl<'a> Linearizer<'a> {
         result
     }
 
+    /// Emit complex arithmetic operation
+    /// Complex values are stored as two adjacent float/double values (real, imag)
+    /// This function expands complex ops to operations on the component parts
+    fn emit_complex_binary(
+        &mut self,
+        op: BinaryOp,
+        left_addr: PseudoId,
+        right_addr: PseudoId,
+        complex_typ: TypeId,
+    ) -> PseudoId {
+        // Get the base float type (float, double, or long double)
+        let base_typ = self.types.complex_base(complex_typ);
+        let base_size = self.types.size_bits(base_typ);
+        let base_bytes = (base_size / 8) as i64;
+
+        // Allocate result temporary (stack space for the complex result)
+        let result_addr = self.alloc_local_temp(complex_typ);
+
+        // Load real and imaginary parts of left operand
+        let left_real = self.alloc_pseudo();
+        self.emit(Instruction::load(
+            left_real, left_addr, 0, base_typ, base_size,
+        ));
+
+        let left_imag = self.alloc_pseudo();
+        self.emit(Instruction::load(
+            left_imag, left_addr, base_bytes, base_typ, base_size,
+        ));
+
+        // Load real and imaginary parts of right operand
+        let right_real = self.alloc_pseudo();
+        self.emit(Instruction::load(
+            right_real, right_addr, 0, base_typ, base_size,
+        ));
+
+        let right_imag = self.alloc_pseudo();
+        self.emit(Instruction::load(
+            right_imag, right_addr, base_bytes, base_typ, base_size,
+        ));
+
+        // Perform the operation on the components
+        let (result_real, result_imag) = match op {
+            BinaryOp::Add => {
+                // (a + bi) + (c + di) = (a+c) + (b+d)i
+                let real = self.alloc_pseudo();
+                self.emit(Instruction::binop(
+                    Opcode::FAdd,
+                    real,
+                    left_real,
+                    right_real,
+                    base_typ,
+                    base_size,
+                ));
+                let imag = self.alloc_pseudo();
+                self.emit(Instruction::binop(
+                    Opcode::FAdd,
+                    imag,
+                    left_imag,
+                    right_imag,
+                    base_typ,
+                    base_size,
+                ));
+                (real, imag)
+            }
+            BinaryOp::Sub => {
+                // (a + bi) - (c + di) = (a-c) + (b-d)i
+                let real = self.alloc_pseudo();
+                self.emit(Instruction::binop(
+                    Opcode::FSub,
+                    real,
+                    left_real,
+                    right_real,
+                    base_typ,
+                    base_size,
+                ));
+                let imag = self.alloc_pseudo();
+                self.emit(Instruction::binop(
+                    Opcode::FSub,
+                    imag,
+                    left_imag,
+                    right_imag,
+                    base_typ,
+                    base_size,
+                ));
+                (real, imag)
+            }
+            BinaryOp::Mul => {
+                // (a + bi) * (c + di) = (ac - bd) + (ad + bc)i
+                let ac = self.alloc_pseudo();
+                self.emit(Instruction::binop(
+                    Opcode::FMul,
+                    ac,
+                    left_real,
+                    right_real,
+                    base_typ,
+                    base_size,
+                ));
+                let bd = self.alloc_pseudo();
+                self.emit(Instruction::binop(
+                    Opcode::FMul,
+                    bd,
+                    left_imag,
+                    right_imag,
+                    base_typ,
+                    base_size,
+                ));
+                let ad = self.alloc_pseudo();
+                self.emit(Instruction::binop(
+                    Opcode::FMul,
+                    ad,
+                    left_real,
+                    right_imag,
+                    base_typ,
+                    base_size,
+                ));
+                let bc = self.alloc_pseudo();
+                self.emit(Instruction::binop(
+                    Opcode::FMul,
+                    bc,
+                    left_imag,
+                    right_real,
+                    base_typ,
+                    base_size,
+                ));
+                let real = self.alloc_pseudo();
+                self.emit(Instruction::binop(
+                    Opcode::FSub,
+                    real,
+                    ac,
+                    bd,
+                    base_typ,
+                    base_size,
+                ));
+                let imag = self.alloc_pseudo();
+                self.emit(Instruction::binop(
+                    Opcode::FAdd,
+                    imag,
+                    ad,
+                    bc,
+                    base_typ,
+                    base_size,
+                ));
+                (real, imag)
+            }
+            BinaryOp::Div => {
+                // (a + bi) / (c + di) = ((ac + bd) + (bc - ad)i) / (c^2 + d^2)
+                // Naive formula without overflow handling
+                let cc = self.alloc_pseudo();
+                self.emit(Instruction::binop(
+                    Opcode::FMul,
+                    cc,
+                    right_real,
+                    right_real,
+                    base_typ,
+                    base_size,
+                ));
+                let dd = self.alloc_pseudo();
+                self.emit(Instruction::binop(
+                    Opcode::FMul,
+                    dd,
+                    right_imag,
+                    right_imag,
+                    base_typ,
+                    base_size,
+                ));
+                let denom = self.alloc_pseudo();
+                self.emit(Instruction::binop(
+                    Opcode::FAdd,
+                    denom,
+                    cc,
+                    dd,
+                    base_typ,
+                    base_size,
+                ));
+
+                let ac = self.alloc_pseudo();
+                self.emit(Instruction::binop(
+                    Opcode::FMul,
+                    ac,
+                    left_real,
+                    right_real,
+                    base_typ,
+                    base_size,
+                ));
+                let bd = self.alloc_pseudo();
+                self.emit(Instruction::binop(
+                    Opcode::FMul,
+                    bd,
+                    left_imag,
+                    right_imag,
+                    base_typ,
+                    base_size,
+                ));
+                let bc = self.alloc_pseudo();
+                self.emit(Instruction::binop(
+                    Opcode::FMul,
+                    bc,
+                    left_imag,
+                    right_real,
+                    base_typ,
+                    base_size,
+                ));
+                let ad = self.alloc_pseudo();
+                self.emit(Instruction::binop(
+                    Opcode::FMul,
+                    ad,
+                    left_real,
+                    right_imag,
+                    base_typ,
+                    base_size,
+                ));
+
+                let real_num = self.alloc_pseudo();
+                self.emit(Instruction::binop(
+                    Opcode::FAdd,
+                    real_num,
+                    ac,
+                    bd,
+                    base_typ,
+                    base_size,
+                ));
+                let imag_num = self.alloc_pseudo();
+                self.emit(Instruction::binop(
+                    Opcode::FSub,
+                    imag_num,
+                    bc,
+                    ad,
+                    base_typ,
+                    base_size,
+                ));
+
+                let real = self.alloc_pseudo();
+                self.emit(Instruction::binop(
+                    Opcode::FDiv,
+                    real,
+                    real_num,
+                    denom,
+                    base_typ,
+                    base_size,
+                ));
+                let imag = self.alloc_pseudo();
+                self.emit(Instruction::binop(
+                    Opcode::FDiv,
+                    imag,
+                    imag_num,
+                    denom,
+                    base_typ,
+                    base_size,
+                ));
+                (real, imag)
+            }
+            _ => {
+                // Other operations not supported for complex types
+                error(
+                    Position::default(),
+                    &format!("unsupported operation {:?} on complex types", op),
+                );
+                return result_addr;
+            }
+        };
+
+        // Store result components
+        self.emit(Instruction::store(
+            result_real,
+            result_addr,
+            0,
+            base_typ,
+            base_size,
+        ));
+        self.emit(Instruction::store(
+            result_imag,
+            result_addr,
+            base_bytes,
+            base_typ,
+            base_size,
+        ));
+
+        result_addr
+    }
+
+    /// Allocate a local temporary variable for a complex result
+    fn alloc_local_temp(&mut self, typ: TypeId) -> PseudoId {
+        let size = self.types.size_bytes(typ);
+        let size_const = self.emit_const(size as i64, self.types.ulong_id);
+        let addr = self.alloc_pseudo();
+        let alloca_insn = Instruction::new(Opcode::Alloca)
+            .with_target(addr)
+            .with_src(size_const)
+            .with_type_and_size(self.types.void_ptr_id, 64);
+        self.emit(alloca_insn);
+        addr
+    }
+
     fn emit_compare_zero(&mut self, val: PseudoId, operand_typ: TypeId) -> PseudoId {
         let result = self.alloc_pseudo();
         let zero = self.emit_const(0, operand_typ);
@@ -4189,9 +4572,45 @@ impl<'a> Linearizer<'a> {
     }
 
     fn emit_assign(&mut self, op: AssignOp, target: &Expr, value: &Expr) -> PseudoId {
-        let rhs = self.linearize_expr(value);
         let target_typ = self.expr_type(target);
         let value_typ = self.expr_type(value);
+
+        // For complex type assignment, handle specially - copy real and imag parts
+        if self.types.is_complex(target_typ) && op == AssignOp::Assign {
+            let target_addr = self.linearize_lvalue(target);
+            let value_addr = self.linearize_lvalue(value);
+            let base_typ = self.types.complex_base(target_typ);
+            let base_size = self.types.size_bits(base_typ);
+            let base_bytes = (base_size / 8) as i64;
+
+            // Load and store real part
+            let real = self.alloc_pseudo();
+            self.emit(Instruction::load(real, value_addr, 0, base_typ, base_size));
+            self.emit(Instruction::store(
+                real,
+                target_addr,
+                0,
+                base_typ,
+                base_size,
+            ));
+
+            // Load and store imaginary part
+            let imag = self.alloc_pseudo();
+            self.emit(Instruction::load(
+                imag, value_addr, base_bytes, base_typ, base_size,
+            ));
+            self.emit(Instruction::store(
+                imag,
+                target_addr,
+                base_bytes,
+                base_typ,
+                base_size,
+            ));
+
+            return real; // Return real part as the result value
+        }
+
+        let rhs = self.linearize_expr(value);
 
         // Check for pointer compound assignment (p += n or p -= n)
         let is_ptr_arith = self.types.kind(target_typ) == TypeKind::Pointer

@@ -15,6 +15,7 @@ mod array_type;
 mod bitfield_type;
 mod bool;
 mod char;
+mod complex;
 mod float;
 mod int;
 mod long;

@@ -146,6 +146,9 @@ bitflags::bitflags! {
 
         // Function specifier: noreturn (_Noreturn keyword, C11)
         const NORETURN = 1 << 14;
+
+        // C99 complex type specifier
+        const COMPLEX = 1 << 15;
     }
 }
 
@@ -591,6 +594,9 @@ pub struct TypeTable {
     pub float_id: TypeId,
     pub double_id: TypeId,
     pub longdouble_id: TypeId,
+    pub complex_float_id: TypeId,
+    pub complex_double_id: TypeId,
+    pub complex_longdouble_id: TypeId,
     pub void_ptr_id: TypeId,
     pub char_ptr_id: TypeId,
 }
@@ -617,6 +623,9 @@ impl TypeTable {
             float_id: TypeId::INVALID,
             double_id: TypeId::INVALID,
             longdouble_id: TypeId::INVALID,
+            complex_float_id: TypeId::INVALID,
+            complex_double_id: TypeId::INVALID,
+            complex_longdouble_id: TypeId::INVALID,
             void_ptr_id: TypeId::INVALID,
             char_ptr_id: TypeId::INVALID,
         };
@@ -650,6 +659,20 @@ impl TypeTable {
         table.float_id = table.intern(Type::basic(TypeKind::Float));
         table.double_id = table.intern(Type::basic(TypeKind::Double));
         table.longdouble_id = table.intern(Type::basic(TypeKind::LongDouble));
+
+        // Pre-intern complex types
+        table.complex_float_id = table.intern(Type::with_modifiers(
+            TypeKind::Float,
+            TypeModifiers::COMPLEX,
+        ));
+        table.complex_double_id = table.intern(Type::with_modifiers(
+            TypeKind::Double,
+            TypeModifiers::COMPLEX,
+        ));
+        table.complex_longdouble_id = table.intern(Type::with_modifiers(
+            TypeKind::LongDouble,
+            TypeModifiers::COMPLEX,
+        ));
 
         // Pre-intern common pointer types
         table.void_ptr_id = table.intern(Type::pointer(table.void_id));
@@ -869,19 +892,53 @@ impl TypeTable {
         )
     }
 
-    /// Check if type is a floating point type
+    /// Check if type is a floating point type (not complex)
     #[inline]
     pub fn is_float(&self, id: TypeId) -> bool {
+        let typ = self.get(id);
         matches!(
-            self.get(id).kind,
+            typ.kind,
             TypeKind::Float | TypeKind::Double | TypeKind::LongDouble
-        )
+        ) && !typ.modifiers.contains(TypeModifiers::COMPLEX)
     }
 
-    /// Check if type is an arithmetic type (integer or float)
+    /// Check if type is a complex floating point type
+    #[inline]
+    pub fn is_complex(&self, id: TypeId) -> bool {
+        self.get(id).modifiers.contains(TypeModifiers::COMPLEX)
+    }
+
+    /// Get the base float type for a complex type (e.g., double for double _Complex)
+    /// Returns the same type if not complex
+    #[inline]
+    pub fn complex_base(&self, id: TypeId) -> TypeId {
+        if !self.is_complex(id) {
+            return id;
+        }
+        match self.get(id).kind {
+            TypeKind::Float => self.float_id,
+            TypeKind::Double => self.double_id,
+            TypeKind::LongDouble => self.longdouble_id,
+            _ => id,
+        }
+    }
+
+    /// Get the complex version of a float type
+    #[inline]
+    #[allow(dead_code)]
+    pub fn complex_of(&self, id: TypeId) -> TypeId {
+        match self.get(id).kind {
+            TypeKind::Float => self.complex_float_id,
+            TypeKind::Double => self.complex_double_id,
+            TypeKind::LongDouble => self.complex_longdouble_id,
+            _ => id,
+        }
+    }
+
+    /// Check if type is an arithmetic type (integer, float, or complex)
     #[inline]
     pub fn is_arithmetic(&self, id: TypeId) -> bool {
-        self.is_integer(id) || self.is_float(id)
+        self.is_integer(id) || self.is_float(id) || self.is_complex(id)
     }
 
     /// Check if type is a scalar type (arithmetic or pointer)
@@ -921,6 +978,8 @@ impl TypeTable {
     /// Get the size of a type in bits
     pub fn size_bits(&self, id: TypeId) -> u32 {
         let typ = self.get(id);
+        let is_complex = typ.modifiers.contains(TypeModifiers::COMPLEX);
+        let multiplier = if is_complex { 2 } else { 1 };
         match typ.kind {
             TypeKind::Void => 0,
             TypeKind::Bool => 8,
@@ -929,9 +988,9 @@ impl TypeTable {
             TypeKind::Int => 32,
             TypeKind::Long => 64,
             TypeKind::LongLong => 64,
-            TypeKind::Float => 32,
-            TypeKind::Double => 64,
-            TypeKind::LongDouble => 128,
+            TypeKind::Float => 32 * multiplier,
+            TypeKind::Double => 64 * multiplier,
+            TypeKind::LongDouble => 128 * multiplier,
             TypeKind::Pointer => 64,
             TypeKind::Array => {
                 let elem_size = typ.base.map(|b| self.size_bits(b)).unwrap_or(0);

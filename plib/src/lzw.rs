@@ -238,10 +238,7 @@ impl UnixLZWReader {
             let header_magic = &header[0..2];
 
             if &MAGIC_HEADER[..] != header_magic {
-                return Err(Error::new(
-                    ErrorKind::Other,
-                    "invalid file header: magic number",
-                ));
+                return Err(Error::other("invalid file header: magic number"));
             }
 
             // the third byte has bitmask of options
@@ -258,7 +255,7 @@ impl UnixLZWReader {
             self.block_compress = (options & HDR_BLOCK_MASK) != 0;
 
             if self.maxbits > BITS {
-                return Err(Error::new(ErrorKind::Other, "invalid file header: bits"));
+                return Err(Error::other("invalid file header: bits"));
             }
 
             // the max value that self.maxcode can have, which is derived
@@ -553,7 +550,7 @@ impl UnixLZWWriter {
             }
         } else {
             if self.offset > 0 {
-                self.offset = (self.offset + 7) / 8;
+                self.offset = self.offset.div_ceil(8);
                 let temp_buf = &self.buf[..self.offset as usize];
                 outbytes.extend(temp_buf);
                 self.bytes_out += self.offset as i32;

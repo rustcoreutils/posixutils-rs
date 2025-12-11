@@ -1090,8 +1090,8 @@ impl SourceContext {
             style_lines.push(
                 seek_positions
                     .style_positions
-                    .iter()
-                    .cloned()
+                    .clone()
+                    .into_iter()
                     .map(|(rng, st)| {
                         deleted_count += rng.end - rng.start - 1;
                         (rng.end - deleted_count - 1, st)
@@ -1770,7 +1770,7 @@ impl MoreControl {
         } else {
             for file_path in &input_files {
                 // Handle '-' as stdin
-                let source = if *file_path == PathBuf::from("-") {
+                let source = if file_path.as_os_str() == "-" {
                     let buf = self.stdin_buffer.clone().unwrap_or_default();
                     Source::Buffer(Cursor::new(buf))
                 } else {
@@ -1786,7 +1786,7 @@ impl MoreControl {
                 };
                 if input_files.len() > 1 {
                     // Format header differently for stdin vs file
-                    if *file_path == PathBuf::from("-") {
+                    if file_path.as_os_str() == "-" {
                         const STDIN_LABEL: &str = "(standard input)";
                         let header_width = STDIN_LABEL.len() + 2; // 2 for border padding
                         let border = ":".repeat(header_width);

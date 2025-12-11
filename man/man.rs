@@ -354,22 +354,16 @@ where
         if let Some(mut process_stdin) = process.stdin.take() {
             process_stdin.write_all(stdin)?;
         } else {
-            Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("failed to open stdin for {name}"),
-            ))?;
+            Err(io::Error::other(format!("failed to open stdin for {name}")))?;
         }
     }
 
-    let output = process.wait_with_output().map_err(|_| {
-        io::Error::new(io::ErrorKind::Other, format!("failed to get {name} stdout"))
-    })?;
+    let output = process
+        .wait_with_output()
+        .map_err(|_| io::Error::other(format!("failed to get {name} stdout")))?;
 
     if !output.status.success() {
-        Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("{name} failed"),
-        ))?
+        Err(io::Error::other(format!("{name} failed")))?
     } else {
         Ok(output)
     }

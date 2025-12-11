@@ -14,8 +14,9 @@ use pest::iterators::Pair;
 use crate::man_util::parser::Rule;
 
 /// Types of formatting AT&T UNIX version
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum AtType {
+    #[default]
     General,
     Version(String),
     V32,
@@ -51,12 +52,6 @@ impl Display for AtType {
         };
 
         write!(f, "{at_n_t_unix}")
-    }
-}
-
-impl Default for AtType {
-    fn default() -> Self {
-        Self::General
     }
 }
 

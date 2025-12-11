@@ -104,7 +104,7 @@ fn decode_file(args: &Args) -> io::Result<()> {
         .unwrap_or(&PathBuf::from("/dev/stdin"))
         .clone();
 
-    if file_p == PathBuf::from("/dev/stdin") {
+    if file_p.as_os_str() == "/dev/stdin" {
         io::stdin().lock().read_to_end(&mut buf)?;
     } else {
         let mut file = File::open(&file_p)?;
@@ -128,7 +128,7 @@ fn decode_file(args: &Args) -> io::Result<()> {
                     }
                 }
 
-                let len = (line[..1].as_bytes()[0] - 32) as usize;
+                let len = (line.as_bytes()[0] - 32) as usize;
                 let mut dec_out = decode_historical_line(&line[1..]);
                 dec_out.truncate(len);
                 out.extend_from_slice(&dec_out);

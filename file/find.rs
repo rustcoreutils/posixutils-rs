@@ -378,7 +378,7 @@ fn evaluate_expression(
                         let file_size = if *in_bytes {
                             metadata.len()
                         } else {
-                            (metadata.len() + 511) / 512
+                            metadata.len().div_ceil(512)
                         };
                         if file_size < *size {
                             c_files.remove(file.path());

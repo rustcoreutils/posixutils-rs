@@ -68,7 +68,7 @@ impl Args {
 fn uniq(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let input: Box<dyn BufRead> = match &args.input_file {
         Some(file) => {
-            if *file == PathBuf::from("-") {
+            if file.as_os_str() == "-" {
                 Box::new(BufReader::new(io::stdin()))
             } else {
                 Box::new(BufReader::new(File::open(file)?))

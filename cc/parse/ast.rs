@@ -711,6 +711,7 @@ pub struct FunctionDef {
 
 /// An external declaration (top-level item)
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum ExternalDecl {
     /// Function definition
     FunctionDef(FunctionDef),

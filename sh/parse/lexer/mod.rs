@@ -31,9 +31,9 @@ trait Lexer {
 
     fn line_no(&self) -> u32;
 
-    fn next_line(&mut self) -> Cow<str>;
+    fn next_line(&mut self) -> Cow<'_, str>;
 
-    fn next_word(&mut self) -> ParseResult<Cow<str>>;
+    fn next_word(&mut self) -> ParseResult<Cow<'_, str>>;
 
     fn skip_comment(&mut self) {
         if self.lookahead() == '#' {

@@ -12,7 +12,7 @@
 // - gettext("Specify repetitive tab stops separated by ({}) columns")
 //
 
-use std::io::{self, Error, ErrorKind, Write};
+use std::io::{self, Error, Write};
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
@@ -179,7 +179,7 @@ fn set_hw_tabs(info: &Database, tabstops: &Vec<u16>) -> io::Result<()> {
 
     if clear_cap.is_none() || set_cap.is_none() {
         let msg = gettext("Terminal does not support hardware tabs.");
-        return Err(Error::new(ErrorKind::Other, msg));
+        return Err(Error::other(msg));
     }
     let clear_cap = clear_cap.unwrap();
     let set_cap = set_cap.unwrap();
@@ -187,7 +187,7 @@ fn set_hw_tabs(info: &Database, tabstops: &Vec<u16>) -> io::Result<()> {
     // clear existing tabs
     if let Err(e) = clear_cap.expand().to(io::stdout()) {
         let msg = format!("{}: {}", gettext("Failed to clear tabs"), e);
-        return Err(Error::new(ErrorKind::Other, msg));
+        return Err(Error::other(msg));
     }
 
     // set new tabs
@@ -202,7 +202,7 @@ fn set_hw_tabs(info: &Database, tabstops: &Vec<u16>) -> io::Result<()> {
 
         if let Err(e) = set_cap.expand().to(io::stdout()) {
             let msg = format!("{}: {}", gettext("Failed to set tab"), e);
-            return Err(Error::new(ErrorKind::Other, msg));
+            return Err(Error::other(msg));
         }
     }
 

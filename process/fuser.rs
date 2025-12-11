@@ -1266,8 +1266,8 @@ mod macos {
         exclude_event_only: bool,
     ) -> io::Result<Vec<u32>> {
         let path_bytes = path.as_os_str().as_bytes();
-        let c_path = CString::new(path_bytes)
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "CString::new failed"))?;
+        let c_path =
+            CString::new(path_bytes).map_err(|_| io::Error::other("CString::new failed"))?;
         let mut pathflags: u32 = 0;
         if is_volume {
             pathflags |= osx_libproc_bindings::PROC_LISTPIDSPATH_PATH_IS_VOLUME;
@@ -1474,9 +1474,7 @@ fn timeout(path: &str, seconds: u32) -> Result<Metadata, io::Error> {
             io::ErrorKind::TimedOut,
             "Operation timed out",
         )),
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            Err(io::Error::new(io::ErrorKind::Other, "Channel disconnected"))
-        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other("Channel disconnected")),
     }
 }
 

@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use clap::{command, Parser};
+use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use libc::{ioctl, winsize, STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO, TIOCGWINSZ};
 use plib::regex::{Regex as PlibRegex, RegexFlags};
@@ -1738,8 +1738,8 @@ fn update_pattern_space(
         return false;
     }
 
-    let main_range = ranges.iter().map(|(_, r)| r.start).min().unwrap()
-        ..ranges.iter().map(|(_, r)| r.end).max().unwrap();
+    let main_range = ranges.values().map(|r| r.start).min().unwrap()
+        ..ranges.values().map(|r| r.end).max().unwrap();
 
     if !group_positions.is_empty() {
         for (position, group) in group_positions {

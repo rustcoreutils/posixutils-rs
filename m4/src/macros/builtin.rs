@@ -770,14 +770,12 @@ pub struct MkstempMacro;
 /// file at the time of a call to mkstemp().
 fn mkstemp(mut template: Vec<u8>) -> Result<Vec<u8>> {
     if template.len() < 6 {
-        return Err(crate::Error::new(crate::ErrorKind::Io).with_source(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(crate::Error::new(crate::ErrorKind::Io).with_source(std::io::Error::other(
             format!("Unable to create temporary file, template should be greater than 6 characters long. template: {:?}", String::from_utf8_lossy(&template))
         )));
     }
     if &template[(template.len() - 6)..] != b"XXXXXX" {
-        return Err(crate::Error::new(crate::ErrorKind::Io).with_source(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(crate::Error::new(crate::ErrorKind::Io).with_source(std::io::Error::other(
             format!("Unable to create temporary file, template does not finish with six trailing 'X's. template: {:?}", String::from_utf8_lossy(&template))
         )));
     }
@@ -790,15 +788,12 @@ fn mkstemp(mut template: Vec<u8>) -> Result<Vec<u8>> {
     if file_descriptor < 0 {
         let e = errno::errno();
         return Err(
-            crate::Error::new(crate::ErrorKind::Io).with_source(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "Unable to create temporary file. template: {:?}, Error {}: {}",
-                    String::from_utf8_lossy(&template),
-                    e.0,
-                    e
-                ),
-            )),
+            crate::Error::new(crate::ErrorKind::Io).with_source(std::io::Error::other(format!(
+                "Unable to create temporary file. template: {:?}, Error {}: {}",
+                String::from_utf8_lossy(&template),
+                e.0,
+                e
+            ))),
         );
     }
     // SAFETY: According to https://linux.die.net/man/2/close it seems like this is correct.
@@ -806,15 +801,12 @@ fn mkstemp(mut template: Vec<u8>) -> Result<Vec<u8>> {
     if result < 0 {
         let e = errno::errno();
         return Err(
-            crate::Error::new(crate::ErrorKind::Io).with_source(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "Unable to close temporary file. template: {:?}, Error {}: {}",
-                    String::from_utf8_lossy(&template),
-                    e.0,
-                    e
-                ),
-            )),
+            crate::Error::new(crate::ErrorKind::Io).with_source(std::io::Error::other(format!(
+                "Unable to close temporary file. template: {:?}, Error {}: {}",
+                String::from_utf8_lossy(&template),
+                e.0,
+                e
+            ))),
         );
     }
     Ok(template)

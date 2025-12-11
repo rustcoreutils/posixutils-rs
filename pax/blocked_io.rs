@@ -141,12 +141,7 @@ impl<R: Read> Read for BlockedReader<R> {
             match self.fill_buffer() {
                 Ok(0) => return Ok(0),
                 Ok(_) => {}
-                Err(e) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    ))
-                }
+                Err(e) => return Err(std::io::Error::other(e.to_string())),
             }
         }
 

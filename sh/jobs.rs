@@ -88,7 +88,7 @@ pub enum JobId<'s> {
 
 /// # Panics
 /// panics if text does not begin with '%'
-pub fn parse_job_id(text: &str) -> Result<JobId, ()> {
+pub fn parse_job_id(text: &str) -> Result<JobId<'_>, ()> {
     assert!(text.starts_with('%'));
     match &text[1..] {
         "%" | "+" => Ok(JobId::CurrentJob),

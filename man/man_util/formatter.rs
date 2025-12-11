@@ -2392,7 +2392,6 @@ impl MdocFormatter {
             content.push_str(&format!("{} ", formatted_node.trim_end()));
         }
 
-        let mut current_lines_count = 0;
         let mut prev_node = Macro::Soi;
         let mut is_first_an_in_authors_block = true;
 
@@ -2497,8 +2496,6 @@ impl MdocFormatter {
                     indent,
                     max_width,
                 );
-
-                current_lines_count += content.lines().count();
             }
 
             content.trim().to_string()
@@ -2506,41 +2503,36 @@ impl MdocFormatter {
             macro_node
                 .nodes
                 .into_iter()
-                .map(|node| {
-                    let content = match node {
-                        Element::Macro(ref macro_node) => {
-                            if title.eq_ignore_ascii_case("AUTHORS") {
-                                match &macro_node.mdoc_macro {
-                                    Macro::An { author_name_type } => {
-                                        if is_first_an_in_authors_block {
-                                            self.formatting_state.split_mod = false;
-                                            is_first_an_in_authors_block = false;
-                                        } else {
-                                            self.formatting_state.split_mod = true;
-                                        }
-
-                                        self.format_an_authors(
-                                            author_name_type.clone(),
-                                            macro_node.clone(),
-                                        )
+                .map(|node| match node {
+                    Element::Macro(ref macro_node) => {
+                        if title.eq_ignore_ascii_case("AUTHORS") {
+                            match &macro_node.mdoc_macro {
+                                Macro::An { author_name_type } => {
+                                    if is_first_an_in_authors_block {
+                                        self.formatting_state.split_mod = false;
+                                        is_first_an_in_authors_block = false;
+                                    } else {
+                                        self.formatting_state.split_mod = true;
                                     }
-                                    _ => self.format_macro_node(macro_node.clone()),
-                                }
-                            } else if title.eq_ignore_ascii_case("SEE ALSO") {
-                                match &macro_node.mdoc_macro {
-                                    Macro::Rs => self.format_rs_see_also(macro_node.clone()),
-                                    _ => self.format_macro_node(macro_node.clone()),
-                                }
-                            } else {
-                                self.format_macro_node(macro_node.clone())
-                            }
-                        }
-                        Element::Text(ref text) => self.format_text_node(text),
-                        Element::Eoi => String::new(),
-                    };
 
-                    current_lines_count += content.lines().count();
-                    content
+                                    self.format_an_authors(
+                                        author_name_type.clone(),
+                                        macro_node.clone(),
+                                    )
+                                }
+                                _ => self.format_macro_node(macro_node.clone()),
+                            }
+                        } else if title.eq_ignore_ascii_case("SEE ALSO") {
+                            match &macro_node.mdoc_macro {
+                                Macro::Rs => self.format_rs_see_also(macro_node.clone()),
+                                _ => self.format_macro_node(macro_node.clone()),
+                            }
+                        } else {
+                            self.format_macro_node(macro_node.clone())
+                        }
+                    }
+                    Element::Text(ref text) => self.format_text_node(text),
+                    Element::Eoi => String::new(),
                 })
                 .filter(|s| !s.is_empty())
                 .collect::<Vec<_>>()

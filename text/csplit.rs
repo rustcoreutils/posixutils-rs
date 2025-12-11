@@ -137,7 +137,7 @@ impl OutputState {
 
         let inc_res = self.incr_suffix();
         if let Err(e) = inc_res {
-            return Err(Error::new(ErrorKind::Other, e));
+            return Err(Error::other(e));
         }
 
         let out_fn = format!("{}{}", self.prefix, self.suffix);
@@ -181,7 +181,7 @@ fn csplit_file(args: &Args, ctx: SplitOps, new_files: &mut Vec<String>) -> io::R
     let mut split_options = ctx.ops;
     // open file, or stdin
     let file: Box<dyn Read> = {
-        if args.filename == PathBuf::from("-") {
+        if args.filename.as_os_str() == "-" {
             Box::new(io::stdin().lock())
         } else {
             Box::new(fs::File::open(&args.filename)?)
@@ -442,7 +442,7 @@ fn parse_op_rx(opstr: &str, delim: char) -> io::Result<Operand> {
     // find where regex string ends, and (optionally) offset begins
     let res = escaped_end_pos(opstr, delim);
     if res.is_none() {
-        return Err(Error::new(ErrorKind::Other, "invalid regex str"));
+        return Err(Error::other("invalid regex str"));
     }
 
     // parse string sandwiched between two delimiter chars
@@ -466,7 +466,7 @@ fn parse_op_rx(opstr: &str, delim: char) -> io::Result<Operand> {
     // parse offset number, positive or negative
     match offset_str.parse::<isize>() {
         Ok(n) => Ok(Operand::Rx(re, n, is_skip)),
-        Err(_e) => Err(Error::new(ErrorKind::Other, "invalid regex offset")),
+        Err(_e) => Err(Error::other("invalid regex offset")),
     }
 }
 
@@ -492,8 +492,7 @@ fn parse_op_rx(opstr: &str, delim: char) -> io::Result<Operand> {
 fn parse_op_repeat(opstr: &str) -> io::Result<Operand> {
     // Must match pattern: {num} or {*}
     if !opstr.starts_with('{') || !opstr.ends_with('}') {
-        return Err(Error::new(
-            ErrorKind::Other,
+        return Err(Error::other(
             "invalid repeat operand: expected {num} or {*}",
         ));
     }
@@ -511,8 +510,7 @@ fn parse_op_repeat(opstr: &str) -> io::Result<Operand> {
         }
     }
 
-    Err(Error::new(
-        ErrorKind::Other,
+    Err(Error::other(
         "invalid repeat operand: expected {num} or {*}",
     ))
 }
@@ -540,14 +538,11 @@ fn parse_op_repeat(opstr: &str) -> io::Result<Operand> {
 fn parse_op_linenum(opstr: &str) -> io::Result<Operand> {
     // parse simple positive integer
     match opstr.parse::<usize>() {
-        Ok(0) => Err(Error::new(
-            ErrorKind::Other,
-            "line number must be greater than zero",
-        )),
+        Ok(0) => Err(Error::other("line number must be greater than zero")),
         Ok(n) => Ok(Operand::LineNum(n)),
         Err(e) => {
             let msg = format!("{}", e);
-            Err(Error::new(ErrorKind::Other, msg))
+            Err(Error::other(msg))
         }
     }
 }
@@ -584,7 +579,7 @@ fn parse_operands(args: &Args) -> io::Result<SplitOps> {
                 '%' => parse_op_rx(opstr, '%')?,
                 '{' => parse_op_repeat(opstr)?,
                 '0'..='9' => parse_op_linenum(opstr)?,
-                _ => return Err(Error::new(ErrorKind::Other, "invalid operand")),
+                _ => return Err(Error::other("invalid operand")),
             }
         };
 

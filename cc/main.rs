@@ -291,7 +291,7 @@ fn process_file(
         let _ = std::fs::remove_file(&temp_asm);
 
         if !status.success() {
-            return Err(io::Error::new(io::ErrorKind::Other, "assembler failed"));
+            return Err(io::Error::other("assembler failed"));
         }
 
         if args.verbose {
@@ -314,7 +314,7 @@ fn process_file(
     let _ = std::fs::remove_file(&temp_asm);
 
     if !status.success() {
-        return Err(io::Error::new(io::ErrorKind::Other, "assembler failed"));
+        return Err(io::Error::other("assembler failed"));
     }
 
     // Link
@@ -325,7 +325,7 @@ fn process_file(
     let _ = std::fs::remove_file(&temp_obj);
 
     if !status.success() {
-        return Err(io::Error::new(io::ErrorKind::Other, "linker failed"));
+        return Err(io::Error::other("linker failed"));
     }
 
     if args.verbose {

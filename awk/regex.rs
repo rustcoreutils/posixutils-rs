@@ -82,7 +82,7 @@ impl Regex {
 
     /// Returns an iterator over all match locations in the string.
     /// Takes ownership of the CString.
-    pub fn match_locations(&self, string: CString) -> MatchIter {
+    pub fn match_locations(&self, string: CString) -> MatchIter<'_> {
         let s = string.into_string().unwrap_or_default();
         MatchIter {
             next_start: 0,

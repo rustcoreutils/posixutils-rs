@@ -119,7 +119,7 @@ fn encode_file(args: &Args) -> io::Result<()> {
         .unwrap_or(&PathBuf::from("/dev/stdin"))
         .clone();
 
-    if file_p == PathBuf::from("/dev/stdin") {
+    if file_p.as_os_str() == "/dev/stdin" {
         let mode = {
             #[cfg(target_os = "macos")]
             {

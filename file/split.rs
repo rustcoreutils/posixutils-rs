@@ -9,7 +9,7 @@
 
 use std::cmp;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, Error, ErrorKind, Read, Write};
+use std::io::{self, BufRead, Error, Read, Write};
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -130,7 +130,7 @@ impl OutputState {
         let suffix = match self.suffix.next() {
             Some(s) => s,
             None => {
-                return Err(Error::new(ErrorKind::Other, "maximum suffix reached"));
+                return Err(Error::other("maximum suffix reached"));
             }
         };
 
@@ -210,7 +210,7 @@ fn split_by_bytes(args: &Args, bytesplit: String) -> io::Result<()> {
         Ok(n) => n * mul,
         Err(e) => {
             eprintln!("{}", e);
-            return Err(Error::new(ErrorKind::Other, "invalid byte spec"));
+            return Err(Error::other("invalid byte spec"));
         }
     };
 

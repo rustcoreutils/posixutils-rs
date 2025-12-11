@@ -865,7 +865,7 @@ impl Editor {
                         }
                     }
                     // Insert new text
-                    let insert_at = if start > 1 { start - 1 } else { 0 };
+                    let insert_at = start.saturating_sub(1);
                     for (i, content) in lines.iter().enumerate() {
                         self.buffer
                             .insert_line_after(insert_at + i, Line::from(content.as_str()));
@@ -2110,7 +2110,7 @@ impl Editor {
         let lines = output.stdout_lines();
 
         // Insert new lines (insert_line_after takes 0-based index for "before first line")
-        let insert_pos = if start > 1 { start - 1 } else { 0 };
+        let insert_pos = start.saturating_sub(1);
         for (i, content) in lines.into_iter().enumerate() {
             self.buffer
                 .insert_line_after(insert_pos + i, Line::from(content.as_str()));
@@ -2278,8 +2278,10 @@ impl Editor {
         };
 
         // Apply count to extend the range if both range and count are specified
-        if range.explicit && count.is_some() {
-            end = (end + count.unwrap() - 1).min(self.buffer.line_count());
+        if let Some(c) = count {
+            if range.explicit {
+                end = (end + c - 1).min(self.buffer.line_count());
+            }
         }
 
         if start >= end || start > self.buffer.line_count() {

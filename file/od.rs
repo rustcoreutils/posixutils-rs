@@ -17,8 +17,6 @@ use std::str::FromStr;
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 
-use crate::io::ErrorKind;
-
 #[derive(Parser)]
 #[command(version, about = gettext("od - dump files in octal and other formats"))]
 struct Args {
@@ -444,10 +442,10 @@ fn print_data<R: Read>(
                     'u' => {
                         // Check if the number of bytes is valid for unsigned integers.
                         if !matches!(num_bytes, 1 | 2 | 4 | 8) {
-                            return Err(Box::new(Error::new(
-                                ErrorKind::Other,
-                                format!("invalid type string `u{}`", num_bytes),
-                            )));
+                            return Err(Box::new(Error::other(format!(
+                                "invalid type string `u{}`",
+                                num_bytes
+                            ))));
                         }
                         let res =
                             process_chunks_formatter(&UFormatter, chunks, num_bytes, local_buf_len);
@@ -462,10 +460,10 @@ fn print_data<R: Read>(
                     'd' => {
                         // Check if the number of bytes is valid for signed integers.
                         if !matches!(num_bytes, 1 | 2 | 4 | 8) {
-                            return Err(Box::new(Error::new(
-                                ErrorKind::Other,
-                                format!("invalid type string `d{}`", num_bytes),
-                            )));
+                            return Err(Box::new(Error::other(format!(
+                                "invalid type string `d{}`",
+                                num_bytes
+                            ))));
                         }
                         let res =
                             process_chunks_formatter(&DFormatter, chunks, num_bytes, local_buf_len);
@@ -480,10 +478,10 @@ fn print_data<R: Read>(
                     'x' => {
                         // Check if the number of bytes is valid for hexadecimal format.
                         if !matches!(num_bytes, 1 | 2 | 4 | 8) {
-                            return Err(Box::new(Error::new(
-                                ErrorKind::Other,
-                                format!("invalid type string `x{}`", num_bytes),
-                            )));
+                            return Err(Box::new(Error::other(format!(
+                                "invalid type string `x{}`",
+                                num_bytes
+                            ))));
                         }
                         let res =
                             process_chunks_formatter(&XFormatter, chunks, num_bytes, local_buf_len);
@@ -498,10 +496,10 @@ fn print_data<R: Read>(
                     'o' => {
                         // Check if the number of bytes is valid for octal format.
                         if !matches!(num_bytes, 1 | 2 | 4 | 8) {
-                            return Err(Box::new(Error::new(
-                                ErrorKind::Other,
-                                format!("invalid type string `o{}`", num_bytes),
-                            )));
+                            return Err(Box::new(Error::other(format!(
+                                "invalid type string `o{}`",
+                                num_bytes
+                            ))));
                         }
                         let res =
                             process_chunks_formatter(&OFormatter, chunks, num_bytes, local_buf_len);
@@ -516,10 +514,10 @@ fn print_data<R: Read>(
                     'f' => {
                         // Check if the number of bytes is valid for floats.
                         if !(matches!(num_bytes, 4 | 8)) {
-                            return Err(Box::new(Error::new(
-                                ErrorKind::Other,
-                                format!("invalid type string `f{}`", num_bytes),
-                            )));
+                            return Err(Box::new(Error::other(format!(
+                                "invalid type string `f{}`",
+                                num_bytes
+                            ))));
                         }
                         let res =
                             process_chunks_formatter(&FFormatter, chunks, num_bytes, local_buf_len);
@@ -1073,63 +1071,61 @@ fn od(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let bytes_that_will_be_skipped = usize::try_from(bytes_to_skip)?;
 
-    let mut reader: Box<dyn Read> = if (args.files.len() == 1
-        && args.files[0] == PathBuf::from("-"))
-        || args.files.is_empty()
-    {
-        // If there is one file and it is "-" (stdin) or no files, read from stdin.
-        let mut stdin: Box<dyn Read> = Box::new(io::stdin().lock());
+    let mut reader: Box<dyn Read> =
+        if (args.files.len() == 1 && args.files[0].as_os_str() == "-") || args.files.is_empty() {
+            // If there is one file and it is "-" (stdin) or no files, read from stdin.
+            let mut stdin: Box<dyn Read> = Box::new(io::stdin().lock());
 
-        // Buffer of size 1 byte for reading char by char to skip bytes.
-        let mut empty_buffer = [0; 1];
+            // Buffer of size 1 byte for reading char by char to skip bytes.
+            let mut empty_buffer = [0; 1];
 
-        // Skip the specified number of bytes from stdin.
-        while bytes_to_skip > 0 {
-            stdin.read_exact(&mut empty_buffer)?;
-            bytes_to_skip -= 1;
-        }
-        stdin // Use stdin as the reader.
-    } else {
-        // Otherwise, process each specified file.
-        for file in &args.files {
-            let mut file = File::open(file)?; // Open the file.
+            // Skip the specified number of bytes from stdin.
+            while bytes_to_skip > 0 {
+                stdin.read_exact(&mut empty_buffer)?;
+                bytes_to_skip -= 1;
+            }
+            stdin // Use stdin as the reader.
+        } else {
+            // Otherwise, process each specified file.
+            for file in &args.files {
+                let mut file = File::open(file)?; // Open the file.
 
-            if bytes_skipped < bytes_to_skip {
-                // If the cumulative bytes skipped are less than the bytes to skip, process the file for skipping.
-                let metadata = file.metadata()?; // Get file metadata.
-                let file_size = metadata.len(); // Get file size.
+                if bytes_skipped < bytes_to_skip {
+                    // If the cumulative bytes skipped are less than the bytes to skip, process the file for skipping.
+                    let metadata = file.metadata()?; // Get file metadata.
+                    let file_size = metadata.len(); // Get file size.
 
-                if bytes_skipped + file_size <= bytes_to_skip {
-                    // Skip the entire file if it is within the range of bytes to skip.
-                    bytes_skipped += file_size;
-                    continue; // Move to the next file.
-                } else {
-                    // Skip part of the file if only a portion of it is within the range of bytes to skip.
-                    let remaining_skip = bytes_to_skip - bytes_skipped;
-                    file.seek(SeekFrom::Start(remaining_skip))?; // Seek to the remaining bytes.
-                    bytes_skipped = bytes_to_skip; // Update the bytes skipped.
+                    if bytes_skipped + file_size <= bytes_to_skip {
+                        // Skip the entire file if it is within the range of bytes to skip.
+                        bytes_skipped += file_size;
+                        continue; // Move to the next file.
+                    } else {
+                        // Skip part of the file if only a portion of it is within the range of bytes to skip.
+                        let remaining_skip = bytes_to_skip - bytes_skipped;
+                        file.seek(SeekFrom::Start(remaining_skip))?; // Seek to the remaining bytes.
+                        bytes_skipped = bytes_to_skip; // Update the bytes skipped.
+                    }
+                }
+
+                // Add the file reader to the vector of readers.
+                all_files.push(Box::new(BufReader::new(file)));
+            }
+
+            if all_files.len() > 1 {
+                // Combine multiple file readers into a single reader.
+                all_files
+                    .into_iter()
+                    .reduce(|acc, file| Box::new(acc.chain(file)) as Box<dyn Read>)
+                    .ok_or_else(|| io::Error::other("No files to chain"))?
+            // Handle error if no files to chain.
+            } else {
+                // If only one file, use it as the reader.
+                match all_files.pop() {
+                    None => return Ok(()), // Return Ok if no files.
+                    Some(f) => f,          // Use the single file as the reader.
                 }
             }
-
-            // Add the file reader to the vector of readers.
-            all_files.push(Box::new(BufReader::new(file)));
-        }
-
-        if all_files.len() > 1 {
-            // Combine multiple file readers into a single reader.
-            all_files
-                .into_iter()
-                .reduce(|acc, file| Box::new(acc.chain(file)) as Box<dyn Read>)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "No files to chain"))?
-        // Handle error if no files to chain.
-        } else {
-            // If only one file, use it as the reader.
-            match all_files.pop() {
-                None => return Ok(()), // Return Ok if no files.
-                Some(f) => f,          // Use the single file as the reader.
-            }
-        }
-    };
+        };
 
     // Print the data using the reader.
     print_data(&mut reader, args, bytes_that_will_be_skipped)?;

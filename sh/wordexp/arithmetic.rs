@@ -517,7 +517,7 @@ impl<'src> ExpressionParser<'src> {
     }
 }
 
-fn parse_expression(expr: &str) -> Result<Expr, String> {
+fn parse_expression(expr: &str) -> Result<Expr<'_>, String> {
     let mut parser = ExpressionParser {
         source: expr,
         source_iter: expr.char_indices().peekable(),

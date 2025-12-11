@@ -9,7 +9,7 @@
 
 use std::cmp::Ordering;
 
-use std::io::{ErrorKind, Read};
+use std::io::Read;
 use std::{
     fs::File,
     io::{self, BufRead, BufWriter, Error, Write},
@@ -458,18 +458,18 @@ fn generate_range(
         .next()
         .unwrap()
         .parse()
-        .map_err(|err| Box::new(Error::new(ErrorKind::Other, err)))?;
+        .map_err(|err| Box::new(Error::other(err)))?;
 
     let start_2 = parts.next();
     let mut start_2: usize = match first {
         true => start_2
             .unwrap_or("1")
             .parse()
-            .map_err(|err| Box::new(Error::new(ErrorKind::Other, err)))?,
+            .map_err(|err| Box::new(Error::other(err)))?,
         false => start_2
             .unwrap_or(&usize::MAX.to_string())
             .parse()
-            .map_err(|err| Box::new(Error::new(ErrorKind::Other, err)))?,
+            .map_err(|err| Box::new(Error::other(err)))?,
     };
 
     if !first && start_2 == 0 {
@@ -733,10 +733,7 @@ fn create_ranges(
     ranges.0 = {
         let key_range = key_ranges.next().unwrap().to_string();
         if key_range == "0" {
-            return Err(Box::new(Error::new(
-                ErrorKind::Other,
-                "the key can't be zero.",
-            )));
+            return Err(Box::new(Error::other("the key can't be zero.")));
         }
         generate_range(&key_range, args, true)?
     };
@@ -750,8 +747,7 @@ fn create_ranges(
     if let Some(range_2) = ranges.1 {
         let (range_1, range_2) = update_range_field(ranges.0, range_2);
         if !compare_range_fields(&range_1, &range_2) {
-            return Err(Box::new(Error::new(
-                ErrorKind::Other,
+            return Err(Box::new(Error::other(
                 "keys fields with end position before start!",
             )));
         }
@@ -788,10 +784,7 @@ fn sort_lines(args: &Args, lines: Vec<String>) -> Result<(), Box<dyn std::error:
         let key_range = &args.key_definition[0];
 
         if key_range.is_empty() {
-            return Err(Box::new(Error::new(
-                ErrorKind::Other,
-                "key must be non-empty",
-            )));
+            return Err(Box::new(Error::other("key must be non-empty")));
         }
 
         let ranges = create_ranges(key_range, args)?;
@@ -844,8 +837,7 @@ fn sort_lines(args: &Args, lines: Vec<String>) -> Result<(), Box<dyn std::error:
 
     if args.check_order_without_war_mess {
         if find_first_difference(&lines, &result_lines).is_some() {
-            return Err(Box::new(Error::new(
-                ErrorKind::Other,
+            return Err(Box::new(Error::other(
                 "The order of the lines is not correct",
             )));
         } else {
@@ -854,7 +846,7 @@ fn sort_lines(args: &Args, lines: Vec<String>) -> Result<(), Box<dyn std::error:
     } else if args.check_order {
         if args.unique && !duplicates.is_empty() {
             let message = format!("Duplicate key was found! `{}`", duplicates.first().unwrap());
-            return Err(Box::new(Error::new(ErrorKind::Other, message)));
+            return Err(Box::new(Error::other(message)));
         }
         if let Some((index, line)) = find_first_difference(&lines, &result_lines) {
             let message = format!(
@@ -862,7 +854,7 @@ fn sort_lines(args: &Args, lines: Vec<String>) -> Result<(), Box<dyn std::error:
                 index + 1,
                 line
             );
-            return Err(Box::new(Error::new(ErrorKind::Other, message)));
+            return Err(Box::new(Error::other(message)));
         }
         return Ok(());
     } else if let Some(file_path) = &args.output_file {
@@ -891,10 +883,10 @@ fn sort_lines(args: &Args, lines: Vec<String>) -> Result<(), Box<dyn std::error:
 /// # Arguments
 ///
 /// * `paths` - A mutable reference to a vector of readers (`Vec<Box<dyn Read>>`) representing
-///             sorted input files.
+///   sorted input files.
 /// * `output_path` - An optional string (`Option<String>`) representing the output file path.
-///                   If `Some`, the merged contents are written to the specified file; if `None`,
-///                   the contents are written to the standard output.
+///   If `Some`, the merged contents are written to the specified file; if `None`,
+///   the contents are written to the standard output.
 ///
 /// # Returns
 ///
@@ -974,7 +966,7 @@ fn merge_empty_lines(vec: Vec<&str>) -> Vec<String> {
 ///
 fn sort(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut readers: Vec<Box<dyn Read>> = if (args.filenames.len() == 1
-        && args.filenames[0] == PathBuf::from("-"))
+        && args.filenames[0].as_os_str() == "-")
         || args.filenames.is_empty()
     {
         vec![Box::new(io::stdin().lock())]

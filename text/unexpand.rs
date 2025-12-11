@@ -29,7 +29,7 @@ fn unexpand(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut stdout = io::stdout();
 
-    if (args.files.len() == 1 && args.files[0] == PathBuf::from("-")) || args.files.is_empty() {
+    if (args.files.len() == 1 && args.files[0].as_os_str() == "-") || args.files.is_empty() {
         let reader = io::stdin();
         let lines = io::BufReader::new(reader).lines();
         for line in lines {

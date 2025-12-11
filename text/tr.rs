@@ -1566,7 +1566,7 @@ mod setup {
 
     impl Translation for NotComplementedTranslation {
         #[inline]
-        fn get_seven_bit_replacement(&self, ue: u8) -> ReplacementCheckResult {
+        fn get_seven_bit_replacement(&self, ue: u8) -> ReplacementCheckResult<'_> {
             let index = usize::from(ue);
 
             let replacement = self.seven_bit[index].as_ref();
@@ -1656,7 +1656,7 @@ mod setup {
 
     impl Translation for ComplementedTranslation {
         #[inline]
-        fn get_seven_bit_replacement(&self, ue: u8) -> ReplacementCheckResult {
+        fn get_seven_bit_replacement(&self, ue: u8) -> ReplacementCheckResult<'_> {
             let index = usize::from(ue);
 
             let value_is_true = self.seven_bit[index];
@@ -1673,7 +1673,11 @@ mod setup {
         }
 
         #[inline]
-        fn get_eight_bit_replacement(&self, ue: u8, next_bytes: &[u8]) -> ReplacementCheckResult {
+        fn get_eight_bit_replacement(
+            &self,
+            ue: u8,
+            next_bytes: &[u8],
+        ) -> ReplacementCheckResult<'_> {
             let index = usize::from(ue);
 
             if self.eight_bit[index] {
@@ -1746,7 +1750,7 @@ mod setup {
 
     pub trait Translation {
         #[inline]
-        fn check(&self, ue: u8, next_bytes: &[u8]) -> ReplacementCheckResult {
+        fn check(&self, ue: u8, next_bytes: &[u8]) -> ReplacementCheckResult<'_> {
             let first_check = if ue < 128_u8 {
                 self.get_seven_bit_replacement(ue)
             } else {
@@ -1760,7 +1764,7 @@ mod setup {
             self.get_equiv_result(ue)
         }
 
-        fn get_seven_bit_replacement(&self, ue: u8) -> ReplacementCheckResult;
+        fn get_seven_bit_replacement(&self, ue: u8) -> ReplacementCheckResult<'_>;
 
         fn get_eight_bit_replacement<'a>(
             &'a self,

@@ -13,7 +13,7 @@
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
-use std::io::{self, Error, ErrorKind, IsTerminal};
+use std::io::{self, Error, IsTerminal};
 use std::mem;
 
 /// mesg - permit or deny messages
@@ -53,7 +53,7 @@ fn tty_to_fd(tty: Stream) -> i32 {
 fn stat_tty() -> io::Result<(i32, libc::stat)> {
     let tty_res = find_tty();
     if tty_res.is_none() {
-        return Err(Error::new(ErrorKind::Other, "tty not found"));
+        return Err(Error::other("tty not found"));
     }
     let fd = tty_to_fd(tty_res.unwrap());
 
@@ -90,7 +90,7 @@ fn parse_setting(setting: &str) -> Result<bool, &'static str> {
 fn set_mesg(fd: i32, st: libc::stat, setting: &str) -> io::Result<()> {
     let res = parse_setting(setting);
     if let Err(e) = res {
-        return Err(Error::new(ErrorKind::Other, e));
+        return Err(Error::other(e));
     }
     let affirm = res.unwrap();
 

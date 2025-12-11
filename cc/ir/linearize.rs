@@ -2373,10 +2373,11 @@ impl<'a> Linearizer<'a> {
             } else {
                 Opcode::SCvtF
             };
+            let dst_size = self.types.size_bits(cast_type);
             let mut insn = Instruction::new(opcode)
                 .with_target(result)
                 .with_src(src)
-                .with_type(cast_type);
+                .with_type_and_size(cast_type, dst_size);
             insn.src_size = self.types.size_bits(src_type);
             self.emit(insn);
             result

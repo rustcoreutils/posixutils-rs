@@ -1284,11 +1284,15 @@ impl<'a> Linearizer<'a> {
     fn linearize_vla_decl(&mut self, declarator: &crate::parse::ast::InitDeclarator) {
         let typ = declarator.typ;
 
-        // Get the innermost element type from the array type
-        // For int arr[n][m], we need int (not int[m])
+        // Get the element type by stripping only VLA dimensions from the array type.
+        // For int arr[n][4], vla_sizes has 1 element, so we strip 1 dimension to get int[4].
+        // For int arr[n][m], vla_sizes has 2 elements, so we strip 2 dimensions to get int.
+        let num_vla_dims = declarator.vla_sizes.len();
         let mut elem_type = typ;
-        while self.types.kind(elem_type) == TypeKind::Array {
-            elem_type = self.types.base_type(elem_type).unwrap_or(self.types.int_id);
+        for _ in 0..num_vla_dims {
+            if self.types.kind(elem_type) == TypeKind::Array {
+                elem_type = self.types.base_type(elem_type).unwrap_or(self.types.int_id);
+            }
         }
         let elem_size = self.types.size_bytes(elem_type) as i64;
 
@@ -2373,10 +2377,11 @@ impl<'a> Linearizer<'a> {
             } else {
                 Opcode::SCvtF
             };
+            let dst_size = self.types.size_bits(cast_type);
             let mut insn = Instruction::new(opcode)
                 .with_target(result)
                 .with_src(src)
-                .with_type(cast_type);
+                .with_type_and_size(cast_type, dst_size);
             insn.src_size = self.types.size_bits(src_type);
             self.emit(insn);
             result

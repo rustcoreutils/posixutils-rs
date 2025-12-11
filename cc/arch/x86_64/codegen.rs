@@ -68,6 +68,8 @@ pub struct X86_64CodeGen {
     reg_save_area_offset: i32,
     /// Number of fixed GP parameters (for variadic functions)
     num_fixed_gp_params: usize,
+    /// Number of fixed FP parameters (for variadic functions)
+    num_fixed_fp_params: usize,
     /// Whether to emit basic unwind tables (cfi_startproc/cfi_endproc)
     emit_unwind_tables: bool,
     /// Last emitted source line (for avoiding duplicate .loc directives)
@@ -93,6 +95,7 @@ impl X86_64CodeGen {
             callee_saved_offset: 0,
             reg_save_area_offset: 0,
             num_fixed_gp_params: 0,
+            num_fixed_fp_params: 0,
             emit_unwind_tables: true, // Default to emitting basic unwind tables
             last_debug_line: 0,
             last_debug_file: 0,
@@ -335,8 +338,9 @@ impl X86_64CodeGen {
 
         // For variadic functions, we need extra space for the register save area
         // 6 GP regs * 8 bytes = 48 bytes for GP registers
-        // (We don't save XMM registers in this implementation for simplicity)
-        let reg_save_area_size: i32 = if is_variadic { 48 } else { 0 };
+        // 8 XMM regs * 16 bytes = 128 bytes for FP registers
+        // Total = 176 bytes
+        let reg_save_area_size: i32 = if is_variadic { 176 } else { 0 };
         self.reg_save_area_offset = if is_variadic {
             // The register save area will be at the end of the stack frame
             self.callee_saved_offset + stack_size + reg_save_area_size
@@ -429,6 +433,24 @@ impl X86_64CodeGen {
                     size: OperandSize::B64,
                     src: GpOperand::Reg(*reg),
                     dst: GpOperand::Mem(MemAddr::BaseOffset {
+                        base: Reg::Rbp,
+                        offset: -offset,
+                    }),
+                });
+            }
+
+            // Save XMM0-XMM7 at offsets 48-175 from register save area base
+            // AMD64 ABI: XMM regs start at offset 48 from reg_save_area base
+            // Each XMM slot is 16 bytes (128-bit aligned)
+            let xmm_arg_regs = XmmReg::arg_regs();
+            for (i, xmm) in xmm_arg_regs.iter().enumerate() {
+                // XMM save area starts at offset 48 from reg_save_area base
+                // Each slot is 16 bytes: base_offset = reg_save_area_offset - 48 - (i * 16)
+                let offset = self.reg_save_area_offset - 48 - (i as i32 * 16);
+                self.push_lir(X86Inst::MovFp {
+                    size: FpSize::Double, // movsd - save 64-bit double
+                    src: XmmOperand::Reg(*xmm),
+                    dst: XmmOperand::Mem(MemAddr::BaseOffset {
                         base: Reg::Rbp,
                         offset: -offset,
                     }),
@@ -544,8 +566,8 @@ impl X86_64CodeGen {
             }
         }
 
-        // Save number of fixed GP params for va_start
-        // Count how many non-FP params we have
+        // Save number of fixed GP and FP params for va_start
+        // Count how many non-FP params and FP params we have
         if is_variadic {
             self.num_fixed_gp_params = func
                 .params
@@ -555,6 +577,11 @@ impl X86_64CodeGen {
             if has_sret {
                 self.num_fixed_gp_params += 1; // Account for hidden sret pointer
             }
+            self.num_fixed_fp_params = func
+                .params
+                .iter()
+                .filter(|(_, typ)| types.is_float(*typ))
+                .count();
         }
 
         // Emit basic blocks
@@ -3425,11 +3452,12 @@ impl X86_64CodeGen {
         // For x86-64 System V ABI:
         // va_list is a 24-byte struct. We initialize:
         // - gp_offset = fixed_gp_params * 8 (offset to first variadic GP arg in save area)
-        // - fp_offset = 176 (skip all 8 FP regs, not saving them in this impl)
+        // - fp_offset = 48 + fixed_fp_params * 16 (offset to first variadic FP arg)
         // - overflow_arg_area = rbp + 16 (where stack args start, for overflow)
         // - reg_save_area = pointer to where we saved the argument registers
 
         let gp_offset = (self.num_fixed_gp_params * 8) as i32;
+        let fp_offset = 48 + (self.num_fixed_fp_params * 16) as i32;
         let reg_save_base = self.reg_save_area_offset;
 
         match ap_loc {
@@ -3443,10 +3471,10 @@ impl X86_64CodeGen {
                         offset,
                     }),
                 });
-                // fp_offset = 176 (all FP args consumed, use stack for FP varargs)
+                // fp_offset = offset to next variadic FP arg (48 + fixed_fp_params * 16)
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B32,
-                    src: GpOperand::Imm(176),
+                    src: GpOperand::Imm(fp_offset as i64),
                     dst: GpOperand::Mem(MemAddr::BaseOffset {
                         base: Reg::Rbp,
                         offset: offset + 4,
@@ -3493,10 +3521,10 @@ impl X86_64CodeGen {
                     src: GpOperand::Imm(gp_offset as i64),
                     dst: GpOperand::Mem(MemAddr::BaseOffset { base: r, offset: 0 }),
                 });
-                // fp_offset = 176 (all FP args consumed)
+                // fp_offset = offset to next variadic FP arg
                 self.push_lir(X86Inst::Mov {
                     size: OperandSize::B32,
-                    src: GpOperand::Imm(176),
+                    src: GpOperand::Imm(fp_offset as i64),
                     dst: GpOperand::Mem(MemAddr::BaseOffset { base: r, offset: 4 }),
                 });
                 // overflow_arg_area = rbp + 16
@@ -3558,16 +3586,10 @@ impl X86_64CodeGen {
         match &ap_loc {
             Loc::Stack(ap_offset) => {
                 if types.is_float(arg_type) {
-                    // For float args, use overflow_arg_area (FP register save not implemented)
-                    // LIR: load overflow_arg_area pointer
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rbp,
-                            offset: ap_offset + 8,
-                        }),
-                        dst: GpOperand::Reg(Reg::Rax),
-                    });
+                    // For float args, check fp_offset to see if we use reg_save_area or overflow
+                    // fp_offset < 176 means we have saved XMM registers to read
+                    let overflow_label = Label::new("va_fp_overflow", label_suffix);
+                    let done_label = Label::new("va_fp_done", label_suffix);
 
                     let fp_size = types.size_bits(arg_type);
                     let lir_fp_size = if fp_size <= 32 {
@@ -3575,11 +3597,57 @@ impl X86_64CodeGen {
                     } else {
                         FpSize::Double
                     };
-                    // LIR: load float value from overflow area
+
+                    // LIR: load fp_offset from va_list (at offset 4)
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B32,
+                        src: GpOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::Rbp,
+                            offset: ap_offset + 4,
+                        }),
+                        dst: GpOperand::Reg(Reg::Rax),
+                    });
+                    // LIR: compare with 176 (end of XMM save area)
+                    self.push_lir(X86Inst::Cmp {
+                        size: OperandSize::B32,
+                        src: GpOperand::Imm(176),
+                        dst: GpOperand::Reg(Reg::Rax),
+                    });
+                    // LIR: jump if above or equal (fp_offset >= 176 means use overflow)
+                    self.push_lir(X86Inst::Jcc {
+                        cc: IntCC::Ae,
+                        target: overflow_label.clone(),
+                    });
+
+                    // Register save area path: load from reg_save_area + fp_offset
+                    // LIR: load reg_save_area pointer
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::Rbp,
+                            offset: ap_offset + 16,
+                        }),
+                        dst: GpOperand::Reg(Reg::R10),
+                    });
+                    // LIR: sign-extend fp_offset to 64-bit
+                    self.push_lir(X86Inst::Movsx {
+                        src_size: OperandSize::B32,
+                        dst_size: OperandSize::B64,
+                        src: GpOperand::Reg(Reg::Rax),
+                        dst: Reg::R11,
+                    });
+                    // LIR: calculate reg_save_area + fp_offset
+                    self.push_lir(X86Inst::Add {
+                        size: OperandSize::B64,
+                        src: GpOperand::Reg(Reg::R11),
+                        dst: Reg::R10,
+                    });
+
+                    // Load float value from save area
                     self.push_lir(X86Inst::MovFp {
                         size: lir_fp_size,
                         src: XmmOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rax,
+                            base: Reg::R10,
                             offset: 0,
                         }),
                         dst: XmmOperand::Reg(XmmReg::Xmm15),
@@ -3588,7 +3656,6 @@ impl X86_64CodeGen {
                     // Store to destination
                     match &dst_loc {
                         Loc::Xmm(x) => {
-                            // LIR: move to destination XMM register
                             self.push_lir(X86Inst::MovFp {
                                 size: lir_fp_size,
                                 src: XmmOperand::Reg(XmmReg::Xmm15),
@@ -3596,7 +3663,6 @@ impl X86_64CodeGen {
                             });
                         }
                         Loc::Stack(dst_offset) => {
-                            // LIR: store to stack
                             self.push_lir(X86Inst::MovFp {
                                 size: lir_fp_size,
                                 src: XmmOperand::Reg(XmmReg::Xmm15),
@@ -3609,14 +3675,77 @@ impl X86_64CodeGen {
                         _ => {}
                     }
 
-                    // Advance overflow_arg_area
-                    // LIR: add bytes to pointer
+                    // Increment fp_offset by 16 (XMM slot size)
                     self.push_lir(X86Inst::Add {
-                        size: OperandSize::B64,
-                        src: GpOperand::Imm(arg_bytes as i64),
+                        size: OperandSize::B32,
+                        src: GpOperand::Imm(16),
                         dst: Reg::Rax,
                     });
-                    // LIR: store updated pointer
+                    // Store updated fp_offset
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B32,
+                        src: GpOperand::Reg(Reg::Rax),
+                        dst: GpOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::Rbp,
+                            offset: ap_offset + 4,
+                        }),
+                    });
+                    // Jump to done
+                    self.push_lir(X86Inst::Jmp {
+                        target: done_label.clone(),
+                    });
+
+                    // Overflow path: use overflow_arg_area
+                    self.push_lir(X86Inst::Directive(Directive::BlockLabel(overflow_label)));
+                    // LIR: load overflow_arg_area pointer
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::Rbp,
+                            offset: ap_offset + 8,
+                        }),
+                        dst: GpOperand::Reg(Reg::Rax),
+                    });
+
+                    // Load float value from overflow area
+                    self.push_lir(X86Inst::MovFp {
+                        size: lir_fp_size,
+                        src: XmmOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::Rax,
+                            offset: 0,
+                        }),
+                        dst: XmmOperand::Reg(XmmReg::Xmm15),
+                    });
+
+                    // Store to destination
+                    match &dst_loc {
+                        Loc::Xmm(x) => {
+                            self.push_lir(X86Inst::MovFp {
+                                size: lir_fp_size,
+                                src: XmmOperand::Reg(XmmReg::Xmm15),
+                                dst: XmmOperand::Reg(*x),
+                            });
+                        }
+                        Loc::Stack(dst_offset) => {
+                            self.push_lir(X86Inst::MovFp {
+                                size: lir_fp_size,
+                                src: XmmOperand::Reg(XmmReg::Xmm15),
+                                dst: XmmOperand::Mem(MemAddr::BaseOffset {
+                                    base: Reg::Rbp,
+                                    offset: *dst_offset,
+                                }),
+                            });
+                        }
+                        _ => {}
+                    }
+
+                    // Advance overflow_arg_area by 8 (double is 8 bytes on stack)
+                    self.push_lir(X86Inst::Add {
+                        size: OperandSize::B64,
+                        src: GpOperand::Imm(8),
+                        dst: Reg::Rax,
+                    });
+                    // Store updated overflow_arg_area
                     self.push_lir(X86Inst::Mov {
                         size: OperandSize::B64,
                         src: GpOperand::Reg(Reg::Rax),
@@ -3625,6 +3754,9 @@ impl X86_64CodeGen {
                             offset: ap_offset + 8,
                         }),
                     });
+
+                    // Done label
+                    self.push_lir(X86Inst::Directive(Directive::BlockLabel(done_label)));
                 } else {
                     // For integer args, check gp_offset to see if we use reg_save_area or overflow
                     // gp_offset < 48 means we have saved registers to read
@@ -3802,17 +3934,12 @@ impl X86_64CodeGen {
                 }
             }
             Loc::Reg(ap_reg) => {
-                // Similar logic for when va_list is in a register
+                // Similar logic for when va_list address is in a register
                 if types.is_float(arg_type) {
-                    // LIR: load overflow_arg_area pointer (at offset 8 from va_list base)
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B64,
-                        src: GpOperand::Mem(MemAddr::BaseOffset {
-                            base: *ap_reg,
-                            offset: 8,
-                        }),
-                        dst: GpOperand::Reg(Reg::Rax),
-                    });
+                    // For float args, check fp_offset to see if we use reg_save_area or overflow
+                    // fp_offset < 176 means we have saved XMM registers to read
+                    let overflow_label = Label::new("va_fp_overflow", label_suffix);
+                    let done_label = Label::new("va_fp_done", label_suffix);
 
                     let fp_size = types.size_bits(arg_type);
                     let lir_fp_size = if fp_size <= 32 {
@@ -3820,19 +3947,65 @@ impl X86_64CodeGen {
                     } else {
                         FpSize::Double
                     };
-                    // LIR: load float value
+
+                    // LIR: load fp_offset from va_list (at offset 4)
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B32,
+                        src: GpOperand::Mem(MemAddr::BaseOffset {
+                            base: *ap_reg,
+                            offset: 4,
+                        }),
+                        dst: GpOperand::Reg(Reg::Rax),
+                    });
+                    // LIR: compare with 176 (end of XMM save area)
+                    self.push_lir(X86Inst::Cmp {
+                        size: OperandSize::B32,
+                        src: GpOperand::Imm(176),
+                        dst: GpOperand::Reg(Reg::Rax),
+                    });
+                    // LIR: jump if above or equal (fp_offset >= 176 means use overflow)
+                    self.push_lir(X86Inst::Jcc {
+                        cc: IntCC::Ae,
+                        target: overflow_label.clone(),
+                    });
+
+                    // Register save area path: load from reg_save_area + fp_offset
+                    // LIR: load reg_save_area pointer
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(MemAddr::BaseOffset {
+                            base: *ap_reg,
+                            offset: 16,
+                        }),
+                        dst: GpOperand::Reg(Reg::R10),
+                    });
+                    // LIR: sign-extend fp_offset to 64-bit
+                    self.push_lir(X86Inst::Movsx {
+                        src_size: OperandSize::B32,
+                        dst_size: OperandSize::B64,
+                        src: GpOperand::Reg(Reg::Rax),
+                        dst: Reg::R11,
+                    });
+                    // LIR: calculate reg_save_area + fp_offset
+                    self.push_lir(X86Inst::Add {
+                        size: OperandSize::B64,
+                        src: GpOperand::Reg(Reg::R11),
+                        dst: Reg::R10,
+                    });
+
+                    // Load float value from save area
                     self.push_lir(X86Inst::MovFp {
                         size: lir_fp_size,
                         src: XmmOperand::Mem(MemAddr::BaseOffset {
-                            base: Reg::Rax,
+                            base: Reg::R10,
                             offset: 0,
                         }),
                         dst: XmmOperand::Reg(XmmReg::Xmm15),
                     });
 
+                    // Store to destination
                     match &dst_loc {
                         Loc::Xmm(x) => {
-                            // LIR: move to destination XMM
                             self.push_lir(X86Inst::MovFp {
                                 size: lir_fp_size,
                                 src: XmmOperand::Reg(XmmReg::Xmm15),
@@ -3840,7 +4013,6 @@ impl X86_64CodeGen {
                             });
                         }
                         Loc::Stack(dst_offset) => {
-                            // LIR: store to stack
                             self.push_lir(X86Inst::MovFp {
                                 size: lir_fp_size,
                                 src: XmmOperand::Reg(XmmReg::Xmm15),
@@ -3853,13 +4025,77 @@ impl X86_64CodeGen {
                         _ => {}
                     }
 
-                    // LIR: advance overflow_arg_area
+                    // Increment fp_offset by 16 (XMM slot size)
                     self.push_lir(X86Inst::Add {
-                        size: OperandSize::B64,
-                        src: GpOperand::Imm(arg_bytes as i64),
+                        size: OperandSize::B32,
+                        src: GpOperand::Imm(16),
                         dst: Reg::Rax,
                     });
-                    // LIR: store updated pointer
+                    // Store updated fp_offset
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B32,
+                        src: GpOperand::Reg(Reg::Rax),
+                        dst: GpOperand::Mem(MemAddr::BaseOffset {
+                            base: *ap_reg,
+                            offset: 4,
+                        }),
+                    });
+                    // Jump to done
+                    self.push_lir(X86Inst::Jmp {
+                        target: done_label.clone(),
+                    });
+
+                    // Overflow path: use overflow_arg_area
+                    self.push_lir(X86Inst::Directive(Directive::BlockLabel(overflow_label)));
+                    // LIR: load overflow_arg_area pointer
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(MemAddr::BaseOffset {
+                            base: *ap_reg,
+                            offset: 8,
+                        }),
+                        dst: GpOperand::Reg(Reg::Rax),
+                    });
+
+                    // Load float value from overflow area
+                    self.push_lir(X86Inst::MovFp {
+                        size: lir_fp_size,
+                        src: XmmOperand::Mem(MemAddr::BaseOffset {
+                            base: Reg::Rax,
+                            offset: 0,
+                        }),
+                        dst: XmmOperand::Reg(XmmReg::Xmm15),
+                    });
+
+                    // Store to destination
+                    match &dst_loc {
+                        Loc::Xmm(x) => {
+                            self.push_lir(X86Inst::MovFp {
+                                size: lir_fp_size,
+                                src: XmmOperand::Reg(XmmReg::Xmm15),
+                                dst: XmmOperand::Reg(*x),
+                            });
+                        }
+                        Loc::Stack(dst_offset) => {
+                            self.push_lir(X86Inst::MovFp {
+                                size: lir_fp_size,
+                                src: XmmOperand::Reg(XmmReg::Xmm15),
+                                dst: XmmOperand::Mem(MemAddr::BaseOffset {
+                                    base: Reg::Rbp,
+                                    offset: *dst_offset,
+                                }),
+                            });
+                        }
+                        _ => {}
+                    }
+
+                    // Advance overflow_arg_area by 8 (double is 8 bytes on stack)
+                    self.push_lir(X86Inst::Add {
+                        size: OperandSize::B64,
+                        src: GpOperand::Imm(8),
+                        dst: Reg::Rax,
+                    });
+                    // Store updated overflow_arg_area
                     self.push_lir(X86Inst::Mov {
                         size: OperandSize::B64,
                         src: GpOperand::Reg(Reg::Rax),
@@ -3868,6 +4104,9 @@ impl X86_64CodeGen {
                             offset: 8,
                         }),
                     });
+
+                    // Done label
+                    self.push_lir(X86Inst::Directive(Directive::BlockLabel(done_label)));
                 } else {
                     // Check gp_offset
                     let overflow_label = Label::new("va_overflow", label_suffix);

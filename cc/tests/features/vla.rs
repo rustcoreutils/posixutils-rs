@@ -430,3 +430,211 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("vla_multidimensional_no_overlap", code), 0);
 }
+
+// ============================================================================
+// VLA: [*] in Function Prototypes (C99 6.7.5.2)
+// ============================================================================
+
+#[test]
+fn vla_star_basic_prototype() {
+    // Test [*] syntax in function prototypes for VLA with unspecified size
+    let code = r#"
+// Prototype with [*] - size unspecified
+void fill_array(int n, int arr[*]);
+
+// Definition with actual size expression
+void fill_array(int n, int arr[n]) {
+    for (int i = 0; i < n; i++) {
+        arr[i] = i * 3;
+    }
+}
+
+int sum_array(int n, int *arr) {
+    int sum = 0;
+    for (int i = 0; i < n; i++) {
+        sum += arr[i];
+    }
+    return sum;
+}
+
+int main(void) {
+    int n = 5;
+    int arr[n];
+    fill_array(n, arr);
+    int result = sum_array(n, arr);
+    // Sum = 0 + 3 + 6 + 9 + 12 = 30
+    if (result != 30) return 1;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("vla_star_basic_prototype", code), 0);
+}
+
+#[test]
+fn vla_star_with_qualifiers() {
+    // Test [*] with type qualifiers (const, restrict)
+    let code = r#"
+// Prototype with const qualifier
+void read_array(int n, const int arr[*]);
+
+// Prototype with restrict qualifier
+void write_array(int n, int arr[restrict *]);
+
+// Prototype with static keyword (optimization hint)
+void process_array(int n, int arr[static *]);
+
+// Definitions
+void read_array(int n, const int arr[n]) {
+    // Can read but not modify
+    int sum = 0;
+    for (int i = 0; i < n; i++) {
+        sum += arr[i];
+    }
+}
+
+void write_array(int n, int arr[restrict n]) {
+    for (int i = 0; i < n; i++) {
+        arr[i] = i;
+    }
+}
+
+void process_array(int n, int arr[static n]) {
+    for (int i = 0; i < n; i++) {
+        arr[i] *= 2;
+    }
+}
+
+int main(void) {
+    int arr[5] = {1, 2, 3, 4, 5};
+    read_array(5, arr);
+    write_array(5, arr);      // arr = {0, 1, 2, 3, 4}
+    process_array(5, arr);    // arr = {0, 2, 4, 6, 8}
+
+    if (arr[0] != 0) return 1;
+    if (arr[4] != 8) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("vla_star_with_qualifiers", code), 0);
+}
+
+#[test]
+fn vla_star_multidimensional() {
+    // Test [*][*] syntax parsing in function prototypes
+    // Note: This tests parsing of multi-dimensional [*] syntax
+    // The prototype declares a 2D VLA parameter with unspecified dimensions
+    let code = r#"
+// Prototype for 2D VLA with [*][*]
+void fill_matrix(int rows, int cols, int mat[*][*]);
+
+// Definition - but we test only that the prototype parses correctly
+// by calling a 1D version (2D VLA function params are a separate issue)
+void fill_1d_as_2d(int total, int *arr) {
+    for (int i = 0; i < total; i++) {
+        arr[i] = i;
+    }
+}
+
+int main(void) {
+    // Test that [*][*] prototypes are accepted by the parser
+    // Use 1D array to verify the function works
+    int arr[12];
+    fill_1d_as_2d(12, arr);
+
+    // Verify values
+    if (arr[0] != 0) return 1;
+    if (arr[5] != 5) return 2;
+    if (arr[11] != 11) return 3;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("vla_star_multidimensional", code), 0);
+}
+
+#[test]
+fn vla_star_mixed_dimensions() {
+    // Test mixing [*] with fixed-size dimensions
+    let code = r#"
+// Prototype with mixed dimensions: first is VLA, second is fixed
+void process_rows(int n, int mat[*][4]);
+
+// Definition
+void process_rows(int n, int mat[n][4]) {
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < 4; j++) {
+            mat[i][j] = (i + 1) * 10 + j;
+        }
+    }
+}
+
+int main(void) {
+    int n = 3;
+    int matrix[n][4];
+    process_rows(n, matrix);
+
+    // Check values: mat[i][j] = (i+1)*10 + j
+    if (matrix[0][0] != 10) return 1;   // 1*10 + 0
+    if (matrix[0][3] != 13) return 2;   // 1*10 + 3
+    if (matrix[2][0] != 30) return 3;   // 3*10 + 0
+    if (matrix[2][3] != 33) return 4;   // 3*10 + 3
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("vla_star_mixed_dimensions", code), 0);
+}
+
+#[test]
+fn vla_star_multiple_prototypes() {
+    // Test multiple function prototypes with [*]
+    let code = r#"
+// Multiple prototypes using [*]
+int sum_1d(int n, int arr[*]);
+void zero_array(int n, int arr[*]);
+int product_1d(int n, int arr[*]);
+
+// Also test that 2D [*][*] is parseable (even if we don't call it)
+int sum_2d(int rows, int cols, int mat[*][*]);
+
+// Definitions
+int sum_1d(int n, int arr[n]) {
+    int sum = 0;
+    for (int i = 0; i < n; i++) {
+        sum += arr[i];
+    }
+    return sum;
+}
+
+void zero_array(int n, int arr[n]) {
+    for (int i = 0; i < n; i++) {
+        arr[i] = 0;
+    }
+}
+
+int product_1d(int n, int arr[n]) {
+    int prod = 1;
+    for (int i = 0; i < n; i++) {
+        prod *= arr[i];
+    }
+    return prod;
+}
+
+int main(void) {
+    int arr[5] = {1, 2, 3, 4, 5};
+
+    // Test sum_1d: 1+2+3+4+5 = 15
+    if (sum_1d(5, arr) != 15) return 1;
+
+    // Test product_1d: 1*2*3*4*5 = 120
+    if (product_1d(5, arr) != 120) return 2;
+
+    // Test zero_array
+    zero_array(5, arr);
+    if (sum_1d(5, arr) != 0) return 3;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("vla_star_multiple_prototypes", code), 0);
+}

@@ -188,3 +188,66 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("varargs_float_args", code), 0);
 }
+
+// ============================================================================
+// User-defined variadic functions with floating-point va_arg
+// Tests that XMM registers are properly saved and retrieved via va_arg
+// ============================================================================
+
+#[test]
+fn varargs_user_defined_float() {
+    let code = r#"
+// Sum doubles using va_arg - tests XMM register save area
+double sum_doubles(int count, ...) {
+    __builtin_va_list ap;
+    __builtin_va_start(ap, count);
+
+    double total = 0.0;
+    for (int i = 0; i < count; i++) {
+        total += __builtin_va_arg(ap, double);
+    }
+
+    __builtin_va_end(ap);
+    return total;
+}
+
+// Mix of GP and FP variadic args
+double sum_mixed_fp(int count, ...) {
+    __builtin_va_list ap;
+    __builtin_va_start(ap, count);
+
+    double total = 0.0;
+    for (int i = 0; i < count; i++) {
+        if (i % 2 == 0) {
+            total += (double)__builtin_va_arg(ap, int);
+        } else {
+            total += __builtin_va_arg(ap, double);
+        }
+    }
+
+    __builtin_va_end(ap);
+    return total;
+}
+
+int main(void) {
+    // Test pure double varargs (uses XMM register save area)
+    double r1 = sum_doubles(3, 10.5, 20.25, 11.25);
+    if (r1 < 41.9 || r1 > 42.1) return 1;  // Should be 42.0
+
+    // Test many doubles (uses all 8 XMM regs)
+    double r2 = sum_doubles(8, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0);
+    if (r2 < 35.9 || r2 > 36.1) return 2;  // Should be 36.0
+
+    // Test overflow to stack (> 8 FP args)
+    double r3 = sum_doubles(10, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0);
+    if (r3 < 54.9 || r3 > 55.1) return 3;  // Should be 55.0
+
+    // Test mixed GP and FP
+    double r4 = sum_mixed_fp(4, 10, 5.5, 20, 6.5);
+    if (r4 < 41.9 || r4 > 42.1) return 4;  // Should be 42.0
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("varargs_user_defined_float", code), 0);
+}

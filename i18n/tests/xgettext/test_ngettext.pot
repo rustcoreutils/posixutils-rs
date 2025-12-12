@@ -1,0 +1,6 @@
+#: tests/xgettext/test_ngettext.rs:7
+#: tests/xgettext/test_ngettext.rs:8
+msgid "One thing"
+msgid_plural "Multiple things"
+msgstr[0] ""
+msgstr[1] ""

@@ -62,6 +62,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] awk
  - [x] basename
  - [x] bc
+ - [x] c99 (Development)
  - [x] cksum
  - [x] cmp
  - [x] comm
@@ -170,6 +171,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] id
  - [x] ipcs (IPC)
  - [x] kill
+ - [x] lex (Development)
  - [x] logger
  - [x] ps
  - [x] stty
@@ -178,6 +180,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] tsort
  - [x] who
  - [x] xargs
+ - [x] xgettext (i18n)
 
 ## Stage 0 - Not started
 
@@ -186,11 +189,9 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] crontab (cron cat.)
 
 ### Development category
- - [ ] c17 (Development)
  - [ ] cflow (Development)
  - [ ] ctags (Development)
  - [ ] cxref (Development)
- - [ ] lex (Development)
 
 ### SCCS category
  - [ ] admin (SCCS)
@@ -209,7 +210,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] localedef (i18n)
  - [ ] msgfmt (i18n)
  - [ ] ngettext (i18n)
- - [ ] xgettext (i18n)
 
 ### Editors category
  - [ ] ed (Editors)

@@ -223,7 +223,7 @@ impl Debug for Errno {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         // some variants have the same value, but it's not guaranteed by the
         // standard
-        #[allow(unreachable_patterns)]
+        #[allow(unreachable_patterns, clippy::match_overlapping_arm)]
         match self.value {
             libc::E2BIG => write!(f, "E2BIG: argument list too long"),
             libc::EACCES => write!(f, "EACCESS: permission denied"),
@@ -321,7 +321,7 @@ impl TryFrom<libc::c_int> for Errno {
     fn try_from(value: libc::c_int) -> Result<Self, Self::Error> {
         // some variants have the same value, but its not guaranteed by the
         // standard
-        #[allow(unreachable_patterns)]
+        #[allow(unreachable_patterns, clippy::match_overlapping_arm)]
         match value {
             libc::E2BIG => Ok(Self::E2BIG),
             libc::EACCES => Ok(Self::EACCES),

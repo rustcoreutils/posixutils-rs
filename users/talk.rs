@@ -1024,10 +1024,7 @@ fn get_local_machine_name() -> Result<String, io::Error> {
         let c_str = unsafe { CStr::from_ptr(buffer.as_ptr()) };
         Ok(c_str.to_string_lossy().into_owned())
     } else {
-        Err(Error::new(
-            io::ErrorKind::Other,
-            "Cannot get local hostname",
-        ))
+        Err(Error::other("Cannot get local hostname"))
     }
 }
 

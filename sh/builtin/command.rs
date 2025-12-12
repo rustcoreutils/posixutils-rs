@@ -31,7 +31,7 @@ struct CommandArgs<'a> {
 }
 
 impl CommandArgs<'_> {
-    fn parse(args: &[String]) -> Result<CommandArgs, String> {
+    fn parse(args: &[String]) -> Result<CommandArgs<'_>, String> {
         let mut use_default_path = false;
         let mut action = Action::Execute;
 

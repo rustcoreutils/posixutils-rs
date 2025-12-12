@@ -3564,7 +3564,7 @@ impl Parser<'_> {
         // Build the type from the base type
         let mut result_type_id = base_type_id;
 
-        if inner_type_id.is_some() {
+        if let Some(inner_tid) = inner_type_id {
             // Grouped declarator: int (*p)[3] or void (*fp)(int)
             // Arrays/functions in suffix apply to the base type first
             // Then we substitute into the inner declarator
@@ -3612,7 +3612,7 @@ impl Parser<'_> {
             // -> Pointer(Array(3, int))
             // For void (*fp)(int): inner_decl is Pointer(Void), result_type is Function(void, [int])
             // -> Pointer(Function(void, [int]))
-            result_type_id = self.substitute_base_type(inner_type_id.unwrap(), result_type_id);
+            result_type_id = self.substitute_base_type(inner_tid, result_type_id);
         } else {
             // Simple declarator: char *arr[3]
             // Pointers bind tighter than arrays: *arr[3] = array of pointers

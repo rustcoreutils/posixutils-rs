@@ -93,20 +93,20 @@ pub(crate) fn main_loop(mut state: State, stderr: &mut dyn Write) -> crate::erro
 
             // Check to see whether it's currently defined macro or it needs some arguments but
             // there's no open bracket.
-            if definition.is_none()
-                || (l != b'(' && (definition.as_ref().unwrap().parse_config.min_args > 0))
-            {
-                state.output.write_all(&token)?;
-            } else {
-                let definition = definition.unwrap();
-
-                let frame = StackFrame::new(0, definition.clone());
-
-                if l == b'(' {
-                    state.output.stack.push(frame);
+            if let Some(definition) = definition {
+                if l != b'(' && definition.parse_config.min_args > 0 {
+                    state.output.write_all(&token)?;
                 } else {
-                    state = definition.implementation.evaluate(state, stderr, frame)?;
+                    let frame = StackFrame::new(0, definition.clone());
+
+                    if l == b'(' {
+                        state.output.stack.push(frame);
+                    } else {
+                        state = definition.implementation.evaluate(state, stderr, frame)?;
+                    }
                 }
+            } else {
+                state.output.write_all(&token)?;
             }
         } else if t == EOF {
             if state.input.input_len() == 1 {

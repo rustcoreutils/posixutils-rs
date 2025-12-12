@@ -1022,9 +1022,9 @@ struct CallFrame<'i> {
 
 /// # Invariants
 /// - `sp` and `bp` are pointers into the same
-///     contiguously allocated chunk of memory
+///   contiguously allocated chunk of memory
 /// - `stack_end` is one past the last valid pointer
-///     of the allocated memory starting at `bp`
+///   of the allocated memory starting at `bp`
 /// - values in the range [`bp`, `sp`) can be accessed safely
 struct Stack<'i, 's> {
     current_function_name: Rc<str>,
@@ -1761,7 +1761,7 @@ impl Interpreter {
                 .pop()
                 // there are no active references to stack values at this point, so this is safe
                 .map(|sv| unsafe { sv.into_owned() })
-                .unwrap_or(AwkValue::uninitialized()),
+                .unwrap_or_default(),
         ))
     }
 

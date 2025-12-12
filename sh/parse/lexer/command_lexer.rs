@@ -440,7 +440,7 @@ impl Lexer for CommandLexer<'_> {
         self.source.line_no()
     }
 
-    fn next_line(&mut self) -> Cow<str> {
+    fn next_line(&mut self) -> Cow<'_, str> {
         let start = self.source.read_state.clone();
         while !self.reached_eof() {
             let lookahead = self.lookahead();
@@ -452,7 +452,7 @@ impl Lexer for CommandLexer<'_> {
         self.source.substr(&start, &self.source.read_state)
     }
 
-    fn next_word(&mut self) -> ParseResult<Cow<str>> {
+    fn next_word(&mut self) -> ParseResult<Cow<'_, str>> {
         self.read_word_token()
     }
 }
@@ -625,7 +625,7 @@ mod tests {
         }
     }
 
-    fn lex_token(token: &str) -> CommandToken {
+    fn lex_token(token: &str) -> CommandToken<'_> {
         let mut lex = CommandLexer::new(token);
         let token = lex.next_token().unwrap().0;
         assert_eq!(lex.next_token().unwrap().0, CommandToken::Eof);

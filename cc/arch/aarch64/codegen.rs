@@ -361,9 +361,9 @@ impl Aarch64CodeGen {
         // Need space for: fp/lr (16 bytes) + GP callee-saved + FP callee-saved + local vars + reg save area
         // Round up callee-saved counts to even for 16-byte alignment
         // Note: AAPCS64 only requires the lower 64 bits of V8-V15 to be preserved (d8-d15)
-        let callee_saved_gp_pairs = (callee_saved.len() + 1) / 2;
+        let callee_saved_gp_pairs = callee_saved.len().div_ceil(2);
         let callee_saved_gp_size = callee_saved_gp_pairs as i32 * 16;
-        let callee_saved_fp_pairs = (callee_saved_fp.len() + 1) / 2;
+        let callee_saved_fp_pairs = callee_saved_fp.len().div_ceil(2);
         let callee_saved_fp_size = callee_saved_fp_pairs as i32 * 16; // 8 bytes per d-reg, 16 per pair
         let callee_saved_size = callee_saved_gp_size + callee_saved_fp_size;
         let total_frame = 16 + callee_saved_size + stack_size + reg_save_area_size;
@@ -2264,7 +2264,7 @@ impl Aarch64CodeGen {
         frame_size: i32,
     ) {
         let struct_size = insn.size; // Size in bits
-        let num_qwords = (struct_size + 63) / 64;
+        let num_qwords = struct_size.div_ceil(64);
 
         // Get source address (where the struct data is)
         let value_loc = self.get_location(value);

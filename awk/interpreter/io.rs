@@ -142,11 +142,13 @@ impl RecordReader for FileStream {
     }
 }
 
+#[cfg(test)]
 pub struct StringRecordReader {
     string: String,
     index: usize,
 }
 
+#[cfg(test)]
 impl<S: Into<String>> From<S> for StringRecordReader {
     fn from(value: S) -> Self {
         Self {
@@ -156,6 +158,7 @@ impl<S: Into<String>> From<S> for StringRecordReader {
     }
 }
 
+#[cfg(test)]
 impl Iterator for StringRecordReader {
     type Item = ReadResult;
 
@@ -170,6 +173,7 @@ impl Iterator for StringRecordReader {
     }
 }
 
+#[cfg(test)]
 impl RecordReader for StringRecordReader {
     fn is_done(&self) -> bool {
         self.index == self.string.len()

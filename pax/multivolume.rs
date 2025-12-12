@@ -184,10 +184,7 @@ impl MultiVolumeWriter {
                 .status()?;
 
             if !status.success() {
-                return Err(PaxError::Io(io::Error::new(
-                    io::ErrorKind::Other,
-                    "volume script failed",
-                )));
+                return Err(PaxError::Io(io::Error::other("volume script failed")));
             }
         } else {
             // Prompt user via /dev/tty
@@ -226,7 +223,7 @@ impl MultiVolumeWriter {
         let writer = self
             .writer
             .as_mut()
-            .ok_or_else(|| PaxError::Io(io::Error::new(io::ErrorKind::Other, "no writer")))?;
+            .ok_or_else(|| PaxError::Io(io::Error::other("no writer")))?;
 
         let mut header = [0u8; BLOCK_SIZE];
 
@@ -291,7 +288,7 @@ impl ArchiveWriter for MultiVolumeWriter {
         let writer = self
             .writer
             .as_mut()
-            .ok_or_else(|| PaxError::Io(io::Error::new(io::ErrorKind::Other, "no writer")))?;
+            .ok_or_else(|| PaxError::Io(io::Error::other("no writer")))?;
         writer.write_all(&header)?;
         self.bytes_written += BLOCK_SIZE as u64;
 
@@ -302,7 +299,7 @@ impl ArchiveWriter for MultiVolumeWriter {
         let writer = self
             .writer
             .as_mut()
-            .ok_or_else(|| PaxError::Io(io::Error::new(io::ErrorKind::Other, "no writer")))?;
+            .ok_or_else(|| PaxError::Io(io::Error::other("no writer")))?;
         writer.write_all(data)?;
         self.bytes_written += data.len() as u64;
         Ok(())
@@ -317,7 +314,7 @@ impl ArchiveWriter for MultiVolumeWriter {
             let writer = self
                 .writer
                 .as_mut()
-                .ok_or_else(|| PaxError::Io(io::Error::new(io::ErrorKind::Other, "no writer")))?;
+                .ok_or_else(|| PaxError::Io(io::Error::other("no writer")))?;
             writer.write_all(&zeros)?;
             self.bytes_written += padding as u64;
         }
@@ -330,7 +327,7 @@ impl ArchiveWriter for MultiVolumeWriter {
         let writer = self
             .writer
             .as_mut()
-            .ok_or_else(|| PaxError::Io(io::Error::new(io::ErrorKind::Other, "no writer")))?;
+            .ok_or_else(|| PaxError::Io(io::Error::other("no writer")))?;
         writer.write_all(&zeros)?;
         writer.write_all(&zeros)?;
         writer.flush()?;
@@ -412,10 +409,7 @@ impl MultiVolumeReader {
                         .env("TAR_ARCHIVE", path.to_string_lossy().as_ref())
                         .status()?;
                     if !status.success() {
-                        return Err(PaxError::Io(io::Error::new(
-                            io::ErrorKind::Other,
-                            "volume script failed",
-                        )));
+                        return Err(PaxError::Io(io::Error::other("volume script failed")));
                     }
                 } else {
                     self.prompt_for_volume()?;
@@ -575,7 +569,7 @@ impl MultiVolumeReader {
         let reader = self
             .reader
             .as_mut()
-            .ok_or_else(|| PaxError::Io(io::Error::new(io::ErrorKind::Other, "no reader")))?;
+            .ok_or_else(|| PaxError::Io(io::Error::other("no reader")))?;
         reader.read_exact(buf)?;
         Ok(())
     }
@@ -688,7 +682,7 @@ impl ArchiveReader for MultiVolumeReader {
         let reader = self
             .reader
             .as_mut()
-            .ok_or_else(|| PaxError::Io(io::Error::new(io::ErrorKind::Other, "no reader")))?;
+            .ok_or_else(|| PaxError::Io(io::Error::other("no reader")))?;
         let n = reader.read(&mut buf[..to_read])?;
 
         self.bytes_read += n as u64;
@@ -711,7 +705,7 @@ impl ArchiveReader for MultiVolumeReader {
             let reader = self
                 .reader
                 .as_mut()
-                .ok_or_else(|| PaxError::Io(io::Error::new(io::ErrorKind::Other, "no reader")))?;
+                .ok_or_else(|| PaxError::Io(io::Error::other("no reader")))?;
 
             let mut remaining = to_skip;
             let mut buf = [0u8; 4096];
@@ -731,7 +725,7 @@ impl ArchiveReader for MultiVolumeReader {
 impl std::io::Read for MultiVolumeReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.read_data(buf)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            .map_err(|e| std::io::Error::other(e.to_string()))
     }
 }
 

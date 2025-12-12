@@ -42,17 +42,17 @@ impl InteractivePrompter {
     #[cfg(unix)]
     pub fn new() -> PaxResult<Self> {
         let tty_read = File::open("/dev/tty").map_err(|e| {
-            PaxError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("cannot open /dev/tty for reading: {}", e),
-            ))
+            PaxError::Io(std::io::Error::other(format!(
+                "cannot open /dev/tty for reading: {}",
+                e
+            )))
         })?;
 
         let tty_write = File::options().write(true).open("/dev/tty").map_err(|e| {
-            PaxError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("cannot open /dev/tty for writing: {}", e),
-            ))
+            PaxError::Io(std::io::Error::other(format!(
+                "cannot open /dev/tty for writing: {}",
+                e
+            )))
         })?;
 
         Ok(InteractivePrompter {

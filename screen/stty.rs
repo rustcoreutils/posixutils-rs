@@ -13,7 +13,7 @@
 mod osdata;
 
 use std::collections::HashMap;
-use std::io::{self, Error, ErrorKind};
+use std::io::{self, Error};
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
@@ -350,7 +350,7 @@ fn set_ti_speed(
 ) -> io::Result<()> {
     let speed_res = speedmap.get(op_arg);
     if speed_res.is_none() {
-        return Err(Error::new(ErrorKind::Other, "Invalid speed"));
+        return Err(Error::other("Invalid speed"));
     }
     let speed = speed_res.unwrap();
 
@@ -403,11 +403,11 @@ fn stty_set_compact(mut ti: Termios, compact: &str) -> io::Result<()> {
                     pairmap.insert(String::from(key), n);
                 }
                 Err(_e) => {
-                    return Err(Error::new(ErrorKind::Other, "Invalid ent"));
+                    return Err(Error::other("Invalid ent"));
                 }
             },
             None => {
-                return Err(Error::new(ErrorKind::Other, "Invalid ent"));
+                return Err(Error::other("Invalid ent"));
             }
         }
     }
@@ -416,7 +416,7 @@ fn stty_set_compact(mut ti: Termios, compact: &str) -> io::Result<()> {
     let dirty = match merge_map(&mut ti, &pairmap) {
         Ok(d) => d,
         Err(e) => {
-            return Err(Error::new(ErrorKind::Other, e));
+            return Err(Error::other(e));
         }
     };
 
@@ -467,7 +467,7 @@ fn stty_set_long(mut ti: Termios, args: &Args) -> io::Result<()> {
         let param_res = tty_params.get(operand);
         if param_res.is_none() {
             let errstr = format!("Unknown operand {}", operand);
-            return Err(Error::new(ErrorKind::Other, errstr));
+            return Err(Error::other(errstr));
         }
         let param = param_res.unwrap();
 
@@ -482,7 +482,7 @@ fn stty_set_long(mut ti: Termios, args: &Args) -> io::Result<()> {
         };
         if negate && ((flags & PNEG) == 0) {
             let errstr = format!("Operand {} cannot be negated", operand);
-            return Err(Error::new(ErrorKind::Other, errstr));
+            return Err(Error::other(errstr));
         }
 
         let mut op_arg = String::new();
@@ -491,7 +491,7 @@ fn stty_set_long(mut ti: Termios, args: &Args) -> io::Result<()> {
 
             if idx == args.operands.len() {
                 let errstr = format!("Missing operand for {}", operand);
-                return Err(Error::new(ErrorKind::Other, errstr));
+                return Err(Error::other(errstr));
             }
 
             op_arg = String::from(&args.operands[idx]);
@@ -515,7 +515,7 @@ fn stty_set_long(mut ti: Termios, args: &Args) -> io::Result<()> {
                 let dirty_res =
                     set_ti_cchar_oparg(&cchar_xlat, &mut ti.c_cc[*chidx], &op_arg, dirty);
                 if let Err(e) = dirty_res {
-                    return Err(Error::new(ErrorKind::Other, e));
+                    return Err(Error::other(e));
                 }
 
                 dirty = dirty_res.unwrap();

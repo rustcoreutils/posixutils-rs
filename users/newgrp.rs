@@ -677,7 +677,7 @@ fn pw_encrypt(clear: &str, shadow_password: Option<&str>) -> Result<String, io::
 
     // Attempt to encrypt the clear text password
     if engine.encrypt(clear.to_string()).is_err() {
-        return Err(io::Error::new(io::ErrorKind::Other, "Encryption failed."));
+        return Err(io::Error::other("Encryption failed."));
     }
 
     Ok(engine.encrypted)
@@ -782,10 +782,7 @@ fn set_login_environment(user: &str) -> Result<(), io::Error> {
 
     if !status.success() {
         eprintln!("Failed to start shell: {}", user_shell);
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            "Shell execution failed",
-        ));
+        return Err(io::Error::other("Shell execution failed"));
     }
 
     Ok(())

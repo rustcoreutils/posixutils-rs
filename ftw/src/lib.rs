@@ -676,12 +676,12 @@ pub struct TraverseDirectoryOpts {
 ///
 /// # Arguments
 /// * `path` - Pathname of the directory. Passing a file to this argument will cause the function to
-///     return `false` but will otherwise allow processing the file inside `file_handler` like a
-///     normal entry.
+///   return `false` but will otherwise allow processing the file inside `file_handler` like a
+///   normal entry.
 ///
 /// * `file_handler` - Called for each entry in the tree. If the current entry is a directory, its
-///     contents will be skipped if `file_handler` returns `false`. The return value of
-///     `file_handler` is ignored when the entry is a file.
+///   contents will be skipped if `file_handler` returns `false`. The return value of
+///   `file_handler` is ignored when the entry is a file.
 ///
 /// * `postprocess_dir` - Called when `traverse_directory` is exiting a directory.
 ///

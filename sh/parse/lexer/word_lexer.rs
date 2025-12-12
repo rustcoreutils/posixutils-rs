@@ -84,7 +84,7 @@ impl Lexer for WordLexer<'_> {
         0
     }
 
-    fn next_line(&mut self) -> Cow<str> {
+    fn next_line(&mut self) -> Cow<'_, str> {
         let start = self.position;
         while self.lookahead != '\n' {
             self.advance()
@@ -92,7 +92,7 @@ impl Lexer for WordLexer<'_> {
         self.source[start..self.position].into()
     }
 
-    fn next_word(&mut self) -> ParseResult<Cow<str>> {
+    fn next_word(&mut self) -> ParseResult<Cow<'_, str>> {
         let start = self.position;
         self.skip_word_token(None, false)?;
         Ok(Cow::from(&self.source[start..self.position]))
@@ -249,7 +249,7 @@ pub fn remove_quotes(word: &str) -> (bool, String) {
 mod tests {
     use super::*;
 
-    fn lex_token(s: &str) -> WordToken {
+    fn lex_token(s: &str) -> WordToken<'_> {
         let mut lex = WordLexer::new(s);
         let token = lex.next_token();
         assert_eq!(lex.next_token(), WordToken::Eof);

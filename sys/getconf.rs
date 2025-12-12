@@ -64,10 +64,7 @@ fn handle_sysconf(
                 gettext("Error: Unknown system configuration variable"),
                 var
             );
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                errstr,
-            )));
+            return Err(Box::new(std::io::Error::other(errstr)));
         }
     };
 
@@ -92,8 +89,7 @@ fn handle_confstr(
     _var: &str,
     _confstr_mappings: &HashMap<&'static str, libc::c_int>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    Err(Box::new(std::io::Error::new(
-        std::io::ErrorKind::Other,
+    Err(Box::new(std::io::Error::other(
         "Not implemented (pls update libc crate)",
     )))
 }
@@ -111,10 +107,7 @@ fn handle_confstr(
                 gettext("Error: Unknown configuration string variable"),
                 var
             );
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                errstr,
-            )));
+            return Err(Box::new(std::io::Error::other(errstr)));
         }
     };
 
@@ -165,10 +158,7 @@ fn handle_pathconf(
                 gettext("Error: Unknown path configuration variable"),
                 var
             );
-            return Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                errstr,
-            )));
+            return Err(Box::new(std::io::Error::other(errstr)));
         }
     };
 
@@ -181,10 +171,7 @@ fn handle_pathconf(
             gettext("Error: Unknown path configuration variable"),
             var
         );
-        return Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            errstr,
-        )));
+        return Err(Box::new(std::io::Error::other(errstr)));
     } else {
         println!("{}", value);
     }

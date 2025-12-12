@@ -2696,7 +2696,7 @@ impl X86_64CodeGen {
     /// The value is a symbol containing the source struct data
     fn emit_struct_store(&mut self, insn: &Instruction, addr: PseudoId, value: PseudoId) {
         let struct_size = insn.size; // Size in bits
-        let num_qwords = (struct_size + 63) / 64;
+        let num_qwords = struct_size.div_ceil(64);
 
         // Get source address (where the struct data is)
         let value_loc = self.get_location(value);

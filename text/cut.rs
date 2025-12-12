@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use std::io::{self, BufRead, Error, ErrorKind, Read};
+use std::io::{self, BufRead, Error, Read};
 
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
@@ -285,14 +285,14 @@ fn cut_fields(line: &str, delim: char, ranges: &Vec<(i32, i32)>, suppress: bool)
 /// A `Result` indicating success or failure. If an error occurs during file processing, it is returned as `Err`.
 ///
 fn cut_files(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    validate_args(&args).map_err(|err| Box::new(Error::new(ErrorKind::Other, err)))?;
+    validate_args(&args).map_err(|err| Box::new(Error::other(err)))?;
 
     // open files, or stdin
 
     let filenames = args.filenames;
     let filenames_len = filenames.len();
     let readers: Vec<Box<dyn Read>> =
-        if filenames_len == 0 || (filenames_len == 1 && filenames[0] == PathBuf::from("-")) {
+        if filenames_len == 0 || (filenames_len == 1 && filenames[0].as_os_str() == "-") {
             vec![Box::new(io::stdin().lock())]
         } else {
             let mut bufs: Vec<Box<dyn Read>> = Vec::with_capacity(filenames_len);
@@ -309,21 +309,21 @@ fn cut_files(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         let parse_option;
 
         if let Some(bytes_list) = &args.bytes {
-            let ranges: Vec<(i32, i32)> = read_range(bytes_list)
-                .map_err(|err| Box::new(Error::new(ErrorKind::Other, err)))?;
+            let ranges: Vec<(i32, i32)> =
+                read_range(bytes_list).map_err(|err| Box::new(Error::other(err)))?;
 
             parse_option = ParseVariat::Bytes(ranges);
         } else if let Some(characters_list) = &args.characters {
-            let ranges: Vec<(i32, i32)> = read_range(characters_list)
-                .map_err(|err| Box::new(Error::new(ErrorKind::Other, err)))?;
+            let ranges: Vec<(i32, i32)> =
+                read_range(characters_list).map_err(|err| Box::new(Error::other(err)))?;
 
             parse_option = ParseVariat::Characters(ranges);
         } else if let Some(fields_list) = &args.fields {
-            let ranges: Vec<(i32, i32)> = read_range(fields_list)
-                .map_err(|err| Box::new(Error::new(ErrorKind::Other, err)))?;
+            let ranges: Vec<(i32, i32)> =
+                read_range(fields_list).map_err(|err| Box::new(Error::other(err)))?;
             parse_option = ParseVariat::Fields(ranges);
         } else {
-            return Err(Box::new(Error::new(ErrorKind::Other, "Invalid arguments")));
+            return Err(Box::new(Error::other("Invalid arguments")));
         }
 
         for line in reader.lines() {

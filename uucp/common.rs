@@ -363,10 +363,7 @@ pub fn ssh_send_file(
                 .args(["-T", "-o", "BatchMode=yes", host, &mkdir_cmd])
                 .status()?;
             if !status.success() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "Failed to create remote directory",
-                ));
+                return Err(io::Error::other("Failed to create remote directory"));
             }
         }
     }
@@ -389,10 +386,7 @@ pub fn ssh_send_file(
 
     let status = child.wait()?;
     if !status.success() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            "Failed to send file to remote",
-        ));
+        return Err(io::Error::other("Failed to send file to remote"));
     }
 
     Ok(())
@@ -420,10 +414,10 @@ pub fn ssh_fetch_file(
 
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("Failed to fetch file: {}", err.trim()),
-        ));
+        return Err(io::Error::other(format!(
+            "Failed to fetch file: {}",
+            err.trim()
+        )));
     }
 
     fs::write(local_path, &output.stdout)?;

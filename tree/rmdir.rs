@@ -10,7 +10,7 @@
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::fs;
-use std::io::{self, Error, ErrorKind};
+use std::io::{self, Error};
 use std::path::Path;
 
 /// rmdir - remove directories
@@ -29,13 +29,14 @@ fn remove_dir(dirname: &str, rm_parents: bool) -> io::Result<()> {
     fs::remove_dir(dirname)?;
 
     if rm_parents {
-        let parent = Path::new(dirname).parent();
-        if parent.is_some() && parent != Some(Path::new("")) {
-            match parent.unwrap().to_str() {
-                Some(parent_name) => return remove_dir(parent_name, rm_parents),
-                None => {
-                    eprintln!("{}", gettext("Non-unicode directory name rejected"));
-                    return Err(Error::new(ErrorKind::Other, "Non-unicode dir name"));
+        if let Some(parent) = Path::new(dirname).parent() {
+            if parent != Path::new("") {
+                match parent.to_str() {
+                    Some(parent_name) => return remove_dir(parent_name, rm_parents),
+                    None => {
+                        eprintln!("{}", gettext("Non-unicode directory name rejected"));
+                        return Err(Error::other("Non-unicode dir name"));
+                    }
                 }
             }
         }

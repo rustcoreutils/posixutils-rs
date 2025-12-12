@@ -253,7 +253,7 @@ pub enum Action {
     None,
 }
 
-fn into_expansion_word(word: &[u8]) -> Result<Cow<str>, CommandError> {
+fn into_expansion_word(word: &[u8]) -> Result<Cow<'_, str>, CommandError> {
     let word = std::str::from_utf8(word).map_err(|_| CommandError)?;
     if word.chars().any(|c| c == '?' || c == '*' || c == '[') {
         Ok(Cow::Borrowed(word))
@@ -543,7 +543,7 @@ impl ViEditor {
                     words.last()
                 };
                 if let Some(word_range) = word_range {
-                    let word = last_command[word_range.start..word_range.end].as_bytes();
+                    let word = &last_command.as_bytes()[word_range.start..word_range.end];
                     // we are in command mode, so cursor is always less than self.edit_line.len()
                     let position = self.cursor.position + 1;
                     self.edit_line

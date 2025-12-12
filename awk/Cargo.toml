@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-awk"
-version = "0.2.2"
+version = "0.7.0"
 repository.workspace = true
 license.workspace = true
 edition.workspace = true

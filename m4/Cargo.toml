@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-m4"
-version = "0.2.2"
+version = "0.7.0"
 description = "m4 - macro language processor"
 authors = ["Luke Frisken"]
 repository.workspace = true

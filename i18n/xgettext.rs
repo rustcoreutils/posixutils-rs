@@ -157,7 +157,7 @@ impl Walker {
         Ok(())
     }
 
-    fn walk(&mut self, stream: TokenStream, path: &String) {
+    fn walk(&mut self, stream: TokenStream, path: &str) {
         let mut iter = stream.into_iter().peekable();
         while let Some(token) = iter.next() {
             match token {
@@ -194,10 +194,10 @@ impl Walker {
         None
     }
 
-    fn push(&mut self, literal: LitStr, path: &String) {
+    fn push(&mut self, literal: LitStr, path: &str) {
         let value = literal.value();
         if self.numbers_lines {
-            let path = path.clone();
+            let path = path.to_owned();
             let lc = literal.span().start();
             let line = lc.line;
             // let column = lc.column;
@@ -222,12 +222,12 @@ impl Walker {
         if !self.numbers_lines {
             return;
         }
-        for (_, lines) in &mut self.messages {
+        for lines in self.messages.values_mut() {
             lines.sort();
         }
     }
 
-    fn escape(value: &String) -> String {
+    fn escape(value: &str) -> String {
         format!(
             "\"{}\"",
             value.replace("\"", "\\\"").replace("\n", "\\n\"\n\"")
@@ -249,7 +249,7 @@ impl std::fmt::Display for Walker {
             }
             writeln!(f, "msgid {}", Self::escape(str))?;
             writeln!(f, "msgstr \"\"")?;
-            writeln!(f, "")?;
+            writeln!(f)?;
         }
         Ok(())
     }
@@ -353,7 +353,7 @@ msgstr ""
     #[test]
     fn test_escape() {
         let value = Walker::escape(
-            &"{about}\n\nUsage: {usage}\n\nArguments:\n{positionals}\n\nOptions:\n{options}".into(),
+            "{about}\n\nUsage: {usage}\n\nArguments:\n{positionals}\n\nOptions:\n{options}",
         );
         assert_eq!(
             value,
@@ -371,7 +371,7 @@ msgstr ""
 
     #[test]
     fn test_escape2() {
-        let value = Walker::escape(&"string \"string2\" string".into());
+        let value = Walker::escape("string \"string2\" string");
         assert_eq!(value, r#""string \"string2\" string""#);
     }
 }

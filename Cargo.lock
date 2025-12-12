@@ -676,7 +676,7 @@ dependencies = [
 
 [[package]]
 name = "ftw"
-version = "0.2.2"
+version = "0.7.0"
 dependencies = [
  "errno",
  "libc",
@@ -762,7 +762,7 @@ dependencies = [
 
 [[package]]
 name = "gettext-rs"
-version = "0.2.2"
+version = "0.7.0"
 
 [[package]]
 name = "glob"
@@ -1072,7 +1072,7 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "m4-test-manager"
-version = "0.2.2"
+version = "0.7.0"
 dependencies = [
  "clap",
 ]
@@ -1422,7 +1422,7 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 
 [[package]]
 name = "plib"
-version = "0.2.2"
+version = "0.7.0"
 dependencies = [
  "cfg-if",
  "errno",
@@ -1446,7 +1446,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-awk"
-version = "0.2.2"
+version = "0.7.0"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -1460,7 +1460,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-calc"
-version = "0.2.2"
+version = "0.7.0"
 dependencies = [
  "bigdecimal",
  "clap",
@@ -1474,7 +1474,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-cc"
-version = "0.2.2"
+version = "0.7.0"
 dependencies = [
  "bitflags 2.10.0",
  "clap",
@@ -1485,7 +1485,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-datetime"
-version = "0.2.2"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "clap",
@@ -1496,7 +1496,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-dev"
-version = "0.2.2"
+version = "0.7.0"
 dependencies = [
  "ar",
  "chrono",
@@ -1509,7 +1509,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-display"
-version = "0.2.2"
+version = "0.7.0"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -1521,7 +1521,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-editors"
-version = "0.2.2"
+version = "0.7.0"
 dependencies = [
  "libc",
  "plib",
@@ -1532,7 +1532,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-file"
-version = "0.2.2"
+version = "0.7.0"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -1545,7 +1545,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-fs"
-version = "0.2.2"
+version = "0.7.0"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -1554,7 +1554,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-i18n"
-version = "0.2.2"
+version = "0.7.0"
 dependencies = [
  "bytemuck",
  "byteorder",
@@ -1572,7 +1572,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-m4"
-version = "0.2.2"
+version = "0.7.0"
 dependencies = [
  "clap",
  "env_logger",
@@ -1590,7 +1590,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-mailx"
-version = "0.2.2"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "dirs 5.0.1",
@@ -1601,7 +1601,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-make"
-version = "0.2.2"
+version = "0.7.0"
 dependencies = [
  "clap",
  "const_format",
@@ -1613,7 +1613,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-man"
-version = "0.2.2"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "clap",
@@ -1631,7 +1631,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-misc"
-version = "0.2.2"
+version = "0.7.0"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -1642,7 +1642,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-pathnames"
-version = "0.2.2"
+version = "0.7.0"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -1652,7 +1652,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-pax"
-version = "0.2.2"
+version = "0.7.0"
 dependencies = [
  "clap",
  "filetime",
@@ -1664,7 +1664,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-process"
-version = "0.2.2"
+version = "0.7.0"
 dependencies = [
  "bindgen",
  "chrono",
@@ -1679,7 +1679,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-sccs"
-version = "0.2.2"
+version = "0.7.0"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -1688,7 +1688,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-screen"
-version = "0.2.2"
+version = "0.7.0"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -1699,7 +1699,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-sh"
-version = "0.1.7"
+version = "0.7.0"
 dependencies = [
  "gettext-rs",
  "libc",
@@ -1708,7 +1708,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-sys"
-version = "0.2.2"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "clap",
@@ -1720,7 +1720,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-text"
-version = "0.2.2"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "clap",
@@ -1740,7 +1740,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-tree"
-version = "0.2.2"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "clap",
@@ -1755,7 +1755,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-users"
-version = "0.2.2"
+version = "0.7.0"
 dependencies = [
  "binrw",
  "chrono",
@@ -1770,7 +1770,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-uucp"
-version = "0.2.2"
+version = "0.7.0"
 dependencies = [
  "clap",
  "gettext-rs",
@@ -1780,7 +1780,7 @@ dependencies = [
 
 [[package]]
 name = "posixutils-xform"
-version = "0.2.2"
+version = "0.7.0"
 dependencies = [
  "base64",
  "clap",

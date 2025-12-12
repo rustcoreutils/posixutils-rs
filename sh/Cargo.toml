@@ -1,6 +1,6 @@
 [package]
 name = "posixutils-sh"
-version = "0.1.7"
+version = "0.7.0"
 edition = "2021"
 
 [dependencies]

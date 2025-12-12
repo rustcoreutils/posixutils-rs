@@ -5,12 +5,112 @@ use std::{
     os::{fd::AsRawFd, unix},
     path::{Path, PathBuf},
 };
+use tempfile::TempDir;
 
 const DIR_HIERARCHY_DEPTH: usize = 300;
 
+/// Helper struct that cleans up deep directory hierarchies on drop.
+/// This is needed because `fs::remove_dir_all()` can fail on very deep hierarchies
+/// and we need cleanup to happen even if the test panics.
+struct DeepDirCleanup {
+    test_dir: TempDir,
+    dir_name: CString,
+    depth: usize,
+}
+
+impl DeepDirCleanup {
+    fn new(prefix: &str, dir_name_str: &str, depth: usize) -> io::Result<Self> {
+        let test_dir = tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))?;
+        let dir_name = CString::new(dir_name_str.as_bytes()).unwrap();
+        Ok(Self {
+            test_dir,
+            dir_name,
+            depth,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        self.test_dir.path()
+    }
+}
+
+impl Drop for DeepDirCleanup {
+    fn drop(&mut self) {
+        // Try standard removal first (works for shallow hierarchies)
+        if fs::remove_dir_all(self.test_dir.path()).is_ok() {
+            // Prevent TempDir from trying to remove again
+            if let Ok(new_tmp) = tempfile::tempdir() {
+                let _ = std::mem::replace(&mut self.test_dir, new_tmp);
+            }
+            return;
+        }
+
+        // Fall back to manual unlinkat() approach for deep hierarchies.
+        // The structure is: test_dir/x/x/x/.../x (depth-1 nested 'x' directories inside test_dir)
+        //
+        // To remove, we navigate to the second-to-last directory (depth-2),
+        // then remove from the deepest working back up.
+        let test_dir_name =
+            CString::new(self.test_dir.path().to_str().unwrap().as_bytes()).unwrap();
+
+        let mut fd = ftw::FileDescriptor::cwd();
+
+        // Navigate down to depth-2 (the parent of the deepest directory).
+        for i in 0..(self.depth.saturating_sub(2)) {
+            let filename = if i == 0 {
+                &test_dir_name
+            } else {
+                &self.dir_name
+            };
+            if let Ok(new_fd) = ftw::FileDescriptor::open_at(&fd, filename, libc::O_RDONLY) {
+                fd = new_fd;
+            } else {
+                // Can't descend further - might already be cleaned up
+                return;
+            }
+        }
+
+        // Now fd is at depth-2. Remove directories from deepest to shallowest.
+        for remaining in (0..self.depth).rev() {
+            let (filename, raw_fd) = if remaining == 0 {
+                // Unlinking test_dir itself from cwd
+                (&test_dir_name, libc::AT_FDCWD)
+            } else {
+                // Unlinking an 'x' directory from fd
+                (&self.dir_name, fd.as_raw_fd())
+            };
+
+            unsafe {
+                libc::unlinkat(raw_fd, filename.as_ptr(), libc::AT_REMOVEDIR);
+            }
+
+            // Move fd up one level (except when we just unlinked test_dir)
+            if remaining > 1 {
+                if let Ok(parent_fd) = ftw::FileDescriptor::open_at(&fd, c"..", libc::O_RDONLY) {
+                    fd = parent_fd;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Prevent TempDir from trying to remove (we already did, or at least tried)
+        if let Ok(new_tmp) = tempfile::tempdir() {
+            let _ = std::mem::replace(&mut self.test_dir, new_tmp);
+        }
+    }
+}
+
 #[test]
 fn test_ftw_simple() {
-    let test_dir = &format!("{}/test_ftw_simple", env!("CARGO_TARGET_TMPDIR"));
+    let tmp_dir = tempfile::Builder::new()
+        .prefix("test_ftw_simple")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let test_dir = tmp_dir.path().to_str().unwrap();
+
     let a_1 = format!("{test_dir}/a/1");
     let a_2 = format!("{test_dir}/a/2");
     let b_1 = format!("{test_dir}/b/1");
@@ -66,15 +166,17 @@ fn test_ftw_simple() {
     );
     filenames.sort();
     assert_eq!(expected_filenames.as_slice(), filenames.as_slice());
-
-    fs::remove_dir_all(test_dir).unwrap();
+    // Cleanup happens automatically when tmp_dir is dropped
 }
 
 // Test if symlinks are properly followed.
 #[test]
 fn test_ftw_symlinks() {
-    let test_dir = &format!("{}/test_ftw_symlinks", env!("CARGO_TARGET_TMPDIR"));
-    fs::create_dir(test_dir).unwrap();
+    let tmp_dir = tempfile::Builder::new()
+        .prefix("test_ftw_symlinks")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let test_dir = tmp_dir.path().to_str().unwrap();
 
     let mut prev = None;
     for i in 0..3 {
@@ -123,28 +225,33 @@ fn test_ftw_symlinks() {
     expected_filenames.sort();
     filenames.sort();
     assert_eq!(expected_filenames.as_slice(), filenames.as_slice());
-
-    fs::remove_dir_all(test_dir).unwrap();
+    // Cleanup happens automatically when tmp_dir is dropped
 }
 
 // Must be able to navigate arbitrarily deep hierarchies.
 #[test]
 fn test_ftw_deep() {
-    let test_dir = &format!("{}/test_ftw_deep", env!("CARGO_TARGET_TMPDIR"));
+    let dir_name_str = ["x"; 200].join("");
+    let cleanup = DeepDirCleanup::new("test_ftw_deep", &dir_name_str, DIR_HIERARCHY_DEPTH).unwrap();
+    let test_dir = cleanup.path().to_str().unwrap();
 
-    let test_dir_name = CString::new(test_dir.as_bytes()).unwrap();
-    let dir_name = CString::new(["x"; 200].join("").as_bytes()).unwrap();
+    let dir_name = CString::new(dir_name_str.as_bytes()).unwrap();
 
-    let mut fd = ftw::FileDescriptor::cwd();
+    let mut fd = ftw::FileDescriptor::open_at(
+        &ftw::FileDescriptor::cwd(),
+        &CString::new(test_dir.as_bytes()).unwrap(),
+        libc::O_RDONLY,
+    )
+    .unwrap();
 
-    for i in 0..DIR_HIERARCHY_DEPTH {
-        let filename = if i == 0 { &test_dir_name } else { &dir_name };
-        let ret = unsafe { libc::mkdirat(fd.as_raw_fd(), filename.as_ptr(), 0o755) };
+    // Create nested directories inside the temp dir (starting at depth 1)
+    for _ in 1..DIR_HIERARCHY_DEPTH {
+        let ret = unsafe { libc::mkdirat(fd.as_raw_fd(), dir_name.as_ptr(), 0o755) };
         if ret != 0 {
             panic!("{}", io::Error::last_os_error());
         }
 
-        fd = ftw::FileDescriptor::open_at(&fd, filename, libc::O_RDONLY).unwrap();
+        fd = ftw::FileDescriptor::open_at(&fd, &dir_name, libc::O_RDONLY).unwrap();
     }
 
     let mut count = 0;
@@ -161,15 +268,17 @@ fn test_ftw_deep() {
     );
 
     assert_eq!(count, DIR_HIERARCHY_DEPTH);
-
-    fs::remove_dir_all(test_dir).unwrap();
+    // Cleanup happens automatically when cleanup is dropped
 }
 
 // Same as `test_ftw_deep` but using symlinks.
 #[test]
 fn test_ftw_deep_symlinks() {
-    let test_dir = &format!("{}/test_ftw_deep_symlinks", env!("CARGO_TARGET_TMPDIR"));
-    fs::create_dir(test_dir).unwrap();
+    let tmp_dir = tempfile::Builder::new()
+        .prefix("test_ftw_deep_symlinks")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let test_dir = tmp_dir.path().to_str().unwrap();
 
     let mut prev = None;
     for i in 0..DIR_HIERARCHY_DEPTH {
@@ -209,23 +318,22 @@ fn test_ftw_deep_symlinks() {
     );
 
     assert_eq!(count, DIR_HIERARCHY_DEPTH);
-
-    fs::remove_dir_all(test_dir).unwrap();
+    // Cleanup happens automatically when tmp_dir is dropped
 }
 
 // Tests the resilience against making the search go to a different directory by modifying the path.
 #[test]
 fn test_ftw_path_prefix_modification() {
-    let test_dir = &format!(
-        "{}/test_ftw_path_prefix_modification",
-        env!("CARGO_TARGET_TMPDIR")
-    );
+    let tmp_dir = tempfile::Builder::new()
+        .prefix("test_ftw_path_prefix_modification")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let test_dir = tmp_dir.path().to_str().unwrap();
+
     let correct_dir = format!("{test_dir}/correct_dir");
     let wrong_dir = format!("{test_dir}/wrong_dir");
     let a_b = format!("{test_dir}/a/b");
     let a_b_c = format!("{test_dir}/a/b/c");
-
-    fs::create_dir(test_dir).unwrap();
 
     fs::create_dir_all(format!("{correct_dir}/c/d/e/f/g/h/i/j")).unwrap();
     fs::create_dir_all(format!("{wrong_dir}/x/x/x/x/x/x/x/x")).unwrap();
@@ -300,34 +408,41 @@ fn test_ftw_path_prefix_modification() {
 
     // Rerunning the directory traversal should now follow the "wrong" directory.
     assert_eq!(filenames.iter().filter(|f| f.as_str() == "x").count(), 8);
-
-    fs::remove_dir_all(test_dir).unwrap();
+    // Cleanup happens automatically when tmp_dir is dropped
 }
 
 // Tests if `traverse_directory` can open filenames longer than `libc::PATH_MAX`
 #[test]
 fn test_ftw_long_filename() {
-    let test_dir = &format!("{}/test_ftw_long_filename", env!("CARGO_TARGET_TMPDIR"));
     let dummy_dirs = "abcde";
+    let dir_name_str = ["x"; 200].join("");
 
-    let test_dir_name = CString::new(test_dir.as_bytes()).unwrap();
-    let dir_name = CString::new(["x"; 200].join("").as_bytes()).unwrap();
+    let cleanup =
+        DeepDirCleanup::new("test_ftw_long_filename", &dir_name_str, DIR_HIERARCHY_DEPTH).unwrap();
+    let test_dir = cleanup.path().to_str().unwrap();
 
-    let mut fd = ftw::FileDescriptor::cwd();
+    let dir_name = CString::new(dir_name_str.as_bytes()).unwrap();
 
-    for i in 0..DIR_HIERARCHY_DEPTH {
-        let filename = if i == 0 { &test_dir_name } else { &dir_name };
-        let ret = unsafe { libc::mkdirat(fd.as_raw_fd(), filename.as_ptr(), 0o755) };
+    let mut fd = ftw::FileDescriptor::open_at(
+        &ftw::FileDescriptor::cwd(),
+        &CString::new(test_dir.as_bytes()).unwrap(),
+        libc::O_RDONLY,
+    )
+    .unwrap();
+
+    // Create nested directories inside the temp dir (starting at depth 1)
+    for i in 1..DIR_HIERARCHY_DEPTH {
+        let ret = unsafe { libc::mkdirat(fd.as_raw_fd(), dir_name.as_ptr(), 0o755) };
         if ret != 0 {
             panic!("{}", io::Error::last_os_error());
         }
 
-        fd = ftw::FileDescriptor::open_at(&fd, filename, libc::O_RDONLY).unwrap();
+        fd = ftw::FileDescriptor::open_at(&fd, &dir_name, libc::O_RDONLY).unwrap();
 
         // If at the last index, add dummy directories
         if i == DIR_HIERARCHY_DEPTH - 1 {
-            for char in dummy_dirs.chars() {
-                let filename = CString::new(char.to_string().as_bytes()).unwrap();
+            for c in dummy_dirs.chars() {
+                let filename = CString::new(c.to_string().as_bytes()).unwrap();
                 let ret = unsafe { libc::mkdirat(fd.as_raw_fd(), filename.as_ptr(), 0o755) };
                 if ret != 0 {
                     panic!("{}", io::Error::last_os_error());
@@ -337,7 +452,6 @@ fn test_ftw_long_filename() {
     }
 
     let mut nested_dir = PathBuf::from(test_dir);
-    nested_dir.push(test_dir_name.to_string_lossy().to_string());
     for _ in 1..DIR_HIERARCHY_DEPTH {
         nested_dir.push(dir_name.to_string_lossy().to_string());
     }
@@ -355,10 +469,9 @@ fn test_ftw_long_filename() {
         ftw::TraverseDirectoryOpts::default(),
     );
 
-    for char in dummy_dirs.chars() {
-        let filename = char.to_string();
+    for c in dummy_dirs.chars() {
+        let filename = c.to_string();
         assert!(dirs.contains(&filename));
     }
-
-    fs::remove_dir_all(test_dir).unwrap();
+    // Cleanup happens automatically when cleanup is dropped
 }

@@ -681,6 +681,7 @@ dependencies = [
  "errno",
  "libc",
  "rand 0.8.5",
+ "tempfile",
 ]
 
 [[package]]

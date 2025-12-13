@@ -134,13 +134,12 @@ impl Substitution {
             let match_start = matches[0].start;
             let match_end = matches[0].end;
 
-            // Replace the matched portion
-            let new_result = format!(
-                "{}{}{}",
-                &result[..match_start],
-                replacement,
-                &result[match_end..]
-            );
+            // Replace the matched portion efficiently using with_capacity and push_str
+            let new_len = result.len() - (match_end - match_start) + replacement.len();
+            let mut new_result = String::with_capacity(new_len);
+            new_result.push_str(&result[..match_start]);
+            new_result.push_str(&replacement);
+            new_result.push_str(&result[match_end..]);
 
             // Update position for next iteration
             // Move past the replacement (or at least one char to avoid infinite loop)
@@ -182,7 +181,8 @@ impl Substitution {
 
 /// Build the replacement string from template and match groups
 fn build_replacement(template: &str, input: &str, matches: &[Match]) -> String {
-    let mut result = String::new();
+    // Pre-allocate with a reasonable estimate (template length + some extra for expansions)
+    let mut result = String::with_capacity(template.len() + 32);
     let mut chars = template.chars().peekable();
 
     while let Some(c) = chars.next() {

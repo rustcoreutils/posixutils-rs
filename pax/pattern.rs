@@ -56,7 +56,9 @@ impl Pattern {
 
     /// Check if a string matches this pattern
     pub fn matches(&self, text: &str) -> bool {
-        match_tokens(&self.tokens, text)
+        // Pre-collect chars once to avoid repeated allocations in recursive calls
+        let text_chars: Vec<char> = text.chars().collect();
+        match_tokens_with_chars(&self.tokens, &text_chars, 0)
     }
 }
 
@@ -132,23 +134,16 @@ fn parse_char_class(chars: &mut std::iter::Peekable<std::str::Chars>) -> PaxResu
     Err(PaxError::PatternError("unclosed bracket".to_string()))
 }
 
-/// Match tokens against text
-fn match_tokens(tokens: &[Token], text: &str) -> bool {
-    match_tokens_at(tokens, text, 0)
-}
-
-/// Recursive matching with position tracking
-fn match_tokens_at(tokens: &[Token], text: &str, pos: usize) -> bool {
+/// Recursive matching with position tracking using pre-collected chars
+fn match_tokens_with_chars(tokens: &[Token], text_chars: &[char], pos: usize) -> bool {
     if tokens.is_empty() {
-        return pos == text.len();
+        return pos == text_chars.len();
     }
-
-    let text_chars: Vec<char> = text.chars().collect();
 
     match &tokens[0] {
         Token::Char(c) => {
             if pos < text_chars.len() && text_chars[pos] == *c {
-                match_tokens_at(&tokens[1..], text, pos + 1)
+                match_tokens_with_chars(&tokens[1..], text_chars, pos + 1)
             } else {
                 false
             }
@@ -156,18 +151,18 @@ fn match_tokens_at(tokens: &[Token], text: &str, pos: usize) -> bool {
         Token::Any => {
             // ? matches any single character except /
             if pos < text_chars.len() && text_chars[pos] != '/' {
-                match_tokens_at(&tokens[1..], text, pos + 1)
+                match_tokens_with_chars(&tokens[1..], text_chars, pos + 1)
             } else {
                 false
             }
         }
         Token::Star => {
             // * matches any sequence except /
-            match_star(&tokens[1..], text, pos)
+            match_star_with_chars(&tokens[1..], text_chars, pos)
         }
         Token::Class(class) => {
             if pos < text_chars.len() && class_matches(class, text_chars[pos]) {
-                match_tokens_at(&tokens[1..], text, pos + 1)
+                match_tokens_with_chars(&tokens[1..], text_chars, pos + 1)
             } else {
                 false
             }
@@ -175,16 +170,18 @@ fn match_tokens_at(tokens: &[Token], text: &str, pos: usize) -> bool {
     }
 }
 
-/// Handle star matching (greedy with backtracking)
+/// Handle star matching (greedy with backtracking) using pre-collected chars
 /// Star matches any sequence except /
-#[allow(clippy::needless_range_loop)]
-fn match_star(remaining_tokens: &[Token], text: &str, start_pos: usize) -> bool {
-    let text_chars: Vec<char> = text.chars().collect();
+fn match_star_with_chars(
+    remaining_tokens: &[Token],
+    text_chars: &[char],
+    start_pos: usize,
+) -> bool {
     let text_len = text_chars.len();
 
     // Try matching zero or more characters (but not /)
     for pos in start_pos..=text_len {
-        if match_tokens_at(remaining_tokens, text, pos) {
+        if match_tokens_with_chars(remaining_tokens, text_chars, pos) {
             return true;
         }
 

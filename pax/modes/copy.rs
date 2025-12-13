@@ -51,9 +51,6 @@ pub struct CopyOptions {
     pub one_file_system: bool,
     /// Interactive rename mode
     pub interactive: bool,
-    /// Reset access time after reading files
-    #[allow(dead_code)]
-    pub reset_atime: bool,
     /// Update mode - only copy if source is newer than destination
     pub update: bool,
     /// Path substitutions (-s option)

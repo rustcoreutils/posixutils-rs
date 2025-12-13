@@ -9,7 +9,9 @@
 
 //! FIRST and FOLLOW set computation for grammar analysis
 
-use crate::grammar::{Grammar, SymbolId, EOF_SYMBOL};
+#[cfg(test)]
+use crate::grammar::EOF_SYMBOL;
+use crate::grammar::{Grammar, SymbolId};
 use std::collections::{HashMap, HashSet};
 
 /// FIRST and FOLLOW sets for a grammar
@@ -17,39 +19,14 @@ use std::collections::{HashMap, HashSet};
 pub struct FirstFollow {
     /// FIRST sets for each symbol
     pub first: HashMap<SymbolId, HashSet<SymbolId>>,
-    /// FOLLOW sets for each non-terminal
-    #[allow(dead_code)]
+    /// FOLLOW sets for each non-terminal (only used in tests)
+    #[cfg(test)]
     pub follow: HashMap<SymbolId, HashSet<SymbolId>>,
     /// Nullable symbols
     pub nullable: HashSet<SymbolId>,
 }
 
 impl FirstFollow {
-    /// Compute FIRST set for a sequence of symbols
-    #[allow(dead_code)]
-    pub fn first_of_sequence(&self, symbols: &[SymbolId], grammar: &Grammar) -> HashSet<SymbolId> {
-        let mut result = HashSet::new();
-
-        for &sym in symbols {
-            // Add FIRST(sym) - {epsilon}
-            if let Some(first_sym) = self.first.get(&sym) {
-                for &f in first_sym {
-                    result.insert(f);
-                }
-            } else if grammar.is_terminal(sym) {
-                result.insert(sym);
-            }
-
-            // If sym is not nullable, stop
-            if !self.nullable.contains(&sym) {
-                return result;
-            }
-        }
-
-        // If we get here, all symbols were nullable
-        result
-    }
-
     /// Compute FIRST set for a sequence of symbols, plus a lookahead
     pub fn first_of_sequence_with_lookahead(
         &self,
@@ -77,22 +54,18 @@ impl FirstFollow {
         result.insert(lookahead);
         result
     }
-
-    /// Check if a sequence of symbols is nullable
-    #[allow(dead_code)]
-    pub fn is_sequence_nullable(&self, symbols: &[SymbolId]) -> bool {
-        symbols.iter().all(|&s| self.nullable.contains(&s))
-    }
 }
 
 /// Compute FIRST and FOLLOW sets for a grammar
 pub fn compute(grammar: &Grammar) -> FirstFollow {
     let nullable = compute_nullable(grammar);
     let first = compute_first(grammar, &nullable);
+    #[cfg(test)]
     let follow = compute_follow(grammar, &nullable, &first);
 
     FirstFollow {
         first,
+        #[cfg(test)]
         follow,
         nullable,
     }
@@ -172,6 +145,7 @@ fn compute_first(
 }
 
 /// Compute FOLLOW sets for all non-terminals
+#[cfg(test)]
 fn compute_follow(
     grammar: &Grammar,
     nullable: &HashSet<SymbolId>,

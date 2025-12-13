@@ -923,18 +923,6 @@ impl TypeTable {
         }
     }
 
-    /// Get the complex version of a float type
-    #[inline]
-    #[allow(dead_code)]
-    pub fn complex_of(&self, id: TypeId) -> TypeId {
-        match self.get(id).kind {
-            TypeKind::Float => self.complex_float_id,
-            TypeKind::Double => self.complex_double_id,
-            TypeKind::LongDouble => self.complex_longdouble_id,
-            _ => id,
-        }
-    }
-
     /// Check if type is an arithmetic type (integer, float, or complex)
     #[inline]
     pub fn is_arithmetic(&self, id: TypeId) -> bool {

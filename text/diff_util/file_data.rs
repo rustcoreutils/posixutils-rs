@@ -1,13 +1,46 @@
-use std::{fs::File, io, mem::take, path::PathBuf, str::from_utf8, time::SystemTime};
+use std::{
+    collections::hash_map::DefaultHasher,
+    fs::File,
+    hash::{Hash, Hasher},
+    io,
+    mem::take,
+    path::PathBuf,
+    str::from_utf8,
+    time::SystemTime,
+};
 
 use super::constants::COULD_NOT_UNWRAP_FILENAME;
+
+/// Normalize whitespace for -b comparison:
+/// - Collapse runs of whitespace to single space
+/// - Trim trailing whitespace
+fn normalize_whitespace(line: &str) -> String {
+    let mut result = String::with_capacity(line.len());
+    let mut prev_was_space = false;
+    for c in line.chars() {
+        if c.is_whitespace() {
+            if !prev_was_space {
+                result.push(' ');
+                prev_was_space = true;
+            }
+        } else {
+            result.push(c);
+            prev_was_space = false;
+        }
+    }
+    // Trim trailing whitespace
+    result.truncate(result.trim_end().len());
+    result
+}
 
 #[derive(Debug)]
 pub struct FileData<'a> {
     path: PathBuf,
     lines: Vec<&'a str>,
+    hashes: Vec<u64>, // Pre-computed line hashes for O(1) comparison
     modified: SystemTime,
     ends_with_newline: bool,
+    normalize_ws: bool, // Whether whitespace normalization is enabled (-b flag)
 }
 
 impl<'a> FileData<'a> {
@@ -19,16 +52,46 @@ impl<'a> FileData<'a> {
         path: PathBuf,
         lines: Vec<&'a str>,
         ends_with_newline: bool,
+        normalize_ws: bool,
     ) -> io::Result<Self> {
         let file = File::open(&path)?;
         let modified = file.metadata()?.modified()?;
 
+        // Pre-compute hashes for O(1) line comparison
+        // If normalize_ws is set (-b flag), hash normalized lines for comparison
+        // but store original lines for output
+        let hashes: Vec<u64> = lines
+            .iter()
+            .map(|line| {
+                let mut hasher = DefaultHasher::new();
+                if normalize_ws {
+                    normalize_whitespace(line).hash(&mut hasher);
+                } else {
+                    line.hash(&mut hasher);
+                }
+                hasher.finish()
+            })
+            .collect();
+
         Ok(Self {
             path,
             lines,
+            hashes,
             modified,
             ends_with_newline,
+            normalize_ws,
         })
+    }
+
+    /// Compare lines with normalization if enabled
+    pub fn lines_equal(&self, my_index: usize, other: &FileData, other_index: usize) -> bool {
+        if self.normalize_ws {
+            // When -b is set, compare normalized lines
+            normalize_whitespace(self.lines[my_index])
+                == normalize_whitespace(other.lines[other_index])
+        } else {
+            self.lines[my_index] == other.lines[other_index]
+        }
     }
 
     pub fn lines(&self) -> &Vec<&str> {
@@ -37,6 +100,10 @@ impl<'a> FileData<'a> {
 
     pub fn line(&self, index: usize) -> &str {
         self.lines[index]
+    }
+
+    pub fn line_hash(&self, index: usize) -> u64 {
+        self.hashes[index]
     }
 
     pub fn modified(&self) -> SystemTime {

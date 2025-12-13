@@ -9,8 +9,18 @@ use std::{
 use super::constants::UTF8_NOT_ALLOWED_BYTES;
 use crate::diff_util::constants::COULD_NOT_UNWRAP_FILENAME;
 
-pub fn system_time_to_rfc2822(system_time: SystemTime) -> String {
-    Into::<DateTime<Local>>::into(system_time).to_rfc2822()
+/// POSIX context diff timestamp format: "%a %b %e %T %Y"
+/// Example: "Sat Dec 13 10:26:40 2025"
+pub fn system_time_to_context_format(system_time: SystemTime) -> String {
+    let dt: DateTime<Local> = system_time.into();
+    dt.format("%a %b %e %T %Y").to_string()
+}
+
+/// POSIX unified diff timestamp format: "%Y-%m-%d %H:%M:%S"
+/// Example: "2025-12-13 10:26:40"
+pub fn system_time_to_unified_format(system_time: SystemTime) -> String {
+    let dt: DateTime<Local> = system_time.into();
+    dt.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 pub fn is_binary(file_path: &PathBuf) -> io::Result<bool> {

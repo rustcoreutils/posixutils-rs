@@ -1713,6 +1713,7 @@ version = "0.7.0"
 dependencies = [
  "chrono",
  "clap",
+ "errno",
  "gettext-rs",
  "libc",
  "plib",

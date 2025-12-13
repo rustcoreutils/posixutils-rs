@@ -17,6 +17,17 @@ use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleC
 use libc::{msgctl, msgget, msqid_ds};
 use libc::{semctl, semget, shmctl, shmget, shmid_ds};
 
+/// Parse an IPC key value that may be decimal or hexadecimal (0x prefix)
+fn parse_ipc_key(s: &str) -> Result<i32, String> {
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u32::from_str_radix(hex, 16)
+            .map(|v| v as i32)
+            .map_err(|e| format!("invalid hex key: {}", e))
+    } else {
+        s.parse::<i32>().map_err(|e| format!("invalid key: {}", e))
+    }
+}
+
 #[derive(Parser)]
 #[command(
     version,
@@ -33,6 +44,7 @@ struct Args {
     #[arg(
         short = 'S',
         action = clap::ArgAction::Append,
+        value_parser = parse_ipc_key,
         help = gettext("Remove the semaphore identifier, created with key semkey, from the system")
     )]
     semkey: Vec<i32>,
@@ -47,11 +59,11 @@ struct Args {
     #[arg(
         short = 'M',
         action = clap::ArgAction::Append,
+        value_parser = parse_ipc_key,
         help = gettext("Remove the shared memory identifier, created with key shmkey, from the system")
     )]
     shmkey: Vec<i32>,
 
-    #[cfg(not(target_os = "macos"))]
     #[arg(
         short = 'q',
         action = clap::ArgAction::Append,
@@ -59,10 +71,10 @@ struct Args {
     )]
     msgid: Vec<i32>,
 
-    #[cfg(not(target_os = "macos"))]
     #[arg(
         short = 'Q',
         action = clap::ArgAction::Append,
+        value_parser = parse_ipc_key,
         help = gettext("Remove the message queue identifier, created with key msgkey, from the system")
     )]
     msgkey: Vec<i32>,
@@ -231,7 +243,7 @@ fn remove_ipcs(args: &Args) -> i32 {
         }
     }
 
-    // Remove message queues (Linux only)
+    // Remove message queues (Linux only - macOS doesn't support SysV message queues)
     #[cfg(not(target_os = "macos"))]
     {
         // Remove message queues by key
@@ -261,6 +273,29 @@ fn remove_ipcs(args: &Args) -> i32 {
                 eprintln!("ipcrm: {}: {}: {}", gettext("message queue id"), msgid, e);
                 exit_code = 1;
             }
+        }
+    }
+
+    // macOS doesn't support SysV message queues - report error if options used
+    #[cfg(target_os = "macos")]
+    {
+        for msgkey in &args.msgkey {
+            eprintln!(
+                "ipcrm: {}: 0x{:x}: {}",
+                gettext("message queue key"),
+                *msgkey,
+                gettext("message queues not supported on this system")
+            );
+            exit_code = 1;
+        }
+        for msgid in &args.msgid {
+            eprintln!(
+                "ipcrm: {}: {}: {}",
+                gettext("message queue id"),
+                msgid,
+                gettext("message queues not supported on this system")
+            );
+            exit_code = 1;
         }
     }
 

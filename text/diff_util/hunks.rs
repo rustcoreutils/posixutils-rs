@@ -113,40 +113,6 @@ impl Hunk {
         }
     }
 
-    pub fn print_debug(&mut self, file1: &FileData, file2: &FileData) {
-        println!(
-            "{}-{} ({}) <> {}-{} ({})",
-            self.ln1_start,
-            self.ln1_end,
-            self.f1_range(false),
-            self.ln2_start,
-            self.ln2_end,
-            self.f2_range(false)
-        );
-
-        match &self.kind {
-            Change::None => {}
-            Change::Insert => {
-                for i in self.ln2_start..self.ln2_end {
-                    println!("+ \"{}\"", file2.line(i));
-                }
-            }
-            Change::Delete => {
-                for i in self.ln1_start..self.ln1_end {
-                    println!("- \"{}\"", file1.line(i));
-                }
-            }
-            Change::Substitute => {
-                for i in self.ln1_start..self.ln1_end {
-                    println!("- \"{}\"", file1.line(i));
-                }
-                for i in self.ln2_start..self.ln2_end {
-                    println!("+ \"{}\"", file2.line(i));
-                }
-            }
-        }
-    }
-
     pub fn print_edit_script(&mut self, file1: &FileData, file2: &FileData, is_last: bool) {
         match &self.kind {
             Change::None => {}
@@ -167,6 +133,47 @@ impl Hunk {
                     println!("{}", file2.line(i));
                 }
 
+                println!(".")
+            }
+        }
+
+        if is_last && !file1.ends_with_newline() {
+            println!(
+                "diff: {}:{}\n",
+                file1.name(),
+                &NO_NEW_LINE_AT_END_OF_FILE[1..]
+            );
+        }
+
+        if is_last && !file2.ends_with_newline() {
+            println!(
+                "diff: {}:{}\n",
+                file2.name(),
+                &NO_NEW_LINE_AT_END_OF_FILE[1..]
+            );
+        }
+    }
+
+    /// Print forward edit script format (-f flag)
+    /// POSIX: command letter comes BEFORE line number (e.g., "c2" not "2c")
+    pub fn print_forward_edit_script(&mut self, file1: &FileData, file2: &FileData, is_last: bool) {
+        match &self.kind {
+            Change::None => {}
+            Change::Insert => {
+                println!("a{}", self.ln1_end);
+                for i in self.ln2_start..self.ln2_end {
+                    println!("{}", file2.line(i));
+                }
+                println!(".")
+            }
+            Change::Delete => {
+                println!("d{}", self.f1_range(true));
+            }
+            Change::Substitute => {
+                println!("c{}", self.f1_range(true));
+                for i in self.ln2_start..self.ln2_end {
+                    println!("{}", file2.line(i));
+                }
                 println!(".")
             }
         }
@@ -260,8 +267,10 @@ impl Hunks {
             self.add_hunk(hunk_start1, hunk_end1, hunk_start2, hunk_end2);
         } else if lcs_indices[lcs_indices.len() - 1] < ((num_lines2 - 1) as i32) {
             // there might be some insertions after the last lcs block
-            hunk_start1 = num_lines1 - 1;
-            hunk_end1 = num_lines1 - 1;
+            // For Insert, ln1_start represents the 1-indexed line after which to insert
+            // For trailing insertion, this should be num_lines1 (after the last line)
+            hunk_start1 = num_lines1;
+            hunk_end1 = num_lines1;
             hunk_start2 = (lcs_indices[lcs_indices.len() - 1] + 1) as usize;
             hunk_end2 = num_lines2;
             self.add_hunk(hunk_start1, hunk_end1, hunk_start2, hunk_end2);

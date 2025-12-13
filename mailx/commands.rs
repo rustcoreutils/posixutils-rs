@@ -8,21 +8,9 @@ use std::process::Command;
 use crate::escapes::handle_escape;
 use crate::mailbox::Mailbox;
 use crate::message::{extract_login, MessageState};
-#[allow(unused_imports)]
-use crate::msglist::{parse_message, parse_msglist, parse_msglist_allnet};
+use crate::msglist::{parse_message, parse_msglist};
 use crate::send::{compose_reply, send_message, ComposedMessage};
 use crate::variables::{parse_set_arg, Variables};
-
-/// Parse a message list, using allnet setting from vars
-#[allow(dead_code)]
-fn msglist(
-    spec: &str,
-    mb: &Mailbox,
-    vars: &Variables,
-    for_undelete: bool,
-) -> Result<Vec<usize>, String> {
-    parse_msglist_allnet(spec, mb, for_undelete, vars.get_bool("allnet"))
-}
 
 /// Result of executing a command
 pub enum CommandResult {

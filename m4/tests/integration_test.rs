@@ -10,6 +10,9 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::ExitStatus;
+use std::sync::Once;
+
+static BUILD_ONCE: Once = Once::new();
 
 fn init() {
     let _ = env_logger::builder()
@@ -71,10 +74,14 @@ fn run_command(input: &Path) -> std::process::Output {
         }
         b"args" => {
             let args = input_string;
-            let _cargo_build_output = std::process::Command::new("cargo")
-                .arg("build")
-                .output()
-                .unwrap();
+            // Use Once to ensure cargo build runs only once, avoiding race conditions
+            // when multiple .args tests run in parallel
+            BUILD_ONCE.call_once(|| {
+                let _cargo_build_output = std::process::Command::new("cargo")
+                    .arg("build")
+                    .output()
+                    .unwrap();
+            });
 
             log::info!("RUST_LOG is ignored for this test because it interferes with output");
             let output = std::process::Command::new("sh")

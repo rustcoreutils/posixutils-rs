@@ -8,9 +8,9 @@
 //
 // TODO:
 // - implement -f option (requires updates to utmpx module)
-// - implement -T, -u options
 //
 
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -82,47 +82,130 @@ struct Args {
     file: Option<PathBuf>,
 }
 
-// convert timestamp into POSIX-specified strftime format
+// convert timestamp into POSIX-specified strftime format (local time)
 fn fmt_timestamp(ts: libc::time_t) -> String {
-    let dt = chrono::DateTime::from_timestamp(ts, 0).unwrap();
+    use chrono::{Local, TimeZone};
+    let dt = Local
+        .timestamp_opt(ts, 0)
+        .single()
+        .unwrap_or_else(Local::now);
     dt.format("%b %e %H:%M").to_string()
 }
 
-fn print_fmt_short(entry: &Utmpx, line: &str) {
-    println!(
-        "{:<16} {:<12} {}",
-        entry.user,
-        line,
-        fmt_timestamp(entry.timestamp)
-    );
-}
-
-fn print_fmt_term(entry: &Utmpx, line: &str) {
-    let term_state = '?';
-    println!(
-        "{:<16} {} {:<12} {}",
-        entry.user,
-        term_state,
-        line,
-        fmt_timestamp(entry.timestamp)
-    );
-}
-
-fn current_terminal() -> String {
-    let s = curuser::tty();
-    if let Some(st) = s.strip_prefix("/dev/") {
-        st.to_owned()
-    } else {
-        s
+// Get terminal state for -T option: + (write allowed), - (write denied), ? (unknown)
+fn get_terminal_state(line: &str) -> char {
+    if line == "system boot" {
+        return ' ';
     }
+    let path = format!("/dev/{}", line);
+    match std::fs::metadata(&path) {
+        Ok(meta) => {
+            let mode = meta.mode();
+            // Check group write permission (o+w would be 0o002, g+w is 0o020)
+            if mode & 0o020 != 0 {
+                '+'
+            } else {
+                '-'
+            }
+        }
+        Err(_) => '?',
+    }
+}
+
+// Get idle time for -u option
+fn get_idle_time(line: &str) -> String {
+    if line == "system boot" {
+        return "   .".to_string();
+    }
+    let path = format!("/dev/{}", line);
+    match std::fs::metadata(&path) {
+        Ok(meta) => {
+            let atime = meta.atime();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            let idle_secs = now - atime;
+            if idle_secs < 60 {
+                "   .".to_string() // Active in last minute
+            } else if idle_secs > 24 * 60 * 60 {
+                " old".to_string()
+            } else {
+                let hours = idle_secs / 3600;
+                let mins = (idle_secs % 3600) / 60;
+                format!("{:02}:{:02}", hours, mins)
+            }
+        }
+        Err(_) => "   ?".to_string(),
+    }
+}
+
+fn print_fmt_short(args: &Args, entry: &Utmpx, line: &str) {
+    if args.idle_time {
+        println!(
+            "{:<16} {:<12} {} {} {:>5}",
+            entry.user,
+            line,
+            fmt_timestamp(entry.timestamp),
+            get_idle_time(line),
+            entry.pid
+        );
+    } else {
+        println!(
+            "{:<16} {:<12} {}",
+            entry.user,
+            line,
+            fmt_timestamp(entry.timestamp)
+        );
+    }
+}
+
+fn print_fmt_term(args: &Args, entry: &Utmpx, line: &str) {
+    let term_state = get_terminal_state(line);
+    if args.idle_time {
+        println!(
+            "{:<16} {} {:<12} {} {} {:>5}",
+            entry.user,
+            term_state,
+            line,
+            fmt_timestamp(entry.timestamp),
+            get_idle_time(line),
+            entry.pid
+        );
+    } else {
+        println!(
+            "{:<16} {} {:<12} {}",
+            entry.user,
+            term_state,
+            line,
+            fmt_timestamp(entry.timestamp)
+        );
+    }
+}
+
+fn current_terminal() -> Option<String> {
+    curuser::tty().map(|s| {
+        if let Some(st) = s.strip_prefix("/dev/") {
+            st.to_owned()
+        } else {
+            s
+        }
+    })
 }
 
 fn print_entry(args: &Args, entry: &Utmpx) {
     // Skip if current_terminal option is set and this entry is not for the current terminal
     if args.current_terminal {
-        let current_tty = current_terminal();
-        if entry.line != current_tty {
-            return;
+        match current_terminal() {
+            Some(current_tty) => {
+                if entry.line != current_tty {
+                    return;
+                }
+            }
+            None => {
+                // No tty available, skip all entries for -m
+                return;
+            }
         }
     }
 
@@ -146,10 +229,10 @@ fn print_entry(args: &Args, entry: &Utmpx) {
         _ => entry.line.as_str(),
     };
 
-    if args.short_format {
-        print_fmt_short(entry, line);
+    if args.terminals {
+        print_fmt_term(args, entry, line);
     } else {
-        print_fmt_term(entry, line);
+        print_fmt_short(args, entry, line);
     }
 }
 
@@ -157,7 +240,7 @@ fn show_utmpx_entries(args: &Args) {
     if args.heading {
         println!(
             "{:<16} {:<12} {}",
-            gettext("USER"),
+            gettext("NAME"),
             gettext("LINE"),
             gettext("TIME")
         );
@@ -170,16 +253,16 @@ fn show_utmpx_entries(args: &Args) {
 }
 
 fn show_utmpx_summary() {
-    let mut count = 0;
     let entries = utmpx::load();
-    for entry in &entries {
-        if !entry.user.is_empty() {
-            println!("{}", entry.user);
-            count += 1;
-        }
-    }
+    let users: Vec<&str> = entries
+        .iter()
+        .filter(|e| !e.user.is_empty() && e.typ == platform::USER_PROCESS)
+        .map(|e| e.user.as_str())
+        .collect();
 
-    println!("# users = {}", count);
+    // Print users horizontally, space-separated (POSIX format)
+    println!("{}", users.join(" "));
+    println!("# users={}", users.len());
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

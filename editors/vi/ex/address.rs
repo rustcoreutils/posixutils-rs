@@ -4,9 +4,10 @@
 
 use crate::buffer::Buffer;
 use crate::error::{Result, ViError};
+use regex::Regex;
 
 /// An ex command address.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Address {
     /// Current line (.).
     Current,
@@ -15,13 +16,35 @@ pub enum Address {
     /// Absolute line number.
     Line(usize),
     /// Pattern search forward (/pattern/).
-    SearchForward(String),
+    SearchForward { pattern: String, regex: Regex },
     /// Pattern search backward (?pattern?).
-    SearchBackward(String),
+    SearchBackward { pattern: String, regex: Regex },
     /// Previous context (').
     Mark(char),
     /// Relative offset from current address (+n or -n).
     Relative(i32),
+}
+
+// Custom PartialEq that ignores regex (compares only pattern strings)
+impl PartialEq for Address {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Address::Current, Address::Current) => true,
+            (Address::Last, Address::Last) => true,
+            (Address::Line(a), Address::Line(b)) => a == b,
+            (
+                Address::SearchForward { pattern: a, .. },
+                Address::SearchForward { pattern: b, .. },
+            ) => a == b,
+            (
+                Address::SearchBackward { pattern: a, .. },
+                Address::SearchBackward { pattern: b, .. },
+            ) => a == b,
+            (Address::Mark(a), Address::Mark(b)) => a == b,
+            (Address::Relative(a), Address::Relative(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 impl Address {
@@ -37,12 +60,11 @@ impl Address {
                     Ok(*n)
                 }
             }
-            Address::SearchForward(pattern) => {
-                // Search forward for pattern
-                let re = regex::Regex::new(pattern)?;
+            Address::SearchForward { pattern, regex } => {
+                // Search forward for pattern (using pre-compiled regex)
                 for line_num in (current + 1)..=buffer.line_count() {
                     if let Some(line) = buffer.line(line_num) {
-                        if re.is_match(line.content()) {
+                        if regex.is_match(line.content()) {
                             return Ok(line_num);
                         }
                     }
@@ -50,19 +72,18 @@ impl Address {
                 // Wrap around
                 for line_num in 1..current {
                     if let Some(line) = buffer.line(line_num) {
-                        if re.is_match(line.content()) {
+                        if regex.is_match(line.content()) {
                             return Ok(line_num);
                         }
                     }
                 }
                 Err(ViError::PatternNotFound(pattern.clone()))
             }
-            Address::SearchBackward(pattern) => {
-                // Search backward for pattern
-                let re = regex::Regex::new(pattern)?;
+            Address::SearchBackward { pattern, regex } => {
+                // Search backward for pattern (using pre-compiled regex)
                 for line_num in (1..current).rev() {
                     if let Some(line) = buffer.line(line_num) {
-                        if re.is_match(line.content()) {
+                        if regex.is_match(line.content()) {
                             return Ok(line_num);
                         }
                     }
@@ -70,7 +91,7 @@ impl Address {
                 // Wrap around
                 for line_num in (current + 1..=buffer.line_count()).rev() {
                     if let Some(line) = buffer.line(line_num) {
-                        if re.is_match(line.content()) {
+                        if regex.is_match(line.content()) {
                             return Ok(line_num);
                         }
                     }
@@ -190,13 +211,18 @@ pub fn parse_address(input: &str) -> Option<(Address, &str)> {
             // Forward search
             let end = input[1..].find('/')?;
             let pattern = input[1..end + 1].to_string();
-            Some((Address::SearchForward(pattern), &input[end + 2..]))
+            let regex = Regex::new(&pattern).ok()?;
+            Some((Address::SearchForward { pattern, regex }, &input[end + 2..]))
         }
         '?' => {
             // Backward search
             let end = input[1..].find('?')?;
             let pattern = input[1..end + 1].to_string();
-            Some((Address::SearchBackward(pattern), &input[end + 2..]))
+            let regex = Regex::new(&pattern).ok()?;
+            Some((
+                Address::SearchBackward { pattern, regex },
+                &input[end + 2..],
+            ))
         }
         '\'' => {
             // Mark

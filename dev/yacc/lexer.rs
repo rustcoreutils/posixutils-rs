@@ -63,8 +63,6 @@ pub enum Token {
 pub struct PositionedToken {
     pub token: Token,
     pub line: usize,
-    #[allow(dead_code)]
-    pub column: usize,
 }
 
 /// Lexer state
@@ -467,7 +465,6 @@ impl<'a> Lexer<'a> {
         self.skip_whitespace_and_comments();
 
         let line = self.line;
-        let column = self.column;
 
         let c = match self.peek() {
             Some(c) => c,
@@ -511,7 +508,7 @@ impl<'a> Lexer<'a> {
                             _ => {
                                 return Err(YaccError::Lexical {
                                     line,
-                                    column,
+                                    column: self.column,
                                     msg: format!("unknown directive: %{}", word),
                                 })
                             }
@@ -520,7 +517,7 @@ impl<'a> Lexer<'a> {
                     _ => {
                         return Err(YaccError::Lexical {
                             line,
-                            column,
+                            column: self.column,
                             msg: "invalid character after '%'".into(),
                         })
                     }
@@ -576,17 +573,13 @@ impl<'a> Lexer<'a> {
             _ => {
                 return Err(YaccError::Lexical {
                     line,
-                    column,
+                    column: self.column,
                     msg: format!("unexpected character: '{}'", c),
                 })
             }
         };
 
-        Ok(Some(PositionedToken {
-            token,
-            line,
-            column,
-        }))
+        Ok(Some(PositionedToken { token, line }))
     }
 }
 

@@ -37,17 +37,6 @@ impl Item {
         prod.rhs.get(self.dot).copied()
     }
 
-    /// Get the symbols after the dot (beta)
-    #[allow(dead_code)]
-    pub fn symbols_after_dot<'a>(&self, grammar: &'a Grammar) -> &'a [SymbolId] {
-        let prod = &grammar.productions[self.production];
-        if self.dot < prod.rhs.len() {
-            &prod.rhs[self.dot..]
-        } else {
-            &[]
-        }
-    }
-
     /// Advance the dot by one position
     pub fn advance(&self) -> Self {
         Item {
@@ -83,22 +72,10 @@ pub struct LR0Automaton {
 }
 
 impl LR0Automaton {
-    /// Get the initial state
-    #[allow(dead_code)]
-    pub fn initial_state(&self) -> StateId {
-        0
-    }
-
     /// Get a state by ID
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn state(&self, id: StateId) -> &State {
         &self.states[id]
-    }
-
-    /// Get transition from a state on a symbol
-    #[allow(dead_code)]
-    pub fn goto(&self, state: StateId, symbol: SymbolId) -> Option<StateId> {
-        self.states[state].transitions.get(&symbol).copied()
     }
 }
 

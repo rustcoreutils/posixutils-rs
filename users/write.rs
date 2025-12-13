@@ -227,7 +227,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let sender_login_id = curuser::login_name();
-    let sending_terminal = curuser::tty();
+    let sending_terminal = curuser::tty().unwrap_or_else(|| "???".to_string());
     let date = get_current_date();
 
     let message = format!(

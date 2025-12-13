@@ -58,14 +58,8 @@ pub struct Production {
     pub action: Option<String>,
     /// Precedence of this rule
     pub precedence: usize,
-    /// Associativity of this rule
-    #[allow(dead_code)]
-    pub associativity: Option<Associativity>,
     /// Line number in source file
     pub line: usize,
-    /// Mid-rule action positions (position in rhs, action code)
-    #[allow(dead_code)]
-    pub mid_actions: Vec<(usize, String)>,
 }
 
 /// The complete grammar
@@ -235,9 +229,7 @@ impl Grammar {
             rhs: vec![grammar.start_symbol, EOF_SYMBOL],
             action: None,
             precedence: 0,
-            associativity: None,
             line: 0,
-            mid_actions: Vec::new(),
         };
         let prod_id = grammar.productions.len();
         grammar.productions.push(augmented_prod);
@@ -332,6 +324,18 @@ impl Grammar {
             return Ok(id);
         }
 
+        // POSIX: "Conforming applications shall not use names beginning in yy or YY"
+        // We warn (not error) since it's the application's responsibility
+        if !name.starts_with('@') && !name.starts_with('\'') {
+            // Skip internal symbols like @1 (mid-rule actions) and 'c' (char literals)
+            if name.starts_with("yy") || name.starts_with("YY") {
+                eprintln!(
+                    "warning: symbol '{}' begins with 'yy' or 'YY' which is reserved",
+                    name
+                );
+            }
+        }
+
         // New symbol - check for duplicate token number
         if let Some(num) = token_number {
             if let Some(existing_name) = self.token_number_map.get(&num) {
@@ -363,9 +367,7 @@ impl Grammar {
             .ok_or_else(|| YaccError::Grammar(format!("undefined non-terminal: {}", rule.lhs)))?;
 
         let mut rhs = Vec::new();
-        let mut mid_actions = Vec::new();
         let mut last_terminal_prec = 0;
-        let mut last_terminal_assoc = None;
 
         for elem in &rule.rhs {
             match elem {
@@ -378,7 +380,6 @@ impl Grammar {
                         let sym_info = &self.symbols[sym_id];
                         if sym_info.precedence > 0 {
                             last_terminal_prec = sym_info.precedence;
-                            last_terminal_assoc = sym_info.associativity;
                         }
                     }
                 }
@@ -395,9 +396,7 @@ impl Grammar {
                         rhs: Vec::new(),
                         action: Some(code.clone()),
                         precedence: 0,
-                        associativity: None,
                         line: rule.line,
-                        mid_actions: Vec::new(),
                     };
                     let prod_id = self.productions.len();
                     self.productions.push(mid_prod);
@@ -406,18 +405,16 @@ impl Grammar {
                         .or_default()
                         .push(prod_id);
 
-                    // Add reference to mid-rule non-terminal
-                    mid_actions.push((rhs.len(), code.clone()));
                     rhs.push(mid_id);
                 }
             }
         }
 
         // Determine rule precedence
-        let (precedence, associativity) = if let Some(ref prec_name) = rule.prec {
+        let precedence = if let Some(ref prec_name) = rule.prec {
             // Explicit %prec
             if let Some(&id) = self.symbol_map.get(prec_name) {
-                (self.symbols[id].precedence, self.symbols[id].associativity)
+                self.symbols[id].precedence
             } else {
                 return Err(YaccError::Grammar(format!(
                     "undefined token in %prec: {}",
@@ -426,7 +423,7 @@ impl Grammar {
             }
         } else {
             // Default: precedence of rightmost terminal
-            (last_terminal_prec, last_terminal_assoc)
+            last_terminal_prec
         };
 
         let prod = Production {
@@ -435,9 +432,7 @@ impl Grammar {
             rhs,
             action: rule.action.clone(),
             precedence,
-            associativity,
             line: rule.line,
-            mid_actions,
         };
 
         let prod_id = self.productions.len();
@@ -480,16 +475,6 @@ impl Grammar {
         self.symbols[id].is_terminal
     }
 
-    /// Get all terminal symbol IDs
-    #[allow(dead_code)]
-    pub fn terminals(&self) -> impl Iterator<Item = SymbolId> + '_ {
-        self.symbols
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| s.is_terminal)
-            .map(|(i, _)| i)
-    }
-
     /// Get all non-terminal symbol IDs
     pub fn nonterminals(&self) -> impl Iterator<Item = SymbolId> + '_ {
         self.symbols
@@ -508,7 +493,7 @@ impl Grammar {
     }
 
     /// Get the augmented start production (should be the last one added)
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn augmented_production(&self) -> &Production {
         // Find production with lhs = AUGMENTED_START
         self.productions

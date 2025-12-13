@@ -65,18 +65,6 @@ impl<R: Read> BlockedReader<R> {
         }
     }
 
-    /// Create a new blocked reader with default record size (10240 bytes)
-    #[allow(dead_code)]
-    pub fn with_default_blocking(reader: R) -> Self {
-        Self::new(reader, DEFAULT_RECORD_SIZE)
-    }
-
-    /// Get the record size
-    #[allow(dead_code)]
-    pub fn record_size(&self) -> usize {
-        self.record_size
-    }
-
     /// Read the next record from the underlying reader
     ///
     /// For tape drives, this performs a single read() of exactly record_size bytes.
@@ -106,31 +94,6 @@ impl<R: Read> BlockedReader<R> {
         self.valid = n;
         self.pos = 0;
         Ok(n)
-    }
-
-    /// Try to detect the blocking factor by reading the first record
-    ///
-    /// This is useful when reading archives where the blocking factor is unknown.
-    /// Returns the detected record size, or the default if detection fails.
-    #[allow(dead_code)]
-    pub fn detect_blocking(reader: R) -> PaxResult<(Self, usize)> {
-        // Start with maximum possible record size
-        let mut r = Self::new(reader, MAX_RECORD_SIZE);
-        r.fill_buffer()?;
-
-        // For regular files, we got what we asked for
-        // For tape drives, we got exactly what was written
-        let detected_size = if r.valid > 0 && r.valid <= MAX_RECORD_SIZE {
-            // Round up to nearest block boundary
-            r.valid.div_ceil(TAR_BLOCK_SIZE) * TAR_BLOCK_SIZE
-        } else {
-            DEFAULT_RECORD_SIZE
-        };
-
-        // Adjust the record size for future reads
-        r.record_size = detected_size;
-
-        Ok((r, detected_size))
     }
 }
 
@@ -183,18 +146,6 @@ impl<W: Write> BlockedWriter<W> {
         }
     }
 
-    /// Create a new blocked writer with default record size (10240 bytes)
-    #[allow(dead_code)]
-    pub fn with_default_blocking(writer: W) -> Self {
-        Self::new(writer, DEFAULT_RECORD_SIZE)
-    }
-
-    /// Get the record size
-    #[allow(dead_code)]
-    pub fn record_size(&self) -> usize {
-        self.record_size
-    }
-
     /// Flush the current record to the underlying writer
     ///
     /// This writes exactly record_size bytes, zero-padding if necessary.
@@ -217,7 +168,7 @@ impl<W: Write> BlockedWriter<W> {
     ///
     /// This ensures the final record is written (with zero padding).
     /// Returns the underlying writer for further use.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn finish(mut self) -> std::io::Result<W> {
         self.flush_record()?;
         self.writer.flush()?;

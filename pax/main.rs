@@ -332,7 +332,6 @@ fn run_write(args: &Args) -> PaxResult<()> {
         one_file_system: args.one_file_system,
         interactive: args.interactive,
         reset_atime: args.reset_atime,
-        update: args.update,
         substitutions,
         format_options,
     };
@@ -428,7 +427,6 @@ fn run_append(args: &Args) -> PaxResult<()> {
         one_file_system: args.one_file_system,
         interactive: args.interactive,
         reset_atime: args.reset_atime,
-        update: args.update,
         substitutions,
         format_options,
     };
@@ -477,7 +475,6 @@ fn run_copy(args: &Args) -> PaxResult<()> {
         no_recurse: args.dir_no_follow,
         one_file_system: args.one_file_system,
         interactive: args.interactive,
-        reset_atime: args.reset_atime,
         update: args.update,
         substitutions,
     };

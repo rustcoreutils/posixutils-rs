@@ -14,7 +14,22 @@ use std::{
     fs::File,
     io::{self, BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom},
     path::PathBuf,
+    sync::LazyLock,
 };
+
+// Pre-compiled static regexes for performance
+static OCTAL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\\([0-7]{1,3})").expect("invalid regex"));
+static COMP_OP_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[=<>&^x]").expect("invalid regex"));
+static HEX_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^0[xX]([0-9A-F]+)").expect("invalid regex"));
+static DEC_OCT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(0?[0-9]+)").expect("invalid regex"));
+static TYPE_SIZE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^([CSIL]|\d+)").expect("invalid regex"));
+static WHITESPACE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[ \t]+").expect("invalid regex"));
 
 #[cfg(target_os = "macos")]
 /// Default raw (text based) magic file
@@ -43,9 +58,6 @@ enum RawMagicLineParseError {
     /// Indicates that the type format is invalid.
     InvalidTypeFormat,
 
-    /// Indicates that a regular expression used for parsing is invalid.
-    InvalidRegex,
-
     /// Indicates that a the value field is invalid
     InvalidValue,
 }
@@ -60,7 +72,6 @@ impl fmt::Display for RawMagicLineParseError {
             match *self {
                 RawMagicLineParseError::InvalidOffsetFormat => "Invalid offset!",
                 RawMagicLineParseError::InvalidTypeFormat => "Invalid type!",
-                RawMagicLineParseError::InvalidRegex => "Invalid Regex!",
                 RawMagicLineParseError::InvalidValue => "Invalid value!",
             }
         )
@@ -135,10 +146,8 @@ impl Value {
     fn replace_all_octal_sequences_with_their_coded_values(
         input: &str,
     ) -> Result<String, RawMagicLineParseError> {
-        // replace octal sequences with specific coded values
-        let re = Regex::new(r"\\([0-7]{1,3})").map_err(|_| RawMagicLineParseError::InvalidRegex)?;
-
-        let result = re
+        // replace octal sequences with specific coded values (using pre-compiled regex)
+        let result = OCTAL_RE
             .replace_all(input, |capture: &regex::Captures| {
                 let mat = capture.get(1).unwrap().as_str();
 
@@ -151,8 +160,7 @@ impl Value {
     }
 
     fn parse_number(input: &mut String) -> Option<(ComparisonOperator, u64)> {
-        let regex = Regex::new(r"^[=<>&^x]").unwrap();
-        let comparision_op = match regex.find(input) {
+        let comparision_op = match COMP_OP_RE.find(input) {
             Some(mat) => {
                 let comp = mat.as_str().chars().next().unwrap();
                 input.replace_range(..1, ""); // Remove the matched operator
@@ -189,10 +197,8 @@ fn parse_number(input: &mut String) -> Option<u64> {
 }
 
 fn parse_hexadecimal(input: &mut String) -> Option<u64> {
-    let re = Regex::new(r"^0[xX]([0-9A-F]+)").ok()?;
-
     let _input = input.clone();
-    let captures = re.captures(&_input)?;
+    let captures = HEX_RE.captures(&_input)?;
     let expr_match = captures.get(0)?;
     let group_match = captures.get(1)?;
 
@@ -201,10 +207,8 @@ fn parse_hexadecimal(input: &mut String) -> Option<u64> {
 }
 
 fn parse_decimal_octal(input: &mut String) -> Option<u64> {
-    let re = Regex::new(r"^(0?[0-9]+)").ok()?;
-
     let _input = input.clone();
-    let captures = re.captures(&_input)?;
+    let captures = DEC_OCT_RE.captures(&_input)?;
     let expr_match = captures.get(0)?;
     let group_match = captures.get(1)?;
 
@@ -290,11 +294,8 @@ impl Type {
 
     /// Parses the number of bytes represented by the type.
     fn parse_no_of_bytes_represented(input: &mut String) -> Result<u64, RawMagicLineParseError> {
-        let re =
-            Regex::new(r"^([CSIL]|\d+)").map_err(|_| RawMagicLineParseError::InvalidTypeFormat)?;
-
         let _input = input.clone();
-        let captures = re
+        let captures = TYPE_SIZE_RE
             .captures(&_input)
             .ok_or(RawMagicLineParseError::InvalidTypeFormat)?;
 
@@ -386,8 +387,7 @@ impl RawMagicFileLine {
     }
 
     fn normalize_whitespace(input: String) -> Result<String, RawMagicLineParseError> {
-        let re = Regex::new(r"[ \t]+").map_err(|_| RawMagicLineParseError::InvalidRegex)?;
-        Ok(re.replacen(&input, 3, " ").to_string())
+        Ok(WHITESPACE_RE.replacen(&input, 3, " ").to_string())
     }
 
     fn test(&self, tf_reader: &mut BufReader<File>) -> Option<String> {

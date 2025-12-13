@@ -10,17 +10,6 @@ pub fn parse_msglist(spec: &str, mb: &Mailbox, for_undelete: bool) -> Result<Vec
     parse_msglist_with_opts(spec, mb, for_undelete, false)
 }
 
-/// Parse a message list with allnet option
-#[allow(dead_code)]
-pub fn parse_msglist_allnet(
-    spec: &str,
-    mb: &Mailbox,
-    for_undelete: bool,
-    allnet: bool,
-) -> Result<Vec<usize>, String> {
-    parse_msglist_with_opts(spec, mb, for_undelete, allnet)
-}
-
 fn parse_msglist_with_opts(
     spec: &str,
     mb: &Mailbox,

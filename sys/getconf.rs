@@ -56,27 +56,32 @@ fn handle_sysconf(
     var: &str,
     sysconf_mappings: &HashMap<&'static str, libc::c_int>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let value = match get_mapping("_SC_", var, sysconf_mappings) {
+    let sc_value = match get_mapping("_SC_", var, sysconf_mappings) {
         Some(value) => value,
         None => {
-            let errstr = format!(
-                "{}: {}",
-                gettext("Error: Unknown system configuration variable"),
-                var
-            );
-            return Err(Box::new(std::io::Error::other(errstr)));
+            eprintln!("getconf: {}: {}", gettext("unrecognized variable"), var);
+            std::process::exit(1);
         }
     };
 
+    // Clear errno before sysconf call
+    errno::set_errno(errno::Errno(0));
+
     // Get the value using sysconf
-    let value = unsafe { sysconf(value) };
+    let value = unsafe { sysconf(sc_value) };
+
     if value == -1 {
-        eprintln!(
-            "{}: {}",
-            gettext("Error: Unknown system configuration variable"),
-            var
-        );
-        std::process::exit(1);
+        // Check errno to distinguish "undefined" from error
+        let errno_val = errno::errno().0;
+        if errno_val == 0 {
+            // Variable is valid but undefined on this system
+            println!("undefined");
+        } else {
+            // Actual error occurred
+            let e = std::io::Error::from_raw_os_error(errno_val);
+            eprintln!("getconf: {}: {}", var, e);
+            std::process::exit(1);
+        }
     } else {
         println!("{}", value);
     }
@@ -86,12 +91,12 @@ fn handle_sysconf(
 
 #[cfg(target_os = "linux")]
 fn handle_confstr(
-    _var: &str,
+    var: &str,
     _confstr_mappings: &HashMap<&'static str, libc::c_int>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    Err(Box::new(std::io::Error::other(
-        "Not implemented (pls update libc crate)",
-    )))
+    // Linux libc crate doesn't expose confstr constants yet
+    eprintln!("getconf: {}: {}", gettext("unrecognized variable"), var);
+    std::process::exit(1);
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -99,46 +104,52 @@ fn handle_confstr(
     var: &str,
     confstr_mappings: &HashMap<&'static str, libc::c_int>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let value = match get_mapping("_CS_", var, confstr_mappings) {
+    let cs_value = match get_mapping("_CS_", var, confstr_mappings) {
         Some(value) => value,
         None => {
-            let errstr = format!(
-                "{}: {}",
-                gettext("Error: Unknown configuration string variable"),
-                var
-            );
-            return Err(Box::new(std::io::Error::other(errstr)));
+            eprintln!("getconf: {}: {}", gettext("unrecognized variable"), var);
+            std::process::exit(1);
         }
     };
 
-    // Get the value using confstr
-    let buflen = unsafe { libc::confstr(value, std::ptr::null_mut(), 0) };
+    // Clear errno before confstr call
+    errno::set_errno(errno::Errno(0));
+
+    // Get the required buffer length
+    let buflen = unsafe { libc::confstr(cs_value, std::ptr::null_mut(), 0) };
     if buflen == 0 {
-        eprintln!(
-            "{}: {}",
-            gettext("Error: Unknown configuration string variable"),
-            var
-        );
-        std::process::exit(1);
+        // Check errno to distinguish undefined from error
+        let errno_val = errno::errno().0;
+        if errno_val == 0 || errno_val == libc::EINVAL {
+            // Variable is valid but undefined on this system
+            println!("undefined");
+        } else {
+            let e = std::io::Error::from_raw_os_error(errno_val);
+            eprintln!("getconf: {}: {}", var, e);
+            std::process::exit(1);
+        }
+        return Ok(());
     }
 
     let mut buf = vec![0u8; buflen as usize];
-    let value = unsafe {
+    let result = unsafe {
         libc::confstr(
-            value,
+            cs_value,
             buf.as_mut_ptr() as *mut libc::c_char,
             buf.len() as libc::size_t,
         )
     };
-    if value == 0 {
-        eprintln!(
-            "{}: {}",
-            gettext("Error: Unknown configuration string variable"),
-            var
-        );
+    if result == 0 {
+        let errno_val = errno::errno().0;
+        let e = std::io::Error::from_raw_os_error(errno_val);
+        eprintln!("getconf: {}: {}", var, e);
         std::process::exit(1);
     } else {
-        let s = std::str::from_utf8(&buf).unwrap();
+        // Trim the null terminator and any trailing whitespace
+        let s = std::str::from_utf8(&buf)
+            .unwrap()
+            .trim_end_matches('\0')
+            .trim_end();
         println!("{}", s);
     }
 
@@ -150,28 +161,33 @@ fn handle_pathconf(
     pathname: &str,
     pathconf_mappings: &HashMap<&'static str, libc::c_int>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let value = match get_mapping("_PC_", var, pathconf_mappings) {
+    let pc_value = match get_mapping("_PC_", var, pathconf_mappings) {
         Some(value) => value,
         None => {
-            let errstr = format!(
-                "{}: {}",
-                gettext("Error: Unknown path configuration variable"),
-                var
-            );
-            return Err(Box::new(std::io::Error::other(errstr)));
+            eprintln!("getconf: {}: {}", gettext("unrecognized variable"), var);
+            std::process::exit(1);
         }
     };
 
+    // Clear errno before pathconf call
+    errno::set_errno(errno::Errno(0));
+
     // Get the value using pathconf
     let c_path = CString::new(pathname)?;
-    let value = unsafe { pathconf(c_path.as_ptr(), value) };
+    let value = unsafe { pathconf(c_path.as_ptr(), pc_value) };
+
     if value == -1 {
-        let errstr = format!(
-            "{}: {}",
-            gettext("Error: Unknown path configuration variable"),
-            var
-        );
-        return Err(Box::new(std::io::Error::other(errstr)));
+        // Check errno to distinguish "undefined" from error
+        let errno_val = errno::errno().0;
+        if errno_val == 0 {
+            // Variable is valid but undefined for this path
+            println!("undefined");
+        } else {
+            // Actual error occurred
+            let e = std::io::Error::from_raw_os_error(errno_val);
+            eprintln!("getconf: {}: {}", pathname, e);
+            std::process::exit(1);
+        }
     } else {
         println!("{}", value);
     }
@@ -182,11 +198,118 @@ fn handle_pathconf(
 fn load_confstr_mapping() -> HashMap<&'static str, libc::c_int> {
     #[cfg(target_os = "macos")]
     {
+        // POSIX_V6_* constants are defined in macOS headers but not in libc crate
+        const _CS_POSIX_V6_ILP32_OFF32_CFLAGS: libc::c_int = 2;
+        const _CS_POSIX_V6_ILP32_OFF32_LDFLAGS: libc::c_int = 3;
+        const _CS_POSIX_V6_ILP32_OFF32_LIBS: libc::c_int = 4;
+        const _CS_POSIX_V6_ILP32_OFFBIG_CFLAGS: libc::c_int = 5;
+        const _CS_POSIX_V6_ILP32_OFFBIG_LDFLAGS: libc::c_int = 6;
+        const _CS_POSIX_V6_ILP32_OFFBIG_LIBS: libc::c_int = 7;
+        const _CS_POSIX_V6_LP64_OFF64_CFLAGS: libc::c_int = 8;
+        const _CS_POSIX_V6_LP64_OFF64_LDFLAGS: libc::c_int = 9;
+        const _CS_POSIX_V6_LP64_OFF64_LIBS: libc::c_int = 10;
+        const _CS_POSIX_V6_LPBIG_OFFBIG_CFLAGS: libc::c_int = 11;
+        const _CS_POSIX_V6_LPBIG_OFFBIG_LDFLAGS: libc::c_int = 12;
+        const _CS_POSIX_V6_LPBIG_OFFBIG_LIBS: libc::c_int = 13;
+        const _CS_POSIX_V6_WIDTH_RESTRICTED_ENVS: libc::c_int = 14;
+
         HashMap::from([
             ("_CS_DARWIN_USER_DIR", libc::_CS_DARWIN_USER_DIR),
             ("_CS_DARWIN_USER_TEMP_DIR", libc::_CS_DARWIN_USER_TEMP_DIR),
             ("_CS_DARWIN_USER_CACHE_DIR", libc::_CS_DARWIN_USER_CACHE_DIR),
             ("_CS_PATH", libc::_CS_PATH),
+            // POSIX_V6 compilation environment strings
+            (
+                "_CS_POSIX_V6_ILP32_OFF32_CFLAGS",
+                _CS_POSIX_V6_ILP32_OFF32_CFLAGS,
+            ),
+            (
+                "_CS_POSIX_V6_ILP32_OFF32_LDFLAGS",
+                _CS_POSIX_V6_ILP32_OFF32_LDFLAGS,
+            ),
+            (
+                "_CS_POSIX_V6_ILP32_OFF32_LIBS",
+                _CS_POSIX_V6_ILP32_OFF32_LIBS,
+            ),
+            (
+                "_CS_POSIX_V6_ILP32_OFFBIG_CFLAGS",
+                _CS_POSIX_V6_ILP32_OFFBIG_CFLAGS,
+            ),
+            (
+                "_CS_POSIX_V6_ILP32_OFFBIG_LDFLAGS",
+                _CS_POSIX_V6_ILP32_OFFBIG_LDFLAGS,
+            ),
+            (
+                "_CS_POSIX_V6_ILP32_OFFBIG_LIBS",
+                _CS_POSIX_V6_ILP32_OFFBIG_LIBS,
+            ),
+            (
+                "_CS_POSIX_V6_LP64_OFF64_CFLAGS",
+                _CS_POSIX_V6_LP64_OFF64_CFLAGS,
+            ),
+            (
+                "_CS_POSIX_V6_LP64_OFF64_LDFLAGS",
+                _CS_POSIX_V6_LP64_OFF64_LDFLAGS,
+            ),
+            ("_CS_POSIX_V6_LP64_OFF64_LIBS", _CS_POSIX_V6_LP64_OFF64_LIBS),
+            (
+                "_CS_POSIX_V6_LPBIG_OFFBIG_CFLAGS",
+                _CS_POSIX_V6_LPBIG_OFFBIG_CFLAGS,
+            ),
+            (
+                "_CS_POSIX_V6_LPBIG_OFFBIG_LDFLAGS",
+                _CS_POSIX_V6_LPBIG_OFFBIG_LDFLAGS,
+            ),
+            (
+                "_CS_POSIX_V6_LPBIG_OFFBIG_LIBS",
+                _CS_POSIX_V6_LPBIG_OFFBIG_LIBS,
+            ),
+            (
+                "_CS_POSIX_V6_WIDTH_RESTRICTED_ENVS",
+                _CS_POSIX_V6_WIDTH_RESTRICTED_ENVS,
+            ),
+            // Aliases without _CS_ prefix (as POSIX requires)
+            ("PATH", libc::_CS_PATH),
+            ("DARWIN_USER_DIR", libc::_CS_DARWIN_USER_DIR),
+            ("DARWIN_USER_TEMP_DIR", libc::_CS_DARWIN_USER_TEMP_DIR),
+            ("DARWIN_USER_CACHE_DIR", libc::_CS_DARWIN_USER_CACHE_DIR),
+            (
+                "POSIX_V6_ILP32_OFF32_CFLAGS",
+                _CS_POSIX_V6_ILP32_OFF32_CFLAGS,
+            ),
+            (
+                "POSIX_V6_ILP32_OFF32_LDFLAGS",
+                _CS_POSIX_V6_ILP32_OFF32_LDFLAGS,
+            ),
+            ("POSIX_V6_ILP32_OFF32_LIBS", _CS_POSIX_V6_ILP32_OFF32_LIBS),
+            (
+                "POSIX_V6_ILP32_OFFBIG_CFLAGS",
+                _CS_POSIX_V6_ILP32_OFFBIG_CFLAGS,
+            ),
+            (
+                "POSIX_V6_ILP32_OFFBIG_LDFLAGS",
+                _CS_POSIX_V6_ILP32_OFFBIG_LDFLAGS,
+            ),
+            ("POSIX_V6_ILP32_OFFBIG_LIBS", _CS_POSIX_V6_ILP32_OFFBIG_LIBS),
+            ("POSIX_V6_LP64_OFF64_CFLAGS", _CS_POSIX_V6_LP64_OFF64_CFLAGS),
+            (
+                "POSIX_V6_LP64_OFF64_LDFLAGS",
+                _CS_POSIX_V6_LP64_OFF64_LDFLAGS,
+            ),
+            ("POSIX_V6_LP64_OFF64_LIBS", _CS_POSIX_V6_LP64_OFF64_LIBS),
+            (
+                "POSIX_V6_LPBIG_OFFBIG_CFLAGS",
+                _CS_POSIX_V6_LPBIG_OFFBIG_CFLAGS,
+            ),
+            (
+                "POSIX_V6_LPBIG_OFFBIG_LDFLAGS",
+                _CS_POSIX_V6_LPBIG_OFFBIG_LDFLAGS,
+            ),
+            ("POSIX_V6_LPBIG_OFFBIG_LIBS", _CS_POSIX_V6_LPBIG_OFFBIG_LIBS),
+            (
+                "POSIX_V6_WIDTH_RESTRICTED_ENVS",
+                _CS_POSIX_V6_WIDTH_RESTRICTED_ENVS,
+            ),
         ])
     }
 
@@ -195,18 +318,6 @@ fn load_confstr_mapping() -> HashMap<&'static str, libc::c_int> {
     {
         HashMap::new()
     }
-
-    //    #[cfg(target_os = "linux")]
-    //    {
-    //        HashMap::from([
-    //            ("_CS_GNU_LIBC_VERSION", libc::_CS_GNU_LIBC_VERSION),
-    //            (
-    //                "_CS_GNU_LIBPTHREAD_VERSION",
-    //                libc::_CS_GNU_LIBPTHREAD_VERSION,
-    //            ),
-    //            ("_CS_PATH", libc::_CS_PATH),
-    //        ])
-    //    }
 }
 
 fn is_confstr_var(var: &str, mapping: &HashMap<&'static str, libc::c_int>) -> bool {
@@ -232,6 +343,26 @@ fn load_sysconf_mapping() -> HashMap<&'static str, libc::c_int> {
         ("_SC_TZNAME_MAX", libc::_SC_TZNAME_MAX),
         ("_SC_JOB_CONTROL", libc::_SC_JOB_CONTROL),
         ("_SC_SAVED_IDS", libc::_SC_SAVED_IDS),
+        ("_SC_VERSION", libc::_SC_VERSION),
+        ("_SC_PAGESIZE", libc::_SC_PAGESIZE),
+        ("_SC_HOST_NAME_MAX", libc::_SC_HOST_NAME_MAX),
+        ("_SC_LOGIN_NAME_MAX", libc::_SC_LOGIN_NAME_MAX),
+        ("_SC_SYMLOOP_MAX", libc::_SC_SYMLOOP_MAX),
+        ("_SC_TTY_NAME_MAX", libc::_SC_TTY_NAME_MAX),
+        ("_SC_IOV_MAX", libc::_SC_IOV_MAX),
+        ("_SC_XOPEN_VERSION", libc::_SC_XOPEN_VERSION),
+        ("_SC_XOPEN_CRYPT", libc::_SC_XOPEN_CRYPT),
+        ("_SC_XOPEN_ENH_I18N", libc::_SC_XOPEN_ENH_I18N),
+        ("_SC_XOPEN_SHM", libc::_SC_XOPEN_SHM),
+        ("_SC_XOPEN_UNIX", libc::_SC_XOPEN_UNIX),
+        ("_SC_PASS_MAX", libc::_SC_PASS_MAX),
+        ("_SC_ATEXIT_MAX", libc::_SC_ATEXIT_MAX),
+        ("_SC_THREADS", libc::_SC_THREADS),
+        ("_SC_THREAD_SAFE_FUNCTIONS", libc::_SC_THREAD_SAFE_FUNCTIONS),
+        ("_SC_REGEXP", libc::_SC_REGEXP),
+        ("_SC_SHELL", libc::_SC_SHELL),
+        ("_SC_SPAWN", libc::_SC_SPAWN),
+        ("_SC_IPV6", libc::_SC_IPV6),
         ("_SC_REALTIME_SIGNALS", libc::_SC_REALTIME_SIGNALS),
         ("_SC_PRIORITY_SCHEDULING", libc::_SC_PRIORITY_SCHEDULING),
         ("_SC_TIMERS", libc::_SC_TIMERS),
@@ -281,6 +412,73 @@ fn load_sysconf_mapping() -> HashMap<&'static str, libc::c_int> {
         ("_SC_2_PBS_MESSAGE", libc::_SC_2_PBS_MESSAGE),
         ("_SC_2_PBS_TRACK", libc::_SC_2_PBS_TRACK),
         ("_SC_ADVISORY_INFO", libc::_SC_ADVISORY_INFO),
+        // POSIX.2 compatibility aliases (names without underscore prefix)
+        // Per POSIX: "For compatibility with earlier versions, the following
+        // variable names shall also be supported ... and shall be equivalent
+        // to the same name prefixed with an <underscore>."
+        ("POSIX2_VERSION", libc::_SC_2_VERSION),
+        ("POSIX2_C_BIND", libc::_SC_2_C_BIND),
+        ("POSIX2_C_DEV", libc::_SC_2_C_DEV),
+        ("POSIX2_CHAR_TERM", libc::_SC_2_CHAR_TERM),
+        ("POSIX2_FORT_DEV", libc::_SC_2_FORT_DEV),
+        ("POSIX2_FORT_RUN", libc::_SC_2_FORT_RUN),
+        ("POSIX2_LOCALEDEF", libc::_SC_2_LOCALEDEF),
+        ("POSIX2_SW_DEV", libc::_SC_2_SW_DEV),
+        ("POSIX2_UPE", libc::_SC_2_UPE),
+        // POSIX.2 limits compatibility aliases
+        ("POSIX2_BC_BASE_MAX", libc::_SC_BC_BASE_MAX),
+        ("POSIX2_BC_DIM_MAX", libc::_SC_BC_DIM_MAX),
+        ("POSIX2_BC_SCALE_MAX", libc::_SC_BC_SCALE_MAX),
+        ("POSIX2_BC_STRING_MAX", libc::_SC_BC_STRING_MAX),
+        ("POSIX2_COLL_WEIGHTS_MAX", libc::_SC_COLL_WEIGHTS_MAX),
+        ("POSIX2_EXPR_NEST_MAX", libc::_SC_EXPR_NEST_MAX),
+        ("POSIX2_LINE_MAX", libc::_SC_LINE_MAX),
+        ("POSIX2_RE_DUP_MAX", libc::_SC_RE_DUP_MAX),
+        // Common aliases without _SC_ prefix
+        ("PAGESIZE", libc::_SC_PAGESIZE),
+        ("PAGE_SIZE", libc::_SC_PAGESIZE),
+        ("_POSIX_VERSION", libc::_SC_VERSION),
+        ("HOST_NAME_MAX", libc::_SC_HOST_NAME_MAX),
+        ("LOGIN_NAME_MAX", libc::_SC_LOGIN_NAME_MAX),
+        ("SYMLOOP_MAX", libc::_SC_SYMLOOP_MAX),
+        ("TTY_NAME_MAX", libc::_SC_TTY_NAME_MAX),
+        ("IOV_MAX", libc::_SC_IOV_MAX),
+        ("_XOPEN_VERSION", libc::_SC_XOPEN_VERSION),
+        ("_XOPEN_CRYPT", libc::_SC_XOPEN_CRYPT),
+        ("_XOPEN_ENH_I18N", libc::_SC_XOPEN_ENH_I18N),
+        ("_XOPEN_SHM", libc::_SC_XOPEN_SHM),
+        ("_XOPEN_UNIX", libc::_SC_XOPEN_UNIX),
+        ("PASS_MAX", libc::_SC_PASS_MAX),
+        ("ATEXIT_MAX", libc::_SC_ATEXIT_MAX),
+        ("_POSIX_THREADS", libc::_SC_THREADS),
+        (
+            "_POSIX_THREAD_SAFE_FUNCTIONS",
+            libc::_SC_THREAD_SAFE_FUNCTIONS,
+        ),
+        ("_POSIX_REGEXP", libc::_SC_REGEXP),
+        ("_POSIX_SHELL", libc::_SC_SHELL),
+        ("_POSIX_SPAWN", libc::_SC_SPAWN),
+        ("_POSIX_IPV6", libc::_SC_IPV6),
+        ("_POSIX_JOB_CONTROL", libc::_SC_JOB_CONTROL),
+        ("_POSIX_SAVED_IDS", libc::_SC_SAVED_IDS),
+        ("_POSIX_REALTIME_SIGNALS", libc::_SC_REALTIME_SIGNALS),
+        ("_POSIX_PRIORITY_SCHEDULING", libc::_SC_PRIORITY_SCHEDULING),
+        ("_POSIX_TIMERS", libc::_SC_TIMERS),
+        ("_POSIX_ASYNCHRONOUS_IO", libc::_SC_ASYNCHRONOUS_IO),
+        ("_POSIX_PRIORITIZED_IO", libc::_SC_PRIORITIZED_IO),
+        ("_POSIX_SYNCHRONIZED_IO", libc::_SC_SYNCHRONIZED_IO),
+        ("_POSIX_FSYNC", libc::_SC_FSYNC),
+        ("_POSIX_MAPPED_FILES", libc::_SC_MAPPED_FILES),
+        ("_POSIX_MEMLOCK", libc::_SC_MEMLOCK),
+        ("_POSIX_MEMLOCK_RANGE", libc::_SC_MEMLOCK_RANGE),
+        ("_POSIX_MEMORY_PROTECTION", libc::_SC_MEMORY_PROTECTION),
+        ("_POSIX_MESSAGE_PASSING", libc::_SC_MESSAGE_PASSING),
+        ("_POSIX_SEMAPHORES", libc::_SC_SEMAPHORES),
+        (
+            "_POSIX_SHARED_MEMORY_OBJECTS",
+            libc::_SC_SHARED_MEMORY_OBJECTS,
+        ),
+        ("_POSIX_ADVISORY_INFO", libc::_SC_ADVISORY_INFO),
     ])
 }
 
@@ -316,6 +514,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     bind_textdomain_codeset("posixutils-rs", "UTF-8")?;
 
     let args = Args::parse();
+
+    // Handle -v specification option
+    // POSIX requires this for selecting different compilation environments,
+    // but we currently only support the default environment.
+    if let Some(ref spec) = args.specification {
+        eprintln!(
+            "getconf: {}: {}",
+            gettext("unsupported specification"),
+            spec
+        );
+        std::process::exit(1);
+    }
 
     if let Some(pathname) = args.pathname {
         let pathconf_mappings = load_pathconf_mapping();

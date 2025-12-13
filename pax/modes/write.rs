@@ -38,10 +38,6 @@ pub struct WriteOptions {
     pub interactive: bool,
     /// Reset access time after reading files
     pub reset_atime: bool,
-    /// Update mode - only archive if file is newer than existing archive member
-    /// Note: Only meaningful with -a (append) mode which is not yet implemented
-    #[allow(dead_code)]
-    pub update: bool,
     /// Path substitutions (-s option)
     pub substitutions: Vec<Substitution>,
     /// Format-specific options (-o option)

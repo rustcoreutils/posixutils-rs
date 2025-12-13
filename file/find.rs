@@ -137,8 +137,8 @@ enum ExecMode {
 #[derive(Clone, Debug)]
 enum Primary {
     // Tests
-    Name(String),
-    Path(String),
+    Name(Regex),
+    Path(Regex),
     Type(FileTypeMatch),
     Perm(PermMode),
     Links(NumericComparison),
@@ -187,15 +187,6 @@ struct EvalContext<'a> {
     metadata: &'a Metadata,
     /// Raw symlink metadata (for -type l checks with -L)
     link_metadata: Option<&'a Metadata>,
-    /// Is this a command-line argument? (reserved for future use)
-    #[allow(dead_code)]
-    is_cmdline: bool,
-    /// Symlink mode (reserved for future use)
-    #[allow(dead_code)]
-    symlink_mode: SymlinkMode,
-    /// The device ID of the starting point (for -xdev) (reserved for future use)
-    #[allow(dead_code)]
-    root_dev: u64,
     /// Initialization time (for -atime, -mtime, -ctime)
     init_time: SystemTime,
 }
@@ -378,11 +369,13 @@ fn parse_primary(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
     match tok {
         "-name" => {
             let pattern = get_arg(tokens, idx, "-name")?;
-            Ok(Expr::Primary(Primary::Name(pattern.to_string())))
+            let regex = pattern_to_regex(pattern)?;
+            Ok(Expr::Primary(Primary::Name(regex)))
         }
         "-path" => {
             let pattern = get_arg(tokens, idx, "-path")?;
-            Ok(Expr::Primary(Primary::Path(pattern.to_string())))
+            let regex = pattern_to_regex(pattern)?;
+            Ok(Expr::Primary(Primary::Path(regex)))
         }
         "-type" => {
             let type_char = get_arg(tokens, idx, "-type")?;
@@ -717,20 +710,14 @@ fn evaluate(expr: &Expr, ctx: &EvalContext, state: &mut FindState) -> EvalResult
 /// Evaluate a single primary
 fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState) -> EvalResult {
     match primary {
-        Primary::Name(pattern) => {
+        Primary::Name(regex) => {
             let name = ctx.path.file_name().unwrap_or(OsStr::new(""));
             let name_str = name.to_string_lossy();
-            match pattern_to_regex(pattern) {
-                Ok(re) => EvalResult::new(re.is_match(&name_str)),
-                Err(_) => EvalResult::new(false),
-            }
+            EvalResult::new(regex.is_match(&name_str))
         }
-        Primary::Path(pattern) => {
+        Primary::Path(regex) => {
             let path_str = ctx.path.to_string_lossy();
-            match pattern_to_regex(pattern) {
-                Ok(re) => EvalResult::new(re.is_match(&path_str)),
-                Err(_) => EvalResult::new(false),
-            }
+            EvalResult::new(regex.is_match(&path_str))
         }
         Primary::Type(ft) => {
             // When -L is used and checking for symlink, use link_metadata
@@ -989,9 +976,6 @@ fn walk_tree(
         path,
         metadata: &metadata,
         link_metadata: link_metadata.as_ref(),
-        is_cmdline,
-        symlink_mode,
-        root_dev,
         init_time,
     };
 

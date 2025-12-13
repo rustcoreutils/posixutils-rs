@@ -31,6 +31,8 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 
 const BLOCK_SIZE: usize = 512;
+/// Static zero buffer for padding and end-of-archive markers
+static ZERO_BLOCK: [u8; BLOCK_SIZE] = [0u8; BLOCK_SIZE];
 
 // Extended header typeflags
 const PAX_XHDR: u8 = b'x'; // Per-file extended header
@@ -504,11 +506,11 @@ impl<R: Read> PaxReader<R> {
         let mut data = vec![0u8; size as usize];
         self.reader.read_exact(&mut data)?;
 
-        // Skip padding to block boundary
+        // Skip padding to block boundary using a stack buffer
         let padding = padding_needed(size);
         if padding > 0 {
-            let mut pad = vec![0u8; padding];
-            self.reader.read_exact(&mut pad)?;
+            let mut pad = [0u8; BLOCK_SIZE];
+            self.reader.read_exact(&mut pad[..padding])?;
         }
 
         ExtendedHeader::parse(&data)
@@ -695,11 +697,10 @@ impl<W: Write> PaxWriter<W> {
         // Write global header data
         self.writer.write_all(&data)?;
 
-        // Pad to block boundary
+        // Pad to block boundary using static buffer
         let padding = padding_needed(data.len() as u64);
         if padding > 0 {
-            let zeros = vec![0u8; padding];
-            self.writer.write_all(&zeros)?;
+            self.writer.write_all(&ZERO_BLOCK[..padding])?;
         }
 
         Ok(())
@@ -759,11 +760,10 @@ impl<W: Write> PaxWriter<W> {
         // Write extended header data
         self.writer.write_all(&data)?;
 
-        // Pad to block boundary
+        // Pad to block boundary using static buffer
         let padding = padding_needed(data.len() as u64);
         if padding > 0 {
-            let zeros = vec![0u8; padding];
-            self.writer.write_all(&zeros)?;
+            self.writer.write_all(&ZERO_BLOCK[..padding])?;
         }
 
         Ok(())
@@ -797,19 +797,18 @@ impl<W: Write> ArchiveWriter for PaxWriter<W> {
     }
 
     fn finish_entry(&mut self) -> PaxResult<()> {
+        // Pad to block boundary using static buffer
         let padding = padding_needed(self.bytes_written);
         if padding > 0 {
-            let zeros = vec![0u8; padding];
-            self.writer.write_all(&zeros)?;
+            self.writer.write_all(&ZERO_BLOCK[..padding])?;
         }
         Ok(())
     }
 
     fn finish(&mut self) -> PaxResult<()> {
-        // Write two zero blocks
-        let zeros = [0u8; BLOCK_SIZE];
-        self.writer.write_all(&zeros)?;
-        self.writer.write_all(&zeros)?;
+        // Write two zero blocks using static buffer
+        self.writer.write_all(&ZERO_BLOCK)?;
+        self.writer.write_all(&ZERO_BLOCK)?;
         self.writer.flush()?;
         Ok(())
     }

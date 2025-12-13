@@ -62,6 +62,8 @@ pub struct FormatOptions {
     pub list_format: Option<String>,
     /// Delete patterns (delete=pattern) - for future pax format support
     pub delete_patterns: Vec<String>,
+    /// Pre-compiled delete patterns for efficient matching
+    delete_patterns_compiled: Vec<Pattern>,
     /// Times option (include atime/mtime in extended headers)
     pub include_times: bool,
     /// Linkdata option (write contents for hard links)
@@ -159,6 +161,10 @@ impl FormatOptions {
             "delete" => {
                 if let Some(pattern) = value {
                     self.delete_patterns.push(pattern.to_string());
+                    // Pre-compile pattern for efficient matching
+                    if let Ok(compiled) = Pattern::new(pattern) {
+                        self.delete_patterns_compiled.push(compiled);
+                    }
                 }
             }
             "times" => {
@@ -224,6 +230,8 @@ impl FormatOptions {
         }
         self.delete_patterns
             .extend(other.delete_patterns.iter().cloned());
+        self.delete_patterns_compiled
+            .extend(other.delete_patterns_compiled.iter().cloned());
         if other.include_times {
             self.include_times = true;
         }
@@ -234,17 +242,11 @@ impl FormatOptions {
 
     /// Check if a keyword should be deleted from extended headers
     ///
-    /// Returns true if the keyword matches any of the delete patterns
+    /// Returns true if the keyword matches any of the pre-compiled delete patterns
     pub fn should_delete_keyword(&self, keyword: &str) -> bool {
-        for pattern_str in &self.delete_patterns {
-            // Parse pattern and match against keyword
-            if let Ok(pattern) = Pattern::new(pattern_str) {
-                if pattern.matches(keyword) {
-                    return true;
-                }
-            }
-        }
-        false
+        self.delete_patterns_compiled
+            .iter()
+            .any(|pattern| pattern.matches(keyword))
     }
 
     /// Get the global options map for extended header generation

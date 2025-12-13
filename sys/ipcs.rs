@@ -103,20 +103,26 @@ fn truncate_to_chars(s: &str, max_chars: usize) -> &str {
 }
 
 /// Format permission mode as 11-character string per POSIX
-/// Format: [S-][RC-][rwx][rwx][rwx][ +]
+/// Format: [S-][RC-][rwa][rwa][rwa]
 /// - First char: S if process waiting on msgsnd, else -
-/// - Second char: R if process waiting on msgrcv, C if shm cleared on attach, else -
-/// - Chars 3-11: owner/group/other permissions (r/w/a for read/write/alter)
-/// - Char 12: space or + for additional access control
+/// - Second char: R if process waiting on msgrcv, C if shm marked for removal, else -
+/// - Chars 3-5: owner permissions (r/w/a)
+/// - Chars 6-8: group permissions (r/w/a)
+/// - Chars 9-11: other permissions (r/w/a)
+///
+/// IPC permission bits map to file permission bits:
+/// - read (r): 0400/040/004
+/// - write (w): 0200/020/002
+/// - alter (a): 0100/010/001 (execute equivalent for IPC)
 fn format_mode(mode: u16, facility: char, _waiting_send: bool, _waiting_recv: bool) -> String {
     // First two special characters
     let c1 = '-'; // We don't have waiting info in current implementation
     let c2 = match facility {
-        'm' => '-', // Could be 'C' for SHM_DEST
+        'm' => '-', // Could be 'C' for SHM_DEST (shm marked for removal)
         _ => '-',
     };
 
-    // Permission bits
+    // Permission bits: read (r), write (w), alter (a)
     let owner_r = if mode & 0o400 != 0 { 'r' } else { '-' };
     let owner_w = if mode & 0o200 != 0 { 'w' } else { '-' };
     let owner_a = if mode & 0o100 != 0 { 'a' } else { '-' };
@@ -148,9 +154,40 @@ fn format_time(timestamp: i64) -> String {
 }
 
 /// Get current date in POSIX locale format (matching `date` command)
+/// Uses libc strftime to get proper timezone abbreviation (e.g., "EST" not "-05:00")
 fn get_current_date() -> String {
-    let now = Local::now();
-    now.format("%a %b %e %H:%M:%S %Z %Y").to_string()
+    use std::mem::MaybeUninit;
+
+    let mut buf = [0u8; 64];
+    let now = unsafe { libc::time(std::ptr::null_mut()) };
+    let mut tm = MaybeUninit::<libc::tm>::uninit();
+
+    unsafe {
+        let tm_ptr = libc::localtime_r(&now, tm.as_mut_ptr());
+        if tm_ptr.is_null() {
+            // Fallback to chrono if localtime_r fails
+            chrono::Local::now()
+                .format("%a %b %e %H:%M:%S %z %Y")
+                .to_string()
+        } else {
+            let tm = tm.assume_init();
+            let format = std::ffi::CString::new("%a %b %e %H:%M:%S %Z %Y").unwrap();
+            let len = libc::strftime(
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                format.as_ptr(),
+                &tm,
+            );
+            if len > 0 {
+                String::from_utf8_lossy(&buf[..len]).to_string()
+            } else {
+                // Fallback to chrono if strftime fails
+                chrono::Local::now()
+                    .format("%a %b %e %H:%M:%S %z %Y")
+                    .to_string()
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -259,11 +296,55 @@ fn read_proc_sem() -> io::Result<Vec<SemInfo>> {
 // macOS-specific IPC enumeration
 // ============================================================================
 
-// Maximum IPC ID to iterate through on macOS.
-// macOS doesn't provide /proc/sysvipc like Linux, so we must iterate.
-// 32768 is a reasonable upper bound that balances coverage vs performance.
+/// Default value for kern.sysv.semmni on macOS (max semaphore identifiers)
 #[cfg(target_os = "macos")]
-const MACOS_MAX_IPC_ID: i32 = 32768;
+const MACOS_DEFAULT_SEMMNI: i32 = 87381;
+
+/// Maximum number of IPC slots to check (caps iteration for performance)
+#[cfg(target_os = "macos")]
+const MAX_IPC_SLOTS_TO_CHECK: i32 = 256;
+
+/// Query a sysctl integer value by name
+#[cfg(target_os = "macos")]
+fn get_sysctl_int(name: &str) -> Option<i32> {
+    use std::ffi::CString;
+    use std::mem::size_of;
+
+    let cname = CString::new(name).ok()?;
+    let mut value: i32 = 0;
+    let mut size = size_of::<i32>();
+
+    let result = unsafe {
+        libc::sysctlbyname(
+            cname.as_ptr(),
+            &mut value as *mut i32 as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+
+    if result == 0 {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+/// Iterate through macOS IPC IDs efficiently.
+/// macOS IPC IDs follow the pattern: slot_index * 65536 + sequence.
+/// We iterate through each slot and a range of sequences within each slot.
+/// This is much faster than iterating through all possible IDs sequentially.
+#[cfg(target_os = "macos")]
+fn iter_macos_ipc_ids(max_slots: i32, seqs_per_slot: i32) -> impl Iterator<Item = i32> {
+    let max_slots = max_slots.min(1024); // Cap slots for safety
+    let seqs = seqs_per_slot.min(1024); // Cap sequences for safety
+
+    (0..max_slots).flat_map(move |slot| {
+        let base = slot * 65536;
+        (0..seqs).map(move |seq| base + seq)
+    })
+}
 
 #[cfg(target_os = "macos")]
 fn read_macos_shm() -> Vec<ShmInfo> {
@@ -272,7 +353,12 @@ fn read_macos_shm() -> Vec<ShmInfo> {
     let mut entries = Vec::new();
     let mut shmbuf: shmid_ds = unsafe { std::mem::zeroed() };
 
-    for shmid in 0..MACOS_MAX_IPC_ID {
+    // kern.sysv.shmmni is the max number of shared memory identifiers (typically 32)
+    let max_slots = get_sysctl_int("kern.sysv.shmmni").unwrap_or(32);
+    // Each slot can have multiple sequences
+    let seqs_per_slot = MAX_IPC_SLOTS_TO_CHECK;
+
+    for shmid in iter_macos_ipc_ids(max_slots, seqs_per_slot) {
         if unsafe { shmctl(shmid, IPC_STAT, &mut shmbuf) } == 0 {
             entries.push(ShmInfo {
                 key: shmbuf.shm_perm._key,
@@ -302,7 +388,15 @@ fn read_macos_sem() -> Vec<SemInfo> {
     let mut entries = Vec::new();
     let mut sembuf: semid_ds = unsafe { std::mem::zeroed() };
 
-    for semid in 0..MACOS_MAX_IPC_ID {
+    // kern.sysv.semmni is the max number of semaphore identifiers
+    // On macOS this can be very high, so we cap the slots we check
+    let max_slots = get_sysctl_int("kern.sysv.semmni")
+        .unwrap_or(MACOS_DEFAULT_SEMMNI)
+        .min(MAX_IPC_SLOTS_TO_CHECK);
+    // Each slot can have multiple sequences
+    let seqs_per_slot = MAX_IPC_SLOTS_TO_CHECK;
+
+    for semid in iter_macos_ipc_ids(max_slots, seqs_per_slot) {
         if unsafe { semctl(semid, 0, IPC_STAT, &mut sembuf) } == 0 {
             entries.push(SemInfo {
                 key: sembuf.sem_perm._key,
@@ -388,79 +482,75 @@ fn display_message_queues(_args: &Args) {
 
     #[cfg(target_os = "linux")]
     {
-        match read_proc_msg() {
-            Ok(entries) if !entries.is_empty() => {
-                // Build header
-                let mut header = String::from("T     ID     KEY        MODE        OWNER    GROUP");
-                if args.creator {
-                    header.push_str("    CREATOR  CGROUP");
-                }
-                if args.outstanding {
-                    header.push_str("   CBYTES    QNUM");
-                }
-                if args.max_size {
-                    header.push_str("   QBYTES");
-                }
-                if args.pid {
-                    header.push_str("    LSPID    LRPID");
-                }
-                if args.time {
-                    header.push_str("      STIME      RTIME      CTIME");
-                }
-                println!("{}", header);
-                println!("{}:", gettext("Message Queues"));
+        let entries = read_proc_msg().unwrap_or_default();
 
-                for entry in entries {
-                    let mode_str = format_mode(entry.perms, 'q', false, false);
-                    let owner = get_username(entry.uid);
-                    let group = get_groupname(entry.gid);
+        // Build header - always show header per POSIX, even when empty
+        let mut header = String::from("T     ID     KEY        MODE       OWNER    GROUP");
+        if args.creator {
+            header.push_str("  CREATOR   CGROUP");
+        }
+        if args.outstanding {
+            header.push_str(" CBYTES  QNUM");
+        }
+        if args.max_size {
+            header.push_str(" QBYTES");
+        }
+        if args.pid {
+            header.push_str("  LSPID  LRPID");
+        }
+        if args.time {
+            header.push_str("   STIME    RTIME    CTIME");
+        }
+        println!("{}", header);
+        println!("{}:", gettext("Message Queues"));
 
-                    let mut line = format!(
-                        "q {:>6} 0x{:08x} {:11} {:>8} {:>8}",
-                        entry.msqid,
-                        entry.key as u32,
-                        mode_str,
-                        truncate_to_chars(&owner, 8),
-                        truncate_to_chars(&group, 8)
-                    );
+        for entry in entries {
+            let mode_str = format_mode(entry.perms, 'q', false, false);
+            let owner = get_username(entry.uid);
+            let group = get_groupname(entry.gid);
 
-                    if args.creator {
-                        let creator = get_username(entry.cuid);
-                        let cgroup = get_groupname(entry.cgid);
-                        line.push_str(&format!(
-                            " {:>8} {:>8}",
-                            truncate_to_chars(&creator, 8),
-                            truncate_to_chars(&cgroup, 8)
-                        ));
-                    }
-                    if args.outstanding {
-                        line.push_str(&format!(" {:>8} {:>7}", entry.cbytes, entry.qnum));
-                    }
-                    if args.max_size {
-                        // Note: qbytes is not in /proc, would need sysctl
-                        line.push_str(&format!(" {:>8}", "-"));
-                    }
-                    if args.pid {
-                        line.push_str(&format!(" {:>8} {:>8}", entry.lspid, entry.lrpid));
-                    }
-                    if args.time {
-                        line.push_str(&format!(
-                            " {:>9} {:>9} {:>9}",
-                            format_time(entry.stime),
-                            format_time(entry.rtime),
-                            format_time(entry.ctime)
-                        ));
-                    }
+            let mut line = format!(
+                "q {:>6} 0x{:08x} {:11} {:>8} {:>8}",
+                entry.msqid,
+                entry.key as u32,
+                mode_str,
+                truncate_to_chars(&owner, 8),
+                truncate_to_chars(&group, 8)
+            );
 
-                    println!("{}", line);
-                }
+            if args.creator {
+                let creator = get_username(entry.cuid);
+                let cgroup = get_groupname(entry.cgid);
+                line.push_str(&format!(
+                    " {:>8} {:>8}",
+                    truncate_to_chars(&creator, 8),
+                    truncate_to_chars(&cgroup, 8)
+                ));
             }
-            _ => {
-                println!("{}", gettext("Message Queue facility not in system."));
+            if args.outstanding {
+                line.push_str(&format!(" {:>8} {:>7}", entry.cbytes, entry.qnum));
             }
+            if args.max_size {
+                // Note: qbytes is not in /proc, would need sysctl
+                line.push_str(&format!(" {:>8}", "-"));
+            }
+            if args.pid {
+                line.push_str(&format!(" {:>8} {:>8}", entry.lspid, entry.lrpid));
+            }
+            if args.time {
+                line.push_str(&format!(
+                    " {:>9} {:>9} {:>9}",
+                    format_time(entry.stime),
+                    format_time(entry.rtime),
+                    format_time(entry.ctime)
+                ));
+            }
+
+            println!("{}", line);
         }
     }
 
+    // macOS doesn't support SysV message queues
     #[cfg(target_os = "macos")]
     {
         println!("{}", gettext("Message Queue facility not in system."));
@@ -476,27 +566,22 @@ fn display_shared_memory(args: &Args) {
     #[cfg(target_os = "macos")]
     let entries = read_macos_shm();
 
-    if entries.is_empty() {
-        println!("{}", gettext("Shared Memory facility not in system."));
-        return;
-    }
-
-    // Build header
-    let mut header = String::from("T     ID     KEY        MODE        OWNER    GROUP");
+    // Build header - always show header per POSIX, even when empty
+    let mut header = String::from("T     ID     KEY        MODE       OWNER    GROUP");
     if args.creator {
-        header.push_str("    CREATOR  CGROUP");
+        header.push_str("  CREATOR   CGROUP");
     }
     if args.outstanding {
-        header.push_str("   NATTCH");
+        header.push_str(" NATTCH");
     }
     if args.max_size {
-        header.push_str("      SEGSZ");
+        header.push_str("  SEGSZ");
     }
     if args.pid {
-        header.push_str("     CPID     LPID");
+        header.push_str("  CPID  LPID");
     }
     if args.time {
-        header.push_str("      ATIME      DTIME      CTIME");
+        header.push_str("   ATIME    DTIME    CTIME");
     }
     println!("{}", header);
     println!("{}:", gettext("Shared Memory"));
@@ -555,21 +640,16 @@ fn display_semaphores(args: &Args) {
     #[cfg(target_os = "macos")]
     let entries = read_macos_sem();
 
-    if entries.is_empty() {
-        println!("{}", gettext("Semaphore facility not in system."));
-        return;
-    }
-
-    // Build header
-    let mut header = String::from("T     ID     KEY        MODE        OWNER    GROUP");
+    // Build header - always show header per POSIX, even when empty
+    let mut header = String::from("T     ID     KEY        MODE       OWNER    GROUP");
     if args.creator {
-        header.push_str("    CREATOR  CGROUP");
+        header.push_str("  CREATOR   CGROUP");
     }
     if args.max_size {
-        header.push_str("    NSEMS");
+        header.push_str(" NSEMS");
     }
     if args.time {
-        header.push_str("      OTIME      CTIME");
+        header.push_str("   OTIME    CTIME");
     }
     println!("{}", header);
     println!("{}:", gettext("Semaphores"));

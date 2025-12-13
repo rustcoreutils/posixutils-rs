@@ -3,7 +3,9 @@ use super::{
     constants::COULD_NOT_UNWRAP_FILENAME,
     diff_exit_status::DiffExitStatus,
     file_data::{FileData, LineReader},
-    functions::{check_existance, is_binary, system_time_to_rfc2822},
+    functions::{
+        check_existance, is_binary, system_time_to_context_format, system_time_to_unified_format,
+    },
     hunks::Hunks,
 };
 
@@ -18,6 +20,16 @@ use std::{
     os::unix::fs::MetadataExt,
     path::PathBuf,
 };
+
+/// Entry for histogram-based LCS algorithm.
+/// Stores occurrence counts and last positions for lines in both files.
+#[derive(Clone, Copy, Default)]
+struct HistEntry {
+    cnt1: i32,
+    pos1: i32,
+    cnt2: i32,
+    pos2: i32,
+}
 
 pub struct FileDiff<'a> {
     file1: &'a mut FileData<'a>,
@@ -54,28 +66,19 @@ impl<'a> FileDiff<'a> {
             let content1 = read_to_string(&path1)?.into_bytes();
             let linereader1 = LineReader::new(&content1);
             let ends_with_newline1 = linereader1.ends_with_newline();
-            let mut lines1 = Vec::new();
-            for line in linereader1 {
-                if !format_options.ignore_trailing_white_spaces {
-                    lines1.push(line);
-                } else {
-                    lines1.push(line.trim_end());
-                }
-            }
+            let lines1: Vec<&str> = linereader1.collect();
 
             let content2 = read_to_string(&path2)?.into_bytes();
             let linereader2 = LineReader::new(&content2);
             let ends_with_newline2 = linereader2.ends_with_newline();
-            let mut lines2 = Vec::new();
-            for line in linereader2 {
-                if !format_options.ignore_trailing_white_spaces {
-                    lines2.push(line);
-                } else {
-                    lines2.push(line.trim_end());
-                }
-            }
-            let mut file1 = FileData::get_file(path1, lines1, ends_with_newline1)?;
-            let mut file2 = FileData::get_file(path2, lines2, ends_with_newline2)?;
+            let lines2: Vec<&str> = linereader2.collect();
+
+            // Pass whitespace normalization flag to FileData
+            // When -b is set, hashes are computed using normalized whitespace for comparison
+            // but original lines are stored for output
+            let normalize_ws = format_options.ignore_trailing_white_spaces;
+            let mut file1 = FileData::get_file(path1, lines1, ends_with_newline1, normalize_ws)?;
+            let mut file2 = FileData::get_file(path2, lines2, ends_with_newline2, normalize_ws)?;
 
             let mut diff = FileDiff::new(&mut file1, &mut file2, format_options);
 
@@ -182,7 +185,6 @@ impl<'a> FileDiff<'a> {
             for hunk_index in 0..hunks_count {
                 let hunk = self.hunks.hunk_at_mut(hunk_index);
                 match self.format_options.output_format {
-                    OutputFormat::Debug => hunk.print_debug(self.file1, self.file2),
                     OutputFormat::Default => {
                         hunk.print_default(self.file1, self.file2, hunk_index == hunks_count - 1)
                     }
@@ -195,7 +197,7 @@ impl<'a> FileDiff<'a> {
                         eprintln!("OutputFormat::Context should be handled in other place");
                         return Ok(DiffExitStatus::Trouble);
                     }
-                    OutputFormat::ForwardEditScript => hunk.print_edit_script(
+                    OutputFormat::ForwardEditScript => hunk.print_forward_edit_script(
                         self.file1,
                         self.file2,
                         hunk_index == hunks_count - 1,
@@ -219,6 +221,11 @@ impl<'a> FileDiff<'a> {
     /// Indices in lcs_indices will be the line number in file1 while values will
     /// be the corresponding line number in file2. If the value is -1, then the
     /// line is not part of the LCS.
+    ///
+    /// Optimizations:
+    /// - Uses pre-computed line hashes for O(1) initial comparison
+    /// - Uses hash-keyed HashMap with stack-allocated HistEntry structs
+    /// - Pre-allocates HashMap capacity to reduce rehashing
     pub fn histogram_lcs(
         file1: &FileData,
         file2: &FileData,
@@ -228,8 +235,12 @@ impl<'a> FileDiff<'a> {
         mut y1: usize,
         lcs_indices: &mut Vec<i32>,
     ) {
-        // collect common elements at the beginning
-        while (x0 < x1) && (y0 < y1) && (file1.line(x0) == file2.line(y0)) {
+        // Collect common elements at the beginning using hash comparison first
+        while (x0 < x1)
+            && (y0 < y1)
+            && file1.line_hash(x0) == file2.line_hash(y0)
+            && file1.line(x0) == file2.line(y0)
+        {
             lcs_indices[x0] = y0 as i32;
             x0 += 1;
             y0 += 1;
@@ -240,59 +251,102 @@ impl<'a> FileDiff<'a> {
             return;
         }
 
-        // collect common elements at the end
-        while (x0 < x1) && (y0 < y1) && (file1.line(x1 - 1) == file2.line(y1 - 1)) {
+        // Collect common elements at the end using hash comparison first
+        while (x0 < x1)
+            && (y0 < y1)
+            && file1.line_hash(x1 - 1) == file2.line_hash(y1 - 1)
+            && file1.line(x1 - 1) == file2.line(y1 - 1)
+        {
             lcs_indices[x1 - 1] = (y1 - 1) as i32;
             x1 -= 1;
             y1 -= 1;
         }
 
-        // build histogram
-        let mut hist: HashMap<&str, Vec<i32>> = HashMap::new();
+        if (x0 == x1) || (y0 == y1) {
+            return;
+        }
+
+        // Build histogram using hash-keyed map with pre-allocated capacity
+        let capacity = (x1 - x0) + (y1 - y0);
+        let mut hist: HashMap<u64, HistEntry> = HashMap::with_capacity(capacity);
+
         for i in x0..x1 {
-            if let Some(rec) = hist.get_mut(file1.line(i)) {
-                rec[0] += 1_i32;
-                rec[1] = i as i32;
-            } else {
-                hist.insert(file1.line(i), vec![1, i as i32, 0, -1]);
-            }
+            let h = file1.line_hash(i);
+            hist.entry(h)
+                .and_modify(|e| {
+                    e.cnt1 += 1;
+                    e.pos1 = i as i32;
+                })
+                .or_insert(HistEntry {
+                    cnt1: 1,
+                    pos1: i as i32,
+                    cnt2: 0,
+                    pos2: -1,
+                });
         }
+
         for i in y0..y1 {
-            if let Some(rec) = hist.get_mut(file2.line(i)) {
-                rec[2] += 1_i32;
-                rec[3] = i as i32;
-            } else {
-                hist.insert(file2.line(i), vec![0, -1, 1, i as i32]);
-            }
+            let h = file2.line_hash(i);
+            hist.entry(h)
+                .and_modify(|e| {
+                    e.cnt2 += 1;
+                    e.pos2 = i as i32;
+                })
+                .or_insert(HistEntry {
+                    cnt1: 0,
+                    pos1: -1,
+                    cnt2: 1,
+                    pos2: i as i32,
+                });
         }
 
-        // find lowest-occurrence item that appears in both files
-        let key = hist
+        // Find lowest-occurrence item that appears in both files
+        let pivot = hist
             .iter()
-            .filter(|(_k, v)| (v[0] > 0) && (v[2] > 0))
-            .min_by(|a, b| {
-                let c = a.1[0] + a.1[2];
-                let d = b.1[0] + b.1[2];
-                c.cmp(&d)
-            })
-            .map(|(k, _v)| *k);
+            .filter(|(_, v)| v.cnt1 > 0 && v.cnt2 > 0)
+            .min_by_key(|(_, v)| v.cnt1 + v.cnt2);
 
-        match key {
-            None => {}
-            Some(k) => {
-                let rec = hist.get(k).unwrap();
-                let x1_new = rec[1] as usize;
-                let y1_new = rec[3] as usize;
+        if let Some((hash, entry)) = pivot {
+            let x1_new = entry.pos1 as usize;
+            let y1_new = entry.pos2 as usize;
+
+            // Verify that lines actually match (handles hash collisions)
+            // This check is important for correctness
+            if file1.line(x1_new) == file2.line(y1_new) {
                 lcs_indices[x1_new] = y1_new as i32;
                 FileDiff::histogram_lcs(file1, file2, x0, x1_new, y0, y1_new, lcs_indices);
                 FileDiff::histogram_lcs(file1, file2, x1_new + 1, x1, y1_new + 1, y1, lcs_indices);
+            } else {
+                // Hash collision: need to find actual matching lines
+                // Fall back to scanning for a true match with this hash
+                let target_hash = *hash;
+                for i in x0..x1 {
+                    if file1.line_hash(i) == target_hash {
+                        for j in y0..y1 {
+                            if file2.line_hash(j) == target_hash && file1.lines_equal(i, file2, j) {
+                                lcs_indices[i] = j as i32;
+                                FileDiff::histogram_lcs(file1, file2, x0, i, y0, j, lcs_indices);
+                                FileDiff::histogram_lcs(
+                                    file1,
+                                    file2,
+                                    i + 1,
+                                    x1,
+                                    j + 1,
+                                    y1,
+                                    lcs_indices,
+                                );
+                                return;
+                            }
+                        }
+                    }
+                }
+                // No actual match found despite hash match - rare case, skip pivot
             }
         }
     }
 
     fn order_hunks_by_output_format(&mut self) {
         match self.format_options.output_format {
-            OutputFormat::Debug => self.order_hunks_ascending(),
             OutputFormat::Default => self.order_hunks_ascending(),
             OutputFormat::Context(_) => self.order_hunks_ascending(),
             OutputFormat::EditScript => self.order_hunks_descending(),
@@ -316,11 +370,11 @@ impl<'a> FileDiff<'a> {
     fn print_context(&mut self, context: usize) -> Result<(), std::fmt::Error> {
         println!(
             "*** {}",
-            Self::get_header(self.file1, self.format_options.label1())
+            Self::get_context_header(self.file1, self.format_options.label1())
         );
         println!(
             "--- {}",
-            Self::get_header(self.file2, self.format_options.label2())
+            Self::get_context_header(self.file2, self.format_options.label2())
         );
 
         let mut diff_disp = ContextDiffDisplay::default();
@@ -443,11 +497,11 @@ impl<'a> FileDiff<'a> {
     fn print_unified(&mut self, unified: usize) -> Result<(), std::fmt::Error> {
         println!(
             "--- {}",
-            Self::get_header(self.file1, self.format_options.label1())
+            Self::get_unified_header(self.file1, self.format_options.label1())
         );
         println!(
             "+++ {}",
-            Self::get_header(self.file2, self.format_options.label2())
+            Self::get_unified_header(self.file2, self.format_options.label2())
         );
 
         let mut diff_disp = UnifiedDiffDisplay::default();
@@ -505,14 +559,26 @@ impl<'a> FileDiff<'a> {
         Ok(())
     }
 
-    pub fn get_header(file: &FileData, label: &Option<String>) -> String {
+    pub fn get_context_header(file: &FileData, label: &Option<String>) -> String {
         if let Some(label) = label {
             label.to_string()
         } else {
             format!(
                 "{}\t{}",
                 file.path(),
-                system_time_to_rfc2822(file.modified())
+                system_time_to_context_format(file.modified())
+            )
+        }
+    }
+
+    pub fn get_unified_header(file: &FileData, label: &Option<String>) -> String {
+        if let Some(label) = label {
+            label.to_string()
+        } else {
+            format!(
+                "{}\t{}",
+                file.path(),
+                system_time_to_unified_format(file.modified())
             )
         }
     }

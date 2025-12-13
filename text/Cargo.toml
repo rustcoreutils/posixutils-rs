@@ -111,3 +111,7 @@ path = "./tsort.rs"
 [[bin]]
 name = "wc"
 path = "./wc.rs"
+
+[[bin]]
+name = "patch"
+path = "./patch.rs"

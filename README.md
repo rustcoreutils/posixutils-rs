@@ -180,7 +180,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] id
  - [x] ipcs (IPC)
  - [x] kill
- - [x] lex (Development)
+ - [ ] lex (Development)
  - [x] logger
  - [x] ps
  - [x] stty

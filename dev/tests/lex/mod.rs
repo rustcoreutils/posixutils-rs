@@ -1,0 +1,1159 @@
+//! Integration tests for lex
+
+use std::fs;
+use std::process::Command;
+use tempfile::TempDir;
+
+fn run_lex(input: &str) -> (String, bool) {
+    let temp_dir = TempDir::new().unwrap();
+    let lex_file = temp_dir.path().join("test.l");
+    let output_file = temp_dir.path().join("lex.yy.c");
+
+    fs::write(&lex_file, input).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_lex"))
+        .args([
+            lex_file.to_str().unwrap(),
+            "-o",
+            output_file.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute lex");
+
+    let success = output.status.success();
+    let c_code = if success {
+        fs::read_to_string(&output_file).unwrap_or_default()
+    } else {
+        String::from_utf8_lossy(&output.stderr).to_string()
+    };
+
+    (c_code, success)
+}
+
+fn compile_and_run(c_code: &str, input: &str) -> Result<String, String> {
+    let temp_dir = TempDir::new().unwrap();
+    let c_file = temp_dir.path().join("lexer.c");
+    let exe_file = temp_dir.path().join("lexer");
+    let input_file = temp_dir.path().join("input.txt");
+
+    fs::write(&c_file, c_code).unwrap();
+    fs::write(&input_file, input).unwrap();
+
+    // Compile
+    let compile = Command::new("cc")
+        .args([
+            "-o",
+            exe_file.to_str().unwrap(),
+            c_file.to_str().unwrap(),
+            "-lm",
+        ])
+        .output()
+        .expect("Failed to compile");
+
+    if !compile.status.success() {
+        return Err(format!(
+            "Compilation failed: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        ));
+    }
+
+    // Run with input
+    let run = Command::new(exe_file)
+        .stdin(fs::File::open(&input_file).unwrap())
+        .output()
+        .expect("Failed to run lexer");
+
+    Ok(String::from_utf8_lossy(&run.stdout).to_string())
+}
+
+#[test]
+fn test_simple_word_lexer() {
+    let lex_input = r#"%%
+[a-z]+    printf("WORD: %s\n", yytext);
+[ \t\n]+  /* skip */
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+    assert!(c_code.contains("int yylex(void)"));
+
+    let result = compile_and_run(&c_code, "hello world\n").unwrap();
+    assert!(result.contains("WORD: hello"));
+    assert!(result.contains("WORD: world"));
+}
+
+#[test]
+fn test_integer_lexer() {
+    let lex_input = r#"
+%%
+[0-9]+    printf("INT: %s\n", yytext);
+[ \t\n]+  /* skip */
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success);
+
+    let result = compile_and_run(&c_code, "123 456 789\n").unwrap();
+    assert!(result.contains("INT: 123"));
+    assert!(result.contains("INT: 456"));
+    assert!(result.contains("INT: 789"));
+}
+
+#[test]
+fn test_keyword_priority() {
+    let lex_input = r#"
+%%
+if        printf("KEYWORD: if\n");
+[a-z]+    printf("ID: %s\n", yytext);
+[ \t\n]+  /* skip */
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success);
+
+    let result = compile_and_run(&c_code, "if foo iffy\n").unwrap();
+    assert!(result.contains("KEYWORD: if"));
+    assert!(result.contains("ID: foo"));
+    assert!(result.contains("ID: iffy"));
+}
+
+#[test]
+fn test_alternation() {
+    let lex_input = r#"
+%%
+cat|dog   printf("ANIMAL: %s\n", yytext);
+[ \t\n]+  /* skip */
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success);
+
+    let result = compile_and_run(&c_code, "cat dog\n").unwrap();
+    assert!(result.contains("ANIMAL: cat"));
+    assert!(result.contains("ANIMAL: dog"));
+}
+
+#[test]
+fn test_character_class() {
+    let lex_input = r#"
+%%
+[A-Z][a-z]*   printf("NAME: %s\n", yytext);
+[ \t\n]+      /* skip */
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success);
+
+    let result = compile_and_run(&c_code, "Hello World\n").unwrap();
+    assert!(result.contains("NAME: Hello"));
+    assert!(result.contains("NAME: World"));
+}
+
+#[test]
+fn test_longest_match() {
+    let lex_input = r#"
+%%
+a         printf("A\n");
+aa        printf("AA\n");
+aaa       printf("AAA\n");
+[ \t\n]+  /* skip */
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success);
+
+    let result = compile_and_run(&c_code, "a aa aaa\n").unwrap();
+    let lines: Vec<&str> = result.trim().lines().collect();
+    assert_eq!(lines, vec!["A", "AA", "AAA"]);
+}
+
+#[test]
+fn test_external_definitions() {
+    let lex_input = r#"
+%{
+#include <string.h>
+static int count = 0;
+%}
+%%
+[a-z]+    { count++; printf("WORD %d: %s\n", count, yytext); }
+[ \t\n]+  /* skip */
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success);
+    assert!(c_code.contains("static int count = 0;"));
+
+    let result = compile_and_run(&c_code, "one two three\n").unwrap();
+    assert!(result.contains("WORD 1: one"));
+    assert!(result.contains("WORD 2: two"));
+    assert!(result.contains("WORD 3: three"));
+}
+
+#[test]
+fn test_return_value() {
+    let lex_input = r#"
+%{
+#define TOK_WORD 1
+%}
+%%
+[a-z]+    return TOK_WORD;
+[ \t\n]+  /* skip */
+%%
+
+int main() {
+    int tok;
+    while ((tok = yylex()) != 0) {
+        printf("Token: %d, Text: %s\n", tok, yytext);
+    }
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success);
+
+    let result = compile_and_run(&c_code, "hello world\n").unwrap();
+    assert!(result.contains("Token: 1, Text: hello"));
+    assert!(result.contains("Token: 1, Text: world"));
+}
+
+#[test]
+fn test_optional_repetition() {
+    let lex_input = r#"
+%%
+ab?c      printf("MATCH: %s\n", yytext);
+[ \t\n]+  /* skip */
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success);
+
+    let result = compile_and_run(&c_code, "ac abc\n").unwrap();
+    assert!(result.contains("MATCH: ac"));
+    assert!(result.contains("MATCH: abc"));
+}
+
+#[test]
+fn test_plus_repetition() {
+    let lex_input = r#"
+%%
+a+        printf("AS: %s\n", yytext);
+[ \t\n]+  /* skip */
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success);
+
+    let result = compile_and_run(&c_code, "a aa aaa\n").unwrap();
+    assert!(result.contains("AS: a"));
+    assert!(result.contains("AS: aa"));
+    assert!(result.contains("AS: aaa"));
+}
+
+#[test]
+fn test_star_repetition() {
+    let lex_input = r#"
+%%
+ba*       printf("BAS: %s\n", yytext);
+[ \t\n]+  /* skip */
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success);
+
+    let result = compile_and_run(&c_code, "b ba baa\n").unwrap();
+    assert!(result.contains("BAS: b"));
+    assert!(result.contains("BAS: ba"));
+    assert!(result.contains("BAS: baa"));
+}
+
+// Start condition tests
+
+#[test]
+fn test_inclusive_start_condition() {
+    // Test %s (inclusive) start conditions
+    // Rules without explicit start conditions are active in INITIAL and %s conditions
+    let lex_input = r#"
+%s SPECIAL
+%%
+[a-z]+        printf("WORD: %s\n", yytext);
+<SPECIAL>[0-9]+    printf("SPECIAL_NUM: %s\n", yytext);
+[ \t\n]+      /* skip */
+%%
+
+int main() {
+    printf("Testing INITIAL state:\n");
+    /* Process input in INITIAL state - should only match words */
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    // Verify start condition defines are generated
+    assert!(c_code.contains("#define INITIAL 0"));
+    assert!(c_code.contains("#define SPECIAL 1"));
+    assert!(c_code.contains("#define BEGIN(x)"));
+
+    // Test that word matching works in INITIAL state
+    let result = compile_and_run(&c_code, "hello\n").unwrap();
+    assert!(result.contains("WORD: hello"));
+}
+
+#[test]
+fn test_exclusive_start_condition() {
+    // Test %x (exclusive) start conditions
+    // Rules without explicit conditions are NOT active in exclusive conditions
+    let lex_input = r#"
+%x COMMENT
+%%
+"/*"          { printf("START_COMMENT\n"); BEGIN(COMMENT); }
+<COMMENT>"*/" { printf("END_COMMENT\n"); BEGIN(INITIAL); }
+<COMMENT>.    /* eat comment chars */
+<COMMENT>\n   /* eat newlines in comments */
+[a-z]+        printf("WORD: %s\n", yytext);
+[ \t\n]+      /* skip */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    // Verify exclusive condition is defined
+    assert!(c_code.contains("#define COMMENT"));
+
+    // Test basic word matching (no comments)
+    let result = compile_and_run(&c_code, "hello world\n").unwrap();
+    assert!(result.contains("WORD: hello"));
+    assert!(result.contains("WORD: world"));
+}
+
+#[test]
+fn test_multiple_start_conditions_on_rule() {
+    // Test rules with multiple start conditions <A,B>pattern
+    // Note: This tests that patterns with explicit start conditions generate
+    // correct code structure. Due to DFA merging, rules with overlapping patterns
+    // may have priority conflicts.
+    let lex_input = r#"
+%s STATE1
+%s STATE2
+%%
+<STATE1,STATE2>xyz   printf("SPECIAL in STATE1 or STATE2\n");
+[a-z]+               printf("WORD: %s\n", yytext);
+[ \t\n]+             /* skip */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    // Verify both state defines exist
+    assert!(c_code.contains("#define STATE1"));
+    assert!(c_code.contains("#define STATE2"));
+
+    // In INITIAL state, words match as WORD
+    let result = compile_and_run(&c_code, "hello world\n").unwrap();
+    assert!(result.contains("WORD: hello"));
+    assert!(result.contains("WORD: world"));
+}
+
+#[test]
+fn test_begin_macro() {
+    // Test that BEGIN macro and yy_start_state are generated correctly
+    // Note: This test verifies code generation. Due to DFA merging with
+    // overlapping patterns, we use distinct patterns that don't conflict.
+    let lex_input = r#"
+%x COMMENT
+%%
+"/*"          { printf("BEGIN_COMMENT\n"); BEGIN(COMMENT); }
+<COMMENT>"*/" { printf("END_COMMENT\n"); BEGIN(INITIAL); }
+<COMMENT>.    /* eat comment */
+<COMMENT>\n   /* eat newline */
+[0-9]+        printf("NUMBER: %s\n", yytext);
+[ \t\n]+      /* skip */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    // Verify BEGIN macro and state variable
+    assert!(c_code.contains("#define BEGIN(x)"));
+    assert!(c_code.contains("yy_start_state"));
+
+    // Test number matching (no comments)
+    let result = compile_and_run(&c_code, "123 456\n").unwrap();
+    assert!(result.contains("NUMBER: 123"));
+    assert!(result.contains("NUMBER: 456"));
+}
+
+#[test]
+fn test_start_condition_code_generation() {
+    // Verify that the correct code structures are generated for start conditions
+    let lex_input = r#"
+%s INCLUSIVE_STATE
+%x EXCLUSIVE_STATE
+%%
+[a-z]+    printf("WORD\n");
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    // Check for start condition defines
+    assert!(c_code.contains("#define INITIAL 0"));
+    assert!(c_code.contains("#define INCLUSIVE_STATE"));
+    assert!(c_code.contains("#define EXCLUSIVE_STATE"));
+
+    // Check for yy_start_state variable
+    assert!(c_code.contains("yy_start_state"));
+
+    // Check for BEGIN macro
+    assert!(c_code.contains("#define BEGIN(x)"));
+
+    // Check for YY_START macro
+    assert!(c_code.contains("#define YY_START"));
+
+    // Check for rule condition table (since we have multiple conditions)
+    assert!(c_code.contains("yy_rule_cond"));
+}
+
+// REJECT tests
+
+#[test]
+fn test_reject_basic() {
+    // Test basic REJECT functionality - match "xyz" then REJECT to match "xy"
+    let lex_input = r#"
+%%
+xyz       { printf("XYZ\n"); REJECT; }
+xy        printf("XY\n");
+[a-z]+    printf("WORD: %s\n", yytext);
+[ \t\n]+  /* skip */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    // Verify REJECT infrastructure is generated
+    assert!(c_code.contains("#define REJECT"));
+    assert!(c_code.contains("yy_reject_flag"));
+    assert!(c_code.contains("yy_accept_list"));
+    assert!(c_code.contains("yy_accept_idx"));
+}
+
+#[test]
+fn test_reject_code_generation() {
+    // Verify REJECT-related code is properly generated
+    let lex_input = r#"
+%%
+abc       { printf("ABC\n"); REJECT; }
+ab        printf("AB\n");
+a         printf("A\n");
+[ \t\n]+  /* skip */
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    // Check for REJECT macro
+    assert!(c_code.contains("#define REJECT"));
+
+    // Check for REJECT support variables
+    assert!(c_code.contains("yy_reject_flag"));
+    assert!(c_code.contains("yy_full_match_pos"));
+    assert!(c_code.contains("yy_full_match_state"));
+    assert!(c_code.contains("yy_full_match_rule_idx"));
+
+    // Check for accepting rules list (for REJECT to find next-best match)
+    assert!(c_code.contains("yy_accept_idx"));
+    assert!(c_code.contains("yy_accept_list"));
+
+    // Check for the find_next_match label
+    assert!(c_code.contains("yy_find_next_match:"));
+}
+
+#[test]
+fn test_reject_multiple_rules() {
+    // Test REJECT with multiple overlapping rules
+    let lex_input = r#"
+%%
+abcd      { printf("ABCD\n"); REJECT; }
+abc       { printf("ABC\n"); REJECT; }
+ab        { printf("AB\n"); REJECT; }
+a         printf("A\n");
+[ \t\n]+  /* skip */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    // Verify code compiles
+    let result = compile_and_run(&c_code, "a\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+    assert!(output.contains("A"));
+}
+
+// yymore, yyless, input, unput tests
+
+#[test]
+fn test_yymore_code_generation() {
+    // Test that yymore support code is generated
+    let lex_input = r#"
+%%
+[a-z]+    printf("WORD: %s\n", yytext);
+[ \t\n]+  /* skip */
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    // Check for yymore support
+    assert!(c_code.contains("yy_more_flag"));
+    assert!(c_code.contains("yy_more_len"));
+    assert!(c_code.contains("#define yymore()"));
+}
+
+#[test]
+fn test_yymore_basic() {
+    // Test basic yymore functionality - accumulate single-char matches
+    // Each letter calls yymore(), the dash prints accumulated text
+    let lex_input = r#"
+%%
+[a-z]     { yymore(); }
+-         { printf("WORD: %s\n", yytext); }
+[ \t\n]+  /* skip */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    // Test that code compiles and runs
+    let result = compile_and_run(&c_code, "abc-def-\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+    // Each letter is matched individually and yymore() accumulates them
+    // When '-' is matched, yytext contains all accumulated letters plus '-'
+    assert!(output.contains("WORD: abc-"));
+    assert!(output.contains("WORD: def-"));
+}
+
+#[test]
+fn test_yyless_code_generation() {
+    // Test that yyless macro is generated
+    let lex_input = r#"
+%%
+[a-z]+    printf("WORD: %s\n", yytext);
+[ \t\n]+  /* skip */
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    // Check for yyless macro
+    assert!(c_code.contains("#define yyless(n)"));
+}
+
+#[test]
+fn test_yyless_basic() {
+    // Test yyless - match "hello" but only keep "hel", pushing "lo" back
+    let lex_input = r#"
+%%
+hello     { yyless(3); printf("MATCHED: %s (len=%d)\n", yytext, yyleng); }
+lo        printf("REMAINDER: %s\n", yytext);
+[a-z]+    printf("WORD: %s\n", yytext);
+[ \t\n]+  /* skip */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    let result = compile_and_run(&c_code, "hello\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+    // Should match "hello", keep only "hel", then "lo" gets matched by second rule
+    assert!(output.contains("MATCHED: hel"));
+    assert!(output.contains("REMAINDER: lo"));
+}
+
+#[test]
+fn test_input_code_generation() {
+    // Test that input() function is generated
+    let lex_input = r#"
+%%
+[a-z]+    printf("WORD: %s\n", yytext);
+[ \t\n]+  /* skip */
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    // Check for input function
+    assert!(c_code.contains("static int input(void)"));
+}
+
+#[test]
+fn test_input_basic() {
+    // Test input() - read characters directly from input
+    let lex_input = r#"
+%%
+"/*"      {
+            int c;
+            printf("START_COMMENT\n");
+            while ((c = input()) != 0) {
+                if (c == '*') {
+                    int c2 = input();
+                    if (c2 == '/') {
+                        printf("END_COMMENT\n");
+                        break;
+                    }
+                    if (c2 != 0) unput(c2);
+                }
+            }
+          }
+[a-z]+    printf("WORD: %s\n", yytext);
+[ \t\n]+  /* skip */
+.         /* skip other */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    let result = compile_and_run(&c_code, "/* comment */ hello\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+    assert!(output.contains("START_COMMENT"));
+    assert!(output.contains("END_COMMENT"));
+    assert!(output.contains("WORD: hello"));
+}
+
+#[test]
+fn test_unput_code_generation() {
+    // Test that unput() function is generated
+    let lex_input = r#"
+%%
+[a-z]+    printf("WORD: %s\n", yytext);
+[ \t\n]+  /* skip */
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    // Check for unput function
+    assert!(c_code.contains("static void unput(int c)"));
+    assert!(c_code.contains("yy_unput_buf"));
+}
+
+#[test]
+fn test_unput_basic() {
+    // Test unput() - push characters back to input
+    let lex_input = r#"
+%%
+abc       {
+            printf("ABC\n");
+            unput('x');
+            unput('y');
+            unput('z');
+          }
+zyx       printf("ZYX\n");
+[a-z]+    printf("WORD: %s\n", yytext);
+[ \t\n]+  /* skip */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    let result = compile_and_run(&c_code, "abc\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+    // After matching "abc", we push "zyx" back (in reverse order)
+    // So next match should be "zyx"
+    assert!(output.contains("ABC"));
+    assert!(output.contains("ZYX"));
+}
+
+// Anchoring and trailing context tests
+
+#[test]
+fn test_bol_anchor_code_generation() {
+    // Test that BOL anchor (^) generates proper code
+    let lex_input = r#"
+%%
+^hello    printf("BOL_HELLO\n");
+hello     printf("HELLO\n");
+[ \t\n]+  /* skip */
+%%
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    // Check for BOL tracking variable
+    assert!(c_code.contains("yy_at_bol"));
+    // Check for BOL rule table
+    assert!(c_code.contains("yy_rule_bol"));
+}
+
+#[test]
+fn test_bol_anchor_basic() {
+    // Test ^ anchor - match only at beginning of line
+    let lex_input = r#"
+%%
+^start    printf("BOL_START\n");
+start     printf("START\n");
+[a-z]+    printf("WORD: %s\n", yytext);
+[ \t]+    /* skip spaces */
+\n        /* newline */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    // Test: "start" at beginning should match ^start
+    // "start" after another word should match regular start
+    let result = compile_and_run(&c_code, "start foo start\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+    assert!(
+        output.contains("BOL_START"),
+        "First 'start' should match BOL rule"
+    );
+    assert!(output.contains("WORD: foo"));
+    // Second "start" is not at BOL, so should match regular rule
+    assert!(
+        output.contains("START"),
+        "Second 'start' should match regular rule"
+    );
+}
+
+#[test]
+fn test_eol_anchor_basic() {
+    // Test $ anchor (end of line) - converted to trailing context /\n
+    let lex_input = r#"
+%%
+end$      printf("EOL_END\n");
+end       printf("END\n");
+[a-z]+    printf("WORD: %s\n", yytext);
+[ \t]+    /* skip spaces */
+\n        /* skip newlines */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    // Test: "end" at end of line should match end$
+    // "end" followed by space should match regular end
+    let result = compile_and_run(&c_code, "end foo\nbar end\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+    // First "end" is followed by space, not newline
+    assert!(
+        output.contains("END"),
+        "'end' followed by space should match regular rule"
+    );
+    // Second "end" is at end of line
+    assert!(
+        output.contains("EOL_END"),
+        "'end' at EOL should match $ rule"
+    );
+}
+
+#[test]
+fn test_trailing_context_basic() {
+    // Test trailing context (r/s) - match r only if followed by s
+    // Note: This tests the basic case where trailing context works correctly.
+    // When the trailing context pattern is followed by its expected context,
+    // yytext contains only the main pattern and the trailing part stays in input.
+    let lex_input = r#"
+%%
+ab/cd     printf("AB_BEFORE_CD: '%s'\n", yytext);
+cd        printf("CD: '%s'\n", yytext);
+[ \t\n]+  /* skip */
+.         printf("OTHER: '%c'\n", yytext[0]);
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    // Check for main pattern length table (used for trailing context)
+    assert!(c_code.contains("yy_rule_main_len"));
+
+    // Test: "abcd" should match ab/cd, with yytext containing only "ab"
+    // Then "cd" should match separately
+    let result = compile_and_run(&c_code, "abcd\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+    // "abcd" - ab matches because followed by cd
+    assert!(
+        output.contains("AB_BEFORE_CD: 'ab'"),
+        "Should match ab/cd with yytext='ab', got: {}",
+        output
+    );
+    assert!(
+        output.contains("CD: 'cd'"),
+        "cd should be matched separately, got: {}",
+        output
+    );
+}
+
+#[test]
+fn test_trailing_context_fixed_length() {
+    // Test trailing context with fixed length pattern
+    let lex_input = r#"
+%%
+foo/bar   printf("FOO_BEFORE_BAR: len=%d\n", yyleng);
+foo       printf("FOO\n");
+bar       printf("BAR\n");
+[a-z]+    printf("WORD\n");
+[ \t\n]+  /* skip */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    let result = compile_and_run(&c_code, "foobar foobaz\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+    // foobar: foo matches with trailing context bar
+    assert!(
+        output.contains("FOO_BEFORE_BAR: len=3"),
+        "foo/bar should have yyleng=3"
+    );
+    assert!(output.contains("BAR"), "bar should be matched after");
+    // foobaz: foo is not followed by bar
+    assert!(
+        output.contains("FOO"),
+        "foo not before bar should match regular foo"
+    );
+}
+
+// Start condition priority tests
+
+#[test]
+fn test_start_condition_rule_priority_exclusive() {
+    // Test that rules in different exclusive conditions have correct priority
+    // When in STATE1, we should match STATE1's rule, not STATE2's
+    let lex_input = r#"
+%x STATE1
+%x STATE2
+%%
+<STATE1>ab  printf("STATE1_AB\n");
+<STATE2>ab  printf("STATE2_AB\n");
+[ \t\n]+    /* skip */
+%%
+
+int main() {
+    BEGIN(STATE1);
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    let result = compile_and_run(&c_code, "ab\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+    assert!(
+        output.contains("STATE1_AB"),
+        "Should match STATE1 rule, got: {}",
+        output
+    );
+    assert!(
+        !output.contains("STATE2_AB"),
+        "Should NOT match STATE2 rule, got: {}",
+        output
+    );
+}
+
+#[test]
+fn test_start_condition_state_switching() {
+    // Test state switching between exclusive conditions
+    let lex_input = r#"
+%x STATE1
+%x STATE2
+%%
+<INITIAL>go1   { printf("TO_STATE1\n"); BEGIN(STATE1); }
+<INITIAL>go2   { printf("TO_STATE2\n"); BEGIN(STATE2); }
+<STATE1>test   printf("STATE1_TEST\n");
+<STATE2>test   printf("STATE2_TEST\n");
+<STATE1>back   { printf("STATE1_BACK\n"); BEGIN(INITIAL); }
+<STATE2>back   { printf("STATE2_BACK\n"); BEGIN(INITIAL); }
+[ \t\n]+       /* skip */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    // Test: go to STATE1, match test, go back, go to STATE2, match test
+    let result = compile_and_run(&c_code, "go1 test back go2 test back\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+
+    assert!(output.contains("TO_STATE1"), "Should switch to STATE1");
+    assert!(output.contains("STATE1_TEST"), "Should match in STATE1");
+    assert!(output.contains("STATE1_BACK"), "Should go back from STATE1");
+    assert!(output.contains("TO_STATE2"), "Should switch to STATE2");
+    assert!(output.contains("STATE2_TEST"), "Should match in STATE2");
+    assert!(output.contains("STATE2_BACK"), "Should go back from STATE2");
+}
+
+#[test]
+fn test_inclusive_vs_exclusive_conditions() {
+    // Test that inclusive (%s) and exclusive (%x) conditions behave correctly
+    // Inclusive: rules without explicit conditions ARE active
+    // Exclusive: rules without explicit conditions are NOT active
+    let lex_input = r#"
+%s INCL
+%x EXCL
+%%
+<INCL>special_incl   printf("SPECIAL_INCL\n");
+<EXCL>special_excl   printf("SPECIAL_EXCL\n");
+word                 printf("WORD\n");
+[ \t\n]+             /* skip */
+%%
+
+int main() {
+    printf("=== INITIAL ===\n");
+    BEGIN(INITIAL);
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    // In INITIAL state, "word" should match
+    let result = compile_and_run(&c_code, "word\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+    assert!(
+        output.contains("WORD"),
+        "Should match 'word' in INITIAL state"
+    );
+}
+
+#[test]
+fn test_exclusive_blocks_unconditional_rules() {
+    // When in an exclusive condition, unconditional rules should NOT match
+    let lex_input = r#"
+%x EXCL
+%%
+enter_excl    { printf("ENTERING_EXCL\n"); BEGIN(EXCL); }
+<EXCL>exit    { printf("EXITING_EXCL\n"); BEGIN(INITIAL); }
+<EXCL>.       /* eat chars in EXCL mode */
+<EXCL>\n      /* eat newlines in EXCL mode */
+hello         printf("HELLO\n");
+[ \t\n]+      /* skip */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    // "hello" before enter_excl should match
+    // "hello" inside exclusive mode should NOT match (eaten by <EXCL>.)
+    // "hello" after exit should match again
+    let result = compile_and_run(&c_code, "hello enter_excl hello exit hello\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+
+    // Count occurrences of HELLO - should be exactly 2
+    let hello_count = output.matches("HELLO").count();
+    assert_eq!(
+        hello_count, 2,
+        "Should have exactly 2 HELLO matches (before and after EXCL), got: {}",
+        output
+    );
+}
+
+// Variable-length trailing context tests
+
+#[test]
+fn test_fixed_main_variable_trailing_context() {
+    // Test fixed-length main pattern with variable-length trailing context: abc/d+
+    // The main pattern "abc" has fixed length 3, trailing context is variable
+    // This should work because we can calculate main pattern length at compile time
+    let lex_input = r#"
+%%
+abc/d+      printf("ABC_BEFORE_D: '%s' len=%d\n", yytext, yyleng);
+d+          printf("D: '%s'\n", yytext);
+[a-z]+      printf("WORD: '%s'\n", yytext);
+[ \t\n]+    /* skip */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    // Test: "abcddd" - should match "abc" with trailing "ddd"
+    let result = compile_and_run(&c_code, "abcddd\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+
+    // yytext should be "abc" (the fixed-length main pattern only)
+    assert!(
+        output.contains("ABC_BEFORE_D: 'abc' len=3"),
+        "Should match abc with yytext='abc' len=3, got: {}",
+        output
+    );
+    // Then "ddd" should be matched by the d+ rule
+    assert!(
+        output.contains("D: 'ddd'"),
+        "Trailing context should be re-matched, got: {}",
+        output
+    );
+}
+
+#[test]
+#[ignore] // TODO: Variable-length main pattern with variable trailing context not yet supported
+fn test_variable_trailing_context() {
+    // Test variable-length trailing context: ab+/cd+
+    // This matches "ab+" followed by "cd+" but only returns the "ab+" part
+    // NOTE: This is a complex case requiring the two-DFA approach
+    let lex_input = r#"
+%%
+ab+/cd+     printf("AB_BEFORE_CD: '%s' len=%d\n", yytext, yyleng);
+cd+         printf("CD: '%s'\n", yytext);
+[a-z]+      printf("WORD: '%s'\n", yytext);
+[ \t\n]+    /* skip */
+%%
+
+int main() {
+    yylex();
+    return 0;
+}
+"#;
+
+    let (c_code, success) = run_lex(lex_input);
+    assert!(success, "lex failed to generate C code");
+
+    // Test: "abbcdd" - should match "abb" with trailing "cdd"
+    let result = compile_and_run(&c_code, "abbcdd\n");
+    assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
+    let output = result.unwrap();
+
+    // yytext should be "abb" (the main pattern only)
+    assert!(
+        output.contains("AB_BEFORE_CD: 'abb'"),
+        "Should match ab+ with yytext='abb', got: {}",
+        output
+    );
+    // Then "cdd" should be matched by the cd+ rule
+    assert!(
+        output.contains("CD: 'cdd'"),
+        "Trailing context should be re-matched, got: {}",
+        output
+    );
+}

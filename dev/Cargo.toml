@@ -13,6 +13,8 @@ gettext-rs.workspace = true
 object =  { version = "0.35", features = ["read", "build", "elf"]}
 chrono.workspace = true
 ar = "0.9"
+regex.workspace = true
+regex-syntax = "0.8"
 
 [dev-dependencies]
 plib = { path = "../plib" }
@@ -41,4 +43,8 @@ path = "./strings.rs"
 [[bin]]
 name = "yacc"
 path = "./yacc/main.rs"
+
+[[bin]]
+name = "lex"
+path = "./lex/main.rs"
 

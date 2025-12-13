@@ -1,3 +1,4 @@
+mod lex;
 mod yacc;
 
 use object::{Object, ObjectSection, ObjectSymbol};

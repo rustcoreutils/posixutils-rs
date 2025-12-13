@@ -1504,6 +1504,8 @@ dependencies = [
  "gettext-rs",
  "object",
  "plib",
+ "regex",
+ "regex-syntax",
  "tempfile",
 ]
 

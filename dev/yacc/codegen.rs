@@ -62,21 +62,31 @@ fn generate_code_file(
 
     // YYDEBUG definition
     if opts.debug_enabled {
-        writeln!(w, "#ifndef YYDEBUG")?;
-        writeln!(w, "# define YYDEBUG 1")?;
-        writeln!(w, "#endif")?;
+        writeln!(
+            w,
+            r#"#ifndef YYDEBUG
+# define YYDEBUG 1
+#endif
+"#
+        )?;
     } else {
-        writeln!(w, "#ifndef YYDEBUG")?;
-        writeln!(w, "# define YYDEBUG 0")?;
-        writeln!(w, "#endif")?;
+        writeln!(
+            w,
+            r#"#ifndef YYDEBUG
+# define YYDEBUG 0
+#endif
+"#
+        )?;
     }
-    writeln!(w)?;
 
     // Standard includes
-    writeln!(w, "#include <stdio.h>")?;
-    writeln!(w, "#include <stdlib.h>")?;
-    writeln!(w, "#include <string.h>")?;
-    writeln!(w)?;
+    writeln!(
+        w,
+        r#"#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+"#
+    )?;
 
     // Prologue code
     for code_block in &grammar.prologue {
@@ -103,12 +113,15 @@ fn generate_code_file(
         writeln!(w, "# define YYSTYPE_IS_DECLARED 1")?;
         writeln!(w, "#endif")?;
     } else {
-        writeln!(w, "#if ! defined YYSTYPE && ! defined YYSTYPE_IS_DECLARED")?;
-        writeln!(w, "typedef int YYSTYPE;")?;
-        writeln!(w, "# define YYSTYPE_IS_DECLARED 1")?;
-        writeln!(w, "#endif")?;
+        writeln!(
+            w,
+            r#"#if ! defined YYSTYPE && ! defined YYSTYPE_IS_DECLARED
+typedef int YYSTYPE;
+# define YYSTYPE_IS_DECLARED 1
+#endif
+"#
+        )?;
     }
-    writeln!(w)?;
 
     // External declarations
     let prefix = &opts.sym_prefix;
@@ -715,15 +728,17 @@ fn generate_parser<W: Write>(
     }
 
     // Stack size
-    writeln!(w, "#ifndef YYINITDEPTH")?;
-    writeln!(w, "#define YYINITDEPTH 200")?;
-    writeln!(w, "#endif")?;
-    writeln!(w)?;
+    writeln!(
+        w,
+        r#"#ifndef YYINITDEPTH
+#define YYINITDEPTH 200
+#endif
 
-    writeln!(w, "#ifndef YYMAXDEPTH")?;
-    writeln!(w, "#define YYMAXDEPTH 10000")?;
-    writeln!(w, "#endif")?;
-    writeln!(w)?;
+#ifndef YYMAXDEPTH
+#define YYMAXDEPTH 10000
+#endif
+"#
+    )?;
 
     // Error handling macros (POSIX required)
     writeln!(
@@ -1380,12 +1395,15 @@ fn generate_header_file(path: &str, opts: &Options, grammar: &Grammar) -> Result
         writeln!(w, "# define YYSTYPE_IS_DECLARED 1")?;
         writeln!(w, "#endif")?;
     } else {
-        writeln!(w, "#if ! defined YYSTYPE && ! defined YYSTYPE_IS_DECLARED")?;
-        writeln!(w, "typedef int YYSTYPE;")?;
-        writeln!(w, "# define YYSTYPE_IS_DECLARED 1")?;
-        writeln!(w, "#endif")?;
+        writeln!(
+            w,
+            r#"#if ! defined YYSTYPE && ! defined YYSTYPE_IS_DECLARED
+typedef int YYSTYPE;
+# define YYSTYPE_IS_DECLARED 1
+#endif
+"#
+        )?;
     }
-    writeln!(w)?;
 
     // External yylval
     writeln!(w, "extern YYSTYPE {}lval;", opts.sym_prefix)?;

@@ -89,9 +89,13 @@ fn write_header<W: Write>(output: &mut W) -> io::Result<()> {
 }
 
 fn write_includes<W: Write>(output: &mut W) -> io::Result<()> {
-    writeln!(output, "#include <stdio.h>")?;
-    writeln!(output, "#include <stdlib.h>")?;
-    writeln!(output, "#include <string.h>\n")?;
+    writeln!(
+        output,
+        r#"#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+"#
+    )?;
     Ok(())
 }
 
@@ -107,28 +111,29 @@ fn write_external_definitions<W: Write>(output: &mut W, lexinfo: &LexInfo) -> io
 }
 
 fn write_macros_and_types<W: Write>(output: &mut W, config: &CodeGenConfig) -> io::Result<()> {
-    writeln!(output, "/* Lex macros and types */")?;
-    writeln!(output, "#ifndef YY_BUF_SIZE")?;
-    writeln!(output, "#define YY_BUF_SIZE 16384")?;
-    writeln!(output, "#endif\n")?;
-
-    writeln!(output, "#ifndef ECHO")?;
-    writeln!(output, "#define ECHO fwrite(yytext, yyleng, 1, yyout)")?;
-    writeln!(output, "#endif\n")?;
-
-    writeln!(output, "#ifndef YY_INPUT")?;
-    writeln!(output, "#define YY_INPUT(buf, result, max_size) \\")?;
-    writeln!(output, "    do {{ \\")?;
-    writeln!(output, "        if (yyin == NULL) yyin = stdin; \\")?;
-    writeln!(output, "        if (feof(yyin)) {{ result = 0; }} \\")?;
-    writeln!(output, "        else {{ \\")?;
     writeln!(
         output,
-        "            result = fread(buf, 1, max_size, yyin); \\"
+        r#"/* Lex macros and types */
+#ifndef YY_BUF_SIZE
+#define YY_BUF_SIZE 16384
+#endif
+
+#ifndef ECHO
+#define ECHO fwrite(yytext, yyleng, 1, yyout)
+#endif
+
+#ifndef YY_INPUT
+#define YY_INPUT(buf, result, max_size) \
+    do {{ \
+        if (yyin == NULL) yyin = stdin; \
+        if (feof(yyin)) {{ result = 0; }} \
+        else {{ \
+            result = fread(buf, 1, max_size, yyin); \
+        }} \
+    }} while (0)
+#endif
+"#
     )?;
-    writeln!(output, "        }} \\")?;
-    writeln!(output, "    }} while (0)")?;
-    writeln!(output, "#endif\n")?;
 
     // Generate start condition defines
     writeln!(output, "/* Start condition states */")?;
@@ -137,108 +142,86 @@ fn write_macros_and_types<W: Write>(output: &mut W, config: &CodeGenConfig) -> i
     }
     writeln!(output)?;
 
-    writeln!(output, "#ifndef BEGIN")?;
-    writeln!(output, "#define BEGIN(x) (yy_start_state = (x))")?;
-    writeln!(output, "#endif\n")?;
+    writeln!(
+        output,
+        r#"#ifndef BEGIN
+#define BEGIN(x) (yy_start_state = (x))
+#endif
 
-    writeln!(output, "#ifndef YY_START")?;
-    writeln!(output, "#define YY_START yy_start_state")?;
-    writeln!(output, "#endif\n")?;
+#ifndef YY_START
+#define YY_START yy_start_state
+#endif
+"#
+    )?;
 
     // yytext declaration
     if config.yytext_is_pointer {
-        writeln!(output, "/* yytext as pointer */")?;
-        writeln!(output, "static char yy_yytext_buf[YY_BUF_SIZE + 1];")?;
-        writeln!(output, "char *yytext = yy_yytext_buf;")?;
+        writeln!(
+            output,
+            r#"/* yytext as pointer */
+static char yy_yytext_buf[YY_BUF_SIZE + 1];
+char *yytext = yy_yytext_buf;
+"#
+        )?;
     } else {
         writeln!(output, "/* yytext as array */")?;
         writeln!(output, "#define YYLMAX {}", config.yytext_size)?;
-        writeln!(output, "char yytext[YYLMAX];")?;
+        writeln!(output, "char yytext[YYLMAX];\n")?;
     }
-    writeln!(output)?;
 
-    // Standard lex variables
-    writeln!(output, "/* Standard lex variables */")?;
-    writeln!(output, "int yyleng;")?;
-    writeln!(output, "FILE *yyin = NULL;")?;
-    writeln!(output, "FILE *yyout = NULL;")?;
-    writeln!(output, "static int yy_start_state = INITIAL;")?;
-    writeln!(output)?;
-
-    // Input buffer
-    writeln!(output, "/* Input buffer */")?;
-    writeln!(output, "static char yy_buffer[YY_BUF_SIZE + 1];")?;
-    writeln!(output, "static int yy_buffer_pos = 0;")?;
-    writeln!(output, "static int yy_buffer_len = 0;")?;
-    writeln!(output)?;
-
-    // Beginning of line tracking
-    writeln!(output, "/* Beginning of line tracking */")?;
     writeln!(
         output,
-        "static int yy_at_bol = 1; /* Start at beginning of line */"
+        r#"/* Standard lex variables */
+int yyleng;
+FILE *yyin = NULL;
+FILE *yyout = NULL;
+static int yy_start_state = INITIAL;
+
+/* Input buffer */
+static char yy_buffer[YY_BUF_SIZE + 1];
+static int yy_buffer_pos = 0;
+static int yy_buffer_len = 0;
+
+/* Beginning of line tracking */
+static int yy_at_bol = 1; /* Start at beginning of line */
+
+/* REJECT support */
+static int yy_reject_flag = 0;
+static int yy_full_match_pos = 0;
+static int yy_full_match_state = 0;
+static int yy_full_match_rule_idx = 0;
+static int yy_saved_buffer_pos = 0; /* Buffer pos before action */
+
+#ifndef REJECT
+#define REJECT {{ yy_reject_flag = 1; yy_buffer_pos = yy_saved_buffer_pos; goto yy_find_next_match; }}
+#endif
+
+/* yymore support */
+static int yy_more_flag = 0;
+static int yy_more_len = 0;
+
+/* Variable-length trailing context support */
+static int yy_main_end_pos = 0; /* Position where main pattern ended */
+static int yy_main_end_rule = -1; /* Which rule's main pattern ended there */
+
+#ifndef yymore
+#define yymore() (yy_more_flag = 1)
+#endif
+
+/* yyless - return characters to input */
+#ifndef yyless
+#define yyless(n) do {{ \
+    yy_buffer_pos = yy_buffer_pos - yyleng + (n); \
+    yyleng = (n); \
+    yytext[yyleng] = '\0'; \
+}} while (0)
+#endif
+
+/* unput support - pushback buffer */
+static char yy_unput_buf[YY_BUF_SIZE];
+static int yy_unput_pos = 0;
+"#
     )?;
-    writeln!(output)?;
-
-    // REJECT support
-    writeln!(output, "/* REJECT support */")?;
-    writeln!(output, "static int yy_reject_flag = 0;")?;
-    writeln!(output, "static int yy_full_match_pos = 0;")?;
-    writeln!(output, "static int yy_full_match_state = 0;")?;
-    writeln!(output, "static int yy_full_match_rule_idx = 0;")?;
-    writeln!(
-        output,
-        "static int yy_saved_buffer_pos = 0; /* Buffer pos before action */"
-    )?;
-    writeln!(output)?;
-
-    writeln!(output, "#ifndef REJECT")?;
-    writeln!(
-        output,
-        "#define REJECT {{ yy_reject_flag = 1; yy_buffer_pos = yy_saved_buffer_pos; goto yy_find_next_match; }}"
-    )?;
-    writeln!(output, "#endif\n")?;
-
-    // yymore support
-    writeln!(output, "/* yymore support */")?;
-    writeln!(output, "static int yy_more_flag = 0;")?;
-    writeln!(output, "static int yy_more_len = 0;")?;
-    writeln!(output)?;
-
-    // Variable-length trailing context support
-    writeln!(output, "/* Variable-length trailing context support */")?;
-    writeln!(
-        output,
-        "static int yy_main_end_pos = 0; /* Position where main pattern ended */"
-    )?;
-    writeln!(
-        output,
-        "static int yy_main_end_rule = -1; /* Which rule's main pattern ended there */"
-    )?;
-    writeln!(output)?;
-
-    writeln!(output, "#ifndef yymore")?;
-    writeln!(output, "#define yymore() (yy_more_flag = 1)")?;
-    writeln!(output, "#endif\n")?;
-
-    // yyless macro
-    writeln!(output, "/* yyless - return characters to input */")?;
-    writeln!(output, "#ifndef yyless")?;
-    writeln!(output, "#define yyless(n) do {{ \\")?;
-    writeln!(
-        output,
-        "    yy_buffer_pos = yy_buffer_pos - yyleng + (n); \\"
-    )?;
-    writeln!(output, "    yyleng = (n); \\")?;
-    writeln!(output, "    yytext[yyleng] = '\\0'; \\")?;
-    writeln!(output, "}} while (0)")?;
-    writeln!(output, "#endif\n")?;
-
-    // Unput buffer for characters pushed back beyond buffer start
-    writeln!(output, "/* unput support - pushback buffer */")?;
-    writeln!(output, "static char yy_unput_buf[YY_BUF_SIZE];")?;
-    writeln!(output, "static int yy_unput_pos = 0;")?;
-    writeln!(output)?;
 
     Ok(())
 }
@@ -636,52 +619,43 @@ fn write_internal_definitions<W: Write>(output: &mut W, lexinfo: &LexInfo) -> io
 }
 
 fn write_helper_functions<W: Write>(output: &mut W) -> io::Result<()> {
-    // input() function - read one character from input
-    writeln!(output, "/* input - read one character from input */")?;
-    writeln!(output, "static int input(void)")?;
-    writeln!(output, "{{")?;
-    writeln!(output, "    int c;")?;
-    writeln!(output, "    /* First check unput buffer */")?;
-    writeln!(output, "    if (yy_unput_pos > 0) {{")?;
+    // input() and unput() functions
     writeln!(
         output,
-        "        return (unsigned char)yy_unput_buf[--yy_unput_pos];"
-    )?;
-    writeln!(output, "    }}")?;
-    writeln!(output, "    /* Then check main buffer */")?;
-    writeln!(output, "    if (yy_buffer_pos < yy_buffer_len) {{")?;
-    writeln!(
-        output,
-        "        return (unsigned char)yy_buffer[yy_buffer_pos++];"
-    )?;
-    writeln!(output, "    }}")?;
-    writeln!(output, "    /* Need to refill buffer */")?;
-    writeln!(output, "    if (yyin == NULL) yyin = stdin;")?;
-    writeln!(output, "    c = getc(yyin);")?;
-    writeln!(output, "    if (c == EOF) return 0;")?;
-    writeln!(output, "    return c;")?;
-    writeln!(output, "}}\n")?;
+        r#"/* input - read one character from input */
+static int input(void)
+{{
+    int c;
+    /* First check unput buffer */
+    if (yy_unput_pos > 0) {{
+        return (unsigned char)yy_unput_buf[--yy_unput_pos];
+    }}
+    /* Then check main buffer */
+    if (yy_buffer_pos < yy_buffer_len) {{
+        return (unsigned char)yy_buffer[yy_buffer_pos++];
+    }}
+    /* Need to refill buffer */
+    if (yyin == NULL) yyin = stdin;
+    c = getc(yyin);
+    if (c == EOF) return 0;
+    return c;
+}}
 
-    // unput() function - push character back to input
-    writeln!(output, "/* unput - push character back to input */")?;
-    writeln!(output, "static void unput(int c)")?;
-    writeln!(output, "{{")?;
-    writeln!(output, "    if (yy_buffer_pos > 0) {{")?;
-    writeln!(
-        output,
-        "        /* Push back into main buffer if possible */"
+/* unput - push character back to input */
+static void unput(int c)
+{{
+    if (yy_buffer_pos > 0) {{
+        /* Push back into main buffer if possible */
+        yy_buffer[--yy_buffer_pos] = (char)c;
+    }} else {{
+        /* Use pushback buffer */
+        if (yy_unput_pos < YY_BUF_SIZE) {{
+            yy_unput_buf[yy_unput_pos++] = (char)c;
+        }}
+    }}
+}}
+"#
     )?;
-    writeln!(output, "        yy_buffer[--yy_buffer_pos] = (char)c;")?;
-    writeln!(output, "    }} else {{")?;
-    writeln!(output, "        /* Use pushback buffer */")?;
-    writeln!(output, "        if (yy_unput_pos < YY_BUF_SIZE) {{")?;
-    writeln!(
-        output,
-        "            yy_unput_buf[yy_unput_pos++] = (char)c;"
-    )?;
-    writeln!(output, "        }}")?;
-    writeln!(output, "    }}")?;
-    writeln!(output, "}}\n")?;
 
     Ok(())
 }

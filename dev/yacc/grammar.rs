@@ -324,6 +324,18 @@ impl Grammar {
             return Ok(id);
         }
 
+        // POSIX: "Conforming applications shall not use names beginning in yy or YY"
+        // We warn (not error) since it's the application's responsibility
+        if !name.starts_with('@') && !name.starts_with('\'') {
+            // Skip internal symbols like @1 (mid-rule actions) and 'c' (char literals)
+            if name.starts_with("yy") || name.starts_with("YY") {
+                eprintln!(
+                    "warning: symbol '{}' begins with 'yy' or 'YY' which is reserved",
+                    name
+                );
+            }
+        }
+
         // New symbol - check for duplicate token number
         if let Some(num) = token_number {
             if let Some(existing_name) = self.token_number_map.get(&num) {

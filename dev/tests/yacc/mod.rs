@@ -1596,3 +1596,685 @@ expr : expr '+' expr { $<ival>$ = $<ival>1 + $<ival>3; }
         "semantic action should use barvsp[...].ival for $<ival>n with -p bar"
     );
 }
+
+#[test]
+fn test_undefined_nonterminal_error() {
+    // POSIX: yacc shall report an error for any non-terminal symbol that does not
+    // appear on the left side of at least one grammar rule
+    let grammar = r#"
+%token A
+%%
+start : A undefined_symbol ;
+%%
+"#;
+
+    let output = run_yacc(&[], grammar);
+
+    assert!(
+        !output.status.success(),
+        "yacc should fail with undefined non-terminal"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("undefined_symbol") && stderr.contains("no rules"),
+        "error message should mention the undefined non-terminal: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_yy_prefix_warning() {
+    // POSIX: "Conforming applications shall not use names beginning in yy or YY"
+    let grammar = r#"
+%token YYtoken yytoken NORMAL
+%%
+yystart : YYtoken yytoken NORMAL ;
+%%
+"#;
+
+    let output = run_yacc(&[], grammar);
+
+    // Should succeed (warning, not error)
+    assert!(
+        output.status.success(),
+        "yacc should succeed with yy/YY names (warning only)"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("YYtoken") && stderr.contains("reserved"),
+        "should warn about YYtoken: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("yytoken") && stderr.contains("reserved"),
+        "should warn about yytoken: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("yystart") && stderr.contains("reserved"),
+        "should warn about yystart: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_compile_and_run_simple_parser() {
+    // End-to-end test: generate parser, compile with cc, and run
+    let grammar = r#"
+%{
+#include <stdio.h>
+#include <stdlib.h>
+
+int yylex(void);
+void yyerror(const char *s);
+
+static int result = 0;
+%}
+
+%token NUM
+
+%%
+input : NUM { result = $1; }
+      ;
+%%
+
+/* Simple lexer that returns a single NUM token with value 42 */
+static int token_returned = 0;
+int yylval;
+
+int yylex(void) {
+    if (token_returned) return 0;  /* EOF */
+    token_returned = 1;
+    yylval = 42;
+    return NUM;
+}
+
+void yyerror(const char *s) {
+    fprintf(stderr, "%s\n", s);
+}
+
+int main(void) {
+    if (yyparse() != 0) {
+        return 1;
+    }
+    return (result == 42) ? 0 : 1;
+}
+"#;
+
+    let temp_dir = TempDir::new().unwrap();
+    let grammar_path = temp_dir.path().join("test.y");
+    fs::write(&grammar_path, grammar).unwrap();
+
+    // Run yacc
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .arg(grammar_path.to_str().unwrap())
+        .output()
+        .expect("failed to execute yacc");
+
+    assert!(
+        output.status.success(),
+        "yacc should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Compile the generated code
+    let code_path = temp_dir.path().join("y.tab.c");
+    let exe_path = temp_dir.path().join("parser");
+
+    let compile = Command::new("cc")
+        .current_dir(temp_dir.path())
+        .args(&[
+            "-Wall",
+            "-o",
+            exe_path.to_str().unwrap(),
+            code_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to execute cc");
+
+    assert!(
+        compile.status.success(),
+        "cc should compile successfully: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    // Run the parser
+    let run = Command::new(exe_path)
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("failed to execute parser");
+
+    assert!(
+        run.status.success(),
+        "parser should run successfully and return 0"
+    );
+}
+
+#[test]
+fn test_compile_and_run_calculator() {
+    // Full calculator grammar with operators
+    let grammar = r#"
+%{
+#include <stdio.h>
+#include <stdlib.h>
+#include <ctype.h>
+
+int yylex(void);
+void yyerror(const char *s);
+
+static int result = 0;
+static const char *input_str;
+static int input_pos;
+%}
+
+%token NUM
+%left '+' '-'
+%left '*' '/'
+
+%%
+input : expr { result = $1; }
+      ;
+
+expr : expr '+' expr { $$ = $1 + $3; }
+     | expr '-' expr { $$ = $1 - $3; }
+     | expr '*' expr { $$ = $1 * $3; }
+     | expr '/' expr { $$ = $1 / $3; }
+     | NUM           { $$ = $1; }
+     ;
+%%
+
+int yylval;
+
+int yylex(void) {
+    while (input_str[input_pos] == ' ') input_pos++;
+    if (input_str[input_pos] == '\0') return 0;
+
+    if (isdigit((unsigned char)input_str[input_pos])) {
+        yylval = 0;
+        while (isdigit((unsigned char)input_str[input_pos])) {
+            yylval = yylval * 10 + (input_str[input_pos] - '0');
+            input_pos++;
+        }
+        return NUM;
+    }
+
+    return input_str[input_pos++];
+}
+
+void yyerror(const char *s) {
+    fprintf(stderr, "%s\n", s);
+}
+
+int main(void) {
+    /* Test: 2 + 3 * 4 = 14 (due to precedence) */
+    input_str = "2 + 3 * 4";
+    input_pos = 0;
+
+    if (yyparse() != 0) {
+        fprintf(stderr, "Parse failed\n");
+        return 1;
+    }
+
+    if (result != 14) {
+        fprintf(stderr, "Expected 14, got %d\n", result);
+        return 1;
+    }
+
+    return 0;
+}
+"#;
+
+    let temp_dir = TempDir::new().unwrap();
+    let grammar_path = temp_dir.path().join("calc.y");
+    fs::write(&grammar_path, grammar).unwrap();
+
+    // Run yacc
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .arg(grammar_path.to_str().unwrap())
+        .output()
+        .expect("failed to execute yacc");
+
+    assert!(
+        output.status.success(),
+        "yacc should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Compile
+    let code_path = temp_dir.path().join("y.tab.c");
+    let exe_path = temp_dir.path().join("calc");
+
+    let compile = Command::new("cc")
+        .current_dir(temp_dir.path())
+        .args(&[
+            "-Wall",
+            "-o",
+            exe_path.to_str().unwrap(),
+            code_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to execute cc");
+
+    assert!(
+        compile.status.success(),
+        "cc should compile calculator: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    // Run
+    let run = Command::new(exe_path)
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("failed to execute calculator");
+
+    assert!(
+        run.status.success(),
+        "calculator should compute 2+3*4=14: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+#[test]
+fn test_error_recovery_basic() {
+    // Test error token in grammar
+    let grammar = r#"
+%{
+#include <stdio.h>
+#include <stdlib.h>
+
+int yylex(void);
+void yyerror(const char *s);
+
+static int recovered = 0;
+static int error_count = 0;
+%}
+
+%token NUM SEMI
+
+%%
+input : stmts
+      ;
+
+stmts : stmts stmt
+      |
+      ;
+
+stmt : NUM SEMI         { /* normal statement */ }
+     | error SEMI       { recovered = 1; yyerrok; }
+     ;
+%%
+
+static int tokens[] = { NUM, NUM, NUM, SEMI, 0 };  /* invalid: NUM NUM NUM before SEMI */
+static int token_pos = 0;
+int yylval;
+
+int yylex(void) {
+    return tokens[token_pos++];
+}
+
+void yyerror(const char *s) {
+    error_count++;
+    fprintf(stderr, "%s\n", s);
+}
+
+int main(void) {
+    int result = yyparse();
+    /* Should recover from error */
+    if (!recovered) {
+        fprintf(stderr, "Error recovery failed\n");
+        return 1;
+    }
+    return 0;
+}
+"#;
+
+    let temp_dir = TempDir::new().unwrap();
+    let grammar_path = temp_dir.path().join("error.y");
+    fs::write(&grammar_path, grammar).unwrap();
+
+    // Run yacc
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .arg(grammar_path.to_str().unwrap())
+        .output()
+        .expect("failed to execute yacc");
+
+    assert!(
+        output.status.success(),
+        "yacc should succeed with error token: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Compile
+    let code_path = temp_dir.path().join("y.tab.c");
+    let exe_path = temp_dir.path().join("error_test");
+
+    let compile = Command::new("cc")
+        .current_dir(temp_dir.path())
+        .args(&[
+            "-Wall",
+            "-Wno-unused-variable",
+            "-Wno-unused-but-set-variable",
+            "-o",
+            exe_path.to_str().unwrap(),
+            code_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to execute cc");
+
+    assert!(
+        compile.status.success(),
+        "cc should compile error recovery test: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    // Run
+    let run = Command::new(exe_path)
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("failed to execute error test");
+
+    assert!(
+        run.status.success(),
+        "error recovery should work: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+#[test]
+fn test_empty_rule() {
+    // Test epsilon production
+    // Note: Uses tokens A and B to avoid shift/reduce conflict
+    // The input "B" forces opt_a to match the empty rule
+    let grammar = r#"
+%{
+#include <stdio.h>
+int yylex(void);
+void yyerror(const char *s);
+static int empty_matched = 0;
+%}
+
+%token A B
+
+%%
+start : opt_a B { if (empty_matched) return 0; else return 1; }
+      ;
+
+opt_a :   /* empty */ { empty_matched = 1; }
+      | A
+      ;
+%%
+
+static int call_count = 0;
+
+int yylex(void) {
+    call_count++;
+    if (call_count == 1) return B;  /* B forces empty opt_a to match */
+    return 0;
+}
+
+void yyerror(const char *s) { fprintf(stderr, "%s\n", s); }
+
+int main(void) {
+    return yyparse();
+}
+"#;
+
+    let temp_dir = TempDir::new().unwrap();
+    let grammar_path = temp_dir.path().join("empty.y");
+    fs::write(&grammar_path, grammar).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .arg(grammar_path.to_str().unwrap())
+        .output()
+        .expect("failed to execute yacc");
+
+    assert!(
+        output.status.success(),
+        "yacc should handle empty rules: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let code_path = temp_dir.path().join("y.tab.c");
+    let exe_path = temp_dir.path().join("empty_test");
+
+    let compile = Command::new("cc")
+        .current_dir(temp_dir.path())
+        .args(&[
+            "-Wall",
+            "-o",
+            exe_path.to_str().unwrap(),
+            code_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to execute cc");
+
+    assert!(
+        compile.status.success(),
+        "cc should compile empty rule test: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(exe_path)
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("failed to execute empty test");
+
+    assert!(
+        run.status.success(),
+        "empty rule should work correctly: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+#[test]
+fn test_mid_rule_action() {
+    // Test mid-rule semantic actions
+    // The mid-rule action sets $$ = 100, which becomes accessible as $2 in the final action
+    let grammar = r#"
+%{
+#include <stdio.h>
+int yylex(void);
+void yyerror(const char *s);
+static int mid_value = 0;
+%}
+
+%token A B
+
+%%
+start : A { mid_value = 100; $$ = 100; } B { if ($2 != 100) return 1; return 0; }
+      ;
+%%
+
+static int call_count = 0;
+int yylval;
+
+int yylex(void) {
+    call_count++;
+    if (call_count == 1) { yylval = 1; return A; }
+    if (call_count == 2) { yylval = 2; return B; }
+    return 0;
+}
+
+void yyerror(const char *s) { fprintf(stderr, "%s\n", s); }
+
+int main(void) {
+    return yyparse();
+}
+"#;
+
+    let temp_dir = TempDir::new().unwrap();
+    let grammar_path = temp_dir.path().join("midaction.y");
+    fs::write(&grammar_path, grammar).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .arg(grammar_path.to_str().unwrap())
+        .output()
+        .expect("failed to execute yacc");
+
+    assert!(
+        output.status.success(),
+        "yacc should handle mid-rule actions: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let code_path = temp_dir.path().join("y.tab.c");
+    let exe_path = temp_dir.path().join("midaction_test");
+
+    let compile = Command::new("cc")
+        .current_dir(temp_dir.path())
+        .args(&[
+            "-Wall",
+            "-Wno-unused-variable",
+            "-o",
+            exe_path.to_str().unwrap(),
+            code_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to execute cc");
+
+    assert!(
+        compile.status.success(),
+        "cc should compile mid-rule action test: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(exe_path)
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("failed to execute midaction test");
+
+    assert!(
+        run.status.success(),
+        "mid-rule action value should be accessible: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+#[test]
+fn test_prec_override() {
+    // Test %prec directive for unary minus
+    let grammar = r#"
+%{
+#include <stdio.h>
+#include <stdlib.h>
+#include <ctype.h>
+
+int yylex(void);
+void yyerror(const char *s);
+
+static int result = 0;
+static const char *input_str;
+static int input_pos;
+%}
+
+%token NUM
+%left '+' '-'
+%left '*'
+%right UMINUS
+
+%%
+input : expr { result = $1; }
+      ;
+
+expr : expr '+' expr { $$ = $1 + $3; }
+     | expr '-' expr { $$ = $1 - $3; }
+     | expr '*' expr { $$ = $1 * $3; }
+     | '-' expr %prec UMINUS { $$ = -$2; }
+     | NUM           { $$ = $1; }
+     ;
+%%
+
+int yylval;
+
+int yylex(void) {
+    while (input_str[input_pos] == ' ') input_pos++;
+    if (input_str[input_pos] == '\0') return 0;
+
+    if (isdigit((unsigned char)input_str[input_pos])) {
+        yylval = 0;
+        while (isdigit((unsigned char)input_str[input_pos])) {
+            yylval = yylval * 10 + (input_str[input_pos] - '0');
+            input_pos++;
+        }
+        return NUM;
+    }
+
+    return input_str[input_pos++];
+}
+
+void yyerror(const char *s) {
+    fprintf(stderr, "%s\n", s);
+}
+
+int main(void) {
+    /* Test: -3 * 2 = -6 (unary minus has higher precedence than *) */
+    input_str = "-3 * 2";
+    input_pos = 0;
+
+    if (yyparse() != 0) {
+        fprintf(stderr, "Parse failed\n");
+        return 1;
+    }
+
+    if (result != -6) {
+        fprintf(stderr, "Expected -6, got %d\n", result);
+        return 1;
+    }
+
+    return 0;
+}
+"#;
+
+    let temp_dir = TempDir::new().unwrap();
+    let grammar_path = temp_dir.path().join("prec.y");
+    fs::write(&grammar_path, grammar).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .arg(grammar_path.to_str().unwrap())
+        .output()
+        .expect("failed to execute yacc");
+
+    assert!(
+        output.status.success(),
+        "yacc should handle %prec: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let code_path = temp_dir.path().join("y.tab.c");
+    let exe_path = temp_dir.path().join("prec_test");
+
+    let compile = Command::new("cc")
+        .current_dir(temp_dir.path())
+        .args(&[
+            "-Wall",
+            "-o",
+            exe_path.to_str().unwrap(),
+            code_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to execute cc");
+
+    assert!(
+        compile.status.success(),
+        "cc should compile %prec test: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run = Command::new(exe_path)
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("failed to execute prec test");
+
+    assert!(
+        run.status.success(),
+        "%prec should work for unary minus: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+}

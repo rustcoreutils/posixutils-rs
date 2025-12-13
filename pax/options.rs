@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2024 Jeff Garzik
+// Copyright (c) 2025-2026 Jeff Garzik
 //
 // This file is part of the pax-rs project covered under
 // the MIT License.  For the full license text, please see the LICENSE
@@ -18,7 +18,38 @@
 //! while `=` is used for global options.
 
 use crate::error::{PaxError, PaxResult};
+use crate::pattern::Pattern;
 use std::collections::HashMap;
+
+/// Action to take when a filename contains invalid characters
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InvalidAction {
+    /// Skip files with invalid filenames (default in write mode)
+    #[default]
+    Bypass,
+    /// Prompt interactively for new name (reuses -i mechanism)
+    Rename,
+    /// Write file with translated/sanitized name
+    Write,
+    /// Use raw UTF-8 encoding without translation
+    Utf8,
+    /// Generate hdrcharset=BINARY header for non-UTF-8 data
+    Binary,
+}
+
+impl InvalidAction {
+    /// Parse from string value
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "bypass" => Some(InvalidAction::Bypass),
+            "rename" => Some(InvalidAction::Rename),
+            "write" => Some(InvalidAction::Write),
+            "UTF-8" => Some(InvalidAction::Utf8),
+            "binary" => Some(InvalidAction::Binary),
+            _ => None,
+        }
+    }
+}
 
 /// Parsed format options
 #[derive(Debug, Clone, Default)]
@@ -35,6 +66,14 @@ pub struct FormatOptions {
     pub include_times: bool,
     /// Linkdata option (write contents for hard links)
     pub link_data: bool,
+    /// Extended header name template (exthdr.name)
+    /// Default: "%d/PaxHeaders.%p/%f"
+    pub exthdr_name: Option<String>,
+    /// Global extended header name template (globexthdr.name)
+    /// Default: "$TMPDIR/GlobalHead.%p.%n"
+    pub globexthdr_name: Option<String>,
+    /// Action to take for invalid filenames
+    pub invalid_action: InvalidAction,
 }
 
 impl FormatOptions {
@@ -128,29 +167,23 @@ impl FormatOptions {
             "linkdata" => {
                 self.link_data = true;
             }
-            // Extended header name templates (for future pax format)
-            "exthdr.name" | "globexthdr.name" => {
-                if is_per_file {
-                    self.per_file
-                        .insert(keyword.to_string(), value.unwrap_or("").to_string());
-                } else {
-                    self.global
-                        .insert(keyword.to_string(), value.unwrap_or("").to_string());
-                }
+            // Extended header name templates
+            "exthdr.name" => {
+                self.exthdr_name = value.map(|s| s.to_string());
             }
-            // Invalid action handling (for future pax format)
+            "globexthdr.name" => {
+                self.globexthdr_name = value.map(|s| s.to_string());
+            }
+            // Invalid action handling
             "invalid" => {
                 if let Some(v) = value {
-                    match v {
-                        "binary" | "bypass" | "rename" | "UTF-8" | "write" => {
-                            self.global.insert(keyword.to_string(), v.to_string());
-                        }
-                        _ => {
-                            return Err(PaxError::InvalidFormat(format!(
-                                "invalid value for 'invalid' option: {}",
-                                v
-                            )));
-                        }
+                    if let Some(action) = InvalidAction::from_str(v) {
+                        self.invalid_action = action;
+                    } else {
+                        return Err(PaxError::InvalidFormat(format!(
+                            "invalid value for 'invalid' option: {}",
+                            v
+                        )));
                     }
                 }
             }
@@ -198,6 +231,127 @@ impl FormatOptions {
             self.link_data = true;
         }
     }
+
+    /// Check if a keyword should be deleted from extended headers
+    ///
+    /// Returns true if the keyword matches any of the delete patterns
+    pub fn should_delete_keyword(&self, keyword: &str) -> bool {
+        for pattern_str in &self.delete_patterns {
+            // Parse pattern and match against keyword
+            if let Ok(pattern) = Pattern::new(pattern_str) {
+                if pattern.matches(keyword) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Get the global options map for extended header generation
+    pub fn global_options(&self) -> &HashMap<String, String> {
+        &self.global
+    }
+
+    /// Get the per-file options map for extended header generation
+    pub fn per_file_options(&self) -> &HashMap<String, String> {
+        &self.per_file
+    }
+
+    /// Expand the exthdr.name template for a given file path
+    ///
+    /// Template specifiers:
+    /// - `%d` - directory name of the file
+    /// - `%f` - filename of the file
+    /// - `%p` - process ID of pax
+    /// - `%%` - literal percent sign
+    ///
+    /// Default template: "%d/PaxHeaders.%p/%f"
+    pub fn expand_exthdr_name(&self, path: &std::path::Path, sequence: u64) -> String {
+        let template = self.exthdr_name.as_deref().unwrap_or("%d/PaxHeaders.%p/%f");
+
+        expand_header_template(template, path, sequence)
+    }
+
+    /// Expand the globexthdr.name template for global extended headers
+    ///
+    /// Template specifiers:
+    /// - `%n` - sequence number for global headers
+    /// - `%p` - process ID of pax
+    /// - `%%` - literal percent sign
+    ///
+    /// Default template: "/tmp/GlobalHead.%p.%n"
+    pub fn expand_globexthdr_name(&self, sequence: u64) -> String {
+        let template = self
+            .globexthdr_name
+            .as_deref()
+            .unwrap_or("/tmp/GlobalHead.%p.%n");
+
+        expand_global_header_template(template, sequence)
+    }
+}
+
+/// Expand template for per-file extended header names
+fn expand_header_template(template: &str, path: &std::path::Path, sequence: u64) -> String {
+    let mut result = String::new();
+    let mut chars = template.chars().peekable();
+    let pid = std::process::id();
+
+    // Extract directory and filename from path
+    let dirname = path
+        .parent()
+        .map(|p| p.to_string_lossy())
+        .unwrap_or_default();
+    let filename = path
+        .file_name()
+        .map(|f| f.to_string_lossy())
+        .unwrap_or_default();
+
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            match chars.next() {
+                Some('d') => result.push_str(&dirname),
+                Some('f') => result.push_str(&filename),
+                Some('p') => result.push_str(&pid.to_string()),
+                Some('n') => result.push_str(&sequence.to_string()),
+                Some('%') => result.push('%'),
+                Some(other) => {
+                    result.push('%');
+                    result.push(other);
+                }
+                None => result.push('%'),
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
+/// Expand template for global extended header names
+fn expand_global_header_template(template: &str, sequence: u64) -> String {
+    let mut result = String::new();
+    let mut chars = template.chars().peekable();
+    let pid = std::process::id();
+
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            match chars.next() {
+                Some('n') => result.push_str(&sequence.to_string()),
+                Some('p') => result.push_str(&pid.to_string()),
+                Some('%') => result.push('%'),
+                Some(other) => {
+                    result.push('%');
+                    result.push(other);
+                }
+                None => result.push('%'),
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
 }
 
 /// Parse list format specification and format an entry

@@ -1,0 +1,37 @@
+#!/bin/bash
+#
+# Update copyright years from 2024 to 2025-2026 in all *.rs files
+# within the specified directories.
+#
+# Usage: ./scripts/fix-headers dir1 [dir2 ...]
+#
+
+set -e
+
+if [ $# -eq 0 ]; then
+    echo "Usage: $0 dir1 [dir2 ...]" >&2
+    echo "Updates copyright headers from 2024 to 2025-2026 in *.rs files" >&2
+    exit 1
+fi
+
+count=0
+
+for dir in "$@"; do
+    if [ ! -d "$dir" ]; then
+        echo "Warning: '$dir' is not a directory, skipping" >&2
+        continue
+    fi
+
+    while IFS= read -r -d '' file; do
+        if grep -iq "copyright \((c) \)\?2024" "$file"; then
+            # Handle "Copyright (c) 2024" -> "Copyright (c) 2025-2026" (case-insensitive)
+            sed -i 's/\(copyright\) ([cC]) 2024/\1 (c) 2025-2026/Ig' "$file"
+            # Handle "Copyright 2024" -> "Copyright 2025-2026" (no "(c)", case-insensitive)
+            sed -i 's/\(copyright\) 2024/\1 2025-2026/Ig' "$file"
+            echo "Updated: $file"
+            ((count++)) || true
+        fi
+    done < <(find "$dir" -name '*.rs' -type f -print0)
+done
+
+echo "Updated $count file(s)"

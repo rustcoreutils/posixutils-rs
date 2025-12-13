@@ -57,6 +57,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
 
 ## Stage 3 - Test coverage
 
+ - [x] admin (SCCS)
  - [x] ar (Development)
  - [x] asa
  - [x] awk
@@ -70,6 +71,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] cp
  - [x] csplit
  - [x] cut
+ - [x] delta (SCCS)
  - [x] diff
  - [x] dirname
  - [x] echo
@@ -82,6 +84,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] fold
  - [x] fuser
  - [x] gencat (i18n)
+ - [x] get (SCCS)
  - [x] grep
  - [x] head
  - [x] iconv (i18n)
@@ -101,10 +104,14 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] pax
  - [x] pr
  - [x] printf
+ - [x] prs (SCCS)
  - [x] readlink
  - [x] realpath
  - [x] rm
+ - [x] rmdel (SCCS)
  - [x] rmdir
+ - [x] sact (SCCS)
+ - [x] sccs (SCCS)
  - [x] sed
  - [x] sh
  - [x] sort
@@ -121,11 +128,13 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] uudecode (uue)
  - [x] uuencode (uue)
  - [x] unexpand
+ - [x] unget (SCCS)
  - [x] uniq
  - [x] unlink
  - [x] uucp (UUCP)
  - [x] uustat (UUCP)
  - [x] uux (UUCP)
+ - [x] val (SCCS)
  - [x] vi (Editors)
  - [x] wc
  - [x] what (SCCS)
@@ -193,18 +202,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [ ] ctags (Development)
  - [ ] cxref (Development)
 
-### SCCS category
- - [ ] admin (SCCS)
- - [ ] delta (SCCS)
- - [ ] get (SCCS)
- - [ ] prs (SCCS)
- - [ ] rmdel (SCCS)
- - [ ] sact (SCCS)
- - [ ] sccs (SCCS)
- - [ ] unget (SCCS)
- - [ ] val (SCCS)
-
- ### i18n category
+### i18n category
  - [ ] gettext (i18n)
  - [ ] locale (i18n)
  - [ ] localedef (i18n)

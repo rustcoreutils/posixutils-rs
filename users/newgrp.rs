@@ -273,7 +273,7 @@ fn set_supplementary_gids(gids: &[gid_t]) -> Result<(), io::Error> {
     let gids_len = gids.len() as i32;
 
     #[cfg(target_os = "linux")]
-    let gids_len = gids.len() as usize;
+    let gids_len = gids.len();
 
     if unsafe { setgroups(gids_len, gids.as_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
@@ -549,33 +549,31 @@ fn check_perms(group: &Group, password: passwd) -> Result<u32, io::Error> {
 
     // Check for permissions if necessary
     unsafe {
-        if getuid() != 0 {
-            if need_password {
-                #[cfg(target_os = "linux")]
-                {
-                    let password_input = read_password().unwrap_or_default();
-                    let shadow_password = get_shadow_password(&group.name)?;
-                    let hashed_input = pw_encrypt(&password_input, Some(&shadow_password))?;
+        if getuid() != 0 && need_password {
+            #[cfg(target_os = "linux")]
+            {
+                let password_input = read_password().unwrap_or_default();
+                let shadow_password = get_shadow_password(&group.name)?;
+                let hashed_input = pw_encrypt(&password_input, Some(&shadow_password))?;
 
-                    if hashed_input == shadow_password {
-                        // Return GID if password matches
-                        return Ok(group.gid);
-                    } else {
-                        eprintln!("Error: Incorrect password for group '{}'.", group.name);
-                        return Err(io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            "Incorrect password for group.",
-                        ));
-                    }
+                if hashed_input == shadow_password {
+                    // Return GID if password matches
+                    return Ok(group.gid);
+                } else {
+                    eprintln!("Error: Incorrect password for group '{}'.", group.name);
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "Incorrect password for group.",
+                    ));
                 }
             }
-            #[cfg(target_os = "macos")]
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "Try to use root.",
-                ));
-            }
+        }
+        #[cfg(target_os = "macos")]
+        if getuid() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Try to use root.",
+            ));
         }
     }
 

@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2024 Jeff Garzik
+// Copyright (c) 2025-2026 Jeff Garzik
 //
 // This file is part of the pax-rs project covered under
 // the MIT License.  For the full license text, please see the LICENSE
@@ -531,7 +531,10 @@ fn set_permissions(path: &Path, entry: &ArchiveEntry, options: &ReadOptions) -> 
 
         // Per POSIX: If owner is not preserved, clear SUID and SGID bits
         if !options.preserve_owner {
-            mode &= !(libc::S_ISUID as u32 | libc::S_ISGID as u32);
+            // Cast to u32 for cross-platform compatibility (u16 on macOS, u32 on Linux)
+            #[allow(clippy::unnecessary_cast)]
+            let setid_mask = !((libc::S_ISUID | libc::S_ISGID) as u32);
+            mode &= setid_mask;
         }
 
         let perms = Permissions::from_mode(mode);

@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2024 Jeff Garzik
+// Copyright (c) 2025-2026 Jeff Garzik
 //
 // This file is part of the pax-rs project covered under
 // the MIT License.  For the full license text, please see the LICENSE
@@ -13,6 +13,7 @@ use crate::archive::{ArchiveEntry, ArchiveFormat, ArchiveWriter, EntryType, Hard
 use crate::error::PaxResult;
 use crate::formats::{CpioWriter, PaxWriter, UstarWriter};
 use crate::interactive::{InteractivePrompter, RenameResult};
+use crate::options::{FormatOptions, InvalidAction};
 use crate::subst::{apply_substitutions, SubstResult, Substitution};
 use std::fs::{self, File, Metadata};
 use std::io::{Read, Write};
@@ -43,6 +44,8 @@ pub struct WriteOptions {
     pub update: bool,
     /// Path substitutions (-s option)
     pub substitutions: Vec<Substitution>,
+    /// Format-specific options (-o option)
+    pub format_options: FormatOptions,
 }
 
 /// Create an archive from files
@@ -64,7 +67,7 @@ pub fn create_archive<W: Write>(
             archive.finish()
         }
         ArchiveFormat::Pax => {
-            let mut archive = PaxWriter::new(writer);
+            let mut archive = PaxWriter::with_options(writer, options.format_options.clone());
             write_files(&mut archive, files, options)?;
             archive.finish()
         }
@@ -168,6 +171,17 @@ fn write_path<W: ArchiveWriter>(
         archive_path
     };
 
+    // Handle invalid filename characters according to -o invalid=action
+    let (archive_path, _needs_binary_charset) = match handle_invalid_filename(
+        &archive_path,
+        options.format_options.invalid_action,
+        prompter,
+    )? {
+        InvalidHandleResult::Use(p) => (p, false),
+        InvalidHandleResult::Skip => return Ok(()),
+        InvalidHandleResult::Binary(p) => (p, true), // TODO: pass to entry for hdrcharset
+    };
+
     if options.verbose {
         eprintln!("{}", path.display());
     }
@@ -204,6 +218,93 @@ fn write_path<W: ArchiveWriter>(
 /// Check if we should follow symlinks
 fn should_follow_symlink(options: &WriteOptions, is_cli_arg: bool) -> bool {
     options.dereference || (is_cli_arg && options.cli_dereference)
+}
+
+/// Check if a path contains valid UTF-8 characters
+#[cfg(unix)]
+fn is_valid_utf8_path(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    // On Unix, check if the raw bytes are valid UTF-8
+    std::str::from_utf8(path.as_os_str().as_bytes()).is_ok()
+}
+
+#[cfg(not(unix))]
+fn is_valid_utf8_path(path: &Path) -> bool {
+    // On non-Unix platforms, paths are typically already UTF-16 or UTF-8
+    path.to_str().is_some()
+}
+
+/// Sanitize a path by replacing invalid UTF-8 sequences with replacement char
+fn sanitize_path(path: &Path) -> PathBuf {
+    PathBuf::from(path.to_string_lossy().into_owned())
+}
+
+/// Result of handling an invalid filename
+enum InvalidHandleResult {
+    /// Use this path (possibly sanitized)
+    Use(PathBuf),
+    /// Skip this file
+    Skip,
+    /// Mark as needing binary charset header
+    Binary(PathBuf),
+}
+
+/// Handle a path with potentially invalid UTF-8 according to the invalid action
+fn handle_invalid_filename(
+    path: &Path,
+    action: InvalidAction,
+    prompter: &mut Option<InteractivePrompter>,
+) -> PaxResult<InvalidHandleResult> {
+    if is_valid_utf8_path(path) {
+        return Ok(InvalidHandleResult::Use(path.to_path_buf()));
+    }
+
+    match action {
+        InvalidAction::Bypass => {
+            eprintln!(
+                "pax: {}: Filename contains invalid characters, skipping",
+                path.display()
+            );
+            Ok(InvalidHandleResult::Skip)
+        }
+        InvalidAction::Rename => {
+            // Use interactive prompt to get new name
+            if let Some(ref mut p) = prompter {
+                let path_str = path.to_string_lossy();
+                eprintln!(
+                    "pax: {}: Filename contains invalid characters",
+                    path.display()
+                );
+                match p.prompt(&path_str)? {
+                    RenameResult::Skip => Ok(InvalidHandleResult::Skip),
+                    RenameResult::UseOriginal => {
+                        // User chose to use original despite warning - sanitize it
+                        Ok(InvalidHandleResult::Use(sanitize_path(path)))
+                    }
+                    RenameResult::Rename(new_path) => Ok(InvalidHandleResult::Use(new_path)),
+                }
+            } else {
+                // No prompter available, fall back to bypass
+                eprintln!(
+                    "pax: {}: Filename contains invalid characters, skipping (no terminal for rename)",
+                    path.display()
+                );
+                Ok(InvalidHandleResult::Skip)
+            }
+        }
+        InvalidAction::Write => {
+            // Sanitize the name and write
+            Ok(InvalidHandleResult::Use(sanitize_path(path)))
+        }
+        InvalidAction::Utf8 => {
+            // Use lossy conversion (already done by to_string_lossy internally)
+            Ok(InvalidHandleResult::Use(sanitize_path(path)))
+        }
+        InvalidAction::Binary => {
+            // Mark for binary charset header, use lossy path
+            Ok(InvalidHandleResult::Binary(sanitize_path(path)))
+        }
+    }
 }
 
 /// Write a directory and its contents
@@ -383,11 +484,16 @@ fn write_file<W: ArchiveWriter>(
     if let Some(original_path) = link_tracker.check(&entry) {
         entry.entry_type = EntryType::Hardlink;
         entry.link_target = Some(original_path);
-        entry.size = 0;
 
-        archive.write_entry(&entry)?;
-        archive.finish_entry()?;
-        return Ok(());
+        // Per POSIX: -o linkdata means write file contents for each hard link
+        // By default, hard links have size=0 and no data
+        if !options.format_options.link_data {
+            entry.size = 0;
+            archive.write_entry(&entry)?;
+            archive.finish_entry()?;
+            return Ok(());
+        }
+        // With linkdata, fall through to write the file contents
     }
 
     // Write regular file

@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2024 Jeff Garzik
+// Copyright (c) 2025-2026 Jeff Garzik
 //
 // This file is part of the pax-rs project covered under
 // the MIT License.  For the full license text, please see the LICENSE
@@ -321,6 +321,7 @@ fn run_read_multi_volume(args: &Args, options: &ReadOptions) -> PaxResult<()> {
 fn run_write(args: &Args) -> PaxResult<()> {
     let files = get_files_to_archive(args)?;
     let substitutions = parse_substitutions(args)?;
+    let format_options = parse_format_options(args)?;
 
     let options = WriteOptions {
         cli_dereference: args.cli_dereference,
@@ -332,6 +333,7 @@ fn run_write(args: &Args) -> PaxResult<()> {
         reset_atime: args.reset_atime,
         update: args.update,
         substitutions,
+        format_options,
     };
 
     let format = ArchiveFormat::from(args.format);
@@ -415,6 +417,7 @@ fn run_append(args: &Args) -> PaxResult<()> {
 
     let files = get_files_to_archive(args)?;
     let substitutions = parse_substitutions(args)?;
+    let format_options = parse_format_options(args)?;
 
     let options = WriteOptions {
         cli_dereference: args.cli_dereference,
@@ -426,6 +429,7 @@ fn run_append(args: &Args) -> PaxResult<()> {
         reset_atime: args.reset_atime,
         update: args.update,
         substitutions,
+        format_options,
     };
 
     modes::append_to_archive(archive_path, &files, &options)

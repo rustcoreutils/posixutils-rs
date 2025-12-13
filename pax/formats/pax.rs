@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2024 Jeff Garzik
+// Copyright (c) 2025-2026 Jeff Garzik
 //
 // This file is part of the pax-rs project covered under
 // the MIT License.  For the full license text, please see the LICENSE
@@ -25,6 +25,7 @@
 
 use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
 use crate::error::{PaxError, PaxResult};
+use crate::options::FormatOptions;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -90,6 +91,10 @@ pub struct ExtendedHeader {
     pub uname: Option<String>,
     /// gname - group name
     pub gname: Option<String>,
+    /// hdrcharset - character encoding for path/linkpath/uname/gname
+    /// Values: "BINARY" (ISO/IEC 646:1991 aka ASCII, non-UTF-8 bytes allowed)
+    ///         "ISO-IR 10646 2000 UTF-8" (default, UTF-8 encoded)
+    pub hdrcharset: Option<String>,
     /// Additional custom keywords
     pub extra: HashMap<String, String>,
 }
@@ -111,6 +116,7 @@ impl ExtendedHeader {
             && self.gid.is_none()
             && self.uname.is_none()
             && self.gname.is_none()
+            && self.hdrcharset.is_none()
             && self.extra.is_empty()
     }
 
@@ -207,6 +213,9 @@ impl ExtendedHeader {
             "gname" => {
                 self.gname = Some(value.to_string());
             }
+            "hdrcharset" => {
+                self.hdrcharset = Some(value.to_string());
+            }
             _ => {
                 // Store unknown keywords for potential future use
                 self.extra.insert(keyword.to_string(), value.to_string());
@@ -215,39 +224,85 @@ impl ExtendedHeader {
         Ok(())
     }
 
-    /// Serialize extended header to bytes
-    pub fn serialize(&self) -> Vec<u8> {
+    /// Serialize extended header to bytes, respecting format options
+    ///
+    /// This method filters out keywords that match delete patterns and applies
+    /// per-file overrides from the options (keyword:=value).
+    pub fn serialize_with_options(&self, options: &FormatOptions) -> Vec<u8> {
         let mut data = Vec::new();
+        let per_file = options.per_file_options();
 
+        // Helper to write a record if keyword is not in delete patterns
+        // Also checks for per-file overrides (keyword:=value)
+        let mut write_if_allowed = |keyword: &str, default_value: &str| {
+            if options.should_delete_keyword(keyword) {
+                return;
+            }
+            // Check for per-file override
+            let value = per_file
+                .get(keyword)
+                .map(|s| s.as_str())
+                .unwrap_or(default_value);
+            write_pax_record(&mut data, keyword, value);
+        };
+
+        // Write hdrcharset first so readers know the encoding of subsequent fields
+        if let Some(ref charset) = self.hdrcharset {
+            write_if_allowed("hdrcharset", charset);
+        }
         if let Some(atime) = self.atime {
-            write_pax_record(&mut data, "atime", &format_pax_time(atime));
+            write_if_allowed("atime", &format_pax_time(atime));
         }
         if let Some(mtime) = self.mtime {
-            write_pax_record(&mut data, "mtime", &format_pax_time(mtime));
+            write_if_allowed("mtime", &format_pax_time(mtime));
         }
         if let Some(ref path) = self.path {
-            write_pax_record(&mut data, "path", path);
+            write_if_allowed("path", path);
         }
         if let Some(ref linkpath) = self.linkpath {
-            write_pax_record(&mut data, "linkpath", linkpath);
+            write_if_allowed("linkpath", linkpath);
         }
         if let Some(size) = self.size {
-            write_pax_record(&mut data, "size", &size.to_string());
+            write_if_allowed("size", &size.to_string());
         }
         if let Some(uid) = self.uid {
-            write_pax_record(&mut data, "uid", &uid.to_string());
+            write_if_allowed("uid", &uid.to_string());
         }
         if let Some(gid) = self.gid {
-            write_pax_record(&mut data, "gid", &gid.to_string());
+            write_if_allowed("gid", &gid.to_string());
         }
         if let Some(ref uname) = self.uname {
-            write_pax_record(&mut data, "uname", uname);
+            write_if_allowed("uname", uname);
         }
         if let Some(ref gname) = self.gname {
-            write_pax_record(&mut data, "gname", gname);
+            write_if_allowed("gname", gname);
         }
         for (key, value) in &self.extra {
-            write_pax_record(&mut data, key, value);
+            write_if_allowed(key, value);
+        }
+
+        // Also write any per-file options that weren't already present in the header
+        // (e.g., user can add custom keywords via -o keyword:=value)
+        for (key, value) in per_file {
+            if options.should_delete_keyword(key) {
+                continue;
+            }
+            // Skip standard keywords that were already handled above
+            let standard_keywords = [
+                "hdrcharset",
+                "atime",
+                "mtime",
+                "path",
+                "linkpath",
+                "size",
+                "uid",
+                "gid",
+                "uname",
+                "gname",
+            ];
+            if !standard_keywords.contains(&key.as_str()) && !self.extra.contains_key(key) {
+                write_pax_record(&mut data, key, value);
+            }
         }
 
         data
@@ -286,8 +341,12 @@ impl ExtendedHeader {
         }
     }
 
-    /// Create extended header from an ArchiveEntry (for values that need extended headers)
-    pub fn from_entry(entry: &ArchiveEntry) -> Self {
+    /// Create extended header with options controlling what to include
+    ///
+    /// # Arguments
+    /// * `entry` - The archive entry to generate extended headers for
+    /// * `include_times` - If true, always include atime and mtime in extended headers
+    pub fn from_entry_with_options(entry: &ArchiveEntry, include_times: bool) -> Self {
         let mut header = ExtendedHeader::new();
 
         // Path needs extended header if too long for ustar
@@ -317,14 +376,24 @@ impl ExtendedHeader {
             header.gid = Some(entry.gid);
         }
 
-        // Include subsecond mtime if present
-        if entry.mtime_nsec > 0 {
+        // Include mtime: always if include_times, or if subsecond precision needed
+        if include_times || entry.mtime_nsec > 0 {
             let mtime_float = entry.mtime as f64 + (entry.mtime_nsec as f64 / 1_000_000_000.0);
             header.mtime = Some(mtime_float);
         }
 
-        // Include atime if present
-        if let Some(atime) = entry.atime {
+        // Include atime: always if include_times, or if present
+        if include_times {
+            // When -o times is set, include atime even if not in entry (use mtime as fallback)
+            let atime = entry.atime.unwrap_or(entry.mtime);
+            let atime_nsec = if entry.atime.is_some() {
+                entry.atime_nsec
+            } else {
+                entry.mtime_nsec
+            };
+            let atime_float = atime as f64 + (atime_nsec as f64 / 1_000_000_000.0);
+            header.atime = Some(atime_float);
+        } else if let Some(atime) = entry.atime {
             let atime_float = atime as f64 + (entry.atime_nsec as f64 / 1_000_000_000.0);
             header.atime = Some(atime_float);
         }
@@ -523,18 +592,117 @@ pub struct PaxWriter<W: Write> {
     writer: W,
     bytes_written: u64,
     current_size: u64,
-    sequence: u64, // For generating unique names for extended header files
+    sequence: u64,          // For generating unique names for extended header files
+    options: FormatOptions, // Format-specific options
+    global_header_written: bool, // Track if global header has been written
 }
 
 impl<W: Write> PaxWriter<W> {
-    /// Create a new pax writer
+    /// Create a new pax writer with default options
     pub fn new(writer: W) -> Self {
+        Self::with_options(writer, FormatOptions::default())
+    }
+
+    /// Create a new pax writer with specified options
+    pub fn with_options(writer: W, options: FormatOptions) -> Self {
         PaxWriter {
             writer,
             bytes_written: 0,
             current_size: 0,
             sequence: 0,
+            options,
+            global_header_written: false,
         }
+    }
+
+    /// Write global extended header (typeflag 'g') if there are global options
+    ///
+    /// Global extended headers apply to all subsequent files in the archive.
+    /// This is called once before the first entry when -o keyword=value options
+    /// are specified (not keyword:=value which are per-file).
+    fn write_global_header(&mut self) -> PaxResult<()> {
+        if self.global_header_written {
+            return Ok(());
+        }
+        self.global_header_written = true;
+
+        // Get global options, filtering out special non-header keywords
+        let global_opts = self.options.global_options();
+        let special_keywords = ["invalid", "listopt", "exthdr.name", "globexthdr.name"];
+
+        // Build extended header data from global options
+        let mut data = Vec::new();
+        for (key, value) in global_opts {
+            // Skip special keywords that aren't actual extended header fields
+            if special_keywords.contains(&key.as_str()) {
+                continue;
+            }
+            // Skip if this keyword should be deleted
+            if self.options.should_delete_keyword(key) {
+                continue;
+            }
+            write_pax_record(&mut data, key, value);
+        }
+
+        // If no actual header data to write, skip
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        // Create a header for the global extended header block
+        let mut header = [0u8; BLOCK_SIZE];
+
+        // Generate name for global header using template
+        self.sequence += 1;
+        let glob_name = self.options.expand_globexthdr_name(self.sequence);
+        // Truncate to fit in NAME_LEN if too long
+        let glob_name = if glob_name.len() > NAME_LEN {
+            format!("GlobalHead.{}", self.sequence)
+        } else {
+            glob_name
+        };
+        write_string(&mut header[NAME_OFF..], &glob_name, NAME_LEN);
+
+        // Mode, uid, gid (use reasonable defaults)
+        write_octal(&mut header[MODE_OFF..], 0o644, 8);
+        write_octal(&mut header[UID_OFF..], 0, 8);
+        write_octal(&mut header[GID_OFF..], 0, 8);
+
+        // Size of global header data
+        write_octal(&mut header[SIZE_OFF..], data.len() as u64, 12);
+
+        // Mtime (use current time)
+        let mtime = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        write_octal(&mut header[MTIME_OFF..], mtime, 12);
+
+        // Typeflag 'g' for global extended header
+        header[TYPEFLAG_OFF] = PAX_GHDR;
+
+        // Magic and version
+        header[MAGIC_OFF..MAGIC_OFF + 6].copy_from_slice(b"ustar\0");
+        header[VERSION_OFF..VERSION_OFF + 2].copy_from_slice(b"00");
+
+        // Calculate and write checksum
+        let checksum = calculate_checksum(&header);
+        write_octal(&mut header[CHKSUM_OFF..], checksum as u64, 8);
+
+        // Write header
+        self.writer.write_all(&header)?;
+
+        // Write global header data
+        self.writer.write_all(&data)?;
+
+        // Pad to block boundary
+        let padding = padding_needed(data.len() as u64);
+        if padding > 0 {
+            let zeros = vec![0u8; padding];
+            self.writer.write_all(&zeros)?;
+        }
+
+        Ok(())
     }
 
     /// Write extended header block
@@ -543,7 +711,8 @@ impl<W: Write> PaxWriter<W> {
         ext_header: &ExtendedHeader,
         entry: &ArchiveEntry,
     ) -> PaxResult<()> {
-        let data = ext_header.serialize();
+        // Serialize with options to respect delete patterns
+        let data = ext_header.serialize_with_options(&self.options);
         if data.is_empty() {
             return Ok(());
         }
@@ -551,17 +720,10 @@ impl<W: Write> PaxWriter<W> {
         // Create a header for the extended header block
         let mut header = [0u8; BLOCK_SIZE];
 
-        // Generate a unique name for the extended header
+        // Generate a unique name for the extended header using template
         self.sequence += 1;
-        let ext_name = format!(
-            "PaxHeader/{}.{}",
-            entry
-                .path
-                .file_name()
-                .map(|n| n.to_string_lossy())
-                .unwrap_or_default(),
-            self.sequence
-        );
+        let ext_name = self.options.expand_exthdr_name(&entry.path, self.sequence);
+        // Truncate to fit in NAME_LEN if too long, or use fallback
         let ext_name = if ext_name.len() > NAME_LEN {
             format!("PaxHeader/{}", self.sequence)
         } else {
@@ -610,8 +772,11 @@ impl<W: Write> PaxWriter<W> {
 
 impl<W: Write> ArchiveWriter for PaxWriter<W> {
     fn write_entry(&mut self, entry: &ArchiveEntry) -> PaxResult<()> {
-        // Check if we need extended headers
-        let ext_header = ExtendedHeader::from_entry(entry);
+        // Write global header if this is the first entry and we have global options
+        self.write_global_header()?;
+
+        // Check if we need extended headers (respecting -o times option)
+        let ext_header = ExtendedHeader::from_entry_with_options(entry, self.options.include_times);
 
         if !ext_header.is_empty() {
             self.write_extended_header(&ext_header, entry)?;
@@ -972,7 +1137,7 @@ mod tests {
         ext.size = Some(10000000000);
         ext.mtime = Some(1234567890.123456789);
 
-        let data = ext.serialize();
+        let data = ext.serialize_with_options(&FormatOptions::default());
         let parsed = ExtendedHeader::parse(&data).unwrap();
 
         assert_eq!(parsed.path, ext.path);
@@ -986,7 +1151,7 @@ mod tests {
         entry.uid = 3000000; // > 2097151
         entry.mtime_nsec = 500000000; // 0.5 seconds
 
-        let ext = ExtendedHeader::from_entry(&entry);
+        let ext = ExtendedHeader::from_entry_with_options(&entry, false);
         assert!(ext.uid.is_some());
         assert!(ext.mtime.is_some());
     }

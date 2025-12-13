@@ -98,6 +98,8 @@ impl Entry {
                         Some('|')
                     } else {
                         let mode = metadata.mode();
+                        // Cast to u32 for cross-platform compatibility (u16 on macOS, u32 on Linux)
+                        #[allow(clippy::unnecessary_cast)]
                         if mode
                             & (libc::S_IXUSR as u32 | libc::S_IXGRP as u32 | libc::S_IXOTH as u32)
                             != 0
@@ -589,20 +591,36 @@ fn get_file_mode_string(metadata: &ftw::Metadata) -> String {
 
     let mode = metadata.mode();
 
+    // Cast to u32 for cross-platform compatibility (u16 on macOS, u32 on Linux)
+    #[allow(clippy::unnecessary_cast)]
+    let s_irusr = libc::S_IRUSR as u32;
+    #[allow(clippy::unnecessary_cast)]
+    let s_iwusr = libc::S_IWUSR as u32;
+    #[allow(clippy::unnecessary_cast)]
+    let s_ixusr = libc::S_IXUSR as u32;
+    #[allow(clippy::unnecessary_cast)]
+    let s_isuid = libc::S_ISUID as u32;
+    #[allow(clippy::unnecessary_cast)]
+    let s_irgrp = libc::S_IRGRP as u32;
+    #[allow(clippy::unnecessary_cast)]
+    let s_iwgrp = libc::S_IWGRP as u32;
+    #[allow(clippy::unnecessary_cast)]
+    let s_ixgrp = libc::S_IXGRP as u32;
+    #[allow(clippy::unnecessary_cast)]
+    let s_iroth = libc::S_IROTH as u32;
+    #[allow(clippy::unnecessary_cast)]
+    let s_iwoth = libc::S_IWOTH as u32;
+    #[allow(clippy::unnecessary_cast)]
+    let s_ixoth = libc::S_IXOTH as u32;
+    #[allow(clippy::unnecessary_cast)]
+    let s_isvtx = libc::S_ISVTX as u32;
+
     // Owner permissions
-    file_mode.push(if mode & (libc::S_IRUSR as u32) != 0 {
-        'r'
-    } else {
-        '-'
-    });
-    file_mode.push(if mode & (libc::S_IWUSR as u32) != 0 {
-        'w'
-    } else {
-        '-'
-    });
+    file_mode.push(if mode & s_irusr != 0 { 'r' } else { '-' });
+    file_mode.push(if mode & s_iwusr != 0 { 'w' } else { '-' });
     file_mode.push({
-        let executable = mode & (libc::S_IXUSR as u32) != 0;
-        let set_user_id = mode & (libc::S_ISUID as u32) != 0;
+        let executable = mode & s_ixusr != 0;
+        let set_user_id = mode & s_isuid != 0;
         match (executable, set_user_id) {
             (true, true) => 's',
             (true, false) => 'x',
@@ -612,44 +630,24 @@ fn get_file_mode_string(metadata: &ftw::Metadata) -> String {
     });
 
     // Group permissions
-    file_mode.push(if mode & (libc::S_IRGRP as u32) != 0 {
-        'r'
-    } else {
-        '-'
-    });
-    file_mode.push(if mode & (libc::S_IWGRP as u32) != 0 {
-        'w'
-    } else {
-        '-'
-    });
-    file_mode.push(if mode & (libc::S_IXGRP as u32) != 0 {
-        'x'
-    } else {
-        '-'
-    });
+    file_mode.push(if mode & s_irgrp != 0 { 'r' } else { '-' });
+    file_mode.push(if mode & s_iwgrp != 0 { 'w' } else { '-' });
+    file_mode.push(if mode & s_ixgrp != 0 { 'x' } else { '-' });
 
     // Other permissions
-    file_mode.push(if mode & (libc::S_IROTH as u32) != 0 {
-        'r'
-    } else {
-        '-'
-    });
-    file_mode.push(if mode & (libc::S_IWOTH as u32) != 0 {
-        'w'
-    } else {
-        '-'
-    });
+    file_mode.push(if mode & s_iroth != 0 { 'r' } else { '-' });
+    file_mode.push(if mode & s_iwoth != 0 { 'w' } else { '-' });
     file_mode.push({
         if file_type.is_dir() {
-            let searchable = mode & (libc::S_IXOTH as u32) != 0;
-            let restricted_deletion = mode & (libc::S_ISVTX as u32) != 0;
+            let searchable = mode & s_ixoth != 0;
+            let restricted_deletion = mode & s_isvtx != 0;
             match (searchable, restricted_deletion) {
                 (true, true) => 't',
                 (true, false) => 'x',
                 (false, true) => 'T',
                 (false, false) => '-',
             }
-        } else if mode & (libc::S_IXOTH as u32) != 0 {
+        } else if mode & s_ixoth != 0 {
             'x'
         } else {
             '-'
@@ -700,14 +698,13 @@ fn get_file_info(metadata: &ftw::Metadata) -> FileInfo {
 
             // major ID - class of the device
             // minor ID - specific instance of a device
-            let (major, minor) = {
-                (
-                    libc::major(device_id as libc::dev_t),
-                    libc::minor(device_id as libc::dev_t),
-                )
-            };
+            // Cast to u32 for cross-platform compatibility (i32 on macOS, u32 on Linux)
+            #[allow(clippy::unnecessary_cast)]
+            let major = libc::major(device_id as libc::dev_t) as u32;
+            #[allow(clippy::unnecessary_cast)]
+            let minor = libc::minor(device_id as libc::dev_t) as u32;
 
-            FileInfo::DeviceInfo((major as u32, minor as u32))
+            FileInfo::DeviceInfo((major, minor))
         }
         _ => FileInfo::Size(metadata.size()),
     }

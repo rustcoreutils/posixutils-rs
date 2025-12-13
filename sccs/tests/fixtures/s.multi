@@ -1,0 +1,31 @@
+h21972
+s 00001/00001/00003
+d D 1.3 25/12/12 22:25:05 jgarzik 3 2
+c modified line2
+e
+s 00001/00000/00003
+d D 1.2 25/12/12 22:24:57 jgarzik 2 1
+c added line4
+e
+s 00003/00000/00000
+d D 1.1 25/12/12 22:24:47 jgarzik 1 0
+c date and time created 25/12/12 22:24:47 by jgarzik
+e
+u
+U
+f e 0
+t
+T
+I 1
+line1
+D 3
+line2
+E 3
+I 3
+modified-line2
+E 3
+line3
+E 1
+I 2
+line4
+E 2

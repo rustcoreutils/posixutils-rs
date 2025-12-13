@@ -79,6 +79,7 @@ fn lookup_uid(username: &str) -> Result<u32, &'static str> {
     Ok(passwd.pw_uid)
 }
 
+#[allow(clippy::unnecessary_cast)] // PRIO_* types differ: i32 on macOS, u32 on Linux
 fn parse_id(which: u32, input: &str) -> Result<u32, &'static str> {
     match input.parse::<u32>() {
         Ok(0) => Err("Invalid ID"),
@@ -108,6 +109,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     // which class of priority to modify
+    // Cast to u32 for cross-platform compatibility (i32 on macOS, u32 on Linux)
+    #[allow(clippy::unnecessary_cast)]
     let which: u32 = {
         if args.pgrp {
             libc::PRIO_PGRP as u32

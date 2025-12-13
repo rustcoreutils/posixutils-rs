@@ -171,7 +171,7 @@ fn read_proc_msg() -> io::Result<Vec<MsgQueueInfo>> {
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() >= 14 {
             entries.push(MsgQueueInfo {
-                key: i32::from_str_radix(fields[0], 10).unwrap_or(0),
+                key: fields[0].parse::<i32>().unwrap_or(0),
                 msqid: fields[1].parse().unwrap_or(0),
                 perms: fields[2].parse().unwrap_or(0),
                 cbytes: fields[3].parse().unwrap_or(0),
@@ -205,7 +205,7 @@ fn read_proc_shm() -> io::Result<Vec<ShmInfo>> {
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() >= 14 {
             entries.push(ShmInfo {
-                key: i32::from_str_radix(fields[0], 10).unwrap_or(0),
+                key: fields[0].parse::<i32>().unwrap_or(0),
                 shmid: fields[1].parse().unwrap_or(0),
                 perms: fields[2].parse().unwrap_or(0),
                 size: fields[3].parse().unwrap_or(0),
@@ -239,7 +239,7 @@ fn read_proc_sem() -> io::Result<Vec<SemInfo>> {
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() >= 10 {
             entries.push(SemInfo {
-                key: i32::from_str_radix(fields[0], 10).unwrap_or(0),
+                key: fields[0].parse::<i32>().unwrap_or(0),
                 semid: fields[1].parse().unwrap_or(0),
                 perms: fields[2].parse().unwrap_or(0),
                 nsems: fields[3].parse().unwrap_or(0),

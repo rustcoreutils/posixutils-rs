@@ -1224,10 +1224,7 @@ int main() {
     // Test tab character
     let result = compile_and_run(&c_code, "\t");
     assert!(result.is_ok(), "Failed to compile/run: {:?}", result);
-    assert!(
-        result.unwrap().contains("TAB"),
-        "Tab should be recognized"
-    );
+    assert!(result.unwrap().contains("TAB"), "Tab should be recognized");
 
     // Test backslash character
     let result = compile_and_run(&c_code, "\\");

@@ -1123,7 +1123,9 @@ mod linux {
         // that device are listed (unless -f is specified).
         // -c (mount): Treat file as mount point, report on any files in filesystem.
         // -f (named_files): Report only for the named files.
-        let is_block_device = (st.mode() & libc::S_IFMT) == libc::S_IFBLK;
+        // Cast to u32 for cross-platform compatibility (u16 on macOS, u32 on Linux)
+        #[allow(clippy::unnecessary_cast)]
+        let is_block_device = (st.mode() & libc::S_IFMT as u32) == libc::S_IFBLK as u32;
         let use_device_mode = mount || (is_block_device && !named_files);
 
         if use_device_mode {
@@ -1331,7 +1333,9 @@ mod macos {
             // that device are listed (unless -f is specified).
             // -c (mount): Treat file as mount point, report on any files in filesystem.
             // -f (named_files): Report only for the named files.
-            let is_block_device = (st.mode() & libc::S_IFMT) == libc::S_IFBLK;
+            // Cast to u32 for cross-platform compatibility (u16 on macOS, u32 on Linux)
+            #[allow(clippy::unnecessary_cast)]
+            let is_block_device = (st.mode() & libc::S_IFMT as u32) == libc::S_IFBLK as u32;
             let is_volume = mount || (is_block_device && !named_files);
 
             let pids = listpidspath(

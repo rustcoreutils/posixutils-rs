@@ -10,9 +10,10 @@ rust-version.workspace = true
 [dependencies]
 clap.workspace = true
 gettext-rs.workspace = true
+plib = { path = "../plib" }
 
 [dev-dependencies]
-plib = { path = "../plib" }
+tempfile = "3"
 
 [lints]
 workspace = true
@@ -20,3 +21,39 @@ workspace = true
 [[bin]]
 name = "what"
 path = "./what.rs"
+
+[[bin]]
+name = "admin"
+path = "./admin.rs"
+
+[[bin]]
+name = "get"
+path = "./get.rs"
+
+[[bin]]
+name = "delta"
+path = "./delta.rs"
+
+[[bin]]
+name = "val"
+path = "./val.rs"
+
+[[bin]]
+name = "sact"
+path = "./sact.rs"
+
+[[bin]]
+name = "unget"
+path = "./unget.rs"
+
+[[bin]]
+name = "rmdel"
+path = "./rmdel.rs"
+
+[[bin]]
+name = "prs"
+path = "./prs.rs"
+
+[[bin]]
+name = "sccs"
+path = "./sccs.rs"

@@ -187,6 +187,7 @@ pub fn parse(mode: &str) -> Result<ChmodMode, String> {
 }
 
 // apply symbolic mutations to the given file at path
+#[allow(clippy::unnecessary_cast)] // casts needed for macOS where libc constants are u16
 pub fn mutate(init_mode: u32, is_dir: bool, symbolic: &ChmodSymbolic) -> u32 {
     let mut user = init_mode & S_IRWXU as u32;
     let mut group = init_mode & S_IRWXG as u32;

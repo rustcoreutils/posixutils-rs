@@ -257,3 +257,67 @@ fn find_newer_test() {
 
     remove_file(&path_to_test_file).unwrap();
 }
+
+/// Run find and compare null-delimited output (for -print0 testing)
+fn run_test_find_print0_sorted(args: &[&str], expected_paths: &[&str], expected_exit_code: i32) {
+    let project_root = env!("CARGO_MANIFEST_DIR");
+    let find_path = format!("{}/../target/release/find", project_root);
+
+    let output = Command::new(&find_path)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to execute find");
+
+    let actual_exit_code = output.status.code().unwrap_or(-1);
+
+    // Split output on null bytes and filter empty entries
+    let mut actual_paths: Vec<&str> = output
+        .stdout
+        .split(|&b| b == 0)
+        .filter_map(|bytes| std::str::from_utf8(bytes).ok())
+        .filter(|s| !s.is_empty())
+        .collect();
+    actual_paths.sort();
+
+    let mut expected_sorted: Vec<&str> = expected_paths.to_vec();
+    expected_sorted.sort();
+
+    assert_eq!(
+        actual_paths, expected_sorted,
+        "stdout mismatch (null-delimited sorted comparison)"
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "stderr should be empty: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(actual_exit_code, expected_exit_code, "exit code mismatch");
+}
+
+#[test]
+fn find_print0_test() {
+    let project_root = env!("CARGO_MANIFEST_DIR");
+    let test_dir = format!("{}/tests/find/other", project_root);
+    let args: [&str; 4] = [&test_dir, "-type", "f", "-print0"];
+
+    let file1 = format!("{}/empty_file.txt", test_dir);
+    let file2 = format!("{}/file with space.txt", test_dir);
+    let file3 = format!("{}/file1.txt", test_dir);
+    let file4 = format!("{}/rust_file.rs", test_dir);
+
+    run_test_find_print0_sorted(&args, &[&file1, &file2, &file3, &file4], 0)
+}
+
+#[test]
+fn find_print0_with_name_filter() {
+    let project_root = env!("CARGO_MANIFEST_DIR");
+    let test_dir = format!("{}/tests/find/other", project_root);
+    let args = [&test_dir, "-name", "*.txt", "-print0"];
+
+    let file1 = format!("{}/empty_file.txt", test_dir);
+    let file2 = format!("{}/file with space.txt", test_dir);
+    let file3 = format!("{}/file1.txt", test_dir);
+
+    run_test_find_print0_sorted(&args, &[&file1, &file2, &file3], 0)
+}

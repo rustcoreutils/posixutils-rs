@@ -100,7 +100,10 @@ impl Entry {
                         let mode = metadata.mode();
                         // Cast to u32 for cross-platform compatibility (u16 on macOS, u32 on Linux)
                         #[allow(clippy::unnecessary_cast)]
-                        if mode & (libc::S_IXUSR as u32 | libc::S_IXGRP as u32 | libc::S_IXOTH as u32) != 0 {
+                        if mode
+                            & (libc::S_IXUSR as u32 | libc::S_IXGRP as u32 | libc::S_IXOTH as u32)
+                            != 0
+                        {
                             Some('*')
                         } else {
                             None

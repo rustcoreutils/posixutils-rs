@@ -12,9 +12,9 @@ use std::path::{Component, Path, PathBuf};
 use clap::Parser;
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 
-/// realpath -- return resolved canonical path
+/// realpath - return resolved canonical path
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("realpath - return resolved canonical path"))]
 struct Args {
     /// Error if the path cannot be resolved
     #[arg(short = 'e', overrides_with = "_canonicalize_missing")]

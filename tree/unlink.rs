@@ -8,12 +8,12 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::{fs, io};
 
 /// unlink - call the unlink function
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("unlink - call the unlink function"))]
 struct Args {
     /// An existing pathname to be unlinked (removed).
     pathname: String,

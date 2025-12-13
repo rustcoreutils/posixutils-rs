@@ -9,11 +9,11 @@
 
 use chrono::{DateTime, Datelike, LocalResult, TimeZone, Utc};
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 
 /// touch - change file access and modification times
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("touch - change file access and modification times"))]
 struct Args {
     /// Change the access time of file.
     #[arg(short, long)]

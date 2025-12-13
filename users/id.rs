@@ -11,14 +11,14 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::group;
 use std::collections::HashMap;
 use std::io::Error;
 
 /// id - return user identity
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("id - return user identity"))]
 struct Args {
     /// Output all different group IDs (effective, real, and supplementary) only, using a numeric format
     #[arg(short = 'G', long, group = "output")]

@@ -104,7 +104,7 @@ msgstr ""
 msgid "Available"
 msgstr ""
 
-#: sccs/what.rs:66
+#: sccs/what.rs:72
 msgid "Cannot open file"
 msgstr ""
 
@@ -283,8 +283,9 @@ msgstr ""
 msgid "Input files (reads from stdin if empty)"
 msgstr ""
 
-#: process/xargs.rs:68
-msgid "Insert mode"
+#: process/xargs.rs:82
+msgid ""
+"Insert mode: execute utility for each line, replacing replstr with input"
 msgstr ""
 
 #: pathnames/pathchk.rs:37
@@ -347,13 +348,13 @@ msgstr ""
 msgid "Invalid tabstop value."
 msgstr ""
 
-#: process/xargs.rs:55
+#: process/xargs.rs:65
 msgid ""
 "Invoke utility using as many standard input arguments as possible yielding a "
 "command line length less than size"
 msgstr ""
 
-#: process/xargs.rs:46
+#: process/xargs.rs:56
 msgid ""
 "Invoke utility using as many standard input arguments as possible, up to "
 "number"
@@ -477,10 +478,6 @@ msgstr ""
 msgid "November"
 msgstr ""
 
-#: process/xargs.rs:77
-msgid "Null-based processing"
-msgstr ""
-
 #: datetime/sleep.rs:19
 msgid "Number of seconds to sleep"
 msgstr ""
@@ -569,8 +566,8 @@ msgstr ""
 msgid "Process id to adjust priority"
 msgstr ""
 
-#: process/xargs.rs:71
-msgid "Prompt mode"
+#: process/xargs.rs:86
+msgid "Prompt mode: ask before executing each command"
 msgstr ""
 
 #: file/od.rs:34
@@ -602,6 +599,10 @@ msgstr ""
 #: sys/ipcrm.rs:50
 msgid ""
 "Remove the shared memory identifier, created with key shmkey, from the system"
+msgstr ""
+
+#: sccs/admin.rs:373
+msgid "SCCS file names must begin with 's.'"
 msgstr ""
 
 #: file/od.rs:37
@@ -736,7 +737,7 @@ msgstr ""
 msgid "Terminal operand to execute"
 msgstr ""
 
-#: process/xargs.rs:84
+#: process/xargs.rs:99
 msgid ""
 "Terminate if a constructed command line will not fit in the implied or "
 "specified size"
@@ -756,7 +757,7 @@ msgstr ""
 msgid "The pathnames to be checked"
 msgstr ""
 
-#: process/xargs.rs:37
+#: process/xargs.rs:46
 msgid ""
 "The utility shall be executed for each non-empty number lines of arguments "
 "from standard input"
@@ -770,8 +771,8 @@ msgstr ""
 msgid "The utility to execute."
 msgstr ""
 
-#: process/xargs.rs:74
-msgid "Trace mode"
+#: process/xargs.rs:89
+msgid "Trace mode: print each command before execution"
 msgstr ""
 
 #: sys/who.rs:160
@@ -792,8 +793,12 @@ msgstr ""
 msgid "Use all print options (-b, -c, -o, -p, -t)"
 msgstr ""
 
-#: process/xargs.rs:64
+#: process/xargs.rs:74
 msgid "Use eofstr as the logical end-of-file string"
+msgstr ""
+
+#: process/xargs.rs:92
+msgid "Use null character as input delimiter"
 msgstr ""
 
 #: file/split.rs:29 file/split.rs:40
@@ -806,12 +811,16 @@ msgstr ""
 msgid "Used"
 msgstr ""
 
-#: process/nice.rs:40 process/xargs.rs:92
+#: process/nice.rs:40 process/xargs.rs:107
 msgid "Utility arguments"
 msgstr ""
 
-#: process/nice.rs:37 process/xargs.rs:89
+#: process/nice.rs:37
 msgid "Utility to invoke"
+msgstr ""
+
+#: process/xargs.rs:104
+msgid "Utility to invoke (default: echo)"
 msgstr ""
 
 #: sys/getconf.rs:25
@@ -892,8 +901,20 @@ msgid ""
 "Write to standard output all the current settings, in stty-readable form"
 msgstr ""
 
+#: sccs/admin.rs:27
+msgid "admin - create and administer SCCS files"
+msgstr ""
+
+#: dev/ar.rs:161
+msgid "ar - create and maintain library archives"
+msgstr ""
+
 #: misc/test.rs:471 misc/test.rs:482
 msgid "argument expected"
+msgstr ""
+
+#: text/asa.rs:19
+msgid "asa - interpret carriage-control characters"
 msgstr ""
 
 #: awk/main.rs:25
@@ -902,6 +923,10 @@ msgstr ""
 
 #: pathnames/basename.rs:18
 msgid "basename - return non-directory portion of a pathname"
+msgstr ""
+
+#: calc/bc.rs:25
+msgid "bc - arbitrary-precision arithmetic language"
 msgstr ""
 
 #: fs/df.rs:140
@@ -916,20 +941,68 @@ msgstr ""
 msgid "cat - concatenate and print files"
 msgstr ""
 
+#: tree/chgrp.rs:19
+msgid "chgrp - change file group ownership"
+msgstr ""
+
+#: tree/chmod.rs:21
+msgid "chmod - change the file modes"
+msgstr ""
+
+#: tree/chown.rs:19
+msgid "chown - change the file ownership"
+msgstr ""
+
+#: xform/cksum.rs:29
+msgid "cksum - write file checksums and sizes"
+msgstr ""
+
 #: file/cmp.rs:19
 msgid "cmp - compare two files"
+msgstr ""
+
+#: text/comm.rs:22
+msgid "comm - select or reject lines common to two files"
+msgstr ""
+
+#: xform/compress.rs:22
+msgid "compress - compress data"
+msgstr ""
+
+#: tree/cp.rs:21
+msgid "cp - copy files"
+msgstr ""
+
+#: text/csplit.rs:19
+msgid "csplit - split files based on context"
+msgstr ""
+
+#: text/cut.rs:18
+msgid "cut - cut out selected fields of each line of a file"
 msgstr ""
 
 #: datetime/date.rs:21
 msgid "date - write the date and time"
 msgstr ""
 
+#: sccs/delta.rs:26
+msgid "delta - make a delta (change) to an SCCS file"
+msgstr ""
+
 #: fs/df.rs:23
 msgid "df - report free storage space"
 msgstr ""
 
+#: text/diff.rs:31
+msgid "diff - compare two files"
+msgstr ""
+
 #: pathnames/dirname.rs:19
 msgid "dirname - return the directory portion of a pathname"
+msgstr ""
+
+#: tree/du.rs:21
+msgid "du - estimate file space usage"
 msgstr ""
 
 #: process/env.rs:20
@@ -940,6 +1013,10 @@ msgstr ""
 msgid "execution error"
 msgstr ""
 
+#: text/expand.rs:20
+msgid "expand - convert tabs to spaces"
+msgstr ""
+
 #: users/mesg.rs:115
 msgid "failed to change terminal mode"
 msgstr ""
@@ -948,20 +1025,53 @@ msgstr ""
 msgid "file - determine file type"
 msgstr ""
 
+#: sccs/admin.rs:401
+msgid "file already exists"
+msgstr ""
+
+#: sccs/admin.rs:460
+msgid "file does not exist"
+msgstr ""
+
+#: text/fold.rs:22
+msgid "fold - filter for folding lines"
+msgstr ""
+
 #: users/mesg.rs:64
 msgid "fstat failed"
+msgstr ""
+
+#: process/fuser.rs:1365
+msgid ""
+"fuser - list process IDs of all processes that have one or more files open"
 msgstr ""
 
 #: i18n/gencat.rs:31
 msgid "gencat - generate a formatted message catalog"
 msgstr ""
 
+#: sccs/get.rs:25
+msgid "get - get a version of an SCCS file"
+msgstr ""
+
 #: sys/getconf.rs:23
 msgid "getconf - get configuration values"
 msgstr ""
 
+#: text/grep.rs:21
+msgid "grep - search a file for a pattern"
+msgstr ""
+
+#: text/head.rs:24
+msgid "head - copy the first part of files"
+msgstr ""
+
 #: i18n/iconv.rs:34
 msgid "iconv - codeset conversion"
+msgstr ""
+
+#: users/id.rs:21
+msgid "id - return user identity"
 msgstr ""
 
 #: misc/test.rs:236 misc/test.rs:246
@@ -974,6 +1084,10 @@ msgstr ""
 
 #: file/dd.rs:310
 msgid "invalid conv option"
+msgstr ""
+
+#: sccs/admin.rs:352
+msgid "invalid flag"
 msgstr ""
 
 #: sys/ipcrm.rs:76 sys/ipcrm.rs:109 sys/ipcrm.rs:141
@@ -1002,8 +1116,28 @@ msgstr ""
 msgid "it is dangerous to operate recursively on '/'"
 msgstr ""
 
-#: make/src/main.rs:268 make/src/signal_handler.rs:25
+#: text/join.rs:19
+msgid "join - relational database operator"
+msgstr ""
+
+#: tree/link.rs:16
+msgid "link - call link function"
+msgstr ""
+
+#: tree/ln.rs:17
+msgid "ln - link files"
+msgstr ""
+
+#: tree/ls.rs:29
+msgid "ls - list directory contents"
+msgstr ""
+
+#: make/src/main.rs:270 make/src/signal_handler.rs:25
 msgid "make"
+msgstr ""
+
+#: make/src/main.rs:38
+msgid "make - maintain, update, and regenerate groups of programs"
 msgstr ""
 
 #: make/src/signal_handler.rs:20
@@ -1012,6 +1146,10 @@ msgstr ""
 
 #: man/man.rs:55
 msgid "man - display system documentation"
+msgstr ""
+
+#: users/mesg.rs:21
+msgid "mesg - permit or deny messages"
 msgstr ""
 
 #: sys/ipcrm.rs:261
@@ -1034,6 +1172,14 @@ msgstr ""
 msgid "missing program argument"
 msgstr ""
 
+#: tree/mkdir.rs:20
+msgid "mkdir - make directories"
+msgstr ""
+
+#: tree/mkfifo.rs:18
+msgid "mkfifo - make FIFO special files"
+msgstr ""
+
 #: datetime/cal.rs:126
 msgid "month must be between 1 and 12"
 msgstr ""
@@ -1042,8 +1188,20 @@ msgstr ""
 msgid "more - display files on a page-by-page basis"
 msgstr ""
 
+#: tree/mv.rs:28
+msgid "mv - move files"
+msgstr ""
+
 #: process/nice.rs:20
 msgid "nice - invoke a utility with an altered nice value"
+msgstr ""
+
+#: text/nl.rs:21
+msgid "nl - line numbering filter"
+msgstr ""
+
+#: dev/nm.rs:33
+msgid "nm - write the name list of an object file"
 msgstr ""
 
 #: i18n/xgettext.rs:268
@@ -1066,6 +1224,10 @@ msgstr ""
 msgid "no targets to execute"
 msgstr ""
 
+#: sccs/delta.rs:417 sccs/get.rs:392
+msgid "not an SCCS file"
+msgstr ""
+
 #: display/printf.rs:1204
 msgid "not enough arguments"
 msgstr ""
@@ -1082,12 +1244,40 @@ msgstr ""
 msgid "parse error"
 msgstr ""
 
+#: text/paste.rs:25
+msgid "paste - merge corresponding or subsequent lines of files"
+msgstr ""
+
 #: pathnames/pathchk.rs:20
 msgid "pathchk - check pathnames"
 msgstr ""
 
+#: pax/main.rs:59
+msgid "pax - portable archive interchange"
+msgstr ""
+
 #: cc/main.rs:42
 msgid "pcc - compile standard C programs"
+msgstr ""
+
+#: text/pr_util/args.rs:22
+msgid "pr - print files"
+msgstr ""
+
+#: sys/ps.rs:33
+msgid "ps - report process status"
+msgstr ""
+
+#: users/pwd.rs:22
+msgid "pwd - return working directory name"
+msgstr ""
+
+#: tree/readlink.rs:21
+msgid "readlink - display the contents of a symbolic link"
+msgstr ""
+
+#: pathnames/realpath.rs:17
+msgid "realpath - return resolved canonical path"
 msgstr ""
 
 #: make/src/error_code.rs:92
@@ -1096,6 +1286,22 @@ msgstr ""
 
 #: process/renice.rs:21
 msgid "renice - set nice values of running processes"
+msgstr ""
+
+#: tree/rm.rs:26
+msgid "rm - remove directory entries"
+msgstr ""
+
+#: sccs/rmdel.rs:23
+msgid "rmdel - remove a delta from an SCCS file"
+msgstr ""
+
+#: tree/rmdir.rs:18
+msgid "rmdir - remove directories"
+msgstr ""
+
+#: sccs/sact.rs:23
+msgid "sact - print current SCCS file-editing activity"
 msgstr ""
 
 #: text/sed.rs:29
@@ -1122,12 +1328,20 @@ msgstr ""
 msgid "sleep - suspend execution for an interval"
 msgstr ""
 
+#: text/sort.rs:24
+msgid "sort - sort, merge, or sequence check text files"
+msgstr ""
+
 #: make/src/error_code.rs:101
 msgid "special target constraint is not fulfilled"
 msgstr ""
 
 #: file/split.rs:21
 msgid "split - split a file into pieces"
+msgstr ""
+
+#: dev/strings.rs:43
+msgid "strings - find printable strings in files"
 msgstr ""
 
 #: dev/strip.rs:23
@@ -1144,6 +1358,10 @@ msgstr ""
 
 #: screen/tabs.rs:25
 msgid "tabs - set terminal tabs"
+msgstr ""
+
+#: text/tail.rs:82
+msgid "tail - copy the last part of a file"
 msgstr ""
 
 #: users/talk.rs:39
@@ -1190,35 +1408,99 @@ msgstr ""
 msgid "touch"
 msgstr ""
 
+#: tree/touch.rs:16
+msgid "touch - change file access and modification times"
+msgstr ""
+
 #: screen/tput.rs:21
 msgid "tput - change terminal characteristics"
+msgstr ""
+
+#: text/tr.rs:17
+msgid "tr - translate or delete characters"
+msgstr ""
+
+#: text/tsort.rs:20
+msgid "tsort - topological sort"
+msgstr ""
+
+#: sys/uname.rs:15
+msgid "uname - return system name"
 msgstr ""
 
 #: misc/test.rs:525
 msgid "unary operator expected"
 msgstr ""
 
+#: xform/uncompress.rs:23
+msgid "uncompress - expand compressed data"
+msgstr ""
+
+#: text/unexpand.rs:8
+msgid "unexpand - convert spaces to tabs"
+msgstr ""
+
 #: misc/test.rs:570
 msgid "unexpected argument"
+msgstr ""
+
+#: text/uniq.rs:9
+msgid "uniq - report or filter out repeated lines in a file"
 msgstr ""
 
 #: misc/test.rs:176 misc/test.rs:335
 msgid "unknown operator"
 msgstr ""
 
+#: tree/unlink.rs:16
+msgid "unlink - call the unlink function"
+msgstr ""
+
 #: i18n/xgettext.rs:282
 msgid "unsupported file type"
+msgstr ""
+
+#: uucp/uucp.rs:30
+msgid "uucp - system-to-system copy"
+msgstr ""
+
+#: xform/uudecode.rs:26
+msgid "uudecode - decode a binary file"
+msgstr ""
+
+#: xform/uuencode.rs:23
+msgid "uuencode - encode a binary file"
+msgstr ""
+
+#: uucp/uustat.rs:26
+msgid "uustat - uucp status inquiry and job control"
+msgstr ""
+
+#: uucp/uux.rs:29
+msgid "uux - remote command execution"
+msgstr ""
+
+#: text/wc.rs:24
+msgid "wc - word, line, and byte or character count"
 msgstr ""
 
 #: sccs/what.rs:18
 msgid "what - identify SCCS files"
 msgstr ""
 
+#: sys/who.rs:23
+msgid "who - display who is on the system"
+msgstr ""
+
 #: sys/who.rs:218
 msgid "who: -f option not yet implemented"
 msgstr ""
 
-#: process/xargs.rs:30
+#: users/write.rs:28
+msgid "write - write to another user"
+msgstr ""
+
+#: process/xargs.rs:37
 msgid "xargs - construct argument lists and invoke utility"
 msgstr ""
 

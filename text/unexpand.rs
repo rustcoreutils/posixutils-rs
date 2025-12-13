@@ -1,10 +1,11 @@
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
+/// unexpand - convert spaces to tabs
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("unexpand - convert spaces to tabs"))]
 struct Args {
     /// Convert all sequences of two or more spaces to tabs
     #[arg(short = 'a')]

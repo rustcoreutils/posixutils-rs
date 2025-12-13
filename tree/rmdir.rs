@@ -15,7 +15,7 @@ use std::path::Path;
 
 /// rmdir - remove directories
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("rmdir - remove directories"))]
 struct Args {
     /// Remove all directories in a pathname
     #[arg(short, long)]

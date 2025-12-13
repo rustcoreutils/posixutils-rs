@@ -10,7 +10,7 @@
 use std::ffi::OsString;
 
 use clap::{Parser, ValueEnum};
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use object::{Object, ObjectSection};
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -40,7 +40,7 @@ struct OutputOptions {
 
 /// strings - find printable strings in files
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("strings - find printable strings in files"))]
 struct Args {
     #[command(flatten)]
     output_options: OutputOptions,

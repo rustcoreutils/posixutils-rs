@@ -24,11 +24,11 @@ use diff_util::{
     file_diff::FileDiff,
     functions::check_existance,
 };
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 
 /// diff - compare two files
 #[derive(Parser, Clone)]
-#[command(version, about)]
+#[command(version, about = gettext("diff - compare two files"))]
 struct Args {
     /// Cause EOL whitespace to be treated as blanks
     #[arg(short = 'b', long = "ignore-space-change")]

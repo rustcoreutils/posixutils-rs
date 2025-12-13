@@ -8,14 +8,14 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use modestr::ChmodMode;
 use plib::modestr;
 use std::io;
 
 /// mkfifo - make FIFO special files
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("mkfifo - make FIFO special files"))]
 struct Args {
     /// Set the file permission bits of the newly-created FIFO to the specified mode value.
     #[arg(short, long)]

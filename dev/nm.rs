@@ -17,7 +17,7 @@ use object::{
 };
 
 use clap::{Parser, ValueEnum};
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::collections::HashMap;
 use std::fs;
 
@@ -30,7 +30,7 @@ enum OutputType {
 
 /// nm - write the name list of an object file
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("nm - write the name list of an object file"))]
 struct Args {
     /// Write the full pathname or library name of an object on each line.
     #[arg(short = 'A', long = "print-file-name")]

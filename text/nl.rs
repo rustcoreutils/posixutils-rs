@@ -8,7 +8,7 @@
 //
 
 use clap::{Parser, ValueEnum};
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use regex::Regex;
 use std::fs;
 use std::io::{self, BufRead, Read};
@@ -18,7 +18,7 @@ use std::str::FromStr;
 
 /// nl - line numbering filter
 #[derive(Parser)]
-#[command(version, about, disable_help_flag = true)]
+#[command(version, about = gettext("nl - line numbering filter"), disable_help_flag = true)]
 struct Args {
     #[arg(long, action = clap::ArgAction::HelpLong)]
     help: Option<bool>,

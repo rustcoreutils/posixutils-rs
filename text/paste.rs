@@ -11,7 +11,7 @@
 // - improve:  don't open all files at once in --serial mode
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::cell::{OnceCell, RefCell};
 use std::error::Error;
 use std::fs::File;
@@ -22,7 +22,7 @@ use std::slice::Iter;
 
 /// paste - merge corresponding or subsequent lines of files
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("paste - merge corresponding or subsequent lines of files"))]
 struct Args {
     /// Concatenate all of the lines from each input file into one line of output per file, in command line order
     #[arg(short, long)]

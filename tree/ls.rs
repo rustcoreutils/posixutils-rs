@@ -26,7 +26,7 @@ use std::{
 
 /// ls - list directory contents
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("ls - list directory contents"))]
 struct Args {
     /// Write out all directory entries, including those whose names begin with
     /// a <period> ( '.' ).

@@ -14,16 +14,16 @@ mod common;
 
 use clap::Parser;
 use common::{find_job, list_jobs, spool_dir};
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::collections::HashMap;
 use std::env;
 use std::process::ExitCode;
 
-/// uustat - UUCP status enquiry and job control
+/// uustat - uucp status inquiry and job control
 #[derive(Parser)]
 #[command(
     version,
-    about = "UUCP status enquiry and job control",
+    about = gettext("uustat - uucp status inquiry and job control"),
     override_usage = "uustat [-q|-k jobid|-r jobid]\n       uustat [-s system] [-u user]"
 )]
 struct Args {

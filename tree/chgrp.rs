@@ -16,7 +16,7 @@ use std::{ffi::CString, io};
 
 /// chgrp - change file group ownership
 #[derive(Parser)]
-#[command(version, about, disable_help_flag = true)]
+#[command(version, about = gettext("chgrp - change file group ownership"), disable_help_flag = true)]
 struct Args {
     #[command(flatten)]
     delegate: ChangeOwnershipArgs,

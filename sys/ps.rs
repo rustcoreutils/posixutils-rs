@@ -16,7 +16,7 @@ mod pslinux;
 use std::collections::HashMap;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 
 #[cfg(target_os = "macos")]
 mod platform {
@@ -30,7 +30,7 @@ mod platform {
 
 /// ps - report process status
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("ps - report process status"))]
 struct Args {
     /// List all processes
     #[arg(short = 'A', long)]

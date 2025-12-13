@@ -9,6 +9,7 @@
 
 use chrono::DateTime;
 use clap::{Parser, Subcommand};
+use gettextrs::gettext;
 use object::{Object, ObjectSymbol, SymbolKind};
 use std::ffi::{OsStr, OsString};
 use std::io::{stdout, Write};
@@ -157,7 +158,7 @@ enum Commands {
 
 /// ar - create and maintain library archives
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("ar - create and maintain library archives"))]
 struct Args {
     #[command(subcommand)]
     command: Commands,

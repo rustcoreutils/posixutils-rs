@@ -18,7 +18,7 @@ use std::{fs, io};
 
 /// cp - copy files
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("cp - copy files"))]
 struct Args {
     /// Do not prompt for confirmation if the destination path exists
     #[arg(short, long)]

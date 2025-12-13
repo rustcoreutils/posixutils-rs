@@ -11,7 +11,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use notify_debouncer_full::new_debouncer;
 use notify_debouncer_full::notify::event::{ModifyKind, RemoveKind};
 use notify_debouncer_full::notify::{EventKind, RecursiveMode, Watcher};
@@ -79,7 +79,7 @@ impl FromStr for RelativeFrom {
 /// tail - copy the last part of a file
 /// If neither -n nor -c are specified, copies the last 10 lines (-n 10).
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("tail - copy the last part of a file"))]
 struct Args {
     /// The number of lines to print from the end of the file
     #[arg(short = 'n', long = "lines", allow_hyphen_values = true)]

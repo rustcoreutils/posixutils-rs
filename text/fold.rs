@@ -11,7 +11,7 @@ use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::io::input_stream;
 use plib::BUFSZ;
 
@@ -19,7 +19,7 @@ const TABSTOP: usize = 8;
 
 /// fold - filter for folding lines
 #[derive(Parser, Clone)]
-#[command(version, about)]
+#[command(version, about = gettext("fold - filter for folding lines"))]
 struct Args {
     /// Count width in bytes rather than column positions.
     #[arg(short, long)]

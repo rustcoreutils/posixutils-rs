@@ -12,7 +12,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::io::input_stream;
 use plib::lzw::UnixLZWReader;
 use std::io::{self, Write};
@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 /// uncompress - expand compressed data
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("uncompress - expand compressed data"))]
 struct Args {
     /// Write to standard output; no files are changed.
     #[arg(short = 'c', long)]

@@ -18,7 +18,7 @@ use std::mem;
 
 /// mesg - permit or deny messages
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("mesg - permit or deny messages"))]
 struct Args {
     /// "y" or "n":  Grant (y) or deny (n) permission to other users to send messages to the terminal device.
     operand: Option<String>,

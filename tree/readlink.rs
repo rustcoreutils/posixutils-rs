@@ -8,7 +8,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::error::Error;
 use std::fs;
 use std::io::Write;
@@ -16,9 +16,9 @@ use std::io::{stderr, stdout, ErrorKind};
 use std::path::PathBuf;
 use std::path::{Component, Path};
 
-/// readlink — display the contents of a symbolic link
+/// readlink - display the contents of a symbolic link
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("readlink - display the contents of a symbolic link"))]
 struct Args {
     /// Do not output a trailing <newline> character.
     #[arg(short, long)]

@@ -15,12 +15,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::sccsfile::{parse_pfile, paths};
 
 /// sact - print current SCCS file-editing activity
 #[derive(Parser)]
-#[command(version, about = "sact - print current SCCS file-editing activity")]
+#[command(version, about = gettext("sact - print current SCCS file-editing activity"))]
 struct Args {
     /// SCCS files to check (use - for stdin)
     #[arg(required = true)]

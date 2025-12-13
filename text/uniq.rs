@@ -1,12 +1,12 @@
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
 
-/// The uniq utility - filters out duplicate lines in a file
+/// uniq - report or filter out repeated lines in a file
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("uniq - report or filter out repeated lines in a file"))]
 struct Args {
     /// Count the number of repeated lines
     #[arg(short = 'c')]

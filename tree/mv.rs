@@ -25,7 +25,7 @@ use std::{
 
 /// mv - move files
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("mv - move files"))]
 struct Args {
     /// Do not prompt for confirmation if the destination path exists
     #[arg(short, long, overrides_with_all = ["force", "interactive"])]

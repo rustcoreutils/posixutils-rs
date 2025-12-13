@@ -15,12 +15,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::sccsfile::{parse_pfile, paths, DeltaType, SccsFile, Sid};
 
 /// rmdel - remove a delta from an SCCS file
 #[derive(Parser)]
-#[command(version, about = "rmdel - remove a delta from an SCCS file")]
+#[command(version, about = gettext("rmdel - remove a delta from an SCCS file"))]
 struct Args {
     /// SID of delta to remove (required)
     #[arg(short = 'r', value_name = "SID", required = true)]

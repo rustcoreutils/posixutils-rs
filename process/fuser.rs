@@ -18,7 +18,7 @@ use std::thread;
 use std::time::Duration;
 
 use clap::{CommandFactory, Parser};
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 
 const NAME_FIELD: usize = 20;
 
@@ -1362,7 +1362,7 @@ mod macos {
 
 /// fuser - list process IDs of all processes that have one or more files open
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("fuser - list process IDs of all processes that have one or more files open"))]
 struct Args {
     /// The file is treated as a mount point and the utility shall report on any files open in the file system.
     #[arg(short = 'c')]

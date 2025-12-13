@@ -12,16 +12,16 @@ use std::io::{self, Read, StdoutLock, Write};
 use std::path::PathBuf;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::io::input_stream;
 use plib::BUFSZ;
 
 const N_C_GROUP: &str = "N_C_GROUP";
 
-/// head - copy the first part of files.
+/// head - copy the first part of files
 /// If neither -n nor -c are specified, copies the first 10 lines of each file (-n 10).
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("head - copy the first part of files"))]
 struct Args {
     /// The first <N> lines of each input file shall be copied to standard output (mutually exclusive with -c)
     #[arg(long = "lines", short, value_parser = clap::value_parser!(usize), group = N_C_GROUP)]

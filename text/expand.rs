@@ -11,13 +11,13 @@ use std::io::{self, BufWriter, Read, Write};
 use std::path::PathBuf;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::io::input_stream;
 use plib::BUFSZ;
 
 /// expand - convert tabs to spaces
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("expand - convert tabs to spaces"))]
 struct Args {
     /// Tab stops, either a single positive decimal integer or a list of tabstops separated by commas.
     #[arg(short, long)]

@@ -18,7 +18,7 @@ use std::{cell::RefCell, io, os::unix::fs::MetadataExt};
 
 /// chmod - change the file modes
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("chmod - change the file modes"))]
 struct Args {
     /// Recursively change file mode bits.
     #[arg(short = 'R', long)]

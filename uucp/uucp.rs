@@ -17,7 +17,7 @@ use common::{
     expand_local_path, expand_remote_path, is_local_system, parse_path_spec, send_mail,
     send_remote_mail, ssh_fetch_file, ssh_send_file, Job,
 };
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -27,7 +27,7 @@ use std::process::ExitCode;
 #[derive(Parser)]
 #[command(
     version,
-    about = "Copy files between systems",
+    about = gettext("uucp - system-to-system copy"),
     override_usage = "uucp [-cCdfjmr] [-n user] source-file... destination-file"
 )]
 struct Args {

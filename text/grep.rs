@@ -8,7 +8,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::regex::{Regex, RegexFlags};
 use std::{
     fs::File,
@@ -16,9 +16,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-/// grep - search a file for a pattern.
+/// grep - search a file for a pattern
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("grep - search a file for a pattern"))]
 struct Args {
     /// Match using extended regular expressions.
     #[arg(short = 'E', long)]

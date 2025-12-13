@@ -15,14 +15,14 @@ use bc_util::{
 };
 use clap::Parser;
 
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use rustyline::{error::ReadlineError, DefaultEditor, Result};
 
 mod bc_util;
 
 /// bc - arbitrary-precision arithmetic language
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("bc - arbitrary-precision arithmetic language"))]
 struct Args {
     #[arg(short = 'l')]
     define_math_functions: bool,

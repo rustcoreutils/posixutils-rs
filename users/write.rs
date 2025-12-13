@@ -25,7 +25,7 @@ const KILL_CHAR: char = '\u{15}';
 
 /// write - write to another user
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("write - write to another user"))]
 struct Args {
     /// Login name of the person to whom the message shall be written.
     username: String,

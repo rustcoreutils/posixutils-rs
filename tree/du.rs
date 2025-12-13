@@ -11,14 +11,14 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::{fs, io};
 
 /// du - estimate file space usage
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("du - estimate file space usage"))]
 struct Args {
     /// Write counts for all files, not just directories
     #[arg(short, long)]

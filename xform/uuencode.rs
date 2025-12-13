@@ -9,7 +9,7 @@
 
 use base64::prelude::*;
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::fs::{File, Permissions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -20,7 +20,7 @@ const RW: u32 = 0o666;
 
 /// uuencode - encode a binary file
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("uuencode - encode a binary file"))]
 struct Args {
     /// Encode to base64 (MIME) standard, rather than UUE format.
     #[arg(short = 'm', long)]

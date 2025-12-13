@@ -23,7 +23,7 @@ use std::{
 
 /// rm - remove directory entries
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("rm - remove directory entries"))]
 struct Args {
     /// Do not prompt for confirmation.
     #[arg(short, long, overrides_with_all = ["force", "interactive"])]

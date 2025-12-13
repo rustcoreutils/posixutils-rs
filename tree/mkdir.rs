@@ -8,7 +8,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use modestr::ChmodMode;
 use plib::modestr;
 use std::ffi::CString;
@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 /// mkdir - make directories
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("mkdir - make directories"))]
 struct Args {
     /// Create any missing intermediate pathname components.
     #[arg(short, long)]

@@ -22,6 +22,7 @@ use archive::{ArchiveFormat, ArchiveWriter};
 use blocked_io::{parse_blocksize, BlockedReader, BlockedWriter, DEFAULT_RECORD_SIZE};
 use clap::{Parser, ValueEnum};
 use error::{PaxError, PaxResult};
+use gettextrs::gettext;
 use modes::copy::CopyOptions;
 use modes::list::ListOptions;
 use modes::read::ReadOptions;
@@ -55,7 +56,7 @@ impl From<Format> for ArchiveFormat {
 
 /// pax - portable archive interchange
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about)]
+#[command(author, version, about = gettext("pax - portable archive interchange"), long_about)]
 struct Args {
     /// Read an archive file from standard input.
     #[arg(short, long = "read")]

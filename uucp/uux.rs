@@ -17,7 +17,7 @@ use common::{
     expand_remote_path, is_local_system, parse_path_spec, send_mail, shell_escape, ssh_exec,
     ssh_fetch_file,
 };
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::env;
 use std::io::{self, Read};
 use std::process::ExitCode;
@@ -26,7 +26,7 @@ use std::process::ExitCode;
 #[derive(Parser)]
 #[command(
     version,
-    about = "Remote command execution",
+    about = gettext("uux - remote command execution"),
     override_usage = "uux [-jnp] [-] command-string"
 )]
 struct Args {

@@ -8,7 +8,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::regex::Regex;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, Error, ErrorKind, Read, Write};
@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 /// csplit - split files based on context
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("csplit - split files based on context"))]
 struct Args {
     /// Name the created files prefix 00, prefix 01, ..., prefixn.
     #[arg(short = 'f', long, default_value = "xx")]

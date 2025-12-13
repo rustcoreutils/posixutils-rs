@@ -8,12 +8,12 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::{fs, io};
 
 /// link - call link function
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("link - call link function"))]
 struct Args {
     /// Link source
     file1: String,

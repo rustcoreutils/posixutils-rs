@@ -8,7 +8,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 /// join - relational database operator
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("join - relational database operator"))]
 struct Args {
     /// Additional lines to include when there are no matches
     #[arg(short, default_value_t = 0)]

@@ -20,7 +20,7 @@ use plib::{curuser, platform, utmpx};
 
 /// who - display who is on the system
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("who - display who is on the system"))]
 struct Args {
     /// Process all utmpx entries
     #[arg(short, long)]

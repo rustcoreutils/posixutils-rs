@@ -16,7 +16,7 @@ use std::{ffi::CString, io};
 
 /// chown - change the file ownership
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("chown - change the file ownership"))]
 struct Args {
     #[command(flatten)]
     delegate: ChangeOwnershipArgs,

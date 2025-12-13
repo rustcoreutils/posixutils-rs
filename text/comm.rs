@@ -8,7 +8,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::io::input_reader;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
@@ -19,7 +19,7 @@ const NODUP: u32 = 1 << 2;
 
 /// comm - select or reject lines common to two files
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("comm - select or reject lines common to two files"))]
 struct Args {
     /// Suppress the output column of lines unique to file1.
     #[arg(short = '1', long)]

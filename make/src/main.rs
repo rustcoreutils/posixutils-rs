@@ -32,8 +32,10 @@ const MAKEFILE_PATH: [&str; 2] = [
     formatcp!("./{}", MAKEFILE_NAME[1]),
 ];
 
+/// make - maintain, update, and regenerate groups of programs
 // todo: sort arguments
 #[derive(Parser, Debug)]
+#[command(version, about = gettext("make - maintain, update, and regenerate groups of programs"))]
 struct Args {
     #[arg(short = 'C', long, help = "Change to DIRECTORY before doing anything")]
     directory: Option<PathBuf>,

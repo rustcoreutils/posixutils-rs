@@ -18,7 +18,7 @@
 mod crc32;
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::io::input_stream;
 use plib::BUFSZ;
 use std::io::{self, Read};
@@ -26,7 +26,7 @@ use std::path::PathBuf;
 
 /// cksum - write file checksums and sizes
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("cksum - write file checksums and sizes"))]
 struct Args {
     /// Files to read as input.  Use "-" or no-args for stdin.
     files: Vec<PathBuf>,

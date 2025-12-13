@@ -9,7 +9,7 @@
 
 use base64::prelude::*;
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::fs::{remove_file, File};
 use std::io::{self, Error, Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -23,7 +23,7 @@ macro_rules! reduce {
 
 /// uudecode - decode a binary file
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("uudecode - decode a binary file"))]
 struct Args {
     /// A pathname of a file that shall be used instead of any pathname contained in the input data.
     #[arg(short, long)]

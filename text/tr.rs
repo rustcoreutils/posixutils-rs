@@ -1,5 +1,5 @@
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use setup::{ForRemoval, ForTranslation};
 use std::error::Error;
 use std::process;
@@ -14,7 +14,7 @@ use transformation::translate::TranslateTransformation;
 
 /// tr - translate or delete characters
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("tr - translate or delete characters"))]
 struct Args {
     /// Delete characters in STRING1 from the input
     #[arg(short = 'd')]

@@ -12,13 +12,14 @@ use crate::{
     PAGE_WIDTH_IF_HAS_SEPARATOR, TAB,
 };
 use clap::Parser;
+use gettextrs::gettext;
 use regex::Regex;
 use std::path::PathBuf;
 use std::str::FromStr;
 
 /// pr - print files
 #[derive(Parser)]
-#[command(version, about, disable_help_flag = true)]
+#[command(version, about = gettext("pr - print files"), disable_help_flag = true)]
 pub struct Args {
     /// Begin output at page number FIRST_PAGE of the formatted input. Stop
     /// printing at LAST_PAGE if present.

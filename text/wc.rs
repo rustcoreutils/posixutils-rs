@@ -15,13 +15,13 @@ use std::{
 };
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::io::input_stream;
 use plib::BUFSZ;
 
 /// wc - word, line, and byte or character count
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("wc - word, line, and byte or character count"))]
 struct Args {
     /// Count number of bytes in each file
     #[arg(short = 'c', long)]

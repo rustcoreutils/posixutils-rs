@@ -11,7 +11,7 @@
 //
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::ffi::OsStr;
 use std::path::{Component, Path};
 
@@ -19,7 +19,7 @@ const PWD_ENV: &str = "PWD";
 
 /// pwd - return working directory name
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("pwd - return working directory name"))]
 struct Args {
     /// Count number of bytes in each file
     #[arg(short = 'L', long)]

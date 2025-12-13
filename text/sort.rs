@@ -17,11 +17,11 @@ use std::{
 };
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 
-/// Sort, merge, or sequence check text files
+/// sort - sort, merge, or sequence check text files
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version, about = gettext("sort - sort, merge, or sequence check text files"))]
 struct Args {
     /// Check that the single input file is ordered as specified
     #[arg(short = 'c')]

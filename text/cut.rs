@@ -10,12 +10,12 @@
 use std::io::{self, BufRead, Error, Read};
 
 use clap::Parser;
-use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
+use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use std::path::PathBuf;
 
-/// Cut - cut out selected fields of each line of a file
+/// cut - cut out selected fields of each line of a file
 #[derive(Parser, Clone)]
-#[command(version, about)]
+#[command(version, about = gettext("cut - cut out selected fields of each line of a file"))]
 struct Args {
     /// Cut based on a list of bytes
     #[arg(short = 'b', long)]

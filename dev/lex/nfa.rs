@@ -325,16 +325,11 @@ impl Nfa {
 
             // {n} or {n,m} - bounded repetition
             (n, max_opt) => {
-                // For bounded repetition, we need to create n copies for minimum
-                // and (m-n) optional copies for the range
-
                 if n == 0 && max_opt == Some(0) {
                     // {0} - matches empty
                     self.add_transition(start, Transition::Epsilon, end);
                     return Ok((start, end));
                 }
-
-                let m = max_opt.unwrap_or(n + 10); // If unbounded, approximate with a limit
 
                 // Build n required copies
                 let mut prev_end = start;
@@ -344,22 +339,25 @@ impl Nfa {
                     prev_end = copy_end;
                 }
 
-                // Build (m-n) optional copies
-                let mut last_ends = vec![prev_end];
-                for _ in n..m {
-                    let (copy_start, copy_end) = self.build_hir(&rep.sub)?;
-                    self.add_transition(prev_end, Transition::Epsilon, copy_start);
-                    last_ends.push(copy_end);
-                    prev_end = copy_end;
-                }
+                if let Some(m) = max_opt {
+                    // Bounded: {n,m} - build (m-n) optional copies
+                    let mut last_ends = vec![prev_end];
+                    for _ in n..m {
+                        let (copy_start, copy_end) = self.build_hir(&rep.sub)?;
+                        self.add_transition(prev_end, Transition::Epsilon, copy_start);
+                        last_ends.push(copy_end);
+                        prev_end = copy_end;
+                    }
+                    // Connect all possible endpoints to final end
+                    for ep in last_ends {
+                        self.add_transition(ep, Transition::Epsilon, end);
+                    }
+                } else {
+                    // Unbounded: {n,} - add loop for unlimited repetitions
+                    // Connect required part to end (allows exactly n matches)
+                    self.add_transition(prev_end, Transition::Epsilon, end);
 
-                // Connect all possible endpoints to final end
-                for ep in last_ends {
-                    self.add_transition(ep, Transition::Epsilon, end);
-                }
-
-                // If unbounded and n > 0, add loop from last copy back to itself
-                if max_opt.is_none() && prev_end != start {
+                    // Add loop for additional matches beyond n
                     let (loop_start, loop_end) = self.build_hir(&rep.sub)?;
                     self.add_transition(prev_end, Transition::Epsilon, loop_start);
                     self.add_transition(loop_end, Transition::Epsilon, loop_start);

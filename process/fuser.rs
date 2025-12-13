@@ -184,7 +184,7 @@ mod linux {
             }
         }
 
-        fn iter(&self) -> IpConnectionsIterator {
+        fn iter(&self) -> IpConnectionsIterator<'_> {
             IpConnectionsIterator {
                 current: Some(self),
             }
@@ -199,9 +199,8 @@ mod linux {
         type Item = &'a IpConnections;
 
         fn next(&mut self) -> Option<Self::Item> {
-            self.current.map(|node| {
+            self.current.inspect(|node| {
                 self.current = node.next.as_deref();
-                node
             })
         }
     }
@@ -226,7 +225,7 @@ mod linux {
             self.next = Some(new_node);
         }
 
-        fn iter(&self) -> UnixSocketListIterator {
+        fn iter(&self) -> UnixSocketListIterator<'_> {
             UnixSocketListIterator {
                 current: Some(self),
             }
@@ -241,9 +240,8 @@ mod linux {
         type Item = &'a UnixSocketList;
 
         fn next(&mut self) -> Option<Self::Item> {
-            self.current.map(|node| {
+            self.current.inspect(|node| {
                 self.current = node.next.as_deref();
-                node
             })
         }
     }
@@ -264,7 +262,7 @@ mod linux {
             }
         }
 
-        fn iter(&self) -> InodeListIterator {
+        fn iter(&self) -> InodeListIterator<'_> {
             InodeListIterator {
                 current: Some(self),
             }
@@ -279,9 +277,8 @@ mod linux {
         type Item = &'a InodeList;
 
         fn next(&mut self) -> Option<Self::Item> {
-            self.current.map(|node| {
+            self.current.inspect(|node| {
                 self.current = node.next.as_deref();
-                node
             })
         }
     }
@@ -306,7 +303,7 @@ mod linux {
                 next: None,
             }
         }
-        fn iter(&self) -> DeviceListIterator {
+        fn iter(&self) -> DeviceListIterator<'_> {
             DeviceListIterator {
                 current: Some(self),
             }
@@ -321,9 +318,8 @@ mod linux {
         type Item = &'a DeviceList;
 
         fn next(&mut self) -> Option<Self::Item> {
-            self.current.map(|node| {
+            self.current.inspect(|node| {
                 self.current = node.next.as_deref();
-                node
             })
         }
     }
@@ -436,7 +432,7 @@ mod linux {
                     Err(_) => continue,
                 };
 
-                let st = fs::metadata(&entry.path())?;
+                let st = fs::metadata(entry.path())?;
                 let uid = st.uid();
 
                 check_root_access(names, pid, uid, &root_stat, device_list, inode_list)?;
@@ -681,7 +677,7 @@ mod linux {
                     };
 
                     if device_list.iter().any(|dev| {
-                        dev.name.filename != PathBuf::from("") && stat_dev == dev.device_id
+                        !dev.name.filename.as_os_str().is_empty() && stat_dev == dev.device_id
                     }) || inode_list.iter().any(|inode| inode.inode == stat_ino)
                     {
                         add_process(names, pid, uid, new_access, ProcType::Normal);

@@ -98,10 +98,7 @@ impl Entry {
                         Some('|')
                     } else {
                         let mode = metadata.mode();
-                        if mode
-                            & (libc::S_IXUSR as u32 | libc::S_IXGRP as u32 | libc::S_IXOTH as u32)
-                            != 0
-                        {
+                        if mode & (libc::S_IXUSR | libc::S_IXGRP | libc::S_IXOTH) != 0 {
                             Some('*')
                         } else {
                             None
@@ -590,19 +587,11 @@ fn get_file_mode_string(metadata: &ftw::Metadata) -> String {
     let mode = metadata.mode();
 
     // Owner permissions
-    file_mode.push(if mode & (libc::S_IRUSR as u32) != 0 {
-        'r'
-    } else {
-        '-'
-    });
-    file_mode.push(if mode & (libc::S_IWUSR as u32) != 0 {
-        'w'
-    } else {
-        '-'
-    });
+    file_mode.push(if mode & libc::S_IRUSR != 0 { 'r' } else { '-' });
+    file_mode.push(if mode & libc::S_IWUSR != 0 { 'w' } else { '-' });
     file_mode.push({
-        let executable = mode & (libc::S_IXUSR as u32) != 0;
-        let set_user_id = mode & (libc::S_ISUID as u32) != 0;
+        let executable = mode & libc::S_IXUSR != 0;
+        let set_user_id = mode & libc::S_ISUID != 0;
         match (executable, set_user_id) {
             (true, true) => 's',
             (true, false) => 'x',
@@ -612,44 +601,24 @@ fn get_file_mode_string(metadata: &ftw::Metadata) -> String {
     });
 
     // Group permissions
-    file_mode.push(if mode & (libc::S_IRGRP as u32) != 0 {
-        'r'
-    } else {
-        '-'
-    });
-    file_mode.push(if mode & (libc::S_IWGRP as u32) != 0 {
-        'w'
-    } else {
-        '-'
-    });
-    file_mode.push(if mode & (libc::S_IXGRP as u32) != 0 {
-        'x'
-    } else {
-        '-'
-    });
+    file_mode.push(if mode & libc::S_IRGRP != 0 { 'r' } else { '-' });
+    file_mode.push(if mode & libc::S_IWGRP != 0 { 'w' } else { '-' });
+    file_mode.push(if mode & libc::S_IXGRP != 0 { 'x' } else { '-' });
 
     // Other permissions
-    file_mode.push(if mode & (libc::S_IROTH as u32) != 0 {
-        'r'
-    } else {
-        '-'
-    });
-    file_mode.push(if mode & (libc::S_IWOTH as u32) != 0 {
-        'w'
-    } else {
-        '-'
-    });
+    file_mode.push(if mode & libc::S_IROTH != 0 { 'r' } else { '-' });
+    file_mode.push(if mode & libc::S_IWOTH != 0 { 'w' } else { '-' });
     file_mode.push({
         if file_type.is_dir() {
-            let searchable = mode & (libc::S_IXOTH as u32) != 0;
-            let restricted_deletion = mode & (libc::S_ISVTX as u32) != 0;
+            let searchable = mode & libc::S_IXOTH != 0;
+            let restricted_deletion = mode & libc::S_ISVTX != 0;
             match (searchable, restricted_deletion) {
                 (true, true) => 't',
                 (true, false) => 'x',
                 (false, true) => 'T',
                 (false, false) => '-',
             }
-        } else if mode & (libc::S_IXOTH as u32) != 0 {
+        } else if mode & libc::S_IXOTH != 0 {
             'x'
         } else {
             '-'
@@ -707,7 +676,7 @@ fn get_file_info(metadata: &ftw::Metadata) -> FileInfo {
                 )
             };
 
-            FileInfo::DeviceInfo((major as u32, minor as u32))
+            FileInfo::DeviceInfo((major, minor))
         }
         _ => FileInfo::Size(metadata.size()),
     }

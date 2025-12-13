@@ -485,7 +485,7 @@ impl MessageCatalog {
         let mut act_size = 1 + self.cat.total_messages() / 5;
 
         while act_size <= best_total {
-            let mut deep = vec![0; act_size as usize];
+            let mut deep = vec![0; act_size];
             let mut act_depth = 1;
 
             for set in self.cat.all_sets() {
@@ -500,7 +500,7 @@ impl MessageCatalog {
                     if deep[idx] > act_depth {
                         act_depth = deep[idx];
 
-                        if act_depth * act_size > best_total as usize {
+                        if act_depth * act_size > best_total {
                             break;
                         }
                     }
@@ -539,7 +539,7 @@ impl MessageCatalog {
                     idx += best_size * 3;
                 }
 
-                array[idx] = (set.set_id + 1) as u32;
+                array[idx] = set.set_id + 1;
                 array[idx + 1] = msg.msg_id as u32;
                 array[idx + 2] = string_pool.len() as u32;
 

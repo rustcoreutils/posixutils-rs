@@ -531,7 +531,7 @@ fn set_permissions(path: &Path, entry: &ArchiveEntry, options: &ReadOptions) -> 
 
         // Per POSIX: If owner is not preserved, clear SUID and SGID bits
         if !options.preserve_owner {
-            mode &= !(libc::S_ISUID as u32 | libc::S_ISGID as u32);
+            mode &= !(libc::S_ISUID | libc::S_ISGID);
         }
 
         let perms = Permissions::from_mode(mode);

@@ -158,7 +158,7 @@ fn main() -> ExitCode {
     }
 
     // Check PROJECTDIR if -d not specified and root_dir is still default
-    if root_dir == PathBuf::from(".") {
+    if root_dir == Path::new(".") {
         if let Ok(projectdir) = env::var("PROJECTDIR") {
             if projectdir.starts_with('/') {
                 root_dir = PathBuf::from(projectdir);

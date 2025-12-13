@@ -84,7 +84,7 @@ fn parse_id(which: u32, input: &str) -> Result<u32, &'static str> {
         Ok(0) => Err("Invalid ID"),
         Ok(n) => Ok(n),
         Err(e) => {
-            if which != libc::PRIO_USER as u32 {
+            if which != libc::PRIO_USER {
                 eprintln!("{}", e);
                 Err("Invalid ID")
             } else {
@@ -110,11 +110,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // which class of priority to modify
     let which: u32 = {
         if args.pgrp {
-            libc::PRIO_PGRP as u32
+            libc::PRIO_PGRP
         } else if args.user {
-            libc::PRIO_USER as u32
+            libc::PRIO_USER
         } else {
-            libc::PRIO_PROCESS as u32
+            libc::PRIO_PROCESS
         }
     };
 

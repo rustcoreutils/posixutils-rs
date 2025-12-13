@@ -55,7 +55,7 @@ fn chmod_file(filename: &str, mode: &ChmodMode, recurse: bool) -> Result<(), io:
                     // Odd quirk: 0755 would not clear the set-group-ID bit but 00755 would even
                     // though the set-group-ID is at the 4th position from the right
                     if is_dir && (*num_digits < 5) {
-                        *m | (md.mode() & (libc::S_ISUID | libc::S_ISGID) as u32)
+                        *m | (md.mode() & (libc::S_ISUID | libc::S_ISGID))
                     } else {
                         *m
                     }

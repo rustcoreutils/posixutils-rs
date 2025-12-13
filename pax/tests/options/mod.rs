@@ -202,3 +202,305 @@ fn test_option_cpio_format() {
     let content = fs::read_to_string(dst_dir.join("cpio_test.txt")).unwrap();
     assert!(content.contains("CPIO format test"));
 }
+
+#[test]
+fn test_option_times() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("test.tar");
+    let dst_dir = temp.path().join("dest");
+
+    // Create source file
+    fs::create_dir(&src_dir).unwrap();
+    let mut f = File::create(src_dir.join("times_test.txt")).unwrap();
+    writeln!(f, "Times test").unwrap();
+
+    // Create archive with -o times option (pax format to use extended headers)
+    let output = run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "pax",
+            "-o",
+            "times",
+            "-f",
+            archive.to_str().unwrap(),
+            ".",
+        ],
+        &src_dir,
+    );
+    assert_success(&output, "pax write with times option");
+
+    // Extract and verify (file content should be preserved)
+    fs::create_dir(&dst_dir).unwrap();
+    let output = run_pax_in_dir(&["-r", "-f", archive.to_str().unwrap()], &dst_dir);
+    assert_success(&output, "pax read with times");
+
+    let content = fs::read_to_string(dst_dir.join("times_test.txt")).unwrap();
+    assert!(content.contains("Times test"));
+}
+
+#[test]
+fn test_option_linkdata() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("test.tar");
+    let dst_dir = temp.path().join("dest");
+
+    // Create source files - a file and a hard link to it
+    fs::create_dir(&src_dir).unwrap();
+    let file1 = src_dir.join("original.txt");
+    let mut f = File::create(&file1).unwrap();
+    writeln!(f, "Original content for linkdata test").unwrap();
+    drop(f);
+
+    // Create hard link
+    let file2 = src_dir.join("hardlink.txt");
+    fs::hard_link(&file1, &file2).unwrap();
+
+    // Create archive with -o linkdata option
+    let output = run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "pax",
+            "-o",
+            "linkdata",
+            "-f",
+            archive.to_str().unwrap(),
+            "original.txt",
+            "hardlink.txt",
+        ],
+        &src_dir,
+    );
+    assert_success(&output, "pax write with linkdata option");
+
+    // Extract and verify both files have content
+    fs::create_dir(&dst_dir).unwrap();
+    let output = run_pax_in_dir(&["-r", "-f", archive.to_str().unwrap()], &dst_dir);
+    assert_success(&output, "pax read with linkdata");
+
+    // Both files should have the same content
+    let content1 = fs::read_to_string(dst_dir.join("original.txt")).unwrap();
+    let content2 = fs::read_to_string(dst_dir.join("hardlink.txt")).unwrap();
+    assert!(content1.contains("Original content for linkdata test"));
+    assert!(content2.contains("Original content for linkdata test"));
+}
+
+#[test]
+fn test_option_invalid_bypass() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("test.tar");
+
+    // Create source file with valid UTF-8 name
+    fs::create_dir(&src_dir).unwrap();
+    let mut f = File::create(src_dir.join("valid_name.txt")).unwrap();
+    writeln!(f, "Valid filename test").unwrap();
+
+    // Create archive with -o invalid=bypass (default behavior, shouldn't affect valid names)
+    let output = run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "pax",
+            "-o",
+            "invalid=bypass",
+            "-f",
+            archive.to_str().unwrap(),
+            ".",
+        ],
+        &src_dir,
+    );
+    assert_success(&output, "pax write with invalid=bypass option");
+
+    // Verify the archive was created
+    assert!(archive.exists(), "Archive should be created");
+}
+
+#[test]
+fn test_option_invalid_write() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("test.tar");
+    let dst_dir = temp.path().join("dest");
+
+    // Create source file
+    fs::create_dir(&src_dir).unwrap();
+    let mut f = File::create(src_dir.join("test_file.txt")).unwrap();
+    writeln!(f, "Test file content").unwrap();
+
+    // Create archive with -o invalid=write
+    let output = run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "pax",
+            "-o",
+            "invalid=write",
+            "-f",
+            archive.to_str().unwrap(),
+            ".",
+        ],
+        &src_dir,
+    );
+    assert_success(&output, "pax write with invalid=write option");
+
+    // Extract and verify
+    fs::create_dir(&dst_dir).unwrap();
+    let output = run_pax_in_dir(&["-r", "-f", archive.to_str().unwrap()], &dst_dir);
+    assert_success(&output, "pax read after invalid=write");
+
+    let content = fs::read_to_string(dst_dir.join("test_file.txt")).unwrap();
+    assert!(content.contains("Test file content"));
+}
+
+#[test]
+fn test_option_global_keyword_value() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("test.tar");
+    let dst_dir = temp.path().join("dest");
+
+    // Create source file
+    fs::create_dir(&src_dir).unwrap();
+    let mut f = File::create(src_dir.join("global_test.txt")).unwrap();
+    writeln!(f, "Global keyword test").unwrap();
+
+    // Create archive with -o keyword=value (global extended header)
+    let output = run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "pax",
+            "-o",
+            "comment=This is a test archive",
+            "-f",
+            archive.to_str().unwrap(),
+            ".",
+        ],
+        &src_dir,
+    );
+    assert_success(&output, "pax write with global keyword=value");
+
+    // Extract and verify file content is preserved
+    fs::create_dir(&dst_dir).unwrap();
+    let output = run_pax_in_dir(&["-r", "-f", archive.to_str().unwrap()], &dst_dir);
+    assert_success(&output, "pax read with global header");
+
+    let content = fs::read_to_string(dst_dir.join("global_test.txt")).unwrap();
+    assert!(content.contains("Global keyword test"));
+}
+
+#[test]
+fn test_option_per_file_keyword_override() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("test.tar");
+    let dst_dir = temp.path().join("dest");
+
+    // Create source file
+    fs::create_dir(&src_dir).unwrap();
+    let mut f = File::create(src_dir.join("perfile_test.txt")).unwrap();
+    writeln!(f, "Per-file keyword test").unwrap();
+
+    // Create archive with -o keyword:=value (per-file extended header)
+    let output = run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "pax",
+            "-o",
+            "gname:=testgroup",
+            "-f",
+            archive.to_str().unwrap(),
+            ".",
+        ],
+        &src_dir,
+    );
+    assert_success(&output, "pax write with per-file keyword:=value");
+
+    // Extract and verify file content is preserved
+    fs::create_dir(&dst_dir).unwrap();
+    let output = run_pax_in_dir(&["-r", "-f", archive.to_str().unwrap()], &dst_dir);
+    assert_success(&output, "pax read with per-file header");
+
+    let content = fs::read_to_string(dst_dir.join("perfile_test.txt")).unwrap();
+    assert!(content.contains("Per-file keyword test"));
+}
+
+#[test]
+fn test_option_delete_pattern() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("test.tar");
+    let dst_dir = temp.path().join("dest");
+
+    // Create source file with long path (to trigger extended header)
+    fs::create_dir(&src_dir).unwrap();
+    let mut f = File::create(src_dir.join("delete_test.txt")).unwrap();
+    writeln!(f, "Delete pattern test").unwrap();
+
+    // Create archive with -o delete=mtime (delete mtime from extended headers)
+    let output = run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "pax",
+            "-o",
+            "times",
+            "-o",
+            "delete=atime",
+            "-f",
+            archive.to_str().unwrap(),
+            ".",
+        ],
+        &src_dir,
+    );
+    assert_success(&output, "pax write with delete pattern");
+
+    // Extract and verify file content is preserved
+    fs::create_dir(&dst_dir).unwrap();
+    let output = run_pax_in_dir(&["-r", "-f", archive.to_str().unwrap()], &dst_dir);
+    assert_success(&output, "pax read after delete pattern");
+
+    let content = fs::read_to_string(dst_dir.join("delete_test.txt")).unwrap();
+    assert!(content.contains("Delete pattern test"));
+}
+
+#[test]
+fn test_option_multiple_combined() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("test.tar");
+    let dst_dir = temp.path().join("dest");
+
+    // Create source files
+    fs::create_dir(&src_dir).unwrap();
+    let mut f = File::create(src_dir.join("combined.txt")).unwrap();
+    writeln!(f, "Combined options test").unwrap();
+
+    // Create archive with multiple -o options combined
+    let output = run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "pax",
+            "-o",
+            "times,comment=test comment,gname:=override",
+            "-f",
+            archive.to_str().unwrap(),
+            ".",
+        ],
+        &src_dir,
+    );
+    assert_success(&output, "pax write with multiple combined options");
+
+    // Extract and verify
+    fs::create_dir(&dst_dir).unwrap();
+    let output = run_pax_in_dir(&["-r", "-f", archive.to_str().unwrap()], &dst_dir);
+    assert_success(&output, "pax read with combined options");
+
+    let content = fs::read_to_string(dst_dir.join("combined.txt")).unwrap();
+    assert!(content.contains("Combined options test"));
+}

@@ -89,6 +89,7 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] head
  - [x] iconv (i18n)
  - [x] join
+ - [x] lex (Development)
  - [x] link
  - [x] ls
  - [x] m4
@@ -180,7 +181,6 @@ Because it is a FAQ, the major differences between this project and uutils are:
  - [x] id
  - [x] ipcs (IPC)
  - [x] kill
- - [ ] lex (Development)
  - [x] logger
  - [x] ps
  - [x] stty

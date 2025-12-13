@@ -22,6 +22,12 @@ type PackedTablesResult = (Vec<i16>, Vec<i16>, Vec<i16>, Vec<i16>, Vec<u8>, Vec<
 
 /// Generate output files
 pub fn generate(opts: &Options, grammar: &Grammar, lalr: &LALRAutomaton) -> Result<(), YaccError> {
+    // Generate description file first if requested (per POSIX, should be produced even on errors)
+    if opts.write_description {
+        let desc_path = format!("{}.output", opts.file_prefix);
+        generate_description_file(&desc_path, grammar, lalr)?;
+    }
+
     // Generate code file
     let code_path = format!("{}.tab.c", opts.file_prefix);
     generate_code_file(&code_path, opts, grammar, lalr)?;
@@ -30,12 +36,6 @@ pub fn generate(opts: &Options, grammar: &Grammar, lalr: &LALRAutomaton) -> Resu
     if opts.write_header {
         let header_path = format!("{}.tab.h", opts.file_prefix);
         generate_header_file(&header_path, opts, grammar)?;
-    }
-
-    // Generate description file if requested
-    if opts.write_description {
-        let desc_path = format!("{}.output", opts.file_prefix);
-        generate_description_file(&desc_path, grammar, lalr)?;
     }
 
     Ok(())
@@ -743,7 +743,7 @@ fn generate_parser<W: Write>(
     writeln!(w, "    /* Value stack */")?;
     writeln!(w, "    YYSTYPE *{}vs = NULL;", prefix)?;
     writeln!(w, "    YYSTYPE *{}vsp;", prefix)?;
-    writeln!(w, "    YYSTYPE {}val;", prefix)?;
+    writeln!(w, "    YYSTYPE {}val = {{0}};", prefix)?;
     writeln!(w)?;
 
     // Allocate stacks
@@ -963,7 +963,7 @@ fn generate_parser<W: Write>(
 
             if let Some(ref action) = prod.action {
                 // Transform $$ and $n references
-                let transformed = transform_action(action, prod.rhs.len(), grammar, prod);
+                let transformed = transform_action(action, prod.rhs.len(), grammar, prod, prefix);
                 if !opts.omit_line_directives {
                     writeln!(w, "#line {} \"{}\"", prod.line, opts.grammar_file)?;
                 }
@@ -1167,6 +1167,7 @@ fn transform_action(
     rhs_len: usize,
     grammar: &Grammar,
     prod: &crate::grammar::Production,
+    prefix: &str,
 ) -> String {
     let mut result = String::new();
     let mut chars = action.chars().peekable();
@@ -1178,9 +1179,9 @@ fn transform_action(
                     chars.next();
                     // Use LHS type if available
                     if let Some(ref tag) = grammar.symbols[prod.lhs].tag {
-                        result.push_str(&format!("(yyval.{})", tag));
+                        result.push_str(&format!("({}val.{})", prefix, tag));
                     } else {
-                        result.push_str("(yyval)");
+                        result.push_str(&format!("({}val)", prefix));
                     }
                 }
                 Some('<') => {
@@ -1199,7 +1200,7 @@ fn transform_action(
                     match chars.peek() {
                         Some('$') => {
                             chars.next();
-                            result.push_str(&format!("(yyval.{})", tag));
+                            result.push_str(&format!("({}val.{})", prefix, tag));
                         }
                         Some(&c) if c.is_ascii_digit() || c == '-' => {
                             // Parse the number (can be negative)
@@ -1218,7 +1219,8 @@ fn transform_action(
                             }
                             let n: i32 = num_str.parse().unwrap_or(0);
                             // Generate stack reference with explicit tag
-                            let stack_ref = generate_stack_reference(n, rhs_len, Some(&tag));
+                            let stack_ref =
+                                generate_stack_reference(n, rhs_len, Some(&tag), prefix);
                             result.push_str(&stack_ref);
                         }
                         _ => {
@@ -1255,7 +1257,8 @@ fn transform_action(
                         None
                     };
 
-                    let stack_ref = generate_stack_reference(n, rhs_len, sym_tag.as_deref());
+                    let stack_ref =
+                        generate_stack_reference(n, rhs_len, sym_tag.as_deref(), prefix);
                     result.push_str(&stack_ref);
                 }
                 _ => {
@@ -1273,16 +1276,16 @@ fn transform_action(
 /// Generate a stack reference for $n syntax
 ///
 /// For a rule with `rhs_len` symbols on the RHS:
-/// - $1 refers to yyvsp[-(rhs_len-1)] (first RHS symbol)
-/// - $rhs_len refers to yyvsp[0] (last RHS symbol)
-/// - $0 refers to yyvsp[-rhs_len] (symbol before the rule on the stack)
-/// - $-1 refers to yyvsp[-(rhs_len+1)] (two symbols before the rule)
+/// - $1 refers to {prefix}vsp[-(rhs_len-1)] (first RHS symbol)
+/// - $rhs_len refers to {prefix}vsp[0] (last RHS symbol)
+/// - $0 refers to {prefix}vsp[-rhs_len] (symbol before the rule on the stack)
+/// - $-1 refers to {prefix}vsp[-(rhs_len+1)] (two symbols before the rule)
 ///
 /// The formula: offset = -(rhs_len - n) = n - rhs_len
-fn generate_stack_reference(n: i32, rhs_len: usize, tag: Option<&str>) -> String {
+fn generate_stack_reference(n: i32, rhs_len: usize, tag: Option<&str>, prefix: &str) -> String {
     // Calculate the stack offset
-    // yyvsp points to the top of the value stack (last RHS symbol)
-    // For $n: offset from yyvsp = n - rhs_len
+    // {prefix}vsp points to the top of the value stack (last RHS symbol)
+    // For $n: offset from {prefix}vsp = n - rhs_len
     // Examples with rhs_len=3:
     //   $1 -> offset = 1-3 = -2 (first RHS symbol)
     //   $2 -> offset = 2-3 = -1
@@ -1293,14 +1296,14 @@ fn generate_stack_reference(n: i32, rhs_len: usize, tag: Option<&str>) -> String
 
     if let Some(tag) = tag {
         if offset == 0 {
-            format!("(yyvsp[0].{})", tag)
+            format!("({}vsp[0].{})", prefix, tag)
         } else {
-            format!("(yyvsp[{}].{})", offset, tag)
+            format!("({}vsp[{}].{})", prefix, offset, tag)
         }
     } else if offset == 0 {
-        "(yyvsp[0])".to_string()
+        format!("({}vsp[0])", prefix)
     } else {
-        format!("(yyvsp[{}])", offset)
+        format!("({}vsp[{}])", prefix, offset)
     }
 }
 
@@ -1525,9 +1528,9 @@ mod tests {
     fn test_generate_stack_reference_positive() {
         // For a rule with 3 RHS symbols:
         // $1 -> yyvsp[-2], $2 -> yyvsp[-1], $3 -> yyvsp[0]
-        assert_eq!(generate_stack_reference(1, 3, None), "(yyvsp[-2])");
-        assert_eq!(generate_stack_reference(2, 3, None), "(yyvsp[-1])");
-        assert_eq!(generate_stack_reference(3, 3, None), "(yyvsp[0])");
+        assert_eq!(generate_stack_reference(1, 3, None, "yy"), "(yyvsp[-2])");
+        assert_eq!(generate_stack_reference(2, 3, None, "yy"), "(yyvsp[-1])");
+        assert_eq!(generate_stack_reference(3, 3, None, "yy"), "(yyvsp[0])");
     }
 
     #[test]
@@ -1536,28 +1539,28 @@ mod tests {
         // $0 -> yyvsp[-3] (one before the rule)
         // $-1 -> yyvsp[-4] (two before the rule)
         // $-2 -> yyvsp[-5]
-        assert_eq!(generate_stack_reference(0, 3, None), "(yyvsp[-3])");
-        assert_eq!(generate_stack_reference(-1, 3, None), "(yyvsp[-4])");
-        assert_eq!(generate_stack_reference(-2, 3, None), "(yyvsp[-5])");
+        assert_eq!(generate_stack_reference(0, 3, None, "yy"), "(yyvsp[-3])");
+        assert_eq!(generate_stack_reference(-1, 3, None, "yy"), "(yyvsp[-4])");
+        assert_eq!(generate_stack_reference(-2, 3, None, "yy"), "(yyvsp[-5])");
     }
 
     #[test]
     fn test_generate_stack_reference_with_tag() {
         // With explicit type tags
         assert_eq!(
-            generate_stack_reference(1, 2, Some("ival")),
+            generate_stack_reference(1, 2, Some("ival"), "yy"),
             "(yyvsp[-1].ival)"
         );
         assert_eq!(
-            generate_stack_reference(2, 2, Some("ival")),
+            generate_stack_reference(2, 2, Some("ival"), "yy"),
             "(yyvsp[0].ival)"
         );
         assert_eq!(
-            generate_stack_reference(0, 2, Some("sval")),
+            generate_stack_reference(0, 2, Some("sval"), "yy"),
             "(yyvsp[-2].sval)"
         );
         assert_eq!(
-            generate_stack_reference(-1, 2, Some("sval")),
+            generate_stack_reference(-1, 2, Some("sval"), "yy"),
             "(yyvsp[-3].sval)"
         );
     }
@@ -1568,8 +1571,8 @@ mod tests {
         // $0 -> yyvsp[0] (the symbol just before where we are)
         // Actually for empty RHS, $0 refers to yyvsp[0 - 0] = yyvsp[0]
         // which is the top of the stack before reduction
-        assert_eq!(generate_stack_reference(0, 0, None), "(yyvsp[0])");
-        assert_eq!(generate_stack_reference(-1, 0, None), "(yyvsp[-1])");
+        assert_eq!(generate_stack_reference(0, 0, None, "yy"), "(yyvsp[0])");
+        assert_eq!(generate_stack_reference(-1, 0, None, "yy"), "(yyvsp[-1])");
     }
 
     #[test]
@@ -1577,8 +1580,19 @@ mod tests {
         // For a rule with 1 RHS symbol:
         // $1 -> yyvsp[0] (the only symbol)
         // $0 -> yyvsp[-1] (one before)
-        assert_eq!(generate_stack_reference(1, 1, None), "(yyvsp[0])");
-        assert_eq!(generate_stack_reference(0, 1, None), "(yyvsp[-1])");
-        assert_eq!(generate_stack_reference(-1, 1, None), "(yyvsp[-2])");
+        assert_eq!(generate_stack_reference(1, 1, None, "yy"), "(yyvsp[0])");
+        assert_eq!(generate_stack_reference(0, 1, None, "yy"), "(yyvsp[-1])");
+        assert_eq!(generate_stack_reference(-1, 1, None, "yy"), "(yyvsp[-2])");
+    }
+
+    #[test]
+    fn test_generate_stack_reference_custom_prefix() {
+        // Test with a custom prefix (for -p option)
+        assert_eq!(generate_stack_reference(1, 2, None, "foo"), "(foovsp[-1])");
+        assert_eq!(generate_stack_reference(2, 2, None, "foo"), "(foovsp[0])");
+        assert_eq!(
+            generate_stack_reference(1, 2, Some("ival"), "my"),
+            "(myvsp[-1].ival)"
+        );
     }
 }

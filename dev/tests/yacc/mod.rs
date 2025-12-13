@@ -1444,3 +1444,155 @@ expr : '\0'
         stderr
     );
 }
+
+#[test]
+fn test_sym_prefix_affects_semantic_actions() {
+    // Test that -p option affects semantic action code ($$ and $n references)
+    let grammar = r#"
+%token NUM
+%%
+expr : expr '+' expr { $$ = $1 + $3; }
+     | NUM           { $$ = $1; }
+     ;
+%%
+"#;
+
+    let temp_dir = TempDir::new().unwrap();
+    let grammar_path = temp_dir.path().join("test.y");
+    fs::write(&grammar_path, grammar).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .args(&["-p", "foo", grammar_path.to_str().unwrap()])
+        .output()
+        .expect("failed to execute yacc-rs");
+
+    assert!(output.status.success(), "yacc -p should succeed");
+
+    let code_path = temp_dir.path().join("y.tab.c");
+    let code = fs::read_to_string(&code_path).expect("should read generated code");
+
+    // Semantic actions should use prefixed names
+    // $$ should become (fooval) and $n should become (foovsp[...])
+    assert!(
+        code.contains("(fooval)"),
+        "semantic action should use (fooval) for $$ with -p foo"
+    );
+    assert!(
+        code.contains("foovsp["),
+        "semantic action should use foovsp for $n with -p foo"
+    );
+
+    // Should NOT contain yyvsp or yyval in semantic actions
+    // (Note: they may appear in parser infrastructure code, so we check within case statements)
+    let case_section = code
+        .split("switch (foon)")
+        .nth(1)
+        .map(|s| s.split("default:").next().unwrap_or(""))
+        .unwrap_or("");
+
+    assert!(
+        !case_section.contains("yyvsp["),
+        "semantic actions should NOT use yyvsp with -p foo"
+    );
+    assert!(
+        !case_section.contains("(yyval)"),
+        "semantic actions should NOT use (yyval) with -p foo"
+    );
+}
+
+#[test]
+fn test_description_file_shows_conflicts() {
+    // Test that -v generates description file that includes conflict information
+    let grammar = r#"
+%token NUM
+%%
+expr : expr '+' expr
+     | NUM
+     ;
+%%
+"#;
+
+    let temp_dir = TempDir::new().unwrap();
+    let grammar_path = temp_dir.path().join("test.y");
+    fs::write(&grammar_path, grammar).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .args(&["-v", grammar_path.to_str().unwrap()])
+        .output()
+        .expect("failed to execute yacc-rs");
+
+    assert!(output.status.success(), "yacc -v should succeed");
+
+    // Check that description file was created
+    let desc_path = temp_dir.path().join("y.output");
+    assert!(
+        desc_path.exists(),
+        "y.output should be created with -v flag"
+    );
+
+    // Check that description file contains grammar and state information
+    let desc = fs::read_to_string(&desc_path).expect("should read description file");
+
+    assert!(
+        desc.contains("Grammar"),
+        "description file should contain Grammar section"
+    );
+    assert!(
+        desc.contains("State"),
+        "description file should contain State sections"
+    );
+
+    // For ambiguous grammar, should mention conflicts
+    assert!(
+        desc.contains("conflict") || desc.contains("Conflict"),
+        "description file should mention conflicts for ambiguous grammar"
+    );
+}
+
+#[test]
+fn test_sym_prefix_affects_tagged_references() {
+    // Test that -p option affects tagged semantic action code ($<tag>n and $<tag>$)
+    let grammar = r#"
+%union {
+    int ival;
+    double dval;
+}
+
+%token <ival> NUM
+%type <ival> expr
+
+%%
+expr : expr '+' expr { $<ival>$ = $<ival>1 + $<ival>3; }
+     | NUM           { $$ = $1; }
+     ;
+%%
+"#;
+
+    let temp_dir = TempDir::new().unwrap();
+    let grammar_path = temp_dir.path().join("test.y");
+    fs::write(&grammar_path, grammar).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .args(&["-p", "bar", grammar_path.to_str().unwrap()])
+        .output()
+        .expect("failed to execute yacc-rs");
+
+    assert!(output.status.success(), "yacc -p should succeed");
+
+    let code_path = temp_dir.path().join("y.tab.c");
+    let code = fs::read_to_string(&code_path).expect("should read generated code");
+
+    // Tagged references should use prefixed names
+    // $<ival>$ should become (barval.ival) and $<ival>n should become (barvsp[...].ival)
+    assert!(
+        code.contains("(barval.ival)"),
+        "semantic action should use (barval.ival) for $<ival>$ with -p bar"
+    );
+    assert!(
+        code.contains("barvsp[") && code.contains(".ival)"),
+        "semantic action should use barvsp[...].ival for $<ival>n with -p bar"
+    );
+}

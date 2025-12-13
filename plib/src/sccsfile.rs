@@ -1562,6 +1562,7 @@ pub fn parse_pfile(contents: &str) -> SccsResult<Vec<PfileEntry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn test_sid_parse() {
